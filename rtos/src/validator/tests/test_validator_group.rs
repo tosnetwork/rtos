@@ -28,6 +28,9 @@ struct DummyEngine;
 
 #[async_trait::async_trait]
 impl EngineOperations for DummyEngine {
+    fn destroy_block_candidates(&self, _: &SessionId) -> Result<bool> {
+        Ok(true)
+    }
     // `on_candidate_observed` persists a valid candidate body
     async fn store_block(
         &self,
@@ -41,6 +44,8 @@ impl EngineOperations for DummyEngine {
 struct MockSimplexSession {
     requests: Mutex<Vec<(BlockIdExt, EnsureCandidateAvailabilityOptions)>>,
     stopped: AtomicBool,
+    stop_calls: std::sync::atomic::AtomicUsize,
+    stop_gate: Mutex<Option<(tokio::sync::oneshot::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl Display for MockSimplexSession {
@@ -53,6 +58,11 @@ impl Session for MockSimplexSession {
     fn start(&self, _prev_blocks: Vec<BlockIdExt>, _min_masterchain_block_id: BlockIdExt) {}
 
     fn stop(&self) {
+        self.stop_calls.fetch_add(1, Ordering::Relaxed);
+        if let Some((entered, release)) = self.stop_gate.lock().unwrap().take() {
+            let _ = entered.send(());
+            release.recv_timeout(Duration::from_secs(10)).expect("stop gate watchdog");
+        }
         self.stopped.store(true, Ordering::Relaxed);
     }
 
@@ -67,6 +77,25 @@ impl Session for MockSimplexSession {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_group_stop_waits_for_session_exit() {
+    let group = make_simplex_group_for_resolver_tests();
+    let session = Arc::new(MockSimplexSession::default());
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *session.stop_gate.lock().unwrap() = Some((entered_tx, release_rx));
+    let holder = Arc::new(super::consensus::SessionHolder::simplex(session.clone()));
+    group.group_impl.execute_sync(|inner| inner.session = Some(holder)).await;
+    let stopped = tokio::spawn(group.clone().stop(tokio::runtime::Handle::current(), false));
+    tokio::time::timeout(Duration::from_secs(5), entered_rx).await.unwrap().unwrap();
+    let completed_before_exit = stopped.is_finished();
+    release_tx.send(()).unwrap();
+    stopped.await.unwrap().unwrap();
+    assert!(!completed_before_exit, "group stop returned before the session exited");
+    assert!(session.stopped.load(Ordering::Relaxed));
+    assert!(group.get_status().await == ValidatorGroupStatus::Stopped);
 }
 
 impl super::consensus::SimplexSession for MockSimplexSession {
@@ -103,6 +132,67 @@ fn make_group_impl_for_start_tests() -> ValidatorGroupImpl {
 }
 
 fn make_simplex_group_for_resolver_tests() -> Arc<ValidatorGroup> {
+    make_simplex_group_for_engine(Arc::new(DummyEngine))
+}
+
+/// Controlled Session boundary for the actual manager -> group teardown path.
+pub(crate) async fn gated_lifecycle_group(
+) -> (Arc<ValidatorGroup>, tokio::sync::oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let group = make_simplex_group_for_resolver_tests();
+    let session = Arc::new(MockSimplexSession::default());
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    *session.stop_gate.lock().unwrap() = Some((entered, wait));
+    let holder = Arc::new(super::consensus::SessionHolder::simplex(session));
+    group.group_impl.execute_sync(|inner| inner.session = Some(holder)).await;
+    (group, observed, release)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_group_stop_waits_for_descendants_and_rejects_late_root_tasks() {
+    let group = make_simplex_group_for_resolver_tests();
+    let (parent_release, parent_gate) = tokio::sync::oneshot::channel();
+    let (child_entered, child_observed) = tokio::sync::oneshot::channel();
+    let (child_release, child_gate) = tokio::sync::oneshot::channel();
+    let owner = group.clone();
+    group.spawn_root_task(&tokio::runtime::Handle::current(), async move {
+        parent_gate.await.unwrap();
+        owner.spawn_task(&tokio::runtime::Handle::current(), async move {
+            child_entered.send(()).unwrap();
+            child_gate.await.unwrap();
+        });
+    });
+    let mut stopped = Box::pin(group.clone().stop(tokio::runtime::Handle::current(), false));
+    assert!(futures::poll!(&mut stopped).is_pending());
+    group.stop_requested.cancelled().await;
+    let late = Arc::new(AtomicBool::new(false));
+    let observed = late.clone();
+    group.spawn_root_task(&tokio::runtime::Handle::current(), async move {
+        observed.store(true, Ordering::Relaxed);
+    });
+    parent_release.send(()).unwrap();
+    child_observed.await.unwrap();
+    assert!(futures::poll!(&mut stopped).is_pending());
+    child_release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), stopped).await.unwrap().unwrap();
+    assert!(!late.load(Ordering::Relaxed));
+    assert!(group.tasks.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_group_stop_reports_task_panic_instead_of_stopped() {
+    let group = make_simplex_group_for_resolver_tests();
+    let task = group.spawn_task(&tokio::runtime::Handle::current(), async {
+        panic!("controlled group task panic");
+    });
+    assert!(task.await.unwrap_err().is_panic());
+    let error = group.clone().stop(tokio::runtime::Handle::current(), false).await.unwrap_err();
+    assert!(error.to_string().contains("task panicked"));
+    assert!(group.get_status().await == ValidatorGroupStatus::Stopping);
+    assert!(group.tasks.is_empty());
+}
+
+fn make_simplex_group_for_engine(engine: Arc<dyn EngineOperations>) -> Arc<ValidatorGroup> {
     let local_key: PrivateKey =
         Ed25519KeyOption::<ZeroizingBytes>::generate().expect("key must be generated");
     let validator_descr = ValidatorDescr::with_params(
@@ -130,7 +220,7 @@ fn make_simplex_group_for_resolver_tests() -> Arc<ValidatorGroup> {
         validator_set,
         0,
         ConsensusOptions::Simplex(Default::default()),
-        Arc::new(DummyEngine),
+        engine,
         false,
         None,
     );
@@ -1117,4 +1207,140 @@ async fn pq_live_group_uses_stable_local_identity_through_accept_and_broadcast()
         1,
         "local PQ creator must retain broadcast ownership"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_group_stop_survives_cancelled_waiter_and_is_idempotent() {
+    let group = make_simplex_group_for_resolver_tests();
+    let session = Arc::new(MockSimplexSession::default());
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *session.stop_gate.lock().unwrap() = Some((entered_tx, release_rx));
+    let holder = Arc::new(super::consensus::SessionHolder::simplex(session.clone()));
+    group.group_impl.execute_sync(|inner| inner.session = Some(holder)).await;
+    let first = tokio::spawn(group.clone().stop(tokio::runtime::Handle::current(), false));
+    tokio::time::timeout(Duration::from_secs(5), entered_rx).await.unwrap().unwrap();
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    let second = tokio::spawn(group.clone().stop(tokio::runtime::Handle::current(), false));
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), second).await.unwrap().unwrap().unwrap();
+    group.clone().stop(tokio::runtime::Handle::current(), false).await.unwrap();
+    assert_eq!(session.stop_calls.load(Ordering::Relaxed), 1);
+    assert!(group
+        .stop(tokio::runtime::Handle::current(), true)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("preserve/destroy"));
+}
+
+struct StoreGateEngine {
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+#[async_trait::async_trait]
+impl EngineOperations for StoreGateEngine {
+    async fn store_block(
+        &self,
+        _: &crate::block::BlockStuff,
+    ) -> Result<crate::internal_db::BlockResult> {
+        self.entered.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        fail!("controlled store completion")
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_group_stop_drains_actual_validation_queue_action() {
+    let engine = Arc::new(StoreGateEngine {
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let group = make_simplex_group_for_engine(engine.clone());
+    let mut block = Block::default();
+    block.set_global_id(42);
+    let bytes = block.write_to_bytes().unwrap();
+    let id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        77,
+        block.serialize().unwrap().repr_hash().clone(),
+        UInt256::calc_file_hash(&bytes),
+    );
+    let receiver = group.receiver.lock().unwrap().take().unwrap();
+    let queue_group = group.clone();
+    let rt = tokio::runtime::Handle::current();
+    group.spawn_task(&rt.clone(), async move {
+        process_validation_queue(receiver, queue_group, rt).await
+    });
+    group
+        .action_queue
+        .send(ValidationAction::OnCandidateObserved {
+            block_id: id.clone(),
+            data: ConsensusCommonFactory::create_block_payload(bytes),
+            collated_data: ConsensusCommonFactory::create_block_payload(Vec::new()),
+            flags: CandidateObservedFlags {
+                body_present: true,
+                parent_ready: false,
+                local_collated: false,
+            },
+        })
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), engine.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let mut stopped = Box::pin(group.clone().stop(tokio::runtime::Handle::current(), false));
+    assert!(futures::poll!(&mut stopped).is_pending());
+    group.session_exit_observed.cancelled().await;
+    let returned_before_action = futures::poll!(&mut stopped).is_ready();
+    let status_before_action = group.get_status().await;
+    engine.release.add_permits(1);
+    assert!(!returned_before_action, "stop returned with a live validation action");
+    assert!(status_before_action == ValidatorGroupStatus::Stopping);
+    tokio::time::timeout(Duration::from_secs(5), stopped).await.unwrap().unwrap();
+    assert!(group.tasks.is_empty());
+    assert!(group.action_queue.is_closed());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_group_stop_joins_real_simplex_threads_and_reopens_preserved_database() {
+    let directory = tempfile::tempdir().unwrap();
+    let group = make_simplex_group_for_resolver_tests();
+    for _ in 0..2 {
+        let options = simplex::SessionOptions { wait_for_db_init: true, ..Default::default() };
+        let nodes = vec![consensus_common::SessionNode {
+            adnl_id: group.local_key.id().clone(),
+            public_key: group.local_key.clone(),
+            weight: 1,
+        }];
+        let session = simplex::SessionFactory::create_session(
+            &options,
+            &group.session_id,
+            &group.shard,
+            nodes,
+            &group.local_key,
+            directory.path().to_str().unwrap().to_owned(),
+            ConsensusCommonFactory::create_dummy_overlay_manager(),
+            group.make_validator_session_callback(),
+            None,
+            1,
+        )
+        .unwrap();
+        // Each iteration is a new manager-owned group using the same real session DB.
+        let owner = make_simplex_group_for_resolver_tests();
+        let holder = Arc::new(super::consensus::SessionHolder::simplex(session.clone()));
+        owner.group_impl.execute_sync(|inner| inner.session = Some(holder)).await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            owner.clone().stop(tokio::runtime::Handle::current(), false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(session.is_stopped());
+        assert!(!session.is_panicked());
+        assert!(directory.path().read_dir().unwrap().next().is_some());
+    }
 }

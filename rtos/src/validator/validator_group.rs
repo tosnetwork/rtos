@@ -36,6 +36,7 @@ use crate::{
         },
     },
 };
+use futures::FutureExt;
 use rtos_block::{
     error, fail, read_single_root_boc, Block, BlockIdExt, BlockSignaturesVariant, Deserializable,
     Result, ShardIdent, UInt256, UnixTime, ValidatorSet,
@@ -49,6 +50,7 @@ use std::{
     },
     time::*,
 };
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use validator_session_listener::{
     process_validation_queue, ValidationAction, ValidatorSessionListener,
 };
@@ -613,7 +615,7 @@ impl ValidatorGroupImpl {
         let receiver = g.receiver.lock().unwrap().take().ok_or_else(|| {
             error!("Receiver already taken - session cannot be started multiple times")
         })?;
-        rt.clone().spawn(async move {
+        g.spawn_task(&rt.clone(), async move {
             process_validation_queue(receiver, g_clone.clone(), rt).await;
         });
 
@@ -985,6 +987,15 @@ pub struct ValidatorGroup {
     allow_unsafe_self_blocks_resync: bool,
 
     group_impl: Arc<MutexWrapper<ValidatorGroupImpl>>,
+    tasks: TaskTracker,
+    task_admission_closed: Mutex<bool>,
+    task_panicked: Arc<AtomicBool>,
+    pub(super) stop_requested: CancellationToken,
+    #[cfg(test)]
+    session_exit_observed: CancellationToken,
+    stop_completion: Mutex<
+        Option<(bool, tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>)>,
+    >,
     /// Validator-side cache/resolver for speculative shard states.
     ///
     /// Simplex delivers candidate observations through `SessionListener`.
@@ -1019,7 +1030,7 @@ impl ResolverBackend for ValidatorGroup {
         let group_impl = self.group_impl.clone();
         let session_id = self.session_id.clone();
         let shard = self.shard.clone();
-        tokio::spawn(async move {
+        self.spawn_root_task(&tokio::runtime::Handle::current(), async move {
             let simplex_session = group_impl.execute_sync(|gi| gi.get_simplex_session()).await;
             match simplex_session {
                 Some(session) => {
@@ -1143,6 +1154,13 @@ impl ValidatorGroup {
             engine,
             allow_unsafe_self_blocks_resync,
             group_impl: Arc::new(MutexWrapper::new(group_impl, id)),
+            tasks: TaskTracker::new(),
+            task_admission_closed: Mutex::new(false),
+            task_panicked: Arc::new(AtomicBool::new(false)),
+            stop_requested: CancellationToken::new(),
+            #[cfg(test)]
+            session_exit_observed: CancellationToken::new(),
+            stop_completion: Mutex::new(None),
             state_resolver_cache: Arc::new(tokio::sync::Mutex::new(StateResolverCache::new())),
             action_queue,
             callback: Arc::new(listener),
@@ -1296,7 +1314,7 @@ impl ValidatorGroup {
         min_ts: SystemTime,
         rt: tokio::runtime::Handle,
     ) -> Result<()> {
-        rt.clone().spawn(async move {
+        self.clone().spawn_root_task(&rt.clone(), async move {
             let callback = self.make_validator_session_callback();
             self.group_impl
                 .execute_sync(|group_impl| {
@@ -1344,71 +1362,141 @@ impl ValidatorGroup {
         Ok(())
     }
 
+    /// Track descendants of an already admitted group operation. The parent
+    /// keeps its token until all child tasks have been registered.
+    pub(super) fn spawn_task<F>(
+        &self,
+        rt: &tokio::runtime::Handle,
+        future: F,
+    ) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let panicked = self.task_panicked.clone();
+        self.tasks.spawn_on(
+            async move {
+                match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+                    Ok(value) => value,
+                    Err(payload) => {
+                        panicked.store(true, Ordering::Release);
+                        std::panic::resume_unwind(payload)
+                    }
+                }
+            },
+            rt,
+        )
+    }
+
+    pub(super) fn spawn_root_task<F>(&self, rt: &tokio::runtime::Handle, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let closed = self.task_admission_closed.lock().expect("task admission poisoned");
+        if !*closed {
+            self.spawn_task(rt, future);
+        }
+    }
+
+    /// Completion is shared by all callers and survives cancellation of one waiter.
+    /// The first request fixes preserve/destroy policy; later callers cannot turn
+    /// a preserving shutdown into deletion of a recovery journal.
     pub async fn stop(
-        self: Arc<ValidatorGroup>,
+        self: Arc<Self>,
+        rt: tokio::runtime::Handle,
+        destroy_database: bool,
+    ) -> Result<()> {
+        let mut completion = {
+            let mut slot = self.stop_completion.lock().expect("stop completion poisoned");
+            if slot.as_ref().is_some_and(|(destroy, _)| *destroy != destroy_database) {
+                fail!("conflicting validator teardown preserve/destroy policy");
+            }
+            slot.get_or_insert_with(|| {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                let group = self.clone();
+                rt.clone().spawn(async move {
+                    let result =
+                        match std::panic::AssertUnwindSafe(group.stop_inner(rt, destroy_database))
+                            .catch_unwind()
+                            .await
+                        {
+                            Ok(result) => result.map_err(|e| e.to_string()),
+                            Err(_) => Err("validator group teardown panicked".to_owned()),
+                        };
+                    tx.send_replace(Some(result));
+                });
+                (destroy_database, rx)
+            })
+            .1
+            .clone()
+        };
+        loop {
+            if let Some(result) = completion.borrow().clone() {
+                return result.map_err(|e| error!("{}", e));
+            }
+            completion.changed().await.map_err(|_| error!("group teardown completion lost"))?;
+        }
+    }
+
+    async fn stop_inner(
+        self: Arc<Self>,
         rt: tokio::runtime::Handle,
         destroy_database: bool,
     ) -> Result<()> {
         self.set_status(ValidatorGroupStatus::Stopping).await?;
+        *self.task_admission_closed.lock().expect("task admission poisoned") = true;
+        self.stop_requested.cancel();
+        self.tasks.close();
         let consensus_label = if self.is_simplex() { "simplex" } else { "catchain" };
-        metrics::counter!("rtos_node_validator_session_stopped_total", "consensus" => consensus_label)
-            .increment(1);
-        let shard = self.shard.clone();
-        let cc_seqno = self.cc_seqno();
-        log::info!(target: "validator",
-            "SESSION_LIFECYCLE: stop_initiated shard={} cc_seqno={} destroy_db={}",
-            shard, cc_seqno, destroy_database);
-        let group_impl = self.group_impl.clone();
-        let self_clone = self.clone();
-        rt.spawn({
-            async move {
-                let session_ptr =
-                    group_impl.execute_sync(|group_impl| group_impl.session.clone()).await;
-                if let Some(s_ptr) = session_ptr {
-                    log::debug!(target: "validator",
-                        "Stopping consensus engine for shard={} cc_seqno={}", shard, cc_seqno);
-                    if destroy_database {
-                        s_ptr.destroy();
-                    } else {
-                        s_ptr.stop();
-                    }
-                }
-                let _ = self_clone.set_status(ValidatorGroupStatus::Stopped).await;
+        metrics::counter!("rtos_node_validator_session_stopped_total", "consensus" => consensus_label).increment(1);
+        let session = self.group_impl.execute_sync(|gi| gi.session.clone()).await;
+        // Session::stop joins OS threads. It must not block a Tokio worker which
+        // those threads may still need in order to finish their callbacks.
+        let session_exit = rt.spawn_blocking(move || {
+            if let Some(session) = session {
                 if destroy_database {
-                    let _ = self_clone.destroy_db().await;
-                    log::debug!(target: "validator",
-                        "DB destroyed for shard={} cc_seqno={}", shard, cc_seqno);
+                    session.destroy();
+                } else {
+                    session.stop();
                 }
-                log::info!(target: "validator",
-                    "SESSION_LIFECYCLE: stopped shard={} cc_seqno={} destroy_db={}",
-                    shard, cc_seqno, destroy_database);
-
-                // Lifecycle: emit sessionStopped after the session is torn down.
-                // A pre-created future that never validated (e.g. a stale future
-                // culled via cull_stale_future / gc_future) is `never_ran`, NOT
-                // `stopped` -- the deterministic session_id may be reused by the
-                // real promoted session later, so mislabeling it `stopped`
-                // produces a spurious stop-before-start for that id. A session
-                // that did start gets `stopped`. The worker flushes the trace
-                // file before writing the stop line ("stop record present =>
-                // trace complete"). Idempotent via stopped_emitted.
-                group_impl
-                    .execute_sync(|gi| {
-                        if !gi.stopped_emitted {
-                            if let Some(ctx) = gi.lifecycle.as_ref() {
-                                let status = if gi.ever_started {
-                                    simplex::LifecycleFinalStatus::Stopped
-                                } else {
-                                    simplex::LifecycleFinalStatus::NeverRan
-                                };
-                                ctx.emit_stopped(status);
-                            }
-                            gi.stopped_emitted = true;
-                        }
-                    })
-                    .await;
+                if session.get_simplex_session().is_some_and(|s| s.is_panicked()) {
+                    fail!("consensus session worker panicked");
+                }
             }
+            Ok::<(), anyhow::Error>(())
         });
+        // Never abort a state apply. Idle queue waits wake on stop_requested;
+        // accepted actions and all their descendants finish before DB cleanup.
+        let session_result = session_exit.await;
+        #[cfg(test)]
+        self.session_exit_observed.cancel();
+        while tokio::time::timeout(Duration::from_secs(5), self.tasks.wait()).await.is_err() {
+            log::warn!(target: "validator", "Waiting for {} group tasks to drain for session {:x}", self.tasks.len(), self.session_id);
+        }
+        session_result.map_err(|e| error!("consensus session teardown failed: {e}"))??;
+        if self.task_panicked.load(Ordering::Acquire) {
+            fail!("validator group task panicked during its lifetime");
+        }
+        if destroy_database {
+            self.destroy_db().await?;
+        }
+        self.group_impl
+            .execute_sync(|gi| {
+                gi.session = None;
+                gi.status = ValidatorGroupStatus::Stopped;
+                if !gi.stopped_emitted {
+                    if let Some(ctx) = &gi.lifecycle {
+                        ctx.emit_stopped(if gi.ever_started {
+                            simplex::LifecycleFinalStatus::Stopped
+                        } else {
+                            simplex::LifecycleFinalStatus::NeverRan
+                        });
+                    }
+                    gi.stopped_emitted = true;
+                }
+            })
+            .await;
+        log::info!(target: "validator", "SESSION_LIFECYCLE: stopped shard={} session_id={:x} destroy_db={}", self.shard, self.session_id, destroy_database);
         Ok(())
     }
 
@@ -1785,7 +1873,7 @@ impl ValidatorGroup {
         #[cfg(not(test))]
         let requires_real_state_update = true;
 
-        let collation_task = tokio::spawn(async move {
+        let collation_task = self.spawn_task(&tokio::runtime::Handle::current(), async move {
             log::info!(
                 target: "validator",
                 "({next_block_descr}): ValidatorGroup::on_generate_slot: collator request, {round_info}"
@@ -2061,7 +2149,7 @@ impl ValidatorGroup {
             .await;
         let accepted_mc_block_rx = self.accepted_mc_block_tx.subscribe();
 
-        let validation_task = tokio::spawn(async move {
+        let validation_task = self.spawn_task(&tokio::runtime::Handle::current(), async move {
             // C++ parity: bounded validation deadline.
             // Simplex: 60s (block-validator.cpp), legacy: 15s (validator-group.cpp).
             let deadline = if use_candidate_native {
@@ -2677,7 +2765,7 @@ impl ValidatorGroup {
             block_id={block_id} source={source_id} round={round}"
         );
 
-        tokio::spawn(async move {
+        self.spawn_task(&tokio::runtime::Handle::current(), async move {
             let (accept_data, prevs) =
                 match Self::resolve_prev_for_finalized_block(engine.clone(), &block_id, data_opt)
                     .await
@@ -2844,4 +2932,4 @@ impl Drop for ValidatorGroup {
 
 #[cfg(test)]
 #[path = "tests/test_validator_group.rs"]
-mod tests;
+pub(super) mod tests;

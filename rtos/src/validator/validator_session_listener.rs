@@ -510,7 +510,12 @@ pub async fn process_validation_queue(
         let g_info = g_clone.info().await;
         let next_block_descr = g_clone.get_next_block_descr(None).await;
 
-        match tokio::time::timeout(VALIDATION_QUEUE_TIMEOUT, queue.recv()).await {
+        let received = tokio::select! {
+            biased;
+            _ = g.stop_requested.cancelled() => break 'queue_loop,
+            received = tokio::time::timeout(VALIDATION_QUEUE_TIMEOUT, queue.recv()) => received,
+        };
+        match received {
             Ok(None) => {
                 // Channel closed
                 log::warn!(
@@ -546,7 +551,7 @@ pub async fn process_validation_queue(
                 );
 
                 let start_time = SystemTime::now();
-                let mut join_handle = rt.spawn(async move {
+                let mut join_handle = g.spawn_task(&rt, async move {
                     process_validation_action(action, g_clone).await;
                 });
 
@@ -571,15 +576,9 @@ pub async fn process_validation_queue(
                         ),
                     }
 
-                    if g.clone().get_status().await == ValidatorGroupStatus::Stopped {
-                        log::error!(
-                            target: "validator",
-                            "({}): Session processing cancelled, \
-                            but validation action took {:#?} and not finished {}, {}",
-                            next_block_descr, get_elapsed_time(&start_time), action_str, g_info
-                        );
-                        break 'queue_loop;
-                    }
+                    // A started action may be applying state. Keep awaiting its
+                    // actual completion even after stop; dropping its JoinHandle
+                    // would detach work from the manager's shutdown barrier.
                 }
             }
         }
