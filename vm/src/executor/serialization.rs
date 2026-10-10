@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project naming and builder-capacity execution compatibility.
+ * RTOS project modifications (2026-10-10): cell hash/depth operand priority.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -773,8 +773,9 @@ pub fn execute_cdepthi(engine: &mut Engine) -> Status {
 /// CDEPTHIX (c i - x), returns the depth i of Cell c.
 pub fn execute_cdepthix(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("CDEPTHIX"))?;
-    fetch_stack(engine, 2)?;
+    fetch_stack(engine, 1)?;
     let i = engine.cmd.var(0).as_integer_value(0..=3)?;
+    fetch_stack(engine, 1)?;
     let c = engine.cmd.var(1).as_cell()?;
     let depth = c.depth(i);
     engine.cc.stack.push_int(depth);
@@ -797,8 +798,9 @@ pub fn execute_chashi(engine: &mut Engine) -> Status {
 /// CHASHIX (c i - x), returns the hash i of Cell c.
 pub fn execute_chashix(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("CHASHIX"))?;
-    fetch_stack(engine, 2)?;
+    fetch_stack(engine, 1)?;
     let i = engine.cmd.var(0).as_integer_value(0..=3)?;
+    fetch_stack(engine, 1)?;
     let c = engine.cmd.var(1).as_cell()?;
     let hash = c.hash(i);
     let hash_int = IntegerData::from_unsigned_bytes_be(hash.as_slice());

@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): complete HASHEXT and exact GETPARAMLONG registration.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -932,7 +932,7 @@ impl Handlers {
                 .set_range(0x61..0x7F, execute_setglob)
                 .set(0x7F, execute_setglob)
                 .set(0x80, execute_extra_balance)
-                .set(0x81, execute_getparam_long)
+                .add_subset(0x81, Handlers::new().set_range(0x00..0xFF, execute_getparam_long))
                 .set_range(0x90..0xA0, execute_in_msg_param),
         )
     }
@@ -949,38 +949,26 @@ impl Handlers {
                 .add_subset(
                     0x04,
                     Handlers::new()
-                        .set(0x00, execute_hashext_sha256)
-                        .set(0x01, execute_hashext_sha512)
-                        .set(0x02, execute_hashext_blake2b)
-                        .set(0x03, execute_hashext_keccak256)
-                        .set(0x04, execute_hashext_keccak512),
+                        .set_range(0x00..0xFF, execute_hashext::<false, false>)
+                        .set(0xFF, execute_hashext::<false, false>),
                 )
                 .add_subset(
                     0x05,
                     Handlers::new()
-                        .set(0x00, execute_hashext_sha256_rev)
-                        .set(0x01, execute_hashext_sha512_rev)
-                        .set(0x02, execute_hashext_blake2b_rev)
-                        .set(0x03, execute_hashext_keccak256_rev)
-                        .set(0x04, execute_hashext_keccak512_rev),
+                        .set_range(0x00..0xFF, execute_hashext::<false, true>)
+                        .set(0xFF, execute_hashext::<false, true>),
                 )
                 .add_subset(
                     0x06,
                     Handlers::new()
-                        .set(0x00, execute_hashext_sha256_add)
-                        .set(0x01, execute_hashext_sha512_add)
-                        .set(0x02, execute_hashext_blake2b_add)
-                        .set(0x03, execute_hashext_keccak256_add)
-                        .set(0x04, execute_hashext_keccak512_add),
+                        .set_range(0x00..0xFF, execute_hashext::<true, false>)
+                        .set(0xFF, execute_hashext::<true, false>),
                 )
                 .add_subset(
                     0x07,
                     Handlers::new()
-                        .set(0x00, execute_hashext_sha256_add_rev)
-                        .set(0x01, execute_hashext_sha512_add_rev)
-                        .set(0x02, execute_hashext_blake2b_add_rev)
-                        .set(0x03, execute_hashext_keccak256_add_rev)
-                        .set(0x04, execute_hashext_keccak512_add_rev),
+                        .set_range(0x00..0xFF, execute_hashext::<true, true>)
+                        .set(0xFF, execute_hashext::<true, true>),
                 )
                 .set(0x10, execute_chksignu)
                 .set(0x11, execute_chksigns)
