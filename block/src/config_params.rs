@@ -1,5 +1,6 @@
 /*
- * RTOS storage fee adaptation (2026-10-10); Copyright (C) 2026 TOS Blockchain Teams.
+ * RTOS storage fee and AUTH policy adaptations (2026-10-10).
+ * Copyright (C) 2026 TOS Blockchain Teams.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -507,6 +508,10 @@ impl ConfigParams {
         relax_par0: bool,
         mparams: Option<MandatoryParams>,
     ) -> Result<bool> {
+        if let Err(error) = self.validate_auth_policy_config() {
+            log::warn!(target: "block", "invalid AUTH configuration: {error}");
+            return Ok(false);
+        }
         if !relax_par0 {
             match self.config(0) {
                 Ok(Some(ConfigParamEnum::ConfigParam0(param))) => {
@@ -635,6 +640,7 @@ pub enum ConfigParamEnum {
     ConfigParam43(SizeLimitsConfig),
     ConfigParam44(SuspendedAddressList),
     ConfigParam45(PrecompiledContractsList),
+    ConfigParam48(crate::AuthPolicy),
     ConfigParam63(AcceleratedConsensusConfig),
     ConfigParam71(OracleBridgeParams), // Ethereum bridge
     ConfigParam72(OracleBridgeParams), // Binance Smart Chain bridge
@@ -701,6 +707,7 @@ impl ConfigParamEnum {
             43 => read_config!(ConfigParam43, SizeLimitsConfig,             cell),
             44 => read_config!(ConfigParam44, SuspendedAddressList,         cell),
             45 => read_config!(ConfigParam45, PrecompiledContractsList,     cell),
+            48 => return Ok(ConfigParamEnum::ConfigParam48(crate::AuthPolicy::construct_from_cell(cell)?)),
             63 => read_config!(ConfigParam63, AcceleratedConsensusConfig,   cell),
             71 => read_config!(ConfigParam71, OracleBridgeParams,           cell),
             72 => read_config!(ConfigParam72, OracleBridgeParams,           cell),
@@ -762,6 +769,7 @@ impl ConfigParamEnum {
             ConfigParamEnum::ConfigParam43(ref c) => serialize(builder, c, 43),
             ConfigParamEnum::ConfigParam44(ref c) => serialize(builder, c, 44),
             ConfigParamEnum::ConfigParam45(ref c) => serialize(builder, c, 45),
+            ConfigParamEnum::ConfigParam48(ref c) => serialize(builder, c, 48),
             ConfigParamEnum::ConfigParam63(ref c) => serialize(builder, c, 63),
             ConfigParamEnum::ConfigParam71(ref c) => serialize(builder, c, 71),
             ConfigParamEnum::ConfigParam72(ref c) => serialize(builder, c, 72),

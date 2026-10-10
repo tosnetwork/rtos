@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): naming and AUTH policy transition checks.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -6239,6 +6239,9 @@ impl ValidateQuery {
                 checks, or one of mandatory configuration parameters is missing"
             )
         }
+        base.prev_state_extra
+            .config
+            .validate_auth_policy_transition(&base.next_state_extra.config)?;
         let new_accounts = base.next_state()?.read_accounts()?;
         let config_address = base.prev_state_extra.config.config_address()?;
         let new_config_address = base.next_state_extra.config.config_address()?;
