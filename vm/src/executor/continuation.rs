@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): SETCONTCTRMANY immediate validation order.
+ * RTOS project modifications (2026-10-10): historical continuation save semantics and snapshot preservation.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -204,8 +204,10 @@ fn save(engine: &mut Engine, index: usize) -> Status {
         let v = engine.cmd.var_count() as u16;
         copy_to_var(engine, ctrl!(creg))?;
         swap(engine, var!(v), savelist!(ctrl!(index), creg))
-    } else {
+    } else if creg == 7 || engine.block_version() >= TVM_VERSION_14 {
         Ok(())
+    } else {
+        fail!(ExceptionCode::TypeCheckError)
     }
 }
 
@@ -1024,12 +1026,17 @@ pub(super) fn execute_saveboth(engine: &mut Engine) -> Status {
     engine.load_instruction(
         Instruction::new("SAVEBOTH").set_opts(InstructionOptions::ControlRegister),
     )?;
-    if engine.ctrl(0).is_ok() || engine.ctrl(1).is_ok() {
-        fail!(ExceptionCode::TypeCheckError)
-    } else {
-        save(engine, 0)?;
+    let creg = engine.cmd.creg();
+    // Both destinations capture the original value, including when it is c0
+    // or c1 or when the two continuations share the same allocation.
+    let value = engine.ctrl(creg)?.clone();
+    for index in [0, 1] {
+        let cont = engine.ctrl_mut(index)?.as_continuation_mut()?;
+        if cont.savelist.get(creg).is_none() {
+            cont.put_to_savelist(creg, value.clone())?;
+        }
     }
-    save(engine, 1)
+    Ok(())
 }
 
 // (x - ), c1.savelist[i] = x
