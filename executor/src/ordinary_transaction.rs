@@ -179,6 +179,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             ..TransactionDescrOrdinary::default()
         };
 
+        let mut incoming_storage_stats = None;
         // first check if contract can pay for importing external message
         if is_ext_msg && !is_special {
             // extranal message comes serialized
@@ -199,6 +200,11 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                 log::debug!(target: "executor", "inbound external message has too big merkle depth, invalid");
                 fail!(ExecutorError::InvalidExtMessage)
             }
+            incoming_storage_stats = Some(rtos_vm::smart_contract_info::IncomingStorageStats {
+                hash: in_msg_cell.repr_hash().clone(),
+                cells: calc.cells() + 1,
+                bits: calc.bits() + in_msg_cell.bit_length() as u64,
+            });
             let fwd_prices = self.config.get_fwd_prices(in_msg.is_masterchain());
             let in_fwd_fee = fwd_prices.calc_fwd_fee(calc.bits(), calc.cells());
             log::debug!(target: "executor", "import message fee: {}, acc_balance: {}", in_fwd_fee, acc_balance.coins);
@@ -316,6 +322,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                 balance: acc_balance.clone(),
                 in_msg: Some(in_msg.clone()),
                 incoming_value: msg_balance.clone(),
+                incoming_storage_stats,
                 storage_fees_collected,
                 due_payment: account.due_payment().map_or(0, Coins::as_u128),
                 config_params,
@@ -530,3 +537,7 @@ mod test_v15_libraries;
 #[cfg(test)]
 #[path = "tests/test_v15_messages.rs"]
 mod test_v15_messages;
+
+#[cfg(test)]
+#[path = "tests/test_incoming_storage.rs"]
+mod test_incoming_storage;
