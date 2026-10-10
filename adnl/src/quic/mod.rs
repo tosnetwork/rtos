@@ -8,6 +8,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 mod rate_limiter;
+mod runtime;
 mod stat;
 mod tasks;
 use crate::{
@@ -40,11 +41,11 @@ use std::{
     net::{IpAddr, SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex, Once, Weak,
+        Arc, Mutex, Once, OnceLock, Weak,
     },
     time::{Duration, Instant},
 };
-use tasks::QuicTasks;
+use tasks::{QuicTasks, ShutdownCompletion};
 
 const TARGET: &str = "quic";
 
@@ -516,6 +517,8 @@ impl Drop for DelayedReservation {
 
 pub struct QuicNode {
     tasks: Arc<QuicTasks>,
+    drivers: Arc<QuicTasks>,
+    shutdown_result: OnceLock<Arc<ShutdownCompletion>>,
     cancellation_token: tokio_util::sync::CancellationToken,
     /// One entry per local identity; each carries its own client config and outbound pool.
     local_keys: lockfree::map::Map<Arc<KeyId>, Arc<LocalKeyState>>,
@@ -616,9 +619,13 @@ impl QuicNode {
                 .expect("Failed to install default Rustls CryptoProvider");
         });
         let (key_cmd_tx, mut key_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<KeyCommand>();
+        let drivers =
+            QuicTasks::new(runtime_handle.clone(), tokio_util::sync::CancellationToken::new());
         let tasks = QuicTasks::new(runtime_handle, cancellation_token.clone());
         let transport = Arc::new(Self {
             tasks: tasks.clone(),
+            drivers,
+            shutdown_result: OnceLock::new(),
             cancellation_token: cancellation_token.clone(),
             local_keys: lockfree::map::Map::new(),
             endpoints: Mutex::new(HashMap::new()),
@@ -1127,8 +1134,26 @@ impl QuicNode {
 
     /// Join actual workers, including subscriber calls already admitted from a stream.
     /// Dropping a waiter never detaches the workers from their retained supervisors.
-    pub async fn shutdown_and_wait(&self) -> Result<()> {
+    pub async fn shutdown_and_wait(self: &Arc<Self>) -> Result<()> {
         self.shutdown();
+        let completion = self.shutdown_result.get_or_init(|| {
+            let completion = Arc::new(ShutdownCompletion::default());
+            let transport = self.clone();
+            let worker = tokio::spawn(async move { transport.finish_shutdown().await });
+            let finished = completion.clone();
+            tokio::spawn(async move {
+                let result = match worker.await {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(error) => Err(format!("QUIC shutdown worker: {error}")),
+                };
+                finished.finish(result);
+            });
+            completion
+        });
+        completion.wait().await
+    }
+
+    async fn finish_shutdown(&self) -> Result<()> {
         let result = self.tasks.wait().await;
         // A key command already executing when shutdown started may have created
         // an endpoint. No key worker remains now, so this snapshot is final.
@@ -1136,9 +1161,29 @@ impl QuicNode {
         let endpoints: Vec<_> =
             self.endpoints.lock().unwrap().values().map(|state| state.endpoint.clone()).collect();
         for endpoint in endpoints {
-            endpoint.wait_idle().await;
+            tokio::select! {
+                _ = endpoint.wait_idle() => {},
+                // A failed driver may no longer deliver idle notifications.
+                // Release its endpoint refs and join the remaining drivers;
+                // their retained error is returned below.
+                _ = self.drivers.cancelled() => {},
+            }
         }
-        result
+        // wait_idle only drains connections. Quinn's endpoint driver terminates
+        // after its last Endpoint reference drops; it still owns the UDP socket.
+        self.endpoints.lock().unwrap().clear();
+        // Closed Connection handles retain their UDP socket too.
+        let keys: Vec<_> = self.local_keys.iter().map(|entry| entry.key().clone()).collect();
+        for key in keys {
+            self.local_keys.remove(&key);
+        }
+        self.inbound_pools.lock().unwrap().clear();
+        let drivers = self.drivers.wait().await;
+        match (result, drivers) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(workers), Err(drivers)) => Err(error!("{workers}; {drivers}")),
+        }
     }
 
     fn addr_by_key(&self, key_id: &Arc<KeyId>) -> Result<SocketAddr> {
@@ -1285,6 +1330,9 @@ impl QuicNode {
     fn get_or_create_endpoint(&self, bind_addr: SocketAddr) -> Result<Arc<EndpointState>> {
         let port = bind_addr.port();
         let mut endpoints = self.endpoints.lock().map_err(|e| error!("Endpoints lock: {e}"))?;
+        if self.cancellation_token.is_cancelled() {
+            fail!("QUIC transport is shut down");
+        }
 
         if let Some(state) = endpoints.get(&port) {
             return Ok(state.clone());
@@ -1357,7 +1405,8 @@ impl QuicNode {
                 "QUIC UDP caps probe failed on {bind_addr}: {e}"
             ),
         }
-        let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+        let runtime: Arc<dyn quinn::Runtime> =
+            Arc::new(runtime::OwnedRuntime(self.drivers.clone()));
         let endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
             Some(quinn_server_config),

@@ -2670,7 +2670,9 @@ async fn quic_owned_shutdown_joins_real_query_and_message_subscribers() {
     tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap().unwrap();
 
     let mut first_waiter = Box::pin(nodes[0].shutdown_and_wait());
-    assert!(tokio::time::timeout(Duration::from_millis(50), &mut first_waiter).await.is_err());
+    // Exceed Quinn's close/drain delay so that endpoint timing alone cannot
+    // disguise a missing join of the blocked application subscriber.
+    assert!(tokio::time::timeout(Duration::from_secs(4), &mut first_waiter).await.is_err());
     assert_eq!(subscriber.completed.load(Ordering::SeqCst), 0);
     drop(first_waiter);
     assert!(nodes[0]
@@ -2689,6 +2691,10 @@ async fn quic_owned_shutdown_joins_real_query_and_message_subscribers() {
         .unwrap()
         .unwrap();
     let _ = query.await.unwrap();
+    // The retained QuicNode objects must no longer retain bound sockets.
+    for address in &addresses {
+        let _rebound = UdpSocket::bind(address).unwrap();
+    }
     let weak_nodes: Vec<_> = nodes.iter().map(Arc::downgrade).collect();
     drop(nodes);
     drop(subscriber);
