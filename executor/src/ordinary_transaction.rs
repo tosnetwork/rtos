@@ -549,3 +549,7 @@ mod test_state_limits;
 #[cfg(test)]
 #[path = "tests/test_incoming_storage.rs"]
 mod test_incoming_storage;
+
+#[cfg(test)]
+#[path = "tests/test_exotic_actions.rs"]
+mod test_exotic_actions;
