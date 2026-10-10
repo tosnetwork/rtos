@@ -147,3 +147,122 @@ fn ticktock_rejects_inbound_message_without_mutating_account() {
         assert_eq!(account.serialize().unwrap(), original);
     }
 }
+
+#[test]
+fn ticktock_message_lt_uses_transaction_floor() {
+    use rtos_block::{InternalMessageHeader, Message};
+    let mut rows = Vec::new();
+    let mut mismatches = Vec::new();
+    for version in [4, 10, 13, 14, 17, 19] {
+        for tock in [false, true] {
+            for supplied in [2_000_000_001u64, 2_000_000_004, 2_000_000_007] {
+                for sends in [0usize, 1, 3] {
+                    let address =
+                        MsgAddressInt::with_standart(None, -1, [0x5a; 32].into()).unwrap();
+                    let cfg = config(version, true, &address);
+                    let dst = MsgAddressInt::with_standart(None, -1, [0x6b; 32].into()).unwrap();
+                    let msg = Message::with_int_header(InternalMessageHeader::with_addresses(
+                        address.clone(),
+                        dst,
+                        CurrencyCollection::with_coins(10_000_000u64),
+                    ));
+                    let source = if sends == 0 {
+                        "NOP".to_owned()
+                    } else {
+                        "PUSHROOT PUSHINT 1 SENDRAWMSG ".repeat(sends)
+                    };
+                    let mut init = StateInit::default();
+                    init.set_code(rtos_assembler::compile_code_to_cell(&source).unwrap());
+                    init.set_data(msg.serialize().unwrap());
+                    init.set_special(rtos_block::TickTock { tick: true, tock: true });
+                    let threshold = cfg.size_limits_config().acc_state_cells_for_storage_dict;
+                    let mut account = Account::active(
+                        address.clone(),
+                        CurrencyCollection::with_coins(10_000_000_000u64),
+                        2_000_000_004,
+                        0,
+                        init,
+                        threshold,
+                    )
+                    .unwrap();
+                    let name = format!(
+                        "lt-v{version}-{}-floor{supplied}-sends{sends}",
+                        if tock { "tock" } else { "tick" }
+                    );
+                    let old = account.hash().unwrap();
+                    let input = format!(
+                        "{name}\t200\t{supplied}\t{}\t{}\t-\t-\t1\t-1\t{}",
+                        boc(cfg.raw_config().serialize().unwrap()),
+                        boc(account.serialize().unwrap()),
+                        "5a".repeat(32)
+                    );
+                    let tt = if tock {
+                        rtos_block::TransactionTickTock::Tock
+                    } else {
+                        rtos_block::TransactionTickTock::Tick
+                    };
+                    let mut tx = TickTockTransactionExecutor::new(cfg, tt)
+                        .execute_with_params(
+                            None,
+                            &mut account,
+                            ExecuteParams {
+                                block_unixtime: 200,
+                                block_lt: 2_000_000_000,
+                                last_tr_lt: supplied,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    account.calc_storage_stat_dict(threshold).unwrap();
+                    if version < 11 {
+                        account.del_storage_stat();
+                    }
+                    tx.write_state_update(&HashUpdate::with_hashes(old, account.hash().unwrap()))
+                        .unwrap();
+                    rows.push(format!(
+                        "{input}\t{:x}\t{:x}",
+                        tx.hash().unwrap(),
+                        account.hash().unwrap()
+                    ));
+                    let logical_time = supplied.max(2_000_000_004);
+                    assert_eq!(tx.logical_time(), logical_time, "{name}");
+                    assert_eq!(tx.out_msgs.len().unwrap(), sends, "{name}");
+                    let mut created = Vec::new();
+                    tx.iterate_out_msgs(|message| {
+                        created.push(message.created_lt().unwrap());
+                        Ok(true)
+                    })
+                    .unwrap();
+                    let want = (1..=sends).map(|i| logical_time + i as u64).collect::<Vec<_>>();
+                    if created != want
+                        || account.last_tr_time() != Some(logical_time + sends as u64 + 1)
+                    {
+                        mismatches.push(format!(
+                            "{name}: messages {created:?} expected {want:?}; end {:?}",
+                            account.last_tr_time()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(rows.len(), 108);
+    if let Ok(path) = std::env::var("RTOS_TICKTOCK_LT_EXPORT") {
+        std::fs::write(path, rows.join("\n") + "\n").unwrap();
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    let expected = include_str!("data/ticktock-message-lt.tsv");
+    assert_eq!(expected.lines().count(), rows.len());
+    for row in rows {
+        let fields = row.split('\t').collect::<Vec<_>>();
+        let reference = expected
+            .lines()
+            .find(|line| line.split('\t').next() == Some(fields[0]))
+            .expect("fixed reference transaction");
+        assert_eq!(
+            format!("{}\t{}\t{}", fields[0], fields[10], fields[11]),
+            reference,
+            "complete transaction and account roots"
+        );
+    }
+}
