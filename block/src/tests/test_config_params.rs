@@ -1400,3 +1400,107 @@ fn test_consensus_v4_transport_flags_and_reused_legacy_reader() {
         }
     }
 }
+
+// Build the wire record independently of SizeLimitsConfig::write_to.
+fn size_limits_wire(tag: u8, loads: Option<u32>, bits: u32, cells: u32) -> Cell {
+    let mut b = BuilderData::new();
+    b.append_u8(tag).unwrap();
+    for n in [1000u32, 100, 1000] {
+        b.append_u32(n).unwrap();
+    }
+    b.append_u16(512).unwrap();
+    b.append_u32(65535).unwrap();
+    b.append_u16(512).unwrap();
+    if tag >= 2 {
+        for n in [5000u32, 10000, 256, 256, 32] {
+            b.append_u32(n).unwrap();
+        }
+        b.append_u8(8).unwrap();
+        b.append_u32(1024).unwrap();
+    }
+    if tag == 3 {
+        b.append_bit_bool(loads.is_some()).unwrap();
+        if let Some(loads) = loads {
+            b.append_u32(loads).unwrap();
+        }
+        b.append_u32(bits).unwrap();
+        b.append_u32(cells).unwrap();
+    }
+    b.into_cell().unwrap()
+}
+
+#[test]
+fn size_limits_v3_wire_and_config_admission() {
+    for loads in [None, Some(0), Some(77), Some(u32::MAX)] {
+        for (bits, cells) in [(0, 0), (2000, 200), (u32::MAX, u32::MAX)] {
+            let wire = size_limits_wire(3, loads, bits, cells);
+            let limits = SizeLimitsConfig::construct_from_cell(wire.clone()).unwrap();
+            assert_eq!(limits.max_transaction_library_loads, loads);
+            assert_eq!(limits.max_total_msg_bits, bits);
+            assert_eq!(limits.max_total_msg_cells, cells);
+            assert_eq!(limits.max_msg_bits, 1000);
+            assert_eq!(limits.max_mc_acc_state_cells, 10000);
+            assert_eq!(limits.serialize().unwrap().repr_hash(), wire.repr_hash());
+            let mut config = ConfigParams::default();
+            config.set_config(ConfigParamEnum::ConfigParam43(limits.clone())).unwrap();
+            assert_eq!(config.config(43).unwrap(), Some(ConfigParamEnum::ConfigParam43(limits)));
+        }
+    }
+}
+
+#[test]
+fn size_limits_old_records_reset_omitted_fields() {
+    let mut limits =
+        SizeLimitsConfig::construct_from_cell(size_limits_wire(3, Some(0), 0, 0)).unwrap();
+    for tag in [2, 1] {
+        let wire = size_limits_wire(tag, None, 0, 0);
+        limits.read_from(&mut SliceData::load_cell(wire.clone()).unwrap()).unwrap();
+        assert_eq!(limits, SizeLimitsConfig::construct_from_cell(wire).unwrap());
+        assert_eq!(limits.max_transaction_library_loads, None);
+        assert_eq!(limits.max_total_msg_bits, MAX_MSG_BITS * 5 / 2);
+        assert_eq!(limits.max_total_msg_cells, MAX_MSG_CELLS * 5 / 2);
+    }
+    assert_eq!(limits.max_acc_state_cells, SizeLimitsConfig::default().max_acc_state_cells);
+    let old = size_limits_wire(2, None, 0, 0);
+    assert_eq!(
+        SizeLimitsConfig::construct_from_cell(old.clone()).unwrap().serialize().unwrap(),
+        old
+    );
+}
+
+#[test]
+fn size_limits_rejects_unknown_and_truncated_records() {
+    for tag in [0, 4, 255] {
+        assert!(SizeLimitsConfig::construct_from_cell(size_limits_wire(tag, None, 0, 0)).is_err());
+    }
+    for loads in [None, Some(77)] {
+        let wire = size_limits_wire(3, loads, 2000, 200);
+        let slice = SliceData::load_cell(wire).unwrap();
+        for len in 0..slice.remaining_bits() {
+            let mut truncated = slice.clone();
+            truncated.shrink_data(0..len);
+            assert!(
+                SizeLimitsConfig::construct_from(&mut truncated).is_err(),
+                "accepted {len} bits"
+            );
+        }
+    }
+}
+
+#[test]
+fn size_limits_cpp_cell_hashes() {
+    let mut count = 0;
+    for line in include_str!("../../tests/data/size-limits.tsv").lines() {
+        let f: Vec<_> = line.split('\t').collect();
+        let tag = f[0].parse().unwrap();
+        let loads = if f[1] == "-1" { None } else { Some(f[1].parse().unwrap()) };
+        let wire = size_limits_wire(tag, loads, f[2].parse().unwrap(), f[3].parse().unwrap());
+        assert_eq!(wire.repr_hash().to_hex_string().to_uppercase(), f[4]);
+        let parsed = SizeLimitsConfig::construct_from_cell(wire.clone()).unwrap();
+        if tag >= 2 {
+            assert_eq!(parsed.serialize().unwrap().repr_hash(), wire.repr_hash());
+        }
+        count += 1;
+    }
+    assert_eq!(count, 14);
+}

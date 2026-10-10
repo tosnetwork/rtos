@@ -1030,6 +1030,16 @@ fn serialize_limits(limits: &SizeLimitsConfig) -> Result<Value> {
         "acc_state_cells_for_storage_dict",
         limits.acc_state_cells_for_storage_dict,
     );
+    if let Some(loads) = limits.max_transaction_library_loads {
+        serialize_field(&mut map, "max_transaction_library_loads", loads);
+    }
+    let defaults = SizeLimitsConfig::default();
+    if limits.max_total_msg_bits != defaults.max_total_msg_bits {
+        serialize_field(&mut map, "max_total_msg_bits", limits.max_total_msg_bits);
+    }
+    if limits.max_total_msg_cells != defaults.max_total_msg_cells {
+        serialize_field(&mut map, "max_total_msg_cells", limits.max_total_msg_cells);
+    }
     Ok(map.into())
 }
 

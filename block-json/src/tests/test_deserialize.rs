@@ -946,3 +946,56 @@ fn test_pq_block_proof_json_round_trip_and_no_classical_fallback() {
     bad.insert("sig_count".into(), serde_json::json!(401));
     assert!(parse(&bad).is_err());
 }
+
+#[test]
+fn test_size_limits_v3_json() {
+    for loads in [None, Some(0), Some(77), Some(u32::MAX)] {
+        let limits = rtos_block::SizeLimitsConfig {
+            max_transaction_library_loads: loads,
+            max_total_msg_bits: 2000,
+            max_total_msg_cells: 0,
+            ..Default::default()
+        };
+        let mut cp = prepare_config_params();
+        cp.set_config(ConfigParamEnum::ConfigParam43(limits)).unwrap();
+        let json: Value = serde_json::from_str(&serialize_config_param(&cp, 43).unwrap()).unwrap();
+        let parse = |v: &Value| parse_config_with_mandatory_params(v.as_object().unwrap(), &[43]);
+        assert_eq!(cp.config(43).unwrap(), parse(&json).unwrap().config(43).unwrap());
+        for field in ["max_transaction_library_loads", "max_total_msg_bits", "max_total_msg_cells"]
+        {
+            for invalid in
+                [serde_json::json!(-1), serde_json::json!(4294967296u64), serde_json::json!(true)]
+            {
+                let mut bad = json.clone();
+                bad["p43"][field] = invalid;
+                assert!(parse(&bad).is_err(), "accepted invalid {field}");
+            }
+        }
+        let mut absent = json.clone();
+        for field in ["max_transaction_library_loads", "max_total_msg_bits", "max_total_msg_cells"]
+        {
+            absent["p43"].as_object_mut().unwrap().remove(field);
+        }
+        let decoded = parse(&absent).unwrap().size_limits_config().unwrap();
+        assert_eq!(decoded.max_transaction_library_loads, None);
+        assert_eq!(decoded.max_total_msg_bits, rtos_block::MAX_MSG_BITS * 5 / 2);
+        assert_eq!(decoded.max_total_msg_cells, rtos_block::MAX_MSG_CELLS * 5 / 2);
+    }
+}
+
+#[test]
+fn test_storage_prices_json_uses_time_keys() {
+    let price = |since| {
+        serde_json::json!({"utime_since": since, "bit_price_ps": 1,
+        "cell_price_ps": 2, "mc_bit_price_ps": 3, "mc_cell_price_ps": 4})
+    };
+    let json = serde_json::json!({"p18": [price(300), price(100), price(200)]});
+    let parsed = parse_config_with_mandatory_params(json.as_object().unwrap(), &[18]).unwrap();
+    let Some(ConfigParamEnum::ConfigParam18(prices)) = parsed.config(18).unwrap() else {
+        panic!("missing storage prices")
+    };
+    assert_eq!(
+        prices.prices().unwrap().iter().map(|p| p.utime_since).collect::<Vec<_>>(),
+        vec![100, 200, 300]
+    );
+}

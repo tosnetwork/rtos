@@ -871,7 +871,7 @@ fn get_validator_set() -> ValidatorSet {
     let keydat = base64_decode("7w3fX5jiuo8PyQoFaEL+K9pE/XvbKjH63i0JcraLlBM=").unwrap();
     let key = SigPubKey::from_bytes(&keydat).unwrap();
     let vd1 = ValidatorDescr::with_params(key, 1, None);
-    let key = SigPubKey::from_bytes(&keydat).unwrap();
+    let key = SigPubKey::from_bytes(&[2; 32]).unwrap();
     let vd2 = ValidatorDescr::with_params(key, 2, None);
     ValidatorSet::new(1234567, 39237233, 1, vec![vd1, vd2]).unwrap()
 }

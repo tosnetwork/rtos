@@ -453,7 +453,6 @@ impl StateParser {
     fn parse_storage_prices(&mut self, config: &PathMap) -> Result<()> {
         self.parse_array(config, 18, |p18| {
             let mut map = ConfigParam18Map::default();
-            let mut index = 0u32;
             p18.iter().try_for_each::<_, Result<_>>(|value| {
                 let p = PathMap::cont(config, "p18", value)?;
                 let p = StoragePrices {
@@ -463,8 +462,7 @@ impl StateParser {
                     mc_bit_price_ps: p.get_num64("mc_bit_price_ps")?,
                     mc_cell_price_ps: p.get_num64("mc_cell_price_ps")?,
                 };
-                map.set(&index, &p)?;
-                index += 1;
+                map.set(&p.utime_since, &p)?;
                 Ok(())
             })?;
             Ok(ConfigParamEnum::ConfigParam18(ConfigParam18 { map }))
@@ -968,6 +966,16 @@ impl StateParser {
         })?;
 
         self.parse_parameter(config, 43, |p43| {
+            let optional_u32 = |name| -> Result<Option<u32>> {
+                p43.map
+                    .get(name)
+                    .map(|_| {
+                        u32::try_from(p43.get_num(name)?)
+                            .map_err(|_| error!("parameter 43 field {name} must be uint32"))
+                    })
+                    .transpose()
+            };
+            let defaults = SizeLimitsConfig::default();
             Ok(ConfigParamEnum::ConfigParam43(SizeLimitsConfig {
                 max_msg_bits: p43.get_num32("max_msg_bits")?,
                 max_msg_cells: p43.get_num32("max_msg_cells")?,
@@ -983,6 +991,14 @@ impl StateParser {
                 max_acc_fixed_prefix_length: p43.get_num8("max_acc_fixed_prefix_length")?,
                 acc_state_cells_for_storage_dict: p43
                     .get_num32("acc_state_cells_for_storage_dict")?,
+                max_transaction_library_loads: match p43.map.get("max_transaction_library_loads") {
+                    None | Some(Value::Null) => None,
+                    _ => optional_u32("max_transaction_library_loads")?,
+                },
+                max_total_msg_bits: optional_u32("max_total_msg_bits")?
+                    .unwrap_or(defaults.max_total_msg_bits),
+                max_total_msg_cells: optional_u32("max_total_msg_cells")?
+                    .unwrap_or(defaults.max_total_msg_cells),
             }))
         })?;
 
