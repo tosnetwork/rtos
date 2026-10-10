@@ -25,12 +25,41 @@ use rtos_api::{
         overlay::membercertificate::MemberCertificate, pub_::publickey::Overlay as OverlayKey,
         ton_node::Broadcast,
     },
-    BoxedSerialize, IntoBoxed,
+    BoxedSerialize, IntoBoxed, WireProfile,
 };
 use rtos_block::{fail, KeyId, KeyOption, Result, ShardIdent, ValidatorDescr};
 use std::sync::Arc;
 
 const MAX_FAST_SYNC_OVERLAY_CLIENTS: usize = 5;
+
+fn fast_sync_transport_authority(
+    validators: &[ValidatorDescr],
+    profile: WireProfile,
+) -> Result<(Vec<Arc<KeyId>>, Vec<Arc<KeyId>>)> {
+    if profile == WireProfile::Legacy {
+        let mut members = Vec::with_capacity(validators.len());
+        let mut roots = Vec::with_capacity(validators.len());
+        for validator in validators {
+            members.push(validator.adnl_addr()?);
+            roots.push(validator.public_key()?.pub_key().id().clone());
+        }
+        return Ok((members, roots));
+    }
+    // Target membership and certificate authority use the same transport
+    // identity. Consensus keys and stable PQ validator IDs are not roots.
+    let mut roots = Vec::with_capacity(validators.len());
+    for validator in validators {
+        let root = match validator.adnl_addr.as_ref().filter(|id| !id.is_zero()) {
+            Some(id) => KeyId::from_data(*id.as_array()),
+            // Only classical descriptors may leave the transport ID implicit.
+            None => validator.public_key()?.pub_key().id().clone(),
+        };
+        roots.push(root);
+    }
+    roots.sort_by(|left, right| left.data().cmp(right.data()));
+    roots.dedup();
+    Ok((roots.clone(), roots))
+}
 
 pub struct FastSyncOverlayClient {
     id: Arc<OverlayShortId>,
@@ -53,12 +82,10 @@ impl FastSyncOverlayClient {
         default_rldp_roundtrip: Option<u32>,
         use_quic: bool,
     ) -> Result<Arc<Self>> {
-        let mut root_adnl_ids = Vec::with_capacity(validators.len());
-        let mut root_public_keys = Vec::with_capacity(validators.len());
-        for vd in validators {
-            root_adnl_ids.push(vd.adnl_addr()?);
-            root_public_keys.push(vd.public_key()?.pub_key().id().clone());
-        }
+        let (root_adnl_ids, root_public_keys) = fast_sync_transport_authority(
+            validators,
+            network_context.stack.overlay.wire_profile(),
+        )?;
         let id = rtos_api::ton::ton_node::fastsyncoverlayid::FastSyncOverlayId {
             zero_state_file_hash: engine.zerostate_id()?.file_hash().clone(),
             shard: (&shard).into(),
@@ -314,3 +341,7 @@ impl FastSyncOverlayClient {
         self.use_twostep
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_fast_sync_transport_authority.rs"]
+mod transport_authority_tests;
