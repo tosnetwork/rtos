@@ -171,7 +171,28 @@ fn test_pq_proof_construction_cannot_downgrade() {
     let signatures =
         BlockSignaturesVariant::construct_from_bytes(&hex::decode(fields[4]).unwrap()).unwrap();
     assert!(super::extract_signature_pairs(&signatures).is_err());
-    assert!(crate::network::pack_signature_set(&signatures).is_err());
+    // Packing creates an unverified target-network carrier, never classical
+    // signatures or authority to persist a final proof.
+    let packed = crate::network::pack_signature_set(&signatures).unwrap();
+    assert!(matches!(
+        packed,
+        rtos_api::ton::ton_node::SignatureSet::TonNode_SignatureSet_SimplexPq(_)
+    ));
+    let bytes = rtos_api::WireProfile::T0.serialize(&packed).unwrap();
+    assert!(rtos_api::WireProfile::Legacy.serialize(&packed).is_err());
+    assert!(rtos_api::WireProfile::Legacy
+        .deserialize_typed::<rtos_api::ton::ton_node::SignatureSet>(&bytes)
+        .is_err());
+    let decoded = rtos_api::WireProfile::T0.deserialize_typed(&bytes).unwrap();
+    let crate::network::NetworkSignatureSet::PostQuantum(decoded) =
+        crate::network::unpack_signature_set(decoded).unwrap()
+    else {
+        panic!("PQ network carrier was downgraded to classical signatures");
+    };
+    assert!(decoded.is_final());
+    let repacked =
+        rtos_api::ton::ton_node::SignatureSet::TonNode_SignatureSet_SimplexPq(decoded.to_node());
+    assert_eq!(rtos_api::WireProfile::T0.serialize(&repacked).unwrap(), bytes);
     let block = crate::block::BlockStuff::read_block_from_file(
         "src/tests/static/test_master_block_proof/key_block__3082181",
     )
