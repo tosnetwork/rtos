@@ -146,8 +146,14 @@ impl Fixture {
     }
 
     async fn stop(&self) {
-        self.router.stop_and_wait().await.unwrap();
-        self.router.network.stop_adnl().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), self.router.stop_and_wait())
+            .await
+            .expect("router workers retained after router cancellation")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), self.router.network.stop_adnl())
+            .await
+            .expect("network shutdown watchdog")
+            .unwrap();
     }
 }
 fn set(members: Vec<ValidatorDescr>) -> ValidatorSet {

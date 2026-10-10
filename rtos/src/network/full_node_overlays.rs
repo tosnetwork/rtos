@@ -868,7 +868,7 @@ impl FullNodeOverlaysRouter {
         let mut pending = PendingFastSync {
             retiring: self.fast_sync_retiring.clone(),
             overlays: Vec::new(),
-            cancellation: self.network.cancellation_token().child_token(),
+            cancellation: self.tasks.cancellation().child_token(),
             committed: false,
         };
         let result: Result<()> = async {
