@@ -1,4 +1,5 @@
 /*
+ * RTOS project modifications (2026-10-10): isolated configuration test output.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -20,6 +21,9 @@ fn make_test_config_handler() -> NodeConfigHandler {
 
 #[tokio::test]
 async fn test_custom_overlays_serde() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let output = dir.path().join("custom_overlays.json");
+    let path = output.to_str().expect("temporary path must be UTF-8");
     for _ in 0..100 {
         let mut overlays = Vec::new();
         for _ in 0..rand::random::<u32>() % 5 {
@@ -59,7 +63,6 @@ async fn test_custom_overlays_serde() -> Result<()> {
             CustomOverlaysConfig { overlays },
         );
 
-        let path = "../target/test_custom_overlays_serde.json";
         TonNodeConfig::save_custom_overlays_json(&coc, path).await?;
         let loaded_coc = TonNodeConfig::load_custom_overlays_json(path)?;
         let _ = std::fs::remove_file(path);
