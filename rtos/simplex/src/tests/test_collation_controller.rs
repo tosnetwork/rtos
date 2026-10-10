@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): naming and durable own-decision journal integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -429,6 +429,8 @@ fn make_precollated(request_id: u32, parent: Option<CandidateParentInfo>) -> Pre
 /// methods can be driven with no `SessionProcessor` — the collation analogue of
 /// the `ValidationBackend` fakes used by the validation-controller tests.
 struct FakeCollationBackend {
+    published: std::cell::RefCell<Vec<Vec<u8>>>,
+    self_received: std::cell::RefCell<Vec<Vec<u8>>>,
     first_non_progressed_slot: SlotIndex,
     current_leader_window_idx: WindowIndex,
     /// Slots the runtime reports as already generated (pipeline-fill guard).
@@ -467,6 +469,8 @@ struct FakeCollationBackend {
 impl FakeCollationBackend {
     fn new(first_non_progressed_slot: SlotIndex, current_leader_window_idx: WindowIndex) -> Self {
         Self {
+            published: Default::default(),
+            self_received: Default::default(),
             first_non_progressed_slot,
             current_leader_window_idx,
             generated: Vec::new(),
@@ -583,7 +587,8 @@ impl CollationBackend for FakeCollationBackend {
     // `generated_block` / `check_collation` orchestration drives them, not any
     // `CollationController` policy method, so the controller unit tests never
     // invoke them. Covered end-to-end by `test_session_processor`.
-    fn broadcast_candidate(&self, _slot: u32, _candidate_hash: UInt256, _candidate: CandidateData) {
+    fn broadcast_candidate(&self, _slot: u32, _candidate_hash: UInt256, candidate: CandidateData) {
+        self.published.borrow_mut().push(rtos_api::serialize_boxed(&candidate).unwrap());
     }
 
     fn persist_candidate_info(
@@ -598,7 +603,9 @@ impl CollationBackend for FakeCollationBackend {
 
     fn request_parent_candidate(&self, _slot: SlotIndex, _hash: UInt256) {}
 
-    fn self_receive_candidate(&self, _self_idx: u32, _candidate: CandidateData) {}
+    fn self_receive_candidate(&self, _self_idx: u32, candidate: CandidateData) {
+        self.self_received.borrow_mut().push(rtos_api::serialize_boxed(&candidate).unwrap());
+    }
 }
 
 /*
@@ -2182,4 +2189,68 @@ fn restart_collation_reuses_pinned_deadlines_across_clock_advance() {
         Some(pinned.budget_anchor),
         "the re-dispatched request must carry the pinned budget anchor"
     );
+}
+
+#[test]
+fn own_journal_real_full_and_empty_publish_barriers() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    use crate::{pq_fixture as f, signing_coordinator::tests::Harness};
+    use std::sync::atomic::Ordering;
+    for full in [false, true] {
+        for stage in [
+            None,
+            Some("before_intent"),
+            Some("after_intent"),
+            Some("before_sign"),
+            Some("after_sign"),
+            Some("before_signed"),
+            Some("after_signed"),
+        ] {
+            let h = Harness::new();
+            h.description.install_test_coordinator(h.coordinator.clone()).unwrap();
+            *h.coordinator.fail_at.lock().unwrap() = stage;
+            let mut controller = mk_ctrl(h.description.clone());
+            let slot = SlotIndex::new(99);
+            let mut backend = FakeCollationBackend::new(slot, h.description.get_window_idx(slot));
+            let (result, parent) = if full {
+                let candidate = crate::ValidatorBlockCandidate {
+                    public_key: f::members().1[1].clone(),
+                    id: f::block_id("ordinary"),
+                    collated_file_hash: UInt256::calc_file_hash(&[]),
+                    data: ConsensusCommonFactory::create_block_payload(f::bytes(
+                        &f::data(),
+                        "block_boc",
+                    )),
+                    collated_data: ConsensusCommonFactory::create_block_payload(vec![]),
+                };
+                (CollationResult::Block(Arc::new(candidate)), None)
+            } else {
+                (
+                    CollationResult::Empty { parent_block_id: f::block_id("empty") },
+                    Some(CandidateParentInfo {
+                        slot: SlotIndex::new(98),
+                        hash: UInt256::from([5; 32]),
+                    }),
+                )
+            };
+            controller.publish_candidate(&mut backend, slot, parent.clone(), result.clone(), None);
+            assert_eq!(
+                backend.published.borrow().len(),
+                usize::from(stage.is_none()),
+                "full={full}, stage={stage:?}"
+            );
+            assert_eq!(*backend.published.borrow(), *backend.self_received.borrow());
+            assert_eq!(
+                controller.local_chain_head().is_some(),
+                stage.is_none(),
+                "cache must not precede durable bytes"
+            );
+            if stage.is_none() {
+                let first = backend.published.borrow()[0].clone();
+                controller.publish_candidate(&mut backend, slot, parent, result, None);
+                assert_eq!(backend.published.borrow()[1], first);
+                assert_eq!(h.calls.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
 }

@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): naming and durable own-decision journal integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -2964,7 +2964,7 @@ impl CollationController {
             }
         };
 
-        let prepared = match prepared {
+        let mut prepared = match prepared {
             Ok(p) => p,
             Err(e) => {
                 log::error!(
@@ -2985,6 +2985,26 @@ impl CollationController {
                 return;
             }
         };
+
+        // No PQ signature exists during preparation. Both full and empty
+        // candidates cross the same durable publication boundary before any
+        // generated-parent cache, local chain head, broadcast or self-receive.
+        if self.description.is_pq() {
+            match self.description.seal_own_candidate(prepared.tl_candidate_data.clone()) {
+                Ok(candidate) => {
+                    prepared.signature = candidate.signature().clone();
+                    prepared.tl_candidate_data = candidate;
+                }
+                Err(error) => {
+                    log::error!("candidate signing journal stopped publication: {error}");
+                    self.telemetry.increment_error();
+                    return;
+                }
+            }
+            if self.description.get_window_idx(slot) != backend.current_leader_window_idx() {
+                return;
+            }
+        }
 
         // Persist candidate info (synchronously, via the collation backend). The
         // hash-data bytes are built here while `prepared` is still borrowed, so
@@ -3688,13 +3708,17 @@ impl CollationController {
         );
 
         // Sign candidate
-        let signature = crate::utils::sign_candidate(
-            &self.session_id(),
-            slot,
-            &candidate_hash,
-            self.description.get_legacy_signing_key()?,
-        )
-        .map_err(|e| error!("failed to sign candidate: {e}"))?;
+        let signature = if self.description.is_pq() {
+            Vec::new()
+        } else {
+            crate::utils::sign_candidate(
+                &self.session_id(),
+                slot,
+                &candidate_hash,
+                self.description.get_legacy_signing_key()?,
+            )
+            .map_err(|e| error!("failed to sign candidate: {e}"))?
+        };
 
         // Build TL candidate for broadcast
         // C++ simplex always uses compressed candidates (compression_enabled=true hardcoded).
@@ -3795,13 +3819,17 @@ impl CollationController {
             crate::utils::compute_candidate_id_hash_empty(parent_block_id, (p.slot, &p.hash));
 
         // Sign candidate
-        let signature = crate::utils::sign_candidate(
-            &self.session_id(),
-            slot,
-            &candidate_hash,
-            self.description.get_legacy_signing_key()?,
-        )
-        .map_err(|e| error!("failed to sign candidate: {e}"))?;
+        let signature = if self.description.is_pq() {
+            Vec::new()
+        } else {
+            crate::utils::sign_candidate(
+                &self.session_id(),
+                slot,
+                &candidate_hash,
+                self.description.get_legacy_signing_key()?,
+            )
+            .map_err(|e| error!("failed to sign candidate: {e}"))?
+        };
 
         // Build TL candidate for broadcast
         // consensus.empty uses CandidateId directly (not CandidateParent wrapper)

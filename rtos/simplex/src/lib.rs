@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): naming and durable own-decision journal integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -892,3 +892,5 @@ impl SessionFactory {
 #[cfg(test)]
 #[path = "tests/pq_fixture.rs"]
 pub(crate) mod pq_fixture;
+
+mod signing_coordinator;
