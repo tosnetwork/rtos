@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): archive group allocation and resume regression tests.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -733,5 +733,118 @@ async fn test_archival_mode_restart_preserves_data() -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+// Exercise the worst valid scheduling order (WC first), concurrent allocation,
+// ordinary groups sharing a slice, and retry after reopening an empty reservation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_import_group_boundary_and_resume() -> Result<()> {
+    use crate::archives::{
+        archive_manager::{ImportBlockMeta, ImportEntry},
+        package::Package,
+        package_entry::PackageEntry,
+    };
+    const NAME: &str = "test_import_group_boundary_and_resume";
+    let (manager, db) = create_manager(DB_PATH, NAME, true).await?;
+    manager.prepare_import_group(1, true).await?;
+    drop(manager);
+    drop(db);
+    let (manager, db) = create_manager(DB_PATH, NAME, false).await?;
+    let (handles, _) = create_block_handle_storage(db.clone());
+    let mut expected = Vec::new();
+    for (seq, key) in [(1u32, true), (101, false), (150, true)] {
+        // Multiple reservations must select one descriptor, including on resume.
+        let (a, b) = tokio::join!(
+            manager.prepare_import_group(seq, key),
+            manager.prepare_import_group(seq, key),
+        );
+        a?;
+        b?;
+        let mut inputs = Vec::new();
+        for wc in [true, false] {
+            let shard =
+                if wc { ShardIdent::with_workchain_id(0)? } else { ShardIdent::masterchain() };
+            let id = BlockIdExt::with_params(
+                shard.clone(),
+                seq + 1,
+                UInt256::with_array([(seq as u8).wrapping_add(wc as u8); 32]),
+                UInt256::with_array([wc as u8; 32]),
+            );
+            let data = format!("group={seq}, workchain={wc}").into_bytes();
+            let path = Path::new(DB_PATH).join(NAME).join(format!("source-{seq}-{wc}.pack"));
+            let package = Package::open(path.clone(), false, true).await?;
+            let mut offset = 0;
+            package
+                .append_entry(
+                    &PackageEntry::with_data(PackageEntryId::Block(&id).filename(), data.clone()),
+                    |pos, _| {
+                        offset = pos;
+                        Ok(())
+                    },
+                )
+                .await?;
+            drop(package);
+            let entries = vec![ImportEntry {
+                entry_id: PackageEntryId::Block(id.clone()),
+                offset,
+                block_meta: Some(ImportBlockMeta {
+                    seq_no: seq + 1,
+                    shard: shard.clone(),
+                    gen_utime: seq,
+                    end_lt: seq as u64,
+                    mc_ref_seq_no: seq + 1,
+                }),
+            }];
+            // Read an ordinary member of the group; key-only archives are a separate API.
+            let handle = handles
+                .create_handle(
+                    id.clone(),
+                    BlockMeta::with_data(0, seq, seq as u64, seq + 1, 0),
+                    None,
+                )?
+                .unwrap();
+            handle.set_data();
+            handle.set_archived();
+            handle.set_block_applied();
+            handles.save_handle(&handle, None)?;
+            expected.push((handle, id, data));
+            inputs.push((path, shard, entries, key && !wc));
+        }
+        let import = |i: usize| {
+            let (path, shard, entries, key) = &inputs[i];
+            manager.import_package(path, seq, shard, entries, false, *key)
+        };
+        if seq == 1 {
+            // Before the fix this puts WC in slice 0, then MC creates slice 1.
+            import(0).await?;
+            import(1).await?;
+        } else {
+            let (wc, mc) = tokio::join!(import(0), import(1));
+            wc?;
+            mc?;
+        }
+        let expected_slice = if seq < 150 { 1 } else { 150 };
+        assert_eq!(manager.file_maps.files().get_closest_id(seq).await, Some(expected_slice));
+        for (handle, id, data) in &expected {
+            assert_eq!(
+                &manager.get_file(handle, &PackageEntryId::Block(id)).await?,
+                data,
+                "before retry: {id}"
+            );
+        }
+        // Reimport the same durable inputs as a retry after an interrupted group.
+        import(0).await?;
+        import(1).await?;
+    }
+    drop(manager);
+    drop(handles);
+    drop(db);
+    let (manager, reopened_db) = create_manager(DB_PATH, NAME, false).await?;
+    for (handle, id, data) in expected {
+        assert_eq!(manager.get_file(&handle, &PackageEntryId::Block(&id)).await?, data, "{id}");
+    }
+    drop(manager);
+    drop(reopened_db);
     Ok(())
 }

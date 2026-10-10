@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and deterministic archive import boundaries.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -605,6 +605,20 @@ impl ArchiveManager {
             }
             PackageId::for_block(package_id)
         }
+    }
+
+    /// Register the authenticated group's slice before its MC and shard packages
+    /// are imported concurrently. Non-key groups retain normal slice selection.
+    /// This reserves metadata only: failed imports may leave an empty descriptor,
+    /// which a retry reuses; package contents and completion are not committed here.
+    pub async fn prepare_import_group(
+        &self,
+        archive_id: u32,
+        starts_with_key_block: bool,
+    ) -> Result<()> {
+        let slice_id = self.get_package_id_force(archive_id, false, starts_with_key_block).await;
+        self.get_or_create_import_desc(&slice_id, ShardIdent::masterchain().prefix_len()).await?;
+        Ok(())
     }
 
     pub async fn import_package(
