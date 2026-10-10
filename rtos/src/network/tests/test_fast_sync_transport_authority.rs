@@ -53,6 +53,10 @@ fn fast_sync_transport_authority_target_implicit_classical_and_invalid_pq() {
     let implicit = classical(None);
     let zero = classical(Some(0));
     let expected = implicit.public_key().unwrap().pub_key().id().clone();
+    // Independently emitted by the fixed reference transport-authority helper.
+    let reference: UInt256 =
+        "9fd606bdd97bc13617a8a03373c3ef9699b04c8b8f1e32c6ae67f1b64aa0c159".parse().unwrap();
+    assert_eq!(expected.data(), reference.as_array());
     assert_eq!(
         fast_sync_transport_authority(&[implicit, zero], WireProfile::T0).unwrap(),
         (vec![expected.clone()], vec![expected])
