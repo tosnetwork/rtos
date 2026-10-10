@@ -95,6 +95,7 @@ pub mod signature;
 pub use signature::*;
 
 pub mod config_params;
+pub mod workchain_execution;
 pub use config_params::*;
 
 pub mod storage_stat;
@@ -523,3 +524,7 @@ impl Deserializable for EmptyValue {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_workchain_execution.rs"]
+mod test_workchain_execution;
