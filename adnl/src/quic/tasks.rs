@@ -169,6 +169,10 @@ impl QuicTasks {
         self.workers.close();
     }
 
+    pub async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+
     pub async fn wait(&self) -> Result<()> {
         self.close();
         self.workers.wait().await;
