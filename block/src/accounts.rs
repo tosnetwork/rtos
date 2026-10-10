@@ -1073,7 +1073,12 @@ impl Account {
         if let Some(stuff) = self.stuff_mut() {
             let new_state = match &stuff.storage.state {
                 AccountState::AccountUninit => {
-                    if stuff.addr.address().contains_bytes(state_init.hash()?.as_slice()) {
+                    let prefix = state_init.fixed_prefix_length().map_or(0, |n| n.as_usize());
+                    let mut state_hash = SliceData::from(&state_init.hash()?);
+                    let mut address = stuff.addr.address().clone();
+                    state_hash.move_by(prefix)?;
+                    address.move_by(prefix)?;
+                    if address == state_hash {
                         AccountState::AccountActive { state_init: state_init.clone() }
                     } else {
                         fail!("StateInit doesn't correspond to uninit account address")

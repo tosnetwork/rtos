@@ -207,7 +207,7 @@ fn test_real_deploy_transaction() {
     replay_transaction_by_files(
         "real_boc/deploy_account_old.boc",
         "real_boc/deploy_account_new.boc",
-        "real_boc/deploy_transaction.boc",
+        "src/tests/data/deploy-metadata/deploy_transaction.boc",
         "real_boc/config.boc",
     )
 }
@@ -307,7 +307,7 @@ fn test_bounce_message_to_new_account() {
     replay_transaction_by_files(
         "real_boc/empty_account.boc",
         "real_boc/bounce_message_to_new_account_account_new.boc",
-        "real_boc/bounce_message_to_new_account_transaction.boc",
+        "src/tests/data/deploy-metadata/bounce_message_to_new_account_transaction.boc",
         "real_boc/config.boc",
     )
 }
@@ -317,7 +317,7 @@ fn test_out_of_gas_in_cmd() {
     replay_transaction_by_files(
         "real_boc/empty_account.boc",
         "real_boc/bounce_message_to_new_account_account_new.boc",
-        "real_boc/bounce_message_to_new_account_transaction.boc",
+        "src/tests/data/deploy-metadata/bounce_message_to_new_account_transaction.boc",
         "real_boc/config.boc",
     )
 }
@@ -347,7 +347,7 @@ fn test_unfreeze_account() {
     replay_transaction_by_files(
         "real_boc/unfreeze_account_old.boc",
         "real_boc/unfreeze_account_new.boc",
-        "real_boc/unfreeze_transaction.boc",
+        "src/tests/data/deploy-metadata/unfreeze_transaction.boc",
         "real_boc/config.boc",
     )
 }
@@ -457,7 +457,7 @@ fn test_deploy_account_with_fixed_prefix() {
     replay_transaction_by_files(
         "real_boc/empty_account.boc",
         "real_boc/deploy_fixed_prefix_account_new.boc",
-        "real_boc/deploy_fixed_prefix_transaction.boc",
+        "src/tests/data/deploy-metadata/deploy_fixed_prefix_transaction.boc",
         "real_boc/config.boc",
     )
 }
@@ -487,7 +487,7 @@ fn test_body_with_pruned_cell() {
     replay_transaction_by_files(
         "real_boc/body_with_pruned_cell_account_old.boc",
         "real_boc/body_with_pruned_cell_account_new.boc",
-        "real_boc/body_with_pruned_cell_transaction.boc",
+        "src/tests/data/deploy-metadata/body_with_pruned_cell_transaction.boc",
         "real_boc/config.boc",
     )
 }

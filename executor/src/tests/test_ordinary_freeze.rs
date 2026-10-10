@@ -357,6 +357,8 @@ fn unfreeze_account(mut acc: Account, state_init: &StateInit, bounce: bool) -> A
     });
     let mut vm_phase = TrComputePhaseVm::default();
     vm_phase.success = true;
+    vm_phase.msg_state_used = true;
+    vm_phase.account_activated = true;
     vm_phase.gas_used = gas_used.into();
     vm_phase.gas_limit = ((msg_income as u32 - due.as_u128() as u32) / 10000).into();
     vm_phase.gas_fees = gas_fees.into();
@@ -713,7 +715,7 @@ fn try_delete_active_account(mut acc: Account, bounce: bool) -> Account {
         acc_balance_before + if bounce { 0 } else { msg_income as u128 },
     ));
     good_trans.orig_status = AccountStatus::AccStateActive;
-    good_trans.set_end_status(AccountStatus::AccStateFrozen);
+    good_trans.set_end_status(AccountStatus::AccStateUninit);
     good_trans.set_logical_time(BLOCK_LT + 2);
     good_trans.set_now(BLOCK_UT);
 

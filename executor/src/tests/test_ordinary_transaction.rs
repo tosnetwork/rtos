@@ -3933,7 +3933,7 @@ fn do_test_acc_size_limits(workchain_id: i8, acc_id: &AccountId, mut config: Con
         trans.read_description().unwrap().compute_phase_ref().unwrap().is_skipped().unwrap(),
         &ComputeSkipReason::BadState
     );
-    assert_eq!(trans.end_status, AccountStatus::AccStateFrozen);
+    assert_eq!(trans.end_status, AccountStatus::AccStateUninit);
     assert_eq!(trans.out_msgs.count(2).unwrap(), 1);
 
     let mut acc = Account::frozen(

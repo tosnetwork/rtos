@@ -211,8 +211,8 @@ fn test_computing_phase_acc_uninit_extmsg_with_state() {
     let gas_config = BLOCKCHAIN_CONFIG.get_gas_config(true);
     let mut vm_phase = TrComputePhaseVm::default();
     vm_phase.success = true;
-    // vm_phase.msg_state_used = true;
-    // vm_phase.account_activated = true;
+    vm_phase.msg_state_used = true;
+    vm_phase.account_activated = true;
     vm_phase.exit_code = 0;
     let used = 67u32;
     vm_phase.gas_used = used.into();

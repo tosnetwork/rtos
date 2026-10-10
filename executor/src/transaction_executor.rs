@@ -68,6 +68,7 @@ pub const SUPPORTED_EXTRA_FLAGS: u8 = EXTRA_FLAG_NEW_BOUNCE_FORMAT | EXTRA_FLAG_
 const RESULT_CODE_LIB_BAD_CELL: i32 = 41;
 const RESULT_CODE_LIB_BAD_ACCOUNT_STATE: i32 = 42;
 const RESULT_CODE_LIB_EXCEEDED_LIMITS: i32 = 43;
+const RESULT_CODE_LIB_FORBIDDEN: i32 = 46;
 
 pub(crate) const MAX_ACTIONS: usize = 255;
 
@@ -330,6 +331,7 @@ pub trait TransactionExecutor {
             return Ok((TrComputePhase::skipped(ComputeSkipReason::NoGas), None, None));
         }
 
+        let use_msg_state = !acc.is_active();
         let mut libraries = vec![];
         let mut result_acc = acc.clone();
         if let Some(msg) = msg {
@@ -512,6 +514,13 @@ pub trait TransactionExecutor {
             fail!("can't sub funds: from acc_balance")
         }
 
+        vm_phase.msg_state_used = use_msg_state;
+        vm_phase.account_activated = use_msg_state
+            && if self.config().block_version() >= 14 { vm_phase.success } else { credit == 0 };
+        if use_msg_state && !vm_phase.account_activated {
+            result_acc = acc.clone();
+        }
+
         // Seed VM-loaded cells as a storage-stat hint before the recalc in
         // `check_account_size_limits` (cpp `add_hint(compute_phase->vm_loaded_cells)`).
         let visited_cells = vm.take_visited_cells();
@@ -578,20 +587,31 @@ pub trait TransactionExecutor {
 
         let mut parsed_actions = Vec::with_capacity(action_slices.len());
         for (i, slice) in action_slices.into_iter().enumerate() {
-            if let Err(err) = OutAction::skip(&mut slice.clone()) {
+            let mut remainder = slice.clone();
+            let parsed = OutAction::skip(&mut remainder).and_then(|_| {
+                if remainder.is_empty_cell() {
+                    Ok(())
+                } else {
+                    fail!("Trailing data in action")
+                }
+            });
+            if let Err(err) = parsed {
                 log::debug!(
                     target: "executor",
                     "invalid action {i} found while preprocessing action list: {err:?}"
                 );
-                if let Some(BlockError::OutActionError(_, mode)) = err.downcast_ref() {
-                    if mode.bit(SENDMSG_IGNORE_ERROR) {
-                        phase.skipped_actions += 1;
-                        parsed_actions.push(None);
-                        continue;
-                    } else if mode.bit(SENDMSG_BOUNCE_IF_FAIL) {
-                        bounce = true;
+                let mut header = slice.clone();
+                if header.get_next_u32().ok() == Some(rtos_block::ACTION_SEND_MSG) {
+                    if let Ok(mode) = header.get_next_byte() {
+                        if mode.bit(SENDMSG_IGNORE_ERROR) {
+                            phase.skipped_actions += 1;
+                            parsed_actions.push(None);
+                            continue;
+                        } else if mode.bit(SENDMSG_BOUNCE_IF_FAIL) {
+                            bounce = true;
+                        }
                     }
-                };
+                }
                 phase.result_code = RESULT_CODE_UNKNOWN_OR_INVALID_ACTION;
                 if i != 0 {
                     phase.result_arg = Some(i as i32);
@@ -705,15 +725,22 @@ pub trait TransactionExecutor {
                         balance_to_string(Some(&acc_remaining_balance))
                     );
                     let mode = mode >> 1;
-                    let code =
-                        change_library_action_handler(limits, &mut acc_copy, mode, code, hash)
-                            .unwrap_or_else(|err| {
-                                log::debug!(
-                                    target: "executor",
-                                    "change_library_action_handler failed: {err}"
-                                );
-                                RESULT_CODE_LIB_BAD_ACCOUNT_STATE
-                            });
+                    let code = change_library_action_handler(
+                        limits,
+                        &mut acc_copy,
+                        mode,
+                        code,
+                        hash,
+                        self.config().block_version(),
+                        is_special,
+                    )
+                    .unwrap_or_else(|err| {
+                        log::debug!(
+                            target: "executor",
+                            "change_library_action_handler failed: {err}"
+                        );
+                        RESULT_CODE_LIB_BAD_ACCOUNT_STATE
+                    });
                     if code == 0 {
                         phase.spec_actions += 1;
                     } else if mode.bit(CHANGE_SET_LIB_BOUNCE_IF_FAIL) {
@@ -757,6 +784,11 @@ pub trait TransactionExecutor {
                 {
                     phase.no_funds = true;
                 }
+                // Library changes survive a later action failure; code/data do not.
+                if let Some(library) = acc.library_mut() {
+                    *library = acc_copy.libraries();
+                }
+                tr.set_account_updates(acc.storage_roots());
                 return finish_action_phase_with_fine(
                     tr,
                     phase,
@@ -1031,8 +1063,19 @@ fn compute_new_state(
                 // borrow code and data from it and switch account state to 'active'.
                 log::debug!(target: "executor", "message for uninitialized: activated");
                 let text = "Cannot construct account from message with hash";
-                if !check_state_init(state_init, addr.is_masterchain(), text, &in_msg.hash()?) {
+                if !check_deploy_state_init(
+                    state_init,
+                    config,
+                    addr.is_masterchain(),
+                    text,
+                    &in_msg.hash()?,
+                ) {
                     return Ok(Some(ComputeSkipReason::BadState));
+                }
+                if let Some(prefix) = state_init.fixed_prefix_length() {
+                    if config.check_fixed_prefix_length(prefix.as_u32()).is_err() {
+                        return Ok(Some(ComputeSkipReason::BadState));
+                    }
                 }
                 match acc.try_activate(state_init) {
                     Err(err) => {
@@ -1696,40 +1739,46 @@ fn setcode_action_handler(acc: &mut Account, code: Cell) -> Option<i32> {
 fn change_library_action_handler(
     limits: &SizeLimitsConfig,
     acc: &mut Account,
-    mode: u8, // raw value left shifted
-    code: Option<Cell>,
+    mode: u8,
+    mut code: Option<Cell>,
     hash: Option<UInt256>,
+    version: u32,
+    is_special: bool,
 ) -> Result<i32> {
+    let mode = mode & !CHANGE_SET_LIB_BOUNCE_IF_FAIL;
+    if mode > 2 {
+        return Ok(RESULT_CODE_UNSUPPORTED);
+    }
+    if version >= 15 && (mode == 1 || !is_special) {
+        return Ok(RESULT_CODE_LIB_FORBIDDEN);
+    }
+    let hash = code.as_ref().map(Cell::repr_hash).cloned().or(hash);
+    let Some(hash) = hash else { return Ok(RESULT_CODE_LIB_BAD_CELL) };
     let Some(library) = acc.library_mut() else { return Ok(RESULT_CODE_LIB_BAD_ACCOUNT_STATE) };
-    if let Some(code) = code {
-        log::debug!(target: "executor", "OutAction::ChangeLibrary mode: {}, code: {}", mode, code);
-        if code.level() > 0 {
-            return Ok(RESULT_CODE_LIB_BAD_CELL);
-        }
-        let hash = code.repr_hash();
-        let is_public = mode.bit(SET_LIB_CODE_ADD_PUBLIC);
-        if let Some(exist) = library.get(hash)? {
-            if exist.root.repr_hash() == hash && exist.is_public_library() == is_public {
+    if mode == 0 {
+        library.remove(&hash)?;
+        return Ok(0);
+    }
+    let is_public = mode == SET_LIB_CODE_ADD_PUBLIC;
+    if let Some(existing) = library.get(&hash)? {
+        if existing.root.repr_hash() == &hash {
+            if existing.is_public_library() == is_public {
                 return Ok(0);
             }
+            code = Some(existing.root);
         }
-        let mut sstat = StorageUsageCalc::with_limits(0, 0);
-        let max_merkle_depth = sstat.append_cell(&code, true, &mut 0)? as u8;
-        if sstat.cells() > limits.max_library_cells as u64 || max_merkle_depth > MAX_MERKLE_DEPTH {
-            log::debug!(target: "executor", "library exceeds size limits: cells {}, bits {}, merkle depth {}",
-                sstat.cells(), sstat.bits(), max_merkle_depth);
-            return Ok(RESULT_CODE_LIB_EXCEEDED_LIMITS);
-        }
-        let key = hash.write_to_bitstring()?;
-        let lib = SimpleLib::new(code, is_public);
-        library.set_raw(key, &lib.write_to_new_cell()?)?;
-    } else if let Some(hash) = hash {
-        log::debug!(target: "executor", "OutAction::ChangeLibrary mode: {}, hash: {:x}", mode, hash);
-        library.remove(&hash)?;
-    } else {
-        log::warn!(target: "executor", "OutAction::ChangeLibrary mode: {}", mode);
+    }
+    let Some(code) = code else { return Ok(RESULT_CODE_LIB_BAD_CELL) };
+    if code.level() > 0 {
         return Ok(RESULT_CODE_LIB_BAD_CELL);
     }
+    let mut sstat = StorageUsageCalc::with_limits(0, 0);
+    let max_merkle_depth = sstat.append_cell(&code, true, &mut 0)? as u8;
+    if sstat.cells() > limits.max_library_cells as u64 || max_merkle_depth > MAX_MERKLE_DEPTH {
+        return Ok(RESULT_CODE_LIB_EXCEEDED_LIMITS);
+    }
+    let key = hash.write_to_bitstring()?;
+    library.set_raw(key, &SimpleLib::new(code, is_public).write_to_new_cell()?)?;
     Ok(0)
 }
 
@@ -1785,6 +1834,20 @@ fn init_gas(
         gas_max as i64,
         gas_info.get_real_gas_price() as i64,
     )
+}
+
+fn check_deploy_state_init(
+    init: &StateInit,
+    config: &BlockchainConfig,
+    is_masterchain: bool,
+    text: &str,
+    msg_hash: &UInt256,
+) -> bool {
+    if !check_state_init(init, config.block_version() >= 15, text, msg_hash) {
+        return false;
+    }
+    // A newly deployed masterchain account cannot publish libraries.
+    !is_masterchain || init.libraries().iterate(|lib| Ok(!lib.is_public_library())).unwrap_or(false)
 }
 
 fn check_state_init(
@@ -1858,8 +1921,13 @@ pub(super) fn account_from_message(
             };
             if !check_address || equal {
                 let text = "Cannot construct account from message with hash";
-                let disable_set_lib = account_address.is_masterchain();
-                if check_state_init(init, disable_set_lib, text, &msg_hash) {
+                if check_deploy_state_init(
+                    init,
+                    config,
+                    account_address.is_masterchain(),
+                    text,
+                    &msg_hash,
+                ) {
                     return Account::active(
                         account_address.clone(),
                         msg_remaining_balance.clone(),

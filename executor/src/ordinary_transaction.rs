@@ -294,6 +294,10 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                 true,
             ) {
                 if check_account_size_limits(self.config().size_limits_config(), &mut new_acc)? {
+                    // Compute decides whether inbound StateInit activation commits.
+                    if new_acc.is_active() {
+                        new_acc.uninit_account();
+                    }
                     *account = new_acc;
                 } else {
                     bad_state = true;
@@ -471,12 +475,12 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         } else {
             account.set_addr(account_address);
         }
-        tr.set_end_status(account.status());
         if let Some(hash) = account.frozen_hash() {
             if account_id.contains_bytes(hash.as_slice()) {
                 account.uninit_account();
             }
         }
+        tr.set_end_status(account.status());
         log::debug!(target: "executor", "set balance {}", acc_balance.coins);
         account.set_balance(acc_balance);
         log::debug!(target: "executor", "add messages {}, start_lt {}", out_msgs.len(), lt);
@@ -526,3 +530,7 @@ mod test_sha256c_transaction;
 #[cfg(test)]
 #[path = "tests/test_library_budget_transaction.rs"]
 mod test_library_budget_transaction;
+
+#[cfg(test)]
+#[path = "tests/test_v15_libraries.rs"]
+mod test_v15_libraries;

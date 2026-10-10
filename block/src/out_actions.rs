@@ -259,21 +259,16 @@ impl Deserializable for OutAction {
             }
             ACTION_CHANGE_LIB => {
                 let mode = slice.get_next_byte()?;
-                let flags = (mode >> 1) & SET_LIB_CODE_ADD_PRIVATE_OR_PUBLIC_MASK;
-                match (mode & CHANGE_SET_LIB_MASK, flags) {
-                    (CHANGE_LIB_MODE, 0) => match UInt256::construct_from(slice) {
+                if mode & CHANGE_SET_LIB_MASK == CHANGE_LIB_MODE {
+                    match UInt256::construct_from(slice) {
                         Ok(hash) => OutAction::new_change_library(mode, None, Some(hash)),
                         Err(err) => fail!(BlockError::OutActionError(err, mode)),
-                    },
-                    (SET_LIB_CODE_MODE, SET_LIB_CODE_REMOVE)
-                    | (SET_LIB_CODE_MODE, SET_LIB_CODE_ADD_PRIVATE)
-                    | (SET_LIB_CODE_MODE, SET_LIB_CODE_ADD_PUBLIC) => {
-                        match slice.checked_drain_reference() {
-                            Ok(code) => OutAction::new_change_library(mode, Some(code), None),
-                            Err(err) => fail!(BlockError::OutActionError(err, mode)),
-                        }
                     }
-                    _ => fail!("wrong mode for ChangeLibrary action: {mode}"),
+                } else {
+                    match slice.checked_drain_reference() {
+                        Ok(code) => OutAction::new_change_library(mode, Some(code), None),
+                        Err(err) => fail!(BlockError::OutActionError(err, mode)),
+                    }
                 }
             }
             tag => fail!(BlockError::InvalidConstructorTag { t: tag, s: "OutAction".to_string() }),
@@ -301,21 +296,12 @@ impl Deserializable for OutAction {
             }
             ACTION_CHANGE_LIB => {
                 let mode = slice.get_next_byte()?;
-                let flags = (mode >> 1) & SET_LIB_CODE_ADD_PRIVATE_OR_PUBLIC_MASK;
-                match (mode & CHANGE_SET_LIB_MASK, flags) {
-                    (CHANGE_LIB_MODE, 0) => {
-                        if let Err(err) = slice.move_by(256) {
-                            fail!(BlockError::OutActionError(err, mode))
-                        }
+                if mode & CHANGE_SET_LIB_MASK == CHANGE_LIB_MODE {
+                    if let Err(err) = slice.move_by(256) {
+                        fail!(BlockError::OutActionError(err, mode))
                     }
-                    (SET_LIB_CODE_MODE, SET_LIB_CODE_REMOVE)
-                    | (SET_LIB_CODE_MODE, SET_LIB_CODE_ADD_PRIVATE)
-                    | (SET_LIB_CODE_MODE, SET_LIB_CODE_ADD_PUBLIC) => {
-                        if let Err(err) = slice.checked_drain_reference() {
-                            fail!(BlockError::OutActionError(err, mode))
-                        }
-                    }
-                    _ => fail!("wrong mode for ChangeLibrary action: {mode}"),
+                } else if let Err(err) = slice.checked_drain_reference() {
+                    fail!(BlockError::OutActionError(err, mode))
                 }
             }
             tag => fail!(BlockError::InvalidConstructorTag { t: tag, s: "OutAction".to_string() }),
