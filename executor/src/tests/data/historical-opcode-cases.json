@@ -1,0 +1,106 @@
+[
+  {
+    "name": "btos",
+    "source": "NEWC BTOS SBITS",
+    "minimum": 12
+  },
+  {
+    "name": "clevel",
+    "source": "NEWC ENDC CLEVEL",
+    "minimum": 6
+  },
+  {
+    "name": "bls",
+    "source": "BLS_PUSHR DROP PUSHINT 77",
+    "minimum": 4
+  },
+  {
+    "name": "rist",
+    "source": "RIST255_PUSHL DROP PUSHINT 77",
+    "minimum": 4
+  },
+  {
+    "name": "hashbu",
+    "source": "NEWC HASHBU DROP PUSHINT 77",
+    "minimum": 12
+  },
+  {
+    "name": "gasconsumed",
+    "source": "GASCONSUMED",
+    "minimum": 4
+  },
+  {
+    "name": "chashix-type",
+    "source": "PUSHNULL CHASHIX",
+    "minimum": 6
+  },
+  {
+    "name": "chashix-range",
+    "source": "PUSHINT -1 CHASHIX",
+    "minimum": 6
+  },
+  {
+    "name": "fees-type",
+    "source": "PUSHNULL GETGASFEE",
+    "minimum": 6
+  },
+  {
+    "name": "fees-missing",
+    "source": "PUSHINT 0 GETGASFEE",
+    "minimum": 6
+  },
+  {
+    "name": "bls-add-missing",
+    "source": "BLS_G1_ADD",
+    "minimum": 4
+  },
+  {
+    "name": "many-invalidmask",
+    "source": "SETCONTCTRMANY 64",
+    "minimum": 9
+  },
+  {
+    "name": "hash-fixed",
+    "source": "PUSHSLICE x61626364 PUSHINT 1 HASHEXT_SHA256 DROP PUSHINT 77",
+    "minimum": 4
+  },
+  {
+    "name": "hash-append",
+    "source": "NEWC PUSHSLICE x61626364 PUSHINT 1 HASHEXTA_SHA256 ENDC HASHCU DROP PUSHINT 77",
+    "minimum": 4
+  },
+  {
+    "name": "optionaladdr",
+    "source": "PUSHSLICE x2_ LDOPTSTDADDR ISNULL",
+    "minimum": 12
+  },
+  {
+    "name": "hashext-dynamic-f0",
+    "source": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 3 .blob xf904ff ",
+    "minimum": 4,
+    "unsigned": true
+  },
+  {
+    "name": "hashext-dynamic-f1",
+    "source": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 3 .blob xf905ff ",
+    "minimum": 4,
+    "unsigned": true
+  },
+  {
+    "name": "hashext-dynamic-f2",
+    "source": "NEWC PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 3 .blob xf906ff ENDC HASHCU",
+    "minimum": 4,
+    "unsigned": true
+  },
+  {
+    "name": "hashext-dynamic-f3",
+    "source": "NEWC PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 3 .blob xf907ff ENDC HASHCU",
+    "minimum": 4,
+    "unsigned": true
+  },
+  {
+    "name": "getparam-unregistered",
+    "source": ".blob xf881ff",
+    "minimum": 11
+  }
+]

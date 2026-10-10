@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): SETCONTCTRMANY immediate validation order.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -1132,6 +1132,9 @@ pub(super) fn execute_setcontctrmany(engine: &mut Engine) -> Status {
     engine.load_instruction(
         Instruction::new("SETCONTCTRMANY").set_opts(InstructionOptions::Length(0..256)),
     )?;
+    if engine.cmd.length() & (1 << 6) != 0 {
+        fail!(ExceptionCode::RangeCheckError, "no control register for c6")
+    }
     fetch_stack(engine, 1)?;
     setcontctrmany_helper(engine, engine.cmd.length())
 }

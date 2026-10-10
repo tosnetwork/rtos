@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): BLS stack checks before operation gas.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -207,9 +207,8 @@ where
     P: FnOnce(&[u8; L], &[u8; L]) -> Result<[u8; L]>,
 {
     engine.load_instruction(Instruction::new(instruction))?;
-    engine.try_use_gas(gas)?;
-
     fetch_stack(engine, 2)?;
+    engine.try_use_gas(gas)?;
     let y = engine.cmd.var(0).as_slice()?.clone().get_next_bytes(L)?;
     let x = engine.cmd.var(1).as_slice()?.clone().get_next_bytes(L)?;
 
@@ -231,9 +230,8 @@ where
     P: FnOnce(&[u8; L], &[u8; BLS_SCALAR_LEN]) -> Result<[u8; L]>,
 {
     engine.load_instruction(Instruction::new(instruction))?;
-    engine.try_use_gas(gas)?;
-
     fetch_stack(engine, 2)?;
+    engine.try_use_gas(gas)?;
     let s = engine.cmd.var(0).as_integer()?;
     let x = engine.cmd.var(1).as_slice()?.clone().get_next_bytes(L)?;
 

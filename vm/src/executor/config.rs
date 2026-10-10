@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): historical fee operand priority and GETPARAMLONG range.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -165,10 +165,8 @@ pub(super) fn execute_unpacked_config(engine: &mut Engine) -> Status {
 
 // - p
 pub(super) fn execute_getparam_long(engine: &mut Engine) -> Status {
-    engine.load_instruction(
-        Instruction::new("GETPARAMLONG").set_opts(InstructionOptions::Length(0..256)),
-    )?;
-    let index = engine.cmd.length();
+    let index = engine.last_cmd() as usize;
+    engine.load_instruction(Instruction::new("GETPARAMLONG"))?;
     let value = engine.smci_param(index)?.clone();
     engine.cc.stack.push(value);
     Ok(())
@@ -227,8 +225,16 @@ pub(super) fn execute_get_global_id(engine: &mut Engine) -> Status {
 
 fn calc_gas_fee(engine: &mut Engine, name: &'static str, simple: bool) -> Status {
     engine.load_instruction(Instruction::new(name))?;
-    fetch_stack(engine, 2)?;
+    let count = 2;
+    if engine.block_version() >= 9 {
+        fetch_stack(engine, count)?;
+    } else {
+        fetch_stack(engine, 1)?;
+    }
     let is_masterchain = engine.cmd.var(0).as_bool()?;
+    if engine.block_version() < 9 {
+        fetch_stack(engine, 1)?;
+    }
     let gas = engine.cmd.var(1).as_integer_value(0..=u64::MAX / 2)?;
     let index = if is_masterchain { 2 } else { 3 };
     let slice = engine.smci_extra_param(14, index)?.as_slice()?;
@@ -251,10 +257,24 @@ pub(super) fn execute_calc_gas_fee_simple(engine: &mut Engine) -> Status {
 // (cells bits delta is_masterchain - integer)
 pub(super) fn execute_calc_storage_fee(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("GETSTORAGEFEE"))?;
-    fetch_stack(engine, 4)?;
+    let count = 4;
+    if engine.block_version() >= 9 {
+        fetch_stack(engine, count)?;
+    } else {
+        fetch_stack(engine, 1)?;
+    }
     let is_masterchain = engine.cmd.var(0).as_bool()?;
+    if engine.block_version() < 9 {
+        fetch_stack(engine, 1)?;
+    }
     let delta = engine.cmd.var(1).as_integer_value(0..=u64::MAX / 2)?;
+    if engine.block_version() < 9 {
+        fetch_stack(engine, 1)?;
+    }
     let bits = engine.cmd.var(2).as_integer_value(0..=u64::MAX / 2)?;
+    if engine.block_version() < 9 {
+        fetch_stack(engine, 1)?;
+    }
     let cells = engine.cmd.var(3).as_integer_value(0..=u64::MAX / 2)?;
     let slice = engine.smci_extra_param(14, 0)?.as_slice()?;
     if slice.is_empty_cell() {
@@ -270,9 +290,20 @@ pub(super) fn execute_calc_storage_fee(engine: &mut Engine) -> Status {
 
 fn calc_forward_prices(engine: &mut Engine, name: &'static str, simple: bool) -> Status {
     engine.load_instruction(Instruction::new(name))?;
-    fetch_stack(engine, 3)?;
+    let count = 3;
+    if engine.block_version() >= 9 {
+        fetch_stack(engine, count)?;
+    } else {
+        fetch_stack(engine, 1)?;
+    }
     let is_masterchain = engine.cmd.var(0).as_bool()?;
+    if engine.block_version() < 9 {
+        fetch_stack(engine, 1)?;
+    }
     let bits = engine.cmd.var(1).as_integer_value(0..=u64::MAX / 2)?;
+    if engine.block_version() < 9 {
+        fetch_stack(engine, 1)?;
+    }
     let cells = engine.cmd.var(2).as_integer_value(0..=u64::MAX / 2)?;
     let index = if is_masterchain { 4 } else { 5 };
     let slice = engine.smci_extra_param(14, index)?.as_slice()?;
@@ -299,8 +330,16 @@ pub(super) fn execute_calc_forward_fee_simple(engine: &mut Engine) -> Status {
 // (fwd_fee bits is_masterchain - integer)
 pub(super) fn execute_get_original_forward_fee(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("GETORIGINALFWDFEE"))?;
-    fetch_stack(engine, 2)?;
+    let count = 2;
+    if engine.block_version() >= 9 {
+        fetch_stack(engine, count)?;
+    } else {
+        fetch_stack(engine, 1)?;
+    }
     let is_masterchain = engine.cmd.var(0).as_bool()?;
+    if engine.block_version() < 9 {
+        fetch_stack(engine, 1)?;
+    }
     let fwd_fee = engine.cmd.var(1).as_integer()?;
     if fwd_fee.is_neg() {
         fail!(ExceptionCode::RangeCheckError, "fwd_fee is negative");

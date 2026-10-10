@@ -1,4 +1,5 @@
 /*
+ * RTOS project modifications (2026-10-10): historical opcode transaction regressions.
  * RTOS project modifications (2026-10-10): naming, historical address
  * commitment across compute admission, and storage-deletion reporting, and message execution compatibility.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
@@ -608,3 +609,7 @@ mod test_sendmsg_transaction;
 #[cfg(test)]
 #[path = "tests/test_bchk_transaction.rs"]
 mod test_bchk_transaction;
+
+#[cfg(test)]
+#[path = "tests/test_historical_opcode_transaction.rs"]
+mod test_historical_opcode_transaction;
