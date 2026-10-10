@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and independently checked validator-hash fixture migration.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -781,6 +781,14 @@ async fn try_collate_by_bundle(
     bundle: Arc<CollatorTestBundle>,
     compare_ethalon: bool,
 ) -> Result<BlockCandidate> {
+    try_collate_by_bundle_reference(bundle, compare_ethalon, None).await
+}
+
+async fn try_collate_by_bundle_reference(
+    bundle: Arc<CollatorTestBundle>,
+    compare_ethalon: bool,
+    reference: Option<Block>,
+) -> Result<BlockCandidate> {
     let block_stuff_opt = bundle.ethalon_block()?;
     let engine = bundle.clone() as Arc<dyn EngineOperations>;
     let collate_result = crate::collator_test_bundle::try_collate(
@@ -814,8 +822,9 @@ async fn try_collate_by_bundle(
         // let new_state = ethalon_block.block()?.read_state_update()?.apply_for(&old_state)?;
         // println!("Original old state root {:#.3}", old_state);
         // println!("Original new state root {:#.3}", new_state);
+        let expected = reference.as_ref().unwrap_or(ethalon_block.block()?);
         if let Err(result) =
-            compare_blocks(&Block::construct_from_bytes(&candidate.data)?, ethalon_block.block()?)
+            compare_blocks(&Block::construct_from_bytes(&candidate.data)?, expected)
         {
             panic!("Blocks are not equal: {}", result);
         }
@@ -1021,6 +1030,32 @@ async fn test_collate_bad_block() {
     }
 }
 
+// Fixed reference computes these V2 hashes from the original masterchain state
+// proofs, including the complete ordered subset. Only this historical header
+// field is migrated in memory; generic block/state/proof comparisons stay exact.
+fn collated_fixture_v2_reference(block: &Block) -> Result<Block> {
+    let root = block.serialize()?.repr_hash().to_hex_string();
+    let (cc, old_hash, new_hash) = match root.as_str() {
+        "af4cd5f77eba2126b2ce6c8ccf21a9936959adf91d5f9797e3349e63c7d4ddba" => {
+            (437427, 3170762694, 828744050)
+        }
+        "5b25cdef8466c04571335b40ac4f74fdbb9eda5de9046225f1351ef1971db775" => {
+            (732644, 3278202662, 2296428594)
+        }
+        "921aa09f23fc31a13569bed64684dfd0c0893f94c7908ffbb25fa359d2f8697e" => {
+            (737272, 3647972037, 3789780191)
+        }
+        _ => panic!("unrecognized historical collated fixture {root}"),
+    };
+    let mut migrated = block.clone();
+    let mut info = migrated.read_info()?;
+    assert_eq!(info.gen_catchain_seqno(), cc);
+    assert_eq!(info.gen_validator_list_hash_short(), old_hash);
+    info.set_gen_validator_list_hash_short(new_hash);
+    migrated.write_info(&info)?;
+    Ok(migrated)
+}
+
 #[cfg(not(feature = "xp25"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_collated_data1() {
@@ -1031,7 +1066,11 @@ async fn test_collated_data1() {
     let capabilities = config.capabilities();
     bundle.set_capabilities(capabilities | GlobalCapabilities::CapFullCollatedData as u64);
 
-    let candidate = try_collate_by_bundle(Arc::new(bundle), true).await.unwrap();
+    let reference =
+        collated_fixture_v2_reference(bundle.ethalon_block().unwrap().unwrap().block().unwrap())
+            .unwrap();
+    let candidate =
+        try_collate_by_bundle_reference(Arc::new(bundle), true, Some(reference)).await.unwrap();
 
     let mut collated_data_roots = read_boc(&candidate.collated_data).unwrap().roots;
     assert_eq!(collated_data_roots.len(), 10);
@@ -1061,14 +1100,19 @@ fn read_dict_proof(root: Cell) -> Result<MerkleProof> {
     MerkleProof::construct_from_cell(AccountStorageDictProof::construct_from_cell(root)?.proof)
 }
 
-async fn check_bundle(bundle: &str, collated_roots: usize) {
+async fn check_bundle(bundle: &str, collated_roots: usize, migrate_hash: bool) {
     let mut bundle = CollatorTestBundle::load(bundle).unwrap();
     let config =
         bundle.load_last_applied_mc_state().await.unwrap().config_params().unwrap().clone();
     let capabilities = config.capabilities();
     bundle.set_capabilities(capabilities | GlobalCapabilities::CapFullCollatedData as u64);
 
-    let candidate = try_collate_by_bundle(Arc::new(bundle), true).await.unwrap();
+    let reference = migrate_hash.then(|| {
+        collated_fixture_v2_reference(bundle.ethalon_block().unwrap().unwrap().block().unwrap())
+            .unwrap()
+    });
+    let candidate =
+        try_collate_by_bundle_reference(Arc::new(bundle), true, reference).await.unwrap();
 
     let mut collated_data_roots = read_boc(&candidate.collated_data).unwrap().roots;
     assert_eq!(collated_data_roots.len(), collated_roots);
@@ -1134,11 +1178,19 @@ async fn check_bundle(bundle: &str, collated_roots: usize) {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_collated_data2() {
     init_test_log();
-    check_bundle("src/tests/static/test_collated_data", 10).await;
-    check_bundle("src/tests/static/0.8000000000000000_56703839_5b25cdef_collator_test_bundle", 10)
-        .await;
-    check_bundle("src/tests/static/0.8000000000000000_57120589_921aa09f_collator_test_bundle", 4)
-        .await;
+    check_bundle("src/tests/static/test_collated_data", 10, true).await;
+    check_bundle(
+        "src/tests/static/0.8000000000000000_56703839_5b25cdef_collator_test_bundle",
+        10,
+        true,
+    )
+    .await;
+    check_bundle(
+        "src/tests/static/0.8000000000000000_57120589_921aa09f_collator_test_bundle",
+        4,
+        true,
+    )
+    .await;
 
     let bundle = Arc::new(
         CollatorTestBundle::load(
@@ -1153,7 +1205,8 @@ async fn test_collated_data2() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_collated_data_xp25() {
     init_test_log();
-    check_bundle("src/tests/static/0.a000000000000000_610_7ff07250_collator_test_bundle", 4).await;
+    check_bundle("src/tests/static/0.a000000000000000_610_7ff07250_collator_test_bundle", 4, false)
+        .await;
 
     let bundle = Arc::new(
         CollatorTestBundle::load(
@@ -1201,4 +1254,42 @@ async fn test_collated_data_add_removed_cells_to_proof() {
     let path = "src/tests/static/0.e000000000000000_67704975_6cea4ad1_collator_test_bundle";
     let bundle = CollatorTestBundle::load(path).unwrap();
     try_collate_by_bundle(Arc::new(bundle), false).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_collated_data_reference_subsets() {
+    let mut rows = String::new();
+    for name in [
+        "test_collated_data",
+        "0.8000000000000000_56703839_5b25cdef_collator_test_bundle",
+        "0.8000000000000000_57120589_921aa09f_collator_test_bundle",
+        "0.6000000000000000_439_d27493e2_collator_test_bundle",
+    ] {
+        let bundle = CollatorTestBundle::load(&format!("src/tests/static/{name}")).unwrap();
+        let state = bundle.load_last_applied_mc_state().await.unwrap();
+        let extra = state.shard_state_extra().unwrap();
+        let shard = bundle.block_id().shard();
+        let cc = extra.shards.calc_shard_cc_seqno(shard).unwrap();
+        let (members, hash) = extra
+            .config
+            .validator_set()
+            .unwrap()
+            .calc_subset(
+                &extra.config.catchain_config().unwrap(),
+                shard.shard_prefix_with_tag(),
+                shard.workchain_id(),
+                cc,
+            )
+            .unwrap();
+        rows.push_str(&format!("{name}\t{cc}\t{hash}\t{}\n", members.len()));
+        for member in members {
+            rows.push_str(&format!(
+                "node\t{:x}\t{}\t{:x}\n",
+                UInt256::from(*member.public_key().unwrap().key_bytes()),
+                member.weight,
+                member.adnl_addr.unwrap_or_default(),
+            ));
+        }
+    }
+    assert_eq!(rows, include_str!("../../tests/static/collated-validator-subsets.tsv"));
 }
