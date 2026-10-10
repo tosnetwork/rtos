@@ -1,6 +1,6 @@
 /*
  * RTOS project modifications (2026-10-10): naming, historical address
- * commitment across compute admission, and storage-deletion reporting.
+ * commitment across compute admission, and storage-deletion reporting, and message execution compatibility.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -600,3 +600,7 @@ mod test_lms_fee_transaction;
 #[cfg(test)]
 #[path = "tests/test_frozen_prefix.rs"]
 mod test_frozen_prefix;
+
+#[cfg(test)]
+#[path = "tests/test_sendmsg_transaction.rs"]
+mod test_sendmsg_transaction;
