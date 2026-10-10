@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project naming, AUTH and workchain execution tests.
+ * RTOS project modifications (2026-10-10): project naming, AUTH/workchain tests and bundle cell-store capability.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -1576,6 +1576,13 @@ impl CollatorTestBundle {
 // Is used instead full node's engine for run tests
 #[async_trait::async_trait]
 impl EngineOperations for CollatorTestBundle {
+    fn db_cells_factory(&self) -> Result<Arc<dyn rtos_block::CellsFactory>> {
+        // Bundles contain in-memory proof cells, not a persistent cell store.
+        // Report the missing optimization so the normal Merkle-update fallback
+        // remains available to non-fake validation.
+        fail!("collator bundle has no persistent cell factory")
+    }
+
     fn now(&self) -> u32 {
         self.index.now
     }

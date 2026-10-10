@@ -25,8 +25,8 @@ fn candidate_with_header(original: &BlockCandidate, seqno: u32, hash: u32) -> Bl
     candidate
 }
 
-// The bundle omits engine services used later by non-fake validation. Exercise
-// the actual non-fake initialization here and full bundle validation below.
+// Exercise the complete non-fake validator with its expected set derived from
+// the archived governing state. The bundle supplies in-memory proof cells.
 async fn validate_real(engine: Arc<CollatorTestBundle>, candidate: BlockCandidate) -> Result<()> {
     let info = Block::construct_from_bytes(&candidate.data)?.read_info()?;
     let shard = info.shard().clone();
@@ -66,7 +66,8 @@ async fn validate_real(engine: Arc<CollatorTestBundle>, candidate: BlockCandidat
         false,
         simplex,
     )
-    .init_base()?;
+    .try_validate()
+    .await?;
     Ok(())
 }
 
@@ -84,7 +85,7 @@ async fn check_headers(cases: &[(&str, u32, u32)], error_field: &str) {
     }
     validate_real(bundle.clone(), valid.clone())
         .await
-        .expect("non-fake initialization accepts the migrated candidate");
+        .expect("full non-fake validation accepts the migrated candidate");
     try_validate(bundle.clone(), valid).await.expect("the migrated full candidate is valid");
     let mut wrongly_accepted = vec![];
     for &(name, seqno, hash) in cases {
