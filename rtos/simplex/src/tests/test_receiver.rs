@@ -358,6 +358,7 @@ struct ReceiverInstance {
     receiver: Arc<dyn Receiver + Send + Sync>,
     stats: Arc<ReceiverStats>,
     _listener: Arc<TestReceiverListener>,
+    health_counters: Arc<crate::receiver::ReceiverHealthCounters>,
     private_key: PrivateKey,
     session_id: SessionId,
 }
@@ -407,7 +408,7 @@ impl ReceiverInstance {
             overlay_manager,
             listener_weak,
             panicked_flag,
-            health_counters,
+            health_counters.clone(),
             crate::receiver::ReceiverSettings {
                 max_candidate_size,
                 max_candidate_query_answer_size,
@@ -416,7 +417,15 @@ impl ReceiverInstance {
             },
         )?;
 
-        Ok(Self { idx, receiver, stats, _listener: listener, private_key, session_id })
+        Ok(Self {
+            idx,
+            receiver,
+            stats,
+            _listener: listener,
+            health_counters,
+            private_key,
+            session_id,
+        })
     }
 
     fn send_vote(&self, slot: u32) {
@@ -2114,7 +2123,9 @@ fn pq_live_receiver_verifies_votes_and_serves_candidates() {
             invalid.signature[0] ^= 1;
         }
         receiver0.receiver.send_vote(invalid);
-        thread::sleep(Duration::from_millis(300));
+        wait_until(Duration::from_secs(5), || {
+            receiver1.health_counters.rejected_vote_signatures.load(Ordering::Acquire) == 1
+        });
         assert_eq!(receiver1.stats.votes_received.load(Ordering::Relaxed), 1);
         receiver0.stop();
         receiver1.stop();
