@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and historical commit test coverage.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -81,6 +81,8 @@ struct TestConfig {
     validation_retry_timeout: std::time::Duration,
     /// Test name for logging and database naming
     test_name: String,
+    /// Wait for a quorum to advance before starting the final two nodes.
+    late_join_round: Option<u32>,
 }
 
 impl Default for TestConfig {
@@ -96,6 +98,7 @@ impl Default for TestConfig {
             validation_retry_attempts: 0,
             validation_retry_timeout: std::time::Duration::from_millis(1000),
             test_name: "accelerated_consensus_session".to_string(),
+            late_join_round: None,
         }
     }
 }
@@ -108,6 +111,7 @@ struct SessionInstance {
     collation_count: Arc<std::sync::atomic::AtomicU32>,
     on_candidate_count: Arc<std::sync::atomic::AtomicU32>,
     on_block_committed_count: Arc<std::sync::atomic::AtomicU32>,
+    empty_commit_payload_count: Arc<std::sync::atomic::AtomicU32>,
     config: TestConfig,
     expected_current_round: Arc<std::sync::atomic::AtomicU32>,
     expected_collation_round: Arc<std::sync::atomic::AtomicU32>,
@@ -390,10 +394,17 @@ impl SessionListener for SessionInstance {
         let now =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
                 as u64;
-        let collated_data = DummyCollatedData::from_bytes(data.data());
-        let latency = now - collated_data.creation_timestamp;
+        // A node catching up with committed rounds may not hold their candidate payloads.
+        // The session reports these commits with empty data, as it does to ValidatorGroup.
+        let latency = if data.data().is_empty() {
+            self.empty_commit_payload_count.fetch_add(1, Ordering::Relaxed);
+            "unavailable (historical payload absent)".to_string()
+        } else {
+            let collated_data = DummyCollatedData::from_bytes(data.data());
+            format!("{} ms", now - collated_data.creation_timestamp)
+        };
         log::info!(
-            "SessionListener::on_block_committed: new block from source {} with hash {:?} has been committed in round {} with latency {} ms (priority={}, first_block_round={}, source #{})",
+            "SessionListener::on_block_committed: new block from source {} with hash {:?} has been committed in round {} with latency {} (priority={}, first_block_round={}, source #{})",
             source_info.source.id(),
             root_hash,
             round,
@@ -657,6 +668,20 @@ where
     instances.reserve(config.node_count);
 
     for i in 0..config.node_count {
+        if i == config.node_count - 2 {
+            if let Some(round) = config.late_join_round {
+                let deadline = std::time::Instant::now() + Duration::from_secs(120);
+                while !instances.iter().all(|instance: &Arc<SpinMutex<SessionInstance>>| {
+                    instance.lock().expected_current_round.load(Ordering::SeqCst) >= round
+                }) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "Initial quorum did not reach round {round} before starting late nodes"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
         let local_key = nodes[i].public_key.clone();
         let db_suffix = format!("catchain_{}", i);
         let listener = Arc::new(SessionInstanceListener { instance: SpinMutex::new(Weak::new()) });
@@ -686,6 +711,7 @@ where
             collation_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             on_candidate_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             on_block_committed_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            empty_commit_payload_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             is_collator: Arc::new(AtomicBool::new(false)),
             config: config.clone(),
             expected_current_round: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -836,6 +862,30 @@ fn test_accelerated_consensus_validation_retries() {
                     candidate_count > commit_count,
                     "Instance {}: Expected candidate_count ({}) > commit_count ({}) due to validation retries",
                     index, candidate_count, commit_count
+                );
+            }
+        },
+    );
+}
+
+#[test]
+fn test_accelerated_consensus_session_late_joiners() {
+    run_validator_session_accelerated_consensus_test(
+        TestConfig {
+            max_wait_round: 50,
+            max_collations: 150,
+            catchain_max_block_delay: Duration::from_millis(1),
+            late_join_round: Some(30),
+            test_name: "accelerated_consensus_late_joiners".to_string(),
+            ..Default::default()
+        },
+        |instances| {
+            for instance in instances.iter().rev().take(2) {
+                let instance = instance.lock();
+                assert!(
+                    instance.empty_commit_payload_count.load(Ordering::Relaxed) > 0,
+                    "Late node {} must exercise commits without historical payloads",
+                    instance.source_index
                 );
             }
         },
