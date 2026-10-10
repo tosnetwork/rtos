@@ -533,6 +533,52 @@ pub async fn get_config(
     TonNodeConfig::from_file(config_dir, config_file, Some(adnl_config), default, None).await
 }
 
+// Keep Tokio's paused clock from auto-advancing while fixture I/O or executor
+// spawn_blocking work runs. A separate real-time watchdog still bounds hangs.
+pub(crate) async fn fixture_clock<T>(
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    fixture_clock_bounded(future, Duration::from_secs(60)).await
+}
+
+pub(crate) async fn fixture_clock_bounded<T>(
+    future: impl std::future::Future<Output = Result<T>>,
+    watchdog: Duration,
+) -> Result<T> {
+    struct ReleaseClock(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for ReleaseClock {
+        fn drop(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+    let (release, held) = std::sync::mpsc::channel();
+    let release = ReleaseClock(Some(release));
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (expired, deadline) = tokio::sync::oneshot::channel();
+    let watchdog_task = tokio::task::spawn_blocking(move || {
+        let _ = started.send(());
+        if matches!(held.recv_timeout(watchdog), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+            let _ = expired.send(());
+            // Keep auto-advance inhibited until the async caller observes the
+            // diagnostic and drops its RAII release, including on panic.
+            let _ = held.recv();
+        }
+    });
+    ready.await?;
+    let result = tokio::select! {
+        biased;
+        status = deadline => {
+            fail!("fixture real-time watchdog fired after {watchdog:?}: {status:?}")
+        }
+        result = future => result,
+    };
+    drop(release);
+    watchdog_task.await?;
+    result
+}
+
 pub async fn test_async(test: impl Fn() -> Pinned<'static, ()>, done: impl Fn()) {
     let ret = test().await;
     done();

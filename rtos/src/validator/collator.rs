@@ -1378,7 +1378,10 @@ pub struct Collator {
     debug: bool,
     rand_seed: UInt256,
 
-    started: Instant,
+    // Use the timer runtime clock for this budget; other profiling clocks stay unchanged.
+    started: tokio::time::Instant,
+    #[cfg(test)]
+    import_gate: Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
     stop_flag: tokio_util::sync::CancellationToken,
     cancel_ext: tokio_util::sync::CancellationToken,
 }
@@ -1488,7 +1491,9 @@ impl Collator {
             collator_settings,
             debug: true,
             rand_seed,
-            started: Instant::now(),
+            started: tokio::time::Instant::now(),
+            #[cfg(test)]
+            import_gate: None,
             stop_flag: tokio_util::sync::CancellationToken::new(),
             cancel_ext: tokio_util::sync::CancellationToken::new(),
         })
@@ -1507,6 +1512,11 @@ impl Collator {
             }
         );
         self.init_timeout();
+        #[cfg(test)]
+        if let Some((entered, release)) = self.import_gate.take() {
+            entered.send(()).expect("collator import observer disappeared");
+            release.await.expect("collator import gate disappeared");
+        }
 
         let mut collator_data;
         let mut empty_attempt = 0;
@@ -5112,7 +5122,7 @@ impl Collator {
     }
 
     fn init_timeout(&mut self) {
-        self.started = Instant::now();
+        self.started = tokio::time::Instant::now();
         let cc = self.engine.collator_config();
         let now = self.now_system();
 
@@ -5132,8 +5142,9 @@ impl Collator {
             None => Duration::from_millis(cc.cutoff_timeout_ms as u64),
         };
         let cancel_ext = self.cancel_ext.clone();
+        let cutoff = tokio::time::sleep(cutoff_delay);
         tokio::spawn(async move {
-            tokio::time::sleep(cutoff_delay).await;
+            cutoff.await;
             cancel_ext.cancel();
         });
 
@@ -5144,8 +5155,9 @@ impl Collator {
             None => Duration::from_millis(cc.stop_timeout_ms as u64),
         };
         let stop_flag = self.stop_flag.clone();
+        let stop = tokio::time::sleep(stop_delay);
         tokio::spawn(async move {
-            tokio::time::sleep(stop_delay).await;
+            stop.await;
             stop_flag.cancel();
         });
     }

@@ -18,7 +18,9 @@ use crate::{
     config::CollatorConfig,
     engine_traits::{EngineAlloc, EngineOperations},
     shard_state::ShardStateStuff,
-    test_helper::{compare_blocks, init_test_log, test_async, TestEngine},
+    test_helper::{
+        compare_blocks, fixture_clock, fixture_clock_bounded, init_test_log, test_async, TestEngine,
+    },
     types::messages::{count_matching_bits, MsgEnvelopeStuff},
 };
 #[cfg(feature = "telemetry")]
@@ -38,6 +40,130 @@ use storage::{
     block_handle_db::{BlockHandle, BlockHandleStorage},
     types::BlockMeta,
 };
+
+async fn deadline_fixture_collator() -> Result<(Collator, BlockIdExt)> {
+    let bundle = Arc::new(
+        CollatorTestBundle::build_with_zero_state(
+            "src/tests/static/zerostate.boc",
+            &["src/tests/static/basestate0.boc", "src/tests/static/basestate0.boc"],
+        )
+        .await?,
+    );
+    let mc = bundle.load_last_applied_mc_state().await?;
+    let mc_id = mc.block_id().clone();
+    let shard = mc_id.shard().clone();
+    let history = PrevBlockHistory::with_prevs(&shard, bundle.prev_blocks_ids().clone());
+    let cc_seqno = mc.shard_state_extra()?.validator_info.catchain_seqno;
+    let mut delta = 0;
+    let nodes = crate::validator::validator_utils::compute_validator_set_cc(
+        &mc,
+        &shard,
+        history.get_next_seqno().unwrap(),
+        cc_seqno,
+        &mut delta,
+    )?;
+    let validators = ValidatorSet::with_cc_seqno(0, 0, 0, delta, nodes)?;
+    let collator = Collator::new(
+        shard,
+        0,
+        &history,
+        Arc::new(tokio::sync::Mutex::new(StateResolverCache::new())),
+        validators,
+        UInt256::default(),
+        bundle,
+        None,
+        CollatorSettings { is_bundle: true, lt_compatible: true, ..Default::default() },
+    )?;
+    Ok((collator, mc_id))
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_collator_fixture_clock_watchdog_is_real() {
+    let start = tokio::time::Instant::now();
+    let result =
+        fixture_clock_bounded(std::future::pending::<Result<()>>(), Duration::from_millis(10))
+            .await;
+    assert!(result.unwrap_err().to_string().contains("fixture real-time watchdog"));
+    assert_eq!(start.elapsed(), Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_collator_fixture_clock_budget_boundaries() {
+    fixture_clock(async {
+        let (mut collator, _) = deadline_fixture_collator().await?;
+        assert_eq!(collator.engine.collator_config().cutoff_timeout_ms, 1000);
+        assert_eq!(collator.engine.collator_config().stop_timeout_ms, 1500);
+        collator.init_timeout();
+        tokio::time::advance(Duration::from_millis(999)).await;
+        assert!(!collator.check_cutoff_timeout());
+        assert!(collator.check_stop_flag().is_ok());
+        assert_eq!(collator.get_remaining_cutoff_time_limit_nanos(), 1_000_000);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        collator.cancel_ext.cancelled().await;
+        assert!(collator.check_cutoff_timeout());
+        assert!(collator.check_stop_flag().is_ok());
+        assert_eq!(collator.get_remaining_cutoff_time_limit_nanos(), 0);
+        tokio::time::advance(Duration::from_millis(499)).await;
+        assert!(collator.check_stop_flag().is_ok());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        collator.stop_flag.cancelled().await;
+        assert_eq!(collator.started.elapsed(), Duration::from_millis(1500));
+        assert!(collator.check_stop_flag().unwrap_err().to_string().contains("Stop flag"));
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_collator_fixture_clock_hard_stop_during_import() {
+    fixture_clock(async {
+        for (elapsed_ms, expires) in [(1499, false), (1500, true)] {
+            let (mut collator, mc_id) = deadline_fixture_collator().await?;
+            let stop = collator.stop_flag.clone();
+            let cutoff = collator.cancel_ext.clone();
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let (release, held) = tokio::sync::oneshot::channel();
+            collator.import_gate = Some((entered, held));
+            let worker = tokio::spawn(async move { collator.collate(&mc_id).await });
+            ready.await?;
+            assert!(!stop.is_cancelled());
+            tokio::time::advance(Duration::from_millis(elapsed_ms)).await;
+            if expires {
+                stop.cancelled().await;
+            } else {
+                cutoff.cancelled().await;
+                assert!(!stop.is_cancelled());
+            }
+            release.send(()).unwrap();
+            let result = worker.await?;
+            if expires {
+                let err = match result {
+                    Err(err) | Ok(CollateResult::Err { err, .. }) => err,
+                    Ok(CollateResult::Ok { .. }) => {
+                        panic!("expired collation unexpectedly succeeded")
+                    }
+                };
+                assert!(err.to_string().contains("Stop flag was set"), "{err:?}");
+            } else {
+                let CollateResult::Ok { candidate, new_state, .. } = result? else {
+                    panic!("collation before the hard deadline unexpectedly failed");
+                };
+                assert_eq!(
+                    candidate.block_id.file_hash(),
+                    &UInt256::calc_file_hash(&candidate.data)
+                );
+                assert_eq!(
+                    Block::construct_from_bytes(&candidate.data)?.read_state_update()?.new_hash,
+                    new_state.serialize()?.repr_hash().clone(),
+                );
+            }
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
 
 #[test]
 fn test_cycle_vec() {
@@ -394,7 +520,7 @@ fn test_calc_utime_strict_mode_saturates_at_u32_max() {
     assert_eq!(gen_utime_ms / 1000, gen_utime as u64);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn test_pipeline_collator() {
     async fn test() -> Result<()> {
         create_dir_all(RES_PATH).ok();
@@ -509,7 +635,7 @@ async fn test_pipeline_collator() {
         Ok(())
     }
     test_async(
-        || Box::pin(test()),
+        || Box::pin(fixture_clock(test())),
         || {
             remove_dir_all(RES_PATH).ok();
         },
@@ -582,7 +708,7 @@ async fn test_simplex_wait_prev_state_uses_resolver_cache_before_engine() {
     test_async(|| Box::pin(test()), || {}).await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn test_simplex_wait_prev_state_materializes_state_from_cached_chain() {
     async fn test() -> Result<()> {
         // Build a real candidate/state pair from fixture data so Merkle update application
@@ -702,7 +828,7 @@ async fn test_simplex_wait_prev_state_materializes_state_from_cached_chain() {
         Ok(())
     }
 
-    test_async(|| Box::pin(test()), || {}).await;
+    test_async(|| Box::pin(fixture_clock(test())), || {}).await;
 }
 
 // prepare for testing purposes
@@ -851,7 +977,7 @@ async fn try_validate_by_bundle(
     crate::collator_test_bundle::try_validate(engine, candidate.clone()).await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn test_collate_first_block() {
     init_test_log();
     async fn test() -> Result<()> {
@@ -868,7 +994,7 @@ async fn test_collate_first_block() {
         }
     }
     test_async(
-        || Box::pin(test()),
+        || Box::pin(fixture_clock(test())),
         || {
             remove_dir_all(RES_PATH).ok();
         },
