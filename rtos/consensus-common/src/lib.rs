@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; typed Simplex protocol and membership admission.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -13,6 +13,7 @@
 //! validator-session and simplex consensus implementations.
 
 // Internal modules
+pub mod simplex_protocol;
 mod validator_identity;
 pub use validator_identity::{SimplexSignatureVerifier, ValidatorIdentity};
 mod activity_node;
@@ -695,6 +696,7 @@ impl BlockSyncOverlayParams {
             current_set.push(id);
         }
 
+        simplex_protocol::SimplexMembership::new(&current_set, members_set.iter().cloned())?;
         Ok(Self {
             members: members_set.into_iter().collect(),
             authorized_keys,
@@ -705,6 +707,25 @@ impl BlockSyncOverlayParams {
             shard: None,
             session_id: None,
         })
+    }
+
+    pub fn membership(&self) -> Result<simplex_protocol::SimplexMembership> {
+        if self.slots_per_leader_window == 0 || self.max_broadcast_size == 0 {
+            rtos_block::fail!("Invalid block-sync limits");
+        }
+        let membership = simplex_protocol::SimplexMembership::new(
+            &self.current_set,
+            self.members.iter().cloned(),
+        )?;
+        if self.authorized_keys.len() != self.current_set.len()
+            || self
+                .current_set
+                .iter()
+                .any(|key| self.authorized_keys.get(key) != Some(&self.max_broadcast_size))
+        {
+            rtos_block::fail!("Block-sync broadcast authority differs from session validators");
+        }
+        Ok(membership)
     }
 
     /// Attach the overlay short id (computed by simplex from session_id).
@@ -1789,6 +1810,33 @@ mod block_sync_overlay_params_tests {
         // members still covers the wider mc set (so overlay survives rotation)
         let mc_only_member = vset(&[14]).list()[0].adnl_addr().unwrap();
         assert!(p.members.contains(&mc_only_member));
+    }
+
+    #[test]
+    fn block_sync_consumers_reject_forged_authority_and_membership() {
+        let curr = vset(&[2, 3]);
+        let cfg = config_with(vset(&[1]), curr.clone(), vset(&[4]), 1 << 22, 1 << 22);
+        let valid = BlockSyncOverlayParams::from_config(&cfg, 4, &curr).unwrap();
+        let observer = vset(&[1]).list()[0].adnl_addr().unwrap();
+        assert_eq!(
+            valid.membership().unwrap().role(&observer).unwrap(),
+            simplex_protocol::OverlayMemberRole::Observer
+        );
+        let mut forged = valid.clone();
+        forged.authorized_keys.insert(observer, valid.max_broadcast_size);
+        assert!(forged.membership().is_err());
+        let mut forged = valid.clone();
+        forged.current_set.push(forged.current_set[0].clone());
+        assert!(forged.membership().is_err());
+        let mut forged = valid.clone();
+        forged.members.retain(|key| key != &valid.current_set[0]);
+        assert!(forged.membership().is_err());
+        let mut forged = valid.clone();
+        *forged.authorized_keys.values_mut().next().unwrap() += 1;
+        assert!(forged.membership().is_err());
+        let mut forged = valid.clone();
+        forged.slots_per_leader_window = 0;
+        assert!(forged.membership().is_err());
     }
 
     /// slots_per_leader_window is plumbed through verbatim

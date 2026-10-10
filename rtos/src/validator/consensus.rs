@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; typed Simplex protocol and membership admission.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -541,14 +541,15 @@ impl ConsensusFactory {
         catchain_seqno: u32,
         session_id: &SessionId,
     ) -> String {
-        let db_dir_name = format!(
-            "consensus.{}.{:016x}.{}.{}",
-            shard.workchain_id(),
-            shard.shard_prefix_with_tag(),
+        consensus_common::simplex_protocol::SimplexNamespace {
+            protocol: Default::default(),
+            role: consensus_common::simplex_protocol::OverlayMemberRole::Validator(0),
+            shard,
             catchain_seqno,
-            session_id.to_hex_string()
-        );
-        format!("{}/consensus/{}", db_root, db_dir_name)
+            session_id,
+        }
+        .runtime_directory(db_root)
+        .expect("legacy validator namespace is admitted")
     }
 
     /// Create a simplex-based consensus session
@@ -572,7 +573,15 @@ impl ConsensusFactory {
         let mut options = options.clone();
         options.use_callback_thread = false;
 
-        let db_path = Self::make_simplex_db_path(&db_root, shard, catchain_seqno, session_id);
+        options.validate()?;
+        let db_path = consensus_common::simplex_protocol::SimplexNamespace {
+            protocol: options.protocol,
+            role: consensus_common::simplex_protocol::OverlayMemberRole::Validator(0),
+            shard,
+            catchain_seqno,
+            session_id,
+        }
+        .runtime_directory(&db_root)?;
 
         let simplex_session = Self::create_simplex_session(
             &options,

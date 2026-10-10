@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; typed Simplex protocol and membership admission.
  * Copyright (C) 2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -72,13 +72,11 @@ impl BlockSyncObserver {
         broadcast_hops: Option<u8>,
         proto_version: u32,
     ) -> Result<Arc<Self>> {
-        if !params.members.contains(local_adnl_key.id()) {
-            fail!(
-                "BlockSyncObserver: local ADNL key {} not in block-sync members ({} entries); \
-                 observer cannot be admitted to the overlay",
-                local_adnl_key.id(),
-                params.members.len(),
-            );
+        let membership = params.membership()?;
+        if membership.role(local_adnl_key.id())?
+            != consensus_common::simplex_protocol::OverlayMemberRole::Observer
+        {
+            fail!("BlockSyncObserver: current session validator cannot start an observer instance");
         }
         let overlay_short_id = simplex::utils::compute_block_sync_overlay_short_id(&session_id)?;
 
