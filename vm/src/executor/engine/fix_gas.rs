@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): truncated quiet opcode gas.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -1122,7 +1122,7 @@ static FIX_GAS15: [(FixGasPrefix, u8); 343] = [
     (FixGasPrefix::Range(0x7D85, 0x7EFF), 10),
     (FixGasPrefix::Range(0x7F00, 0x7FFF), 26),
 ];
-static FIX_GAS16: [(FixGasPrefix, u8); 33] = [
+static FIX_GAS16: [(FixGasPrefix, u8); 34] = [
     (FixGasPrefix::Number(0x6C), 28),
     (FixGasPrefix::Range(0x86, 0x87), 28),
     (FixGasPrefix::Number(0xAF), 28),
@@ -1156,6 +1156,9 @@ static FIX_GAS16: [(FixGasPrefix, u8); 33] = [
     (FixGasPrefix::Range(0xA9B0, 0xA9BF), 34),
     (FixGasPrefix::Range(0xA9D0, 0xA9DF), 34),
     (FixGasPrefix::Range(0xA9E0, 0xA9FF), 10),
+    // Registered quiet Ristretto prefixes are handled before this fallback.
+    // Padding an incomplete b7f9 prefix into an unregistered slot costs 10.
+    (FixGasPrefix::Number(0xB7F9), 10),
 ];
 
 static FIX_GAS24: [(FixGasPrefix, u8); 10] = [

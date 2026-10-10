@@ -1,4 +1,5 @@
 /*
+ * RTOS project modifications (2026-10-10): historical opcode activation gates.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -12,6 +13,7 @@ mod core;
 pub(in crate::executor) mod data;
 mod fix_gas;
 mod handlers;
+mod version_gates;
 #[macro_use]
 pub(in crate::executor) mod storage;
 
