@@ -376,7 +376,7 @@ async fn config_scheduler_dropped_inbox_and_current_answer_wake_callers() {
     let (sent, received) = tokio::sync::mpsc::unbounded_channel();
     let (queued, mut queued_answer) = Wait::new();
     queued.request();
-    sent.send((queued.clone(), Task::GetKey([7; 32]))).unwrap();
+    assert!(sent.send((queued.clone(), Task::GetKey([7; 32]))).is_ok());
     drop(scheduler::ConfigInbox(received));
     assert!(matches!(queued.wait(&mut queued_answer, true).await, Some(None)));
     let (current, mut current_answer) = Wait::new();
