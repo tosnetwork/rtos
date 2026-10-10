@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): historical instruction base gas ordering.
+ * RTOS project modifications (2026-10-10): historical base gas, persistent exception handlers and OOG results.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -1167,6 +1167,13 @@ impl Engine {
         }
         let mut result = match child.execute() {
             Ok(result) => result,
+            Err(err) if tvm_exception_code(&err) == Some(ExceptionCode::OutOfGas) => {
+                // OOG bypasses c2 and replaces the child result with its full
+                // consumed gas amount. It has no API-only exit item to pop.
+                child.cc.stack = Stack::new();
+                child.cc.stack.push_int(child.gas_used());
+                !(ExceptionCode::OutOfGas as i32)
+            }
             Err(err) => {
                 // in case of error we have copy of code on stack
                 match child.cc.stack.pop().and_then(|x| x.as_integer_value(0..=0xFFF)) {
@@ -1651,7 +1658,10 @@ impl Engine {
             self.step += 1;
             if code == ExceptionCode::OutOfGas {
                 log::trace!(target: "tvm", "OUT OF GAS CODE: {}\n", self.cmd_code_string());
-                return Err(err);
+                // Every OOG path exposes the full consumed amount, including
+                // an explicit SETGASLIMIT failure before changing the limit.
+                let (exception, _) = tvm_exception_full(err)?;
+                fail!(TvmError::new(exception, StackItem::int(self.gas_used())));
             }
         }
         if let Err(err) = self.gas.try_use_gas(Gas::exception_price()) {
@@ -1664,7 +1674,7 @@ impl Engine {
             self.gas_used(),
             Some(format!("EXCEPTION: {:?}", err)),
         );
-        let Some(c2) = self.ctrls.remove(2) else {
+        let Some(c2) = self.ctrls.get(2).cloned() else {
             return Err(err);
         };
         let (exception, value) = tvm_exception_full(err).inspect_err(
