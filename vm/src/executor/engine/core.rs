@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and message execution compatibility.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -633,7 +633,15 @@ impl Engine {
             self.gas_used(),
             Some("NORMAL TERMINATION".to_string()),
         );
-        self.try_commit()?;
+        if let Err(err) = self.try_commit() {
+            // Automatic commit failure bypasses c2 and replaces the result
+            // stack with zero. Keep the API's extra exit-code item so RUNVM
+            // can consume it just like an interpreter exception.
+            self.cc.stack = Stack::new();
+            self.cc.stack.push_int(0);
+            self.cc.stack.push_int(tvm_exception_or_custom_code(&err));
+            return Err(err);
+        }
         Ok(result)
     }
 

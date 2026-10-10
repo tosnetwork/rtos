@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and message execution compatibility.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -565,3 +565,7 @@ mod test_falcon512_transaction;
 #[cfg(test)]
 #[path = "tests/test_poseidon2_transaction.rs"]
 mod test_poseidon2_transaction;
+
+#[cfg(test)]
+#[path = "tests/test_sendmsg_transaction.rs"]
+mod test_sendmsg_transaction;

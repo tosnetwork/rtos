@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and message execution compatibility.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -70,6 +70,64 @@ const RESULT_CODE_LIB_BAD_CELL: i32 = 41;
 const RESULT_CODE_LIB_BAD_ACCOUNT_STATE: i32 = 42;
 const RESULT_CODE_LIB_EXCEEDED_LIMITS: i32 = 43;
 const RESULT_CODE_LIB_FORBIDDEN: i32 = 46;
+
+// Action validation uses structural currency encodings, while execution ignores
+// user forwarding fees from version 8 onward. Keep this normalization local:
+// shared message codecs and transaction ingress still require canonical values.
+fn decode_action(slice: &mut SliceData, version: u32) -> Result<OutAction> {
+    let mut header = slice.clone();
+    if version < 8 || header.get_next_u32()? != rtos_block::ACTION_SEND_MSG {
+        return OutAction::construct_from(slice);
+    }
+    let mode = header.get_next_byte()?;
+    let mut decode = || -> Result<Message> {
+        let cell = header.checked_drain_reference()?;
+        let original = SliceData::load_cell(cell.clone())?;
+        let mut rest = original.clone();
+        if rest.get_next_bit()? {
+            return Message::construct_from_cell(cell);
+        }
+        rest.get_next_int(3)?;
+        rtos_block::MsgAddressIntOrNone::skip(&mut rest)?;
+        MsgAddressInt::skip(&mut rest)?;
+        CurrencyCollection::construct_from(&mut rest)?;
+        let mut prefix = original;
+        prefix.shrink_by_remainder(&rest);
+        let mut read_raw = || -> Result<(u128, bool)> {
+            let len = rest.get_next_int(4)?;
+            let mut value = 0u128;
+            let mut canonical = true;
+            for i in 0..len {
+                let byte = rest.get_next_byte()?;
+                if i == 0 && byte == 0 {
+                    canonical = false;
+                }
+                value = (value << 8) | byte as u128;
+            }
+            Ok((value, canonical))
+        };
+        let (flags, canonical) = read_raw()?;
+        read_raw()?;
+        // A failed handwritten flags decode is an execution error (45), not
+        // an invalid action list. The unsupported sentinel preserves that path.
+        let flags = if version < 12 {
+            0
+        } else if canonical {
+            flags
+        } else {
+            4
+        };
+        let mut rebuilt = prefix.as_builder()?;
+        VarUInteger16::try_from(flags)?.write_to(&mut rebuilt)?;
+        Coins::zero().write_to(&mut rebuilt)?;
+        rebuilt.append_builder(&rest.as_builder()?)?;
+        Message::construct_from_cell(rebuilt.into_cell()?)
+    };
+    match decode() {
+        Ok(message) => Ok(OutAction::new_send(mode, message)),
+        Err(err) => fail!(BlockError::OutActionError(err, mode)),
+    }
+}
 
 pub(crate) const MAX_ACTIONS: usize = 255;
 
@@ -641,7 +699,7 @@ pub trait TransactionExecutor {
             // set result_arg to index of failed action in case of error
             phase.result_arg = Some(i as i32);
             let mut init_balance = acc_remaining_balance.clone();
-            let mut err_code = match OutAction::construct_from(&mut slice) {
+            let mut err_code = match decode_action(&mut slice, self.config().block_version()) {
                 Ok(OutAction::SendMsg { mode, mut out_msg }) => {
                     log::debug!(
                         target: "executor",
@@ -1315,6 +1373,81 @@ fn check_rewrite_dest_addr(
     }
 }
 
+// Action-message size accounting is bounded by cells, but must retain the
+// first over-limit cell and count exotic payload bytes without resolving them.
+// This is distinct from account-state statistics and VM SENDMSG load charging.
+struct ActionMessageStorage {
+    cells: u64,
+    bits: u64,
+    limit: u64,
+    max_merkle_depth: u32,
+    seen: std::collections::HashMap<rtos_block::UInt256, u32>,
+}
+impl ActionMessageStorage {
+    fn new(limit: u64) -> Self {
+        Self { cells: 0, bits: 0, limit, max_merkle_depth: 0, seen: Default::default() }
+    }
+    fn cells(&self) -> u64 {
+        self.cells
+    }
+    fn bits(&self) -> u64 {
+        self.bits
+    }
+    fn max_merkle_depth(&self) -> u32 {
+        self.max_merkle_depth
+    }
+    fn append_cell(&mut self, cell: &Cell, count_root: bool) -> Result<()> {
+        if let Some(depth) = self.visit(cell, count_root)? {
+            self.max_merkle_depth = self.max_merkle_depth.max(depth);
+        }
+        Ok(())
+    }
+    fn visit(&mut self, cell: &Cell, count_root: bool) -> Result<Option<u32>> {
+        enum Frame {
+            Enter(Cell, bool),
+            Exit(Option<rtos_block::UInt256>, usize, bool),
+        }
+        let mut pending = vec![Frame::Enter(cell.clone(), count_root)];
+        let mut depths: Vec<u32> = Vec::new();
+        while let Some(frame) = pending.pop() {
+            match frame {
+                Frame::Enter(cell, count_root) => {
+                    if count_root {
+                        if let Some(depth) = self.seen.get(cell.repr_hash()) {
+                            depths.push(*depth);
+                            continue;
+                        }
+                        self.seen.insert(cell.repr_hash().clone(), 0);
+                        self.cells += 1;
+                        if self.cells > self.limit {
+                            return Ok(None);
+                        }
+                        self.bits += cell.bit_length() as u64;
+                    }
+                    let slice = SliceData::load_cell(cell.clone())?;
+                    pending.push(Frame::Exit(
+                        count_root.then(|| cell.repr_hash().clone()),
+                        slice.remaining_references(),
+                        cell.is_merkle(),
+                    ));
+                    for i in (0..slice.remaining_references()).rev() {
+                        pending.push(Frame::Enter(slice.reference(i)?, true));
+                    }
+                }
+                Frame::Exit(hash, children, merkle) => {
+                    let depth = depths.drain(depths.len() - children..).max().unwrap_or(0)
+                        + u32::from(merkle);
+                    if let Some(hash) = hash {
+                        self.seen.insert(hash, depth);
+                    }
+                    depths.push(depth);
+                }
+            }
+        }
+        Ok(depths.pop())
+    }
+}
+
 fn outmsg_action_handler(
     phase: &mut TrActionPhase,
     mut mode: u8,
@@ -1355,6 +1488,12 @@ fn outmsg_action_handler(
             Err(code)
         }
     };
+    // Flags are evaluated before address rewriting in the action consumer.
+    if let Some(int_header) = msg.int_header() {
+        if int_header.extra_flags.inner() > SUPPORTED_EXTRA_FLAGS as u128 {
+            return check_skip_invalid(RESULT_CODE_INVALID_EXTRA_FLAGS);
+        }
+    }
     if let Some(new_src) = check_replace_src_addr(&msg.src(), my_addr) {
         msg.set_src_address(new_src.clone());
     } else {
@@ -1381,11 +1520,6 @@ fn outmsg_action_handler(
                 log::warn!(target: "executor", "Incorrect destination address {}", int_header.dst);
                 return check_skip_invalid(RESULT_CODE_UNKNOWN_OR_INVALID_ACTION);
             }
-        }
-
-        if int_header.extra_flags.inner() > SUPPORTED_EXTRA_FLAGS as u128 {
-            log::warn!(target: "executor", "unsupported extra flags in outbound message: {}", int_header.extra_flags.inner());
-            return check_skip_invalid(RESULT_CODE_INVALID_EXTRA_FLAGS);
         }
 
         if config.block_version() >= 8 {
@@ -1498,16 +1632,16 @@ fn outmsg_action_handler(
                 },
             ),
         };
-        let mut sstat = StorageUsageCalc::with_limits(max_cells, limits.max_msg_bits as u64);
-        if let Some(body) = &body {
-            sstat.append_cell(body, body_to_ref, &mut 0).map_err(|err| {
-                log::error!(target: "executor", "cannot calc msg storage used for body: {err}");
+        let mut sstat = ActionMessageStorage::new(max_cells);
+        if let Some(init) = &init {
+            sstat.append_cell(init, init_to_ref).map_err(|err| {
+                log::error!(target: "executor", "cannot calc msg storage used for state_init: {err}");
                 RESULT_CODE_UNKNOWN_OR_INVALID_ACTION
             })?;
         }
-        if let Some(init) = &init {
-            sstat.append_cell(init, init_to_ref, &mut 0).map_err(|err| {
-                log::error!(target: "executor", "cannot calc msg storage used for state_init: {err}");
+        if let Some(body) = &body {
+            sstat.append_cell(body, body_to_ref).map_err(|err| {
+                log::error!(target: "executor", "cannot calc msg storage used for body: {err}");
                 RESULT_CODE_UNKNOWN_OR_INVALID_ACTION
             })?;
         }
@@ -1533,22 +1667,22 @@ fn outmsg_action_handler(
                 phase.action_fine += fine;
             }
         };
+        if sstat.cells() > max_cells && max_cells < limits.max_msg_cells as u64 {
+            log::debug!(target: "executor", "not enough funds to process a message (max_cells={})", max_cells);
+            collect_fine();
+            return check_skip_invalid(RESULT_CODE_INVALID_BALANCE);
+        }
+        if sstat.bits() > limits.max_msg_bits as u64 || sstat.cells() > max_cells {
+            log::debug!(target: "executor", "message too large, invalid");
+            collect_fine();
+            return check_skip_invalid(RESULT_CODE_INVALID_BALANCE);
+        }
+        if sstat.max_merkle_depth() > MAX_MSG_MERKLE_DEPTH {
+            log::debug!(target: "executor", "message has too big merkle depth, invalid");
+            collect_fine();
+            return check_skip_invalid(RESULT_CODE_INVALID_BALANCE);
+        }
         let compute_fwd_fee = if !is_special {
-            if sstat.cells() > max_cells && max_cells < limits.max_msg_cells as u64 {
-                log::debug!(target: "executor", "not enough funds to process a message (max_cells={})", max_cells);
-                collect_fine();
-                return check_skip_invalid(RESULT_CODE_INVALID_BALANCE);
-            }
-            if sstat.bits() > limits.max_msg_bits as u64 || sstat.cells() > max_cells {
-                log::debug!(target: "executor", "message too large, invalid");
-                collect_fine();
-                return check_skip_invalid(RESULT_CODE_INVALID_BALANCE);
-            }
-            if sstat.max_merkle_depth() > MAX_MSG_MERKLE_DEPTH {
-                log::debug!(target: "executor", "message has too big merkle depth, invalid");
-                collect_fine();
-                return check_skip_invalid(RESULT_CODE_INVALID_BALANCE);
-            }
             Coins::try_from(fwd_prices.calc_fwd_fee(sstat.bits(), sstat.cells()))
                 .map_err(|err| {
                     log::error!(target: "executor", "cannot calc fwd fee message in action phase : {}", err);

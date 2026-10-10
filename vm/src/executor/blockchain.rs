@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and message execution compatibility.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -22,11 +22,9 @@ use crate::{
 };
 use num::{bigint::Sign, BigInt};
 use rtos_block::{
-    fail, BuilderData, Cell, Deserializable, ExceptionCode, GasConsumer, IBitstring, Message,
-    MsgAddressInt, MsgForwardPrices, Result, Serializable, SizeLimitsConfig, SliceData, Status,
-    StorageUsageCalc, StorageUsed, ACTION_CHANGE_LIB, ACTION_RESERVE, ACTION_SEND_MSG,
-    ACTION_SET_CODE, CHANGE_SET_LIB_VALID_MODES, SENDMSG_ALL_BALANCE,
-    SENDMSG_REMAINING_MSG_BALANCE,
+    fail, BuilderData, Cell, Deserializable, ExceptionCode, GasConsumer, IBitstring, MsgAddressInt,
+    MsgForwardPrices, Result, SizeLimitsConfig, SliceData, Status, ACTION_CHANGE_LIB,
+    ACTION_RESERVE, ACTION_SEND_MSG, ACTION_SET_CODE, CHANGE_SET_LIB_VALID_MODES,
 };
 
 fn get_bigint(slice: &SliceData) -> BigInt {
@@ -74,94 +72,349 @@ pub(super) fn execute_changelib(engine: &mut Engine) -> Status {
     add_action(engine, ACTION_CHANGE_LIB, None, suffix)
 }
 
-fn calc_storage_used_short(
+// SENDMSG walks the original envelope references, stopping the entire walk at
+// the cell limit. This is a VM fee simulation, not action-phase size validation.
+fn sendmsg_storage(
     engine: &mut Engine,
-    msg: &Message,
-    limits: &SizeLimitsConfig,
-) -> Result<StorageUsed> {
-    let mut calc =
-        StorageUsageCalc::with_limits(limits.max_msg_cells as u64, limits.max_msg_bits as u64);
-    let (body_to_ref, init_to_ref) = msg.recalc_serialization_params()?;
-    // When body/init was originally stored as a ref in
-    // the envelope (body_to_ref/init_to_ref == Some(true)), the body cell is
-    // a real ref and gas should be charged.
-    // When body/init was inline in the envelope — load only sub-refs with
-    // gas, root without.
-    if let Some(body) = msg.body() {
-        let root = body.clone().into_cell()?;
-        if msg.body_to_ref() == Some(true) {
-            calc.append_cell(&root, body_to_ref, engine)?;
-        } else {
-            calc.append_cell_no_root_gas(&root, body_to_ref, engine)?;
+    cell: Cell,
+    limit: u64,
+    visited: &mut std::collections::HashSet<rtos_block::UInt256>,
+    cells: &mut u64,
+    bits: &mut u64,
+) -> Result<bool> {
+    let mut pending = vec![cell];
+    while let Some(cell) = pending.pop() {
+        if !visited.insert(cell.repr_hash().clone()) {
+            continue;
+        }
+        if *cells >= limit {
+            return Ok(false);
+        }
+        *cells += 1;
+        let slice = engine.load_hashed_cell(cell, false)?;
+        *bits += slice.remaining_bits() as u64;
+        for i in (0..slice.remaining_references()).rev() {
+            pending.push(slice.reference(i)?);
         }
     }
-    if let Some(init) = msg.state_init() {
-        let root = init.serialize()?;
-        if msg.init_to_ref() == Some(true) {
-            calc.append_cell(&root, init_to_ref, engine)?;
-        } else {
-            calc.append_cell_no_root_gas(&root, init_to_ref, engine)?;
-        }
-    }
-    let sstat = calc.storage_used()?;
-    Ok(sstat)
+    Ok(true)
 }
 
-/// SENDMSG (c x – fee): pop mode and message cell from stack and put it at the
-/// end of output actions list and calc fee.
+// MYADDR is an arbitrary c7 slice. This consumer reads only the workchain
+// prefix, including the reference reader's quiet EOF behavior; it does not
+// validate the address tail or impose the shared address codec's constraints.
+fn sendmsg_workchain(mut slice: SliceData) -> Result<i32> {
+    if slice.get_next_int(1).unwrap_or(u64::MAX) != 1 {
+        fail!(ExceptionCode::RangeCheckError, "not an internal message address");
+    }
+    let is_var = slice.get_next_int(1).unwrap_or(u64::MAX) != 0;
+    if slice.get_next_int(1).unwrap_or(u64::MAX) == 1 {
+        if let Ok(depth) = slice.get_next_int(5) {
+            if depth <= 30 {
+                let _ = slice.move_by(depth as usize);
+            }
+        }
+    }
+    if is_var {
+        let _ = slice.move_by(9);
+        Ok(slice.get_next_int(32).unwrap_or(0) as u32 as i32)
+    } else {
+        Ok(slice.get_next_int(8).unwrap_or(0) as u8 as i8 as i32)
+    }
+}
+
+fn sendmsg_grams_bits(value: u128) -> usize {
+    4 + (128 - value.leading_zeros() as usize).div_ceil(8) * 8
+}
+
+fn sendmsg_value_bits(value: &Option<BigInt>) -> usize {
+    // The unsigned bit-size operation returns INT_MAX for NaN/negative
+    // values; SENDMSG uses that size to decide whether the body must move.
+    let bits = value
+        .as_ref()
+        .filter(|n| n.sign() != Sign::Minus)
+        .map_or(i32::MAX as usize, |n| n.bits() as usize);
+    4 + bits.div_ceil(8) * 8
+}
+
+struct SendMessageInfo {
+    external: bool,
+    dest_bits: usize,
+    dest_masterchain: bool,
+    value: u128,
+    extra: bool,
+    ihr_disabled: bool,
+    user_fwd: u128,
+    user_ihr: u128,
+    extra_flags_bits: usize,
+}
+fn sendmsg_varuint(slice: &mut SliceData) -> Result<(u128, usize, bool)> {
+    let bytes = slice.get_next_int(4)? as usize;
+    let mut value = 0u128;
+    let mut canonical = true;
+    for i in 0..bytes {
+        let byte = slice.get_next_byte()?;
+        if i == 0 && byte == 0 {
+            canonical = false;
+        }
+        value = (value << 8) | byte as u128;
+    }
+    Ok((value, 4 + bytes * 8, canonical))
+}
+fn sendmsg_header(slice: &mut SliceData) -> Result<SendMessageInfo> {
+    if !slice.get_next_bit()? {
+        let flags = slice.get_next_int(3)?;
+        rtos_block::MsgAddressIntOrNone::skip(slice)?;
+        let before = slice.remaining_bits();
+        let dest = MsgAddressInt::construct_from(slice)?;
+        let dest_bits = before - slice.remaining_bits();
+        let (value, _, canonical) = sendmsg_varuint(slice)?;
+        if !canonical {
+            fail!(ExceptionCode::UnknownError);
+        }
+        let extra = slice.get_next_bit()?;
+        if extra {
+            slice.checked_drain_reference()?;
+        }
+        let (user_ihr, extra_flags_bits, canonical) = sendmsg_varuint(slice)?;
+        let user_ihr = if canonical { user_ihr } else { 0 };
+        let (user_fwd, _, canonical) = sendmsg_varuint(slice)?;
+        let user_fwd = if canonical { user_fwd } else { 0 };
+        slice.move_by(96)?;
+        Ok(SendMessageInfo {
+            external: false,
+            dest_bits,
+            dest_masterchain: dest.is_masterchain(),
+            value,
+            extra,
+            ihr_disabled: flags & 4 != 0,
+            user_fwd,
+            user_ihr,
+            extra_flags_bits,
+        })
+    } else {
+        if !slice.get_next_bit()? {
+            fail!(ExceptionCode::UnknownError);
+        }
+        rtos_block::MsgAddressIntOrNone::skip(slice)?;
+        let before = slice.remaining_bits();
+        rtos_block::MsgAddressExt::skip(slice)?;
+        let dest_bits = before - slice.remaining_bits();
+        slice.move_by(96)?;
+        Ok(SendMessageInfo {
+            external: true,
+            dest_bits,
+            dest_masterchain: false,
+            value: 0,
+            extra: false,
+            ihr_disabled: true,
+            user_fwd: 0,
+            user_ihr: 0,
+            extra_flags_bits: 0,
+        })
+    }
+}
+
+/// SENDMSG (c x – fee): simulate forwarding fees using the original message
+/// layout, and optionally append the original cell to the action list.
 pub(super) fn execute_send_msg(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("SENDMSG"))?;
     fetch_stack(engine, 2)?;
-    let mut x = engine.cmd.var(0).as_integer_value(0..=0x4FF)?;
-    let send = (x & 1024) == 0;
-    x &= !1024;
-    if x >= 256 {
+    let mut mode = engine.cmd.var(0).as_integer_value(0..=2047)?;
+    let send = (mode & 1024) == 0;
+    mode &= !1024;
+    if mode >= 256 {
         fail!(ExceptionCode::RangeCheckError);
     }
-    let x = x as u8;
     let cell = engine.cmd.var(1).as_cell()?.clone();
-    // println!("msg: {}", rtos_block::base64_encode(rtos_block::write_boc(&cell)?));
-    let mut slice = engine.load_cell(cell.clone())?;
-    let mut msg = Message::construct_from(&mut slice)?;
+    let original = engine.load_cell(cell.clone())?;
+    // Parse the envelope without loading referenced StateInit or body cells.
+    // Those references are opaque at this stage and are visited below with gas.
+    let parsed = (|| -> Result<_> {
+        let mut slice = original.clone();
+        let header = sendmsg_header(&mut slice)?;
+        let have_init = slice.get_next_bit()?;
+        let mut init_ref = false;
+        let (mut init_bits, mut init_refs) = (0, 0);
+        if have_init {
+            init_ref = slice.get_next_bit()?;
+            if init_ref {
+                slice.checked_drain_reference()?;
+            } else {
+                let before = slice.remainig();
+                rtos_block::StateInit::skip(&mut slice)?;
+                init_bits = before.0 - slice.remaining_bits();
+                init_refs = before.1 - slice.remaining_references();
+            }
+        }
+        let body_ref = slice.get_next_bit()?;
+        let (body_bits, body_refs) = if body_ref {
+            slice.checked_drain_reference()?;
+            if !slice.is_empty_cell() {
+                fail!(ExceptionCode::UnknownError);
+            }
+            (0, 0)
+        } else {
+            slice.remainig()
+        };
+        Ok((header, have_init, init_ref, init_bits, init_refs, body_ref, body_bits, body_refs))
+    })()
+    .map_err(|_| rtos_block::error!(ExceptionCode::UnknownError))?;
+    let (header, have_init, mut init_ref, init_bits, init_refs, mut body_ref, body_bits, body_refs) =
+        parsed;
     let my_addr = engine.smci_param(8)?.as_slice()?;
-    let my_addr = MsgAddressInt::construct_from(&mut my_addr.clone())?;
-    let is_masterchain = my_addr.is_masterchain() | msg.is_dst_masterchain();
-    msg.set_src_address(my_addr);
-    let index = if is_masterchain { 4 } else { 5 };
-    let prices = engine.smci_extra_param(14, index)?.as_slice()?;
-    let prices = MsgForwardPrices::construct_from(&mut prices.clone())?;
-    // it is not published yet
-    let limits = if let Ok(limits) = engine.smci_extra_param(14, 6)?.as_slice() {
-        SizeLimitsConfig::construct_from(&mut limits.clone())?
+    let my_addr_bits = my_addr.remaining_bits();
+    let my_workchain = sendmsg_workchain(my_addr.clone())?;
+    let version = engine.block_version();
+    let SendMessageInfo {
+        external,
+        dest_bits,
+        value,
+        mut extra,
+        ihr_disabled,
+        user_fwd,
+        user_ihr,
+        extra_flags_bits,
+        dest_masterchain,
+    } = header;
+    let mut value = Some(BigInt::from(value));
+    let ihr_disabled = ihr_disabled || version >= 11;
+    let user_ihr = if version >= 12 { 0 } else { user_ihr };
+    let masterchain = my_workchain == -1 || dest_masterchain;
+    let prices = if version >= 6 {
+        let index = if masterchain { 4 } else { 5 };
+        let slice = engine
+            .smci_extra_param(14, index)?
+            .as_slice()
+            .map_err(|_| rtos_block::error!(ExceptionCode::UnknownError))?;
+        MsgForwardPrices::construct_from(&mut slice.clone())
+            .map_err(|_| rtos_block::error!(ExceptionCode::CellUnderflow))?
     } else {
-        SizeLimitsConfig::default()
+        let cell = engine
+            .get_config_param(if masterchain { 24 } else { 25 })?
+            .ok_or(ExceptionCode::UnknownError)?;
+        MsgForwardPrices::construct_from(&mut engine.load_cell(cell)?)
+            .map_err(|_| rtos_block::error!(ExceptionCode::CellUnderflow))?
     };
-
-    let mut legacy_fwd_fee_lower_bound = None;
-    if let Some(hdr) = msg.int_header_mut() {
-        if x & SENDMSG_ALL_BALANCE != 0 {
-            hdr.value.coins = engine.smci_extra_param(7, 0)?.as_coins()?.try_into()?
-        } else if x & SENDMSG_REMAINING_MSG_BALANCE != 0 {
-            hdr.value.coins += engine.smci_extra_param(11, 0)?.as_coins()?
+    let max_cells = if version >= 6 {
+        match engine.smci_extra_param(14, 6)?.as_slice() {
+            Ok(slice) => {
+                SizeLimitsConfig::construct_from(&mut slice.clone())
+                    .map_err(|_| rtos_block::error!(ExceptionCode::CellUnderflow))?
+                    .max_msg_cells
+            }
+            Err(_) => SizeLimitsConfig::default().max_msg_cells,
         }
-        if engine.block_version() < 14 {
-            legacy_fwd_fee_lower_bound = Some(hdr.fwd_fee.clone());
-            let fwd_full_fees = prices.lump_price.into();
-            let fwd_mine_fees = prices.mine_fee_checked(&fwd_full_fees)?;
-            hdr.fwd_fee = hdr.fwd_fee.max(fwd_full_fees - fwd_mine_fees);
+    } else {
+        1 << 13
+    };
+    let envelope = engine.load_cell(cell.clone())?;
+    let (mut cells, mut bits) = (0u64, 0u64);
+    let mut visited = std::collections::HashSet::new();
+    for i in usize::from(version >= 10 && extra)..envelope.remaining_references() {
+        if !sendmsg_storage(
+            engine,
+            envelope.reference(i)?,
+            max_cells as u64,
+            &mut visited,
+            &mut cells,
+            &mut bits,
+        )? {
+            break;
         }
     }
-    // TODO: need to remove extra load when cpp is fixed
-    engine.load_cell(cell.clone())?;
-    let msg_storage = calc_storage_used_short(engine, &msg, &limits)?;
-    let mut fee = prices.calc_fwd_fee(msg_storage.bits(), msg_storage.cells());
-    if let Some(fwd_fee) = legacy_fwd_fee_lower_bound {
-        fee = fee.max(fwd_fee.as_u128());
+    if !external {
+        let balance = if mode & 128 != 0 {
+            Some((7, false))
+        } else if mode & 64 != 0 {
+            Some((11, true))
+        } else {
+            None
+        };
+        if let Some((index, add)) = balance {
+            let amount = engine.smci_extra_param(index, 0)?.as_integer()?.as_int();
+            value = if add {
+                value.as_ref().zip(amount.as_ref()).map(|(value, amount)| value + amount)
+            } else {
+                amount.clone()
+            };
+            if version < 10 {
+                extra |= engine.smci_extra_param(index, 1)?.as_cell().is_ok();
+            }
+        }
     }
-    engine.cc.stack.push(StackItem::int(fee));
+    let compute_fees = |bits, cells| {
+        // The reference VM's forwarding arithmetic takes the low 64 bits.
+        let computed = prices.calc_fwd_fee(bits, cells) as u64 as u128;
+        let ihr = if ihr_disabled {
+            0
+        } else {
+            (computed * prices.ihr_price_factor as u128 >> 16) as u64 as u128
+        };
+        if version < 14 {
+            (computed.max(user_fwd), ihr.max(if ihr_disabled { 0 } else { user_ihr }))
+        } else {
+            (computed, ihr)
+        }
+    };
+    let root_size = |fee: u128, ihr: u128, init_ref: bool, body_ref: bool| {
+        let header = if external {
+            2 + my_addr_bits + dest_bits + 96
+        } else {
+            4 + my_addr_bits
+                + dest_bits
+                + sendmsg_value_bits(&value)
+                + 1
+                + 96
+                + sendmsg_grams_bits(
+                    fee - ((fee >> 16) * prices.first_frac as u128
+                        + ((fee & 65535) * prices.first_frac as u128 >> 16)),
+                )
+                + if version >= 12 { extra_flags_bits } else { sendmsg_grams_bits(ihr) }
+        };
+        (
+            header
+                + 2
+                + usize::from(have_init)
+                + if have_init && !init_ref { init_bits } else { 0 }
+                + if body_ref { 0 } else { body_bits },
+            usize::from(extra)
+                + if have_init {
+                    if init_ref {
+                        1
+                    } else {
+                        init_refs
+                    }
+                } else {
+                    0
+                }
+                + if body_ref { 1 } else { body_refs },
+        )
+    };
+    let (mut fee, mut ihr) = compute_fees(bits, cells);
+    let (root_bits, root_refs) = root_size(fee, ihr, init_ref, body_ref);
+    if have_init && !init_ref && (root_bits > 1023 || root_refs > 4) {
+        init_ref = true;
+        cells += 1;
+        bits += init_bits as u64;
+        (fee, ihr) = compute_fees(bits, cells);
+    }
+    let (root_bits, root_refs) = root_size(fee, ihr, init_ref, body_ref);
+    if !body_ref && (root_bits > 1023 || root_refs > 4) {
+        body_ref = true;
+        cells += 1;
+        bits += body_bits as u64;
+        (fee, ihr) = compute_fees(bits, cells);
+    }
+    let _ = body_ref;
+    engine.cc.stack.push(StackItem::int(fee + ihr));
     if send {
-        let suffix = BuilderData::with_raw(vec![x], 8)?;
-        add_action(engine, ACTION_SEND_MSG, Some(cell), suffix)?;
+        add_action(
+            engine,
+            ACTION_SEND_MSG,
+            Some(cell),
+            BuilderData::with_raw(vec![mode as u8], 8)?,
+        )?;
     }
     Ok(())
 }
