@@ -15,9 +15,12 @@ use crate::{
         build_block_broadcast, build_block_broadcast_compressed,
         build_block_broadcast_compressed_v2, build_block_candidate_broadcast_compressed,
         custom_overlay_client::CustomOverlayClient,
-        fast_sync_overlay_client::FastSyncOverlayClient,
-        full_node_overlay_client::FullNodeOverlayClient, full_node_service::FullNodeOverlayService,
-        node_network::NodeNetwork, overlay_client::OverlayClient, pack_block_signatures,
+        fast_sync_overlay_client::{fast_sync_transport_authority, FastSyncOverlayClient},
+        full_node_overlay_client::FullNodeOverlayClient,
+        full_node_service::FullNodeOverlayService,
+        node_network::NodeNetwork,
+        overlay_client::OverlayClient,
+        pack_block_signatures,
     },
     types::{awaiters_pool::AwaitersPool, top_block_descr::TopBlockDescrStuff},
     validator::validator_utils::{compute_validator_list_id, get_adnl_id, sigpubkey_to_publickey},
@@ -75,6 +78,32 @@ use std::{
 ///               NodeNetwork                   <- low level node components
 ///                    v
 ///            network protocols
+#[derive(Debug, thiserror::Error)]
+#[error("fast-sync inputs changed during transport refresh")]
+struct RetryFastSyncRefresh;
+
+struct FastSyncRefreshBinding {
+    transport_revision: u64,
+    applied_id: Option<BlockIdExt>,
+    valid_until: Option<u64>,
+}
+
+struct LocalFastSyncTransport {
+    key: Arc<dyn KeyOption>,
+    valid_until: Option<u64>,
+}
+
+#[derive(Clone, PartialEq)]
+struct FastSyncSnapshot {
+    previous: ValidatorSet,
+    current: ValidatorSet,
+    next: ValidatorSet,
+    monitor_min_split: u8,
+    local_key: Option<Arc<KeyId>>,
+    mc_use_quic: bool,
+    shard_use_quic: bool,
+}
+
 pub struct FullNodeOverlaysRouter {
     engine: Arc<dyn EngineOperations>,
     network: Arc<NodeNetwork>,
@@ -84,12 +113,36 @@ pub struct FullNodeOverlaysRouter {
     fast_sync_overlays: lockfree::map::Map<ShardIdent, Arc<FastSyncOverlayClient>>,
     custom_overlays: lockfree::map::Map<String, Arc<CustomOverlayClient>>,
     public_overlays_awaiters: AwaitersPool<ShardIdent, Arc<FullNodeOverlayClient>>,
-    validators: tokio::sync::Mutex<ValidatorSet>,
+    fast_sync_snapshot: tokio::sync::Mutex<Option<FastSyncSnapshot>>,
+    fast_sync_refresh: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    fast_sync_refresh_gate: std::sync::Mutex<
+        Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
+    >,
     monitor_min_split_for_fast_sync: AtomicU8,
     last_known_keyblock_id: tokio::sync::Mutex<Option<BlockIdExt>>,
     actual_monitor_min_split: AtomicU8,
     monitor_min_split_worker_started: AtomicBool,
     fast_sync_peer_resolver: tokio::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+}
+
+// Keeps a partially constructed generation unreachable through the router and
+// revokes all completed registrations if construction fails or is cancelled.
+struct PendingFastSync {
+    overlays: Vec<(ShardIdent, Arc<FastSyncOverlayClient>)>,
+    cancellation: tokio_util::sync::CancellationToken,
+    committed: bool,
+}
+
+impl Drop for PendingFastSync {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.cancellation.cancel();
+            for (_, overlay) in &self.overlays {
+                overlay.stop();
+            }
+        }
+    }
 }
 
 impl FullNodeOverlaysRouter {
@@ -115,7 +168,10 @@ impl FullNodeOverlaysRouter {
             fast_sync_overlays: lockfree::map::Map::new(),
             custom_overlays: lockfree::map::Map::new(),
             public_overlays_awaiters,
-            validators: tokio::sync::Mutex::new(ValidatorSet::default()),
+            fast_sync_snapshot: tokio::sync::Mutex::new(None),
+            fast_sync_refresh: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            fast_sync_refresh_gate: std::sync::Mutex::new(None),
             monitor_min_split_for_fast_sync: AtomicU8::new(0),
             last_known_keyblock_id: tokio::sync::Mutex::new(None),
             actual_monitor_min_split,
@@ -251,7 +307,13 @@ impl FullNodeOverlaysRouter {
             );
             let mut history = None;
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {},
+                    _ = self.network.transport_config_changed() => {},
+                }
+                if let Err(error) = self.refresh_fast_sync_from_applied_state().await {
+                    log::warn!("Fast-sync transport refresh: {error}");
+                }
                 if self.engine.check_sync().await.unwrap_or(false) {
                     log::trace!("Monitor min split worker: node is in sync - skipping iteration");
                 } else {
@@ -307,7 +369,29 @@ impl FullNodeOverlaysRouter {
         Ok(())
     }
 
+    pub(crate) async fn refresh_fast_sync_from_applied_state(self: &Arc<Self>) -> Result<()> {
+        // Read after taking the refresh lock: a delayed caller must not install
+        // an older applied configuration after a newer refresh has completed.
+        let _refresh = self.fast_sync_refresh.lock().await;
+        loop {
+            let state = self.engine.load_last_applied_mc_state().await?;
+            match self
+                .update_private_overlays_inner(
+                    state.config_params()?,
+                    Some(state.block_id().clone()),
+                )
+                .await
+            {
+                Err(error) if error.is::<RetryFastSyncRefresh>() => continue,
+                result => return result,
+            }
+        }
+    }
+
     pub(crate) async fn special_update_fastsync_overlays(self: &Arc<Self>) -> Result<()> {
+        if self.network.context().stack.overlay.wire_profile() == rtos_api::WireProfile::T0 {
+            return self.refresh_fast_sync_from_applied_state().await;
+        }
         // Special case: create fast sync overlays when we are a validator from the
         // previous set. The normal flow (update_validator_lists in validator_manager)
         // only processes current and next sets, so the prev set ADNL key is never
@@ -467,23 +551,65 @@ impl FullNodeOverlaysRouter {
         .await
     }
 
-    pub(crate) async fn update_private_overlays(
+    #[cfg(test)]
+    async fn update_private_overlays(self: &Arc<Self>, config: &ConfigParams) -> Result<()> {
+        let _refresh = self.fast_sync_refresh.lock().await;
+        loop {
+            match self.update_private_overlays_inner(config, None).await {
+                Err(error) if error.is::<RetryFastSyncRefresh>() => continue,
+                result => return result,
+            }
+        }
+    }
+
+    async fn update_private_overlays_inner(
         self: &Arc<Self>,
         config: &ConfigParams,
+        applied_id: Option<BlockIdExt>,
     ) -> Result<()> {
+        let mut binding = FastSyncRefreshBinding {
+            transport_revision: self.network.config_handler().validator_transport_revision()?,
+            applied_id,
+            valid_until: None,
+        };
         let prev_vset = config.prev_validator_set()?;
         let this_vset = config.validator_set()?;
         let next_vset = config.next_validator_set()?;
-        let key = if let Some(k) = self.try_get_our_key(&this_vset)? {
-            Some(k)
-        } else if let Some(k) = self.try_get_our_key(&prev_vset)? {
-            Some(k)
-        } else {
-            self.try_get_our_key(&next_vset)?
-        };
+        let key =
+            if self.network.context().stack.overlay.wire_profile() == rtos_api::WireProfile::T0 {
+                match self.find_transport_authority(&[&this_vset, &prev_vset, &next_vset]).await {
+                    Ok(selected) => selected.map(|selected| {
+                        binding.valid_until = selected.valid_until;
+                        selected.key
+                    }),
+                    Err(error) => {
+                        let mut installed = self.fast_sync_snapshot.lock().await;
+                        *installed = None;
+                        self.clear_fast_sync_overlays();
+                        if let Some(resolver) = self.fast_sync_peer_resolver.lock().await.take() {
+                            resolver.cancel();
+                        }
+                        return Err(error);
+                    }
+                }
+            } else if let Some(k) = self.try_get_our_key(&this_vset)? {
+                Some(k)
+            } else if let Some(k) = self.try_get_our_key(&prev_vset)? {
+                Some(k)
+            } else {
+                self.try_get_our_key(&next_vset)?
+            };
         let mc_use_quic = config.get_mc_simplex_config()?.map_or(false, |c| c.use_quic);
         let shard_use_quic = config.get_shard_simplex_config()?.map_or(false, |c| c.use_quic);
-        self.update_fast_sync_overlays(
+        #[cfg(test)]
+        {
+            let gate = self.fast_sync_refresh_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+        }
+        self.update_fast_sync_overlays_checked(
             &prev_vset,
             &this_vset,
             &next_vset,
@@ -491,6 +617,7 @@ impl FullNodeOverlaysRouter {
             key.as_ref(),
             mc_use_quic,
             shard_use_quic,
+            Some(&binding),
         )
         .await?;
         Ok(())
@@ -555,150 +682,304 @@ impl FullNodeOverlaysRouter {
         mc_use_quic: bool,
         shard_use_quic: bool,
     ) -> Result<()> {
-        let mut cur_validators = self.validators.lock().await;
-        let validators_changed = *cur_validators != *this_validators;
-        let old_monitor_min_split = self.monitor_min_split_for_fast_sync.load(Ordering::Relaxed);
-        if (old_monitor_min_split == new_monitor_min_split) && !validators_changed {
+        self.update_fast_sync_overlays_checked(
+            prev_validators,
+            this_validators,
+            next_validators,
+            new_monitor_min_split,
+            key,
+            mc_use_quic,
+            shard_use_quic,
+            None,
+        )
+        .await
+    }
+
+    async fn update_fast_sync_overlays_checked(
+        self: &Arc<Self>,
+        prev_validators: &ValidatorSet,
+        this_validators: &ValidatorSet,
+        next_validators: &ValidatorSet,
+        new_monitor_min_split: u8,
+        key: Option<&Arc<dyn KeyOption>>,
+        mc_use_quic: bool,
+        shard_use_quic: bool,
+        binding: Option<&FastSyncRefreshBinding>,
+    ) -> Result<()> {
+        let mut installed = self.fast_sync_snapshot.lock().await;
+        self.publish_fast_sync(binding, || Ok(()))?;
+        let desired = FastSyncSnapshot {
+            previous: prev_validators.clone(),
+            current: this_validators.clone(),
+            next: next_validators.clone(),
+            monitor_min_split: new_monitor_min_split,
+            local_key: key.map(|key| key.id().clone()),
+            mc_use_quic,
+            shard_use_quic,
+        };
+        if installed.as_ref() == Some(&desired) {
             return Ok(());
         }
-
-        log::info!(
-            "Updating fast sync overlays: \
-            monitor min split {old_monitor_min_split} -> {new_monitor_min_split}, \
-            validators changed {validators_changed}, \
-            mc_use_quic {mc_use_quic}, shard_use_quic {shard_use_quic}"
-        );
-
-        // Root members = union of past + current + next validator sets.
-        // Duplicates (a validator present in multiple rounds) are collapsed by
-        // the HashSet/HashMap inside add_semiprivate_overlay
-        let mut validators: Vec<ValidatorDescr> = Vec::with_capacity(
-            prev_validators.list().len()
-                + this_validators.list().len()
-                + next_validators.list().len(),
-        );
-        validators.extend(prev_validators.list().iter().cloned());
-        validators.extend(this_validators.list().iter().cloned());
-        validators.extend(next_validators.list().iter().cloned());
-
-        let create_overlay = |shard: &ShardIdent, use_quic: bool| {
-            FastSyncOverlayClient::new(
-                shard.clone(),
-                &validators,
-                key,
-                None,
-                self.network.cancellation_token().child_token(),
-                self.network.context().clone(),
-                self.engine.clone(),
-                self.policy.clone(),
-                self.network.default_rldp_roundtrip(),
-                use_quic,
-            )
+        // Revoke the old generation before installing any new authority. On
+        // failure the snapshot stays unset, so the same input is retried.
+        *installed = None;
+        self.clear_fast_sync_overlays();
+        if let Some(previous) = self.fast_sync_peer_resolver.lock().await.take() {
+            previous.cancel();
+        }
+        self.monitor_min_split_for_fast_sync.store(new_monitor_min_split, Ordering::Relaxed);
+        let Some(local_key) = key else {
+            return self.publish_fast_sync(binding, || {
+                *installed = Some(desired);
+                Ok(())
+            });
         };
+        let mut pending = PendingFastSync {
+            overlays: Vec::new(),
+            cancellation: self.network.cancellation_token().child_token(),
+            committed: false,
+        };
+        let result: Result<()> = async {
+            check_monitor_min_split(new_monitor_min_split)?;
+            // Root members = union of past + current + next validator sets.
+            // Duplicates (a validator present in multiple rounds) are collapsed by
+            // the HashSet/HashMap inside add_semiprivate_overlay
+            let mut validators: Vec<ValidatorDescr> = Vec::with_capacity(
+                prev_validators.list().len()
+                    + this_validators.list().len()
+                    + next_validators.list().len(),
+            );
+            validators.extend(prev_validators.list().iter().cloned());
+            validators.extend(this_validators.list().iter().cloned());
+            validators.extend(next_validators.list().iter().cloned());
 
-        let update_monitor_min_split = async |monitor_min_split: u8, create| -> Result<()> {
-            for prefix in 0..(1 << monitor_min_split) {
-                let shard_prefix =
-                    if monitor_min_split == 0 { 0 } else { prefix << (64 - monitor_min_split) };
+            let generation = pending.cancellation.clone();
+            let create_overlay = |shard: &ShardIdent, use_quic: bool| {
+                FastSyncOverlayClient::new(
+                    shard.clone(),
+                    &validators,
+                    key,
+                    None,
+                    generation.child_token(),
+                    self.network.context().clone(),
+                    self.engine.clone(),
+                    self.policy.clone(),
+                    self.network.default_rldp_roundtrip(),
+                    use_quic,
+                )
+            };
+
+            // Resolve ADNL addresses for fastsync root members (prev/this/next union)
+            // OverlayNode::pending_peers retry promotes peers automatically as soon
+            // as they appear in ADNL.
+            let local_key_id = local_key.id().clone();
+            let adnl = &self.network.context().stack.adnl;
+            let mut to_resolve: Vec<Arc<KeyId>> = Vec::new();
+            let mut seen: HashSet<Arc<KeyId>> = HashSet::new();
+            let (transport_ids, _) = fast_sync_transport_authority(
+                &validators,
+                self.network.context().stack.overlay.wire_profile(),
+            )?;
+            for adnl_id in transport_ids {
+                if !seen.insert(adnl_id.clone()) {
+                    continue;
+                }
+                if adnl_id == local_key_id {
+                    continue;
+                }
+                if matches!(adnl.peer_ip_address(&local_key_id, &adnl_id), Ok(Some(_))) {
+                    continue;
+                }
+                to_resolve.push(adnl_id);
+            }
+            {
+                let mut slot = self.fast_sync_peer_resolver.lock().await;
+                if let Some(prev) = slot.take() {
+                    prev.cancel();
+                }
+                if !to_resolve.is_empty() {
+                    log::info!(
+                        "fastsync: scheduling DHT resolve for {} peers under {local_key_id}",
+                        to_resolve.len()
+                    );
+                    let token = pending.cancellation.child_token();
+                    NodeNetwork::spawn_overlay_peer_resolver(
+                        local_key_id.clone(),
+                        to_resolve,
+                        self.network.context().stack.dht.clone(),
+                        self.network.context().stack.overlay.clone(),
+                        token.clone(),
+                        "fastsync".to_string(),
+                    );
+                    *slot = Some(token);
+                }
+            }
+
+            let masterchain = ShardIdent::MASTERCHAIN;
+            let master = create_overlay(&masterchain, mc_use_quic).await?;
+            pending.overlays.push((masterchain, master));
+            for prefix in 0u64..(1u64 << new_monitor_min_split) {
+                let shard_prefix = if new_monitor_min_split == 0 {
+                    0
+                } else {
+                    prefix << (64 - new_monitor_min_split)
+                };
                 let shard = ShardIdent::with_prefix_len(
-                    monitor_min_split,
+                    new_monitor_min_split,
                     BASE_WORKCHAIN_ID,
                     shard_prefix,
                 )?;
-                if create {
-                    if let Some(old) = self.fast_sync_overlays.remove(&shard) {
-                        old.val().stop();
-                    }
-                    let overlay = create_overlay(&shard, shard_use_quic).await?;
-                    self.fast_sync_overlays.insert(shard, overlay)
-                } else {
-                    self.fast_sync_overlays.remove(&shard)
-                }
-                .map(|removed| removed.val().stop());
+                let overlay = create_overlay(&shard, shard_use_quic).await?;
+                pending.overlays.push((shard, overlay));
             }
-            Ok(())
-        };
 
-        // Delete old overlays if monitor min split changed or we are not a validator anymore
-        if (old_monitor_min_split != new_monitor_min_split) || key.is_none() {
-            if key.is_none() {
-                if let Some(old) = self.fast_sync_overlays.remove(&ShardIdent::MASTERCHAIN) {
-                    old.val().stop();
-                }
-            }
-            update_monitor_min_split(old_monitor_min_split, false).await?;
-        }
-
-        let Some(local_key) = key else {
             self.monitor_min_split_for_fast_sync.store(new_monitor_min_split, Ordering::Relaxed);
-            log::info!("We are not a validator");
-            *cur_validators = this_validators.clone();
-            if let Some(prev) = self.fast_sync_peer_resolver.lock().await.take() {
-                prev.cancel();
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            self.clear_fast_sync_overlays();
+            if let Some(resolver) = self.fast_sync_peer_resolver.lock().await.take() {
+                resolver.cancel();
             }
-            return Ok(());
+            return Err(error);
+        }
+        self.publish_fast_sync(binding, || {
+            for (shard, overlay) in pending.overlays.drain(..) {
+                self.fast_sync_overlays.insert(shard, overlay);
+            }
+            pending.committed = true;
+            *installed = Some(desired);
+            Ok(())
+        })
+    }
+
+    fn publish_fast_sync<T>(
+        &self,
+        binding: Option<&FastSyncRefreshBinding>,
+        publish: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let Some(binding) = binding else {
+            return publish();
         };
+        self.network
+            .config_handler()
+            .with_validator_transport_revision(binding.transport_revision, || {
+                if let Some(expected) = &binding.applied_id {
+                    if self.engine.load_last_applied_mc_block_id()?.as_deref() != Some(expected) {
+                        return Err(RetryFastSyncRefresh.into());
+                    }
+                }
+                if binding
+                    .valid_until
+                    .is_some_and(|deadline| deadline <= rtos_block::UnixTime::now() as u64)
+                {
+                    return Err(RetryFastSyncRefresh.into());
+                }
+                publish()
+            })?
+            .ok_or_else(|| error!(RetryFastSyncRefresh))?
+    }
 
-        // Resolve ADNL addresses for fastsync root members (prev/this/next union)
-        // OverlayNode::pending_peers retry promotes peers automatically as soon
-        // as they appear in ADNL.
-        let local_key_id = local_key.id().clone();
-        let adnl = &self.network.context().stack.adnl;
-        let mut to_resolve: Vec<Arc<KeyId>> = Vec::new();
-        let mut seen: HashSet<Arc<KeyId>> = HashSet::new();
-        for vd in &validators {
-            let adnl_id = vd.adnl_addr()?;
-            if !seen.insert(adnl_id.clone()) {
-                continue;
-            }
-            if adnl_id == local_key_id {
-                continue;
-            }
-            if matches!(adnl.peer_ip_address(&local_key_id, &adnl_id), Ok(Some(_))) {
-                continue;
-            }
-            to_resolve.push(adnl_id);
-        }
-        {
-            let mut slot = self.fast_sync_peer_resolver.lock().await;
-            if let Some(prev) = slot.take() {
-                prev.cancel();
-            }
-            if !to_resolve.is_empty() {
-                log::info!(
-                    "fastsync: scheduling DHT resolve for {} peers under {local_key_id}",
-                    to_resolve.len()
-                );
-                let token = self.network.cancellation_token().child_token();
-                NodeNetwork::spawn_overlay_peer_resolver(
-                    local_key_id.clone(),
-                    to_resolve,
-                    self.network.context().stack.dht.clone(),
-                    self.network.context().stack.overlay.clone(),
-                    token.clone(),
-                    "fastsync".to_string(),
-                );
-                *slot = Some(token);
-            }
-        }
-
-        // Update masterchain overlay
-        if validators_changed {
-            let shard = ShardIdent::MASTERCHAIN;
+    fn clear_fast_sync_overlays(&self) {
+        let shards: Vec<_> =
+            self.fast_sync_overlays.iter().map(|entry| entry.key().clone()).collect();
+        for shard in shards {
             if let Some(old) = self.fast_sync_overlays.remove(&shard) {
                 old.val().stop();
             }
-            let overlay = create_overlay(&shard, mc_use_quic).await?;
-            self.fast_sync_overlays.insert(shard, overlay);
         }
+    }
 
-        // Create new shard overlays
-        update_monitor_min_split(new_monitor_min_split, true).await?;
+    // The full-node ADNL identity and unexpired classical validator transport
+    // registrations are existing local transport authorities. Neither grants
+    // PQ voting custody; that separately requires held validator/key bindings.
+    // Re-read registrations so cached list contexts cannot retain revoked keys.
+    #[cfg(test)]
+    async fn find_transport_key(
+        &self,
+        sets: &[&ValidatorSet],
+    ) -> Result<Option<Arc<dyn KeyOption>>> {
+        Ok(self.find_transport_authority(sets).await?.map(|selected| selected.key))
+    }
 
-        self.monitor_min_split_for_fast_sync.store(new_monitor_min_split, Ordering::Relaxed);
-        *cur_validators = this_validators.clone();
-
-        Ok(())
+    async fn find_transport_authority(
+        &self,
+        sets: &[&ValidatorSet],
+    ) -> Result<Option<LocalFastSyncTransport>> {
+        let handler = self.network.config_handler();
+        let now = rtos_block::UnixTime::now();
+        let local_ids = handler
+            .get_actual_validator_keys()?
+            .into_iter()
+            .filter(|entry| i64::from(entry.expire_at) > now as i64)
+            .filter_map(|entry| entry.validator_adnl_key_id.map(|id| (id, entry.expire_at)))
+            .map(|(id, deadline)| {
+                let bytes = rtos_block::base64_decode(&id)?;
+                Ok((KeyId::from_data(bytes.as_slice().try_into()?), deadline as u64))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let context = self.network.context();
+        let primary = context.stack.adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)?;
+        for validators in sets {
+            let (members, _) =
+                fast_sync_transport_authority(validators.list(), rtos_api::WireProfile::T0)?;
+            if members.contains(primary.id()) {
+                return Ok(Some(LocalFastSyncTransport {
+                    key: primary.clone(),
+                    valid_until: None,
+                }));
+            }
+            for id in members {
+                let Some(deadline) = local_ids
+                    .iter()
+                    .filter(|(registered, _)| registered == &id)
+                    .map(|(_, deadline)| *deadline)
+                    .max()
+                else {
+                    continue;
+                };
+                let Some((key, election_id)) = handler.get_validator_key(&id).await else {
+                    continue;
+                };
+                if key.id() != &id || key.pvt_key().is_err() {
+                    continue;
+                }
+                if context.stack.adnl.key_by_id(&id).is_err() {
+                    if let Err(error) =
+                        context.stack.adnl.add_key(key.clone(), election_id as usize)
+                    {
+                        log::warn!("Cannot activate fast-sync transport {id}: {error}");
+                        continue;
+                    }
+                    NodeNetwork::start_periodic_store_ip_addr(
+                        context.stack.dht.clone(),
+                        key.clone(),
+                        self.network.cancellation_token().child_token(),
+                    );
+                }
+                // Retry QUIC registration even if an earlier attempt already
+                // installed ADNL before failing to bind its QUIC endpoint.
+                if let Some(quic) = &context.stack.quic {
+                    let address = context.stack.adnl.ip_address_adnl();
+                    let port = match context.quic_address {
+                        Some(address) => address.port(),
+                        None => address
+                            .port()
+                            .checked_add(adnl::QuicNode::OFFSET_PORT)
+                            .ok_or_else(|| error!("Fast-sync QUIC port overflow"))?,
+                    };
+                    let private = key.pvt_key()?;
+                    quic.add_key(
+                        (&private.lock()? as &[u8]).try_into()?,
+                        &id,
+                        SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port),
+                    )?;
+                }
+                return Ok(Some(LocalFastSyncTransport { key, valid_until: Some(deadline) }));
+            }
+        }
+        Ok(None)
     }
 
     /// Look up the local ADNL key for the given validator set.
@@ -1161,3 +1442,7 @@ fn trim_shard(shard: &ShardIdent, min_split: u8) -> Result<ShardIdent> {
 #[cfg(test)]
 #[path = "tests/test_full_node_overlays.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/test_fast_sync_snapshot.rs"]
+mod snapshot_tests;

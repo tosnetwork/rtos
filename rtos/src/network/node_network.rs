@@ -313,6 +313,10 @@ impl NodeNetwork {
             .map(|set_context| set_context.val().validator_adnl_key.clone())
     }
 
+    pub(crate) async fn transport_config_changed(&self) {
+        self.config_handler.validator_transport_changed().await;
+    }
+
     pub fn cancellation_token(&self) -> &tokio_util::sync::CancellationToken {
         &self.cancellation_token
     }
@@ -1119,6 +1123,9 @@ impl PrivateOverlayOperations for NodeNetwork {
 #[async_trait::async_trait]
 impl NodeConfigSubscriber for NodeNetwork {
     async fn event(&self, sender: ConfigEvent) -> Result<bool> {
+        // Wake the existing router monitor even when transport setup fails: a
+        // removed local identity must revoke its old overlay authority.
+        self.config_handler.notify_validator_transport_changed();
         match sender {
             ConfigEvent::AddValidatorAdnlKey(validator_adnl_key_id, election_id) => {
                 self.load_and_store_validator_adnl_key(validator_adnl_key_id, election_id).await

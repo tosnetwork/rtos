@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 const MAX_FAST_SYNC_OVERLAY_CLIENTS: usize = 5;
 
-fn fast_sync_transport_authority(
+pub(super) fn fast_sync_transport_authority(
     validators: &[ValidatorDescr],
     profile: WireProfile,
 ) -> Result<(Vec<Arc<KeyId>>, Vec<Arc<KeyId>>)> {

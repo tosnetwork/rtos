@@ -1403,6 +1403,8 @@ pub struct NodeConfigHandlerContext {
 
 pub struct NodeConfigHandler {
     scheduler: Arc<ConfigScheduler>,
+    validator_transport_changed: tokio::sync::Notify,
+    validator_transport_revision: std::sync::Mutex<u64>,
     runtime_handle: tokio::runtime::Handle,
     sender: tokio::sync::mpsc::UnboundedSender<(Arc<Wait<Answer>>, Task)>,
     key_ring: Arc<lockfree::map::Map<String, Arc<dyn KeyOption>>>,
@@ -1445,6 +1447,8 @@ impl NodeConfigHandler {
         let (sender, reader) = tokio::sync::mpsc::unbounded_channel();
         let config_handler = Arc::new(NodeConfigHandler {
             scheduler: Arc::default(),
+            validator_transport_changed: tokio::sync::Notify::new(),
+            validator_transport_revision: std::sync::Mutex::new(0),
             runtime_handle,
             sender,
             key_ring: Arc::new(lockfree::map::Map::new()),
@@ -1452,6 +1456,54 @@ impl NodeConfigHandler {
         });
 
         Ok((config_handler, NodeConfigHandlerContext { reader, config }))
+    }
+
+    pub(crate) async fn validator_transport_changed(&self) {
+        self.validator_transport_changed.notified().await;
+    }
+
+    pub(crate) fn notify_validator_transport_changed(&self) {
+        if let Err(error) = self.update_validator_transport(|| Ok(())) {
+            log::error!("Cannot publish transport configuration revision: {error}");
+        }
+    }
+
+    fn update_validator_transport(&self, update: impl FnOnce() -> Result<()>) -> Result<()> {
+        let mut revision = self
+            .validator_transport_revision
+            .lock()
+            .map_err(|_| error!("Transport configuration revision lock poisoned"))?;
+        *revision = revision
+            .checked_add(1)
+            .ok_or_else(|| error!("Transport configuration revision exhausted"))?;
+        let result = update();
+        drop(revision);
+        self.validator_transport_changed.notify_one();
+        result
+    }
+
+    pub(crate) fn validator_transport_revision(&self) -> Result<u64> {
+        self.validator_transport_revision
+            .lock()
+            .map(|revision| *revision)
+            .map_err(|_| error!("Transport configuration revision lock poisoned"))
+    }
+
+    // Publication is synchronous while registration writers are excluded. The
+    // caller must keep this bounded and must not await a keyring query.
+    pub(crate) fn with_validator_transport_revision<T>(
+        &self,
+        expected: u64,
+        publish: impl FnOnce() -> T,
+    ) -> Result<Option<T>> {
+        let revision = self
+            .validator_transport_revision
+            .lock()
+            .map_err(|_| error!("Transport configuration revision lock poisoned"))?;
+        if *revision != expected {
+            return Ok(None);
+        }
+        Ok(Some(publish()))
     }
 
     pub fn get_validator_status(&self) -> bool {
@@ -1753,7 +1805,10 @@ impl NodeConfigHandler {
             oldest_key.validator_adnl_key_id,
         );
         config.remove_validator_key(oldest_key.validator_key_id.clone(), election_id).await?;
-        validator_keys.remove(&oldest_key)?;
+        self.update_validator_transport(|| {
+            validator_keys.remove(&oldest_key)?;
+            Ok(())
+        })?;
         config.remove_key_from_key_ring(&oldest_key.validator_key_id).await?;
         let Some(adnl_key_id) = &oldest_key.validator_adnl_key_id else {
             return Ok(());
@@ -1804,7 +1859,7 @@ impl NodeConfigHandler {
     ) -> Result<()> {
         let key = config.add_validator_adnl_key(validator_key_hash, validator_adnl_key_hash)?;
         let election_id = key.election_id;
-        validator_keys.add(key.clone())?;
+        self.update_validator_transport(|| validator_keys.add(key.clone()))?;
         try_n_times(3, Duration::from_millis(150), || SecretsVaultConfig::save_validator_key(&key))
             .await?;
         let adnl_key_id = KeyId::from_data(*validator_adnl_key_hash);
@@ -1823,6 +1878,7 @@ impl NodeConfigHandler {
     }
 
     async fn add_validator_key_and_save(
+        &self,
         validator_keys: Arc<ValidatorKeys>,
         config: &mut TonNodeConfig,
         key_id: &[u8; 32],
@@ -1830,7 +1886,7 @@ impl NodeConfigHandler {
         expire_at: i32,
     ) -> Result<()> {
         let key = config.add_validator_key(key_id, election_id, expire_at)?;
-        validator_keys.add(key.clone())?;
+        self.update_validator_transport(|| validator_keys.add(key.clone()))?;
         config.save_to_file(&config.file_name).await?;
         try_n_times(3, Duration::from_millis(150), || SecretsVaultConfig::save_validator_key(&key))
             .await?;
@@ -1931,7 +1987,9 @@ impl NodeConfigHandler {
         // load validator keys
         if let Some(validator_keys) = &config.validator_keys {
             for key in validator_keys.iter() {
-                if let Err(e) = self.validator_keys.add(key.clone()) {
+                if let Err(e) =
+                    self.update_validator_transport(|| self.validator_keys.add(key.clone()))
+                {
                     log::warn!("fail added key to validator keys map: {}", e);
                 }
                 if let Some(validator_adnl_key_id) = &key.validator_adnl_key_id {
@@ -2034,6 +2092,7 @@ impl NodeConfigHandler {
                             &name,
                         )
                         .await;
+                        self.notify_validator_transport_changed();
                         Answer::ImportPrivateKey(result)
                     }
                     Task::AddValidatorAdnlKey(key, adnl_key) => {
@@ -2046,17 +2105,20 @@ impl NodeConfigHandler {
                             &subscribers,
                         )
                         .await;
+                        self.notify_validator_transport_changed();
                         Answer::Result(result)
                     }
                     Task::AddValidatorKey(key, election_id, expire_at) => {
-                        let result = NodeConfigHandler::add_validator_key_and_save(
-                            validator_keys.clone(),
-                            &mut actual_config,
-                            &key,
-                            election_id,
-                            expire_at,
-                        )
-                        .await;
+                        let result = self
+                            .add_validator_key_and_save(
+                                validator_keys.clone(),
+                                &mut actual_config,
+                                &key,
+                                election_id,
+                                expire_at,
+                            )
+                            .await;
+                        self.notify_validator_transport_changed();
                         Answer::Result(result)
                     }
                     Task::GetKey(key_data) => {
