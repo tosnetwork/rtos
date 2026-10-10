@@ -1,3 +1,4 @@
+// RTOS modifications (2026-10-10): owned consumer readiness and authenticated finality recovery.
 // Copyright 2026 TOS Blockchain Teams. SPDX-License-Identifier: LGPL-2.0-or-later
 //! PQ final signatures bound to an explicitly supplied governing configuration.
 //! The caller must authenticate that configuration and its place in chain history.
@@ -12,6 +13,9 @@ use rtos_block::{
     ValidatorDescr, ValidatorKey,
 };
 use std::{collections::HashMap, io::Cursor};
+
+mod network;
+pub use network::{PqNetworkSignatureSet, VerifiedPqNetworkSignatures};
 
 /// Immutable expected context, derived from the caller's governing configuration.
 /// Construction validates protocol consistency, not the origin of the config.
@@ -72,7 +76,7 @@ impl PqSessionContext {
     }
 }
 
-/// Live-only notarization quorum. This type intentionally has no serialization
+/// Live-only notarization quorum. This type intentionally has no on-chain serialization
 /// or conversion into the final-only on-chain #13 signature carrier.
 #[derive(Clone, Debug)]
 pub struct PqApproval {

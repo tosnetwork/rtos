@@ -239,3 +239,55 @@ async fn engine_owned_drain_top_shard_writer_flushes_accepted_work_and_reports_f
     assert!(sender.send(crate::shard_blocks::StoreAction::Remove(Default::default())).is_err());
     assert_eq!(Arc::strong_count(&writer), 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_owned_drain_cancelled_waiter_retains_server_and_sticky_failure() {
+    struct HeldServer {
+        started: tokio::sync::oneshot::Sender<()>,
+        gate: tokio::sync::Mutex<tokio::sync::oneshot::Receiver<()>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Stoppable for HeldServer {
+        fn name(&self) -> &'static str {
+            "controlled held server"
+        }
+        async fn shutdown(self: Box<Self>) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.send(()).unwrap();
+            self.gate.into_inner().await.unwrap();
+            panic!("controlled terminal server failure");
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    config(dir.path());
+    let engine = open(dir.path()).await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (started, entered) = tokio::sync::oneshot::channel();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    engine.servers.push(Box::new(HeldServer {
+        started,
+        gate: tokio::sync::Mutex::new(gate),
+        calls: calls.clone(),
+    }));
+    let first = tokio::spawn(engine.clone().wait_stop());
+    tokio::time::timeout(Duration::from_secs(10), entered).await.unwrap().unwrap();
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert!(tokio::time::timeout(Duration::from_millis(30), engine.clone().wait_stop())
+        .await
+        .is_err());
+    release.send(()).unwrap();
+    for _ in 0..2 {
+        let error = tokio::time::timeout(Duration::from_secs(15), engine.clone().wait_stop())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("controlled held server shutdown panicked"));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let weak = Arc::downgrade(&engine);
+    drop(engine);
+    assert!(weak.upgrade().is_none());
+    stopped(open(dir.path()).await).await;
+}

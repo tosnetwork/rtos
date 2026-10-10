@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration; owned consumer readiness and authenticated finality recovery.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -367,6 +367,10 @@ impl OverlayClient {
                 }
             });
         }
+    }
+
+    pub(crate) fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
+        self.ctx.cancellation_token.clone()
     }
 
     pub fn delete(&self) -> Result<bool> {
@@ -769,9 +773,19 @@ impl OverlayClient {
         }
     }
 
-    pub async fn wait_broadcast(&self) -> Result<Option<(Broadcast, Arc<KeyId>)>> {
+    pub fn subscribe_broadcast(&self) -> Result<adnl::BroadcastSubscription> {
+        self.ctx.overlay_node().subscribe_broadcast(&self.ctx.id)
+    }
+
+    pub async fn wait_broadcast(
+        &self,
+        subscription: &mut adnl::BroadcastSubscription,
+    ) -> Result<Option<(Broadcast, Arc<KeyId>, usize)>> {
+        if subscription.overlay_id() != &self.ctx.id {
+            fail!("Broadcast subscription belongs to another overlay");
+        }
         loop {
-            match self.ctx.overlay_node().wait_for_broadcast(&self.ctx.id).await? {
+            match subscription.recv().await? {
                 Some(info) => {
                     if let Ok(answer) = self
                         .ctx
@@ -779,7 +793,7 @@ impl OverlayClient {
                         .wire_profile()
                         .deserialize_typed::<Broadcast>(&info.data)
                     {
-                        return Ok(Some((answer, info.recv_from)));
+                        return Ok(Some((answer, info.recv_from, info.data.len())));
                     } else if let Ok(_telemetry) = self
                         .ctx
                         .overlay_node()

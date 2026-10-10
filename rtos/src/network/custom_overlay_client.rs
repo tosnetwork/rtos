@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration; owned consumer readiness and authenticated finality recovery.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -167,8 +167,9 @@ impl CustomOverlayClient {
                 }
                 continue;
             }
+            let subscription = self.stack.overlay.subscribe_broadcast(&self.id)?;
             self.is_active.store(true, Ordering::Relaxed);
-            self.clone().listen_broadcasts()?;
+            self.clone().listen_broadcasts(subscription)?;
             self.tasks.spawn_handle("custom overlay peer resolver", || {
                 NodeNetwork::spawn_overlay_peer_resolver(
                     key.id().clone(),
@@ -238,7 +239,10 @@ impl CustomOverlayClient {
         false
     }
 
-    fn listen_broadcasts(self: Arc<Self>) -> Result<()> {
+    fn listen_broadcasts(
+        self: Arc<Self>,
+        mut subscription: adnl::BroadcastSubscription,
+    ) -> Result<()> {
         let tasks = self.tasks.clone();
         tasks.spawn("custom overlay broadcast listener", async move {
             log::debug!(
@@ -250,7 +254,7 @@ impl CustomOverlayClient {
                 if self.engine.check_stop() || self.cancellation_token.is_cancelled() {
                     break;
                 }
-                let broadcast = tokio::select! { biased; _ = self.cancellation_token.cancelled() => break, result = self.stack.overlay.wait_for_broadcast(&self.id) => result };
+                let broadcast = tokio::select! { biased; _ = self.cancellation_token.cancelled() => break, result = subscription.recv() => result };
                 match broadcast {
                     Err(e) => log::error!(
                         "Error while wait_broadcast in custom overlay \"{}\" {}: {}",
@@ -305,6 +309,13 @@ impl CustomOverlayClient {
             self.id
         );
         match broadcast {
+            Broadcast::TonNode_BlockFinalityBroadcast(broadcast) => {
+                self.check_send_block_permission(src)?;
+                self.engine
+                    .clone()
+                    .process_block_finality_broadcast(broadcast, src.clone(), info.data.len())
+                    .await?;
+            }
             Broadcast::TonNode_BlockBroadcast(broadcast) => {
                 self.check_send_block_permission(src)?;
                 self.engine.clone().process_block_broadcast(broadcast, src.clone())

@@ -58,6 +58,8 @@ pub struct FullNodeOverlayService {
     engine: Arc<dyn EngineOperations>,
     compression: bool,
     tasks: Arc<OwnedTasks>,
+    #[cfg(test)]
+    block_download_queries: std::sync::atomic::AtomicUsize,
 }
 
 impl FullNodeOverlayService {
@@ -66,7 +68,18 @@ impl FullNodeOverlayService {
         compression: bool,
         tasks: Arc<OwnedTasks>,
     ) -> Self {
-        Self { engine, compression, tasks }
+        Self {
+            engine,
+            compression,
+            tasks,
+            #[cfg(test)]
+            block_download_queries: Default::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_block_download_queries(&self) -> usize {
+        self.block_download_queries.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     // tonNode.getNextBlockDescription prev_block:tonNode.blockIdExt = tonNode.BlockDescription;
@@ -276,6 +289,8 @@ impl FullNodeOverlayService {
 
     // tonNode.downloadBlockFull block:tonNode.blockIdExt = tonNode.DataFull;
     async fn download_block_full(&self, query: DownloadBlockFull) -> Result<TLObject> {
+        #[cfg(test)]
+        self.block_download_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut answer = DataFullBoxed::TonNode_DataFullEmpty;
         if let Some(handle) = self.engine.load_block_handle(&query.block)? {
             let has_proof_link = handle.has_proof_link();

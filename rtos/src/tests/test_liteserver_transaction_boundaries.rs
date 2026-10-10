@@ -68,11 +68,24 @@ fn fixture(
     Ok((raw, id, hashes))
 }
 async fn query(engine: Arc<BoundaryEngine>, request: TLObject) -> Result<TLObject> {
-    let subscriber =
-        LiteServerQuerySubscriber::new(tokio::runtime::Handle::current(), engine, 16, 16, 1)?;
+    raw_query(engine, serialize_boxed(&request)?, rtos_api::WireProfile::Legacy).await
+}
+async fn raw_query(
+    engine: Arc<BoundaryEngine>,
+    data: Vec<u8>,
+    profile: rtos_api::WireProfile,
+) -> Result<TLObject> {
+    let subscriber = LiteServerQuerySubscriber::new_with_profile(
+        profile,
+        tokio::runtime::Handle::current(),
+        engine,
+        16,
+        16,
+        1,
+    )?;
     let result = subscriber
         .try_consume_query(
-            Query { data: serialize_boxed(&request)? }.into_tl_object(),
+            Query { data }.into_tl_object(),
             &AdnlPeers::with_keys(KeyId::from_data([0; 32]), KeyId::from_data([0; 32])),
         )
         .await?;
@@ -83,9 +96,11 @@ async fn query(engine: Arc<BoundaryEngine>, request: TLObject) -> Result<TLObjec
     };
     match answer {
         Some(Answer::Object(reply)) => Ok(reply.object),
+        Some(Answer::Raw(reply)) => profile.deserialize(&reply.object),
         _ => fail!("boundary query did not return an object"),
     }
 }
+
 fn unhex(value: &str) -> Vec<u8> {
     value
         .as_bytes()
@@ -168,13 +183,20 @@ async fn liteserver_transaction_boundary_reference() -> Result<()> {
                 references.get(name.as_str()).ok_or_else(|| error!("missing reference {name}"))?;
             let fields: Vec<_> = row.split('\t').collect();
             if fields[0] == "ERROR" {
+                let expected: serde_json::Value = serde_json::from_str(fields[1])?;
+                let bytes = serialize_boxed(&reply)?;
+                assert_eq!(
+                    i32::from_le_bytes(bytes[4..8].try_into().unwrap()) as i64,
+                    expected["code"].as_i64().unwrap(),
+                    "{name}: public error code"
+                );
                 let error = reply
                     .clone()
                     .downcast::<ErrorEnum>()
                     .map_err(|_| error!("reference error, Rust success"))?;
                 if count < 0 {
                     assert!(
-                        error.message().contains("count must be"),
+                        error.message().contains("negative"),
                         "negative count is rejected before workchain validation"
                     );
                 }
@@ -275,6 +297,14 @@ async fn liteserver_one_transaction_boundary_reference() -> Result<()> {
                 }
                 let fields: Vec<_> = references[name.as_str()].split('\t').collect();
                 if fields[0] == "ERROR" {
+                    let reference_error: String = serde_json::from_str(fields[1])?;
+                    let code: i32 = reference_error.split('\t').nth(1).unwrap().parse()?;
+                    let bytes = serialize_boxed(&reply)?;
+                    assert_eq!(
+                        i32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                        code,
+                        "{name}: public error code"
+                    );
                     let error = reply.downcast::<ErrorEnum>().expect("wrong workchain is an error");
                     if !error.message().contains("cannot contain account") {
                         failures.push(format!("{name}: {}", error.message()));
@@ -311,5 +341,216 @@ async fn liteserver_one_transaction_boundary_reference() -> Result<()> {
         }
     }
     assert!(failures.is_empty(), "{} one-transaction differences: {:?}", failures.len(), failures);
+    Ok(())
+}
+
+#[tokio::test]
+async fn liteserver_transaction_error_reference() -> Result<()> {
+    let account = UInt256::from([0x22; 32]);
+    let references: HashMap<_, _> = include_str!("data/liteserver-transaction-errors.tsv")
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .collect();
+    let export = std::env::var_os("RTOS_LITESERVER_ERROR_EXPORT").map(std::path::PathBuf::from);
+    if let Some(path) = &export {
+        std::fs::create_dir_all(path)?;
+    }
+    let mut failures = vec![];
+    for (label, first, len, lt) in [
+        ("low", 500, 20, 519),
+        ("high", (1_u64 << 63) - 8, 20, i64::MIN),
+        ("edge", u64::MAX - 1, 1, -2),
+    ] {
+        let (raw, id, hashes) = fixture(first, len, &account)?;
+        for variant in [
+            "zero-hash",
+            "wrong-hash",
+            "missing-account",
+            "zero-count",
+            "negative-count-invalid-wc",
+            "zero-count-invalid-wc",
+            "negative-count-truncated",
+            "positive-count-truncated",
+            "count-truncated-4",
+            "count-truncated-5",
+            "count-truncated-7",
+        ] {
+            let name = format!("{label}-{variant}");
+            let mut count = 1;
+            let mut workchain = -1;
+            let mut addr = account.clone();
+            let mut hash = hashes[&(lt as u64)].clone();
+            match variant {
+                "zero-hash" => hash = UInt256::ZERO,
+                "wrong-hash" => hash = UInt256::from([0x55; 32]),
+                "missing-account" => addr = UInt256::from([0x33; 32]),
+                "zero-count" => count = 0,
+                "negative-count-invalid-wc" => {
+                    count = -1;
+                    workchain = INVALID_WORKCHAIN_ID;
+                }
+                "zero-count-invalid-wc" => {
+                    count = 0;
+                    workchain = INVALID_WORKCHAIN_ID;
+                }
+                "negative-count-truncated" => count = -1,
+                "positive-count-truncated"
+                | "count-truncated-4"
+                | "count-truncated-5"
+                | "count-truncated-7" => {}
+                _ => unreachable!(),
+            }
+            let engine = Arc::new(BoundaryEngine {
+                id: id.clone(),
+                data: raw.clone(),
+                lookups: Mutex::new(vec![]),
+                allocated: create_engine_allocated(),
+                #[cfg(feature = "telemetry")]
+                telemetry: create_engine_telemetry(),
+            });
+            let request =
+                GetTransactions { count, account: AccountIdTl { workchain, id: addr }, lt, hash }
+                    .into_tl_object();
+            let mut raw_request = serialize_boxed(&request)?;
+            if variant == "negative-count-truncated" || variant == "positive-count-truncated" {
+                raw_request.truncate(8);
+            }
+            if let Some(len) = variant.strip_prefix("count-truncated-") {
+                raw_request.truncate(len.parse()?);
+            }
+            let reply = raw_query(engine, raw_request.clone(), rtos_api::WireProfile::Legacy).await;
+            if let Some(path) = &export {
+                std::fs::write(path.join(format!("{name}.block.boc")), &raw)?;
+                std::fs::write(path.join(format!("{name}.query.bin")), &raw_request)?;
+            }
+            let reply = match reply {
+                Ok(reply) => reply,
+                Err(error) => {
+                    failures.push(format!("{name}: unframed error {error}"));
+                    continue;
+                }
+            };
+            let bytes = serialize_boxed(&reply)?;
+            if let Some(path) = &export {
+                std::fs::write(path.join(format!("{name}.rust.bin")), &bytes)?;
+            }
+            let fields: Vec<_> = references[name.as_str()].split('\t').collect();
+            if fields[0] == "ERROR" {
+                match reply.downcast::<ErrorEnum>() {
+                    Ok(error) => {
+                        let code = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                        if code != fields[1].parse::<i32>()? {
+                            failures.push(format!("{name}: code {code}, expected {}", fields[1]));
+                        }
+                        let message = fields[2].strip_suffix(" at 8").unwrap_or(fields[2]);
+                        let category_matches = if variant == "positive-count-truncated"
+                            || variant.starts_with("count-truncated-")
+                        {
+                            !error.message().contains("negative")
+                        } else {
+                            error.message().contains(message)
+                        };
+                        if !category_matches {
+                            failures
+                                .push(format!("{name}: wrong error category {}", error.message()));
+                        }
+                    }
+                    Err(_) => failures.push(format!("{name}: reference rejection, Rust success")),
+                }
+            } else {
+                let actual = reply
+                    .downcast::<rtos_api::ton::lite_server::TransactionList>()
+                    .expect("zero count is successful");
+                assert!(actual.ids().is_empty());
+                assert!(actual.transactions().is_empty());
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{} error semantics differences: {:?}", failures.len(), failures);
+    Ok(())
+}
+
+#[tokio::test]
+async fn liteserver_transaction_decode_profile_boundaries() -> Result<()> {
+    use rtos_api::{Constructor, WireProfile};
+    let export = std::env::var_os("RTOS_LITESERVER_DECODE_EXPORT").map(std::path::PathBuf::from);
+    if let Some(path) = &export {
+        std::fs::create_dir_all(path)?;
+    }
+    let account = UInt256::from([0x22; 32]);
+    let (raw, id, hashes) = fixture(500, 20, &account)?;
+    let engine = Arc::new(BoundaryEngine {
+        id,
+        data: raw,
+        lookups: Mutex::new(vec![]),
+        allocated: create_engine_allocated(),
+        #[cfg(feature = "telemetry")]
+        telemetry: create_engine_telemetry(),
+    });
+    for profile in [WireProfile::Legacy, WireProfile::T0] {
+        for (count, length) in [(-1, 84), (-1, 8), (1, 8), (1, 4), (1, 5), (1, 7)] {
+            let request = GetTransactions {
+                count,
+                account: AccountIdTl { workchain: INVALID_WORKCHAIN_ID, id: account.clone() },
+                lt: 519,
+                hash: hashes[&519].clone(),
+            };
+            let mut bytes = profile.serialize(&request)?;
+            assert_eq!(
+                bytes,
+                WireProfile::Legacy.serialize(&request)?,
+                "getTransactions has a shared constructor/layout"
+            );
+            bytes.truncate(length);
+            if let Some(path) = &export {
+                std::fs::write(
+                    path.join(format!("{profile:?}-list-{count}-{length}.query.bin")),
+                    &bytes,
+                )?;
+            }
+            let reply = raw_query(engine.clone(), bytes, profile).await?;
+            let bytes = serialize_boxed(&reply)?;
+            let error = reply.downcast::<ErrorEnum>().expect("decode error is a public reply");
+            assert_eq!(i32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0);
+            assert_eq!(error.message().contains("negative"), count < 0);
+        }
+    }
+    for profile in [WireProfile::Legacy, WireProfile::T0] {
+        let request = GetOneTransaction {
+            id: engine.id.clone(),
+            account: AccountIdTl { workchain: -1, id: account.clone() },
+            lt: 519,
+        };
+        for line in include_str!("data/liteserver-one-transaction-decode-errors.tsv").lines() {
+            let fields: Vec<_> = line.split('\t').collect();
+            let mut bytes = profile.serialize(&request)?;
+            bytes.truncate(fields[0].parse()?);
+            if let Some(path) = &export {
+                std::fs::write(
+                    path.join(format!("{profile:?}-one-{}.query.bin", fields[0])),
+                    &bytes,
+                )?;
+            }
+            let reply = raw_query(engine.clone(), bytes, profile).await?;
+            let bytes = serialize_boxed(&reply)?;
+            let error = reply
+                .downcast::<ErrorEnum>()
+                .expect("one-transaction decode error is a public reply");
+            assert_eq!(
+                i32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                fields[2].parse::<i32>()?
+            );
+            assert!(!error.message().contains("negative"));
+        }
+    }
+    for constructor in [GetOneTransaction::constructor_const(), 0xdeadbeef] {
+        let mut bytes = constructor.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&(-1_i32).to_le_bytes());
+        assert!(
+            raw_query(engine.clone(), bytes, WireProfile::T0).await.is_err(),
+            "wrong-profile or unknown constructor is not a count precheck"
+        );
+    }
+    assert!(engine.lookups.lock().unwrap().is_empty());
     Ok(())
 }

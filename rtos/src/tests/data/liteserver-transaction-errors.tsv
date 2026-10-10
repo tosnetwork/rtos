@@ -1,0 +1,33 @@
+low-zero-hash	ERROR	-400	transaction hash mismatch
+low-wrong-hash	ERROR	-400	transaction hash mismatch
+low-missing-account	ERROR	-400	cannot locate transaction in block with specified logical time
+low-zero-count	OK	0	3adab48d0000000000000000
+low-negative-count-invalid-wc	ERROR	0	Variable of type # can't be negative at 8
+low-zero-count-invalid-wc	ERROR	-400	invalid workchain specified
+low-negative-count-truncated	ERROR	0	Variable of type # can't be negative at 8
+low-positive-count-truncated	ERROR	0	Not enough data to read at 8
+low-count-truncated-4	ERROR	0	Not enough data to read at 4
+low-count-truncated-5	ERROR	0	Not enough data to read at 4
+low-count-truncated-7	ERROR	0	Not enough data to read at 4
+high-zero-hash	ERROR	-400	transaction hash mismatch
+high-wrong-hash	ERROR	-400	transaction hash mismatch
+high-missing-account	ERROR	-400	cannot locate transaction in block with specified logical time
+high-zero-count	OK	0	3adab48d0000000000000000
+high-negative-count-invalid-wc	ERROR	0	Variable of type # can't be negative at 8
+high-zero-count-invalid-wc	ERROR	-400	invalid workchain specified
+high-negative-count-truncated	ERROR	0	Variable of type # can't be negative at 8
+high-positive-count-truncated	ERROR	0	Not enough data to read at 8
+high-count-truncated-4	ERROR	0	Not enough data to read at 4
+high-count-truncated-5	ERROR	0	Not enough data to read at 4
+high-count-truncated-7	ERROR	0	Not enough data to read at 4
+edge-zero-hash	ERROR	-400	transaction hash mismatch
+edge-wrong-hash	ERROR	-400	transaction hash mismatch
+edge-missing-account	ERROR	-400	cannot locate transaction in block with specified logical time
+edge-zero-count	OK	0	3adab48d0000000000000000
+edge-negative-count-invalid-wc	ERROR	0	Variable of type # can't be negative at 8
+edge-zero-count-invalid-wc	ERROR	-400	invalid workchain specified
+edge-negative-count-truncated	ERROR	0	Variable of type # can't be negative at 8
+edge-positive-count-truncated	ERROR	0	Not enough data to read at 8
+edge-count-truncated-4	ERROR	0	Not enough data to read at 4
+edge-count-truncated-5	ERROR	0	Not enough data to read at 4
+edge-count-truncated-7	ERROR	0	Not enough data to read at 4

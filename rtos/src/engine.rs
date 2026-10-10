@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; owned consumer readiness and authenticated finality recovery.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -109,6 +109,8 @@ pub struct Engine {
     candidate_db: CandidateDbPool,
     network: Arc<NodeNetwork>,
     owned_services: std::sync::Mutex<EngineOwners>,
+    shutdown_started: std::sync::Mutex<bool>,
+    shutdown_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
     ingress_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
     persistence_tasks: crate::types::owned_tasks::OwnedTasks,
 
@@ -129,6 +131,7 @@ pub struct Engine {
     flags: EngineFlags,
     archives_life_time_hours: Option<u32>,
     shard_blocks: ShardBlocksPool,
+    pub(crate) pending_finality: crate::full_node::finality::SharedPendingFinality,
     candidates_cache: parking_lot::Mutex<lru::LruCache<BlockIdExt, Arc<Vec<u8>>>>,
     last_applied_mc_block_seqno: AtomicU32,
     last_applied_mc_block_utime: AtomicU32,
@@ -822,6 +825,8 @@ impl Engine {
             archives_life_time_hours,
             network,
             owned_services: std::sync::Mutex::new(EngineOwners::default()),
+            shutdown_started: std::sync::Mutex::new(false),
+            shutdown_tasks: Arc::new(crate::types::owned_tasks::OwnedTasks::default()),
             ingress_tasks: Arc::new(crate::types::owned_tasks::OwnedTasks::new(
                 tokio_util::sync::CancellationToken::new(),
             )),
@@ -829,6 +834,7 @@ impl Engine {
                 tokio_util::sync::CancellationToken::new(),
             ),
             shard_blocks: shard_blocks_pool,
+            pending_finality: Default::default(),
             candidates_cache: parking_lot::Mutex::new(lru::LruCache::new(
                 Self::CANDIDATES_CACHE_SIZE.try_into()?,
             )),
@@ -914,9 +920,29 @@ impl Engine {
     }
 
     pub async fn wait_stop(self: Arc<Self>) -> Result<()> {
+        let tasks = self.shutdown_tasks.clone();
+        {
+            let mut started = self.shutdown_started.lock().unwrap();
+            if !*started {
+                let engine = self.clone();
+                let result_owner = tasks.clone();
+                tasks.spawn("Engine shutdown", async move {
+                    if let Err(error) = engine.wait_stop_inner().await {
+                        result_owner.record_error(format!("Engine shutdown: {error}"));
+                    }
+                })?;
+                *started = true;
+            }
+        }
+        tasks.wait().await
+    }
+
+    async fn wait_stop_inner(self: Arc<Self>) -> Result<()> {
         // set stop flag
         self.stopper.set_stop();
         self.ingress_tasks.stop();
+        let finality_tasks = self.pending_finality.lock().tasks.clone();
+        finality_tasks.stop();
         let (router, queue) = {
             let mut owners = self.owned_services.lock().unwrap();
             owners.stopping = true;
@@ -933,10 +959,14 @@ impl Engine {
         // stop servers
         let mut tasks = Vec::new();
         while let Some(server) = self.servers.pop() {
+            let stopper = self.stopper.clone();
             tasks.push(async move {
+                use futures::FutureExt;
                 let name = server.name();
                 log::info!("Stopping {name} server...");
-                server.shutdown().await;
+                if std::panic::AssertUnwindSafe(server.shutdown()).catch_unwind().await.is_err() {
+                    stopper.report_service_failure(0, format!("{name} shutdown panicked"));
+                }
                 log::info!("Stopped {name} server");
             });
         }
@@ -977,17 +1007,19 @@ impl Engine {
             self.stopper.report_service_failure(0, format!("broadcast ingress: {error}"));
         }
 
-        // stop states GC
-        let engine = self.clone();
-        tokio::spawn(async move {
-            engine.db.stop_states_db().await;
-            engine.stopper.release_stop(Self::MASK_SERVICE_SHARDSTATE_GC);
-        });
+        if let Err(error) = finality_tasks.wait().await {
+            self.stopper.report_service_failure(0, format!("finality recovery: {error}"));
+        }
 
-        // wait while all node's services will stop
-        // Failure sources are sticky. Still finish transport cleanup before
-        // returning the final result, including failures reported during it.
-        let _ = self.stopper.clone().wait_stop().await;
+        // The retained shutdown supervisor owns both futures. Cancelling an
+        // external waiter cannot detach GC or start a second GC shutdown.
+        let (_, _) = tokio::join!(
+            async {
+                self.db.stop_states_db().await;
+                self.stopper.release_stop(Self::MASK_SERVICE_SHARDSTATE_GC);
+            },
+            self.stopper.clone().wait_stop(),
+        );
         // Producers have stopped. Close the queue and flush accepted metadata
         // writes before releasing the Engine/database owner.
         if let Err(error) = self.persistence_tasks.wait().await {
@@ -1042,6 +1074,12 @@ impl Engine {
 
     pub async fn overlay_client(&self, shard: &ShardIdent) -> Result<Arc<FullNodeOverlayClient>> {
         self.overlays_router()?.overlay_client(shard).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn initialize_test_full_node_overlays(self: &Arc<Self>) -> Result<()> {
+        self.initialize_full_node_overlays(DhtSearchPolicy::default()).await?;
+        Ok(())
     }
 
     pub fn overlays_router(&self) -> Result<Arc<FullNodeOverlaysRouter>> {
@@ -1270,6 +1308,13 @@ impl Engine {
         &self.split_queues_cache
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_monitoring(&self, depth: u8, mask: u64) {
+        assert!(depth <= Self::MAX_MONITOR_MIN_SPLIT);
+        self.monitor_min_split.store(depth, Ordering::Relaxed);
+        self.monitored_shards.store(mask, Ordering::Relaxed);
+    }
+
     pub fn need_monitor(&self, shard: &ShardIdent) -> Result<bool> {
         if shard.is_masterchain() {
             return Ok(true);
@@ -1279,7 +1324,8 @@ impl Engine {
             let monitored_shards = self.monitored_shards.load(Ordering::Relaxed);
             for i in 0..(1 << monitor_min_split) as u64 {
                 if (1 << i) & monitored_shards != 0 {
-                    let shard_prefix = i << (64 - monitor_min_split);
+                    let shard_prefix =
+                        if monitor_min_split == 0 { 0 } else { i << (64 - monitor_min_split) };
                     let monitored_shard = ShardIdent::with_prefix_len(
                         monitor_min_split,
                         shard.workchain_id(),

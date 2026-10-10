@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project naming and bounded Plumtree consumer admission; explicit target wire profile integration.
+ * RTOS project modifications (2026-10-10): project naming and bounded Plumtree consumer admission; explicit target wire profile integration; owned consumer readiness and authenticated finality recovery.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -505,6 +505,8 @@ pub(crate) struct AsyncReceiver<T> {
     subscribers: lockfree::queue::Queue<Arc<tokio::sync::Barrier>>,
     sync: AtomicU32,
     started_receiving: AtomicBool,
+    leased: AtomicBool,
+    leased_notify: tokio::sync::Notify,
     pending_items: AtomicUsize,
     bounded_closed: std::sync::Mutex<bool>,
     alive_tasks: AtomicU32,
@@ -534,11 +536,50 @@ impl<T: Send + 'static> AsyncReceiver<T> {
             subscribers: lockfree::queue::Queue::new(),
             sync: AtomicU32::new(0),
             started_receiving: AtomicBool::new(false),
+            leased: AtomicBool::new(false),
+            leased_notify: tokio::sync::Notify::new(),
             pending_items: AtomicUsize::new(0),
             bounded_closed: std::sync::Mutex::new(false),
             alive_tasks: AtomicU32::new(0),
             total_spawned: AtomicU64::new(0),
         })
+    }
+
+    pub(crate) fn subscribe(&self) -> Result<()> {
+        let closed = self.bounded_closed.lock().unwrap();
+        if *closed || self.leased.swap(true, Ordering::AcqRel) {
+            fail!("Receiver is closed or already has an owned subscription");
+        }
+        // Readiness admits bounded producers immediately. Historical unbounded
+        // producers retain their old first-receive boundary while unsynced.
+        Ok(())
+    }
+
+    pub(crate) fn has_subscription(&self) -> bool {
+        self.leased.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn pop_subscribed(&self) -> Result<Option<T>> {
+        if !self.has_subscription() {
+            fail!("Receiver subscription was released");
+        }
+        self.started_receiving.store(true, Ordering::Release);
+        loop {
+            let notified = self.leased_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(data) = self.data.pop() {
+                self.pending_items.fetch_sub(1, Ordering::AcqRel);
+                return Ok(data);
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn release_subscription(self: &Arc<Self>) {
+        self.leased.store(false, Ordering::Release);
+        self.started_receiving.store(false, Ordering::Release);
+        self.stop();
     }
 
     pub(crate) fn push(self: &Arc<Self>, data: T) {
@@ -566,6 +607,9 @@ impl<T: Send + 'static> AsyncReceiver<T> {
         // Serialize bounded admission with the closing sentinel. Previously
         // admitted values precede it; no bounded value can be queued after it.
         let mut closed = self.bounded_closed.lock().unwrap();
+        if *closed {
+            return;
+        }
         *closed = true;
         self.do_push(None)
     }
@@ -574,7 +618,8 @@ impl<T: Send + 'static> AsyncReceiver<T> {
     /// Existing producers retain their prior admission behavior.
     pub(crate) fn try_push_bounded(self: &Arc<Self>, data: T, limit: usize) -> bool {
         let closed = self.bounded_closed.lock().unwrap();
-        if *closed || !self.started_receiving.load(Ordering::Acquire) {
+        if *closed || (!self.started_receiving.load(Ordering::Acquire) && !self.has_subscription())
+        {
             return false;
         }
         if self
@@ -597,6 +642,7 @@ impl<T: Send + 'static> AsyncReceiver<T> {
 
     fn do_push_reserved(self: &Arc<Self>, data: Option<T>) {
         self.data.push(data);
+        self.leased_notify.notify_one();
         if self.sync.load(Ordering::Relaxed) == 0 {
             return;
         }
@@ -1613,6 +1659,42 @@ where
 #[cfg(test)]
 mod bounded_receiver_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn owned_subscription_is_ready_before_poll_and_closes_on_release() {
+        let receiver = AsyncReceiver::new();
+        receiver.subscribe().unwrap();
+        assert!(receiver.subscribe().is_err());
+        assert!(receiver.has_subscription());
+        receiver.push(99);
+        assert_eq!(
+            receiver.pending_items.load(Ordering::Acquire),
+            0,
+            "owned readiness must not start legacy unbounded ingress before first receive"
+        );
+        for value in 0..4 {
+            assert!(receiver.try_push_bounded(value, 4));
+        }
+        assert!(!receiver.try_push_bounded(5, 4));
+        for value in 0..4 {
+            assert_eq!(receiver.pop_subscribed().await.unwrap(), Some(value));
+        }
+        // Cancel a wait repeatedly. Owned receive uses Notify, so cancellation
+        // cannot leave abandoned two-party barriers or wake tasks behind.
+        for _ in 0..20 {
+            let mut waiting = Box::pin(receiver.pop_subscribed());
+            assert!(matches!(futures::poll!(&mut waiting), std::task::Poll::Pending));
+        }
+        assert_eq!(receiver.alive_tasks.load(Ordering::Acquire), 0);
+        assert!(receiver.try_push_bounded(9, 4));
+        assert_eq!(receiver.pop_subscribed().await.unwrap(), Some(9));
+        receiver.release_subscription();
+        assert!(!receiver.has_subscription());
+        assert!(!receiver.try_push_bounded(10, 4));
+        assert!(receiver.subscribe().is_err());
+        receiver.stop(); // closing is idempotent
+        assert_eq!(receiver.pending_items.load(Ordering::Acquire), 1);
+    }
 
     #[tokio::test]
     async fn concurrent_bounded_admission_and_drain() {

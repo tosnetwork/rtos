@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration; owned consumer readiness and authenticated finality recovery.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -25,6 +25,7 @@ pub mod telemetry;
 
 use crate::{block::BlockStuff, block_proof::BlockProofStuff, engine_traits::EngineOperations};
 use rtos_api::{
+    pq_finality::PqNetworkSignatureSet,
     serialize_boxed,
     ton::{
         ton_node::{
@@ -89,9 +90,15 @@ fn decompress_block_broadcast(
 ///
 /// Contains signatures as `BlockSignaturesVariant` which supports both
 /// ordinary (catchain) and simplex signature schemes.
+#[derive(Clone, Debug)]
+pub enum NetworkSignatureSet {
+    Classical(BlockSignaturesVariant),
+    PostQuantum(PqNetworkSignatureSet),
+}
+
 pub struct BlockBroadcastV2 {
     pub id: BlockIdExt,
-    pub signatures: BlockSignaturesVariant,
+    pub signatures: NetworkSignatureSet,
     pub proof: Vec<u8>,
     pub data: Vec<u8>,
 }
@@ -161,8 +168,10 @@ fn unpack_pure_signatures(signatures: &[BlockSignature]) -> Result<BlockSignatur
 /// Pack BlockSignaturesVariant into TL SignatureSet for V2 broadcast
 pub(crate) fn pack_signature_set(signatures: &BlockSignaturesVariant) -> Result<SignatureSet> {
     match signatures {
-        BlockSignaturesVariant::SimplexPq(_) => {
-            fail!("PQ network signature encoding is not yet implemented")
+        BlockSignaturesVariant::SimplexPq(signatures) => {
+            Ok(SignatureSet::TonNode_SignatureSet_SimplexPq(
+                PqNetworkSignatureSet::from_final_fields(signatures)?.to_node(),
+            ))
         }
         BlockSignaturesVariant::Ordinary(sigs) => {
             let packed = pack_block_signatures(sigs)?;
@@ -193,18 +202,23 @@ pub(crate) fn pack_signature_set(signatures: &BlockSignaturesVariant) -> Result<
 }
 
 /// Unpack TL SignatureSet into BlockSignaturesVariant
-pub(crate) fn unpack_signature_set(sig_set: SignatureSet) -> Result<BlockSignaturesVariant> {
-    match sig_set {
+pub(crate) fn unpack_signature_set(sig_set: SignatureSet) -> Result<NetworkSignatureSet> {
+    let classical = match sig_set {
+        SignatureSet::TonNode_SignatureSet_SimplexPq(signatures) => {
+            return Ok(NetworkSignatureSet::PostQuantum(PqNetworkSignatureSet::from_node(
+                signatures,
+            )?));
+        }
         SignatureSet::TonNode_SignatureSet_Ordinary(sigs) => {
             let validator_info = ValidatorBaseInfo::with_params(
                 sigs.validator_set_hash as u32,
                 sigs.cc_seqno as u32,
             );
             let pure_signatures = unpack_pure_signatures(&sigs.signatures)?;
-            Ok(BlockSignaturesVariant::Ordinary(BlockSignatures::with_params(
+            BlockSignaturesVariant::Ordinary(BlockSignatures::with_params(
                 validator_info,
                 pure_signatures,
-            )))
+            ))
         }
         SignatureSet::TonNode_SignatureSet_Simplex(sigs) => {
             let validator_info = ValidatorBaseInfo::with_params(
@@ -224,9 +238,10 @@ pub(crate) fn unpack_signature_set(sig_set: SignatureSet) -> Result<BlockSignatu
                 candidate,
                 is_final,
             );
-            Ok(BlockSignaturesVariant::Simplex(simplex_sigs))
+            BlockSignaturesVariant::Simplex(simplex_sigs)
         }
-    }
+    };
+    Ok(NetworkSignatureSet::Classical(classical))
 }
 
 fn build_block_broadcast(

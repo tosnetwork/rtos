@@ -1,3 +1,4 @@
+// RTOS modifications (2026-10-10): owned consumer readiness and authenticated finality recovery.
 /*
  * RTOS project additions (2026-10-10): authenticated Plumtree overlay transport.
  * Licensed under the GNU General Public License v3.0.
@@ -1386,6 +1387,7 @@ mod transport_tests {
         addr: SocketAddr,
         token: CancellationToken,
         reports: tokio::sync::mpsc::UnboundedReceiver<([u8; 32], bool)>,
+        subscriptions: std::sync::Mutex<Vec<super::super::BroadcastSubscription>>,
     }
     impl Drop for Endpoint {
         fn drop(&mut self) {
@@ -1420,7 +1422,7 @@ mod transport_tests {
         );
         quic.add_key(&[seed; 32], key.id(), addr).unwrap();
         overlay.set_quic(quic.clone()).unwrap();
-        Endpoint { overlay, key, quic, addr, token, reports }
+        Endpoint { overlay, key, quic, addr, token, reports, subscriptions: Default::default() }
     }
     fn config(key: &Arc<dyn KeyOption>) -> PlumtreeConfig {
         PlumtreeConfig {
@@ -1465,6 +1467,15 @@ mod transport_tests {
                     None,
                 )
                 .unwrap();
+            assert!(local
+                .overlay
+                .configure_plumtree(&id, config(&a.key), &tokio::runtime::Handle::current())
+                .is_err());
+            local
+                .subscriptions
+                .lock()
+                .unwrap()
+                .push(local.overlay.subscribe_broadcast(&id).unwrap());
             local
                 .overlay
                 .configure_plumtree(&id, config(&a.key), &tokio::runtime::Handle::current())
@@ -1475,6 +1486,55 @@ mod transport_tests {
             );
         }
         (a, b, id)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn owned_consumer_isolated_across_real_overlay_recreation() {
+        let (a, b, id) = pair().await;
+        let mut old = b.subscriptions.lock().unwrap().pop().unwrap();
+        b.overlay.delete_private_overlay(&id).unwrap();
+        assert!(old.recv().await.unwrap().is_none());
+        b.overlay
+            .add_private_overlay(
+                OverlayParams::with_id_only(&id),
+                &b.key,
+                &[a.key.id().clone()],
+                true,
+                None,
+            )
+            .unwrap();
+        let mut new = b.overlay.subscribe_broadcast(&id).unwrap();
+        assert!(b.overlay.subscribe_broadcast(&id).is_err());
+        b.overlay
+            .configure_plumtree(&id, config(&a.key), &tokio::runtime::Handle::current())
+            .unwrap();
+        // Dropping an old generation cannot close or unsubscribe the replacement.
+        drop(old);
+        let send = a.overlay.broadcast_plumtree(
+            &id,
+            &a.key,
+            Certificate::Overlay_EmptyCertificate,
+            0,
+            Some([109; 32]),
+            b"new generation payload",
+        );
+        let (received, sent) =
+            tokio::time::timeout(Duration::from_secs(15), async { tokio::join!(new.recv(), send) })
+                .await
+                .unwrap();
+        sent.unwrap();
+        assert_eq!(received.unwrap().unwrap().data, b"new generation payload");
+        drop(new);
+        assert!(!b
+            .overlay
+            .get_overlay(&id, "closed consumer")
+            .unwrap()
+            .received_rawbytes
+            .has_subscription());
+        assert!(
+            b.overlay.subscribe_broadcast(&id).is_err(),
+            "closed generation cannot be silently reactivated"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1603,6 +1663,11 @@ mod transport_tests {
             let mut cfg = config(&a.key);
             cfg.fixed_members = false;
             cfg.original_sender = endpoint.key.id() == a.key.id();
+            endpoint
+                .subscriptions
+                .lock()
+                .unwrap()
+                .push(endpoint.overlay.subscribe_broadcast(&id).unwrap());
             endpoint
                 .overlay
                 .configure_plumtree(&id, cfg, &tokio::runtime::Handle::current())

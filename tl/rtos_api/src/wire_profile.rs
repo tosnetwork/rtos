@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): explicit target wire profiles.
+ * RTOS project modifications (2026-10-10): explicit target wire profiles; owned consumer readiness and authenticated finality recovery.
  * Copyright (C) 2026 RTOS contributors.
  * Licensed under the GNU General Public License v3.0.
  * See the LICENSE file in the root of this repository.
@@ -162,6 +162,10 @@ const CONSTRUCTORS: &[(u32, u32)] = &[
     (0x1d7235ae, 0x79378446), // tosNode.zeroStateIdExt
 ];
 
+// These carriers never existed in the historical generated network domain.
+const TARGET_ONLY: &[u32] =
+    &[0x535666d0, 0x590da166, 0x5e6f085d, 0x8f4731ef, 0xfb759362, 0xf9f0b390];
+
 const UNSUPPORTED: &[u32] = &[
     0xc85af8a4, // consensus.simplex.db.cert
     0xaf37a688, 0x7cb0ed4d, // consensus.simplex.db.vote
@@ -180,6 +184,9 @@ const UNSUPPORTED: &[u32] = &[
 impl WireProfile {
     pub(crate) fn encode_constructor(self, id: u32) -> Result<u32> {
         if self == Self::Legacy {
+            if TARGET_ONLY.contains(&id) {
+                fail!("Target-only constructor {id:08x} has no legacy wire codec");
+            }
             return Ok(id);
         }
         if UNSUPPORTED.contains(&id) {
@@ -190,6 +197,9 @@ impl WireProfile {
 
     pub(crate) fn decode_constructor(self, id: u32) -> Result<u32> {
         if self == Self::Legacy {
+            if TARGET_ONLY.contains(&id) {
+                fail!("Target-only constructor {id:08x} has no legacy wire codec");
+            }
             return Ok(id);
         }
         if UNSUPPORTED.contains(&id) {

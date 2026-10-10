@@ -1363,3 +1363,145 @@ async fn test_monitor_history_rejects_foreign_cached_authority() {
     assert!(history.is_none());
     assert!(engine.stored.lock().is_empty());
 }
+
+#[tokio::test]
+async fn historical_broadcast_context_authenticates_old_epoch_after_rotation() {
+    use rtos_block::*;
+    use std::sync::atomic::AtomicUsize;
+    let chain: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tl/rtos_api/tests/data/bootstrap-history.json"
+    ))
+    .unwrap();
+    let warm: serde_json::Value =
+        serde_json::from_str(include_str!("../../../tl/rtos_api/tests/data/warm-history.json"))
+            .unwrap();
+    let anchor = bootstrap_fixture_proof(
+        &serde_json::json!({"block_boc": chain["anchor_boc"]}),
+        false,
+        false,
+    );
+    let first = bootstrap_fixture_proof(&chain["cases"][1], true, false);
+    let second = bootstrap_fixture_proof(&chain["cases"][2], true, false);
+    let latest = bootstrap_fixture_proof(&warm, true, false);
+    let state = ShardStateUnsplit::construct_from_bytes(
+        &hex::decode(warm["state_boc"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let state = crate::shard_state::ShardStateStuff::from_state(
+        latest.id().clone(),
+        state,
+        #[cfg(feature = "telemetry")]
+        &crate::collator_test_bundle::create_engine_telemetry(),
+        &crate::collator_test_bundle::create_engine_allocated(),
+    )
+    .unwrap();
+    let handles = crate::collator_test_bundle::create_block_handle_storage(None).unwrap();
+    let entries = [anchor.clone(), first.clone(), second.clone()]
+        .into_iter()
+        .map(|proof| {
+            let handle = handles
+                .create_handle(proof.id().clone(), storage::types::BlockMeta::default(), None)
+                .unwrap()
+                .unwrap();
+            handle.set_data();
+            handle.set_proof();
+            handle.set_block_applied();
+            (handle, proof)
+        })
+        .collect();
+    let mut engine = RecoveryProofEngine {
+        pin: anchor.id().clone(),
+        state,
+        entries,
+        next: None,
+        previous: None,
+        saves: AtomicUsize::new(0),
+        stores: AtomicUsize::new(0),
+        proof_reads: AtomicUsize::new(0),
+        verifier: Default::default(),
+    };
+    // The history fixture predates broadcast header binding. Use a separately
+    // signed block whose header catchain/subset match its certificate.
+    let broadcast: serde_json::Value = serde_json::from_str(include_str!(
+        "../full_node/finality/testdata/historical-broadcast.json"
+    ))
+    .unwrap();
+    let second = bootstrap_fixture_proof(&broadcast, true, false);
+    let block = second.virtualize_block().unwrap().0;
+    assert!(
+        crate::full_node::shard_client::pq_broadcast_context(&engine.state, second.id(), &block)
+            .is_err(),
+        "fixture must require historical rather than current governing config"
+    );
+    let context = crate::full_node::shard_client::resolve_pq_broadcast_context(
+        &engine,
+        &engine.state,
+        second.id(),
+        &block,
+    )
+    .await
+    .unwrap();
+    let BlockSignaturesVariant::SimplexPq(carrier) = second.clone().drain_signatures().unwrap()
+    else {
+        panic!("PQ fixture required")
+    };
+    let network =
+        rtos_api::pq_finality::PqNetworkSignatureSet::from_final_fields(&carrier).unwrap();
+    context.verify_network(&network).unwrap();
+    let mut corrupt = carrier.clone();
+    corrupt.signatures[0].signature[0] ^= 1;
+    assert!(context
+        .verify_network(
+            &rtos_api::pq_finality::PqNetworkSignatureSet::from_final_fields(&corrupt).unwrap()
+        )
+        .is_err());
+    // Current state's lookup coordinates alone cannot grant historical authority.
+    // Even an applied/data/proof-marked old key block must authenticate from pin.
+    engine.entries[1].1 = bootstrap_fixture_proof(&chain["cases"][1], true, true);
+    assert!(crate::full_node::shard_client::resolve_pq_broadcast_context(
+        &engine,
+        &engine.state,
+        second.id(),
+        &block
+    )
+    .await
+    .is_err());
+    engine.entries[1].1 = first;
+    for epoch in [engine.pin.seq_no() - 1, u32::MAX] {
+        let mut altered = block.clone();
+        let mut header = altered.read_info().unwrap();
+        header.set_prev_key_block_seqno(epoch);
+        altered.write_info(&header).unwrap();
+        assert!(
+            crate::full_node::shard_client::resolve_pq_broadcast_context(
+                &engine,
+                &engine.state,
+                second.id(),
+                &altered
+            )
+            .await
+            .is_err(),
+            "forged epoch must not resolve trusted authority"
+        );
+    }
+    let mut foreign = block.clone();
+    foreign.set_global_id(block.global_id().wrapping_add(1));
+    assert!(crate::full_node::shard_client::resolve_pq_broadcast_context(
+        &engine,
+        &engine.state,
+        second.id(),
+        &foreign
+    )
+    .await
+    .is_err());
+    engine.pin.file_hash = UInt256::from([55; 32]);
+    assert!(crate::full_node::shard_client::resolve_pq_broadcast_context(
+        &engine,
+        &engine.state,
+        second.id(),
+        &block
+    )
+    .await
+    .is_err());
+    assert_eq!(engine.stores.load(std::sync::atomic::Ordering::SeqCst), 0);
+}

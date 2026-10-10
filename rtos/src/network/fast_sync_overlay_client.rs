@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration; owned consumer readiness and authenticated finality recovery.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -26,12 +26,41 @@ use rtos_api::{
         overlay::membercertificate::MemberCertificate, pub_::publickey::Overlay as OverlayKey,
         ton_node::Broadcast,
     },
-    BoxedSerialize, IntoBoxed,
+    BoxedSerialize, IntoBoxed, WireProfile,
 };
 use rtos_block::{fail, KeyId, KeyOption, Result, ShardIdent, ValidatorDescr};
 use std::sync::Arc;
 
 const MAX_FAST_SYNC_OVERLAY_CLIENTS: usize = 5;
+
+fn fast_sync_transport_authority(
+    validators: &[ValidatorDescr],
+    profile: WireProfile,
+) -> Result<(Vec<Arc<KeyId>>, Vec<Arc<KeyId>>)> {
+    if profile == WireProfile::Legacy {
+        let mut members = Vec::with_capacity(validators.len());
+        let mut roots = Vec::with_capacity(validators.len());
+        for validator in validators {
+            members.push(validator.adnl_addr()?);
+            roots.push(validator.public_key()?.pub_key().id().clone());
+        }
+        return Ok((members, roots));
+    }
+    // Target membership and certificate authority use the same transport
+    // identity. Consensus keys and stable PQ validator IDs are not roots.
+    let mut roots = Vec::with_capacity(validators.len());
+    for validator in validators {
+        let root = match validator.adnl_addr.as_ref().filter(|id| !id.is_zero()) {
+            Some(id) => KeyId::from_data(*id.as_array()),
+            // Only classical descriptors may leave the transport ID implicit.
+            None => validator.public_key()?.pub_key().id().clone(),
+        };
+        roots.push(root);
+    }
+    roots.sort_by(|left, right| left.data().cmp(right.data()));
+    roots.dedup();
+    Ok((roots.clone(), roots))
+}
 
 pub struct FastSyncOverlayClient {
     id: Arc<OverlayShortId>,
@@ -58,12 +87,10 @@ impl FastSyncOverlayClient {
         use_quic: bool,
         owner: Arc<OwnedTasks>,
     ) -> Result<Arc<Self>> {
-        let mut root_adnl_ids = Vec::with_capacity(validators.len());
-        let mut root_public_keys = Vec::with_capacity(validators.len());
-        for vd in validators {
-            root_adnl_ids.push(vd.adnl_addr()?);
-            root_public_keys.push(vd.public_key()?.pub_key().id().clone());
-        }
+        let (root_adnl_ids, root_public_keys) = fast_sync_transport_authority(
+            validators,
+            network_context.stack.overlay.wire_profile(),
+        )?;
         let id = rtos_api::ton::ton_node::fastsyncoverlayid::FastSyncOverlayId {
             zero_state_file_hash: engine.zerostate_id()?.file_hash().clone(),
             shard: (&shard).into(),
@@ -103,6 +130,13 @@ impl FastSyncOverlayClient {
         )
         .await?;
 
+        let subscription = match client.subscribe_broadcast() {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                let _ = client.delete();
+                return Err(error);
+            }
+        };
         let result = Arc::new(Self {
             id: id_short,
             shard,
@@ -114,7 +148,7 @@ impl FastSyncOverlayClient {
             exit_gate: std::sync::Mutex::new(None),
         });
 
-        if let Err(error) = result.clone().listen_broadcasts() {
+        if let Err(error) = result.clone().listen_broadcasts(subscription) {
             result.stop();
             return Err(error);
         }
@@ -152,7 +186,10 @@ impl FastSyncOverlayClient {
         Ok(())
     }
 
-    fn listen_broadcasts(self: Arc<Self>) -> Result<()> {
+    fn listen_broadcasts(
+        self: Arc<Self>,
+        mut subscription: adnl::BroadcastSubscription,
+    ) -> Result<()> {
         let tasks = self.tasks.clone();
         tasks.spawn("fast-sync broadcast listener", async move {
             log::debug!(
@@ -173,7 +210,7 @@ impl FastSyncOverlayClient {
                     tokio::select! { _ = self.tasks.cancellation().cancelled() => break, _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {} }
                     continue;
                 }
-                let broadcast = tokio::select! { biased; _ = self.tasks.cancellation().cancelled() => break, result = self.client.wait_broadcast() => result };
+                let broadcast = tokio::select! { biased; _ = self.tasks.cancellation().cancelled() => break, result = self.client.wait_broadcast(&mut subscription) => result };
                 match broadcast {
                     Err(e) => {
                         log::error!(
@@ -192,14 +229,16 @@ impl FastSyncOverlayClient {
                         );
                         break;
                     }
-                    Ok(Some((broadcast, src))) => {
+                    Ok(Some((broadcast, src, received_bytes))) => {
                         log::trace!(
                             "Received broadcast {:08x} in fast sync overlay {} {} from {src}",
                             broadcast.bare_object().constructor(),
                             self.shard,
                             self.id
                         );
-                        if let Err(e) = self.process_broadcast(&src, broadcast).await {
+                        if let Err(e) =
+                            self.process_broadcast(&src, broadcast, received_bytes).await
+                        {
                             log::warn!(
                                 "Error while processing broadcast from {src} \
                                 in fast sync overlay {} {}: {e}",
@@ -219,8 +258,18 @@ impl FastSyncOverlayClient {
         Ok(())
     }
 
-    async fn process_broadcast(&self, src: &Arc<KeyId>, broadcast: Broadcast) -> Result<()> {
+    async fn process_broadcast(
+        &self,
+        src: &Arc<KeyId>,
+        broadcast: Broadcast,
+        received_bytes: usize,
+    ) -> Result<()> {
         match broadcast {
+            Broadcast::TonNode_BlockFinalityBroadcast(broadcast) => {
+                self.engine.clone().process_block_finality_broadcast(
+                    broadcast, src.clone(), received_bytes,
+                ).await?;
+            }
             Broadcast::TonNode_BlockBroadcast(broadcast) => {
                 self.engine.clone().process_block_broadcast(broadcast, src.clone())
             }
@@ -357,3 +406,7 @@ impl FastSyncOverlayClient {
         self.use_twostep
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_fast_sync_transport_authority.rs"]
+mod transport_authority_tests;

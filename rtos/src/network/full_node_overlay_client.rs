@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration; owned consumer readiness and authenticated finality recovery.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -73,6 +73,13 @@ impl FullNodeOverlayClient {
         shard: ShardIdent,
         owner: Arc<OwnedTasks>,
     ) -> Result<Arc<Self>> {
+        let subscription = match client.subscribe_broadcast() {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                let _ = client.delete();
+                return Err(error);
+            }
+        };
         let fnc = Arc::new(Self {
             active_peers: lockfree::set::Set::new(),
             bad_peers: lockfree::set::Set::new(),
@@ -83,7 +90,7 @@ impl FullNodeOverlayClient {
             exit_gate: std::sync::Mutex::new(None),
             tasks: Arc::new(OwnedTasks::child(owner.clone(), owner.cancellation().child_token())),
         });
-        if let Err(error) = fnc.clone().listen_broadcasts() {
+        if let Err(error) = fnc.clone().listen_broadcasts(subscription) {
             fnc.stop();
             return Err(error);
         }
@@ -119,7 +126,10 @@ impl FullNodeOverlayClient {
         Ok(())
     }
 
-    fn listen_broadcasts(self: Arc<Self>) -> Result<()> {
+    fn listen_broadcasts(
+        self: Arc<Self>,
+        mut subscription: adnl::BroadcastSubscription,
+    ) -> Result<()> {
         let tasks = self.tasks.clone();
         tasks.spawn("public overlay broadcast listener", async move {
             log::debug!("Started listening broadcasts for shard {}", self.shard());
@@ -152,7 +162,7 @@ impl FullNodeOverlayClient {
                 let broadcast = tokio::select! {
                     biased;
                     _ = self.tasks.cancellation().cancelled() => break,
-                    result = self.overlay_client().wait_broadcast() => result,
+                    result = self.overlay_client().wait_broadcast(&mut subscription) => result,
                 };
                 match broadcast {
                     Err(e) => {
@@ -167,14 +177,16 @@ impl FullNodeOverlayClient {
                         log::warn!("wait_broadcast finished.");
                         break;
                     }
-                    Ok(Some((broadcast, src))) => {
+                    Ok(Some((broadcast, src, received_bytes))) => {
                         log::trace!(
                             "Received broadcast {:08x} in public overlay {} shard {} from {src}",
                             broadcast.bare_object().constructor(),
                             self.client.id(),
                             self.shard
                         );
-                        if let Err(e) = self.process_broadcast(&src, broadcast).await {
+                        if let Err(e) =
+                            self.process_broadcast(&src, broadcast, received_bytes).await
+                        {
                             log::warn!(
                                 "Error while processing broadcast from {src} \
                                 in public overlay {} for shard {}: {e}",
@@ -196,8 +208,18 @@ impl FullNodeOverlayClient {
         Ok(())
     }
 
-    async fn process_broadcast(&self, src: &Arc<KeyId>, broadcast: Broadcast) -> Result<()> {
+    async fn process_broadcast(
+        &self,
+        src: &Arc<KeyId>,
+        broadcast: Broadcast,
+        received_bytes: usize,
+    ) -> Result<()> {
         match broadcast {
+            Broadcast::TonNode_BlockFinalityBroadcast(broadcast) => {
+                self.engine.clone().process_block_finality_broadcast(
+                    broadcast, src.clone(), received_bytes,
+                ).await?;
+            }
             Broadcast::TonNode_BlockBroadcast(broadcast) => {
                 self.engine.clone().process_block_broadcast(broadcast, src.clone())
             }

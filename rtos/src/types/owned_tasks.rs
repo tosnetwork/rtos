@@ -77,6 +77,12 @@ mod tests {
     }
 }
 
+impl Default for OwnedTasks {
+    fn default() -> Self {
+        Self::new(CancellationToken::new())
+    }
+}
+
 impl OwnedTasks {
     pub fn new(cancellation: CancellationToken) -> Self {
         Self {

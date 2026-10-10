@@ -230,8 +230,22 @@ impl MasterchainProofVerifier {
         }
         let (_, info) = proof.pre_check_block_proof()?;
         let epoch = info.prev_key_block_seqno();
+        if epoch >= proof.id().seq_no {
+            fail!("Governing epoch must precede the target masterchain block");
+        }
+        let history = self.governing_authority(engine, epoch).await?;
+        // A cache hit reuses only the governing authority. Every incoming
+        // certificate, including repeat block IDs, must still pass verification.
+        history.authenticate_block(proof.id(), proof.clone())
+    }
+
+    async fn governing_authority<E: EngineOperations + ?Sized>(
+        &self,
+        engine: &E,
+        epoch: u32,
+    ) -> Result<BootstrapAuthority> {
         let pin = engine.init_mc_block_id();
-        if epoch < pin.seq_no || epoch >= proof.id().seq_no {
+        if epoch < pin.seq_no {
             fail!("Governing epoch is outside the locally pinned history");
         }
         let hint = if epoch > pin.seq_no {
@@ -305,9 +319,35 @@ impl MasterchainProofVerifier {
             }
             history
         };
-        // A cache hit reuses only the governing authority. Every incoming
-        // certificate, including repeat block IDs, must still pass verification.
-        history.authenticate_block(proof.id(), proof.clone())
+        Ok(history)
+    }
+
+    /// Resolve a historical broadcast epoch through the same pinned key-block
+    /// proof chain as masterchain proof verification. A state index is a lookup
+    /// hint only: each authority transition is authenticated before config use.
+    pub(crate) async fn pq_broadcast_context<E: EngineOperations + ?Sized>(
+        &self,
+        engine: &E,
+        id: &BlockIdExt,
+        block: &Block,
+    ) -> Result<rtos_api::pq_finality::PqVerificationContext> {
+        let info = block.read_info()?;
+        let authority = self.governing_authority(engine, info.prev_key_block_seqno()).await?;
+        if block.global_id() != authority.global_id {
+            fail!("PQ broadcast global_id differs from authenticated history");
+        }
+        let context = rtos_api::pq_finality::PqVerificationContext::from_governing_config(
+            authority.global_id,
+            &authority.config()?,
+            id.clone(),
+            info.vert_seq_no(),
+            info.prev_key_block_seqno(),
+            info.gen_catchain_seqno(),
+        )?;
+        if context.subset_hash() != info.gen_validator_list_hash_short() {
+            fail!("PQ broadcast header disagrees with historical governing validator set");
+        }
+        Ok(context)
     }
 }
 
