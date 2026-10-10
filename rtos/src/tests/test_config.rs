@@ -12,6 +12,7 @@ use super::*;
 fn make_test_config_handler() -> NodeConfigHandler {
     let (sender, _reader) = tokio::sync::mpsc::unbounded_channel();
     NodeConfigHandler {
+        scheduler: Arc::default(),
         runtime_handle: tokio::runtime::Handle::current(),
         sender,
         key_ring: Arc::new(lockfree::map::Map::new()),
@@ -180,4 +181,272 @@ fn test_initial_checkpoint_is_an_explicit_complete_local_pin() {
     let mut other_zero = zero.clone();
     other_zero["file_hash"] = serde_json::json!("03".repeat(32));
     assert!(parse(other_zero).is_err());
+}
+
+fn scheduler_test_config() -> TonNodeConfig {
+    serde_json::from_value(serde_json::json!({
+        "validator_keys": [], "validator_key_ring": {}
+    }))
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_scheduler_stop_releases_actor_and_rejects_new_writes() {
+    let (handler, context) =
+        NodeConfigHandler::create(scheduler_test_config(), tokio::runtime::Handle::current())
+            .unwrap();
+    handler.clone().start_sheduler(context, vec![]).unwrap();
+    handler.show_custom_overlays().await.unwrap();
+    handler.stop_and_wait().await.unwrap();
+    assert!(handler.show_custom_overlays().await.is_err());
+    assert!(handler.get_key_raw([7; 32]).await.is_none());
+    handler.stop_and_wait().await.unwrap();
+    let weak = Arc::downgrade(&handler);
+    drop(handler);
+    assert!(weak.upgrade().is_none(), "scheduler retained its own sender");
+}
+
+struct HeldConfigSubscriber {
+    handler: Arc<NodeConfigHandler>,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+    completed: atomic::AtomicBool,
+    panic: bool,
+    events: std::sync::Mutex<Vec<u8>>,
+}
+
+#[async_trait::async_trait]
+impl NodeConfigSubscriber for HeldConfigSubscriber {
+    async fn event(&self, event: ConfigEvent) -> Result<bool> {
+        self.entered.notify_one();
+        self.release.acquire().await.unwrap().forget();
+        if self.panic {
+            panic!("controlled configuration subscriber failure");
+        }
+        // This uses the real GetKey request queue after public admission closed.
+        let (key_id, kind) = match event {
+            ConfigEvent::AddValidatorAdnlKey(id, _) => (id, 1),
+            ConfigEvent::RemoveValidatorAdnlKey(id, _) => (id, 2),
+        };
+        let key = self
+            .handler
+            .get_key_raw(*key_id.data())
+            .await
+            .expect("accepted callback lookup must still be served during shutdown");
+        assert_eq!(key.id(), &key_id);
+        self.events.lock().unwrap().push(kind);
+        self.completed.store(true, atomic::Ordering::Release);
+        Ok(true)
+    }
+}
+
+fn scheduler_subscriber_config() -> TonNodeConfig {
+    let mut config = scheduler_test_config();
+    // Public deterministic test key, never a node/operator secret.
+    let (json, key) =
+        Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[71; 32]).unwrap();
+    config.validator_key_ring = Some(HashMap::from([(base64_encode(key.id().data()), json)]));
+    config.validator_keys = Some(vec![ValidatorKeysJson {
+        expire_at: i32::MAX,
+        election_id: 1001,
+        validator_key_id: base64_encode([8; 32]),
+        validator_adnl_key_id: Some(base64_encode(key.id().data())),
+    }]);
+    config
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_scheduler_drain_serves_accepted_callback_lookup_after_cancelled_waiter() {
+    let (handler, context) =
+        NodeConfigHandler::create(scheduler_subscriber_config(), tokio::runtime::Handle::current())
+            .unwrap();
+    let subscriber = Arc::new(HeldConfigSubscriber {
+        handler: handler.clone(),
+        entered: Default::default(),
+        release: tokio::sync::Semaphore::new(0),
+        completed: atomic::AtomicBool::new(false),
+        panic: false,
+        events: Default::default(),
+    });
+    handler.clone().start_sheduler(context, vec![subscriber.clone()]).unwrap();
+    subscriber.entered.notified().await;
+    let waiter_handler = handler.clone();
+    let waiter = tokio::spawn(async move { waiter_handler.stop_and_wait().await });
+    tokio::task::yield_now().await;
+    waiter.abort();
+    let _ = waiter.await;
+    assert!(tokio::time::timeout(Duration::from_millis(30), handler.stop_and_wait())
+        .await
+        .is_err());
+    assert!(handler.show_custom_overlays().await.is_err());
+    subscriber.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(3), handler.stop_and_wait()).await.unwrap().unwrap();
+    assert!(subscriber.completed.load(atomic::Ordering::Acquire));
+    let weak_handler = Arc::downgrade(&handler);
+    let weak_subscriber = Arc::downgrade(&subscriber);
+    drop(subscriber);
+    drop(handler);
+    assert!(weak_subscriber.upgrade().is_none());
+    assert!(weak_handler.upgrade().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_scheduler_subscriber_panic_is_sticky_after_real_join() {
+    let (handler, context) =
+        NodeConfigHandler::create(scheduler_subscriber_config(), tokio::runtime::Handle::current())
+            .unwrap();
+    let subscriber = Arc::new(HeldConfigSubscriber {
+        handler: handler.clone(),
+        entered: Default::default(),
+        release: tokio::sync::Semaphore::new(1),
+        completed: atomic::AtomicBool::new(false),
+        panic: true,
+        events: Default::default(),
+    });
+    handler.clone().start_sheduler(context, vec![subscriber.clone()]).unwrap();
+    subscriber.entered.notified().await;
+    for _ in 0..2 {
+        let error = tokio::time::timeout(Duration::from_secs(3), handler.stop_and_wait())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("configuration subscriber"));
+    }
+    let weak = Arc::downgrade(&handler);
+    drop(subscriber);
+    drop(handler);
+    assert!(weak.upgrade().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_scheduler_partial_load_failure_drains_started_callbacks() {
+    let mut config = scheduler_subscriber_config();
+    config.validator_keys.as_mut().unwrap().push(ValidatorKeysJson {
+        expire_at: i32::MAX,
+        election_id: 1002,
+        validator_key_id: base64_encode([9; 32]),
+        validator_adnl_key_id: Some("invalid base64!".into()),
+    });
+    let (handler, context) =
+        NodeConfigHandler::create(config, tokio::runtime::Handle::current()).unwrap();
+    let subscriber = Arc::new(HeldConfigSubscriber {
+        handler: handler.clone(),
+        entered: Default::default(),
+        release: tokio::sync::Semaphore::new(0),
+        completed: atomic::AtomicBool::new(false),
+        panic: false,
+        events: Default::default(),
+    });
+    assert!(handler.clone().start_sheduler(context, vec![subscriber.clone()]).is_err());
+    subscriber.entered.notified().await;
+    assert!(handler.show_custom_overlays().await.is_err());
+    subscriber.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(3), handler.stop_and_wait()).await.unwrap().unwrap();
+    assert!(subscriber.completed.load(atomic::Ordering::Acquire));
+    let weak = Arc::downgrade(&handler);
+    drop(subscriber);
+    drop(handler);
+    assert!(weak.upgrade().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_scheduler_commits_accepted_write_before_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = scheduler_test_config();
+    config.custom_overlays_file_name = dir.path().join("overlays.json").to_str().unwrap().into();
+    let (handler, context) =
+        NodeConfigHandler::create(config, tokio::runtime::Handle::current()).unwrap();
+    handler.clone().start_sheduler(context, vec![]).unwrap();
+    let overlay = CustomOverlay {
+        name: "accepted-before-stop".into(),
+        nodes: vec![],
+        sender_shards: vec![],
+        skip_public_msg_send: false.into(),
+        use_quic: false.into(),
+    };
+    let (wait, mut reader) = Wait::new();
+    wait.request();
+    handler.send_task((wait.clone(), Task::AddCustomOverlay(overlay))).unwrap();
+    handler.stop_and_wait().await.unwrap();
+    assert!(matches!(
+        wait.wait(&mut reader, true).await,
+        Some(Some(Answer::CustomOverlays(Ok(_))))
+    ));
+    let stored = std::fs::read_to_string(dir.path().join("overlays.json")).unwrap();
+    assert!(stored.contains("accepted-before-stop"));
+}
+
+#[tokio::test]
+async fn config_scheduler_stop_before_start_rejects_lookups_without_waiting() {
+    let (handler, context) =
+        NodeConfigHandler::create(scheduler_test_config(), tokio::runtime::Handle::current())
+            .unwrap();
+    handler.stop_and_wait().await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(1), handler.get_key_raw([7; 32]))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(handler.clone().start_sheduler(context, vec![]).is_err());
+}
+
+#[tokio::test]
+async fn config_scheduler_dropped_inbox_and_current_answer_wake_callers() {
+    let (sent, received) = tokio::sync::mpsc::unbounded_channel();
+    let (queued, mut queued_answer) = Wait::new();
+    queued.request();
+    assert!(sent.send((queued.clone(), Task::GetKey([7; 32]))).is_ok());
+    drop(scheduler::ConfigInbox(received));
+    assert!(matches!(queued.wait(&mut queued_answer, true).await, Some(None)));
+    let (current, mut current_answer) = Wait::new();
+    current.request();
+    drop(PendingAnswer::new(current.clone()));
+    assert!(matches!(current.wait(&mut current_answer, true).await, Some(None)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_scheduler_removal_callback_is_ordered_and_can_reenter_lookup_during_stop() {
+    let config = scheduler_subscriber_config();
+    let key_id = KeyId::from_data(
+        base64_decode(
+            config.validator_keys.as_ref().unwrap()[0].validator_adnl_key_id.as_ref().unwrap(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap(),
+    );
+    let (handler, context) =
+        NodeConfigHandler::create(config, tokio::runtime::Handle::current()).unwrap();
+    let subscriber = Arc::new(HeldConfigSubscriber {
+        handler: handler.clone(),
+        entered: Default::default(),
+        release: tokio::sync::Semaphore::new(0),
+        completed: atomic::AtomicBool::new(false),
+        panic: false,
+        events: Default::default(),
+    });
+    handler.clone().start_sheduler(context, vec![subscriber.clone()]).unwrap();
+    subscriber.entered.notified().await;
+    // This is the same dispatch method used by actual validator-key retirement.
+    handler.dispatch_config_event(
+        subscriber.clone(),
+        ConfigEvent::RemoveValidatorAdnlKey(key_id.clone(), 1001),
+    );
+    handler.stop();
+    for _ in 0..16 {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), handler.get_key_raw(*key_id.data()))
+                .await
+                .unwrap()
+                .is_none(),
+            "external reads must not prolong shutdown"
+        );
+    }
+    assert!(subscriber.events.lock().unwrap().is_empty());
+    subscriber.release.add_permits(2);
+    tokio::time::timeout(Duration::from_secs(3), handler.stop_and_wait()).await.unwrap().unwrap();
+    assert_eq!(*subscriber.events.lock().unwrap(), vec![1, 2]);
+    let weak = Arc::downgrade(&handler);
+    drop(subscriber);
+    drop(handler);
+    assert!(weak.upgrade().is_none());
 }

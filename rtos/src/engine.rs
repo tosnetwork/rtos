@@ -1007,7 +1007,9 @@ impl Engine {
                 if let Some(db) = opened_db.take() {
                     db.stop_states_db().await;
                 }
-                rollback_network.stop_adnl().await;
+                if let Err(error) = rollback_network.stop_adnl().await {
+                    rollback_stopper.report_service_failure(0, format!("partial Engine network shutdown: {error}"));
+                }
                 if let Some(trace) = trace_collector.take() {
                     trace.stop();
                 }
@@ -1223,7 +1225,9 @@ impl Engine {
         if let Err(error) = self.persistence_tasks.wait().await {
             self.stopper.report_service_failure(0, format!("top shard persistence: {error}"));
         }
-        self.network.stop_adnl().await;
+        if let Err(error) = self.network.stop_adnl().await {
+            self.stopper.report_service_failure(0, format!("node network shutdown: {error}"));
+        }
         if let Some(tc) = &self.trace_collector {
             tc.stop();
         }

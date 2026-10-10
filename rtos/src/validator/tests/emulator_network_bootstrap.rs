@@ -1139,6 +1139,7 @@ async fn test_bootstrap_config_is_consumed_by_node_config_handler() -> Result<()
     assert_eq!(handler.get_actual_validator_key_ids()?.len(), 3);
     assert_eq!(handler.get_actual_validator_adnl_key_ids()?.len(), 3);
     assert_eq!(handler.get_actual_validator_keys()?.len(), 3);
+    handler.stop_and_wait().await?;
 
     Ok(())
 }
