@@ -12,6 +12,7 @@ use super::*;
 fn make_test_config_handler() -> NodeConfigHandler {
     let (sender, _reader) = tokio::sync::mpsc::unbounded_channel();
     NodeConfigHandler {
+        validator_transport_changed: tokio::sync::Notify::new(),
         runtime_handle: tokio::runtime::Handle::current(),
         sender,
         key_ring: Arc::new(lockfree::map::Map::new()),

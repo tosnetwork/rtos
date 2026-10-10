@@ -808,7 +808,12 @@ impl FullNodeOverlaysRouter {
                     continue;
                 }
                 if context.stack.adnl.key_by_id(&id).is_err() {
-                    context.stack.adnl.add_key(key.clone(), election_id as usize)?;
+                    if let Err(error) =
+                        context.stack.adnl.add_key(key.clone(), election_id as usize)
+                    {
+                        log::warn!("Cannot activate fast-sync transport {id}: {error}");
+                        continue;
+                    }
                     NodeNetwork::start_periodic_store_ip_addr(
                         context.stack.dht.clone(),
                         key.clone(),

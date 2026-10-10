@@ -32,6 +32,10 @@ fn isolate_quic(bootstrap: &EmulatorNetworkBootstrap) -> Result<()> {
     let mut config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&bootstrap.config_path)?)?;
     config["ip_address_quic"] = "127.0.0.1:0".into();
+    // Election IDs are also ADNL dynamic key tags; reserve the node's tags 1/2.
+    for entry in config["validator_keys"].as_array_mut().unwrap() {
+        entry["election_id"] = (entry["election_id"].as_i64().unwrap() + 1000).into();
+    }
     std::fs::write(&bootstrap.config_path, serde_json::to_vec_pretty(&config)?)?;
     Ok(())
 }
@@ -362,7 +366,7 @@ async fn fast_sync_snapshot_rejects_expired_missing_and_implicit_transport_regis
     let old = overlay(&f.router, &ShardIdent::MASTERCHAIN);
     // Updating a registration clears its ADNL field; put that field back so
     // expiration, rather than missing registration, is the cause of rejection.
-    handler.add_validator_key(local.validator_key.id().data(), 1, 1).await?;
+    handler.add_validator_key(local.validator_key.id().data(), 1001, 1).await?;
     handler
         .add_validator_adnl_key(local.validator_key.id().data(), local.adnl_key.id().data())
         .await?;
@@ -374,7 +378,7 @@ async fn fast_sync_snapshot_rejects_expired_missing_and_implicit_transport_regis
     assert!(old.client().cancellation_token().is_cancelled());
     assert_eq!(f.router.fast_sync_overlays.iter().count(), 0);
 
-    handler.add_validator_key(local.validator_key.id().data(), 1, i32::MAX).await?;
+    handler.add_validator_key(local.validator_key.id().data(), 1001, i32::MAX).await?;
     let mut implicit = f.member(0);
     implicit.adnl_addr = Some(UInt256::from(*local.validator_key.id().data()));
     assert!(
