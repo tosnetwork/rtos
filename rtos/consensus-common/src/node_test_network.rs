@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and test network unwind isolation.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -51,11 +51,12 @@ pub struct Node {
 }
 
 pub struct NodeTestNetwork<'a> {
-    mutex_lock: MutexGuard<'a, ()>, // lock to prevent multiple tests from running concurrently
     nodes: Vec<Arc<Node>>,
     runtime: tokio::runtime::Runtime,
     auto_shutdown: bool,
     is_shutdown: AtomicBool,
+    // Drop the exclusion guard only after nodes and their runtime release the bound ports.
+    mutex_lock: MutexGuard<'a, ()>,
 }
 
 impl<'a> NodeTestNetwork<'a> {
@@ -73,7 +74,13 @@ impl<'a> NodeTestNetwork<'a> {
         is_tcp_enabled: bool,
         is_quic_enabled: bool,
     ) -> Self {
-        let mutex_lock = NODE_NETWORK_TEST_MUTEX.lock().unwrap();
+        // This mutex protects port ownership, not shared mutable network state. A previous
+        // fixture's unwind drops its entire network before releasing this guard.
+        let mutex_lock = NODE_NETWORK_TEST_MUTEX.lock().unwrap_or_else(|poisoned| {
+            log::warn!("Recovering test-network exclusion after a previous fixture panic");
+            NODE_NETWORK_TEST_MUTEX.clear_poison();
+            poisoned.into_inner()
+        });
         let runtime = tokio::runtime::Builder::new_multi_thread()
             //.worker_threads(num_nodes * 2)
             .worker_threads(num_nodes * num_threads_per_node)
