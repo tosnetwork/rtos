@@ -251,6 +251,11 @@ pub struct CollatorTestBundle {
 
 #[allow(dead_code)]
 impl CollatorTestBundle {
+    #[cfg(test)]
+    pub(crate) fn set_test_clock(&mut self, now: u32) {
+        self.index.now = now;
+    }
+
     pub async fn build_with_zero_state(
         mc_zero_state_name: &str,
         wc_zero_state_names: &[&str],
