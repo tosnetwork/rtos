@@ -33,7 +33,7 @@ stream-cancel = '0.8.0'
 tokio = { features = [ 'io-util', 'macros', 'net', 'rt-multi-thread' ], version = '1.5' }
 tokio-io-timeout = '1.1.1'
 tokio-stream = { features = [ 'net' ], version = '0.1.4' }
-tokio-util = '0.7'
+tokio-util = { version = '0.7', features = [ 'rt' ] }
 rtos_block = { path = '../block', features = [ 'export_key' ] }
 lockfree = { path = '../lockfree' }
 raptorq = { path = 'raptorq', version = '1.2.1' }
