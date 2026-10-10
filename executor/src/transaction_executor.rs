@@ -1,6 +1,7 @@
 /*
  * RTOS project modifications (2026-10-10): naming, frozen-state admission,
- * fixed-prefix canonicalization, and historical address normalization, and message execution compatibility.
+ * fixed-prefix canonicalization, historical address normalization, and
+ * historical send-mode/error-priority compatibility.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -682,6 +683,16 @@ pub trait TransactionExecutor {
         for (i, slice) in action_slices.into_iter().enumerate() {
             let mut remainder = slice.clone();
             let parsed = OutAction::skip(&mut remainder).and_then(|_| {
+                // A send action contains MessageRelaxed, which excludes ext_in.
+                // Keep this structural rejection in preprocessing, before modes.
+                let mut header = slice.clone();
+                if header.get_next_u32()? == rtos_block::ACTION_SEND_MSG {
+                    header.get_next_byte()?;
+                    let mut message = SliceData::load_cell(header.checked_drain_reference()?)?;
+                    if message.get_next_int(2)? == 2 {
+                        fail!("Outbound action contains an inbound external message");
+                    }
+                }
                 if remainder.is_empty_cell() {
                     Ok(())
                 } else {
@@ -694,7 +705,9 @@ pub trait TransactionExecutor {
                     "invalid action {i} found while preprocessing action list: {err:?}"
                 );
                 let mut header = slice.clone();
-                if header.get_next_u32().ok() == Some(rtos_block::ACTION_SEND_MSG) {
+                if self.config().block_version() >= 8
+                    && header.get_next_u32().ok() == Some(rtos_block::ACTION_SEND_MSG)
+                {
                     if let Ok(mode) = header.get_next_byte() {
                         if mode.bit(SENDMSG_IGNORE_ERROR) {
                             phase.skipped_actions += 1;
@@ -715,6 +728,7 @@ pub trait TransactionExecutor {
                     Some(msg_remaining_balance),
                     acc_balance,
                     bounce,
+                    self.config().block_version(),
                 );
             }
             parsed_actions.push(Some(slice));
@@ -761,7 +775,10 @@ pub trait TransactionExecutor {
                                 target: "executor",
                                 "outmsg_action_handler failed with code {code}"
                             );
-                            if code != RESULT_CODE_SKIPPED && (SENDMSG_BOUNCE_IF_FAIL & mode) != 0 {
+                            if self.config().block_version() >= 4
+                                && code != RESULT_CODE_SKIPPED
+                                && (SENDMSG_BOUNCE_IF_FAIL & mode) != 0
+                            {
                                 bounce = true;
                             }
                             code
@@ -866,7 +883,9 @@ pub trait TransactionExecutor {
                 err_code = RESULT_CODE_UNKNOWN_OR_INVALID_ACTION;
             }
             if err_code == RESULT_CODE_SKIPPED {
-                phase.skipped_actions += 1;
+                if self.config().block_version() >= 8 {
+                    phase.skipped_actions += 1;
+                }
             } else if err_code != 0 {
                 log::debug!(target: "executor", "action failed: error_code={}", err_code);
                 phase.valid = true;
@@ -904,6 +923,7 @@ pub trait TransactionExecutor {
                     Some(msg_remaining_balance),
                     acc_balance,
                     bounce,
+                    self.config().block_version(),
                 );
             }
         }
@@ -965,9 +985,17 @@ pub trait TransactionExecutor {
                     Some(msg_remaining_balance),
                     acc_balance,
                     true,
+                    self.config().block_version(),
                 );
             }
-            return finish_action_phase_with_fine(tr, phase, None, acc_balance, true);
+            return finish_action_phase_with_fine(
+                tr,
+                phase,
+                None,
+                acc_balance,
+                true,
+                self.config().block_version(),
+            );
         }
 
         if account_deleted {
@@ -1490,6 +1518,41 @@ impl ActionMessageStorage {
     }
 }
 
+// Validate StateInitWithLibs with the fixed 1024 typed-cell budget. Dictionary
+// iteration alone is insufficient: it tolerates trailing data in fork cells.
+fn validate_send_message_libraries(msg: &Message) -> Result<bool> {
+    let Some(root) = msg.state_init().and_then(|init| init.libraries().root()) else {
+        return Ok(true);
+    };
+    let mut remaining_cells = 1024 - usize::from(msg.serialization_params().1.unwrap_or(false));
+    let mut pending = vec![(root.clone(), 256usize)];
+    while let Some((cell, mut key_bits)) = pending.pop() {
+        if remaining_cells == 0
+            || cell.cell_type() != rtos_block::CellType::Ordinary
+            || cell.bit_length() == 0
+        {
+            return Ok(false);
+        }
+        remaining_cells -= 1;
+        let mut label = rtos_block::LabelReader::with_cell(&cell)?;
+        label.skip_label(&mut key_bits)?;
+        let rest = label.remainder()?;
+        if key_bits == 0 {
+            // SimpleLib: public bit followed by an opaque root reference.
+            if rest.remaining_bits() != 1 || rest.remaining_references() != 1 {
+                return Ok(false);
+            }
+        } else {
+            if rest.remaining_bits() != 0 || rest.remaining_references() != 2 {
+                return Ok(false);
+            }
+            pending.push((rest.reference(1)?, key_bits - 1));
+            pending.push((rest.reference(0)?, key_bits - 1));
+        }
+    }
+    Ok(true)
+}
+
 fn outmsg_action_handler(
     phase: &mut TrActionPhase,
     mut mode: u8,
@@ -1504,31 +1567,6 @@ fn outmsg_action_handler(
     account_deleted: &mut bool,
     fail_action_fine: &mut Coins,
 ) -> std::result::Result<CurrencyCollection, i32> {
-    if msg.is_inbound_external() {
-        log::debug!(target: "executor", "outbound msg cannot be inbound external");
-        return Err(RESULT_CODE_UNKNOWN_OR_INVALID_ACTION);
-    }
-    // outbound message cannot contain libraries
-    if let Some(init) = msg.state_init() {
-        if !init.libraries().is_empty() {
-            log::debug!(target: "executor", "outbound internal msg with not empty libraries");
-            return Err(RESULT_CODE_UNKNOWN_OR_INVALID_ACTION);
-        }
-    }
-    // we cannot send all balance from account and from message simultaneously ?
-    if (mode & !SENDMSG_VALID_FLAGS) != 0
-        || mode.bit(SENDMSG_REMAINING_MSG_BALANCE | SENDMSG_ALL_BALANCE)
-    {
-        log::error!(target: "executor", "outmsg mode has unsupported flags");
-        return Err(RESULT_CODE_UNSUPPORTED);
-    }
-    // Carry/delete modes apply only to internal messages. Bit 32 alone is a
-    // valid internal flag; deletion still requires the all-balance combination.
-    if msg.ext_out_header().is_some()
-        && mode & !(SENDMSG_PAY_FEE_SEPARATELY | SENDMSG_IGNORE_ERROR | SENDMSG_BOUNCE_IF_FAIL) != 0
-    {
-        return Err(RESULT_CODE_UNSUPPORTED);
-    }
     let check_skip_invalid = move |code: i32| {
         if mode.bit(SENDMSG_IGNORE_ERROR) {
             Err(RESULT_CODE_SKIPPED)
@@ -1536,9 +1574,43 @@ fn outmsg_action_handler(
             Err(code)
         }
     };
+    // Bounce-on-action-failure is a flag only from version 4. General mode
+    // validation precedes message-specific checks; +2 suppresses it from v13.
+    let valid_flags = if config.block_version() >= 4 {
+        SENDMSG_VALID_FLAGS
+    } else {
+        SENDMSG_VALID_FLAGS & !SENDMSG_BOUNCE_IF_FAIL
+    };
+    if mode & !valid_flags != 0 || mode.bit(SENDMSG_REMAINING_MSG_BALANCE | SENDMSG_ALL_BALANCE) {
+        return if config.block_version() >= 13 {
+            check_skip_invalid(RESULT_CODE_UNSUPPORTED)
+        } else {
+            Err(RESULT_CODE_UNSUPPORTED)
+        };
+    }
+    if msg.is_inbound_external() {
+        return Err(RESULT_CODE_UNKNOWN_OR_INVALID_ACTION);
+    }
+    // Valid nonempty libraries are allowed; malformed dictionaries become
+    // skippable only at version 13, after general mode validation.
+    if !validate_send_message_libraries(msg).unwrap_or(false) {
+        return if config.block_version() >= 13 {
+            check_skip_invalid(RESULT_CODE_UNKNOWN_OR_INVALID_ACTION)
+        } else {
+            Err(RESULT_CODE_UNKNOWN_OR_INVALID_ACTION)
+        };
+    }
+    // External messages still reject carry/delete modes even when +2 is set.
+    if msg.ext_out_header().is_some()
+        && mode & !(SENDMSG_PAY_FEE_SEPARATELY | SENDMSG_IGNORE_ERROR | SENDMSG_BOUNCE_IF_FAIL) != 0
+    {
+        return Err(RESULT_CODE_UNSUPPORTED);
+    }
     // Flags are evaluated before address rewriting in the action consumer.
     if let Some(int_header) = msg.int_header() {
-        if int_header.extra_flags.inner() > SUPPORTED_EXTRA_FLAGS as u128 {
+        if config.block_version() >= 12
+            && int_header.extra_flags.inner() > SUPPORTED_EXTRA_FLAGS as u128
+        {
             return check_skip_invalid(RESULT_CODE_INVALID_EXTRA_FLAGS);
         }
     }
@@ -1546,7 +1618,11 @@ fn outmsg_action_handler(
         msg.set_src_address(new_src.clone());
     } else {
         log::warn!(target: "executor", "Incorrect source address {:?}", msg.src());
-        return Err(RESULT_CODE_INCORRECT_SRC_ADDRESS);
+        return if config.block_version() >= 13 {
+            check_skip_invalid(RESULT_CODE_INCORRECT_SRC_ADDRESS)
+        } else {
+            Err(RESULT_CODE_INCORRECT_SRC_ADDRESS)
+        };
     }
 
     if let Some(int_header) = msg.int_header_mut() {
@@ -1577,6 +1653,10 @@ fn outmsg_action_handler(
             int_header.ihr_disabled = true;
         }
         int_header.bounced = false;
+        // Before v12 this field is the IHR fee, cleared when IHR is disabled.
+        if config.block_version() < 12 && int_header.ihr_disabled {
+            int_header.extra_flags = VarUInteger16::default();
+        }
 
         let max_extras = config.size_limits_config().max_msg_extra_currencies as usize;
         let extras_count = int_header.value.other.count(max_extras + 1).map_err(|err| {
@@ -1599,7 +1679,7 @@ fn outmsg_action_handler(
     // calc max cells according to funds
     let mut max_cells = limits.max_msg_cells as u64;
     let mut fine_per_cell = 0;
-    if !is_special {
+    if !is_special && config.block_version() >= 4 {
         fine_per_cell = (fwd_prices.cell_price >> 16) / 4;
         let mut funds = acc_balance.coins.as_u128();
         if let Some(int_header) = msg.int_header() {
@@ -2227,7 +2307,13 @@ fn finish_action_phase_with_fine(
     msg_remaining_balance: Option<&mut CurrencyCollection>,
     acc_balance: &mut CurrencyCollection,
     bounce: bool,
+    version: u32,
 ) -> Result<ActionPhaseResult> {
+    // Before action fines were enabled, failed actions retained their attempted
+    // forwarding-fee statistics without charging those fees to the account.
+    if version < 4 {
+        return Ok(ActionPhaseResult::new(phase, vec![], bounce));
+    }
     phase.action_fine = phase.action_fine.min(acc_balance.coins);
     if let Some(msg_remaining_balance) = msg_remaining_balance {
         if !msg_remaining_balance.coins.sub_checked(&phase.action_fine) {
