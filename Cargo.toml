@@ -8,6 +8,7 @@ members = [
     'emulator',
     'lockfree',
     'pq-crypto',
+    'pq-consensus',
     'rtos',
     'rtos/catchain',
     'rtos/consensus-common',
