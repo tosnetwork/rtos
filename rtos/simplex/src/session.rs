@@ -592,9 +592,12 @@ impl SessionImpl {
         };
 
         // Phase 4: Load bootstrap (cancellable via stop_flag)
-        let bootstrap = match db
-            .load_bootstrap_cancellable(&should_stop_flag, Duration::from_millis(100))
-        {
+        let loaded_bootstrap = if pq_session {
+            db.load_pq_bootstrap_cancellable(&should_stop_flag, Duration::from_millis(100))
+        } else {
+            db.load_bootstrap_cancellable(&should_stop_flag, Duration::from_millis(100))
+        };
+        let bootstrap = match loaded_bootstrap {
             Ok(boot) => boot,
             Err(err) => {
                 // Check if this was a cancellation
