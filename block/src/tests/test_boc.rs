@@ -1,4 +1,5 @@
 /*
+ * RTOS project modifications (2026-10-10): repeated-root interoperability coverage.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -333,10 +334,9 @@ fn test_roots_share_same_tree() -> Result<()> {
     Ok(())
 }
 
-// non-unique roots are banned
-#[ignore]
+// Root occurrences are ordered and may refer to the same serialized cell.
 #[test]
-fn test_bug_serialization() -> Result<()> {
+fn test_repeated_root_serialization() -> Result<()> {
     let node0 = Cell::default();
     let node1 = BuilderData::with_raw(vec![0xff], 8)?.into_cell()?;
     let roots = vec![node0.clone(), node1, node0];
@@ -1057,5 +1057,133 @@ fn test_bench_boc_write() -> Result<()> {
 
     println!("{:?}", header);
 
+    Ok(())
+}
+
+fn check_repeated_root_readers(data: &[u8], roots: &[Cell]) -> Result<()> {
+    assert_eq!(BocReader::new().read(data)?.roots, roots);
+    assert_eq!(BocReader::new().stream_read(&mut Cursor::new(data))?.roots, roots);
+    assert_eq!(BocReader::new().read_to_storage(data, &mut CellsHMStorage::new())?.roots, roots);
+    if roots.len() > 1 {
+        assert!(BocReader::new().read_root(data).is_err());
+        assert!(read_single_root_boc(data).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_roots_reference_reader_vectors() -> Result<()> {
+    for line in include_str!("data/boc-repeated-roots.tsv").lines() {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let count: usize = fields[0].parse()?;
+        let data = hex::decode(fields[4])?;
+        if fields[2] == "ok" {
+            let roots = vec![Cell::default(); count];
+            check_repeated_root_readers(&data, &roots)?;
+            let flags = BocFlags::from_bits(fields[1].parse()?).unwrap();
+            assert_eq!(BocWriter::with_flags(roots, flags)?.write_to_vec()?, data);
+        } else {
+            // The fixed reference writer truncates root_count at 256 with a one-byte width.
+            assert!(BocReader::new().read(&data).is_err());
+            assert!(BocReader::new().stream_read(&mut Cursor::new(&data)).is_err());
+            assert!(BocReader::new().read_to_storage(&data, &mut CellsHMStorage::new()).is_err());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_roots_writer_and_width_boundaries() -> Result<()> {
+    let leaf = BuilderData::with_raw(vec![0x97], 8)?.into_cell()?;
+    let parent = BuilderData::with_raw_and_refs(vec![0xab], 8, vec![leaf.clone()])?.into_cell()?;
+    let mut exported = String::new();
+    for count in [1, 2, 3, 255, 256, 257, 1024, 1025, 16384] {
+        for shape in 0..3 {
+            let roots = (0..count)
+                .map(|i| match shape {
+                    0 => Cell::default(),
+                    1 => parent.clone(),
+                    _ => {
+                        if i % 2 == 0 {
+                            parent.clone()
+                        } else {
+                            leaf.clone()
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+            for mode in [0, 1, 2, 3, 17, 19] {
+                let flags = BocFlags::from_bits(mode).unwrap();
+                let writer = BocWriter::with_flags(roots.clone(), flags)?;
+                let size = writer.calc_boc_size();
+                let data = writer.write_to_vec()?;
+                assert_eq!(data.len(), size);
+                check_repeated_root_readers(&data, &roots)?;
+                let chunked = ChunkedBocWriter::with_flags(roots.clone(), flags)?.write_to_vec()?;
+                assert_eq!(chunked, data);
+                let mut storage = TestCellsStorage::new();
+                for r in &roots {
+                    storage.add_root(r.clone());
+                }
+                let big = BigBocWriter::with_params(
+                    roots.clone(),
+                    MAX_SAFE_DEPTH,
+                    flags,
+                    &|| false,
+                    Arc::new(storage),
+                )?
+                .write_to_vec()?;
+                assert_eq!(big, data);
+                let hashes = roots
+                    .iter()
+                    .map(|c| format!("{:x}", c.repr_hash()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                exported.push_str(&format!(
+                    "{count}-{shape}-{mode}\t{}\t{hashes}\n",
+                    hex::encode(&data)
+                ));
+            }
+        }
+    }
+    if let Ok(path) = std::env::var("RTOS_BOC_ROOTS_EXPORT") {
+        std::fs::write(path, exported)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_roots_reject_malformed_headers_and_payloads() -> Result<()> {
+    let valid = BocWriter::with_roots(vec![Cell::default(); 2])?.write_to_vec()?;
+    let mut invalid = vec![
+        // Repeating index zero cannot account for a second unreferenced cell.
+        hex::decode("b5ee9c72010102020004000000000000")?,
+    ];
+    for (offset, value) in [(7, 0), (8, 1), (9, 0), (10, 1), (11, 1)] {
+        let mut bytes = valid.clone();
+        bytes[offset] = value;
+        invalid.push(bytes);
+    }
+    for len in 0..valid.len() {
+        invalid.push(valid[..len].to_vec());
+    }
+    let mut crc =
+        BocWriter::with_flags(vec![Cell::default(); 2], BocFlags::Crc32)?.write_to_vec()?;
+    *crc.last_mut().unwrap() ^= 1;
+    invalid.push(crc);
+    invalid.push(BocWriter::with_roots(vec![Cell::default(); 16385])?.write_to_vec()?);
+    for bytes in invalid {
+        assert!(BocReader::new().read(&bytes).is_err(), "memory: {}", hex::encode(&bytes));
+        assert!(
+            BocReader::new().stream_read(&mut Cursor::new(&bytes)).is_err(),
+            "stream: {}",
+            hex::encode(&bytes)
+        );
+        assert!(
+            BocReader::new().read_to_storage(&bytes, &mut CellsHMStorage::new()).is_err(),
+            "storage: {}",
+            hex::encode(&bytes)
+        );
+    }
     Ok(())
 }
