@@ -1392,12 +1392,17 @@ enum Answer {
     CustomOverlays(Result<CustomOverlaysConfigBoxed>),
 }
 
+#[path = "config_scheduler.rs"]
+mod scheduler;
+use scheduler::{ConfigScheduler, PendingAnswer};
+
 pub struct NodeConfigHandlerContext {
     reader: tokio::sync::mpsc::UnboundedReceiver<(Arc<Wait<Answer>>, Task)>,
     config: TonNodeConfig,
 }
 
 pub struct NodeConfigHandler {
+    scheduler: Arc<ConfigScheduler>,
     runtime_handle: tokio::runtime::Handle,
     sender: tokio::sync::mpsc::UnboundedSender<(Arc<Wait<Answer>>, Task)>,
     key_ring: Arc<lockfree::map::Map<String, Arc<dyn KeyOption>>>,
@@ -1405,12 +1410,31 @@ pub struct NodeConfigHandler {
 }
 
 impl NodeConfigHandler {
+    fn send_task(&self, task: (Arc<Wait<Answer>>, Task)) -> Result<()> {
+        let gate = self.scheduler.admission.lock().unwrap();
+        // Accepted subscribers may need a key lookup while writes are draining.
+        // The scheduler closes the receiver after their actual completion.
+        if !gate.open && (!gate.started || !matches!(&task.1, Task::GetKey(_))) {
+            fail!("Configuration scheduler is stopping");
+        }
+        self.sender.send(task).map_err(|_| error!("Configuration scheduler is closed"))
+    }
+
+    pub(crate) fn stop(&self) {
+        self.scheduler.stop();
+    }
+
+    pub(crate) async fn stop_and_wait(&self) -> Result<()> {
+        self.scheduler.stop_and_wait().await
+    }
+
     pub fn create(
         config: TonNodeConfig,
         runtime_handle: tokio::runtime::Handle,
     ) -> Result<(Arc<Self>, NodeConfigHandlerContext)> {
         let (sender, reader) = tokio::sync::mpsc::unbounded_channel();
         let config_handler = Arc::new(NodeConfigHandler {
+            scheduler: Arc::default(),
             runtime_handle,
             sender,
             key_ring: Arc::new(lockfree::map::Map::new()),
@@ -1434,7 +1458,7 @@ impl NodeConfigHandler {
         let task = Task::AddValidatorKey(*key_hash, election_date, expire_at);
         let pushed_task = (wait.clone(), task);
         wait.request();
-        if let Err(e) = self.sender.send(pushed_task) {
+        if let Err(e) = self.send_task(pushed_task) {
             fail!("Error add_validator_key: {}", e);
         }
         match wait.wait(&mut queue_reader, true).await {
@@ -1456,7 +1480,7 @@ impl NodeConfigHandler {
             Task::AddValidatorAdnlKey(*validator_key_hash, *validator_adnl_key_hash),
         );
         wait.request();
-        if let Err(e) = self.sender.send(pushed_task) {
+        if let Err(e) = self.send_task(pushed_task) {
             fail!("Error add_validator_adnl_key: {}", e);
         }
         match wait.wait(&mut queue_reader, true).await {
@@ -1536,7 +1560,7 @@ impl NodeConfigHandler {
         let (wait, mut queue_reader) = Wait::new();
         let pushed_task = (wait.clone(), Task::AddCustomOverlay(overlay));
         wait.request();
-        if let Err(e) = self.sender.send(pushed_task) {
+        if let Err(e) = self.send_task(pushed_task) {
             fail!("Error add_custom_overlay: {}", e);
         }
         match wait.wait(&mut queue_reader, true).await {
@@ -1551,7 +1575,7 @@ impl NodeConfigHandler {
         let (wait, mut queue_reader) = Wait::new();
         let pushed_task = (wait.clone(), Task::DelCustomOverlay(name));
         wait.request();
-        if let Err(e) = self.sender.send(pushed_task) {
+        if let Err(e) = self.send_task(pushed_task) {
             fail!("Error del_custom_overlay: {}", e);
         }
         match wait.wait(&mut queue_reader, true).await {
@@ -1566,7 +1590,7 @@ impl NodeConfigHandler {
         let (wait, mut queue_reader) = Wait::new();
         let pushed_task = (wait.clone(), Task::GetCustomOverlays);
         wait.request();
-        if let Err(e) = self.sender.send(pushed_task) {
+        if let Err(e) = self.send_task(pushed_task) {
             fail!("Error show_custom_overlays: {}", e);
         }
         match wait.wait(&mut queue_reader, true).await {
@@ -1581,7 +1605,7 @@ impl NodeConfigHandler {
         let (wait, mut queue_reader) = Wait::new();
         let pushed_task = (wait.clone(), Task::ExportAdnlKeys);
         wait.request();
-        if let Err(e) = self.sender.send(pushed_task) {
+        if let Err(e) = self.send_task(pushed_task) {
             log::warn!("Error get_adnl_keys {e}");
             return Ok(vec![]);
         }
@@ -1614,7 +1638,7 @@ impl NodeConfigHandler {
         let (wait, mut queue_reader) = Wait::new();
         let pushed_task = (wait.clone(), Task::GetKey(key_hash));
         wait.request();
-        if let Err(e) = self.sender.send(pushed_task) {
+        if let Err(e) = self.send_task(pushed_task) {
             log::warn!("Error get_key_raw {}", e);
             return None;
         }
@@ -1782,7 +1806,7 @@ impl NodeConfigHandler {
         for subscriber in subscribers.iter() {
             let subscriber = subscriber.clone();
             let adnl_key_id = adnl_key_id.clone();
-            self.clone().runtime_handle.spawn(async move {
+            self.scheduler.spawn_callback(&self.runtime_handle, async move {
                 if let Err(e) = subscriber
                     .event(ConfigEvent::AddValidatorAdnlKey(adnl_key_id, election_id))
                     .await
@@ -1915,7 +1939,7 @@ impl NodeConfigHandler {
                     let adnl_key_id = KeyId::from_data(adnl_key_id[..].try_into()?);
                     let election_id = key.election_id;
                     let subscribers = subscribers.to_vec();
-                    self.runtime_handle.spawn(async move {
+                    self.scheduler.spawn_callback(&self.runtime_handle, async move {
                         for subscriber in subscribers.iter() {
                             if let Err(e) = subscriber
                                 .event(ConfigEvent::AddValidatorAdnlKey(
@@ -1958,13 +1982,47 @@ impl NodeConfigHandler {
     ) -> Result<()> {
         let name = config_handler_context.config.file_name.clone();
         let mut actual_config = config_handler_context.config;
-        let mut reader = config_handler_context.reader;
+        let mut reader = scheduler::ConfigInbox(config_handler_context.reader);
         let key_ring = self.key_ring.clone();
         let validator_keys = self.validator_keys.clone();
-        self.load_config(&actual_config, &subscribers)?;
-
-        self.clone().runtime_handle.spawn(async move {
-            while let Some(task) = reader.recv().await {
+        let scheduler = self.scheduler.clone();
+        let mut admission = scheduler.admission.lock().unwrap();
+        if !admission.open || admission.started {
+            fail!("Configuration scheduler is stopped or already started");
+        }
+        admission.started = true;
+        let loaded = self.load_config(&actual_config, &subscribers);
+        let scheduler_worker = scheduler.clone();
+        let runtime = self.runtime_handle.clone();
+        let worker = runtime.spawn(async move {
+            let mut draining = false;
+            loop {
+                let task = if draining {
+                    match reader.try_recv() {
+                        Ok(task) => Some(task),
+                        Err(_) => {
+                            // No external writes can enter after stop. Existing
+                            // callbacks may still ask this actor for their key.
+                            scheduler_worker.callbacks.close();
+                            tokio::select! {
+                                biased;
+                                _ = scheduler_worker.callbacks.wait() => None,
+                                task = reader.recv() => task,
+                            }
+                        }
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = scheduler_worker.cancellation.cancelled() => {
+                            draining = true;
+                            continue;
+                        },
+                        task = reader.recv() => task,
+                    }
+                };
+                let Some(task) = task else { break };
+                let mut response = PendingAnswer::new(task.0);
                 let answer = match task.1 {
                     Task::Generate(key_type) => {
                         let result = NodeConfigHandler::generate_and_save(
@@ -2037,11 +2095,19 @@ impl NodeConfigHandler {
                         Answer::CustomOverlays(Ok(actual_config.custom_overlays.clone()))
                     }
                 };
-                task.0.respond(Some(answer));
+                response.respond(answer);
             }
             reader.close();
+            while let Ok((wait, _)) = reader.try_recv() {
+                wait.respond(None);
+            }
         });
-        Ok(())
+        scheduler.own_worker(&runtime, worker);
+        drop(admission);
+        if loaded.is_err() {
+            scheduler.stop();
+        }
+        loaded
     }
 }
 
@@ -2052,7 +2118,7 @@ impl KeyRing for NodeConfigHandler {
         let (wait, mut queue_reader) = Wait::new();
         let pushed_task = (wait.clone(), Task::Generate(key_type));
         wait.request();
-        if let Err(e) = self.sender.send(pushed_task) {
+        if let Err(e) = self.send_task(pushed_task) {
             fail!("Error generate: {}", e);
         }
         match wait.wait(&mut queue_reader, true).await {
@@ -2068,7 +2134,7 @@ impl KeyRing for NodeConfigHandler {
         let (wait, mut queue_reader) = Wait::new();
         let pushed_task = (wait.clone(), Task::ImportPrivateKey(key));
         wait.request();
-        if let Err(e) = self.sender.send(pushed_task) {
+        if let Err(e) = self.send_task(pushed_task) {
             fail!("Error generate: {}", e);
         }
         match wait.wait(&mut queue_reader, true).await {

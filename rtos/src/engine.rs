@@ -920,7 +920,9 @@ impl Engine {
         // Failure sources are sticky. Still finish transport cleanup before
         // returning the final result, including failures reported during it.
         let _ = self.stopper.clone().wait_stop().await;
-        self.network.stop_adnl().await;
+        if let Err(error) = self.network.stop_adnl().await {
+            self.stopper.report_service_failure(0, format!("node network shutdown: {error}"));
+        }
         if let Some(tc) = &self.trace_collector {
             tc.stop();
         }

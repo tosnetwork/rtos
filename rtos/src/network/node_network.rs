@@ -270,11 +270,21 @@ impl NodeNetwork {
         };
         let node_network = Arc::new(node_network);
 
-        NodeConfigHandler::start_sheduler(
+        if let Err(error) = NodeConfigHandler::start_sheduler(
             node_network.config_handler.clone(),
             config_handler_context,
             vec![node_network.clone()],
-        )?;
+        ) {
+            // Keep cleanup owned if the failed constructor's caller is cancelled.
+            let cleanup = node_network.clone();
+            let drain = tokio::spawn(async move { cleanup.stop_adnl().await });
+            if let Err(cleanup_error) = drain.await? {
+                return Err(error!(
+                    "Network config initialization: {error}; cleanup: {cleanup_error}"
+                ));
+            }
+            return Err(error);
+        }
         Ok(node_network)
     }
 
@@ -320,9 +330,13 @@ impl NodeNetwork {
         self.config_handler.clone()
     }
 
-    pub async fn stop_adnl(&self) {
+    pub async fn stop_adnl(&self) -> Result<()> {
         log::info!("Stopping node network loops...");
+        self.config_handler.stop();
         self.cancellation_token.cancel();
+        // A queued subscriber must finish before transport shutdown, otherwise
+        // it can register a new endpoint after the old endpoints were stopped.
+        let config_result = self.config_handler.stop_and_wait().await;
         if let Some(quic) = &self.network_context.stack.quic {
             log::info!("Stopping QUIC...");
             quic.shutdown();
@@ -330,6 +344,7 @@ impl NodeNetwork {
         log::info!("Node network loops stopped. Stopping adnl...");
         self.network_context.stack.adnl.stop().await;
         log::info!("Stopped adnl");
+        config_result
     }
 
     fn try_add_counted_object<K: Hash + Ord + Clone, T: CountedObject>(
