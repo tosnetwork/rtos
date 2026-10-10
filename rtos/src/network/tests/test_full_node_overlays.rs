@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -17,6 +17,7 @@ use crate::{
 };
 use adnl::{common::TaggedTlObject, node::IpAddress};
 use rtos_api::{
+    serialize_boxed,
     ton::{
         adnl::Pong as AdnlPongBoxed, rpc::adnl::Ping as AdnlPing,
         ton_node::blocksignature::BlockSignature,
@@ -281,31 +282,49 @@ fn test_block_broadcast_compression() {
     let cc_seqno = rand::random();
     let validator_set_hash = rand::random();
 
-    let bcast_c = build_block_broadcast_compressed(
-        &block,
-        &proof,
-        cc_seqno,
-        signatures.clone(),
-        validator_set_hash,
-    )
-    .unwrap();
+    for profile in [rtos_api::WireProfile::Legacy, rtos_api::WireProfile::T0] {
+        let bcast_c = build_block_broadcast_compressed(
+            profile,
+            &block,
+            &proof,
+            cc_seqno,
+            signatures.clone(),
+            validator_set_hash,
+        )
+        .unwrap();
 
-    let bcast = decompress_block_broadcast(bcast_c).unwrap();
+        let other = if profile == rtos_api::WireProfile::T0 {
+            rtos_api::WireProfile::Legacy
+        } else {
+            rtos_api::WireProfile::T0
+        };
+        assert!(decompress_block_broadcast(bcast_c.clone(), other).is_err());
+        let mut trailing = bcast_c.clone();
+        let mut decoded = rtos_block::lz4_decompress(
+            &trailing.compressed,
+            rtos_block::Lz4DecompressMode::WithMaxSize(super::super::MAX_COMPRESSED_SIZE as i32),
+        )
+        .unwrap();
+        decoded.push(1);
+        trailing.compressed = rtos_block::lz4_compress(decoded, false).unwrap();
+        assert!(decompress_block_broadcast(trailing, profile).is_err());
+        let bcast = decompress_block_broadcast(bcast_c, profile).unwrap();
 
-    let block2 =
-        BlockStuff::deserialize_block_checked(bcast.id.clone(), Arc::new(bcast.data.clone()))
-            .unwrap();
-    assert_eq!(block, block2);
-    let proof2 = BlockProofStuff::deserialize(
-        block2.id(),
-        bcast.proof,
-        !block2.id().shard().is_masterchain(),
-    )
-    .unwrap();
-    assert_eq!(proof.root_cell(), proof2.root_cell());
-    assert_eq!(cc_seqno, bcast.catchain_seqno as u32);
-    assert_eq!(validator_set_hash, bcast.validator_set_hash as u32);
-    assert_eq!(signatures, bcast.signatures);
+        let block2 =
+            BlockStuff::deserialize_block_checked(bcast.id.clone(), Arc::new(bcast.data.clone()))
+                .unwrap();
+        assert_eq!(block, block2);
+        let proof2 = BlockProofStuff::deserialize(
+            block2.id(),
+            bcast.proof,
+            !block2.id().shard().is_masterchain(),
+        )
+        .unwrap();
+        assert_eq!(proof.root_cell(), proof2.root_cell());
+        assert_eq!(cc_seqno, bcast.catchain_seqno as u32);
+        assert_eq!(validator_set_hash, bcast.validator_set_hash as u32);
+        assert_eq!(signatures, bcast.signatures);
+    }
 }
 
 /// Helper to create test BlockSignaturesVariant::Ordinary

@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming; typed Simplex protocol and membership admission.
+ * RTOS project modifications (2026-10-10): project and crate naming; typed Simplex protocol and membership admission; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -23,7 +23,7 @@ use adnl::{
     PrivateOverlayShortId,
 };
 use rtos_api::{
-    deserialize_boxed, serialize_bare, serialize_boxed, serialize_boxed_append,
+    deserialize_boxed, serialize_bare, serialize_boxed,
     ton::{
         catchain::BroadcastWrapper,
         consensus::{
@@ -814,7 +814,8 @@ impl AdnlOverlayConsumer {
 #[async_trait::async_trait]
 impl Subscriber for AdnlOverlayConsumer {
     async fn try_consume_custom(&self, data: &[u8], peers: &AdnlPeers) -> Result<bool> {
-        let object = deserialize_boxed(data)?;
+        let overlay = self.overlay.upgrade().ok_or_else(|| error!("Overlay stopped"))?;
+        let object = overlay.stack.overlay.wire_profile().deserialize(data)?;
 
         // Handle catchain broadcast wrapper
         let object = match object.downcast::<BroadcastWrapper>() {
@@ -1385,7 +1386,8 @@ impl AdnlOverlay {
         );
 
         let now = Instant::now();
-        let data = serialize_boxed(&query).map_err(|e| {
+        let profile = self.stack.overlay.wire_profile();
+        let data = profile.serialize(&query).map_err(|e| {
             log::warn!(target: LOG_TARGET, "AdnlOverlay: query is bad: {:?}", e);
             e
         })?;
@@ -1436,7 +1438,8 @@ impl AdnlOverlay {
 
                         // Transform BlockPayloadPtr result to Answer
                         let answer_result = result.and_then(|payload| {
-                            deserialize_boxed(payload.data())
+                            profile
+                                .deserialize(payload.data())
                                 .map(|answer| Some(Answer::Object(answer.into())))
                         });
                         wait_for_response.respond(Some(answer_result));
@@ -1889,7 +1892,8 @@ impl ConsensusOverlay for AdnlOverlay {
 
             // Execute query with timeout and handle result
             let result = async {
-                let query: TaggedTlObject = deserialize_boxed(msg.data())?.into();
+                let query: TaggedTlObject =
+                    overlay_node.wire_profile().deserialize(msg.data())?.into();
                 let timeout_ms = Some(AdnlNode::calc_timeout(Some(timeout.as_millis() as u64)));
                 let now = Instant::now();
 
@@ -1913,7 +1917,7 @@ impl ConsensusOverlay for AdnlOverlay {
                     .record(elapsed);
 
                 let result = result.ok_or_else(|| error!("answer is None!"))?;
-                let data = serialize_boxed(&result)?;
+                let data = overlay_node.wire_profile().serialize(&result)?;
                 normalize_query_response_payload(data)
             }
             .await;
@@ -1962,7 +1966,7 @@ impl ConsensusOverlay for AdnlOverlay {
             }
 
             let result = async {
-                let query_body = deserialize_boxed(query.data())?;
+                let query_body = overlay_node.wire_profile().deserialize(query.data())?;
 
                 if is_quic {
                     // QUIC path: use bi-directional stream query (no max_answer_size needed)
@@ -1971,12 +1975,12 @@ impl ConsensusOverlay for AdnlOverlay {
                         .query_via_quic(&dst_adnl_id, &tagged, &overlay_id, None)
                         .await?;
                     let result = result.ok_or_else(|| error!("QUIC query answer is None!"))?;
-                    let data = serialize_boxed(&result)?;
+                    let data = overlay_node.wire_profile().serialize(&result)?;
                     normalize_query_response_payload(data)
                 } else {
                     // RLDP path: traditional large-message query
                     let mut query_data = overlay_node.get_query_prefix(&overlay_id)?;
-                    serialize_boxed_append(&mut query_data, &query_body)?;
+                    overlay_node.wire_profile().serialize_append(&mut query_data, &query_body)?;
 
                     let (data, _) = overlay_node
                         .query_via_rldp(
@@ -2256,6 +2260,10 @@ impl Drop for AdnlOverlayManager {
 }
 
 impl ConsensusOverlayManager for AdnlOverlayManager {
+    fn wire_profile(&self) -> rtos_api::WireProfile {
+        self.stack.overlay.wire_profile()
+    }
+
     /// Start new consensus overlay with given parameters
     fn start_overlay(
         &self,

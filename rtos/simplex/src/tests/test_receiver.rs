@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming; typed Simplex protocol and membership admission.
+ * RTOS project modifications (2026-10-10): project and crate naming; typed Simplex protocol and membership admission; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -137,6 +137,7 @@ struct ReceiverStats {
     /// Number of votes received
     votes_received: AtomicU32,
     received_vote_bytes: Mutex<Vec<(u32, Vec<u8>)>>,
+    received_candidates: Mutex<Vec<CandidateData>>,
     /// Number of broadcasts received
     broadcasts_received: AtomicU32,
     /// Number of certificates received
@@ -162,6 +163,7 @@ impl ReceiverStats {
         Self {
             votes_received: AtomicU32::new(0),
             received_vote_bytes: Mutex::new(Vec::new()),
+            received_candidates: Mutex::new(Vec::new()),
             broadcasts_received: AtomicU32::new(0),
             certificates_received: AtomicU32::new(0),
             received_certificates: Mutex::new(Vec::new()),
@@ -231,7 +233,8 @@ impl ReceiverListener for TestReceiverListener {
         candidate: CandidateData,
         _notar_cert: Option<Vec<u8>>,
     ) {
-        let count = self.stats.broadcasts_received.fetch_add(1, Ordering::Relaxed) + 1;
+        self.stats.received_candidates.lock().unwrap().push(candidate.clone());
+        let count = self.stats.broadcasts_received.fetch_add(1, Ordering::Release) + 1;
         log::trace!(
             "Receiver {} received candidate from source {}: count={}, slot={}",
             self.stats.receiver_idx,
@@ -389,6 +392,26 @@ impl ReceiverInstance {
         overlay_manager: ConsensusOverlayManagerPtr,
         protocol: consensus_common::simplex_protocol::SimplexProtocol,
     ) -> Result<Self, Error> {
+        Self::create_with_profile(
+            idx,
+            session_id,
+            nodes,
+            private_key,
+            overlay_manager,
+            protocol,
+            rtos_api::WireProfile::Legacy,
+        )
+    }
+
+    fn create_with_profile<N: Clone + Into<crate::SimplexSessionNode>>(
+        idx: u32,
+        session_id: SessionId,
+        nodes: &[N],
+        private_key: PrivateKey,
+        overlay_manager: ConsensusOverlayManagerPtr,
+        protocol: consensus_common::simplex_protocol::SimplexProtocol,
+        wire_profile: rtos_api::WireProfile,
+    ) -> Result<Self, Error> {
         let (listener, stats) = TestReceiverListener::create(idx);
         let listener_arc: Arc<dyn ReceiverListener + Send + Sync> = listener.clone();
         let listener_weak: ReceiverListenerPtr = Arc::downgrade(&listener_arc);
@@ -413,6 +436,7 @@ impl ReceiverInstance {
                 max_candidate_size,
                 max_candidate_query_answer_size,
                 protocol,
+                wire_profile,
                 ..Default::default()
             },
         )?;
@@ -2044,36 +2068,41 @@ fn test_receiver_standstill_cache_does_not_overwrite_existing_certificate() {
 #[test]
 fn pq_live_receiver_verifies_votes_and_serves_candidates() {
     use crate::pq_fixture as f;
-    for (protocol, wrong_member) in [
+    for (protocol, wrong_member, wire_profile) in [
         consensus_common::simplex_protocol::SimplexProtocol::Private,
         consensus_common::simplex_protocol::SimplexProtocol::BlockSync,
     ]
     .into_iter()
     .flat_map(|protocol| [(protocol, false), (protocol, true)])
-    {
+    .flat_map(|(protocol, wrong_member)| {
+        [rtos_api::WireProfile::Legacy, rtos_api::WireProfile::T0]
+            .map(|wire_profile| (protocol, wrong_member, wire_profile))
+    }) {
         let (nodes, keys) = f::members();
         for (node, key) in nodes.iter().zip(&keys) {
             assert_eq!(&node.adnl_id, key.id());
             assert_ne!(node.identity.id(), key.id());
             assert_ne!(node.identity.pq_key().unwrap().key_id.as_slice(), key.id().data());
         }
-        let overlay = SessionFactory::create_in_process_overlay_manager(2);
-        let receiver0 = ReceiverInstance::create_with_protocol(
+        let overlay = consensus_common::ConsensusCommonFactory::create_in_process_overlay_manager_with_profile(2, wire_profile);
+        let receiver0 = ReceiverInstance::create_with_profile(
             0,
             f::session(),
             &nodes,
             keys[0].clone(),
             overlay.clone(),
             protocol,
+            wire_profile,
         )
         .unwrap();
-        let receiver1 = ReceiverInstance::create_with_protocol(
+        let receiver1 = ReceiverInstance::create_with_profile(
             1,
             f::session(),
             &nodes,
             keys[1].clone(),
             overlay,
             protocol,
+            wire_profile,
         )
         .unwrap();
         receiver0.receiver.set_ingress_progress_slot(99);
@@ -2099,7 +2128,7 @@ fn pq_live_receiver_verifies_votes_and_serves_candidates() {
             signature: f::bytes(&f::row("empty", "candidate", 1, f::CONTEXT), "signature"),
         }
         .into_boxed();
-        let payload = serialize_boxed(&empty).unwrap();
+        let payload = wire_profile.serialize(&empty).unwrap();
         receiver0._listener.set_query_fallback_payloads(
             99,
             f::candidate_hash("empty"),
@@ -2182,6 +2211,25 @@ fn test_receiver_typed_protocol_and_membership_fail_before_overlay_start() {
         let error = create(vec![node.clone()], protocol, &outsider).err().unwrap();
         assert!(error.to_string().contains("Local key not found"), "{error}");
         assert_eq!(overlay.0.load(Ordering::SeqCst), 0);
+        let error = crate::receiver::ReceiverWrapper::create(
+            UInt256::rand(),
+            &ShardIdent::masterchain(),
+            &[node.clone()],
+            &key,
+            overlay.clone(),
+            Arc::downgrade(&listener),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+            crate::receiver::ReceiverSettings {
+                protocol,
+                wire_profile: rtos_api::WireProfile::T0,
+                ..Default::default()
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("wire profile mismatch"), "{error}");
+        assert_eq!(overlay.0.load(Ordering::SeqCst), 0);
     }
     let error = create(vec![node], SimplexProtocol::PrivateObserversPlumtree, &key).err().unwrap();
     assert!(error.to_string().contains("protocol version 2 runtime"), "{error}");
@@ -2191,4 +2239,83 @@ fn test_receiver_typed_protocol_and_membership_fail_before_overlay_start() {
         ..Default::default()
     };
     assert!(options.validate().unwrap_err().to_string().contains("protocol version 2 runtime"));
+}
+
+#[test]
+fn classical_target_receiver_real_candidate_repair_for_protocols_zero_one() {
+    use consensus_common::simplex_protocol::SimplexProtocol;
+    for protocol in [SimplexProtocol::Private, SimplexProtocol::BlockSync] {
+        let profile = rtos_api::WireProfile::T0;
+        let session = UInt256::rand();
+        let keys: Vec<PrivateKey> =
+            (0..2).map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap()).collect();
+        let nodes: Vec<_> = keys
+            .iter()
+            .map(|key| SessionNode {
+                public_key: key.clone(),
+                adnl_id: key.id().clone(),
+                weight: 1,
+            })
+            .collect();
+        let overlay=consensus_common::ConsensusCommonFactory::create_in_process_overlay_manager_with_profile(2,profile);
+        let a = ReceiverInstance::create_with_profile(
+            0,
+            session.clone(),
+            &nodes,
+            keys[0].clone(),
+            overlay.clone(),
+            protocol,
+            profile,
+        )
+        .unwrap();
+        let b = ReceiverInstance::create_with_profile(
+            1,
+            session.clone(),
+            &nodes,
+            keys[1].clone(),
+            overlay,
+            protocol,
+            profile,
+        )
+        .unwrap();
+        a.receiver.set_ingress_progress_slot(99);
+        b.receiver.set_ingress_progress_slot(99);
+        let parent_hash = UInt256::from([5; 32]);
+        let block = rtos_block::BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            42,
+            [21; 32].into(),
+            [22; 32].into(),
+        );
+        let hash = crate::utils::compute_candidate_id_hash_empty(
+            &block,
+            (SlotIndex::new(98), &parent_hash),
+        );
+        let signature = crate::utils::sign_candidate_u32(&session, 99, &hash, &keys[1]).unwrap();
+        let candidate = rtos_api::ton::consensus::candidatedata::Empty {
+            slot: 99,
+            parent: TlCandidateId { slot: 98, hash: parent_hash }.into_boxed(),
+            block,
+            signature,
+        }
+        .into_boxed();
+        let wire = profile.serialize(&candidate).unwrap();
+        assert_eq!(&wire[..4], &0x0740558cu32.to_le_bytes());
+        b._listener.set_query_fallback_payloads(
+            99,
+            hash.clone(),
+            wire.clone(),
+            build_valid_notar_bytes(&session, 99, &hash, &[(0, &keys[0]), (1, &keys[1])]),
+        );
+        a.receiver.request_candidate(99, hash);
+        wait_until(Duration::from_secs(5), || {
+            a.stats.broadcasts_received.load(Ordering::Acquire) == 1
+        });
+        assert_eq!(
+            profile.serialize(&a.stats.received_candidates.lock().unwrap()[0]).unwrap(),
+            wire
+        );
+        a.stop();
+        b.stop();
+    }
 }

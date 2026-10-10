@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -329,6 +329,10 @@ impl LossyOverlayManager {
 }
 
 impl ConsensusOverlayManager for LossyOverlayManager {
+    fn wire_profile(&self) -> rtos_api::WireProfile {
+        self.inner.wire_profile()
+    }
+
     fn start_overlay(
         &self,
         local_id: &PrivateKey,

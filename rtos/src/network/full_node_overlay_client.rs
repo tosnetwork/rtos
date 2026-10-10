@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -155,7 +155,7 @@ impl FullNodeOverlayClient {
                 self.engine.clone().process_new_shard_block_broadcast(broadcast, src.clone())
             }
             Broadcast::TonNode_BlockBroadcastCompressed(broadcast) => {
-                match decompress_block_broadcast(broadcast) {
+                match decompress_block_broadcast(broadcast, self.client.network_context().stack.overlay.wire_profile()) {
                     Err(e) => log::error!("Error decompressing block broadcast: {e}"),
                     Ok(b) => self.engine.clone().process_block_broadcast(b, src.clone()),
                 }

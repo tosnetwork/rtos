@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -25,7 +25,6 @@ use adnl::{
     server::{AdnlServer, AdnlServerConfig, AdnlServerConfigJson},
 };
 use rtos_api::{
-    deserialize_boxed,
     ton::{
         lite_server::{
             accountdispatchqueueinfo::AccountDispatchQueueInfo,
@@ -554,7 +553,8 @@ impl LiteServer {
         runtime: tokio::runtime::Handle,
         engine: Arc<dyn EngineOperations>,
     ) -> Result<Self> {
-        let subscriber = LiteServerQuerySubscriber::new(
+        let subscriber = LiteServerQuerySubscriber::new_with_profile(
+            rtos_api::WireProfile::T0,
             runtime,
             engine,
             config.max_parallel_fast_queries,
@@ -719,12 +719,31 @@ struct SubscriberContext {
 }
 
 pub struct LiteServerQuerySubscriber {
+    wire_profile: rtos_api::WireProfile,
     context: Arc<SubscriberContext>,
     runtime: tokio::runtime::Handle,
 }
 
 impl LiteServerQuerySubscriber {
     pub fn new(
+        runtime: tokio::runtime::Handle,
+        engine: Arc<dyn EngineOperations>,
+        max_parallel_fast_queries: u64,
+        max_parallel_slow_queries: u64,
+        account_state_cache_size_mb: u64,
+    ) -> Result<Self> {
+        Self::new_with_profile(
+            rtos_api::WireProfile::Legacy,
+            runtime,
+            engine,
+            max_parallel_fast_queries,
+            max_parallel_slow_queries,
+            account_state_cache_size_mb,
+        )
+    }
+
+    pub fn new_with_profile(
+        wire_profile: rtos_api::WireProfile,
         runtime: tokio::runtime::Handle,
         engine: Arc<dyn EngineOperations>,
         max_parallel_fast_queries: u64,
@@ -757,7 +776,7 @@ impl LiteServerQuerySubscriber {
                 notify: tokio::sync::Notify::new(),
             }),
         });
-        Ok(Self { context, runtime })
+        Ok(Self { context, runtime, wire_profile })
     }
 
     async fn get_account_state(
@@ -2687,7 +2706,7 @@ impl LiteServerQuerySubscriber {
         if !Self::get_prefix(data, Query::constructor_const()) {
             return Ok(None);
         }
-        let obj = deserialize_boxed(data)?;
+        let obj = rtos_api::WireProfile::Legacy.deserialize(data)?;
         if let Ok(q) = obj.downcast::<Query>() {
             return Ok(Some(q.data));
         }
@@ -3067,7 +3086,7 @@ impl Subscriber for LiteServerQuerySubscriber {
         } else {
             None
         };
-        let query = deserialize_boxed(data)?;
+        let query = self.wire_profile.deserialize(data)?;
 
         // Three query categories:
         // 1. immediate — lightweight, processed inline without semaphore
@@ -3085,7 +3104,9 @@ impl Subscriber for LiteServerQuerySubscriber {
                 || query.is::<SendMessage>());
         if immediate {
             let (result, _) = Self::process(self.context.as_ref(), query, false).await?;
-            return Ok(QueryResult::Consumed(QueryAnswer::Ready(result)));
+            return Ok(QueryResult::Consumed(
+                QueryAnswer::Ready(result).with_profile(self.wire_profile)?,
+            ));
         }
 
         let maybe_immediate = query.is::<GetAccountState>() || query.is::<GetAccountStatePrunned>();
@@ -3093,7 +3114,9 @@ impl Subscriber for LiteServerQuerySubscriber {
             let (result, is_slow) =
                 Self::process(self.context.as_ref(), query.clone(), false).await?;
             if !is_slow {
-                return Ok(QueryResult::Consumed(QueryAnswer::Ready(result)));
+                return Ok(QueryResult::Consumed(
+                    QueryAnswer::Ready(result).with_profile(self.wire_profile)?,
+                ));
             }
         }
 
@@ -3120,7 +3143,9 @@ impl Subscriber for LiteServerQuerySubscriber {
             let handle = self.runtime.spawn(async move {
                 rx.await.map_err(|_| anyhow::anyhow!("wait registry dropped"))?
             });
-            return Ok(QueryResult::Consumed(QueryAnswer::Pending(handle)));
+            return Ok(QueryResult::Consumed(
+                QueryAnswer::Pending(handle).with_profile(self.wire_profile)?,
+            ));
         }
 
         // Non-immediate queries without wait prefix — spawn with semaphore
@@ -3137,7 +3162,7 @@ impl Subscriber for LiteServerQuerySubscriber {
                 .await
             }
         });
-        Ok(QueryResult::Consumed(QueryAnswer::Pending(handle)))
+        Ok(QueryResult::Consumed(QueryAnswer::Pending(handle).with_profile(self.wire_profile)?))
     }
 }
 

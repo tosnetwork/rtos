@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -859,10 +859,29 @@ impl RawCandidate {
         max_size: usize,
         proto_version: u32,
     ) -> Result<Self> {
-        // Parse TL object
-        let data_vec = data.to_vec();
-        let candidate_tl =
-            consensus_common::utils::deserialize_tl_boxed_object::<CandidateData>(&data_vec)?;
+        Self::deserialize_with_profile(
+            data,
+            session_id,
+            leader_key,
+            leader_idx,
+            shard,
+            max_size,
+            proto_version,
+            rtos_api::WireProfile::Legacy,
+        )
+    }
+
+    pub fn deserialize_with_profile(
+        data: &[u8],
+        session_id: &SessionId,
+        leader_key: &(impl Clone + Into<consensus_common::ValidatorIdentity>),
+        leader_idx: ValidatorIndex,
+        shard: &ShardIdent,
+        max_size: usize,
+        proto_version: u32,
+        wire_profile: rtos_api::WireProfile,
+    ) -> Result<Self> {
+        let candidate_tl = wire_profile.deserialize_typed::<CandidateData>(data)?;
 
         Self::from_tl(
             &candidate_tl,

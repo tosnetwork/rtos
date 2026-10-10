@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -20,14 +20,13 @@ use adnl::{
     BroadcastRecvInfo, NetworkStack, OverlayNode, OverlayParams, OverlayShortId,
 };
 use rtos_api::{
-    deserialize_typed,
     ton::{
         engine::validator::{customoverlay::CustomOverlay, customoverlaynode::CustomOverlayNode},
         pub_::publickey::Overlay as OverlayKey,
         ton_node::{customoverlayid::CustomOverlayId, Broadcast},
         Bool,
     },
-    BoxedSerialize,
+    BoxedSerialize, IntoBoxed,
 };
 use rtos_block::{error, fail, AccountIdPrefixFull, KeyId, Result, ShardIdent, UInt256};
 use std::{
@@ -70,7 +69,11 @@ impl CustomOverlayClient {
             let id = KeyId::from_data(node.adnl_id.as_slice().to_owned());
             nodes.insert(id, node.clone());
         }
-        let id_short = Self::calc_overlay_id(config, engine.zerostate_id()?.file_hash())?;
+        let id_short = Self::calc_overlay_id_with_profile(
+            config,
+            engine.zerostate_id()?.file_hash(),
+            stack.overlay.wire_profile(),
+        )?;
         log::debug!("Creating custom overlay {} with id {}", config.name, id_short);
 
         let mut shards = Vec::new();
@@ -248,7 +251,8 @@ impl CustomOverlayClient {
     }
 
     async fn process_broadcast(&self, info: &BroadcastRecvInfo) -> Result<()> {
-        let broadcast: Broadcast = deserialize_typed(&info.data)?;
+        let broadcast: Broadcast =
+            self.stack.overlay.wire_profile().deserialize_typed(&info.data)?;
         let src = &info.recv_from;
         log::trace!(
             "Received broadcast {:08x} in custom overlay {} {} from {src}",
@@ -276,7 +280,8 @@ impl CustomOverlayClient {
             }
             Broadcast::TonNode_BlockBroadcastCompressed(broadcast) => {
                 self.check_send_block_permission(src)?;
-                let bb = decompress_block_broadcast(broadcast).map_err(|e| {
+                let bb = decompress_block_broadcast(broadcast, self.stack.overlay.wire_profile())
+                    .map_err(|e| {
                     error!(
                         "Error decompressing block broadcast: \
                         {e} in custom overlay \"{}\" {} from {src}",
@@ -421,6 +426,18 @@ impl CustomOverlayClient {
         config: &CustomOverlay,
         zero_state_file_hash: &UInt256,
     ) -> Result<Arc<OverlayShortId>> {
+        Self::calc_overlay_id_with_profile(
+            config,
+            zero_state_file_hash,
+            rtos_api::WireProfile::Legacy,
+        )
+    }
+
+    pub fn calc_overlay_id_with_profile(
+        config: &CustomOverlay,
+        zero_state_file_hash: &UInt256,
+        profile: rtos_api::WireProfile,
+    ) -> Result<Arc<OverlayShortId>> {
         let mut nodes: Vec<UInt256> = config.nodes.iter().map(|n| n.adnl_id.clone()).collect();
         nodes.sort();
         let id_full = CustomOverlayId {
@@ -428,7 +445,11 @@ impl CustomOverlayClient {
             name: config.name.clone(),
             nodes,
         };
-        let overlay_key = OverlayKey { name: hash(id_full)?.into() };
+        let overlay_key = OverlayKey {
+            name: UInt256::calc_file_hash(&profile.serialize(&id_full.into_boxed())?)
+                .as_slice()
+                .to_vec(),
+        };
         let id_short = OverlayShortId::from_data(hash(overlay_key)?);
         Ok(id_short)
     }

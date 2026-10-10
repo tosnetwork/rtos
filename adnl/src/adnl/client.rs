@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -173,7 +173,7 @@ impl AdnlClient {
 
     /// Query server
     pub async fn query(&mut self, query: &TaggedTlObject) -> Result<TLObject> {
-        let (query_id, msg) = Query::build(None, query)?;
+        let (query_id, msg) = Query::build(None, query, rtos_api::WireProfile::Legacy)?;
         let mut buf = serialize_boxed(&msg.object)?;
         self.crypto.send(&mut self.stream, &mut buf).await?;
         loop {

@@ -9,10 +9,15 @@ use std::{
     },
 };
 pub(crate) fn description() -> Arc<SessionDescription> {
+    description_with_profile(rtos_api::WireProfile::Legacy)
+}
+pub(crate) fn description_with_profile(
+    wire_profile: rtos_api::WireProfile,
+) -> Arc<SessionDescription> {
     let (nodes, keys) = f::members();
     Arc::new(
         SessionDescription::new(
-            &SessionOptions::default(),
+            &SessionOptions { wire_profile, ..Default::default() },
             f::session(),
             42,
             &nodes,
@@ -30,7 +35,8 @@ pub(crate) fn binding(d: &SessionDescription) -> SigningBinding {
     let identity = d.get_source_public_key(d.get_self_idx());
     let key = identity.pq_key().unwrap();
     SigningBinding {
-        schema: 1,
+        schema: 2,
+        wire_profile: d.opts().wire_profile as u8,
         global_id: -777,
         zerostate_workchain: -1,
         zerostate_root: [11; 32],
@@ -86,10 +92,13 @@ pub(crate) struct Harness {
 }
 impl Harness {
     pub fn new() -> Self {
+        Self::new_with_profile(rtos_api::WireProfile::Legacy)
+    }
+    pub fn new_with_profile(wire_profile: rtos_api::WireProfile) -> Self {
         let root = std::env::temp_dir().join(format!("rtos-signing-{}", UInt256::rand()));
         std::fs::create_dir(&root).unwrap();
         let db = crate::database::SimplexDb::open(root.join("db"), "own-signing").unwrap();
-        let description = self::description();
+        let description = description_with_profile(wire_profile);
         let calls = Arc::new(AtomicUsize::new(0));
         let coordinator = Arc::new(
             SigningCoordinator::open(
@@ -106,12 +115,13 @@ impl Harness {
     }
     pub fn reopen(self) -> Self {
         let Self { root, db, description, coordinator, calls } = self;
+        let wire_profile = description.opts().wire_profile;
         drop(coordinator);
         drop(description);
         db.close(None).unwrap();
         drop(db);
         let db = crate::database::SimplexDb::open(root.join("db"), "own-signing").unwrap();
-        let description = self::description();
+        let description = description_with_profile(wire_profile);
         let coordinator = Arc::new(
             SigningCoordinator::open(
                 db.clone(),
@@ -260,7 +270,12 @@ fn own_journal_process_probe() {
     let Ok(root) = std::env::var("RTOS_SIGNING_PROBE_ROOT") else { return };
     let root = PathBuf::from(root);
     let initialize = std::env::var("RTOS_SIGNING_PROBE_MODE").unwrap() == "initialize";
-    let d = description();
+    let profile = match std::env::var("RTOS_SIGNING_PROBE_WIRE_PROFILE").as_deref() {
+        Ok("target") => rtos_api::WireProfile::T0,
+        Err(_) | Ok("legacy") => rtos_api::WireProfile::Legacy,
+        _ => panic!("unknown isolated probe wire profile"),
+    };
+    let d = description_with_profile(profile);
     let db = crate::database::SimplexDb::open(root.join("db"), "own-signing").unwrap();
     let count_path = root.join("sign-count");
     let signer = Signer::PublicTest(Box::new(move |message| {
@@ -293,12 +308,29 @@ fn own_journal_process_probe() {
     }
     let candidate = std::env::var("RTOS_SIGNING_PROBE_CANDIDATE").is_ok();
     let result = if candidate {
-        c.candidate(empty()).and_then(|v| Ok(rtos_api::serialize_boxed(&v)?))
+        c.candidate(empty()).and_then(|v| profile.serialize(&v))
     } else {
-        c.vote(&vote("notarize")).and_then(|v| Ok(rtos_api::serialize_boxed(&v.into_boxed())?))
+        c.vote(&vote("notarize")).and_then(|v| profile.serialize(&v.into_boxed()))
     };
     match result {
         Ok(bytes) => {
+            assert!(
+                c.state
+                    .lock()
+                    .unwrap()
+                    .records
+                    .values()
+                    .any(|record| record.signed.as_ref() == Some(&bytes)),
+                "probe publication must equal a complete durable carrier"
+            );
+            if candidate {
+                let expected = if profile == rtos_api::WireProfile::T0 {
+                    0x0740558cu32
+                } else {
+                    0xf117f8ffu32
+                };
+                assert_eq!(&bytes[..4], &expected.to_le_bytes());
+            }
             let mut file = File::create(root.join("published")).unwrap();
             file.write_all(&bytes).unwrap();
             file.sync_all().unwrap();
@@ -383,6 +415,7 @@ fn own_journal_rejects_every_binding_change_and_damaged_records() {
     let identity = description.get_source_public_key(description.get_self_idx()).clone();
     for field in [
         "schema",
+        "wire_profile",
         "global_id",
         "zerostate_workchain",
         "zerostate_root",
@@ -595,4 +628,107 @@ fn own_journal_failed_retirement_needs_external_monotonic_anchor() {
         "known limitation: old active header plus clock rollback cannot prove prior expiry"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn wire_profile_binding_refuses_old_headers_and_alternate_namespace_without_mutation() {
+    let h = Harness::new();
+    h.coordinator.candidate(empty()).unwrap();
+    let Harness { root, db, description, coordinator, calls } = h;
+    let b = binding(&description);
+    let identity = description.get_source_public_key(description.get_self_idx()).clone();
+    let owner = root.join(format!("{}.signer", hex::encode(b.validator)));
+    let owner_bytes = std::fs::read(&owner).unwrap();
+    drop(coordinator);
+    let before = db.storage.get_by_prefix(Vec::new(), None).wait().unwrap();
+    let mut target = b.clone();
+    target.wire_profile = rtos_api::WireProfile::T0 as u8;
+    for initialize in [false, true] {
+        assert!(SigningCoordinator::open(
+            db.clone(),
+            target.clone(),
+            identity.clone(),
+            &root,
+            initialize,
+            signer(calls.clone())
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&owner).unwrap(), owner_bytes);
+        assert_eq!(db.storage.get_by_prefix(Vec::new(), None).wait().unwrap(), before);
+    }
+    let alternate =
+        crate::database::SimplexDb::open(root.join("target-namespace"), "alternate-target")
+            .unwrap();
+    for initialize in [false, true] {
+        assert!(SigningCoordinator::open(
+            alternate.clone(),
+            target.clone(),
+            identity.clone(),
+            &root,
+            initialize,
+            signer(calls.clone())
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&owner).unwrap(), owner_bytes);
+        assert!(alternate.storage.get_by_prefix(Vec::new(), None).wait().unwrap().is_empty());
+    }
+    let original_header = before.iter().find(|(key, _)| key == HEADER).unwrap().1.clone();
+    for mode in 0..3 {
+        let mut header: Header = decode(&original_header).unwrap();
+        let expected;
+        let bad = match mode {
+            0 => {
+                header.binding.schema = 1;
+                expected = "unsupported signing header schema";
+                encode(&header).unwrap()
+            }
+            1 => {
+                header.binding.wire_profile = 99;
+                expected = "unknown signing wire profile";
+                encode(&header).unwrap()
+            }
+            _ => {
+                let mut value = serde_json::to_value(&header).unwrap();
+                value["binding"].as_object_mut().unwrap().remove("wire_profile");
+                expected = "missing field";
+                serde_json::to_vec(&value).unwrap()
+            }
+        };
+        db.storage.set(HEADER.to_vec(), bad.clone(), None).wait().unwrap();
+        let snapshot = db.storage.get_by_prefix(Vec::new(), None).wait().unwrap();
+        let error = SigningCoordinator::open(
+            db.clone(),
+            b.clone(),
+            identity.clone(),
+            &root,
+            false,
+            signer(calls.clone()),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains(expected), "{error}");
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(db.load_pq_bootstrap_cancellable(&cancelled, Duration::from_millis(10)).is_err());
+        assert_eq!(db.storage.get_by_prefix(Vec::new(), None).wait().unwrap(), snapshot);
+        assert_eq!(std::fs::read(&owner).unwrap(), owner_bytes);
+        assert!(validate_record(HEADER, &bad).is_err());
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn target_candidate_reuses_exact_durable_wire_after_restart() {
+    let h = Harness::new_with_profile(rtos_api::WireProfile::T0);
+    let signed = h.coordinator.candidate(empty()).unwrap();
+    let wire = rtos_api::WireProfile::T0.serialize(&signed).unwrap();
+    assert_eq!(&wire[..4], &0x0740558cu32.to_le_bytes());
+    assert_ne!(wire, rtos_api::serialize_boxed(&signed).unwrap());
+    let raw = h.db.storage.get_by_prefix(PREFIX.to_vec(), None).wait().unwrap();
+    let record: Record = decode(&raw.iter().find(|(key, _)| key != HEADER).unwrap().1).unwrap();
+    assert_eq!(record.signed.as_ref(), Some(&wire));
+    let h = h.reopen();
+    let again = h.coordinator.candidate(empty()).unwrap();
+    assert_eq!(rtos_api::WireProfile::T0.serialize(&again).unwrap(), wire);
+    assert_eq!(h.calls.load(Ordering::SeqCst), 1);
+    assert!(h.coordinator.check_session(&description()).is_err());
 }

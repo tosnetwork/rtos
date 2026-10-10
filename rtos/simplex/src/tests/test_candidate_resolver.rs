@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -719,6 +719,7 @@ fn test_validate_repair_candidate_identity_accepts_matching_empty_block() {
 
     let shard = ShardIdent::masterchain();
     let parsed = super::ReceiverImpl::validate_repair_candidate_identity(
+        rtos_api::WireProfile::Legacy,
         &session_id,
         &sources,
         1,
@@ -752,6 +753,7 @@ fn test_validate_repair_candidate_identity_rejects_wrong_hash() {
     let shard = ShardIdent::masterchain();
     let wrong_hash = UInt256::from_slice(&[0xEE; 32]);
     let err = super::ReceiverImpl::validate_repair_candidate_identity(
+        rtos_api::WireProfile::Legacy,
         &session_id,
         &sources,
         1,
@@ -778,6 +780,7 @@ fn test_validate_repair_candidate_identity_rejects_wrong_slot() {
 
     let shard = ShardIdent::masterchain();
     let err = super::ReceiverImpl::validate_repair_candidate_identity(
+        rtos_api::WireProfile::Legacy,
         &session_id,
         &sources,
         1,
@@ -801,6 +804,7 @@ fn test_validate_repair_candidate_identity_rejects_oversize() {
     let shard = ShardIdent::masterchain();
     let bytes = vec![0u8; 64];
     let err = super::ReceiverImpl::validate_repair_candidate_identity(
+        rtos_api::WireProfile::Legacy,
         &session_id,
         &sources,
         1,
@@ -829,6 +833,7 @@ fn test_validate_repair_candidate_identity_rejects_invalid_leader_signature() {
 
     let shard = ShardIdent::masterchain();
     let err = super::ReceiverImpl::validate_repair_candidate_identity(
+        rtos_api::WireProfile::Legacy,
         &session_id,
         &sources,
         1,
@@ -863,6 +868,7 @@ fn test_validate_repair_candidate_identity_rejects_empty_block_candidate_bytes()
 
     let shard = ShardIdent::masterchain();
     let err = super::ReceiverImpl::validate_repair_candidate_identity(
+        rtos_api::WireProfile::Legacy,
         &session_id,
         &sources,
         1,
@@ -894,6 +900,7 @@ fn test_validate_repair_notar_signature_set_accepts_quorum() {
     let notar_bytes = build_notar_signature_set_bytes(&session_id, &vote, &signing);
 
     super::ReceiverImpl::validate_repair_notar_signature_set(
+        rtos_api::WireProfile::Legacy,
         &session_id,
         &sources,
         /* max_candidate_query_answer_size */ 1 << 24,
@@ -926,6 +933,7 @@ fn test_validate_repair_notar_signature_set_rejects_invalid_validator_index() {
     let notar_bytes = serialize_boxed(&tl_set).expect("serialize VoteSignatureSet");
 
     let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        rtos_api::WireProfile::Legacy,
         &session_id,
         &sources,
         1 << 24,
@@ -950,6 +958,7 @@ fn test_validate_repair_notar_signature_set_rejects_duplicate_validator() {
     let notar_bytes = build_notar_signature_set_bytes(&session_id, &vote, &signing);
 
     let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        rtos_api::WireProfile::Legacy,
         &session_id,
         &sources,
         1 << 24,
@@ -987,6 +996,7 @@ fn test_validate_repair_notar_signature_set_rejects_invalid_signature() {
     let notar_bytes = serialize_boxed(&tl_set).expect("serialize VoteSignatureSet");
 
     let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        rtos_api::WireProfile::Legacy,
         &session_id,
         &sources,
         1 << 24,
@@ -1012,6 +1022,7 @@ fn test_validate_repair_notar_signature_set_rejects_insufficient_weight() {
     let notar_bytes = build_notar_signature_set_bytes(&session_id, &vote, &signing);
 
     let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        rtos_api::WireProfile::Legacy,
         &session_id,
         &sources,
         1 << 24,
@@ -1036,6 +1047,7 @@ fn test_validate_repair_notar_signature_set_rejects_empty_validator_set() {
     let notar_bytes = build_notar_signature_set_bytes(&session_id, &vote, &[]);
 
     let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        rtos_api::WireProfile::Legacy,
         &session_id,
         &sources,
         1 << 24,
@@ -1064,6 +1076,7 @@ fn test_validate_repair_notar_signature_set_rejects_zero_total_weight() {
     let notar_bytes = build_notar_signature_set_bytes(&session_id, &vote, &signing);
 
     let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        rtos_api::WireProfile::Legacy,
         &session_id,
         &sources,
         1 << 24,
@@ -1095,6 +1108,7 @@ fn test_validate_repair_notar_signature_set_rejects_mismatched_vote() {
     // Receiver requested a different block_hash; verification must fail because
     // the dataToSign payload is bound to the requested NotarizeVote.
     let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        rtos_api::WireProfile::Legacy,
         &session_id,
         &sources,
         1 << 24,
@@ -1115,6 +1129,7 @@ fn test_validate_repair_notar_signature_set_rejects_oversize() {
     let block_hash = UInt256::from_slice(&[0xBB; 32]);
     let bytes = vec![0u8; 128];
     let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        rtos_api::WireProfile::Legacy,
         &session_id,
         &sources,
         /* max_candidate_query_answer_size */ 64,
@@ -1142,6 +1157,7 @@ fn test_validate_repair_notar_signature_set_rejects_wrong_tl_type() {
     let bytes = serialize_boxed(&bogus.into_boxed()).expect("serialize OverlayId");
 
     let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        rtos_api::WireProfile::Legacy,
         &session_id,
         &sources,
         1 << 24,
