@@ -1,0 +1,1002 @@
+[
+  {
+    "name": "GASCONSUMED-f807-v4-s1-g1000000",
+    "code": "f807",
+    "version": 4,
+    "setup": "PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "GASCONSUMED-f807-v4-s3-g1000000",
+    "code": "f807",
+    "version": 4,
+    "setup": "PUSHNULL PUSHNULL PUSHNULL PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "GASCONSUMED-f807-v5-s1-g1000000",
+    "code": "f807",
+    "version": 5,
+    "setup": "PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "GASCONSUMED-f807-v5-s3-g1000000",
+    "code": "f807",
+    "version": 5,
+    "setup": "PUSHNULL PUSHNULL PUSHNULL PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "RIST255_PUSHL-f926-v4-s1-g1000000",
+    "code": "f926",
+    "version": 4,
+    "setup": "PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "RIST255_PUSHL-f926-v4-s3-g1000000",
+    "code": "f926",
+    "version": 4,
+    "setup": "PUSHNULL PUSHNULL PUSHNULL PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "RIST255_PUSHL-f926-v5-s1-g1000000",
+    "code": "f926",
+    "version": 5,
+    "setup": "PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "RIST255_PUSHL-f926-v5-s3-g1000000",
+    "code": "f926",
+    "version": 5,
+    "setup": "PUSHNULL PUSHNULL PUSHNULL PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_G1_ZERO-f93015-v4-s0-g59",
+    "code": "f93015",
+    "version": 4,
+    "setup": "",
+    "gas": 59
+  },
+  {
+    "name": "BLS_G1_ZERO-f93015-v4-s0-g60",
+    "code": "f93015",
+    "version": 4,
+    "setup": "",
+    "gas": 60
+  },
+  {
+    "name": "BLS_G1_ZERO-f93015-v4-s0-g1000000",
+    "code": "f93015",
+    "version": 4,
+    "setup": "",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_G1_ZERO-f93015-v4-s1-g1000000",
+    "code": "f93015",
+    "version": 4,
+    "setup": "PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_G1_ZERO-f93015-v4-s2-g1000000",
+    "code": "f93015",
+    "version": 4,
+    "setup": "PUSHINT -1",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_G1_ZERO-f93015-v4-s3-g1000000",
+    "code": "f93015",
+    "version": 4,
+    "setup": "PUSHNULL PUSHNULL PUSHNULL PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_G1_ZERO-f93015-v5-s0-g59",
+    "code": "f93015",
+    "version": 5,
+    "setup": "",
+    "gas": 59
+  },
+  {
+    "name": "BLS_G1_ZERO-f93015-v5-s0-g60",
+    "code": "f93015",
+    "version": 5,
+    "setup": "",
+    "gas": 60
+  },
+  {
+    "name": "BLS_G1_ZERO-f93015-v5-s0-g1000000",
+    "code": "f93015",
+    "version": 5,
+    "setup": "",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_G1_ZERO-f93015-v5-s1-g1000000",
+    "code": "f93015",
+    "version": 5,
+    "setup": "PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_G1_ZERO-f93015-v5-s2-g1000000",
+    "code": "f93015",
+    "version": 5,
+    "setup": "PUSHINT -1",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_G1_ZERO-f93015-v5-s3-g1000000",
+    "code": "f93015",
+    "version": 5,
+    "setup": "PUSHNULL PUSHNULL PUSHNULL PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_G2_ZERO-f93025-v4-s0-g59",
+    "code": "f93025",
+    "version": 4,
+    "setup": "",
+    "gas": 59
+  },
+  {
+    "name": "BLS_G2_ZERO-f93025-v4-s0-g60",
+    "code": "f93025",
+    "version": 4,
+    "setup": "",
+    "gas": 60
+  },
+  {
+    "name": "BLS_G2_ZERO-f93025-v4-s0-g1000000",
+    "code": "f93025",
+    "version": 4,
+    "setup": "",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_G2_ZERO-f93025-v4-s1-g1000000",
+    "code": "f93025",
+    "version": 4,
+    "setup": "PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_G2_ZERO-f93025-v4-s2-g1000000",
+    "code": "f93025",
+    "version": 4,
+    "setup": "PUSHINT -1",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_G2_ZERO-f93025-v4-s3-g1000000",
+    "code": "f93025",
+    "version": 4,
+    "setup": "PUSHNULL PUSHNULL PUSHNULL PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_G2_ZERO-f93025-v5-s0-g59",
+    "code": "f93025",
+    "version": 5,
+    "setup": "",
+    "gas": 59
+  },
+  {
+    "name": "BLS_G2_ZERO-f93025-v5-s0-g60",
+    "code": "f93025",
+    "version": 5,
+    "setup": "",
+    "gas": 60
+  },
+  {
+    "name": "BLS_G2_ZERO-f93025-v5-s0-g1000000",
+    "code": "f93025",
+    "version": 5,
+    "setup": "",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_G2_ZERO-f93025-v5-s1-g1000000",
+    "code": "f93025",
+    "version": 5,
+    "setup": "PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_G2_ZERO-f93025-v5-s2-g1000000",
+    "code": "f93025",
+    "version": 5,
+    "setup": "PUSHINT -1",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_G2_ZERO-f93025-v5-s3-g1000000",
+    "code": "f93025",
+    "version": 5,
+    "setup": "PUSHNULL PUSHNULL PUSHNULL PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_PUSHR-f93031-v4-s1-g1000000",
+    "code": "f93031",
+    "version": 4,
+    "setup": "PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_PUSHR-f93031-v4-s3-g1000000",
+    "code": "f93031",
+    "version": 4,
+    "setup": "PUSHNULL PUSHNULL PUSHNULL PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_PUSHR-f93031-v5-s1-g1000000",
+    "code": "f93031",
+    "version": 5,
+    "setup": "PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "BLS_PUSHR-f93031-v5-s3-g1000000",
+    "code": "f93031",
+    "version": 5,
+    "setup": "PUSHNULL PUSHNULL PUSHNULL PUSHNULL",
+    "gas": 1000000
+  },
+  {
+    "name": "hashext-valid-f0-a2-dynamicFalse-v4-g1000",
+    "code": "f90402",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2",
+    "version": 4,
+    "gas": 1000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f0-a2-dynamicFalse-v4-g1000000",
+    "code": "f90402",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2",
+    "version": 4,
+    "gas": 1000000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f0-a2-dynamicFalse-v8-g1000",
+    "code": "f90402",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2",
+    "version": 8,
+    "gas": 1000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f0-a2-dynamicFalse-v8-g1000000",
+    "code": "f90402",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2",
+    "version": 8,
+    "gas": 1000000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f0-a2-dynamicFalse-v9-g1000",
+    "code": "f90402",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2",
+    "version": 9,
+    "gas": 1000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f0-a2-dynamicFalse-v9-g1000000",
+    "code": "f90402",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2",
+    "version": 9,
+    "gas": 1000000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f0-a2-dynamicFalse-v14-g1000",
+    "code": "f90402",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2",
+    "version": 14,
+    "gas": 1000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f0-a2-dynamicFalse-v14-g1000000",
+    "code": "f90402",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2",
+    "version": 14,
+    "gas": 1000000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f0-a2-dynamicTrue-v4-g1000",
+    "code": "f904ff",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 2",
+    "version": 4,
+    "gas": 1000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f0-a2-dynamicTrue-v4-g1000000",
+    "code": "f904ff",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 2",
+    "version": 4,
+    "gas": 1000000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f0-a2-dynamicTrue-v8-g1000",
+    "code": "f904ff",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 2",
+    "version": 8,
+    "gas": 1000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f0-a2-dynamicTrue-v8-g1000000",
+    "code": "f904ff",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 2",
+    "version": 8,
+    "gas": 1000000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f0-a2-dynamicTrue-v9-g1000",
+    "code": "f904ff",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 2",
+    "version": 9,
+    "gas": 1000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f0-a2-dynamicTrue-v9-g1000000",
+    "code": "f904ff",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 2",
+    "version": 9,
+    "gas": 1000000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f0-a2-dynamicTrue-v14-g1000",
+    "code": "f904ff",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 2",
+    "version": 14,
+    "gas": 1000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f0-a2-dynamicTrue-v14-g1000000",
+    "code": "f904ff",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 2",
+    "version": 14,
+    "gas": 1000000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f1-a2-dynamicFalse-v4-g1000",
+    "code": "f90502",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2",
+    "version": 4,
+    "gas": 1000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f1-a2-dynamicFalse-v4-g1000000",
+    "code": "f90502",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2",
+    "version": 4,
+    "gas": 1000000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f1-a2-dynamicFalse-v8-g1000",
+    "code": "f90502",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2",
+    "version": 8,
+    "gas": 1000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f1-a2-dynamicFalse-v8-g1000000",
+    "code": "f90502",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2",
+    "version": 8,
+    "gas": 1000000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f1-a2-dynamicFalse-v9-g1000",
+    "code": "f90502",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2",
+    "version": 9,
+    "gas": 1000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f1-a2-dynamicFalse-v9-g1000000",
+    "code": "f90502",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2",
+    "version": 9,
+    "gas": 1000000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f1-a2-dynamicFalse-v14-g1000",
+    "code": "f90502",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2",
+    "version": 14,
+    "gas": 1000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f1-a2-dynamicFalse-v14-g1000000",
+    "code": "f90502",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2",
+    "version": 14,
+    "gas": 1000000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f1-a2-dynamicTrue-v4-g1000",
+    "code": "f905ff",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 2",
+    "version": 4,
+    "gas": 1000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f1-a2-dynamicTrue-v4-g1000000",
+    "code": "f905ff",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 2",
+    "version": 4,
+    "gas": 1000000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f1-a2-dynamicTrue-v8-g1000",
+    "code": "f905ff",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 2",
+    "version": 8,
+    "gas": 1000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f1-a2-dynamicTrue-v8-g1000000",
+    "code": "f905ff",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 2",
+    "version": 8,
+    "gas": 1000000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f1-a2-dynamicTrue-v9-g1000",
+    "code": "f905ff",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 2",
+    "version": 9,
+    "gas": 1000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f1-a2-dynamicTrue-v9-g1000000",
+    "code": "f905ff",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 2",
+    "version": 9,
+    "gas": 1000000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f1-a2-dynamicTrue-v14-g1000",
+    "code": "f905ff",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 2",
+    "version": 14,
+    "gas": 1000,
+    "tail": ""
+  },
+  {
+    "name": "hashext-valid-f1-a2-dynamicTrue-v14-g1000000",
+    "code": "f905ff",
+    "setup": "PUSHSLICE x6162 PUSHSLICE x6364 PUSHINT 2 PUSHINT 2",
+    "version": 14,
+    "gas": 1000000,
+    "tail": ""
+  },
+  {
+    "name": "positive-optionaladdr-v12-g100",
+    "code": "fa50",
+    "setup": "PUSHSLICE x2_",
+    "version": 12,
+    "gas": 100,
+    "tail": "ISNULL"
+  },
+  {
+    "name": "positive-optionaladdr-v12-g1000",
+    "code": "fa50",
+    "setup": "PUSHSLICE x2_",
+    "version": 12,
+    "gas": 1000,
+    "tail": "ISNULL"
+  },
+  {
+    "name": "positive-optionaladdr-v12-g1000000",
+    "code": "fa50",
+    "setup": "PUSHSLICE x2_",
+    "version": 12,
+    "gas": 1000000,
+    "tail": "ISNULL"
+  },
+  {
+    "name": "positive-optionaladdr-v13-g100",
+    "code": "fa50",
+    "setup": "PUSHSLICE x2_",
+    "version": 13,
+    "gas": 100,
+    "tail": "ISNULL"
+  },
+  {
+    "name": "positive-optionaladdr-v13-g1000",
+    "code": "fa50",
+    "setup": "PUSHSLICE x2_",
+    "version": 13,
+    "gas": 1000,
+    "tail": "ISNULL"
+  },
+  {
+    "name": "positive-optionaladdr-v13-g1000000",
+    "code": "fa50",
+    "setup": "PUSHSLICE x2_",
+    "version": 13,
+    "gas": 1000000,
+    "tail": "ISNULL"
+  },
+  {
+    "name": "positive-optionaladdr-v14-g100",
+    "code": "fa50",
+    "setup": "PUSHSLICE x2_",
+    "version": 14,
+    "gas": 100,
+    "tail": "ISNULL"
+  },
+  {
+    "name": "positive-optionaladdr-v14-g1000",
+    "code": "fa50",
+    "setup": "PUSHSLICE x2_",
+    "version": 14,
+    "gas": 1000,
+    "tail": "ISNULL"
+  },
+  {
+    "name": "positive-optionaladdr-v14-g1000000",
+    "code": "fa50",
+    "setup": "PUSHSLICE x2_",
+    "version": 14,
+    "gas": 1000000,
+    "tail": "ISNULL"
+  },
+  {
+    "name": "typed-null-v3",
+    "setup": "PUSHNULL",
+    "code": "00",
+    "version": 3,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-null-v4",
+    "setup": "PUSHNULL",
+    "code": "00",
+    "version": 4,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-null-v8",
+    "setup": "PUSHNULL",
+    "code": "00",
+    "version": 8,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-null-v9",
+    "setup": "PUSHNULL",
+    "code": "00",
+    "version": 9,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-null-v12",
+    "setup": "PUSHNULL",
+    "code": "00",
+    "version": 12,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-null-v14",
+    "setup": "PUSHNULL",
+    "code": "00",
+    "version": 14,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-cell-empty-v3",
+    "setup": "NEWC ENDC",
+    "code": "00",
+    "version": 3,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-cell-empty-v4",
+    "setup": "NEWC ENDC",
+    "code": "00",
+    "version": 4,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-cell-empty-v8",
+    "setup": "NEWC ENDC",
+    "code": "00",
+    "version": 8,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-cell-empty-v9",
+    "setup": "NEWC ENDC",
+    "code": "00",
+    "version": 9,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-cell-empty-v12",
+    "setup": "NEWC ENDC",
+    "code": "00",
+    "version": 12,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-cell-empty-v14",
+    "setup": "NEWC ENDC",
+    "code": "00",
+    "version": 14,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-cell-ref-v3",
+    "setup": "NEWC PUSHINT 7 NEWC STU 3 ENDC SWAP STREF ENDC",
+    "code": "00",
+    "version": 3,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-cell-ref-v4",
+    "setup": "NEWC PUSHINT 7 NEWC STU 3 ENDC SWAP STREF ENDC",
+    "code": "00",
+    "version": 4,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-cell-ref-v8",
+    "setup": "NEWC PUSHINT 7 NEWC STU 3 ENDC SWAP STREF ENDC",
+    "code": "00",
+    "version": 8,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-cell-ref-v9",
+    "setup": "NEWC PUSHINT 7 NEWC STU 3 ENDC SWAP STREF ENDC",
+    "code": "00",
+    "version": 9,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-cell-ref-v12",
+    "setup": "NEWC PUSHINT 7 NEWC STU 3 ENDC SWAP STREF ENDC",
+    "code": "00",
+    "version": 12,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-cell-ref-v14",
+    "setup": "NEWC PUSHINT 7 NEWC STU 3 ENDC SWAP STREF ENDC",
+    "code": "00",
+    "version": 14,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-builder-empty-v3",
+    "setup": "NEWC",
+    "code": "00",
+    "version": 3,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-builder-empty-v4",
+    "setup": "NEWC",
+    "code": "00",
+    "version": 4,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-builder-empty-v8",
+    "setup": "NEWC",
+    "code": "00",
+    "version": 8,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-builder-empty-v9",
+    "setup": "NEWC",
+    "code": "00",
+    "version": 9,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-builder-empty-v12",
+    "setup": "NEWC",
+    "code": "00",
+    "version": 12,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-builder-empty-v14",
+    "setup": "NEWC",
+    "code": "00",
+    "version": 14,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-builder-bits-ref-v3",
+    "setup": "PUSHINT 5 NEWC STU 3 PUSHINT 7 NEWC STU 3 ENDC SWAP STREF",
+    "code": "00",
+    "version": 3,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-builder-bits-ref-v4",
+    "setup": "PUSHINT 5 NEWC STU 3 PUSHINT 7 NEWC STU 3 ENDC SWAP STREF",
+    "code": "00",
+    "version": 4,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-builder-bits-ref-v8",
+    "setup": "PUSHINT 5 NEWC STU 3 PUSHINT 7 NEWC STU 3 ENDC SWAP STREF",
+    "code": "00",
+    "version": 8,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-builder-bits-ref-v9",
+    "setup": "PUSHINT 5 NEWC STU 3 PUSHINT 7 NEWC STU 3 ENDC SWAP STREF",
+    "code": "00",
+    "version": 9,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-builder-bits-ref-v12",
+    "setup": "PUSHINT 5 NEWC STU 3 PUSHINT 7 NEWC STU 3 ENDC SWAP STREF",
+    "code": "00",
+    "version": 12,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-builder-bits-ref-v14",
+    "setup": "PUSHINT 5 NEWC STU 3 PUSHINT 7 NEWC STU 3 ENDC SWAP STREF",
+    "code": "00",
+    "version": 14,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-slice-window-v3",
+    "setup": "PUSHSLICE xaabb PUSHINT 3 SDSKIPFIRST",
+    "code": "00",
+    "version": 3,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-slice-window-v4",
+    "setup": "PUSHSLICE xaabb PUSHINT 3 SDSKIPFIRST",
+    "code": "00",
+    "version": 4,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-slice-window-v8",
+    "setup": "PUSHSLICE xaabb PUSHINT 3 SDSKIPFIRST",
+    "code": "00",
+    "version": 8,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-slice-window-v9",
+    "setup": "PUSHSLICE xaabb PUSHINT 3 SDSKIPFIRST",
+    "code": "00",
+    "version": 9,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-slice-window-v12",
+    "setup": "PUSHSLICE xaabb PUSHINT 3 SDSKIPFIRST",
+    "code": "00",
+    "version": 12,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-slice-window-v14",
+    "setup": "PUSHSLICE xaabb PUSHINT 3 SDSKIPFIRST",
+    "code": "00",
+    "version": 14,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-slice-ref-v3",
+    "setup": "NEWC PUSHINT 7 NEWC STU 3 ENDC SWAP STREF ENDC CTOS",
+    "code": "00",
+    "version": 3,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-slice-ref-v4",
+    "setup": "NEWC PUSHINT 7 NEWC STU 3 ENDC SWAP STREF ENDC CTOS",
+    "code": "00",
+    "version": 4,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-slice-ref-v8",
+    "setup": "NEWC PUSHINT 7 NEWC STU 3 ENDC SWAP STREF ENDC CTOS",
+    "code": "00",
+    "version": 8,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-slice-ref-v9",
+    "setup": "NEWC PUSHINT 7 NEWC STU 3 ENDC SWAP STREF ENDC CTOS",
+    "code": "00",
+    "version": 9,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-slice-ref-v12",
+    "setup": "NEWC PUSHINT 7 NEWC STU 3 ENDC SWAP STREF ENDC CTOS",
+    "code": "00",
+    "version": 12,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-slice-ref-v14",
+    "setup": "NEWC PUSHINT 7 NEWC STU 3 ENDC SWAP STREF ENDC CTOS",
+    "code": "00",
+    "version": 14,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-tuple-nested-v3",
+    "setup": "PUSHNULL NEWC ENDC NEWC PUSHSLICE xa_ TUPLE 4 PUSHINT 123 SWAP PAIR",
+    "code": "00",
+    "version": 3,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-tuple-nested-v4",
+    "setup": "PUSHNULL NEWC ENDC NEWC PUSHSLICE xa_ TUPLE 4 PUSHINT 123 SWAP PAIR",
+    "code": "00",
+    "version": 4,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-tuple-nested-v8",
+    "setup": "PUSHNULL NEWC ENDC NEWC PUSHSLICE xa_ TUPLE 4 PUSHINT 123 SWAP PAIR",
+    "code": "00",
+    "version": 8,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-tuple-nested-v9",
+    "setup": "PUSHNULL NEWC ENDC NEWC PUSHSLICE xa_ TUPLE 4 PUSHINT 123 SWAP PAIR",
+    "code": "00",
+    "version": 9,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-tuple-nested-v12",
+    "setup": "PUSHNULL NEWC ENDC NEWC PUSHSLICE xa_ TUPLE 4 PUSHINT 123 SWAP PAIR",
+    "code": "00",
+    "version": 12,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-tuple-nested-v14",
+    "setup": "PUSHNULL NEWC ENDC NEWC PUSHSLICE xa_ TUPLE 4 PUSHINT 123 SWAP PAIR",
+    "code": "00",
+    "version": 14,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-tuple-empty-v3",
+    "setup": "NIL",
+    "code": "00",
+    "version": 3,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-tuple-empty-v4",
+    "setup": "NIL",
+    "code": "00",
+    "version": 4,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-tuple-empty-v8",
+    "setup": "NIL",
+    "code": "00",
+    "version": 8,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-tuple-empty-v9",
+    "setup": "NIL",
+    "code": "00",
+    "version": 9,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-tuple-empty-v12",
+    "setup": "NIL",
+    "code": "00",
+    "version": 12,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-tuple-empty-v14",
+    "setup": "NIL",
+    "code": "00",
+    "version": 14,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-nan-v3",
+    "setup": "PUSHNAN",
+    "code": "00",
+    "version": 3,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-nan-v4",
+    "setup": "PUSHNAN",
+    "code": "00",
+    "version": 4,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-nan-v8",
+    "setup": "PUSHNAN",
+    "code": "00",
+    "version": 8,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-nan-v9",
+    "setup": "PUSHNAN",
+    "code": "00",
+    "version": 9,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-nan-v12",
+    "setup": "PUSHNAN",
+    "code": "00",
+    "version": 12,
+    "gas": 1000000
+  },
+  {
+    "name": "typed-nan-v14",
+    "setup": "PUSHNAN",
+    "code": "00",
+    "version": 14,
+    "gas": 1000000
+  }
+]
