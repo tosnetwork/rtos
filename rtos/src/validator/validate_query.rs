@@ -176,7 +176,7 @@ struct ValidateBase {
     virt_states: HashMap<UInt256, ShardStateUnsplit>, // prev state and neighbour out msg queues proofs by block root hash
     storage_dict_proofs: HashMap<UInt256, Cell>,
     full_collated_data: bool,
-    now_ms: Option<u64>, // gen_utime_ms from ConsensusExtraData (simplex consensus)
+    now_ms: Option<u64>, // gen_utime_ms from mandatory ConsensusExtraData
 
     gas_used: Arc<AtomicU64>,
     transactions_executed: Arc<AtomicU32>,
@@ -717,10 +717,6 @@ impl ValidateQuery {
                                                 reject_query!(
                                                     "duplicate ConsensusExtraData in collated data"
                                                 )
-                                            }
-                                            // Check: ConsensusExtraData is only valid when simplex is enabled
-                                            if !base.is_simplex {
-                                                reject_query!("unexpected ConsensusExtraData")
                                             }
                                             base.now_ms = Some(extra.gen_utime_ms);
                                         }
@@ -2258,18 +2254,16 @@ impl ValidateQuery {
                 delta_hard
             )
         }
-        if base.is_simplex {
-            match base.now_ms {
-                None => reject_query!("now_ms is not set"),
-                Some(now_ms) if now_ms / 1000 != base.info.gen_utime() as u64 => {
-                    reject_query!(
-                        "gen_utime is {}, but gen_utime_ms in ConsensusExtraData is {}",
-                        base.info.gen_utime(),
-                        now_ms
-                    )
-                }
-                _ => {}
+        match base.now_ms {
+            None => reject_query!("now_ms is not set"),
+            Some(now_ms) if now_ms / 1000 != base.info.gen_utime() as u64 => {
+                reject_query!(
+                    "gen_utime is {}, but gen_utime_ms in ConsensusExtraData is {}",
+                    base.info.gen_utime(),
+                    now_ms
+                )
             }
+            _ => {}
         }
         Ok(())
     }

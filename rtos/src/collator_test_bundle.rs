@@ -477,11 +477,12 @@ impl CollatorTestBundle {
         } else {
             let path = format!("{}/candidate/", path);
             let data = read(format!("{}/data", path))?;
+            let collated_data = read(format!("{}/collated_data", path))?;
             Some(BlockCandidate {
                 block_id: index.id.clone(),
-                collated_file_hash: catchain::utils::get_hash(&data),
+                collated_file_hash: catchain::utils::get_hash(&collated_data),
                 data,
-                collated_data: read(format!("{}/collated_data", path))?,
+                collated_data,
                 created_by: index.created_by.clone(),
             })
         };

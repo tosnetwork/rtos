@@ -5251,14 +5251,10 @@ impl Collator {
             roots.push(tbds.serialize()?);
         }
 
-        // 1.2 store info for simplex consensus (C++ parity)
-        if self.collator_settings.is_simplex {
-            let extra = rtos_block::ConsensusExtraData {
-                flags: 0,
-                gen_utime_ms: collator_data.gen_utime_ms(),
-            };
-            roots.push(extra.serialize()?);
-        }
+        // Every candidate carries its millisecond creation time.
+        let extra =
+            rtos_block::ConsensusExtraData { flags: 0, gen_utime_ms: collator_data.gen_utime_ms() };
+        roots.push(extra.serialize()?);
 
         let collated_data_flags = if collator_data
             .config
