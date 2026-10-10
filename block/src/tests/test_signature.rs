@@ -1049,3 +1049,41 @@ fn test_block_signatures_simplex_session_id_preserved() {
     let deserialized = BlockSignaturesSimplex::construct_from_cell(serialized).unwrap();
     assert_eq!(deserialized.session_id, session_id);
 }
+
+#[test]
+fn test_signature_weight_rejects_duplicate_unknown_and_invalid_membership() {
+    let keys: Vec<_> =
+        (0..3).map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap()).collect();
+    let validators: Vec<_> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| {
+            ValidatorDescr::with_params(
+                SigPubKey::from_bytes(key.pub_key().unwrap()).unwrap(),
+                (i + 1) as u64,
+                None,
+            )
+        })
+        .collect();
+    let data = b"bounded signature weight test";
+    let pair = |i: usize| CryptoSignaturePair {
+        node_id_short: validators[i].compute_node_id_short(),
+        sign: CryptoSignature::from_bytes(&keys[i].sign(data).unwrap()).unwrap(),
+    };
+    let mut signatures = BlockSignaturesPure::default();
+    signatures.add_sigpair(pair(0));
+    signatures.add_sigpair(pair(2));
+    assert_eq!(signatures.check_signatures(&validators, data).unwrap(), 4);
+    assert!(crate::has_quorum(4, 6));
+    assert!(signatures.check_signatures(&validators[..2], data).is_err());
+    signatures.add_sigpair(pair(0));
+    assert!(signatures.check_signatures(&validators, data).is_err());
+    let mut signatures = BlockSignaturesPure::default();
+    signatures.add_sigpair(pair(0));
+    assert!(signatures
+        .check_signatures(&[validators[0].clone(), validators[0].clone()], data)
+        .is_err());
+    let mut oversized = validators.clone();
+    oversized[0].weight = crate::MAX_TOTAL_VALIDATOR_WEIGHT;
+    assert!(signatures.check_signatures(&oversized, data).is_err());
+}

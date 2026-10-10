@@ -288,6 +288,7 @@ impl BlockSignaturesPure {
     }
 
     pub fn check_signatures(&self, validators_list: &[ValidatorDescr], data: &[u8]) -> Result<u64> {
+        crate::validate_validator_list(validators_list)?;
         // Calc validators short ids
         let mut validators_map = HashMap::new();
         for vd in validators_list {
@@ -306,7 +307,9 @@ impl BlockSignaturesPure {
                 if !vd.verify_signature(data, &sign.sign) {
                     fail!(BlockError::BadSignature)
                 }
-                weight += vd.weight;
+                weight = crate::checked_add_validator_weight(weight, vd.weight)?;
+            } else {
+                fail!("signature from an unknown validator");
             }
             Ok(true)
         })?;

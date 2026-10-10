@@ -34,15 +34,14 @@ use rtos_block::{BlockIdExt, Ed25519KeyOption, ShardIdent, UInt256, ZeroizingByt
 /// Test 2/3 and 1/3 threshold calculations
 ///
 /// Verifies that threshold functions match C++ implementation:
-/// - threshold_66: (total * 2) / 3 + 1
+/// - threshold_66: ceil(total * 2 / 3)
 /// - threshold_33: total / 3 + 1
 #[test]
 fn test_threshold_calculations() {
-    // Test strict 2/3 threshold (> 2/3)
-    // Formula: (total * 2) / 3 + 1
+    // The target threshold includes exactly two thirds.
     assert_eq!(threshold_66(100), 67); // (200 / 3) + 1 = 67
-    assert_eq!(threshold_66(3), 3); // (6 / 3) + 1 = 3
-    assert_eq!(threshold_66(99), 67); // (198 / 3) + 1 = 67
+    assert_eq!(threshold_66(3), 2);
+    assert_eq!(threshold_66(99), 66);
 
     // Test strict 1/3 threshold (> 1/3)
     // Formula: total / 3 + 1

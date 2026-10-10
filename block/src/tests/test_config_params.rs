@@ -200,7 +200,7 @@ fn get_validator_set() -> ValidatorSet {
     for n in 0..2 {
         let keypair = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
         let key = SigPubKey::from_bytes(keypair.pub_key().unwrap()).unwrap();
-        let vd = ValidatorDescr::with_params(key, n, None);
+        let vd = ValidatorDescr::with_params(key, n + 1, None);
         list.push(vd);
     }
 

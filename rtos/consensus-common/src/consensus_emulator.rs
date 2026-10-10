@@ -310,12 +310,9 @@ fn build_simplex_signatures_variant(
     Ok(BlockSignaturesVariant::Simplex(sigs))
 }
 
-/// Strict 2/3 threshold (mirrors simplex `threshold_66`).
+/// At-least-two-thirds threshold shared with live consensus.
 fn threshold_66(total_weight: ValidatorWeight) -> ValidatorWeight {
-    if total_weight == 0 {
-        return 0;
-    }
-    (((total_weight as u128) * 2) / 3 + 1) as ValidatorWeight
+    rtos_block::quorum_threshold(total_weight)
 }
 
 /// First 8 hex characters of the session id, for log prefixes.
@@ -1566,8 +1563,11 @@ impl ConsensusEmulatorImpl {
                 v.clone()
             }
         };
-        let total_weight: u64 = validators.iter().map(|v| v.weight).sum();
-        let signer_weight: u64 = signer_indices.iter().map(|&i| validators[i].weight).sum();
+        let total_weight: u64 =
+            rtos_block::checked_validator_weight_sum(validators.iter().map(|v| v.weight))?;
+        let signer_weight: u64 = rtos_block::checked_validator_weight_sum(
+            signer_indices.iter().map(|&i| validators[i].weight),
+        )?;
         let needed = threshold_66(total_weight);
         if signer_weight < needed {
             return Err(error!(

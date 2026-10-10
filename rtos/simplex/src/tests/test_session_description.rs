@@ -191,7 +191,7 @@ fn test_get_total_weight() {
 
 #[test]
 fn test_get_threshold_66() {
-    // With total weight 100, strict >2/3 threshold = 67
+    // With total weight 100, ceil(2W/3) = 67
     let nodes = create_test_validators_weighted(&[25, 25, 25, 25]);
     let desc = create_test_desc(&nodes, 0);
 
@@ -212,7 +212,7 @@ fn test_get_threshold_33() {
 #[test]
 fn test_thresholds_with_equal_weights() {
     // 4 validators with weight 1 each, total = 4
-    // threshold_66 = (4 * 2) / 3 + 1 = 3  (strict >2/3)
+    // threshold_66 = ceil(4 * 2 / 3) = 3
     // threshold_33 = 4 / 3 + 1 = 2        (strict >1/3)
     let nodes = create_test_validators(4);
     let desc = create_test_desc(&nodes, 0);
@@ -224,17 +224,12 @@ fn test_thresholds_with_equal_weights() {
 
 #[test]
 fn test_thresholds_when_total_divisible_by_3() {
-    // This is the critical boundary case for ton-simnet WC0:
-    // total_weight divisible by 3 must still require STRICT >2/3 and >1/3.
-    //
-    // For 6 validators with weight 1 each:
-    // threshold_66 = (6 * 2) / 3 + 1 = 5
-    // threshold_33 = 6 / 3 + 1 = 3
+    // Exactly two thirds is sufficient; the one-third threshold remains strict.
     let nodes = create_test_validators(6);
     let desc = create_test_desc(&nodes, 0);
 
     assert_eq!(desc.get_total_weight(), 6);
-    assert_eq!(desc.get_threshold_66(), 5);
+    assert_eq!(desc.get_threshold_66(), 4);
     assert_eq!(desc.get_threshold_33(), 3);
 }
 
@@ -484,4 +479,34 @@ fn test_display() {
     assert!(display.contains("nodes=5"));
     assert!(display.contains("total_weight=5"));
     assert!(display.contains("self_idx=v002"));
+}
+
+#[test]
+fn test_session_rejects_invalid_weight_and_identity() {
+    let construct = |nodes: &[SessionNode]| {
+        SessionDescription::new(
+            &SessionOptions::default(),
+            SessionId::default(),
+            1,
+            nodes,
+            nodes[0].public_key.clone(),
+            &ShardIdent::masterchain(),
+            SystemTime::now(),
+            None,
+        )
+    };
+    for weights in [[0, 1], [rtos_block::MAX_TOTAL_VALIDATOR_WEIGHT, 1], [u64::MAX, 1]] {
+        assert!(construct(&create_test_validators_weighted(&weights)).is_err());
+    }
+    let mut nodes = create_test_validators(2);
+    nodes[1].public_key = nodes[0].public_key.clone();
+    assert!(construct(&nodes).is_err());
+    let mut nodes = create_test_validators(2);
+    nodes[1].adnl_id = nodes[0].adnl_id.clone();
+    assert!(construct(&nodes).is_err());
+    let nodes = create_test_validators_weighted(&[rtos_block::MAX_TOTAL_VALIDATOR_WEIGHT - 1, 1]);
+    assert_eq!(
+        construct(&nodes).unwrap().get_total_weight(),
+        rtos_block::MAX_TOTAL_VALIDATOR_WEIGHT
+    );
 }

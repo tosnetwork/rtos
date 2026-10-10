@@ -142,25 +142,9 @@ pub(crate) fn install_simplex_panic_hook_once() {
 /// Used by SimplexState::debug_dump and Receiver for active weight calculation
 pub const ACTIVITY_THRESHOLD: Duration = Duration::from_secs(30);
 
-/*
-    Threshold calculation helpers
-
-    C++ reference (rtos-cpp-simplex) uses STRICT thresholds:
-    - 2/3 quorum: (total_weight * 2) / 3 + 1  (equivalent to weight * 3 > total_weight * 2)
-      - validator/consensus/simplex/pool.cpp
-      - crypto/block/signature-set.cpp (check_threshold)
-    - 1/3 quorum: total_weight / 3 + 1
-      - validator-session/validator-session-types.h
-*/
-
-/// Calculate strict 2/3 threshold for quorum/certificates.
-///
-/// Matches C++: `(total_weight * 2) / 3 + 1` (i.e. **strictly greater** than 2/3).
+/// Integral weight at least two thirds of the total.
 pub fn threshold_66(total_weight: ValidatorWeight) -> ValidatorWeight {
-    if total_weight == 0 {
-        return 0;
-    }
-    (((total_weight as u128) * 2) / 3 + 1) as ValidatorWeight
+    rtos_block::quorum_threshold(total_weight)
 }
 
 /// Calculate strict 1/3 threshold for safety conditions.

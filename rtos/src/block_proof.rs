@@ -581,7 +581,8 @@ impl BlockProofStuff {
             ))
         })?;
 
-        let total_weight: u64 = subset.validators.iter().map(|v| v.weight).sum();
+        let total_weight: u64 =
+            rtos_block::checked_validator_weight_sum(subset.validators.iter().map(|v| v.weight))?;
         let weight = signatures
             .pure_signatures()
             .check_signatures(&subset.validators, &checked_data)
@@ -602,7 +603,7 @@ impl BlockProofStuff {
             )));
         }
 
-        if weight * 3 <= total_weight * 2 {
+        if !rtos_block::has_quorum(weight, total_weight) {
             fail!(NodeError::InvalidData(format!(
                 "Proof for {}: too small signatures weight",
                 self.id(),

@@ -74,7 +74,7 @@ fn test_validator_set_serialize() {
     for n in 0..20 {
         let keypair = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
         let key = SigPubKey::from_bytes(keypair.pub_key().unwrap()).unwrap();
-        let vd = ValidatorDescr::with_params(key, n, None);
+        let vd = ValidatorDescr::with_params(key, n + 1, None);
         list.push(vd);
     }
 
@@ -212,5 +212,40 @@ fn test_isolate_mc_validators() {
                 assert_ne!(sv.public_key, mv.public_key)
             }
         }
+    }
+}
+
+#[test]
+fn test_validator_set_weight_admission() {
+    let make = |weight| {
+        let key = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
+        ValidatorDescr::with_params(
+            SigPubKey::from_bytes(key.pub_key().unwrap()).unwrap(),
+            weight,
+            None,
+        )
+    };
+    let cap = crate::MAX_TOTAL_VALIDATOR_WEIGHT;
+    let valid = vec![make(cap - 1), make(1)];
+    assert_eq!(ValidatorSet::new(0, 100, 1, valid.clone()).unwrap().total_weight(), cap);
+    assert!(ValidatorSet::new(0, 100, 1, vec![make(cap), make(1)]).is_err());
+    assert!(ValidatorSet::new(0, 100, 1, vec![make(0)]).is_err());
+    assert!(ValidatorSet::new(0, 100, 1, vec![valid[0].clone(), valid[0].clone()]).is_err());
+    assert!(ValidatorSet::with_values_version_2(0, 100, 1, cap - 1, valid).is_err());
+
+    // Exercise deserialization independently of the checked constructor.
+    for weights in [[0, 1], [cap, 1], [u64::MAX, 1]] {
+        let mut map = ValidatorDescriptions::default();
+        map.set(&0u16, &make(weights[0])).unwrap();
+        map.set(&1u16, &make(weights[1])).unwrap();
+        let mut b = BuilderData::new();
+        b.append_u8(0x12).unwrap();
+        b.append_u32(0).unwrap();
+        b.append_u32(100).unwrap();
+        b.append_u16(2).unwrap();
+        b.append_u16(1).unwrap();
+        b.append_u64(weights[0].wrapping_add(weights[1])).unwrap();
+        map.write_to(&mut b).unwrap();
+        assert!(ValidatorSet::construct_from_cell(b.into_cell().unwrap()).is_err());
     }
 }

@@ -130,7 +130,7 @@ fn test_certificate_total_weight() {
     let cert: NotarCert = Certificate::new(vote, signatures);
 
     // Total weight should be 200 (2 validators * 100 weight each)
-    assert_eq!(cert.total_weight(&desc), 200);
+    assert_eq!(cert.total_weight(&desc).unwrap(), 200);
 }
 
 #[test]
@@ -522,4 +522,48 @@ fn test_certificate_from_tl_rejects_invalid_signature() {
     let result = Certificate::<Vote>::from_tl(&tl_cert, &desc, &session_id);
     assert!(result.is_err(), "Certificate with invalid signature should be rejected");
     assert!(result.unwrap_err().to_string().contains("Invalid vote signature"));
+}
+
+#[test]
+fn test_certificate_accepts_exact_two_thirds() {
+    for count in [3usize, 6, 9] {
+        let (desc, keys) = create_test_session_desc(count);
+        let session_id = create_test_session_id();
+        let vote = create_test_vote(42);
+        let signatures = keys
+            .iter()
+            .take(count * 2 / 3)
+            .enumerate()
+            .map(|(i, key)| {
+                let signed = sign_vote(&Vote::Notarize(vote.clone()), &session_id, key).unwrap();
+                VoteSignature::new(ValidatorIndex::new(i as u32), signed.signature().to_vec())
+            })
+            .collect();
+        let certificate = Certificate::new(vote.clone(), signatures);
+        assert!(
+            Certificate::<Vote>::from_tl(&certificate.to_tl().unwrap(), &desc, &session_id).is_ok(),
+            "exact quorum for {count}"
+        );
+        assert!(Certificate::<NotarizeVote>::from_tl_signatures(
+            &certificate.to_tl_vote_signature_set(),
+            vote,
+            &desc,
+            &session_id
+        )
+        .is_ok());
+    }
+}
+
+#[test]
+fn test_unverified_certificate_weight_rejects_duplicate_and_unknown_signers() {
+    let (desc, _) = create_test_session_desc(3);
+    for indices in [vec![0, 0], vec![0, 3]] {
+        let signatures = indices
+            .into_iter()
+            .map(|i| VoteSignature::new(ValidatorIndex::new(i), vec![]))
+            .collect();
+        let certificate = Certificate::new(create_test_vote(0), signatures);
+        assert!(certificate.total_weight(&desc).is_err());
+        assert!(!certificate.has_sufficient_weight(&desc));
+    }
 }

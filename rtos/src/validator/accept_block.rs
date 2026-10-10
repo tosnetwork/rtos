@@ -538,7 +538,7 @@ fn create_new_proof_internal(
 
     block_signatures.pure_signatures.set_weight(weight);
 
-    if weight * 3 <= total_weight * 2 {
+    if !rtos_block::has_quorum(weight, total_weight) {
         fail!(
             "Block {}: too small signatures weight (weight: {}, total: {})",
             id,
@@ -634,7 +634,7 @@ fn create_new_proof_with_variant_internal(
 
     block_signatures_pure.set_weight(weight);
 
-    if weight * 3 <= total_weight * 2 {
+    if !rtos_block::has_quorum(weight, total_weight) {
         fail!(
             "Block {}: too small signatures weight (weight: {}, total: {})",
             id,

@@ -306,6 +306,28 @@ impl Ord for IncludedValidatorWeight {
     }
 }
 
+/// Validate identities and weights before constructing a governing set or subset.
+pub fn validate_validator_list(list: &[ValidatorDescr]) -> Result<u64> {
+    if list.is_empty() || list.len() > u16::MAX as usize {
+        fail!("invalid validator count");
+    }
+    let mut identities = std::collections::HashSet::new();
+    let mut addresses = std::collections::HashSet::new();
+    let mut total = 0;
+    for validator in list {
+        if !identities.insert(validator.compute_node_id_short()) {
+            fail!("duplicate validator identity");
+        }
+        if let Some(address) = &validator.adnl_addr {
+            if !address.is_zero() && !addresses.insert(address) {
+                fail!("duplicate validator network identity");
+            }
+        }
+        total = crate::checked_add_validator_weight(total, validator.weight)?;
+    }
+    Ok(total)
+}
+
 impl ValidatorSet {
     pub fn new(
         utime_since: u32,
@@ -313,15 +335,11 @@ impl ValidatorSet {
         main: u16,
         mut list: Vec<ValidatorDescr>,
     ) -> Result<Self> {
-        if list.is_empty() {
-            fail!(BlockError::InvalidArg("`list` can't be empty".to_string()))
-        }
-        let mut total_weight = 0;
+        let total_weight = validate_validator_list(&list)?;
+        let mut prefix = 0;
         for descr in &mut list {
-            descr.prev_weight_sum = total_weight;
-            total_weight = total_weight.checked_add(descr.weight).ok_or_else(|| {
-                BlockError::InvalidData("Validator's total weight is more than 2^64".to_string())
-            })?;
+            descr.prev_weight_sum = prefix;
+            prefix = crate::checked_add_validator_weight(prefix, descr.weight)?;
         }
         Ok(ValidatorSet {
             utime_since,
@@ -351,7 +369,11 @@ impl ValidatorSet {
         total_weight: u64,
         list: Vec<ValidatorDescr>,
     ) -> Result<Self> {
-        Ok(Self { total_weight, ..Self::new(utime_since, utime_until, main, list)? })
+        let set = Self::new(utime_since, utime_until, main, list)?;
+        if set.total_weight != total_weight {
+            fail!("declared validator weight differs from the checked sum");
+        }
+        Ok(set)
     }
 
     pub fn utime_since(&self) -> u32 {
@@ -573,14 +595,12 @@ impl Deserializable for ValidatorSet {
                 ))
             })?;
             val.prev_weight_sum = total_weight;
-            total_weight += val.weight;
+            total_weight = crate::checked_add_validator_weight(total_weight, val.weight)?;
             self.list.push(val);
         }
-        if self.list.is_empty() {
-            fail!(BlockError::InvalidData("list can't be empty".to_string()));
-        }
+        validate_validator_list(&self.list)?;
         if tag == VALIDATOR_SET_TAG {
-            self.total_weight = self.list.iter().map(|vd| vd.weight).sum();
+            self.total_weight = total_weight;
         } else if self.total_weight != total_weight {
             fail!(BlockError::InvalidData(
                 "Calculated total_weight is not equal to the read one while read ValidatorSet"

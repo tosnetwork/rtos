@@ -872,7 +872,8 @@ impl TopBlockDescrStuff {
             self.proof_for()
         );
 
-        let total_weight: u64 = subset.validators.iter().map(|v| v.weight).sum();
+        let total_weight: u64 =
+            rtos_block::checked_validator_weight_sum(subset.validators.iter().map(|v| v.weight))?;
         let weight = match check_crypto_signatures(
             signatures_variant.pure_signatures(),
             &subset.validators,
@@ -895,7 +896,7 @@ impl TopBlockDescrStuff {
             }
             Ok(w) => w,
         };
-        if !self.is_fake && weight * 3 <= total_weight * 2 {
+        if !self.is_fake && !rtos_block::has_quorum(weight, total_weight) {
             *res_flags |= 0x21;
             self.signarutes_validation_result.store(-1, atomic::Ordering::Relaxed);
             fail!(

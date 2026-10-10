@@ -55,3 +55,57 @@ fn test_check_master_blocks_proof_shuffle() {
         block_proof.check_with_prev_key_block_proof(&key_block_proof).unwrap();
     }
 }
+
+#[test]
+fn test_proof_signature_quorum_weighted_boundary() {
+    use crate::validator::validator_utils::ValidatorSubsetInfo;
+    use rtos_block::{
+        Block, BlockIdExt, BlockProof, BlockSignatures, BlockSignaturesPure, Cell, CryptoSignature,
+        CryptoSignaturePair, Ed25519KeyOption, ShardIdent, SigPubKey, UInt256, ValidatorBaseInfo,
+        ValidatorDescr, ZeroizingBytes,
+    };
+    let keys: Vec<_> =
+        (0..3).map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap()).collect();
+    let validators: Vec<_> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| {
+            ValidatorDescr::with_params(
+                SigPubKey::from_bytes(key.pub_key().unwrap()).unwrap(),
+                (i + 1) as u64,
+                None,
+            )
+        })
+        .collect();
+    let subset = ValidatorSubsetInfo { validators, short_hash: 42 };
+    let id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        1,
+        UInt256::from([1; 32]),
+        UInt256::from([2; 32]),
+    );
+    let data = Block::build_data_for_sign(&id.root_hash, &id.file_hash);
+    for (signers, accepted) in [(vec![0, 2], true), (vec![0, 1], false), (vec![0, 0, 2], false)] {
+        let mut signatures = BlockSignaturesPure::default();
+        let mut weight = 0;
+        for i in signers {
+            signatures.add_sigpair(CryptoSignaturePair {
+                node_id_short: subset.validators[i].compute_node_id_short(),
+                sign: CryptoSignature::from_bytes(&keys[i].sign(&data).unwrap()).unwrap(),
+            });
+            weight += subset.validators[i].weight;
+        }
+        signatures.set_weight(weight);
+        let proof = BlockProof::with_ordinary_signatures(
+            id.clone(),
+            Cell::default(),
+            Some(BlockSignatures::with_params(ValidatorBaseInfo::with_params(42, 0), signatures)),
+        );
+        let proof = BlockProofStuff::new(proof, false).unwrap();
+        assert_eq!(
+            proof.check_signatures(&subset).is_ok(),
+            accepted,
+            "signed weight {weight} of 6"
+        );
+    }
+}

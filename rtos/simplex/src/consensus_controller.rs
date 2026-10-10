@@ -1381,10 +1381,16 @@ impl ConsensusController {
         let block_hash = &event.block_hash;
         let finalized_id = RawCandidateId { slot, hash: block_hash.clone() };
 
-        // INVARIANT CHECK - Certificate must have sufficient weight (>=2/3+1).
+        // INVARIANT CHECK - Certificate must have weight at least two thirds.
         // Reference: C++ pool.cpp - certificate is only created when threshold is reached.
         let certificate = &event.certificate;
-        let cert_weight = certificate.total_weight(&self.description);
+        let cert_weight = match certificate.total_weight(&self.description) {
+            Ok(weight) => weight,
+            Err(error) => {
+                log::error!("Invalid finalization certificate membership: {error}");
+                return;
+            }
+        };
         let total_weight = self.description.get_total_weight();
         let threshold = threshold_66(total_weight);
         debug_assert!(
@@ -2264,11 +2270,16 @@ impl ConsensusController {
 
         // Calculate total weight and add signature pairs
         let mut total_weight: u64 = 0;
+        let mut seen_signers = std::collections::HashSet::new();
         for (node_id, sig_payload) in raw_signatures {
-            // Get validator weight by looking up the source index
-            if let Ok(src_idx) = self.description.get_source_index(node_id) {
-                total_weight += self.description.get_node_weight(src_idx);
+            if !seen_signers.insert(node_id) {
+                rtos_block::fail!("duplicate signer in finalized signature set");
             }
+            let src_idx = self.description.get_source_index(node_id)?;
+            total_weight = rtos_block::checked_add_validator_weight(
+                total_weight,
+                self.description.get_node_weight(src_idx),
+            )?;
 
             // Convert raw signature bytes to CryptoSignaturePair
             let sig_bytes = sig_payload.data().to_vec();

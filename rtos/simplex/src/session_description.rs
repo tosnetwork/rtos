@@ -120,7 +120,8 @@ impl SessionDescription {
         let local_idx = nodes.iter().position(|n| n.public_key.id() == local_id);
 
         // Calculate weights (same as old log_creation_info)
-        let total_weight: ValidatorWeight = nodes.iter().map(|n| n.weight).sum();
+        let total_weight =
+            rtos_block::checked_validator_weight_sum(nodes.iter().map(|n| n.weight))?;
         let threshold_66_weight = threshold_66(total_weight);
         let threshold_33_weight = threshold_33(total_weight);
 
@@ -152,7 +153,7 @@ impl SessionDescription {
         let local_id = local_id;
 
         // Initialize sources
-        let mut total_weight: ValidatorWeight = 0;
+        let mut network_ids = std::collections::HashSet::new();
         let mut sources = Vec::with_capacity(nodes.len());
         let mut rev_sources = HashMap::new();
 
@@ -164,10 +165,13 @@ impl SessionDescription {
                 weight: node.weight,
             };
 
-            rev_sources.insert(source.id.clone(), ValidatorIndex::from(node_index));
+            if rev_sources.insert(source.id.clone(), ValidatorIndex::from(node_index)).is_some() {
+                fail!("duplicate validator identity in session");
+            }
+            if !network_ids.insert(source.adnl_id.clone()) {
+                fail!("duplicate validator network identity in session");
+            }
             sources.push(source);
-
-            total_weight += node.weight;
         }
 
         let self_idx = match rev_sources.get(local_id) {

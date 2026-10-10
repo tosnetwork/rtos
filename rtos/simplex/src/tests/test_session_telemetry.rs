@@ -917,13 +917,9 @@ fn collect_health_findings_returns_zero_finalization_speed_error_at_long_stall()
 
 #[test]
 fn collect_health_findings_returns_low_activity_warn() {
-    let (description, telemetry, _) = make_health_fixture(3, baseline_time());
+    let (description, telemetry, _) = make_health_fixture(4, baseline_time());
 
-    // total_weight = 3 → threshold_66 = 3, threshold_33 = 2 (see
-    // `utils::threshold_*`: `n*2/3 + 1` and `n/3 + 1` respectively, mirroring
-    // the C++ "strictly greater than" semantics).
-    // active_weight = 2 satisfies `< threshold_66` (Warn) but
-    // not `< threshold_33` (Error).
+    // total 4: quorum 3 and one-third threshold 2; active 2 is a warning.
     let snapshot = HealthCheckSnapshot {
         active_weight: 2,
         first_non_finalized: SlotIndex(5),

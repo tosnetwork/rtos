@@ -263,8 +263,17 @@ impl<T: Clone> Certificate<T> {
     /// # Returns
     ///
     /// Sum of weights for all validators in signatures
-    pub fn total_weight(&self, desc: &SessionDescription) -> u64 {
-        self.signatures.iter().map(|sig| desc.get_node_weight(sig.validator_idx)).sum()
+    pub fn total_weight(&self, desc: &SessionDescription) -> Result<u64> {
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0;
+        for signature in &self.signatures {
+            let index = signature.validator_idx;
+            if index.value() as usize >= desc.get_total_nodes() || !seen.insert(index) {
+                fail!("invalid or duplicate certificate signer");
+            }
+            total = rtos_block::checked_add_validator_weight(total, desc.get_node_weight(index))?;
+        }
+        Ok(total)
     }
 
     /// Check if certificate has sufficient weight (>= 2/3)
@@ -278,7 +287,8 @@ impl<T: Clone> Certificate<T> {
     /// true if total signature weight >= 2/3 threshold
     #[allow(dead_code)] // Available for validation in future
     pub fn has_sufficient_weight(&self, desc: &SessionDescription) -> bool {
-        self.total_weight(desc) >= desc.get_threshold_66()
+        self.total_weight(desc)
+            .is_ok_and(|weight| rtos_block::has_quorum(weight, desc.get_total_weight()))
     }
 
     /// Convert signatures to TL VoteSignatureSet
@@ -423,6 +433,9 @@ impl<T: ToTlUnsignedVote> Certificate<T> {
         let vote_bytes = crate::utils::create_data_to_sign(session_id, &raw_vote_bytes);
 
         let num_validators = desc.get_total_nodes();
+        if votes_vec.len() > num_validators {
+            fail!("more certificate signatures than validators");
+        }
         let mut voted = vec![false; num_validators];
         let mut signatures = Vec::with_capacity(votes_vec.len());
         let mut voted_weight: u64 = 0;
@@ -452,7 +465,10 @@ impl<T: ToTlUnsignedVote> Certificate<T> {
                 fail!("Invalid vote signature for validator {}", validator_idx)
             }
 
-            voted_weight += desc.get_node_weight(validator_idx);
+            voted_weight = rtos_block::checked_add_validator_weight(
+                voted_weight,
+                desc.get_node_weight(validator_idx),
+            )?;
             signatures.push(sig);
         }
 
@@ -512,6 +528,9 @@ impl Certificate<Vote> {
         // Parse and verify signatures
         let votes_vec = tl_cert.signatures().votes();
         let num_validators = desc.get_total_nodes();
+        if votes_vec.len() > num_validators {
+            fail!("more certificate signatures than validators");
+        }
         let mut voted = vec![false; num_validators];
         let mut signatures = Vec::with_capacity(votes_vec.len());
         let mut voted_weight: u64 = 0;
@@ -538,7 +557,10 @@ impl Certificate<Vote> {
 
             // Mark as voted and accumulate weight
             voted[validator_idx.value() as usize] = true;
-            voted_weight += desc.get_node_weight(validator_idx);
+            voted_weight = rtos_block::checked_add_validator_weight(
+                voted_weight,
+                desc.get_node_weight(validator_idx),
+            )?;
             signatures.push(sig);
         }
 

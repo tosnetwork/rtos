@@ -468,7 +468,8 @@ fn validate_brodcast(
     // Check signatures
     let checked_data =
         rtos_block::Block::build_data_for_sign(&block_id.root_hash, &block_id.file_hash);
-    let total_weight: u64 = subset.validators.iter().map(|v| v.weight).sum();
+    let total_weight: u64 =
+        rtos_block::checked_validator_weight_sum(subset.validators.iter().map(|v| v.weight))?;
     let weight =
         blk_pure_signatures.check_signatures(&subset.validators, &checked_data).map_err(|err| {
             NodeError::InvalidData(format!(
@@ -477,7 +478,7 @@ fn validate_brodcast(
             ))
         })?;
 
-    if weight * 3 <= total_weight * 2 {
+    if !rtos_block::has_quorum(weight, total_weight) {
         fail!(NodeError::InvalidData(format!(
             "Too small signatures weight in broadcast with block {}",
             block_id,
@@ -519,7 +520,8 @@ fn validate_brodcast_v2(
     // Use variant-aware signature checking
     let data_to_verify = build_checked_data(signatures, block_id)?;
 
-    let total_weight: u64 = subset.validators.iter().map(|v| v.weight).sum();
+    let total_weight: u64 =
+        rtos_block::checked_validator_weight_sum(subset.validators.iter().map(|v| v.weight))?;
     let weight = signatures
         .pure_signatures()
         .check_signatures(&subset.validators, &data_to_verify)
@@ -530,7 +532,7 @@ fn validate_brodcast_v2(
             ))
         })?;
 
-    if weight * 3 <= total_weight * 2 {
+    if !rtos_block::has_quorum(weight, total_weight) {
         fail!(NodeError::InvalidData(format!(
             "Too small signatures weight in V2 broadcast with block {}",
             block_id,

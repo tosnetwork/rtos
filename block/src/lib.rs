@@ -78,6 +78,9 @@ pub use merkle_proof::*;
 pub mod merkle_update;
 pub use merkle_update::*;
 
+pub mod quorum;
+pub use quorum::*;
+
 pub mod validators;
 pub use validators::*;
 
