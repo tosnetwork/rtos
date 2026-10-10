@@ -274,31 +274,38 @@ async fn execution_validator_config_account_transition() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn execution_validator_local_role() -> Result<()> {
-    for kind in ["unknown", "mode"] {
-        let (bundle, prev) = execution_shard_bundle(kind).await?;
-        let name = format!("local-{kind}");
-        if std::env::var_os("RTOS_EXECUTION_EXPORT").is_some() {
-            let (candidate, _) =
-                collate_execution(bundle, ShardIdent::with_workchain_id(0)?, prev, false).await?;
-            write_execution_candidate(&candidate, &name)?;
-        } else {
-            let result =
-                validate_execution_candidate(bundle, read_execution_candidate(&name)?, prev).await;
-            let error =
-                result.err().expect("unsupported local engine must fail validation").to_string();
-            assert!(
-                error.contains(if kind == "mode" {
-                    "requires vm_mode=0"
-                } else {
-                    "missing local workchain execution engine"
-                }),
-                "{kind}: {error}"
-            );
+    crate::test_helper::fixture_clock(async {
+        for kind in ["unknown", "mode"] {
+            let (bundle, prev) = execution_shard_bundle(kind).await?;
+            let name = format!("local-{kind}");
+            if std::env::var_os("RTOS_EXECUTION_EXPORT").is_some() {
+                let (candidate, _) =
+                    collate_execution(bundle, ShardIdent::with_workchain_id(0)?, prev, false)
+                        .await?;
+                write_execution_candidate(&candidate, &name)?;
+            } else {
+                let result =
+                    validate_execution_candidate(bundle, read_execution_candidate(&name)?, prev)
+                        .await;
+                let error = result
+                    .err()
+                    .expect("unsupported local engine must fail validation")
+                    .to_string();
+                assert!(
+                    error.contains(if kind == "mode" {
+                        "requires vm_mode=0"
+                    } else {
+                        "missing local workchain execution engine"
+                    }),
+                    "{kind}: {error}"
+                );
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 #[tokio::test]
