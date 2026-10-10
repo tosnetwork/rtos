@@ -1031,6 +1031,7 @@ mod actions {
             &address,
             &Default::default(),
             &mut false,
+            &mut Coins::zero(),
         );
 
         let mut res_val = CurrencyCollection::with_coins(val);
@@ -1419,4 +1420,27 @@ fn test_generate_account_and_update() {
 #[test]
 fn test_special_limit_accounts() {
     assert_ne!(SPECIAL_LIMIT_ACCOUNTS.len(), 0);
+}
+
+#[test]
+fn failed_action_fine_is_capped_by_account_balance() {
+    let mut phase = TrActionPhase::default();
+    phase.action_fine = Coins::from(11u64);
+    phase.add_action_fees(&Coins::from(100u64));
+    let mut account_balance = CurrencyCollection::with_coins(7u64);
+    let mut inbound_balance = CurrencyCollection::with_coins(20u64);
+    let mut tx = Transaction::default();
+    let result = finish_action_phase_with_fine(
+        &mut tx,
+        phase,
+        Some(&mut inbound_balance),
+        &mut account_balance,
+        false,
+    )
+    .unwrap();
+    assert_eq!(result.phase.action_fine, Coins::from(7u64));
+    assert_eq!(result.phase.total_action_fees(), Coins::from(7u64));
+    assert_eq!(account_balance.coins, Coins::zero());
+    assert_eq!(inbound_balance.coins, Coins::from(13u64));
+    assert!(result.messages.is_empty());
 }

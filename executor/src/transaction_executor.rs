@@ -55,6 +55,7 @@ pub const RESULT_CODE_NON_ZERO_CELL_LEVEL: i32 = 42;
 pub const RESULT_CODE_TOO_MANY_EXTRA: i32 = 44;
 /// Result code indicating that invalid or unsupported extra flags were provided in a message or transaction.
 pub const RESULT_CODE_INVALID_EXTRA_FLAGS: i32 = 45;
+pub const RESULT_CODE_TOTAL_MESSAGE_LIMIT: i32 = 47;
 pub const RESULT_CODE_EXCEEDED_LIMITS: i32 = 50;
 pub const RESULT_CODE_UNSUPPORTED: i32 = -1;
 
@@ -556,6 +557,9 @@ pub trait TransactionExecutor {
         let mut acc_remaining_balance = acc_balance.clone();
         let mut phase = TrActionPhase::default();
         let mut total_reserved_value = Coins::default();
+        // Successful sends incur this deferred fine only if the action phase later fails.
+        let mut fail_action_fine = Coins::zero();
+        let msg_balance_before_actions = msg_remaining_balance.clone();
         let mut bounce = false;
         phase.action_list_hash = actions_cell.repr_hash().clone();
         let action_slices = match unpack_out_action_slices(actions_cell) {
@@ -655,6 +659,7 @@ pub trait TransactionExecutor {
                         my_addr,
                         &total_reserved_value,
                         &mut account_deleted,
+                        &mut fail_action_fine,
                     );
                     match result {
                         Ok(_) => {
@@ -789,6 +794,11 @@ pub trait TransactionExecutor {
                     *library = acc_copy.libraries();
                 }
                 tr.set_account_updates(acc.storage_roots());
+                // Roll back forwarding modes before charging the fine used by bounce.
+                if self.config().block_version() >= 14 {
+                    *msg_remaining_balance = msg_balance_before_actions.clone();
+                }
+                phase.action_fine += fail_action_fine;
                 return finish_action_phase_with_fine(
                     tr,
                     phase,
@@ -842,6 +852,17 @@ pub trait TransactionExecutor {
                 "Account size limits exceeded. Taking fine and rolling back state"
             );
             phase.result_code = RESULT_CODE_EXCEEDED_LIMITS;
+            phase.action_fine += fail_action_fine;
+            if self.config().block_version() >= 14 {
+                *msg_remaining_balance = msg_balance_before_actions;
+                return finish_action_phase_with_fine(
+                    tr,
+                    phase,
+                    Some(msg_remaining_balance),
+                    acc_balance,
+                    true,
+                );
+            }
             return finish_action_phase_with_fine(tr, phase, None, acc_balance, true);
         }
 
@@ -1274,6 +1295,7 @@ fn outmsg_action_handler(
     my_addr: &MsgAddressInt,
     reserved_value: &Coins,
     account_deleted: &mut bool,
+    fail_action_fine: &mut Coins,
 ) -> std::result::Result<CurrencyCollection, i32> {
     if msg.is_inbound_external() {
         log::debug!(target: "executor", "outbound msg cannot be inbound external");
@@ -1462,6 +1484,9 @@ fn outmsg_action_handler(
         if !is_special {
             fine = Coins::from(fine_per_cell * max_cells.min(sstat.cells()));
         }
+        let action_fine_before = phase.action_fine;
+        let total_bits_before = phase.tot_msg_size.bits();
+        let total_cells_before = phase.tot_msg_size.cells();
         let mut acc_balance_copy = acc_balance.clone();
         let mut collect_fine = || {
             if !is_special {
@@ -1529,14 +1554,11 @@ fn outmsg_action_handler(
                 //send all remainig balance of inbound message
                 result_value.coins.add(&msg_balance.coins).ok();
                 if mode.non(SENDMSG_PAY_FEE_SEPARATELY) {
-                    if &result_value.coins < compute_phase_fees {
-                        // TODO: collect_fine();
+                    let consumed = *compute_phase_fees + action_fine_before;
+                    if !result_value.coins.sub_checked(&consumed) {
+                        collect_fine();
                         return check_skip_invalid(RESULT_CODE_NOT_ENOUGH_COINS);
                     }
-                    result_value.coins.sub(compute_phase_fees).map_err(|err| {
-                        log::error!(target: "executor", "cannot subtract msg balance : {}", err);
-                        RESULT_CODE_ACTIONLIST_INVALID
-                    })?;
                 }
                 int_header.value = result_value.clone();
             }
@@ -1588,6 +1610,13 @@ fn outmsg_action_handler(
             }
         };
         let add_bits = root.length_in_bits() as u64;
+        if config.block_version() >= 15
+            && (total_bits_before + sstat.bits() + add_bits > limits.max_total_msg_bits as u64
+                || total_cells_before + sstat.cells() + 1 > limits.max_total_msg_cells as u64)
+        {
+            collect_fine();
+            return check_skip_invalid(RESULT_CODE_TOTAL_MESSAGE_LIMIT);
+        }
         if params.is_some() {
             match root.into_cell().and_then(Deserializable::construct_from_cell) {
                 Ok(msg_repacked) => {
@@ -1640,6 +1669,9 @@ fn outmsg_action_handler(
         phase.add_action_fees(&fwd_mine_fee);
 
         phase.tot_msg_size.add_bits_and_cells(sstat.bits() + add_bits, sstat.cells() + 1);
+        if config.block_version() >= 15 {
+            *fail_action_fine += fine;
+        }
 
         if mode.any(SENDMSG_ALL_BALANCE | SENDMSG_REMAINING_MSG_BALANCE) {
             msg_balance.coins.clear();
@@ -1981,8 +2013,12 @@ fn finish_action_phase_with_fine(
     acc_balance: &mut CurrencyCollection,
     bounce: bool,
 ) -> Result<ActionPhaseResult> {
+    phase.action_fine = phase.action_fine.min(acc_balance.coins);
     if let Some(msg_remaining_balance) = msg_remaining_balance {
-        msg_remaining_balance.coins.sub_checked(&phase.action_fine);
+        if !msg_remaining_balance.coins.sub_checked(&phase.action_fine) {
+            // A negative inbound remainder cannot fund a bounce.
+            msg_remaining_balance.coins.clear();
+        }
     }
     acc_balance.coins.sub_checked(&phase.action_fine);
     phase.del_action_fees();
