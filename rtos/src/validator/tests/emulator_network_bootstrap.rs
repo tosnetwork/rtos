@@ -1329,7 +1329,7 @@ async fn test_real_engine_progresses_with_emulated_consensus() -> Result<()> {
 
     stopper.set_stop();
     let _ = tokio::time::timeout(Duration::from_secs(10), join_handle).await;
-    engine.wait_stop().await;
+    engine.wait_stop().await.unwrap();
 
     let last_applied = result?;
     assert!(last_applied.seq_no >= TARGET_SEQNO);

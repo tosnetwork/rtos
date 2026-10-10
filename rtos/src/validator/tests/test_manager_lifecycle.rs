@@ -11,6 +11,7 @@ struct LifecycleEngine {
     stopping: std::sync::atomic::AtomicBool,
     fail_teardown: std::sync::atomic::AtomicBool,
     invocations: std::sync::atomic::AtomicUsize,
+    reported: std::sync::Mutex<Vec<(u32, String)>>,
     candidate_deletes: std::sync::atomic::AtomicUsize,
     fail_candidates: std::sync::atomic::AtomicBool,
     state_gate: Option<Arc<StateGate>>,
@@ -46,6 +47,10 @@ impl EngineOperations for LifecycleEngine {
         gate.release.acquire().await.unwrap().forget();
         assert!(!gate.panic, "controlled split task panic");
         fail!("controlled state read completion")
+    }
+    fn report_service_failure(&self, mask: u32, error: String) {
+        self.reported.lock().unwrap().push((mask, error));
+        self.stopping.store(true, Ordering::Release);
     }
     fn get_validator_status(&self) -> bool {
         true
@@ -95,6 +100,13 @@ async fn test_manager_lifecycle_service_mask_and_restart_refused_after_teardown_
         tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
         assert!(engine.acquired.load(Ordering::Acquire));
         assert_eq!(engine.released.load(Ordering::Acquire), !failing);
+        let reported = engine.reported.lock().unwrap();
+        assert_eq!(reported.len(), usize::from(failing));
+        if failing {
+            assert_eq!(reported[0].0, Engine::MASK_SERVICE_VALIDATOR_MANAGER);
+            assert!(reported[0].1.contains("persistence failure"));
+            assert!(engine.stopping.load(Ordering::Acquire));
+        }
         assert_eq!(
             engine.invocations.load(Ordering::Relaxed),
             1,

@@ -518,19 +518,19 @@ fn main() {
     })
     .expect("Error setting termination signals handler");
 
-    // Any panic signals stopper for graceful shutdown; default hook runs after.
+    // A panic requests shutdown but can never authorize a clean-shutdown marker.
     let stopper_panic = stopper.clone();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         log::error!("FATAL PANIC: {info}");
-        stopper_panic.set_stop();
+        stopper_panic.report_service_failure(0, format!("panic: {info}"));
         default_hook(info);
     }));
 
     let validator_rt_handle = validator_runtime.handle().clone();
     let liteserver_rt_handle = liteserver_runtime.handle().clone();
     let db_dir = config.internal_db_path().to_string();
-    runtime.block_on(async move {
+    let clean_shutdown = runtime.block_on(async move {
         match start_engine(
             config,
             zerostate_path,
@@ -543,20 +543,19 @@ fn main() {
         .await
         {
             Err(e) => {
-                if stopper.check_stop() {
-                    log::warn!("Node stopped ({})", e);
-                    set_graceful_termination(&db_dir);
-                } else {
-                    log::error!("Can't start node's Engine: {e:?}");
-                    eprintln!("Can't start node's Engine: {e:?}");
-                }
+                log::error!("Can't start node's Engine: {e:?}");
+                eprintln!("Can't start node's Engine: {e:?}");
+                false
             }
             Ok((engine, join_handle)) => {
-                join_handle.await.ok();
-                log::warn!("Still safe stopping node...");
-                engine.wait_stop().await;
-                log::warn!("Node stopped");
-                set_graceful_termination(&db_dir);
+                if let Err(error) = join_handle.await {
+                    stopper.report_service_failure(
+                        0,
+                        format!("Engine supervisor join failed: {error}"),
+                    );
+                }
+                log::warn!("Still stopping node...");
+                finish_node_shutdown(engine.wait_stop().await, &db_dir)
             }
         }
     });
@@ -566,4 +565,60 @@ fn main() {
     runtime.shutdown_timeout(shutdown_timeout);
     validator_runtime.shutdown_timeout(shutdown_timeout);
     liteserver_runtime.shutdown_timeout(shutdown_timeout);
+    if !clean_shutdown {
+        std::process::exit(1);
+    }
+}
+
+// Keep clean-shutdown bookkeeping tied to the actual terminal result.
+fn finish_node_shutdown(result: Result<()>, db_dir: &str) -> bool {
+    match result {
+        Ok(()) => {
+            log::warn!("Node stopped");
+            set_graceful_termination(db_dir);
+            true
+        }
+        Err(error) => {
+            log::error!("Node shutdown failed: {error}");
+            eprintln!("Node shutdown failed: {error}");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_shutdown_keeps_database_recovery_beacon() {
+        let directory = tempfile::tempdir().unwrap();
+        let beacon = directory.path().join("ton_node.running");
+        std::fs::write(&beacon, b"running").unwrap();
+        let stopper = Arc::new(Stopper::new());
+        stopper.acquire_stop(Engine::MASK_SERVICE_VALIDATOR_MANAGER);
+        stopper.report_service_failure(
+            Engine::MASK_SERVICE_VALIDATOR_MANAGER,
+            "controlled validator teardown failure".to_owned(),
+        );
+        assert!(!finish_node_shutdown(
+            stopper.wait_stop().await,
+            directory.path().to_str().unwrap()
+        ));
+        assert!(beacon.exists(), "failed stop must require database recovery");
+    }
+
+    #[tokio::test]
+    async fn successful_shutdown_clears_database_recovery_beacon() {
+        let directory = tempfile::tempdir().unwrap();
+        let beacon = directory.path().join("ton_node.running");
+        std::fs::write(&beacon, b"running").unwrap();
+        let stopper = Arc::new(Stopper::new());
+        stopper.set_stop();
+        assert!(finish_node_shutdown(
+            stopper.wait_stop().await,
+            directory.path().to_str().unwrap()
+        ));
+        assert!(!beacon.exists());
+    }
 }

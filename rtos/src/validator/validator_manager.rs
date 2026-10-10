@@ -1656,12 +1656,13 @@ impl ValidatorManagerImpl {
         // Split precomputation belongs to the manager, not a particular group.
         // No manager task can register more work while this &mut self is held.
         self.background_tasks.close();
-        let retirement_result = self.drain_retiring().await;
+        // drain_retiring latches every failure; aggregate again after the
+        // background barrier so simultaneous failure sources are not lost.
+        let _ = self.drain_retiring().await;
         self.background_tasks.wait().await;
         if self.background_panicked.load(Ordering::Acquire) {
             self.lifecycle_errors.insert("manager background task panicked".to_owned());
         }
-        retirement_result?;
         self.check_lifecycle_errors()?;
         self.background_tasks.reopen();
         self.garbage_collect().await;
@@ -2968,6 +2969,7 @@ fn spawn_validator_manager(
                 // No replacement manager and no successful service-stop signal
                 // when teardown could not certify termination.
                 log::error!(target: "validator_manager", "FATAL: validator teardown failed; restart refused: {e}");
+                engine.report_service_failure(Engine::MASK_SERVICE_VALIDATOR_MANAGER, e.to_string());
                 return;
             }
             let Err(e) = res else { break };

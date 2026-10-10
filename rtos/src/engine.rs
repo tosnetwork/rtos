@@ -383,6 +383,8 @@ impl Downloader for ZeroStateDownloader {
 pub struct Stopper {
     stop: Arc<AtomicU32>,
     token: tokio_util::sync::CancellationToken,
+    // A failed owner keeps its service bit. Failure is not a successful release.
+    failures: std::sync::Mutex<std::collections::BTreeMap<u32, Vec<String>>>,
 }
 
 impl Stopper {
@@ -390,6 +392,7 @@ impl Stopper {
         Stopper {
             stop: Arc::new(AtomicU32::new(0)),
             token: tokio_util::sync::CancellationToken::new(),
+            failures: Default::default(),
         }
     }
 
@@ -399,14 +402,42 @@ impl Stopper {
         self.token.cancel();
     }
 
-    pub async fn wait_stop(self: Arc<Self>) {
+    /// Report a terminal owner failure only after its owned work has drained.
+    /// mask=0 records an unclassified failure without exempting any live service.
+    pub fn report_service_failure(&self, mask: u32, error: String) {
+        let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        let errors = failures.entry(mask).or_default();
+        if !errors.contains(&error) {
+            errors.push(error);
+        }
+        drop(failures);
+        self.set_stop();
+    }
+
+    pub async fn wait_stop(self: Arc<Self>) -> Result<()> {
         loop {
-            tokio::time::sleep(Duration::from_millis(Engine::TIMEOUT_STOP_MS)).await;
-            let stop = self.stop.load(Ordering::Relaxed) & !Engine::MASK_STOP;
-            Self::log_stop_status(stop);
-            if (self.stop.load(Ordering::Relaxed) & !Engine::MASK_STOP) == 0 {
-                break;
+            {
+                let failures = self.failures.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let stop = self.stop.load(Ordering::Acquire) & !Engine::MASK_STOP;
+                let failed = failures.keys().fold(0, |masks, mask| masks | mask);
+                Self::log_stop_status(stop);
+                // Terminal failed owners cannot release successfully, but every
+                // other service must finish before shutdown returns its error.
+                if stop & !failed == 0 {
+                    if failures.is_empty() {
+                        return Ok(());
+                    }
+                    let sources: Vec<_> = failures
+                        .iter()
+                        .map(|(mask, errors)| format!("service {mask:#06x}: {}", errors.join("; ")))
+                        .collect();
+                    fail!(
+                        "node shutdown failed; unreleased service mask {stop:#06x}: {}",
+                        sources.join("; ")
+                    );
+                }
             }
+            tokio::time::sleep(Duration::from_millis(Engine::TIMEOUT_STOP_MS)).await;
         }
     }
 
@@ -857,7 +888,7 @@ impl Engine {
         self.monitor_min_split.load(Ordering::Relaxed)
     }
 
-    pub async fn wait_stop(self: Arc<Self>) {
+    pub async fn wait_stop(self: Arc<Self>) -> Result<()> {
         // set stop flag
         self.stopper.set_stop();
         if let Ok(or) = self.overlays_router() {
@@ -884,11 +915,14 @@ impl Engine {
         });
 
         // wait while all node's services will stop
-        self.stopper.clone().wait_stop().await;
+        // Failure sources are sticky. Still finish transport cleanup before
+        // returning the final result, including failures reported during it.
+        let _ = self.stopper.clone().wait_stop().await;
         self.network.stop_adnl().await;
         if let Some(tc) = &self.trace_collector {
             tc.stop();
         }
+        self.stopper.clone().wait_stop().await
     }
 
     pub fn stopper(&self) -> &Stopper {
@@ -2517,12 +2551,31 @@ pub async fn run(
     match result {
         Err(e) => {
             // Always wait for engine stop
-            engine_ret.wait_stop().await;
-            Err(e)
+            match engine_ret.wait_stop().await {
+                Ok(()) => Err(e),
+                Err(cleanup) => {
+                    Err(error!("Engine startup failed: {e}; cleanup failed: {cleanup}"))
+                }
+            }
         }
         Ok((join_shards, join_master)) => {
+            let stopper = engine_ret.stopper.clone();
             let join_engine = tokio::spawn(async move {
-                let (_, _) = tokio::join!(join_master, join_shards);
+                let observe = |name: &'static str, task: tokio::task::JoinHandle<()>| {
+                    let stopper = stopper.clone();
+                    async move {
+                        if let Err(error) = task.await {
+                            // A failed client may have descendants outside this
+                            // join. Record the failure without certifying drain.
+                            stopper
+                                .report_service_failure(0, format!("{name} join failed: {error}"));
+                        }
+                    }
+                };
+                tokio::join!(
+                    observe("masterchain client", join_master),
+                    observe("shardchain client", join_shards)
+                );
             });
             Ok((engine_ret, join_engine))
         }
@@ -3204,3 +3257,7 @@ pub async fn start_metrics_server(
 #[cfg(test)]
 #[path = "tests/test_parent_apply.rs"]
 pub(crate) mod parent_apply_tests;
+
+#[cfg(test)]
+#[path = "tests/test_stopper.rs"]
+mod stopper_tests;
