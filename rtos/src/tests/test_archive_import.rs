@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project naming and protocol-consistent test fixtures.
+ * RTOS project modifications (2026-10-10): protocol-consistent authenticated cross-chain archive fixtures.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -27,6 +27,10 @@ use std::{
     sync::{atomic::AtomicU8, Arc},
 };
 use storage::{archives::epoch::ArchivalModeConfig, db::rocksdb::RocksDb};
+
+#[path = "test_archive_import_fixture.rs"]
+mod authenticated_fixture;
+use authenticated_fixture::Fixture;
 
 async fn wait_for_db_release(db: Arc<RocksDb>) {
     while Arc::strong_count(&db) > 1 {
@@ -144,190 +148,98 @@ async fn check_imported_block(
     Ok(block_stuff)
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_import_and_verify() -> Result<()> {
     init_test_log();
-    let dir = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new();
+    let dir = tempfile::tempdir()?;
     let archives = dir.path().join("archives");
-    prepare_archives(&archives).unwrap();
-    let config = import_config(dir.path(), archives);
-
-    run_import(config).await?;
-
+    fixture.prepare(dir.path(), &archives).await?;
+    let node_db = run_import(fixture.config(dir.path(), archives)).await?;
+    wait_for_db_release(node_db).await;
     let db = open_db(dir.path()).await?;
-
-    let last_mc =
-        db.load_full_node_state(LAST_APPLIED_MC_BLOCK)?.expect("LAST_APPLIED_MC_BLOCK must be set");
-    assert_eq!(last_mc.seq_no(), 199);
-    assert!(last_mc.shard().is_masterchain());
-
-    let gc_block = db.load_full_node_state(ARCHIVES_GC_BLOCK)?;
-    assert_eq!(last_mc, gc_block.unwrap());
-
-    let pss_block = db.load_full_node_state(PSS_KEEPER_MC_BLOCK)?;
-    assert_eq!(last_mc, pss_block.unwrap());
-
-    let shard_client = db.load_full_node_state(SHARD_CLIENT_MC_BLOCK)?;
-    assert_eq!(last_mc, shard_client.unwrap());
-
-    let last_mc_block = check_imported_block(&db, &last_mc).await?.unwrap();
-
-    for shard_block in last_mc_block.top_blocks_all()? {
-        check_imported_block(&db, &shard_block).await?;
-    }
-
-    let first_mc =
-        db.lookup_block_by_seqno(&AccountIdPrefixFull::any_masterchain(), 1).await?.unwrap();
-    let first_mc_block = check_imported_block(&db, &first_mc.0).await?.unwrap();
-    // MC zerostate
-    check_imported_block(&db, &first_mc_block.construct_prev_id()?.0).await?;
-
-    let first_wc =
-        db.lookup_block_by_seqno(&AccountIdPrefixFull::workchain(0, SHARD_FULL), 1).await?.unwrap();
-    let first_wc_block = check_imported_block(&db, &first_wc.0).await?.unwrap();
-    // WC zerostate
-    check_imported_block(&db, &first_wc_block.construct_prev_id()?.0).await?;
-
+    fixture.assert_imported(&db, 4).await?;
     db.stop_states_db().await;
-
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_import_resume() -> Result<()> {
     init_test_log();
-    let dir = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new();
+    let dir = tempfile::tempdir()?;
     let all_archives = dir.path().join("archives");
-    prepare_archives(&all_archives).unwrap();
-
-    let partial_archives = dir.path().join("partial");
-    std::fs::create_dir_all(&partial_archives)?;
-
-    // Copy only the first group (archive.00000.*)
+    fixture.prepare(dir.path(), &all_archives).await?;
+    let partial = dir.path().join("partial");
+    std::fs::create_dir(&partial)?;
     for entry in std::fs::read_dir(&all_archives)? {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("archive.00000.") {
-            std::fs::copy(entry.path(), partial_archives.join(&name))?;
+        if entry.file_name().to_string_lossy().starts_with("archive.00001.") {
+            std::fs::copy(entry.path(), partial.join(entry.file_name()))?;
         }
     }
-
-    // First import — only first group
-    let config1 = ImportConfig {
-        archives_path: partial_archives.clone(),
-        epochs_path: dir.path().join("epochs"),
-        epoch_size: 20_000,
-        node_db_path: dir.path().join("node_db"),
-        mc_zerostate_path: PathBuf::from(MC_ZEROSTATE_PATH),
-        wc_zerostate_paths: vec![PathBuf::from(WC_ZEROSTATE_PATH)],
-        global_config_path: PathBuf::from(GLOBAL_CONFIG_PATH),
-        skip_validation: false,
-        move_files: true,
-    };
-    let node_db = run_import(config1).await?;
+    assert_eq!(std::fs::read_dir(&partial)?.count(), 2, "first MC and WC packages");
+    let mut first = fixture.config(dir.path(), partial.clone());
+    first.move_files = true;
+    let node_db = run_import(first).await?;
     wait_for_db_release(node_db).await;
-
-    let db1 = open_db(dir.path()).await?;
-    let last_mc_1 = db1
-        .load_full_node_state(LAST_APPLIED_MC_BLOCK)?
-        .expect("After first import, LAST_APPLIED_MC_BLOCK must be set");
-    assert_eq!(last_mc_1.seq_no(), 99);
-    drop(db1);
-
-    // Copy remaining files for second import
+    assert_eq!(
+        std::fs::read_dir(&partial)?.count(),
+        0,
+        "successful move import consumes both chains"
+    );
+    let db = open_db(dir.path()).await?;
+    fixture.assert_imported(&db, 2).await?;
+    db.stop_states_db().await;
+    drop(db);
     for entry in std::fs::read_dir(&all_archives)? {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with("archive.00000.") {
-            std::fs::copy(entry.path(), partial_archives.join(&name))?;
+        if entry.file_name().to_string_lossy().starts_with("archive.00003.") {
+            std::fs::copy(entry.path(), partial.join(entry.file_name()))?;
         }
     }
-
-    // Second import — should resume and process remaining groups
-    let config2 = ImportConfig {
-        archives_path: partial_archives,
-        epochs_path: dir.path().join("epochs"),
-        epoch_size: 20_000,
-        node_db_path: dir.path().join("node_db"),
-        mc_zerostate_path: PathBuf::from(MC_ZEROSTATE_PATH),
-        wc_zerostate_paths: vec![PathBuf::from(WC_ZEROSTATE_PATH)],
-        global_config_path: PathBuf::from(GLOBAL_CONFIG_PATH),
-        skip_validation: false,
-        move_files: false,
-    };
-    run_import(config2).await?;
-
-    let db2 = open_db(dir.path()).await?;
-    let last_mc_2 = db2
-        .load_full_node_state(LAST_APPLIED_MC_BLOCK)?
-        .expect("After second import, LAST_APPLIED_MC_BLOCK must be set");
-    assert_eq!(last_mc_2.seq_no(), 199);
-    db2.stop_states_db().await;
+    assert_eq!(std::fs::read_dir(&partial)?.count(), 2, "second MC and WC packages");
+    let node_db = run_import(fixture.config(dir.path(), partial)).await?;
+    wait_for_db_release(node_db).await;
+    let db = open_db(dir.path()).await?;
+    fixture.assert_imported(&db, 4).await?;
+    db.stop_states_db().await;
     Ok(())
 }
 
-/// Regression for the resume bug: when the archive MC index is ahead of the shard
-/// client (the node applied MC blocks the shard client hasn't reached yet), run_import
-/// must clamp the resume point to SHARD_CLIENT_MC_BLOCK and RE-IMPORT those groups
-/// instead of skipping them. Skipping leaves the shard tops of those MC blocks without
-/// handles, which later breaks shard-chain stitching ("Block handle not found" /
-/// "Shard chain break").
-///
-/// Observable check: after rewinding SHARD_CLIENT to the top of the first group, a
-/// move-mode re-import must consume (move away) group 00000's source files — proving it
-/// was re-imported. A buggy resume by the archive max would skip 00000, leaving them.
-#[tokio::test(flavor = "multi_thread")]
+/// Archive indexes can be ahead of the shard client. Rewinding the client to
+/// group one's tip must re-import both chains of group one, not skip to group two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_import_resume_respects_shard_client() -> Result<()> {
     init_test_log();
-    let dir = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new();
+    let dir = tempfile::tempdir()?;
     let archives = dir.path().join("archives");
-    prepare_archives(&archives).unwrap(); // groups 00000 (0..=99) and 00100 (100..=199)
-
-    // First import of both groups (copy — keep source files for the second import).
-    let mut cfg1 = import_config(dir.path(), archives.clone());
-    cfg1.move_files = false;
-    let node_db = run_import(cfg1).await?;
+    fixture.prepare(dir.path(), &archives).await?;
+    let node_db = run_import(fixture.config(dir.path(), archives.clone())).await?;
     wait_for_db_release(node_db).await;
-
-    // Simulate shard-client lag: rewind SHARD_CLIENT_MC_BLOCK to the top of the first
-    // group (seqno 99) while the archive index / LAST_APPLIED stay at 199.
     {
         let db = open_db(dir.path()).await?;
-        assert_eq!(db.load_full_node_state(LAST_APPLIED_MC_BLOCK)?.unwrap().seq_no(), 199);
-        let mc99 = db
-            .lookup_block_by_seqno(&AccountIdPrefixFull::any_masterchain(), 99)
-            .await?
-            .expect("MC block 99 must exist after first import")
-            .0;
-        db.save_full_node_state(SHARD_CLIENT_MC_BLOCK, &mc99)?;
+        fixture.assert_imported(&db, 4).await?;
+        db.save_full_node_state(SHARD_CLIENT_MC_BLOCK, &fixture.id(2, false))?;
         db.stop_states_db().await;
     }
-
-    // Second import in move mode. Correct resume clamps to the shard client (99) and
-    // re-imports group 00000 (moving its source files away). A buggy resume by the
-    // archive max (199) would skip group 00000, leaving its source files in place.
-    let mut cfg2 = import_config(dir.path(), archives.clone());
-    cfg2.move_files = true;
-    let node_db2 = run_import(cfg2).await?;
-    wait_for_db_release(node_db2).await;
-
-    let leftover: Vec<String> = std::fs::read_dir(&archives)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n.starts_with("archive.00000."))
+    let mut second = fixture.config(dir.path(), archives.clone());
+    second.move_files = true;
+    let node_db = run_import(second).await?;
+    wait_for_db_release(node_db).await;
+    let leftover: Vec<_> = std::fs::read_dir(&archives)?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|name| name.starts_with("archive.00001."))
         .collect();
     assert!(
         leftover.is_empty(),
-        "run_import must clamp resume to SHARD_CLIENT_MC_BLOCK and re-import group 00000; \
-         leftover source files mean it was wrongly skipped: {:?}",
-        leftover,
+        "shard-client resume must consume group one's MC and WC packages: {leftover:?}"
     );
-
-    // Final state must still be complete.
     let db = open_db(dir.path()).await?;
-    assert_eq!(db.load_full_node_state(LAST_APPLIED_MC_BLOCK)?.unwrap().seq_no(), 199);
-    let shard_client = db.load_full_node_state(SHARD_CLIENT_MC_BLOCK)?.unwrap();
-    assert_eq!(shard_client.seq_no(), 199, "second import must re-advance the shard client");
+    fixture.assert_imported(&db, 4).await?;
     db.stop_states_db().await;
     Ok(())
 }

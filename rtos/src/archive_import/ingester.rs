@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and deterministic cross-chain archive import.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -587,6 +587,10 @@ impl Ingester {
             .await
             .map_err(|e| error!("MC parse task panicked: {}", e))??;
         let parse_mc_ms = t.elapsed().as_millis();
+
+        // A key block starts a new archive slice. Register that boundary before
+        // either chain selects its slice, while retaining parallel package I/O.
+        self.archive_manager.prepare_import_group(group.archive_id, key_block.is_some()).await?;
 
         let t = Instant::now();
         for entry in &mc_entries {
