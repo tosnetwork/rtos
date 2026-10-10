@@ -192,7 +192,9 @@ async fn test_group_stop_reports_task_panic_instead_of_stopped() {
     assert!(group.tasks.is_empty());
 }
 
-fn make_simplex_group_for_engine(engine: Arc<dyn EngineOperations>) -> Arc<ValidatorGroup> {
+pub(crate) fn make_simplex_group_for_engine(
+    engine: Arc<dyn EngineOperations>,
+) -> Arc<ValidatorGroup> {
     let local_key: PrivateKey =
         Ed25519KeyOption::<ZeroizingBytes>::generate().expect("key must be generated");
     let validator_descr = ValidatorDescr::with_params(

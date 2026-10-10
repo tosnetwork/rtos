@@ -89,3 +89,7 @@ async fn test_observer_lifecycle_real_overlay_stop_rejoin_and_idempotency() {
     replacement.stop_and_wait().await.unwrap();
     observer.stop_and_wait().await.unwrap();
 }
+
+pub(crate) fn abort_listener_for_test(observer: &BlockSyncObserver) {
+    observer.listener_handle.lock().unwrap().as_ref().unwrap().abort();
+}

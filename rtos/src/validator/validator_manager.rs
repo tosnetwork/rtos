@@ -36,6 +36,7 @@ use crate::{
 };
 #[cfg(test)]
 use consensus_common::EmulatorDelaySpec;
+use futures::FutureExt;
 #[cfg(test)]
 use rtos_api::IntoBoxed;
 use rtos_block::{
@@ -800,6 +801,13 @@ struct ValidatorManagerImpl {
     current_sessions: HashMap<UInt256, Arc<ValidatorGroup>>,
     /// Sessions for the next (future) validator set with pre-created engines.
     future_sessions: HashMap<UInt256, Arc<ValidatorGroup>>,
+    // Retiring objects remain owned across cancellation and failed teardown.
+    // The first retirement fixes the database policy for all later waiters.
+    retiring_groups: Vec<(UInt256, Arc<ValidatorGroup>, bool)>,
+    retiring_observers: Vec<Arc<super::block_sync_observer::BlockSyncObserver>>,
+    lifecycle_errors: HashSet<String>,
+    background_tasks: tokio_util::task::TaskTracker,
+    background_panicked: Arc<std::sync::atomic::AtomicBool>,
     /// Number of current subsets selected for the local node on the last successful
     /// `update_shards()` pass.
     owned_current_shards: usize,
@@ -834,6 +842,11 @@ impl ValidatorManagerImpl {
             rt: rt.clone(),
             current_sessions: HashMap::default(),
             future_sessions: HashMap::default(),
+            retiring_groups: Vec::new(),
+            retiring_observers: Vec::new(),
+            lifecycle_errors: HashSet::new(),
+            background_tasks: tokio_util::task::TaskTracker::new(),
+            background_panicked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             owned_current_shards: 0,
             owned_future_shards: 0,
             validator_list_status: ValidatorListStatus::default(),
@@ -1229,97 +1242,132 @@ impl ValidatorManagerImpl {
     /// Stop sessions that are no longer active or pending, and record their IDs in the
     /// destroyed-session blacklist to prevent recreation within the same masterchain cycle.
     /// Mirrors C++ group destruction logic in `update_shards()` (`manager.cpp`).
+    fn retire_group(&mut self, id: UInt256, group: Arc<ValidatorGroup>, destroy: bool) {
+        self.destroyed_sessions.insert(id.clone());
+        if !self.retiring_groups.iter().any(|(_, old, _)| Arc::ptr_eq(old, &group)) {
+            let consensus = if group.is_simplex() { "simplex" } else { "catchain" };
+            metrics::counter!("rtos_node_validator_session_destroyed_total", "consensus" => consensus).increment(1);
+            self.retiring_groups.push((id, group, destroy));
+        }
+    }
+
+    fn retire_observer(&mut self, id: &UInt256) {
+        if let Some(observer) = self.block_sync_observers.remove(id) {
+            observer.stop();
+            self.retiring_observers.push(observer);
+        }
+    }
+
+    // Every object is registered before the first await. A cancelled caller can
+    // resume this drain without forgetting siblings or changing their policy.
+    async fn drain_retiring(&mut self) -> Result<()> {
+        let rt = self.rt.clone();
+        let groups = self.retiring_groups.clone();
+        let results = futures::future::join_all(
+            groups.iter().map(|(_, group, destroy)| group.clone().stop(rt.clone(), *destroy)),
+        )
+        .await;
+        for ((id, group, _), result) in groups.into_iter().zip(results) {
+            match result {
+                Ok(()) => {
+                    self.retiring_groups.retain(|(_, old, _)| !Arc::ptr_eq(old, &group));
+                    if !self.is_active_shard(group.shard()).await {
+                        self.engine.remove_last_validation_time(group.shard());
+                        self.engine.remove_last_collation_time(group.shard());
+                    }
+                }
+                Err(error) => {
+                    self.lifecycle_errors.insert(format!("session {id:x}: {error}"));
+                }
+            }
+        }
+        for observer in self.retiring_observers.clone() {
+            match observer.stop_and_wait().await {
+                Ok(()) => self.retiring_observers.retain(|old| !Arc::ptr_eq(old, &observer)),
+                Err(error) => {
+                    self.lifecycle_errors.insert(format!("observer: {error}"));
+                }
+            }
+        }
+        self.check_lifecycle_errors()
+    }
+
+    fn check_lifecycle_errors(&self) -> Result<()> {
+        if !self.lifecycle_errors.is_empty() {
+            let mut errors: Vec<_> = self.lifecycle_errors.iter().cloned().collect();
+            errors.sort();
+            fail!("validator teardown failed: {}", errors.join("; "));
+        }
+        Ok(())
+    }
+
     async fn stop_and_remove_sessions(
         &mut self,
         sessions_to_remove: &HashSet<UInt256>,
         destroy_database: bool,
-    ) {
-        if !sessions_to_remove.is_empty() {
-            log::debug!(target: "validator_manager",
-                "stop_and_remove_sessions: removing {} sessions, destroy_db={}",
-                sessions_to_remove.len(), destroy_database);
-        }
-        for id in sessions_to_remove.iter() {
+    ) -> Result<()> {
+        for id in sessions_to_remove {
             self.destroyed_sessions.insert(id.clone());
-
-            let future_group = self.future_sessions.remove(id);
-
-            match self.current_sessions.get(id) {
-                None => {
-                    if let Some(fg) = future_group {
-                        // C++ parity: tentative groups are destroyed via
-                        // IValidatorGroup::destroy in manager.cpp.
-                        log::info!(target: "validator_manager",
-                            "SESSION_LIFECYCLE: gc_future shard={} cc_seqno={} session_id={:x} \
-                             destroy_db={} (no longer needed)",
-                            fg.shard(), fg.cc_seqno(), id, destroy_database);
-                        let cl = if fg.is_simplex() { "simplex" } else { "catchain" };
-                        metrics::counter!(
-                            "rtos_node_validator_session_destroyed_total",
-                            "consensus" => cl
-                        )
-                        .increment(1);
-                        if let Err(e) = fg.stop(self.rt.clone(), destroy_database).await {
-                            log::error!(target: "validator_manager",
-                                "SESSION_LIFECYCLE: gc_future_stop_failed session_id={:x}: {}",
-                                id, e);
-                        }
-                    } else {
-                        log::trace!(target: "validator_manager",
-                            "Session {:x} not in current or future maps", id);
-                    }
-                }
-                Some(session) => {
-                    let status = session.get_status().await;
-                    let shard = session.shard().clone();
-                    match status {
-                        ValidatorGroupStatus::Stopping => {
-                            log::debug!(target: "validator_manager",
-                                "SESSION_LIFECYCLE: already stopping shard={} session_id={:x}",
-                                shard, id);
-                        }
-                        ValidatorGroupStatus::Stopped => {
-                            if let Some(group) = self.current_sessions.remove(id) {
-                                log::info!(target: "validator_manager",
-                                    "SESSION_LIFECYCLE: gc_stopped shard={} session_id={:x}",
-                                    shard, id);
-                                let cl = if group.is_simplex() { "simplex" } else { "catchain" };
-                                metrics::counter!(
-                                    "rtos_node_validator_session_destroyed_total",
-                                    "consensus" => cl
-                                )
-                                .increment(1);
-                                if !self.is_active_shard(group.shard()).await {
-                                    self.engine.remove_last_validation_time(group.shard());
-                                    self.engine.remove_last_collation_time(group.shard());
-                                }
-                            }
-                        }
-                        _ => {
-                            log::info!(target: "validator_manager",
-                                "SESSION_LIFECYCLE: gc_stop shard={shard} session_id={id:x} \
-                                status={status} destroy_db={}",
-                                destroy_database
-                            );
-                            let cl = if session.is_simplex() { "simplex" } else { "catchain" };
-                            metrics::counter!(
-                                "rtos_node_validator_session_destroyed_total",
-                                "consensus" => cl
-                            )
-                            .increment(1);
-                            if let Err(e) =
-                                session.clone().stop(self.rt.clone(), destroy_database).await
-                            {
-                                log::error!(target: "validator_manager",
-                                    "SESSION_LIFECYCLE: gc_stop_failed shard={} session_id={:x}: {}",
-                                    shard, id, e);
-                                self.current_sessions.remove(id);
-                            }
-                        }
-                    }
-                }
+            if let Some(group) = self.current_sessions.remove(id) {
+                self.retire_group(id.clone(), group, destroy_database);
+            }
+            if let Some(group) = self.future_sessions.remove(id) {
+                self.retire_group(id.clone(), group, destroy_database);
             }
         }
+        self.drain_retiring().await
+    }
+
+    async fn replace_current_sessions(
+        &mut self,
+        selected: HashMap<UInt256, Arc<ValidatorGroup>>,
+    ) -> Result<()> {
+        let old = std::mem::replace(&mut self.current_sessions, selected);
+        for (id, group) in old {
+            if !self.current_sessions.get(&id).is_some_and(|new| Arc::ptr_eq(new, &group)) {
+                self.retire_group(id, group, true);
+            }
+        }
+        self.drain_retiring().await
+    }
+
+    async fn cull_stale_future_sessions(&mut self) -> Result<()> {
+        let stale_ids: Vec<_> = self
+            .future_sessions
+            .iter()
+            .filter(|(_, future)| {
+                self.current_sessions.values().any(|current| {
+                    let equal = current.shard() == future.shard();
+                    let related = current.shard().is_ancestor_for(future.shard())
+                        || future.shard().is_ancestor_for(current.shard());
+                    (equal && current.cc_seqno() >= future.cc_seqno())
+                        || (related && current.cc_seqno() > future.cc_seqno())
+                })
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale_ids {
+            let group = self.future_sessions.remove(&id).expect("collected future owner");
+            self.retire_group(id, group, true);
+        }
+        self.drain_retiring().await
+    }
+
+    fn spawn_split_queue_precalculation(&self, id: BlockIdExt) {
+        let engine = self.engine.clone();
+        let panicked = self.background_panicked.clone();
+        self.background_tasks.spawn_on(async move {
+            let work = async move {
+                match OutMsgQueueInfoStuff::precalc_split_queues(&engine, &id).await {
+                    Ok(()) => log::trace!(target: "validator_manager", "Split queues precalculated for {id}"),
+                    Err(error) => log::error!(target: "validator_manager", "Cannot precalculate split queues for {id}: {error}"),
+                }
+            };
+            if let Err(payload) = std::panic::AssertUnwindSafe(work).catch_unwind().await {
+                panicked.store(true, Ordering::Release);
+                std::panic::resume_unwind(payload);
+            }
+        }, &self.rt);
     }
 
     async fn compute_session_options(
@@ -1595,40 +1643,27 @@ impl ValidatorManagerImpl {
         self.owned_current_shards = 0;
         self.owned_future_shards = 0;
 
-        let groups: HashMap<_, _> = self
-            .current_sessions
-            .iter()
-            .chain(self.future_sessions.iter())
-            .map(|(id, group)| (id.clone(), group.clone()))
-            .collect();
-        let observers: Vec<_> = self.block_sync_observers.values().cloned().collect();
-        let mut errors = Vec::new();
-        // Request all observer cancellations before waiting for any session.
-        for observer in &observers {
-            observer.stop();
+        for (id, group) in std::mem::take(&mut self.current_sessions)
+            .into_iter()
+            .chain(std::mem::take(&mut self.future_sessions))
+        {
+            self.retire_group(id, group, clear_rotation);
         }
-        let rt = self.rt.clone();
-        let results = futures::future::join_all(
-            groups.values().map(|group| group.clone().stop(rt.clone(), clear_rotation)),
-        )
-        .await;
-        for result in results {
-            if let Err(e) = result {
-                errors.push(e.to_string());
-            }
+        let observer_ids: Vec<_> = self.block_sync_observers.keys().cloned().collect();
+        for id in observer_ids {
+            self.retire_observer(&id);
         }
-        for observer in observers {
-            if let Err(e) = observer.stop_and_wait().await {
-                errors.push(e.to_string());
-            }
+        // Split precomputation belongs to the manager, not a particular group.
+        // No manager task can register more work while this &mut self is held.
+        self.background_tasks.close();
+        let retirement_result = self.drain_retiring().await;
+        self.background_tasks.wait().await;
+        if self.background_panicked.load(Ordering::Acquire) {
+            self.lifecycle_errors.insert("manager background task panicked".to_owned());
         }
-        if !errors.is_empty() {
-            fail!("validator teardown failed: {}", errors.join("; "));
-        }
-        self.destroyed_sessions.extend(groups.keys().cloned());
-        self.current_sessions.clear();
-        self.future_sessions.clear();
-        self.block_sync_observers.clear();
+        retirement_result?;
+        self.check_lifecycle_errors()?;
+        self.background_tasks.reopen();
         self.garbage_collect().await;
         self.engine.set_will_validate(false);
         if clear_rotation {
@@ -1830,10 +1865,8 @@ impl ValidatorManagerImpl {
             };
 
             if let Some(local_id) = &local_id_option {
-                if let Some(observer) = self.block_sync_observers.get(&session_id) {
-                    observer.stop_and_wait().await?;
-                    self.block_sync_observers.remove(&session_id);
-                }
+                self.retire_observer(&session_id);
+                self.drain_retiring().await?;
                 log::debug!(
                     target: "validator_manager",
                     "subset for session: shard {}, cc_seqno {}, keyblock_seqno {}, \
@@ -1905,6 +1938,9 @@ impl ValidatorManagerImpl {
                         ))
                     }
                 };
+                // Promotion removed the future owner. Register the selected
+                // group before any await/start, including on a partial pass.
+                self.current_sessions.insert(session_id.clone(), session.clone());
                 new_current_sessions.insert(session_id.clone(), session.clone());
 
                 let session_status = session.get_status().await;
@@ -1969,48 +2005,8 @@ impl ValidatorManagerImpl {
             }
             log::trace!(target: "validator_manager", "Session {} started (if necessary)", ident);
         }
-        let stale_old_current_sessions: Vec<(UInt256, Arc<ValidatorGroup>)> = self
-            .current_sessions
-            .iter()
-            .filter(|(id, _)| !new_current_sessions.contains_key(*id))
-            .map(|(id, group)| (id.clone(), group.clone()))
-            .collect();
-
         let old_current_count = self.current_sessions.len();
-        self.current_sessions = new_current_sessions;
-
-        for (session_id, stale_group) in stale_old_current_sessions {
-            self.destroyed_sessions.insert(session_id.clone());
-            let stale_shard = stale_group.shard().clone();
-            let status = stale_group.get_status().await;
-            log::info!(
-                target: "validator_manager",
-                "SESSION_LIFECYCLE: gc_stop shard={} session_id={:x} status={} destroy_db=true \
-                 (obsolete after current-map swap)",
-                stale_group.shard(),
-                session_id,
-                status
-            );
-            let consensus_label = if stale_group.is_simplex() { "simplex" } else { "catchain" };
-            metrics::counter!(
-                "rtos_node_validator_session_destroyed_total",
-                "consensus" => consensus_label
-            )
-            .increment(1);
-            if let Err(e) = stale_group.clone().stop(self.rt.clone(), true).await {
-                log::error!(
-                    target: "validator_manager",
-                    "SESSION_LIFECYCLE: gc_stop_failed shard={} session_id={:x}: {}",
-                    stale_group.shard(),
-                    session_id,
-                    e
-                );
-            }
-            if !self.is_active_shard(&stale_shard).await {
-                self.engine.remove_last_validation_time(&stale_shard);
-                self.engine.remove_last_collation_time(&stale_shard);
-            }
-        }
+        self.replace_current_sessions(new_current_sessions).await?;
 
         log::trace!(
             target: "validator_manager",
@@ -2030,15 +2026,9 @@ impl ValidatorManagerImpl {
             .cloned()
             .collect();
         for sid in stale_observer_ids {
-            if let Some(observer) = self.block_sync_observers.remove(&sid) {
-                log::info!(
-                    target: "validator_manager",
-                    "SESSION_LIFECYCLE: observer_stopped shard={} session_id={:x}",
-                    observer.shard(), sid,
-                );
-                observer.stop_and_wait().await?;
-            }
+            self.retire_observer(&sid);
         }
+        self.drain_retiring().await?;
         Ok(())
     }
 
@@ -2430,49 +2420,7 @@ impl ValidatorManagerImpl {
         self.owned_current_shards = our_current_shards.len();
         self.owned_future_shards = owned_future_shards;
 
-        // Stale-future culling: remove future entries whose shard already has a current
-        // group with equal or higher cc_seqno, or whose shard is an ancestor/descendant
-        // of a current shard with strictly higher cc_seqno.
-        // C++ parity: equal + related conditions from manager.cpp update_shards().
-        {
-            let stale_ids: Vec<UInt256> = self
-                .future_sessions
-                .iter()
-                .filter(|(_, fg)| {
-                    self.current_sessions.values().any(|cg| {
-                        let shards_equal = cg.shard() == fg.shard();
-                        let shards_related = cg.shard().is_ancestor_for(fg.shard())
-                            || fg.shard().is_ancestor_for(cg.shard());
-                        let equal_condition = shards_equal && cg.cc_seqno() >= fg.cc_seqno();
-                        let related_condition = shards_related && cg.cc_seqno() > fg.cc_seqno();
-                        equal_condition || related_condition
-                    })
-                })
-                .map(|(id, _)| id.clone())
-                .collect();
-            for id in stale_ids {
-                if let Some(fg) = self.future_sessions.remove(&id) {
-                    // C++ parity: destroyed_validator_sessions_.insert(id)
-                    self.destroyed_sessions.insert(id.clone());
-                    log::info!(target: "validator_manager",
-                        "SESSION_LIFECYCLE: cull_stale_future shard={} cc_seqno={} session_id={:x} \
-                        (superseded by active current session)",
-                        fg.shard(), fg.cc_seqno(), id);
-                    let cl = if fg.is_simplex() { "simplex" } else { "catchain" };
-                    metrics::counter!(
-                        "rtos_node_validator_session_destroyed_total",
-                        "consensus" => cl
-                    )
-                    .increment(1);
-                    // C++ parity: IValidatorGroup::destroy
-                    if let Err(e) = fg.stop(self.rt.clone(), true).await {
-                        log::error!(target: "validator_manager",
-                            "SESSION_LIFECYCLE: cull_stale_future_stop_failed session_id={:x}: {}",
-                            id, e);
-                    }
-                }
-            }
-        }
+        self.cull_stale_future_sessions().await?;
 
         let mut precalc_split_queues_for: HashSet<BlockIdExt> = HashSet::new();
         for session in self.current_sessions.values().chain(self.future_sessions.values()) {
@@ -2488,21 +2436,7 @@ impl ValidatorManagerImpl {
 
         // start background tasks which will precalculate split out messages queues
         for id in precalc_split_queues_for {
-            let engine = self.engine.clone();
-            tokio::spawn(async move {
-                log::trace!(
-                    target: "validator_manager", "Split queues precalculating for {}", id
-                );
-                match OutMsgQueueInfoStuff::precalc_split_queues(&engine, &id).await {
-                    Ok(_) => log::trace!(
-                        target: "validator_manager", "Split queues precalculated for {}", id
-                    ),
-                    Err(e) => log::error!(
-                        target: "validator_manager",
-                        "Can't precalculate split queues for {}: {}", id, e
-                    ),
-                }
-            });
+            self.spawn_split_queue_precalculation(id);
         }
 
         // Notify simplex sessions with the currently applied top for their shard.
@@ -2510,7 +2444,7 @@ impl ValidatorManagerImpl {
         self.notify_simplex_sessions_applied_tops(mc_state.as_ref(), mc_state_extra);
 
         log::trace!(target: "validator_manager", "starting stop&remove");
-        self.stop_and_remove_sessions(&gc_validator_sessions, true).await;
+        self.stop_and_remove_sessions(&gc_validator_sessions, true).await?;
 
         if rotate_all_shards(mc_state_extra) {
             log::info!(target: "validator_manager", "New last rotation block: {}", last_masterchain_block);
