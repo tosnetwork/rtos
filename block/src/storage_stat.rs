@@ -1,5 +1,5 @@
 /*
- * RTOS modification (2026-10-10): reject removal of unavailable pruned state data.
+ * RTOS modification (2026-10-10): preserve root multiplicity and reject unavailable pruned removals.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -306,15 +306,20 @@ impl AccountStorageStat {
         self.dict_updated = false;
         // hint applies only with a (proof) dict; empty dict → rebuilt from scratch, count everything
         let hint = if self.dict.is_empty() { ahash::AHashSet::new() } else { hint };
+        // Each root contributes a reference, even when code and data are identical.
+        // Match occurrences one at a time: set membership loses multiplicity and
+        // leaves incorrect refcounts in the committed storage dictionary.
+        let mut to_remove = self.roots.clone();
         for root in &roots {
-            if !self.roots.contains(root) {
+            if let Some(index) = to_remove.iter().position(|old| old == root) {
+                to_remove.remove(index);
+            } else {
                 self.add_cell(root, &hint)?;
             }
         }
-        for root in &std::mem::take(&mut self.roots) {
-            if !roots.contains(root) {
-                self.remove_cell(root)?;
-            }
+        // Add first so shared descendants remain available throughout the update.
+        for root in &to_remove {
+            self.remove_cell(root)?;
         }
         self.roots = roots;
         Ok(())
