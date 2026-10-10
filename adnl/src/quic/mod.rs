@@ -9,11 +9,11 @@
  */
 mod rate_limiter;
 mod stat;
-
+mod tasks;
 use crate::{
     common::{
-        add_unbound_object_to_map, add_unbound_object_to_map_with_update, spawn_cancelable,
-        AdnlPeers, Answer, Query, QueryAnswer, Subscriber,
+        add_unbound_object_to_map, add_unbound_object_to_map_with_update, AdnlPeers, Answer, Query,
+        QueryAnswer, Subscriber,
     },
     node::AdnlNode,
     transport::{Connections, SendQueue},
@@ -44,6 +44,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tasks::QuicTasks;
 
 const TARGET: &str = "quic";
 
@@ -489,7 +490,32 @@ enum KeyCommand {
     },
 }
 
+struct InboundReservation {
+    inbound: Arc<QuicInboundMap>,
+    key: QuicInboundKey,
+    counts: Arc<QuicIpConnCount>,
+    ip: IpAddr,
+}
+impl Drop for InboundReservation {
+    fn drop(&mut self) {
+        self.inbound.remove(&self.key);
+        QuicNode::ip_conn_dec(&self.counts, self.ip);
+    }
+}
+
+struct DelayedReservation {
+    delayed: Arc<QuicDelayedAccepts>,
+    count: Arc<AtomicUsize>,
+    ip: IpAddr,
+}
+impl Drop for DelayedReservation {
+    fn drop(&mut self) {
+        QuicNode::release_delayed_accept(&self.delayed, &self.count, self.ip);
+    }
+}
+
 pub struct QuicNode {
+    tasks: Arc<QuicTasks>,
     cancellation_token: tokio_util::sync::CancellationToken,
     /// One entry per local identity; each carries its own client config and outbound pool.
     local_keys: lockfree::map::Map<Arc<KeyId>, Arc<LocalKeyState>>,
@@ -590,7 +616,9 @@ impl QuicNode {
                 .expect("Failed to install default Rustls CryptoProvider");
         });
         let (key_cmd_tx, mut key_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<KeyCommand>();
+        let tasks = QuicTasks::new(runtime_handle, cancellation_token.clone());
         let transport = Arc::new(Self {
+            tasks: tasks.clone(),
             cancellation_token: cancellation_token.clone(),
             local_keys: lockfree::map::Map::new(),
             endpoints: Mutex::new(HashMap::new()),
@@ -608,9 +636,11 @@ impl QuicNode {
         // Spawn background task that processes key commands inside the Tokio runtime.
         let weak = Arc::downgrade(&transport);
         let token = cancellation_token.clone();
-        runtime_handle.spawn(async move {
+        tasks.spawn("key commands", async move {
             loop {
                 tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
                     cmd = key_cmd_rx.recv() => {
                         let Some(cmd) = cmd else { break };
                         match cmd {
@@ -637,12 +667,11 @@ impl QuicNode {
                             }
                         }
                     }
-                    _ = token.cancelled() => break,
                 }
             }
         });
-        Self::spawn_connection_checker(Arc::downgrade(&transport), cancellation_token.clone());
-        Self::spawn_stats_dumper(Arc::downgrade(&transport), cancellation_token);
+        Self::spawn_connection_checker(Arc::downgrade(&transport), tasks.clone());
+        Self::spawn_stats_dumper(Arc::downgrade(&transport), tasks);
         transport
     }
 
@@ -657,6 +686,9 @@ impl QuicNode {
         key_id: &Arc<KeyId>,
         bind_addr: SocketAddr,
     ) -> Result<()> {
+        if self.cancellation_token.is_cancelled() {
+            fail!("QUIC transport is shut down");
+        }
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.key_cmd_tx
             .send(KeyCommand::AddKey {
@@ -777,6 +809,9 @@ impl QuicNode {
     /// key state. After this call the QUIC server will no longer present this
     /// key's RPK certificate to connecting peers.
     pub fn remove_key(&self, key_id: &Arc<KeyId>, bind_addr: SocketAddr) -> Result<()> {
+        if self.cancellation_token.is_cancelled() {
+            fail!("QUIC transport is shut down");
+        }
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.key_cmd_tx
             .send(KeyCommand::RemoveKey { key_id: key_id.clone(), bind_addr, reply: reply_tx })
@@ -986,8 +1021,8 @@ impl QuicNode {
             let send_queue = outbound.send_queue.clone();
             let sender_state = outbound.sender_state.clone();
             let outbound_conns = state.outbound.clone();
-            spawn_cancelable(
-                self.cancellation_token.clone(),
+            self.tasks.spawn_cancelable(
+                "sender",
                 Self::run_sender_task(
                     quic,
                     peers.clone(),
@@ -1057,6 +1092,7 @@ impl QuicNode {
 
     /// Shut down all QUIC endpoints, cancel background tasks, and release resources.
     pub fn shutdown(&self) {
+        self.tasks.close();
         // Cancel all background tasks (accept loops, connection checkers, drain tasks)
         self.cancellation_token.cancel();
 
@@ -1077,6 +1113,22 @@ impl QuicNode {
                 state.endpoint.close(0u32.into(), b"shutdown");
             }
         }
+    }
+
+    /// Join actual workers, including subscriber calls already admitted from a stream.
+    /// Dropping a waiter never detaches the workers from their retained supervisors.
+    pub async fn shutdown_and_wait(&self) -> Result<()> {
+        self.shutdown();
+        let result = self.tasks.wait().await;
+        // A key command already executing when shutdown started may have created
+        // an endpoint. No key worker remains now, so this snapshot is final.
+        self.shutdown();
+        let endpoints: Vec<_> =
+            self.endpoints.lock().unwrap().values().map(|state| state.endpoint.clone()).collect();
+        for endpoint in endpoints {
+            endpoint.wait_idle().await;
+        }
+        result
     }
 
     fn addr_by_key(&self, key_id: &Arc<KeyId>) -> Result<SocketAddr> {
@@ -1159,7 +1211,7 @@ impl QuicNode {
     /// so the peer's accept loop isn't disrupted by an abrupt close.
     fn park_superseded_connection(&self, conn: quinn::Connection) {
         let token = self.cancellation_token.clone();
-        tokio::spawn(async move {
+        self.tasks.spawn("parked connection", async move {
             tokio::select! {
                 _ = conn.closed() => {}
                 _ = token.cancelled() => {
@@ -1192,6 +1244,9 @@ impl QuicNode {
     }
 
     fn ensure_peer_registered(&self, adnl: Option<&AdnlNode>, peers: &AdnlPeers) -> Result<()> {
+        if self.cancellation_token.is_cancelled() {
+            fail!("QUIC transport is shut down");
+        }
         let dst = peers.other();
         if self.has_peer_key(dst) {
             return Ok(());
@@ -1338,6 +1393,7 @@ impl QuicNode {
             conn_rate_limiters,
             global_rate_limiter,
             self.transport_errors.clone(),
+            self.tasks.clone(),
         );
 
         let state = Arc::new(EndpointState { endpoint, active_identity, registered_keys });
@@ -1476,6 +1532,7 @@ impl QuicNode {
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
         bind_addr: SocketAddr,
         msg_stats: Arc<MsgStats>,
+        tasks: Arc<QuicTasks>,
     ) {
         let addr = incoming.remote_address();
 
@@ -1548,6 +1605,12 @@ impl QuicNode {
             QuicInboundKey(local_key_id.clone(), peer_key_id.clone(), conn.stable_id());
         let _ = add_unbound_object_to_map(&inbound, inbound_key.clone(), || Ok(conn.clone()));
         Self::ip_conn_inc(&ip_conn_count, addr.ip());
+        let _reservation = InboundReservation {
+            inbound: inbound.clone(),
+            key: inbound_key,
+            counts: ip_conn_count,
+            ip: addr.ip(),
+        };
 
         let peers = AdnlPeers::with_keys(local_key_id, peer_key_id);
         let conn_id = conn.stable_id();
@@ -1582,7 +1645,7 @@ impl QuicNode {
                 let subscribers = subs_bi.clone();
                 let peers = peers_bi.clone();
                 let stats = stats_bi.clone();
-                tokio::spawn(async move {
+                tasks.spawn("inbound bidirectional stream", async move {
                     if let Err(e) = Self::process_incoming_stream(
                         recv,
                         send,
@@ -1612,7 +1675,7 @@ impl QuicNode {
                 let subscribers = subs_uni.clone();
                 let peers = peers_uni.clone();
                 let stats = stats_uni.clone();
-                tokio::spawn(async move {
+                tasks.spawn("inbound unidirectional stream", async move {
                     if let Err(e) =
                         Self::process_incoming_uni_stream(recv, &subscribers, &peers, addr, &stats)
                             .await
@@ -1656,8 +1719,6 @@ impl QuicNode {
             } => {}
         }
         let total_streams = streams_accepted.load(Ordering::Relaxed);
-        inbound.remove(&inbound_key);
-        Self::ip_conn_dec(&ip_conn_count, addr.ip());
 
         log::info!(
             target: TARGET,
@@ -2203,6 +2264,7 @@ impl QuicNode {
         mut conn_rate_limiters: ConnectionRateLimiters,
         mut global_rate_limiter: Option<RateLimiter>,
         transport_errors: Arc<TransportErrors>,
+        tasks: Arc<QuicTasks>,
     ) {
         log::info!(
             target: TARGET,
@@ -2211,7 +2273,8 @@ impl QuicNode {
             rl_config.per_ip_capacity,
             rl_config.global_capacity,
         );
-        tokio::spawn(async move {
+        let children = tasks.clone();
+        tasks.spawn("endpoint accept", async move {
             loop {
                 log::trace!(target: TARGET, "Loop QUIC server on {bind_addr}");
                 tokio::select! {
@@ -2285,37 +2348,42 @@ impl QuicNode {
                         let ipc = ip_conn_count.clone();
                         let subs = subscribers.clone();
                         let stats = msg_stats.clone();
+                        let tasks = children.clone();
                         if delayed {
-                            let da = delayed_accepts.clone();
-                            let dac = delayed_accept_count.clone();
-                            tokio::spawn(async move {
+                            let reservation = DelayedReservation {
+                                delayed: delayed_accepts.clone(),
+                                count: delayed_accept_count.clone(), ip: addr.ip(),
+                            };
+                            let connection_tasks = tasks.clone();
+                            tasks.spawn("connection handler", async move {
+                                let reservation = reservation;
                                 tokio::select! {
                                     _ = token.cancelled() => {
                                         log::debug!(target: TARGET, "QUIC delayed accept for {addr} cancelled");
-                                        Self::release_delayed_accept(&da, &dac, addr.ip());
                                         return;
                                     }
                                     _ = tokio::time::sleep(Self::PER_IP_INBOUND_DELAY) => {
-                                        Self::release_delayed_accept(&da, &dac, addr.ip());
                                     }
                                 }
+                                drop(reservation);
                                 tokio::select! {
                                     _ = token.cancelled() => {
                                         log::debug!(target: TARGET, "QUIC connection handler for {addr} cancelled");
                                     }
                                     _ = Self::handle_connection(
-                                        incoming, ai, rk, ib, ipc, subs, bind_addr, stats,
+                                        incoming, ai, rk, ib, ipc, subs, bind_addr, stats, connection_tasks,
                                     ) => {}
                                 }
                             });
                         } else {
-                            tokio::spawn(async move {
+                            let connection_tasks = tasks.clone();
+                            tasks.spawn("connection handler", async move {
                                 tokio::select! {
                                     _ = token.cancelled() => {
                                         log::debug!(target: TARGET, "QUIC connection handler for {addr} cancelled");
                                     }
                                     _ = Self::handle_connection(
-                                        incoming, ai, rk, ib, ipc, subs, bind_addr, stats,
+                                        incoming, ai, rk, ib, ipc, subs, bind_addr, stats, connection_tasks,
                                     ) => {}
                                 }
                             });
@@ -2330,11 +2398,8 @@ impl QuicNode {
     /// removes dead connections. This detects peer crashes, network changes, and
     /// idle timeouts before the next send attempt, avoiding the 10-15s hang on
     /// first use of a dead connection.
-    fn spawn_connection_checker(
-        weak: Weak<QuicNode>,
-        cancellation_token: tokio_util::sync::CancellationToken,
-    ) {
-        spawn_cancelable(cancellation_token, async move {
+    fn spawn_connection_checker(weak: Weak<QuicNode>, tasks: Arc<QuicTasks>) {
+        tasks.spawn_cancelable("periodic maintenance", async move {
             loop {
                 tokio::time::sleep(Self::CONNECTION_CHECK_INTERVAL).await;
                 let Some(transport) = weak.upgrade() else {
@@ -2395,11 +2460,8 @@ impl QuicNode {
 
     /// Background task that periodically logs statistics for all active QUIC connections.
     /// Shows deltas (bytes/dgrams/lost since last dump) plus instantaneous path metrics.
-    fn spawn_stats_dumper(
-        weak: Weak<QuicNode>,
-        cancellation_token: tokio_util::sync::CancellationToken,
-    ) {
-        spawn_cancelable(cancellation_token, async move {
+    fn spawn_stats_dumper(weak: Weak<QuicNode>, tasks: Arc<QuicTasks>) {
+        tasks.spawn_cancelable("periodic maintenance", async move {
             // Key: (stable_id, is_outbound) → previous snapshot of cumulative counters
             let mut prev: HashMap<(usize, bool), ConnSnapshot> = HashMap::new();
 

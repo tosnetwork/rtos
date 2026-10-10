@@ -2589,3 +2589,112 @@ fn test_quic_stateless_retry() {
         server_token.cancel();
     });
 }
+
+/// A received request may have entered application code before shutdown. Its
+/// completion, and a received one-way message, must both precede the drain result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_owned_shutdown_joins_real_query_and_message_subscribers() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct HeldSubscriber {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: tokio::sync::Semaphore,
+        completed: AtomicUsize,
+    }
+    impl HeldSubscriber {
+        async fn hold(&self) {
+            self.entered.send(()).unwrap();
+            self.release.acquire().await.unwrap().forget();
+            self.completed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[async_trait::async_trait]
+    impl Subscriber for HeldSubscriber {
+        async fn try_consume_custom(&self, _: &[u8], _: &AdnlPeers) -> Result<bool> {
+            self.hold().await;
+            Ok(true)
+        }
+        async fn try_consume_query(&self, object: TLObject, _: &AdnlPeers) -> Result<QueryResult> {
+            self.hold().await;
+            match object.downcast::<AdnlPing>() {
+                Ok(ping) => QueryResult::consume(
+                    AdnlPong { value: ping.value },
+                    #[cfg(feature = "telemetry")]
+                    None,
+                ),
+                Err(object) => Ok(QueryResult::Rejected(object)),
+            }
+        }
+    }
+    let sockets: Vec<_> = (0..2).map(|_| UdpSocket::bind("127.0.0.1:0").unwrap()).collect();
+    let addresses: Vec<_> = sockets.iter().map(|socket| socket.local_addr().unwrap()).collect();
+    let (entered, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let subscriber = Arc::new(HeldSubscriber {
+        entered,
+        release: tokio::sync::Semaphore::new(0),
+        completed: AtomicUsize::new(0),
+    });
+    let weak_subscriber = Arc::downgrade(&subscriber);
+    let mut nodes = Vec::new();
+    let mut ids = Vec::new();
+    drop(sockets);
+    for (index, address) in addresses.iter().enumerate() {
+        let key = ed25519_generate_private_key().unwrap().to_bytes();
+        let (_, config) = AdnlNodeConfig::from_ip_address_and_private_keys(
+            &address.to_string(),
+            vec![(key, KEY_TAG)],
+        )
+        .unwrap();
+        let id = config.key_by_tag(KEY_TAG).unwrap().id().clone();
+        let subscribers: Vec<Arc<dyn Subscriber>> =
+            if index == 0 { vec![subscriber.clone()] } else { Vec::new() };
+        let node = QuicNode::new(
+            subscribers,
+            CancellationToken::new(),
+            tokio::runtime::Handle::current(),
+            Some(QuicRateLimitConfig::disabled()),
+        );
+        node.add_key(&key, &id, *address).unwrap();
+        nodes.push(node);
+        ids.push(id);
+    }
+    nodes[0].add_peer_key(ids[1].clone(), addresses[1]).unwrap();
+    nodes[1].add_peer_key(ids[0].clone(), addresses[0]).unwrap();
+    let peers = AdnlPeers::with_keys(ids[1].clone(), ids[0].clone());
+    let query_node = nodes[1].clone();
+    let query_peers = peers.clone();
+    let query = tokio::spawn(async move {
+        query_node.query(make_ping_data(321), None, &query_peers, Some(5000)).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap().unwrap();
+    nodes[1].message(MSG_PAYLOAD.to_vec(), None, &peers).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap().unwrap();
+
+    let mut first_waiter = Box::pin(nodes[0].shutdown_and_wait());
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut first_waiter).await.is_err());
+    assert_eq!(subscriber.completed.load(Ordering::SeqCst), 0);
+    drop(first_waiter);
+    assert!(nodes[0]
+        .query(make_ping_data(9), None, &AdnlPeers::with_keys(ids[0].clone(), ids[1].clone()), None)
+        .await
+        .is_err());
+    subscriber.release.add_permits(2);
+    tokio::time::timeout(Duration::from_secs(10), nodes[0].shutdown_and_wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(subscriber.completed.load(Ordering::SeqCst), 2);
+    nodes[0].shutdown_and_wait().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), nodes[1].shutdown_and_wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let _ = query.await.unwrap();
+    let weak_nodes: Vec<_> = nodes.iter().map(Arc::downgrade).collect();
+    drop(nodes);
+    drop(subscriber);
+    assert!(weak_nodes.iter().all(|weak| weak.upgrade().is_none()));
+    assert!(weak_subscriber.upgrade().is_none());
+    for address in addresses {
+        let _rebound = UdpSocket::bind(address).unwrap();
+    }
+}
