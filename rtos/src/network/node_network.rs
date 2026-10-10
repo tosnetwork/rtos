@@ -351,8 +351,8 @@ impl NodeNetwork {
         dht: Arc<DhtNode>,
         node_key: Arc<dyn KeyOption>,
         cancellation_token: tokio_util::sync::CancellationToken,
-    ) {
-        Self::periodic_store_ip_addr(dht, node_key, None, cancellation_token);
+    ) -> tokio::task::JoinHandle<()> {
+        Self::periodic_store_ip_addr(dht, node_key, None, cancellation_token)
     }
 
     fn bind_quic_key(
@@ -408,7 +408,7 @@ impl NodeNetwork {
         node_key: Arc<dyn KeyOption>,
         validator_info: Option<(Arc<ValidatorAdnlKeyIds>, i32)>,
         cancellation_token: tokio_util::sync::CancellationToken,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         spawn_cancelable(cancellation_token, async move {
             let key_id = node_key.id();
             loop {
@@ -426,7 +426,7 @@ impl NodeNetwork {
                     }
                 }
             }
-        });
+        })
     }
 
     fn search_validator_keys_for_validator(

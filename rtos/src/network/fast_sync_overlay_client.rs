@@ -40,10 +40,12 @@ pub struct FastSyncOverlayClient {
     engine: Arc<dyn EngineOperations>,
     use_twostep: bool,
     tasks: Arc<OwnedTasks>,
+    #[cfg(test)]
+    exit_gate: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 impl FastSyncOverlayClient {
-    pub async fn new(
+    pub(crate) async fn new(
         shard: ShardIdent,
         validators: &[ValidatorDescr],
         key: Option<&Arc<dyn KeyOption>>,
@@ -108,6 +110,8 @@ impl FastSyncOverlayClient {
             engine,
             use_twostep,
             tasks: Arc::new(OwnedTasks::child(owner, cancellation_token)),
+            #[cfg(test)]
+            exit_gate: std::sync::Mutex::new(None),
         });
 
         if let Err(error) = result.clone().listen_broadcasts() {
@@ -124,6 +128,13 @@ impl FastSyncOverlayClient {
 
     pub fn client(&self) -> &Arc<OverlayClient> {
         &self.client
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_listener_exit(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (release, gate) = tokio::sync::oneshot::channel();
+        *self.exit_gate.lock().unwrap() = Some(gate);
+        release
     }
 
     pub fn stop(&self) {
@@ -198,6 +209,11 @@ impl FastSyncOverlayClient {
                         }
                     }
                 }
+            }
+            #[cfg(test)]
+            {
+                let gate = self.exit_gate.lock().unwrap().take();
+                if let Some(gate) = gate { let _ = gate.await; }
             }
         })?;
         Ok(())

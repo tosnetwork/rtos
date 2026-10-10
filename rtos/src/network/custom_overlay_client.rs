@@ -56,11 +56,13 @@ pub struct CustomOverlayClient {
     is_msg_sender: AtomicBool,
     is_block_sender: AtomicBool,
     tasks: Arc<OwnedTasks>,
+    #[cfg(test)]
+    exit_gate: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     activation: std::sync::Mutex<()>,
 }
 
 impl CustomOverlayClient {
-    pub fn new(
+    pub(crate) fn new(
         config: &CustomOverlay,
         cancellation_token: tokio_util::sync::CancellationToken,
         stack: Arc<NetworkStack>,
@@ -103,6 +105,8 @@ impl CustomOverlayClient {
             engine,
             tasks: Arc::new(OwnedTasks::child(owner, cancellation_token.clone())),
             activation: std::sync::Mutex::new(()),
+            #[cfg(test)]
+            exit_gate: std::sync::Mutex::new(None),
             cancellation_token,
             is_active: AtomicBool::new(false),
             is_msg_sender: AtomicBool::new(false),
@@ -183,6 +187,13 @@ impl CustomOverlayClient {
     #[allow(dead_code)]
     pub fn id(&self) -> &OverlayShortId {
         &self.id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_listener_exit(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (release, gate) = tokio::sync::oneshot::channel();
+        *self.exit_gate.lock().unwrap() = Some(gate);
+        release
     }
 
     pub fn stop(&self) {
@@ -273,6 +284,11 @@ impl CustomOverlayClient {
                         }
                     }
                 }
+            }
+            #[cfg(test)]
+            {
+                let gate = self.exit_gate.lock().unwrap().take();
+                if let Some(gate) = gate { let _ = gate.await; }
             }
         })?;
         Ok(())

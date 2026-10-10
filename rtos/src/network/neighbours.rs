@@ -89,7 +89,7 @@ impl Display for Neighbour {
 }
 
 impl Neighbour {
-    pub fn new(id: Arc<KeyId>, default_rldp_roundtrip: u32) -> Self {
+    pub(crate) fn new(id: Arc<KeyId>, default_rldp_roundtrip: u32) -> Self {
         Self {
             id,
             last_ping: AtomicU64::new(0),
@@ -245,7 +245,7 @@ impl Neighbours {
     const TIMEOUT_PING_MAX: Duration = Duration::from_millis(Self::TIMEOUT_PING_MAX_MS);
     const TIMEOUT_PING_MIN: Duration = Duration::from_millis(10);
 
-    pub fn new(
+    pub(crate) fn new(
         start_peers: &[Arc<KeyId>],
         overlay: &Arc<OverlayNode>,
         overlay_id: Arc<OverlayShortId>,
@@ -891,7 +891,7 @@ struct ReserveNeighbours {
 }
 
 impl ReserveNeighbours {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         ReserveNeighbours { last_ping: AtomicU64::new(0), reserve: lockfree::map::Map::new() }
     }
 

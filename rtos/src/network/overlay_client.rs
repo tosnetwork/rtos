@@ -134,7 +134,7 @@ pub(crate) struct OverlayInitGate {
 }
 
 impl OverlayClient {
-    pub async fn new_public(
+    pub(crate) async fn new_public(
         id: Arc<OverlayShortId>,
         id_full: OverlayId,
         network_context: Arc<NetworkContext>,
@@ -201,7 +201,7 @@ impl OverlayClient {
         Ok(client)
     }
 
-    pub async fn new_semiprivate(
+    pub(crate) async fn new_semiprivate(
         id: Arc<OverlayShortId>,
         id_full: OverlayId,
         root_adnl_ids: Vec<Arc<KeyId>>,

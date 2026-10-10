@@ -38,7 +38,7 @@ async fn open(dir: &Path) -> Arc<Engine> {
 
 async fn seed_queue(engine: &Arc<Engine>) {
     let bytes = include_bytes!("static/zerostate.boc");
-    let id = engine.zerostate_id().unwrap().clone();
+    let id = engine.zerostate_id().clone();
     let state = ShardStateStuff::deserialize_zerostate(
         id.clone(),
         bytes,
@@ -72,6 +72,7 @@ async fn engine_owned_drain_two_real_engines_wait_for_listener_then_reopen_datab
     seed_queue(&b).await;
     a.initialize_full_node_overlays(DhtSearchPolicy::default()).await.unwrap();
     b.initialize_full_node_overlays(DhtSearchPolicy::default()).await.unwrap();
+    let auxiliary = a.overlays_router().unwrap().hold_test_auxiliary_listeners().await.unwrap();
     let client = a.overlay_client(&ShardIdent::MASTERCHAIN).await.unwrap();
     let release = client.hold_listener_exit();
     let client_weak = Arc::downgrade(&client);
@@ -82,6 +83,14 @@ async fn engine_owned_drain_two_real_engines_wait_for_listener_then_reopen_datab
     assert!(a.overlays_router().is_err(), "stop must close normal request admission");
     assert!(a.initialize_full_node_overlays(DhtSearchPolicy::default()).await.is_err());
     release.send(()).unwrap();
+    for release in auxiliary {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !stopping.is_finished(),
+            "Engine returned before all real fast/custom listeners joined"
+        );
+        release.send(()).unwrap();
+    }
     stopping.await.unwrap();
     stopped(b.clone()).await;
     assert!(client_weak.upgrade().is_none(), "listener/client ownership leaked");
@@ -120,6 +129,17 @@ async fn partial_initialization(cancel: bool) {
         .router
         .clone()
         .expect("owner registered before constructor await");
+    let overlay = engine.network.context().stack.overlay.clone();
+    let profile = overlay.wire_profile();
+    let file_hash = engine.zerostate_id().file_hash();
+    let base_id = adnl::OverlayUtils::calc_overlay_short_id_with_profile(
+        0,
+        i64::MIN,
+        file_hash.as_slice(),
+        profile,
+    )
+    .unwrap();
+    assert!(overlay.get_query_prefix(&base_id).is_ok(), "base overlay was never registered");
     assert!(engine.overlays_router().is_err(), "partial owner must not be externally ready");
     // The sibling is a real initialized overlay with its real workers running.
     let mc = router.overlay_client(&ShardIdent::MASTERCHAIN).await.unwrap();
@@ -136,6 +156,7 @@ async fn partial_initialization(cancel: bool) {
         assert!(starting.await.unwrap().is_err());
     }
     stopped(engine.clone()).await;
+    assert!(overlay.get_query_prefix(&base_id).is_err(), "partial protocol registration leaked");
     assert!(client_weak.upgrade().is_none());
     drop(router);
     let weak = Arc::downgrade(&engine);
@@ -152,4 +173,69 @@ async fn engine_owned_drain_partial_constructor_failure_joins_successful_sibling
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn engine_owned_drain_cancelled_constructor_joins_successful_sibling() {
     partial_initialization(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn engine_owned_drain_top_shard_writer_flushes_accepted_work_and_reports_failures() {
+    struct Writer {
+        entered: tokio::sync::Notify,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        writes: std::sync::atomic::AtomicUsize,
+        errors: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl EngineOperations for Writer {
+        fn remove_top_shard_block(
+            &self,
+            _: &crate::types::top_block_descr::TopBlockDescrId,
+        ) -> Result<()> {
+            let index = self.writes.fetch_add(1, Ordering::SeqCst);
+            if index == 0 {
+                self.entered.notify_one();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+            if index != 1 {
+                fail!("controlled persistence failure {index}");
+            }
+            Ok(())
+        }
+        fn report_service_failure(&self, mask: u32, error: String) {
+            assert_eq!(mask, 0);
+            self.errors.lock().unwrap().push(error);
+        }
+    }
+    let (release, held) = std::sync::mpsc::channel();
+    let writer = Arc::new(Writer {
+        entered: tokio::sync::Notify::new(),
+        release: std::sync::Mutex::new(held),
+        writes: Default::default(),
+        errors: Default::default(),
+    });
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    for _ in 0..3 {
+        sender.send(crate::shard_blocks::StoreAction::Remove(Default::default())).unwrap();
+    }
+    let owner = Arc::new(crate::types::owned_tasks::OwnedTasks::new(
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    owner
+        .spawn_handle("actual top shard writer", || {
+            save_top_shard_blocks_worker(writer.clone(), receiver, owner.cancellation().clone())
+        })
+        .unwrap();
+    writer.entered.notified().await;
+    let stopping_owner = owner.clone();
+    let stopping = tokio::spawn(async move { stopping_owner.wait().await });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(!stopping.is_finished(), "storage writer was not actually joined");
+    release.send(()).unwrap();
+    stopping.await.unwrap().unwrap();
+    assert_eq!(
+        writer.writes.load(Ordering::SeqCst),
+        3,
+        "accepted writes were dropped at cancellation"
+    );
+    assert_eq!(writer.errors.lock().unwrap().len(), 2, "storage failures were lost");
+    assert!(sender.send(crate::shard_blocks::StoreAction::Remove(Default::default())).is_err());
+    assert_eq!(Arc::strong_count(&writer), 1);
 }

@@ -18,9 +18,9 @@ struct QueueEngine {
 impl QueueEngine {
     fn new(hold_read: bool) -> Arc<Self> {
         Arc::new(Self {
-            allocated: Arc::default(),
+            allocated: crate::collator_test_bundle::create_engine_allocated(),
             #[cfg(feature = "telemetry")]
-            telemetry: Arc::default(),
+            telemetry: crate::collator_test_bundle::create_engine_telemetry(),
             initial_read: tokio::sync::Notify::new(),
             release_read: tokio::sync::Semaphore::new(0),
             hold_read,

@@ -357,19 +357,39 @@ async fn resend_top_shard_blocks(engine: &dyn EngineOperations) -> Result<()> {
 pub fn save_top_shard_blocks_worker(
     engine: Arc<dyn EngineOperations>,
     mut receiver: tokio::sync::mpsc::UnboundedReceiver<StoreAction>,
-) {
+    cancellation: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(action) = receiver.recv().await {
-            match action {
-                StoreAction::Save(id, tsb) => match engine.save_top_shard_block(&id, &tsb) {
-                    Ok(_) => log::trace!("save_top_shard_block {}: OK", id),
-                    Err(e) => log::error!("save_top_shard_block {}: {:?}", id, e),
-                },
-                StoreAction::Remove(id) => match engine.remove_top_shard_block(&id) {
-                    Ok(_) => log::trace!("remove_top_shard_block {}: OK", id),
-                    Err(e) => log::error!("remove_top_shard_block {}: {:?}", id, e),
-                },
+        let mut closing = false;
+        loop {
+            let action = if closing {
+                receiver.recv().await
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        // Reject later sends, but flush every accepted action.
+                        receiver.close();
+                        closing = true;
+                        continue;
+                    }
+                    action = receiver.recv() => action,
+                }
+            };
+            let Some(action) = action else {
+                break;
+            };
+            let (label, result) = match action {
+                StoreAction::Save(id, tsb) => {
+                    (format!("save top shard {id}"), engine.save_top_shard_block(&id, &tsb))
+                }
+                StoreAction::Remove(id) => {
+                    (format!("remove top shard {id}"), engine.remove_top_shard_block(&id))
+                }
+            };
+            if let Err(error) = result {
+                engine.report_service_failure(0, format!("{label}: {error}"));
             }
         }
-    });
+    })
 }

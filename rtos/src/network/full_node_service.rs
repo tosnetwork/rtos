@@ -61,7 +61,7 @@ pub struct FullNodeOverlayService {
 }
 
 impl FullNodeOverlayService {
-    pub fn new(
+    pub(crate) fn new(
         engine: Arc<dyn EngineOperations>,
         compression: bool,
         tasks: Arc<OwnedTasks>,

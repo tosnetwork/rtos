@@ -110,6 +110,7 @@ pub struct Engine {
     network: Arc<NodeNetwork>,
     owned_services: std::sync::Mutex<EngineOwners>,
     ingress_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
+    persistence_tasks: crate::types::owned_tasks::OwnedTasks,
 
     shard_states_awaiters: AwaitersPool<BlockIdExt, Arc<ShardStateStuff>>,
     block_applying_awaiters: AwaitersPool<BlockIdExt, ()>,
@@ -824,6 +825,9 @@ impl Engine {
             ingress_tasks: Arc::new(crate::types::owned_tasks::OwnedTasks::new(
                 tokio_util::sync::CancellationToken::new(),
             )),
+            persistence_tasks: crate::types::owned_tasks::OwnedTasks::new(
+                tokio_util::sync::CancellationToken::new(),
+            ),
             shard_blocks: shard_blocks_pool,
             candidates_cache: parking_lot::Mutex::new(lru::LruCache::new(
                 Self::CANDIDATES_CACHE_SIZE.try_into()?,
@@ -867,7 +871,13 @@ impl Engine {
         });
 
         engine.acquire_stop(Self::MASK_SERVICE_SHARDSTATE_GC);
-        save_top_shard_blocks_worker(engine.clone(), shard_blocks_receiver);
+        engine.persistence_tasks.spawn_handle("top shard persistence", || {
+            save_top_shard_blocks_worker(
+                engine.clone(),
+                shard_blocks_receiver,
+                engine.persistence_tasks.cancellation().clone(),
+            )
+        })?;
         engine.external_messages().clone().start_applied_blocks_worker(applied_blocks_rx);
         Ok(engine)
     }
@@ -978,6 +988,11 @@ impl Engine {
         // Failure sources are sticky. Still finish transport cleanup before
         // returning the final result, including failures reported during it.
         let _ = self.stopper.clone().wait_stop().await;
+        // Producers have stopped. Close the queue and flush accepted metadata
+        // writes before releasing the Engine/database owner.
+        if let Err(error) = self.persistence_tasks.wait().await {
+            self.stopper.report_service_failure(0, format!("top shard persistence: {error}"));
+        }
         self.network.stop_adnl().await;
         if let Some(tc) = &self.trace_collector {
             tc.stop();

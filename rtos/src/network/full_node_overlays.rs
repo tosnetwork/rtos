@@ -142,6 +142,69 @@ impl FullNodeOverlaysRouter {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn hold_test_auxiliary_listeners(
+        self: &Arc<Self>,
+    ) -> Result<Vec<tokio::sync::oneshot::Sender<()>>> {
+        use rtos_api::ton::engine::validator::customoverlaynode::CustomOverlayNode;
+        use rtos_block::{Ed25519KeyOption, SigPubKey, UInt256, ZeroizingBytes};
+        let local = self.network.context().stack.adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)?;
+        let peer = Ed25519KeyOption::<ZeroizingBytes>::generate()?;
+        let validators = ValidatorSet::new(
+            0,
+            u32::MAX,
+            2,
+            vec![
+                ValidatorDescr::with_params(
+                    SigPubKey::from_bytes(local.pub_key()?)?,
+                    1,
+                    Some(UInt256::from_slice(local.id().data())),
+                ),
+                ValidatorDescr::with_params(
+                    SigPubKey::from_bytes(peer.pub_key()?)?,
+                    1,
+                    Some(UInt256::from_slice(peer.id().data())),
+                ),
+            ],
+        )?;
+        self.update_fast_sync_overlays(
+            &ValidatorSet::default(),
+            &validators,
+            &ValidatorSet::default(),
+            0,
+            Some(&local),
+            false,
+            false,
+        )
+        .await?;
+        let config = CustomOverlay {
+            name: "owned-drain-test".into(),
+            nodes: vec![local.id(), peer.id()]
+                .into_iter()
+                .map(|id| CustomOverlayNode {
+                    adnl_id: UInt256::from_slice(id.data()),
+                    msg_sender: true.into(),
+                    msg_sender_priority: 0,
+                    block_sender: true.into(),
+                })
+                .collect(),
+            sender_shards: vec![(&ShardIdent::MASTERCHAIN).into()],
+            skip_public_msg_send: false.into(),
+            use_quic: false.into(),
+        };
+        self.update_custom_overlays(Some(&[config])).await?;
+        self.update_public_overlays(self.engine.zerostate_id()?, 0).await?;
+        let mut gates = Vec::new();
+        for entry in self.fast_sync_overlays.iter() {
+            gates.push(entry.val().hold_listener_exit());
+        }
+        for entry in self.custom_overlays.iter() {
+            gates.push(entry.val().hold_listener_exit());
+        }
+        assert_eq!(gates.len(), 3, "two fast-sync and one active custom listener");
+        Ok(gates)
+    }
+
     pub async fn overlay_client(
         self: &Arc<Self>,
         shard: &ShardIdent,
@@ -333,6 +396,7 @@ impl FullNodeOverlaysRouter {
     }
 
     pub(crate) async fn special_update_fastsync_overlays(self: &Arc<Self>) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         // Special case: create fast sync overlays when we are a validator from the
         // previous set. The normal flow (update_validator_lists in validator_manager)
         // only processes current and next sets, so the prev set ADNL key is never
@@ -470,11 +534,13 @@ impl FullNodeOverlaysRouter {
         };
 
         // 4) Start periodic_store_ip_addr to DHT
-        NodeNetwork::start_periodic_store_ip_addr(
-            self.network.context().stack.dht.clone(),
-            adnl_key.clone(),
-            self.tasks.cancellation().child_token(),
-        );
+        self.tasks.spawn_handle("fast-sync DHT address announcements", || {
+            NodeNetwork::start_periodic_store_ip_addr(
+                self.network.context().stack.dht.clone(),
+                adnl_key.clone(),
+                self.tasks.cancellation().child_token(),
+            )
+        })?;
 
         // In update_fast_sync_overlays:
         // 5) Resolve peers and 6) create fast sync overlays
@@ -496,6 +562,7 @@ impl FullNodeOverlaysRouter {
         self: &Arc<Self>,
         config: &ConfigParams,
     ) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         let prev_vset = config.prev_validator_set()?;
         let this_vset = config.validator_set()?;
         let next_vset = config.next_validator_set()?;
@@ -775,6 +842,7 @@ impl FullNodeOverlaysRouter {
         proof: &BlockProofStuff,
         signatures: &BlockSignaturesVariant,
     ) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         log::debug!("Sending block broadcast {}...", block.id());
 
         let mut custom_overlays = vec![];
@@ -881,6 +949,7 @@ impl FullNodeOverlaysRouter {
         self: &Arc<Self>,
         tbd: Arc<TopBlockDescrStuff>,
     ) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         log::debug!("Sending top shard blocks broadcast {}...", tbd.proof_for());
 
         let broadcast = TaggedByteSlice {
@@ -909,6 +978,7 @@ impl FullNodeOverlaysRouter {
         to: &AccountIdPrefixFull,
         data: &[u8],
     ) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         let broadcast = TaggedByteSlice {
             object: &self.network.context().stack.overlay.wire_profile().serialize(
                 &ExternalMessageBroadcast { message: ExternalMessage { data: data.to_vec() } }
@@ -944,6 +1014,7 @@ impl FullNodeOverlaysRouter {
         validator_set_hash: u32,
         block_root: &Cell,
     ) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         let mut custom_overlays = vec![];
         for guard in self.custom_overlays.iter() {
             let overlay = guard.val();
@@ -998,6 +1069,7 @@ impl FullNodeOverlaysRouter {
         msg_count: u32,
         limits: ImportedMsgQueueLimits,
     ) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         if let Some(client) = self.fast_sync_overlay(&dst_shard) {
             log::debug!("Sending out msg queue proof broadcast {} for shard {}...", id, dst_shard);
             let broadcast = OutMsgQueueProofBroadcast {

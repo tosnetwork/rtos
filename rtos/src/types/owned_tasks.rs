@@ -9,7 +9,7 @@ use std::{
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::{
     sync::CancellationToken,
-    task::{TaskTracker, TaskTrackerToken},
+    task::{task_tracker::TaskTrackerToken, TaskTracker},
 };
 
 /// Owns task completion, including tasks cancelled or panicked outside the owner.
@@ -58,6 +58,22 @@ mod tests {
         assert!(child.wait().await.unwrap_err().to_string().contains("aborted child"));
         assert!(owner.wait().await.unwrap_err().to_string().contains("aborted child"));
         assert!(child.spawn("late child", async {}).is_err());
+    }
+
+    #[tokio::test]
+    async fn owned_tasks_parent_waits_for_held_child_after_sibling_panic() {
+        let owner = Arc::new(OwnedTasks::new(CancellationToken::new()));
+        let child = OwnedTasks::child(owner.clone(), owner.cancellation().child_token());
+        let (release, gate) = tokio::sync::oneshot::channel();
+        child
+            .spawn("held child", async move {
+                gate.await.unwrap();
+            })
+            .unwrap();
+        child.spawn("panicked sibling", async { panic!("controlled worker panic") }).unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(20), owner.wait()).await.is_err());
+        release.send(()).unwrap();
+        assert!(owner.wait().await.unwrap_err().to_string().contains("panicked sibling"));
     }
 }
 
