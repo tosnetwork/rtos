@@ -76,6 +76,7 @@ struct Pair {
 
 impl Pair {
     async fn new(variant: &str, corrupt_signature: bool) -> Self {
+        let _ = env_logger::builder().is_test(true).try_init();
         let recovery: serde_json::Value =
             serde_json::from_str(include_str!("testdata/recovery.json")).unwrap();
         let inclusion: serde_json::Value =
@@ -122,7 +123,11 @@ impl Pair {
                     engine.engine_allocated(),
                 )
                 .unwrap();
-                engine.store_zerostate(state, bytes).await.unwrap();
+                let (_, handle) = engine.store_zerostate(state, bytes).await.unwrap();
+                // Match boot.rs::download_zerostate: trusted bootstrap states are
+                // already applied. Successor blocks must still apply normally.
+                assert_eq!(handle.id().seq_no(), 0);
+                engine.set_applied(&handle, 0).await.unwrap();
             }
             engine.save_last_applied_mc_block_id(&anchor).unwrap();
             engine.save_shard_client_mc_block_id(&anchor).unwrap();
@@ -197,7 +202,7 @@ impl Pair {
             crate::full_node::shard_client::start_shards_client(ops, self.anchor.clone()).unwrap();
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                if self.receiver.load_shard_client_mc_block_id().unwrap().as_ref()
+                if self.receiver.load_shard_client_mc_block_id().unwrap().as_deref()
                     == Some(self.master.id())
                 {
                     break;
@@ -214,7 +219,7 @@ impl Pair {
             &self.master_state_root
         );
         assert_eq!(
-            self.receiver.load_last_applied_mc_block_id().unwrap().as_ref(),
+            self.receiver.load_last_applied_mc_block_id().unwrap().as_deref(),
             Some(self.master.id())
         );
         (master, shards)
@@ -444,6 +449,21 @@ async fn lost_real_plumtree_notification_is_repaired_by_normal_masterchain_disco
 async fn full_consumer_queue_loses_seen_notification_then_masterchain_repairs_it() {
     let pair = Pair::new("included", false).await;
     let overlay = pair.enable_plumtree(0).await;
+    use rtos_api::Constructor;
+    let receiver_key = pair
+        .receiver
+        .network()
+        .context()
+        .stack
+        .adnl
+        .key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)
+        .unwrap();
+    let prefix = rtos_api::serialize_boxed(
+        &rtos_api::ton::overlay::message::Message { overlay: UInt256::from(*overlay.data()) }
+            .into_boxed(),
+    )
+    .unwrap();
+    pair.provider.network().test_broadcast_faults.configure(*receiver_key.id().data(), prefix, 0);
     let client = pair.receiver.overlay_client(pair.shard.id().shard()).await.unwrap();
     let gate = client.pause_test_consumer();
     let filler = WireProfile::T0
@@ -457,6 +477,19 @@ async fn full_consumer_queue_loses_seen_notification_then_masterchain_repairs_it
     // Wake a consumer already blocked in pop, and establish the real eager path.
     pair.publish(&overlay, [1; 32], &filler).await;
     tokio::time::timeout(Duration::from_secs(5), gate.wait_entered()).await.unwrap();
+    // Consumer progress precedes the sender's Useful acknowledgement. Wait for
+    // actual production dispatch, not a sleep or a synthetic eager-state edit.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if pair.provider.network().test_broadcast_faults.receipts().iter().any(|receipt| {
+                receipt.constructor == rtos_api::ton::overlay::broadcast::BroadcastPlumtreeUseful::constructor_const()
+                    && !receipt.dropped && receipt.error.is_none()
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.expect("primer must establish the real Useful/eager handshake");
     for index in 0..16u8 {
         let id = [index + 2; 32];
         pair.publish(&overlay, id, &filler).await;
@@ -606,11 +639,11 @@ async fn invalid_masterchain_proof_or_state_cannot_apply_preapplied_shard() {
             assert!(!handle.is_applied());
         }
         assert_eq!(
-            pair.receiver.load_last_applied_mc_block_id().unwrap().as_ref(),
+            pair.receiver.load_last_applied_mc_block_id().unwrap().as_deref(),
             Some(&pair.anchor)
         );
         assert_eq!(
-            pair.receiver.load_shard_client_mc_block_id().unwrap().as_ref(),
+            pair.receiver.load_shard_client_mc_block_id().unwrap().as_deref(),
             Some(&pair.anchor)
         );
         assert!(!pair.receiver.load_block_handle(pair.shard.id()).unwrap().unwrap().is_applied());
@@ -658,8 +691,14 @@ async fn changed_masterchain_inclusion_descriptor_fails_real_download_authentica
     assert!(error.is_err());
     assert!(pair.receiver.load_block_handle(altered.id()).unwrap().is_none());
     assert!(pair.receiver.load_block_handle(pair.shard.id()).unwrap().is_none());
-    assert_eq!(pair.receiver.load_last_applied_mc_block_id().unwrap().as_ref(), Some(&pair.anchor));
-    assert_eq!(pair.receiver.load_shard_client_mc_block_id().unwrap().as_ref(), Some(&pair.anchor));
+    assert_eq!(
+        pair.receiver.load_last_applied_mc_block_id().unwrap().as_deref(),
+        Some(&pair.anchor)
+    );
+    assert_eq!(
+        pair.receiver.load_shard_client_mc_block_id().unwrap().as_deref(),
+        Some(&pair.anchor)
+    );
     assert!(pair.provider.overlays_router().unwrap().test_block_download_queries() > 0);
     pair.receiver.clone().wait_stop().await.unwrap();
     pair.provider.clone().wait_stop().await.unwrap();
