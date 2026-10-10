@@ -990,6 +990,7 @@ pub struct ValidatorGroup {
     tasks: TaskTracker,
     task_admission_closed: Mutex<bool>,
     task_panicked: Arc<AtomicBool>,
+    teardown_drained: AtomicBool,
     pub(super) stop_requested: CancellationToken,
     #[cfg(test)]
     session_exit_observed: CancellationToken,
@@ -1157,6 +1158,7 @@ impl ValidatorGroup {
             tasks: TaskTracker::new(),
             task_admission_closed: Mutex::new(false),
             task_panicked: Arc::new(AtomicBool::new(false)),
+            teardown_drained: AtomicBool::new(false),
             stop_requested: CancellationToken::new(),
             #[cfg(test)]
             session_exit_observed: CancellationToken::new(),
@@ -1438,6 +1440,10 @@ impl ValidatorGroup {
         }
     }
 
+    pub(super) fn teardown_drained(&self) -> bool {
+        self.teardown_drained.load(Ordering::Acquire)
+    }
+
     async fn stop_inner(
         self: Arc<Self>,
         rt: tokio::runtime::Handle,
@@ -1473,6 +1479,9 @@ impl ValidatorGroup {
         while tokio::time::timeout(Duration::from_secs(5), self.tasks.wait()).await.is_err() {
             log::warn!(target: "validator", "Waiting for {} group tasks to drain for session {:x}", self.tasks.len(), self.session_id);
         }
+        // A panic/cancellation of the blocking join itself does not prove the
+        // consensus workers exited. Only its returned result certifies the join.
+        self.teardown_drained.store(session_result.is_ok(), Ordering::Release);
         session_result.map_err(|e| error!("consensus session teardown failed: {e}"))??;
         if self.task_panicked.load(Ordering::Acquire) {
             fail!("validator group task panicked during its lifetime");

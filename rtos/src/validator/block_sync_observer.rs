@@ -56,6 +56,7 @@ pub struct BlockSyncObserver {
     listener_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     ticker_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     cancellation: tokio_util::sync::CancellationToken,
+    teardown_drained: Arc<AtomicBool>,
     #[cfg(test)]
     listener_exit_gate: Mutex<Option<Arc<lifecycle_tests::ListenerExitGate>>>,
     stop_completion:
@@ -148,6 +149,7 @@ impl BlockSyncObserver {
             listener_handle: Mutex::new(None),
             ticker_handle: Mutex::new(None),
             cancellation: tokio_util::sync::CancellationToken::new(),
+            teardown_drained: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             listener_exit_gate: Mutex::new(None),
             stop_completion: Mutex::new(None),
@@ -190,15 +192,26 @@ impl BlockSyncObserver {
         let ticker = self.ticker_handle.lock().expect("ticker handle poisoned").take();
         let (tx, rx) = tokio::sync::watch::channel(None);
         *completion = Some(rx);
+        let drained = self.teardown_drained.clone();
         self.runtime_handle.spawn(async move {
-            let mut result = deletion;
-            for task in [listener, ticker].into_iter().flatten() {
-                if let Err(e) = task.await {
-                    result = Err(format!("observer task join failed: {e}"));
+            let mut errors = Vec::new();
+            if let Err(error) = deletion {
+                errors.push(format!("overlay deletion failed: {error}"));
+            }
+            for (name, task) in [("listener", listener), ("ticker", ticker)] {
+                if let Some(task) = task {
+                    if let Err(error) = task.await {
+                        errors.push(format!("observer task join failed ({name}): {error}"));
+                    }
                 }
             }
-            tx.send_replace(Some(result));
+            drained.store(true, Ordering::Release);
+            tx.send_replace(Some(if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }));
         });
+    }
+
+    pub(super) fn teardown_drained(&self) -> bool {
+        self.teardown_drained.load(Ordering::Acquire)
     }
 
     /// Shared terminal result; cancellation of a waiter cannot detach cleanup.

@@ -45,6 +45,7 @@ struct MockSimplexSession {
     requests: Mutex<Vec<(BlockIdExt, EnsureCandidateAvailabilityOptions)>>,
     stopped: AtomicBool,
     stop_calls: std::sync::atomic::AtomicUsize,
+    panic_on_stop: AtomicBool,
     stop_gate: Mutex<Option<(tokio::sync::oneshot::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
@@ -59,6 +60,7 @@ impl Session for MockSimplexSession {
 
     fn stop(&self) {
         self.stop_calls.fetch_add(1, Ordering::Relaxed);
+        assert!(!self.panic_on_stop.load(Ordering::Relaxed), "controlled blocking stop panic");
         if let Some((entered, release)) = self.stop_gate.lock().unwrap().take() {
             let _ = entered.send(());
             release.recv_timeout(Duration::from_secs(10)).expect("stop gate watchdog");
@@ -1345,4 +1347,16 @@ async fn test_group_stop_joins_real_simplex_threads_and_reopens_preserved_databa
         assert!(!session.is_panicked());
         assert!(directory.path().read_dir().unwrap().next().is_some());
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_group_stop_blocking_join_panic_does_not_certify_worker_exit() {
+    let group = make_simplex_group_for_resolver_tests();
+    let session = Arc::new(MockSimplexSession::default());
+    session.panic_on_stop.store(true, Ordering::Relaxed);
+    let holder = Arc::new(super::consensus::SessionHolder::simplex(session));
+    group.group_impl.execute_sync(|inner| inner.session = Some(holder)).await;
+    let error = group.clone().stop(tokio::runtime::Handle::current(), false).await.unwrap_err();
+    assert!(error.to_string().contains("session teardown failed"));
+    assert!(!group.teardown_drained(), "a failed join must not certify consensus exit");
 }

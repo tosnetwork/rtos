@@ -11,7 +11,9 @@ struct LifecycleEngine {
     stopping: std::sync::atomic::AtomicBool,
     fail_teardown: std::sync::atomic::AtomicBool,
     invocations: std::sync::atomic::AtomicUsize,
+    panic_invocation: std::sync::atomic::AtomicBool,
     reported: std::sync::Mutex<Vec<(u32, String)>>,
+    stopper: Arc<crate::engine::Stopper>,
     candidate_deletes: std::sync::atomic::AtomicUsize,
     fail_candidates: std::sync::atomic::AtomicBool,
     state_gate: Option<Arc<StateGate>>,
@@ -49,6 +51,7 @@ impl EngineOperations for LifecycleEngine {
         fail!("controlled state read completion")
     }
     fn report_service_failure(&self, mask: u32, error: String) {
+        self.stopper.report_service_failure(mask, error.clone());
         self.reported.lock().unwrap().push((mask, error));
         self.stopping.store(true, Ordering::Release);
     }
@@ -58,16 +61,19 @@ impl EngineOperations for LifecycleEngine {
     fn acquire_stop(&self, mask: u32) {
         assert_eq!(mask, Engine::MASK_SERVICE_VALIDATOR_MANAGER);
         self.acquired.store(true, Ordering::Release);
+        self.stopper.acquire_stop(mask);
     }
     fn release_stop(&self, mask: u32) {
         assert_eq!(mask, Engine::MASK_SERVICE_VALIDATOR_MANAGER);
         self.released.store(true, Ordering::Release);
+        self.stopper.release_stop(mask);
     }
     fn check_stop(&self) -> bool {
         self.stopping.load(Ordering::Acquire)
     }
     fn load_destroyed_session_ids(&self) -> Result<Vec<UInt256>> {
         self.invocations.fetch_add(1, Ordering::Relaxed);
+        assert!(!self.panic_invocation.load(Ordering::Relaxed), "controlled invocation panic");
         fail!("controlled invocation failure")
     }
     fn validation_status(&self) -> ValidationStatus {
@@ -106,6 +112,13 @@ async fn test_manager_lifecycle_service_mask_and_restart_refused_after_teardown_
             assert_eq!(reported[0].0, Engine::MASK_SERVICE_VALIDATOR_MANAGER);
             assert!(reported[0].1.contains("persistence failure"));
             assert!(engine.stopping.load(Ordering::Acquire));
+        }
+        drop(reported);
+        let terminal = engine.stopper.clone().wait_stop().await;
+        if failing {
+            assert!(terminal.unwrap_err().to_string().contains("persistence failure"));
+        } else {
+            terminal.unwrap();
         }
         assert_eq!(
             engine.invocations.load(Ordering::Relaxed),
@@ -272,6 +285,14 @@ async fn test_manager_lifecycle_tracks_actual_split_precalculation_and_panic() {
         let engine =
             Arc::new(LifecycleEngine { state_gate: Some(gate.clone()), ..Default::default() });
         let mut manager = manager_fixture(engine.clone());
+        if panic {
+            engine.fail_candidates.store(true, Ordering::Relaxed);
+            // A rotation failure and a background panic must both survive aggregation.
+            let group = group_fixture(engine.clone());
+            let id = UInt256::rand();
+            manager.current_sessions.insert(id.clone(), group);
+            manager.stop_and_remove_sessions(&HashSet::from([id]), true).await.unwrap_err();
+        }
         let owners_before = Arc::strong_count(&engine);
         manager.spawn_split_queue_precalculation(BlockIdExt::default());
         tokio::time::timeout(Duration::from_secs(5), gate.entered.acquire())
@@ -284,7 +305,9 @@ async fn test_manager_lifecycle_tracks_actual_split_precalculation_and_panic() {
         gate.release.add_permits(1);
         let result = tokio::time::timeout(Duration::from_secs(5), stop).await.unwrap();
         if panic {
-            assert!(result.unwrap_err().to_string().contains("background task panicked"));
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("background task panicked"));
+            assert!(error.contains("candidate delete failure"));
         } else {
             result.unwrap();
         }
@@ -316,4 +339,56 @@ async fn test_manager_lifecycle_failed_observer_remains_owned_after_removal() {
     // Shutdown of the remaining owners must preserve the earlier failure.
     let error = manager.stop_validation().await.unwrap_err();
     assert!(error.to_string().contains("observer task join failed"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_manager_lifecycle_lost_observer_completion_does_not_exempt_service() {
+    use super::super::block_sync_observer::lifecycle_tests::{
+        lose_completion_for_test, observer_fixture, restore_completion_for_test,
+    };
+    let engine = Arc::new(LifecycleEngine::default());
+    engine.acquire_stop(Engine::MASK_SERVICE_VALIDATOR_MANAGER);
+    let mut manager = manager_fixture(engine.clone());
+    let (observer, fixture) = observer_fixture().await;
+    lose_completion_for_test(&observer);
+    manager.block_sync_observers.insert(fixture.session_id.clone(), observer.clone());
+    let error = manager.stop_validation().await.unwrap_err();
+    manager.report_teardown_failure(error.to_string());
+    assert_eq!(
+        engine.reported.lock().unwrap()[0].0,
+        0,
+        "live observer must not be exempted from stop mask"
+    );
+    let mut wait = Box::pin(engine.stopper.clone().wait_stop());
+    assert!(futures::poll!(&mut wait).is_pending());
+    restore_completion_for_test(&observer);
+    // The old failure remains sticky, but this owner can now certify actual drain.
+    let error = manager.stop_validation().await.unwrap_err();
+    assert!(observer.teardown_drained());
+    manager.report_teardown_failure(error.to_string());
+    assert_eq!(engine.reported.lock().unwrap()[1].0, Engine::MASK_SERVICE_VALIDATOR_MANAGER);
+    assert!(tokio::time::timeout(Duration::from_secs(5), wait).await.unwrap().is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_manager_lifecycle_invocation_panic_drains_before_terminal_failure() {
+    let engine = Arc::new(LifecycleEngine::default());
+    engine.panic_invocation.store(true, Ordering::Relaxed);
+    let task = spawn_validator_manager(
+        engine.clone(),
+        tokio::runtime::Handle::current(),
+        ValidatorManagerConfig::default(),
+    );
+    tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+    assert_eq!(engine.invocations.load(Ordering::Relaxed), 1);
+    assert!(!engine.released.load(Ordering::Acquire));
+    assert_eq!(engine.reported.lock().unwrap()[0].0, Engine::MASK_SERVICE_VALIDATOR_MANAGER);
+    assert!(engine
+        .stopper
+        .clone()
+        .wait_stop()
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("invocation panicked"));
 }

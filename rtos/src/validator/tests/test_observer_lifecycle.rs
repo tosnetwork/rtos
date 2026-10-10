@@ -93,3 +93,38 @@ async fn test_observer_lifecycle_real_overlay_stop_rejoin_and_idempotency() {
 pub(crate) fn abort_listener_for_test(observer: &BlockSyncObserver) {
     observer.listener_handle.lock().unwrap().as_ref().unwrap().abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_observer_lifecycle_aggregates_worker_errors_after_both_joins() {
+    let (observer, _) = observer_fixture().await;
+    abort_listener_for_test(&observer);
+    observer.ticker_handle.lock().unwrap().as_ref().unwrap().abort();
+    let error = observer.stop_and_wait().await.unwrap_err().to_string();
+    assert!(error.contains("join failed (listener)"));
+    assert!(error.contains("join failed (ticker)"));
+    assert!(observer.teardown_drained());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_observer_lifecycle_lost_completion_does_not_certify_live_workers() {
+    let (observer, _) = observer_fixture().await;
+    let (sender, receiver) = tokio::sync::watch::channel(None);
+    *observer.stop_completion.lock().unwrap() = Some(receiver);
+    drop(sender);
+    let error = observer.stop_and_wait().await.unwrap_err().to_string();
+    assert!(error.contains("completion lost"));
+    assert!(!observer.teardown_drained());
+    // Restore a real cleanup owner and join both actual worker handles.
+    *observer.stop_completion.lock().unwrap() = None;
+    observer.stop_and_wait().await.unwrap();
+    assert!(observer.teardown_drained());
+}
+
+pub(crate) fn lose_completion_for_test(observer: &BlockSyncObserver) {
+    let (sender, receiver) = tokio::sync::watch::channel(None);
+    *observer.stop_completion.lock().unwrap() = Some(receiver);
+    drop(sender);
+}
+pub(crate) fn restore_completion_for_test(observer: &BlockSyncObserver) {
+    *observer.stop_completion.lock().unwrap() = None;
+}
