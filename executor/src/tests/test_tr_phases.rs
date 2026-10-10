@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and versioned failed-action fine coverage.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -1437,6 +1437,7 @@ fn failed_action_fine_is_capped_by_account_balance() {
         Some(&mut inbound_balance),
         &mut account_balance,
         false,
+        14,
     )
     .unwrap();
     assert_eq!(result.phase.action_fine, Coins::from(7u64));
