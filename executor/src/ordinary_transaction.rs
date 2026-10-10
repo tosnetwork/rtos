@@ -611,5 +611,8 @@ mod test_sendmsg_transaction;
 mod test_bchk_transaction;
 
 #[cfg(test)]
+#[path = "tests/test_continuation_save_transaction.rs"]
+mod test_continuation_save_transaction;
+#[cfg(test)]
 #[path = "tests/test_historical_opcode_transaction.rs"]
 mod test_historical_opcode_transaction;

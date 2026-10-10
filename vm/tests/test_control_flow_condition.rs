@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): restore initialized-return continuation coverage.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -519,14 +519,13 @@ fn switch_to_continuation_from_register_if_non_zero_err_type_check() {
     .expect_failure(ExceptionCode::TypeCheckError);
 }
 
-#[ignore] // c0, c1 may be inited
 #[test]
-fn switch_to_continuation_from_register_if_non_zero_err_type_check_cont() {
+fn switch_to_continuation_from_register_if_non_zero_initialized_return() {
     test_case(
         "PUSHINT 1
         IFRET",
     )
-    .expect_failure(ExceptionCode::TypeCheckError);
+    .expect_int_stack(&[]);
 }
 
 #[test]
@@ -575,14 +574,13 @@ fn switch_to_continuation_from_register_if_zero_err_type_check() {
     .expect_failure(ExceptionCode::TypeCheckError);
 }
 
-#[ignore] // c0, c1 may be inited
 #[test]
-fn switch_to_continuation_from_register_if_zero_err_type_check_cont() {
+fn switch_to_continuation_from_register_if_zero_initialized_return() {
     test_case(
         "PUSHINT 0
         IFNOTRET",
     )
-    .expect_failure(ExceptionCode::TypeCheckError);
+    .expect_int_stack(&[]);
 }
 
 #[test]

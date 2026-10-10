@@ -1,0 +1,367 @@
+[
+  {
+    "name": "SAVE-call-c0",
+    "source": "PUSHCONT { SAVE c0 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVE-repeat-c0",
+    "source": "SAVE c0 SAVE c0 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVE-call-c1",
+    "source": "PUSHCONT { SAVE c1 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVE-repeat-c1",
+    "source": "SAVE c1 SAVE c1 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVE-call-c2",
+    "source": "PUSHCONT { SAVE c2 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVE-repeat-c2",
+    "source": "SAVE c2 SAVE c2 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVE-call-c3",
+    "source": "PUSHCONT { SAVE c3 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVE-repeat-c3",
+    "source": "SAVE c3 SAVE c3 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVE-call-c4",
+    "source": "PUSHCONT { SAVE c4 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVE-repeat-c4",
+    "source": "SAVE c4 SAVE c4 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVE-call-c5",
+    "source": "PUSHCONT { SAVE c5 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVE-repeat-c5",
+    "source": "SAVE c5 SAVE c5 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVE-call-c7",
+    "source": "PUSHCONT { SAVE c7 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVE-repeat-c7",
+    "source": "SAVE c7 SAVE c7 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVE-root-restore0-c4",
+    "source": "PUSHINT 14 NEWC STU 8 ENDC POPCTR c4 PUSHCONT { PUSHCTR c4 CTOS LDU 8 DROP NEWC STI 16 ENDC POPROOT } POPCTR c0 SAVE c4 PUSHINT 24 NEWC STU 8 ENDC POPCTR c4 RET",
+    "self_store": true
+  },
+  {
+    "name": "SAVE-root-restore0-c5",
+    "source": "PUSHINT 15 NEWC STU 8 ENDC POPCTR c5 PUSHCONT { PUSHCTR c5 CTOS LDU 8 DROP NEWC STI 16 ENDC POPROOT } POPCTR c0 SAVE c5 PUSHINT 25 NEWC STU 8 ENDC POPCTR c5 RET",
+    "self_store": true
+  },
+  {
+    "name": "SAVE-root-restore0-c7",
+    "source": "PUSHINT 17 SINGLE POPCTR c7 PUSHCONT { PUSHCTR c7 FIRST NEWC STI 16 ENDC POPROOT } POPCTR c0 SAVE c7 PUSHINT 27 SINGLE POPCTR c7 RET",
+    "self_store": true
+  },
+  {
+    "name": "SAVE-root-restore1-c4",
+    "source": "PUSHINT 14 NEWC STU 8 ENDC POPCTR c4 PUSHCONT { PUSHCTR c4 CTOS LDU 8 DROP NEWC STI 16 ENDC POPROOT } POPCTR c1 SAVE c4 PUSHINT 24 NEWC STU 8 ENDC POPCTR c4 RETALT",
+    "self_store": true
+  },
+  {
+    "name": "SAVE-root-restore1-c5",
+    "source": "PUSHINT 15 NEWC STU 8 ENDC POPCTR c5 PUSHCONT { PUSHCTR c5 CTOS LDU 8 DROP NEWC STI 16 ENDC POPROOT } POPCTR c1 SAVE c5 PUSHINT 25 NEWC STU 8 ENDC POPCTR c5 RETALT",
+    "self_store": true
+  },
+  {
+    "name": "SAVE-root-restore1-c7",
+    "source": "PUSHINT 17 SINGLE POPCTR c7 PUSHCONT { PUSHCTR c7 FIRST NEWC STI 16 ENDC POPROOT } POPCTR c1 SAVE c7 PUSHINT 27 SINGLE POPCTR c7 RETALT",
+    "self_store": true
+  },
+  {
+    "name": "SAVE-low-gas",
+    "source": "PUSHINT 130 SETGASLIMIT SAVE c4 SAVE c4 PUSHINT 43",
+    "self_store": false
+  },
+  {
+    "name": "SAVEALT-call-c0",
+    "source": "PUSHCONT { SAVEALT c0 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVEALT-repeat-c0",
+    "source": "SAVEALT c0 SAVEALT c0 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVEALT-call-c1",
+    "source": "PUSHCONT { SAVEALT c1 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVEALT-repeat-c1",
+    "source": "SAVEALT c1 SAVEALT c1 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVEALT-call-c2",
+    "source": "PUSHCONT { SAVEALT c2 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVEALT-repeat-c2",
+    "source": "SAVEALT c2 SAVEALT c2 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVEALT-call-c3",
+    "source": "PUSHCONT { SAVEALT c3 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVEALT-repeat-c3",
+    "source": "SAVEALT c3 SAVEALT c3 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVEALT-call-c4",
+    "source": "PUSHCONT { SAVEALT c4 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVEALT-repeat-c4",
+    "source": "SAVEALT c4 SAVEALT c4 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVEALT-call-c5",
+    "source": "PUSHCONT { SAVEALT c5 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVEALT-repeat-c5",
+    "source": "SAVEALT c5 SAVEALT c5 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVEALT-call-c7",
+    "source": "PUSHCONT { SAVEALT c7 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVEALT-repeat-c7",
+    "source": "SAVEALT c7 SAVEALT c7 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVEALT-root-restore0-c4",
+    "source": "PUSHINT 14 NEWC STU 8 ENDC POPCTR c4 PUSHCONT { PUSHCTR c4 CTOS LDU 8 DROP NEWC STI 16 ENDC POPROOT } POPCTR c0 SAVEALT c4 PUSHINT 24 NEWC STU 8 ENDC POPCTR c4 RET",
+    "self_store": true
+  },
+  {
+    "name": "SAVEALT-root-restore0-c5",
+    "source": "PUSHINT 15 NEWC STU 8 ENDC POPCTR c5 PUSHCONT { PUSHCTR c5 CTOS LDU 8 DROP NEWC STI 16 ENDC POPROOT } POPCTR c0 SAVEALT c5 PUSHINT 25 NEWC STU 8 ENDC POPCTR c5 RET",
+    "self_store": true
+  },
+  {
+    "name": "SAVEALT-root-restore0-c7",
+    "source": "PUSHINT 17 SINGLE POPCTR c7 PUSHCONT { PUSHCTR c7 FIRST NEWC STI 16 ENDC POPROOT } POPCTR c0 SAVEALT c7 PUSHINT 27 SINGLE POPCTR c7 RET",
+    "self_store": true
+  },
+  {
+    "name": "SAVEALT-root-restore1-c4",
+    "source": "PUSHINT 14 NEWC STU 8 ENDC POPCTR c4 PUSHCONT { PUSHCTR c4 CTOS LDU 8 DROP NEWC STI 16 ENDC POPROOT } POPCTR c1 SAVEALT c4 PUSHINT 24 NEWC STU 8 ENDC POPCTR c4 RETALT",
+    "self_store": true
+  },
+  {
+    "name": "SAVEALT-root-restore1-c5",
+    "source": "PUSHINT 15 NEWC STU 8 ENDC POPCTR c5 PUSHCONT { PUSHCTR c5 CTOS LDU 8 DROP NEWC STI 16 ENDC POPROOT } POPCTR c1 SAVEALT c5 PUSHINT 25 NEWC STU 8 ENDC POPCTR c5 RETALT",
+    "self_store": true
+  },
+  {
+    "name": "SAVEALT-root-restore1-c7",
+    "source": "PUSHINT 17 SINGLE POPCTR c7 PUSHCONT { PUSHCTR c7 FIRST NEWC STI 16 ENDC POPROOT } POPCTR c1 SAVEALT c7 PUSHINT 27 SINGLE POPCTR c7 RETALT",
+    "self_store": true
+  },
+  {
+    "name": "SAVEALT-low-gas",
+    "source": "PUSHINT 130 SETGASLIMIT SAVEALT c4 SAVEALT c4 PUSHINT 43",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-call-c0",
+    "source": "PUSHCONT { SAVEBOTH c0 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-repeat-c0",
+    "source": "SAVEBOTH c0 SAVEBOTH c0 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-call-c1",
+    "source": "PUSHCONT { SAVEBOTH c1 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-repeat-c1",
+    "source": "SAVEBOTH c1 SAVEBOTH c1 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-call-c2",
+    "source": "PUSHCONT { SAVEBOTH c2 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-repeat-c2",
+    "source": "SAVEBOTH c2 SAVEBOTH c2 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-call-c3",
+    "source": "PUSHCONT { SAVEBOTH c3 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-repeat-c3",
+    "source": "SAVEBOTH c3 SAVEBOTH c3 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-call-c4",
+    "source": "PUSHCONT { SAVEBOTH c4 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-repeat-c4",
+    "source": "SAVEBOTH c4 SAVEBOTH c4 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-call-c5",
+    "source": "PUSHCONT { SAVEBOTH c5 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-repeat-c5",
+    "source": "SAVEBOTH c5 SAVEBOTH c5 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-call-c7",
+    "source": "PUSHCONT { SAVEBOTH c7 PUSHINT 41 } CALLX",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-repeat-c7",
+    "source": "SAVEBOTH c7 SAVEBOTH c7 PUSHINT 42",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-root-restore0-c4",
+    "source": "PUSHINT 14 NEWC STU 8 ENDC POPCTR c4 PUSHCONT { PUSHCTR c4 CTOS LDU 8 DROP NEWC STI 16 ENDC POPROOT } POPCTR c0 SAVEBOTH c4 PUSHINT 24 NEWC STU 8 ENDC POPCTR c4 RET",
+    "self_store": true
+  },
+  {
+    "name": "SAVEBOTH-root-restore0-c5",
+    "source": "PUSHINT 15 NEWC STU 8 ENDC POPCTR c5 PUSHCONT { PUSHCTR c5 CTOS LDU 8 DROP NEWC STI 16 ENDC POPROOT } POPCTR c0 SAVEBOTH c5 PUSHINT 25 NEWC STU 8 ENDC POPCTR c5 RET",
+    "self_store": true
+  },
+  {
+    "name": "SAVEBOTH-root-restore0-c7",
+    "source": "PUSHINT 17 SINGLE POPCTR c7 PUSHCONT { PUSHCTR c7 FIRST NEWC STI 16 ENDC POPROOT } POPCTR c0 SAVEBOTH c7 PUSHINT 27 SINGLE POPCTR c7 RET",
+    "self_store": true
+  },
+  {
+    "name": "SAVEBOTH-root-restore1-c4",
+    "source": "PUSHINT 14 NEWC STU 8 ENDC POPCTR c4 PUSHCONT { PUSHCTR c4 CTOS LDU 8 DROP NEWC STI 16 ENDC POPROOT } POPCTR c1 SAVEBOTH c4 PUSHINT 24 NEWC STU 8 ENDC POPCTR c4 RETALT",
+    "self_store": true
+  },
+  {
+    "name": "SAVEBOTH-root-restore1-c5",
+    "source": "PUSHINT 15 NEWC STU 8 ENDC POPCTR c5 PUSHCONT { PUSHCTR c5 CTOS LDU 8 DROP NEWC STI 16 ENDC POPROOT } POPCTR c1 SAVEBOTH c5 PUSHINT 25 NEWC STU 8 ENDC POPCTR c5 RETALT",
+    "self_store": true
+  },
+  {
+    "name": "SAVEBOTH-root-restore1-c7",
+    "source": "PUSHINT 17 SINGLE POPCTR c7 PUSHCONT { PUSHCTR c7 FIRST NEWC STI 16 ENDC POPROOT } POPCTR c1 SAVEBOTH c7 PUSHINT 27 SINGLE POPCTR c7 RETALT",
+    "self_store": true
+  },
+  {
+    "name": "SAVEBOTH-low-gas",
+    "source": "PUSHINT 130 SETGASLIMIT SAVEBOTH c4 SAVEBOTH c4 PUSHINT 43",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-original-c0",
+    "source": "PUSHCONT { PUSHINT 51 NEWC STI 16 ENDC POPROOT } POPCTR c0 PUSHCONT { PUSHINT 52 NEWC STI 16 ENDC POPROOT } POPCTR c1 SAVEBOTH c0 RETALT",
+    "self_store": true
+  },
+  {
+    "name": "SAVEBOTH-shared-c0",
+    "source": "PUSHCONT { PUSHINT 51 NEWC STI 16 ENDC POPROOT } POPCTR c0 SAMEALT SAVEBOTH c0 RETALT",
+    "self_store": true
+  },
+  {
+    "name": "base-underflow-low-gas",
+    "source": "PUSHINT 85 SETGASLIMIT DROP",
+    "self_store": false
+  },
+  {
+    "name": "SAVE-invalid-c6",
+    "source": "SAVE c6 PUSHINT 43",
+    "self_store": false
+  },
+  {
+    "name": "SAVE-invalid-c9",
+    "source": "SAVE c9 PUSHINT 43",
+    "self_store": false
+  },
+  {
+    "name": "SAVEALT-invalid-c6",
+    "source": "SAVEALT c6 PUSHINT 43",
+    "self_store": false
+  },
+  {
+    "name": "SAVEALT-invalid-c9",
+    "source": "SAVEALT c9 PUSHINT 43",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-invalid-c6",
+    "source": "SAVEBOTH c6 PUSHINT 43",
+    "self_store": false
+  },
+  {
+    "name": "SAVEBOTH-invalid-c9",
+    "source": "SAVEBOTH c9 PUSHINT 43",
+    "self_store": false
+  },
+  {
+    "name": "SAVE-boundary-low-gas",
+    "source": "PUSHINT 150 SETGASLIMIT SAVE c4 SAVE c4 PUSHINT 43",
+    "self_store": false
+  }
+]

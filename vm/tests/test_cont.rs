@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): restore continuation-save regression coverage.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -28,10 +28,11 @@ fn stack_with_cont(cont: ContinuationData) -> Stack {
     stack
 }
 
-#[ignore] // we should have c0, c1, c2 and other instantiated
 #[test]
-fn test_pushctr_uninitialized_register() {
-    test_case("PUSHCTR c1").expect_failure(ExceptionCode::TypeCheckError);
+fn test_pushctr_initialized_alternative_return() {
+    test_case("PUSHCTR c1").expect_item(StackItem::continuation(ContinuationData::with_type(
+        rtos_vm::stack::continuation::ContinuationType::Quit(1),
+    )));
 }
 
 mod cont_bytecode {
@@ -612,7 +613,6 @@ fn savealt() {
     .expect_int_stack(&[1, 2, 2]);
 }
 
-#[ignore]
 #[test]
 fn saveboth() {
     let mut cont1 = ContinuationData::with_code(compile_code("NOP").unwrap());
@@ -698,12 +698,11 @@ fn saveboth() {
         SAVEBOTH c9
         ",
     )
-    .expect_item(int!(1));
+    .expect_failure(ExceptionCode::InvalidOpcode);
 }
 
-#[ignore] // it will be fixed in other PR
 #[test]
-fn test_save_both_failure() {
+fn test_save_both_c7_inside_call() {
     test_case(
         "
         PUSHCONT {
@@ -712,7 +711,7 @@ fn test_save_both_failure() {
         CALLX
     ",
     )
-    .expect_failure(ExceptionCode::TypeCheckError);
+    .expect_int_stack(&[]);
 }
 
 #[test]
