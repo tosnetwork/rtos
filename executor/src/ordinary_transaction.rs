@@ -561,3 +561,7 @@ mod test_opcode_gates;
 #[cfg(test)]
 #[path = "tests/test_falcon512_transaction.rs"]
 mod test_falcon512_transaction;
+
+#[cfg(test)]
+#[path = "tests/test_poseidon2_transaction.rs"]
+mod test_poseidon2_transaction;
