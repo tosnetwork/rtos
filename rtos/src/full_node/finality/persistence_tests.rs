@@ -34,6 +34,39 @@ async fn real_engine_finality_downloads_over_network_without_candidate_cache() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_engine_broadcast_sync_gate_uses_fixture_chain_time() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("testdata/recovery.json")).unwrap();
+    let data = hex::decode(fixture["state_boc"].as_str().unwrap()).unwrap();
+    let root = read_single_root_boc(&data).unwrap();
+    let id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        0,
+        root.repr_hash().clone(),
+        UInt256::calc_file_hash(&data),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    write_recovery_config(dir.path(), &id, true);
+    let engine = open_engine(dir.path()).await;
+    let state = ShardStateStuff::from_root_cell(
+        id.clone(),
+        root,
+        #[cfg(feature = "telemetry")]
+        engine.engine_telemetry(),
+        engine.engine_allocated(),
+    )
+    .unwrap();
+    engine.store_zerostate(state, &data).await.unwrap();
+    engine.save_last_applied_mc_block_id(&id).unwrap();
+    assert!(!crate::network::check_sync_for_listen_bcasts(engine.as_ref()));
+    engine.set_test_chain_time(Some(1002));
+    assert!(crate::network::check_sync_for_listen_bcasts(engine.as_ref()));
+    engine.set_test_chain_time(None);
+    assert!(!crate::network::check_sync_for_listen_bcasts(engine.as_ref()));
+    engine.wait_stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_engine_monitoring_covers_zero_and_maximum_split() {
     let dir = tempfile::tempdir().unwrap();
     let fixture: serde_json::Value =
@@ -345,3 +378,6 @@ fn write_recovery_config(dir: &std::path::Path, mc_id: &BlockIdExt, network: boo
         "test_bundles_config":{"collator":{"path":""},"validator":{"path":""}}
     })).unwrap()).unwrap();
 }
+
+#[path = "inclusion_tests.rs"]
+mod inclusion_tests;

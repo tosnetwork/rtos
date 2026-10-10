@@ -90,6 +90,12 @@ fn deserialize_destroyed_session_ids(data: &[u8]) -> Result<Vec<UInt256>> {
 
 #[async_trait::async_trait]
 impl EngineOperations for Engine {
+    #[cfg(test)]
+    fn now(&self) -> u32 {
+        u32::try_from(self.test_chain_time.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or_else(|_| rtos_block::UnixTime::now() as u32)
+    }
+
     async fn check_masterchain_proof(&self, proof: &BlockProofStuff) -> Result<()> {
         self.masterchain_proof_verifier.verify(self, proof).await.map(|_| ())
     }
@@ -904,6 +910,8 @@ impl EngineOperations for Engine {
         src: Arc<KeyId>,
         received_bytes: usize,
     ) -> Result<()> {
+        #[cfg(test)]
+        self.test_finality_notifications.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pending = self.pending_finality.clone();
         crate::full_node::finality::receive(self, pending, broadcast, src, received_bytes).await
     }

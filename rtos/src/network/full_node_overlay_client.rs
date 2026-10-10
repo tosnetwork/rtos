@@ -52,6 +52,8 @@ use storage::types::PersistentStatePartId;
 
 /// Wrapper for OverlayClient that provides methods for performing fullnode network requests
 pub struct FullNodeOverlayClient {
+    #[cfg(test)]
+    test_consumer_gate: std::sync::Mutex<Option<Arc<super::test_broadcast_faults::ConsumerGate>>>,
     active_peers: lockfree::set::Set<Arc<KeyId>>,
     bad_peers: lockfree::set::Set<Arc<KeyId>>,
     engine: Arc<dyn EngineOperations>,
@@ -70,6 +72,8 @@ impl FullNodeOverlayClient {
     ) -> Result<Arc<Self>> {
         let subscription = client.subscribe_broadcast()?;
         let fnc = Arc::new(Self {
+            #[cfg(test)]
+            test_consumer_gate: std::sync::Mutex::new(None),
             active_peers: lockfree::set::Set::new(),
             bad_peers: lockfree::set::Set::new(),
             engine,
@@ -78,6 +82,13 @@ impl FullNodeOverlayClient {
         });
         fnc.clone().listen_broadcasts(subscription);
         Ok(fnc)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_test_consumer(&self) -> Arc<super::test_broadcast_faults::ConsumerGate> {
+        let gate = super::test_broadcast_faults::ConsumerGate::new();
+        *self.test_consumer_gate.lock().unwrap() = Some(gate.clone());
+        gate
     }
 
     pub fn overlay_client(&self) -> &Arc<OverlayClient> {
@@ -110,6 +121,15 @@ impl FullNodeOverlayClient {
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     continue;
+                }
+                #[cfg(test)]
+                {
+                    let gate = self.test_consumer_gate.lock().unwrap().clone();
+                    if let Some(gate) = gate {
+                        if !gate.hold(&self.client.cancellation_token()).await {
+                            break;
+                        }
+                    }
                 }
                 match self.overlay_client().wait_broadcast(&mut subscription).await {
                     Err(e) => {
