@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): naming and deterministic waiter registration in tests.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -125,7 +125,7 @@ async fn test_awaiters_pool_fail() {
         .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_awaiters_pool_timeout() {
     let pool = Arc::new(AwaitersPool::new(
         "",
@@ -133,41 +133,51 @@ async fn test_awaiters_pool_timeout() {
         create_engine_telemetry(),
         create_engine_allocated(),
     ));
-    let mut handles = vec![];
-
-    {
-        let pool = pool.clone();
-        handles.push(tokio::spawn(async move {
-            let id = 1_u32;
-            pool.do_or_wait(&id, None, async move {
-                futures_timer::Delay::new(Duration::from_millis(10)).await;
+    // Keep the operation pending until both waiters have observed this exact
+    // registration. Wall-clock sleeps cannot establish that ordering: a late
+    // waiter would otherwise create a new entry after the result was removed.
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let operation_pool = pool.clone();
+    let operation = tokio::spawn(async move {
+        operation_pool
+            .do_or_wait(&1_u32, None, async move {
+                started_tx.send(()).unwrap();
+                release_rx.await.unwrap();
                 Ok(())
             })
             .await
-            .unwrap();
-        }));
-    }
-    {
-        let pool = pool.clone();
-        handles.push(tokio::spawn(async move {
-            let id = 1_u32;
-            assert!(pool.wait(&id, Some(1), || Ok(false)).await.is_err());
-        }));
-    }
-    {
-        let pool = pool.clone();
-        handles.push(tokio::spawn(async move {
-            let id = 1_u32;
-            pool.wait(&id, Some(20), || Ok(false)).await.unwrap().unwrap();
-        }));
-    }
+    });
+    let watchdog = Duration::from_secs(30);
+    tokio::time::timeout(watchdog, started_rx).await.unwrap().unwrap();
 
-    futures::future::join_all(handles)
+    let (registered_tx, mut registered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let waiter_pool = pool.clone();
+    let waiter = tokio::spawn(async move {
+        waiter_pool
+            .wait(&1_u32, None, || {
+                // This callback runs after wait_operation subscribes to the
+                // result. Completion remains false while the gate is held.
+                registered_tx.send(()).unwrap();
+                Ok(false)
+            })
+            .await
+    });
+    tokio::time::timeout(watchdog, registered_rx.recv()).await.unwrap().unwrap();
+    let error = tokio::time::timeout(watchdog, pool.wait(&1_u32, Some(1), || Ok(false)))
         .await
-        .into_iter()
-        .find(|r| r.is_err())
-        .unwrap_or(Ok(()))
-        .unwrap();
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("timeout"), "{error}");
+    assert!(!operation.is_finished(), "one waiter's timeout must not cancel the operation");
+    assert!(!waiter.is_finished(), "another waiter must remain subscribed");
+
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(watchdog, operation).await.unwrap().unwrap().unwrap(),
+        Some(())
+    );
+    assert_eq!(tokio::time::timeout(watchdog, waiter).await.unwrap().unwrap().unwrap(), Some(()));
 }
 
 const WAIT_2_TASKS: usize = 100;
