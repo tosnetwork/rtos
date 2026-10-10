@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming; typed Simplex protocol and membership admission.
+ * RTOS project modifications (2026-10-10): project and crate naming; typed Simplex protocol and membership admission; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -69,7 +69,7 @@ use consensus_common::{
 use crossbeam::channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use rand::{seq::SliceRandom, Rng};
 use rtos_api::{
-    deserialize_boxed, serialize_boxed, tag_from_data,
+    tag_from_data,
     ton::{
         consensus::{
             broadcastextra::BroadcastExtra,
@@ -441,6 +441,7 @@ pub(crate) trait ReceiverListener: Send + Sync {
 // inherent impl by lifecycle layer; support types sit beside their owners.
 
 pub(crate) struct ReceiverImpl {
+    wire_profile: rtos_api::WireProfile,
     /// Session ID
     session_id: SessionId,
     /// Overlay for sending messages
@@ -929,7 +930,7 @@ impl ReceiverImpl {
         // Deserialize TL message
         // Reference: C++ pool.cpp `handle(IncomingProtocolMessage)` parses both
         // `tl::vote` and `tl::certificate` on the same channel.
-        let message = match deserialize_boxed(data.data()) {
+        let message = match self.wire_profile.deserialize(data.data()) {
             Ok(msg) => msg,
             Err(err) => {
                 log::warn!(
@@ -1051,7 +1052,7 @@ impl ReceiverImpl {
         check_execution_time!(50_000);
 
         let request_data = data.data();
-        let object = match deserialize_boxed(request_data) {
+        let object = match self.wire_profile.deserialize(request_data) {
             Ok(object) => object,
             Err(e) => {
                 log::warn!(
@@ -1142,7 +1143,7 @@ impl ReceiverImpl {
                     notar: notar_bytes.into(),
                 };
 
-                let result = match serialize_boxed(&response.into_boxed()) {
+                let result = match self.wire_profile.serialize(&response.into_boxed()) {
                     Ok(response_bytes) => {
                         log::trace!(
                             "SimplexReceiver {}: requestCandidate response size={}",
@@ -1194,7 +1195,8 @@ impl ReceiverImpl {
         }
 
         // Serialize vote for network transmission
-        let serialized = consensus_common::serialize_tl_boxed_object!(&vote.clone().into_boxed());
+        let serialized =
+            self.wire_profile.serialize(&vote.clone().into_boxed()).expect("fixed wire carrier");
         let raw_vote: RawVoteData = serialized.into();
         let payload = consensus_common::ConsensusCommonFactory::create_block_payload(
             raw_vote.to_raw_buffer(),
@@ -1330,7 +1332,13 @@ impl ReceiverImpl {
         }
 
         // Serialize candidate (CandidateData is already boxed)
-        let serialized = consensus_common::serialize_tl_boxed_object!(&candidate);
+        let serialized = match self.wire_profile.serialize(&candidate) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log::error!("Candidate wire serialization failed: {error}");
+                return;
+            }
+        };
 
         // Cache candidate for query responses (candidate resolver)
         // This allows other validators to request the candidate from us via requestCandidate
@@ -1367,7 +1375,8 @@ impl ReceiverImpl {
 
         // Build consensus.broadcastExtra with slot info (required for C++ interop)
         let broadcast_extra = BroadcastExtra { slot: slot as i32 };
-        let extra = consensus_common::serialize_tl_boxed_object!(&broadcast_extra.into_boxed());
+        let extra =
+            self.wire_profile.serialize(&broadcast_extra.into_boxed()).expect("fixed wire carrier");
 
         // Send via overlay FEC broadcast
         self.overlay.send_broadcast_fec_ex(
@@ -1883,7 +1892,7 @@ impl ReceiverImpl {
         }
 
         // Deserialize TL message
-        let candidate = match deserialize_boxed(&candidate_bytes) {
+        let candidate = match self.wire_profile.deserialize(&candidate_bytes) {
             Ok(message) => match message.downcast::<CandidateData>() {
                 Ok(c) => c,
                 Err(_) => {
@@ -2084,7 +2093,7 @@ impl ReceiverImpl {
         instrument!();
 
         // Serialize TL boxed object (Certificate is already boxed enum type)
-        let serialized = consensus_common::serialize_tl_boxed_object!(&certificate);
+        let serialized = self.wire_profile.serialize(&certificate).expect("fixed wire carrier");
         let payload = ConsensusCommonFactory::create_block_payload(serialized.into());
 
         log::trace!(
@@ -2527,8 +2536,10 @@ impl ReceiverImpl {
         }
         match item {
             StandstillReplayItem::Vote(vote) => {
-                let serialized =
-                    consensus_common::serialize_tl_boxed_object!(&vote.clone().into_boxed());
+                let serialized = self
+                    .wire_profile
+                    .serialize(&vote.clone().into_boxed())
+                    .expect("fixed wire carrier");
                 serialized.len() as u64 * recipient_count
             }
             StandstillReplayItem::Certificate(bytes) => bytes.len() as u64 * recipient_count,
@@ -2977,7 +2988,7 @@ impl ReceiverImpl {
             want_candidate: want_candidate.into(),
             want_notar: want_notar.into(),
         };
-        let (serialized, query_name) = (serialize_boxed(&request), "requestCandidate");
+        let (serialized, query_name) = (self.wire_profile.serialize(&request), "requestCandidate");
 
         let serialized = match serialized {
             Ok(bytes) => bytes,
@@ -3340,7 +3351,7 @@ impl ReceiverImpl {
             Ok(response_payload) => {
                 // Deserialize response
                 let response_data = response_payload.data();
-                match deserialize_boxed(response_data) {
+                match self.wire_profile.deserialize(response_data) {
                     Ok(message) => match message.downcast::<CandidateAndCertBoxed>() {
                         Ok(response) => {
                             let candidate_bytes = response.candidate();
@@ -3416,6 +3427,7 @@ impl ReceiverImpl {
 
                             let parsed_candidate = if !candidate_bytes.is_empty() {
                                 match Self::validate_repair_candidate_identity(
+                                    self.wire_profile,
                                     &self.session_id,
                                     &self.sources,
                                     self.slots_per_leader_window,
@@ -3451,6 +3463,7 @@ impl ReceiverImpl {
 
                             if !notar_bytes.is_empty() {
                                 match Self::validate_repair_notar_signature_set(
+                                    self.wire_profile,
                                     &self.session_id,
                                     &self.sources,
                                     self.max_candidate_query_answer_size,
@@ -3609,9 +3622,10 @@ impl ReceiverImpl {
                                 return;
                             }
 
-                            let _candidate = match deserialize_boxed(
-                                merged_candidate_bytes.as_slice(),
-                            ) {
+                            let _candidate = match self
+                                .wire_profile
+                                .deserialize(merged_candidate_bytes.as_slice())
+                            {
                                 Ok(msg) => match msg.downcast::<CandidateData>() {
                                     Ok(c) => c,
                                     Err(_) => {
@@ -3794,6 +3808,7 @@ impl ReceiverImpl {
     /// state. Exposed as an associated function (not a method) so unit tests
     /// can exercise it without a full `ReceiverImpl`.
     fn validate_repair_candidate_identity(
+        wire_profile: rtos_api::WireProfile,
         session_id: &SessionId,
         sources: &[SourceStats],
         slots_per_leader_window: u32,
@@ -3814,7 +3829,7 @@ impl ReceiverImpl {
         }
 
         let message =
-            deserialize_boxed(candidate_bytes).map_err(|e| format!("deserialize: {e}"))?;
+            wire_profile.deserialize(candidate_bytes).map_err(|e| format!("deserialize: {e}"))?;
         let candidate: CandidateData = message
             .downcast::<CandidateData>()
             .map_err(|_| "unexpected TL type (expected consensus.CandidateData)".to_string())?;
@@ -3929,6 +3944,7 @@ impl ReceiverImpl {
     /// verification succeeds, so we never seed the resolver cache or the
     /// per-request pending state with them until they pass.
     fn validate_repair_notar_signature_set(
+        wire_profile: rtos_api::WireProfile,
         session_id: &SessionId,
         sources: &[SourceStats],
         max_candidate_query_answer_size: u64,
@@ -3949,7 +3965,8 @@ impl ReceiverImpl {
             ));
         }
 
-        let message = deserialize_boxed(notar_bytes)
+        let message = wire_profile
+            .deserialize(notar_bytes)
             .map_err(|e| format!("deserialize VoteSignatureSet: {e}"))?;
         let tl_sigs: VoteSignatureSetBoxed =
             message.downcast::<VoteSignatureSetBoxed>().map_err(|_| {
@@ -4358,6 +4375,7 @@ impl ReceiverImpl {
 /// `ReceiverSettings::default()` and override the few fields they care about.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReceiverSettings {
+    pub wire_profile: rtos_api::WireProfile,
     /// Maximum candidate body size accepted from peers (bytes).
     pub max_candidate_size: usize,
     /// Maximum response size advertised to peers for `requestCandidate` queries (bytes).
@@ -4401,6 +4419,7 @@ impl ReceiverSettings {
         Self {
             max_candidate_size,
             max_candidate_query_answer_size,
+            wire_profile: options.wire_profile,
             proto_version: options.proto_version,
             standstill_timeout: options.standstill_timeout,
             standstill_max_egress_bytes_per_s: options.standstill_max_egress_bytes_per_s,
@@ -4750,6 +4769,9 @@ impl ReceiverWrapper {
     ) -> Result<ReceiverPtr> {
         let ids: Vec<crate::SimplexSessionNode> = ids.iter().cloned().map(Into::into).collect();
         settings.protocol.admits_runtime()?;
+        if settings.wire_profile != overlay_manager.wire_profile() {
+            fail!("Simplex receiver/overlay wire profile mismatch");
+        }
         let ordered_adnl: Vec<_> = ids.iter().map(|node| node.adnl_id.clone()).collect();
         let membership = consensus_common::simplex_protocol::SimplexMembership::new(
             &ordered_adnl,
@@ -4770,6 +4792,7 @@ impl ReceiverWrapper {
         // Destructure once at the top so the rest of the function reads as if
         // each setting were still a free-standing parameter.
         let ReceiverSettings {
+            wire_profile,
             max_candidate_size,
             max_candidate_query_answer_size,
             proto_version,
@@ -4943,6 +4966,7 @@ impl ReceiverWrapper {
 
                 // Create ReceiverImpl inside the processing thread
                 let mut receiver_impl = ReceiverImpl {
+                    wire_profile,
                     session_id: session_id_clone.clone(),
                     overlay: overlay_clone,
                     local_key: local_key_clone,

@@ -28,6 +28,7 @@ fn pq_live_repair_candidate_authentication_and_bounds() {
     for version in [0, 1] {
         let check = |session: &UInt256, slot, hash: &UInt256, bytes: &[u8], size| {
             ReceiverImpl::validate_repair_candidate_identity(
+                rtos_api::WireProfile::Legacy,
                 session,
                 &members,
                 1,
@@ -67,6 +68,7 @@ fn pq_live_repair_candidate_authentication_and_bounds() {
         )
         .is_err());
         assert!(ReceiverImpl::validate_repair_candidate_identity(
+            rtos_api::WireProfile::Legacy,
             &f::session(),
             &members,
             1,
@@ -94,6 +96,7 @@ fn pq_live_resolver_notar_quorum_and_member_rejection() {
     let members = sources();
     let check = |session: &UInt256, bytes: &[u8]| {
         ReceiverImpl::validate_repair_notar_signature_set(
+            rtos_api::WireProfile::Legacy,
             session,
             &members,
             1 << 20,
@@ -139,6 +142,7 @@ fn pq_live_verified_candidate_survives_database_reopen_and_resolver_validation()
     let payload = rtos_api::serialize_boxed(&empty()).unwrap();
     let hash = f::candidate_hash("empty");
     ReceiverImpl::validate_repair_candidate_identity(
+        rtos_api::WireProfile::Legacy,
         &f::session(),
         &members,
         1,
@@ -166,6 +170,7 @@ fn pq_live_verified_candidate_survives_database_reopen_and_resolver_validation()
     let restored = db.load_candidate_payload_by_id(&id, Duration::from_secs(10)).unwrap().unwrap();
     assert_eq!(restored, payload);
     ReceiverImpl::validate_repair_candidate_identity(
+        rtos_api::WireProfile::Legacy,
         &f::session(),
         &members,
         1,
@@ -179,6 +184,7 @@ fn pq_live_verified_candidate_survives_database_reopen_and_resolver_validation()
     )
     .unwrap();
     assert!(ReceiverImpl::validate_repair_candidate_identity(
+        rtos_api::WireProfile::Legacy,
         &UInt256::from([89; 32]),
         &members,
         1,

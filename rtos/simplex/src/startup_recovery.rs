@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): naming and durable own-decision journal integration.
+ * RTOS project modifications (2026-10-10): naming and durable own-decision journal integration; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -304,6 +304,18 @@ impl SessionStartupRecoveryProcessor {
             self.session_id.to_hex_string()
         );
 
+        if self.description.opts().wire_profile == rtos_api::WireProfile::T0 {
+            // A restart must not serve a legacy opaque candidate from an old
+            // cache under a target namespace, even in classical verification.
+            // Validate before replay mutates the FSM or schedules any send.
+            for (_, bytes) in &bootstrap.candidate_payloads {
+                let value: CandidateData =
+                    self.description.opts().wire_profile.deserialize_typed(bytes)?;
+                if self.description.opts().wire_profile.serialize(&value)? != *bytes {
+                    rtos_block::fail!("candidate cache wire profile mismatch");
+                }
+            }
+        }
         if self.description.pq_context().is_some() {
             self.verify_pq_bootstrap(&bootstrap)?;
             self.description.recover_own_journal(&mut bootstrap)?;
@@ -609,9 +621,9 @@ impl SessionStartupRecoveryProcessor {
             }
         }
         for (id, bytes) in &bootstrap.candidate_payloads {
-            let _: CandidateData = Self::decode_pq_record(bytes)?;
+            let _: CandidateData = self.description.opts().wire_profile.deserialize_typed(bytes)?;
             let leader = self.description.get_leader(id.slot);
-            let candidate = crate::block::RawCandidate::deserialize(
+            let candidate = crate::block::RawCandidate::deserialize_with_profile(
                 bytes,
                 &self.session_id,
                 self.description.get_source_public_key(leader),
@@ -620,6 +632,7 @@ impl SessionStartupRecoveryProcessor {
                 self.description.opts().max_block_size
                     + self.description.opts().max_collated_data_size,
                 self.description.opts().proto_version,
+                self.description.opts().wire_profile,
             )?;
             if candidate.id != *id {
                 rtos_block::fail!("PQ recovery payload key mismatch");
@@ -1394,7 +1407,11 @@ impl SessionStartupRecoveryProcessor {
         let candidate_data = CandidateData::Consensus_Empty(tl_empty);
 
         // Serialize
-        let bytes = serialize_boxed(&candidate_data)
+        let bytes = self
+            .description
+            .opts()
+            .wire_profile
+            .serialize(&candidate_data)
             .map_err(|e| error!("Failed to serialize empty CandidateData: {}", e))?;
 
         log::trace!(

@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): wait for database completion before testing continuation effects.
+ * RTOS project modifications (2026-10-10): durable journal and explicit wire profile integration; wait for database completion before asserting effects.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -10783,96 +10783,106 @@ fn own_journal_real_vote_controller_and_recovery() {
 #[test]
 fn own_journal_real_candidate_recovery_uses_durable_carrier() {
     use crate::signing_coordinator::tests::{empty, full, Harness};
-    for candidate in [empty(), full()] {
-        for intent_only in [false, true] {
-            let h = Harness::new();
-            if intent_only {
-                *h.coordinator.fail_at.lock().unwrap() = Some("after_intent");
-            }
-            let signed = h.coordinator.candidate(candidate.clone());
-            assert_eq!(signed.is_err(), intent_only);
-            let h = h.reopen();
-            h.description.install_test_coordinator(h.coordinator.clone()).unwrap();
-            let cancel = Arc::new(AtomicBool::new(false));
-            let bootstrap =
-                h.db.load_pq_bootstrap_cancellable(&cancel, Duration::from_millis(10)).unwrap();
-            assert!(
-                bootstrap.candidate_infos.is_empty() && bootstrap.candidate_payloads.is_empty(),
-                "journal must be sufficient without peer caches"
-            );
-            let mut target =
-                make_pq_processor_with_description_for_test(h.db.clone(), h.description.clone());
-            let receiver = MockReceiver::new();
-            target.receiver = receiver.clone();
-            crate::startup_recovery::SessionStartupRecoveryProcessor::new(
-                crate::pq_fixture::session(),
-                h.description.clone(),
-                bootstrap,
-            )
-            .apply_bootstrap(&mut target)
-            .unwrap();
-            let actions = receiver.drain_actions();
-            assert!(
-                !actions.iter().any(|a| matches!(
-                    a,
-                    ReceiverAction::SendVote { .. } | ReceiverAction::SendBlockBroadcast { .. }
-                )),
-                "startup must not publish a recovered candidate"
-            );
-            let restored = h.coordinator.candidate(candidate.clone()).unwrap();
-            let empty = matches!(candidate, CandidateData::Consensus_Empty(_));
-            let hash = if empty {
-                crate::pq_fixture::candidate_hash("empty")
-            } else {
-                // Fixed canonical full-candidate ID covered by the public signature fixture.
-                UInt256::from_slice(
-                    &hex::decode(
-                        "e159212aac1dbb99e8c9d5c143881582bb50bc6acfad45e48e023c17b24101a5",
-                    )
-                    .unwrap(),
-                )
-            };
-            let cached: Vec<_> = actions
-                .iter()
-                .filter_map(|a| match a {
-                    ReceiverAction::CacheCandidateBytes { slot, block_hash, candidate_data } => {
-                        Some((*slot, block_hash.clone(), candidate_data.clone()))
-                    }
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(
-                cached,
-                vec![(99, hash.clone(), serialize_boxed(&restored).unwrap())],
-                "actual receiver must restore exact durable carrier bytes"
-            );
-            let id = crate::block::RawCandidateId { slot: SlotIndex::new(99), hash: hash.clone() };
-            let received = target
-                .candidate
-                .book()
-                .received(&id)
-                .expect("actual candidate book must receive recovered metadata");
-            assert_eq!(UInt256::calc_file_hash(&received.candidate_hash_data_bytes), hash);
-            assert_eq!(received.source_idx, ValidatorIndex::new(1));
-            assert_eq!(received.is_empty, empty);
-            assert_eq!(received.block_id.seq_no, 42);
-            assert_eq!(received.block_id.root_hash, crate::pq_fixture::block_id("empty").root_hash);
-            let parent = if empty {
-                Some(crate::block::RawCandidateId {
-                    slot: SlotIndex::new(98),
-                    hash: UInt256::from([5; 32]),
-                })
-            } else {
-                None
-            };
-            assert_eq!(received.parent_id, parent);
-            if let Ok(original) = signed {
-                assert_eq!(
-                    serialize_boxed(&original).unwrap(),
-                    serialize_boxed(&restored).unwrap()
+    for profile in [rtos_api::WireProfile::Legacy, rtos_api::WireProfile::T0] {
+        for candidate in [empty(), full()] {
+            for intent_only in [false, true] {
+                let h = Harness::new_with_profile(profile);
+                if intent_only {
+                    *h.coordinator.fail_at.lock().unwrap() = Some("after_intent");
+                }
+                let signed = h.coordinator.candidate(candidate.clone());
+                assert_eq!(signed.is_err(), intent_only);
+                let h = h.reopen();
+                h.description.install_test_coordinator(h.coordinator.clone()).unwrap();
+                let cancel = Arc::new(AtomicBool::new(false));
+                let bootstrap =
+                    h.db.load_pq_bootstrap_cancellable(&cancel, Duration::from_millis(10)).unwrap();
+                assert!(
+                    bootstrap.candidate_infos.is_empty() && bootstrap.candidate_payloads.is_empty(),
+                    "journal must be sufficient without peer caches"
                 );
+                let mut target = make_pq_processor_with_description_for_test(
+                    h.db.clone(),
+                    h.description.clone(),
+                );
+                let receiver = MockReceiver::new();
+                target.receiver = receiver.clone();
+                crate::startup_recovery::SessionStartupRecoveryProcessor::new(
+                    crate::pq_fixture::session(),
+                    h.description.clone(),
+                    bootstrap,
+                )
+                .apply_bootstrap(&mut target)
+                .unwrap();
+                let actions = receiver.drain_actions();
+                assert!(
+                    !actions.iter().any(|a| matches!(
+                        a,
+                        ReceiverAction::SendVote { .. } | ReceiverAction::SendBlockBroadcast { .. }
+                    )),
+                    "startup must not publish a recovered candidate"
+                );
+                let restored = h.coordinator.candidate(candidate.clone()).unwrap();
+                let empty = matches!(candidate, CandidateData::Consensus_Empty(_));
+                let hash = if empty {
+                    crate::pq_fixture::candidate_hash("empty")
+                } else {
+                    // Fixed canonical full-candidate ID covered by the public signature fixture.
+                    UInt256::from_slice(
+                        &hex::decode(
+                            "e159212aac1dbb99e8c9d5c143881582bb50bc6acfad45e48e023c17b24101a5",
+                        )
+                        .unwrap(),
+                    )
+                };
+                let cached: Vec<_> = actions
+                    .iter()
+                    .filter_map(|a| match a {
+                        ReceiverAction::CacheCandidateBytes {
+                            slot,
+                            block_hash,
+                            candidate_data,
+                        } => Some((*slot, block_hash.clone(), candidate_data.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    cached,
+                    vec![(99, hash.clone(), profile.serialize(&restored).unwrap())],
+                    "actual receiver must restore exact durable carrier bytes"
+                );
+                let id =
+                    crate::block::RawCandidateId { slot: SlotIndex::new(99), hash: hash.clone() };
+                let received = target
+                    .candidate
+                    .book()
+                    .received(&id)
+                    .expect("actual candidate book must receive recovered metadata");
+                assert_eq!(UInt256::calc_file_hash(&received.candidate_hash_data_bytes), hash);
+                assert_eq!(received.source_idx, ValidatorIndex::new(1));
+                assert_eq!(received.is_empty, empty);
+                assert_eq!(received.block_id.seq_no, 42);
+                assert_eq!(
+                    received.block_id.root_hash,
+                    crate::pq_fixture::block_id("empty").root_hash
+                );
+                let parent = if empty {
+                    Some(crate::block::RawCandidateId {
+                        slot: SlotIndex::new(98),
+                        hash: UInt256::from([5; 32]),
+                    })
+                } else {
+                    None
+                };
+                assert_eq!(received.parent_id, parent);
+                if let Ok(original) = signed {
+                    assert_eq!(
+                        profile.serialize(&original).unwrap(),
+                        profile.serialize(&restored).unwrap()
+                    );
+                }
+                assert_eq!(h.calls.load(Ordering::SeqCst), 1);
             }
-            assert_eq!(h.calls.load(Ordering::SeqCst), 1);
         }
     }
 }

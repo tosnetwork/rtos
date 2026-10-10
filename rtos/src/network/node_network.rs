@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -159,10 +159,11 @@ impl NodeNetwork {
             adnl.set_options(AdnlNode::OPTION_FORCE_COMPRESSION)
         }
         let dht = DhtNode::with_adnl_node(adnl.clone(), Self::TAG_DHT_KEY)?;
-        let overlay = OverlayNode::with_params(
+        let overlay = OverlayNode::with_params_and_profile(
             adnl.clone(),
             masterchain_zero_state_id.file_hash.as_slice(),
             Self::TAG_OVERLAY_KEY,
+            rtos_api::WireProfile::T0,
         )?;
         if config.extensions().disable_broadcast_retransmit {
             overlay.set_broadcast_retransmit(false)

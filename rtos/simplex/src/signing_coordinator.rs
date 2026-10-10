@@ -28,6 +28,8 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 #[serde(deny_unknown_fields)]
 pub(crate) struct SigningBinding {
     pub schema: u32,
+    /// Required constructor-domain binding; absent historical headers fail closed.
+    pub wire_profile: u8,
     pub global_id: i32,
     pub zerostate_workchain: i32,
     pub zerostate_root: [u8; 32],
@@ -47,6 +49,16 @@ pub(crate) struct SigningBinding {
     pub local_index: u32,
     pub validator_count: u32,
     pub slots_per_window: u32,
+}
+
+impl SigningBinding {
+    fn wire(&self) -> Result<rtos_api::WireProfile> {
+        match self.wire_profile {
+            0 => Ok(rtos_api::WireProfile::Legacy),
+            1 => Ok(rtos_api::WireProfile::T0),
+            _ => fail!("unknown signing wire profile"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -94,8 +106,14 @@ fn decode<T: Serialize + serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T>
     Ok(result)
 }
 fn tl<T: rtos_api::AnyBoxedSerialize>(bytes: &[u8]) -> Result<T> {
-    let (value, consumed) = rtos_api::deserialize_typed_with_suffix::<T>(bytes)?;
-    if consumed != bytes.len() || rtos_api::serialize_boxed(&value)? != bytes {
+    tl_with_profile(rtos_api::WireProfile::Legacy, bytes)
+}
+fn tl_with_profile<T: rtos_api::AnyBoxedSerialize>(
+    profile: rtos_api::WireProfile,
+    bytes: &[u8],
+) -> Result<T> {
+    let value = profile.deserialize_typed::<T>(bytes)?;
+    if profile.serialize(&value)? != bytes {
         fail!("noncanonical signing carrier");
     }
     Ok(value)
@@ -108,7 +126,11 @@ fn key(decision: &Decision) -> Result<Vec<u8>> {
 }
 pub(crate) fn validate_record(key_bytes: &[u8], value: &[u8]) -> Result<()> {
     if key_bytes == HEADER {
-        let _: Header = decode(value)?;
+        let header: Header = decode(value)?;
+        if header.binding.schema != 2 {
+            fail!("unsupported signing header schema");
+        }
+        header.binding.wire()?;
     } else {
         let record: Record = decode(value)?;
         if key(&record.decision)? != key_bytes {
@@ -187,8 +209,10 @@ impl SigningCoordinator {
         signer: Signer,
     ) -> Result<Self> {
         let pq = identity.pq_key().ok_or_else(|| error!("journal requires PQ identity"))?;
-        if binding.schema != 1
-            || binding.protocol > 1
+        if binding.schema != 2 {
+            fail!("unsupported signing binding schema");
+        }
+        if binding.protocol > 1
             || binding.generation == 0
             || binding.slots_per_window == 0
             || binding.validator_count == 0
@@ -200,6 +224,7 @@ impl SigningCoordinator {
         {
             fail!("signing identity/profile binding mismatch");
         }
+        binding.wire()?;
         ShardIdent::with_tagged_prefix(binding.shard_workchain, binding.shard_prefix)?;
         // The protected directory must already exist; provisioning is outside
         // session cache lifecycle and must not be created by untrusted requests.
@@ -300,6 +325,7 @@ impl SigningCoordinator {
             || b.validator
                 != *description.get_source_public_key_hash(description.get_self_idx()).data()
             || b.protocol != description.opts().proto_version
+            || b.wire()? != description.opts().wire_profile
             || b.local_index != description.get_self_idx().value()
             || b.validator_count as usize != description.get_total_nodes()
             || b.slots_per_window != description.opts().slots_per_leader_window
@@ -395,7 +421,7 @@ impl SigningCoordinator {
         }
         let d = &record.decision;
         let mut canonical = if d.kind == 3 {
-            let candidate: CandidateData = tl(&d.unsigned)?;
+            let candidate: CandidateData = tl_with_profile(b.wire()?, &d.unsigned)?;
             let expected = candidate_decision(candidate, b)?;
             if expected != *d {
                 fail!("candidate decision/body mismatch");
@@ -411,9 +437,9 @@ impl SigningCoordinator {
         };
         if let Some(bytes) = &record.signed {
             let signature = if d.kind == 3 {
-                let mut candidate: CandidateData = tl(bytes)?;
+                let mut candidate: CandidateData = tl_with_profile(b.wire()?, bytes)?;
                 let sig = take_signature(&mut candidate);
-                if rtos_api::serialize_boxed(&candidate)? != d.unsigned {
+                if b.wire()?.serialize(&candidate)? != d.unsigned {
                     fail!("signed candidate body mismatch");
                 }
                 sig
@@ -472,9 +498,10 @@ impl SigningCoordinator {
             self.live(&mut state)?;
             self.identity.verify_simplex(&preimage, &signature)?;
             let bytes = if record.decision.kind == 3 {
-                let mut candidate: CandidateData = tl(&record.decision.unsigned)?;
+                let mut candidate: CandidateData =
+                    tl_with_profile(state.header.binding.wire()?, &record.decision.unsigned)?;
                 set_signature(&mut candidate, signature);
-                rtos_api::serialize_boxed(&candidate)?
+                state.header.binding.wire()?.serialize(&candidate)?
             } else {
                 let vote = tl::<simplex::UnsignedVote>(&record.decision.unsigned)?;
                 rtos_api::serialize_boxed(&simplex::vote::Vote { vote, signature }.into_boxed())?
@@ -498,7 +525,7 @@ impl SigningCoordinator {
     pub fn candidate(&self, candidate: CandidateData) -> Result<CandidateData> {
         let binding =
             self.state.lock().map_err(|_| error!("journal lock poisoned"))?.header.binding.clone();
-        tl(&self.authorize(candidate_decision(candidate, &binding)?)?)
+        tl_with_profile(binding.wire()?, &self.authorize(candidate_decision(candidate, &binding)?)?)
     }
     /// Resume only previously committed decisions, then feed the existing
     /// authenticated startup replay. No receiver or network publication here.
@@ -520,7 +547,7 @@ impl SigningCoordinator {
                 hash: UInt256::from(record.decision.hash.unwrap_or_default()),
             };
             if record.decision.kind == 3 {
-                let candidate: CandidateData = tl(&bytes)?;
+                let candidate: CandidateData = tl_with_profile(binding.wire()?, &bytes)?;
                 let data = candidate_hash_data(&candidate, &binding)?;
                 let info = crate::database::CandidateInfoRecord {
                     candidate_id: id.clone(),
@@ -653,7 +680,7 @@ fn candidate_decision(mut candidate: CandidateData, b: &SigningBinding) -> Resul
         kind: 3,
         slot: slot as u32,
         hash: Some(*hash.as_array()),
-        unsigned: rtos_api::serialize_boxed(&candidate)?,
+        unsigned: b.wire()?.serialize(&candidate)?,
     })
 }
 

@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -25,7 +25,7 @@ use rtos_api::{
         overlay::membercertificate::MemberCertificate, pub_::publickey::Overlay as OverlayKey,
         ton_node::Broadcast,
     },
-    BoxedSerialize,
+    BoxedSerialize, IntoBoxed,
 };
 use rtos_block::{fail, KeyId, KeyOption, Result, ShardIdent, ValidatorDescr};
 use std::sync::Arc;
@@ -63,7 +63,11 @@ impl FastSyncOverlayClient {
             zero_state_file_hash: engine.zerostate_id()?.file_hash().clone(),
             shard: (&shard).into(),
         };
-        let id_full = hash(id)?;
+        let id_full = rtos_block::UInt256::calc_file_hash(
+            &network_context.stack.overlay.wire_profile().serialize(&id.into_boxed())?,
+        )
+        .as_slice()
+        .to_owned();
         let overlay_key = OverlayKey { name: id_full.clone().into() };
         let id_short = OverlayShortId::from_data(hash(overlay_key)?);
 
@@ -192,7 +196,7 @@ impl FastSyncOverlayClient {
                 self.engine.clone().process_new_shard_block_broadcast(broadcast, src.clone())
             }
             Broadcast::TonNode_BlockBroadcastCompressed(broadcast) => {
-                match decompress_block_broadcast(broadcast) {
+                match decompress_block_broadcast(broadcast, self.client.network_context().stack.overlay.wire_profile()) {
                     Err(e) => log::error!("Error decompressing block broadcast: {e}"),
                     Ok(b) => self.engine.clone().process_block_broadcast(b, src.clone()),
                 }

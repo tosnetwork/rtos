@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project naming and scoped QUIC envelope decoding.
+ * RTOS project modifications (2026-10-10): project naming and scoped QUIC envelopes and explicit target wire profiles.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -34,6 +34,8 @@ macro_rules! _invalid_id {
 pub mod pq_finality;
 pub mod secure;
 pub mod session_identity;
+mod wire_profile;
+pub use wire_profile::WireProfile;
 #[rustfmt::skip]
 #[allow(non_camel_case_types)]
 pub mod ton;
@@ -98,18 +100,24 @@ pub struct Deserializer<'r> {
     reader: &'r mut dyn Read,
     pos: usize,
     bytes_limit: usize,
+    profile: WireProfile,
 }
 
 impl<'r> Deserializer<'r> {
     /// Create `Deserializer` with given `io::Read` trait object
     pub fn new(reader: &'r mut dyn Read) -> Self {
-        Deserializer { reader, pos: 0, bytes_limit: ton_prelude::MAX_TL_BYTES_LEN }
+        Self::with_profile(reader, WireProfile::Legacy)
+    }
+
+    pub fn with_profile(reader: &'r mut dyn Read, profile: WireProfile) -> Self {
+        Deserializer { reader, pos: 0, bytes_limit: ton_prelude::MAX_TL_BYTES_LEN, profile }
     }
 
     /// Read `ConstructorNumber` from reader
     pub fn read_constructor(&mut self) -> Result<u32> {
         use byteorder::{LittleEndian, ReadBytesExt};
-        Ok(self.read_u32::<LittleEndian>()?)
+        let id = self.read_u32::<LittleEndian>()?;
+        self.profile.decode_constructor(id)
     }
 
     /// Read bare-serialized TL-object
@@ -192,18 +200,23 @@ impl DynamicDeserializer {
 /// Struct for serializing TL-scheme objects into any `io::Write`
 pub struct Serializer<'w> {
     writer: &'w mut dyn Write,
+    profile: WireProfile,
 }
 
 impl<'w> Serializer<'w> {
     /// Create `Serializer` with given `io::Write` trait object
     pub fn new(writer: &'w mut dyn Write) -> Self {
-        Serializer { writer }
+        Self::with_profile(writer, WireProfile::Legacy)
+    }
+
+    pub fn with_profile(writer: &'w mut dyn Write, profile: WireProfile) -> Self {
+        Serializer { writer, profile }
     }
 
     /// Serialize TL id into writer
     pub fn write_constructor(&mut self, id: u32) -> Result<()> {
         use byteorder::{LittleEndian, WriteBytesExt};
-        self.write_u32::<LittleEndian>(id)?;
+        self.write_u32::<LittleEndian>(self.profile.encode_constructor(id)?)?;
         Ok(())
     }
 

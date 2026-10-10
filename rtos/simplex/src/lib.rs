@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): naming, durable own-decision journals and typed protocol admission.
+ * RTOS project modifications (2026-10-10): naming, durable own-decision journals and typed protocol admission; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -421,6 +421,8 @@ pub type SessionReplayListenerPtr = consensus_common::ConsensusReplayListenerPtr
 /// Simplex session options
 #[derive(Clone, Copy, Debug)]
 pub struct SessionOptions {
+    /// Immutable target constructor domain, independent of protocol version.
+    pub wire_profile: rtos_api::WireProfile,
     /// Protocol version
     pub proto_version: u32,
 
@@ -572,6 +574,7 @@ pub enum PrometheusLabels {
 impl Default for SessionOptions {
     fn default() -> Self {
         Self {
+            wire_profile: rtos_api::WireProfile::Legacy,
             proto_version: 0,
             slots_per_leader_window: 1,
             target_rate: Duration::from_secs(1),

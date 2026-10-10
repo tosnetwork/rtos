@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming; typed Simplex protocol and membership admission.
+ * RTOS project modifications (2026-10-10): project and crate naming; typed Simplex protocol and membership admission; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -1044,6 +1044,11 @@ impl OverlayTransportType {
 
 /// Overlay manager
 pub trait ConsensusOverlayManager {
+    /// Constructor domain fixed by the underlying network stack.
+    fn wire_profile(&self) -> rtos_api::WireProfile {
+        rtos_api::WireProfile::Legacy
+    }
+
     /// Create new overlay; when `enable_observers=true`, simplex attaches the
     /// block-sync overlay id to `block_sync_params` via `with_overlay_id`.
     fn start_overlay(
@@ -1178,6 +1183,13 @@ impl ConsensusCommonFactory {
     /// Create in-process overlay manager
     pub fn create_in_process_overlay_manager(num_threads: usize) -> ConsensusOverlayManagerPtr {
         in_process_overlay::OverlayManagerImpl::create(num_threads)
+    }
+
+    pub fn create_in_process_overlay_manager_with_profile(
+        num_threads: usize,
+        profile: rtos_api::WireProfile,
+    ) -> ConsensusOverlayManagerPtr {
+        in_process_overlay::OverlayManagerImpl::create_with_profile(num_threads, profile)
     }
 
     /// Create a lossy overlay manager that wraps a base overlay manager

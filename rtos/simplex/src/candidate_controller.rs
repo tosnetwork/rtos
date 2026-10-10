@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -64,7 +64,6 @@ use consensus_common::{
     check_execution_time, CandidateObservedFlags, EnsureCandidateAvailabilityOptions,
 };
 use rtos_api::{
-    serialize_boxed,
     ton::consensus::{
         candidatedata::Empty as CandidateDataEmpty, candidateid::CandidateId,
         simplex::candidateandcert::CandidateAndCert, CandidateData, CandidateHashData,
@@ -633,7 +632,7 @@ impl CandidateController {
         // This provides a secondary in-memory store that persists independently of
         // the receiver's resolver_cache, enabling peers to retrieve candidates even
         // after the resolver_cache is cleaned up.
-        match serialize_boxed(&candidate) {
+        match self.description.opts().wire_profile.serialize(&candidate) {
             Ok(bytes) => {
                 self.book.insert_cached_data(candidate_id.clone(), bytes.clone());
                 // Persist to DB for restart serving (C++ CandidateResolver::store_candidate parity)
@@ -1427,11 +1426,12 @@ impl CandidateController {
             );
         }
 
-        Self::send_candidate_and_cert_response(candidate_bytes, notar_bytes, response_callback);
+        self.send_candidate_and_cert_response(candidate_bytes, notar_bytes, response_callback);
     }
 
     /// Build and send CandidateAndCert response.
     fn send_candidate_and_cert_response(
+        &self,
         candidate_bytes: Vec<u8>,
         notar_bytes: Vec<u8>,
         response_callback: crate::QueryResponseCallback,
@@ -1441,7 +1441,7 @@ impl CandidateController {
         let response =
             CandidateAndCert { candidate: candidate_bytes.into(), notar: notar_bytes.into() };
 
-        let result = match serialize_boxed(&response.into_boxed()) {
+        let result = match self.description.opts().wire_profile.serialize(&response.into_boxed()) {
             Ok(bytes) => Ok(ConsensusCommonFactory::create_block_payload(bytes)),
             Err(e) => Err(error!("Failed to serialize fallback response: {}", e)),
         };
@@ -1476,7 +1476,10 @@ impl CandidateController {
         };
 
         let candidate_data = CandidateData::Consensus_Empty(tl_empty);
-        serialize_boxed(&candidate_data)
+        self.description
+            .opts()
+            .wire_profile
+            .serialize(&candidate_data)
             .map_err(|e| error!("Failed to serialize empty CandidateData: {}", e))
     }
 }
