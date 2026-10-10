@@ -568,3 +568,31 @@ async fn engine_owned_drain_real_service_recovery_loops_exit_before_database_shu
     assert!(weak.upgrade().is_none());
     stopped(open(dir.path()).await).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_owned_drain_service_start_panic_preserves_failure_without_hanging_mask() {
+    let dir = tempfile::tempdir().unwrap();
+    config(dir.path());
+    let engine = open(dir.path()).await;
+    assert!(engine
+        .register_service_task(
+            "controlled start",
+            Engine::MASK_SERVICE_MASTERCHAIN_CLIENT,
+            Box::new(|| panic!("controlled synchronous start failure"))
+        )
+        .is_err());
+    let error = tokio::time::timeout(Duration::from_secs(15), engine.clone().wait_stop())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("controlled start: service start panicked"));
+    assert_ne!(
+        engine.stopper.stop.load(Ordering::Acquire) & Engine::MASK_SERVICE_MASTERCHAIN_CLIENT,
+        0
+    );
+    assert!(engine.state_db_stop_started.load(Ordering::Acquire));
+    let weak = Arc::downgrade(&engine);
+    drop(engine);
+    assert!(weak.upgrade().is_none());
+    stopped(open(dir.path()).await).await;
+}

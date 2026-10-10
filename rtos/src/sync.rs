@@ -37,7 +37,7 @@ const TARGET: &str = "sync";
 const SHARD_RETRIES: u8 = 10;
 
 #[async_trait::async_trait]
-pub trait StopSyncChecker {
+pub trait StopSyncChecker: Send + Sync {
     async fn check(&self, engine: &Arc<dyn EngineOperations>) -> bool;
 }
 

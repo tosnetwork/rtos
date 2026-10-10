@@ -48,7 +48,11 @@ impl ServiceTasks {
                     // accepted descendants might still be writing.
                     stopper.report_service_failure(0, error.clone());
                 }
-                completions.lock().unwrap().push((mask, result.clone()));
+                // Successful transient children need no permanent completion
+                // record; the tracker already retains their real join.
+                if mask != 0 || result.is_err() {
+                    completions.lock().unwrap().push((mask, result.clone()));
+                }
                 let _ = sent.send(result);
             }))
         })?;
