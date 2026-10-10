@@ -441,3 +441,130 @@ async fn engine_owned_drain_run_sampling_workers_release_engine_during_sleep() {
     assert!(weak.upgrade().is_none(), "run sampling retained Engine");
     stopped(open(dir.path()).await).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_owned_drain_service_graph_holds_parent_mask_until_children_join() {
+    let dir = tempfile::tempdir().unwrap();
+    config(dir.path());
+    let engine = open(dir.path()).await;
+    let (release, child) = tokio::sync::oneshot::channel();
+    let parent_engine = engine.clone();
+    let parent = engine
+        .register_service_task(
+            "test parent",
+            Engine::MASK_SERVICE_MASTERCHAIN_CLIENT,
+            Box::new(move || {
+                tokio::spawn(async move {
+                    let _child = parent_engine
+                        .register_service_task(
+                            "accepted child write",
+                            0,
+                            Box::new(move || {
+                                tokio::spawn(async move {
+                                    child.await.unwrap();
+                                })
+                            }),
+                        )
+                        .unwrap();
+                })
+            }),
+        )
+        .unwrap();
+    parent.await.unwrap();
+    let mask = engine.stopper.stop.load(Ordering::Acquire);
+    assert_ne!(mask & Engine::MASK_SERVICE_MASTERCHAIN_CLIENT, 0);
+    assert!(tokio::time::timeout(Duration::from_millis(30), engine.clone().wait_stop())
+        .await
+        .is_err());
+    assert!(!engine.state_db_stop_started.load(Ordering::Acquire));
+    assert_ne!(
+        engine.stopper.stop.load(Ordering::Acquire) & Engine::MASK_SERVICE_MASTERCHAIN_CLIENT,
+        0
+    );
+    assert!(engine.register_service_task("late child", 0, Box::new(|| unreachable!())).is_err());
+    release.send(()).unwrap();
+    stopped(engine.clone()).await;
+    assert!(engine.state_db_stop_started.load(Ordering::Acquire));
+    let weak = Arc::downgrade(&engine);
+    drop(engine);
+    assert!(weak.upgrade().is_none());
+    stopped(open(dir.path()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_owned_drain_unknown_validator_failure_blocks_database_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    config(dir.path());
+    let engine = open(dir.path()).await;
+    let owner = engine.clone();
+    engine
+        .register_service_task(
+            "uncertified validator",
+            0,
+            Box::new(move || {
+                owner.acquire_stop(Engine::MASK_SERVICE_VALIDATOR_MANAGER);
+                tokio::spawn(async move {
+                    owner.report_service_failure(0, "validator children still unjoined".into());
+                })
+            }),
+        )
+        .unwrap()
+        .await
+        .unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(50), engine.clone().wait_stop())
+        .await
+        .is_err());
+    assert!(
+        !engine.state_db_stop_started.load(Ordering::Acquire),
+        "DB stopped while validator ownership remained uncertified"
+    );
+    engine.report_service_failure(
+        Engine::MASK_SERVICE_VALIDATOR_MANAGER,
+        "validator descendants now joined with errors".into(),
+    );
+    assert!(tokio::time::timeout(Duration::from_secs(15), engine.clone().wait_stop())
+        .await
+        .unwrap()
+        .is_err());
+    assert!(engine.state_db_stop_started.load(Ordering::Acquire));
+    assert_ne!(
+        engine.stopper.stop.load(Ordering::Acquire) & Engine::MASK_SERVICE_VALIDATOR_MANAGER,
+        0
+    );
+    let weak = Arc::downgrade(&engine);
+    drop(engine);
+    assert!(weak.upgrade().is_none());
+    stopped(open(dir.path()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_owned_drain_real_service_recovery_loops_exit_before_database_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    config(dir.path());
+    let engine = open(dir.path()).await;
+    seed_queue(&engine).await;
+    let mut absent = engine.zerostate_id().clone();
+    absent.seq_no = 9;
+    let keeper = engine.shard_states_keeper();
+    keeper.clone().start_workers(engine.clone(), absent.clone(), absent.clone()).unwrap();
+    let master = start_masterchain_client(engine.clone(), absent.clone()).unwrap();
+    let shards = start_shards_client(engine.clone(), absent.clone()).unwrap();
+    resend_top_shard_blocks_worker(engine.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while keeper.worker_retry_counts.iter().any(|count| count.load(Ordering::Relaxed) == 0) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both actual state keeper error paths must run");
+    assert!(!master.is_finished());
+    assert!(!shards.is_finished());
+    stopped(engine.clone()).await;
+    master.await.unwrap();
+    shards.await.unwrap();
+    drop(keeper);
+    let weak = Arc::downgrade(&engine);
+    drop(engine);
+    assert!(weak.upgrade().is_none());
+    stopped(open(dir.path()).await).await;
+}

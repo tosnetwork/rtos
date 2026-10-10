@@ -90,6 +90,8 @@ impl Drop for PinnedShardStateGuard {
 ///              ↓            ↓
 ///       databases  network protocols
 pub struct ShardStatesKeeper {
+    #[cfg(test)]
+    pub(crate) worker_retry_counts: [std::sync::atomic::AtomicUsize; 2],
     db: Arc<InternalDb>,
     gc_resolver: Arc<AllowStateGcSmartResolver>,
     cache_resolver: Arc<AllowStateGcSmartResolver>,
@@ -127,6 +129,8 @@ impl ShardStatesKeeper {
         db.start_states_gc(gc_resolver.clone());
 
         Ok(Arc::new(ShardStatesKeeper {
+            #[cfg(test)]
+            worker_retry_counts: Default::default(),
             db,
             gc_resolver,
             cache_resolver,
@@ -149,12 +153,19 @@ impl ShardStatesKeeper {
         engine: Arc<Engine>,
         last_applied_mc_block: BlockIdExt,
         shard_client_mc_block: BlockIdExt,
-        mut ss_keeper_block: BlockIdExt,
+        ss_keeper_block: BlockIdExt,
     ) -> Result<()> {
         log::trace!("start");
-
         self.restore_states(last_applied_mc_block, shard_client_mc_block.clone()).await?;
+        self.start_workers(engine, shard_client_mc_block, ss_keeper_block)
+    }
 
+    pub(crate) fn start_workers(
+        self: Arc<Self>,
+        engine: Arc<Engine>,
+        shard_client_mc_block: BlockIdExt,
+        mut ss_keeper_block: BlockIdExt,
+    ) -> Result<()> {
         let engine_ = engine.clone();
         let self_ = self.clone();
         engine_.clone().register_service_task(
@@ -163,6 +174,9 @@ impl ShardStatesKeeper {
             Box::new(move || {
                 tokio::spawn(async move {
                     while let Err(e) = self_.pss_worker(&engine_, &ss_keeper_block).await {
+                        #[cfg(test)]
+                        self_.worker_retry_counts[0]
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if engine_.check_stop() {
                             break;
                         }
@@ -203,6 +217,9 @@ impl ShardStatesKeeper {
                     while let Err(e) =
                         self.clean_cache_worker(&engine, &states_cache_mc_block).await
                     {
+                        #[cfg(test)]
+                        self.worker_retry_counts[1]
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if engine.check_stop() {
                             return;
                         }

@@ -113,6 +113,8 @@ struct EngineOwners {
 
 pub struct Engine {
     #[cfg(test)]
+    state_db_stop_started: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     pub(crate) overlay_init_test_gate:
         std::sync::Mutex<Option<Arc<crate::network::overlay_client::OverlayInitGate>>>,
     #[cfg(test)]
@@ -835,6 +837,8 @@ impl Engine {
             external_messages: Arc::new(ext_messages_pool),
             confirmed_block_events: ConfirmedBlockEvents::new(),
 
+            #[cfg(test)]
+            state_db_stop_started: std::sync::atomic::AtomicBool::new(false),
             servers: lockfree::queue::Queue::new(),
             stopper: stopper.clone(),
             _network_binding: network_binding,
@@ -1099,6 +1103,8 @@ impl Engine {
         }
         // An unknown validator teardown retains its bit and blocks DB shutdown.
         let _ = self.stopper.clone().wait_stop_except(Self::MASK_SERVICE_SHARDSTATE_GC).await;
+        #[cfg(test)]
+        self.state_db_stop_started.store(true, Ordering::Release);
         self.db.stop_states_db().await;
         self.stopper.release_stop(Self::MASK_SERVICE_SHARDSTATE_GC);
         // Producers have stopped. Close the queue and flush accepted metadata
@@ -2681,15 +2687,15 @@ pub async fn run(
     let truncate_db = flags.truncate_db;
     let engine = Engine::new(node_config, flags, stopper.clone()).await?;
     let mut startup_guard = EngineShutdownGuard(Some(engine.clone()));
-    if let Some(mc_seq_no) = truncate_db {
-        engine.truncate_database(mc_seq_no).await?;
-    }
     let engine_ret = engine.clone();
     let zerostate_path = zerostate_path.map(str::to_owned);
     let result = crate::types::service_tasks::spawn_owned(
         engine_ret.as_ref(),
         "Engine startup",
         async move {
+            if let Some(mc_seq_no) = truncate_db {
+                engine.truncate_database(mc_seq_no).await?;
+            }
             #[cfg(feature = "telemetry")]
             telemetry_logger(engine.clone())?;
             #[cfg(all(target_os = "linux", feature = "telemetry"))]
