@@ -392,3 +392,44 @@ async fn test_manager_lifecycle_invocation_panic_drains_before_terminal_failure(
         .to_string()
         .contains("invocation panicked"));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_manager_lifecycle_observer_callback_panic_retains_owner_until_join() {
+    use super::super::block_sync_observer::lifecycle_tests::{
+        gate_listener_exit_for_test, observer_fixture, panic_during_deletion_for_test,
+    };
+    let engine = Arc::new(LifecycleEngine::default());
+    let mut manager = manager_fixture(engine.clone());
+    let (observer, fixture) = observer_fixture().await;
+    let callback_entered = panic_during_deletion_for_test(&observer);
+    let gate = gate_listener_exit_for_test(&observer);
+    manager.block_sync_observers.insert(fixture.session_id.clone(), observer.clone());
+    {
+        let mut stop = Box::pin(manager.stop_validation());
+        assert!(futures::poll!(&mut stop).is_pending());
+        tokio::time::timeout(Duration::from_secs(5), callback_entered).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        assert!(
+            !observer.teardown_drained(),
+            "callback panic cannot certify a still-live listener"
+        );
+        assert!(futures::poll!(&mut stop).is_pending());
+    }
+    assert_eq!(manager.retiring_observers.len(), 1, "cancelled waiter forgot failed observer");
+    assert!(Arc::ptr_eq(&manager.retiring_observers[0], &observer));
+    manager.report_teardown_failure("observer still stopping".to_owned());
+    assert_eq!(engine.reported.lock().unwrap()[0].0, 0);
+    gate.release.add_permits(1);
+    let error = tokio::time::timeout(Duration::from_secs(5), manager.stop_validation())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("observer cleanup callback panicked"));
+    assert!(observer.teardown_drained());
+    manager.report_teardown_failure(error.to_string());
+    assert_eq!(engine.reported.lock().unwrap()[1].0, Engine::MASK_SERVICE_VALIDATOR_MANAGER);
+}

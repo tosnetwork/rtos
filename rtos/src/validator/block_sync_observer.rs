@@ -59,6 +59,8 @@ pub struct BlockSyncObserver {
     teardown_drained: Arc<AtomicBool>,
     #[cfg(test)]
     listener_exit_gate: Mutex<Option<Arc<lifecycle_tests::ListenerExitGate>>>,
+    #[cfg(test)]
+    deletion_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     stop_completion:
         Mutex<Option<tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>>>,
 }
@@ -152,6 +154,8 @@ impl BlockSyncObserver {
             teardown_drained: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             listener_exit_gate: Mutex::new(None),
+            #[cfg(test)]
+            deletion_hook: Mutex::new(None),
             stop_completion: Mutex::new(None),
         });
         let cancellation = observer.cancellation.clone();
@@ -182,21 +186,33 @@ impl BlockSyncObserver {
         }
         self.stop_requested.store(true, Ordering::Release);
         self.cancellation.cancel();
-        self.stats.dump();
-        let deletion = self
-            .overlay_node
-            .delete_private_overlay(&self.overlay_short_id)
-            .map(|_| ())
-            .map_err(|e| e.to_string());
         let listener = self.listener_handle.lock().expect("listener handle poisoned").take();
         let ticker = self.ticker_handle.lock().expect("ticker handle poisoned").take();
         let (tx, rx) = tokio::sync::watch::channel(None);
         *completion = Some(rx);
+        // Publish completion and transfer handles before invoking any cleanup
+        // callback. A callback panic must not detach the remaining workers.
+        drop(completion);
         let drained = self.teardown_drained.clone();
+        let stats = self.stats.clone();
+        let overlay = self.overlay_node.clone();
+        let overlay_id = self.overlay_short_id.clone();
+        let session_id = self.session_id.clone();
+        #[cfg(test)]
+        let deletion_hook = self.deletion_hook.lock().unwrap().take();
         self.runtime_handle.spawn(async move {
             let mut errors = Vec::new();
-            if let Err(error) = deletion {
-                errors.push(format!("overlay deletion failed: {error}"));
+            let deletion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                stats.dump();
+                log::trace!(target: LOG_TARGET, "deleting observer overlay for session {session_id:x}");
+                #[cfg(test)]
+                if let Some(hook) = deletion_hook { hook(); }
+                overlay.delete_private_overlay(&overlay_id).map(|_| ())
+            }));
+            match deletion {
+                Ok(Ok(())) => {},
+                Ok(Err(error)) => errors.push(format!("overlay deletion failed: {error}")),
+                Err(_) => errors.push("observer cleanup callback panicked".to_owned()),
             }
             for (name, task) in [("listener", listener), ("ticker", ticker)] {
                 if let Some(task) = task {

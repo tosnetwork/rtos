@@ -7,9 +7,9 @@ struct NoSigningEngine;
 #[async_trait::async_trait]
 impl EngineOperations for NoSigningEngine {}
 
-pub(super) struct ListenerExitGate {
-    pub(super) entered: tokio::sync::Semaphore,
-    pub(super) release: tokio::sync::Semaphore,
+pub(crate) struct ListenerExitGate {
+    pub(crate) entered: tokio::sync::Semaphore,
+    pub(crate) release: tokio::sync::Semaphore,
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -127,4 +127,24 @@ pub(crate) fn lose_completion_for_test(observer: &BlockSyncObserver) {
 }
 pub(crate) fn restore_completion_for_test(observer: &BlockSyncObserver) {
     *observer.stop_completion.lock().unwrap() = None;
+}
+
+pub(crate) fn panic_during_deletion_for_test(
+    observer: &BlockSyncObserver,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let (entered, receiver) = tokio::sync::oneshot::channel();
+    *observer.deletion_hook.lock().unwrap() = Some(Box::new(move || {
+        let _ = entered.send(());
+        panic!("controlled observer deletion callback panic");
+    }));
+    receiver
+}
+
+pub(crate) fn gate_listener_exit_for_test(observer: &BlockSyncObserver) -> Arc<ListenerExitGate> {
+    let gate = Arc::new(ListenerExitGate {
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    *observer.listener_exit_gate.lock().unwrap() = Some(gate.clone());
+    gate
 }
