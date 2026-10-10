@@ -322,6 +322,29 @@ mod files {
         }
     }
     #[test]
+    fn protected_seed_rejects_actual_wrong_owner() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("other-owner");
+        let uid = unsafe { libc::geteuid() };
+        let target = if uid == 0 {
+            seed(&path, 103);
+            let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(cpath.as_ptr(), 65534, 65534) }, 0);
+            path.as_path()
+        } else {
+            // A public system file: rejection happens at fstat owner checking,
+            // before any bytes are read or interpreted as a seed.
+            Path::new("/etc/passwd")
+        };
+        assert_ne!(fs::metadata(target).unwrap().uid(), uid);
+        assert!(matches!(
+            load_consensus_key(target, 0),
+            Err(Error::KeyFile(KeyFileError::WrongOwner))
+        ));
+    }
+
+    #[test]
     fn configured_load_refuses_duplicate_paths_seeds_and_all_expired() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a");

@@ -1,0 +1,13 @@
+This crate uses the unmodified ML-DSA compilation subtree in
+../pq-crypto/native/mldsa-native, whose notices and licenses remain there.
+Copyright (c) The mldsa-native project authors.
+Apache-2.0 OR ISC OR MIT; see ../pq-crypto/native/mldsa-native/LICENSE.
+
+The consensus contexts, key identity, custody windows and protected-file rules
+follow the fixed reference tosnetwork/tos revision
+8f083dc06bff16705710a01de15eb3123d5d696b.
+Copyright 2026 TOS Blockchain Teams. The reference consensus signer is
+LGPL-2.0-or-later; validator/node-consensus-status.h is GPL-3.0-or-later.
+The embedded public keygen test vector is reproduced from that revision's
+test/pq-mldsa44/pq-signer-test.cpp. Implementation review and evidence are kept
+in the memo repository under rtos/.

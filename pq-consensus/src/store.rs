@@ -57,7 +57,7 @@ pub struct ConsensusSignature {
 /// an immutable Arc instead. The deadline is fixed before a store can be shared.
 pub struct ConsensusKeyStore {
     key: PqConsensusKey,
-    secret: Zeroizing<Box<[u8; SECRET_BYTES]>>,
+    secret: Box<Zeroizing<[u8; SECRET_BYTES]>>,
     expire_at: u32,
     signatures_produced: AtomicU64,
     refused_after_expiry: AtomicU64,
@@ -70,7 +70,7 @@ impl ConsensusKeyStore {
             return Err(Error::SeedLength(seed.len()));
         }
         let mut public = [0; PUBLIC_KEY_BYTES];
-        let mut secret = Zeroizing::new(Box::new([0; SECRET_BYTES]));
+        let mut secret = Box::new(Zeroizing::new([0; SECRET_BYTES]));
         // SAFETY: all buffers have the pinned ABI widths, remain live for the
         // synchronous call, and do not alias. Native code retains no pointers.
         let code = unsafe {
@@ -224,4 +224,36 @@ pub(crate) fn native_sign(
         return Err(Error::Backend(code));
     }
     Ok(signature)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    #[test]
+    fn poisoned_registry_aborts() {
+        use std::os::unix::process::ExitStatusExt;
+        if std::env::var_os("RTOS_PQ_REGISTRY_POISON_CHILD").is_some() {
+            // A controlled subprocess must not leave a core file containing
+            // other tests' memory or consume disk space when it aborts.
+            let limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) }, 0);
+            let _ = std::panic::catch_unwind(|| {
+                let _guard = retired_keys().lock().unwrap();
+                panic!("controlled registry poisoning");
+            });
+            consensus_key_retired(&[0; 32]);
+            panic!("a poisoned retirement registry was silently reused");
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "store::tests::poisoned_registry_aborts", "--nocapture"])
+            .env("RTOS_PQ_REGISTRY_POISON_CHILD", "1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "child output: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
