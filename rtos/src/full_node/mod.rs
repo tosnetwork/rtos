@@ -1,3 +1,4 @@
+// RTOS modifications (2026-10-10): owned consumer readiness and authenticated finality recovery.
 /*
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
@@ -10,6 +11,7 @@
  */
 pub mod apply_block;
 pub mod counters;
+pub(crate) mod finality;
 pub mod shard_client;
 pub mod state_helper;
 #[cfg(feature = "telemetry")]

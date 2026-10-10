@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration; owned consumer readiness and authenticated finality recovery.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -124,9 +124,10 @@ impl FastSyncOverlayClient {
         )
         .await?;
 
+        let subscription = client.subscribe_broadcast()?;
         let result = Arc::new(Self { id: id_short, shard, client, engine, use_twostep });
 
-        result.clone().listen_broadcasts(cancellation_token.clone());
+        result.clone().listen_broadcasts(cancellation_token.clone(), subscription);
 
         Ok(result)
     }
@@ -144,7 +145,11 @@ impl FastSyncOverlayClient {
         self.client.delete().ok();
     }
 
-    fn listen_broadcasts(self: Arc<Self>, cancellation_token: tokio_util::sync::CancellationToken) {
+    fn listen_broadcasts(
+        self: Arc<Self>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+        mut subscription: adnl::BroadcastSubscription,
+    ) {
         spawn_cancelable(cancellation_token.clone(), async move {
             log::debug!(
                 "Started listening broadcasts in fast sync overlay {} {}",
@@ -164,7 +169,7 @@ impl FastSyncOverlayClient {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     continue;
                 }
-                match self.client.wait_broadcast().await {
+                match self.client.wait_broadcast(&mut subscription).await {
                     Err(e) => {
                         log::error!(
                             "Error while wait_broadcast in fast sync overlay {} {}: {e}",
@@ -182,14 +187,16 @@ impl FastSyncOverlayClient {
                         );
                         break;
                     }
-                    Ok(Some((broadcast, src))) => {
+                    Ok(Some((broadcast, src, received_bytes))) => {
                         log::trace!(
                             "Received broadcast {:08x} in fast sync overlay {} {} from {src}",
                             broadcast.bare_object().constructor(),
                             self.shard,
                             self.id
                         );
-                        if let Err(e) = self.process_broadcast(&src, broadcast).await {
+                        if let Err(e) =
+                            self.process_broadcast(&src, broadcast, received_bytes).await
+                        {
                             log::warn!(
                                 "Error while processing broadcast from {src} \
                                 in fast sync overlay {} {}: {e}",
@@ -203,8 +210,18 @@ impl FastSyncOverlayClient {
         });
     }
 
-    async fn process_broadcast(&self, src: &Arc<KeyId>, broadcast: Broadcast) -> Result<()> {
+    async fn process_broadcast(
+        &self,
+        src: &Arc<KeyId>,
+        broadcast: Broadcast,
+        received_bytes: usize,
+    ) -> Result<()> {
         match broadcast {
+            Broadcast::TonNode_BlockFinalityBroadcast(broadcast) => {
+                self.engine.clone().process_block_finality_broadcast(
+                    broadcast, src.clone(), received_bytes,
+                ).await?;
+            }
             Broadcast::TonNode_BlockBroadcast(broadcast) => {
                 self.engine.clone().process_block_broadcast(broadcast, src.clone())
             }

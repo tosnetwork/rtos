@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; owned consumer readiness and authenticated finality recovery.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -890,6 +890,16 @@ impl EngineOperations for Engine {
                 }
             }
         });
+    }
+
+    async fn process_block_finality_broadcast(
+        self: Arc<Self>,
+        broadcast: rtos_api::ton::ton_node::broadcast::BlockFinalityBroadcast,
+        src: Arc<KeyId>,
+        received_bytes: usize,
+    ) -> Result<()> {
+        let pending = self.pending_finality.clone();
+        crate::full_node::finality::receive(self, pending, broadcast, src, received_bytes).await
     }
 
     fn process_block_broadcast_v2(

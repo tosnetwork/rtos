@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration; owned consumer readiness and authenticated finality recovery.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -67,7 +67,8 @@ impl FullNodeOverlayClient {
         engine: Arc<dyn EngineOperations>,
         client: Arc<OverlayClient>,
         shard: ShardIdent,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>> {
+        let subscription = client.subscribe_broadcast()?;
         let fnc = Arc::new(Self {
             active_peers: lockfree::set::Set::new(),
             bad_peers: lockfree::set::Set::new(),
@@ -75,8 +76,8 @@ impl FullNodeOverlayClient {
             client,
             shard,
         });
-        fnc.clone().listen_broadcasts();
-        fnc
+        fnc.clone().listen_broadcasts(subscription);
+        Ok(fnc)
     }
 
     pub fn overlay_client(&self) -> &Arc<OverlayClient> {
@@ -87,14 +88,15 @@ impl FullNodeOverlayClient {
         &self.shard
     }
 
-    fn listen_broadcasts(self: Arc<Self>) {
-        tokio::spawn(async move {
+    fn listen_broadcasts(self: Arc<Self>, mut subscription: adnl::BroadcastSubscription) {
+        adnl::common::spawn_cancelable(self.client.cancellation_token(), async move {
             log::debug!("Started listening broadcasts for shard {}", self.shard());
             loop {
                 if self.engine.check_stop() {
                     break;
                 }
                 if !self.overlay_client().is_active() {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
                 if self.overlay_client().is_died() {
@@ -109,7 +111,7 @@ impl FullNodeOverlayClient {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     continue;
                 }
-                match self.overlay_client().wait_broadcast().await {
+                match self.overlay_client().wait_broadcast(&mut subscription).await {
                     Err(e) => {
                         log::error!("Error while wait_broadcast for shard {}: {e}", self.shard());
                         // Wait for the graceful loop exit
@@ -119,14 +121,16 @@ impl FullNodeOverlayClient {
                         log::warn!("wait_broadcast finished.");
                         break;
                     }
-                    Ok(Some((broadcast, src))) => {
+                    Ok(Some((broadcast, src, received_bytes))) => {
                         log::trace!(
                             "Received broadcast {:08x} in public overlay {} shard {} from {src}",
                             broadcast.bare_object().constructor(),
                             self.client.id(),
                             self.shard
                         );
-                        if let Err(e) = self.process_broadcast(&src, broadcast).await {
+                        if let Err(e) =
+                            self.process_broadcast(&src, broadcast, received_bytes).await
+                        {
                             log::warn!(
                                 "Error while processing broadcast from {src} \
                                 in public overlay {} for shard {}: {e}",
@@ -140,8 +144,18 @@ impl FullNodeOverlayClient {
         });
     }
 
-    async fn process_broadcast(&self, src: &Arc<KeyId>, broadcast: Broadcast) -> Result<()> {
+    async fn process_broadcast(
+        &self,
+        src: &Arc<KeyId>,
+        broadcast: Broadcast,
+        received_bytes: usize,
+    ) -> Result<()> {
         match broadcast {
+            Broadcast::TonNode_BlockFinalityBroadcast(broadcast) => {
+                self.engine.clone().process_block_finality_broadcast(
+                    broadcast, src.clone(), received_bytes,
+                ).await?;
+            }
             Broadcast::TonNode_BlockBroadcast(broadcast) => {
                 self.engine.clone().process_block_broadcast(broadcast, src.clone())
             }

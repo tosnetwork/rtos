@@ -423,6 +423,10 @@ tonNode.blockSignature who:int256 signature:bytes = tonNode.BlockSignature;
 tonNode.signatureSet.ordinary cc_seqno:int validator_set_hash:int signatures:(vector tonNode.blockSignature) = tonNode.SignatureSet;
 tonNode.signatureSet.simplex final:Bool cc_seqno:int validator_set_hash:int signatures:(vector tonNode.blockSignature)
     session_id:int256 slot:int candidate:consensus.CandidateHashData = tonNode.SignatureSet;
+// Fixed target-only constructors. Legacy wire profiles must reject these.
+tonNode.pqBlockSignature#535666d0 validator_id:int256 algorithm_id:int signature:bytes = tonNode.PqBlockSignature;
+tonNode.signatureSet.simplexPq#590da166 final:Bool cc_seqno:int validator_set_hash:int signatures:(vector tonNode.pqBlockSignature)
+    session_id:int256 slot:int candidate:consensus.CandidateHashData = tonNode.SignatureSet;
 
 tonNode.blockId workchain:int shard:long seqno:int = tonNode.BlockId;
 tonNode.blockIdExt workchain:int shard:long seqno:int root_hash:int256 file_hash:int256 = tonNode.BlockIdExt;
@@ -460,6 +464,8 @@ tonNode.blockBroadcastCompressed id:tonNode.blockIdExt catchain_seqno:int valida
               flags:# compressed:bytes = tonNode.Broadcast;
 tonNode.blockBroadcastCompressedV2 id:tonNode.blockIdExt signature_set:tonNode.SignatureSet
               flags:# proof:bytes data_compressed:bytes = tonNode.Broadcast;
+tonNode.finalityBroadcastId#5e6f085d id:tonNode.blockIdExt = tonNode.FinalityBroadcastId;
+tonNode.blockFinalityBroadcast#8f4731ef id:tonNode.blockIdExt signature_set:tonNode.SignatureSet = tonNode.Broadcast;
 tonNode.ihrMessageBroadcast message:tonNode.ihrMessage = tonNode.Broadcast;
 tonNode.externalMessageBroadcast message:tonNode.externalMessage = tonNode.Broadcast;
 tonNode.newShardBlockBroadcast block:tonNode.newShardBlock = tonNode.Broadcast;

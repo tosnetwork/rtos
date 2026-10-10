@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; owned consumer readiness and authenticated finality recovery.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -116,6 +116,7 @@ pub struct Engine {
     flags: EngineFlags,
     archives_life_time_hours: Option<u32>,
     shard_blocks: ShardBlocksPool,
+    pub(crate) pending_finality: crate::full_node::finality::SharedPendingFinality,
     candidates_cache: parking_lot::Mutex<lru::LruCache<BlockIdExt, Arc<Vec<u8>>>>,
     last_applied_mc_block_seqno: AtomicU32,
     last_applied_mc_block_utime: AtomicU32,
@@ -809,6 +810,7 @@ impl Engine {
             network,
             overlays_router: OnceLock::new(),
             shard_blocks: shard_blocks_pool,
+            pending_finality: Default::default(),
             candidates_cache: parking_lot::Mutex::new(lru::LruCache::new(
                 Self::CANDIDATES_CACHE_SIZE.try_into()?,
             )),

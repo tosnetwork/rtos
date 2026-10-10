@@ -1,0 +1,255 @@
+// Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
+//! Unverified network evidence has no persisted weight or final-proof authority.
+//! Only an independently constructed governing context can grant either role.
+use super::*;
+use crate::{ton, WireProfile};
+use rtos_block::{
+    BlockSignaturesSimplex, PqBlockSignaturePair, ValidatorBaseInfo, MLDSA44_ALGORITHM_ID,
+    PQ_SIGNATURE_BYTES, PQ_SIGNATURE_MAX_SIGNERS,
+};
+use std::collections::HashSet;
+
+#[derive(Clone, Debug)]
+pub struct PqNetworkSignatureSet {
+    is_final: bool,
+    validator_info: ValidatorBaseInfo,
+    signatures: Vec<PqBlockSignaturePair>,
+    session_id: UInt256,
+    slot: u32,
+    candidate: ton::consensus::CandidateHashData,
+}
+
+impl PqNetworkSignatureSet {
+    pub fn from_node(value: ton::ton_node::signature_set::signatureset::SimplexPq) -> Result<Self> {
+        if value.signatures.len() > PQ_SIGNATURE_MAX_SIGNERS as usize {
+            fail!("PQ network signer count exceeds maximum");
+        }
+        let mut signatures = Vec::with_capacity(value.signatures.len());
+        for pair in value.signatures {
+            signatures.push(PqBlockSignaturePair {
+                validator_id: pair.validator_id,
+                algorithm_id: u16::try_from(pair.algorithm_id)
+                    .map_err(|_| error!("PQ network algorithm out of range"))?,
+                signature: pair.signature,
+            });
+        }
+        let result = Self {
+            is_final: matches!(value.final_, ton::Bool::BoolTrue),
+            validator_info: ValidatorBaseInfo::with_params(
+                value.validator_set_hash as u32,
+                value.cc_seqno as u32,
+            ),
+            signatures,
+            session_id: value.session_id,
+            slot: value.slot as u32,
+            candidate: value.candidate,
+        };
+        result.validate_structure()?;
+        Ok(result)
+    }
+
+    pub fn from_lite(
+        value: ton::lite_server::signature_set::signatureset::SimplexPq,
+    ) -> Result<Self> {
+        if value.signatures.len() > PQ_SIGNATURE_MAX_SIGNERS as usize {
+            fail!("PQ network signer count exceeds maximum");
+        }
+        if value.candidate.len() > 1024 {
+            fail!("PQ network candidate exceeds maximum");
+        }
+        let candidate = WireProfile::T0.deserialize_typed(&value.candidate)?;
+        Self::from_node(ton::ton_node::signature_set::signatureset::SimplexPq {
+            final_: ton::Bool::BoolTrue,
+            cc_seqno: value.cc_seqno,
+            validator_set_hash: value.validator_set_hash,
+            signatures: value
+                .signatures
+                .into_iter()
+                .map(|pair| ton::ton_node::pqblocksignature::PqBlockSignature {
+                    validator_id: pair.validator_id,
+                    algorithm_id: pair.algorithm_id,
+                    signature: pair.signature,
+                })
+                .collect(),
+            session_id: value.session_id,
+            slot: value.slot,
+            candidate,
+        })
+    }
+
+    /// Prepare outgoing final fields; this is structural validation, not authentication.
+    pub fn from_final_fields(value: &BlockSignaturesSimplexPq) -> Result<Self> {
+        value.serialize()?;
+        let result = Self {
+            is_final: true,
+            validator_info: value.validator_info.clone(),
+            signatures: value.signatures.clone(),
+            session_id: value.session_id.clone(),
+            slot: value.slot,
+            candidate: WireProfile::T0.deserialize_typed(&value.candidate_bytes()?)?,
+        };
+        result.validate_structure()?;
+        Ok(result)
+    }
+
+    pub fn from_approval(value: &PqApproval) -> Result<Self> {
+        let mut result = Self::from_final_fields(&value.data)?;
+        result.is_final = false;
+        Ok(result)
+    }
+
+    fn validate_structure(&self) -> Result<()> {
+        if self.signatures.len() > PQ_SIGNATURE_MAX_SIGNERS as usize {
+            fail!("PQ network signer count exceeds maximum");
+        }
+        let mut ids = HashSet::new();
+        for pair in &self.signatures {
+            if pair.algorithm_id != MLDSA44_ALGORITHM_ID {
+                fail!("PQ network unsupported algorithm");
+            }
+            if pair.signature.len() != PQ_SIGNATURE_BYTES {
+                fail!("PQ network signature length");
+            }
+            if !ids.insert(&pair.validator_id) {
+                fail!("PQ network duplicate validator identity");
+            }
+        }
+        if WireProfile::T0.serialize(&self.candidate)?.len() > 1024 {
+            fail!("PQ network candidate exceeds maximum");
+        }
+        Ok(())
+    }
+
+    pub fn to_node(&self) -> ton::ton_node::signature_set::signatureset::SimplexPq {
+        ton::ton_node::signature_set::signatureset::SimplexPq {
+            final_: if self.is_final { ton::Bool::BoolTrue } else { ton::Bool::BoolFalse },
+            cc_seqno: self.validator_info.catchain_seqno as i32,
+            validator_set_hash: self.validator_info.validator_list_hash_short as i32,
+            signatures: self
+                .signatures
+                .iter()
+                .map(|pair| ton::ton_node::pqblocksignature::PqBlockSignature {
+                    validator_id: pair.validator_id.clone(),
+                    algorithm_id: i32::from(pair.algorithm_id),
+                    signature: pair.signature.clone(),
+                })
+                .collect(),
+            session_id: self.session_id.clone(),
+            slot: self.slot as i32,
+            candidate: self.candidate.clone(),
+        }
+    }
+
+    pub fn to_lite(&self) -> Result<ton::lite_server::signature_set::signatureset::SimplexPq> {
+        if !self.is_final {
+            fail!("PQ approval cannot become a final-only LiteServer proof carrier");
+        }
+        Ok(ton::lite_server::signature_set::signatureset::SimplexPq {
+            cc_seqno: self.validator_info.catchain_seqno as i32,
+            validator_set_hash: self.validator_info.validator_list_hash_short as i32,
+            signatures: self
+                .signatures
+                .iter()
+                .map(|pair| ton::lite_server::pqsignature::PqSignature {
+                    validator_id: pair.validator_id.clone(),
+                    algorithm_id: i32::from(pair.algorithm_id),
+                    signature: pair.signature.clone(),
+                })
+                .collect(),
+            session_id: self.session_id.clone(),
+            slot: self.slot as i32,
+            candidate: WireProfile::T0.serialize(&self.candidate)?,
+        })
+    }
+
+    pub fn is_final(&self) -> bool {
+        self.is_final
+    }
+    pub fn validator_info(&self) -> &ValidatorBaseInfo {
+        &self.validator_info
+    }
+    pub fn block_id(&self) -> &BlockIdExt {
+        self.candidate.block()
+    }
+    pub fn session_id(&self) -> &UInt256 {
+        &self.session_id
+    }
+    pub fn slot(&self) -> u32 {
+        self.slot
+    }
+}
+
+#[derive(Debug)]
+enum VerifiedNetworkRole {
+    Final(BlockSignaturesSimplexPq, VerifiedPqSignatures),
+    Approval(PqApproval, VerifiedPqApproval),
+}
+
+/// Private association prevents pairing a verified token with different unverified fields.
+#[derive(Debug)]
+pub struct VerifiedPqNetworkSignatures {
+    evidence: VerifiedNetworkRole,
+}
+impl VerifiedPqNetworkSignatures {
+    pub fn is_final(&self) -> bool {
+        matches!(self.evidence, VerifiedNetworkRole::Final(..))
+    }
+    pub fn into_final(self) -> Result<(BlockSignaturesSimplexPq, VerifiedPqSignatures)> {
+        match self.evidence {
+            VerifiedNetworkRole::Final(carrier, verified) => Ok((carrier, verified)),
+            VerifiedNetworkRole::Approval(..) => fail!("PQ approval has no final proof authority"),
+        }
+    }
+    pub fn into_approval(self) -> Result<(PqApproval, VerifiedPqApproval)> {
+        match self.evidence {
+            VerifiedNetworkRole::Approval(carrier, verified) => Ok((carrier, verified)),
+            VerifiedNetworkRole::Final(..) => fail!("PQ final evidence is not a notarization"),
+        }
+    }
+}
+
+impl PqVerificationContext {
+    pub fn verify_network(
+        &self,
+        input: &PqNetworkSignatureSet,
+    ) -> Result<VerifiedPqNetworkSignatures> {
+        input.validate_structure()?;
+        let members: HashMap<_, _> = self
+            .validators
+            .iter()
+            .map(|member| Ok((member.validator_id()?, member)))
+            .collect::<Result<_>>()?;
+        let weights = input
+            .signatures
+            .iter()
+            .map(|pair| {
+                members
+                    .get(&pair.validator_id)
+                    .map(|member| member.weight)
+                    .ok_or_else(|| error!("PQ network signer is not in governing context"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let weight = checked_validator_weight_sum(weights)?;
+        // Weight comes only from this governing context, never from wire metadata.
+        let carrier = BlockSignaturesSimplexPq {
+            validator_info: input.validator_info.clone(),
+            sig_count: input.signatures.len() as u32,
+            sig_weight: weight,
+            signatures: input.signatures.clone(),
+            session_id: input.session_id.clone(),
+            slot: input.slot,
+            candidate_data: BlockSignaturesSimplex::bytes_to_cell_tree(
+                &WireProfile::T0.serialize(&input.candidate)?,
+            )?,
+        };
+        let evidence = if input.is_final {
+            let verified = self.verify_final(&carrier)?;
+            VerifiedNetworkRole::Final(carrier, verified)
+        } else {
+            let approval = PqApproval::from_notarization_fields(carrier)?;
+            let verified = self.verify_approval(&approval)?;
+            VerifiedNetworkRole::Approval(approval, verified)
+        };
+        Ok(VerifiedPqNetworkSignatures { evidence })
+    }
+}

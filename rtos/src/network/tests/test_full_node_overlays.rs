@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration; owned consumer readiness and authenticated finality recovery.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -437,7 +437,10 @@ fn test_block_broadcast_compression_v2_ordinary() {
     assert_eq!(proof.root_cell(), proof2.root_cell());
 
     // Verify signatures type is preserved
-    assert!(matches!(decompressed.signatures, BlockSignaturesVariant::Ordinary(_)));
+    assert!(matches!(
+        decompressed.signatures,
+        crate::network::NetworkSignatureSet::Classical(BlockSignaturesVariant::Ordinary(_))
+    ));
 
     // Verify validator info is preserved
     let decompressed_info = decompressed.signatures.validator_info();
@@ -482,7 +485,10 @@ fn test_block_broadcast_compression_v2_simplex() {
     assert_eq!(proof.root_cell(), proof2.root_cell());
 
     // Verify signatures type is preserved
-    assert!(matches!(decompressed.signatures, BlockSignaturesVariant::Simplex(_)));
+    assert!(matches!(
+        decompressed.signatures,
+        crate::network::NetworkSignatureSet::Classical(BlockSignaturesVariant::Simplex(_))
+    ));
 
     // Verify validator info is preserved
     let decompressed_info = decompressed.signatures.validator_info();
@@ -490,7 +496,10 @@ fn test_block_broadcast_compression_v2_simplex() {
     assert_eq!(decompressed_info.validator_list_hash_short, validator_set_hash);
 
     // Verify simplex-specific fields
-    if let BlockSignaturesVariant::Simplex(ref simplex) = decompressed.signatures {
+    if let crate::network::NetworkSignatureSet::Classical(BlockSignaturesVariant::Simplex(
+        ref simplex,
+    )) = decompressed.signatures
+    {
         assert_eq!(simplex.slot, 42);
         assert!(simplex.is_final);
     } else {

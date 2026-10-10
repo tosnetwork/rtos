@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project naming and authenticated Plumtree transport dispatch; explicit target wire profile integration.
+ * RTOS project modifications (2026-10-10): project naming and authenticated Plumtree transport dispatch; explicit target wire profile integration; owned consumer readiness and authenticated finality recovery.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -93,6 +93,27 @@ use broadcast::{
     OwnedBroadcast,
 };
 pub use broadcast::{BroadcastRecvInfo, BroadcastSendInfo};
+
+/// Owned readiness lease for one concrete overlay generation. Dropping it
+/// closes bounded broadcast admission; recreating an overlay creates a new queue.
+pub struct BroadcastSubscription {
+    receiver: Arc<AsyncReceiver<BroadcastRecvInfo>>,
+    overlay_id: Arc<OverlayShortId>,
+}
+impl BroadcastSubscription {
+    pub fn overlay_id(&self) -> &Arc<OverlayShortId> {
+        &self.overlay_id
+    }
+    pub async fn recv(&mut self) -> Result<Option<BroadcastRecvInfo>> {
+        self.receiver.pop_subscribed().await
+    }
+}
+impl Drop for BroadcastSubscription {
+    fn drop(&mut self) {
+        self.receiver.release_subscription();
+    }
+}
+
 pub use plumtree::PlumtreeConfig;
 
 const TARGET: &str = "overlay";
@@ -2065,6 +2086,21 @@ impl OverlayNode {
         Ok(())
     }
 
+    pub fn subscribe_broadcast(
+        &self,
+        overlay_id: &Arc<OverlayShortId>,
+    ) -> Result<BroadcastSubscription> {
+        let overlay = self.get_overlay(overlay_id, "Subscribing to unknown overlay")?;
+        if overlay.flags & Overlay::FLAG_OVERLAY_OTHER_WORKCHAIN != 0 {
+            fail!("Cannot subscribe to an inactive workchain overlay");
+        }
+        overlay.received_rawbytes.subscribe()?;
+        Ok(BroadcastSubscription {
+            receiver: overlay.received_rawbytes.clone(),
+            overlay_id: overlay_id.clone(),
+        })
+    }
+
     /// Wait for broadcast
     pub async fn wait_for_broadcast(
         &self,
@@ -3091,6 +3127,9 @@ impl OverlayNode {
         let overlay = self.get_overlay(overlay_id, "Configuring Plumtree on unknown overlay")?;
         if overlay.flags & Overlay::FLAG_OVERLAY_OTHER_WORKCHAIN != 0 {
             fail!("Plumtree cannot be enabled for an inactive workchain");
+        }
+        if !overlay.received_rawbytes.has_subscription() {
+            fail!("Plumtree requires an owned broadcast consumer subscription before activation");
         }
         let quic = self
             .quic
