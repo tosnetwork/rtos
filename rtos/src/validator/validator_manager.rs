@@ -1292,6 +1292,19 @@ impl ValidatorManagerImpl {
         self.check_lifecycle_errors()
     }
 
+    fn report_teardown_failure(&self, error: String) {
+        let drained = self.current_sessions.is_empty()
+            && self.future_sessions.is_empty()
+            && self.block_sync_observers.is_empty()
+            && self.background_tasks.is_empty()
+            && self.retiring_observers.iter().all(|observer| observer.teardown_drained())
+            && self.retiring_groups.iter().all(|(_, group, _)| group.teardown_drained());
+        self.engine.report_service_failure(
+            if drained { Engine::MASK_SERVICE_VALIDATOR_MANAGER } else { 0 },
+            error,
+        );
+    }
+
     fn check_lifecycle_errors(&self) -> Result<()> {
         if !self.lifecycle_errors.is_empty() {
             let mut errors: Vec<_> = self.lifecycle_errors.iter().cloned().collect();
@@ -2964,12 +2977,28 @@ fn spawn_validator_manager(
             }
             let mut manager =
                 ValidatorManagerImpl::create(engine.clone(), runtime.clone(), config.clone());
-            let res = manager.invoke().await;
-            if let Err(e) = manager.stop_validation().await {
+            let res = match std::panic::AssertUnwindSafe(manager.invoke()).catch_unwind().await {
+                Ok(result) => result,
+                Err(_) => {
+                    manager.lifecycle_errors.insert("validator manager invocation panicked".to_owned());
+                    Err(error!("validator manager invocation panicked"))
+                }
+            };
+            let teardown = std::panic::AssertUnwindSafe(manager.stop_validation()).catch_unwind().await;
+            let teardown = match teardown {
+                Ok(result) => result,
+                Err(_) => {
+                    // A panic inside drain leaves ownership uncertified. Request
+                    // global failure without exempting the manager's live bit.
+                    engine.report_service_failure(0, "validator manager teardown panicked before certifying drain".to_owned());
+                    return;
+                }
+            };
+            if let Err(e) = teardown {
                 // No replacement manager and no successful service-stop signal
                 // when teardown could not certify termination.
                 log::error!(target: "validator_manager", "FATAL: validator teardown failed; restart refused: {e}");
-                engine.report_service_failure(Engine::MASK_SERVICE_VALIDATOR_MANAGER, e.to_string());
+                manager.report_teardown_failure(e.to_string());
                 return;
             }
             let Err(e) = res else { break };
