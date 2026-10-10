@@ -424,7 +424,7 @@ fn build_lifecycle_ctx(
     let our_idx = validator_set
         .list()
         .iter()
-        .position(|d| d.compute_node_id_short().as_slice() == local_id.data());
+        .position(|d| d.compute_node_id_short().is_ok_and(|id| id.as_slice() == local_id.data()));
     let our_idx = match our_idx {
         Some(i) => i as u32,
         None => {
@@ -633,8 +633,8 @@ impl ValidatorGroupImpl {
                     .enumerate()
                     .map(|(i, d)| simplex::LifecycleValidator {
                         idx: i as u32,
-                        pubkey: hex::encode(d.public_key.key_bytes()),
-                        adnl: Some(hex::encode(get_adnl_id(d).data())),
+                        pubkey: hex::encode(d.consensus_public_key_bytes()),
+                        adnl: get_adnl_id(d).ok().map(|id| hex::encode(id.data())),
                         weight: d.weight.to_string(),
                     })
                     .collect();

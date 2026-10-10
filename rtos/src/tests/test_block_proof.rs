@@ -90,7 +90,7 @@ fn test_proof_signature_quorum_weighted_boundary() {
         let mut weight = 0;
         for i in signers {
             signatures.add_sigpair(CryptoSignaturePair {
-                node_id_short: subset.validators[i].compute_node_id_short(),
+                node_id_short: subset.validators[i].compute_node_id_short().unwrap(),
                 sign: CryptoSignature::from_bytes(&keys[i].sign(&data).unwrap()).unwrap(),
             });
             weight += subset.validators[i].weight;

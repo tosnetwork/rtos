@@ -26,3 +26,11 @@ Copyright 2026 TOS Blockchain Teams, LGPL-2.0-or-later. The license text is in
 [LICENSES/LGPL-2.0.txt](LICENSES/LGPL-2.0.txt). RTOS adjusts the fixture location
 for independent workspace builds. Detailed import provenance is maintained in
 [memo](https://github.com/tosnetwork/memo/blob/main/rtos/source-imports.json).
+
+`block/src/validators.rs` and `block/src/tests/test_validators.rs` merge descriptor,
+identity, subset commitment and reference-test changes from the same fixed source
+commit. Their GPLv3 headers and EverX/RSquad copyright notices are retained.
+The `validator-descr-*` and `validator-set-*` files in `block/tests/data` are
+unmodified public reference fixtures from its `test/pq-native` directory, covered
+by that repository's GPLv3 license. File digests and merge details are recorded
+in the memo import manifest linked above.

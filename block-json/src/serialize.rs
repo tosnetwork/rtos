@@ -950,7 +950,18 @@ fn serialize_validators_set(
     let mut vector = Vec::<Value>::new();
     for v in set.list() {
         let mut map = Map::new();
-        serialize_field(&mut map, "public_key", hex::encode(v.public_key.as_slice()));
+        match &v.key {
+            rtos_block::ValidatorKey::Ed25519(key) => {
+                serialize_field(&mut map, "public_key", hex::encode(key.as_slice()));
+            }
+            rtos_block::ValidatorKey::Pq(key) => {
+                serialize_field(&mut map, "key_type", "pq");
+                serialize_uint256(&mut map, "validator_id", &v.validator_id()?);
+                serialize_field(&mut map, "algorithm_id", key.algorithm_id);
+                serialize_uint256(&mut map, "key_id", &key.key_id);
+                serialize_field(&mut map, "public_key", hex::encode(&key.public_key));
+            }
+        }
         serialize_u64(&mut map, "weight", &v.weight, mode);
         serialize_id(&mut map, "adnl_addr", v.adnl_addr.as_ref());
         vector.push(map.into());

@@ -95,8 +95,9 @@ fn do_test_get_validator_set_id(contents: &str) {
     let p = ValidatorParams::parse(&parser);
 
     let serialized =
-        get_session_id_serialize(p.general_session_info.clone(), p.val_set.list(), true);
-    let computed_id = get_session_id(p.general_session_info.clone(), p.val_set.list(), true, false);
+        get_session_id_serialize(p.general_session_info.clone(), p.val_set.list(), true).unwrap();
+    let computed_id =
+        get_session_id(p.general_session_info.clone(), p.val_set.list(), true, false).unwrap();
     let actual_id = UInt256::from_slice(&parser.parse_slice("group_id"));
 
     println!("Serialized: {}", hex::encode(&serialized));
@@ -128,7 +129,8 @@ fn do_test_catchain_unsafe_rotate(s: &str) {
         .insert(p.general_session_info.catchain_seqno, (prev_block, rotation_id));
 
     //let session_id = get_session_id(&p.shard, &p.val_set, &p.opts_hash, p.key_seqno, true, 0);
-    let session_id = get_session_id(p.general_session_info.clone(), p.val_set.list(), true, false);
+    let session_id =
+        get_session_id(p.general_session_info.clone(), p.val_set.list(), true, false).unwrap();
     let unsafe_serialized = compute_session_unsafe_serialized(&session_id, rotation_id);
     let actual_serialized = parser.parse_slice("unsafe_serialized");
 
@@ -140,7 +142,8 @@ fn do_test_catchain_unsafe_rotate(s: &str) {
         Some(prev_block),
         &config,
         false,
-    );
+    )
+    .unwrap();
     let real_unsafe_id = UInt256::from_slice(&parser.parse_slice("unsafe_id"));
 
     println!("Actual unsafe-id: {:x}", real_unsafe_id);
@@ -566,7 +569,7 @@ fn test_session_id_new_catchain_ids_true_succeeds() {
     let key = make_test_key();
     let val = make_validator_descr_from_key(&key);
 
-    let result = get_session_id_serialize(session_info, &[val], true);
+    let result = get_session_id_serialize(session_info, &[val], true).unwrap();
     assert!(!result.is_empty());
 }
 
@@ -584,7 +587,7 @@ fn test_session_id_new_catchain_ids_false_panics() {
     let val = make_validator_descr_from_key(&key);
 
     // This should panic with the assert message
-    let _ = get_session_id_serialize(session_info, &[val], false);
+    let _ = get_session_id_serialize(session_info, &[val], false).unwrap();
 }
 
 #[test]
@@ -599,8 +602,8 @@ fn test_session_id_with_accelerated_consensus() {
     let key = make_test_key();
     let val = make_validator_descr_from_key(&key);
 
-    let id_without = get_session_id(session_info.clone(), &[val.clone()], true, false);
-    let id_with = get_session_id(session_info, &[val], true, true);
+    let id_without = get_session_id(session_info.clone(), &[val.clone()], true, false).unwrap();
+    let id_with = get_session_id(session_info, &[val], true, true).unwrap();
 
     // Accelerated consensus tag changes the session ID
     assert_ne!(id_without, id_with);
@@ -669,7 +672,7 @@ fn test_get_session_unsafe_id_skips_patch_when_flag_false() {
     let mut config = ValidatorManagerConfig::default();
     config.unsafe_catchain_rotates.insert(42, (1, 99));
 
-    let plain_id = get_session_id(session_info.clone(), &[val.clone()], true, false);
+    let plain_id = get_session_id(session_info.clone(), &[val.clone()], true, false).unwrap();
 
     let id_with_flag_false = get_session_unsafe_id(
         session_info.clone(),
@@ -679,11 +682,12 @@ fn test_get_session_unsafe_id_skips_patch_when_flag_false() {
         Some(100),
         &config,
         false,
-    );
+    )
+    .unwrap();
     assert_eq!(id_with_flag_false, plain_id, "flag=false must return the plain session ID");
 
     let id_with_flag_true =
-        get_session_unsafe_id(session_info, &[val], true, true, Some(100), &config, false);
+        get_session_unsafe_id(session_info, &[val], true, true, Some(100), &config, false).unwrap();
     assert_ne!(id_with_flag_true, plain_id, "flag=true must apply the unsafe rotation patch");
 }
 

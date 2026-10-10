@@ -1726,7 +1726,7 @@ impl ElectionRunner {
             let pubkey = validator_entry.as_ref().map(|(_, entry, ..)| {
                 base64::Engine::encode(
                     &base64::engine::general_purpose::STANDARD,
-                    entry.public_key.as_bytes(),
+                    entry.consensus_public_key_bytes(),
                 )
             });
             let adnl = validator_entry
@@ -1757,7 +1757,7 @@ impl ElectionRunner {
                     .unwrap_or((None, None, None, None));
             let stake = validator_entry.as_ref().and_then(|(_, vd, ..)| {
                 let mut pubkey = [0u8; 32];
-                pubkey.copy_from_slice(vd.public_key.as_slice());
+                pubkey.copy_from_slice(vd.public_key().ok()?.as_slice());
                 self.past_elections
                     .iter()
                     .find_map(|pe| pe.frozen_map.get(&pubkey))
@@ -2090,8 +2090,10 @@ async fn find_validator_entries(
 
         if current_entry.is_none()
             && let Some(vset) = current_vset
-            && let Some(idx) =
-                vset.list().iter().position(|item| item.public_key.as_slice() == &key)
+            && let Some(idx) = vset
+                .list()
+                .iter()
+                .position(|item| item.public_key().is_ok_and(|pk| pk.as_slice() == &key))
         {
             current_entry =
                 Some((u16::try_from(idx)?, vset.list()[idx].clone(), *election_id, entry.clone()));
@@ -2099,7 +2101,10 @@ async fn find_validator_entries(
 
         if !is_in_next
             && let Some(vset) = next_vset
-            && vset.list().iter().any(|item| item.public_key.as_slice() == &key)
+            && vset
+                .list()
+                .iter()
+                .any(|item| item.public_key().is_ok_and(|pk| pk.as_slice() == &key))
         {
             is_in_next = true;
         }

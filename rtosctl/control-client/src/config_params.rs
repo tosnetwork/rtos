@@ -8,11 +8,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use anyhow::Context;
-use rtos_block::{
-    Coins, ConfigParam15, ConfigParam16, ConfigParam17, SigPubKey, UInt256, ValidatorDescr,
-    ValidatorSet,
-};
-use std::str::FromStr;
+use rtos_block::{Coins, ConfigParam15, ConfigParam16, ConfigParam17, ValidatorSet};
 
 pub fn parse_config_param_15(bytes: &[u8]) -> anyhow::Result<ConfigParam15> {
     let param: serde_json::Value =
@@ -49,64 +45,21 @@ pub fn parse_config_param_36(bytes: &[u8]) -> anyhow::Result<ValidatorSet> {
 }
 
 fn parse_validator_set(bytes: &[u8], key: &str) -> anyhow::Result<ValidatorSet> {
-    let param: serde_json::Value = serde_json::from_slice(bytes)?;
-    let map = param
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("invalid config param"))?
-        .get(key)
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| anyhow::anyhow!("{} entry not found", key))?;
-    let utime_since = map
-        .get("utime_since")
-        .and_then(|value| value.as_u64())
-        .map(|v| v as u32)
-        .ok_or_else(|| anyhow::anyhow!("utime_since"))?;
-    let utime_until = map
-        .get("utime_until")
-        .and_then(|value| value.as_u64())
-        .map(|v| v as u32)
-        .ok_or_else(|| anyhow::anyhow!("utime_until"))?;
-    let _ = map
-        .get("total")
-        .and_then(|value| value.as_u64())
-        .map(|v| v as u16)
-        .ok_or_else(|| anyhow::anyhow!("total"))?;
-    let main = map
-        .get("main")
-        .and_then(|value| value.as_u64())
-        .map(|v| v as u16)
-        .ok_or_else(|| anyhow::anyhow!("main"))?;
-    let json_list = map
-        .get("list")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| anyhow::anyhow!("list"))?;
-    let mut list = vec![];
-    for entry in json_list {
-        let map = entry.as_object().ok_or_else(|| anyhow::anyhow!("invalid list entry"))?;
-        let pubkey = map
-            .get("public_key")
-            .and_then(|v| v.as_str())
-            .map(hex::decode)
-            .transpose()?
-            .ok_or(anyhow::anyhow!("public_key"))?;
-        let weight = map
-            .get("weight_dec")
-            .and_then(|v| v.as_str())
-            .and_then(|v| v.parse::<u64>().ok())
-            .ok_or(anyhow::anyhow!("weight"))?;
-        let adnl_addr =
-            map.get("adnl_addr").and_then(|v| v.as_str()).map(UInt256::from_str).transpose()?;
-        let descr = ValidatorDescr {
-            public_key: SigPubKey::from_bytes(&pubkey)
-                .map_err(|_| anyhow::anyhow!("public key is invalid"))?,
-            weight,
-            adnl_addr,
-            mc_seq_no_since: 0,
-            prev_weight_sum: 0,
-        };
-        list.push(descr);
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let map = value.as_object().ok_or_else(|| anyhow::anyhow!("invalid config param"))?;
+    let index = match key {
+        "p32" => 32,
+        "p34" => 34,
+        "p36" => 36,
+        _ => anyhow::bail!("unsupported validator set parameter {key}"),
+    };
+    let config = rtos_block_json::parse_config_with_mandatory_params(map, &[index])?;
+    match config.config(index)? {
+        Some(rtos_block::ConfigParamEnum::ConfigParam32(param)) => Ok(param.prev_validators),
+        Some(rtos_block::ConfigParamEnum::ConfigParam34(param)) => Ok(param.cur_validators),
+        Some(rtos_block::ConfigParamEnum::ConfigParam36(param)) => Ok(param.next_validators),
+        _ => anyhow::bail!("validator set parameter {key} is missing"),
     }
-    ValidatorSet::new(utime_since, utime_until, main, list)
 }
 
 pub fn parse_config_param_16(bytes: &[u8]) -> anyhow::Result<ConfigParam16> {
@@ -166,4 +119,43 @@ pub fn parse_config_param_17(bytes: &[u8]) -> anyhow::Result<ConfigParam17> {
             .ok_or_else(|| anyhow::anyhow!("max_stake_factor not found"))? as u32;
 
     Ok(ConfigParam17 { min_stake, max_stake, min_total_stake, max_stake_factor })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtos_block::{MLDSA44_PUBLIC_KEY_BYTES, UInt256, derive_consensus_key_id};
+
+    #[test]
+    fn validator_set_json_preserves_pq_and_classical_addresses() {
+        let key = vec![7; MLDSA44_PUBLIC_KEY_BYTES];
+        let members = serde_json::json!([
+            {"public_key": "03".repeat(32), "weight_dec": "1", "adnl_addr": "04".repeat(32)},
+            {"key_type": "pq", "algorithm_id": 1, "public_key": hex::encode(&key),
+             "key_id": format!("{:x}", derive_consensus_key_id(1, &key)),
+             "validator_id": "01".repeat(32), "adnl_addr": "02".repeat(32), "weight_dec": "3"}
+        ]);
+        for index in [34, 36] {
+            let field = format!("p{index}");
+            let mut json = serde_json::json!({field.clone(): {
+                "utime_since": 1, "utime_until": 100, "total": 2, "main": 1,
+                "total_weight_dec": "4", "list": members.clone()
+            }});
+            let parse = |value: &serde_json::Value| {
+                let bytes = serde_json::to_vec(value).unwrap();
+                if index == 34 {
+                    parse_config_param_34(&bytes)
+                } else {
+                    parse_config_param_36(&bytes)
+                }
+            };
+            let set = parse(&json).unwrap();
+            assert_eq!(set.total_weight(), 4);
+            assert_eq!(set.list()[0].adnl_addr, Some(UInt256::from([4; 32])));
+            assert_eq!(set.list()[1].validator_id().unwrap(), UInt256::from([1; 32]));
+            assert_eq!(set.list()[1].pq_key().unwrap().public_key, key);
+            json[&field]["list"][1]["key_id"] = serde_json::json!("05".repeat(32));
+            assert!(parse(&json).is_err());
+        }
+    }
 }

@@ -56,8 +56,8 @@ impl FastSyncOverlayClient {
         let mut root_adnl_ids = Vec::with_capacity(validators.len());
         let mut root_public_keys = Vec::with_capacity(validators.len());
         for vd in validators {
-            root_adnl_ids.push(vd.adnl_addr().clone());
-            root_public_keys.push(vd.public_key.pub_key().id().clone());
+            root_adnl_ids.push(vd.adnl_addr()?);
+            root_public_keys.push(vd.public_key()?.pub_key().id().clone());
         }
         let id = rtos_api::ton::ton_node::fastsyncoverlayid::FastSyncOverlayId {
             zero_state_file_hash: engine.zerostate_id()?.file_hash().clone(),

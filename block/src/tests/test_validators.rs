@@ -83,7 +83,7 @@ fn test_validator_set_serialize() {
     write_read_and_assert(vset);
 }
 
-fn check_block_proof(key_block_file_name: &str, proof_file_name: &str) {
+fn check_legacy_subset_fixture(key_block_file_name: &str, proof_file_name: &str) {
     let key_block = Block::construct_from_file(key_block_file_name).unwrap();
     let proof = BlockProof::construct_from_file(proof_file_name).unwrap();
 
@@ -120,10 +120,31 @@ fn check_block_proof(key_block_file_name: &str, proof_file_name: &str) {
         )
         .unwrap();
 
+    // These upstream proofs fix the historical selection/order and signatures.
+    // Reproduce their old hash only in this fixture test: production uses V2,
+    // whose exact bytes and checksum have separate fixed reference vectors below.
+    let cc_seqno = proof
+        .signatures
+        .as_ref()
+        .map(|s| s.validator_info().catchain_seqno)
+        .unwrap_or_else(|| virt_info.gen_catchain_seqno());
+    let mut legacy = Crc32::new();
+    legacy.update(0x901660edu32.to_le_bytes());
+    legacy.update(cc_seqno.to_le_bytes());
+    legacy.update((validators.len() as u32).to_le_bytes());
+    for member in &validators {
+        legacy.update(member.public_key().unwrap().as_slice());
+        legacy.update(member.weight.to_le_bytes());
+        legacy.update(member.adnl_addr.clone().unwrap_or_default().as_slice());
+    }
+    let legacy_hash = legacy.finalize();
+    assert_ne!(hash_short, legacy_hash, "target V2 must not accept the legacy hash");
+    assert_eq!(hash_short, ValidatorSet::calc_subset_hash_short(&validators, cc_seqno).unwrap());
+
     if let Some(signatures) = proof.signatures.as_ref() {
         assert_eq!(signatures.validator_info().catchain_seqno, virt_info.gen_catchain_seqno());
 
-        assert_eq!(signatures.validator_info().validator_list_hash_short, hash_short);
+        assert_eq!(signatures.validator_info().validator_list_hash_short, legacy_hash);
 
         let pure_signatures = signatures.pure_signatures();
 
@@ -132,13 +153,13 @@ fn check_block_proof(key_block_file_name: &str, proof_file_name: &str) {
         let weight = pure_signatures.check_signatures(&validators, &data).unwrap();
         assert_eq!(weight, pure_signatures.weight());
     } else {
-        assert_eq!(virt_info.gen_validator_list_hash_short(), hash_short);
+        assert_eq!(virt_info.gen_validator_list_hash_short(), legacy_hash);
     }
 }
 
 #[test]
 fn test_calc_mc_subset() {
-    check_block_proof(
+    check_legacy_subset_fixture(
         "src/tests/data/test_calc_subset/key_block__no_shuffle",
         "src/tests/data/test_calc_subset/proof__no_shuffle",
     );
@@ -146,7 +167,7 @@ fn test_calc_mc_subset() {
 
 #[test]
 fn test_calc_mc_subset_shuffle() {
-    check_block_proof(
+    check_legacy_subset_fixture(
         "src/tests/data/test_calc_subset/key_block__shuffle",
         "src/tests/data/test_calc_subset/proof__shuffle",
     );
@@ -154,7 +175,7 @@ fn test_calc_mc_subset_shuffle() {
 
 #[test]
 fn test_calc_shard_subset() {
-    check_block_proof(
+    check_legacy_subset_fixture(
         "src/tests/data/test_calc_shard_subset/key_block",
         "src/tests/data/test_calc_shard_subset/proof_4377252",
     );
@@ -209,7 +230,7 @@ fn test_isolate_mc_validators() {
 
         for sv in shard_validators.iter() {
             for mv in main_validators.iter() {
-                assert_ne!(sv.public_key, mv.public_key)
+                assert_ne!(sv.validator_id().unwrap(), mv.validator_id().unwrap())
             }
         }
     }
@@ -247,5 +268,334 @@ fn test_validator_set_weight_admission() {
         b.append_u64(weights[0].wrapping_add(weights[1])).unwrap();
         map.write_to(&mut b).unwrap();
         assert!(ValidatorSet::construct_from_cell(b.into_cell().unwrap()).is_err());
+    }
+}
+
+// The accepted ValidatorDescr constructor set is shared with the C++ side through
+// test/pq-native/validator-descr-tags.tsv. One implementation accepting a tag the
+// other rejects is a consensus split, so both read the same file.
+//
+// Each rejected tag is given a body that is well formed for the 0x73 shape, so the
+// tag is the only possible reason for refusal; otherwise the test would pass for
+// the wrong reason.
+#[test]
+fn accepted_descriptor_tags_match_the_shared_set() {
+    fn descriptor_bytes(tag: u8) -> SliceData {
+        let mut b = BuilderData::new();
+        b.append_u8(tag).unwrap();
+        if tag == 0xb3 {
+            // the post-quantum shape
+            UInt256::from([1u8; 32]).write_to(&mut b).unwrap();
+            b.append_bits(1, 16).unwrap();
+            UInt256::from([2u8; 32]).write_to(&mut b).unwrap();
+            b.checked_append_reference(pack_pq_bytes(&vec![3u8; 1312], PQ_BYTES_HARD_MAX).unwrap())
+                .unwrap();
+            1234u64.write_to(&mut b).unwrap();
+            UInt256::from([9u8; 32]).write_to(&mut b).unwrap();
+        } else {
+            // the classical shape; 0x53 carries no adnl_addr
+            SigPubKey::from_bytes(&[7u8; 32]).unwrap().write_to(&mut b).unwrap();
+            1234u64.write_to(&mut b).unwrap();
+            if tag != 0x53 {
+                UInt256::from([9u8; 32]).write_to(&mut b).unwrap();
+            }
+        }
+        SliceData::load_builder(b).unwrap()
+    }
+
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/validator-descr-tags.tsv");
+    let text = std::fs::read_to_string(path).expect("shared descriptor tag set");
+    let mut checked = 0;
+    for line in text.lines() {
+        if line.trim_start().starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let mut f = line.split('\t');
+        let tag = u8::from_str_radix(f.next().expect("tag"), 16).expect("hex tag");
+        let verdict = f.next().expect("verdict");
+
+        let mut cs = descriptor_bytes(tag);
+        let parsed = ValidatorDescr::construct_from(&mut cs);
+        match verdict {
+            "accept" => assert!(parsed.is_ok(), "tag 0x{:02x} must be accepted", tag),
+            "reject" => assert!(parsed.is_err(), "tag 0x{:02x} must be rejected", tag),
+            other => panic!("unknown verdict {other}"),
+        }
+        checked += 1;
+    }
+    assert!(checked >= 6, "expected the full shared tag set, saw {checked}");
+
+    // The writer must never produce a tag outside the accepted set.
+    for adnl in [None, Some(UInt256::from([9u8; 32]))] {
+        let d = ValidatorDescr::with_params(SigPubKey::from_bytes(&[7u8; 32]).unwrap(), 1, adnl);
+        let mut b = BuilderData::new();
+        d.write_to(&mut b).unwrap();
+        let emitted = SliceData::load_builder(b).unwrap().get_next_byte().unwrap();
+        assert!(emitted == 0x53 || emitted == 0x73, "writer emitted 0x{emitted:02x}");
+    }
+}
+
+fn sample_validator_id() -> UInt256 {
+    UInt256::from([1u8; 32])
+}
+
+fn sample_pq_key() -> PqConsensusKey {
+    PqConsensusKey {
+        algorithm_id: 1,
+        key_id: UInt256::from([2u8; 32]),
+        public_key: vec![3u8; 1312],
+    }
+}
+
+// A post-quantum descriptor survives a full encode/decode cycle with every field
+// intact, including the 1312-byte key that has to travel through the bounded-bytes
+// cell encoding because it cannot fit inline.
+#[test]
+fn pq_descriptor_round_trip() {
+    let descr = ValidatorDescr::with_pq_params(
+        sample_validator_id(),
+        sample_pq_key(),
+        4242,
+        UInt256::from([9u8; 32]),
+    );
+
+    let mut b = BuilderData::new();
+    descr.write_to(&mut b).unwrap();
+    let mut cs = SliceData::load_builder(b).unwrap();
+    let back = ValidatorDescr::construct_from(&mut cs).unwrap();
+
+    assert_eq!(back, descr);
+    let key = back.pq_key().expect("post-quantum key");
+    assert_eq!(back.validator_id().unwrap(), sample_validator_id());
+    assert_eq!(key.algorithm_id, 1);
+    assert_eq!(key.key_id, UInt256::from([2u8; 32]));
+    assert_eq!(key.public_key.len(), 1312);
+    assert_eq!(back.weight, 4242);
+    assert_eq!(back.adnl_addr, Some(UInt256::from([9u8; 32])));
+
+    // The classical accessor refuses rather than inventing an Ed25519 key.
+    assert!(back.public_key().is_err());
+
+    // A post-quantum descriptor without an explicit ADNL address cannot be written,
+    // because an ADNL identity is never derived from a consensus key.
+    let no_adnl =
+        ValidatorDescr::with_key(sample_validator_id(), ValidatorKey::Pq(sample_pq_key()), 1, None);
+    assert!(no_adnl.write_to(&mut BuilderData::new()).is_err());
+
+    // The writer emits the frozen tag.
+    let mut b = BuilderData::new();
+    descr.write_to(&mut b).unwrap();
+    assert_eq!(SliceData::load_builder(b).unwrap().get_next_byte().unwrap(), 0xb3);
+}
+
+// The post-quantum descriptor bytes are produced authoritatively by the C++ side and
+// recorded in test/pq-native/validator-descr-vectors.txt. Rust must decode each one to
+// the same fields and re-encode to the identical cell, so neither implementation can
+// change the wire format without the other noticing.
+#[test]
+fn pq_descriptor_matches_shared_cpp_vectors() {
+    use crate::read_single_root_boc;
+
+    fn u256(hex_str: &str) -> UInt256 {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&hex::decode(hex_str).unwrap());
+        UInt256::from(a)
+    }
+
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/validator-descr-vectors.txt");
+    let text = std::fs::read_to_string(path).expect("shared descriptor vectors");
+    let mut checked = 0;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split(' ').collect();
+        assert_eq!(f.len(), 8, "bad vector line");
+        let (vid, alg) = (u256(f[0]), f[1].parse::<u16>().unwrap());
+        let (kid, public_key) = (u256(f[2]), hex::decode(f[3]).unwrap());
+        let (weight, adnl) = (f[4].parse::<u64>().unwrap(), u256(f[5]));
+        let (root_hex, boc) = (f[6], hex::decode(f[7]).unwrap());
+
+        // The C++-produced cell decodes to exactly the recorded fields.
+        let cell = read_single_root_boc(&boc).unwrap();
+        assert_eq!(cell.repr_hash().as_hex_string(), root_hex);
+        let mut cs = SliceData::load_cell_ref(&cell).unwrap();
+        let descr = ValidatorDescr::construct_from(&mut cs).unwrap();
+        let key = descr.pq_key().expect("post-quantum key");
+        assert_eq!(descr.validator_id().unwrap(), vid);
+        assert_eq!(key.algorithm_id, alg);
+        assert_eq!(key.key_id, kid);
+        assert_eq!(key.public_key, public_key);
+        assert_eq!(descr.weight, weight);
+        assert_eq!(descr.adnl_addr, Some(adnl));
+
+        // Re-encoding the same fields in Rust yields the identical cell.
+        let mut b = BuilderData::new();
+        descr.write_to(&mut b).unwrap();
+        assert_eq!(b.into_cell().unwrap().repr_hash().as_hex_string(), root_hex);
+        checked += 1;
+    }
+    assert!(checked >= 3, "expected the full vector set, saw {checked}");
+}
+
+// The version 2 validator-set commitment is produced authoritatively by the C++ side
+// and recorded in test/pq-native/validator-set-hash-vectors.txt. Rust rebuilds the same
+// descriptors and must produce the identical preimage bytes and the identical hash, so
+// the two implementations of one consensus preimage cannot drift apart.
+#[test]
+fn validator_set_hash_matches_shared_cpp_vectors() {
+    fn u256(hex_str: &str) -> UInt256 {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&hex::decode(hex_str).unwrap());
+        UInt256::from(a)
+    }
+
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/validator-set-hash-vectors.txt");
+    let text = std::fs::read_to_string(path).expect("shared validator-set hash vectors");
+    let mut by_name = std::collections::HashMap::new();
+    let mut checked = 0;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split(' ').collect();
+        assert_eq!(f.len(), 5, "bad vector line");
+        let (name, cc_seqno) = (f[0], f[1].parse::<u32>().unwrap());
+        let (preimage, hash) = (hex::decode(f[3]).unwrap(), u32::from_str_radix(f[4], 16).unwrap());
+
+        // The commitment only depends on the two identities, the weight and the ADNL
+        // address, so the key material here is a placeholder and must not affect it.
+        let subset: Vec<ValidatorDescr> = f[2]
+            .split(';')
+            .map(|entry| {
+                let p: Vec<&str> = entry.split(':').collect();
+                assert_eq!(p.len(), 4);
+                ValidatorDescr::with_pq_params(
+                    u256(p[0]),
+                    PqConsensusKey {
+                        algorithm_id: 1,
+                        key_id: u256(p[1]),
+                        public_key: vec![1u8; 1312],
+                    },
+                    p[2].parse::<u64>().unwrap(),
+                    u256(p[3]),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            ValidatorSet::hash_preimage(&subset, cc_seqno).unwrap(),
+            preimage,
+            "preimage mismatch for {name}"
+        );
+        assert_eq!(
+            ValidatorSet::calc_subset_hash_short(&subset, cc_seqno).unwrap(),
+            hash,
+            "hash mismatch for {name}"
+        );
+        by_name.insert(name.to_string(), hash);
+        checked += 1;
+    }
+    assert!(checked >= 5, "expected the full vector set, saw {checked}");
+
+    // The property the whole split exists for: holding the membership identity fixed and
+    // rotating only the key identity has to move the commitment.
+    assert_ne!(by_name["single"], by_name["rotated"]);
+}
+
+// The verdicts on a malformed validator set are shared with the C++ side through
+// test/pq-native/validator-set-cases.txt. Both read these exact encoded sets: one
+// implementation accepting a set the other refuses is a split, and for consensus state
+// that has to be caught here rather than in production.
+#[test]
+fn validator_set_verdicts_match_cpp() {
+    use crate::read_single_root_boc;
+
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/validator-set-cases.txt");
+    let text = std::fs::read_to_string(path).expect("shared validator-set cases");
+    let mut checked = 0;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split(' ').collect();
+        assert_eq!(f.len(), 3, "bad case line");
+        let (name, verdict) = (f[0], f[1]);
+        let cell = read_single_root_boc(&hex::decode(f[2]).unwrap()).unwrap();
+
+        let accepted = SliceData::load_cell_ref(&cell)
+            .and_then(|mut cs| ValidatorSet::construct_from(&mut cs))
+            .is_ok();
+        assert_eq!(accepted, verdict == "accept", "verdict for {name}");
+        checked += 1;
+    }
+    assert!(checked >= 14, "expected the full case set, saw {checked}");
+}
+
+#[test]
+fn pq_identity_rotation_and_admission() {
+    let make = |seed: u8| {
+        let public_key = vec![seed; MLDSA44_PUBLIC_KEY_BYTES];
+        ValidatorDescr::with_pq_params(
+            UInt256::from([1; 32]),
+            PqConsensusKey {
+                algorithm_id: MLDSA44_ALGORITHM_ID,
+                key_id: derive_consensus_key_id(MLDSA44_ALGORITHM_ID, &public_key),
+                public_key,
+            },
+            1,
+            UInt256::from([2; 32]),
+        )
+    };
+    let first = make(3);
+    let rotated = make(4);
+    first.validate_consensus().unwrap();
+    rotated.validate_consensus().unwrap();
+    assert_eq!(first.validator_id().unwrap(), rotated.validator_id().unwrap());
+    assert_ne!(first.consensus_key_id().unwrap(), rotated.consensus_key_id().unwrap());
+    assert_ne!(
+        ValidatorSet::calc_subset_hash_short(&[first.clone()], 7).unwrap(),
+        ValidatorSet::calc_subset_hash_short(&[rotated.clone()], 7).unwrap()
+    );
+    assert_eq!(first.adnl_addr().unwrap().data(), &[2; 32]);
+    assert!(first.public_key().is_err());
+    assert!(first.compute_node_id_short().is_err());
+    assert!(crate::BlockSignaturesPure::default()
+        .check_signatures(&[first.clone()], b"test")
+        .is_err());
+    assert!(ValidatorSet::new(0, 100, 1, vec![first.clone(), rotated]).is_err());
+    let duplicate_key = ValidatorDescr::with_key(
+        UInt256::from([9; 32]),
+        first.key.clone(),
+        1,
+        Some(UInt256::from([8; 32])),
+    );
+    assert!(ValidatorSet::new(0, 100, 1, vec![first.clone(), duplicate_key]).is_err());
+    for mutation in 0..7 {
+        let mut invalid = first.clone();
+        match mutation {
+            0 => {
+                if let ValidatorKey::Pq(k) = &mut invalid.key {
+                    k.key_id = UInt256::from([99; 32]);
+                }
+            }
+            1 => {
+                if let ValidatorKey::Pq(k) = &mut invalid.key {
+                    k.algorithm_id = 2;
+                }
+            }
+            2 => {
+                if let ValidatorKey::Pq(k) = &mut invalid.key {
+                    k.public_key.pop();
+                }
+            }
+            3 => invalid.validator_id = UInt256::default(),
+            4 => invalid.adnl_addr = None,
+            5 => invalid.adnl_addr = Some(UInt256::default()),
+            6 => invalid.weight = 0,
+            _ => unreachable!(),
+        }
+        assert!(invalid.validate_consensus().is_err(), "mutation {mutation}");
+        assert!(ValidatorSet::new(0, 100, 1, vec![invalid]).is_err(), "mutation {mutation}");
     }
 }

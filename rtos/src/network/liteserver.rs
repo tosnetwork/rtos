@@ -2081,7 +2081,7 @@ impl LiteServerQuerySubscriber {
                     break;
                 }
 
-                let pubkey = UInt256::from_slice(validator.public_key.as_slice());
+                let pubkey = UInt256::from_slice(validator.public_key()?.as_slice());
                 if let Some(start) = &start_after {
                     if &pubkey <= start {
                         continue;

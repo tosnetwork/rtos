@@ -414,23 +414,27 @@ impl FullNodeOverlaysRouter {
         }
 
         let matched = prev_vset.list().iter().find(|descr| {
-            let pubkey = sigpubkey_to_publickey(&descr.public_key);
-            validator_key_ids.iter().any(|kid| kid == pubkey.id())
+            descr.public_key().is_ok_and(|key| {
+                let pubkey = sigpubkey_to_publickey(key);
+                validator_key_ids.iter().any(|kid| kid == pubkey.id())
+            })
         });
         let Some(matched_descr) = matched else {
             log::info!("special_update_fastsync: not a validator in prev set");
             return Ok(());
         };
         if cur_vset.list().iter().chain(next_vset.list().iter()).any(|descr| {
-            let pubkey = sigpubkey_to_publickey(&descr.public_key);
-            validator_key_ids.iter().any(|kid| kid == pubkey.id())
+            descr.public_key().is_ok_and(|key| {
+                let pubkey = sigpubkey_to_publickey(key);
+                validator_key_ids.iter().any(|kid| kid == pubkey.id())
+            })
         }) {
             log::info!("special_update_fastsync: is a validator in current or next set - skipping");
             return Ok(());
         }
 
-        let pubkey = sigpubkey_to_publickey(&matched_descr.public_key);
-        let adnl_id = get_adnl_id(matched_descr);
+        let pubkey = sigpubkey_to_publickey(matched_descr.public_key()?);
+        let adnl_id = get_adnl_id(matched_descr)?;
         let (_, election_id) = config_handler
             .get_validator_key(pubkey.id())
             .await
@@ -722,7 +726,7 @@ impl FullNodeOverlaysRouter {
         let mut to_resolve: Vec<Arc<KeyId>> = Vec::new();
         let mut seen: HashSet<Arc<KeyId>> = HashSet::new();
         for vd in &validators {
-            let adnl_id = vd.adnl_addr();
+            let adnl_id = vd.adnl_addr()?;
             if !seen.insert(adnl_id.clone()) {
                 continue;
             }

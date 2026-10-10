@@ -589,15 +589,52 @@ impl StateParser {
         config.get_vec("list").and_then(|p| {
             p.iter().try_for_each::<_, Result<_>>(|p| {
                 let p = PathMap::cont(config, "p", p)?;
-                let public_key = hex::decode(p.get_str("public_key")?)?;
+                let public_key_hex = p.get_str("public_key")?;
+                if public_key_hex.len() > rtos_block::PQ_BYTES_HARD_MAX * 2 {
+                    fail!("validator public key exceeds the structural bound");
+                }
+                let public_key = hex::decode(public_key_hex)?;
                 let weight = p.get_num64("weight")?;
-                let adnl_addr = p.get_uint256("adnl_addr").ok();
-
-                let descr = ValidatorDescr::with_params(
-                    SigPubKey::from_bytes(&public_key)?,
-                    weight,
-                    adnl_addr,
-                );
+                let adnl_addr = if p.map.contains_key("adnl_addr") {
+                    Some(p.get_uint256("adnl_addr")?)
+                } else {
+                    None
+                };
+                let descr = match p.map.get("key_type").and_then(Value::as_str) {
+                    Some("pq") => {
+                        let algorithm = p
+                            .get_item("algorithm_id")?
+                            .as_u64()
+                            .ok_or_else(|| error!("algorithm_id must be an unsigned integer"))?;
+                        let algorithm_id = u16::try_from(algorithm)?;
+                        ValidatorDescr::with_pq_params(
+                            p.get_uint256("validator_id")?,
+                            rtos_block::PqConsensusKey {
+                                algorithm_id,
+                                key_id: p.get_uint256("key_id")?,
+                                public_key,
+                            },
+                            weight,
+                            adnl_addr.ok_or_else(|| error!("PQ descriptor requires adnl_addr"))?,
+                        )
+                    }
+                    None | Some("ed25519") => {
+                        if (p.map.contains_key("key_type")
+                            && p.get_item("key_type")?.as_str().is_none())
+                            || ["validator_id", "algorithm_id", "key_id"]
+                                .iter()
+                                .any(|name| p.map.contains_key(*name))
+                        {
+                            fail!("invalid classical validator descriptor fields");
+                        }
+                        ValidatorDescr::with_params(
+                            SigPubKey::from_bytes(&public_key)?,
+                            weight,
+                            adnl_addr,
+                        )
+                    }
+                    Some(_) => fail!("unknown validator key_type"),
+                };
                 list.push(descr);
 
                 Ok(())
@@ -858,27 +895,10 @@ impl StateParser {
             }))
         })?;
 
-        self.parse_parameter(config, 34, |p34| {
-            let mut list = vec![];
-            p34.get_vec("list").and_then(|p| {
-                p.iter().try_for_each::<_, Result<()>>(|p| {
-                    let p = PathMap::cont(config, "p34", p)?;
-
-                    list.push(ValidatorDescr::with_params(
-                        p.get_str("public_key")?.parse()?,
-                        p.get_num64("weight")?,
-                        None,
-                    ));
-                    Ok(())
-                })
-            })?;
-            let cur_validators = ValidatorSet::new(
-                p34.get_num32("utime_since")?,
-                p34.get_num32("utime_until")?,
-                p34.get_num16("main")?,
-                list,
-            )?;
-            Ok(ConfigParamEnum::ConfigParam34(ConfigParam34 { cur_validators }))
+        self.parse_parameter(config, 34, |p| {
+            Ok(ConfigParamEnum::ConfigParam34(ConfigParam34 {
+                cur_validators: Self::parse_validator_set(p)?,
+            }))
         })?;
 
         self.parse_parameter(config, 35, |p| {

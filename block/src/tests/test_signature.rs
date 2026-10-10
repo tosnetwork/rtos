@@ -1067,7 +1067,7 @@ fn test_signature_weight_rejects_duplicate_unknown_and_invalid_membership() {
         .collect();
     let data = b"bounded signature weight test";
     let pair = |i: usize| CryptoSignaturePair {
-        node_id_short: validators[i].compute_node_id_short(),
+        node_id_short: validators[i].compute_node_id_short().unwrap(),
         sign: CryptoSignature::from_bytes(&keys[i].sign(data).unwrap()).unwrap(),
     };
     let mut signatures = BlockSignaturesPure::default();

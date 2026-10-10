@@ -1268,12 +1268,12 @@ async fn test_manager_selects_validator_key_by_validator_key_order() -> Result<(
     let all_validators = bootstrap.validator_set().list();
     let first_descr = all_validators
         .iter()
-        .find(|val| val.compute_node_id_short().as_slice() == expected_first.as_slice())
+        .find(|val| val.compute_node_id_short().unwrap().as_slice() == expected_first.as_slice())
         .ok_or_else(|| error!("missing descriptor for expected first key"))?
         .clone();
     let second_descr = all_validators
         .iter()
-        .find(|val| val.compute_node_id_short().as_slice() == expected_second.as_slice())
+        .find(|val| val.compute_node_id_short().unwrap().as_slice() == expected_second.as_slice())
         .ok_or_else(|| error!("missing descriptor for expected second key"))?
         .clone();
 

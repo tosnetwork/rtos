@@ -823,3 +823,68 @@ fn test_simplex_protocol_version_json_round_trip_and_rejection() {
         }
     }
 }
+
+#[test]
+fn test_pq_validator_config_json_admission() {
+    use rtos_block::{
+        derive_consensus_key_id, PqConsensusKey, ValidatorDescr, MLDSA44_PUBLIC_KEY_BYTES,
+    };
+    let key = vec![7; MLDSA44_PUBLIC_KEY_BYTES];
+    let pq = ValidatorDescr::with_pq_params(
+        UInt256::from([1; 32]),
+        PqConsensusKey {
+            algorithm_id: 1,
+            key_id: derive_consensus_key_id(1, &key),
+            public_key: key,
+        },
+        3,
+        UInt256::from([2; 32]),
+    );
+    let members = vec![
+        ValidatorDescr::with_params(SigPubKey::from_bytes(&[3; 32]).unwrap(), 1, None),
+        ValidatorDescr::with_params(
+            SigPubKey::from_bytes(&[4; 32]).unwrap(),
+            2,
+            Some(UInt256::from([5; 32])),
+        ),
+        pq,
+    ];
+    let mut cp = ConfigParams::default();
+    cp.set_config(ConfigParamEnum::ConfigParam34(ConfigParam34::with_validator_set(
+        ValidatorSet::new(10, 100, 1, members).unwrap(),
+    )))
+    .unwrap();
+    let json: Value = serde_json::from_str(&serialize_config_param(&cp, 34).unwrap()).unwrap();
+    let parse = |v: &Value| parse_config_with_mandatory_params(v.as_object().unwrap(), &[34]);
+    let parsed = parse(&json).unwrap();
+    assert_eq!(cp.config(34).unwrap(), parsed.config(34).unwrap());
+    for (field, value) in [
+        ("key_type", serde_json::json!("unknown")),
+        ("key_type", serde_json::json!(null)),
+        ("algorithm_id", serde_json::json!(2)),
+        ("algorithm_id", serde_json::json!(65537)),
+        ("algorithm_id", serde_json::json!("1")),
+        ("algorithm_id", serde_json::json!(-1)),
+        ("key_id", serde_json::json!("00".repeat(32))),
+        ("validator_id", serde_json::json!("00".repeat(32))),
+        ("adnl_addr", serde_json::json!("00".repeat(32))),
+        ("adnl_addr", serde_json::json!("invalid")),
+        ("public_key", serde_json::json!("07".repeat(1311))),
+        ("public_key", serde_json::json!("07".repeat(8193))),
+    ] {
+        let mut bad = json.clone();
+        bad["p34"]["list"][2][field] = value;
+        assert!(parse(&bad).is_err(), "invalid {field}");
+    }
+    for field in ["key_type", "algorithm_id", "key_id", "validator_id", "adnl_addr"] {
+        let mut bad = json.clone();
+        bad["p34"]["list"][2].as_object_mut().unwrap().remove(field);
+        assert!(parse(&bad).is_err(), "missing {field}");
+    }
+    let mut bad = json.clone();
+    bad["p34"]["list"][0]["adnl_addr"] = serde_json::json!(false);
+    assert!(parse(&bad).is_err());
+    let mut bad = json.clone();
+    bad["p34"]["list"][0]["key_id"] = serde_json::json!("00".repeat(32));
+    assert!(parse(&bad).is_err());
+}

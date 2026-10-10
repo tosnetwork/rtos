@@ -82,17 +82,17 @@ pub fn check_crypto_signatures(
     signatures.check_signatures(validators_list, data)
 }
 
-pub fn validatordescr_to_consensus_node(descr: &ValidatorDescr) -> ConsensusNode {
-    ConsensusNode {
-        adnl_id: get_adnl_id(descr),
-        public_key: sigpubkey_to_publickey(&descr.public_key),
-    }
+pub fn validatordescr_to_consensus_node(descr: &ValidatorDescr) -> Result<ConsensusNode> {
+    Ok(ConsensusNode {
+        adnl_id: get_adnl_id(descr)?,
+        public_key: sigpubkey_to_publickey(descr.public_key()?),
+    })
 }
 
 pub fn validatordescr_to_session_node(descr: &ValidatorDescr) -> Result<SessionNode> {
     Ok(SessionNode {
-        adnl_id: get_adnl_id(descr),
-        public_key: sigpubkey_to_publickey(&descr.public_key),
+        adnl_id: get_adnl_id(descr)?,
+        public_key: sigpubkey_to_publickey(descr.public_key()?),
         weight: descr.weight,
     })
 }
@@ -121,7 +121,7 @@ pub fn validatorset_to_string(vs: &ValidatorSet) -> String {
             res.append(format!(
                 "val_set.{}.pk = {} val_set.{}.weight = {} val_set.{}.adnl = {} ",
                 i,
-                hex::encode(x.public_key.key_bytes()),
+                hex::encode(x.consensus_public_key_bytes()),
                 i,
                 x.weight,
                 i,
@@ -132,13 +132,9 @@ pub fn validatorset_to_string(vs: &ValidatorSet) -> String {
     res.string().unwrap_or_default()
 }
 
-// returns adnl_id of validator or calc it by the
-pub fn get_adnl_id(validator: &ValidatorDescr) -> Arc<KeyId> {
-    if let Some(addr) = &validator.adnl_addr {
-        KeyId::from_data(*addr.as_slice())
-    } else {
-        KeyId::from_data(validator.compute_node_id_short().inner())
-    }
+/// Resolve transport identity independently from consensus key type.
+pub fn get_adnl_id(validator: &ValidatorDescr) -> Result<Arc<KeyId>> {
+    validator.adnl_addr()
 }
 
 pub type ValidatorListHash = UInt256;
@@ -158,7 +154,7 @@ pub fn compute_validator_list_id(
             hasher.update(serialized.data());
         }
         for x in list {
-            hasher.update(x.compute_node_id_short().as_slice());
+            hasher.update(x.compute_node_id_short()?.as_slice());
         }
         let hash: [u8; 32] = hasher.finalize();
         Ok(Some(hash.into()))
@@ -320,17 +316,18 @@ pub fn calc_subset_for_workchain_standard(
 pub fn get_group_members_by_validator_descrs(
     iterator: &[ValidatorDescr],
     dst: &mut Vec<GroupMember>,
-) {
+) -> Result<()> {
     for descr in iterator.iter() {
-        let node_id = descr.compute_node_id_short();
+        let node_id = descr.compute_node_id_short()?;
         // Use zeros when adnl_addr is None to match C++ session ID calculation
         let adnl_id = descr.adnl_addr.clone().unwrap_or_default();
         dst.push(rtos_api::ton::engine::validator::validator::groupmember::GroupMember {
             public_key_hash: node_id,
             adnl: adnl_id,
-            weight: descr.weight as i64,
+            weight: i64::try_from(descr.weight)?,
         });
     }
+    Ok(())
 }
 
 pub async fn get_masterchain_seqno(
@@ -548,5 +545,31 @@ pub struct GeneralSessionInfo {
 impl Display for GeneralSessionInfo {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}, cc {}", self.shard, self.catchain_seqno)
+    }
+}
+
+#[cfg(test)]
+mod pq_descriptor_tests {
+    use super::*;
+    use rtos_block::{derive_consensus_key_id, PqConsensusKey, MLDSA44_PUBLIC_KEY_BYTES};
+
+    #[test]
+    fn pq_transport_is_separate_from_classical_consensus_adapters() {
+        let public_key = vec![7; MLDSA44_PUBLIC_KEY_BYTES];
+        let member = ValidatorDescr::with_pq_params(
+            UInt256::from([1; 32]),
+            PqConsensusKey {
+                algorithm_id: 1,
+                key_id: derive_consensus_key_id(1, &public_key),
+                public_key,
+            },
+            1,
+            UInt256::from([2; 32]),
+        );
+        member.validate_consensus().unwrap();
+        assert_eq!(get_adnl_id(&member).unwrap().data(), &[2; 32]);
+        assert!(validatordescr_to_consensus_node(&member).is_err());
+        assert!(validatordescr_to_session_node(&member).is_err());
+        assert!(get_group_members_by_validator_descrs(&[member], &mut Vec::new()).is_err());
     }
 }

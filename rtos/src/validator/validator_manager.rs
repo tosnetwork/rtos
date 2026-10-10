@@ -221,16 +221,15 @@ fn get_session_id_serialize(
     session_info: Arc<GeneralSessionInfo>,
     vals: &[ValidatorDescr],
     new_catchain_ids: bool,
-) -> RawBuffer {
+) -> Result<RawBuffer> {
     let mut members = Vec::new();
-    get_group_members_by_validator_descrs(vals, &mut members);
+    get_group_members_by_validator_descrs(vals, &mut members)?;
 
-    assert!(
-        new_catchain_ids,
-        "Old catchain IDs format (new_catchain_ids=false) is not supported by the Rust implementation"
-    );
+    if !new_catchain_ids {
+        fail!("Old catchain IDs format (new_catchain_ids=false) is not supported");
+    }
     {
-        serialize_tl_boxed_object!(&rtos_api::ton::validator::group::GroupNew {
+        Ok(serialize_tl_boxed_object!(&rtos_api::ton::validator::group::GroupNew {
             workchain: session_info.shard.workchain_id(),
             shard: session_info.shard.shard_prefix_with_tag() as i64,
             vertical_seqno: session_info.max_vertical_seqno as i32,
@@ -239,7 +238,7 @@ fn get_session_id_serialize(
             config_hash: session_info.opts_hash.clone(),
             members
         }
-        .into_boxed())
+        .into_boxed()))
     }
 }
 
@@ -253,12 +252,12 @@ fn get_session_id(
     val_set: &[ValidatorDescr],
     new_catchain_ids: bool,
     accelerated_consensus_enabled: bool,
-) -> UInt256 {
-    let mut serialized = get_session_id_serialize(session_info, val_set, new_catchain_ids);
+) -> Result<UInt256> {
+    let mut serialized = get_session_id_serialize(session_info, val_set, new_catchain_ids)?;
     if accelerated_consensus_enabled {
         serialized.extend_from_slice(&ACCELERATED_CONSENSUS_MAGIC_TAG.to_le_bytes());
     }
-    UInt256::calc_file_hash(&serialized)
+    Ok(UInt256::calc_file_hash(&serialized))
 }
 
 fn compute_session_unsafe_serialized(session_id: &UInt256, rotate_id: u32) -> Vec<u8> {
@@ -300,8 +299,7 @@ fn find_local_validator_key(
     for local_key in local_keys? {
         let local_keyhash = local_key.id().data();
         for val in validators {
-            let pkhash = val.compute_node_id_short();
-            if pkhash.as_slice() == local_keyhash {
+            if val.compute_node_id_short().is_ok_and(|id| id.as_slice() == local_keyhash) {
                 return Some(local_key.clone());
             }
         }
@@ -338,13 +336,13 @@ fn get_session_unsafe_id(
     rotation_block_seqno_opt: Option<u32>,
     vm_config: &ValidatorManagerConfig,
     accelerated_consensus_enabled: bool,
-) -> UInt256 {
+) -> Result<UInt256> {
     let session_id = get_session_id(
         session_info.clone(),
         val_set,
         new_catchain_ids,
         accelerated_consensus_enabled,
-    );
+    )?;
 
     if do_unsafe_catchain_rotate && session_info.shard.is_masterchain() {
         if let Some(rotate_id) = vm_config
@@ -362,10 +360,10 @@ fn get_session_unsafe_id(
                 rotate_id,
                 unsafe_id.to_hex_string()
             );
-            return unsafe_id;
+            return Ok(unsafe_id);
         }
     }
-    session_id
+    Ok(session_id)
 }
 
 fn validator_session_options_serialize(opts: &CatchainSessionOptions) -> RawBuffer {
@@ -935,8 +933,9 @@ impl ValidatorManagerImpl {
         let local_pkhash = local_validator_key.id().data();
         let local_adnl_id = union
             .iter()
-            .find(|v| v.compute_node_id_short().as_slice() == local_pkhash)
+            .find(|v| v.compute_node_id_short().is_ok_and(|id| id.as_slice() == local_pkhash))
             .map(|v| v.adnl_addr())
+            .transpose()?
             .ok_or_else(|| error!("local pubkey not found in union (logic error)"))?;
 
         // (3) Resolve the ADNL KeyOption from the adnl node.
@@ -995,7 +994,7 @@ impl ValidatorManagerImpl {
         let nodes_res: Vec<ConsensusNode> = validator_list
             .iter()
             .map(validatordescr_to_consensus_node)
-            .collect::<Vec<ConsensusNode>>();
+            .collect::<Result<Vec<ConsensusNode>>>()?;
 
         log::info!(target: "validator_manager", "Updating {} validator list (id {:x}):", name, list_id);
         for x in &nodes_res {
@@ -1734,7 +1733,7 @@ impl ValidatorManagerImpl {
                 rotation_block_seqno_opt,
                 &self.config,
                 accelerated_consensus_enabled,
-            );
+            )?;
 
             let local_id_option = self.find_us(&subset.validators);
 
@@ -2273,7 +2272,7 @@ impl ValidatorManagerImpl {
                     &wc.validators,
                     true,
                     accelerated_consensus_enabled,
-                );
+                )?;
 
                 // C++ parity: skip sessions in the destroyed set
                 if self.destroyed_sessions.contains(&session_id) {

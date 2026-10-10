@@ -48,6 +48,8 @@ dependencies = [
  "raptorq",
  "rcgen",
  "ring",
+ "rtos_api",
+ "rtos_block",
  "rustls",
  "secrets-vault",
  "serde",
@@ -58,8 +60,6 @@ dependencies = [
  "tokio-io-timeout",
  "tokio-stream",
  "tokio-util",
- "rtos_api",
- "rtos_block",
 ]
 
 [[package]]
@@ -643,13 +643,13 @@ dependencies = [
  "quanta",
  "rand 0.8.5",
  "regex",
+ "rtos_api",
+ "rtos_block",
  "secrets-vault",
  "serde_json",
  "spin 0.7.1",
  "storage",
  "tokio",
- "rtos_api",
- "rtos_block",
 ]
 
 [[package]]
@@ -880,15 +880,15 @@ dependencies = [
  "control-client",
  "reqwest",
  "rpassword",
+ "rtos-http-api-client",
+ "rtos_block",
+ "rtos_block_json",
  "scopeguard",
  "secrets-vault",
  "serde",
  "serde_json",
  "service",
  "tokio",
- "rtos-http-api-client",
- "rtos_block",
- "rtos_block_json",
  "tracing",
 ]
 
@@ -906,13 +906,13 @@ dependencies = [
  "libc",
  "num",
  "rolling-file",
+ "rtos_api",
+ "rtos_block",
  "secrets-vault",
  "serde",
  "serde_json",
  "serde_yaml2",
  "tokio",
- "rtos_api",
- "rtos_block",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -932,14 +932,14 @@ dependencies = [
  "hex",
  "log",
  "rand 0.8.5",
+ "rtos_api",
+ "rtos_block",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tokio-test",
  "tokio-util",
- "rtos_api",
- "rtos_block",
 ]
 
 [[package]]
@@ -966,14 +966,14 @@ dependencies = [
  "rand 0.8.5",
  "regex",
  "rocksdb",
+ "rtos_api",
+ "rtos_block",
  "secrets-vault",
  "serde_json",
  "spin 0.7.1",
  "storage",
  "tokio",
  "tokio-util",
- "rtos_api",
- "rtos_block",
 ]
 
 [[package]]
@@ -1002,10 +1002,10 @@ dependencies = [
  "async-trait",
  "common",
  "hex",
- "tokio",
  "rtos-http-api-client",
  "rtos_api",
  "rtos_block",
+ "tokio",
 ]
 
 [[package]]
@@ -1017,11 +1017,12 @@ dependencies = [
  "async-trait",
  "common",
  "hex",
+ "rtos_api",
+ "rtos_block",
+ "rtos_block_json",
  "serde",
  "serde_json",
  "tokio",
- "rtos_api",
- "rtos_block",
  "tracing",
 ]
 
@@ -1641,12 +1642,12 @@ dependencies = [
  "anyhow",
  "log",
  "log4rs",
- "serde_json",
- "thiserror 1.0.69",
  "rtos_block",
  "rtos_block_json",
  "rtos_executor",
  "rtos_vm",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3236,93 +3237,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rtos"
-version = "0.9.0"
-dependencies = [
- "adnl",
- "ahash",
- "anyhow",
- "async-recursion",
- "async-trait",
- "bitflags 2.11.0",
- "catchain",
- "chrono",
- "clap 4.6.0",
- "colored",
- "consensus-common",
- "criterion 0.5.1",
- "crossbeam-channel",
- "ctor",
- "ctrlc",
- "dashmap",
- "deflate",
- "difference",
- "dirs",
- "enum-as-inner 0.6.1",
- "env_logger",
- "external-ip",
- "futures",
- "futures-timer",
- "hex",
- "http 1.4.0",
- "http-body-util",
- "inflate",
- "lazy_static",
- "lockfree",
- "log",
- "log4rs",
- "lru",
- "metrics",
- "metrics-exporter-prometheus",
- "num-bigint",
- "num_cpus",
- "openssl",
- "parking_lot",
- "pretty_assertions",
- "rand 0.8.5",
- "rayon",
- "regex",
- "reqwest",
- "secrets-vault",
- "serde",
- "serde_derive",
- "serde_json",
- "shell-words",
- "simplex",
- "smallvec",
- "spin 0.7.1",
- "storage",
- "stream-cancel",
- "string-builder",
- "tempfile",
- "thiserror 1.0.69",
- "tikv-jemalloc-ctl",
- "tikv-jemallocator",
- "tokio",
- "tokio-util",
- "rtos_api",
- "rtos_block",
- "rtos_block_json",
- "rtos_executor",
- "rtos_vm",
- "validator_session",
- "warp",
-]
-
-[[package]]
-name = "rtosctl"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "clap 4.6.0",
- "commands",
- "common",
- "secrets-vault",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4507,6 +4421,263 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtos"
+version = "0.9.0"
+dependencies = [
+ "adnl",
+ "ahash",
+ "anyhow",
+ "async-recursion",
+ "async-trait",
+ "bitflags 2.11.0",
+ "catchain",
+ "chrono",
+ "clap 4.6.0",
+ "colored",
+ "consensus-common",
+ "criterion 0.5.1",
+ "crossbeam-channel",
+ "ctor",
+ "ctrlc",
+ "dashmap",
+ "deflate",
+ "difference",
+ "dirs",
+ "enum-as-inner 0.6.1",
+ "env_logger",
+ "external-ip",
+ "futures",
+ "futures-timer",
+ "hex",
+ "http 1.4.0",
+ "http-body-util",
+ "inflate",
+ "lazy_static",
+ "lockfree",
+ "log",
+ "log4rs",
+ "lru",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "num-bigint",
+ "num_cpus",
+ "openssl",
+ "parking_lot",
+ "pretty_assertions",
+ "rand 0.8.5",
+ "rayon",
+ "regex",
+ "reqwest",
+ "rtos_api",
+ "rtos_block",
+ "rtos_block_json",
+ "rtos_executor",
+ "rtos_vm",
+ "secrets-vault",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "shell-words",
+ "simplex",
+ "smallvec",
+ "spin 0.7.1",
+ "storage",
+ "stream-cancel",
+ "string-builder",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
+ "tokio",
+ "tokio-util",
+ "validator_session",
+ "warp",
+]
+
+[[package]]
+name = "rtos-http-api-client"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "common",
+ "rtos_api",
+ "rtos_block",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toncenter-rs",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rtos_api"
+version = "0.4.32"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "extfmt",
+ "hex",
+ "lazy_static",
+ "ordered-float 2.10.1",
+ "rtos_block",
+ "rtos_tl_codegen",
+ "secstr",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "rtos_assembler"
+version = "1.9.3"
+dependencies = [
+ "anyhow",
+ "clap 4.6.0",
+ "hex",
+ "log",
+ "num",
+ "num-traits",
+ "rtos_block",
+ "rtos_vm",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rtos_block"
+version = "1.11.22"
+dependencies = [
+ "aes",
+ "ahash",
+ "anyhow",
+ "base64 0.13.1",
+ "bitflags 2.11.0",
+ "bitstream-io",
+ "blake2b_simd",
+ "blst",
+ "crc16",
+ "crc32c",
+ "criterion 0.5.1",
+ "ctr",
+ "curve25519-dalek",
+ "ed25519",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "hex",
+ "keccak-hash",
+ "lockfree",
+ "log",
+ "lz4",
+ "num",
+ "num-derive",
+ "num-traits",
+ "openssl",
+ "p256",
+ "pprof",
+ "pretty_assertions",
+ "rand 0.8.5",
+ "secp256k1",
+ "serde",
+ "sha2",
+ "smallvec",
+ "thiserror 1.0.69",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "rtos_block_json"
+version = "0.9.41"
+dependencies = [
+ "anyhow",
+ "hex",
+ "log",
+ "metrics",
+ "num",
+ "num-traits",
+ "pretty_assertions",
+ "rtos_api",
+ "rtos_block",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "rtos_executor"
+version = "1.18.31"
+dependencies = [
+ "anyhow",
+ "criterion 0.3.6",
+ "libloading 0.6.7",
+ "log",
+ "log4rs",
+ "num",
+ "pretty_assertions",
+ "rand 0.8.5",
+ "rtos_assembler",
+ "rtos_block",
+ "rtos_block_json",
+ "rtos_vm",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "rtos_tl_codegen"
+version = "0.1.0"
+dependencies = [
+ "crc",
+ "pom",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_derive",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "rtos_vm"
+version = "2.2.26"
+dependencies = [
+ "anyhow",
+ "criterion 0.4.0",
+ "env_logger",
+ "hex",
+ "libloading 0.6.7",
+ "log",
+ "log4rs",
+ "num",
+ "num-traits",
+ "pprof",
+ "pretty_assertions",
+ "rand 0.8.5",
+ "rtos_api",
+ "rtos_assembler",
+ "rtos_block",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "rtosctl"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "clap 4.6.0",
+ "commands",
+ "common",
+ "secrets-vault",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4732,6 +4903,7 @@ dependencies = [
  "reqwest",
  "rmp-serde",
  "rsa",
+ "rtos_block",
  "scopeguard",
  "serde",
  "serde_json",
@@ -4741,7 +4913,6 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "rtos_block",
  "urlencoding",
  "uuid",
  "winapi",
@@ -4942,14 +5113,14 @@ dependencies = [
  "jsonwebtoken",
  "mockall",
  "parking_lot",
+ "rtos-http-api-client",
+ "rtos_block",
  "secrets-vault",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "rtos-http-api-client",
- "rtos_block",
  "tower",
  "tracing",
  "utoipa",
@@ -5055,12 +5226,12 @@ dependencies = [
  "log",
  "metrics",
  "rand 0.8.5",
+ "rtos_api",
+ "rtos_block",
  "serde",
  "serde_json",
  "spin 0.7.1",
  "tokio",
- "rtos_api",
- "rtos_block",
 ]
 
 [[package]]
@@ -5174,6 +5345,8 @@ dependencies = [
  "rand 0.8.5",
  "rayon",
  "rocksdb",
+ "rtos_api",
+ "rtos_block",
  "serde",
  "serde_cbor",
  "serde_derive",
@@ -5185,8 +5358,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
- "rtos_api",
- "rtos_block",
  "zip",
 ]
 
@@ -5637,176 +5808,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rtos-http-api-client"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "common",
- "serde",
- "serde_json",
- "tokio",
- "rtos_api",
- "rtos_block",
- "toncenter-rs",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "rtos_api"
-version = "0.4.32"
-dependencies = [
- "anyhow",
- "byteorder",
- "extfmt",
- "hex",
- "lazy_static",
- "ordered-float 2.10.1",
- "secstr",
- "serde",
- "serde_derive",
- "serde_json",
- "thiserror 1.0.69",
- "rtos_block",
- "rtos_tl_codegen",
-]
-
-[[package]]
-name = "rtos_assembler"
-version = "1.9.3"
-dependencies = [
- "anyhow",
- "clap 4.6.0",
- "hex",
- "log",
- "num",
- "num-traits",
- "serde",
- "serde_json",
- "rtos_block",
- "rtos_vm",
-]
-
-[[package]]
-name = "rtos_block"
-version = "1.11.22"
-dependencies = [
- "aes",
- "ahash",
- "anyhow",
- "base64 0.13.1",
- "bitflags 2.11.0",
- "bitstream-io",
- "blake2b_simd",
- "blst",
- "crc16",
- "crc32c",
- "criterion 0.5.1",
- "ctr",
- "curve25519-dalek",
- "ed25519",
- "ed25519-dalek",
- "getrandom 0.2.17",
- "hex",
- "keccak-hash",
- "lockfree",
- "log",
- "lz4",
- "num",
- "num-derive",
- "num-traits",
- "openssl",
- "p256",
- "pprof",
- "pretty_assertions",
- "rand 0.8.5",
- "secp256k1",
- "serde",
- "sha2",
- "smallvec",
- "thiserror 1.0.69",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
-name = "rtos_block_json"
-version = "0.9.41"
-dependencies = [
- "anyhow",
- "hex",
- "log",
- "metrics",
- "num",
- "num-traits",
- "pretty_assertions",
- "serde",
- "serde_derive",
- "serde_json",
- "thiserror 1.0.69",
- "rtos_api",
- "rtos_block",
-]
-
-[[package]]
-name = "rtos_executor"
-version = "1.18.31"
-dependencies = [
- "anyhow",
- "criterion 0.3.6",
- "libloading 0.6.7",
- "log",
- "log4rs",
- "num",
- "pretty_assertions",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "rtos_assembler",
- "rtos_block",
- "rtos_block_json",
- "rtos_vm",
-]
-
-[[package]]
-name = "rtos_tl_codegen"
-version = "0.1.0"
-dependencies = [
- "crc",
- "pom",
- "proc-macro2",
- "quote",
- "serde",
- "serde_derive",
- "syn 1.0.109",
-]
-
-[[package]]
-name = "rtos_vm"
-version = "2.2.26"
-dependencies = [
- "anyhow",
- "criterion 0.4.0",
- "env_logger",
- "hex",
- "libloading 0.6.7",
- "log",
- "log4rs",
- "num",
- "num-traits",
- "pprof",
- "pretty_assertions",
- "rand 0.8.5",
- "serde_json",
- "thiserror 1.0.69",
- "rtos_api",
- "rtos_assembler",
- "rtos_block",
-]
-
-[[package]]
 name = "toncenter-rs"
 version = "0.1.0"
 source = "git+https://github.com/RSquad/toncenter-rs.git?branch=main#bf7977ac34ce558cb44a8a7a8dd03b53b879d6c0"
@@ -6119,11 +6120,11 @@ dependencies = [
  "num-derive",
  "num-traits",
  "rand 0.8.5",
+ "rtos_api",
+ "rtos_block",
  "serde",
  "spin 0.7.1",
  "storage",
- "rtos_api",
- "rtos_block",
 ]
 
 [[package]]

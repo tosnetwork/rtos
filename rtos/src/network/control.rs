@@ -17,7 +17,6 @@ use crate::{
     network::node_network::NodeNetwork,
     shard_states_keeper::PinnedShardStateGuard,
     validating_utils::{supported_capabilities, supported_version},
-    validator::validator_utils::validatordescr_to_consensus_node,
 };
 use adnl::{
     common::{AdnlPeers, QueryResult, Subscriber},
@@ -448,13 +447,15 @@ impl ControlQuerySubscriber {
         let adnl_ids = self.config.get_actual_validator_adnl_key_ids()?;
         if let Some(mc_state) = &mc_state {
             let current = mc_state.config_params()?.validator_set()?.list().iter().any(|val| {
-                let catchain_node = validatordescr_to_consensus_node(val);
-                let is_validator = adnl_ids.contains(&catchain_node.adnl_id);
+                let Ok(adnl_id) = val.adnl_addr() else {
+                    return false;
+                };
+                let is_validator = adnl_ids.contains(&adnl_id);
                 if is_validator {
                     Self::add_stats(
                         &mut stats,
                         "current_vset_p34_adnl_id",
-                        format!("\"{}\"", &catchain_node.adnl_id),
+                        format!("\"{}\"", &adnl_id),
                     );
                 }
                 is_validator
@@ -467,13 +468,15 @@ impl ControlQuerySubscriber {
         // in_next_vset_p36
         if let Some(mc_state) = &mc_state {
             let next = mc_state.config_params()?.next_validator_set()?.list().iter().any(|val| {
-                let catchain_node = validatordescr_to_consensus_node(val);
-                let is_validator = adnl_ids.contains(&catchain_node.adnl_id);
+                let Ok(adnl_id) = val.adnl_addr() else {
+                    return false;
+                };
+                let is_validator = adnl_ids.contains(&adnl_id);
                 if is_validator {
                     Self::add_stats(
                         &mut stats,
                         "next_vset_p36_adnl_id",
-                        format!("\"{}\"", &catchain_node.adnl_id),
+                        format!("\"{}\"", &adnl_id),
                     );
                 }
                 is_validator

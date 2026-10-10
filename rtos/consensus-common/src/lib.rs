@@ -670,7 +670,7 @@ impl BlockSyncOverlayParams {
 
         for vset in [&prev, &curr, &next] {
             for val in vset.list() {
-                members_set.insert(val.adnl_addr());
+                members_set.insert(val.adnl_addr()?);
             }
         }
 
@@ -680,7 +680,7 @@ impl BlockSyncOverlayParams {
         // shuffled order; using raw mc order makes the precheck reject every
         // valid leader broadcast except by coincidence
         for val in cur_subset.list() {
-            let id = val.adnl_addr();
+            let id = val.adnl_addr()?;
             authorized_keys.insert(id.clone(), max_size);
             current_set.push(id);
         }
@@ -1689,14 +1689,15 @@ mod block_sync_overlay_params_tests {
         let p =
             BlockSyncOverlayParams::from_config(&cfg, /*slots_per_leader_window*/ 4, &curr)
                 .unwrap();
-        let curr_ids: Vec<_> = vset(&[2, 3]).list().iter().map(|v| v.adnl_addr()).collect();
+        let curr_ids: Vec<_> =
+            vset(&[2, 3]).list().iter().map(|v| v.adnl_addr().unwrap()).collect();
         assert_eq!(p.authorized_keys.len(), 2);
         for id in &curr_ids {
             assert!(p.authorized_keys.contains_key(id));
         }
         // prev-only id (seed=1) and next-only id (seed=4) must NOT be authorized
-        let prev_id = vset(&[1]).list()[0].adnl_addr();
-        let next_id = vset(&[4]).list()[0].adnl_addr();
+        let prev_id = vset(&[1]).list()[0].adnl_addr().unwrap();
+        let next_id = vset(&[4]).list()[0].adnl_addr().unwrap();
         assert!(!p.authorized_keys.contains_key(&prev_id));
         assert!(!p.authorized_keys.contains_key(&next_id));
         // Both must still appear in `members`
@@ -1744,7 +1745,7 @@ mod block_sync_overlay_params_tests {
         }
         // current_set MUST follow cur_subset.list() order (shuffled per-session
         // order in production), not raw HashMap iteration
-        let expected: Vec<_> = curr.list().iter().map(|v| v.adnl_addr()).collect();
+        let expected: Vec<_> = curr.list().iter().map(|v| v.adnl_addr().unwrap()).collect();
         assert_eq!(p.current_set, expected);
     }
 
@@ -1765,17 +1766,17 @@ mod block_sync_overlay_params_tests {
         );
         let p = BlockSyncOverlayParams::from_config(&cfg, 4, &shard_subset).unwrap();
         // current_set follows the shard subset order, NOT the mc validator_set order
-        let expected: Vec<_> = shard_subset.list().iter().map(|v| v.adnl_addr()).collect();
+        let expected: Vec<_> = shard_subset.list().iter().map(|v| v.adnl_addr().unwrap()).collect();
         assert_eq!(p.current_set, expected);
         // authorized covers only the shard subset
         assert_eq!(p.authorized_keys.len(), 3);
-        let mc_only_id = vset(&[11]).list()[0].adnl_addr();
+        let mc_only_id = vset(&[11]).list()[0].adnl_addr().unwrap();
         assert!(
             !p.authorized_keys.contains_key(&mc_only_id),
             "mc-only validator must NOT be in authorized_keys"
         );
         // members still covers the wider mc set (so overlay survives rotation)
-        let mc_only_member = vset(&[14]).list()[0].adnl_addr();
+        let mc_only_member = vset(&[14]).list()[0].adnl_addr().unwrap();
         assert!(p.members.contains(&mc_only_member));
     }
 
