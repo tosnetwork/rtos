@@ -1246,15 +1246,15 @@ impl ValidatorManagerImpl {
         self.destroyed_sessions.insert(id.clone());
         if !self.retiring_groups.iter().any(|(_, old, _)| Arc::ptr_eq(old, &group)) {
             let consensus = if group.is_simplex() { "simplex" } else { "catchain" };
-            metrics::counter!("rtos_node_validator_session_destroyed_total", "consensus" => consensus).increment(1);
             self.retiring_groups.push((id, group, destroy));
+            metrics::counter!("rtos_node_validator_session_destroyed_total", "consensus" => consensus).increment(1);
         }
     }
 
     fn retire_observer(&mut self, id: &UInt256) {
         if let Some(observer) = self.block_sync_observers.remove(id) {
+            self.retiring_observers.push(observer.clone());
             observer.stop();
-            self.retiring_observers.push(observer);
         }
     }
 
