@@ -1709,6 +1709,8 @@ impl ReceiverImpl {
                 source_idx,
                 err
             );
+            #[cfg(test)]
+            self.health_counters.rejected_vote_signatures.fetch_add(1, Ordering::Release);
             // C++ parity: `pool.cpp` calls `ban(message->source)` on bad vote sig.
             self.ban_source_for_bad_signature_impl(source_idx);
             return;
@@ -4088,11 +4090,18 @@ impl ReceiverImpl {
 pub(crate) struct ReceiverHealthCounters {
     pub standstill_triggers: AtomicU64,
     pub candidate_giveups: AtomicU64,
+    #[cfg(test)]
+    pub rejected_vote_signatures: AtomicU64,
 }
 
 impl ReceiverHealthCounters {
     pub fn new() -> Self {
-        Self { standstill_triggers: AtomicU64::new(0), candidate_giveups: AtomicU64::new(0) }
+        Self {
+            standstill_triggers: AtomicU64::new(0),
+            candidate_giveups: AtomicU64::new(0),
+            #[cfg(test)]
+            rejected_vote_signatures: AtomicU64::new(0),
+        }
     }
 }
 
