@@ -1537,7 +1537,7 @@ impl ValidatorManagerImpl {
                         for (id, group) in &self.future_sessions {
                             let g = group.clone();
                             let session_id = id.clone();
-                            tokio::spawn(async move {
+                            g.clone().spawn_root_task(&self.rt, async move {
                                 if let Err(e) = g.pre_create_engine().await {
                                     log::error!(target: "validator_manager",
                                         "SESSION_LIFECYCLE: backfill_pre_create_failed \
@@ -1595,9 +1595,40 @@ impl ValidatorManagerImpl {
         self.owned_current_shards = 0;
         self.owned_future_shards = 0;
 
-        let existing_validator_sessions: HashSet<UInt256> =
-            self.current_sessions.keys().chain(self.future_sessions.keys()).cloned().collect();
-        self.stop_and_remove_sessions(&existing_validator_sessions, clear_rotation).await;
+        let groups: HashMap<_, _> = self
+            .current_sessions
+            .iter()
+            .chain(self.future_sessions.iter())
+            .map(|(id, group)| (id.clone(), group.clone()))
+            .collect();
+        let observers: Vec<_> = self.block_sync_observers.values().cloned().collect();
+        let mut errors = Vec::new();
+        // Request all observer cancellations before waiting for any session.
+        for observer in &observers {
+            observer.stop();
+        }
+        let rt = self.rt.clone();
+        let results = futures::future::join_all(
+            groups.values().map(|group| group.clone().stop(rt.clone(), clear_rotation)),
+        )
+        .await;
+        for result in results {
+            if let Err(e) = result {
+                errors.push(e.to_string());
+            }
+        }
+        for observer in observers {
+            if let Err(e) = observer.stop_and_wait().await {
+                errors.push(e.to_string());
+            }
+        }
+        if !errors.is_empty() {
+            fail!("validator teardown failed: {}", errors.join("; "));
+        }
+        self.destroyed_sessions.extend(groups.keys().cloned());
+        self.current_sessions.clear();
+        self.future_sessions.clear();
+        self.block_sync_observers.clear();
         self.garbage_collect().await;
         self.engine.set_will_validate(false);
         if clear_rotation {
@@ -1612,10 +1643,8 @@ impl ValidatorManagerImpl {
         Ok(())
     }
 
-    async fn stop_validation(&mut self) {
-        if let Err(e) = self.disable_validation(false).await {
-            log::error!(target: "validator_manager", "Cannot disable validation: {}", e);
-        };
+    async fn stop_validation(&mut self) -> Result<()> {
+        self.disable_validation(false).await
     }
 
     fn enable_validation(&mut self) {
@@ -1801,6 +1830,10 @@ impl ValidatorManagerImpl {
             };
 
             if let Some(local_id) = &local_id_option {
+                if let Some(observer) = self.block_sync_observers.get(&session_id) {
+                    observer.stop_and_wait().await?;
+                    self.block_sync_observers.remove(&session_id);
+                }
                 log::debug!(
                     target: "validator_manager",
                     "subset for session: shard {}, cc_seqno {}, keyblock_seqno {}, \
@@ -2003,7 +2036,7 @@ impl ValidatorManagerImpl {
                     "SESSION_LIFECYCLE: observer_stopped shard={} session_id={:x}",
                     observer.shard(), sid,
                 );
-                observer.stop();
+                observer.stop_and_wait().await?;
             }
         }
         Ok(())
@@ -2384,7 +2417,7 @@ impl ValidatorManagerImpl {
                         ident, next_cc_seqno, session_id);
                     let g = group.clone();
                     let sid = session_id.clone();
-                    tokio::spawn(async move {
+                    g.clone().spawn_root_task(&self.rt, async move {
                         if let Err(e) = g.pre_create_engine().await {
                             log::error!(target: "validator_manager",
                                 "SESSION_LIFECYCLE: pre_create_engine_failed session_id={:x} error={}", sid, e);
@@ -2959,6 +2992,14 @@ pub fn start_validator_manager(
     runtime: tokio::runtime::Handle,
     config: ValidatorManagerConfig,
 ) {
+    let _ = spawn_validator_manager(engine, runtime, config);
+}
+
+fn spawn_validator_manager(
+    engine: Arc<dyn EngineOperations>,
+    runtime: tokio::runtime::Handle,
+    config: ValidatorManagerConfig,
+) -> tokio::task::JoinHandle<()> {
     const CHECK_VALIDATOR_TIMEOUT: u64 = 60; //secs
     runtime.clone().spawn(async move {
         log::info!(
@@ -2989,7 +3030,12 @@ pub fn start_validator_manager(
             let mut manager =
                 ValidatorManagerImpl::create(engine.clone(), runtime.clone(), config.clone());
             let res = manager.invoke().await;
-            manager.stop_validation().await;
+            if let Err(e) = manager.stop_validation().await {
+                // No replacement manager and no successful service-stop signal
+                // when teardown could not certify termination.
+                log::error!(target: "validator_manager", "FATAL: validator teardown failed; restart refused: {e}");
+                return;
+            }
             let Err(e) = res else { break };
             log::error!(
                 target: "validator_manager",
@@ -3000,7 +3046,7 @@ pub fn start_validator_manager(
 
         log::info!(target: "validator_manager", "Exiting, validator manager is stopped");
         engine.release_stop(Engine::MASK_SERVICE_VALIDATOR_MANAGER);
-    });
+    })
 }
 
 #[cfg(test)]
@@ -3010,3 +3056,7 @@ mod test_session_id;
 #[cfg(test)]
 #[path = "tests/emulator_network_bootstrap.rs"]
 mod emulator_network_bootstrap;
+
+#[cfg(test)]
+#[path = "tests/test_manager_lifecycle.rs"]
+mod lifecycle_tests;

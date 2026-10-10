@@ -110,6 +110,11 @@ const SESSION_PROFILING_DUMP_PERIOD_MS: u64 = 30000; // period of profiling dump
 const SESSION_HEALTH_CHECK_PERIOD_MS: u64 = 20000;
 //LK: for debugging only; need to be removed in future
 const SESSION_MAX_LEADER_WINDOW_DESYNC_MARGIN: u32 = 0;
+thread_local! {
+    // Joining a consensus worker from another consensus callback can form a
+    // cycle. Worker callers request stop; an external owner performs the join.
+    static IN_SESSION_WORKER: Cell<bool> = const { Cell::new(false) };
+}
 const LOG_TARGET_PROFILING: &str = "simplex_profiling"; // log target for profiling
 
 // ======================================================================
@@ -268,6 +273,12 @@ where
 
 /// Simplex session implementation
 pub(crate) struct SessionImpl {
+    /// Real worker ownership, including destruction of their stack-local DBs.
+    /// Serialized joins make repeated external stop calls completion barriers.
+    worker_threads: Mutex<Vec<thread::JoinHandle<()>>>,
+    #[cfg(test)]
+    worker_exit_gate:
+        Arc<Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>>,
     /// Atomic flag to indicate that all processing threads should be stopped
     stop_flag: Arc<AtomicBool>,
     /// Indicates database should be destroyed on stop
@@ -331,6 +342,8 @@ impl ConsensusSession for SessionImpl {
 
     fn stop(&self) {
         self.stop_async();
+        assert!(!IN_SESSION_WORKER.with(Cell::get),
+            "synchronous Session::stop is forbidden on a consensus worker; use stop_async and let the external owner join");
         self.stop_impl(false);
     }
 
@@ -422,20 +435,25 @@ impl SessionImpl {
 
         self.stop_flag.store(true, Ordering::Release);
 
-        loop {
-            if self.callbacks_processing_thread_stopped.load(Ordering::Relaxed)
-                && self.main_processing_thread_stopped.load(Ordering::Relaxed)
-            {
-                break;
-            }
-
-            log::info!(
-                "...waiting for SimplexSession threads (session_id is {})",
-                self.session_id.to_hex_string()
+        if IN_SESSION_WORKER.with(Cell::get) {
+            // A worker cannot synchronously join itself (or another worker
+            // waiting on it). This is request-only: no terminal flag is forged.
+            // ValidatorGroup always calls stop from spawn_blocking and joins.
+            log::warn!(
+                "Session stop from a consensus worker is request-only; external owner must join"
             );
-
-            const CHECKING_INTERVAL: Duration = Duration::from_millis(300);
-            thread::sleep(CHECKING_INTERVAL);
+            return;
+        }
+        let mut workers = self.worker_threads.lock().unwrap_or_else(|e| e.into_inner());
+        for worker in workers.drain(..) {
+            if let Err(error) = worker.join() {
+                self.panicked_flag.store(true, Ordering::Release);
+                log::error!(
+                    "Session {} worker join failed: {:?}",
+                    self.session_id.to_hex_string(),
+                    error
+                );
+            }
         }
 
         log::info!(
@@ -547,6 +565,9 @@ impl SessionImpl {
             if !init_signaled.get() {
                 let _ =
                     init_result_sender.send(Err(error!("Session stopped before bootstrap load")));
+            }
+            if destroy_db_flag.load(Ordering::Acquire) {
+                db.mark_for_destroy();
             }
             is_stopped_flag.store(true, Ordering::Release);
             return;
@@ -696,6 +717,9 @@ impl SessionImpl {
                         "SimplexSession {} stopped while waiting for start()",
                         session_id.to_hex_string()
                     );
+                    if destroy_db_flag.load(Ordering::Acquire) {
+                        db.mark_for_destroy();
+                    }
                     is_stopped_flag.store(true, Ordering::Release);
                     return;
                 }
@@ -1252,8 +1276,15 @@ impl SessionImpl {
         let max_candidate_query_answer_size: u64 =
             (options.max_block_size + options.max_collated_data_size) as u64 + (1 << 20);
 
+        #[cfg(test)]
+        let worker_exit_gate = Arc::new(Mutex::new(
+            None::<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+        ));
         // Create session (receiver is created in main_loop after bootstrap loading)
         let session = SessionImpl {
+            worker_threads: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            worker_exit_gate: worker_exit_gate.clone(),
             stop_flag: stop_flag.clone(),
             destroy_db_flag: destroy_db_flag.clone(),
             start_flag: start_flag.clone(),
@@ -1286,9 +1317,10 @@ impl SessionImpl {
 
         // Create main processing thread
         let metrics_receiver_clone = metrics_receiver.clone();
-        let _main_processing_thread = thread::Builder::new()
+        let main_processing_thread = thread::Builder::new()
             .name(format!("{}:{}", MAIN_LOOP_NAME, session_id.to_hex_string()))
             .spawn(move || {
+                IN_SESSION_WORKER.with(|inside| inside.set(true));
                 crate::utils::install_simplex_panic_hook_once();
 
                 let stop_flag_for_panic = stop_flag_for_main_loop.clone();
@@ -1334,9 +1366,24 @@ impl SessionImpl {
                     stop_flag_for_panic.store(true, Ordering::Release);
                 }
 
+                #[cfg(test)]
+                if let Some((entered, release)) = worker_exit_gate.lock().unwrap().take() {
+                    let _ = entered.send(());
+                    release
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("session exit gate watchdog");
+                }
                 // Always mark thread as stopped (normal exit or panic).
                 stopped_flag_for_panic.store(true, Ordering::Release);
             });
+
+        match main_processing_thread {
+            Ok(worker) => session.worker_threads.lock().unwrap().push(worker),
+            Err(error) => {
+                session.main_processing_thread_stopped.store(true, Ordering::Release);
+                return Err(error.into());
+            }
+        }
 
         // Wait for main loop initialization result
         match init_result_receiver.recv() {
@@ -1376,9 +1423,10 @@ impl SessionImpl {
                 session_id.to_hex_string()
             );
 
-            let _callbacks_processing_thread = thread::Builder::new()
+            let callbacks_processing_thread = thread::Builder::new()
                 .name(format!("{}:{}", CALLBACKS_LOOP_NAME, session_id.to_hex_string()))
                 .spawn(move || {
+                    IN_SESSION_WORKER.with(|inside| inside.set(true));
                     crate::utils::install_simplex_panic_hook_once();
 
                     let stop_flag_for_panic = stop_flag_for_callbacks_loop.clone();
@@ -1406,6 +1454,14 @@ impl SessionImpl {
                     // Always mark thread as stopped (normal exit or panic).
                     stopped_flag_for_panic.store(true, Ordering::Release);
                 });
+            match callbacks_processing_thread {
+                Ok(worker) => session.worker_threads.lock().unwrap().push(worker),
+                Err(error) => {
+                    session.callbacks_processing_thread_stopped.store(true, Ordering::Release);
+                    session.stop_flag.store(true, Ordering::Release);
+                    return Err(error.into());
+                }
+            }
         } else {
             log::info!(
                 "SimplexSession {}: Callback processing thread is disabled (use_callback_thread=false), \
@@ -1430,3 +1486,7 @@ impl SessionImpl {
         unimplemented!("SessionImpl::create_replay: log replay not implemented yet")
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_session_lifecycle.rs"]
+mod lifecycle_tests;

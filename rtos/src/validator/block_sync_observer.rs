@@ -23,7 +23,7 @@ use rtos_api::{
     ton::consensus::{candidatedata::Block as ConsensusBlock, CandidateData},
 };
 use rtos_block::{
-    fail, BlockIdExt, CryptoSignaturePair, KeyId, KeyOption, Result, ShardIdent, UInt256,
+    error, fail, BlockIdExt, CryptoSignaturePair, KeyId, KeyOption, Result, ShardIdent, UInt256,
 };
 use std::{
     collections::HashSet,
@@ -51,10 +51,15 @@ pub struct BlockSyncObserver {
     max_candidate_size: usize,
     proto_version: u32,
     stats: Arc<BlockSyncStats>,
-    /// JoinHandle for the listener task spawned by `run_listener`. Awaited
-    /// from a cleanup task spawned in `stop` so the listener exits before
-    /// any subsequent observer for the same session_id is constructed
+    /// Owned worker handles. stop_and_wait confirms their terminal result
+    /// before the manager replaces an observer with the same overlay ID.
     listener_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    ticker_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    cancellation: tokio_util::sync::CancellationToken,
+    #[cfg(test)]
+    listener_exit_gate: Mutex<Option<Arc<lifecycle_tests::ListenerExitGate>>>,
+    stop_completion:
+        Mutex<Option<tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>>>,
 }
 
 impl BlockSyncObserver {
@@ -141,51 +146,76 @@ impl BlockSyncObserver {
             proto_version,
             stats: stats.clone(),
             listener_handle: Mutex::new(None),
+            ticker_handle: Mutex::new(None),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            #[cfg(test)]
+            listener_exit_gate: Mutex::new(None),
+            stop_completion: Mutex::new(None),
         });
-        stats.spawn_ticker(runtime_handle, observer.stop_requested.clone());
+        let cancellation = observer.cancellation.clone();
+        let ticker = runtime_handle.spawn(async move {
+            let mut interval =
+                tokio::time::interval(consensus_common::BLOCK_SYNC_STATS_LOG_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => break,
+                    _ = interval.tick() => stats.dump(),
+                }
+            }
+        });
+        *observer.ticker_handle.lock().expect("ticker handle poisoned") = Some(ticker);
         let handle = observer.clone().run_listener();
         *observer.listener_handle.lock().expect("listener_handle poisoned") = Some(handle);
         Ok(observer)
     }
 
-    /// Stop the observer. Removes the overlay from the ADNL node and signals
-    /// the listener task to exit at its next loop iteration
+    /// Request cancellation. Call stop_and_wait before reusing this overlay ID.
     pub fn stop(&self) {
-        if self.stop_requested.swap(true, Ordering::Relaxed) {
+        let mut completion = self.stop_completion.lock().expect("stop completion poisoned");
+        if completion.is_some() {
             return;
         }
-        // Final telemetry dump so short-lived sessions always log at least once
+        self.stop_requested.store(true, Ordering::Release);
+        self.cancellation.cancel();
         self.stats.dump();
-        log::info!(
-            target: LOG_TARGET,
-            "stopping observer for shard={} session={:x}",
-            self.shard, self.session_id,
-        );
-        if let Err(e) = self.overlay_node.delete_private_overlay(&self.overlay_short_id) {
-            log::warn!(
-                target: LOG_TARGET,
-                "observer for shard={}: delete_private_overlay({}) failed: {e}",
-                self.shard, self.overlay_short_id,
-            );
-        }
-        // Spawn an async cleanup task that awaits the listener exit (the
-        // overlay deletion above causes `wait_for_broadcast` to return None)
-        let handle = self.listener_handle.lock().expect("listener_handle poisoned").take();
-        if let Some(handle) = handle {
-            let shard = self.shard.clone();
-            let overlay_short_id = self.overlay_short_id.clone();
-            self.runtime_handle.spawn(async move {
-                match handle.await {
-                    Ok(()) => log::trace!(
-                        target: LOG_TARGET,
-                        "observer shard={shard}: listener task exited cleanly (overlay={overlay_short_id})"
-                    ),
-                    Err(e) => log::warn!(
-                        target: LOG_TARGET,
-                        "observer shard={shard}: listener task join failed: {e}"
-                    ),
+        let deletion = self
+            .overlay_node
+            .delete_private_overlay(&self.overlay_short_id)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        let listener = self.listener_handle.lock().expect("listener handle poisoned").take();
+        let ticker = self.ticker_handle.lock().expect("ticker handle poisoned").take();
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        *completion = Some(rx);
+        self.runtime_handle.spawn(async move {
+            let mut result = deletion;
+            for task in [listener, ticker].into_iter().flatten() {
+                if let Err(e) = task.await {
+                    result = Err(format!("observer task join failed: {e}"));
                 }
-            });
+            }
+            tx.send_replace(Some(result));
+        });
+    }
+
+    /// Shared terminal result; cancellation of a waiter cannot detach cleanup.
+    pub async fn stop_and_wait(&self) -> Result<()> {
+        self.stop();
+        let mut completion = self
+            .stop_completion
+            .lock()
+            .expect("stop completion poisoned")
+            .as_ref()
+            .expect("stop installs completion")
+            .clone();
+        loop {
+            if let Some(result) = completion.borrow().clone() {
+                return result.map_err(|e| error!("{}", e));
+            }
+            completion.changed().await.map_err(|_| error!("observer teardown completion lost"))?;
         }
     }
 
@@ -199,6 +229,7 @@ impl BlockSyncObserver {
         let overlay_short_id = self.overlay_short_id.clone();
         let stop_requested = self.stop_requested.clone();
         let shard = self.shard.clone();
+        let cancellation = self.cancellation.clone();
         self.runtime_handle.spawn(async move {
             log::trace!(
                 target: LOG_TARGET,
@@ -208,7 +239,15 @@ impl BlockSyncObserver {
                 if stop_requested.load(Ordering::Relaxed) {
                     break;
                 }
-                match overlay_node.wait_for_broadcast(&overlay_short_id).await {
+                let received = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => break,
+                    received = overlay_node.wait_for_broadcast(&overlay_short_id) => received,
+                };
+                if stop_requested.load(Ordering::Acquire) {
+                    break;
+                }
+                match received {
                     Ok(Some(message)) => {
                         let Some(this) = weak.upgrade() else { return };
                         this.process_inbound(message.recv_from, message.data);
@@ -220,6 +259,14 @@ impl BlockSyncObserver {
                             "observer shard={shard}: wait_for_broadcast error: {e}"
                         );
                     }
+                }
+            }
+            #[cfg(test)]
+            if let Some(this) = weak.upgrade() {
+                let gate = this.listener_exit_gate.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    gate.entered.add_permits(1);
+                    gate.release.acquire().await.unwrap().forget();
                 }
             }
             log::trace!(
@@ -313,3 +360,13 @@ impl BlockSyncObserver {
         Ok(())
     }
 }
+
+impl Drop for BlockSyncObserver {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/test_observer_lifecycle.rs"]
+pub(super) mod lifecycle_tests;
