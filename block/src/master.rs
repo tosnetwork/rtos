@@ -710,8 +710,9 @@ impl OldMcBlocksInfo {
         })?;
 
         if let Some(id) = found {
-            debug_assert!(id.blk_ref.seq_no >= req_seqno);
-            debug_assert!(id.key);
+            if id.blk_ref.seq_no < req_seqno || !id.key {
+                fail!("Invalid next key-block index entry");
+            }
             Ok(Some(id.blk_ref))
         } else {
             Ok(None)

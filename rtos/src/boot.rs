@@ -11,7 +11,7 @@
  */
 use crate::{
     block::BlockStuff,
-    block_proof::{BlockProofStuff, BootstrapAuthority},
+    block_proof::{BlockProofStuff, BootstrapAuthority, VerifiedMasterchainState},
     engine::Engine,
     engine_traits::EngineOperations,
     shard_state::ShardStateStuff,
@@ -689,6 +689,86 @@ pub async fn cold_boot(
     }
 }
 
+/// Rebuild authority from the explicit local pin. The recovered state's history
+/// dictionary is only a lookup hint until its own root is authenticated below.
+/// Keep one key proof at a time; no unbounded vector of historical proofs.
+pub(crate) async fn authenticate_recovered_state(
+    engine: &dyn EngineOperations,
+    block_id: &BlockIdExt,
+) -> Result<VerifiedMasterchainState> {
+    let pin = engine.init_mc_block_id();
+    if !block_id.shard().is_masterchain_ext() || block_id.seq_no < pin.seq_no {
+        fail!("Recovery position is outside the pinned masterchain history");
+    }
+    let state = engine.load_state(block_id).await?;
+    if state.block_id() != block_id {
+        fail!("Recovery state identity mismatch");
+    }
+    let mut history = if pin.seq_no == 0 {
+        if pin != engine.zerostate_id()? {
+            fail!("Recovery pin differs from network zerostate");
+        }
+        BootstrapAuthority::from_zerostate(pin, engine.load_mc_zero_state().await?)?
+    } else {
+        let proof = load_recovery_proof(engine, pin, true).await?;
+        BootstrapAuthority::from_checkpoint(pin, proof)?
+    };
+    if block_id == pin {
+        return history.authenticate_current_state(state);
+    }
+    // Untrusted augmented dictionaries may omit or substitute keys. Every
+    // returned proof must still name the preceding authenticated governing epoch.
+    let index = &state.shard_state_extra()?.prev_blocks;
+    loop {
+        if engine.check_stop() {
+            fail!("Recovery authentication stopped");
+        }
+        let seq = history
+            .id()
+            .seq_no
+            .checked_add(1)
+            .ok_or_else(|| error!("Recovery key sequence overflow"))?;
+        let Some(next) = index.get_next_key_block(seq)? else {
+            break;
+        };
+        let next = next.master_block_id().1;
+        if next.seq_no < seq || next.seq_no >= block_id.seq_no {
+            fail!("Recovery history index has an invalid key-block position");
+        }
+        let proof = load_recovery_proof(engine, &next, false).await?;
+        history = history.advance_key_block(&next, proof)?;
+    }
+    let proof = load_recovery_proof(engine, block_id, false).await?;
+    let verified = history.authenticate_block(block_id, proof)?.authenticate_state(state)?;
+    if !verified.state().has_prev_block(pin)? {
+        fail!("Authenticated recovered state does not contain the local pin");
+    }
+    Ok(verified)
+}
+
+async fn load_recovery_proof(
+    engine: &dyn EngineOperations,
+    id: &BlockIdExt,
+    checkpoint: bool,
+) -> Result<BlockProofStuff> {
+    if let Some(handle) = engine.load_block_handle(id)? {
+        if handle.id() != id {
+            fail!("Recovery proof handle identity mismatch");
+        }
+        if let Ok(proof) = engine.load_block_proof(&handle, false).await {
+            return Ok(proof);
+        }
+        if checkpoint {
+            if let Ok(proof) = engine.load_block_proof(&handle, true).await {
+                return Ok(proof);
+            }
+        }
+    }
+    // A checkpoint may use a proof link because its complete ID is pinned.
+    // Every unpinned successor requires a finality proof.
+    engine.download_block_proof(id, checkpoint, false).await
+}
+
 pub async fn warm_boot(
     engine: Arc<Engine>,
     block_id: Arc<BlockIdExt>,
@@ -696,54 +776,101 @@ pub async fn warm_boot(
 ) -> Result<BlockIdExt> {
     log::info!(target: "boot", "Warm boot");
     ensure_block_chain_for_state(&engine, &block_id).await?;
-    if let Some(block_id) = check_hardforks(&engine, &block_id, hardfork_path).await? {
-        return Ok(block_id);
+    if !engine.hardforks().is_empty() {
+        authenticate_recovered_state(engine.as_ref(), &block_id).await?;
+        if let Some(block_id) = check_hardforks(&engine, &block_id, hardfork_path).await? {
+            authenticate_recovered_state(engine.as_ref(), &block_id).await?;
+            return Ok(block_id);
+        }
     }
-    let mut block_id = block_id.deref().clone();
+    recover_warm_boot_position(engine.as_ref(), &block_id).await
+}
+
+pub(crate) async fn recover_warm_boot_position(
+    engine: &dyn EngineOperations,
+    start: &BlockIdExt,
+) -> Result<BlockIdExt> {
+    if !start.shard().is_masterchain_ext() {
+        fail!("Recovery cursor is not a full masterchain block");
+    }
+    let mut block_id = start.clone();
     loop {
+        if engine.check_stop() {
+            fail!("Warm boot recovery stopped");
+        }
         let handle = engine
             .load_block_handle(&block_id)?
             .ok_or_else(|| error!("Cannot load handle for block {}", block_id))?;
+        if handle.id() != &block_id {
+            fail!("Recovery handle identity mismatch");
+        }
         // go back to find last applied block
         if handle.is_applied() {
             break;
         }
         CHECK!(handle.has_state());
         CHECK!(handle.has_prev1());
-        block_id = engine.load_block_prev1(&block_id)?;
+        let previous = engine.load_block_prev1(&block_id)?;
+        if !previous.shard().is_masterchain_ext()
+            || previous.seq_no.checked_add(1) != Some(block_id.seq_no)
+        {
+            fail!("Recovery previous pointer does not move to the preceding masterchain block");
+        }
+        block_id = previous;
     }
     // walk forward via next1 to find the most recent applied block
     // (LAST_APPLIED_MC_BLOCK pointer may lag behind actual applied state after crash)
     loop {
+        if engine.check_stop() {
+            fail!("Warm boot recovery stopped");
+        }
         let handle = engine
             .load_block_handle(&block_id)?
             .ok_or_else(|| error!("Cannot load handle for block {}", block_id))?;
+        if handle.id() != &block_id {
+            fail!("Recovery handle identity mismatch");
+        }
         if !handle.has_next1() {
             break;
         }
         let next_id = engine.load_block_next1(&block_id)?;
+        if !next_id.shard().is_masterchain_ext()
+            || block_id.seq_no.checked_add(1) != Some(next_id.seq_no)
+        {
+            fail!("Recovery next pointer does not move to the next masterchain block");
+        }
         let Some(next_handle) = engine.load_block_handle(&next_id)? else {
             break;
         };
+        if next_handle.id() != &next_id {
+            fail!("Recovery next handle identity mismatch");
+        }
         if !next_handle.is_applied() {
             break;
         }
         block_id = next_id;
     }
+    authenticate_recovered_state(engine, &block_id).await?;
     engine.save_last_applied_mc_block_id(&block_id)?;
     log::info!(target: "boot", "last applied block id = {}", block_id);
-    let state = engine.load_state(&block_id).await?;
-    let init_block_id = engine.init_mc_block_id();
-    CHECK!(&block_id == init_block_id || state.has_prev_block(init_block_id)?);
     Ok(block_id)
 }
 
 async fn ensure_block_chain_for_state(engine: &Arc<Engine>, start: &BlockIdExt) -> Result<()> {
     let mut id = start.clone();
+    if !id.shard().is_masterchain_ext() {
+        fail!("Recovery source is not masterchain");
+    }
     loop {
+        if engine.check_stop() {
+            fail!("Warm boot recovery stopped");
+        }
         let handle = engine
             .load_block_handle(&id)?
             .ok_or_else(|| error!("Cannot load handle for block {}", id))?;
+        if handle.id() != &id {
+            fail!("Recovery source handle identity mismatch");
+        }
         if handle.has_saved_state() {
             return Ok(());
         }
@@ -767,7 +894,13 @@ async fn ensure_block_chain_for_state(engine: &Arc<Engine>, start: &BlockIdExt) 
         if !handle.has_prev1() {
             fail!("ensure_block_chain_for_state: no prev1 for {id}")
         }
-        id = engine.load_block_prev1(&id)?;
+        let previous = engine.load_block_prev1(&id)?;
+        if !previous.shard().is_masterchain_ext()
+            || previous.seq_no.checked_add(1) != Some(id.seq_no)
+        {
+            fail!("Recovery data chain has an invalid previous pointer");
+        }
+        id = previous;
     }
 }
 

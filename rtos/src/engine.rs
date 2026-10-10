@@ -2256,7 +2256,7 @@ async fn boot(
         Ok(Some(id)) => {
             let id =
                 crate::boot::warm_boot(engine.clone(), id.clone(), hardfork_path).await.map_err(
-                    |e| error!("Warm boot failed: {e}. Need to clear the DB and re-sync node"),
+                    |e| error!("Warm boot failed: {e}. Preserve the database and inspect recovery proofs and the configured trust anchor"),
                 )?;
             (id, false)
         }

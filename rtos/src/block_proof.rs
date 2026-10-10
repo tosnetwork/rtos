@@ -52,6 +52,40 @@ pub(crate) struct VerifiedMasterchainProof {
     global_id: i32,
 }
 
+/// State whose root is committed by an authenticated masterchain block or pin.
+/// This attests to the commitment, not replayed execution or permission to sign.
+pub(crate) struct VerifiedMasterchainState {
+    state: Arc<ShardStateStuff>,
+}
+
+impl VerifiedMasterchainState {
+    pub(crate) fn state(&self) -> &Arc<ShardStateStuff> {
+        &self.state
+    }
+}
+
+impl VerifiedMasterchainProof {
+    pub(crate) fn authenticate_state(
+        self,
+        state: Arc<ShardStateStuff>,
+    ) -> Result<VerifiedMasterchainState> {
+        authenticate_committed_state(&self.proof, self.global_id, state)
+    }
+}
+
+fn authenticate_committed_state(
+    proof: &BlockProofStuff,
+    global_id: i32,
+    state: Arc<ShardStateStuff>,
+) -> Result<VerifiedMasterchainState> {
+    let root = proof.virtualize_block()?.0.read_state_update()?.new_hash;
+    state.verify_state_root(proof.id(), &root)?;
+    if state.state()?.global_id() != global_id {
+        fail!("Recovered state global_id differs from authenticated block");
+    }
+    Ok(VerifiedMasterchainState { state })
+}
+
 impl std::fmt::Debug for BootstrapAuthority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BootstrapAuthority")
@@ -100,6 +134,21 @@ impl BootstrapAuthority {
         match &self.source {
             BootstrapSource::Zerostate(state) => Ok(state.config_params()?.clone()),
             BootstrapSource::KeyBlock(proof) => proof.get_config_params(),
+        }
+    }
+
+    pub(crate) fn authenticate_current_state(
+        &self,
+        state: Arc<ShardStateStuff>,
+    ) -> Result<VerifiedMasterchainState> {
+        match &self.source {
+            BootstrapSource::Zerostate(_) => {
+                state.verify_zerostate(self.id())?;
+                Ok(VerifiedMasterchainState { state })
+            }
+            BootstrapSource::KeyBlock(proof) => {
+                authenticate_committed_state(proof, self.global_id, state)
+            }
         }
     }
 

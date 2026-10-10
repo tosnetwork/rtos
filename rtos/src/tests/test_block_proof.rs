@@ -598,3 +598,308 @@ fn test_bootstrap_authority_starts_from_pinned_zerostate() {
         assert!(BootstrapAuthority::from_zerostate(&wrong_pin, zero).is_err());
     }
 }
+
+#[tokio::test]
+async fn test_warm_recovery_authenticates_history_before_saving_cursor() {
+    use rtos_block::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let chain: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tl/rtos_api/tests/data/bootstrap-history.json"
+    ))
+    .unwrap();
+    let row: serde_json::Value =
+        serde_json::from_str(include_str!("../../../tl/rtos_api/tests/data/warm-history.json"))
+            .unwrap();
+    for mutation in 0..13 {
+        let anchor = bootstrap_fixture_proof(
+            &serde_json::json!({"block_boc":chain["anchor_boc"]}),
+            false,
+            false,
+        );
+        let first = bootstrap_fixture_proof(&chain["cases"][1], true, mutation == 1);
+        let second = bootstrap_fixture_proof(&chain["cases"][2], true, false);
+        let mut target = bootstrap_fixture_proof(&row, true, mutation == 2);
+        if mutation == 12 {
+            let (block, root) = target.virtualize_block().unwrap();
+            let excluded = block.read_state_update().unwrap().new_hash;
+            let proof = MerkleProof::create(&root, |hash| hash != &excluded).unwrap();
+            target = BlockProofStuff::new(
+                BlockProof::with_params(
+                    target.id().clone(),
+                    proof.serialize().unwrap(),
+                    target.proof.signatures.clone(),
+                ),
+                false,
+            )
+            .unwrap();
+        }
+        let target_id = target.id().clone();
+        let mut state = ShardStateUnsplit::construct_from_bytes(
+            &hex::decode(row["state_boc"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        if mutation == 3 {
+            state.set_gen_time(999);
+        }
+        if mutation == 4 || mutation == 11 {
+            let mut custom = state.read_custom().unwrap().unwrap();
+            if mutation == 4 {
+                custom.prev_blocks.del(&42).unwrap();
+            } else {
+                custom
+                    .prev_blocks
+                    .set(
+                        &42,
+                        &KeyExtBlkRef { key: true, blk_ref: ExtBlkRef::fake(0, 0) },
+                        &KeyMaxLt { key: true, max_end_lt: 0 },
+                    )
+                    .unwrap();
+            }
+            state.write_custom(Some(&custom)).unwrap();
+        }
+        if mutation == 9 {
+            state.set_seq_no(45);
+        }
+        let state = crate::shard_state::ShardStateStuff::from_state(
+            target_id.clone(),
+            state,
+            #[cfg(feature = "telemetry")]
+            &crate::collator_test_bundle::create_engine_telemetry(),
+            &crate::collator_test_bundle::create_engine_allocated(),
+        )
+        .unwrap();
+        let handles = crate::collator_test_bundle::create_block_handle_storage(None).unwrap();
+        let pin = anchor.id().clone();
+        let mut entries = Vec::new();
+        for proof in [anchor, first, second, target] {
+            let handle = handles
+                .create_handle(proof.id().clone(), storage::types::BlockMeta::default(), None)
+                .unwrap()
+                .unwrap();
+            handle.set_block_applied();
+            entries.push((handle, proof));
+        }
+        let mut start = target_id.clone();
+        let mut next = None;
+        let mut previous = None;
+        // Follow an applied successor after a crash left the saved cursor behind.
+        if mutation == 0 || mutation == 6 {
+            start = entries[2].0.id().clone();
+            entries[2].0.set_next1();
+            next = Some(if mutation == 6 { start.clone() } else { target_id.clone() });
+        }
+        // Backtrack over an interrupted application; reject a cyclic pointer.
+        if mutation == 7 || mutation == 8 {
+            start.seq_no = 45;
+            start.root_hash = UInt256::from([99; 32]);
+            start.file_hash = UInt256::from([98; 32]);
+            let handle = handles
+                .create_handle(start.clone(), storage::types::BlockMeta::default(), None)
+                .unwrap()
+                .unwrap();
+            handle.set_state();
+            handle.set_prev1();
+            entries.push((handle, BlockProofStuff::fake(&start).unwrap()));
+            previous = Some(if mutation == 8 { start.clone() } else { target_id.clone() });
+        }
+        if mutation == 5 {
+            entries[0].1 = entries[1].1.clone();
+        }
+        if mutation == 10 {
+            entries.remove(1);
+        }
+        let engine =
+            RecoveryProofEngine { pin, state, entries, next, previous, saves: AtomicUsize::new(0) };
+        let result = crate::boot::recover_warm_boot_position(&engine, &start).await;
+        if mutation == 0 || mutation == 7 || mutation == 12 {
+            assert_eq!(result.unwrap(), target_id, "mutation {mutation}");
+            assert_eq!(engine.saves.load(Ordering::SeqCst), 1);
+        } else {
+            let error = result
+                .expect_err(&format!("invalid recovery mutation {mutation} accepted"))
+                .to_string();
+            if mutation == 3 {
+                assert!(error.contains("Snapshot root differs"), "{error}");
+            }
+            if mutation == 11 {
+                assert!(error.contains("Invalid next key-block index entry"), "{error}");
+            }
+            println!("recovery mutation {mutation} rejected before cursor write: {error}");
+            assert_eq!(
+                engine.saves.load(Ordering::SeqCst),
+                0,
+                "unverified cursor persisted for mutation {mutation}"
+            );
+        }
+    }
+}
+
+struct RecoveryProofEngine {
+    pin: rtos_block::BlockIdExt,
+    state: std::sync::Arc<crate::shard_state::ShardStateStuff>,
+    entries: Vec<(std::sync::Arc<storage::block_handle_db::BlockHandle>, BlockProofStuff)>,
+    next: Option<rtos_block::BlockIdExt>,
+    previous: Option<rtos_block::BlockIdExt>,
+    saves: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::engine_traits::EngineOperations for RecoveryProofEngine {
+    fn zerostate_id(&self) -> rtos_block::Result<&rtos_block::BlockIdExt> {
+        Ok(&self.pin)
+    }
+    async fn load_mc_zero_state(
+        &self,
+    ) -> rtos_block::Result<std::sync::Arc<crate::shard_state::ShardStateStuff>> {
+        Ok(self.state.clone())
+    }
+
+    fn init_mc_block_id(&self) -> &rtos_block::BlockIdExt {
+        &self.pin
+    }
+    fn check_stop(&self) -> bool {
+        false
+    }
+    fn load_block_handle(
+        &self,
+        id: &rtos_block::BlockIdExt,
+    ) -> rtos_block::Result<Option<std::sync::Arc<storage::block_handle_db::BlockHandle>>> {
+        Ok(self.entries.iter().find(|(h, _)| h.id() == id).map(|(h, _)| h.clone()))
+    }
+    async fn load_block_proof(
+        &self,
+        handle: &std::sync::Arc<storage::block_handle_db::BlockHandle>,
+        _: bool,
+    ) -> rtos_block::Result<BlockProofStuff> {
+        self.entries
+            .iter()
+            .find(|(h, _)| h.id() == handle.id())
+            .map(|(_, p)| p.clone())
+            .ok_or_else(|| rtos_block::error!("missing recovery proof"))
+    }
+    async fn download_block_proof(
+        &self,
+        _: &rtos_block::BlockIdExt,
+        _: bool,
+        _: bool,
+    ) -> rtos_block::Result<BlockProofStuff> {
+        rtos_block::fail!("missing recovery proof download reached")
+    }
+    async fn load_state(
+        &self,
+        _: &rtos_block::BlockIdExt,
+    ) -> rtos_block::Result<std::sync::Arc<crate::shard_state::ShardStateStuff>> {
+        Ok(self.state.clone())
+    }
+    fn load_block_next1(
+        &self,
+        _: &rtos_block::BlockIdExt,
+    ) -> rtos_block::Result<rtos_block::BlockIdExt> {
+        Ok(self.next.clone().unwrap())
+    }
+    fn load_block_prev1(
+        &self,
+        _: &rtos_block::BlockIdExt,
+    ) -> rtos_block::Result<rtos_block::BlockIdExt> {
+        Ok(self.previous.clone().unwrap())
+    }
+    fn save_last_applied_mc_block_id(&self, id: &rtos_block::BlockIdExt) -> rtos_block::Result<()> {
+        assert_eq!(id, self.state.block_id());
+        self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_warm_recovery_accepts_pinned_states_only_with_matching_roots() {
+    use rtos_block::*;
+    for zerostate in [false, true] {
+        for corrupt in [false, true] {
+            let mut state = ShardStateUnsplit::default();
+            state.set_global_id(-239);
+            state.set_shard(ShardIdent::masterchain());
+            if !zerostate {
+                state.set_seq_no(10);
+            }
+            let mut custom = McStateExtra::default();
+            custom.config = pq_fixture::config();
+            state.write_custom(Some(&custom)).unwrap();
+            let root = state.serialize().unwrap();
+            let (pin, proof) = if zerostate {
+                let pin = BlockIdExt::with_params(
+                    ShardIdent::masterchain(),
+                    0,
+                    root.repr_hash().clone(),
+                    UInt256::calc_file_hash(&write_boc(&root).unwrap()),
+                );
+                (pin.clone(), BlockProofStuff::fake(&pin).unwrap())
+            } else {
+                let mut info = BlockInfo::default();
+                info.set_seq_no(10).unwrap();
+                info.set_shard(ShardIdent::masterchain());
+                info.set_key_block(true);
+                info.set_gen_utime(900);
+                let mut extra = BlockExtra::default();
+                let mut mc = McBlockExtra::default();
+                mc.set_config(custom.config);
+                extra.write_custom(&mc).unwrap();
+                let block = Block::with_params(
+                    -239,
+                    info,
+                    ValueFlow::default(),
+                    MerkleUpdate::create(&Cell::default(), &root).unwrap(),
+                    extra,
+                )
+                .unwrap();
+                let root = block.serialize().unwrap();
+                let pin = BlockIdExt::with_params(
+                    ShardIdent::masterchain(),
+                    10,
+                    root.repr_hash().clone(),
+                    UInt256::calc_file_hash(&write_boc(&root).unwrap()),
+                );
+                let proof = BlockProofStuff::new(
+                    BlockProof::with_params(
+                        pin.clone(),
+                        MerkleProof::create(&root, |_| true).unwrap().serialize().unwrap(),
+                        None,
+                    ),
+                    true,
+                )
+                .unwrap();
+                (pin, proof)
+            };
+            if corrupt {
+                state.set_gen_time(777);
+            }
+            let state = crate::shard_state::ShardStateStuff::from_state(
+                pin.clone(),
+                state,
+                #[cfg(feature = "telemetry")]
+                &crate::collator_test_bundle::create_engine_telemetry(),
+                &crate::collator_test_bundle::create_engine_allocated(),
+            )
+            .unwrap();
+            let handles = crate::collator_test_bundle::create_block_handle_storage(None).unwrap();
+            let handle = handles
+                .create_handle(pin.clone(), storage::types::BlockMeta::default(), None)
+                .unwrap()
+                .unwrap();
+            handle.set_block_applied();
+            let engine = RecoveryProofEngine {
+                pin: pin.clone(),
+                state,
+                entries: vec![(handle, proof)],
+                next: None,
+                previous: None,
+                saves: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let result = crate::boot::recover_warm_boot_position(&engine, &pin).await;
+            assert_eq!(result.is_ok(), !corrupt, "zero={zerostate} corrupt={corrupt}: {result:?}");
+            assert_eq!(
+                engine.saves.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(!corrupt)
+            );
+        }
+    }
+}
