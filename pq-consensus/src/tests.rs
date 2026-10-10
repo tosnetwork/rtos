@@ -347,6 +347,7 @@ mod files {
     #[test]
     fn configured_load_refuses_duplicate_paths_seeds_and_all_expired() {
         let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let a = dir.path().join("a");
         let b = dir.path().join("b");
         seed(&a, 102);

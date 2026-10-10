@@ -4562,6 +4562,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtos_pq_consensus"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "getrandom 0.2.17",
+ "hex",
+ "libc",
+ "rtos_block",
+ "rtos_pq_crypto",
+ "serde_json",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "rtos_pq_crypto"
 version = "0.1.0"
 dependencies = [
