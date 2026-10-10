@@ -1,5 +1,6 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): naming, historical address
+ * commitment across compute admission, and storage-deletion reporting.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -150,6 +151,13 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         let mut original_acc_balance = acc_balance.clone();
         let is_special = self.config.is_special_account(is_masterchain, &account_id)?;
         let account_address = MsgAddressInt::with_params(wc_id, account_id.clone())?;
+        // Uninitialized accounts discard their historical rewrite when loaded,
+        // before compute admission (including Suspended and NoGas).
+        if account.is_uninit()
+            && account.get_addr().is_some_and(|addr| addr.rewrite_pfx().is_some())
+        {
+            account.set_addr(account_address.clone());
+        }
 
         log::debug!(
             target: "executor",
@@ -418,6 +426,14 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             now = Instant::now();
         }
 
+        if self.config.block_version() >= 13
+            && description
+                .storage_ph
+                .as_ref()
+                .is_some_and(|phase| phase.status_change == AccStatusChange::Deleted)
+        {
+            description.destroyed = true;
+        }
         description.aborted = match description.action.as_ref() {
             Some(phase) => {
                 log::debug!(
@@ -476,7 +492,14 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             *account = Account::uninit(account_address, acc_balance.clone(), 0, last_paid);
             // }
         } else {
-            account.set_addr(account_address);
+            // A compute-phase early return has not normalized a historical
+            // anycast account address. Preserve its stored rewrite prefix.
+            let keep_rewrite = (self.config.block_version() < 10
+                || matches!(description.compute_ph, TrComputePhase::Skipped(_)))
+                && account.get_addr().is_some_and(|addr| addr.rewrite_pfx().is_some());
+            if !keep_rewrite {
+                account.set_addr(account_address);
+            }
         }
         if let Some(hash) = account.frozen_hash() {
             if account_id.contains_bytes(hash.as_slice()) {
@@ -569,3 +592,7 @@ mod test_poseidon2_transaction;
 #[cfg(test)]
 #[path = "tests/test_pq_suite_transaction.rs"]
 mod test_pq_suite_transaction;
+
+#[cfg(test)]
+#[path = "tests/test_frozen_prefix.rs"]
+mod test_frozen_prefix;

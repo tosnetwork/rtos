@@ -1,5 +1,6 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): naming, historical address
+ * normalization, and address commitment across failed tick/tock execution.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -47,10 +48,11 @@ impl TransactionExecutor for TickTockTransactionExecutor {
         if in_msg_cell.is_some() {
             fail!("Tick Tock transaction must not have input message")
         }
-        let account_id = match account.get_id() {
-            Some(addr) => addr.clone(),
-            None => fail!("Tick Tock contract should have Standard address"),
-        };
+        let stored_address = account
+            .get_addr()
+            .cloned()
+            .ok_or_else(|| error!("Tick Tock account has no address"))?;
+        let (workchain, account_id) = stored_address.extract_std_address(true)?;
         match account.get_tick_tock() {
             Some(tt) => {
                 if tt.tock != self.tt.is_tock() && tt.tick != self.tt.is_tick() {
@@ -59,7 +61,11 @@ impl TransactionExecutor for TickTockTransactionExecutor {
             }
             None => fail!("Account {:x} is not special account for tick tock", account_id),
         }
-        let account_address = account.get_addr().cloned().unwrap_or_default();
+        let account_address = if self.config.block_version() >= 10 {
+            rtos_block::MsgAddressInt::with_params(workchain, account_id.clone())?
+        } else {
+            stored_address
+        };
         log::debug!(target: "executor", "tick tock transation account {:x}", account_id);
         let mut acc_balance = account.balance().cloned().unwrap_or_default();
 
@@ -105,10 +111,7 @@ impl TransactionExecutor for TickTockTransactionExecutor {
             prev_blocks_info: params.prev_blocks_info.clone(),
             ..Default::default()
         };
-        smc_info.calc_rand_seed(
-            params.seed_block.clone(),
-            &account_address.address().get_bytestring(0),
-        );
+        smc_info.calc_rand_seed(params.seed_block.clone(), &account_id.get_bytestring(0));
         let mut stack = Stack::new();
         stack
             .push(int!(account.balance().map_or(0, |value| value.coins.as_u128())))
@@ -139,6 +142,8 @@ impl TransactionExecutor for TickTockTransactionExecutor {
                 }
             }
         };
+        // Address normalization is committed independently of VM/action success.
+        let committed_address = account.get_addr().cloned();
         let mut out_msgs = vec![];
         description.compute_ph = compute_ph;
         description.action = match description.compute_ph {
@@ -197,6 +202,9 @@ impl TransactionExecutor for TickTockTransactionExecutor {
         account.set_balance(acc_balance);
         if description.aborted {
             *account = old_account;
+            if let Some(address) = committed_address {
+                account.set_addr(address);
+            }
         }
         let lt = self.add_messages(&mut tr, out_msgs, params.last_tr_lt)?;
         account.set_last_tr_time(lt);
@@ -212,7 +220,10 @@ impl TransactionExecutor for TickTockTransactionExecutor {
     fn build_stack(&self, _in_msg: Option<&Message>, account: &Account) -> Result<Stack> {
         let account_balance =
             account.balance().ok_or_else(|| error!("Can't get account balance."))?.coins.as_u128();
-        let account_id = account.get_id().ok_or_else(|| error!("Can't get account id."))?;
+        let (_, account_id) = account
+            .get_addr()
+            .ok_or_else(|| error!("Can't get account address."))?
+            .extract_std_address(true)?;
         let mut stack = Stack::new();
         stack
             .push(int!(account_balance))
