@@ -715,14 +715,6 @@ impl Engine {
         )?;
         let test_bundles_config = general_config.test_bundles_config().clone();
         let session_logs_file = general_config.session_logs_file();
-        // Spawn the trace collector worker only when an on-disk session-stats
-        // file is configured. Otherwise leave it as `None` so we don't run an
-        // idle background thread
-        let trace_collector = if session_logs_file.is_some() {
-            Some(simplex::TraceCollector::new(session_logs_file))
-        } else {
-            None
-        };
         let external_messages_maximum_queue_length =
             collator_config.external_messages_maximum_queue_length;
 
@@ -746,9 +738,12 @@ impl Engine {
             let mut opened_db: Option<Arc<InternalDb>> = None;
             let mut status_server: Option<ControlServer> = None;
             let mut network_binding = Some(network_binding);
-            let mut trace_collector = trace_collector;
+            let mut trace_collector = None;
             let mut transferred = false;
             let result = std::panic::AssertUnwindSafe(async {
+                if session_logs_file.is_some() {
+                    trace_collector = Some(simplex::TraceCollector::new(session_logs_file));
+                }
                 network.start().await?;
                 #[cfg(test)]
                 stopper.wait_construction_gate("network").await?;
@@ -1008,7 +1003,10 @@ impl Engine {
                     db.stop_states_db().await;
                 }
                 if let Err(error) = rollback_network.stop_adnl().await {
-                    rollback_stopper.report_service_failure(0, format!("partial Engine network shutdown: {error}"));
+                    rollback_stopper.report_service_failure(
+                        0,
+                        format!("partial Engine network shutdown: {error}"),
+                    );
                 }
                 if let Some(trace) = trace_collector.take() {
                     trace.stop();

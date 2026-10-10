@@ -54,6 +54,7 @@ pub struct NetworkContext {
 }
 
 pub struct NodeNetwork {
+    tasks: crate::types::owned_tasks::OwnedTasks,
     network_context: Arc<NetworkContext>,
     validator_context: ValidatorContext,
     runtime_handle: tokio::runtime::Handle,
@@ -197,7 +198,6 @@ impl NodeNetwork {
         }
 
         let dht_key = adnl.key_by_tag(Self::TAG_DHT_KEY)?;
-        NodeNetwork::periodic_store_ip_addr(dht.clone(), dht_key, None, cancellation_token.clone());
 
         let overlay_key = adnl.key_by_tag(Self::TAG_OVERLAY_KEY)?;
         // Bind QUIC immediately on the default overlay ADNL key, validator key will be added later
@@ -215,14 +215,6 @@ impl NodeNetwork {
                 Err(e) => log::warn!("Skipping default QUIC identity: {e}"),
             }
         }
-
-        NodeNetwork::periodic_store_ip_addr(
-            dht.clone(),
-            overlay_key,
-            None,
-            cancellation_token.clone(),
-        );
-        NodeNetwork::find_dht_nodes(dht.clone(), cancellation_token.clone());
 
         let (config_handler, config_handler_context) =
             NodeConfigHandler::create(config, tokio::runtime::Handle::current())?;
@@ -261,6 +253,7 @@ impl NodeNetwork {
         let network_context = Arc::new(network_context);
 
         let node_network = NodeNetwork {
+            tasks: crate::types::owned_tasks::OwnedTasks::new(cancellation_token.child_token()),
             network_context: network_context.clone(),
             validator_context,
             runtime_handle: tokio::runtime::Handle::current(),
@@ -285,6 +278,22 @@ impl NodeNetwork {
             }
             return Err(error);
         }
+        for key in [dht_key, overlay_key] {
+            node_network.tasks.spawn_handle("network DHT announcement", || {
+                Self::periodic_store_ip_addr(
+                    node_network.network_context.stack.dht.clone(),
+                    key,
+                    None,
+                    node_network.cancellation_token.clone(),
+                )
+            })?;
+        }
+        node_network.tasks.spawn_handle("network DHT discovery", || {
+            Self::find_dht_nodes(
+                node_network.network_context.stack.dht.clone(),
+                node_network.cancellation_token.clone(),
+            )
+        })?;
         Ok(node_network)
     }
 
@@ -341,6 +350,7 @@ impl NodeNetwork {
         // A queued subscriber must finish before transport shutdown, otherwise
         // it can register a new endpoint after the old endpoints were stopped.
         let config_result = self.config_handler.stop_and_wait().await;
+        let workers_result = self.tasks.wait().await;
         if let Some(quic) = &self.network_context.stack.quic {
             log::info!("Stopping QUIC...");
             quic.shutdown();
@@ -348,7 +358,14 @@ impl NodeNetwork {
         log::info!("Node network loops stopped. Stopping adnl...");
         self.network_context.stack.adnl.stop().await;
         log::info!("Stopped adnl");
-        config_result
+        match (config_result, workers_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (config, workers) => Err(error!(
+                "Network shutdown: config={:?}; workers={:?}",
+                config.err(),
+                workers.err()
+            )),
+        }
     }
 
     fn try_add_counted_object<K: Hash + Ord + Clone, T: CountedObject>(
@@ -408,7 +425,10 @@ impl NodeNetwork {
         Ok((quic_addr, bind_addr))
     }
 
-    fn find_dht_nodes(dht: Arc<DhtNode>, cancellation_token: tokio_util::sync::CancellationToken) {
+    fn find_dht_nodes(
+        dht: Arc<DhtNode>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
         spawn_cancelable(cancellation_token, async move {
             loop {
                 let mut iter = None;
@@ -419,7 +439,7 @@ impl NodeNetwork {
                 }
                 tokio::time::sleep(Self::TIMEOUT_FIND_DHT_NODES).await;
             }
-        });
+        })
     }
 
     fn periodic_store_ip_addr(
@@ -454,12 +474,12 @@ impl NodeNetwork {
         validators_contexts: Arc<lockfree::map::Map<UInt256, Arc<ValidatorSetContext>>>,
         validator_list_id: UInt256,
         validators: Vec<CatchainNode>,
-    ) {
+    ) -> Result<()> {
         let dht = self.network_context.stack.dht.clone();
         let adnl = self.network_context.stack.adnl.clone();
         let overlay = self.network_context.stack.overlay.clone();
 
-        spawn_cancelable(self.cancellation_token.clone(), async move {
+        self.tasks.spawn_cancelable("validator key discovery", async move {
             let mut current_validators = validators;
             loop {
                 match Self::search_validator_keys_round(
@@ -494,7 +514,8 @@ impl NodeNetwork {
                     break;
                 }
             }
-        });
+        })?;
+        Ok(())
     }
 
     /// Spawn a background task that DHT-resolves ADNL addresses for a list of
@@ -683,12 +704,15 @@ impl NodeNetwork {
                 log::warn!("Cannot add validator ADNL key {key_id} to QUIC: {e}");
             }
         }
-        NodeNetwork::periodic_store_ip_addr(
-            self.network_context.stack.dht.clone(),
-            self.network_context.stack.adnl.key_by_id(&key_id)?,
-            Some((self.validator_context.adnl_key_ids.clone(), election_id)),
-            self.cancellation_token.clone(),
-        );
+        let stored_key = self.network_context.stack.adnl.key_by_id(&key_id)?;
+        self.tasks.spawn_handle("validator DHT announcement", || {
+            NodeNetwork::periodic_store_ip_addr(
+                self.network_context.stack.dht.clone(),
+                stored_key,
+                Some((self.validator_context.adnl_key_ids.clone(), election_id)),
+                self.cancellation_token.clone(),
+            )
+        })?;
         log::info!(
             "load_and_store_validator_adnl_key: \
             id {key_id} added for elections {election_id}"
@@ -913,7 +937,7 @@ impl PrivateOverlayOperations for NodeNetwork {
                 self.validator_context.sets_contexts.clone(),
                 validator_list_id.clone(),
                 lost_validators,
-            );
+            )?;
         }
 
         for peer in context.validator_peers.iter() {

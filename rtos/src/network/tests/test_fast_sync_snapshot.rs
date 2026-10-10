@@ -141,7 +141,7 @@ impl Fixture {
     }
 
     async fn stop(&self) {
-        self.router.clear_fast_sync_overlays();
+        self.router.clear_fast_sync_overlays().await.unwrap();
         self.router.network.stop_adnl().await.unwrap();
     }
 }
