@@ -145,6 +145,6 @@ async fn parent_apply_stored_chain_probe() -> Result<()> {
     *engine.parent_apply_test_gate.lock().unwrap() = None;
     stopper.set_stop();
     let _ = tokio::time::timeout(Duration::from_secs(10), join).await;
-    engine.wait_stop().await;
+    engine.wait_stop().await?;
     result
 }
