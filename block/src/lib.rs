@@ -1,4 +1,5 @@
 /*
+ * RTOS project modifications (2026-10-10): AUTH policy module registration.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -8,6 +9,9 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+pub mod auth_policy;
+pub use auth_policy::*;
+
 pub mod types;
 pub use types::*;
 

@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): naming and AUTH policy transition checks.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -4611,6 +4611,7 @@ impl Collator {
                     new_config.config_addr
                 );
             }
+            old_config.validate_auth_policy_transition(&new_config)?;
             let is_key_block =
                 new_config.important_config_parameters_changed(state_extra.config(), false)?;
             if is_key_block {
