@@ -169,23 +169,23 @@ fn test_add_hint_treats_pruned_shared_cell_as_preexisting() {
     };
     let loaded: HashSet<UInt256> = [old_parent_pruned.repr_hash().clone()].into_iter().collect();
 
-    // Without the hint: `shared` is re-counted as a brand-new cell → overcount.
+    // Without the hint, the missing old subtree cannot be removed safely.
     let mut without_hint = AccountStorageStat::default();
     seed(&mut without_hint);
-    without_hint.replace_roots([new_parent.clone()].as_slice().into()).unwrap();
+    let error = without_hint.replace_roots([new_parent.clone()].as_slice().into()).unwrap_err();
+    assert!(error.to_string().contains("incomplete old-state proof"));
 
     // With the hint: `shared` is recognised as pre-existing → totals unchanged.
     let mut with_hint = AccountStorageStat::default();
     seed(&mut with_hint);
     with_hint.add_hint(&loaded);
     assert!(with_hint.hint.contains(&shared_hash), "hint marks the shared subtree");
-    with_hint.replace_roots([new_parent].as_slice().into()).unwrap();
+    with_hint.replace_roots([new_parent.clone()].as_slice().into()).unwrap();
 
     assert_eq!(with_hint.total_cells(), full_cells, "with hint: shared subtree not re-counted");
-    assert_eq!(
-        without_hint.total_cells(),
-        full_cells + 1,
-        "without hint: shared cell wrongly counted as new"
-    );
-    assert!(with_hint.total_bits() < without_hint.total_bits(), "hint avoids the extra bits too");
+    assert_eq!(with_hint.total_bits(), full_bits, "hint preserves complete subtree bit count");
+    let mut rebuilt = AccountStorageStat::default();
+    rebuilt.replace_roots([new_parent].as_slice().into()).unwrap();
+    let expected = rebuilt.calc_dict().unwrap().unwrap().repr_hash().clone();
+    assert_eq!(with_hint.calc_dict().unwrap().unwrap().repr_hash(), &expected);
 }

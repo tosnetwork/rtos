@@ -1,5 +1,6 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and storage fee integration.
+ * Storage fee adaptation: Copyright (C) 2026 TOS Blockchain Teams.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -11,9 +12,9 @@
  */
 use num::BigInt;
 use rtos_block::{
-    fail, AccountId, BurningConfig, Coins, ConfigParam18, ConfigParamEnum, ConfigParams,
-    FundamentalSmcAddresses, GasLimitsPrices, GlobalCapabilities, Mask, MsgAddressInt,
-    MsgForwardPrices, Result, SizeLimitsConfig, StorageInfo, StoragePrices, UInt256,
+    accrued_storage_fee, fail, AccountId, BurningConfig, Coins, ConfigParam18, ConfigParamEnum,
+    ConfigParams, FundamentalSmcAddresses, GasLimitsPrices, GlobalCapabilities, Mask,
+    MsgAddressInt, MsgForwardPrices, Result, SizeLimitsConfig, StorageInfo, StoragePrices, UInt256,
     SUPPORTED_VERSION,
 };
 
@@ -73,32 +74,12 @@ impl AccStoragePrices {
         &self,
         cells: u64,
         bits: u64,
-        mut last_paid: u32,
+        last_paid: u32,
         now: u32,
         is_masterchain: bool,
     ) -> Result<u128> {
-        if now <= last_paid
-            || last_paid == 0
-            || self.prices.is_empty()
-            || now <= self.prices[0].utime_since
-        {
-            return Ok(0);
-        }
-        let mut fee = BigInt::default();
-        // storage prices config contains prices array for some time intervals
-        // to calculate account storage fee we need to sum fees for all intervals since last
-        // storage fee pay calculated by formula `(cells * cell_price + bits * bits_price) * interval`
-        for i in 0..self.prices.len() {
-            let prices = &self.prices[i];
-            let end = if i < self.prices.len() - 1 { self.prices[i + 1].utime_since } else { now };
-
-            if end >= last_paid {
-                let delta = end - prices.utime_since.max(last_paid);
-                fee += prices.calc_storage_fee_part(cells, bits, delta as u64, is_masterchain);
-                last_paid = end;
-            }
-        }
-        fee = (fee + 0xffffu32) >> 16;
+        let fee: BigInt =
+            accrued_storage_fee(&self.prices, cells, bits, last_paid, now, false, is_masterchain)?;
         Ok(fee.try_into()?)
     }
 
@@ -350,3 +331,7 @@ impl BlockchainConfig {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_storage_fees.rs"]
+mod storage_fee_tests;

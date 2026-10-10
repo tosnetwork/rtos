@@ -1,4 +1,5 @@
 /*
+ * RTOS modification (2026-10-10): reject removal of unavailable pruned state data.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -392,6 +393,9 @@ impl AccountStorageStat {
         };
 
         if removed {
+            if cell.is_pruned() {
+                fail!("Cannot remove a pruned cell from storage statistics: incomplete old-state proof");
+            }
             // Use `reference` (not `reference_without_usage`) so that removed cells are marked as
             // visited in the `UsageTree` and therefore included in the resulting proof.
             // This path is only hit for incremental removals (the initial full dict build uses

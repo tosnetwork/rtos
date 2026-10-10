@@ -96,7 +96,8 @@ fn test_config_param_18() {
 
     for i in 0..10 {
         cp18.get(i).expect_err(&format!("param with index {} must not be present yet", i));
-        cp18.insert(&get_storage_prices()).unwrap();
+        let price = StoragePrices { utime_since: i, ..get_storage_prices() };
+        cp18.insert(&price).unwrap();
         cp18.get(i).unwrap();
         assert_eq!(cp18.map.len().unwrap(), i as usize + 1);
         write_read_and_assert(cp18.clone());
