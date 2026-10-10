@@ -18,6 +18,8 @@ pub mod error;
 pub mod smart_contract_info;
 pub mod utils;
 
-pub use self::smart_contract_info::{run_smc_method, SmartContractInfo, SmcMethodResult};
+pub use self::smart_contract_info::{
+    run_smc_method, run_smc_method_with_block_id, SmartContractInfo, SmcMethodResult,
+};
 
 include!("../../common/src/info.rs");

@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): node getter context and versioned library selection.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -23,9 +23,9 @@ use rtos_api::{
     IntoBoxed,
 };
 use rtos_block::{
-    error, fail, read_single_root_boc, write_boc, Account, Cell, ConfigParams, CurrencyCollection,
-    Deserializable, ExtBlkRef, HashmapAugType, KeyExtBlkRef, Message, OldMcBlocksInfo, Result,
-    Serializable, Sha256, ShardStateUnsplit, SliceData, UInt256, UnixTime,
+    error, fail, read_single_root_boc, write_boc, Account, BlockIdExt, Cell, ConfigParams,
+    CurrencyCollection, Deserializable, ExtBlkRef, HashmapAugType, KeyExtBlkRef, Message,
+    OldMcBlocksInfo, Result, Serializable, Sha256, ShardStateUnsplit, SliceData, UInt256, UnixTime,
 };
 use std::{borrow::Cow, mem};
 
@@ -89,6 +89,31 @@ pub struct SmcMethodResult {
 }
 
 impl SmcMethodResult {
+    /// Initial node getter context. The reduced response hides configuration and
+    /// uses a fresh seed, as it is independent of the context used for execution.
+    pub fn initial_c7(&self, full: bool) -> Result<StackItem> {
+        self.initial_c7_with_rng(full, &mut rand::rngs::OsRng)
+    }
+
+    fn initial_c7_with_rng<R: rand::RngCore + rand::CryptoRng>(
+        &self,
+        full: bool,
+        rng: &mut R,
+    ) -> Result<StackItem> {
+        let mut context = self.smc_info.as_get_method_data_item()?;
+        if full {
+            return Ok(context);
+        }
+        let mut outer = context.as_tuple_mut()?;
+        let mut fields = outer.remove(0).as_tuple_mut()?;
+        fields.truncate(10);
+        fields[9] = StackItem::None;
+        let mut seed = [0; 32];
+        rng.try_fill_bytes(&mut seed)?;
+        fields[6] = StackItem::integer(IntegerData::from_unsigned_bytes_be(&seed));
+        Ok(StackItem::tuple(vec![StackItem::tuple(fields)]))
+    }
+
     pub fn into_run_result(self) -> Result<rtos_api::ton::smc::runresult::RunResult> {
         Ok(rtos_api::ton::smc::runresult::RunResult {
             gas_used: self.gas_used,
@@ -334,6 +359,120 @@ impl SmartContractInfo {
         StackItem::tuple(tuple)
     }
 
+    fn get_method_prev_blocks_info(
+        state: &ShardStateUnsplit,
+        current: &BlockIdExt,
+    ) -> Result<StackItem> {
+        let extra = state.read_custom()?.ok_or_else(|| error!("No custom data in mc_state"))?;
+        let current_ref = ExtBlkRef {
+            seq_no: current.seq_no(),
+            end_lt: state.gen_lt(),
+            root_hash: current.root_hash().clone(),
+            file_hash: current.file_hash().clone(),
+        };
+        let lookup = |seq_no: u32| -> Result<Option<ExtBlkRef>> {
+            if seq_no == current.seq_no() {
+                Ok(Some(current_ref.clone()))
+            } else {
+                // Dictionary traversal errors remain fatal. An absent or malformed
+                // historical record makes the optional getter history unavailable.
+                let Some(mut slice) = extra.prev_blocks.get_as_slice(&seq_no)? else {
+                    return Ok(None);
+                };
+                Ok(KeyExtBlkRef::construct_from(&mut slice)
+                    .ok()
+                    .filter(|entry| {
+                        entry.blk_ref.seq_no == seq_no
+                            && slice.remaining_bits() == 0
+                            && slice.remaining_references() == 0
+                    })
+                    .map(|entry| entry.blk_ref))
+            }
+        };
+        let mut recent = Vec::new();
+        for seq_no in (current.seq_no().saturating_sub(15)..=current.seq_no()).rev() {
+            let Some(block) = lookup(seq_no)? else {
+                return Ok(StackItem::None);
+            };
+            recent.push(Self::id2tuple(&block));
+        }
+        let last_key =
+            if extra.after_key_block { Some(&current_ref) } else { extra.last_key_block.as_ref() };
+        let Some(last_key) = last_key else {
+            return Ok(StackItem::None);
+        };
+        let mut fields = vec![StackItem::tuple(recent), Self::id2tuple(last_key)];
+        if extra.config.global_version() >= 9 {
+            let mut centuries = Vec::new();
+            let mut seq_no = current.seq_no() / 100 * 100;
+            loop {
+                let Some(block) = lookup(seq_no)? else {
+                    return Ok(StackItem::None);
+                };
+                centuries.push(Self::id2tuple(&block));
+                if centuries.len() == 16 || seq_no < 100 {
+                    break;
+                }
+                seq_no -= 100;
+            }
+            fields.push(StackItem::tuple(centuries));
+        }
+        Ok(StackItem::tuple(fields))
+    }
+
+    fn get_method_precompiled(&self) -> Result<Option<rtos_block::PrecompiledSmc>> {
+        let Some(param) = self.config_params.config_params.get(45u32.write_to_bitstring()?)? else {
+            return Ok(None);
+        };
+        let Some(cell) = param.reference_opt(0) else {
+            return Ok(None);
+        };
+        let mut slice = SliceData::load_cell(cell)?;
+        // The optional parameter and leaf records must decode exactly. Keep
+        // dictionary traversal failures distinct from malformed optional records.
+        let mut list = rtos_block::HashmapE::with_bit_len(256);
+        if slice.get_next_byte().ok() != Some(0xc0)
+            || list.read_from(&mut slice).is_err()
+            || slice.remaining_bits() != 0
+            || slice.remaining_references() != 0
+        {
+            return Ok(None);
+        }
+        let Some(mut entry) = list.get(self.mycode.repr_hash().write_to_bitstring()?)? else {
+            return Ok(None);
+        };
+        Ok(rtos_block::PrecompiledSmc::construct_from(&mut entry)
+            .ok()
+            .filter(|_| entry.remaining_bits() == 0 && entry.remaining_references() == 0))
+    }
+
+    /// Node getter context follows the lite-server profile. It has no
+    /// authenticated message import and does not include the incoming storage
+    /// slot used by the transaction context. Historical tuple lengths remain observable.
+    fn as_get_method_data_item(&self) -> Result<StackItem> {
+        let version = self.config_params.global_version();
+        let mut outer = self.as_temp_data_item().as_tuple_mut()?;
+        let mut fields = outer.remove(0).as_tuple_mut()?;
+        let length = if version < 4 {
+            10
+        } else if version < 6 {
+            14
+        } else if version < 11 {
+            17
+        } else {
+            18
+        };
+        fields.truncate(length);
+        if version >= 6 {
+            // A configured zero cost is an integer, distinct from no entry.
+            let precompiled = self.get_method_precompiled()?;
+            fields[16] = precompiled
+                .map(|contract| StackItem::int(contract.gas_usage))
+                .unwrap_or(StackItem::None);
+        }
+        Ok(StackItem::tuple(vec![StackItem::tuple(fields)]))
+    }
+
     pub fn as_temp_data_item(&self) -> StackItem {
         // let config = rtos_block_json::debug_config(&self.config_params).unwrap();
         // std::fs::write("d:\\config.json", config)?;
@@ -523,6 +662,8 @@ pub fn convert_ton_stack(items: &[StackEntry]) -> Result<Vec<StackItem>> {
     Ok(result)
 }
 
+/// Execute without a block identifier; the current block hashes in history are zero.
+/// Node callers with a pinned snapshot should use `run_smc_method_with_block_id`.
 pub fn run_smc_method(
     account: &Account,
     mc_state_cell: Cell,
@@ -531,26 +672,138 @@ pub fn run_smc_method(
     gen_utime: u32,
     gen_lt: u64,
 ) -> Result<SmcMethodResult> {
+    run_smc_method_with_rng(
+        account,
+        mc_state_cell,
+        method_id,
+        stack,
+        gen_utime,
+        gen_lt,
+        None,
+        &mut rand::rngs::OsRng,
+    )
+}
+
+/// Execute a getter with the complete identifier of its pinned masterchain snapshot.
+pub fn run_smc_method_with_block_id(
+    account: &Account,
+    mc_state_cell: Cell,
+    mc_block_id: &BlockIdExt,
+    method_id: u32,
+    stack: Vec<StackEntry>,
+    gen_utime: u32,
+    gen_lt: u64,
+) -> Result<SmcMethodResult> {
+    run_smc_method_with_rng(
+        account,
+        mc_state_cell,
+        method_id,
+        stack,
+        gen_utime,
+        gen_lt,
+        Some(mc_block_id),
+        &mut rand::rngs::OsRng,
+    )
+}
+
+fn run_smc_method_with_rng<R: rand::RngCore + rand::CryptoRng>(
+    account: &Account,
+    mc_state_cell: Cell,
+    method_id: u32,
+    stack: Vec<StackEntry>,
+    gen_utime: u32,
+    gen_lt: u64,
+    mc_block_id: Option<&BlockIdExt>,
+    rng: &mut R,
+) -> Result<SmcMethodResult> {
+    let mut seed = [0u8; 32];
+    rng.try_fill_bytes(&mut seed)?;
+    run_smc_method_with_seed(
+        account,
+        mc_state_cell,
+        method_id,
+        stack,
+        gen_utime,
+        gen_lt,
+        seed,
+        mc_block_id,
+    )
+}
+
+fn run_smc_method_with_seed(
+    account: &Account,
+    mc_state_cell: Cell,
+    method_id: u32,
+    stack: Vec<StackEntry>,
+    gen_utime: u32,
+    gen_lt: u64,
+    seed: [u8; 32],
+    mc_block_id: Option<&BlockIdExt>,
+) -> Result<SmcMethodResult> {
     let code = account.get_code().ok_or_else(|| error!("Account has no code"))?;
     let data = account.get_data().unwrap_or_default();
+    let mc_state = ShardStateUnsplit::construct_from_cell(mc_state_cell.clone())?;
+    let current = mc_block_id.cloned().unwrap_or_else(|| {
+        BlockIdExt::with_params(
+            mc_state.shard().clone(),
+            mc_state.seq_no(),
+            UInt256::default(),
+            UInt256::default(),
+        )
+    });
+    if !mc_state.shard().is_masterchain()
+        || current.shard() != mc_state.shard()
+        || current.seq_no() != mc_state.seq_no()
+    {
+        fail!(
+            "Getter masterchain block identifier disagrees with snapshot shard or sequence number"
+        );
+    }
+    // The node config entrypoint requires a valid zero-state reference even
+    // when this VM version does not expose previous blocks in c7.
+    if mc_state.seq_no() != 0 {
+        let extra = mc_state.read_custom()?.ok_or_else(|| error!("No custom data in mc_state"))?;
+        let mut zero = extra
+            .prev_blocks
+            .get_as_slice(&0)?
+            .ok_or_else(|| error!("Masterchain history has no zero-state reference"))?;
+        let entry = KeyExtBlkRef::construct_from(&mut zero)?;
+        if entry.blk_ref.seq_no != 0
+            || zero.remaining_bits() != 0
+            || zero.remaining_references() != 0
+        {
+            fail!("Masterchain history has an invalid zero-state reference");
+        }
+    }
     let mut smc_info =
         SmartContractInfo::with_params(Some(account), None, Some(mc_state_cell.clone()))?;
     smc_info.unix_time = gen_utime;
     smc_info.block_lt = gen_lt;
     smc_info.trans_lt = gen_lt;
+    smc_info.rand_seed = IntegerData::from_unsigned_bytes_be(&seed);
+    smc_info.prev_blocks_info =
+        PrevBlocksInfo::Tuple(if smc_info.config_params.global_version() >= 4 {
+            SmartContractInfo::get_method_prev_blocks_info(&mc_state, &current)?
+        } else {
+            StackItem::None
+        });
 
     let mut storage = convert_ton_stack(&stack)?;
     storage.push(StackItem::int(method_id));
     let stack = Stack::with_storage(storage);
 
     let mut ctrls = SaveList::new();
-    ctrls.put(7, smc_info.as_temp_data_item())?;
+    ctrls.put(7, smc_info.as_get_method_data_item()?)?;
     ctrls.put(4, StackItem::Cell(data))?;
 
     let gas = Gas::new(1000000, 0, 1000000, 1000000);
 
-    let mc_state = ShardStateUnsplit::construct_from_cell(mc_state_cell)?;
-    let libraries = vec![account.libraries().inner(), mc_state.libraries().clone().inner()];
+    // Global libraries take precedence over the account dictionary. From
+    // version 15 the account dictionary is no longer eligible for getters.
+    let mut libraries = vec![mc_state.libraries().clone().inner()];
+    if smc_info.config_params.global_version() < 15 {
+        libraries.push(account.libraries().inner());
+    }
 
     let caps = smc_info.config_params.capabilities();
     let mut vm =
@@ -580,3 +833,11 @@ pub fn run_smc_method(
 #[cfg(test)]
 #[path = "tests/test_smart_contract_info.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/test_get_context.rs"]
+mod get_context_tests;
+
+#[cfg(test)]
+#[path = "tests/test_get_history_context.rs"]
+mod get_history_context_tests;

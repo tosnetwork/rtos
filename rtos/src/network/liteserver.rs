@@ -875,6 +875,7 @@ impl LiteServerQuerySubscriber {
         )
         .await?;
         let mc_state_root = resolved.mc_state.state().root_cell().clone();
+        let mc_block_id = resolved.id.clone();
 
         let lib_extras =
             if mode.contains(RunSmcMethodMode::LIB_EXTRAS) { Some(Vec::new()) } else { None };
@@ -943,9 +944,10 @@ impl LiteServerQuerySubscriber {
             let input_stack = deserialize_vm_stack_boc(&params)?;
             let input_entries = convert_stack(&input_stack)?;
 
-            let run = rtos_vm::run_smc_method(
+            let run = rtos_vm::run_smc_method_with_block_id(
                 &account,
                 mc_state_root.clone(),
+                &mc_block_id,
                 method_id as u32,
                 input_entries,
                 resolved.gen_utime,
@@ -973,11 +975,9 @@ impl LiteServerQuerySubscriber {
                 .transpose()?;
 
             let init_c7 = if mode.contains(RunSmcMethodMode::INIT_C7) {
-                let mut smc_info = run.smc_info;
-                if !mode.contains(RunSmcMethodMode::FULL_C7) {
-                    smc_info.config_params = Default::default();
-                }
-                Some(serialize_vm_stack_value_boc(&smc_info.as_temp_data_item())?)
+                Some(serialize_vm_stack_value_boc(
+                    &run.initial_c7(mode.contains(RunSmcMethodMode::FULL_C7))?,
+                )?)
             } else {
                 None
             };
