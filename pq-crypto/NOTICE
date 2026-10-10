@@ -49,3 +49,9 @@ nonces are unchanged. The original submission and source are MIT licensed
 (see native/falcon-reference/LICENSE). An additional 28 fixed-profile cases
 come from the pinned reference test/pq-falcon512/vectors.json; its GPLv3
 license text is retained at tests/data/TOS-LICENSE.txt.
+
+The LMS fee module is a portable Rust implementation of the fixed RFC 8554
+profile used by crypto/pq/lms-fee.cpp in the pinned reference revision above,
+under LGPL-2.0-or-later. It admits only one-level HSS with LMS_SHA256_M32_H20
+and LMOTS_SHA256_N32_W4. SHA-256 uses the RustCrypto sha2 crate. No signing,
+stateful key management or tree generation is included.
