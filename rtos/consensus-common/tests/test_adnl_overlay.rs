@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and overlay signer recovery tests.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -297,6 +297,7 @@ fn run_overlay_test(
 
     // Create Catchain nodes with unique key pairs
     let mut consensus_nodes = Vec::new();
+    let mut local_signing_keys = Vec::new();
     for i in 0..num_nodes {
         let private_key =
             get_key_option_factory().generate().expect("Failed to generate private key");
@@ -306,6 +307,7 @@ fn run_overlay_test(
             .try_into()
             .expect("Invalid public key length");
         let public_key = get_key_option_factory().from_public_key(public_key_bytes);
+        local_signing_keys.push(private_key);
         let adnl_id =
             test_nodes[i].stack.adnl.key_by_tag(test_nodes[i].adnl_tag).unwrap().id().clone();
         consensus_nodes
@@ -325,7 +327,7 @@ fn run_overlay_test(
         let (listener, weak_listener, msg_count, query_count, broadcast_count) =
             make_listener(consensus_node.public_key.id().clone());
         let overlay = test_nodes[i].overlay_manager.start_overlay(
-            consensus_node.public_key.classical_key().unwrap(),
+            &local_signing_keys[i],
             &overlay_short_id,
             &consensus_nodes,
             weak_listener,
@@ -1023,4 +1025,43 @@ fn test_adnl_overlay_performance() -> Result<()> {
         run_adnl_overlay_performance_test(test_network.get_nodes().clone(), TRANSPORT_TYPE);
 
     result
+}
+
+#[test]
+fn test_adnl_overlay_restarts_after_fixture_panic() -> Result<()> {
+    init_overlay_test_log("adnl-overlay-panic-recovery");
+    let interrupted = std::panic::catch_unwind(|| {
+        let network = NodeTestNetwork::create_with_options(
+            "test_adnl_overlay_before_fixture_panic",
+            2,
+            4,
+            true,
+            true,
+            true,
+        );
+        {
+            let _runtime_guard = network.get_runtime().enter();
+            run_overlay_test(network.get_nodes().clone(), OverlayTransportType::SimplexQuic)
+                .expect("QUIC traffic before the deliberate fixture panic must succeed");
+        }
+        panic!("deliberate overlay fixture panic");
+    });
+    let panic = interrupted.expect_err("The fixture must unwind while holding its network guard");
+    assert_eq!(panic.downcast_ref::<&str>(), Some(&"deliberate overlay fixture panic"));
+
+    // Reuse the same loopback ports after all resources from the failed fixture are dropped.
+    let network = NodeTestNetwork::create_with_options(
+        "test_adnl_overlay_after_fixture_panic",
+        2,
+        4,
+        true,
+        true,
+        true,
+    );
+    {
+        let _runtime_guard = network.get_runtime().enter();
+        run_overlay_test(network.get_nodes().clone(), OverlayTransportType::SimplexQuic)?;
+    }
+    network.shutdown();
+    Ok(())
 }
