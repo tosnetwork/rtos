@@ -137,47 +137,211 @@ fn test_message_keeper() {
 
 #[test]
 fn test_message_keeper_multithread() {
-    let m = Message::with_ext_in_header(ExternalInboundMessageHeader::default());
-    let mk = Arc::new(MessageKeeper::new(Arc::new(m), Default::default(), 0).unwrap());
-
-    let mut hs = vec![];
-    for _ in 0..50 {
-        let mk = mk.clone();
-        let h = std::thread::spawn(move || {
-            assert!(mk.check_active(10000));
-            std::thread::sleep(std::time::Duration::from_millis(200));
-
-            assert!(mk.can_postpone());
-            // gen=0: reactivate at 10001+5 = 10006
-            mk.postpone(10001);
-            std::thread::sleep(std::time::Duration::from_millis(200));
-
-            assert!(mk.check_active(10006));
-            std::thread::sleep(std::time::Duration::from_millis(200));
-
-            assert!(mk.can_postpone());
-            // gen=1: reactivate at 10007+10 = 10017
-            mk.postpone(10007);
-            assert!(!mk.check_active(10009));
-            std::thread::sleep(std::time::Duration::from_millis(200));
-
-            assert!(mk.check_active(10017));
-            std::thread::sleep(std::time::Duration::from_millis(200));
-
-            assert!(mk.can_postpone());
-            // gen=2: reactivate at 10018+15 = 10033
-            mk.postpone(10018);
-            std::thread::sleep(std::time::Duration::from_millis(200));
-
-            assert!(mk.check_active(10033));
-            assert!(!mk.can_postpone());
-        });
-        hs.push(h);
+    use std::sync::mpsc;
+    let message = Message::with_ext_in_header(ExternalInboundMessageHeader::default());
+    let keeper = Arc::new(MessageKeeper::new(Arc::new(message), Default::default(), 0).unwrap());
+    let (finished, completions) = mpsc::sync_channel(50);
+    let mut commands = Vec::new();
+    let mut workers = Vec::new();
+    for index in 0..50 {
+        let keeper = keeper.clone();
+        let finished = finished.clone();
+        let (command, phases) = mpsc::sync_channel(1);
+        commands.push(command);
+        workers.push(std::thread::spawn(move || {
+            for phase in 0..7 {
+                assert_eq!(
+                    phases
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .expect("phase command deadline"),
+                    phase
+                );
+                let correct = match phase {
+                    0 => keeper.check_active(10000) && keeper.can_postpone(),
+                    1 => {
+                        keeper.postpone(10001);
+                        !keeper.check_active(10005)
+                    }
+                    2 => keeper.check_active(10006) && keeper.can_postpone(),
+                    3 => {
+                        keeper.postpone(10007);
+                        !keeper.check_active(10016)
+                    }
+                    4 => keeper.check_active(10017) && keeper.can_postpone(),
+                    5 => {
+                        keeper.postpone(10018);
+                        !keeper.check_active(10032)
+                    }
+                    6 => keeper.check_active(10033) && !keeper.can_postpone(),
+                    _ => unreachable!(),
+                };
+                finished.send((index, phase, correct)).unwrap();
+            }
+        }));
     }
-
-    for h in hs {
-        h.join().unwrap();
+    drop(finished);
+    for phase in 0..7 {
+        for command in &commands {
+            command.send(phase).expect("worker disconnected");
+        }
+        let mut seen = [false; 50];
+        for _ in 0..50 {
+            let (index, reported, correct) = completions
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|error| panic!("phase {phase} incomplete: {seen:?}; {error}"));
+            assert_eq!(reported, phase);
+            assert!(!seen[index], "duplicate worker {index} in phase {phase}");
+            seen[index] = true;
+            assert!(correct, "worker {index}, phase {phase}");
+        }
     }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+}
+
+fn keeper_pause(
+    keeper: &MessageKeeper,
+    operation: &'static str,
+) -> (std::sync::mpsc::Receiver<u64>, std::sync::mpsc::SyncSender<()>) {
+    use std::sync::{atomic::AtomicBool, mpsc, Mutex};
+    let (entered, snapshots) = mpsc::sync_channel(1);
+    let (resume, release) = mpsc::sync_channel(1);
+    let release = Mutex::new(release);
+    let armed = AtomicBool::new(true);
+    *keeper.transition_hook.lock().unwrap() = Some(Arc::new(move |kind, snapshot| {
+        if kind == operation
+            && std::thread::current().name() == Some("keeper-stale")
+            && armed.swap(false, Ordering::Relaxed)
+        {
+            entered.send(snapshot).unwrap();
+            release
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("stale transition release deadline");
+        }
+    }));
+    (snapshots, resume)
+}
+
+fn keeper_race_pool() -> (Arc<MessagesPool>, UInt256, MessageKeeper, ShardIdent) {
+    let pool = Arc::new(MessagesPool::new(0, None).0);
+    let message = create_external_message(1, vec![0x42]);
+    let id = message.hash().unwrap();
+    pool.new_message(&id, message, 0).unwrap();
+    let keeper = pool.messages.get(&id).unwrap().val().clone();
+    (pool, id, keeper, ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap())
+}
+
+#[test]
+fn message_keeper_stale_activation_preserves_new_postpone() {
+    let (pool, id, keeper, shard) = keeper_race_pool();
+    pool.complete_messages(&[id.clone()], &[], 100).unwrap();
+    let (snapshots, resume) = keeper_pause(&keeper, "check_active");
+    let (done, result) = std::sync::mpsc::sync_channel(1);
+    let worker_pool = pool.clone();
+    let worker_shard = shard.clone();
+    let worker = std::thread::Builder::new()
+        .name("keeper-stale".into())
+        .spawn(move || {
+            done.send(worker_pool.get_messages(&worker_shard, 105).unwrap().len()).unwrap();
+        })
+        .unwrap();
+    let snapshot = snapshots
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("activation snapshot deadline");
+    assert!(!MessageKeeper::fetch_active(snapshot));
+    assert_eq!(MessageKeeper::fetch_generation(snapshot), 0);
+    assert_eq!(pool.get_messages(&shard, 105).unwrap().len(), 1);
+    pool.complete_messages(&[id.clone()], &[], 106).unwrap();
+    resume.send(()).unwrap();
+    let count = result
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("activation completion deadline");
+    worker.join().unwrap();
+    assert_eq!(count, 0, "a stale activation cannot undo a completed postpone");
+    let state = keeper.atomic_storage.load(Ordering::Relaxed);
+    assert!(!MessageKeeper::fetch_active(state));
+    assert_eq!(MessageKeeper::fetch_generation(state), 1);
+    assert_eq!(MessageKeeper::fetch_reactivate_at(state), 116);
+    assert!(pool.get_messages(&shard, 115).unwrap().is_empty());
+    assert_eq!(pool.get_messages(&shard, 116).unwrap().len(), 1);
+}
+
+#[test]
+fn message_keeper_stale_postpone_preserves_new_generation() {
+    let (pool, id, keeper, shard) = keeper_race_pool();
+    let (snapshots, resume) = keeper_pause(&keeper, "postpone");
+    let (done, result) = std::sync::mpsc::sync_channel(1);
+    let worker_pool = pool.clone();
+    let worker_id = id.clone();
+    let worker = std::thread::Builder::new()
+        .name("keeper-stale".into())
+        .spawn(move || {
+            worker_pool.complete_messages(&[worker_id], &[], 100).unwrap();
+            done.send(()).unwrap();
+        })
+        .unwrap();
+    let snapshot = snapshots
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("postpone snapshot deadline");
+    assert!(MessageKeeper::fetch_active(snapshot));
+    assert_eq!(MessageKeeper::fetch_generation(snapshot), 0);
+    pool.complete_messages(&[id.clone()], &[], 100).unwrap();
+    assert_eq!(pool.get_messages(&shard, 105).unwrap().len(), 1);
+    pool.complete_messages(&[id.clone()], &[], 106).unwrap();
+    resume.send(()).unwrap();
+    result.recv_timeout(std::time::Duration::from_secs(10)).expect("postpone completion deadline");
+    worker.join().unwrap();
+    let state = keeper.atomic_storage.load(Ordering::Relaxed);
+    assert!(!MessageKeeper::fetch_active(state));
+    assert_eq!(
+        MessageKeeper::fetch_generation(state),
+        1,
+        "stale postpone must not roll generation back"
+    );
+    assert_eq!(MessageKeeper::fetch_reactivate_at(state), 116);
+    assert!(pool.get_messages(&shard, 115).unwrap().is_empty());
+}
+
+#[test]
+fn message_keeper_stale_postpone_rechecks_generation_limit() {
+    let (pool, id, keeper, shard) = keeper_race_pool();
+    pool.complete_messages(&[id.clone()], &[], 100).unwrap();
+    assert_eq!(pool.get_messages(&shard, 105).unwrap().len(), 1);
+    pool.complete_messages(&[id.clone()], &[], 106).unwrap();
+    assert_eq!(pool.get_messages(&shard, 116).unwrap().len(), 1);
+    let (snapshots, resume) = keeper_pause(&keeper, "postpone");
+    let (done, result) = std::sync::mpsc::sync_channel(1);
+    let worker_pool = pool.clone();
+    let worker_id = id.clone();
+    let worker = std::thread::Builder::new()
+        .name("keeper-stale".into())
+        .spawn(move || {
+            worker_pool.complete_messages(&[worker_id], &[], 117).unwrap();
+            done.send(()).unwrap();
+        })
+        .unwrap();
+    let snapshot = snapshots
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("generation-limit snapshot deadline");
+    assert!(MessageKeeper::fetch_active(snapshot));
+    assert_eq!(MessageKeeper::fetch_generation(snapshot), 2);
+    pool.complete_messages(&[id.clone()], &[], 117).unwrap();
+    assert_eq!(pool.get_messages(&shard, 132).unwrap().len(), 1);
+    resume.send(()).unwrap();
+    result
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("generation-limit completion deadline");
+    worker.join().unwrap();
+    // Retrying against generation three must choose the same removal as a
+    // serial completion at that generation, not schedule a fourth delay.
+    assert_eq!(MessageKeeper::fetch_generation(keeper.atomic_storage.load(Ordering::Relaxed)), 3);
+    assert!(pool.messages.get(&id).is_none());
+    assert_eq!(pool.total_messages(), 0);
+    assert!(!pool.has_messages());
+    assert!(pool.get_messages(&shard, 200).unwrap().is_empty());
 }
 
 fn create_external_message(dst_shard: u8, salt: Vec<u8>) -> Arc<Message> {

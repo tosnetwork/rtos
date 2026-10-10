@@ -38,6 +38,9 @@ const ORDER_SEQNO_UNSET: u32 = u32::MAX;
 
 pub const EXT_MESSAGES_TRACE_TARGET: &str = "ext_messages";
 
+#[cfg(test)]
+type KeeperTransitionHook = Arc<dyn Fn(&'static str, u64) + Send + Sync>;
+
 #[derive(Clone)]
 struct MessageKeeper {
     addr_key: (i32, UInt256),
@@ -47,6 +50,8 @@ struct MessageKeeper {
     // generation: u8,          0x0_ff_00000000
     // reactivate_at: u32,      0x0_00_ffffffff
     atomic_storage: Arc<AtomicU64>,
+    #[cfg(test)]
+    transition_hook: Arc<std::sync::Mutex<Option<KeeperTransitionHook>>>,
 
     hash_norm: UInt256,
 
@@ -71,6 +76,8 @@ impl MessageKeeper {
             addr_key,
             message,
             atomic_storage: Arc::new(AtomicU64::new(atomic_storage)),
+            #[cfg(test)]
+            transition_hook: Arc::new(std::sync::Mutex::new(None)),
             hash_norm,
             home_ts,
             home_seqno: Arc::new(AtomicU32::new(ORDER_SEQNO_UNSET)),
@@ -81,39 +88,74 @@ impl MessageKeeper {
         &self.message
     }
 
-    fn check_active(&self, now: u32) -> bool {
-        let mut atomic_storage = self.atomic_storage.load(Ordering::Relaxed);
-        let active = Self::fetch_active(atomic_storage);
-        let generation = Self::fetch_generation(atomic_storage);
-        let reactivate_at = Self::fetch_reactivate_at(atomic_storage);
-
-        if !active && reactivate_at <= now {
-            Self::set_active(&mut atomic_storage, true);
-            Self::set_generation(&mut atomic_storage, generation + 1);
-            self.atomic_storage.store(atomic_storage, Ordering::Relaxed);
-            true
-        } else {
-            active
+    #[cfg(test)]
+    fn before_transition(&self, operation: &'static str, snapshot: u64) {
+        let hook = self.transition_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(operation, snapshot);
         }
     }
 
-    fn can_postpone(&self) -> bool {
-        let atomic_storage = self.atomic_storage.load(Ordering::Relaxed);
-        Self::fetch_generation(atomic_storage) < MESSAGE_MAX_GENERATIONS
+    fn check_active(&self, now: u32) -> bool {
+        let mut snapshot = self.atomic_storage.load(Ordering::Relaxed);
+        loop {
+            if Self::fetch_active(snapshot) {
+                return true;
+            }
+            if Self::fetch_reactivate_at(snapshot) > now {
+                return false;
+            }
+            let mut next = snapshot;
+            Self::set_active(&mut next, true);
+            Self::set_generation(&mut next, Self::fetch_generation(snapshot) + 1);
+            #[cfg(test)]
+            self.before_transition("check_active", snapshot);
+            // The packed state is the entire transition; no other data is published.
+            match self.atomic_storage.compare_exchange_weak(
+                snapshot,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(current) => snapshot = current,
+            }
+        }
     }
 
-    fn postpone(&self, now: u32) {
-        let mut atomic_storage = self.atomic_storage.load(Ordering::Relaxed);
-        let active = Self::fetch_active(atomic_storage);
+    #[cfg(test)]
+    fn can_postpone(&self) -> bool {
+        Self::fetch_generation(self.atomic_storage.load(Ordering::Relaxed))
+            < MESSAGE_MAX_GENERATIONS
+    }
 
-        if active {
-            let generation = Self::fetch_generation(atomic_storage);
-            Self::set_active(&mut atomic_storage, false);
-            // (generation + 1) * 5 so the first postpone (generation == 0) gives
-            // a non-zero grace window; otherwise reactivate_at == now and the
-            // very next iteration would immediately re-activate the message.
-            Self::set_reactivate_at(&mut atomic_storage, now + (generation as u32 + 1) * 5);
-            self.atomic_storage.store(atomic_storage, Ordering::Relaxed);
+    // False asks the pool to remove an exhausted keeper. Test the generation in
+    // the same snapshot as the update, including after every failed CAS.
+    fn postpone(&self, now: u32) -> bool {
+        let mut snapshot = self.atomic_storage.load(Ordering::Relaxed);
+        loop {
+            let generation = Self::fetch_generation(snapshot);
+            if generation >= MESSAGE_MAX_GENERATIONS {
+                return false;
+            }
+            if !Self::fetch_active(snapshot) {
+                return true;
+            }
+            let mut next = snapshot;
+            Self::set_active(&mut next, false);
+            // Preserve the first five-second grace window and subsequent delays.
+            Self::set_reactivate_at(&mut next, now + (generation as u32 + 1) * 5);
+            #[cfg(test)]
+            self.before_transition("postpone", snapshot);
+            match self.atomic_storage.compare_exchange_weak(
+                snapshot,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(current) => snapshot = current,
+            }
         }
     }
 
@@ -467,12 +509,11 @@ impl MessagesPool {
     ) -> Result<()> {
         for id in to_delay {
             let result = self.messages.remove_with(id, |(_, keeper)| {
-                if keeper.can_postpone() {
+                if keeper.postpone(now) {
                     log::debug!(
                         target: EXT_MESSAGES_TRACE_TARGET,
                         "complete_messages: postponed external message {:x}", id
                     );
-                    keeper.postpone(now);
                     false
                 } else {
                     true
