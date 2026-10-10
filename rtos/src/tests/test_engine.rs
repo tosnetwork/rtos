@@ -87,7 +87,7 @@ fn test_node_restart() {
                 Ok((engine, join_handle)) => rt.block_on(async move {
                     join_handle.await.ok();
                     println!("Stopping node...");
-                    engine.wait_stop().await;
+                    engine.wait_stop().await.unwrap();
                     println!("Node stopped (in run phase).");
                 }),
             }

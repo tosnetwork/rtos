@@ -1249,6 +1249,10 @@ impl EngineOperations for Engine {
         self.stopper().release_stop(mask);
     }
 
+    fn report_service_failure(&self, mask: u32, error: String) {
+        self.stopper().report_service_failure(mask, error);
+    }
+
     // returns true if there were no either calculating or done queues before
     fn set_split_queues_calculating(&self, before_split_block: &BlockIdExt) -> bool {
         // insert None is there was not value before and return true

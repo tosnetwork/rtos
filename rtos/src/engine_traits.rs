@@ -996,6 +996,13 @@ pub trait EngineOperations: Sync + Send {
         unimplemented!();
     }
 
+    /// Terminal failure after the service drained its owned work. Never clears its bit.
+    fn report_service_failure(&self, mask: u32, error: String) {
+        unimplemented!(
+            "EngineOperations must report terminal service failure {mask:#06x}: {error}"
+        );
+    }
+
     fn set_split_queues_calculating(&self, before_split_block: &BlockIdExt) -> bool {
         true
     }
