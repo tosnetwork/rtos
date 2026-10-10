@@ -631,7 +631,7 @@ async fn engine_owned_drain_cancelled_real_run_releases_metrics_and_database() {
         .await
     });
     tokio::select! {
-        result = &mut task => panic!("real startup ended before opening metrics: {result:?}"),
+        result = &mut task => panic!("real startup ended before opening metrics: {:?}", result.err()),
         result = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if tokio::net::TcpStream::connect(address).await.is_ok() {
