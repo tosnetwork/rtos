@@ -710,7 +710,7 @@ pub(crate) async fn authenticate_recovered_state(
         }
         BootstrapAuthority::from_zerostate(pin, engine.load_mc_zero_state().await?)?
     } else {
-        let proof = load_recovery_proof(engine, pin, true).await?;
+        let proof = load_history_proof(engine, pin, true, true).await?;
         BootstrapAuthority::from_checkpoint(pin, proof)?
     };
     if block_id == pin {
@@ -735,10 +735,10 @@ pub(crate) async fn authenticate_recovered_state(
         if next.seq_no < seq || next.seq_no >= block_id.seq_no {
             fail!("Recovery history index has an invalid key-block position");
         }
-        let proof = load_recovery_proof(engine, &next, false).await?;
+        let proof = load_history_proof(engine, &next, false, true).await?;
         history = history.advance_key_block(&next, proof)?;
     }
-    let proof = load_recovery_proof(engine, block_id, false).await?;
+    let proof = load_history_proof(engine, block_id, false, false).await?;
     let verified = history.authenticate_block(block_id, proof)?.authenticate_state(state)?;
     if !verified.state().has_prev_block(pin)? {
         fail!("Authenticated recovered state does not contain the local pin");
@@ -746,10 +746,11 @@ pub(crate) async fn authenticate_recovered_state(
     Ok(verified)
 }
 
-async fn load_recovery_proof(
-    engine: &dyn EngineOperations,
+pub(crate) async fn load_history_proof<E: EngineOperations + ?Sized>(
+    engine: &E,
     id: &BlockIdExt,
     checkpoint: bool,
+    key_block: bool,
 ) -> Result<BlockProofStuff> {
     if let Some(handle) = engine.load_block_handle(id)? {
         if handle.id() != id {
@@ -766,7 +767,7 @@ async fn load_recovery_proof(
     }
     // A checkpoint may use a proof link because its complete ID is pinned.
     // Every unpinned successor requires a finality proof.
-    engine.download_block_proof(id, checkpoint, false).await
+    engine.download_block_proof(id, checkpoint, key_block).await
 }
 
 pub async fn warm_boot(

@@ -90,6 +90,10 @@ fn deserialize_destroyed_session_ids(data: &[u8]) -> Result<Vec<UInt256>> {
 
 #[async_trait::async_trait]
 impl EngineOperations for Engine {
+    async fn check_masterchain_proof(&self, proof: &BlockProofStuff) -> Result<()> {
+        self.masterchain_proof_verifier.verify(self, proof).await.map(|_| ())
+    }
+
     // Global node's state
 
     fn set_sync_status(&self, status: u32) {

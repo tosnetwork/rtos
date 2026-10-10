@@ -109,6 +109,7 @@ pub struct Engine {
 
     zerostate_id: BlockIdExt,
     init_mc_block_id: BlockIdExt,
+    pub(crate) masterchain_proof_verifier: crate::block_proof::MasterchainProofVerifier,
     hardforks: Vec<BlockIdExt>,
     flags: EngineFlags,
     archives_life_time_hours: Option<u32>,
@@ -766,6 +767,7 @@ impl Engine {
             _network_binding: network_binding,
             zerostate_id: zero_state_id,
             init_mc_block_id,
+            masterchain_proof_verifier: Default::default(),
             hardforks,
             flags,
             archives_life_time_hours,
@@ -1146,7 +1148,13 @@ impl Engine {
 
         loop {
             if let Some(handle) = self.load_block_handle(id)? {
+                if handle.id() != id {
+                    fail!("Cached apply handle identity mismatch");
+                }
                 if handle.is_applied() || pre_apply && handle.has_state() {
+                    if id.shard().is_masterchain() {
+                        crate::block_proof::check_applied_masterchain(self.as_ref(), id).await?;
+                    }
                     log::trace!(
                         "download_and_apply_block_worker(pre_apply: {}): block is already applied {}",
                         pre_apply,
@@ -1170,6 +1178,14 @@ impl Engine {
                             .block_applying_awaiters()
                             .do_or_wait(handle.id(), Some(10_000), async {
                                 let block = s.load_block(&handle).await?;
+                                let proof = s.load_block_proof(&handle, is_link).await?;
+                                crate::block_proof::check_block_proof_pair(
+                                    s.as_ref(),
+                                    id,
+                                    &block,
+                                    &proof,
+                                )
+                                .await?;
                                 s.apply_block_worker(
                                     &handle,
                                     &block,
@@ -1230,7 +1246,8 @@ impl Engine {
                 let downloading_time = now.elapsed().as_millis();
 
                 let now = std::time::Instant::now();
-                proof.check_proof(self.deref()).await?;
+                crate::block_proof::check_block_proof_pair(self.as_ref(), id, &block, &proof)
+                    .await?;
                 let handle = self.store_block(&block).await?;
                 let handle =
                     if let Some(handle) = handle.to_non_created() { handle } else { continue };
@@ -1320,6 +1337,10 @@ impl Engine {
         pre_apply: bool,
         recursion_depth: u32,
     ) -> Result<()> {
+        block.verify_expected_id(handle.id())?;
+        if handle.id().shard().is_masterchain() {
+            crate::block_proof::check_applied_masterchain(self.as_ref(), handle.id()).await?;
+        }
         if handle.is_applied() || pre_apply && handle.has_state() {
             log::trace!(
                 "apply_block_worker(pre_apply: {}): block is already applied {}",

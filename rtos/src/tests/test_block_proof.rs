@@ -708,8 +708,17 @@ async fn test_warm_recovery_authenticates_history_before_saving_cursor() {
         if mutation == 10 {
             entries.remove(1);
         }
-        let engine =
-            RecoveryProofEngine { pin, state, entries, next, previous, saves: AtomicUsize::new(0) };
+        let engine = RecoveryProofEngine {
+            pin,
+            state,
+            entries,
+            next,
+            previous,
+            saves: AtomicUsize::new(0),
+            stores: AtomicUsize::new(0),
+            proof_reads: AtomicUsize::new(0),
+            verifier: Default::default(),
+        };
         let result = crate::boot::recover_warm_boot_position(&engine, &start).await;
         if mutation == 0 || mutation == 7 || mutation == 12 {
             assert_eq!(result.unwrap(), target_id, "mutation {mutation}");
@@ -741,10 +750,47 @@ struct RecoveryProofEngine {
     next: Option<rtos_block::BlockIdExt>,
     previous: Option<rtos_block::BlockIdExt>,
     saves: std::sync::atomic::AtomicUsize,
+    stores: std::sync::atomic::AtomicUsize,
+    proof_reads: std::sync::atomic::AtomicUsize,
+    verifier: super::MasterchainProofVerifier,
 }
 
 #[async_trait::async_trait]
 impl crate::engine_traits::EngineOperations for RecoveryProofEngine {
+    async fn store_block(
+        &self,
+        block: &BlockStuff,
+    ) -> rtos_block::Result<crate::internal_db::BlockResult> {
+        self.stores.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let handle = self.entries.iter().find(|(h, _)| h.id() == block.id()).unwrap().0.clone();
+        Ok(crate::internal_db::BlockResult::with_status(
+            handle,
+            crate::internal_db::DataStatus::Updated,
+        ))
+    }
+    async fn store_block_proof(
+        &self,
+        id: &rtos_block::BlockIdExt,
+        _: Option<std::sync::Arc<storage::block_handle_db::BlockHandle>>,
+        _: &BlockProofStuff,
+    ) -> rtos_block::Result<crate::internal_db::BlockResult> {
+        self.stores.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let handle = self.entries.iter().find(|(h, _)| h.id() == id).unwrap().0.clone();
+        Ok(crate::internal_db::BlockResult::with_status(
+            handle,
+            crate::internal_db::DataStatus::Updated,
+        ))
+    }
+
+    async fn check_masterchain_proof(&self, proof: &BlockProofStuff) -> rtos_block::Result<()> {
+        self.verifier.verify(self, proof).await.map(|_| ())
+    }
+    async fn load_last_applied_mc_state(
+        &self,
+    ) -> rtos_block::Result<std::sync::Arc<crate::shard_state::ShardStateStuff>> {
+        Ok(self.state.clone())
+    }
+
     fn zerostate_id(&self) -> rtos_block::Result<&rtos_block::BlockIdExt> {
         Ok(&self.pin)
     }
@@ -771,6 +817,7 @@ impl crate::engine_traits::EngineOperations for RecoveryProofEngine {
         handle: &std::sync::Arc<storage::block_handle_db::BlockHandle>,
         _: bool,
     ) -> rtos_block::Result<BlockProofStuff> {
+        self.proof_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.entries
             .iter()
             .find(|(h, _)| h.id() == handle.id())
@@ -779,10 +826,13 @@ impl crate::engine_traits::EngineOperations for RecoveryProofEngine {
     }
     async fn download_block_proof(
         &self,
-        _: &rtos_block::BlockIdExt,
+        id: &rtos_block::BlockIdExt,
         _: bool,
-        _: bool,
+        key_block: bool,
     ) -> rtos_block::Result<BlockProofStuff> {
+        if [10, 42, 43].contains(&id.seq_no) {
+            assert!(key_block, "historical key proof requested through ordinary archive");
+        }
         rtos_block::fail!("missing recovery proof download reached")
     }
     async fn load_state(
@@ -893,6 +943,9 @@ async fn test_warm_recovery_accepts_pinned_states_only_with_matching_roots() {
                 next: None,
                 previous: None,
                 saves: std::sync::atomic::AtomicUsize::new(0),
+                stores: std::sync::atomic::AtomicUsize::new(0),
+                proof_reads: std::sync::atomic::AtomicUsize::new(0),
+                verifier: Default::default(),
             };
             let result = crate::boot::recover_warm_boot_position(&engine, &pin).await;
             assert_eq!(result.is_ok(), !corrupt, "zero={zerostate} corrupt={corrupt}: {result:?}");
@@ -902,4 +955,202 @@ async fn test_warm_recovery_accepts_pinned_states_only_with_matching_roots() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn test_live_proof_history_cache_never_caches_incoming_certificates() {
+    use rtos_block::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let chain: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tl/rtos_api/tests/data/bootstrap-history.json"
+    ))
+    .unwrap();
+    let row: serde_json::Value =
+        serde_json::from_str(include_str!("../../../tl/rtos_api/tests/data/warm-history.json"))
+            .unwrap();
+    let anchor = bootstrap_fixture_proof(
+        &serde_json::json!({"block_boc":chain["anchor_boc"]}),
+        false,
+        false,
+    );
+    let first = bootstrap_fixture_proof(&chain["cases"][1], true, false);
+    let second = bootstrap_fixture_proof(&chain["cases"][2], true, false);
+    let target = bootstrap_fixture_proof(&row, true, false);
+    let state = ShardStateUnsplit::construct_from_bytes(
+        &hex::decode(row["state_boc"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let state = crate::shard_state::ShardStateStuff::from_state(
+        target.id().clone(),
+        state,
+        #[cfg(feature = "telemetry")]
+        &crate::collator_test_bundle::create_engine_telemetry(),
+        &crate::collator_test_bundle::create_engine_allocated(),
+    )
+    .unwrap();
+    let pin = anchor.id().clone();
+    let handles = crate::collator_test_bundle::create_block_handle_storage(None).unwrap();
+    let entries = [anchor, first.clone(), second.clone(), target.clone()]
+        .into_iter()
+        .map(|proof| {
+            let handle = handles
+                .create_handle(proof.id().clone(), storage::types::BlockMeta::default(), None)
+                .unwrap()
+                .unwrap();
+            handle.set_block_applied();
+            handle.set_data();
+            handle.set_proof();
+            (handle, proof)
+        })
+        .collect();
+    let engine = RecoveryProofEngine {
+        pin,
+        state,
+        entries,
+        next: None,
+        previous: None,
+        saves: AtomicUsize::new(0),
+        stores: AtomicUsize::new(0),
+        proof_reads: AtomicUsize::new(0),
+        verifier: Default::default(),
+    };
+    let block = BlockStuff::deserialize_block_checked(
+        target.id().clone(),
+        Arc::new(hex::decode(row["block_boc"].as_str().unwrap()).unwrap()),
+    )
+    .unwrap();
+    super::check_block_proof_pair(&engine, target.id(), &block, &target).await.unwrap();
+    assert_eq!(engine.proof_reads.load(Ordering::SeqCst), 3, "anchor plus two key proofs");
+    target.check_proof(&engine).await.unwrap();
+    assert_eq!(
+        engine.proof_reads.load(Ordering::SeqCst),
+        3,
+        "verified governing authority should be reused"
+    );
+    let engine_arc = Arc::new(engine);
+    let consumer_engine: Arc<dyn crate::engine_traits::EngineOperations> = engine_arc.clone();
+    crate::sync::save_test_block(
+        &consumer_engine,
+        target.id(),
+        Arc::new(block.clone()),
+        Arc::new(target.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(engine_arc.stores.load(Ordering::SeqCst), 2);
+    engine_arc.stores.store(0, Ordering::SeqCst);
+    for bad in [
+        bootstrap_fixture_proof(&row, true, true),
+        first.clone(),
+        BlockProofStuff::new(target.proof.clone(), true).unwrap(),
+    ] {
+        assert!(
+            crate::sync::save_test_block(
+                &consumer_engine,
+                target.id(),
+                Arc::new(block.clone()),
+                Arc::new(bad)
+            )
+            .await
+            .is_err(),
+            "archive accepted invalid proof"
+        );
+        assert_eq!(engine_arc.stores.load(Ordering::SeqCst), 0, "archive stored unverified input");
+    }
+    drop(consumer_engine);
+    let mut engine =
+        Arc::try_unwrap(engine_arc).unwrap_or_else(|_| panic!("archive consumer retained engine"));
+    let corrupt = bootstrap_fixture_proof(&row, true, true);
+    assert!(
+        corrupt.check_proof(&engine).await.is_err(),
+        "cached block ID bypassed incoming signature verification"
+    );
+    assert_eq!(engine.proof_reads.load(Ordering::SeqCst), 3);
+    let link = BlockProofStuff::new(target.proof.clone(), true).unwrap();
+    assert!(link.check_proof(&engine).await.is_err(), "masterchain link accepted as finality");
+    assert!(
+        super::check_block_proof_pair(&engine, target.id(), &block, &first).await.is_err(),
+        "unrelated valid proof accepted with block"
+    );
+    let mut wrong_id = target.id().clone();
+    wrong_id.file_hash = UInt256::from([55; 32]);
+    assert!(super::check_block_proof_pair(&engine, &wrong_id, &block, &target).await.is_err());
+
+    // Reusing an immutable authenticated authority does not reread corrupted DB
+    // objects. A fresh verifier must authenticate that DB object from the pin.
+    engine.entries[2].1 = bootstrap_fixture_proof(&chain["cases"][2], true, true);
+    target.check_proof(&engine).await.unwrap();
+    engine.verifier = Default::default();
+    assert!(
+        target.check_proof(&engine).await.is_err(),
+        "parsed cached history promoted without verification"
+    );
+    engine.entries[2].1 = second;
+    target.check_proof(&engine).await.unwrap();
+    // The current state's ID may itself be the governing key block, which is
+    // absent from its prev_blocks dictionary. Its raw config is never authority.
+    let original_hint = engine.state.clone();
+    let mut hint = original_hint.state().unwrap().clone();
+    hint.set_seq_no(43);
+    let mut custom = hint.read_custom().unwrap().unwrap();
+    custom.prev_blocks.del(&43).unwrap();
+    custom.config.set_config(ConfigParamEnum::ConfigParam19(0)).unwrap();
+    hint.write_custom(Some(&custom)).unwrap();
+    engine.state = crate::shard_state::ShardStateStuff::from_state(
+        engine.entries[2].0.id().clone(),
+        hint,
+        #[cfg(feature = "telemetry")]
+        &crate::collator_test_bundle::create_engine_telemetry(),
+        &crate::collator_test_bundle::create_engine_allocated(),
+    )
+    .unwrap();
+    engine.verifier = Default::default();
+    target.check_proof(&engine).await.unwrap();
+    engine.state = original_hint;
+    let original_pin = engine.pin.clone();
+    engine.pin.file_hash = UInt256::from([77; 32]);
+    assert!(
+        target.check_proof(&engine).await.is_err(),
+        "wrong local pin reused another pin's cached authority"
+    );
+    engine.pin = original_pin;
+    let before = engine.proof_reads.load(Ordering::SeqCst);
+    engine.pin = first.id().clone();
+    target.check_proof(&engine).await.unwrap();
+    assert_eq!(
+        engine.proof_reads.load(Ordering::SeqCst) - before,
+        2,
+        "a new pin must not reuse old-pin authorities"
+    );
+
+    // is_applied/has_data/has_proof are all set, yet a bad stored certificate is
+    // rejected by the actual applied-cache validation helper.
+    super::check_applied_masterchain(&engine, target.id()).await.unwrap();
+    engine.entries[3].1 = corrupt;
+    assert!(
+        super::check_applied_masterchain(&engine, target.id()).await.is_err(),
+        "applied flag bypassed finality"
+    );
+    engine.entries[3].1 = target.clone();
+    let mut altered = engine.state.state().unwrap().clone();
+    let mut custom = altered.read_custom().unwrap().unwrap();
+    let mut reference = custom.prev_blocks.get(&43).unwrap().unwrap();
+    reference.blk_ref.root_hash = UInt256::from([66; 32]);
+    custom.prev_blocks.set(&43, &reference, &KeyMaxLt { key: true, max_end_lt: 0 }).unwrap();
+    altered.write_custom(Some(&custom)).unwrap();
+    engine.state = crate::shard_state::ShardStateStuff::from_state(
+        target.id().clone(),
+        altered,
+        #[cfg(feature = "telemetry")]
+        &crate::collator_test_bundle::create_engine_telemetry(),
+        &crate::collator_test_bundle::create_engine_allocated(),
+    )
+    .unwrap();
+    assert!(
+        target.check_proof(&engine).await.is_err(),
+        "same-height substituted history reused cached authority"
+    );
 }

@@ -108,6 +108,11 @@ async fn load_next_master_block(
     if let Some(prev_handle) = engine.load_block_handle(prev_id)? {
         if prev_handle.has_next1() {
             let next_id = engine.load_block_next1(prev_id)?;
+            if !next_id.shard().is_masterchain_ext()
+                || Some(next_id.seq_no) != prev_id.seq_no.checked_add(1)
+            {
+                fail!("Cached next masterchain pointer has invalid coordinates");
+            }
             log::debug!(
                 "load_next_master_block: has_next1, will download_and_apply_block {}, prev: {}",
                 next_id,
@@ -123,14 +128,17 @@ async fn load_next_master_block(
     log::debug!("load_next_master_block: downloading next block... prev: {}", prev_id);
     let (block, proof) = engine.download_next_block(prev_id).await?;
     log::debug!("load_next_master_block: downloaded next block {}, prev: {}", block.id(), prev_id);
-    if block.id().seq_no != prev_id.seq_no + 1 {
+    if Some(block.id().seq_no) != prev_id.seq_no.checked_add(1) {
         fail!("Invalid next master block got: {}, prev: {}", block.id(), prev_id);
     }
 
     log::debug!("load_next_master_block: waiting for prev state {}", prev_id);
-    let prev_state = engine.clone().wait_state(prev_id, None, true).await?;
+    let _prev_state = engine.clone().wait_state(prev_id, None, true).await?;
     log::debug!("load_next_master_block: got prev state, checking proof for {}", block.id());
-    proof.check_with_master_state(&prev_state)?;
+    crate::block_proof::check_block_proof_pair(engine.as_ref(), block.id(), &block, &proof).await?;
+    if block.construct_prev_id()?.0 != *prev_id {
+        fail!("Downloaded master block does not extend the requested predecessor");
+    }
     let mut next_handle = loop {
         if let Some(next_handle) = engine.load_block_handle(block.id())? {
             if !next_handle.has_data() {
@@ -356,7 +364,7 @@ pub async fn process_block_broadcast(
 
     // Build and save block and proof
     if is_master {
-        proof.check_with_master_state(last_applied_mc_state.as_ref())?;
+        proof.check_proof(engine.as_ref()).await?;
     } else {
         proof.check_proof_link()?;
     }
@@ -608,7 +616,7 @@ pub async fn process_block_broadcast_v2(
 
     // Build and save block and proof
     if is_master {
-        proof.check_with_master_state(last_applied_mc_state.as_ref())?;
+        proof.check_proof(engine.as_ref()).await?;
     } else {
         proof.check_proof_link()?;
     }

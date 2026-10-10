@@ -334,6 +334,13 @@ pub trait EngineOperations: Sync + Send {
     fn save_last_applied_mc_block_id(&self, last_mc_block: &BlockIdExt) -> Result<()> {
         unimplemented!()
     }
+    async fn check_masterchain_proof(&self, proof: &BlockProofStuff) -> Result<()> {
+        crate::block_proof::MasterchainProofVerifier::default()
+            .verify(self, proof)
+            .await
+            .map(|_| ())
+    }
+
     async fn load_actual_config_params(&self) -> Result<ConfigParams> {
         match self.load_last_applied_mc_block_id()? {
             Some(block_id) => {

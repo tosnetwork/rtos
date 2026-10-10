@@ -196,6 +196,162 @@ impl BootstrapAuthority {
     }
 }
 
+/// Small, process-local cache of authenticated governing authorities. Neither
+/// database flags nor parsed peer/config objects can be inserted here.
+/// Both the local pin and the complete governing block ID scope every entry.
+pub(crate) struct MasterchainProofVerifier {
+    authorities: parking_lot::Mutex<lru::LruCache<(BlockIdExt, BlockIdExt), BootstrapAuthority>>,
+}
+
+impl Default for MasterchainProofVerifier {
+    fn default() -> Self {
+        Self { authorities: parking_lot::Mutex::new(lru::LruCache::new(16.try_into().unwrap())) }
+    }
+}
+
+impl MasterchainProofVerifier {
+    fn remember(&self, authority: BootstrapAuthority) {
+        // Large valid proofs remain verifiable without being retained. This is
+        // a serialized-size cache budget, not a resident-memory accounting bound.
+        if authority.key_block_proof().is_some_and(|proof| proof.data.len() <= 1024 * 1024) {
+            self.authorities
+                .lock()
+                .put((authority.anchor().clone(), authority.id().clone()), authority);
+        }
+    }
+
+    pub(crate) async fn verify<E: EngineOperations + ?Sized>(
+        &self,
+        engine: &E,
+        proof: &BlockProofStuff,
+    ) -> Result<VerifiedMasterchainProof> {
+        if proof.is_link() || !proof.id().shard().is_masterchain_ext() {
+            fail!("Masterchain finality requires a full proof");
+        }
+        let (_, info) = proof.pre_check_block_proof()?;
+        let epoch = info.prev_key_block_seqno();
+        let pin = engine.init_mc_block_id();
+        if epoch < pin.seq_no || epoch >= proof.id().seq_no {
+            fail!("Governing epoch is outside the locally pinned history");
+        }
+        let hint = if epoch > pin.seq_no {
+            Some(engine.load_last_applied_mc_state().await?)
+        } else {
+            None
+        };
+        let governing = match &hint {
+            Some(state) => state.find_block_id(epoch)?,
+            None => pin.clone(),
+        };
+        let cached = self.authorities.lock().get(&(pin.clone(), governing.clone())).cloned();
+        let history = if let Some(history) = cached {
+            history
+        } else {
+            // Use the newest already-authenticated predecessor that agrees with
+            // the lookup index; the index itself conveys no authority.
+            let predecessor = {
+                let cache = self.authorities.lock();
+                cache
+                    .iter()
+                    .filter(|((anchor, id), _)| anchor == pin && id.seq_no <= epoch)
+                    .filter(|((_, id), _)| {
+                        id == pin
+                            || hint.as_ref().is_some_and(|state| {
+                                state.find_block_id(id.seq_no).is_ok_and(|found| &found == id)
+                            })
+                    })
+                    .max_by_key(|((_, id), _)| id.seq_no)
+                    .map(|(_, value)| value.clone())
+            };
+            let mut history = match predecessor {
+                Some(history) => history,
+                None if pin.seq_no == 0 => {
+                    if pin != engine.zerostate_id()? {
+                        fail!("Proof pin differs from network zerostate");
+                    }
+                    BootstrapAuthority::from_zerostate(pin, engine.load_mc_zero_state().await?)?
+                }
+                None => BootstrapAuthority::from_checkpoint(
+                    pin,
+                    crate::boot::load_history_proof(engine, pin, true, true).await?,
+                )?,
+            };
+            self.remember(history.clone());
+            while history.id().seq_no < epoch {
+                if engine.check_stop() {
+                    fail!("Proof history authentication stopped");
+                }
+                let state =
+                    hint.as_ref().ok_or_else(|| error!("Missing historical proof lookup index"))?;
+                let next = state
+                    .shard_state_extra()?
+                    .prev_blocks
+                    .get_next_key_block(history.id().seq_no + 1)?
+                    .map(|reference| reference.master_block_id().1)
+                    .or_else(|| {
+                        (state.block_id().seq_no == epoch).then(|| state.block_id().clone())
+                    })
+                    .ok_or_else(|| error!("Missing governing key-block history"))?;
+                if next.seq_no <= history.id().seq_no || next.seq_no > epoch {
+                    fail!("Historical proof index skipped the governing epoch");
+                }
+                let next_proof =
+                    crate::boot::load_history_proof(engine, &next, false, true).await?;
+                history = history.advance_key_block(&next, next_proof)?;
+                self.remember(history.clone());
+            }
+            if history.id() != &governing {
+                fail!("Governing proof differs from lookup identity");
+            }
+            history
+        };
+        // A cache hit reuses only the governing authority. Every incoming
+        // certificate, including repeat block IDs, must still pass verification.
+        history.authenticate_block(proof.id(), proof.clone())
+    }
+}
+
+/// Cache flags do not authenticate a masterchain identity. An explicitly pinned
+/// checkpoint is a separate trust source from an unpinned finality certificate.
+pub(crate) async fn check_applied_masterchain(
+    engine: &dyn EngineOperations,
+    expected: &BlockIdExt,
+) -> Result<()> {
+    if !expected.shard().is_masterchain_ext() {
+        fail!("Applied masterchain identity is not a full shard");
+    }
+    if expected.seq_no == 0 {
+        if expected != engine.zerostate_id()? {
+            fail!("Applied zerostate differs from network pin");
+        }
+        BootstrapAuthority::from_zerostate(expected, engine.load_mc_zero_state().await?)?;
+        return Ok(());
+    }
+    let checkpoint = expected == engine.init_mc_block_id();
+    let proof = crate::boot::load_history_proof(engine, expected, checkpoint, checkpoint).await?;
+    if proof.id() != expected {
+        fail!("Applied cache proof identity mismatch");
+    }
+    if checkpoint {
+        proof.check_trusted_checkpoint(expected)
+    } else {
+        proof.check_proof(engine).await
+    }
+}
+
+pub(crate) async fn check_block_proof_pair(
+    engine: &dyn EngineOperations,
+    expected: &BlockIdExt,
+    block: &crate::block::BlockStuff,
+    proof: &BlockProofStuff,
+) -> Result<()> {
+    block.verify_expected_id(expected)?;
+    if proof.id() != expected {
+        fail!("Block proof does not match the requested block identity");
+    }
+    proof.check_proof(engine).await
+}
+
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct BlockProofStuff {
     proof: BlockProof,
@@ -415,49 +571,11 @@ impl BlockProofStuff {
     }
 
     pub async fn check_proof(&self, engine: &dyn EngineOperations) -> Result<()> {
-        if self.is_link() {
-            self.check_proof_link()?;
+        if self.id().is_masterchain() {
+            engine.check_masterchain_proof(self).await
         } else {
-            let now = std::time::Instant::now();
-            log::trace!("Checking proof for block: {}", self.id());
-
-            let (virt_block, virt_block_info) = self.pre_check_block_proof()?;
-            let prev_key_block_seqno = virt_block_info.prev_key_block_seqno();
-
-            if prev_key_block_seqno == 0 {
-                let zerostate = engine.load_mc_zero_state().await?;
-                zerostate.verify_zerostate(engine.zerostate_id()?)?;
-                self.check_with_master_state_(&zerostate, &virt_block, &virt_block_info)?;
-            } else {
-                let state = engine.load_last_applied_mc_state().await?;
-                let prev_key_block_id =
-                    state.find_block_id(prev_key_block_seqno).map_err(|err| {
-                        error!(
-                            "Couldn't find previous MC key block by seq_no = {}: {}",
-                            prev_key_block_seqno, err
-                        )
-                    })?;
-                let handle = engine.load_block_handle(&prev_key_block_id)?.ok_or_else(|| {
-                    error!(
-                        "Couldn't load handle for previous MC key block by seq_no = {}",
-                        prev_key_block_seqno
-                    )
-                })?;
-                let prev_key_block_proof = engine.load_block_proof(&handle, false).await?;
-                self.check_with_prev_key_block_proof_(
-                    &prev_key_block_proof,
-                    &virt_block,
-                    &virt_block_info,
-                )?;
-            }
-
-            log::trace!(
-                "Checked proof for block: {}   TIME {}ms",
-                self.id(),
-                now.elapsed().as_millis()
-            );
+            self.check_proof_link()
         }
-        Ok(())
     }
 
     // Unused

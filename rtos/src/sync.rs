@@ -936,7 +936,7 @@ async fn save_block(
         let link_str = if block_id.shard().is_masterchain() { "" } else { "link" };
         fail!("Proof{} not found in archive: {}", link_str, block_id);
     };
-    proof.check_proof(engine.as_ref()).await?;
+    crate::block_proof::check_block_proof_pair(engine.as_ref(), block_id, &block, &proof).await?;
     let handle = engine.store_block(&block).await?.to_non_created().ok_or_else(|| {
         error!("INTERNAL ERROR: mismatch in block {} store result during sync", block_id)
     })?;
@@ -948,6 +948,17 @@ async fn save_block(
         error!("INTERNAL ERROR: mismatch in block {} proof store result during sync", block_id)
     })?;
     Ok((handle, block, proof))
+}
+
+#[cfg(test)]
+pub(crate) async fn save_test_block(
+    engine: &Arc<dyn EngineOperations>,
+    id: &BlockIdExt,
+    block: Arc<BlockStuff>,
+    proof: Arc<BlockProofStuff>,
+) -> Result<()> {
+    save_block(engine, id, &BlocksEntry { block: Some(block), proof: Some(proof) }).await?;
+    Ok(())
 }
 
 #[cfg(test)]
