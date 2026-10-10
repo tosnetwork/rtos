@@ -22,17 +22,58 @@ struct State {
     peer: Option<[u8; 32]>,
     prefix: Vec<u8>,
     remaining: usize,
+    ihave_only: bool,
     receipts: Vec<Receipt>,
 }
 
 #[derive(Default)]
-pub(crate) struct BroadcastFaults(Mutex<State>);
+pub(crate) struct BroadcastFaults(Mutex<State>, Mutex<Option<RepairLoss>>);
+
+struct RepairLoss {
+    peer: [u8; 32],
+    budget: Arc<RepairReceipts>,
+}
+
+/// Shared across actual relay endpoints: discard only the first authenticated reply.
+#[derive(Default)]
+pub(crate) struct RepairReceipts {
+    pub built: std::sync::atomic::AtomicUsize,
+    pub dropped: std::sync::atomic::AtomicUsize,
+    pub delivered: std::sync::atomic::AtomicUsize,
+}
 
 impl BroadcastFaults {
     pub fn configure(&self, peer: [u8; 32], prefix: Vec<u8>, drops: usize) {
         assert!(!prefix.is_empty());
-        *self.0.lock().unwrap() =
-            State { peer: Some(peer), prefix, remaining: drops, receipts: vec![] };
+        *self.0.lock().unwrap() = State {
+            peer: Some(peer),
+            prefix,
+            remaining: drops,
+            ihave_only: false,
+            receipts: vec![],
+        };
+    }
+
+    pub fn drop_one_ihave(&self) {
+        self.0.lock().unwrap().ihave_only = true;
+    }
+
+    pub fn suppress_first_repair_reply(&self, peer: [u8; 32], budget: Arc<RepairReceipts>) {
+        *self.1.lock().unwrap() = Some(RepairLoss { peer, budget });
+    }
+
+    fn repair_budget(&self, bytes: &[u8], peers: &AdnlPeers) -> Option<Arc<RepairReceipts>> {
+        let rule = self.1.lock().unwrap();
+        let rule = rule.as_ref()?;
+        if rule.peer != *peers.other().data() {
+            return None;
+        }
+        let objects = rtos_api::WireProfile::T0.deserialize_bundle(bytes).ok()?;
+        if objects.len() != 2 || !objects[1].is::<rtos_api::ton::rpc::overlay::RepairPlumtreePart>()
+        {
+            return None;
+        }
+        Some(rule.budget.clone())
     }
 
     pub fn receipts(&self) -> Vec<Receipt> {
@@ -47,7 +88,16 @@ impl BroadcastFaults {
         let constructor = u32::from_le_bytes(
             bytes.get(state.prefix.len()..state.prefix.len() + 4)?.try_into().ok()?,
         );
-        let drop = state.remaining > 0;
+        let ihave = rtos_api::deserialize_boxed(&bytes[state.prefix.len()..])
+            .ok()
+            .and_then(|object| object.downcast::<rtos_api::ton::overlay::Broadcast>().ok())
+            .is_some_and(|broadcast| {
+                matches!(
+                    broadcast,
+                    rtos_api::ton::overlay::Broadcast::Overlay_BroadcastPlumtreeIHave(_)
+                )
+            });
+        let drop = state.remaining > 0 && (!state.ihave_only || ihave);
         if drop && state.remaining != usize::MAX {
             state.remaining -= 1;
         }
@@ -106,7 +156,18 @@ impl Subscriber for ObservedOverlay {
         bytes: &[u8],
         peers: &AdnlPeers,
     ) -> Result<Option<QueryAnswer>> {
-        self.overlay.try_consume_raw_query(bytes, peers).await
+        let budget = self.faults.repair_budget(bytes, peers);
+        // Let the real overlay authenticate the query and build its reply first.
+        let result = self.overlay.try_consume_raw_query(bytes, peers).await?;
+        if let (Some(budget), Some(_)) = (budget, result.as_ref()) {
+            use std::sync::atomic::Ordering;
+            if budget.built.fetch_add(1, Ordering::AcqRel) == 0 {
+                budget.dropped.fetch_add(1, Ordering::AcqRel);
+                return Ok(Some(QueryAnswer::Ready(None)));
+            }
+            budget.delivered.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(result)
     }
 
     async fn try_consume_query_bundle(

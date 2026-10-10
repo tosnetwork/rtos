@@ -664,3 +664,138 @@ async fn changed_masterchain_inclusion_descriptor_fails_real_download_authentica
     pair.receiver.clone().wait_stop().await.unwrap();
     pair.provider.clone().wait_stop().await.unwrap();
 }
+
+/// Four real Engines: publisher, receiver and two independent repair relays.
+/// The receiver loses the publisher's IHAVE; the first relay reply is discarded
+/// only after the production overlay has authenticated and built it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_multinode_plumtree_repairs_lost_ihave_and_first_repair_response() {
+    use crate::network::test_broadcast_faults::RepairReceipts;
+    use std::sync::atomic::Ordering;
+    let pair = Pair::new("included", false).await;
+    let relays = Pair::new("included", false).await;
+    let engines = [&pair.provider, &pair.receiver, &relays.receiver, &relays.provider];
+    let client = pair.receiver.overlay_client(pair.shard.id().shard()).await.unwrap();
+    let overlay = adnl::OverlayShortId::from_data(*client.overlay_client().id().data());
+    let keys: Vec<_> = engines
+        .iter()
+        .map(|engine| {
+            engine.network().context().stack.adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap()
+        })
+        .collect();
+    let mut addresses = vec![];
+    for (engine, key) in engines.iter().zip(&keys) {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        drop(socket);
+        let private = key.pvt_key().unwrap().lock().unwrap();
+        engine
+            .network()
+            .context()
+            .stack
+            .quic
+            .as_ref()
+            .unwrap()
+            .add_key(private.as_ref().try_into().unwrap(), key.id(), address)
+            .unwrap();
+        addresses.push(address);
+    }
+    for (index, engine) in engines.iter().enumerate() {
+        let stack = &engine.network().context().stack;
+        for (remote_index, remote) in engines.iter().enumerate() {
+            if index == remote_index {
+                continue;
+            }
+            let remote_stack = &remote.network().context().stack;
+            let peer = stack
+                .adnl
+                .add_peer(
+                    keys[index].id(),
+                    remote_stack.adnl.ip_address_adnl(),
+                    None,
+                    &keys[remote_index],
+                )
+                .unwrap()
+                .unwrap();
+            engine
+                .overlay_client(pair.shard.id().shard())
+                .await
+                .unwrap()
+                .overlay_client()
+                .neighbours()
+                .add(peer)
+                .unwrap();
+            let advertisement = remote_stack.overlay.get_signed_node(&overlay, false).unwrap();
+            stack
+                .overlay
+                .add_public_peer(remote_stack.adnl.ip_address_adnl(), &advertisement, &overlay)
+                .unwrap()
+                .unwrap();
+            stack
+                .quic
+                .as_ref()
+                .unwrap()
+                .add_peer_key(keys[remote_index].id().clone(), addresses[remote_index])
+                .unwrap();
+        }
+        stack
+            .overlay
+            .configure_plumtree(
+                &overlay,
+                adnl::PlumtreeConfig {
+                    authorized_keys: std::collections::BTreeMap::from([(
+                        *keys[0].id().data(),
+                        2 << 20,
+                    )]),
+                    max_untrusted_size: 0,
+                    untrusted_flags: 0,
+                    fixed_members: true,
+                    original_sender: index == 0,
+                    eager_limit: 4,
+                    max_retained_bytes: 64 << 20,
+                    max_broadcasts: 64,
+                },
+                &tokio::runtime::Handle::current(),
+            )
+            .unwrap();
+    }
+    let prefix = rtos_api::serialize_boxed(
+        &rtos_api::ton::overlay::message::Message { overlay: UInt256::from(*overlay.data()) }
+            .into_boxed(),
+    )
+    .unwrap();
+    let faults = &pair.receiver.network().test_broadcast_faults;
+    faults.configure(*keys[0].id().data(), prefix, 1);
+    faults.drop_one_ihave();
+    let replies = Arc::new(RepairReceipts::default());
+    for relay in [&relays.receiver, &relays.provider] {
+        relay
+            .network()
+            .test_broadcast_faults
+            .suppress_first_repair_reply(*keys[1].id().data(), replies.clone());
+    }
+    let (wire, id) = pair.finality_wire();
+    pair.publish(&overlay, id, &wire).await;
+    pair.wait_preapplied().await;
+    assert_eq!(
+        faults.receipts().iter().filter(|receipt| receipt.dropped).count(),
+        1,
+        "the real publisher IHAVE must be lost"
+    );
+    assert_eq!(
+        replies.dropped.load(Ordering::Acquire),
+        1,
+        "the first real relay reply must be lost after authentication"
+    );
+    assert!(
+        replies.delivered.load(Ordering::Acquire) >= 1,
+        "another real relay must answer the production fallback query"
+    );
+    assert_eq!(pair.receiver.test_finality_notifications.load(Ordering::Acquire), 1);
+    assert!(pair.receiver.try_get_cached_block_candidate(pair.shard.id()).is_none());
+    let (master, shards) = pair.apply_by_normal_clients().await;
+    assert!(pair.receiver.load_block_handle(pair.shard.id()).unwrap().unwrap().is_applied());
+    pair.finish(master, shards).await;
+    relays.receiver.clone().wait_stop().await.unwrap();
+    relays.provider.clone().wait_stop().await.unwrap();
+}
