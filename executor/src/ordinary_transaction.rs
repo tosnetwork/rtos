@@ -604,3 +604,7 @@ mod test_frozen_prefix;
 #[cfg(test)]
 #[path = "tests/test_sendmsg_transaction.rs"]
 mod test_sendmsg_transaction;
+
+#[cfg(test)]
+#[path = "tests/test_bchk_transaction.rs"]
+mod test_bchk_transaction;

@@ -1,0 +1,426 @@
+[
+  {
+    "name": "BCHKREFS-stored0-0-rPUSHINT-1-b",
+    "source": "NEWC   PUSHINT -1 BCHKREFS"
+  },
+  {
+    "name": "BCHKREFS-stored0-0-rPUSHINT0-b",
+    "source": "NEWC   PUSHINT 0 BCHKREFS"
+  },
+  {
+    "name": "BCHKREFS-stored0-0-rPUSHINT1-b",
+    "source": "NEWC   PUSHINT 1 BCHKREFS"
+  },
+  {
+    "name": "BCHKREFS-stored0-0-rPUSHINT4-b",
+    "source": "NEWC   PUSHINT 4 BCHKREFS"
+  },
+  {
+    "name": "BCHKREFS-stored0-0-rPUSHINT5-b",
+    "source": "NEWC   PUSHINT 5 BCHKREFS"
+  },
+  {
+    "name": "BCHKREFS-stored0-0-rPUSHINT6-b",
+    "source": "NEWC   PUSHINT 6 BCHKREFS"
+  },
+  {
+    "name": "BCHKREFS-stored0-0-rPUSHINT7-b",
+    "source": "NEWC   PUSHINT 7 BCHKREFS"
+  },
+  {
+    "name": "BCHKREFS-stored0-0-rPUSHINT8-b",
+    "source": "NEWC   PUSHINT 8 BCHKREFS"
+  },
+  {
+    "name": "BCHKREFS-stored0-0-rPUSHNAN-b",
+    "source": "NEWC   PUSHNAN BCHKREFS"
+  },
+  {
+    "name": "BCHKREFS-stored0-0-rNULL-b",
+    "source": "NEWC   NULL BCHKREFS"
+  },
+  {
+    "name": "BCHKREFS-invalid-NULL-NULL-PUSHINT-8",
+    "source": "NULL NULL PUSHINT 8 BCHKREFS"
+  },
+  {
+    "name": "BCHKREFS-invalid-NEWC-NULL-PUSHINT-8",
+    "source": "NEWC NULL PUSHINT 8 BCHKREFS"
+  },
+  {
+    "name": "BCHKREFSQ-stored0-0-rPUSHINT-1-b",
+    "source": "NEWC   PUSHINT -1 BCHKREFSQ"
+  },
+  {
+    "name": "BCHKREFSQ-stored0-0-rPUSHINT0-b",
+    "source": "NEWC   PUSHINT 0 BCHKREFSQ"
+  },
+  {
+    "name": "BCHKREFSQ-stored0-0-rPUSHINT1-b",
+    "source": "NEWC   PUSHINT 1 BCHKREFSQ"
+  },
+  {
+    "name": "BCHKREFSQ-stored0-0-rPUSHINT4-b",
+    "source": "NEWC   PUSHINT 4 BCHKREFSQ"
+  },
+  {
+    "name": "BCHKREFSQ-stored0-0-rPUSHINT5-b",
+    "source": "NEWC   PUSHINT 5 BCHKREFSQ"
+  },
+  {
+    "name": "BCHKREFSQ-stored0-0-rPUSHINT6-b",
+    "source": "NEWC   PUSHINT 6 BCHKREFSQ"
+  },
+  {
+    "name": "BCHKREFSQ-stored0-0-rPUSHINT7-b",
+    "source": "NEWC   PUSHINT 7 BCHKREFSQ"
+  },
+  {
+    "name": "BCHKREFSQ-stored0-0-rPUSHINT8-b",
+    "source": "NEWC   PUSHINT 8 BCHKREFSQ"
+  },
+  {
+    "name": "BCHKREFSQ-stored0-0-rPUSHNAN-b",
+    "source": "NEWC   PUSHNAN BCHKREFSQ"
+  },
+  {
+    "name": "BCHKREFSQ-stored0-0-rNULL-b",
+    "source": "NEWC   NULL BCHKREFSQ"
+  },
+  {
+    "name": "BCHKREFSQ-invalid-NULL-NULL-PUSHINT-8",
+    "source": "NULL NULL PUSHINT 8 BCHKREFSQ"
+  },
+  {
+    "name": "BCHKREFSQ-invalid-NEWC-NULL-PUSHINT-8",
+    "source": "NEWC NULL PUSHINT 8 BCHKREFSQ"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT-1-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHINT -1 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT-1-bNULL",
+    "source": "NEWC  NULL PUSHINT -1 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT0-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHINT 0 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT0-bNULL",
+    "source": "NEWC  NULL PUSHINT 0 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT1-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHINT 1 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT1-bNULL",
+    "source": "NEWC  NULL PUSHINT 1 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT4-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHINT 4 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT4-bNULL",
+    "source": "NEWC  NULL PUSHINT 4 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT5-bPUSHINT-1",
+    "source": "NEWC  PUSHINT -1 PUSHINT 5 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT5-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHINT 5 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT5-bPUSHINT1",
+    "source": "NEWC  PUSHINT 1 PUSHINT 5 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT5-bPUSHINT8",
+    "source": "NEWC  PUSHINT 8 PUSHINT 5 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT5-bPUSHINT1023",
+    "source": "NEWC  PUSHINT 1023 PUSHINT 5 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT5-bPUSHINT1024",
+    "source": "NEWC  PUSHINT 1024 PUSHINT 5 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT5-bPUSHNAN",
+    "source": "NEWC  PUSHNAN PUSHINT 5 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT5-bNULL",
+    "source": "NEWC  NULL PUSHINT 5 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT6-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHINT 6 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT6-bNULL",
+    "source": "NEWC  NULL PUSHINT 6 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT7-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHINT 7 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT7-bNULL",
+    "source": "NEWC  NULL PUSHINT 7 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT8-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHINT 8 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHINT8-bNULL",
+    "source": "NEWC  NULL PUSHINT 8 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHNAN-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHNAN BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rPUSHNAN-bNULL",
+    "source": "NEWC  NULL PUSHNAN BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rNULL-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 NULL BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-stored0-0-rNULL-bNULL",
+    "source": "NEWC  NULL NULL BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-invalid-NULL-NULL-PUSHINT-8",
+    "source": "NULL NULL PUSHINT 8 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFS-invalid-NEWC-NULL-PUSHINT-8",
+    "source": "NEWC NULL PUSHINT 8 BCHKBITREFS"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT-1-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHINT -1 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT-1-bNULL",
+    "source": "NEWC  NULL PUSHINT -1 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT0-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHINT 0 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT0-bNULL",
+    "source": "NEWC  NULL PUSHINT 0 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT1-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHINT 1 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT1-bNULL",
+    "source": "NEWC  NULL PUSHINT 1 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT4-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHINT 4 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT4-bNULL",
+    "source": "NEWC  NULL PUSHINT 4 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT5-bPUSHINT-1",
+    "source": "NEWC  PUSHINT -1 PUSHINT 5 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT5-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHINT 5 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT5-bPUSHINT1",
+    "source": "NEWC  PUSHINT 1 PUSHINT 5 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT5-bPUSHINT8",
+    "source": "NEWC  PUSHINT 8 PUSHINT 5 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT5-bPUSHINT1023",
+    "source": "NEWC  PUSHINT 1023 PUSHINT 5 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT5-bPUSHINT1024",
+    "source": "NEWC  PUSHINT 1024 PUSHINT 5 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT5-bPUSHNAN",
+    "source": "NEWC  PUSHNAN PUSHINT 5 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT5-bNULL",
+    "source": "NEWC  NULL PUSHINT 5 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT6-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHINT 6 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT6-bNULL",
+    "source": "NEWC  NULL PUSHINT 6 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT7-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHINT 7 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT7-bNULL",
+    "source": "NEWC  NULL PUSHINT 7 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT8-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHINT 8 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHINT8-bNULL",
+    "source": "NEWC  NULL PUSHINT 8 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHNAN-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 PUSHNAN BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rPUSHNAN-bNULL",
+    "source": "NEWC  NULL PUSHNAN BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rNULL-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0 NULL BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-stored0-0-rNULL-bNULL",
+    "source": "NEWC  NULL NULL BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-invalid-NULL-NULL-PUSHINT-8",
+    "source": "NULL NULL PUSHINT 8 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITREFSQ-invalid-NEWC-NULL-PUSHINT-8",
+    "source": "NEWC NULL PUSHINT 8 BCHKBITREFSQ"
+  },
+  {
+    "name": "BCHKBITS-stored0-0-r-bPUSHINT-1",
+    "source": "NEWC  PUSHINT -1  BCHKBITS"
+  },
+  {
+    "name": "BCHKBITS-stored0-0-r-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0  BCHKBITS"
+  },
+  {
+    "name": "BCHKBITS-stored0-0-r-bPUSHINT1",
+    "source": "NEWC  PUSHINT 1  BCHKBITS"
+  },
+  {
+    "name": "BCHKBITS-stored0-0-r-bPUSHINT8",
+    "source": "NEWC  PUSHINT 8  BCHKBITS"
+  },
+  {
+    "name": "BCHKBITS-stored0-0-r-bPUSHINT1023",
+    "source": "NEWC  PUSHINT 1023  BCHKBITS"
+  },
+  {
+    "name": "BCHKBITS-stored0-0-r-bPUSHINT1024",
+    "source": "NEWC  PUSHINT 1024  BCHKBITS"
+  },
+  {
+    "name": "BCHKBITS-stored0-0-r-bPUSHNAN",
+    "source": "NEWC  PUSHNAN  BCHKBITS"
+  },
+  {
+    "name": "BCHKBITS-stored0-0-r-bNULL",
+    "source": "NEWC  NULL  BCHKBITS"
+  },
+  {
+    "name": "BCHKBITS-invalid-NULL-NULL-PUSHINT-8",
+    "source": "NULL NULL PUSHINT 8 BCHKBITS"
+  },
+  {
+    "name": "BCHKBITS-invalid-NEWC-NULL-PUSHINT-8",
+    "source": "NEWC NULL PUSHINT 8 BCHKBITS"
+  },
+  {
+    "name": "BCHKBITSQ-stored0-0-r-bPUSHINT-1",
+    "source": "NEWC  PUSHINT -1  BCHKBITSQ"
+  },
+  {
+    "name": "BCHKBITSQ-stored0-0-r-bPUSHINT0",
+    "source": "NEWC  PUSHINT 0  BCHKBITSQ"
+  },
+  {
+    "name": "BCHKBITSQ-stored0-0-r-bPUSHINT1",
+    "source": "NEWC  PUSHINT 1  BCHKBITSQ"
+  },
+  {
+    "name": "BCHKBITSQ-stored0-0-r-bPUSHINT8",
+    "source": "NEWC  PUSHINT 8  BCHKBITSQ"
+  },
+  {
+    "name": "BCHKBITSQ-stored0-0-r-bPUSHINT1023",
+    "source": "NEWC  PUSHINT 1023  BCHKBITSQ"
+  },
+  {
+    "name": "BCHKBITSQ-stored0-0-r-bPUSHINT1024",
+    "source": "NEWC  PUSHINT 1024  BCHKBITSQ"
+  },
+  {
+    "name": "BCHKBITSQ-stored0-0-r-bPUSHNAN",
+    "source": "NEWC  PUSHNAN  BCHKBITSQ"
+  },
+  {
+    "name": "BCHKBITSQ-stored0-0-r-bNULL",
+    "source": "NEWC  NULL  BCHKBITSQ"
+  },
+  {
+    "name": "BCHKBITSQ-invalid-NULL-NULL-PUSHINT-8",
+    "source": "NULL NULL PUSHINT 8 BCHKBITSQ"
+  },
+  {
+    "name": "BCHKBITSQ-invalid-NEWC-NULL-PUSHINT-8",
+    "source": "NEWC NULL PUSHINT 8 BCHKBITSQ"
+  },
+  {
+    "name": "BCHKBITS-8-stored0-0-r-b",
+    "source": "NEWC    BCHKBITS 8"
+  },
+  {
+    "name": "BCHKBITS-8-invalid-NULL-NULL-PUSHINT-8",
+    "source": "NULL NULL PUSHINT 8 BCHKBITS 8"
+  },
+  {
+    "name": "BCHKBITS-8-invalid-NEWC-NULL-PUSHINT-8",
+    "source": "NEWC NULL PUSHINT 8 BCHKBITS 8"
+  },
+  {
+    "name": "BCHKBITSQ-8-stored0-0-r-b",
+    "source": "NEWC    BCHKBITSQ 8"
+  },
+  {
+    "name": "BCHKBITSQ-8-invalid-NULL-NULL-PUSHINT-8",
+    "source": "NULL NULL PUSHINT 8 BCHKBITSQ 8"
+  },
+  {
+    "name": "BCHKBITSQ-8-invalid-NEWC-NULL-PUSHINT-8",
+    "source": "NEWC NULL PUSHINT 8 BCHKBITSQ 8"
+  }
+]
