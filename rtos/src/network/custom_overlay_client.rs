@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration; owned consumer readiness and authenticated finality recovery.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -148,8 +148,9 @@ impl CustomOverlayClient {
                 }
                 continue;
             }
+            let subscription = self.stack.overlay.subscribe_broadcast(&self.id)?;
             self.is_active.store(true, Ordering::Relaxed);
-            self.clone().listen_broadcasts();
+            self.clone().listen_broadcasts(subscription);
             NodeNetwork::spawn_overlay_peer_resolver(
                 key.id().clone(),
                 self.nodes.keys().cloned().collect(),
@@ -202,7 +203,7 @@ impl CustomOverlayClient {
         false
     }
 
-    fn listen_broadcasts(self: Arc<Self>) {
+    fn listen_broadcasts(self: Arc<Self>, mut subscription: adnl::BroadcastSubscription) {
         spawn_cancelable(self.cancellation_token.clone(), async move {
             log::debug!(
                 "Started listening broadcasts in custom overlay \"{}\" {}",
@@ -213,7 +214,7 @@ impl CustomOverlayClient {
                 if self.engine.check_stop() {
                     break;
                 }
-                match self.stack.overlay.wait_for_broadcast(&self.id).await {
+                match subscription.recv().await {
                     Err(e) => log::error!(
                         "Error while wait_broadcast in custom overlay \"{}\" {}: {}",
                         self.config.name,
@@ -261,6 +262,13 @@ impl CustomOverlayClient {
             self.id
         );
         match broadcast {
+            Broadcast::TonNode_BlockFinalityBroadcast(broadcast) => {
+                self.check_send_block_permission(src)?;
+                self.engine
+                    .clone()
+                    .process_block_finality_broadcast(broadcast, src.clone(), info.data.len())
+                    .await?;
+            }
             Broadcast::TonNode_BlockBroadcast(broadcast) => {
                 self.check_send_block_permission(src)?;
                 self.engine.clone().process_block_broadcast(broadcast, src.clone())

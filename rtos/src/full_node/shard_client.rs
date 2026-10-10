@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; owned consumer readiness and authenticated finality recovery.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -15,7 +15,7 @@ use crate::{
     engine::Engine,
     engine_traits::EngineOperations,
     error::NodeError,
-    network::BlockBroadcastV2,
+    network::{BlockBroadcastV2, NetworkSignatureSet},
     shard_state::ShardStateStuff,
     validating_utils::{build_checked_data, fmt_block_id_short},
     validator::validator_utils::{calc_subset_for_masterchain, calc_subset_for_workchain_standard},
@@ -500,7 +500,7 @@ fn validate_brodcast(
 ///
 /// For Ordinary signatures: Uses standard block data signing
 /// For Simplex signatures: Uses session-aware signing with CandidateHashData
-fn validate_brodcast_v2(
+pub(crate) fn validate_brodcast_v2(
     signatures: &BlockSignaturesVariant,
     mc_state: &ShardStateStuff,
     block_id: &BlockIdExt,
@@ -550,6 +550,58 @@ fn validate_brodcast_v2(
     Ok(())
 }
 
+/// Authenticate network evidence only after a hash-bound header is available.
+pub(crate) fn validate_pq_broadcast(
+    signatures: &rtos_api::pq_finality::PqNetworkSignatureSet,
+    mc_state: &ShardStateStuff,
+    block_id: &BlockIdExt,
+    block: &rtos_block::Block,
+) -> Result<rtos_api::pq_finality::VerifiedPqNetworkSignatures> {
+    let block_info = block.read_info()?;
+    let context = pq_broadcast_context(mc_state, block_id, block)?;
+    if signatures.validator_info().catchain_seqno != block_info.gen_catchain_seqno()
+        || signatures.validator_info().validator_list_hash_short
+            != block_info.gen_validator_list_hash_short()
+    {
+        fail!("PQ broadcast certificate differs from hash-bound header validator coordinates");
+    }
+
+    context.verify_network(signatures)
+}
+
+pub(crate) fn pq_broadcast_context(
+    mc_state: &ShardStateStuff,
+    block_id: &BlockIdExt,
+    block: &rtos_block::Block,
+) -> Result<rtos_api::pq_finality::PqVerificationContext> {
+    let block_info = block.read_info()?;
+    let extra = mc_state.shard_state_extra()?;
+    let governing_key_seqno = if extra.after_key_block {
+        mc_state.block_id().seq_no()
+    } else {
+        extra.last_key_block.as_ref().map(|key| key.seq_no).unwrap_or(0)
+    };
+    if governing_key_seqno != block_info.prev_key_block_seqno() {
+        fail!("PQ broadcast governing state belongs to a different key-block epoch");
+    }
+    let global_id = mc_state.state()?.global_id();
+    if block.global_id() != global_id {
+        fail!("PQ broadcast global_id differs from governing state");
+    }
+    let context = rtos_api::pq_finality::PqVerificationContext::from_governing_config(
+        global_id,
+        mc_state.config_params()?,
+        block_id.clone(),
+        block_info.vert_seq_no(),
+        block_info.prev_key_block_seqno(),
+        block_info.gen_catchain_seqno(),
+    )?;
+    if context.subset_hash() != block_info.gen_validator_list_hash_short() {
+        fail!("PQ broadcast header disagrees with the trusted governing validator set");
+    }
+    Ok(context)
+}
+
 /// Process V2 block broadcast with variant signature support.
 ///
 /// Similar to `process_block_broadcast` but handles `BlockSignaturesVariant`
@@ -558,12 +610,31 @@ pub async fn process_block_broadcast_v2(
     engine: &Arc<dyn EngineOperations>,
     broadcast: BlockBroadcastV2,
 ) -> Result<Option<BlockStuff>> {
+    process_block_broadcast_v2_inner(engine, broadcast, false).await
+}
+
+/// A recovery attempt must resume a partially stored block after a failed proof
+/// write or state application. It still authenticates the entire carrier and
+/// proof before touching storage; ordinary broadcast duplicate handling stays
+/// unchanged.
+pub(crate) async fn process_recovered_block_broadcast_v2(
+    engine: &Arc<dyn EngineOperations>,
+    broadcast: BlockBroadcastV2,
+) -> Result<Option<BlockStuff>> {
+    process_block_broadcast_v2_inner(engine, broadcast, true).await
+}
+
+async fn process_block_broadcast_v2_inner(
+    engine: &Arc<dyn EngineOperations>,
+    broadcast: BlockBroadcastV2,
+    resume: bool,
+) -> Result<Option<BlockStuff>> {
     let block_descr = fmt_block_id_short(&broadcast.id);
     log::trace!("({}): process_block_broadcast_v2: {}", block_descr, broadcast.id);
 
     // Check if block already exists
     if let Some(handle) = engine.load_block_handle(&broadcast.id)? {
-        if handle.has_data() {
+        if handle.has_data() && !resume {
             #[cfg(feature = "telemetry")]
             {
                 let duplicate = handle.got_by_broadcast();
@@ -605,7 +676,14 @@ pub async fn process_block_broadcast_v2(
     }
 
     // Validate with V2 signature support
-    validate_brodcast_v2(&broadcast.signatures, &last_applied_mc_state, &broadcast.id)?;
+    match &broadcast.signatures {
+        NetworkSignatureSet::Classical(signatures) => {
+            validate_brodcast_v2(signatures, &last_applied_mc_state, &broadcast.id)?;
+        }
+        NetworkSignatureSet::PostQuantum(signatures) => {
+            validate_pq_broadcast(signatures, &last_applied_mc_state, &broadcast.id, &virt_block)?;
+        }
+    }
 
     log::trace!(
         "({}): validated that V2 broadcast {} is from right validators set, last_applied_mc_state {}",
@@ -624,7 +702,10 @@ pub async fn process_block_broadcast_v2(
     let block =
         BlockStuff::deserialize_block_checked(broadcast.id.clone(), Arc::new(broadcast.data))?;
 
-    let mut handle = if let Some(handle) = engine.store_block(&block).await?.to_updated() {
+    let stored = engine.store_block(&block).await?;
+    let mut handle = if resume {
+        stored.to_any()
+    } else if let Some(handle) = stored.to_updated() {
         handle
     } else {
         log::debug!(
@@ -640,7 +721,9 @@ pub async fn process_block_broadcast_v2(
 
     if !handle.has_proof() {
         let result = engine.store_block_proof(block.id(), Some(handle), &proof).await?;
-        handle = if let Some(handle) = result.to_updated() {
+        handle = if resume {
+            result.to_any()
+        } else if let Some(handle) = result.to_updated() {
             handle
         } else {
             log::debug!(

@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration; owned consumer readiness and authenticated finality recovery.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -199,7 +199,7 @@ impl FullNodeOverlaysRouter {
                                 self.engine.clone(),
                                 client,
                                 shard.clone(),
-                            );
+                            )?;
                             self.public_overlays.insert(shard.clone(), fullnode_client.clone());
 
                             Ok(fullnode_client)
