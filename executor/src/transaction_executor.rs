@@ -554,6 +554,7 @@ pub trait TransactionExecutor {
     ) -> Result<ActionPhaseResult> {
         let mut out_msgs = vec![];
         let mut acc_copy = acc.clone();
+        let mut pending_code = None;
         let mut acc_remaining_balance = acc_balance.clone();
         let mut phase = TrActionPhase::default();
         let mut total_reserved_value = Coins::default();
@@ -715,8 +716,10 @@ pub trait TransactionExecutor {
                         new_code.repr_hash(),
                         balance_to_string(Some(&acc_remaining_balance))
                     );
-                    match setcode_action_handler(&mut acc_copy, new_code) {
+                    let mut code_candidate = acc_copy.clone();
+                    match setcode_action_handler(&mut code_candidate, new_code) {
                         None => {
+                            pending_code = code_candidate.get_code();
                             phase.spec_actions += 1;
                             0
                         }
@@ -771,10 +774,6 @@ pub trait TransactionExecutor {
                 balance_to_string(Some(&acc_remaining_balance)),
                 balance_to_string(Some(&init_balance))
             );
-            // This is required here because changes to libraries are applied even if action phase fails
-            if err_code != 0 && !is_special && !check_account_size_limits(limits, &mut acc_copy)? {
-                fail!("Account size limits exceeded");
-            }
             if err_code == RESULT_CODE_UNSUPPORTED {
                 err_code = RESULT_CODE_UNKNOWN_OR_INVALID_ACTION;
             }
@@ -789,11 +788,23 @@ pub trait TransactionExecutor {
                 {
                     phase.no_funds = true;
                 }
-                // Library changes survive a later action failure; code/data do not.
-                if let Some(library) = acc.library_mut() {
-                    *library = acc_copy.libraries();
+                // Library changes survive an action failure unless the changed state exceeds limits.
+                tr.set_account_updates(acc_copy.storage_roots());
+                if is_special
+                    || check_changed_state_limits(
+                        limits,
+                        &mut acc_copy,
+                        acc,
+                        self.config().block_version(),
+                    )?
+                {
+                    if let Some(library) = acc.library_mut() {
+                        *library = acc_copy.libraries();
+                    }
+                } else {
+                    phase.result_code = RESULT_CODE_EXCEEDED_LIMITS;
+                    bounce = true;
                 }
-                tr.set_account_updates(acc.storage_roots());
                 // Roll back forwarding modes before charging the fine used by bounce.
                 if self.config().block_version() >= 14 {
                     *msg_remaining_balance = msg_balance_before_actions.clone();
@@ -833,20 +844,25 @@ pub trait TransactionExecutor {
 
         msg_remaining_balance.coins.sub_checked(&phase.action_fine);
 
-        if account_deleted {
-            log::debug!(target: "executor", "\nAccount deleted");
-            phase.status_change = AccStatusChange::Deleted;
-        }
-
         phase.valid = true;
 
+        if let Some(new_code) = pending_code {
+            acc_copy.set_code(new_code);
+        }
         if let Some(new_data) = new_data {
             acc_copy.set_data(new_data);
         }
         // Roots the stat ran over : the candidate state — tentative on
         // a limit rollback, final on success.
         tr.set_account_updates(acc_copy.storage_roots());
-        if !is_special && !check_account_size_limits(limits, &mut acc_copy)? {
+        if !is_special
+            && !check_changed_state_limits(
+                limits,
+                &mut acc_copy,
+                acc,
+                self.config().block_version(),
+            )?
+        {
             log::debug!(
                 target: "executor",
                 "Account size limits exceeded. Taking fine and rolling back state"
@@ -864,6 +880,11 @@ pub trait TransactionExecutor {
                 );
             }
             return finish_action_phase_with_fine(tr, phase, None, acc_balance, true);
+        }
+
+        if account_deleted {
+            log::debug!(target: "executor", "\nAccount deleted");
+            phase.status_change = AccStatusChange::Deleted;
         }
 
         phase.add_action_fine();
@@ -1104,7 +1125,12 @@ fn compute_new_state(
                         Ok(Some(ComputeSkipReason::BadState))
                     }
                     Ok(_) => {
-                        if check_account_size_limits(config.size_limits_config(), acc)? {
+                        if check_changed_state_limits(
+                            config.size_limits_config(),
+                            acc,
+                            &original_state,
+                            config.block_version(),
+                        )? {
                             Ok(None)
                         } else {
                             *acc = original_state;
@@ -1139,7 +1165,12 @@ fn compute_new_state(
                     Ok(Some(ComputeSkipReason::BadState))
                 } else {
                     log::debug!(target: "executor", "message for frozen: activated");
-                    if check_account_size_limits(config.size_limits_config(), acc)? {
+                    if check_changed_state_limits(
+                        config.size_limits_config(),
+                        acc,
+                        &original_state,
+                        config.block_version(),
+                    )? {
                         Ok(None)
                     } else {
                         *acc = original_state;
@@ -2049,12 +2080,41 @@ fn check_vm_init_params(ctrls: &SaveList, stack: &Stack) {
     debug_assert_eq!(balance_in_smc, balance_in_stack);
 }
 
-pub(super) fn check_account_size_limits(cfg: &SizeLimitsConfig, acc: &mut Account) -> Result<bool> {
-    let max_acc_state_cells = if acc.get_addr().is_some_and(|addr| addr.is_masterchain()) {
-        cfg.max_mc_acc_state_cells as u64
-    } else {
-        cfg.max_acc_state_cells as u64
-    };
+fn check_changed_state_limits(
+    cfg: &SizeLimitsConfig,
+    acc: &mut Account,
+    original: &Account,
+    version: u32,
+) -> Result<bool> {
+    if acc.storage_roots() == original.storage_roots() {
+        return Ok(true);
+    }
+    if !check_account_size_limits(cfg, acc, version)? {
+        return Ok(false);
+    }
+    if acc.get_addr().is_some_and(|addr| addr.is_masterchain())
+        && acc.libraries().root() != original.libraries().root()
+    {
+        let mut count = 0u64;
+        return acc.libraries().iterate(|library| {
+            count += u64::from(library.is_public_library());
+            Ok(count <= cfg.max_acc_public_libraries as u64)
+        });
+    }
+    Ok(true)
+}
+
+pub(super) fn check_account_size_limits(
+    cfg: &SizeLimitsConfig,
+    acc: &mut Account,
+    version: u32,
+) -> Result<bool> {
+    let max_acc_state_cells =
+        if version >= 12 && acc.get_addr().is_some_and(|addr| addr.is_masterchain()) {
+            cfg.max_mc_acc_state_cells as u64
+        } else {
+            cfg.max_acc_state_cells as u64
+        };
     let acc_id = acc.get_id().cloned().unwrap_or_default();
     let _tc = time_checker!(|| format!("account {:x} precalc_storage_stat", acc_id), 100);
     let Some(stat) = acc.precalc_storage_stat()? else {

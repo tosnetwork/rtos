@@ -293,7 +293,11 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                 if !is_special { params.block_unixtime } else { 0 },
                 true,
             ) {
-                if check_account_size_limits(self.config().size_limits_config(), &mut new_acc)? {
+                if check_account_size_limits(
+                    self.config().size_limits_config(),
+                    &mut new_acc,
+                    self.config().block_version(),
+                )? {
                     // Compute decides whether inbound StateInit activation commits.
                     if new_acc.is_active() {
                         new_acc.uninit_account();
@@ -530,3 +534,7 @@ mod test_v15_libraries;
 #[cfg(test)]
 #[path = "tests/test_v15_messages.rs"]
 mod test_v15_messages;
+
+#[cfg(test)]
+#[path = "tests/test_state_limits.rs"]
+mod test_state_limits;
