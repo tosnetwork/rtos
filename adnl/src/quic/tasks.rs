@@ -8,6 +8,29 @@ use std::{
 use tokio::runtime::Handle;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
+#[derive(Default)]
+pub(super) struct ShutdownCompletion {
+    result: Mutex<Option<std::result::Result<(), String>>>,
+    changed: tokio::sync::Notify,
+}
+
+impl ShutdownCompletion {
+    pub fn finish(&self, result: std::result::Result<(), String>) {
+        *self.result.lock().unwrap() = Some(result);
+        self.changed.notify_waiters();
+    }
+
+    pub async fn wait(&self) -> Result<()> {
+        loop {
+            let changed = self.changed.notified();
+            if let Some(result) = self.result.lock().unwrap().clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            changed.await;
+        }
+    }
+}
+
 /// Admission and actual worker joins share one lifetime. Supervisors are never
 /// cancelled by transport shutdown: they observe the real worker's terminal state.
 pub(super) struct QuicTasks {
