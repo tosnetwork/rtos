@@ -109,7 +109,7 @@ pub(crate) async fn start_sync(
         sync_context: &mut SyncContext,
         mc_seq_no: u32,
         archive_context: Option<ArchiveContext>,
-    ) {
+    ) -> Result<()> {
         sync_context.wait.request();
         let archive_context = archive_context.unwrap_or_else(|| {
             let shards_count = 1 << sync_context.engine.get_monitor_min_split();
@@ -128,11 +128,16 @@ pub(crate) async fn start_sync(
             }
         });
         let sync_context = sync_context.clone();
-        tokio::spawn(async move {
-            let res = download_archives(&sync_context, mc_seq_no, archive_context).await;
-            sync_context.wait.respond(Some((mc_seq_no, res)));
-        });
+        crate::types::service_tasks::spawn_owned(
+            sync_context.engine.clone().as_ref(),
+            "archive download batch",
+            async move {
+                let res = download_archives(&sync_context, mc_seq_no, archive_context).await;
+                sync_context.wait.respond(Some((mc_seq_no, res)));
+            },
+        )?;
         log::info!(target: TARGET, "Download scheduled for MC seq_no = {mc_seq_no}");
+        Ok(())
     }
 
     async fn force_redownload(
@@ -234,7 +239,7 @@ pub(crate) async fn start_sync(
         // Gap-close: nothing in queue moves us past sync_mc_seq_no.
         if !queue.iter().any(|(s, _)| *s <= sync_mc_seq_no) {
             queue.push((sync_mc_seq_no, ArchiveStatus::Downloading));
-            download(sync_context, sync_mc_seq_no, None);
+            download(sync_context, sync_mc_seq_no, None)?;
         }
         // Prefetch above the max queued entry to avoid overlapping with existing.
         let mut next =
@@ -245,7 +250,7 @@ pub(crate) async fn start_sync(
                 break;
             }
             queue.push((next, ArchiveStatus::Downloading));
-            download(sync_context, next, None);
+            download(sync_context, next, None)?;
             next += ARCHIVE_PACKAGE_SIZE;
         }
         log::info!(
@@ -269,7 +274,7 @@ pub(crate) async fn start_sync(
                 what
             ),
         };
-        download(sync_context, *seq_no, Some(archive_context));
+        download(sync_context, *seq_no, Some(archive_context))?;
         Ok(())
     }
 
@@ -384,7 +389,7 @@ pub(crate) async fn start_sync(
                         target: TARGET,
                         "Error while downloading package seq_no {seq_no}: {e}"
                     );
-                    download(&mut sync_context, seq_no, None)
+                    download(&mut sync_context, seq_no, None)?
                 }
                 Some(Some((seq_no_recv, Ok((archive_context, update))))) => {
                     let Some(index) = queue.iter().position(|(seq_no_send, status)| match status {
@@ -535,8 +540,11 @@ async fn download_archives(
     let mut tasks = Vec::new();
     if archive_context.master.is_none() {
         let context = sync_context.clone();
-        let task =
-            tokio::spawn(async move { (None, download_archive(&context, None, mc_seq_no).await) });
+        let task = crate::types::service_tasks::spawn_owned(
+            context.engine.clone().as_ref(),
+            "master archive download",
+            async move { (None, download_archive(&context, None, mc_seq_no).await) },
+        )?;
         tasks.push(task);
     }
     if archive_context.need_shards {
@@ -556,10 +564,14 @@ async fn download_archives(
             }
             *retry -= 1;
             let context = sync_context.clone();
-            let task = tokio::spawn(async move {
-                let shard = Some(shard);
-                (shard.clone(), download_archive(&context, shard, mc_seq_no).await)
-            });
+            let task = crate::types::service_tasks::spawn_owned(
+                context.engine.clone().as_ref(),
+                "shard archive download",
+                async move {
+                    let shard = Some(shard);
+                    (shard.clone(), download_archive(&context, shard, mc_seq_no).await)
+                },
+            )?;
             tasks.push(task);
         }
         // Decrement retries for absent shards not covered by min_split
@@ -758,50 +770,56 @@ async fn import_shard_blocks(
             let maps = maps.clone();
             total_blocks += 1;
             bad_shards.insert(id.shard().clone());
-            let task = tokio::spawn(async move {
-                log::debug!(
-                    target: TARGET,
-                    "Importing shardchain block: {id} for MC block: {}...",
-                    mc_handle.id()
-                );
-                if let Some(handle) = engine.load_block_handle(&id)? {
-                    if handle.is_applied() {
-                        log::debug!(target: TARGET, "Skipped already applied block: {id}");
-                        return Ok(id);
-                    }
-                    if id.seq_no() == 0 {
-                        log::info!(target: TARGET, "Downloading zerostate: {id}...");
-                        boot::download_zerostate(engine.as_ref(), &id).await?;
-                        return Ok(id);
-                    }
-                    log::debug!(target: TARGET, "Applying shardchain block: {id}...");
-                    let block = match maps.blocks.get(&id) {
-                        Some(entry) => match entry.block {
-                            Some(ref block) => Some(block.as_ref().clone()),
-                            None => engine.load_block(&handle).await.ok(),
-                        },
-                        None => {
-                            log::warn!(
-                                target: TARGET,
-                                "Shard block is not found in the package: {id}"
-                            );
-                            engine.load_block(&handle).await.ok()
+            let task = crate::types::service_tasks::spawn_owned(
+                engine.clone().as_ref(),
+                "archive shard import",
+                async move {
+                    log::debug!(
+                        target: TARGET,
+                        "Importing shardchain block: {id} for MC block: {}...",
+                        mc_handle.id()
+                    );
+                    if let Some(handle) = engine.load_block_handle(&id)? {
+                        if handle.is_applied() {
+                            log::debug!(target: TARGET, "Skipped already applied block: {id}");
+                            return Ok(id);
                         }
-                    };
-                    if let Some(block) = block {
-                        engine.apply_block(&handle, &block, mc_handle.id().seq_no(), false).await?;
-                        return Ok(id);
+                        if id.seq_no() == 0 {
+                            log::info!(target: TARGET, "Downloading zerostate: {id}...");
+                            boot::download_zerostate(engine.as_ref(), &id).await?;
+                            return Ok(id);
+                        }
+                        log::debug!(target: TARGET, "Applying shardchain block: {id}...");
+                        let block = match maps.blocks.get(&id) {
+                            Some(entry) => match entry.block {
+                                Some(ref block) => Some(block.as_ref().clone()),
+                                None => engine.load_block(&handle).await.ok(),
+                            },
+                            None => {
+                                log::warn!(
+                                    target: TARGET,
+                                    "Shard block is not found in the package: {id}"
+                                );
+                                engine.load_block(&handle).await.ok()
+                            }
+                        };
+                        if let Some(block) = block {
+                            engine
+                                .apply_block(&handle, &block, mc_handle.id().seq_no(), false)
+                                .await?;
+                            return Ok(id);
+                        }
                     }
-                }
-                log::warn!(
-                    target: TARGET,
-                    "Shard block {id} is not found either in the package or among \
-                    unapplied blocks. Will try to download it directly"
-                );
-                absent_blocks.fetch_add(1, Ordering::Relaxed);
-                engine.download_and_apply_block(&id, mc_handle.id().seq_no(), false).await?;
-                Ok(id)
-            });
+                    log::warn!(
+                        target: TARGET,
+                        "Shard block {id} is not found either in the package or among \
+                        unapplied blocks. Will try to download it directly"
+                    );
+                    absent_blocks.fetch_add(1, Ordering::Relaxed);
+                    engine.download_and_apply_block(&id, mc_handle.id().seq_no(), false).await?;
+                    Ok(id)
+                },
+            )?;
             tasks.push(task)
         }
 

@@ -121,6 +121,7 @@ pub struct Engine {
     candidate_db: CandidateDbPool,
     network: Arc<NodeNetwork>,
     owned_services: std::sync::Mutex<EngineOwners>,
+    service_tasks: crate::types::service_tasks::ServiceTasks,
     server_constructors: crate::types::owned_tasks::OwnedTasks,
     shutdown_started: std::sync::Mutex<bool>,
     shutdown_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
@@ -444,6 +445,10 @@ impl Stopper {
     }
 
     pub async fn wait_stop(self: Arc<Self>) -> Result<()> {
+        self.wait_stop_except(0).await
+    }
+
+    async fn wait_stop_except(self: Arc<Self>, except: u32) -> Result<()> {
         loop {
             {
                 let failures = self.failures.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -452,7 +457,7 @@ impl Stopper {
                 Self::log_stop_status(stop);
                 // Terminal failed owners cannot release successfully, but every
                 // other service must finish before shutdown returns its error.
-                if stop & !failed == 0 {
+                if stop & !failed & !except == 0 {
                     if failures.is_empty() {
                         return Ok(());
                     }
@@ -520,7 +525,9 @@ impl Stopper {
     }
 
     pub fn release_stop(&self, mask: u32) {
-        self.stop.fetch_and(!mask, Ordering::Relaxed);
+        let failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        let failed = failures.keys().fold(0, |all, mask| all | mask);
+        self.stop.fetch_and(!(mask & !failed), Ordering::Relaxed);
     }
 
     pub fn _token(&self) -> tokio_util::sync::CancellationToken {
@@ -829,7 +836,7 @@ impl Engine {
             confirmed_block_events: ConfirmedBlockEvents::new(),
 
             servers: lockfree::queue::Queue::new(),
-            stopper,
+            stopper: stopper.clone(),
             _network_binding: network_binding,
             zerostate_id: zero_state_id,
             init_mc_block_id,
@@ -839,6 +846,7 @@ impl Engine {
             archives_life_time_hours,
             network,
             owned_services: std::sync::Mutex::new(EngineOwners::default()),
+            service_tasks: crate::types::service_tasks::ServiceTasks::new(stopper.clone()),
             server_constructors: Default::default(),
             shutdown_started: std::sync::Mutex::new(false),
             shutdown_tasks: Arc::new(crate::types::owned_tasks::OwnedTasks::default()),
@@ -935,6 +943,15 @@ impl Engine {
         self.monitor_min_split.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn register_owned_service(
+        &self,
+        name: &'static str,
+        mask: u32,
+        start: Box<dyn FnOnce() -> tokio::task::JoinHandle<()> + Send>,
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        self.service_tasks.register(name, mask, start)
+    }
+
     fn start_shutdown(self: &Arc<Self>) -> Result<Arc<crate::types::owned_tasks::OwnedTasks>> {
         let tasks = self.shutdown_tasks.clone();
         {
@@ -942,6 +959,7 @@ impl Engine {
             if !*started {
                 self.stopper.set_stop();
                 self.server_constructors.stop();
+                self.service_tasks.stop();
                 let engine = self.clone();
                 let result_owner = tasks.clone();
                 tasks.spawn("Engine shutdown", async move {
@@ -1076,15 +1094,13 @@ impl Engine {
             self.stopper.report_service_failure(0, format!("finality recovery: {error}"));
         }
 
-        // The retained shutdown supervisor owns both futures. Cancelling an
-        // external waiter cannot detach GC or start a second GC shutdown.
-        let (_, _) = tokio::join!(
-            async {
-                self.db.stop_states_db().await;
-                self.stopper.release_stop(Self::MASK_SERVICE_SHARDSTATE_GC);
-            },
-            self.stopper.clone().wait_stop(),
-        );
+        if let Err(error) = self.service_tasks.wait().await {
+            self.stopper.report_service_failure(0, format!("service ownership: {error}"));
+        }
+        // An unknown validator teardown retains its bit and blocks DB shutdown.
+        let _ = self.stopper.clone().wait_stop_except(Self::MASK_SERVICE_SHARDSTATE_GC).await;
+        self.db.stop_states_db().await;
+        self.stopper.release_stop(Self::MASK_SERVICE_SHARDSTATE_GC);
         // Producers have stopped. Close the queue and flush accepted metadata
         // writes before releasing the Engine/database owner.
         if let Err(error) = self.persistence_tasks.wait().await {
@@ -2223,14 +2239,20 @@ impl Engine {
         archives_gc_block: BlockIdExt,
     ) -> Result<tokio::task::JoinHandle<()>> {
         log::info!("start_archives_gc");
-        let join_handle = tokio::spawn(async move {
-            engine.acquire_stop(Engine::MASK_SERVICE_ARCHIVES_GC);
-            if let Err(e) = Self::archives_gc_worker(&engine, archives_gc_block).await {
-                log::error!("CRITICAL!!! Unexpected error in archives gc: {:?}", e);
-            }
-            engine.release_stop(Engine::MASK_SERVICE_ARCHIVES_GC);
-        });
-        Ok(join_handle)
+        engine.clone().register_service_task(
+            "archive GC",
+            Engine::MASK_SERVICE_ARCHIVES_GC,
+            Box::new(move || {
+                tokio::spawn(async move {
+                    if let Err(e) = Self::archives_gc_worker(&engine, archives_gc_block).await {
+                        engine.report_service_failure(
+                            Engine::MASK_SERVICE_ARCHIVES_GC,
+                            format!("archives GC: {e}"),
+                        );
+                    }
+                })
+            }),
+        )
     }
 
     pub async fn archives_gc_worker(
@@ -2663,131 +2685,139 @@ pub async fn run(
         engine.truncate_database(mc_seq_no).await?;
     }
     let engine_ret = engine.clone();
-    let result = async move {
-        #[cfg(feature = "telemetry")]
-        telemetry_logger(engine.clone())?;
-        #[cfg(all(target_os = "linux", feature = "telemetry"))]
-        proc_status_logger(engine.clone())?;
+    let zerostate_path = zerostate_path.map(str::to_owned);
+    let result = crate::types::service_tasks::spawn_owned(
+        engine_ret.as_ref(),
+        "Engine startup",
+        async move {
+            #[cfg(feature = "telemetry")]
+            telemetry_logger(engine.clone())?;
+            #[cfg(all(target_os = "linux", feature = "telemetry"))]
+            proc_status_logger(engine.clone())?;
 
-        // Each constructor is owned before its first poll. A cancelled startup
-        // can neither abandon a live server nor race late registration with stop.
-        if let Some(config) = control_server_config {
-            let owner = engine.clone();
-            engine
-                .start_owned_server("control", async move {
-                    let server = ControlServer::with_params(
-                        config,
-                        DataSource::Engine(owner.clone()),
-                        owner.network().config_handler(),
-                        owner.network().config_handler(),
-                        Some(owner.network()),
-                    )
+            // Each constructor is owned before its first poll. A cancelled startup
+            // can neither abandon a live server nor race late registration with stop.
+            if let Some(config) = control_server_config {
+                let owner = engine.clone();
+                engine
+                    .start_owned_server("control", async move {
+                        let server = ControlServer::with_params(
+                            config,
+                            DataSource::Engine(owner.clone()),
+                            owner.network().config_handler(),
+                            owner.network().config_handler(),
+                            Some(owner.network()),
+                        )
+                        .await?;
+                        Ok(Box::new(server) as Box<dyn Stoppable>)
+                    })
                     .await?;
-                    Ok(Box::new(server) as Box<dyn Stoppable>)
-                })
-                .await?;
-        }
-        if let Some(config) = lite_server_config {
-            let owner = engine.clone();
-            engine
-                .start_owned_server("lite", async move {
-                    let server = LiteServer::with_params(config, liteserver_runtime, owner).await?;
-                    Ok(Box::new(server) as Box<dyn Stoppable>)
-                })
-                .await?;
-        }
-        if let Some(config) = json_rpc_server_config {
-            let owner = engine.clone();
-            engine
-                .start_owned_server("JSON RPC", async move {
-                    let server = RpcServer::start(config, owner).await?;
-                    Ok(Box::new(server) as Box<dyn Stoppable>)
-                })
-                .await?;
-        }
-        if let Some((address, handle)) = metrics {
-            let owner = engine.clone();
-            engine
-                .start_owned_server("metrics", async move {
-                    Ok(Box::new(start_metrics_server(owner, address, handle).await)
-                        as Box<dyn Stoppable>)
-                })
-                .await?;
-        }
-
-        // Overlays
-        let overlays_router =
-            engine.initialize_full_node_overlays(DhtSearchPolicy::default()).await?;
-        overlays_router.update_custom_overlays(Some(&custom_overlays_config)).await?;
-
-        // Boot
-        let mut boot_info =
-            boot(&engine, zerostate_path, configs_dir, pss_downloading_threads).await?;
-
-        engine.initialize_queue_manager().await?;
-
-        Engine::start_archives_gc(engine.clone(), boot_info.archives_gc_block)?;
-
-        engine
-            .shard_states_keeper
-            .clone()
-            .start(
-                engine.clone(),
-                boot_info.last_applied_mc_block.clone(),
-                boot_info.shard_client_mc_block.clone(),
-                boot_info.ss_keeper_mc_block,
-            )
-            .await?;
-
-        // Start validator manager, which will start validator sessions when necessary
-        start_validator_manager(
-            Arc::clone(&engine) as Arc<dyn EngineOperations>,
-            validator_runtime,
-            vm_config,
-        );
-
-        // Sync by archives
-        if sync_by_archives && !engine.check_sync().await? {
-            engine.set_sync_status(Engine::SYNC_STATUS_SYNC_ARCHIVES);
-            struct Checker;
-            #[async_trait::async_trait]
-            impl crate::sync::StopSyncChecker for Checker {
-                async fn check(&self, engine: &Arc<dyn EngineOperations>) -> bool {
-                    engine.check_sync().await.unwrap_or(false)
-                }
             }
-            crate::sync::start_sync(
+            if let Some(config) = lite_server_config {
+                let owner = engine.clone();
+                engine
+                    .start_owned_server("lite", async move {
+                        let server =
+                            LiteServer::with_params(config, liteserver_runtime, owner).await?;
+                        Ok(Box::new(server) as Box<dyn Stoppable>)
+                    })
+                    .await?;
+            }
+            if let Some(config) = json_rpc_server_config {
+                let owner = engine.clone();
+                engine
+                    .start_owned_server("JSON RPC", async move {
+                        let server = RpcServer::start(config, owner).await?;
+                        Ok(Box::new(server) as Box<dyn Stoppable>)
+                    })
+                    .await?;
+            }
+            if let Some((address, handle)) = metrics {
+                let owner = engine.clone();
+                engine
+                    .start_owned_server("metrics", async move {
+                        Ok(Box::new(start_metrics_server(owner, address, handle).await)
+                            as Box<dyn Stoppable>)
+                    })
+                    .await?;
+            }
+
+            // Overlays
+            let overlays_router =
+                engine.initialize_full_node_overlays(DhtSearchPolicy::default()).await?;
+            overlays_router.update_custom_overlays(Some(&custom_overlays_config)).await?;
+
+            // Boot
+            let mut boot_info =
+                boot(&engine, zerostate_path.as_deref(), configs_dir, pss_downloading_threads)
+                    .await?;
+
+            engine.initialize_queue_manager().await?;
+
+            Engine::start_archives_gc(engine.clone(), boot_info.archives_gc_block)?;
+
+            engine
+                .shard_states_keeper
+                .clone()
+                .start(
+                    engine.clone(),
+                    boot_info.last_applied_mc_block.clone(),
+                    boot_info.shard_client_mc_block.clone(),
+                    boot_info.ss_keeper_mc_block,
+                )
+                .await?;
+
+            // Start validator manager, which will start validator sessions when necessary
+            start_validator_manager(
                 Arc::clone(&engine) as Arc<dyn EngineOperations>,
-                Some(&Checker),
-                None,
-            )
-            .await?;
-            boot_info.last_applied_mc_block = engine
-                .load_last_applied_mc_block_id()?
-                .ok_or_else(|| error!("INTERNAL ERROR: No last applied MC block after sync"))?
-                .deref()
-                .clone();
-            boot_info.shard_client_mc_block = engine
-                .load_shard_client_mc_block_id()?
-                .ok_or_else(|| error!("INTERNAL ERROR: No shard client MC block after sync"))?
-                .deref()
-                .clone();
-        }
+                validator_runtime,
+                vm_config,
+            )?;
 
-        // top shard blocks
-        resend_top_shard_blocks_worker(engine.clone());
+            // Sync by archives
+            if sync_by_archives && !engine.check_sync().await? {
+                engine.set_sync_status(Engine::SYNC_STATUS_SYNC_ARCHIVES);
+                struct Checker;
+                #[async_trait::async_trait]
+                impl crate::sync::StopSyncChecker for Checker {
+                    async fn check(&self, engine: &Arc<dyn EngineOperations>) -> bool {
+                        engine.check_sync().await.unwrap_or(false)
+                    }
+                }
+                crate::sync::start_sync(
+                    Arc::clone(&engine) as Arc<dyn EngineOperations>,
+                    Some(&Checker),
+                    None,
+                )
+                .await?;
+                boot_info.last_applied_mc_block = engine
+                    .load_last_applied_mc_block_id()?
+                    .ok_or_else(|| error!("INTERNAL ERROR: No last applied MC block after sync"))?
+                    .deref()
+                    .clone();
+                boot_info.shard_client_mc_block = engine
+                    .load_shard_client_mc_block_id()?
+                    .ok_or_else(|| error!("INTERNAL ERROR: No shard client MC block after sync"))?
+                    .deref()
+                    .clone();
+            }
 
-        overlays_router.special_update_fastsync_overlays().await?;
+            // top shard blocks
+            resend_top_shard_blocks_worker(engine.clone())?;
 
-        // blocks download clients
-        engine.set_sync_status(Engine::SYNC_STATUS_SYNC_BLOCKS);
-        Engine::check_finish_sync(Arc::clone(&engine))?;
-        let join_shards = start_shards_client(engine.clone(), boot_info.shard_client_mc_block)?;
-        let join_master =
-            start_masterchain_client(engine.clone(), boot_info.last_applied_mc_block)?;
-        Ok((join_shards, join_master))
-    }
-    .await;
+            overlays_router.special_update_fastsync_overlays().await?;
+
+            // blocks download clients
+            engine.set_sync_status(Engine::SYNC_STATUS_SYNC_BLOCKS);
+            Engine::check_finish_sync(Arc::clone(&engine))?;
+            let join_shards = start_shards_client(engine.clone(), boot_info.shard_client_mc_block)?;
+            let join_master =
+                start_masterchain_client(engine.clone(), boot_info.last_applied_mc_block)?;
+            Ok((join_shards, join_master))
+        },
+    )?
+    .await
+    .map_err(|error| error!("Engine startup join: {error}"))?;
 
     let result = match result {
         Err(e) => {

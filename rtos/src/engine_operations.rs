@@ -1262,6 +1262,15 @@ impl EngineOperations for Engine {
         self.db().adjust_states_gc_interval(interval_ms)
     }
 
+    fn register_service_task(
+        &self,
+        name: &'static str,
+        mask: u32,
+        start: Box<dyn FnOnce() -> tokio::task::JoinHandle<()> + Send>,
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        self.register_owned_service(name, mask, start)
+    }
+
     fn acquire_stop(&self, mask: u32) {
         self.stopper().acquire_stop(mask);
     }

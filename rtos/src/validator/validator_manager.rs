@@ -2939,22 +2939,25 @@ pub fn start_validator_manager(
     engine: Arc<dyn EngineOperations>,
     runtime: tokio::runtime::Handle,
     config: ValidatorManagerConfig,
-) {
-    let _ = spawn_validator_manager(engine, runtime, config);
+) -> Result<()> {
+    spawn_validator_manager(engine, runtime, config)?;
+    Ok(())
 }
 
 fn spawn_validator_manager(
     engine: Arc<dyn EngineOperations>,
     runtime: tokio::runtime::Handle,
     config: ValidatorManagerConfig,
-) -> tokio::task::JoinHandle<()> {
+) -> Result<tokio::task::JoinHandle<()>> {
     const CHECK_VALIDATOR_TIMEOUT: u64 = 60; //secs
-    runtime.clone().spawn(async move {
+    engine.clone().register_service_task("validator manager", 0, Box::new(move || {
+        // This owner alone knows whether group/thread teardown was certified.
+        engine.acquire_stop(Engine::MASK_SERVICE_VALIDATOR_MANAGER);
+        runtime.clone().spawn(async move {
         log::info!(
             target: "validator_manager",
             "checking if current node is a validator during {CHECK_VALIDATOR_TIMEOUT} secs"
         );
-        engine.acquire_stop(Engine::MASK_SERVICE_VALIDATOR_MANAGER);
         while !engine.get_validator_status() {
             log::trace!(target: "validator_manager", "Not a validator, waiting...");
             let _ = engine.clear_last_rotation_block_id();
@@ -3012,6 +3015,7 @@ fn spawn_validator_manager(
         log::info!(target: "validator_manager", "Exiting, validator manager is stopped");
         engine.release_stop(Engine::MASK_SERVICE_VALIDATOR_MANAGER);
     })
+    }))
 }
 
 #[cfg(test)]

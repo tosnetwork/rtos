@@ -401,7 +401,9 @@ async fn engine_owned_drain_retires_public_generations_without_deleting_replacem
             .context()
             .stack
             .overlay
-            .get_query_prefix(replacements[0].overlay_client().id())
+            .get_query_prefix(&rtos_block::KeyId::from_data(
+                *replacements[0].overlay_client().id().data()
+            ))
             .is_ok(),
         "retired generation deleted replacement protocol"
     );

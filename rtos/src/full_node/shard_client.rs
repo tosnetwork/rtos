@@ -31,31 +31,48 @@ pub fn start_masterchain_client(
     engine: Arc<dyn EngineOperations>,
     last_got_block_id: BlockIdExt,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let join_handle = tokio::spawn(async move {
-        engine.acquire_stop(Engine::MASK_SERVICE_MASTERCHAIN_CLIENT);
-        while let Err(e) = load_master_blocks_cycle(engine.clone(), last_got_block_id.clone()).await
-        {
-            log::error!("Unexpected error in master blocks loading cycle: {:?}", e);
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        engine.release_stop(Engine::MASK_SERVICE_MASTERCHAIN_CLIENT);
-    });
-    Ok(join_handle)
+    let owner = engine.clone();
+    owner.register_service_task(
+        "masterchain client",
+        Engine::MASK_SERVICE_MASTERCHAIN_CLIENT,
+        Box::new(move || {
+            tokio::spawn(async move {
+                while let Err(e) =
+                    load_master_blocks_cycle(engine.clone(), last_got_block_id.clone()).await
+                {
+                    if engine.check_stop() {
+                        break;
+                    }
+                    log::error!("Unexpected error in master blocks loading cycle: {:?}", e);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            })
+        }),
+    )
 }
 
 pub fn start_shards_client(
     engine: Arc<dyn EngineOperations>,
     shards_mc_block_id: BlockIdExt,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let join_handle = tokio::spawn(async move {
-        engine.acquire_stop(Engine::MASK_SERVICE_SHARDCHAIN_CLIENT);
-        while let Err(e) = load_shard_blocks_cycle(engine.clone(), &shards_mc_block_id).await {
-            log::error!("Unexpected error in shards client: {:?}", e);
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        engine.release_stop(Engine::MASK_SERVICE_SHARDCHAIN_CLIENT);
-    });
-    Ok(join_handle)
+    let owner = engine.clone();
+    owner.register_service_task(
+        "shardchain client",
+        Engine::MASK_SERVICE_SHARDCHAIN_CLIENT,
+        Box::new(move || {
+            tokio::spawn(async move {
+                while let Err(e) =
+                    load_shard_blocks_cycle(engine.clone(), &shards_mc_block_id).await
+                {
+                    if engine.check_stop() {
+                        break;
+                    }
+                    log::error!("Unexpected error in shards client: {:?}", e);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            })
+        }),
+    )
 }
 
 // Remember about ShardStatesKeeper::MAX_CATCH_UP_DEPTH and ShardStateDb::MAX_QUEUE_LEN
@@ -208,15 +225,23 @@ async fn load_shard_blocks_cycle(
         log::debug!("load_shard_blocks_cycle: process next mc block: {}", mc_block.id());
 
         let engine = Arc::clone(&engine);
-        tokio::spawn(async move {
-            if let Err(e) = load_shard_blocks(engine.clone(), semaphore_permit, &mc_block).await {
-                log::error!(
+        engine.clone().register_service_task(
+            "shard block batch",
+            0,
+            Box::new(move || {
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        load_shard_blocks(engine.clone(), semaphore_permit, &mc_block).await
+                    {
+                        log::error!(
                     "FATAL!!! Unexpected error in shard blocks processing for mc block {}: {:?}",
                     mc_block.id(),
                     e
                 );
-            }
-        });
+                    }
+                })
+            }),
+        )?;
     }
 }
 
@@ -230,33 +255,42 @@ pub async fn load_shard_blocks(
         shard_block_id: BlockIdExt,
         mc_seq_no: u32,
         msg: String,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut attempt = 0;
-            log::debug!("load_shard_blocks_cycle: {}, applying block...", msg);
-            loop {
-                if let Err(e) = Arc::clone(&engine)
-                    .download_and_apply_block(&shard_block_id, mc_seq_no, false)
-                    .await
-                {
-                    log::error!(
-                        "Error while applying shard block (attempt {}) {}: {:?}",
-                        attempt,
-                        shard_block_id,
-                        e
-                    );
-                    attempt += 1;
-                    // TODO make method to ban bad peer who gave bad block
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    if engine.check_stop() {
-                        break;
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        engine.clone().register_service_task(
+            "shard apply",
+            0,
+            Box::new(move || {
+                tokio::spawn(async move {
+                    let mut attempt = 0;
+                    log::debug!("load_shard_blocks_cycle: {}, applying block...", msg);
+                    loop {
+                        if engine.check_stop() {
+                            break;
+                        }
+                        if let Err(e) = Arc::clone(&engine)
+                            .download_and_apply_block(&shard_block_id, mc_seq_no, false)
+                            .await
+                        {
+                            log::error!(
+                                "Error while applying shard block (attempt {}) {}: {:?}",
+                                attempt,
+                                shard_block_id,
+                                e
+                            );
+                            attempt += 1;
+                            // TODO make method to ban bad peer who gave bad block
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            if engine.check_stop() {
+                                break;
+                            }
+                        } else {
+                            log::debug!("load_shard_blocks_cycle: {}, applied block", msg);
+                            break;
+                        }
                     }
-                } else {
-                    log::debug!("load_shard_blocks_cycle: {}, applied block", msg);
-                    break;
-                }
-            }
-        })
+                })
+            }),
+        )
     }
 
     let mut apply_tasks = Vec::new();
@@ -279,7 +313,7 @@ pub async fn load_shard_blocks(
             shard_block_id.clone(),
             mc_seq_no,
             msg,
-        ));
+        )?);
     }
 
     futures::future::join_all(apply_tasks)

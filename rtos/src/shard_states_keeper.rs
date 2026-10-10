@@ -157,56 +157,85 @@ impl ShardStatesKeeper {
 
         let engine_ = engine.clone();
         let self_ = self.clone();
-        tokio::spawn(async move {
-            engine_.acquire_stop(Engine::MASK_SERVICE_PSS_KEEPER);
-            while let Err(e) = self_.pss_worker(&engine_, &ss_keeper_block).await {
-                if engine_.check_stop() {
-                    break;
-                }
-                log::error!("pss worker: CRITICAL!!! Unexpected error: {:?}", e);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                ss_keeper_block = 'a: loop {
-                    match engine_.load_pss_keeper_mc_block_id() {
-                        Err(e) => {
-                            log::error!(
-                                "pss worker: CRITICAL!!! load_pss_keeper_mc_block_id: {:?}",
-                                e
-                            );
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+        engine_.clone().register_service_task(
+            "persistent state keeper",
+            Engine::MASK_SERVICE_PSS_KEEPER,
+            Box::new(move || {
+                tokio::spawn(async move {
+                    while let Err(e) = self_.pss_worker(&engine_, &ss_keeper_block).await {
+                        if engine_.check_stop() {
+                            break;
                         }
-                        Ok(None) => {
-                            log::error!("CRITICAL!!! load_pss_keeper_mc_block_id returned None");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-                        Ok(Some(id)) => break 'a (*id).clone(),
+                        log::error!("pss worker: CRITICAL!!! Unexpected error: {:?}", e);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        ss_keeper_block = 'a: loop {
+                            if engine_.check_stop() {
+                                return;
+                            }
+                            match engine_.load_pss_keeper_mc_block_id() {
+                                Err(e) => {
+                                    log::error!(
+                                        "pss worker: CRITICAL!!! load_pss_keeper_mc_block_id: {:?}",
+                                        e
+                                    );
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                }
+                                Ok(None) => {
+                                    log::error!(
+                                        "CRITICAL!!! load_pss_keeper_mc_block_id returned None"
+                                    );
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                }
+                                Ok(Some(id)) => break 'a (*id).clone(),
+                            }
+                        };
                     }
-                };
-            }
-            engine_.release_stop(Engine::MASK_SERVICE_PSS_KEEPER);
-        });
+                })
+            }),
+        )?;
 
-        tokio::spawn(async move {
-            engine.acquire_stop(Engine::MASK_SERVICE_SS_CACHE_KEEPER);
-            let mut states_cache_mc_block = shard_client_mc_block;
-            while let Err(e) = self.clean_cache_worker(&engine, &states_cache_mc_block).await {
-                log::error!("CRITICAL!!! Unexpected error in clean states cache worker: {:?}", e);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                states_cache_mc_block = 'a: loop {
-                    match engine.load_shard_client_mc_block_id() {
-                        Err(e) => {
-                            log::error!("CRITICAL!!! load_shard_client_mc_block_id: {:?}", e);
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+        engine.clone().register_service_task(
+            "state cache keeper",
+            Engine::MASK_SERVICE_SS_CACHE_KEEPER,
+            Box::new(move || {
+                tokio::spawn(async move {
+                    let mut states_cache_mc_block = shard_client_mc_block;
+                    while let Err(e) =
+                        self.clean_cache_worker(&engine, &states_cache_mc_block).await
+                    {
+                        if engine.check_stop() {
+                            return;
                         }
-                        Ok(None) => {
-                            log::error!("CRITICAL!!! load_shard_client_mc_block_id returned None");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-                        Ok(Some(id)) => break 'a (*id).clone(),
+                        log::error!(
+                            "CRITICAL!!! Unexpected error in clean states cache worker: {:?}",
+                            e
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        states_cache_mc_block = 'a: loop {
+                            if engine.check_stop() {
+                                return;
+                            }
+                            match engine.load_shard_client_mc_block_id() {
+                                Err(e) => {
+                                    log::error!(
+                                        "CRITICAL!!! load_shard_client_mc_block_id: {:?}",
+                                        e
+                                    );
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                }
+                                Ok(None) => {
+                                    log::error!(
+                                        "CRITICAL!!! load_shard_client_mc_block_id returned None"
+                                    );
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                }
+                                Ok(Some(id)) => break 'a (*id).clone(),
+                            }
+                        };
                     }
-                };
-            }
-            engine.release_stop(Engine::MASK_SERVICE_SS_CACHE_KEEPER);
-        });
+                })
+            }),
+        )?;
 
         Ok(())
     }

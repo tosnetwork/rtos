@@ -16,3 +16,5 @@ pub mod lockfree_cache;
 pub mod messages;
 pub(crate) mod owned_tasks;
 pub mod top_block_descr;
+
+pub(crate) mod service_tasks;

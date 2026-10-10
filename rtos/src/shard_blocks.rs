@@ -312,27 +312,35 @@ impl ShardBlocksPool {
     }
 }
 
-pub fn resend_top_shard_blocks_worker(engine: Arc<dyn EngineOperations>) {
-    tokio::spawn(async move {
-        engine.acquire_stop(Engine::MASK_SERVICE_TOP_SHARDBLOCKS_SENDER);
-        loop {
-            if engine.check_stop() {
-                break;
-            }
-            // 2..3 seconds
-            let delay = rand::thread_rng().gen_range(2000..3000);
-            futures_timer::Delay::new(Duration::from_millis(delay)).await;
-            match resend_top_shard_blocks(engine.deref()).await {
-                Ok(_) => log::trace!("resend_top_shard_blocks: ok"),
-                Err(e) => log::error!("resend_top_shard_blocks: {:?}", e),
-            }
-        }
-        engine.release_stop(Engine::MASK_SERVICE_TOP_SHARDBLOCKS_SENDER);
-    });
+pub fn resend_top_shard_blocks_worker(engine: Arc<dyn EngineOperations>) -> Result<()> {
+    engine.clone().register_service_task(
+        "top shard sender",
+        Engine::MASK_SERVICE_TOP_SHARDBLOCKS_SENDER,
+        Box::new(move || {
+            tokio::spawn(async move {
+                loop {
+                    if engine.check_stop() {
+                        break;
+                    }
+                    // 2..3 seconds
+                    let delay = rand::thread_rng().gen_range(2000..3000);
+                    futures_timer::Delay::new(Duration::from_millis(delay)).await;
+                    match resend_top_shard_blocks(engine.deref()).await {
+                        Ok(_) => log::trace!("resend_top_shard_blocks: ok"),
+                        Err(e) => log::error!("resend_top_shard_blocks: {:?}", e),
+                    }
+                }
+            })
+        }),
+    )?;
+    Ok(())
 }
 
 async fn resend_top_shard_blocks(engine: &dyn EngineOperations) -> Result<()> {
     loop {
+        if engine.check_stop() {
+            return Ok(());
+        }
         let mc_state = engine.load_last_applied_mc_state().await?;
         let mut actual_last_mc_seqno = mc_state.block_id().seq_no;
         match engine.get_own_shard_blocks(&mc_state, Some(&mut actual_last_mc_seqno)).await {
