@@ -812,14 +812,14 @@ async fn partial_engine_construction(stage: &'static str, cancel: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn engine_owned_drain_partial_engine_cancel_preserves_network_control_and_restore() {
-    for stage in ["network", "control", "database"] {
+    for stage in ["network", "control", "database", "complete"] {
         partial_engine_construction(stage, true).await;
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn engine_owned_drain_partial_engine_failure_releases_network_control_and_restore() {
-    for stage in ["network", "control", "database"] {
+    for stage in ["network", "control", "database", "complete"] {
         partial_engine_construction(stage, false).await;
     }
 }

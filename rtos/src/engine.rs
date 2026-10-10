@@ -748,6 +748,7 @@ impl Engine {
             let mut network_binding = Some(network_binding);
             let mut trace_collector = None;
             let mut transferred = false;
+            let mut transferred_engine: Option<Arc<Engine>> = None;
             let result = std::panic::AssertUnwindSafe(async {
                 if session_logs_file.is_some() {
                     trace_collector = Some(simplex::TraceCollector::new(session_logs_file));
@@ -971,6 +972,7 @@ impl Engine {
                 });
 
                 transferred = true;
+                transferred_engine = Some(engine.clone());
                 opened_db.take();
                 let guard = EngineShutdownGuard(Some(engine.clone()));
                 engine.acquire_stop(Self::MASK_SERVICE_SHARDSTATE_GC);
@@ -987,6 +989,8 @@ impl Engine {
                         engine.persistence_tasks.cancellation().clone(),
                     )
                 })?;
+                #[cfg(test)]
+                stopper.wait_construction_gate("complete").await?;
                 Ok::<_, anyhow::Error>(guard)
             })
             .catch_unwind()
@@ -999,6 +1003,16 @@ impl Engine {
                     Err(error!("Engine construction panicked"))
                 }
             };
+            if result.is_err() {
+                if let Some(engine) = transferred_engine.take() {
+                    if let Err(error) = engine.wait_stop().await {
+                        rollback_stopper.report_service_failure(
+                            0,
+                            format!("constructed Engine rollback: {error}"),
+                        );
+                    }
+                }
+            }
             if !transferred {
                 if let Some(server) = status_server.take() {
                     if std::panic::AssertUnwindSafe(server.shutdown()).catch_unwind().await.is_err()

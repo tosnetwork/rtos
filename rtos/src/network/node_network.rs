@@ -200,22 +200,6 @@ impl NodeNetwork {
         let dht_key = adnl.key_by_tag(Self::TAG_DHT_KEY)?;
 
         let overlay_key = adnl.key_by_tag(Self::TAG_OVERLAY_KEY)?;
-        // Bind QUIC immediately on the default overlay ADNL key, validator key will be added later
-        if let Some(quic) = &quic {
-            let adnl_ip = adnl.ip_address_adnl();
-            match Self::compute_quic_bind_addr(adnl_ip, quic_address) {
-                Ok((_quic_addr, bind_addr)) => {
-                    if let Err(e) = Self::bind_quic_key(quic, &overlay_key, bind_addr) {
-                        log::warn!(
-                            "Cannot register default ADNL key {} on QUIC: {e}",
-                            overlay_key.id()
-                        );
-                    }
-                }
-                Err(e) => log::warn!("Skipping default QUIC identity: {e}"),
-            }
-        }
-
         let (config_handler, config_handler_context) =
             NodeConfigHandler::create(config, tokio::runtime::Handle::current())?;
 
@@ -264,6 +248,22 @@ impl NodeNetwork {
         let node_network = Arc::new(node_network);
 
         let initialized = (|| -> Result<()> {
+            // Bind QUIC immediately on the default overlay ADNL key, validator key will be added later
+            if let Some(quic) = &node_network.network_context.stack.quic {
+                let adnl_ip = node_network.network_context.stack.adnl.ip_address_adnl();
+                match Self::compute_quic_bind_addr(adnl_ip, quic_address) {
+                    Ok((_quic_addr, bind_addr)) => {
+                        if let Err(e) = Self::bind_quic_key(quic, &overlay_key, bind_addr) {
+                            log::warn!(
+                                "Cannot register default ADNL key {} on QUIC: {e}",
+                                overlay_key.id()
+                            );
+                        }
+                    }
+                    Err(e) => log::warn!("Skipping default QUIC identity: {e}"),
+                }
+            }
+
             NodeConfigHandler::start_sheduler(
                 node_network.config_handler.clone(),
                 config_handler_context,
