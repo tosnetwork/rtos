@@ -94,6 +94,7 @@ struct OverlayRegistration {
     id: Arc<OverlayShortId>,
     cancellation: tokio_util::sync::CancellationToken,
     committed: bool,
+    deletion: Arc<std::sync::Mutex<bool>>,
     owner: Arc<OwnedTasks>,
 }
 impl OverlayRegistration {
@@ -103,13 +104,25 @@ impl OverlayRegistration {
         cancellation: tokio_util::sync::CancellationToken,
         owner: Arc<OwnedTasks>,
     ) -> Self {
-        Self { network, id, cancellation, committed: false, owner }
+        Self {
+            network,
+            id,
+            cancellation,
+            committed: false,
+            deletion: Arc::new(std::sync::Mutex::new(false)),
+            owner,
+        }
     }
 }
 impl Drop for OverlayRegistration {
     fn drop(&mut self) {
         if !self.committed {
             self.cancellation.cancel();
+            let mut deleted = self.deletion.lock().unwrap();
+            if *deleted {
+                return;
+            }
+            *deleted = true;
             if let Err(error) = self.network.stack.overlay.delete_public_overlay(&self.id) {
                 self.owner.record_error(format!("Partial overlay {} cleanup: {error}", self.id));
             }
@@ -118,6 +131,7 @@ impl Drop for OverlayRegistration {
 }
 
 pub struct OverlayClient {
+    deletion: Arc<std::sync::Mutex<bool>>,
     ctx: Arc<OverlayClientContext>,
     tasks: Arc<OwnedTasks>,
     neighbours_rotation_handle: tokio::task::AbortHandle,
@@ -196,6 +210,7 @@ impl OverlayClient {
             initial_peers,
             Some(search_ctx),
             owner,
+            registration.deletion.clone(),
         )?;
         registration.committed = true;
         Ok(client)
@@ -246,6 +261,7 @@ impl OverlayClient {
             root_adnl_ids,
             None,
             owner,
+            registration.deletion.clone(),
         )?;
         registration.committed = true;
         Ok(client)
@@ -262,6 +278,7 @@ impl OverlayClient {
         initial_peers: Vec<Arc<KeyId>>,
         search_ctx: Option<OverlayNodesSearchContext>,
         owner: Arc<OwnedTasks>,
+        deletion: Arc<std::sync::Mutex<bool>>,
     ) -> Result<Arc<Self>> {
         let tasks = Arc::new(OwnedTasks::child(owner, cancellation_token.clone()));
         // Create a neighbors manager
@@ -325,6 +342,7 @@ impl OverlayClient {
             })?;
 
         Ok(Arc::new(Self {
+            deletion,
             ctx,
             tasks,
             neighbours_rotation_handle,
@@ -369,13 +387,16 @@ impl OverlayClient {
         }
     }
 
-    pub(crate) fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
-        self.ctx.cancellation_token.clone()
-    }
-
     pub fn delete(&self) -> Result<bool> {
         self.tasks.stop();
         self.ctx.is_active.store(false, Ordering::Relaxed);
+        let mut deleted = self.deletion.lock().unwrap();
+        if *deleted {
+            return Ok(false);
+        }
+        // Shared with the constructor guard; hold through protocol deletion so
+        // a concurrent repeat cannot certify retirement before deletion finishes.
+        *deleted = true;
         let result = self.ctx.overlay_node().delete_public_overlay(&self.ctx.id);
         if let Err(error) = &result {
             self.tasks.record_error(format!("Overlay {} deletion: {error}", self.id()));

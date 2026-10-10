@@ -124,6 +124,7 @@ pub struct Engine {
     server_constructors: crate::types::owned_tasks::OwnedTasks,
     shutdown_started: std::sync::Mutex<bool>,
     shutdown_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
+    background_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
     ingress_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
     persistence_tasks: crate::types::owned_tasks::OwnedTasks,
 
@@ -841,6 +842,7 @@ impl Engine {
             server_constructors: Default::default(),
             shutdown_started: std::sync::Mutex::new(false),
             shutdown_tasks: Arc::new(crate::types::owned_tasks::OwnedTasks::default()),
+            background_tasks: Arc::new(Default::default()),
             ingress_tasks: Arc::new(crate::types::owned_tasks::OwnedTasks::new(
                 tokio_util::sync::CancellationToken::new(),
             )),
@@ -993,6 +995,7 @@ impl Engine {
     async fn wait_stop_inner(self: Arc<Self>) -> Result<()> {
         // set stop flag
         self.stopper.set_stop();
+        self.background_tasks.stop();
         self.ingress_tasks.stop();
         let finality_tasks = self.pending_finality.lock().tasks.clone();
         finality_tasks.stop();
@@ -1062,6 +1065,9 @@ impl Engine {
         drop(router);
         drop(queue);
 
+        if let Err(error) = self.background_tasks.wait().await {
+            self.stopper.report_service_failure(0, format!("background sampling: {error}"));
+        }
         if let Err(error) = self.ingress_tasks.wait().await {
             self.stopper.report_service_failure(0, format!("broadcast ingress: {error}"));
         }
@@ -2021,7 +2027,7 @@ impl Engine {
             return Ok(id);
         }
 
-        tokio::spawn({
+        self.ingress_tasks.clone().spawn("top shard state/apply", {
             let id = id.clone();
             async move {
                 // just passively waiting for 1s...
@@ -2053,7 +2059,7 @@ impl Engine {
                     }
                 }
             }
-        });
+        })?;
 
         Ok(id)
     }
@@ -2381,17 +2387,18 @@ impl Engine {
         }
     }
 
-    fn check_finish_sync(self: Arc<Self>) {
-        tokio::spawn(async move {
+    fn check_finish_sync(self: Arc<Self>) -> Result<tokio::task::AbortHandle> {
+        let tasks = self.background_tasks.clone();
+        tasks.spawn_cancelable("sync status sampler", async move {
             const SLEEP_TIME: u64 = 30;
             loop {
                 if let Ok(true) = self.check_sync().await {
                     self.set_sync_status(Engine::SYNC_STATUS_FINISH_SYNC);
                     return;
-                };
+                }
                 tokio::time::sleep(Duration::from_secs(SLEEP_TIME)).await;
             }
-        });
+        })
     }
 
     #[allow(dead_code)]
@@ -2658,9 +2665,9 @@ pub async fn run(
     let engine_ret = engine.clone();
     let result = async move {
         #[cfg(feature = "telemetry")]
-        telemetry_logger(engine.clone());
+        telemetry_logger(engine.clone())?;
         #[cfg(all(target_os = "linux", feature = "telemetry"))]
-        proc_status_logger();
+        proc_status_logger(engine.clone())?;
 
         // Each constructor is owned before its first poll. A cancelled startup
         // can neither abandon a live server nor race late registration with stop.
@@ -2774,7 +2781,7 @@ pub async fn run(
 
         // blocks download clients
         engine.set_sync_status(Engine::SYNC_STATUS_SYNC_BLOCKS);
-        Engine::check_finish_sync(Arc::clone(&engine));
+        Engine::check_finish_sync(Arc::clone(&engine))?;
         let join_shards = start_shards_client(engine.clone(), boot_info.shard_client_mc_block)?;
         let join_master =
             start_masterchain_client(engine.clone(), boot_info.last_applied_mc_block)?;
@@ -2819,8 +2826,8 @@ pub async fn run(
 }
 
 #[cfg(target_os = "linux")]
-fn proc_status_logger() {
-    tokio::spawn(async move {
+fn proc_status_logger(engine: Arc<Engine>) -> Result<tokio::task::AbortHandle> {
+    engine.background_tasks.spawn_cancelable("process status sampler", async move {
         let parse_kb = |line: &str| -> u64 {
             line.split_whitespace().nth(1).and_then(|n| n.parse().ok()).unwrap_or(0)
         };
@@ -2850,12 +2857,13 @@ fn proc_status_logger() {
                 vm_size / 1024,
             );
         }
-    });
+    })
 }
 
 #[cfg(feature = "telemetry")]
-fn telemetry_logger(engine: Arc<Engine>) {
-    tokio::spawn(async move {
+fn telemetry_logger(engine: Arc<Engine>) -> Result<tokio::task::AbortHandle> {
+    let tasks = engine.background_tasks.clone();
+    tasks.spawn_cancelable("telemetry sampler", async move {
         #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
         {
             let dirty: isize =
@@ -3037,7 +3045,7 @@ fn telemetry_logger(engine: Arc<Engine>) {
             }
             engine.telemetry_printer.try_print();
         }
-    });
+    })
 }
 
 pub fn init_prometheus_recorder(

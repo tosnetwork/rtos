@@ -85,6 +85,8 @@ pub struct FullNodeOverlaysRouter {
     network: Arc<NodeNetwork>,
     service: Arc<FullNodeOverlayService>,
     policy: DhtSearchPolicy,
+    public_generations:
+        std::sync::Mutex<std::collections::HashMap<ShardIdent, Arc<tokio::sync::Mutex<()>>>>,
     public_overlays: lockfree::map::Map<ShardIdent, Arc<FullNodeOverlayClient>>,
     fast_sync_overlays: lockfree::map::Map<ShardIdent, Arc<FastSyncOverlayClient>>,
     custom_overlays: lockfree::map::Map<String, Arc<CustomOverlayClient>>,
@@ -120,6 +122,7 @@ impl FullNodeOverlaysRouter {
             network,
             service,
             policy,
+            public_generations: Default::default(),
             public_overlays: lockfree::map::Map::new(),
             fast_sync_overlays: lockfree::map::Map::new(),
             custom_overlays: lockfree::map::Map::new(),
@@ -225,6 +228,9 @@ impl FullNodeOverlaysRouter {
         shard: ShardIdent,
     ) -> Result<Arc<FullNodeOverlayClient>> {
         let _admission = self.tasks.enter()?;
+        let generation =
+            self.public_generations.lock().unwrap().entry(shard.clone()).or_default().clone();
+        let _generation = generation.lock().await;
         loop {
             match self.public_overlays.get(&shard) {
                 Some(guard) => {
@@ -234,7 +240,13 @@ impl FullNodeOverlaysRouter {
                     } else if client.overlay_client().is_died() {
                         log::debug!("Overlay client {} is dead - will be recreated", shard);
                         client.stop_and_wait().await?;
-                        self.public_overlays.remove(&shard);
+                        if self
+                            .public_overlays
+                            .get(&shard)
+                            .is_some_and(|current| Arc::ptr_eq(current.val(), client))
+                        {
+                            self.public_overlays.remove(&shard);
+                        }
                     } else {
                         log::debug!(
                             "Overlay client {} was not died yet - will be activated",

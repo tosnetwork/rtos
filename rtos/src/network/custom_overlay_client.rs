@@ -59,6 +59,7 @@ pub struct CustomOverlayClient {
     #[cfg(test)]
     exit_gate: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     activation: std::sync::Mutex<()>,
+    deleted: AtomicBool,
 }
 
 impl CustomOverlayClient {
@@ -105,6 +106,7 @@ impl CustomOverlayClient {
             engine,
             tasks: Arc::new(OwnedTasks::child(owner, cancellation_token.clone())),
             activation: std::sync::Mutex::new(()),
+            deleted: AtomicBool::new(false),
             #[cfg(test)]
             exit_gate: std::sync::Mutex::new(None),
             cancellation_token,
@@ -202,6 +204,9 @@ impl CustomOverlayClient {
         self.tasks.stop();
         log::debug!("Stopping custom overlay \"{}\"", self.config.name);
         self.cancellation_token.cancel();
+        if self.deleted.swap(true, Ordering::AcqRel) {
+            return;
+        }
         if let Err(e) = self.stack.overlay.delete_private_overlay(&self.id) {
             self.tasks.record_error(format!("Custom overlay {} deletion: {e}", self.id));
             log::error!("Error while deleting custom overlay \"{}\": {}", self.config.name, e);

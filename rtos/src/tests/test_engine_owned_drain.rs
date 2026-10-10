@@ -372,3 +372,70 @@ async fn engine_owned_drain_cancelled_server_constructor_waiter_preserves_live_w
 async fn engine_owned_drain_concurrent_server_constructor_and_stop_closes_admission() {
     server_construction_race(false).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_owned_drain_retires_public_generations_without_deleting_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    config(dir.path());
+    let engine = open(dir.path()).await;
+    let router = engine.initialize_full_node_overlays(DhtSearchPolicy::default()).await.unwrap();
+    let old = router.overlay_client(&ShardIdent::MASTERCHAIN).await.unwrap();
+    old.stop_and_wait().await.unwrap();
+    let mut requests = Vec::new();
+    for _ in 0..8 {
+        let router = router.clone();
+        requests.push(tokio::spawn(async move {
+            router.overlay_client(&ShardIdent::MASTERCHAIN).await.unwrap()
+        }));
+    }
+    let mut replacements = Vec::new();
+    for request in requests {
+        replacements.push(request.await.unwrap());
+    }
+    assert!(replacements.iter().all(|client| Arc::ptr_eq(client, &replacements[0])));
+    assert!(!Arc::ptr_eq(&old, &replacements[0]));
+    old.stop_and_wait().await.unwrap();
+    assert!(
+        engine
+            .network
+            .context()
+            .stack
+            .overlay
+            .get_query_prefix(replacements[0].overlay_client().id())
+            .is_ok(),
+        "retired generation deleted replacement protocol"
+    );
+    assert!(Arc::ptr_eq(
+        &router.overlay_client(&ShardIdent::MASTERCHAIN).await.unwrap(),
+        &replacements[0]
+    ));
+    drop(old);
+    drop(replacements);
+    drop(router);
+    stopped(engine.clone()).await;
+    let weak = Arc::downgrade(&engine);
+    drop(engine);
+    assert!(weak.upgrade().is_none());
+    stopped(open(dir.path()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_owned_drain_run_sampling_workers_release_engine_during_sleep() {
+    let dir = tempfile::tempdir().unwrap();
+    config(dir.path());
+    let engine = open(dir.path()).await;
+    // Exact startup functions called by run(), including its default telemetry.
+    let mut handles = vec![engine.clone().check_finish_sync().unwrap()];
+    #[cfg(feature = "telemetry")]
+    handles.push(telemetry_logger(engine.clone()).unwrap());
+    #[cfg(all(target_os = "linux", feature = "telemetry"))]
+    handles.push(proc_status_logger(engine.clone()).unwrap());
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(handles.iter().all(|handle| !handle.is_finished()));
+    stopped(engine.clone()).await;
+    assert!(handles.iter().all(|handle| handle.is_finished()));
+    let weak = Arc::downgrade(&engine);
+    drop(engine);
+    assert!(weak.upgrade().is_none(), "run sampling retained Engine");
+    stopped(open(dir.path()).await).await;
+}
