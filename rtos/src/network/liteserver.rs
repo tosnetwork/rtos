@@ -1703,10 +1703,6 @@ impl LiteServerQuerySubscriber {
         account_id: AccountIdTl,
         lt: i64,
     ) -> Result<TransactionInfo> {
-        if lt < 0 {
-            fail!("lt must be positive");
-        }
-
         let id_bytes = account_id.id.as_slice();
         if id_bytes.len() < 8 {
             fail!(BlockError::InvalidArg("account id too short for prefix".into()));
@@ -1955,18 +1951,19 @@ impl LiteServerQuerySubscriber {
         lt_i64: i64,
         mut hash: UInt256,
     ) -> Result<TransactionList> {
-        if count_i32 <= 0 {
-            fail!("count must be > 0");
+        if count_i32 < 0 {
+            fail!("count must be >= 0");
         }
         if account_id.workchain == INVALID_WORKCHAIN_ID {
             fail!("invalid workchain specified");
         }
-        if lt_i64 == 0 {
+        if count_i32 == 0 || lt_i64 == 0 {
             return Ok(TransactionList { ids: Vec::new(), transactions: Vec::new() });
         }
         let count = usize::try_from(count_i32)
             .map_err(|_| error!("count is too large for this platform"))?;
-        let mut lt = u64::try_from(lt_i64).map_err(|_| error!("lt must be >= 0"))?;
+        // TL long carries the unsigned logical time's complete 64-bit pattern.
+        let mut lt = lt_i64 as u64;
         let workchain_id = account_id.workchain;
         let mut remaining = count.min(MAX_TRANSACTION_COUNT);
 
