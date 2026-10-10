@@ -121,6 +121,13 @@ pub struct EmulatorNetworkBootstrap {
 
 impl EmulatorNetworkBootstrap {
     pub fn build(validator_count: usize) -> Result<Self> {
+        Self::build_with_config(validator_count, |_, _| Ok(()))
+    }
+
+    pub(crate) fn build_with_config(
+        validator_count: usize,
+        configure: impl FnOnce(&mut ConfigParams, &[TestValidatorKeyPair]) -> Result<()>,
+    ) -> Result<Self> {
         assert!(validator_count > 0, "emulator network must have at least one validator");
 
         let temp_dir = tempfile::tempdir()?;
@@ -128,7 +135,9 @@ impl EmulatorNetworkBootstrap {
             (0..validator_count).map(TestValidatorKeyPair::generate).collect::<Result<Vec<_>>>()?;
         let validator_set = make_validator_set(&validators)?;
         let (base_state_id, base_state_boc) = make_basechain_zerostate()?;
-        let config_params = make_config_params(&validator_set, &base_state_id)?;
+        let mut config_params = make_config_params(&validator_set, &base_state_id)?;
+        configure(&mut config_params, &validators)?;
+        let validator_set = config_params.validator_set()?;
         let (zerostate_id, zerostate_boc) = make_masterchain_zerostate(
             config_params.clone(),
             &validator_set,

@@ -170,9 +170,7 @@ impl EngineOperations for Engine {
 
         if matches!(&outcome, ValidatorListOutcome::Selected { .. }) {
             if network.has_validator_list_context(&validator_list_id) {
-                let state = self.load_last_applied_mc_state().await?;
-                let config = state.config_params()?;
-                self.overlays_router()?.update_private_overlays(config).await?;
+                self.overlays_router()?.refresh_fast_sync_from_applied_state().await?;
                 self.overlays_router()?.update_custom_overlays(None).await?;
             } else {
                 log::warn!(

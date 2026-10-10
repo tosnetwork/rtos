@@ -1917,10 +1917,10 @@ impl Engine {
             )
         }
         self.monitor_min_split.store(new_monitor_min_split, Ordering::Relaxed);
-        // Here we can update only public overlays.
-        // Private overlays updated in set_validator_list function,
-        // because we don't have the needed keys in adnl before set_validator_list call.
         self.overlays_router()?.update_public_overlays(keyblock_id, new_monitor_min_split).await?;
+        // Transport roots are authorized by locally applied state, independently
+        // of consensus membership and the availability of a signing key.
+        self.overlays_router()?.refresh_fast_sync_from_applied_state().await?;
         Ok(())
     }
 
