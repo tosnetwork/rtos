@@ -1197,7 +1197,7 @@ async fn test_manager_creates_emulator_sessions_from_generated_mc_states() -> Re
 
     let session_ids =
         manager.current_sessions.keys().cloned().collect::<std::collections::HashSet<_>>();
-    manager.stop_and_remove_sessions(&session_ids, true).await;
+    manager.stop_and_remove_sessions(&session_ids, true).await.unwrap();
 
     Ok(())
 }
@@ -1290,7 +1290,7 @@ async fn test_manager_selects_validator_key_by_validator_key_order() -> Result<(
 
     let session_ids =
         manager.current_sessions.keys().cloned().collect::<std::collections::HashSet<_>>();
-    manager.stop_and_remove_sessions(&session_ids, true).await;
+    manager.stop_and_remove_sessions(&session_ids, true).await.unwrap();
 
     Ok(())
 }
