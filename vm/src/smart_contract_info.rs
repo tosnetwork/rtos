@@ -52,6 +52,14 @@ impl Default for PrevBlocksInfo {
     }
 }
 
+/// Full original external inbound message DAG, including its root cell.
+#[derive(Clone, Debug)]
+pub struct IncomingStorageStats {
+    pub hash: UInt256,
+    pub cells: u64,
+    pub bits: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SmartContractInfo {
     pub actions: u16,
@@ -65,6 +73,7 @@ pub struct SmartContractInfo {
     pub config_params: ConfigParams,
     pub mycode: Cell,
     pub in_msg: Option<Message>,
+    pub incoming_storage_stats: Option<IncomingStorageStats>,
     pub incoming_value: CurrencyCollection, // remaining value
     pub storage_fees_collected: u128,
     pub prev_blocks_info: PrevBlocksInfo,
@@ -368,6 +377,16 @@ impl SmartContractInfo {
         ];
         if version >= 11 {
             params.push(msg_info);
+        }
+        if version >= 17 {
+            params.push(self.incoming_storage_stats.as_ref().map_or(StackItem::None, |stats| {
+                StackItem::tuple(vec![
+                    StackItem::int(1),
+                    StackItem::int(IntegerData::from_unsigned_bytes_be(stats.hash.as_slice())),
+                    StackItem::int(stats.cells),
+                    StackItem::int(stats.bits),
+                ])
+            }));
         }
         StackItem::tuple(vec![StackItem::tuple(params)])
     }

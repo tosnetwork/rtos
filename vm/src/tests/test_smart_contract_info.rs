@@ -568,3 +568,45 @@ fn test_convert_stack_tuple_pair_with_inner_tuple() {
         other => panic!("expected tuple, got {:?}", other),
     }
 }
+
+#[test]
+fn incoming_storage_context_version_boundary_and_absence() {
+    use crate::smart_contract_info::IncomingStorageStats;
+    use rtos_block::ConfigParam8;
+    for version in [14, 16, 17, 18, 19] {
+        for present in [false, true] {
+            let mut config = ConfigParams::default();
+            let mut version_param = ConfigParam8::default();
+            version_param.global_version.version = version;
+            config.set_config(ConfigParamEnum::ConfigParam8(version_param)).unwrap();
+            let mut info = SmartContractInfo { config_params: config, ..Default::default() };
+            if present {
+                info.incoming_storage_stats = Some(IncomingStorageStats {
+                    hash: UInt256::from([0xff; 32]),
+                    cells: 17,
+                    bits: 1025,
+                });
+            }
+            let outer = info.as_temp_data_item();
+            let tuple = outer.as_tuple().unwrap()[0].as_tuple().unwrap();
+            assert_eq!(tuple.len(), if version >= 17 { 19 } else { 18 });
+            if version >= 17 {
+                if present {
+                    let stats = tuple[18].as_tuple().unwrap();
+                    assert_eq!(stats.len(), 4);
+                    for (value, expected) in stats.iter().zip([
+                        "1".to_string(),
+                        ((num::BigInt::from(1u8) << 256usize) - 1u8).to_string(),
+                        "17".to_string(),
+                        "1025".to_string(),
+                    ]) {
+                        assert_eq!(value.as_integer().unwrap().to_str_radix(10), expected);
+                    }
+                } else {
+                    // Tick-tock and get methods have no external incoming storage context.
+                    assert!(matches!(tuple[18], StackItem::None));
+                }
+            }
+        }
+    }
+}
