@@ -675,7 +675,7 @@ pub fn run_smc_method(
     run_smc_method_with_rng(
         account,
         mc_state_cell,
-        method_id,
+        method_id.into(),
         stack,
         gen_utime,
         gen_lt,
@@ -684,12 +684,12 @@ pub fn run_smc_method(
     )
 }
 
-/// Execute a getter with the complete identifier of its pinned masterchain snapshot.
+/// Execute a getter with its pinned masterchain identifier and full signed method ID.
 pub fn run_smc_method_with_block_id(
     account: &Account,
     mc_state_cell: Cell,
     mc_block_id: &BlockIdExt,
-    method_id: u32,
+    method_id: i64,
     stack: Vec<StackEntry>,
     gen_utime: u32,
     gen_lt: u64,
@@ -709,7 +709,7 @@ pub fn run_smc_method_with_block_id(
 fn run_smc_method_with_rng<R: rand::RngCore + rand::CryptoRng>(
     account: &Account,
     mc_state_cell: Cell,
-    method_id: u32,
+    method_id: i64,
     stack: Vec<StackEntry>,
     gen_utime: u32,
     gen_lt: u64,
@@ -733,7 +733,7 @@ fn run_smc_method_with_rng<R: rand::RngCore + rand::CryptoRng>(
 fn run_smc_method_with_seed(
     account: &Account,
     mc_state_cell: Cell,
-    method_id: u32,
+    method_id: i64,
     stack: Vec<StackEntry>,
     gen_utime: u32,
     gen_lt: u64,
@@ -841,3 +841,7 @@ mod get_context_tests;
 #[cfg(test)]
 #[path = "tests/test_get_history_context.rs"]
 mod get_history_context_tests;
+
+#[cfg(test)]
+#[path = "tests/test_get_method_id.rs"]
+mod get_method_id_tests;
