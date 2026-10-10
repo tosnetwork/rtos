@@ -409,7 +409,9 @@ pub(crate) async fn receive(
                 match work {
                     Work::Stop => break,
                     Work::Sleep(delay) => tokio::select! {
-                        _ = cancellation.cancelled() => break,
+                        // Re-enter the stop branch to clear retained retries,
+                        // including verified entries that have no active lease.
+                        _ = cancellation.cancelled() => continue,
                         _ = tokio::time::sleep(delay) => {},
                     },
                     Work::Run(id, entry) => {

@@ -22,6 +22,47 @@ fn config(dir: &Path) {
     })).unwrap()).unwrap();
 }
 
+struct TransportRefs {
+    overlay: std::sync::Weak<adnl::OverlayNode>,
+    rldp: std::sync::Weak<adnl::RldpNode>,
+    quic: std::sync::Weak<adnl::QuicNode>,
+    ports: Vec<String>,
+}
+impl TransportRefs {
+    fn new(network: &NodeNetwork) -> Self {
+        let stack = &network.context().stack;
+        let adnl = stack.adnl.ip_address_adnl();
+        let quic = stack.adnl.ip_address_quic().map(ToString::to_string).unwrap_or_else(|| {
+            format!(
+                "{}:{}",
+                std::net::Ipv4Addr::from(adnl.ip()),
+                adnl.port().checked_add(1000).unwrap()
+            )
+        });
+        let ports = vec![adnl.to_string(), quic];
+        for port in &ports {
+            assert!(
+                std::net::UdpSocket::bind(port).is_err(),
+                "fixture transport port {port} was never bound"
+            );
+        }
+        Self {
+            overlay: Arc::downgrade(&stack.overlay),
+            rldp: Arc::downgrade(&stack.rldp),
+            quic: Arc::downgrade(stack.quic.as_ref().unwrap()),
+            ports,
+        }
+    }
+    fn assert_released(self) {
+        assert!(self.overlay.upgrade().is_none(), "OverlayNode retained after shutdown");
+        assert!(self.rldp.upgrade().is_none(), "RLDP retained after shutdown");
+        assert!(self.quic.upgrade().is_none(), "QUIC retained after shutdown");
+        for port in self.ports {
+            drop(std::net::UdpSocket::bind(port).expect("actual ADNL/QUIC UDP port retained"));
+        }
+    }
+}
+
 async fn open(dir: &Path) -> Arc<Engine> {
     let config =
         TonNodeConfig::from_file(dir.to_str().unwrap(), "config.json", None, "config.json", None)
@@ -68,6 +109,7 @@ async fn engine_owned_drain_two_real_engines_wait_for_listener_then_reopen_datab
     config(second.path());
     let a = open(first.path()).await;
     let b = open(second.path()).await;
+    let transports = [TransportRefs::new(&a.network), TransportRefs::new(&b.network)];
     seed_queue(&a).await;
     seed_queue(&b).await;
     a.initialize_full_node_overlays(DhtSearchPolicy::default()).await.unwrap();
@@ -98,23 +140,14 @@ async fn engine_owned_drain_two_real_engines_wait_for_listener_then_reopen_datab
     let weak_b = Arc::downgrade(&b);
     let network_a = Arc::downgrade(&a.network);
     let network_b = Arc::downgrade(&b.network);
-    let addresses: Vec<_> = [&a, &b]
-        .into_iter()
-        .flat_map(|engine| {
-            let adnl = &engine.network.context().stack.adnl;
-            std::iter::once(adnl.ip_address_adnl().to_string())
-                .chain(adnl.ip_address_quic().map(ToString::to_string))
-                .collect::<Vec<_>>()
-        })
-        .collect();
     drop(a);
     drop(b);
     assert!(weak_a.upgrade().is_none(), "first Engine retained after joined shutdown");
     assert!(weak_b.upgrade().is_none(), "second Engine retained after joined shutdown");
     assert!(network_a.upgrade().is_none(), "first network/config owner retained");
     assert!(network_b.upgrade().is_none(), "second network/config owner retained");
-    for address in addresses {
-        drop(std::net::UdpSocket::bind(address).expect("network UDP port retained"));
+    for transport in transports {
+        transport.assert_released();
     }
     // Same process and runtime: real storage locks must have been released.
     let reopened_a = open(first.path()).await;
@@ -769,6 +802,9 @@ async fn partial_engine_construction(stage: &'static str, cancel: bool) {
         result = &mut opening => panic!("constructor completed before held {stage}: {:?}", result.err()),
         result = tokio::time::timeout(Duration::from_secs(15), gate.entered.notified()) => result.unwrap(),
     }
+    let transport = TransportRefs::new(
+        &stopper.construction_network.lock().unwrap().as_ref().unwrap().upgrade().unwrap(),
+    );
     if let Some(address) = control_address {
         assert!(std::net::TcpListener::bind(address).is_err(), "actual control listener not held");
     }
@@ -800,6 +836,7 @@ async fn partial_engine_construction(stage: &'static str, cancel: bool) {
         stopper.construction_network.lock().unwrap().as_ref().unwrap().upgrade().is_none(),
         "partial constructor retained network/config owner"
     );
+    transport.assert_released();
     assert_eq!(stopper.stop.load(Ordering::Acquire) & Engine::MASK_SERVICE_DB_RESTORE, 0);
     if let Some(address) = control_address {
         drop(

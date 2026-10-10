@@ -17,7 +17,10 @@ use crate::{
 #[cfg(feature = "telemetry")]
 use crate::{engine_traits::EngineTelemetry, network::telemetry::FullNodeNetworkTelemetry};
 use adnl::{
-    common::{add_counted_object_to_map, spawn_cancelable, CountedObject, Counter},
+    common::{
+        add_counted_object_to_map, spawn_cancelable, AdnlPeers, CountedObject, Counter,
+        QueryAnswer, QueryResult, Subscriber,
+    },
     declare_counted,
     node::AdnlNode,
     AddressSearchContext, DhtNode, DhtSearchPolicy, NetworkStack, OverlayNode, OverlayShortId,
@@ -51,6 +54,65 @@ pub struct NetworkContext {
     #[cfg(feature = "telemetry")]
     pub engine_telemetry: Arc<EngineTelemetry>,
     pub engine_allocated: Arc<EngineAlloc>,
+}
+
+// Transports dispatch through the node-owned overlay without retaining a
+// reverse strong edge. Each accepted callback keeps its target alive until done.
+struct WeakOverlaySubscriber(std::sync::Weak<OverlayNode>);
+
+#[async_trait::async_trait]
+impl Subscriber for WeakOverlaySubscriber {
+    async fn poll(&self, start: &Arc<std::time::Instant>) {
+        if let Some(overlay) = self.0.upgrade() {
+            overlay.poll(start).await;
+        }
+    }
+    async fn try_consume_custom(&self, data: &[u8], peers: &AdnlPeers) -> Result<bool> {
+        match self.0.upgrade() {
+            Some(overlay) => overlay.try_consume_custom(data, peers).await,
+            None => Ok(false),
+        }
+    }
+    async fn try_consume_object(
+        &self,
+        object: rtos_api::TLObject,
+        peers: &AdnlPeers,
+    ) -> Result<bool> {
+        match self.0.upgrade() {
+            Some(overlay) => overlay.try_consume_object(object, peers).await,
+            None => Ok(false),
+        }
+    }
+    async fn try_consume_raw_query(
+        &self,
+        bytes: &[u8],
+        peers: &AdnlPeers,
+    ) -> Result<Option<QueryAnswer>> {
+        match self.0.upgrade() {
+            Some(overlay) => overlay.try_consume_raw_query(bytes, peers).await,
+            None => Ok(None),
+        }
+    }
+    async fn try_consume_query(
+        &self,
+        object: rtos_api::TLObject,
+        peers: &AdnlPeers,
+    ) -> Result<QueryResult> {
+        match self.0.upgrade() {
+            Some(overlay) => overlay.try_consume_query(object, peers).await,
+            None => Ok(QueryResult::Rejected(object)),
+        }
+    }
+    async fn try_consume_query_bundle(
+        &self,
+        objects: Vec<rtos_api::TLObject>,
+        peers: &AdnlPeers,
+    ) -> Result<QueryResult> {
+        match self.0.upgrade() {
+            Some(overlay) => overlay.try_consume_query_bundle(objects, peers).await,
+            None => Ok(QueryResult::RejectedBundle(objects)),
+        }
+    }
 }
 
 pub struct NodeNetwork {
@@ -169,14 +231,16 @@ impl NodeNetwork {
         if config.extensions().disable_broadcast_retransmit {
             overlay.set_broadcast_retransmit(false)
         }
-        let rldp = RldpNode::with_params(adnl.clone(), vec![overlay.clone()], None)?;
+        let overlay_subscriber: Arc<dyn Subscriber> =
+            Arc::new(WeakOverlaySubscriber(Arc::downgrade(&overlay)));
+        let rldp = RldpNode::with_params(adnl.clone(), vec![overlay_subscriber.clone()], None)?;
         overlay.set_rldp(rldp.clone())?;
 
         // Initialize QUIC transport (lazy: no endpoint bound until add_key() is called).
         // Validator ADNL keys are registered when a validator set is activated.
         let quic = {
             let quic = adnl::QuicNode::new(
-                vec![overlay.clone()],
+                vec![overlay_subscriber],
                 cancellation_token.clone(),
                 tokio::runtime::Handle::current(),
                 None,
