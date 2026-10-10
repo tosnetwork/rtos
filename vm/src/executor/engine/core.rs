@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project naming and message execution compatibility.
+ * RTOS project modifications (2026-10-10): gate registrations before operand decoding.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -581,9 +581,34 @@ impl Engine {
                 break result;
             }
             self.cmd_code = SliceProto::from(self.cc.code());
+            if let Some((minimum, width)) = super::version_gates::registration(self.cc.code())? {
+                if self.block_version < minimum {
+                    let err = self.reject_unavailable_instruction().unwrap_err();
+                    self.cmd.clear();
+                    self.raise_exception(err)?;
+                    continue;
+                }
+                if self.cc.code().remaining_bits() < width {
+                    self.step += 1;
+                    let gas = Gas::basic_gas_price(width, 0);
+                    let err = match self.try_use_gas(gas) {
+                        Err(err) => err,
+                        Ok(()) => error!(ExceptionCode::InvalidOpcode),
+                    };
+                    self.raise_exception(err)?;
+                    continue;
+                }
+            }
             if let Some((prefix, bits, gas)) = check_too_short_code(self.cc.code())? {
                 self.cc.code_mut().move_by(bits as usize)?;
-                let err = match self.try_use_gas(gas as i64) {
+                // Before v4, exception gas is charged before checking exhaustion.
+                let gas_result = if self.block_version >= 4 {
+                    self.try_use_gas(gas as i64)
+                } else {
+                    self.use_gas(gas as i64);
+                    Ok(())
+                };
+                let err = match gas_result {
                     Err(err) => err,
                     Ok(_) => error!(
                         ExceptionCode::InvalidOpcode,
@@ -597,9 +622,15 @@ impl Engine {
             let execution_result = match HANDLERS_CP0.get_handler(self) {
                 Err(err) => {
                     self.step += 1;
-                    match self.basic_use_gas(8) {
-                        Err(err) => Some(err),
-                        Ok(_) => Some(err),
+                    if self.block_version < 4 {
+                        let bits = 8 + self.cc.code().pos().saturating_sub(self.cmd_code.pos());
+                        self.use_gas(Gas::basic_gas_price(bits, 0));
+                        Some(err)
+                    } else {
+                        match self.basic_use_gas(8) {
+                            Err(err) => Some(err),
+                            Ok(_) => Some(err),
+                        }
                     }
                 }
                 Ok(Some(handler)) => {
@@ -613,15 +644,7 @@ impl Engine {
                         Ok(_) => self.gas.check_gas_remaining().err(),
                     }
                 }
-                Ok(None) => {
-                    let code = self.last_cmd();
-                    log::trace!(target: "tvm", "Invalid code: {} ({:#X})\n", code, code);
-                    if let Err(err) = self.try_use_gas(Gas::basic_gas_price(0, 0)) {
-                        Some(err)
-                    } else {
-                        Some(error!(ExceptionCode::InvalidOpcode))
-                    }
-                }
+                Ok(None) => Some(self.reject_unavailable_instruction().unwrap_err()),
             };
             self.cmd.clear();
             if let Some(err) = execution_result {
