@@ -60,6 +60,17 @@ record, is rejected. Automatic adoption of legacy databases is not supported;
 use a fresh directory until an authenticated migration path is available. This
 local binding does not authenticate copied snapshots or replace chain verification.
 
+## Cold-boot trust anchors
+
+The local global configuration's `init_block`, when present, is an explicit
+trusted checkpoint for the selected network. Supply it only from an approved
+source. A nonzero checkpoint must identify a complete masterchain key block;
+a sequence-zero entry must exactly match the configured zerostate. RTOS verifies
+the checkpoint proof against that exact identity before using its configuration;
+this does not authenticate history preceding the checkpoint. Without an initial
+checkpoint, cold boot starts from the configured zerostate. A saved database
+resume cursor cannot replace the configured trust anchor.
+
 ## Documentation
 
 - [Release guidelines](RELEASE.md) — versioning, branching, and release process

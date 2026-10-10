@@ -25,8 +25,7 @@ use crate::{
         shard_client::{start_masterchain_client, start_shards_client, SHARD_BROADCAST_WINDOW},
     },
     internal_db::{
-        InternalDb, InternalDbConfig, ARCHIVES_GC_BLOCK, INITIAL_MC_BLOCK, LAST_APPLIED_MC_BLOCK,
-        PSS_KEEPER_MC_BLOCK,
+        InternalDb, InternalDbConfig, ARCHIVES_GC_BLOCK, LAST_APPLIED_MC_BLOCK, PSS_KEEPER_MC_BLOCK,
     },
     network::{
         control::{ControlServer, DataSource, StatusReporter},
@@ -597,6 +596,13 @@ impl Engine {
         let boot_from_zerostate = general_config.boot_from_zerostate();
         let global_config = general_config.load_global_config()?;
         let zero_state_id = global_config.zero_state()?;
+        let init_mc_block_id = match global_config.init_block()? {
+            Some(init_mc_block_id) if !boot_from_zerostate => {
+                log::info!("zero state substitued by init block {}", init_mc_block_id);
+                init_mc_block_id
+            }
+            _ => zero_state_id.clone(),
+        };
         let network_binding = crate::network_db::DbNetworkBinding::acquire(
             std::path::Path::new(&db_config.db_directory),
             &zero_state_id,
@@ -667,13 +673,6 @@ impl Engine {
         stopper.release_stop(Self::MASK_SERVICE_DB_RESTORE);
         let db = db?;
 
-        let mut init_mc_block_id = match global_config.init_block()? {
-            Some(init_mc_block_id) if !boot_from_zerostate => {
-                log::info!("zero state substitued by init block {}", init_mc_block_id);
-                init_mc_block_id
-            }
-            _ => zero_state_id.clone(),
-        };
         let mut hardforks = global_config.hardforks()?;
         hardforks.sort_by(|a, b| a.seq_no.cmp(&b.seq_no));
         if !boot_from_zerostate {
@@ -687,11 +686,8 @@ impl Engine {
                     )
                 }
             }
-            if let Ok(Some(block_id)) = db.load_full_node_state(INITIAL_MC_BLOCK) {
-                if block_id.seq_no > init_mc_block_id.seq_no {
-                    init_mc_block_id = block_id.deref().clone()
-                }
-            }
+            // A persisted resume cursor cannot replace an explicitly configured
+            // trust anchor. Cold boot reauthenticates forward from that anchor.
         }
 
         log::info!("load_all_top_shard_blocks");

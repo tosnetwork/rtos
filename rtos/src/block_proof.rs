@@ -185,6 +185,28 @@ impl BlockProofStuff {
         Ok(())
     }
 
+    /// Authenticate checkpoint contents against an explicitly trusted local pin.
+    /// The pin itself is an out-of-band trust decision, not derived from this
+    /// proof, a peer response, or a database resume cursor. This does not verify
+    /// history before the checkpoint or the original full block's file bytes.
+    pub(crate) fn check_trusted_checkpoint(&self, expected: &BlockIdExt) -> Result<()> {
+        if self.id() != expected || !expected.shard().is_masterchain_ext() || expected.seq_no == 0 {
+            fail!("Checkpoint proof differs from the explicitly pinned masterchain identity");
+        }
+        let (block, info) = self.pre_check_block_proof()?;
+        if !info.key_block() {
+            fail!("Checkpoint must be a key block");
+        }
+        self.pre_check_key_block_proof(&block)?;
+        let config = self.read_config_params(&block)?;
+        match config.config(19)? {
+            Some(rtos_block::ConfigParamEnum::ConfigParam19(id))
+                if id == block.global_id() as u32 => {}
+            _ => fail!("Checkpoint global_id disagrees with missing or mismatched Param19"),
+        }
+        Ok(())
+    }
+
     pub fn check_proof_as_link(&self) -> Result<()> {
         let now = std::time::Instant::now();
         log::trace!("Checking proof for block: {}", self.id());

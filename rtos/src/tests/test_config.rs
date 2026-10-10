@@ -120,8 +120,9 @@ fn test_network_zerostate_requires_complete_masterchain_anchor() {
         "workchain": -1, "shard": i64::MIN, "seqno": 0,
         "root_hash": "01".repeat(32), "file_hash": "02".repeat(32)
     }}});
-    let parse =
-        |value| serde_json::from_value::<TonNodeGlobalConfigJson>(value).unwrap().zero_state();
+    let parse = |value| -> Result<BlockIdExt> {
+        serde_json::from_value::<TonNodeGlobalConfigJson>(value)?.zero_state()
+    };
     let id = parse(good.clone()).unwrap();
     assert!(id.shard().is_masterchain_ext());
     assert_eq!(id.seq_no, 0);
@@ -130,6 +131,7 @@ fn test_network_zerostate_requires_complete_masterchain_anchor() {
         ("shard", serde_json::json!(0x4000000000000000i64)),
         ("seqno", serde_json::json!(1)),
         ("seqno", serde_json::json!(-1)),
+        ("seqno", serde_json::json!(u64::from(u32::MAX) + 1)),
         ("root_hash", serde_json::json!("00".repeat(32))),
         ("file_hash", serde_json::json!("00".repeat(32))),
         ("file_hash", serde_json::Value::Null),
@@ -139,4 +141,40 @@ fn test_network_zerostate_requires_complete_masterchain_anchor() {
         value_json["validator"]["zero_state"][field] = value;
         assert!(parse(value_json).is_err(), "invalid {field}");
     }
+}
+
+#[test]
+fn test_initial_checkpoint_is_an_explicit_complete_local_pin() {
+    let zero = serde_json::json!({
+        "workchain": -1, "shard": i64::MIN, "seqno": 0,
+        "root_hash": "01".repeat(32), "file_hash": "02".repeat(32)
+    });
+    let mut init = zero.clone();
+    init["seqno"] = serde_json::json!(10);
+    let parse = |init| -> Result<Option<BlockIdExt>> {
+        serde_json::from_value::<TonNodeGlobalConfigJson>(
+            serde_json::json!({"validator": {"zero_state": zero, "init_block": init}}),
+        )?
+        .init_block()
+    };
+    assert_eq!(parse(init.clone()).unwrap().unwrap().seq_no, 10);
+    assert_eq!(parse(zero.clone()).unwrap().unwrap().seq_no, 0);
+    let mut maximum = init.clone();
+    maximum["seqno"] = serde_json::json!(u32::MAX);
+    assert_eq!(parse(maximum).unwrap().unwrap().seq_no, u32::MAX);
+    for (field, value) in [
+        ("workchain", serde_json::json!(0)),
+        ("shard", serde_json::json!(0x4000000000000000i64)),
+        ("seqno", serde_json::json!(-1)),
+        ("seqno", serde_json::json!(u64::from(u32::MAX) + 1)),
+        ("root_hash", serde_json::json!("00".repeat(32))),
+        ("file_hash", serde_json::Value::Null),
+    ] {
+        let mut bad = init.clone();
+        bad[field] = value;
+        assert!(parse(bad).is_err());
+    }
+    let mut other_zero = zero.clone();
+    other_zero["file_hash"] = serde_json::json!("03".repeat(32));
+    assert!(parse(other_zero).is_err());
 }

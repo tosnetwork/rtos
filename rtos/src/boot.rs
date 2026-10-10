@@ -25,7 +25,7 @@ const RETRY_SHARD_STATE_DOWNLOAD: usize = 30;
 
 /// cold boot entry point
 /// download zero state or block proof link and check it
-async fn run_cold(
+pub(crate) async fn run_cold(
     engine: &dyn EngineOperations,
 ) -> Result<(Arc<BlockHandle>, Option<Arc<ShardStateStuff>>, Option<BlockProofStuff>)> {
     let block_id = engine.init_mc_block_id();
@@ -57,6 +57,7 @@ async fn run_cold(
                     engine.load_block_proof(&handle, true).await?
                 }
             };
+            proof.check_trusted_checkpoint(block_id)?;
             CHECK!(handle.is_key_block()?);
             return Ok((handle, None, Some(proof)));
         }
@@ -72,7 +73,7 @@ async fn run_cold(
 
         log::info!(target: "boot", "download init block proof {}", block_id);
         match engine.download_block_proof(block_id, false, true).await {
-            Ok(proof) => match proof.check_proof_as_link() {
+            Ok(proof) => match proof.check_trusted_checkpoint(block_id) {
                 Ok(_) => {
                     log::info!(target: "boot", "block proof downloaded {}", block_id);
                     let handle = engine
@@ -101,7 +102,7 @@ async fn run_cold(
 
         log::info!(target: "boot", "download init block proof link {}", block_id);
         match engine.download_block_proof(block_id, true, true).await {
-            Ok(proof) => match proof.check_proof_link() {
+            Ok(proof) => match proof.check_trusted_checkpoint(block_id) {
                 Ok(_) => {
                     let handle = engine
                         .store_block_proof(block_id, handle, &proof)

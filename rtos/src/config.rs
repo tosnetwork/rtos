@@ -2216,7 +2216,7 @@ struct Validator {
 struct ConfigBlockId {
     workchain: Option<i32>,
     shard: Option<i64>,
-    seqno: Option<i32>,
+    seqno: Option<u32>,
     root_hash: Option<String>,
     file_hash: Option<String>,
 }
@@ -2325,7 +2325,7 @@ impl TonNodeGlobalConfigJson {
 
         Ok(BlockIdExt {
             shard_id: ShardIdent::with_tagged_prefix(workchain_id, shard as u64)?,
-            seq_no: seqno as u32,
+            seq_no: seqno,
             root_hash,
             file_hash,
         })
@@ -2347,7 +2347,18 @@ impl TonNodeGlobalConfigJson {
     pub fn init_block(&self) -> Result<Option<BlockIdExt>> {
         match self.validator.init_block {
             Some(ref init_block) => match self.parse_block_id(init_block) {
-                Ok(block_id) => Ok(Some(block_id)),
+                Ok(block_id) => {
+                    if !block_id.shard().is_masterchain_ext()
+                        || block_id.root_hash == UInt256::default()
+                        || block_id.file_hash == UInt256::default()
+                    {
+                        fail!("Initial checkpoint requires a complete masterchain block identity");
+                    }
+                    if block_id.seq_no == 0 && block_id != self.zero_state()? {
+                        fail!("Initial sequence-zero checkpoint differs from network zerostate");
+                    }
+                    Ok(Some(block_id))
+                }
                 Err(err) => fail!("init block parse error: {}", err),
             },
             None => Ok(None),

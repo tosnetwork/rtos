@@ -221,6 +221,7 @@ async fn test_pq_proof_verifies_with_governing_state_and_key_block() {
         false,
     )
     .unwrap();
+    key_proof.check_trusted_checkpoint(key_proof.id()).unwrap();
     let handles = crate::collator_test_bundle::create_block_handle_storage(None).unwrap();
     let cached_handle = handles
         .create_handle(pq_fixture::block_id(), storage::types::BlockMeta::default(), None)
@@ -358,5 +359,95 @@ impl crate::engine_traits::EngineOperations for CachedProofEngine {
         _: bool,
     ) -> rtos_block::Result<BlockProofStuff> {
         rtos_block::fail!("replacement download reached")
+    }
+}
+
+#[tokio::test]
+async fn test_cold_boot_checkpoint_checks_cached_contents_against_local_pin() {
+    use rtos_block::*;
+    for mutation in 0..5 {
+        let handles = crate::collator_test_bundle::create_block_handle_storage(None).unwrap();
+        let mut info = BlockInfo::default();
+        info.set_seq_no(10).unwrap();
+        info.set_shard(ShardIdent::masterchain());
+        info.set_key_block(mutation != 2);
+        info.set_gen_utime(900);
+        let mut custom = McBlockExtra::default();
+        custom.set_config(pq_fixture::config());
+        let mut extra = BlockExtra::default();
+        extra.write_custom(&custom).unwrap();
+        let block = Block::with_params(
+            if mutation == 3 { 0 } else { -239 },
+            info,
+            ValueFlow::default(),
+            MerkleUpdate::default(),
+            extra,
+        )
+        .unwrap();
+        let root = block.serialize().unwrap();
+        let id = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            10,
+            root.repr_hash().clone(),
+            UInt256::calc_file_hash(&write_boc(&root).unwrap()),
+        );
+        let proof = BlockProofStuff::new(
+            BlockProof::with_params(
+                id.clone(),
+                if mutation == 4 {
+                    Cell::default()
+                } else {
+                    MerkleProof::create(&root, |_| true).unwrap().serialize().unwrap()
+                },
+                None,
+            ),
+            true,
+        )
+        .unwrap();
+        let mut pin = id.clone();
+        if mutation == 1 {
+            pin.file_hash = UInt256::from([77; 32]);
+        }
+        // The handle claims a key block even for the non-key counterexample.
+        // Its cache flags must never replace validation of actual proof content.
+        let meta = storage::types::BlockMeta::for_import(900, 0, 0, true, true, false);
+        let handle = handles.create_handle(pin.clone(), meta, None).unwrap().unwrap();
+        let engine = CheckpointCacheEngine { pin, handle, proof };
+        let result = crate::boot::run_cold(&engine).await;
+        if mutation == 0 {
+            let (_, zero, proof) = result.unwrap();
+            assert!(zero.is_none());
+            assert_eq!(proof.unwrap().id(), &id);
+        } else {
+            assert!(result.is_err(), "checkpoint mutation {mutation} accepted");
+        }
+    }
+}
+
+struct CheckpointCacheEngine {
+    pin: rtos_block::BlockIdExt,
+    handle: std::sync::Arc<storage::block_handle_db::BlockHandle>,
+    proof: BlockProofStuff,
+}
+#[async_trait::async_trait]
+impl crate::engine_traits::EngineOperations for CheckpointCacheEngine {
+    fn init_mc_block_id(&self) -> &rtos_block::BlockIdExt {
+        &self.pin
+    }
+    fn get_last_fork_masterchain_seqno(&self) -> u32 {
+        0
+    }
+    fn load_block_handle(
+        &self,
+        _: &rtos_block::BlockIdExt,
+    ) -> rtos_block::Result<Option<std::sync::Arc<storage::block_handle_db::BlockHandle>>> {
+        Ok(Some(self.handle.clone()))
+    }
+    async fn load_block_proof(
+        &self,
+        _: &std::sync::Arc<storage::block_handle_db::BlockHandle>,
+        _: bool,
+    ) -> rtos_block::Result<BlockProofStuff> {
+        Ok(self.proof.clone())
     }
 }
