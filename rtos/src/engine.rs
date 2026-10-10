@@ -1122,6 +1122,13 @@ impl Engine {
         &self.split_queues_cache
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_monitoring(&self, depth: u8, mask: u64) {
+        assert!(depth <= Self::MAX_MONITOR_MIN_SPLIT);
+        self.monitor_min_split.store(depth, Ordering::Relaxed);
+        self.monitored_shards.store(mask, Ordering::Relaxed);
+    }
+
     pub fn need_monitor(&self, shard: &ShardIdent) -> Result<bool> {
         if shard.is_masterchain() {
             return Ok(true);
@@ -1131,7 +1138,8 @@ impl Engine {
             let monitored_shards = self.monitored_shards.load(Ordering::Relaxed);
             for i in 0..(1 << monitor_min_split) as u64 {
                 if (1 << i) & monitored_shards != 0 {
-                    let shard_prefix = i << (64 - monitor_min_split);
+                    let shard_prefix =
+                        if monitor_min_split == 0 { 0 } else { i << (64 - monitor_min_split) };
                     let monitored_shard = ShardIdent::with_prefix_len(
                         monitor_min_split,
                         shard.workchain_id(),

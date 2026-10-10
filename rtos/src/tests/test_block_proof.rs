@@ -1420,6 +1420,13 @@ async fn historical_broadcast_context_authenticates_old_epoch_after_rotation() {
         proof_reads: AtomicUsize::new(0),
         verifier: Default::default(),
     };
+    // The history fixture predates broadcast header binding. Use a separately
+    // signed block whose header catchain/subset match its certificate.
+    let broadcast: serde_json::Value = serde_json::from_str(include_str!(
+        "../full_node/finality/testdata/historical-broadcast.json"
+    ))
+    .unwrap();
+    let second = bootstrap_fixture_proof(&broadcast, true, false);
     let block = second.virtualize_block().unwrap().0;
     assert!(
         crate::full_node::shard_client::pq_broadcast_context(&engine.state, second.id(), &block)
