@@ -1,3 +1,4 @@
+use crate::types::owned_tasks::OwnedTasks;
 /*
  * RTOS project modifications (2026-10-10): project and crate naming.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
@@ -56,6 +57,7 @@ pub struct Neighbours {
     all_attempts: AtomicU64,
     start: Instant,
     cancellation_token: tokio_util::sync::CancellationToken,
+    tasks: Arc<OwnedTasks>,
 }
 
 pub const PROTOCOL_VERSION_MAJOR: i32 = 2;
@@ -249,6 +251,7 @@ impl Neighbours {
         overlay_id: Arc<OverlayShortId>,
         default_rldp_roundtrip: &Option<u32>,
         cancellation_token: tokio_util::sync::CancellationToken,
+        tasks: Arc<OwnedTasks>,
     ) -> Result<Self> {
         let default_rldp_roundtrip =
             default_rldp_roundtrip.unwrap_or(Self::DEFAULT_RLDP_ROUNDTRIP_MS);
@@ -262,6 +265,7 @@ impl Neighbours {
             all_attempts: AtomicU64::new(0),
             start: Instant::now(),
             cancellation_token,
+            tasks,
         };
         Ok(ret)
     }
@@ -574,12 +578,18 @@ impl Neighbours {
             let wait_cloned = wait.clone();
             let mut count = wait.request();
             peer.set_last_ping(self.start.elapsed().as_millis() as u64);
-            tokio::spawn(async move {
-                if let Err(e) = self_cloned.update_capabilities(peer, ping_reserve).await {
-                    log::debug!("{}; ping_idx #{}", e, ping_idx)
-                }
-                wait_cloned.respond(Some(()));
-            });
+            if self
+                .tasks
+                .spawn_cancelable("neighbour capability ping", async move {
+                    if let Err(e) = self_cloned.update_capabilities(peer, ping_reserve).await {
+                        log::debug!("{}; ping_idx #{}", e, ping_idx)
+                    }
+                    wait_cloned.respond(Some(()));
+                })
+                .is_err()
+            {
+                return;
+            }
             while count >= max_count {
                 wait.wait(&mut queue_reader, false).await;
                 count -= 1;

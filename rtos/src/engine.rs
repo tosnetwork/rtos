@@ -73,7 +73,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
-        Arc, OnceLock,
+        Arc,
     },
     time::Duration,
 };
@@ -91,13 +91,25 @@ struct StorageDictInfo {
 }
 
 pub type SplitQueues = Option<(OutMsgQueue, OutMsgQueue, ahash::AHashSet<UInt256>)>;
+#[derive(Default)]
+struct EngineOwners {
+    stopping: bool,
+    router_ready: bool,
+    router: Option<Arc<FullNodeOverlaysRouter>>,
+    queue: Option<Arc<OutMsgQueueManager>>,
+}
+
 pub struct Engine {
+    #[cfg(test)]
+    pub(crate) overlay_init_test_gate:
+        std::sync::Mutex<Option<Arc<crate::network::overlay_client::OverlayInitGate>>>,
     #[cfg(test)]
     pub(crate) parent_apply_test_gate: std::sync::Mutex<Option<Arc<parent_apply_tests::ApplyGate>>>,
     db: Arc<InternalDb>,
     candidate_db: CandidateDbPool,
     network: Arc<NodeNetwork>,
-    overlays_router: OnceLock<Arc<FullNodeOverlaysRouter>>,
+    owned_services: std::sync::Mutex<EngineOwners>,
+    ingress_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
 
     shard_states_awaiters: AwaitersPool<BlockIdExt, Arc<ShardStateStuff>>,
     block_applying_awaiters: AwaitersPool<BlockIdExt, ()>,
@@ -135,7 +147,6 @@ pub struct Engine {
     collator_config_mc: CollatorConfig,
 
     shard_states_keeper: Arc<ShardStatesKeeper>,
-    out_msg_queue_manager: OnceLock<Arc<OutMsgQueueManager>>,
 
     // None - queue calculating is in progress
     split_queues_cache: lockfree::map::Map<BlockIdExt, SplitQueues>,
@@ -768,6 +779,8 @@ impl Engine {
         let engine = Arc::new(Engine {
             #[cfg(test)]
             parent_apply_test_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            overlay_init_test_gate: std::sync::Mutex::new(None),
             db,
             candidate_db,
             shard_states_awaiters: AwaitersPool::new(
@@ -807,7 +820,10 @@ impl Engine {
             flags,
             archives_life_time_hours,
             network,
-            overlays_router: OnceLock::new(),
+            owned_services: std::sync::Mutex::new(EngineOwners::default()),
+            ingress_tasks: Arc::new(crate::types::owned_tasks::OwnedTasks::new(
+                tokio_util::sync::CancellationToken::new(),
+            )),
             shard_blocks: shard_blocks_pool,
             candidates_cache: parking_lot::Mutex::new(lru::LruCache::new(
                 Self::CANDIDATES_CACHE_SIZE.try_into()?,
@@ -824,7 +840,6 @@ impl Engine {
             collator_config,
             collator_config_mc,
             shard_states_keeper: shard_states_keeper.clone(),
-            out_msg_queue_manager: OnceLock::new(),
             split_queues_cache: lockfree::map::Map::new(),
             validation_status: AtomicU8::new(0),
             last_validation_time: lockfree::map::Map::new(),
@@ -891,8 +906,18 @@ impl Engine {
     pub async fn wait_stop(self: Arc<Self>) -> Result<()> {
         // set stop flag
         self.stopper.set_stop();
-        if let Ok(or) = self.overlays_router() {
-            or.delete_overlays();
+        self.ingress_tasks.stop();
+        let (router, queue) = {
+            let mut owners = self.owned_services.lock().unwrap();
+            owners.stopping = true;
+            owners.router_ready = false;
+            (owners.router.clone(), owners.queue.clone())
+        };
+        if let Some(router) = &router {
+            router.stop();
+        }
+        if let Some(queue) = &queue {
+            queue.stop();
         }
 
         // stop servers
@@ -906,6 +931,41 @@ impl Engine {
             });
         }
         futures::future::join_all(tasks).await;
+
+        let (router_result, queue_result) = tokio::join!(
+            async {
+                if let Some(router) = &router {
+                    router.stop_and_wait().await
+                } else {
+                    Ok(())
+                }
+            },
+            async {
+                if let Some(queue) = &queue {
+                    queue.stop_and_wait().await
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        for (name, result) in
+            [("full-node overlays", router_result), ("out-message queue", queue_result)]
+        {
+            if let Err(error) = result {
+                self.stopper.report_service_failure(0, format!("{name}: {error}"));
+            }
+        }
+        {
+            let mut owners = self.owned_services.lock().unwrap();
+            owners.router.take();
+            owners.queue.take();
+        }
+        drop(router);
+        drop(queue);
+
+        if let Err(error) = self.ingress_tasks.wait().await {
+            self.stopper.report_service_failure(0, format!("broadcast ingress: {error}"));
+        }
 
         // stop states GC
         let engine = self.clone();
@@ -923,6 +983,10 @@ impl Engine {
             tc.stop();
         }
         self.stopper.clone().wait_stop().await
+    }
+
+    pub(crate) fn ingress_tasks(&self) -> &Arc<crate::types::owned_tasks::OwnedTasks> {
+        &self.ingress_tasks
     }
 
     pub fn stopper(&self) -> &Stopper {
@@ -965,10 +1029,57 @@ impl Engine {
         self.overlays_router()?.overlay_client(shard).await
     }
 
-    pub fn overlays_router(&self) -> Result<&Arc<FullNodeOverlaysRouter>> {
-        self.overlays_router
-            .get()
-            .ok_or_else(|| error!("INTERNAL ERROR: overlays router is not initialized"))
+    pub fn overlays_router(&self) -> Result<Arc<FullNodeOverlaysRouter>> {
+        let owners = self.owned_services.lock().unwrap();
+        if owners.stopping || !owners.router_ready {
+            fail!("Overlays router is not ready or is stopping");
+        }
+        owners.router.clone().ok_or_else(|| error!("Overlays router is absent"))
+    }
+
+    pub(crate) async fn initialize_full_node_overlays(
+        self: &Arc<Self>,
+        policy: DhtSearchPolicy,
+    ) -> Result<Arc<FullNodeOverlaysRouter>> {
+        let router = FullNodeOverlaysRouter::create(self.clone(), self.network.clone(), policy)?;
+        #[cfg(test)]
+        {
+            *router.init_gate.lock().unwrap() = self.overlay_init_test_gate.lock().unwrap().clone();
+        }
+        {
+            let mut owners = self.owned_services.lock().unwrap();
+            if owners.stopping || self.stopper.check_stop() {
+                fail!("Engine is stopping");
+            }
+            if owners.router.is_some() {
+                fail!("Overlays router already registered");
+            }
+            owners.router = Some(router.clone());
+        }
+        router.initialize().await?;
+        {
+            let mut owners = self.owned_services.lock().unwrap();
+            if owners.stopping || self.stopper.check_stop() {
+                fail!("Engine stopped during overlay initialization");
+            }
+            owners.router_ready = true;
+        }
+        Ok(router)
+    }
+
+    async fn initialize_queue_manager(self: &Arc<Self>) -> Result<()> {
+        let manager = OutMsgQueueManager::create(self.clone());
+        {
+            let mut owners = self.owned_services.lock().unwrap();
+            if owners.stopping || self.stopper.check_stop() {
+                fail!("Engine is stopping");
+            }
+            if owners.queue.is_some() {
+                fail!("Queue manager already registered");
+            }
+            owners.queue = Some(manager.clone());
+        }
+        manager.initialize().await
     }
 
     pub fn shard_states_awaiters(&self) -> &AwaitersPool<BlockIdExt, Arc<ShardStateStuff>> {
@@ -2463,27 +2574,15 @@ pub async fn run(
         }
 
         // Overlays
-        let overlays_router = FullNodeOverlaysRouter::new(
-            engine.clone(),
-            engine.network.clone(),
-            DhtSearchPolicy::default(),
-        )
-        .await?;
+        let overlays_router =
+            engine.initialize_full_node_overlays(DhtSearchPolicy::default()).await?;
         overlays_router.update_custom_overlays(Some(&custom_overlays_config)).await?;
-        engine
-            .overlays_router
-            .set(overlays_router.clone())
-            .map_err(|_| error!("Overlays router already set"))?;
 
         // Boot
         let mut boot_info =
             boot(&engine, zerostate_path, configs_dir, pss_downloading_threads).await?;
 
-        let out_msg_queue_manager = OutMsgQueueManager::new(engine.clone()).await?;
-        engine
-            .out_msg_queue_manager
-            .set(out_msg_queue_manager.clone())
-            .map_err(|_| error!("OutMsgQueueManager already set"))?;
+        engine.initialize_queue_manager().await?;
 
         Engine::start_archives_gc(engine.clone(), boot_info.archives_gc_block)?;
 
@@ -3261,3 +3360,7 @@ pub(crate) mod parent_apply_tests;
 #[cfg(test)]
 #[path = "tests/test_stopper.rs"]
 mod stopper_tests;
+
+#[cfg(test)]
+#[path = "tests/test_engine_owned_drain.rs"]
+mod owned_drain_tests;

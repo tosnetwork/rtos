@@ -874,7 +874,8 @@ impl EngineOperations for Engine {
         // because of ALL blocks-broadcasts received in one task - spawn for each block
         log::debug!("Processing block broadcast {} from {}", broadcast.id, src);
         let engine = self.clone() as Arc<dyn EngineOperations>;
-        tokio::spawn(async move {
+        let tasks = self.ingress_tasks().clone();
+        let _ = tasks.spawn("process_block_broadcast", async move {
             let id = broadcast.id.clone();
             match process_block_broadcast(&engine, broadcast).await {
                 Err(e) => {
@@ -900,7 +901,8 @@ impl EngineOperations for Engine {
         // V2 broadcast processing - spawn for async processing
         log::debug!("Processing block broadcast V2 {} from {}", broadcast.id, src);
         let engine = self.clone() as Arc<dyn EngineOperations>;
-        tokio::spawn(async move {
+        let tasks = self.ingress_tasks().clone();
+        let _ = tasks.spawn("process_block_broadcast_v2", async move {
             let id = broadcast.id.clone();
             match process_block_broadcast_v2(&engine, broadcast).await {
                 Err(e) => {
@@ -960,7 +962,8 @@ impl EngineOperations for Engine {
     ) {
         let id = broadcast.block.block.clone();
         log::trace!("Processing new shard block broadcast {} from {}", id, src);
-        tokio::spawn(async move {
+        let tasks = self.ingress_tasks().clone();
+        let _ = tasks.spawn("process_new_shard_block_broadcast", async move {
             match self.clone().process_new_shard_block(broadcast).await {
                 Err(e) => {
                     log::warn!(

@@ -224,6 +224,10 @@ async fn test_overlay_client() {
         network.cancellation_token().clone(),
         DhtSearchPolicy::default(),
         None,
+        Arc::new(crate::types::owned_tasks::OwnedTasks::new(
+            network.cancellation_token().child_token(),
+        )),
+        None,
     )
     .await
     .unwrap();

@@ -493,10 +493,7 @@ impl NodeNetwork {
         overlay: Arc<OverlayNode>,
         cancellation_token: tokio_util::sync::CancellationToken,
         label: String,
-    ) {
-        if peers.is_empty() {
-            return;
-        }
+    ) -> tokio::task::JoinHandle<()> {
         spawn_cancelable(cancellation_token, async move {
             let mut peers = peers;
             loop {
@@ -516,7 +513,7 @@ impl NodeNetwork {
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
-        });
+        })
     }
 
     async fn resolve_overlay_peers_round(

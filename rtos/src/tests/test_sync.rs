@@ -588,8 +588,8 @@ async fn test_sync() -> Result<()> {
     network.start().await?;
 
     let overlays_router =
-        FullNodeOverlaysRouter::new(engine.clone(), network, DhtSearchPolicy::FastSearch(5))
-            .await?;
+        FullNodeOverlaysRouter::create(engine.clone(), network, DhtSearchPolicy::FastSearch(5))?;
+    overlays_router.initialize().await?;
     engine
         .overlays_router
         .set(overlays_router)

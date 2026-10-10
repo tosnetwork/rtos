@@ -14,9 +14,10 @@ use crate::{
         decompress_and_check_candidate_data, decompress_block_broadcast,
         decompress_block_broadcast_v2, node_network::NetworkContext, overlay_client::OverlayClient,
     },
+    types::owned_tasks::OwnedTasks,
 };
 use adnl::{
-    common::{hash, spawn_cancelable, TaggedByteSlice},
+    common::{hash, TaggedByteSlice},
     node::AdnlSendMethod,
     DhtSearchPolicy, OverlayNode, OverlayShortId,
 };
@@ -38,6 +39,7 @@ pub struct FastSyncOverlayClient {
     client: Arc<OverlayClient>,
     engine: Arc<dyn EngineOperations>,
     use_twostep: bool,
+    tasks: Arc<OwnedTasks>,
 }
 
 impl FastSyncOverlayClient {
@@ -52,6 +54,7 @@ impl FastSyncOverlayClient {
         policy: DhtSearchPolicy,
         default_rldp_roundtrip: Option<u32>,
         use_quic: bool,
+        owner: Arc<OwnedTasks>,
     ) -> Result<Arc<Self>> {
         let mut root_adnl_ids = Vec::with_capacity(validators.len());
         let mut root_public_keys = Vec::with_capacity(validators.len());
@@ -94,12 +97,23 @@ impl FastSyncOverlayClient {
             default_rldp_roundtrip,
             MAX_FAST_SYNC_OVERLAY_CLIENTS,
             use_twostep,
+            owner.clone(),
         )
         .await?;
 
-        let result = Arc::new(Self { id: id_short, shard, client, engine, use_twostep });
+        let result = Arc::new(Self {
+            id: id_short,
+            shard,
+            client,
+            engine,
+            use_twostep,
+            tasks: Arc::new(OwnedTasks::child(owner, cancellation_token)),
+        });
 
-        result.clone().listen_broadcasts(cancellation_token.clone());
+        if let Err(error) = result.clone().listen_broadcasts() {
+            result.stop();
+            return Err(error);
+        }
 
         Ok(result)
     }
@@ -114,18 +128,29 @@ impl FastSyncOverlayClient {
 
     pub fn stop(&self) {
         log::info!("Stopping fast sync overlay {} {}", self.shard, self.id);
+        self.tasks.stop();
         self.client.delete().ok();
     }
 
-    fn listen_broadcasts(self: Arc<Self>, cancellation_token: tokio_util::sync::CancellationToken) {
-        spawn_cancelable(cancellation_token.clone(), async move {
+    pub async fn stop_and_wait(&self) -> Result<()> {
+        self.stop();
+        let (listener, client) = tokio::join!(self.tasks.wait(), self.client.stop_and_wait());
+        if listener.is_err() || client.is_err() {
+            fail!("Fast overlay shutdown: listener={listener:?}; client={client:?}");
+        }
+        Ok(())
+    }
+
+    fn listen_broadcasts(self: Arc<Self>) -> Result<()> {
+        let tasks = self.tasks.clone();
+        tasks.spawn("fast-sync broadcast listener", async move {
             log::debug!(
                 "Started listening broadcasts in fast sync overlay {} {}",
                 self.shard,
                 self.id
             );
             loop {
-                if self.engine.check_stop() {
+                if self.engine.check_stop() || self.tasks.cancellation().is_cancelled() {
                     break;
                 }
                 if !check_sync_for_listen_bcasts(self.engine.as_ref()) {
@@ -134,10 +159,11 @@ impl FastSyncOverlayClient {
                         self.shard,
                         self.id
                     );
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    tokio::select! { _ = self.tasks.cancellation().cancelled() => break, _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {} }
                     continue;
                 }
-                match self.client.wait_broadcast().await {
+                let broadcast = tokio::select! { biased; _ = self.tasks.cancellation().cancelled() => break, result = self.client.wait_broadcast() => result };
+                match broadcast {
                     Err(e) => {
                         log::error!(
                             "Error while wait_broadcast in fast sync overlay {} {}: {e}",
@@ -145,7 +171,7 @@ impl FastSyncOverlayClient {
                             self.id
                         );
                         // Wait for the graceful loop exit
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        tokio::select! { _ = self.tasks.cancellation().cancelled() => break, _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {} }
                     }
                     Ok(None) => {
                         log::debug!(
@@ -173,7 +199,8 @@ impl FastSyncOverlayClient {
                     }
                 }
             }
-        });
+        })?;
+        Ok(())
     }
 
     async fn process_broadcast(&self, src: &Arc<KeyId>, broadcast: Broadcast) -> Result<()> {

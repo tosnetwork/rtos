@@ -18,6 +18,7 @@ use crate::{
         MAX_COMPRESSED_SIZE,
     },
     shard_state::ShardStateStuff,
+    types::owned_tasks::OwnedTasks,
 };
 use adnl::{
     common::{TaggedByteSlice, TaggedObject},
@@ -57,6 +58,9 @@ pub struct FullNodeOverlayClient {
     engine: Arc<dyn EngineOperations>,
     client: Arc<OverlayClient>,
     shard: ShardIdent,
+    tasks: Arc<OwnedTasks>,
+    #[cfg(test)]
+    exit_gate: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 impl FullNodeOverlayClient {
@@ -67,16 +71,23 @@ impl FullNodeOverlayClient {
         engine: Arc<dyn EngineOperations>,
         client: Arc<OverlayClient>,
         shard: ShardIdent,
-    ) -> Arc<Self> {
+        owner: Arc<OwnedTasks>,
+    ) -> Result<Arc<Self>> {
         let fnc = Arc::new(Self {
             active_peers: lockfree::set::Set::new(),
             bad_peers: lockfree::set::Set::new(),
             engine,
             client,
             shard,
+            #[cfg(test)]
+            exit_gate: std::sync::Mutex::new(None),
+            tasks: Arc::new(OwnedTasks::child(owner.clone(), owner.cancellation().child_token())),
         });
-        fnc.clone().listen_broadcasts();
-        fnc
+        if let Err(error) = fnc.clone().listen_broadcasts() {
+            fnc.stop();
+            return Err(error);
+        }
+        Ok(fnc)
     }
 
     pub fn overlay_client(&self) -> &Arc<OverlayClient> {
@@ -87,14 +98,40 @@ impl FullNodeOverlayClient {
         &self.shard
     }
 
-    fn listen_broadcasts(self: Arc<Self>) {
-        tokio::spawn(async move {
+    #[cfg(test)]
+    pub(crate) fn hold_listener_exit(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (release, gate) = tokio::sync::oneshot::channel();
+        *self.exit_gate.lock().unwrap() = Some(gate);
+        release
+    }
+
+    pub fn stop(&self) {
+        self.tasks.stop();
+        let _ = self.client.delete();
+    }
+
+    pub async fn stop_and_wait(&self) -> Result<()> {
+        self.stop();
+        let (listener, client) = tokio::join!(self.tasks.wait(), self.client.stop_and_wait());
+        if listener.is_err() || client.is_err() {
+            fail!("Public overlay shutdown: listener={listener:?}; client={client:?}");
+        }
+        Ok(())
+    }
+
+    fn listen_broadcasts(self: Arc<Self>) -> Result<()> {
+        let tasks = self.tasks.clone();
+        tasks.spawn("public overlay broadcast listener", async move {
             log::debug!("Started listening broadcasts for shard {}", self.shard());
             loop {
-                if self.engine.check_stop() {
+                if self.engine.check_stop() || self.tasks.cancellation().is_cancelled() {
                     break;
                 }
                 if !self.overlay_client().is_active() {
+                    tokio::select! {
+                        _ = self.tasks.cancellation().cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                    }
                     continue;
                 }
                 if self.overlay_client().is_died() {
@@ -106,14 +143,25 @@ impl FullNodeOverlayClient {
                         "Node is not synced, pause processing broadcasts for shard {}",
                         self.shard()
                     );
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    tokio::select! {
+                        _ = self.tasks.cancellation().cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                    }
                     continue;
                 }
-                match self.overlay_client().wait_broadcast().await {
+                let broadcast = tokio::select! {
+                    biased;
+                    _ = self.tasks.cancellation().cancelled() => break,
+                    result = self.overlay_client().wait_broadcast() => result,
+                };
+                match broadcast {
                     Err(e) => {
                         log::error!("Error while wait_broadcast for shard {}: {e}", self.shard());
                         // Wait for the graceful loop exit
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        tokio::select! {
+                            _ = self.tasks.cancellation().cancelled() => break,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                        }
                     }
                     Ok(None) => {
                         log::warn!("wait_broadcast finished.");
@@ -137,7 +185,15 @@ impl FullNodeOverlayClient {
                     }
                 }
             }
-        });
+            #[cfg(test)]
+            {
+                let gate = self.exit_gate.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    let _ = gate.await;
+                }
+            }
+        })?;
+        Ok(())
     }
 
     async fn process_broadcast(&self, src: &Arc<KeyId>, broadcast: Broadcast) -> Result<()> {
