@@ -1221,6 +1221,20 @@ impl Engine {
 
     // Implementation *********************************************************
 
+    /// A version-disabled opcode still counts as an attempted instruction.
+    pub(in crate::executor) fn reject_unavailable_instruction(&mut self) -> Status {
+        self.step += 1;
+        // Since version 4, exhaustion precedes exception dispatch. Older
+        // versions also charge the exception before detecting exhaustion.
+        let gas = Gas::basic_gas_price(0, 0);
+        if self.block_version >= 4 {
+            self.try_use_gas(gas)?;
+        } else {
+            self.use_gas(gas);
+        }
+        fail!(ExceptionCode::InvalidOpcode);
+    }
+
     pub(in crate::executor) fn load_instruction(&mut self, proto: Instruction) -> Status {
         self.cmd.proto = proto;
         self.cmd.params.clear();

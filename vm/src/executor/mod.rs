@@ -28,6 +28,7 @@ mod globals;
 mod math;
 pub use math::DivMode;
 mod null;
+mod poseidon2;
 mod pq;
 mod rand;
 mod serialization;

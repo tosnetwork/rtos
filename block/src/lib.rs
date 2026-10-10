@@ -14,6 +14,10 @@ pub use types::*;
 pub mod cell;
 pub use cell::*;
 
+pub mod poseidon2;
+pub mod poseidon2_kat;
+pub mod poseidon2_params;
+
 pub mod pq_bytes;
 pub use pq_bytes::*;
 
