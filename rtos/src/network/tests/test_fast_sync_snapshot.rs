@@ -14,7 +14,9 @@ use std::sync::atomic::AtomicUsize;
 struct SnapshotEngine {
     zero: BlockIdExt,
     fail_after: AtomicUsize,
+    applied: std::sync::RwLock<Option<Arc<crate::shard_state::ShardStateStuff>>>,
 }
+#[async_trait::async_trait]
 impl EngineOperations for SnapshotEngine {
     fn zerostate_id(&self) -> Result<&BlockIdExt> {
         let left = self.fail_after.fetch_sub(1, Ordering::SeqCst);
@@ -25,6 +27,12 @@ impl EngineOperations for SnapshotEngine {
     }
     fn check_stop(&self) -> bool {
         true
+    }
+    fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
+        Ok(self.applied.read().unwrap().as_ref().map(|state| Arc::new(state.block_id().clone())))
+    }
+    async fn load_last_applied_mc_state(&self) -> Result<Arc<crate::shard_state::ShardStateStuff>> {
+        self.applied.read().unwrap().clone().ok_or_else(|| error!("no fixture applied state"))
     }
 }
 
@@ -63,6 +71,7 @@ impl Fixture {
         let engine = Arc::new(SnapshotEngine {
             zero: bootstrap.zerostate_id.clone(),
             fail_after: AtomicUsize::new(usize::MAX),
+            applied: std::sync::RwLock::new(None),
         });
         let router = Arc::new(FullNodeOverlaysRouter {
             engine: engine.clone(),
@@ -79,6 +88,8 @@ impl Fixture {
                 allocated,
             ),
             fast_sync_snapshot: tokio::sync::Mutex::new(None),
+            fast_sync_refresh: tokio::sync::Mutex::new(()),
+            fast_sync_refresh_gate: std::sync::Mutex::new(None),
             monitor_min_split_for_fast_sync: AtomicU8::new(0),
             last_known_keyblock_id: tokio::sync::Mutex::new(None),
             actual_monitor_min_split: AtomicU8::new(0),
@@ -99,6 +110,36 @@ impl Fixture {
             UInt256::from(*self.bootstrap.validators[index].adnl_key.id().data()),
         )
     }
+    // Only a state-provider scheduling fixture. The separate real Engine test
+    // below exercises actual anchored startup; this does not authenticate blocks.
+    fn publish_config(&self, config: ConfigParams, seqno: u32) -> Result<()> {
+        use rtos_block::{McStateExtra, Serializable, ShardStateUnsplit};
+        let mut state = ShardStateUnsplit::with_ident(ShardIdent::MASTERCHAIN);
+        if seqno != 0 {
+            state.set_seq_no(seqno);
+        }
+        let mut extra = McStateExtra::default();
+        extra.config = config;
+        state.write_custom(Some(&extra))?;
+        let root = state.serialize()?;
+        let id = BlockIdExt::with_params(
+            ShardIdent::MASTERCHAIN,
+            seqno,
+            root.repr_hash().clone(),
+            UInt256::calc_file_hash(&rtos_block::write_boc(&root)?),
+        );
+        let context = self.router.network.context();
+        let state = crate::shard_state::ShardStateStuff::from_state(
+            id,
+            state,
+            #[cfg(feature = "telemetry")]
+            &context.engine_telemetry,
+            &context.engine_allocated,
+        )?;
+        *self.engine.applied.write().unwrap() = Some(state);
+        Ok(())
+    }
+
     async fn stop(&self) {
         self.router.clear_fast_sync_overlays();
         self.router.network.stop_adnl().await;
@@ -132,11 +173,15 @@ async fn fast_sync_snapshot_previous_next_and_transport_changes_replace_live_ove
         .update_fast_sync_overlays(&empty, &current, &empty, 0, Some(&key), false, false)
         .await?;
     assert!(Arc::ptr_eq(&master, &overlay(&f.router, &ShardIdent::MASTERCHAIN)));
+    let mut next_member = f.member(1);
+    next_member.adnl_addr = Some(UInt256::from([77; 32]));
+    let next_set = set(vec![next_member]);
     for (prev, next, mc, base) in [
         (&previous, &empty, false, false),
-        (&empty, &previous, false, false),
-        (&empty, &previous, true, false),
-        (&empty, &previous, true, true),
+        (&previous, &next_set, false, false),
+        (&empty, &next_set, false, false),
+        (&empty, &next_set, true, false),
+        (&empty, &next_set, true, true),
     ] {
         f.router.update_fast_sync_overlays(prev, &current, next, 0, Some(&key), mc, base).await?;
         let new_master = overlay(&f.router, &ShardIdent::MASTERCHAIN);
@@ -145,7 +190,14 @@ async fn fast_sync_snapshot_previous_next_and_transport_changes_replace_live_ove
         assert_replaced(&shard, &new_shard);
         assert_eq!(new_master.use_twostep(), mc);
         assert_eq!(new_shard.use_twostep(), base);
-        assert!(new_master.client().neighbours().contains(f.bootstrap.validators[1].adnl_key.id()));
+        assert_eq!(
+            new_master.client().neighbours().contains(f.bootstrap.validators[1].adnl_key.id()),
+            !prev.list().is_empty()
+        );
+        assert_eq!(
+            new_master.client().neighbours().contains(&KeyId::from_data([77; 32])),
+            !next.list().is_empty()
+        );
         master = new_master;
         shard = new_shard;
     }
@@ -379,6 +431,7 @@ async fn fast_sync_snapshot_rejects_expired_missing_and_implicit_transport_regis
     assert_eq!(f.router.fast_sync_overlays.iter().count(), 0);
 
     handler.add_validator_key(local.validator_key.id().data(), 1001, i32::MAX).await?;
+    f.router.network.context().stack.adnl.add_key(local.validator_key.clone(), 901)?;
     let mut implicit = f.member(0);
     implicit.adnl_addr = Some(UInt256::from(*local.validator_key.id().data()));
     assert!(
@@ -416,6 +469,165 @@ async fn fast_sync_snapshot_primary_adnl_is_an_independent_transport_source() ->
         .update_fast_sync_overlays(&previous, &empty, &empty, 0, Some(&key), false, false)
         .await?;
     assert_eq!(f.router.fast_sync_overlays.iter().count(), 2);
+    f.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fast_sync_snapshot_revocation_during_key_lookup_cannot_publish_stale_authority(
+) -> Result<()> {
+    use rtos_block::{ConfigParam34, ConfigParamEnum};
+    let f = Fixture::new().await?;
+    let mut config = f.bootstrap.config_params().clone();
+    config.set_config(ConfigParamEnum::ConfigParam34(ConfigParam34::with_validator_set(set(
+        vec![f.member(0)],
+    ))))?;
+    f.publish_config(config, 0)?;
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let (release, held) = tokio::sync::oneshot::channel();
+    *f.router.fast_sync_refresh_gate.lock().unwrap() = Some((entered, held));
+    let router = f.router.clone();
+    let refresh = tokio::spawn(async move { router.refresh_fast_sync_from_applied_state().await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), ready).await??;
+    f.router
+        .network
+        .config_handler()
+        .add_validator_adnl_key(
+            f.bootstrap.validators[0].validator_key.id().data(),
+            f.bootstrap.validators[1].adnl_key.id().data(),
+        )
+        .await?;
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), refresh).await???;
+    assert_eq!(f.router.fast_sync_overlays.iter().count(), 0);
+    // The stale selected key must be discarded before even constructing a new
+    // protocol registration, not installed and eventually cleaned by polling.
+    assert_eq!(f.engine.fail_after.load(Ordering::SeqCst), usize::MAX);
+    assert!(f.router.fast_sync_snapshot.lock().await.as_ref().unwrap().local_key.is_none());
+    f.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fast_sync_snapshot_delayed_refresh_cannot_overwrite_later_configuration() -> Result<()> {
+    use rtos_block::{ConfigParam34, ConfigParam36, ConfigParamEnum};
+    let f = Fixture::new().await?;
+    let mut old_config = f.bootstrap.config_params().clone();
+    old_config.set_config(ConfigParamEnum::ConfigParam34(ConfigParam34::with_validator_set(
+        set(vec![f.member(0)]),
+    )))?;
+    let mut new_config = old_config.clone();
+    new_config.set_config(ConfigParamEnum::ConfigParam36(ConfigParam36::with_validator_set(
+        set(vec![f.member(1)]),
+    )))?;
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let (release, held) = tokio::sync::oneshot::channel();
+    *f.router.fast_sync_refresh_gate.lock().unwrap() = Some((entered, held));
+    let router = f.router.clone();
+    let old_refresh =
+        tokio::spawn(async move { router.update_private_overlays(&old_config).await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), ready).await??;
+    let router = f.router.clone();
+    let mut new_refresh =
+        tokio::spawn(async move { router.update_private_overlays(&new_config).await });
+    let early_result =
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut new_refresh).await;
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), old_refresh).await???;
+    match early_result {
+        Ok(result) => result??,
+        Err(_) => tokio::time::timeout(std::time::Duration::from_secs(10), new_refresh).await???,
+    }
+    let actual = overlay(&f.router, &ShardIdent::MASTERCHAIN);
+    assert!(
+        actual.client().neighbours().contains(f.bootstrap.validators[1].adnl_key.id()),
+        "the delayed older refresh overwrote the newer transport set"
+    );
+    assert_eq!(
+        f.router.fast_sync_snapshot.lock().await.as_ref().unwrap().next,
+        set(vec![f.member(1)])
+    );
+    f.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fast_sync_snapshot_applied_state_change_during_lookup_discards_older_inputs() -> Result<()>
+{
+    use rtos_block::{ConfigParam34, ConfigParam36, ConfigParamEnum};
+    let f = Fixture::new().await?;
+    let mut config = f.bootstrap.config_params().clone();
+    config.set_config(ConfigParamEnum::ConfigParam34(ConfigParam34::with_validator_set(set(
+        vec![f.member(0)],
+    ))))?;
+    f.publish_config(config.clone(), 0)?;
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let (release, held) = tokio::sync::oneshot::channel();
+    *f.router.fast_sync_refresh_gate.lock().unwrap() = Some((entered, held));
+    let router = f.router.clone();
+    let old_refresh =
+        tokio::spawn(async move { router.refresh_fast_sync_from_applied_state().await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), ready).await??;
+    config.set_config(ConfigParamEnum::ConfigParam36(ConfigParam36::with_validator_set(set(
+        vec![f.member(1)],
+    ))))?;
+    f.publish_config(config, 1)?;
+    let router = f.router.clone();
+    let new_refresh =
+        tokio::spawn(async move { router.refresh_fast_sync_from_applied_state().await });
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), old_refresh).await???;
+    tokio::time::timeout(std::time::Duration::from_secs(10), new_refresh).await???;
+    let actual = overlay(&f.router, &ShardIdent::MASTERCHAIN);
+    assert!(actual.client().neighbours().contains(f.bootstrap.validators[1].adnl_key.id()));
+    assert_eq!(
+        f.engine.fail_after.load(Ordering::SeqCst),
+        usize::MAX - 2,
+        "the obsolete applied configuration was constructed before the new generation"
+    );
+    f.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fast_sync_snapshot_registration_expiring_during_lookup_cannot_publish() -> Result<()> {
+    use rtos_block::{ConfigParam34, ConfigParamEnum};
+    let f = Fixture::new().await?;
+    let handler = f.router.network.config_handler();
+    let local = &f.bootstrap.validators[0];
+    let deadline = rtos_block::UnixTime::now() as i32 + 4;
+    handler.add_validator_key(local.validator_key.id().data(), 1001, deadline).await?;
+    handler
+        .add_validator_adnl_key(local.validator_key.id().data(), local.adnl_key.id().data())
+        .await?;
+    let mut config = f.bootstrap.config_params().clone();
+    config.set_config(ConfigParamEnum::ConfigParam34(ConfigParam34::with_validator_set(set(
+        vec![f.member(0)],
+    ))))?;
+    f.publish_config(config, 0)?;
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let (release, held) = tokio::sync::oneshot::channel();
+    *f.router.fast_sync_refresh_gate.lock().unwrap() = Some((entered, held));
+    let router = f.router.clone();
+    let refresh = tokio::spawn(async move { router.refresh_fast_sync_from_applied_state().await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), ready).await??;
+    let revision = handler.validator_transport_revision()?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while (rtos_block::UnixTime::now() as i64) < i64::from(deadline) {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await?;
+    assert_eq!(
+        handler.validator_transport_revision()?,
+        revision,
+        "expiry must be detected without a config mutation"
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), refresh).await???;
+    assert_eq!(f.router.fast_sync_overlays.iter().count(), 0);
+    assert_eq!(f.engine.fail_after.load(Ordering::SeqCst), usize::MAX);
+    assert!(f.router.fast_sync_snapshot.lock().await.as_ref().unwrap().local_key.is_none());
     f.stop().await;
     Ok(())
 }

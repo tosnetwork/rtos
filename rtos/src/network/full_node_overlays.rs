@@ -78,6 +78,21 @@ use std::{
 ///               NodeNetwork                   <- low level node components
 ///                    v
 ///            network protocols
+#[derive(Debug, thiserror::Error)]
+#[error("fast-sync inputs changed during transport refresh")]
+struct RetryFastSyncRefresh;
+
+struct FastSyncRefreshBinding {
+    transport_revision: u64,
+    applied_id: Option<BlockIdExt>,
+    valid_until: Option<u64>,
+}
+
+struct LocalFastSyncTransport {
+    key: Arc<dyn KeyOption>,
+    valid_until: Option<u64>,
+}
+
 #[derive(Clone, PartialEq)]
 struct FastSyncSnapshot {
     previous: ValidatorSet,
@@ -99,6 +114,11 @@ pub struct FullNodeOverlaysRouter {
     custom_overlays: lockfree::map::Map<String, Arc<CustomOverlayClient>>,
     public_overlays_awaiters: AwaitersPool<ShardIdent, Arc<FullNodeOverlayClient>>,
     fast_sync_snapshot: tokio::sync::Mutex<Option<FastSyncSnapshot>>,
+    fast_sync_refresh: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    fast_sync_refresh_gate: std::sync::Mutex<
+        Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
+    >,
     monitor_min_split_for_fast_sync: AtomicU8,
     last_known_keyblock_id: tokio::sync::Mutex<Option<BlockIdExt>>,
     actual_monitor_min_split: AtomicU8,
@@ -149,6 +169,9 @@ impl FullNodeOverlaysRouter {
             custom_overlays: lockfree::map::Map::new(),
             public_overlays_awaiters,
             fast_sync_snapshot: tokio::sync::Mutex::new(None),
+            fast_sync_refresh: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            fast_sync_refresh_gate: std::sync::Mutex::new(None),
             monitor_min_split_for_fast_sync: AtomicU8::new(0),
             last_known_keyblock_id: tokio::sync::Mutex::new(None),
             actual_monitor_min_split,
@@ -347,11 +370,28 @@ impl FullNodeOverlaysRouter {
     }
 
     pub(crate) async fn refresh_fast_sync_from_applied_state(self: &Arc<Self>) -> Result<()> {
-        let state = self.engine.load_last_applied_mc_state().await?;
-        self.update_private_overlays(state.config_params()?).await
+        // Read after taking the refresh lock: a delayed caller must not install
+        // an older applied configuration after a newer refresh has completed.
+        let _refresh = self.fast_sync_refresh.lock().await;
+        loop {
+            let state = self.engine.load_last_applied_mc_state().await?;
+            match self
+                .update_private_overlays_inner(
+                    state.config_params()?,
+                    Some(state.block_id().clone()),
+                )
+                .await
+            {
+                Err(error) if error.is::<RetryFastSyncRefresh>() => continue,
+                result => return result,
+            }
+        }
     }
 
     pub(crate) async fn special_update_fastsync_overlays(self: &Arc<Self>) -> Result<()> {
+        if self.network.context().stack.overlay.wire_profile() == rtos_api::WireProfile::T0 {
+            return self.refresh_fast_sync_from_applied_state().await;
+        }
         // Special case: create fast sync overlays when we are a validator from the
         // previous set. The normal flow (update_validator_lists in validator_manager)
         // only processes current and next sets, so the prev set ADNL key is never
@@ -360,9 +400,6 @@ impl FullNodeOverlaysRouter {
         // 0) Load last master state and config
         let mc_state = self.engine.load_last_applied_mc_state().await?;
         let config = mc_state.config_params()?;
-        if self.network.context().stack.overlay.wire_profile() == rtos_api::WireProfile::T0 {
-            return self.update_private_overlays(config).await;
-        }
 
         // 1) Read prev validator set
         let prev_vset = config.prev_validator_set()?;
@@ -514,17 +551,37 @@ impl FullNodeOverlaysRouter {
         .await
     }
 
-    pub(crate) async fn update_private_overlays(
+    #[cfg(test)]
+    async fn update_private_overlays(self: &Arc<Self>, config: &ConfigParams) -> Result<()> {
+        let _refresh = self.fast_sync_refresh.lock().await;
+        loop {
+            match self.update_private_overlays_inner(config, None).await {
+                Err(error) if error.is::<RetryFastSyncRefresh>() => continue,
+                result => return result,
+            }
+        }
+    }
+
+    async fn update_private_overlays_inner(
         self: &Arc<Self>,
         config: &ConfigParams,
+        applied_id: Option<BlockIdExt>,
     ) -> Result<()> {
+        let mut binding = FastSyncRefreshBinding {
+            transport_revision: self.network.config_handler().validator_transport_revision()?,
+            applied_id,
+            valid_until: None,
+        };
         let prev_vset = config.prev_validator_set()?;
         let this_vset = config.validator_set()?;
         let next_vset = config.next_validator_set()?;
         let key =
             if self.network.context().stack.overlay.wire_profile() == rtos_api::WireProfile::T0 {
-                match self.find_transport_key(&[&this_vset, &prev_vset, &next_vset]).await {
-                    Ok(key) => key,
+                match self.find_transport_authority(&[&this_vset, &prev_vset, &next_vset]).await {
+                    Ok(selected) => selected.map(|selected| {
+                        binding.valid_until = selected.valid_until;
+                        selected.key
+                    }),
                     Err(error) => {
                         let mut installed = self.fast_sync_snapshot.lock().await;
                         *installed = None;
@@ -544,7 +601,15 @@ impl FullNodeOverlaysRouter {
             };
         let mc_use_quic = config.get_mc_simplex_config()?.map_or(false, |c| c.use_quic);
         let shard_use_quic = config.get_shard_simplex_config()?.map_or(false, |c| c.use_quic);
-        self.update_fast_sync_overlays(
+        #[cfg(test)]
+        {
+            let gate = self.fast_sync_refresh_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+        }
+        self.update_fast_sync_overlays_checked(
             &prev_vset,
             &this_vset,
             &next_vset,
@@ -552,6 +617,7 @@ impl FullNodeOverlaysRouter {
             key.as_ref(),
             mc_use_quic,
             shard_use_quic,
+            Some(&binding),
         )
         .await?;
         Ok(())
@@ -616,7 +682,32 @@ impl FullNodeOverlaysRouter {
         mc_use_quic: bool,
         shard_use_quic: bool,
     ) -> Result<()> {
+        self.update_fast_sync_overlays_checked(
+            prev_validators,
+            this_validators,
+            next_validators,
+            new_monitor_min_split,
+            key,
+            mc_use_quic,
+            shard_use_quic,
+            None,
+        )
+        .await
+    }
+
+    async fn update_fast_sync_overlays_checked(
+        self: &Arc<Self>,
+        prev_validators: &ValidatorSet,
+        this_validators: &ValidatorSet,
+        next_validators: &ValidatorSet,
+        new_monitor_min_split: u8,
+        key: Option<&Arc<dyn KeyOption>>,
+        mc_use_quic: bool,
+        shard_use_quic: bool,
+        binding: Option<&FastSyncRefreshBinding>,
+    ) -> Result<()> {
         let mut installed = self.fast_sync_snapshot.lock().await;
+        self.publish_fast_sync(binding, || Ok(()))?;
         let desired = FastSyncSnapshot {
             previous: prev_validators.clone(),
             current: this_validators.clone(),
@@ -638,8 +729,10 @@ impl FullNodeOverlaysRouter {
         }
         self.monitor_min_split_for_fast_sync.store(new_monitor_min_split, Ordering::Relaxed);
         let Some(local_key) = key else {
-            *installed = Some(desired);
-            return Ok(());
+            return self.publish_fast_sync(binding, || {
+                *installed = Some(desired);
+                Ok(())
+            });
         };
         let mut pending = PendingFastSync {
             overlays: Vec::new(),
@@ -751,12 +844,41 @@ impl FullNodeOverlaysRouter {
             }
             return Err(error);
         }
-        for (shard, overlay) in pending.overlays.drain(..) {
-            self.fast_sync_overlays.insert(shard, overlay);
-        }
-        pending.committed = true;
-        *installed = Some(desired);
-        Ok(())
+        self.publish_fast_sync(binding, || {
+            for (shard, overlay) in pending.overlays.drain(..) {
+                self.fast_sync_overlays.insert(shard, overlay);
+            }
+            pending.committed = true;
+            *installed = Some(desired);
+            Ok(())
+        })
+    }
+
+    fn publish_fast_sync<T>(
+        &self,
+        binding: Option<&FastSyncRefreshBinding>,
+        publish: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let Some(binding) = binding else {
+            return publish();
+        };
+        self.network
+            .config_handler()
+            .with_validator_transport_revision(binding.transport_revision, || {
+                if let Some(expected) = &binding.applied_id {
+                    if self.engine.load_last_applied_mc_block_id()?.as_deref() != Some(expected) {
+                        return Err(RetryFastSyncRefresh.into());
+                    }
+                }
+                if binding
+                    .valid_until
+                    .is_some_and(|deadline| deadline <= rtos_block::UnixTime::now() as u64)
+                {
+                    return Err(RetryFastSyncRefresh.into());
+                }
+                publish()
+            })?
+            .ok_or_else(|| error!(RetryFastSyncRefresh))?
     }
 
     fn clear_fast_sync_overlays(&self) {
@@ -773,20 +895,28 @@ impl FullNodeOverlaysRouter {
     // registrations are existing local transport authorities. Neither grants
     // PQ voting custody; that separately requires held validator/key bindings.
     // Re-read registrations so cached list contexts cannot retain revoked keys.
+    #[cfg(test)]
     async fn find_transport_key(
         &self,
         sets: &[&ValidatorSet],
     ) -> Result<Option<Arc<dyn KeyOption>>> {
+        Ok(self.find_transport_authority(sets).await?.map(|selected| selected.key))
+    }
+
+    async fn find_transport_authority(
+        &self,
+        sets: &[&ValidatorSet],
+    ) -> Result<Option<LocalFastSyncTransport>> {
         let handler = self.network.config_handler();
         let now = rtos_block::UnixTime::now();
         let local_ids = handler
             .get_actual_validator_keys()?
             .into_iter()
             .filter(|entry| i64::from(entry.expire_at) > now as i64)
-            .filter_map(|entry| entry.validator_adnl_key_id)
-            .map(|id| {
+            .filter_map(|entry| entry.validator_adnl_key_id.map(|id| (id, entry.expire_at)))
+            .map(|(id, deadline)| {
                 let bytes = rtos_block::base64_decode(&id)?;
-                Ok(KeyId::from_data(bytes.as_slice().try_into()?))
+                Ok((KeyId::from_data(bytes.as_slice().try_into()?), deadline as u64))
             })
             .collect::<Result<Vec<_>>>()?;
         let context = self.network.context();
@@ -795,12 +925,20 @@ impl FullNodeOverlaysRouter {
             let (members, _) =
                 fast_sync_transport_authority(validators.list(), rtos_api::WireProfile::T0)?;
             if members.contains(primary.id()) {
-                return Ok(Some(primary.clone()));
+                return Ok(Some(LocalFastSyncTransport {
+                    key: primary.clone(),
+                    valid_until: None,
+                }));
             }
             for id in members {
-                if !local_ids.contains(&id) {
+                let Some(deadline) = local_ids
+                    .iter()
+                    .filter(|(registered, _)| registered == &id)
+                    .map(|(_, deadline)| *deadline)
+                    .max()
+                else {
                     continue;
-                }
+                };
                 let Some((key, election_id)) = handler.get_validator_key(&id).await else {
                     continue;
                 };
@@ -838,7 +976,7 @@ impl FullNodeOverlaysRouter {
                         SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port),
                     )?;
                 }
-                return Ok(Some(key));
+                return Ok(Some(LocalFastSyncTransport { key, valid_until: Some(deadline) }));
             }
         }
         Ok(None)
