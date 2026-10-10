@@ -62,7 +62,7 @@ async fn real_engine_monitoring_covers_zero_and_maximum_split() {
         assert!(engine.need_monitor(&ShardIdent::masterchain()).unwrap());
         assert!(!engine.need_monitor(&ShardIdent::with_prefix_len(0, 1, 0).unwrap()).unwrap());
     }
-    engine.wait_stop().await;
+    engine.wait_stop().await.unwrap();
 }
 
 async fn run_engine_recovery(network_repair: bool) {
@@ -186,7 +186,7 @@ async fn run_engine_recovery(network_repair: bool) {
         assert_eq!(engine.load_block_proof(&handle, true).await.unwrap().data(), proof_bytes);
         drop(ops);
         drop(handle);
-        engine.clone().wait_stop().await;
+        engine.clone().wait_stop().await.unwrap();
         return;
     }
     assert!(matches!(phase.as_deref(), Some("write" | "network")));
@@ -318,9 +318,9 @@ async fn run_engine_recovery(network_repair: bool) {
     drop(ops);
     drop(partial);
     drop(handle);
-    engine.clone().wait_stop().await;
+    engine.clone().wait_stop().await.unwrap();
     if let Some(provider) = provider {
-        provider.clone().wait_stop().await;
+        provider.clone().wait_stop().await.unwrap();
     }
 }
 
