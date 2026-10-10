@@ -13,6 +13,7 @@ use super::consensus::{
     BlockHash, BlockPayloadPtr, ConsensusNode, PublicKey, PublicKeyHash, SessionNode,
 };
 use crate::{engine_traits::EngineOperations, shard_state::ShardStateStuff};
+#[cfg(test)]
 use rtos_api::ton::engine::validator::validator::groupmember::GroupMember;
 use rtos_block::{
     error, fail, BlockIdExt, BlockSignatures, BlockSignaturesPure, BuilderData, ConfigParams,
@@ -313,6 +314,7 @@ pub fn calc_subset_for_workchain_standard(
 ///
 /// Note: For runtime communication (not session ID), C++ uses `hash(pubkey)`
 /// as ADNL fallback - but that's handled separately in `validatordescr_to_session_node`.
+#[cfg(test)]
 pub fn get_group_members_by_validator_descrs(
     iterator: &[ValidatorDescr],
     dst: &mut Vec<GroupMember>,

@@ -563,6 +563,11 @@ impl StateParser {
     fn parse_consensus_config(p29: &PathMap) -> Result<ConfigParamEnum> {
         Ok(ConfigParamEnum::ConfigParam29(ConsensusConfig {
             new_catchain_ids: p29.get_bool("new_catchain_ids")?,
+            use_quic: if p29.map.contains_key("use_quic") {
+                p29.get_bool("use_quic")?
+            } else {
+                false
+            },
             round_candidates: p29.get_num32("round_candidates")?,
             next_candidate_delay_ms: p29.get_num32("next_candidate_delay_ms")?,
             consensus_timeout_ms: p29.get_num32("consensus_timeout_ms")?,

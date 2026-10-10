@@ -34,3 +34,11 @@ The `validator-descr-*` and `validator-set-*` files in `block/tests/data` are
 unmodified public reference fixtures from its `test/pq-native` directory, covered
 by that repository's GPLv3 license. File digests and merge details are recorded
 in the memo import manifest linked above.
+
+`tl/rtos_api/src/session_identity.rs` adapts the canonical session derivation
+and member mapping from the same fixed reference commit's
+`crypto/block/validator-session-id.cpp` and `validator-session-members.cpp`.
+The source retains the 2026 contributor copyright and LGPL-2.0-or-later notice.
+The two session fixtures under `tl/rtos_api/tests/data` are copied unchanged
+from that commit's `test/pq-native` directory. Schema and import digests are
+recorded in the memo manifest.

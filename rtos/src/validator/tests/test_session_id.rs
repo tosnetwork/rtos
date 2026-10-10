@@ -236,6 +236,7 @@ fn test_cxx_interop_session_options_hash_ignores_accelerated_fields() {
 
 fn make_test_consensus_config() -> ConsensusConfig {
     ConsensusConfig {
+        use_quic: false,
         new_catchain_ids: true,
         round_candidates: 3,
         next_candidate_delay_ms: 2000,

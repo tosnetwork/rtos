@@ -11,10 +11,13 @@
  */
 #[cfg(test)]
 use super::consensus::EmulatorConsensusOptions;
+#[cfg(test)]
+use super::consensus::{serialize_tl_boxed_object, RawBuffer};
 use super::consensus::{
-    serialize_tl_boxed_object, CatchainSessionOptions, ConsensusNode, ConsensusOptions, PublicKey,
-    RawBuffer, SimplexSessionOptions,
+    CatchainSessionOptions, ConsensusNode, ConsensusOptions, PublicKey, SimplexSessionOptions,
 };
+#[cfg(test)]
+use super::validator_utils::get_group_members_by_validator_descrs;
 use crate::{
     config::ValidatorManagerConfig,
     engine::Engine,
@@ -24,8 +27,7 @@ use crate::{
         out_msg_queue::OutMsgQueueInfoStuff,
         validator_group::{SessionSnapshot, ValidatorGroup, ValidatorGroupStatus},
         validator_utils::{
-            compute_validator_list_id, get_group_members_by_validator_descrs,
-            get_masterchain_seqno, try_calc_subset_for_workchain,
+            compute_validator_list_id, get_masterchain_seqno, try_calc_subset_for_workchain,
             try_calc_subset_for_workchain_standard, validatordescr_to_consensus_node,
             validatorset_to_string, GeneralSessionInfo, PrevBlockHistory, ValidatorListHash,
             ValidatorSubsetInfo,
@@ -34,6 +36,7 @@ use crate::{
 };
 #[cfg(test)]
 use consensus_common::EmulatorDelaySpec;
+#[cfg(test)]
 use rtos_api::IntoBoxed;
 use rtos_block::{
     base64_encode, error, fail, AcceleratedConsensusConfig, BlockIdExt, CatchainConfig,
@@ -43,7 +46,6 @@ use rtos_block::{
 use std::{
     cmp::max,
     collections::{HashMap, HashSet},
-    convert::TryFrom,
     ops::RangeInclusive,
     sync::{atomic::Ordering, Arc},
     time::{Duration, SystemTime},
@@ -178,20 +180,13 @@ fn validation_state_phase_label(status: ValidatorGroupStatus) -> &'static str {
 /// does not include this tag because C++ does not yet support accelerated consensus in the
 /// validator manager (`bridge.cpp` has only a TODO). When accelerated consensus is
 /// disabled (the default for C++ interop), session IDs are byte-identical to C++.
+#[cfg(test)]
 const ACCELERATED_CONSENSUS_MAGIC_TAG: u32 = 0xACCE1E8A;
 
 #[derive(Clone)]
 pub struct SessionsOptions {
     pub mc_options: CatchainSessionOptions,
     pub shard_options: CatchainSessionOptions,
-    /// Session-options hash used inside `validator.groupNew` for masterchain sessions.
-    ///
-    /// Without `xp25`, both hashes intentionally collapse to one C++-compatible
-    /// `ValidatorSessionOptions` hash. With `xp25`, masterchain and shard hashes may
-    /// diverge if their runtime session options differ in hash-relevant fields.
-    pub mc_session_id_hash: UInt256,
-    /// Session-options hash used inside `validator.groupNew` for shard sessions.
-    pub shard_session_id_hash: UInt256,
 }
 
 impl SessionsOptions {
@@ -202,21 +197,11 @@ impl SessionsOptions {
             &self.shard_options
         }
     }
-
-    pub fn get_session_id_hash(&self, shard_id: &ShardIdent) -> &UInt256 {
-        if shard_id.is_masterchain() {
-            &self.mc_session_id_hash
-        } else {
-            &self.shard_session_id_hash
-        }
-    }
 }
 
-/// Serialize the `validator.groupNew` TL object for session-ID hashing.
-///
-/// Mirrors `get_validator_set_id()` in C++ (`manager.cpp`) for the
-/// `new_catchain_ids == true` branch. Old catchain ID formats are intentionally
-/// unsupported (see assertion).
+/// Historical upstream fixture encoder, compiled only for tests.
+/// Production group creation calls derive_governing_session_info.
+#[cfg(test)]
 fn get_session_id_serialize(
     session_info: Arc<GeneralSessionInfo>,
     vals: &[ValidatorDescr],
@@ -228,18 +213,21 @@ fn get_session_id_serialize(
     if !new_catchain_ids {
         fail!("Old catchain IDs format (new_catchain_ids=false) is not supported");
     }
-    {
-        Ok(serialize_tl_boxed_object!(&rtos_api::ton::validator::group::GroupNew {
-            workchain: session_info.shard.workchain_id(),
-            shard: session_info.shard.shard_prefix_with_tag() as i64,
-            vertical_seqno: session_info.max_vertical_seqno as i32,
-            last_key_block_seqno: session_info.key_seqno as i32,
-            catchain_seqno: session_info.catchain_seqno as i32,
-            config_hash: session_info.opts_hash.clone(),
-            members
-        }
-        .into_boxed()))
+    // Historical fixture-only encoding. Production uses session_identity below.
+    let mut bytes = 0x9843a14du32.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&session_info.shard.workchain_id().to_le_bytes());
+    bytes.extend_from_slice(&session_info.shard.shard_prefix_with_tag().to_le_bytes());
+    bytes.extend_from_slice(&session_info.max_vertical_seqno.to_le_bytes());
+    bytes.extend_from_slice(&session_info.key_seqno.to_le_bytes());
+    bytes.extend_from_slice(&session_info.catchain_seqno.to_le_bytes());
+    bytes.extend_from_slice(session_info.opts_hash.as_slice());
+    bytes.extend_from_slice(&(members.len() as u32).to_le_bytes());
+    for member in members {
+        bytes.extend_from_slice(member.public_key_hash.as_slice());
+        bytes.extend_from_slice(member.adnl.as_slice());
+        bytes.extend_from_slice(&member.weight.to_le_bytes());
     }
+    Ok(bytes)
 }
 
 /// Compute session ID by hashing the serialized `validator.groupNew` TL object.
@@ -247,6 +235,7 @@ fn get_session_id_serialize(
 /// When `accelerated_consensus_enabled` is true, appends [`ACCELERATED_CONSENSUS_MAGIC_TAG`]
 /// before hashing to differentiate accelerated sessions from standard ones. Without the
 /// tag, the resulting hash is byte-identical to C++ `get_validator_set_id()`.
+#[cfg(test)]
 fn get_session_id(
     session_info: Arc<GeneralSessionInfo>,
     val_set: &[ValidatorDescr],
@@ -260,6 +249,7 @@ fn get_session_id(
     Ok(UInt256::calc_file_hash(&serialized))
 }
 
+#[cfg(test)]
 fn compute_session_unsafe_serialized(session_id: &UInt256, rotate_id: u32) -> Vec<u8> {
     let mut unsafe_id_serialized: Vec<u8> = session_id.as_slice().to_vec();
     let mut rotate_id_serialized: Vec<u8> = rotate_id.to_le_bytes().to_vec();
@@ -280,6 +270,7 @@ fn should_skip_session_for_unsafe_rotation(
     do_unsafe_catchain_rotate && !shard.is_masterchain()
 }
 
+#[cfg(test)]
 fn unsafe_rotation_block_seqno(
     shard: &ShardIdent,
     last_masterchain_block: &BlockIdExt,
@@ -328,6 +319,7 @@ fn select_existing_session_for_current_map<T: Clone>(
 /// replaces session_id with unsafe rotation session id.
 /// The `do_unsafe_catchain_rotate` flag mirrors C++ `force_recover`:
 /// the per-shard rotation check only runs when the global gate is set.
+#[cfg(test)]
 fn get_session_unsafe_id(
     session_info: Arc<GeneralSessionInfo>,
     val_set: &[ValidatorDescr],
@@ -366,6 +358,7 @@ fn get_session_unsafe_id(
     Ok(session_id)
 }
 
+#[cfg(test)]
 fn validator_session_options_serialize(opts: &CatchainSessionOptions) -> RawBuffer {
     match opts.proto_version {
         0 => {
@@ -447,6 +440,7 @@ fn validator_session_options_serialize(opts: &CatchainSessionOptions) -> RawBuff
     }
 }
 
+#[cfg(test)]
 fn get_validator_session_options_hash(
     mut opts: CatchainSessionOptions,
     last_masterchain_block_seqno: u32,
@@ -460,6 +454,7 @@ fn get_validator_session_options_hash(
 }
 
 #[cfg_attr(feature = "xp25", allow(dead_code))]
+#[cfg(test)]
 fn get_cxx_interop_session_options_hash(
     opts: &CatchainSessionOptions,
     last_masterchain_block_seqno: u32,
@@ -484,6 +479,7 @@ fn get_cxx_interop_session_options_hash(
 /// Rust's runtime accelerated-consensus toggles. It is used only in non-`xp25` builds
 /// where Rust must preserve the C++ single-`opts_hash` behavior.
 #[cfg_attr(feature = "xp25", allow(dead_code))]
+#[cfg(test)]
 fn get_cxx_interop_session_options(
     opts: &ConsensusConfig,
     catchain_config: &CatchainConfig,
@@ -493,6 +489,7 @@ fn get_cxx_interop_session_options(
 }
 
 #[cfg(feature = "xp25")]
+#[cfg(test)]
 fn get_session_id_hashes(
     _consensus_config: &ConsensusConfig,
     _catchain_config: &CatchainConfig,
@@ -507,6 +504,7 @@ fn get_session_id_hashes(
 }
 
 #[cfg(not(feature = "xp25"))]
+#[cfg(test)]
 fn get_session_id_hashes(
     consensus_config: &ConsensusConfig,
     catchain_config: &CatchainConfig,
@@ -538,7 +536,7 @@ fn get_session_options(
         catchain_max_block_height_coeff: {
             let catchain_lifetime =
                 max(catchain_config.mc_catchain_lifetime, catchain_config.shard_catchain_lifetime);
-            (opts.catchain_max_blocks_coeff * catchain_lifetime) as u64
+            u64::from(opts.catchain_max_blocks_coeff) * u64::from(catchain_lifetime)
         },
         proto_version: opts.proto_version as u32,
         catchain_block_hash_covers_data: {
@@ -597,6 +595,39 @@ fn get_session_options(
     }
 
     result
+}
+
+fn derive_governing_session_info(
+    state: &ShardStateStuff,
+    shard: &ShardIdent,
+    validators: &[ValidatorDescr],
+    catchain_seqno: u32,
+    key_seqno: u32,
+    vertical_seqno: u32,
+) -> Result<(Arc<GeneralSessionInfo>, UInt256)> {
+    use rtos_api::session_identity::{derive_session_from_config, SessionCoordinates};
+    let identity = derive_session_from_config(
+        state.state()?.global_id(),
+        state.config_params()?,
+        SessionCoordinates {
+            shard,
+            catchain_seqno,
+            vertical_seqno,
+            last_key_block_seqno: key_seqno,
+            new_catchain_ids: false,
+        },
+        validators,
+    )?;
+    Ok((
+        Arc::new(GeneralSessionInfo {
+            shard: shard.clone(),
+            opts_hash: identity.config_hash,
+            catchain_seqno,
+            key_seqno,
+            max_vertical_seqno: vertical_seqno,
+        }),
+        identity.session_id,
+    ))
 }
 
 #[repr(u8)]
@@ -1301,8 +1332,6 @@ impl ValidatorManagerImpl {
             _ => fail!("no CatchainConfig in config_params"),
         };
         let accelerated_consensus_config = self.get_accelerated_consensus_config(mc_state_extra);
-        let last_key_block_seqno =
-            mc_state_extra.last_key_block.as_ref().map(|x| x.seq_no).unwrap_or(0);
 
         // Compute session options for masterchain (accelerated consensus controlled by constant)
         let mc_accelerated_consensus_enabled = MC_ACCELERATED_CONSENSUS_ENABLED
@@ -1323,16 +1352,11 @@ impl ValidatorManagerImpl {
             shard_accelerated_consensus_enabled,
             &accelerated_consensus_config,
         );
-        let (
-            (mc_session_id_hash, mc_session_id_options_serialized),
-            (shard_session_id_hash, shard_session_id_options_serialized),
-        ) = get_session_id_hashes(
-            &consensus_config,
-            catchain_config,
-            &mc_options,
-            &shard_options,
-            last_key_block_seqno,
-        );
+        let mc_session_id_options_serialized =
+            rtos_api::session_identity::session_options_bytes(&consensus_config, catchain_config)?;
+        let mc_session_id_hash = UInt256::calc_file_hash(&mc_session_id_options_serialized);
+        let shard_session_id_hash = mc_session_id_hash.clone();
+        let shard_session_id_options_serialized = mc_session_id_options_serialized.clone();
 
         log::trace!(
             target: "validator_manager",
@@ -1355,7 +1379,7 @@ impl ValidatorManagerImpl {
             "Shard SessionOptions from config.29: {shard_options:?}"
         );
 
-        Ok(SessionsOptions { mc_options, shard_options, mc_session_id_hash, shard_session_id_hash })
+        Ok(SessionsOptions { mc_options, shard_options })
     }
 
     fn get_accelerated_consensus_config(
@@ -1435,6 +1459,11 @@ impl ValidatorManagerImpl {
             {
                 return Ok((options, None));
             }
+
+            if cur_subset.list().iter().any(|member| member.pq_key().is_none()) {
+                fail!("target Simplex requires PQ consensus keys for every member");
+            }
+            rtos_block::validate_validator_list(cur_subset.list())?;
 
             // when enable_observers=true for this shard, compute the
             // block-sync overlay membership + authorization from the masterchain
@@ -1713,26 +1742,19 @@ impl ValidatorManagerImpl {
                 ValidatorSet::with_cc_seqno(0, 0, 0, cc_seqno, subset.validators.clone())?;
             let max_vertical_seqno = self.engine.hardforks().len() as u32;
 
-            let general_session_info = Arc::new(GeneralSessionInfo {
-                shard: ident.clone(),
-                opts_hash: sessions_options.get_session_id_hash(&ident).clone(),
-                catchain_seqno: cc_seqno,
-                key_seqno: keyblock_seqno,
-                max_vertical_seqno: max_vertical_seqno,
-            });
-
-            let rotation_block_seqno_opt =
-                unsafe_rotation_block_seqno(&ident, last_masterchain_block);
-            let accelerated_consensus_enabled =
-                self.is_accelerated_consensus_enabled_for_shard(mc_state_extra, &ident);
-            let session_id = get_session_unsafe_id(
-                general_session_info.clone(),
+            if do_unsafe_catchain_rotate {
+                fail!("unsafe rotation cannot alter the canonical consensus session ID");
+            }
+            if self.is_accelerated_consensus_enabled_for_shard(mc_state_extra, &ident) {
+                fail!("accelerated consensus has not been admitted for the target protocol");
+            }
+            let (general_session_info, session_id) = derive_governing_session_info(
+                mc_state,
+                &ident,
                 vsubset.list(),
-                true,
-                do_unsafe_catchain_rotate,
-                rotation_block_seqno_opt,
-                &self.config,
-                accelerated_consensus_enabled,
+                cc_seqno,
+                keyblock_seqno,
+                max_vertical_seqno,
             )?;
 
             let local_id_option = self.find_us(&subset.validators);
@@ -2257,21 +2279,26 @@ impl ValidatorManagerImpl {
             if let Some(local_id) = self.find_us_for_list(&wc.validators, next_val_list_id) {
                 owned_future_shards += 1;
                 let max_vertical_seqno = self.engine.hardforks().len() as u32;
-                let new_session_info = Arc::new(GeneralSessionInfo {
-                    shard: ident.clone(),
-                    opts_hash: sessions_options.get_session_id_hash(&ident).clone(),
-                    catchain_seqno: *next_cc_seqno,
-                    key_seqno: keyblock_seqno,
-                    max_vertical_seqno: max_vertical_seqno,
-                });
-
-                let accelerated_consensus_enabled =
-                    self.is_accelerated_consensus_enabled_for_shard(mc_state_extra, &ident);
-                let session_id = get_session_id(
-                    new_session_info.clone(),
+                if self.is_accelerated_consensus_enabled_for_shard(mc_state_extra, &ident) {
+                    fail!("accelerated consensus has not been admitted for the target protocol");
+                }
+                if self
+                    .config
+                    .check_unsafe_catchain_rotation(
+                        Some(last_masterchain_block.seq_no),
+                        *next_cc_seqno,
+                    )
+                    .is_some()
+                {
+                    fail!("unsafe rotation cannot alter the canonical consensus session ID");
+                }
+                let (new_session_info, session_id) = derive_governing_session_info(
+                    &mc_state,
+                    &ident,
                     &wc.validators,
-                    true,
-                    accelerated_consensus_enabled,
+                    *next_cc_seqno,
+                    keyblock_seqno,
+                    max_vertical_seqno,
                 )?;
 
                 // C++ parity: skip sessions in the destroyed set

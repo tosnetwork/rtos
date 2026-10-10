@@ -1327,6 +1327,9 @@ pub fn serialize_known_config_param(
         }
         ConfigParamEnum::ConfigParam29(c) => {
             serialize_field(&mut map, "new_catchain_ids", c.new_catchain_ids);
+            if c.use_quic {
+                serialize_field(&mut map, "use_quic", true);
+            }
             serialize_field(&mut map, "round_candidates", c.round_candidates);
             serialize_field(&mut map, "next_candidate_delay_ms", c.next_candidate_delay_ms);
             serialize_field(&mut map, "consensus_timeout_ms", c.consensus_timeout_ms);

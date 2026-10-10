@@ -237,6 +237,7 @@ fn make_config_params(
         shard_validators_num: validator_set.list().len() as u32,
     };
     let consensus_config = ConsensusConfig {
+        use_quic: false,
         new_catchain_ids: true,
         round_candidates: 1,
         next_candidate_delay_ms: 100,
@@ -1398,5 +1399,52 @@ async fn test_manager_rejects_unadmitted_simplex_configurations() -> Result<()> 
         .is_err());
     assert!(manager.current_sessions.is_empty());
     assert!(manager.future_sessions.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_manager_session_identity_binds_governing_state() -> Result<()> {
+    let bootstrap = EmulatorNetworkBootstrap::build(4)?;
+    let engine = Arc::new(BootstrapTestEngine::new(&bootstrap).await?);
+    let original = engine.build_masterchain_state(&bootstrap, 0)?;
+    let shard = ShardIdent::masterchain();
+    let derive = |state: &ShardStateStuff| {
+        derive_governing_session_info(state, &shard, bootstrap.validator_set.list(), 17, 91, 7)
+    };
+    let (base_info, base_id) = derive(&original)?;
+    for mutation in 0..3 {
+        let mut state = original.state()?.clone();
+        if mutation == 0 {
+            state.set_global_id(state.global_id().wrapping_add(1));
+        } else {
+            let mut extra = state.read_custom()?.unwrap();
+            if mutation == 1 {
+                let mut config = extra.config.get_mc_simplex_config()?.unwrap();
+                config.slots_per_leader_window += 1;
+                extra.config.set_config(ConfigParamEnum::ConfigParam30(NewConsensusConfigAll {
+                    mc: Some(config),
+                    shard: extra.config.get_shard_simplex_config()?,
+                }))?;
+            } else {
+                let mut config = match extra.config.config(29)?.unwrap() {
+                    ConfigParamEnum::ConfigParam29(c) => c,
+                    _ => unreachable!(),
+                };
+                config.next_candidate_delay_ms += 1;
+                extra.config.set_config(ConfigParamEnum::ConfigParam29(config))?;
+            }
+            state.write_custom(Some(&extra))?;
+        }
+        let changed = ShardStateStuff::from_state(
+            original.block_id().clone(),
+            state,
+            #[cfg(feature = "telemetry")]
+            &engine.telemetry,
+            &engine.allocated,
+        )?;
+        let (info, id) = derive(&changed)?;
+        assert_ne!(base_info.opts_hash, info.opts_hash, "mutation {mutation}");
+        assert_ne!(base_id, id, "mutation {mutation}");
+    }
     Ok(())
 }

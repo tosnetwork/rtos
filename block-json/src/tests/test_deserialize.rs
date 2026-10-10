@@ -330,6 +330,7 @@ fn get_config_param15() -> ConfigParam15 {
 
 fn get_config_param29() -> ConsensusConfig {
     ConsensusConfig {
+        use_quic: false,
         new_catchain_ids: true,
         round_candidates: 10_u32 | 1,
         next_candidate_delay_ms: 20,
@@ -887,4 +888,17 @@ fn test_pq_validator_config_json_admission() {
     let mut bad = json.clone();
     bad["p34"]["list"][0]["key_id"] = serde_json::json!("00".repeat(32));
     assert!(parse(&bad).is_err());
+}
+
+#[test]
+fn test_consensus_quic_json_round_trip() {
+    let mut cp = prepare_config_params();
+    let mut p29 = get_config_param29();
+    p29.use_quic = true;
+    cp.set_config(ConfigParamEnum::ConfigParam29(p29)).unwrap();
+    let mut json: Value = serde_json::from_str(&serialize_config_param(&cp, 29).unwrap()).unwrap();
+    let parsed = parse_config_with_mandatory_params(json.as_object().unwrap(), &[29]).unwrap();
+    assert_eq!(cp.config(29).unwrap(), parsed.config(29).unwrap());
+    json["p29"]["use_quic"] = serde_json::json!("true");
+    assert!(parse_config_with_mandatory_params(json.as_object().unwrap(), &[29]).is_err());
 }

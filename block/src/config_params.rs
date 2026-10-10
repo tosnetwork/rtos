@@ -1885,9 +1885,10 @@ consensus_config_new#d8
     proto_version: uint16
 = ConsensusConfig;
 
-consensus_config_new#d9
-    flags: (## 7)
+consensus_config_v4#d9
+    flags: (## 6)
     { flags = 0 }
+    use_quic: Bool
     new_catchain_ids: Bool
     round_candidates: (## 8) { round_candidates >= 1 }
     next_candidate_delay_ms: uint32
@@ -1905,6 +1906,7 @@ consensus_config_new#d9
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct ConsensusConfig {
     pub new_catchain_ids: bool,
+    pub use_quic: bool,
     pub round_candidates: u32,
     pub next_candidate_delay_ms: u32,
     pub consensus_timeout_ms: u32,
@@ -1938,12 +1940,14 @@ impl Deserializable for ConsensusConfig {
         {
             fail!(Self::invalid_tag(tag as u32))
         }
+        *self = Self::default();
         if tag == CONSENSUS_CONFIG_TAG_1 {
             self.round_candidates.read_from(cell)?;
         } else {
             let flags = u8::construct_from(cell)?;
-            self.new_catchain_ids = flags == 1;
-            if flags >> 1 != 0 {
+            self.new_catchain_ids = flags & 1 != 0;
+            self.use_quic = tag == CONSENSUS_CONFIG_TAG_4 && flags & 2 != 0;
+            if flags >> (if tag == CONSENSUS_CONFIG_TAG_4 { 2 } else { 1 }) != 0 {
                 fail!(BlockError::InvalidArg("`flags` should be zero".to_string()))
             }
             self.round_candidates = u8::construct_from(cell)? as u32;
@@ -1967,17 +1971,20 @@ impl Deserializable for ConsensusConfig {
             self.catchain_max_blocks_coeff.read_from(cell)?;
         }
 
+        if self.round_candidates == 0 {
+            fail!("round_candidates must be positive");
+        }
         Ok(())
     }
 }
 
 impl Serializable for ConsensusConfig {
     fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
-        if self.round_candidates == 0 {
+        if self.round_candidates == 0 || self.round_candidates > u8::MAX as u32 {
             fail!(BlockError::InvalidArg("`round_candidates` should be positive".to_string()))
         }
         cell.append_u8(CONSENSUS_CONFIG_TAG_4)?;
-        cell.append_u8(self.new_catchain_ids as u8)?;
+        cell.append_u8((self.new_catchain_ids as u8) | ((self.use_quic as u8) << 1))?;
         (self.round_candidates as u8).write_to(cell)?;
         self.next_candidate_delay_ms.write_to(cell)?;
         self.consensus_timeout_ms.write_to(cell)?;

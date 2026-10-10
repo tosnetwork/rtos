@@ -32,6 +32,7 @@ macro_rules! _invalid_id {
 }
 
 pub mod secure;
+pub mod session_identity;
 #[rustfmt::skip]
 #[allow(non_camel_case_types)]
 pub mod ton;

@@ -832,6 +832,7 @@ fn get_config_param15() -> ConfigParam15 {
 
 fn get_config_param29() -> ConsensusConfig {
     ConsensusConfig {
+        use_quic: false,
         new_catchain_ids: true,
         round_candidates: rand::random::<u8>() as u32 | 1,
         next_candidate_delay_ms: rand::random::<u32>(),
@@ -1334,4 +1335,67 @@ fn test_simplex_selected_rejects_trailing_cells_and_malformed_wrapper() {
         legacy.append_u32(value).unwrap();
     }
     assert!(SimplexConfig::construct_from_cell(legacy.into_cell().unwrap()).is_err());
+}
+
+#[test]
+fn test_consensus_v4_transport_flags_and_reused_legacy_reader() {
+    let base = get_config_param29();
+    for quic in [false, true] {
+        for new_ids in [false, true] {
+            let config =
+                ConsensusConfig { use_quic: quic, new_catchain_ids: new_ids, ..base.clone() };
+            let cell = config.serialize().unwrap();
+            let mut slice = SliceData::load_cell_ref(&cell).unwrap();
+            assert_eq!(slice.get_next_byte().unwrap(), 0xd9);
+            assert_eq!(slice.get_next_byte().unwrap(), (u8::from(quic) << 1) | u8::from(new_ids));
+            assert_eq!(ConsensusConfig::construct_from_cell(cell).unwrap(), config);
+        }
+    }
+    let mut legacy = BuilderData::new();
+    legacy.append_u8(0xd6).unwrap();
+    for n in [3, 2000, 16000, 4, 16, 4, 1 << 20, 1 << 20] {
+        legacy.append_u32(n).unwrap();
+    }
+    let mut reused = ConsensusConfig {
+        use_quic: true,
+        new_catchain_ids: true,
+        proto_version: 4,
+        catchain_max_blocks_coeff: 123,
+        ..base
+    };
+    reused.read_from(&mut SliceData::load_builder(legacy).unwrap()).unwrap();
+    assert!(!reused.use_quic && !reused.new_catchain_ids);
+    assert_eq!(reused.proto_version, 0);
+    assert_eq!(reused.catchain_max_blocks_coeff, 0);
+    assert!(ConsensusConfig { round_candidates: 256, ..reused }.serialize().is_err());
+    for tag in [0xd7, 0xd8, 0xd9] {
+        for invalid in [false, true] {
+            let mut b = BuilderData::new();
+            b.append_u8(tag).unwrap();
+            b.append_u8(if invalid {
+                if tag == 0xd9 {
+                    4
+                } else {
+                    2
+                }
+            } else {
+                0
+            })
+            .unwrap();
+            b.append_u8(3).unwrap();
+            for n in [2000, 16000, 4, 16, 4, 1 << 20, 1 << 20] {
+                b.append_u32(n).unwrap();
+            }
+            if tag >= 0xd8 {
+                b.append_u16(2).unwrap();
+            }
+            if tag >= 0xd9 {
+                b.append_u32(123).unwrap();
+            }
+            assert_eq!(
+                ConsensusConfig::construct_from_cell(b.into_cell().unwrap()).is_err(),
+                invalid
+            );
+        }
+    }
 }
