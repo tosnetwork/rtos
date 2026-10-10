@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): naming and Cargo-owned generated sources.
  * Copyright (C) 2019-2022 TON Labs. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -26,14 +26,10 @@ fn get_value(cmd: &str, args: &[&str]) -> String {
     "Unknown".to_string()
 }
 
-const OUTPUT_DIR: &str = "src/ton";
 const TL_DIR: &str = "tl";
 const TL_FILES: [&str; 3] = ["lite_api.tl", "ton_api.tl", "tonlib_api.tl"];
 
 fn main() {
-    // TODO: This line was commented because of different behavior of cargo in rust ver 1.50.
-    //       We can revert it, when this behavior is fixed.
-    // println!("cargo:rerun-if-changed={}", OUTPUT_DIR);
     println!("cargo:rerun-if-changed={}", TL_DIR);
     println!("cargo:rerun-if-changed=../rtos_tl_codegen");
 
@@ -73,7 +69,22 @@ fn main() {
         None
     };
 
-    rtos_tl_codegen::generate_code_for(config, &input, Path::new(OUTPUT_DIR));
+    // Generated files belong to the cached build output, not to a checkout.
+    // Otherwise a shared target can reuse this build script's fingerprint in
+    // another worktree whose ignored src/ton directory has never been generated.
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"));
+    let generated = out_dir.join("ton");
+    rtos_tl_codegen::generate_code_for(config, &input, &generated);
+    // A path module preserves the generated root's inner attributes and its
+    // relative child modules; including that root directly would not.
+    fs::write(
+        out_dir.join("ton_module.rs"),
+        format!(
+            "#[rustfmt::skip]\n#[allow(non_camel_case_types)]\n#[path = {:?}]\npub mod ton;\n",
+            generated.join("mod.rs")
+        ),
+    )
+    .expect("write generated TL module declaration");
 
     let git_branch = get_value("git", &["rev-parse", "--abbrev-ref", "HEAD"]);
     let git_commit = get_value("git", &["rev-parse", "HEAD"]);
