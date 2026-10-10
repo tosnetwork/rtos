@@ -415,3 +415,6 @@ fn check_block_candidate_data(broadcast: &NewBlockCandidateBroadcast) -> Result<
     }
     Ok(())
 }
+
+#[cfg(test)]
+pub(crate) mod test_broadcast_faults;

@@ -54,6 +54,8 @@ pub struct NetworkContext {
 }
 
 pub struct NodeNetwork {
+    #[cfg(test)]
+    pub(crate) test_broadcast_faults: Arc<super::test_broadcast_faults::BroadcastFaults>,
     network_context: Arc<NetworkContext>,
     validator_context: ValidatorContext,
     runtime_handle: tokio::runtime::Handle,
@@ -173,9 +175,20 @@ impl NodeNetwork {
 
         // Initialize QUIC transport (lazy: no endpoint bound until add_key() is called).
         // Validator ADNL keys are registered when a validator set is activated.
+        #[cfg(test)]
+        let test_broadcast_faults =
+            Arc::new(super::test_broadcast_faults::BroadcastFaults::default());
         let quic = {
+            #[cfg(test)]
+            let subscriber: Arc<dyn adnl::common::Subscriber> =
+                Arc::new(super::test_broadcast_faults::ObservedOverlay {
+                    overlay: overlay.clone(),
+                    faults: test_broadcast_faults.clone(),
+                });
+            #[cfg(not(test))]
+            let subscriber: Arc<dyn adnl::common::Subscriber> = overlay.clone();
             let quic = adnl::QuicNode::new(
-                vec![overlay.clone()],
+                vec![subscriber],
                 cancellation_token.clone(),
                 tokio::runtime::Handle::current(),
                 None,
@@ -261,6 +274,8 @@ impl NodeNetwork {
         let network_context = Arc::new(network_context);
 
         let node_network = NodeNetwork {
+            #[cfg(test)]
+            test_broadcast_faults,
             network_context: network_context.clone(),
             validator_context,
             runtime_handle: tokio::runtime::Handle::current(),
