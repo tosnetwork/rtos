@@ -45,7 +45,7 @@ fn record(
     Ok(Some(rtos_api::deserialize_boxed(bytes)?))
 }
 
-fn check_one(
+pub(super) fn check_one(
     reply: &rtos_api::ton::lite_server::TransactionInfo,
     id: &BlockIdExt,
     account: &UInt256,
