@@ -845,7 +845,17 @@ fn validate_candidate_tl(bytes: &[u8]) -> Result<()> {
             };
             match u32::from_le_bytes(parent.try_into()?) {
                 0x22cb_cca9 => 120,
-                0x1a4b_9af1 => 156,
+                0x1a4b_9af1 => {
+                    // CandidateParent contains a boxed CandidateId (constructor,
+                    // slot, hash); omitting its constructor would accept bare data.
+                    if bytes.get(120..124) != Some(&[0x3f, 0xcd, 0x91, 0xb6][..]) {
+                        return pq_reject(
+                            PqBlockSignatureReasonCode::CandidateTl,
+                            "invalid parent candidate ID",
+                        );
+                    }
+                    160
+                }
                 _ => return pq_reject(PqBlockSignatureReasonCode::CandidateTl, "invalid TL"),
             }
         }

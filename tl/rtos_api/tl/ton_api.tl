@@ -1087,8 +1087,8 @@ consensus.candidateParent id:consensus.CandidateId = consensus.CandidateParent;
 consensus.candidateWithoutParents = consensus.CandidateParent;
 
 // Candidate hash data (for signature computation)
-consensus.candidateHashDataOrdinary block:tonNode.blockIdExt collated_file_hash:int256 parent:consensus.CandidateParent = consensus.CandidateHashData;
-consensus.candidateHashDataEmpty block:tonNode.blockIdExt parent:consensus.candidateId = consensus.CandidateHashData;
+consensus.candidateHashDataOrdinary#3f6431f8 block:tonNode.blockIdExt collated_file_hash:int256 parent:consensus.CandidateParent = consensus.CandidateHashData;
+consensus.candidateHashDataEmpty#8354642d block:tonNode.blockIdExt parent:consensus.candidateId = consensus.CandidateHashData;
 
 // Block candidate data (on wire)
 consensus.block slot:int parent:consensus.CandidateParent candidate:bytes signature:bytes = consensus.CandidateData;

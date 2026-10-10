@@ -4522,6 +4522,7 @@ dependencies = [
  "lazy_static",
  "ordered-float 2.10.1",
  "rtos_block",
+ "rtos_pq_crypto",
  "rtos_tl_codegen",
  "secstr",
  "serde",

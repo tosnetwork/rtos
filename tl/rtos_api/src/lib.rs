@@ -31,6 +31,7 @@ macro_rules! _invalid_id {
     };
 }
 
+pub mod pq_finality;
 pub mod secure;
 pub mod session_identity;
 #[rustfmt::skip]

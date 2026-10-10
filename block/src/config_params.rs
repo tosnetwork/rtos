@@ -335,7 +335,6 @@ impl ConfigParams {
         Ok(self.config_present(33)? || self.config_present(32)?)
     }
     pub fn validator_set(&self) -> Result<ValidatorSet> {
-        #[cfg(feature = "mirrornet")]
         if let Some(ConfigParamEnum::ConfigParam35(param)) = self.config(35)? {
             return Ok(param.cur_temp_validators);
         }

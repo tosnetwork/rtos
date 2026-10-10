@@ -71,3 +71,10 @@ verification profile as malformed. The complete NIST notice and Wycheproof
 Apache-2.0 license are retained beside the fixtures. Public context-binding
 fixtures use explicitly public deterministic test seeds. Import digests,
 corpus selection and shared-backend limitations are recorded in memo.
+
+`tl/rtos_api/src/pq_finality.rs` adapts final-vote preimage and governing
+context rules from the fixed reference's `crypto/block/signature-set.cpp`
+and `validator/pq-finality-verification.h` under LGPL-2.0-or-later. The
+contributor notice is retained. Its public deterministic test fixtures use
+seeds 0xa0/0xa1 repeated 32 times with the same native test-signing backend;
+they are not independent cryptographic or chain-authentication references.

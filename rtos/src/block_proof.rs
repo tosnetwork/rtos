@@ -139,6 +139,8 @@ impl BlockProofStuff {
         self.proof.signatures.ok_or_else(|| error!("Proof doesn't contain signatures"))
     }
 
+    /// The caller must authenticate the previous key block against its network
+    /// anchor/history before using it as governing authority here.
     pub fn check_with_prev_key_block_proof(
         &self,
         prev_key_block_proof: &BlockProofStuff,
@@ -158,6 +160,8 @@ impl BlockProofStuff {
         Ok(())
     }
 
+    /// The caller must supply a master state authenticated against its selected
+    /// network/history. A decoded state alone is not a trust anchor.
     pub fn check_with_master_state(&self, master_state: &ShardStateStuff) -> Result<()> {
         let now = std::time::Instant::now();
         log::trace!("Checking proof for block: {}", self.id());
@@ -283,7 +287,7 @@ impl BlockProofStuff {
     //        Ok((cur_validator_set, cc_config))
     //    }
 
-    pub fn check_with_prev_key_block_proof_(
+    fn check_with_prev_key_block_proof_(
         &self,
         prev_key_block_proof: &BlockProofStuff,
         virt_block: &Block,
@@ -334,6 +338,22 @@ impl BlockProofStuff {
             self.pre_check_key_block_proof(virt_block)?;
         }
 
+        if let Some(BlockSignaturesVariant::SimplexPq(carrier)) = &self.proof.signatures {
+            if virt_block.global_id() != virt_prev_key_block.global_id() {
+                fail!("PQ target global_id differs from governing key block");
+            }
+            let config = prev_key_block_proof.read_config_params(&virt_prev_key_block)?;
+            let context = rtos_api::pq_finality::PqVerificationContext::from_governing_config(
+                virt_prev_key_block.global_id(),
+                &config,
+                self.id.clone(),
+                virt_block_info.vert_seq_no(),
+                virt_block_info.prev_key_block_seqno(),
+                carrier.validator_info.catchain_seqno,
+            )?;
+            context.verify_final(carrier)?;
+            return Ok(());
+        }
         self.check_signatures(&subset)
     }
 
@@ -347,6 +367,31 @@ impl BlockProofStuff {
             self.pre_check_key_block_proof(virt_block)?;
         }
         let subset = self.process_given_state(master_state, virt_block_info)?;
+        if let Some(BlockSignaturesVariant::SimplexPq(carrier)) = &self.proof.signatures {
+            let extra = master_state.shard_state_extra()?;
+            let governing_key_seqno = if extra.after_key_block {
+                master_state.block_id().seq_no
+            } else {
+                extra.last_key_block.as_ref().map(|key| key.seq_no).unwrap_or(0)
+            };
+            if governing_key_seqno != virt_block_info.prev_key_block_seqno() {
+                fail!("PQ governing state belongs to a different key-block epoch");
+            }
+            let global_id = master_state.state()?.global_id();
+            if virt_block.global_id() != global_id {
+                fail!("PQ target global_id differs from governing state");
+            }
+            let context = rtos_api::pq_finality::PqVerificationContext::from_governing_config(
+                global_id,
+                master_state.config_params()?,
+                self.id.clone(),
+                virt_block_info.vert_seq_no(),
+                virt_block_info.prev_key_block_seqno(),
+                carrier.validator_info.catchain_seqno,
+            )?;
+            context.verify_final(carrier)?;
+            return Ok(());
+        }
         self.check_signatures(&subset)
     }
 
@@ -641,7 +686,7 @@ impl BlockProofStuff {
                 block_info.prev_key_block_seqno()
             )));
         }
-        if state.block_id().seq_no > self.id().seq_no {
+        if state.block_id().seq_no >= self.id().seq_no {
             fail!(NodeError::InvalidData(format!(
                 "Can't check proof for block {} using newer master state {}",
                 self.id(),

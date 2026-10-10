@@ -10,6 +10,9 @@
  */
 use crate::{block::BlockStuff, block_proof::BlockProofStuff};
 
+#[path = "../../../tl/rtos_api/tests/common/pq_finality.rs"]
+mod pq_fixture;
+
 #[test]
 fn test_check_master_blocks_proof() {
     let name = "src/tests/static/test_master_block_proof/key_block__3082181";
@@ -146,4 +149,132 @@ fn test_pq_proof_requires_authenticated_finality_context() {
     assert!(error.to_string().contains("no CryptoSignature view"), "{error}");
     let error = crate::validating_utils::build_checked_data(&signatures, proof.id()).unwrap_err();
     assert!(error.to_string().contains("trusted governing session context"), "{error}");
+}
+
+#[test]
+fn test_pq_proof_verifies_with_governing_state_and_key_block() {
+    use rtos_block::*;
+    let config = pq_fixture::config();
+    let mut state = ShardStateUnsplit::default();
+    state.set_global_id(-239);
+    state.set_shard(ShardIdent::masterchain());
+    state.set_seq_no(10);
+    let mut state_extra = McStateExtra::default();
+    state_extra.config = config.clone();
+    state_extra.after_key_block = true;
+    state.write_custom(Some(&state_extra)).unwrap();
+    let state_id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        10,
+        UInt256::default(),
+        UInt256::default(),
+    );
+    let master = crate::shard_state::ShardStateStuff::from_state(
+        state_id,
+        state,
+        #[cfg(feature = "telemetry")]
+        &crate::collator_test_bundle::create_engine_telemetry(),
+        &crate::collator_test_bundle::create_engine_allocated(),
+    )
+    .unwrap();
+
+    // The test explicitly supplies this synthetic governing key block as its
+    // trusted input. This does not exercise authentication from a network anchor.
+    let mut info = BlockInfo::default();
+    info.set_seq_no(10).unwrap();
+    info.set_shard(ShardIdent::masterchain());
+    info.set_key_block(true);
+    info.set_gen_utime(900);
+    let mut extra = BlockExtra::default();
+    let mut custom = McBlockExtra::default();
+    custom.set_config(config);
+    extra.write_custom(&custom).unwrap();
+    let key = Block::with_params(-239, info, ValueFlow::default(), MerkleUpdate::default(), extra)
+        .unwrap();
+    let key_root = key.serialize().unwrap();
+    let key_id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        10,
+        key_root.repr_hash().clone(),
+        UInt256::calc_file_hash(&write_boc(&key_root).unwrap()),
+    );
+    let key_proof = BlockProofStuff::new(
+        BlockProof::with_params(
+            key_id,
+            MerkleProof::create(&key_root, |_| true).unwrap().serialize().unwrap(),
+            None,
+        ),
+        false,
+    )
+    .unwrap();
+    let root = pq_fixture::target_block().serialize().unwrap();
+    let merkle = MerkleProof::create(&root, |_| true).unwrap().serialize().unwrap();
+    for mutation in 0..4 {
+        let mut carrier = pq_fixture::signed(&[1], "finalize", "TOS-CONSENSUS-SIMPLEX-v1");
+        match mutation {
+            1 => carrier.signatures[0].signature[0] ^= 1,
+            2 => carrier.session_id = UInt256::default(),
+            3 => carrier = pq_fixture::signed(&[1], "notarize", "TOS-CONSENSUS-SIMPLEX-v1"),
+            _ => {}
+        }
+        let proof = BlockProofStuff::new(
+            BlockProof::with_params(
+                pq_fixture::block_id(),
+                merkle.clone(),
+                Some(BlockSignaturesVariant::SimplexPq(carrier)),
+            ),
+            false,
+        )
+        .unwrap();
+        let state_result = proof.check_with_master_state(&master);
+        let key_result = proof.check_with_prev_key_block_proof(&key_proof);
+        assert_eq!(
+            state_result.is_ok(),
+            mutation == 0,
+            "state mutation {mutation}: {state_result:?}"
+        );
+        assert_eq!(key_result.is_ok(), mutation == 0, "key mutation {mutation}: {key_result:?}");
+    }
+}
+
+#[test]
+fn test_pq_proof_refuses_later_governing_epoch_even_with_same_keys() {
+    use rtos_block::*;
+    let mut state = ShardStateUnsplit::default();
+    state.set_global_id(-239);
+    state.set_shard(ShardIdent::masterchain());
+    state.set_seq_no(11);
+    let mut extra = McStateExtra::default();
+    extra.config = pq_fixture::config();
+    extra.after_key_block = true;
+    state.write_custom(Some(&extra)).unwrap();
+    let master = crate::shard_state::ShardStateStuff::from_state(
+        BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            11,
+            UInt256::default(),
+            UInt256::default(),
+        ),
+        state,
+        #[cfg(feature = "telemetry")]
+        &crate::collator_test_bundle::create_engine_telemetry(),
+        &crate::collator_test_bundle::create_engine_allocated(),
+    )
+    .unwrap();
+    let root = pq_fixture::target_block().serialize().unwrap();
+    let carrier = pq_fixture::signed(&[1], "finalize", "TOS-CONSENSUS-SIMPLEX-v1");
+    let proof = BlockProofStuff::new(
+        BlockProof::with_params(
+            pq_fixture::block_id(),
+            MerkleProof::create(&root, |_| true).unwrap().serialize().unwrap(),
+            Some(BlockSignaturesVariant::SimplexPq(carrier)),
+        ),
+        false,
+    )
+    .unwrap();
+    assert!(proof
+        .check_with_master_state(&master)
+        .unwrap_err()
+        .to_string()
+        .contains("different key-block epoch"));
 }
