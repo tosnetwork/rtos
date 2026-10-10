@@ -1,0 +1,33 @@
+RTOS PQ verification interface
+Copyright 2026 TOS Blockchain Teams. LGPL-2.0-or-later (see LICENSE).
+
+The interface and verification configuration adapt crypto/pq/mldsa44.cpp and
+mldsa44-config.h from tosnetwork/tos at
+8f083dc06bff16705710a01de15eb3123d5d696b. On 2026-10-10, RTOS implemented the
+Rust FFI boundary and changed the configuration's native symbol namespace.
+
+native/mldsa-native contains an unmodified copy of that revision's vendored
+mldsa compilation subtree and license files. Its declared upstream version is
+mldsa-native v2.0.0, commit 834a90d5e846ffa1e1611bd24e160bb2e9b86d35.
+Copyright (c) The mldsa-native project authors.
+Apache-2.0 OR ISC OR MIT; see native/mldsa-native/LICENSE and RELICENSE.md.
+
+The public OpenSSL fixtures are copied from the reference's
+ test/pq-mldsa44/fixtures.json; its GPLv3 text is tests/data/TOS-LICENSE.txt.
+
+RTOS acknowledges the National Institute of Standards and Technology as the
+source of the ACVP vectors (ACVP-Server commit
+975de31eb83d87039ec88934fdc47d8c312b892d). On 2026-10-10, RTOS extracted the
+pure ML-DSA-44 external-interface cases into TSV and classified inputs outside
+the bounded verification profile as malformed. The entire original NIST
+notice is retained in tests/data/ACVP-LICENSE.txt.
+
+Wycheproof vectors are from C2SP/wycheproof commit
+3fa63dd0344abb611f1fb1d77e119938603ea230, under Apache-2.0; see
+ tests/data/WYCHEPROOF-LICENSE.txt. Vector values and verdicts are preserved
+except for explicit malformed-input classification at the Rust API's bounds.
+
+The context-binding fixture uses a public deterministic test seed. It was
+created with the same native backend and is not an independent crypto reference.
+Detailed import hashes, corpus generation and test evidence are maintained at
+https://github.com/tosnetwork/memo/tree/main/rtos.

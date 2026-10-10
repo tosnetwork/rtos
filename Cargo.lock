@@ -4629,6 +4629,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtos_pq_crypto"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "hex",
+ "serde_json",
+]
+
+[[package]]
 name = "rtos_tl_codegen"
 version = "0.1.0"
 dependencies = [

@@ -51,3 +51,23 @@ its 2026 contributor copyright and LGPL-2.0-or-later notice. Its additional
 under the same license and checks the fixed measurement digest. The fixture
 `block/tests/data/pq-block-signature-vectors.txt` is copied unchanged from
 `test/pq-native`. Parsing these carriers is distinct from authenticating finality.
+
+`pq-crypto` provides a Rust verification interface under LGPL-2.0-or-later,
+with its license text included in that crate. The portable C compilation tree
+in `pq-crypto/native/mldsa-native` is copied unchanged from the fixed reference
+commit above, which pins mldsa-native v2.0.0 at
+`834a90d5e846ffa1e1611bd24e160bb2e9b86d35`. Its authorship, LICENSE and
+RELICENSE.md are retained (Apache-2.0 OR ISC OR MIT). The verification build
+configuration adapts the reference's LGPL-2.0-or-later configuration with an
+RTOS symbol namespace. No C++ protocol verifier is included in this crate.
+
+The ML-DSA test corpus includes public OpenSSL fixtures from the fixed
+reference, NIST ACVP-Server vectors at `975de31eb83d87039ec88934fdc47d8c312b892d`,
+and C2SP Wycheproof vectors at `3fa63dd0344abb611f1fb1d77e119938603ea230`.
+RTOS acknowledges the National Institute of Standards and Technology as the
+source of the ACVP material. On 2026-10-10, RTOS extracted the pure ML-DSA-44
+external-interface cases into TSV and classified inputs outside the bounded
+verification profile as malformed. The complete NIST notice and Wycheproof
+Apache-2.0 license are retained beside the fixtures. Public context-binding
+fixtures use explicitly public deterministic test seeds. Import digests,
+corpus selection and shared-backend limitations are recorded in memo.

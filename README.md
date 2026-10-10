@@ -17,6 +17,7 @@ The node source code is available under the [GNU General Public License v3.0](LI
 | `adnl` | ADNL/RLDP/Overlay/DHT protocol stack |
 | `rtos_block` | Blockchain data types in `block/` |
 | `rtos_block_json` | JSON serialization in `block-json/` |
+| `rtos_pq_crypto` | Bounded ML-DSA-44 verification in `pq-crypto/` |
 | `rtos_vm` | TVM in `vm/` |
 | `rtos_executor` | Transaction executor in `executor/` |
 | `rtos_assembler` | TVM assembler/disassembler in `assembler/` |
