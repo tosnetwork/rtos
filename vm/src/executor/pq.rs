@@ -14,7 +14,7 @@ fn read_bytes(engine: &mut Engine, cell: Cell, limit: usize) -> Result<Vec<u8>> 
     read_bytes_priced(engine, cell, limit, 1)
 }
 
-fn read_bytes_priced(
+pub(super) fn read_bytes_priced(
     engine: &mut Engine,
     mut cell: Cell,
     limit: usize,

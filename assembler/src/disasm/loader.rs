@@ -1877,6 +1877,10 @@ impl Loader {
         check_eq!(slice.get_next_int(24)?, 0xf93100);
         Ok(Instruction::new("PQCHECKSIG_MLDSA44"))
     }
+    pub(super) fn pq_suite(&mut self, slice: &mut SliceData) -> Result<Instruction> {
+        check_eq!(slice.get_next_int(24)?, 0xf93102);
+        Ok(Instruction::new("PQCHECKSIG_SUITE"))
+    }
     pub(super) fn pq_falcon512(&mut self, slice: &mut SliceData) -> Result<Instruction> {
         check_eq!(slice.get_next_int(24)?, 0xf93101);
         Ok(Instruction::new("PQCHECKSIG_FALCON512_PADDED"))

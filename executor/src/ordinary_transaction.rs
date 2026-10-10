@@ -565,3 +565,7 @@ mod test_falcon512_transaction;
 #[cfg(test)]
 #[path = "tests/test_poseidon2_transaction.rs"]
 mod test_poseidon2_transaction;
+
+#[cfg(test)]
+#[path = "tests/test_pq_suite_transaction.rs"]
+mod test_pq_suite_transaction;

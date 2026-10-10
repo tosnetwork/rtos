@@ -101,7 +101,7 @@ fn falcon512_assembler_roundtrip_and_unallocated_neighbours() {
     let combined = rtos_assembler::compile_code("NOP PQCHECKSIG_FALCON512_PADDED DROP").unwrap();
     let text = rtos_assembler::disasm::disasm(&mut combined.clone()).unwrap();
     assert_eq!(rtos_assembler::compile_code(&text).unwrap(), combined);
-    for bytes in [vec![0xf9, 0x31], vec![0xf9, 0x31, 0x03], vec![0xf9, 0x31, 0x02]] {
+    for bytes in [vec![0xf9, 0x31], vec![0xf9, 0x31, 0x04], vec![0xf9, 0x31, 0x05]] {
         let mut slice = rtos_block::SliceData::from_raw(bytes.clone(), bytes.len() * 8);
         if let Ok(text) = rtos_assembler::disasm::disasm(&mut slice) {
             assert!(!text.contains("PQCHECKSIG_FALCON512_PADDED"), "{text}");

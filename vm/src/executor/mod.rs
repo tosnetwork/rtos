@@ -30,6 +30,7 @@ pub use math::DivMode;
 mod null;
 mod poseidon2;
 mod pq;
+mod pq_suite;
 mod rand;
 mod serialization;
 mod slice_comparison;
