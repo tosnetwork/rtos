@@ -214,7 +214,7 @@ async fn fast_sync_snapshot_failure_revokes_partial_generation_and_retries() -> 
         .context()
         .stack
         .overlay
-        .get_query_prefix(&Arc::new(old.id().clone()))
+        .get_query_prefix(&KeyId::from_data(*old.id().data()))
         .is_err());
     f.engine.fail_after.store(usize::MAX, Ordering::SeqCst);
     f.router
