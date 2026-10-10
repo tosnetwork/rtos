@@ -33,6 +33,38 @@ async fn real_engine_finality_downloads_over_network_without_candidate_cache() {
     run_engine_recovery(true).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_engine_monitoring_covers_zero_and_maximum_split() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("testdata/recovery.json")).unwrap();
+    let data = hex::decode(fixture["state_boc"].as_str().unwrap()).unwrap();
+    let mc_id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        0,
+        read_single_root_boc(&data).unwrap().repr_hash().clone(),
+        UInt256::calc_file_hash(&data),
+    );
+    write_recovery_config(dir.path(), &mc_id, true);
+    let engine = open_engine(dir.path()).await;
+    let root = ShardIdent::with_prefix_len(0, 0, 0).unwrap();
+    for depth in [0, Engine::MAX_MONITOR_MIN_SPLIT] {
+        let last = (1u64 << depth) - 1;
+        engine.set_test_monitoring(depth, 1u64 << last);
+        assert!(engine.need_monitor(&root).unwrap());
+        for index in 0..=last {
+            let prefix = if depth == 0 { 0 } else { index << (64 - depth) };
+            let shard = ShardIdent::with_prefix_len(depth, 0, prefix).unwrap();
+            assert_eq!(engine.need_monitor(&shard).unwrap(), index == last);
+        }
+        engine.set_test_monitoring(depth, 0);
+        assert!(!engine.need_monitor(&root).unwrap());
+        assert!(engine.need_monitor(&ShardIdent::masterchain()).unwrap());
+        assert!(!engine.need_monitor(&ShardIdent::with_prefix_len(0, 1, 0).unwrap()).unwrap());
+    }
+    engine.wait_stop().await;
+}
+
 async fn run_engine_recovery(network_repair: bool) {
     let _ = env_logger::builder().is_test(true).try_init();
     // Public deterministic test keys only; reproducer is archived with C2a evidence.
