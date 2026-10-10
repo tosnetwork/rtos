@@ -1,8 +1,10 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 use rtos_api::{
-    ton::lite_server::{BlockData, BlockState},
-    ton::rpc::lite_server::{GetBlock, GetState},
+    ton::{
+        lite_server::{BlockData, BlockState},
+        rpc::lite_server::{GetBlock, GetState},
+    },
     WireProfile,
 };
 
