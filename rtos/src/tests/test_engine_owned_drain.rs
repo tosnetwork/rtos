@@ -96,10 +96,26 @@ async fn engine_owned_drain_two_real_engines_wait_for_listener_then_reopen_datab
     assert!(client_weak.upgrade().is_none(), "listener/client ownership leaked");
     let weak_a = Arc::downgrade(&a);
     let weak_b = Arc::downgrade(&b);
+    let network_a = Arc::downgrade(&a.network);
+    let network_b = Arc::downgrade(&b.network);
+    let addresses: Vec<_> = [&a, &b]
+        .into_iter()
+        .flat_map(|engine| {
+            let adnl = &engine.network.context().stack.adnl;
+            std::iter::once(adnl.ip_address_adnl().to_string())
+                .chain(adnl.ip_address_quic().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        })
+        .collect();
     drop(a);
     drop(b);
     assert!(weak_a.upgrade().is_none(), "first Engine retained after joined shutdown");
     assert!(weak_b.upgrade().is_none(), "second Engine retained after joined shutdown");
+    assert!(network_a.upgrade().is_none(), "first network/config owner retained");
+    assert!(network_b.upgrade().is_none(), "second network/config owner retained");
+    for address in addresses {
+        drop(std::net::UdpSocket::bind(address).expect("network UDP port retained"));
+    }
     // Same process and runtime: real storage locks must have been released.
     let reopened_a = open(first.path()).await;
     let reopened_b = open(second.path()).await;
@@ -779,6 +795,10 @@ async fn partial_engine_construction(stage: &'static str, cancel: bool) {
     })
     .await
     .expect("partial constructor retained Engine/DB owner");
+    assert!(
+        stopper.construction_network.lock().unwrap().as_ref().unwrap().upgrade().is_none(),
+        "partial constructor retained network/config owner"
+    );
     assert_eq!(stopper.stop.load(Ordering::Acquire) & Engine::MASK_SERVICE_DB_RESTORE, 0);
     if let Some(address) = control_address {
         drop(

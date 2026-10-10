@@ -423,6 +423,8 @@ impl Downloader for ZeroStateDownloader {
 #[derive(Default)]
 pub struct Stopper {
     #[cfg(test)]
+    construction_network: std::sync::Mutex<Option<std::sync::Weak<NodeNetwork>>>,
+    #[cfg(test)]
     construction_gate: std::sync::Mutex<
         Option<(&'static str, Arc<crate::network::overlay_client::OverlayInitGate>)>,
     >,
@@ -440,6 +442,8 @@ impl Stopper {
             failures: Default::default(),
             #[cfg(test)]
             construction_gate: Default::default(),
+            #[cfg(test)]
+            construction_network: Default::default(),
         }
     }
 
@@ -726,6 +730,10 @@ impl Engine {
             engine_allocated.clone(),
         )
         .await?;
+        #[cfg(test)]
+        {
+            *stopper.construction_network.lock().unwrap() = Some(Arc::downgrade(&network));
+        }
         // Once the network exists, construction owns writes and services until
         // their actual completion. Dropping this caller only requests stop.
         let mut caller = StopOnDrop(Some(stopper.clone()));

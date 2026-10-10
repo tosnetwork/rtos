@@ -263,11 +263,31 @@ impl NodeNetwork {
         };
         let node_network = Arc::new(node_network);
 
-        if let Err(error) = NodeConfigHandler::start_sheduler(
-            node_network.config_handler.clone(),
-            config_handler_context,
-            vec![node_network.clone()],
-        ) {
+        let initialized = (|| -> Result<()> {
+            NodeConfigHandler::start_sheduler(
+                node_network.config_handler.clone(),
+                config_handler_context,
+                vec![node_network.clone()],
+            )?;
+            for key in [dht_key, overlay_key] {
+                node_network.tasks.spawn_handle("network DHT announcement", || {
+                    Self::periodic_store_ip_addr(
+                        node_network.network_context.stack.dht.clone(),
+                        key,
+                        None,
+                        node_network.cancellation_token.clone(),
+                    )
+                })?;
+            }
+            node_network.tasks.spawn_handle("network DHT discovery", || {
+                Self::find_dht_nodes(
+                    node_network.network_context.stack.dht.clone(),
+                    node_network.cancellation_token.clone(),
+                )
+            })?;
+            Ok(())
+        })();
+        if let Err(error) = initialized {
             // Keep cleanup owned if the failed constructor's caller is cancelled.
             let cleanup = node_network.clone();
             let drain = tokio::spawn(async move { cleanup.stop_adnl().await });
@@ -278,22 +298,6 @@ impl NodeNetwork {
             }
             return Err(error);
         }
-        for key in [dht_key, overlay_key] {
-            node_network.tasks.spawn_handle("network DHT announcement", || {
-                Self::periodic_store_ip_addr(
-                    node_network.network_context.stack.dht.clone(),
-                    key,
-                    None,
-                    node_network.cancellation_token.clone(),
-                )
-            })?;
-        }
-        node_network.tasks.spawn_handle("network DHT discovery", || {
-            Self::find_dht_nodes(
-                node_network.network_context.stack.dht.clone(),
-                node_network.cancellation_token.clone(),
-            )
-        })?;
         Ok(node_network)
     }
 
