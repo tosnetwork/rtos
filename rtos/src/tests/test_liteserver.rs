@@ -3251,3 +3251,6 @@ async fn run_smc_method_preserves_signed_method_id() -> Result<()> {
 
 #[path = "test_liteserver_absence_reference.rs"]
 mod absence_reference;
+
+#[path = "test_liteserver_transaction_boundaries.rs"]
+mod transaction_boundaries;
