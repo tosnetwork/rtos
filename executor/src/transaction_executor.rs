@@ -334,7 +334,9 @@ pub trait TransactionExecutor {
         let mut result_acc = acc.clone();
         if let Some(msg) = msg {
             if let Some(state_init) = msg.state_init() {
-                libraries.push(state_init.libraries().clone().inner());
+                if self.config().block_version() < 15 {
+                    libraries.push(state_init.libraries().clone().inner());
+                }
             }
             if let Some(reason) = compute_new_state(
                 &mut result_acc,
@@ -378,7 +380,9 @@ pub trait TransactionExecutor {
             }
         };
         let data = result_acc.get_data().unwrap_or_default();
-        libraries.push(result_acc.libraries().inner());
+        if self.config().block_version() < 15 {
+            libraries.push(result_acc.libraries().inner());
+        }
         libraries.push(params.state_libs.clone());
 
         let code_hash = code.repr_hash();
@@ -427,6 +431,9 @@ pub trait TransactionExecutor {
             vm.set_arc_trace_callback(trace_callback);
         }
         vm.set_block_version(self.config().block_version());
+        if let Some(limit) = self.config().size_limits_config().max_transaction_library_loads {
+            vm.set_max_library_loads(limit);
+        }
         if let Some(modifiers) = params.behavior_modifiers.clone() {
             vm.modify_behavior(modifiers);
         }

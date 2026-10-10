@@ -1352,7 +1352,7 @@ pub(super) fn execute_whileend_break(engine: &mut Engine) -> Status {
 }
 
 fn run_vm(engine: &mut Engine, mode: isize) -> Status {
-    debug_assert!(engine.block_version() >= 10, "But block version is {}", engine.block_version());
+    debug_assert!(engine.block_version() >= 4, "But block version is {}", engine.block_version());
     if mode >= 512 {
         fail!(ExceptionCode::RangeCheckError, "invalid flags {mode:#x}");
     }

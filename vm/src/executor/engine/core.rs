@@ -99,6 +99,8 @@ pub struct Engine {
     // SliceData::load_cell() is faster than trying to cache SliceData for each
     // visited cell with HashMap<UInt256, SliceData>
     visited_cells: HashSet<UInt256>,
+    loaded_libraries: HashSet<UInt256>,
+    max_library_loads: Option<u32>,
     cstate: Option<(Cell, Cell)>,
     time: u64,
     gas: Gas,
@@ -207,6 +209,8 @@ impl Engine {
             modifiers: BehaviorModifiers::default(),
             checked_signatures_count: 0,
             visited_cells: HashSet::new(),
+            loaded_libraries: HashSet::new(),
+            max_library_loads: None,
             cstate: None,
             time: 0,
             gas: Gas::empty(),
@@ -224,6 +228,12 @@ impl Engine {
             capabilities,
             block_version: 0,
         }
+    }
+
+    /// Limit distinct library lookup attempts, including missing libraries.
+    /// Repeated lookups share this budget across all nested VM invocations.
+    pub fn set_max_library_loads(&mut self, limit: u32) {
+        self.max_library_loads = Some(limit);
     }
 
     pub fn set_block_version(&mut self, block_version: u32) {
@@ -794,7 +804,7 @@ impl Engine {
         Ok(None)
     }
 
-    fn resolve_init_code_cell(&self, code: Cell) -> Result<SliceData> {
+    fn resolve_init_code_cell(&mut self, code: Cell) -> Result<SliceData> {
         let mut slice = SliceData::load_cell(code.clone())?;
         if code.cell_type() == CellType::Ordinary {
             return Ok(slice);
@@ -823,7 +833,17 @@ impl Engine {
         SliceData::load_builder(builder)
     }
 
-    fn load_library_cell(&self, hash: SliceData) -> Result<Cell> {
+    fn load_library_cell(&mut self, hash: SliceData) -> Result<Cell> {
+        if let Some(limit) = self.max_library_loads {
+            let key = UInt256::construct_from(&mut hash.clone())?;
+            if self.loaded_libraries.len() >= limit as usize {
+                if !self.loaded_libraries.contains(&key) {
+                    fail!(ExceptionCode::CellUnderflow, "Library load limit exceeded");
+                }
+            } else {
+                self.loaded_libraries.insert(key);
+            }
+        }
         for library in &self.libraries {
             if let Some(lib_bucket) = library.get(hash.clone())? {
                 let lib = lib_bucket.reference(0)?;
@@ -1088,7 +1108,9 @@ impl Engine {
             cc: ContinuationData::with_code_and_stack(params.code, params.stack),
             cmd: InstructionExt::default(),
             ctrls,
-            libraries: self.libraries.clone(),
+            libraries: std::mem::take(&mut self.libraries),
+            loaded_libraries: std::mem::take(&mut self.loaded_libraries),
+            max_library_loads: self.max_library_loads,
             modifiers: self.modifiers.clone(),
             checked_signatures_count: self.checked_signatures_count,
             visited_cells,
@@ -1130,6 +1152,8 @@ impl Engine {
                 tvm_exception_or_custom_code(&err)
             }
         };
+        self.libraries = std::mem::take(&mut child.libraries);
+        self.loaded_libraries = std::mem::take(&mut child.loaded_libraries);
         self.free_gas_consumed = child.free_gas_consumed;
         self.checked_signatures_count = child.checked_signatures_count;
         log::debug!(
