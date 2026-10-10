@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and authenticated Plumtree transport dispatch.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -85,6 +85,7 @@ use std::{
 };
 
 mod broadcast;
+mod plumtree;
 use broadcast::{
     BroadcastData, BroadcastFecProtocol, BroadcastId, BroadcastProtocol, BroadcastRecvContext,
     BroadcastSendContext, BroadcastSendMethod, BroadcastSimpleProtocol,
@@ -92,6 +93,7 @@ use broadcast::{
     OwnedBroadcast,
 };
 pub use broadcast::{BroadcastRecvInfo, BroadcastSendInfo};
+pub use plumtree::PlumtreeConfig;
 
 const TARGET: &str = "overlay";
 const TARGET_BROADCAST: &str = "overlay_broadcast";
@@ -503,6 +505,7 @@ declare_counted!(
         nodes: lockfree::map::Map<Arc<KeyId>, NodeObject>,
         overlay_id: Arc<OverlayShortId>,
         owned_broadcasts: lockfree::map::Map<BroadcastId, OwnedBroadcast>,
+        plumtree: OnceLock<PlumtreeTransport>,
         // Peers waiting for ADNL address resolution before being added to known_peers
         pending_peers: lockfree::queue::Queue<Arc<KeyId>>,
         purge_broadcasts: lockfree::queue::Queue<BroadcastId>,
@@ -792,6 +795,10 @@ impl Overlay {
         Ok(())
     }
 
+    fn use_v2_peer_advertisements(&self) -> bool {
+        self.overlay_type.has_certified_members() || self.plumtree.get().is_some()
+    }
+
     async fn get_random_peers(
         &self,
         dst: &Arc<KeyId>,
@@ -845,7 +852,8 @@ impl Overlay {
     ) -> Result<OverlayNodeInfo<NodeV1, NodeV2>> {
         let key = self.overlay_key().unwrap_or(default_key);
         let overlay_id = UInt256::with_array(*self.overlay_id.data());
-        let flags = 0;
+        let flags =
+            if !v2 || self.plumtree.get().is_some_and(|p| !p.original_sender) { 0 } else { 2 };
         let version = Version::get();
         let local_node = OverlayUtils::get_node_to_sign(key, &overlay_id, flags, version);
         let node = if v2 {
@@ -1740,6 +1748,9 @@ impl OverlayNode {
         if overlay.neighbours.contains(peer) {
             overlay.update_neighbours(1)?
         }
+        if overlay.plumtree.get().is_some() {
+            overlay.plumtree_engine()?.remove_peer(*peer.data());
+        }
         // DO NOT DELETE from ADNL, because it may be shared between overlays
         // self.adnl.delete_peer(self.node_key.id(), peer)
         Ok(true)
@@ -2045,6 +2056,7 @@ impl OverlayNode {
             overlay_id: params.overlay_id.clone(),
             overlay_type,
             owned_broadcasts: lockfree::map::Map::new(),
+            plumtree: OnceLock::new(),
             pending_peers: lockfree::queue::Queue::new(),
             purge_broadcasts: lockfree::queue::Queue::new(),
             purge_broadcasts_count: AtomicU32::new(0),
@@ -2185,7 +2197,7 @@ impl OverlayNode {
                             let (ping_res, peers_res) = if overlay.overlay_type.is_private() {
                                 (ping_task.await, None)
                             } else {
-                                let v2 = overlay.overlay_type.has_certified_members();
+                                let v2 = overlay.use_v2_peer_advertisements();
                                 let peers_task = overlay.get_random_peers(
                                     &peer,
                                     &default_key,
@@ -2369,6 +2381,9 @@ impl OverlayNode {
                 if !roots.is_empty() {
                     rldp.change_inbound_cap_for_peers(&roots, -1)?;
                 }
+            }
+            if let Some(transport) = overlay.plumtree.get() {
+                transport.stopped.store(true, Ordering::Release);
             }
             overlay.received_peers.stop();
             overlay.received_rawbytes.stop();
@@ -2623,6 +2638,22 @@ impl Subscriber for OverlayNode {
                     BroadcastTwostepSimpleProtocol::for_recv(reliable).recv(bcast, ctx).await?;
                     return Ok(true);
                 }
+                Ok(bcast) if plumtree::Engine::accepts(&bcast) => {
+                    if have_postfix {
+                        fail!("Trailing bytes in Plumtree message");
+                    }
+                    let neighbours = overlay.plumtree_neighbours();
+                    let actions = overlay.plumtree_engine()?.receive(
+                        *peers.other().data(),
+                        bcast,
+                        None,
+                        &neighbours,
+                        plumtree_now(),
+                        Instant::now(),
+                    )?;
+                    overlay.execute_plumtree(actions).await?;
+                    return Ok(true);
+                }
                 Ok(bcast) => fail!("Unsupported overlay broadcast message {:?}", bcast),
                 Err(message) => message,
             };
@@ -2714,6 +2745,25 @@ impl Subscriber for OverlayNode {
             }
             Err(object) => object,
         };
+        let object = match object.downcast::<rtos_api::ton::rpc::overlay::RepairPlumtreePart>() {
+            Ok(query) => {
+                if other_workchain {
+                    return Ok(QueryResult::Consumed(QueryAnswer::Ready(None)));
+                }
+                let answer = overlay.plumtree_engine()?.repair_query(
+                    *peers.other().data(),
+                    query,
+                    plumtree_now(),
+                    Instant::now(),
+                )?;
+                return QueryResult::consume_boxed(
+                    answer,
+                    #[cfg(feature = "telemetry")]
+                    None,
+                );
+            }
+            Err(object) => object,
+        };
         let object = match object.downcast::<Ping>() {
             Ok(_query) => {
                 return QueryResult::consume_boxed(
@@ -2740,5 +2790,265 @@ impl Subscriber for OverlayNode {
             Err(msg) => fail!("Unsupported query {msg} in overlay {overlay_id}"),
             r => r,
         }
+    }
+}
+
+struct PlumtreeTransport {
+    quic: Arc<QuicNode>,
+    engine: std::sync::Mutex<plumtree::Engine>,
+    local: Arc<KeyId>,
+    original_sender: bool,
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+fn plumtree_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(f64::NAN, |d| d.as_secs_f64())
+}
+
+impl Overlay {
+    fn plumtree_engine(&self) -> Result<std::sync::MutexGuard<'_, plumtree::Engine>> {
+        let transport =
+            self.plumtree.get().ok_or_else(|| error!("Plumtree is disabled on this overlay"))?;
+        if transport.stopped.load(Ordering::Acquire) {
+            fail!("Plumtree overlay is retired");
+        }
+        transport.engine.lock().map_err(|_| error!("Plumtree state lock is poisoned"))
+    }
+
+    fn plumtree_neighbours(&self) -> Vec<[u8; 32]> {
+        // Public peers must have a fresh authenticated node advertisement.
+        // V1 peers imply flags zero in the fixed wire protocol.
+        let now = Version::get();
+        let mut peers = Vec::new();
+        let mut iter = None;
+        while let Some(peer) = self.known_peers.next(&mut iter) {
+            let eligible = if let Some(node) = self.nodes.get(&peer) {
+                let pair = if let Some(v2) = &node.val().v2 {
+                    Some((v2.flags, v2.version))
+                } else {
+                    node.val().v1.as_ref().map(|v1| (0, v1.version))
+                };
+                pair.is_some_and(|(flags, version)| {
+                    flags == 0
+                        && (!self.overlay_type.is_public()
+                            || (version as i64 >= now as i64 - 600
+                                && version as i64 <= now as i64 + 60))
+                })
+            } else {
+                !self.overlay_type.is_public()
+            };
+            if eligible && self.check_peer(&peer, None).is_ok() {
+                peers.push(*peer.data());
+            }
+        }
+        // Randomize lazy selection without dropping established eager peers
+        // that happen not to be among this broadcast's five active neighbours.
+        use rand::seq::SliceRandom;
+        peers.shuffle(&mut rand::thread_rng());
+        peers
+    }
+
+    fn execute_plumtree(
+        self: &Arc<Self>,
+        actions: Vec<plumtree::Action>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            let transport =
+                self.plumtree.get().ok_or_else(|| error!("Plumtree transport is disabled"))?;
+            let quic = &transport.quic;
+            let mut first_error = None;
+            for action in actions {
+                if transport.stopped.load(Ordering::Acquire) {
+                    fail!("Plumtree overlay is retired");
+                }
+                match action {
+                    plumtree::Action::Deliver { source, data } => {
+                        if !self.received_rawbytes.try_push_bounded(
+                            BroadcastRecvInfo { packets: 1, data, extra: None, recv_from: source },
+                            16,
+                        ) {
+                            if first_error.is_none() {
+                                first_error = Some(error!(
+                                    "Plumtree consumer is absent or its bounded queue is full"
+                                ));
+                            }
+                        }
+                    }
+                    plumtree::Action::Send { peer, message } => {
+                        let peers =
+                            AdnlPeers::with_keys(transport.local.clone(), KeyId::from_data(peer));
+                        if let Err(err) = self.check_peer(peers.other(), None) {
+                            if first_error.is_none() {
+                                first_error = Some(err);
+                            }
+                            continue;
+                        }
+                        let mut bytes = self.message_prefix.clone();
+                        serialize_boxed_append(&mut bytes, &message)?;
+                        if let Err(err) = quic.message(bytes, Some(&self.adnl), &peers).await {
+                            if first_error.is_none() {
+                                first_error = Some(err);
+                            }
+                        }
+                    }
+                    plumtree::Action::Query { peer, key, query, answer_limit } => {
+                        let overlay = Arc::downgrade(self);
+                        let quic = quic.clone();
+                        let adnl = self.adnl.clone();
+                        let peers =
+                            AdnlPeers::with_keys(transport.local.clone(), KeyId::from_data(peer));
+                        if let Err(err) = self.check_peer(peers.other(), None) {
+                            self.plumtree_engine()?.query_failed(key, peer, Instant::now());
+                            if first_error.is_none() {
+                                first_error = Some(err);
+                            }
+                            continue;
+                        }
+                        let mut bytes = self.query_prefix.clone();
+                        serialize_boxed_append(&mut bytes, &query)?;
+                        tokio::spawn(async move {
+                            // The total budget also bounds the QUIC helper's reconnect/retry.
+                            let response = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                quic.query_with_answer_limit(
+                                    bytes,
+                                    Some(&adnl),
+                                    &peers,
+                                    Some(5000),
+                                    answer_limit,
+                                ),
+                            )
+                            .await
+                            .unwrap_or_else(|_| Err(error!("Plumtree repair deadline exceeded")));
+                            let Some(overlay) = overlay.upgrade() else {
+                                return;
+                            };
+                            let neighbours = overlay.plumtree_neighbours();
+                            let result = (|| -> Result<Vec<plumtree::Action>> {
+                                let mut engine = overlay.plumtree_engine()?;
+                                match response {
+                                    Ok(Some(bytes)) => {
+                                        match plumtree::decode_repair_response(&bytes) {
+                                            Ok(message) => engine.receive(
+                                                peer,
+                                                message,
+                                                Some(key),
+                                                &neighbours,
+                                                plumtree_now(),
+                                                Instant::now(),
+                                            ),
+                                            Err(err) => {
+                                                engine.query_failed(key, peer, Instant::now());
+                                                Err(err)
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        engine.query_failed(key, peer, Instant::now());
+                                        Ok(Vec::new())
+                                    }
+                                    Err(err) => {
+                                        engine.query_failed(key, peer, Instant::now());
+                                        Err(err)
+                                    }
+                                }
+                            })();
+                            let result = match result {
+                                Ok(actions) => overlay.execute_plumtree(actions).await,
+                                Err(err) => Err(err),
+                            };
+                            if let Err(err) = result {
+                                log::warn!(target: TARGET, "Plumtree repair rejected: {err}");
+                            }
+                        });
+                    }
+                }
+            }
+            if let Some(err) = first_error {
+                Err(err)
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+impl OverlayNode {
+    /// Explicit opt-in for the transport implementation. This does not admit
+    /// protocol v2 at the consensus manager or create any signing journal.
+    pub fn configure_plumtree(
+        &self,
+        overlay_id: &Arc<OverlayShortId>,
+        config: PlumtreeConfig,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<()> {
+        let overlay = self.get_overlay(overlay_id, "Configuring Plumtree on unknown overlay")?;
+        if overlay.flags & Overlay::FLAG_OVERLAY_OTHER_WORKCHAIN != 0 {
+            fail!("Plumtree cannot be enabled for an inactive workchain");
+        }
+        let quic = self
+            .quic
+            .get()
+            .ok_or_else(|| error!("Plumtree requires an installed QUIC sender"))?
+            .clone();
+        // The largest supported member-certificate prefix is 160 bytes:
+        // message/query tag + overlay ID + flags + 120-byte Ed25519 certificate.
+        if overlay.message_prefix.len() > 160 || overlay.query_prefix.len() > 160 {
+            fail!("Plumtree membership envelope exceeds its authenticated wire budget");
+        }
+        let original_sender = config.original_sender;
+        let engine = plumtree::Engine::new(config, *overlay_id.data())?;
+        let local = overlay.overlay_key().unwrap_or(&self.node_key).id().clone();
+        overlay.plumtree.set(PlumtreeTransport { quic, engine: std::sync::Mutex::new(engine), local, original_sender, stopped: std::sync::atomic::AtomicBool::new(false) })
+            .map_err(|_| error!("Plumtree policy is already installed; recreate the overlay to change its authority"))?;
+        let weak = Arc::downgrade(&overlay);
+        runtime.spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(50));
+            loop {
+                ticker.tick().await;
+                let Some(overlay) = weak.upgrade() else {
+                    break;
+                };
+                let actions = match overlay.plumtree_engine() {
+                    Ok(mut engine) => engine.tick(plumtree_now(), Instant::now()),
+                    Err(err) => {
+                        log::error!(target: TARGET, "Plumtree timer terminated: {err}");
+                        break;
+                    }
+                };
+                if let Err(err) = overlay.execute_plumtree(actions).await {
+                    log::warn!(target: TARGET, "Plumtree transport error: {err}");
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// `simple_id = None` selects FEC; a supplied ID selects the simple carrier.
+    /// The supplied signer is a transport signer, independent of consensus keys.
+    pub async fn broadcast_plumtree(
+        &self,
+        overlay_id: &Arc<OverlayShortId>,
+        signer: &Arc<dyn KeyOption>,
+        certificate: rtos_api::ton::overlay::Certificate,
+        flags: u32,
+        simple_id: Option<[u8; 32]>,
+        data: &[u8],
+    ) -> Result<()> {
+        let overlay = self.get_overlay(overlay_id, "Plumtree broadcast to unknown overlay")?;
+        let neighbours = overlay.plumtree_neighbours();
+        let actions = overlay.plumtree_engine()?.publish(
+            signer,
+            certificate,
+            flags as i32,
+            simple_id,
+            data,
+            &neighbours,
+            plumtree_now(),
+            Instant::now(),
+        )?;
+        overlay.execute_plumtree(actions).await
     }
 }
