@@ -28,6 +28,14 @@ impl EngineOperations for SnapshotEngine {
     }
 }
 
+fn isolate_quic(bootstrap: &EmulatorNetworkBootstrap) -> Result<()> {
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&bootstrap.config_path)?)?;
+    config["ip_address_quic"] = "127.0.0.1:0".into();
+    std::fs::write(&bootstrap.config_path, serde_json::to_vec_pretty(&config)?)?;
+    Ok(())
+}
+
 struct Fixture {
     router: Arc<FullNodeOverlaysRouter>,
     engine: Arc<SnapshotEngine>,
@@ -36,6 +44,7 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Result<Self> {
         let bootstrap = EmulatorNetworkBootstrap::build(2)?;
+        isolate_quic(&bootstrap)?;
         let allocated = create_engine_allocated();
         #[cfg(feature = "telemetry")]
         let telemetry = crate::collator_test_bundle::create_engine_telemetry();
@@ -79,7 +88,7 @@ impl Fixture {
             UInt256::from([20 + index as u8; 32]),
             PqConsensusKey {
                 algorithm_id: 1,
-                key_id: UInt256::from([30 + index as u8; 32]),
+                key_id: rtos_block::derive_consensus_key_id(1, &vec![40 + index as u8; 1312]),
                 public_key: vec![40 + index as u8; 1312],
             },
             1,
@@ -261,4 +270,78 @@ async fn fast_sync_snapshot_prior_only_pq_custody_is_rechecked_without_chain_cha
     assert_replaced(&initial, &recovered);
     f.stop().await;
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fast_sync_snapshot_real_engine_pq_transport_startup_and_keyring_notification() -> Result<()>
+{
+    use crate::engine::{run, EngineFlags, Stopper};
+    use rtos_block::{ConfigParam32, ConfigParam34, ConfigParamEnum};
+    use std::time::Duration;
+    let bootstrap = EmulatorNetworkBootstrap::build_with_config(2, |config, keys| {
+        let key_bytes = vec![71; 1312];
+        let pq = ValidatorDescr::with_pq_params(
+            UInt256::from([51; 32]),
+            PqConsensusKey {
+                algorithm_id: 1,
+                key_id: rtos_block::derive_consensus_key_id(1, &key_bytes),
+                public_key: key_bytes,
+            },
+            1,
+            UInt256::from(*keys[0].adnl_key.id().data()),
+        );
+        let mut remote = pq.clone();
+        remote.adnl_addr = Some(UInt256::from([199; 32]));
+        // The local member exists only in the previous set; both sets use PQ
+        // identities, with no corresponding consensus private key configured.
+        config.set_config(ConfigParamEnum::ConfigParam32(ConfigParam32::with_validator_set(
+            set(vec![pq]),
+        )))?;
+        config.set_config(ConfigParamEnum::ConfigParam34(ConfigParam34::with_validator_set(
+            set(vec![remote]),
+        )))?;
+        Ok(())
+    })?;
+    isolate_quic(&bootstrap)?;
+    let stopper = Arc::new(Stopper::new());
+    let (engine, join) = run(
+        bootstrap.load_node_config().await?,
+        bootstrap.config_dir().to_str(),
+        tokio::runtime::Handle::current(),
+        tokio::runtime::Handle::current(),
+        EngineFlags { initial_sync_disabled: true, force_check_db: false, truncate_db: None },
+        stopper.clone(),
+        None,
+    )
+    .await?;
+    let result: Result<()> = async {
+        let router = engine.overlays_router()?;
+        let first = overlay(router, &ShardIdent::MASTERCHAIN);
+        assert_eq!(
+            router.fast_sync_snapshot.lock().await.as_ref().unwrap().local_key.as_ref(),
+            Some(bootstrap.validators[0].adnl_key.id())
+        );
+        engine
+            .network()
+            .config_handler()
+            .add_validator_adnl_key(
+                bootstrap.validators[0].validator_key.id().data(),
+                bootstrap.validators[1].adnl_key.id().data(),
+            )
+            .await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while router.fast_sync_overlays.iter().count() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        assert!(first.client().cancellation_token().is_cancelled());
+        assert_eq!(engine.load_last_applied_mc_block_id()?.unwrap().seq_no, 0);
+        Ok(())
+    }
+    .await;
+    stopper.set_stop();
+    tokio::time::timeout(Duration::from_secs(30), join).await??;
+    tokio::time::timeout(Duration::from_secs(30), engine.wait_stop()).await??;
+    result
 }

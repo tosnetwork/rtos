@@ -284,7 +284,13 @@ impl FullNodeOverlaysRouter {
             );
             let mut history = None;
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {},
+                    _ = self.network.transport_config_changed() => {},
+                }
+                if let Err(error) = self.refresh_fast_sync_from_applied_state().await {
+                    log::warn!("Fast-sync transport refresh: {error}");
+                }
                 if self.engine.check_sync().await.unwrap_or(false) {
                     log::trace!("Monitor min split worker: node is in sync - skipping iteration");
                 } else {
@@ -340,6 +346,11 @@ impl FullNodeOverlaysRouter {
         Ok(())
     }
 
+    pub(crate) async fn refresh_fast_sync_from_applied_state(self: &Arc<Self>) -> Result<()> {
+        let state = self.engine.load_last_applied_mc_state().await?;
+        self.update_private_overlays(state.config_params()?).await
+    }
+
     pub(crate) async fn special_update_fastsync_overlays(self: &Arc<Self>) -> Result<()> {
         // Special case: create fast sync overlays when we are a validator from the
         // previous set. The normal flow (update_validator_lists in validator_manager)
@@ -350,7 +361,7 @@ impl FullNodeOverlaysRouter {
         let mc_state = self.engine.load_last_applied_mc_state().await?;
         let config = mc_state.config_params()?;
         if self.network.context().stack.overlay.wire_profile() == rtos_api::WireProfile::T0 {
-            return self.update_private_overlays(&config).await;
+            return self.update_private_overlays(config).await;
         }
 
         // 1) Read prev validator set
@@ -512,7 +523,18 @@ impl FullNodeOverlaysRouter {
         let next_vset = config.next_validator_set()?;
         let key =
             if self.network.context().stack.overlay.wire_profile() == rtos_api::WireProfile::T0 {
-                self.find_transport_key(&[&this_vset, &prev_vset, &next_vset]).await?
+                match self.find_transport_key(&[&this_vset, &prev_vset, &next_vset]).await {
+                    Ok(key) => key,
+                    Err(error) => {
+                        let mut installed = self.fast_sync_snapshot.lock().await;
+                        *installed = None;
+                        self.clear_fast_sync_overlays();
+                        if let Some(resolver) = self.fast_sync_peer_resolver.lock().await.take() {
+                            resolver.cancel();
+                        }
+                        return Err(error);
+                    }
+                }
             } else if let Some(k) = self.try_get_our_key(&this_vset)? {
                 Some(k)
             } else if let Some(k) = self.try_get_our_key(&prev_vset)? {
@@ -772,27 +794,29 @@ impl FullNodeOverlaysRouter {
                 }
                 if context.stack.adnl.key_by_id(&id).is_err() {
                     context.stack.adnl.add_key(key.clone(), election_id as usize)?;
-                    if let Some(quic) = &context.stack.quic {
-                        let address = context.stack.adnl.ip_address_adnl();
-                        let port = match context.quic_address {
-                            Some(address) => address.port(),
-                            None => address
-                                .port()
-                                .checked_add(adnl::QuicNode::OFFSET_PORT)
-                                .ok_or_else(|| error!("Fast-sync QUIC port overflow"))?,
-                        };
-                        let private = key.pvt_key()?;
-                        quic.add_key(
-                            (&private.lock()? as &[u8]).try_into()?,
-                            &id,
-                            SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port),
-                        )?;
-                    }
                     NodeNetwork::start_periodic_store_ip_addr(
                         context.stack.dht.clone(),
                         key.clone(),
                         self.network.cancellation_token().child_token(),
                     );
+                }
+                // Retry QUIC registration even if an earlier attempt already
+                // installed ADNL before failing to bind its QUIC endpoint.
+                if let Some(quic) = &context.stack.quic {
+                    let address = context.stack.adnl.ip_address_adnl();
+                    let port = match context.quic_address {
+                        Some(address) => address.port(),
+                        None => address
+                            .port()
+                            .checked_add(adnl::QuicNode::OFFSET_PORT)
+                            .ok_or_else(|| error!("Fast-sync QUIC port overflow"))?,
+                    };
+                    let private = key.pvt_key()?;
+                    quic.add_key(
+                        (&private.lock()? as &[u8]).try_into()?,
+                        &id,
+                        SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port),
+                    )?;
                 }
                 return Ok(Some(key));
             }

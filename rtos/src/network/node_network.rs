@@ -54,6 +54,7 @@ pub struct NetworkContext {
 }
 
 pub struct NodeNetwork {
+    transport_config_changed: tokio::sync::Notify,
     network_context: Arc<NetworkContext>,
     validator_context: ValidatorContext,
     runtime_handle: tokio::runtime::Handle,
@@ -261,6 +262,7 @@ impl NodeNetwork {
         let network_context = Arc::new(network_context);
 
         let node_network = NodeNetwork {
+            transport_config_changed: tokio::sync::Notify::new(),
             network_context: network_context.clone(),
             validator_context,
             runtime_handle: tokio::runtime::Handle::current(),
@@ -301,6 +303,10 @@ impl NodeNetwork {
             .sets_contexts
             .get(val_list_id)
             .map(|set_context| set_context.val().validator_adnl_key.clone())
+    }
+
+    pub(crate) async fn transport_config_changed(&self) {
+        self.transport_config_changed.notified().await;
     }
 
     pub fn cancellation_token(&self) -> &tokio_util::sync::CancellationToken {
@@ -1104,6 +1110,9 @@ impl PrivateOverlayOperations for NodeNetwork {
 #[async_trait::async_trait]
 impl NodeConfigSubscriber for NodeNetwork {
     async fn event(&self, sender: ConfigEvent) -> Result<bool> {
+        // Wake the existing router monitor even when transport setup fails: a
+        // removed local identity must revoke its old overlay authority.
+        self.transport_config_changed.notify_one();
         match sender {
             ConfigEvent::AddValidatorAdnlKey(validator_adnl_key_id, election_id) => {
                 self.load_and_store_validator_adnl_key(validator_adnl_key_id, election_id).await
