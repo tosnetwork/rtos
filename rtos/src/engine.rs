@@ -127,6 +127,10 @@ pub struct Engine {
     pub(crate) overlay_init_test_gate:
         std::sync::Mutex<Option<Arc<crate::network::overlay_client::OverlayInitGate>>>,
     #[cfg(test)]
+    pub(crate) test_chain_time: AtomicU64,
+    #[cfg(test)]
+    pub(crate) test_finality_notifications: AtomicU64,
+    #[cfg(test)]
     pub(crate) parent_apply_test_gate: std::sync::Mutex<Option<Arc<parent_apply_tests::ApplyGate>>>,
     db: Arc<InternalDb>,
     candidate_db: CandidateDbPool,
@@ -934,6 +938,10 @@ impl Engine {
                         Self::CANDIDATES_CACHE_SIZE.try_into()?,
                     )),
                     last_applied_mc_block_seqno: AtomicU32::new(0),
+                    #[cfg(test)]
+                    test_chain_time: AtomicU64::new(u64::MAX),
+                    #[cfg(test)]
+                    test_finality_notifications: AtomicU64::new(0),
                     last_applied_mc_block_utime: AtomicU32::new(0),
                     last_known_mc_block_seqno: AtomicU32::new(0),
                     last_known_keyblock_seqno: AtomicU32::new(0),
@@ -1528,6 +1536,11 @@ impl Engine {
 
     pub fn split_queues_cache(&self) -> &lockfree::map::Map<BlockIdExt, SplitQueues> {
         &self.split_queues_cache
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_chain_time(&self, now: Option<u32>) {
+        self.test_chain_time.store(now.map(u64::from).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     #[cfg(test)]

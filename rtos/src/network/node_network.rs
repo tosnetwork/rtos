@@ -117,6 +117,8 @@ impl Subscriber for WeakOverlaySubscriber {
 
 pub struct NodeNetwork {
     tasks: crate::types::owned_tasks::OwnedTasks,
+    #[cfg(test)]
+    pub(crate) test_broadcast_faults: Arc<super::test_broadcast_faults::BroadcastFaults>,
     network_context: Arc<NetworkContext>,
     validator_context: ValidatorContext,
     runtime_handle: tokio::runtime::Handle,
@@ -238,9 +240,20 @@ impl NodeNetwork {
 
         // Initialize QUIC transport (lazy: no endpoint bound until add_key() is called).
         // Validator ADNL keys are registered when a validator set is activated.
+        #[cfg(test)]
+        let test_broadcast_faults =
+            Arc::new(super::test_broadcast_faults::BroadcastFaults::default());
         let quic = {
+            #[cfg(test)]
+            let subscriber: Arc<dyn adnl::common::Subscriber> =
+                Arc::new(super::test_broadcast_faults::ObservedOverlay {
+                    overlay: overlay_subscriber.clone(),
+                    faults: test_broadcast_faults.clone(),
+                });
+            #[cfg(not(test))]
+            let subscriber: Arc<dyn adnl::common::Subscriber> = overlay_subscriber;
             let quic = adnl::QuicNode::new(
-                vec![overlay_subscriber],
+                vec![subscriber],
                 cancellation_token.clone(),
                 tokio::runtime::Handle::current(),
                 None,
@@ -302,6 +315,8 @@ impl NodeNetwork {
 
         let node_network = NodeNetwork {
             tasks: crate::types::owned_tasks::OwnedTasks::new(cancellation_token.child_token()),
+            #[cfg(test)]
+            test_broadcast_faults,
             network_context: network_context.clone(),
             validator_context,
             runtime_handle: tokio::runtime::Handle::current(),
