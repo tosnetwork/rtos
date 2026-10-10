@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and protocol-consistent test fixtures.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -28,7 +28,7 @@ pub fn test_fullnode_service_telemetry() {
     println!("{}", r);
     assert_eq!(r,
 "                                   query       total       bytes  succeded   time: min   avg   max    failed    time: min   avg   max
-↓rtos_api..c::ton_node::PrepareBlockProof         999     1522476       800( 80%)     2   501  1000       199( 20%)      6   501   996
+↓rtos_ap..c::ton_node::PrepareBlockProof         999     1522476       800( 80%)     2   501  1000       199( 20%)      6   501   996
 Total: 1522476 bytes, 304495 bytes/secons");
 
     for i in 1..100 {

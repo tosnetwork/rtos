@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and protocol-consistent test fixtures.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -253,6 +253,8 @@ fn make_config_params(
     let simplex_config = SimplexConfig::default();
     let block_limits = make_block_limits()?;
     let mut workchain_descr = WorkchainDescr::default();
+    workchain_descr.format =
+        rtos_block::WorkchainFormat::Basic(rtos_block::WorkchainFormat1::with_params(-1, 0));
     workchain_descr.active = true;
     workchain_descr.accept_msgs = true;
     workchain_descr.zerostate_root_hash = base_state_id.root_hash.clone();
@@ -274,6 +276,7 @@ fn make_config_params(
         },
     }))?;
     config.set_config(ConfigParamEnum::ConfigParam18(make_storage_prices()?))?;
+    config.set_config(ConfigParamEnum::ConfigParam19(0))?;
     config.set_config(ConfigParamEnum::ConfigParam20(make_gas_prices()))?;
     config.set_config(ConfigParamEnum::ConfigParam21(make_gas_prices()))?;
     config.set_config(ConfigParamEnum::ConfigParam22(block_limits.clone()))?;

@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and protocol-consistent test fixtures.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -333,7 +333,7 @@ async fn test_import_resume_respects_shard_client() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_import_skip_validation() -> Result<()> {
+async fn test_import_rejects_skip_validation() -> Result<()> {
     init_test_log();
     let dir = tempfile::tempdir().unwrap();
     let archives = dir.path().join("archives");
@@ -341,18 +341,9 @@ async fn test_import_skip_validation() -> Result<()> {
     let mut config = import_config(dir.path(), archives);
     config.skip_validation = true;
 
-    run_import(config).await?;
-
-    let db = open_db(dir.path()).await?;
-    let last_mc = db.load_full_node_state(LAST_APPLIED_MC_BLOCK)?;
-    assert!(last_mc.is_some(), "Even with skip_validation, last MC must be set");
-
-    let last_mc = last_mc.unwrap();
-    let handle = db
-        .load_block_handle(&last_mc)?
-        .expect("Block handle must exist after skip_validation import");
-    assert!(handle.has_data());
-
-    db.stop_states_db().await;
+    let error = run_import(config).await.err().expect("skip-validation must be rejected");
+    assert!(error.to_string().contains("--skip-validation is unsupported"));
+    assert!(!dir.path().join("node_db").exists(), "rejected import must not create a database");
+    assert!(!dir.path().join("epochs").exists(), "rejected import must not move archives");
     Ok(())
 }
