@@ -1,5 +1,7 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and SHA256C protocol execution.
+ * SHA256C adapted from the reference VM: Copyright 2017-2020 Telegram Systems LLP
+ * and Copyright 2025-2026 TOS Blockchain Teams (LGPL-2.0-or-later).
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -93,6 +95,45 @@ pub(super) fn execute_sha256u(engine: &mut Engine) -> Status {
     } else {
         fail!(ExceptionCode::CellUnderflow)
     }
+}
+
+// SHA256C (c - x): hash concatenated bytes, independently of cell boundaries.
+pub(super) fn execute_sha256c(engine: &mut Engine) -> Status {
+    if engine.block_version() < TVM_VERSION_14 {
+        if engine.block_version() >= 4 {
+            engine.try_use_gas(Gas::basic_gas_price(0, 0))?;
+        } else {
+            engine.use_gas(Gas::basic_gas_price(0, 0));
+        }
+        fail!(ExceptionCode::InvalidOpcode);
+    }
+    engine.load_instruction(Instruction::new("SHA256C"))?;
+    fetch_stack(engine, 1)?;
+    let mut cell = Some(engine.cmd.var(0).as_cell()?.clone());
+    let mut hasher = rtos_block::Sha256::new();
+    let mut cells = 0;
+    let mut total_bits = 0;
+    while let Some(current) = cell {
+        cells += 1;
+        if cells > 512 {
+            fail!(ExceptionCode::CellUnderflow);
+        }
+        let slice = engine.load_hashed_cell(current, true)?;
+        let bits = slice.remaining_bits();
+        if bits % 8 != 0 || slice.remaining_references() > 1 {
+            fail!(ExceptionCode::CellUnderflow);
+        }
+        total_bits += bits;
+        if total_bits > (2 << 20) * 8 {
+            fail!(ExceptionCode::CellUnderflow);
+        }
+        hasher.update(slice.get_bytestring(0));
+        // The instruction is available only after checked gas charging was activated.
+        engine.try_use_gas((1 + bits / 8 / 33) as i64)?;
+        cell = if slice.remaining_references() == 1 { Some(slice.reference(0)?) } else { None };
+    }
+    engine.cc.stack.push(StackItem::integer(hash_to_uint(hasher.finalize())));
+    Ok(())
 }
 
 fn check_signature(engine: &mut Engine, name: &'static str, hash: bool) -> Status {

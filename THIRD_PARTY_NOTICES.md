@@ -92,3 +92,10 @@ On 2026-10-10, RTOS encoded those public vectors as VM Cell BOCs, added malforme
 structure and gas/version boundary cases, and recorded reference execution
 outcomes. The ACVP notice and Wycheproof license are also retained beside the
 VM fixture. NIST is acknowledged as the source of the ACVP material.
+
+`vm/src/executor/crypto.rs` adapts SHA256C (F903, version 14) from the fixed
+reference's `crypto/vm/tosops.cpp`, Copyright 2017-2020 Telegram Systems LLP
+and Copyright 2025-2026 TOS Blockchain Teams, under LGPL-2.0-or-later.
+The adaptation uses RTOS Cell loading and the existing streaming SHA-256
+wrapper. The synthetic VM fixtures include reference outcomes and independently
+computed byte digests; fixture generators and comparison records reside in memo.

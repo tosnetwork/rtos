@@ -1872,6 +1872,7 @@ impl Loader {
     create_handler_2!(hashcu, 0xf900, "HASHCU");
     create_handler_2!(hashsu, 0xf901, "HASHSU");
     create_handler_2!(sha256u, 0xf902, "SHA256U");
+    create_handler_2!(sha256c, 0xf903, "SHA256C");
     pub(super) fn pq_mldsa44(&mut self, slice: &mut SliceData) -> Result<Instruction> {
         check_eq!(slice.get_next_int(24)?, 0xf93100);
         Ok(Instruction::new("PQCHECKSIG_MLDSA44"))

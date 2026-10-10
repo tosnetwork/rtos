@@ -518,3 +518,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
 #[cfg(test)]
 #[path = "tests/test_pq_mldsa44_transaction.rs"]
 mod pq_mldsa44_tests;
+
+#[cfg(test)]
+#[path = "tests/test_sha256c_transaction.rs"]
+mod test_sha256c_transaction;
