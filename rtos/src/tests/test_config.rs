@@ -452,3 +452,99 @@ async fn config_scheduler_removal_callback_is_ordered_and_can_reenter_lookup_dur
     drop(handler);
     assert!(weak.upgrade().is_none());
 }
+
+struct RotationConfigSubscriber {
+    handler: Arc<NodeConfigHandler>,
+    retained_key: Arc<KeyId>,
+    events: std::sync::Mutex<Vec<(u8, i32)>>,
+}
+
+#[async_trait::async_trait]
+impl NodeConfigSubscriber for RotationConfigSubscriber {
+    async fn event(&self, event: ConfigEvent) -> Result<bool> {
+        let key = self
+            .handler
+            .get_key_raw(*self.retained_key.data())
+            .await
+            .expect("rotation callback must reenter the real actor and read the retained key");
+        assert_eq!(key.id(), &self.retained_key);
+        let entry = match event {
+            ConfigEvent::AddValidatorAdnlKey(_, election) => (1, election),
+            ConfigEvent::RemoveValidatorAdnlKey(_, election) => (2, election),
+        };
+        self.events.lock().unwrap().push(entry);
+        Ok(true)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_scheduler_fourth_election_retires_old_key_without_callback_deadlock() {
+    // All identities below are public deterministic test seeds. This test uses
+    // only its temporary JSON config and the ordinary non-vault key backend.
+    assert!(get_vault().is_none(), "isolated configuration fixture requires no global vault");
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = scheduler_test_config();
+    config.configs_dir = dir.path().to_str().unwrap().into();
+    config.file_name = "config.json".into();
+    let mut validator_ids = vec![];
+    let mut adnl_ids = vec![];
+    for index in 0..4u8 {
+        let (validator_json, validator) =
+            Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[101 + index; 32])
+                .unwrap();
+        let (adnl_json, adnl) =
+            Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[111 + index; 32])
+                .unwrap();
+        let ring = config.validator_key_ring.as_mut().unwrap();
+        ring.insert(base64_encode(validator.id().data()), validator_json);
+        ring.insert(base64_encode(adnl.id().data()), adnl_json);
+        if index < 3 {
+            config.validator_keys.as_mut().unwrap().push(ValidatorKeysJson {
+                expire_at: i32::MAX,
+                election_id: 1001 + i32::from(index),
+                validator_key_id: base64_encode(validator.id().data()),
+                validator_adnl_key_id: Some(base64_encode(adnl.id().data())),
+            });
+        }
+        validator_ids.push(validator.id().clone());
+        adnl_ids.push(adnl.id().clone());
+    }
+    let (handler, context) =
+        NodeConfigHandler::create(config, tokio::runtime::Handle::current()).unwrap();
+    let subscriber = Arc::new(RotationConfigSubscriber {
+        handler: handler.clone(),
+        retained_key: adnl_ids[3].clone(),
+        events: Default::default(),
+    });
+    handler.clone().start_sheduler(context, vec![subscriber.clone()]).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        handler.add_validator_key(validator_ids[3].data(), 1004, i32::MAX).await.unwrap();
+        // This public command invokes actual revision_validator_keys at four
+        // registrations and emits Remove for the oldest, unshared ADNL key.
+        handler.add_validator_adnl_key(validator_ids[3].data(), adnl_ids[3].data()).await.unwrap();
+    })
+    .await
+    .expect("the fourth registration must not wait on its own GetKey queue");
+    assert!(handler.get_key_raw(*adnl_ids[0].data()).await.is_none());
+    assert!(handler.get_key_raw(*validator_ids[0].data()).await.is_none());
+    assert!(handler.get_key_raw(*adnl_ids[3].data()).await.is_some());
+    tokio::time::timeout(Duration::from_secs(3), handler.stop_and_wait()).await.unwrap().unwrap();
+    assert_eq!(
+        *subscriber.events.lock().unwrap(),
+        vec![(1, 1001), (1, 1002), (1, 1003), (1, 1004), (2, 1001)]
+    );
+    let saved: TonNodeConfig =
+        serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap()).unwrap();
+    let saved_keys = saved.validator_keys.unwrap();
+    assert_eq!(saved_keys.len(), 3);
+    assert!(!saved_keys.iter().any(|entry| entry.election_id == 1001));
+    assert!(saved_keys.iter().any(|entry| entry.election_id == 1004));
+    let saved_ring = saved.validator_key_ring.unwrap();
+    assert!(!saved_ring.contains_key(&base64_encode(adnl_ids[0].data())));
+    assert!(!saved_ring.contains_key(&base64_encode(validator_ids[0].data())));
+    assert!(saved_ring.contains_key(&base64_encode(adnl_ids[3].data())));
+    let weak = Arc::downgrade(&handler);
+    drop(subscriber);
+    drop(handler);
+    assert!(weak.upgrade().is_none());
+}
