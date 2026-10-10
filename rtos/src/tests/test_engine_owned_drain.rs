@@ -706,3 +706,99 @@ async fn engine_owned_drain_failed_parent_retains_accepted_child_until_join() {
     assert!(weak.upgrade().is_none());
     stopped(open(dir.path()).await).await;
 }
+
+async fn partial_engine_construction(stage: &'static str, cancel: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    config(dir.path());
+    let control_address = if stage == "control" {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        drop(socket);
+        let path = dir.path().join("config.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let (key, _) = rtos_block::Ed25519KeyOption::generate_with_json().unwrap();
+        value["control_server"] = serde_json::to_value(
+            adnl::server::AdnlServerConfigJson::with_params(address.to_string(), key, None, None),
+        )
+        .unwrap();
+        std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+        Some(address)
+    } else {
+        None
+    };
+    let config = TonNodeConfig::from_file(
+        dir.path().to_str().unwrap(),
+        "config.json",
+        None,
+        "config.json",
+        None,
+    )
+    .await
+    .unwrap();
+    let stopper = Arc::new(Stopper::new());
+    let gate = Arc::new(OverlayInitGate {
+        entered: Default::default(),
+        release: tokio::sync::Semaphore::new(0),
+        fail: !cancel,
+    });
+    *stopper.construction_gate.lock().unwrap() = Some((stage, gate.clone()));
+    let mut opening = Box::pin(Engine::new(
+        config,
+        EngineFlags { initial_sync_disabled: true, force_check_db: false, truncate_db: None },
+        stopper.clone(),
+    ));
+    tokio::select! {
+        result = &mut opening => panic!("constructor completed before held {stage}: {:?}", result.err()),
+        result = tokio::time::timeout(Duration::from_secs(15), gate.entered.notified()) => result.unwrap(),
+    }
+    if let Some(address) = control_address {
+        assert!(std::net::TcpListener::bind(address).is_err(), "actual control listener not held");
+    }
+    if stage == "database" {
+        assert_ne!(stopper.stop.load(Ordering::Acquire) & Engine::MASK_SERVICE_DB_RESTORE, 0);
+    }
+    if cancel {
+        drop(opening);
+        assert!(stopper.check_stop());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(Arc::strong_count(&stopper) > 1, "accepted constructor was dropped while held");
+        if stage == "database" {
+            assert_ne!(stopper.stop.load(Ordering::Acquire) & Engine::MASK_SERVICE_DB_RESTORE, 0);
+        }
+        gate.release.add_permits(1);
+    } else {
+        gate.release.add_permits(1);
+        let result = opening.await;
+        assert!(result.err().unwrap().to_string().contains("controlled"));
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while Arc::strong_count(&stopper) != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("partial constructor retained Engine/DB owner");
+    assert_eq!(stopper.stop.load(Ordering::Acquire) & Engine::MASK_SERVICE_DB_RESTORE, 0);
+    if let Some(address) = control_address {
+        drop(
+            std::net::TcpListener::bind(address)
+                .expect("partial constructor retained control socket"),
+        );
+    }
+    stopped(open(dir.path()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_owned_drain_partial_engine_cancel_preserves_network_control_and_restore() {
+    for stage in ["network", "control", "database"] {
+        partial_engine_construction(stage, true).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_owned_drain_partial_engine_failure_releases_network_control_and_restore() {
+    for stage in ["network", "control", "database"] {
+        partial_engine_construction(stage, false).await;
+    }
+}
