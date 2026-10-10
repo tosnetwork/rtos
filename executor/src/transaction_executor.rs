@@ -1,5 +1,6 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): naming, frozen-state admission,
+ * fixed-prefix canonicalization, and historical address normalization.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -297,6 +298,7 @@ pub trait TransactionExecutor {
                 if let Some(state_init) = msg.state_init() {
                     if let Some(addr) = acc.get_addr() {
                         if msg.is_inbound_external()
+                            && (self.config().block_version() < 8 || acc.is_active())
                             && !addr
                                 .address()
                                 .contains_bytes(state_init.serialize()?.repr_hash().as_slice())
@@ -353,6 +355,23 @@ pub trait TransactionExecutor {
                 return Ok((TrComputePhase::skipped(reason), None, None));
             }
         };
+
+        // Match the reference's address-normalization point, including tick/tock
+        // transactions with no inbound message. A later precompiled-cost check
+        // may still skip compute. Before version 10, MYADDR retains the rewrite.
+        if let Some(address) = acc.get_addr().filter(|addr| addr.rewrite_pfx().is_some()) {
+            let address = if self.config().block_version() >= 10 {
+                let (workchain, id) = address.extract_std_address(true)?;
+                MsgAddressInt::with_params(workchain, id)?
+            } else {
+                address.clone()
+            };
+            smc_info.myself = address.write_to_bitstring()?;
+            if self.config().block_version() >= 10 {
+                acc.set_addr(address.clone());
+                result_acc.set_addr(address);
+            }
+        }
 
         vm_phase.gas_credit = match gas.get_gas_credit() as u32 {
             0 => None,
@@ -521,6 +540,16 @@ pub trait TransactionExecutor {
             && if self.config().block_version() >= 14 { vm_phase.success } else { credit == 0 };
         if use_msg_state && !vm_phase.account_activated {
             result_acc = acc.clone();
+        }
+        if vm_phase.account_activated {
+            // Hash authorization uses the original StateInit above. Only the
+            // committed account representation canonicalizes an explicit zero
+            // fixed prefix to the absent form, as the reference serializer does.
+            if let Some(state) = result_acc.state_init_mut() {
+                if state.fixed_prefix_length().is_some_and(|n| n.as_u32() == 0) {
+                    state.fixed_prefix_length = None;
+                }
+            }
         }
 
         // Seed VM-loaded cells as a storage-stat hint before the recalc in
@@ -1160,6 +1189,19 @@ fn compute_new_state(
                 let text = "Cannot unfreeze account from message with hash";
                 if !check_state_init(state_init, false, text, &in_msg.hash()?) {
                     return Ok(Some(ComputeSkipReason::BadState));
+                }
+                // Before version 16 a frozen account retains the rewrite length
+                // parsed from its stored address. A standard address has length
+                // zero even if the frozen StateInit used a nonzero fixed prefix.
+                if config.block_version() < 16 {
+                    let prefix = state_init.fixed_prefix_length().map_or(0, |n| n.as_u32());
+                    let rewrite = acc
+                        .get_addr()
+                        .and_then(|addr| addr.rewrite_pfx())
+                        .map_or(0, |anycast| anycast.depth.as_u32());
+                    if prefix != rewrite {
+                        return Ok(Some(ComputeSkipReason::BadState));
+                    }
                 }
                 if let Err(err) = acc.try_activate(state_init) {
                     log::debug!(target: "executor", "reason: {}", err);
