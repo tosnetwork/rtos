@@ -1,6 +1,6 @@
 /*
  * RTOS project modifications (2026-10-10): naming, historical address
- * normalization, and address commitment across failed tick/tock execution.
+ * normalization, failed-execution address commitment, and transaction-based message times.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -206,7 +206,7 @@ impl TransactionExecutor for TickTockTransactionExecutor {
                 account.set_addr(address);
             }
         }
-        let lt = self.add_messages(&mut tr, out_msgs, params.last_tr_lt)?;
+        let lt = self.add_messages(&mut tr, out_msgs, lt)?;
         account.set_last_tr_time(lt);
         tr.write_description(&TransactionDescr::TickTock(description))?;
         Ok(tr)
