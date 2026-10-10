@@ -1343,8 +1343,10 @@ mod tests {
 
 #[cfg(test)]
 mod transport_tests {
-    use super::super::{OverlayNode, OverlayParams, OverlayShortId, OverlayUtils};
-    use super::*;
+    use super::{
+        super::{OverlayNode, OverlayParams, OverlayShortId, OverlayUtils},
+        *,
+    };
     use crate::{
         common::{AdnlPeers, QueryResult, Subscriber},
         node::{AdnlNode, AdnlNodeConfig, IpAddress},
