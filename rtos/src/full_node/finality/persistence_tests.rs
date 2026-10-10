@@ -378,3 +378,6 @@ fn write_recovery_config(dir: &std::path::Path, mc_id: &BlockIdExt, network: boo
         "test_bundles_config":{"collator":{"path":""},"validator":{"path":""}}
     })).unwrap()).unwrap();
 }
+
+#[path = "inclusion_tests.rs"]
+mod inclusion_tests;

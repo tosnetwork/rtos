@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Debug)]
 pub(crate) struct Receipt {
     pub constructor: u32,
+    pub simple_id: Option<[u8; 32]>,
+    pub wire: Vec<u8>,
     pub dropped: bool,
     pub error: Option<String>,
 }
@@ -37,7 +39,7 @@ impl BroadcastFaults {
         self.0.lock().unwrap().receipts.clone()
     }
 
-    fn classify(&self, bytes: &[u8], peers: &AdnlPeers) -> Option<(u32, bool)> {
+    fn classify(&self, bytes: &[u8], peers: &AdnlPeers) -> Option<Receipt> {
         let mut state = self.0.lock().unwrap();
         if state.peer != Some(*peers.other().data()) || !bytes.starts_with(&state.prefix) {
             return None;
@@ -49,7 +51,26 @@ impl BroadcastFaults {
         if drop && state.remaining != usize::MAX {
             state.remaining -= 1;
         }
-        Some((constructor, drop))
+        let simple_id = rtos_api::deserialize_boxed(&bytes[state.prefix.len()..])
+            .ok()
+            .and_then(|object| object.downcast::<rtos_api::ton::overlay::Broadcast>().ok())
+            .and_then(|broadcast| match broadcast {
+                rtos_api::ton::overlay::Broadcast::Overlay_BroadcastPlumtreeSimple(value) => {
+                    Some(*value.broadcast_id.as_array())
+                }
+                _ => None,
+            });
+        Some(Receipt {
+            constructor,
+            simple_id,
+            wire: if simple_id.is_some() && bytes.len() <= 16_384 {
+                bytes.to_vec()
+            } else {
+                vec![]
+            },
+            dropped: drop,
+            error: None,
+        })
     }
 
     fn record(&self, receipt: Receipt) {
@@ -68,17 +89,14 @@ pub(crate) struct ObservedOverlay {
 impl Subscriber for ObservedOverlay {
     async fn try_consume_custom(&self, bytes: &[u8], peers: &AdnlPeers) -> Result<bool> {
         let selected = self.faults.classify(bytes, peers);
-        if let Some((constructor, true)) = selected {
-            self.faults.record(Receipt { constructor, dropped: true, error: None });
+        if selected.as_ref().is_some_and(|receipt| receipt.dropped) {
+            self.faults.record(selected.unwrap());
             return Ok(true); // Real received message deliberately lost at this boundary.
         }
         let result = self.overlay.try_consume_custom(bytes, peers).await;
-        if let Some((constructor, false)) = selected {
-            self.faults.record(Receipt {
-                constructor,
-                dropped: false,
-                error: result.as_ref().err().map(ToString::to_string),
-            });
+        if let Some(mut receipt) = selected {
+            receipt.error = result.as_ref().err().map(ToString::to_string);
+            self.faults.record(receipt);
         }
         result
     }

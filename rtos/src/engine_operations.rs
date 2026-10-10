@@ -912,6 +912,8 @@ impl EngineOperations for Engine {
         src: Arc<KeyId>,
         received_bytes: usize,
     ) -> Result<()> {
+        #[cfg(test)]
+        self.test_finality_notifications.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pending = self.pending_finality.clone();
         crate::full_node::finality::receive(self, pending, broadcast, src, received_bytes).await
     }
