@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and protocol-consistent test fixtures.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -283,6 +283,7 @@ pub async fn create_network(
 ) -> Result<Arc<NodeNetwork>> {
     static INIT_CFG: Once = Once::new();
     INIT_CFG.call_once(|| {
+        std::fs::create_dir_all("../target").unwrap();
         copy("./configs/ton-global.config-sample.json", "../target/ton-global.config-sample.json")
             .unwrap();
     });
@@ -385,8 +386,10 @@ pub fn gen_master_state(
         param.config_addr = AccountId::from([1; 32]);
         ms.config.set_config(ConfigParamEnum::ConfigParam0(param)).unwrap();
         let mut param = ConfigParam34::new();
+        let mut validator = ValidatorDescr::default();
+        validator.weight = 1;
         param.cur_validators =
-            ValidatorSet::new(1600000000, 1610000000, 1, vec![ValidatorDescr::default()]).unwrap();
+            ValidatorSet::new(1600000000, 1610000000, 1, vec![validator]).unwrap();
         ms.config.set_config(ConfigParamEnum::ConfigParam34(param)).unwrap();
     }
 

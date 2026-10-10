@@ -568,6 +568,7 @@ impl EngineOperations for TestSendMsgEngine {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_control_send_message() {
     init_test_log();
+    std::fs::create_dir_all("../target").unwrap();
 
     let body = Message::default().write_to_bytes().unwrap();
     let engine = TestSendMsgEngine { expected_data: body.clone() };
