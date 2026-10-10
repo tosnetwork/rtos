@@ -3169,3 +3169,70 @@ async fn run_smc_method_uses_node_context_and_pinned_identifier() -> Result<()> 
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn run_smc_method_preserves_signed_method_id() -> Result<()> {
+    let mut cases = 0;
+    for row in include_str!("../../../vm/src/tests/data/get-method-id-context.tsv").lines() {
+        let fields: Vec<_> = row.split('\t').collect();
+        let name = fields[0];
+        if std::env::var("RTOS_GET_CASE_FILTER").ok().is_some_and(|filter| !name.contains(&filter))
+        {
+            continue;
+        }
+        cases += 1;
+        let version = fields[1].parse::<u32>().unwrap();
+        let method_id = fields[2].parse::<i64>().unwrap();
+        let code = read_single_root_boc(hex::decode(fields[3]).unwrap())?;
+        let mut init = rtos_block::StateInit::default();
+        init.set_code(code);
+        let account = Account::active(
+            MsgAddressInt::with_standart(None, -1, [0x5a; 32].into())?,
+            CurrencyCollection::with_coins(10_000_000_000u64),
+            0,
+            0,
+            init,
+            1000,
+        )?;
+        let mut config = ConfigParams::default();
+        config.set_config(ConfigParamEnum::ConfigParam8(rtos_block::ConfigParam8 {
+            global_version: rtos_block::GlobalVersion { version, capabilities: 0 },
+        }))?;
+        let state = gen_master_state(
+            GenMasterStateParams {
+                config,
+                accounts: &[&account],
+                after_key_block: true,
+                ..Default::default()
+            },
+            #[cfg(feature = "telemetry")]
+            None,
+            None,
+        );
+        let id = state.block_id().clone();
+        let engine: Arc<dyn EngineOperations> = Arc::new(GetterContextTestEngine(state));
+        let result = LiteServerQuerySubscriber::run_smc_method(
+            &engine,
+            RunSmcMethodMode::RESULT.bits(),
+            id,
+            AccountIdTl { workchain: -1, id: [0x5a; 32].into() },
+            method_id,
+            write_boc(&serialize_vm_stack(&[])?)?,
+        )
+        .await?;
+        assert_eq!(result.exit_code, fields[4].parse::<i32>().unwrap(), "{name}");
+        let stack = deserialize_vm_stack_boc(result.result.as_ref().unwrap())?;
+        let actual = stack
+            .iter()
+            .map(|value| value.as_integer().unwrap().to_str_radix(10))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(actual, fields[6], "{name}");
+    }
+    if std::env::var("RTOS_GET_CASE_FILTER").is_ok() {
+        assert!(cases > 0);
+    } else {
+        assert_eq!(cases, 80);
+    }
+    Ok(())
+}

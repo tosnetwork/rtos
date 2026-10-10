@@ -948,7 +948,7 @@ impl LiteServerQuerySubscriber {
                 &account,
                 mc_state_root.clone(),
                 &mc_block_id,
-                method_id as u32,
+                method_id,
                 input_entries,
                 resolved.gen_utime,
                 resolved.gen_lt,
