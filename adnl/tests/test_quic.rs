@@ -2670,7 +2670,7 @@ async fn quic_owned_shutdown_joins_real_query_and_message_subscribers() {
     tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap().unwrap();
 
     let mut first_waiter = Box::pin(nodes[0].shutdown_and_wait());
-    assert!(tokio::time::timeout(Duration::from_millis(50), &mut first_waiter).await.is_err());
+    assert!(tokio::time::timeout(Duration::from_secs(4), &mut first_waiter).await.is_err());
     assert_eq!(subscriber.completed.load(Ordering::SeqCst), 0);
     drop(first_waiter);
     assert!(nodes[0]
