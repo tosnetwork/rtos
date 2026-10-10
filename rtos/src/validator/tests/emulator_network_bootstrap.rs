@@ -924,7 +924,9 @@ impl EngineOperations for BootstrapTestEngine {
     }
 
     fn destroy_block_candidates(&self, _session_id: &SessionId) -> Result<bool> {
-        Ok(false)
+        // This engine does not persist candidate tables. False means deletion
+        // is still pending and would keep a real teardown barrier open forever.
+        Ok(true)
     }
 
     async fn load_state(&self, block_id: &BlockIdExt) -> Result<Arc<ShardStateStuff>> {
@@ -1197,7 +1199,12 @@ async fn test_manager_creates_emulator_sessions_from_generated_mc_states() -> Re
 
     let session_ids =
         manager.current_sessions.keys().cloned().collect::<std::collections::HashSet<_>>();
-    manager.stop_and_remove_sessions(&session_ids, true).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.stop_and_remove_sessions(&session_ids, true),
+    )
+    .await
+    .expect("manager session teardown watchdog")?;
 
     Ok(())
 }
@@ -1290,7 +1297,12 @@ async fn test_manager_selects_validator_key_by_validator_key_order() -> Result<(
 
     let session_ids =
         manager.current_sessions.keys().cloned().collect::<std::collections::HashSet<_>>();
-    manager.stop_and_remove_sessions(&session_ids, true).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.stop_and_remove_sessions(&session_ids, true),
+    )
+    .await
+    .expect("manager session teardown watchdog")?;
 
     Ok(())
 }
