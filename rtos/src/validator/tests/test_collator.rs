@@ -812,6 +812,17 @@ async fn try_collate_by_bundle_reference(
         CollateResult::Ok { candidate, .. } => candidate.clone(),
         CollateResult::Err { err, .. } => panic!("No block candidate produced {err:?}"),
     };
+    let extras = read_boc(&candidate.collated_data)?
+        .roots
+        .into_iter()
+        .filter_map(|root| rtos_block::ConsensusExtraData::construct_from_cell(root).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(extras.len(), 1, "the real collator must emit one timestamp");
+    assert_eq!(
+        extras[0].gen_utime_ms / 1000,
+        u64::from(Block::construct_from_bytes(&candidate.data)?.read_info()?.gen_utime())
+    );
+    assert_eq!(candidate.collated_file_hash, UInt256::calc_file_hash(&candidate.collated_data));
     if !compare_ethalon {
         return Ok(candidate);
     }
@@ -1079,6 +1090,34 @@ async fn try_validate_historical_bundle(bundle: Arc<CollatorTestBundle>) {
     candidate.data = migrated.write_to_bytes().unwrap();
     candidate.block_id.root_hash = migrated.serialize().unwrap().repr_hash().clone();
     candidate.block_id.file_hash = UInt256::calc_file_hash(&candidate.data);
+    // Migrate only archives that predate mandatory timestamp metadata.
+    let mut roots = read_boc(&candidate.collated_data).unwrap().roots;
+    let extras = roots
+        .iter()
+        .filter_map(|root| rtos_block::ConsensusExtraData::construct_from_cell(root.clone()).ok())
+        .collect::<Vec<_>>();
+    if extras.is_empty() {
+        roots.push(
+            rtos_block::ConsensusExtraData {
+                flags: 0,
+                gen_utime_ms: u64::from(migrated.read_info().unwrap().gen_utime()) * 1000,
+            }
+            .serialize()
+            .unwrap(),
+        );
+        candidate.collated_data =
+            rtos_block::BocWriter::with_flags(roots, rtos_block::BocFlags::Crc32)
+                .unwrap()
+                .write_to_vec()
+                .unwrap();
+        candidate.collated_file_hash = UInt256::calc_file_hash(&candidate.collated_data);
+    } else {
+        assert_eq!(extras.len(), 1);
+        assert_eq!(
+            extras[0].gen_utime_ms / 1000,
+            u64::from(migrated.read_info().unwrap().gen_utime())
+        );
+    }
     crate::collator_test_bundle::try_validate(bundle, candidate).await.unwrap();
 }
 
@@ -1099,7 +1138,7 @@ async fn test_collated_data1() {
         try_collate_by_bundle_reference(Arc::new(bundle), true, Some(reference)).await.unwrap();
 
     let mut collated_data_roots = read_boc(&candidate.collated_data).unwrap().roots;
-    assert_eq!(collated_data_roots.len(), 10);
+    assert_eq!(collated_data_roots.len(), 11);
     let state_proof = MerkleProof::construct_from_cell(collated_data_roots.pop().unwrap()).unwrap();
     let state: ShardStateUnsplit = state_proof.virtualize().unwrap();
     let account = state
@@ -1141,7 +1180,7 @@ async fn check_bundle(bundle: &str, collated_roots: usize, migrate_hash: bool) {
         try_collate_by_bundle_reference(Arc::new(bundle), true, reference).await.unwrap();
 
     let mut collated_data_roots = read_boc(&candidate.collated_data).unwrap().roots;
-    assert_eq!(collated_data_roots.len(), collated_roots);
+    assert_eq!(collated_data_roots.len(), collated_roots + 1);
     let state_proof = MerkleProof::construct_from_cell(collated_data_roots.pop().unwrap()).unwrap();
     let state: ShardStateUnsplit = state_proof.virtualize().unwrap();
     let accounts = state.read_accounts().unwrap();
@@ -1150,6 +1189,9 @@ async fn check_bundle(bundle: &str, collated_roots: usize, migrate_hash: bool) {
     let dict_proofs = collated_data_roots
         .iter()
         .filter_map(|root| {
+            if rtos_block::ConsensusExtraData::construct_from_cell(root.clone()).is_ok() {
+                return None;
+            }
             if let Ok(dict_proof) = read_dict_proof(root.clone()) {
                 Some(dict_proof)
             } else {
