@@ -1,4 +1,5 @@
 /*
+ * RTOS project modifications (2026-10-10): preserve repeated BOC roots and size their header fields.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -28,7 +29,7 @@ const BOC_INDEXED_TAG: u32 = 0x68ff65f3; // deprecated, is used only for read
 const BOC_INDEXED_CRC32_TAG: u32 = 0xacc3a728; // deprecated, is used only for read
 const BOC_GENERIC_TAG: u32 = 0xb5ee9c72;
 
-const MAX_ROOTS_COUNT: usize = 1024;
+const MAX_ROOTS_COUNT: usize = 16384;
 const MAX_CELL_WEIGHT: u32 = 0xFF;
 const MAX_CELL_DISTR_WEIGHT: u32 = 64;
 
@@ -520,26 +521,20 @@ macro_rules! define_BocWriter {
                         $field_name,
                     )*
                 };
-                let mut roots_set = HashSet::new();
                 for root_cell in root_cells {
                     if root_cell.virtualization() != 0 {
                         fail!("Virtual cells serialisation is prohibited");
                     }
                     let root_hash = root_cell.repr_hash().clone();
-                    if !roots_set.insert(root_hash.clone()) {
-                        fail!("roots must be all unique")
-                    }
                     let depth = root_cell.repr_depth();
                     if depth > max_depth {
                         fail!("Cell {:x} is too deep: {} > {}", root_hash, depth, max_depth);
                     }
 
-                    if let Some(rev_index) = boc.cells_index.get(&root_hash) {
-                        boc.roots_indexes_rev.push(*rev_index as usize);
-                    } else {
-                        let rev_index = boc.arrange_cells(root_cell)?;
-                        boc.roots_indexes_rev.push(rev_index as usize);
-                    }
+                    // Every root occurrence is a reference, including a root already visited
+                    // as a child. arrange_cells also sets the shared-cell cache bit.
+                    let rev_index = boc.arrange_cells(root_cell)?;
+                    boc.roots_indexes_rev.push(rev_index as usize);
                 }
 
                 boc.distribute_weights()?;
@@ -604,7 +599,7 @@ macro_rules! define_BocWriter {
             }
 
             fn compute_serialization_params(&self) -> (usize, usize, usize) {
-                let ref_size = Self::number_of_bytes_to_fit(self.cells_count());
+                let ref_size = Self::number_of_bytes_to_fit(self.cells_count().max(self.roots_count()));
                 let mut total_cells_size = self.data_size + self.references * ref_size;
                 if self.flags.contains(BocFlags::IntHashes) || self.flags.contains(BocFlags::TopHash) {
                     total_cells_size += self.stored_hashes * (SHA256_SIZE + DEPTH_SIZE);
@@ -1916,15 +1911,6 @@ impl<'a> BocReader<'a> {
                 offset_size
             )
         }
-        if roots_count + absent_count > cells_count {
-            fail!(
-                "roots count + absent count has to be less or equal than cells count, roots: {}, \
-                absent: {}, cells: {}",
-                roots_count,
-                absent_count,
-                cells_count
-            );
-        }
         if absent_count != 0 {
             fail!("absent cells are not supported")
         }
@@ -1934,13 +1920,6 @@ impl<'a> BocReader<'a> {
             4 * (DEPTH_SIZE + SHA256_SIZE) + // stored hashe & depths
             MAX_DATA_BYTES +
             MAX_REFERENCES_COUNT * ref_size;
-        let min_cell_size = 2; // descr bytes only
-                               // every raw cell except roots must be referenced at least once, hence the formula
-        let tot_cells_size_minimal =
-            cells_count * (min_cell_size + ref_size) - ref_size * roots_count;
-        if tot_cells_size < tot_cells_size_minimal {
-            fail!("tot_cells_size is too small with respect to cells_count");
-        }
         if tot_cells_size > max_cell_size * cells_count {
             fail!("tot_cells_size is too big with respect to cells_count");
         }
@@ -1957,15 +1936,27 @@ impl<'a> BocReader<'a> {
                         cells_count
                     );
                 }
-                if roots_indexes.contains(&index) {
-                    fail!("Duplicate root index {} found", index);
-                }
                 roots_indexes.push(index); // cells:(##(size * 8))
             }
             roots_indexes
         } else {
             vec![0]
         };
+
+        // Each distinct root exempts at most one cell from needing an incoming
+        // reference. Repeated root entries do not reduce the cell-data minimum.
+        let distinct_roots = roots_indexes.iter().copied().collect::<HashSet<_>>().len();
+        let tot_cells_size_minimal = cells_count
+            .checked_mul(2)
+            .and_then(|size| {
+                (cells_count - distinct_roots)
+                    .checked_mul(ref_size)
+                    .and_then(|refs| size.checked_add(refs))
+            })
+            .ok_or_else(|| error!("BOC minimum cell size overflow"))?;
+        if tot_cells_size < tot_cells_size_minimal {
+            fail!("tot_cells_size is too small with respect to cells_count");
+        }
 
         let header = BocHeader {
             magic,
