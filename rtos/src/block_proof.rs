@@ -235,6 +235,7 @@ impl BlockProofStuff {
 
             if prev_key_block_seqno == 0 {
                 let zerostate = engine.load_mc_zero_state().await?;
+                zerostate.verify_zerostate(engine.zerostate_id()?)?;
                 self.check_with_master_state_(&zerostate, &virt_block, &virt_block_info)?;
             } else {
                 let state = engine.load_last_applied_mc_state().await?;

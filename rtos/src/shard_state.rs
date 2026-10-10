@@ -80,6 +80,22 @@ impl ShardStateStuff {
         )
     }
 
+    /// Rebind a decoded/cached zerostate to the caller's pinned identity.
+    /// Original BOC bytes must separately pass file-hash verification when
+    /// imported; re-encoding cached cells is not the original file.
+    pub fn verify_zerostate(&self, expected: &BlockIdExt) -> Result<()> {
+        if expected.seq_no != 0 || self.block_id() != expected {
+            fail!("Zerostate does not match the pinned block identity");
+        }
+        if self.root.repr_hash() != expected.root_hash() {
+            fail!("Cached zerostate root differs from the pinned root hash");
+        }
+        if self.shard_state.seq_no() != 0 || self.shard_state.shard() != expected.shard() {
+            fail!("Zerostate header differs from the pinned shard or sequence number");
+        }
+        Ok(())
+    }
+
     pub fn deserialize_zerostate(
         block_id: BlockIdExt,
         bytes: &[u8],

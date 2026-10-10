@@ -694,7 +694,9 @@ impl EngineOperations for Engine {
 
     async fn load_mc_zero_state(&self) -> Result<Arc<ShardStateStuff>> {
         let block_id = self.zerostate_id();
-        self.load_state(block_id).await
+        let state = self.load_state(block_id).await?;
+        state.verify_zerostate(block_id)?;
+        Ok(state)
     }
 
     async fn load_state(&self, block_id: &BlockIdExt) -> Result<Arc<ShardStateStuff>> {

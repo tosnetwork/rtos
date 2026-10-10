@@ -70,3 +70,93 @@ fn test_shard_state_deserilaize() {
     .expect("not zero state no need to be checked");
     assert_eq!(new_ss.state().unwrap(), &ss);
 }
+
+#[tokio::test]
+async fn test_zerostate_cache_is_bound_to_pinned_identity() {
+    let ss = ShardStateUnsplit::with_ident(ShardIdent::masterchain());
+    let bytes = write_boc(&ss.serialize().unwrap()).unwrap();
+    let id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        0,
+        ss.serialize().unwrap().repr_hash().clone(),
+        UInt256::calc_file_hash(&bytes),
+    );
+    let make = |id, ss| {
+        ShardStateStuff::from_state(
+            id,
+            ss,
+            #[cfg(feature = "telemetry")]
+            &create_engine_telemetry(),
+            &create_engine_allocated(),
+        )
+        .unwrap()
+    };
+    let valid = make(id.clone(), ss.clone());
+    valid.verify_zerostate(&id).unwrap();
+    for mutation in 0..4 {
+        let mut expected = id.clone();
+        match mutation {
+            0 => expected.seq_no = 1,
+            1 => expected.shard_id = ShardIdent::full(0),
+            2 => expected.root_hash = UInt256::from([1; 32]),
+            3 => expected.file_hash = UInt256::from([2; 32]),
+            _ => unreachable!(),
+        }
+        assert!(valid.verify_zerostate(&expected).is_err());
+    }
+    let handles = crate::collator_test_bundle::create_block_handle_storage(None).unwrap();
+    let handle = handles
+        .create_handle(id.clone(), storage::types::BlockMeta::default(), None)
+        .unwrap()
+        .unwrap();
+    handle.set_state();
+    for corrupt in [false, true] {
+        let mut content = ss.clone();
+        if corrupt {
+            content.set_global_id(123);
+        }
+        let engine = ZeroCacheEngine { handle: handle.clone(), state: make(id.clone(), content) };
+        let result = crate::boot::download_zerostate(&engine, &id).await;
+        if corrupt {
+            assert!(result.unwrap_err().to_string().contains("pinned root hash"));
+        } else {
+            assert_eq!(result.unwrap().id(), &id);
+        }
+    }
+    // Even a matching root must not hide inconsistent embedded metadata from
+    // an unchecked in-memory constructor or a corrupt cache.
+    for wrong_shard in [false, true] {
+        let mut content = ss.clone();
+        if wrong_shard {
+            content.set_shard(ShardIdent::full(0));
+        } else {
+            content.set_seq_no(1);
+        }
+        let mut claimed = id.clone();
+        claimed.root_hash = content.serialize().unwrap().repr_hash().clone();
+        let state = make(claimed.clone(), content);
+        assert!(state
+            .verify_zerostate(&claimed)
+            .unwrap_err()
+            .to_string()
+            .contains("header differs"));
+    }
+}
+
+struct ZeroCacheEngine {
+    handle: std::sync::Arc<storage::block_handle_db::BlockHandle>,
+    state: std::sync::Arc<ShardStateStuff>,
+}
+
+#[async_trait::async_trait]
+impl crate::engine_traits::EngineOperations for ZeroCacheEngine {
+    fn load_block_handle(
+        &self,
+        _: &BlockIdExt,
+    ) -> Result<Option<std::sync::Arc<storage::block_handle_db::BlockHandle>>> {
+        Ok(Some(self.handle.clone()))
+    }
+    async fn load_state(&self, _: &BlockIdExt) -> Result<std::sync::Arc<ShardStateStuff>> {
+        Ok(self.state.clone())
+    }
+}

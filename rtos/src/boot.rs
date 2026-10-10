@@ -33,6 +33,9 @@ async fn run_cold(
     CHECK!(block_id.shard().is_masterchain());
     CHECK!(block_id.seq_no >= engine.get_last_fork_masterchain_seqno());
     if block_id.seq_no() == 0 {
+        if block_id != engine.zerostate_id()? {
+            fail!("Boot zerostate differs from the configured network anchor");
+        }
         let handle = download_zerostate(engine, block_id).await?;
         engine.save_last_applied_mc_block_id(&block_id)?;
         let zero_state = engine.load_state(handle.id()).await?;
@@ -557,6 +560,8 @@ pub(crate) async fn download_zerostate(
 ) -> Result<Arc<BlockHandle>> {
     if let Some(handle) = engine.load_block_handle(block_id)? {
         if handle.has_state() {
+            let state = engine.load_state(block_id).await?;
+            state.verify_zerostate(block_id)?;
             return Ok(handle);
         }
     }
@@ -567,6 +572,10 @@ pub(crate) async fn download_zerostate(
         }
         match engine.download_zerostate(block_id).await {
             Ok((state, state_bytes)) => {
+                state.verify_zerostate(block_id)?;
+                if UInt256::calc_file_hash(&state_bytes) != block_id.file_hash {
+                    fail!("Downloaded zerostate file differs from the pinned file hash");
+                }
                 log::info!(target: "boot", "zero state {} received", block_id);
                 let (_, handle) = engine.store_zerostate(state, &state_bytes).await?;
                 engine.set_applied(&handle, 0).await?;

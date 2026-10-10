@@ -113,3 +113,30 @@ async fn test_get_actual_validator_key_ids_uses_validator_key_order() -> Result<
     assert_eq!(actual, expected);
     Ok(())
 }
+
+#[test]
+fn test_network_zerostate_requires_complete_masterchain_anchor() {
+    let good = serde_json::json!({"validator": {"zero_state": {
+        "workchain": -1, "shard": i64::MIN, "seqno": 0,
+        "root_hash": "01".repeat(32), "file_hash": "02".repeat(32)
+    }}});
+    let parse =
+        |value| serde_json::from_value::<TonNodeGlobalConfigJson>(value).unwrap().zero_state();
+    let id = parse(good.clone()).unwrap();
+    assert!(id.shard().is_masterchain_ext());
+    assert_eq!(id.seq_no, 0);
+    for (field, value) in [
+        ("workchain", serde_json::json!(0)),
+        ("shard", serde_json::json!(0x4000000000000000i64)),
+        ("seqno", serde_json::json!(1)),
+        ("seqno", serde_json::json!(-1)),
+        ("root_hash", serde_json::json!("00".repeat(32))),
+        ("file_hash", serde_json::json!("00".repeat(32))),
+        ("file_hash", serde_json::Value::Null),
+        ("root_hash", serde_json::Value::Null),
+    ] {
+        let mut value_json = good.clone();
+        value_json["validator"]["zero_state"][field] = value;
+        assert!(parse(value_json).is_err(), "invalid {field}");
+    }
+}

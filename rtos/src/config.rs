@@ -2332,8 +2332,16 @@ impl TonNodeGlobalConfigJson {
     }
 
     pub fn zero_state(&self) -> Result<BlockIdExt> {
-        self.parse_block_id(&self.validator.zero_state)
-            .map_err(|err| error!("zero state parse error: {}", err))
+        let id = self
+            .parse_block_id(&self.validator.zero_state)
+            .map_err(|err| error!("zero state parse error: {}", err))?;
+        if !id.shard().is_masterchain_ext() || id.seq_no != 0 {
+            fail!("Network zerostate must be masterchain sequence zero");
+        }
+        if id.root_hash == UInt256::default() || id.file_hash == UInt256::default() {
+            fail!("Network zerostate requires explicit nonzero root and file hashes");
+        }
+        Ok(id)
     }
 
     pub fn init_block(&self) -> Result<Option<BlockIdExt>> {

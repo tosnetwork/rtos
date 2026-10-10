@@ -594,6 +594,7 @@ impl Engine {
         let collator_config_mc = general_config.collator_config_mc().clone();
         let boot_from_zerostate = general_config.boot_from_zerostate();
         let global_config = general_config.load_global_config()?;
+        let zero_state_id = global_config.zero_state()?;
         let test_bundles_config = general_config.test_bundles_config().clone();
         let session_logs_file = general_config.session_logs_file();
         // Spawn the trace collector worker only when an on-disk session-stats
@@ -660,7 +661,6 @@ impl Engine {
         stopper.release_stop(Self::MASK_SERVICE_DB_RESTORE);
         let db = db?;
 
-        let zero_state_id = global_config.zero_state().expect("check zero state settings");
         let mut init_mc_block_id = match global_config.init_block()? {
             Some(init_mc_block_id) if !boot_from_zerostate => {
                 log::info!("zero state substitued by init block {}", init_mc_block_id);
@@ -2170,6 +2170,7 @@ pub(crate) async fn load_zero_state(engine: &Arc<Engine>, path: &str) -> Result<
 
     if let Some(handle) = engine.load_block_handle(zero_id)? {
         if handle.is_applied() {
+            engine.load_state(zero_id).await?.verify_zerostate(zero_id)?;
             log::trace!("zero state already applied");
             return Ok(false);
         }
