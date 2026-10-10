@@ -43,7 +43,7 @@ mod test_signature;
 /// This helper converts the structured signature data back to raw pairs
 /// for use by the internal proof creation functions.
 fn extract_signature_pairs(variant: &BlockSignaturesVariant) -> Result<Vec<CryptoSignaturePair>> {
-    let pure_sigs = variant.pure_signatures();
+    let pure_sigs = variant.pure_signatures()?;
     let mut pairs = Vec::with_capacity(pure_sigs.count() as usize);
 
     pure_sigs.signatures().iterate_slices(|_key, slice| {
@@ -58,6 +58,7 @@ fn extract_signature_pairs(variant: &BlockSignaturesVariant) -> Result<Vec<Crypt
 fn can_promote_to_top_shard_descr(signatures: &BlockSignaturesVariant) -> bool {
     match signatures {
         BlockSignaturesVariant::Ordinary(_) => true,
+        BlockSignaturesVariant::SimplexPq(_) => true,
         BlockSignaturesVariant::Simplex(simplex) => simplex.is_final(),
     }
 }
@@ -247,6 +248,9 @@ pub async fn accept_block_routine(
     is_fake: bool,
     is_fork: bool,
 ) -> Result<Option<(Arc<BlockHandle>, BlockStuff, BlockProofStuff, BlockSignaturesVariant)>> {
+    if matches!(signatures_variant, Some(BlockSignaturesVariant::SimplexPq(_))) {
+        fail!("PQ proof construction requires a verified finality context");
+    }
     let handle_opt = if let Some(handle) = engine.load_block_handle(id)? {
         if handle.is_applied() {
             return Ok(None);
@@ -318,6 +322,9 @@ pub async fn accept_block_routine(
 
     // Create proof using variant-aware function if Simplex variant provided
     let (proof, signatures_out) = match signatures_variant {
+        Some(BlockSignaturesVariant::SimplexPq(_)) => {
+            fail!("PQ proof construction requires a verified finality context")
+        }
         Some(variant @ BlockSignaturesVariant::Simplex(_)) => {
             // Use Simplex-aware proof creation
             create_new_proof_with_variant(&block, validator_set, signatures, variant)?
@@ -569,6 +576,9 @@ fn create_new_proof_with_variant_internal(
     force_proof_link: bool,
     signatures_variant: Option<&BlockSignaturesVariant>,
 ) -> Result<(BlockProofStuff, BlockSignaturesVariant)> {
+    if matches!(signatures_variant, Some(BlockSignaturesVariant::SimplexPq(_))) {
+        fail!("PQ proof construction requires a verified finality context");
+    }
     let id = block_stuff.id();
     let block_descr = fmt_block_id_short(id);
     log::debug!(target: "validator", "({}): accept_block: create_new_proof_with_variant", block_descr);
@@ -616,6 +626,9 @@ fn create_new_proof_with_variant_internal(
 
     // Check signatures using the appropriate signed data format
     let checked_data = match signatures_variant {
+        Some(BlockSignaturesVariant::SimplexPq(_)) => {
+            fail!("PQ proof construction requires a verified finality context")
+        }
         Some(BlockSignaturesVariant::Simplex(simplex)) => {
             // For Simplex, use the stored context to build the signed data.
             // Also validate that the embedded candidate refers to this block id.
@@ -645,6 +658,9 @@ fn create_new_proof_with_variant_internal(
 
     // Build the output signature variant, preserving the type from input
     let output_variant = match signatures_variant {
+        Some(BlockSignaturesVariant::SimplexPq(_)) => {
+            fail!("PQ proof construction requires a verified finality context")
+        }
         Some(BlockSignaturesVariant::Simplex(simplex)) => {
             // Preserve Simplex variant with updated validator_info and weight
             let mut updated = simplex.clone();

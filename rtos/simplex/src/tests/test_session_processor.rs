@@ -473,6 +473,9 @@ impl consensus_common::SessionListener for RecordingListener {
         _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
     ) {
         let is_final = match signatures {
+            BlockSignaturesVariant::SimplexPq(_) => {
+                panic!("classical test harness received PQ signatures")
+            }
             BlockSignaturesVariant::Simplex(simplex) => simplex.is_final(),
             BlockSignaturesVariant::Ordinary(_) => true,
         };

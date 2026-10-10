@@ -562,8 +562,8 @@ impl BlockProofStuff {
                 signatures.validator_info().validator_list_hash_short
             )));
         }
-        let expected_count = signatures.pure_signatures().count() as usize;
-        let count = signatures.pure_signatures().signatures().count(expected_count)?;
+        let expected_count = signatures.pure_signatures()?.count() as usize;
+        let count = signatures.pure_signatures()?.signatures().count(expected_count)?;
         if expected_count != count {
             fail!(NodeError::InvalidData(format!(
                 "Proof for {}: signature count mismatch: declared: {}, calculated: {}",
@@ -584,7 +584,7 @@ impl BlockProofStuff {
         let total_weight: u64 =
             rtos_block::checked_validator_weight_sum(subset.validators.iter().map(|v| v.weight))?;
         let weight = signatures
-            .pure_signatures()
+            .pure_signatures()?
             .check_signatures(&subset.validators, &checked_data)
             .map_err(|err| {
                 NodeError::InvalidData(format!(
@@ -594,11 +594,11 @@ impl BlockProofStuff {
             })?;
 
         // Check weight
-        if weight != signatures.pure_signatures().weight() {
+        if weight != signatures.pure_signatures()?.weight() {
             fail!(NodeError::InvalidData(format!(
                 "Proof for {}: total signature weight mismatch: declared: {}, calculated: {}",
                 self.id(),
-                signatures.pure_signatures().weight(),
+                signatures.pure_signatures()?.weight(),
                 weight
             )));
         }

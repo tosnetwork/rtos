@@ -42,3 +42,12 @@ The source retains the 2026 contributor copyright and LGPL-2.0-or-later notice.
 The two session fixtures under `tl/rtos_api/tests/data` are copied unchanged
 from that commit's `test/pq-native` directory. Schema and import digests are
 recorded in the memo manifest.
+
+`block/src/signature.rs` merges the persisted PQ block-signature carrier from
+that fixed commit's `tosctl/src/block/src/signature.rs`, retaining its GPLv3
+header and original copyright notices. The corresponding vector test retains
+its 2026 contributor copyright and LGPL-2.0-or-later notice. Its additional
+400-signer regression adapts `test/pq-native/block-signature-carrier-common.h`
+under the same license and checks the fixed measurement digest. The fixture
+`block/tests/data/pq-block-signature-vectors.txt` is copied unchanged from
+`test/pq-native`. Parsing these carriers is distinct from authenticating finality.

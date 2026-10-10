@@ -498,9 +498,9 @@ fn sigset_from_proof_boc(id: &BlockIdExt, boc: &[u8]) -> Result<SignatureSet> {
         proof.drain_signatures().map_err(|_| error!("no signatures in proof for {}", id))?;
 
     let mut out_sigs: Vec<Signature> =
-        Vec::with_capacity(block_sigs.pure_signatures().count() as usize);
+        Vec::with_capacity(block_sigs.pure_signatures()?.count() as usize);
 
-    block_sigs.pure_signatures().signatures().iterate_slices(
+    block_sigs.pure_signatures()?.signatures().iterate_slices(
         |_key_bits, mut slice: SliceData| {
             // Every value — that's CryptoSignaturePair
             let pair = CryptoSignaturePair::construct_from(&mut slice)?;
@@ -515,6 +515,9 @@ fn sigset_from_proof_boc(id: &BlockIdExt, boc: &[u8]) -> Result<SignatureSet> {
     let cc_seqno = block_sigs.validator_info().catchain_seqno as i32;
 
     Ok(match block_sigs {
+        BlockSignaturesVariant::SimplexPq(_) => {
+            fail!("PQ lite signature response format is not yet implemented")
+        }
         BlockSignaturesVariant::Ordinary(_) => {
             SignatureSet::LiteServer_SignatureSet_Ordinary(TlSignatureSetOrdinary {
                 validator_set_hash,

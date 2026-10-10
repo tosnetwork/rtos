@@ -523,7 +523,7 @@ fn validate_brodcast_v2(
     let total_weight: u64 =
         rtos_block::checked_validator_weight_sum(subset.validators.iter().map(|v| v.weight))?;
     let weight = signatures
-        .pure_signatures()
+        .pure_signatures()?
         .check_signatures(&subset.validators, &data_to_verify)
         .map_err(|err| {
             NodeError::InvalidData(format!(

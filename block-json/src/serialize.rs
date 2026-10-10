@@ -2490,37 +2490,47 @@ pub fn db_serialize_block_proof_ex(
     serialize_cell(&mut map, "proof", Some(&proof.root), false)?;
 
     if let Some(signatures) = proof.signatures.as_ref() {
-        // Serialize common fields
         map.insert(
             "validator_list_hash_short".to_string(),
             signatures.validator_info().validator_list_hash_short.into(),
         );
         map.insert("catchain_seqno".to_string(), signatures.validator_info().catchain_seqno.into());
-        serialize_u64(&mut map, "sig_weight", &signatures.pure_signatures().weight(), mode);
-
+        serialize_u64(&mut map, "sig_weight", &signatures.declared_signature_weight(), mode);
         let mut signs = Vec::new();
-        signatures.pure_signatures().signatures().iterate_slices(
-            |_key, mut value| -> Result<bool> {
-                signs.push(serialize_crypto_signature(&CryptoSignaturePair::construct_from(
-                    &mut value,
-                )?)?);
-                Ok(true)
-            },
-        )?;
-        serialize_field(&mut map, "signatures", signs);
-
-        // Serialize variant-specific fields
-        match signatures {
-            BlockSignaturesVariant::Ordinary(_) => {
-                serialize_field(&mut map, "signature_type", "ordinary");
+        if let BlockSignaturesVariant::SimplexPq(pq) = signatures {
+            // Validate the structural carrier before exporting it; this is not authentication.
+            pq.serialize()?;
+            serialize_field(&mut map, "signature_type", "simplex_pq");
+            serialize_field(&mut map, "sig_count", pq.sig_count);
+            serialize_uint256(&mut map, "session_id", &pq.session_id);
+            serialize_field(&mut map, "slot", pq.slot);
+            serialize_cell(&mut map, "candidate_data", Some(&pq.candidate_data), true)?;
+            for signature in &pq.signatures {
+                let mut item = Map::new();
+                serialize_uint256(&mut item, "validator_id", &signature.validator_id);
+                serialize_field(&mut item, "algorithm_id", signature.algorithm_id);
+                serialize_field(&mut item, "signature", hex::encode(&signature.signature));
+                signs.push(Value::Object(item));
             }
-            BlockSignaturesVariant::Simplex(simplex) => {
+        } else {
+            signatures.pure_signatures()?.signatures().iterate_slices(
+                |_key, mut value| -> Result<bool> {
+                    signs.push(serialize_crypto_signature(&CryptoSignaturePair::construct_from(
+                        &mut value,
+                    )?)?);
+                    Ok(true)
+                },
+            )?;
+            if let Some(simplex) = signatures.as_simplex() {
                 serialize_field(&mut map, "signature_type", "simplex");
                 serialize_uint256(&mut map, "session_id", &simplex.session_id);
                 serialize_field(&mut map, "slot", simplex.slot);
                 serialize_cell(&mut map, "candidate_data", Some(&simplex.candidate_data), true)?;
+            } else {
+                serialize_field(&mut map, "signature_type", "ordinary");
             }
         }
+        serialize_field(&mut map, "signatures", signs);
     }
     Ok(map)
 }

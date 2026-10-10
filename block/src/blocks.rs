@@ -1419,7 +1419,7 @@ impl TopBlockDescr {
     pub fn ordinary_signatures(&self) -> Option<&BlockSignatures> {
         self.signatures.as_ref().and_then(|irf| match &irf.0 {
             BlockSignaturesVariant::Ordinary(sigs) => Some(sigs),
-            BlockSignaturesVariant::Simplex(_) => None,
+            BlockSignaturesVariant::Simplex(_) | BlockSignaturesVariant::SimplexPq(_) => None,
         })
     }
 
@@ -1427,9 +1427,14 @@ impl TopBlockDescr {
     /// Returns None if signatures are Ordinary format
     pub fn simplex_signatures(&self) -> Option<&BlockSignaturesSimplex> {
         self.signatures.as_ref().and_then(|irf| match &irf.0 {
-            BlockSignaturesVariant::Ordinary(_) => None,
+            BlockSignaturesVariant::Ordinary(_) | BlockSignaturesVariant::SimplexPq(_) => None,
             BlockSignaturesVariant::Simplex(sigs) => Some(sigs),
         })
+    }
+
+    /// Parsed PQ signatures; this accessor does not establish finality.
+    pub fn simplex_pq_signatures(&self) -> Option<&crate::BlockSignaturesSimplexPq> {
+        self.signatures().and_then(BlockSignaturesVariant::as_simplex_pq)
     }
 
     pub fn chain(&self) -> &Vec<Cell> {

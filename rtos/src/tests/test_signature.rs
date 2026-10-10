@@ -159,3 +159,29 @@ fn test_top_shard_descr_promotion_allows_final_simplex_signatures() {
 fn test_top_shard_descr_promotion_rejects_notarized_simplex_signatures() {
     assert!(!can_promote_to_top_shard_descr(&make_simplex_variant(false)));
 }
+
+#[test]
+fn test_pq_proof_construction_cannot_downgrade() {
+    use rtos_block::Deserializable;
+    let row = include_str!("../../../block/tests/data/pq-block-signature-vectors.txt")
+        .lines()
+        .find(|line| line.starts_with("valid-1\t"))
+        .unwrap();
+    let fields: Vec<_> = row.split('\t').collect();
+    let signatures =
+        BlockSignaturesVariant::construct_from_bytes(&hex::decode(fields[4]).unwrap()).unwrap();
+    assert!(super::extract_signature_pairs(&signatures).is_err());
+    assert!(crate::network::pack_signature_set(&signatures).is_err());
+    let block = crate::block::BlockStuff::read_block_from_file(
+        "src/tests/static/test_master_block_proof/key_block__3082181",
+    )
+    .unwrap();
+    let error = super::create_new_proof_with_variant(
+        &block,
+        &rtos_block::ValidatorSet::default(),
+        &[],
+        &signatures,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("verified finality context"), "{error}");
+}

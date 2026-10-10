@@ -256,7 +256,7 @@ fn test_block_signatures_variant_ordinary() {
     assert!(variant.is_ordinary());
     assert!(!variant.is_simplex());
     assert_eq!(variant.validator_info(), &ordinary.validator_info);
-    assert_eq!(variant.pure_signatures().weight(), ordinary.pure_signatures.weight());
+    assert_eq!(variant.pure_signatures().unwrap().weight(), ordinary.pure_signatures.weight());
 }
 
 #[test]
@@ -267,7 +267,7 @@ fn test_block_signatures_variant_simplex() {
     assert!(!variant.is_ordinary());
     assert!(variant.is_simplex());
     assert_eq!(variant.validator_info(), &simplex.validator_info);
-    assert_eq!(variant.pure_signatures().weight(), simplex.pure_signatures.weight());
+    assert_eq!(variant.pure_signatures().unwrap().weight(), simplex.pure_signatures.weight());
 }
 
 #[test]
@@ -808,6 +808,7 @@ fn test_block_proof_with_simplex_signatures() {
     let deserialized = BlockProof::construct_from_cell(serialized).unwrap();
 
     match deserialized.signatures.as_ref().unwrap() {
+        BlockSignaturesVariant::SimplexPq(_) => panic!("expected classical Simplex"),
         BlockSignaturesVariant::Simplex(s) => {
             assert_eq!(s.session_id, session_id);
             assert_eq!(s.slot, slot);

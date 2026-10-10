@@ -1213,48 +1213,86 @@ pub fn parse_block_proof(map: &Map<String, Value>, block_file_hash: UInt256) -> 
         block_file_hash,
     );
 
-    let signatures = if let Ok(signatures) = map_path.get_vec("signatures") {
-        // Parse common signature fields
-        let mut pure_signatures = BlockSignaturesPure::new();
-        pure_signatures.set_weight(map_path.get_num64("sig_weight")?);
-        for signature in signatures {
-            let signature = PathMap::cont(&map_path, "signatures", signature)?;
-            pure_signatures.add_sigpair(CryptoSignaturePair {
-                node_id_short: signature.get_uint256("node_id")?,
-                sign: CryptoSignature::from_r_s_str(
-                    signature.get_str("r")?,
-                    signature.get_str("s")?,
-                )?,
-            });
+    let signature_type = match map.get("signature_type") {
+        None => "ordinary",
+        Some(Value::String(value))
+            if matches!(value.as_str(), "ordinary" | "simplex" | "simplex_pq") =>
+        {
+            value
         }
-
+        _ => fail!("unknown or malformed block signature_type"),
+    };
+    let signatures = if map.contains_key("signatures") {
+        let signatures = map_path.get_vec("signatures")?;
         let validator_info = ValidatorBaseInfo::with_params(
             map_path.get_num32("validator_list_hash_short")?,
             map_path.get_num32("catchain_seqno")?,
         );
-
-        // Check signature type - defaults to "ordinary" for backward compatibility
-        let signature_type = map_path.get_str("signature_type").unwrap_or("ordinary");
-        let variant = if signature_type == "simplex" {
-            // Parse Simplex-specific fields
-            let session_id = map_path.get_uint256("session_id")?;
-            let slot = map_path.get_num32("slot")?;
-            let candidate_data = read_single_root_boc(map_path.get_base64("candidate_data")?)?;
-            BlockSignaturesVariant::Simplex(BlockSignaturesSimplex::new_finalize(
+        let variant = if signature_type == "simplex_pq" {
+            if signatures.len() > rtos_block::PQ_SIGNATURE_MAX_SIGNERS as usize {
+                fail!("PQ signer count exceeds maximum");
+            }
+            let mut pairs = Vec::with_capacity(signatures.len());
+            for item in signatures {
+                let item = PathMap::cont(&map_path, "signatures", item)?;
+                let algorithm = item
+                    .get_item("algorithm_id")?
+                    .as_u64()
+                    .ok_or_else(|| error!("algorithm_id must be an unsigned integer"))?;
+                let encoded = item.get_str("signature")?;
+                if encoded.len() != rtos_block::PQ_SIGNATURE_BYTES * 2 {
+                    fail!("PQ signature length mismatch");
+                }
+                pairs.push(rtos_block::PqBlockSignaturePair {
+                    validator_id: item.get_uint256("validator_id")?,
+                    algorithm_id: u16::try_from(algorithm)?,
+                    signature: hex::decode(encoded)?,
+                });
+            }
+            if map_path.get_str("candidate_data")?.len() > 8192 {
+                fail!("PQ candidate BOC exceeds maximum");
+            }
+            let pq = rtos_block::BlockSignaturesSimplexPq {
                 validator_info,
-                pure_signatures,
-                session_id,
-                slot,
-                candidate_data,
-            ))
+                sig_count: map_path.get_num32("sig_count")?,
+                sig_weight: map_path.get_num64("sig_weight")?,
+                signatures: pairs,
+                session_id: map_path.get_uint256("session_id")?,
+                slot: map_path.get_num32("slot")?,
+                candidate_data: read_single_root_boc(map_path.get_base64("candidate_data")?)?,
+            };
+            pq.serialize()?;
+            BlockSignaturesVariant::SimplexPq(pq)
         } else {
-            BlockSignaturesVariant::Ordinary(rtos_block::BlockSignatures::with_params(
-                validator_info,
-                pure_signatures,
-            ))
+            let mut pure = BlockSignaturesPure::new();
+            pure.set_weight(map_path.get_num64("sig_weight")?);
+            for item in signatures {
+                let item = PathMap::cont(&map_path, "signatures", item)?;
+                pure.add_sigpair(CryptoSignaturePair {
+                    node_id_short: item.get_uint256("node_id")?,
+                    sign: CryptoSignature::from_r_s_str(item.get_str("r")?, item.get_str("s")?)?,
+                });
+            }
+            if signature_type == "simplex" {
+                BlockSignaturesVariant::Simplex(BlockSignaturesSimplex::new_finalize(
+                    validator_info,
+                    pure,
+                    map_path.get_uint256("session_id")?,
+                    map_path.get_num32("slot")?,
+                    read_single_root_boc(map_path.get_base64("candidate_data")?)?,
+                ))
+            } else {
+                BlockSignaturesVariant::Ordinary(rtos_block::BlockSignatures::with_params(
+                    validator_info,
+                    pure,
+                ))
+            }
         };
         Some(variant)
     } else {
+        if map.contains_key("signature_type") {
+            fail!("signature_type requires signatures");
+        }
         None
     };
 

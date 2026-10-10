@@ -158,6 +158,9 @@ fn unpack_pure_signatures(signatures: &[BlockSignature]) -> Result<BlockSignatur
 /// Pack BlockSignaturesVariant into TL SignatureSet for V2 broadcast
 pub(crate) fn pack_signature_set(signatures: &BlockSignaturesVariant) -> Result<SignatureSet> {
     match signatures {
+        BlockSignaturesVariant::SimplexPq(_) => {
+            fail!("PQ network signature encoding is not yet implemented")
+        }
         BlockSignaturesVariant::Ordinary(sigs) => {
             let packed = pack_block_signatures(sigs)?;
             Ok(SignatureSet::TonNode_SignatureSet_Ordinary(TlOrdinary {

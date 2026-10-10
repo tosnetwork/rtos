@@ -1157,7 +1157,12 @@ fn test_db_serialize_block_proof() {
     )
     .unwrap()))
     .unwrap();
-    assert_json_eq_file(&json, "proof");
+    // The historical snapshot predates the explicit carrier tag, which the
+    // serializer already emits for ordinary proofs. Preserve all other fields.
+    let mut expected: Value =
+        serde_json::from_str(include_str!("data/proof-ethalon.json")).unwrap();
+    expected["signature_type"] = Value::String("ordinary".into());
+    pretty_assertions::assert_eq!(serde_json::from_str::<Value>(&json).unwrap(), expected);
 }
 
 /// Test that serialization of ordinary signatures includes signature_type field
@@ -1259,8 +1264,11 @@ fn test_db_serialize_block_proof_simplex() {
     let original_proof = BlockProof::construct_from_cell(cell).unwrap();
 
     // Create pure signatures (copy weight from original)
-    let original_weight =
-        original_proof.signatures.as_ref().map(|s| s.pure_signatures().weight()).unwrap_or(0);
+    let original_weight = original_proof
+        .signatures
+        .as_ref()
+        .map(|s| s.pure_signatures().unwrap().weight())
+        .unwrap_or(0);
     let mut pure_signatures = BlockSignaturesPure::new();
     pure_signatures.set_weight(original_weight);
     pure_signatures.add_sigpair(CryptoSignaturePair {

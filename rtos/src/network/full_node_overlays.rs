@@ -834,6 +834,9 @@ impl FullNodeOverlaysRouter {
         let fast_sync_client = self.fast_sync_overlay(block.id().shard());
 
         match signatures {
+            BlockSignaturesVariant::SimplexPq(_) => {
+                rtos_block::fail!("PQ block broadcast requires the PQ network signature format")
+            }
             BlockSignaturesVariant::Ordinary(sigs) => {
                 // Use V1 format for ordinary signatures (backward compatibility)
                 let packed_signatures = pack_block_signatures(sigs)?;

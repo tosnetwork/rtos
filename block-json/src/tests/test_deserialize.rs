@@ -680,6 +680,7 @@ fn test_parse_block_proof_legacy_format_without_signature_type() {
 
     // Verify it parses as Ordinary variant (the default)
     match parsed_proof.signatures.as_ref().unwrap() {
+        rtos_block::BlockSignaturesVariant::SimplexPq(_) => panic!("expected classical carrier"),
         BlockSignaturesVariant::Ordinary(sig) => {
             // Verify the signatures match the original
             assert_eq!(
@@ -697,7 +698,7 @@ fn test_parse_block_proof_legacy_format_without_signature_type() {
             );
             assert_eq!(
                 sig.pure_signatures.weight(),
-                ethalon_proof.signatures.as_ref().unwrap().pure_signatures().weight()
+                ethalon_proof.signatures.as_ref().unwrap().pure_signatures().unwrap().weight()
             );
         }
         BlockSignaturesVariant::Simplex(_) => {
@@ -723,6 +724,7 @@ fn test_parse_block_proof_explicit_ordinary_signature_type() {
 
     // Verify it parses as Ordinary variant
     match parsed_proof.signatures.as_ref().unwrap() {
+        rtos_block::BlockSignaturesVariant::SimplexPq(_) => panic!("expected classical carrier"),
         BlockSignaturesVariant::Ordinary(_) => {
             // Expected
         }
@@ -783,6 +785,7 @@ fn test_parse_block_proof_with_simplex_signatures() {
 
     // Verify the signatures match
     match parsed_proof.signatures.as_ref().unwrap() {
+        rtos_block::BlockSignaturesVariant::SimplexPq(_) => panic!("expected classical carrier"),
         BlockSignaturesVariant::Simplex(s) => {
             assert_eq!(s.session_id, session_id);
             assert_eq!(s.slot, slot);
@@ -901,4 +904,45 @@ fn test_consensus_quic_json_round_trip() {
     assert_eq!(cp.config(29).unwrap(), parsed.config(29).unwrap());
     json["p29"]["use_quic"] = serde_json::json!("true");
     assert!(parse_config_with_mandatory_params(json.as_object().unwrap(), &[29]).is_err());
+}
+
+#[test]
+fn test_pq_block_proof_json_round_trip_and_no_classical_fallback() {
+    use rtos_block::{BlockProof, BlockSignaturesSimplexPq, BlockSignaturesVariant};
+    let text = include_str!("../../../block/tests/data/pq-block-signature-vectors.txt");
+    let row: Vec<_> =
+        text.lines().find(|l| l.starts_with("valid-1\t")).unwrap().split('\t').collect();
+    let pq = BlockSignaturesSimplexPq::construct_from_bytes(&hex::decode(row[4]).unwrap()).unwrap();
+    // Only codec coverage: the public proof and carrier are intentionally unrelated.
+    let mut proof = BlockProof::construct_from_bytes(include_bytes!("data/block_proof")).unwrap();
+    proof.signatures = Some(BlockSignaturesVariant::SimplexPq(pq));
+    let json = crate::db_serialize_block_proof("_id", &proof).unwrap();
+    let parse = |json: &serde_json::Map<String, Value>| {
+        parse_block_proof(json, proof.proof_for.file_hash.clone())
+    };
+    assert_eq!(parse(&json).unwrap().signatures, proof.signatures);
+    for invalid in [serde_json::json!("unknown"), serde_json::json!(null), serde_json::json!(7)] {
+        let mut bad = json.clone();
+        bad.insert("signature_type".into(), invalid);
+        assert!(parse(&bad).is_err());
+    }
+    for (field, value) in [
+        ("algorithm_id", serde_json::json!(2)),
+        ("algorithm_id", serde_json::json!(65537)),
+        ("signature", serde_json::json!("00")),
+        ("validator_id", serde_json::json!("xx")),
+    ] {
+        let mut bad = Value::Object(json.clone());
+        bad["signatures"][0][field] = value;
+        assert!(parse(bad.as_object().unwrap()).is_err());
+    }
+    let mut bad = json.clone();
+    bad.insert("signatures".into(), serde_json::json!(false));
+    assert!(parse(&bad).is_err());
+    let mut bad = json.clone();
+    bad.remove("signatures");
+    assert!(parse(&bad).is_err());
+    let mut bad = json.clone();
+    bad.insert("sig_count".into(), serde_json::json!(401));
+    assert!(parse(&bad).is_err());
 }

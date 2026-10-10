@@ -109,3 +109,41 @@ fn test_proof_signature_quorum_weighted_boundary() {
         );
     }
 }
+
+#[test]
+fn test_pq_proof_requires_authenticated_finality_context() {
+    use crate::validator::validator_utils::ValidatorSubsetInfo;
+    use rtos_block::{BlockProof, BlockSignaturesVariant, Cell, Deserializable};
+
+    // Structurally valid reference payload; its patterned signature is not a
+    // cryptographic certificate. Decoding must not authorize a node proof.
+    let row = include_str!("../../../block/tests/data/pq-block-signature-vectors.txt")
+        .lines()
+        .find(|line| line.starts_with("valid-1\t"))
+        .unwrap();
+    let fields: Vec<_> = row.split('\t').collect();
+    let signatures =
+        BlockSignaturesVariant::construct_from_bytes(&hex::decode(fields[4]).unwrap()).unwrap();
+    let subset = ValidatorSubsetInfo {
+        validators: vec![],
+        short_hash: signatures.validator_info().validator_list_hash_short,
+    };
+    let proof = BlockProofStuff::new(
+        BlockProof::with_params(
+            rtos_block::BlockIdExt::with_params(
+                rtos_block::ShardIdent::masterchain(),
+                1,
+                Default::default(),
+                Default::default(),
+            ),
+            Cell::default(),
+            Some(signatures.clone()),
+        ),
+        false,
+    )
+    .unwrap();
+    let error = proof.check_signatures(&subset).unwrap_err();
+    assert!(error.to_string().contains("no CryptoSignature view"), "{error}");
+    let error = crate::validating_utils::build_checked_data(&signatures, proof.id()).unwrap_err();
+    assert!(error.to_string().contains("trusted governing session context"), "{error}");
+}

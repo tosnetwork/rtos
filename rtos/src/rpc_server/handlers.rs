@@ -820,8 +820,8 @@ async fn get_masterchain_block_signatures(p: MasterchainSeqnoParams, ctx: Ctx) -
 fn serialize_block_signature_pairs(
     signatures: &BlockSignaturesVariant,
 ) -> Result<Vec<serde_json::Value>> {
-    let mut result = Vec::with_capacity(signatures.pure_signatures().count() as usize);
-    signatures.pure_signatures().signatures().iterate_slices(
+    let mut result = Vec::with_capacity(signatures.pure_signatures()?.count() as usize);
+    signatures.pure_signatures()?.signatures().iterate_slices(
         |_key, mut value| -> Result<bool> {
             let pair = CryptoSignaturePair::construct_from(&mut value)?;
             result.push(serde_json::json!({
@@ -839,8 +839,27 @@ fn serialize_block_signatures(
     block_id: &BlockIdExt,
     signatures: BlockSignaturesVariant,
 ) -> JsonResult {
+    if let BlockSignaturesVariant::SimplexPq(pq) = &signatures {
+        pq.serialize()?;
+        let pairs: Vec<_> = pq
+            .signatures
+            .iter()
+            .map(|pair| {
+                serde_json::json!({
+                    "validator_id": serialize_uint256(&pair.validator_id),
+                    "algorithm_id": pair.algorithm_id, "signature": base64_encode(&pair.signature),
+                })
+            })
+            .collect();
+        return Ok(serde_json::json!({
+            "@type": "blocks.blockSignatures.simplexPq", "id": serialize_block_id(block_id),
+            "signatures": pairs, "session_id": serialize_uint256(&pq.session_id),
+            "slot": pq.slot, "candidate": base64_encode(pq.candidate_bytes()?),
+        }));
+    }
     let signature_pairs = serialize_block_signature_pairs(&signatures)?;
     match signatures {
+        BlockSignaturesVariant::SimplexPq(_) => fail!("PQ signatures handled above"),
         BlockSignaturesVariant::Ordinary(_) => Ok(serde_json::json!({
             "@type": "blocks.blockSignatures",
             "id": serialize_block_id(block_id),

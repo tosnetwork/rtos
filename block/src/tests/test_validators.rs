@@ -146,7 +146,7 @@ fn check_legacy_subset_fixture(key_block_file_name: &str, proof_file_name: &str)
 
         assert_eq!(signatures.validator_info().validator_list_hash_short, legacy_hash);
 
-        let pure_signatures = signatures.pure_signatures();
+        let pure_signatures = signatures.pure_signatures().unwrap();
 
         let data =
             Block::build_data_for_sign(&proof.proof_for.root_hash, &proof.proof_for.file_hash);

@@ -756,6 +756,9 @@ pub fn build_checked_data(
     block_id: &BlockIdExt,
 ) -> Result<Vec<u8>> {
     match signatures {
+        BlockSignaturesVariant::SimplexPq(_) => {
+            fail!("PQ signature verification requires trusted governing session context")
+        }
         BlockSignaturesVariant::Ordinary(_) => {
             Ok(Block::build_data_for_sign(&block_id.root_hash, &block_id.file_hash).to_vec())
         }
@@ -776,6 +779,9 @@ pub fn check_signatures(
     block_id: &BlockIdExt,
 ) -> Result<u64> {
     match signatures {
+        BlockSignaturesVariant::SimplexPq(_) => {
+            fail!("PQ signature verification requires trusted governing session context")
+        }
         BlockSignaturesVariant::Ordinary(sigs) => {
             let data = Block::build_data_for_sign(&block_id.root_hash, &block_id.file_hash);
             sigs.pure_signatures.check_signatures(validators_list, &data)

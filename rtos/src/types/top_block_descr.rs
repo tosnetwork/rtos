@@ -75,7 +75,7 @@ impl TopBlockDescrStuff {
         );
 
         if (tbd.signatures().is_none()
-            || tbd.signatures().map(|s| s.pure_signatures().count()).unwrap_or(0) == 0)
+            || tbd.signatures().map(|s| s.declared_signature_count()).unwrap_or(0) == 0)
             && !is_fake
         {
             fail!(
@@ -864,6 +864,7 @@ impl TopBlockDescrStuff {
         let sig_type = match signatures_variant {
             BlockSignaturesVariant::Ordinary(_) => "ORDINARY",
             BlockSignaturesVariant::Simplex(_) => "SIMPLEX",
+            BlockSignaturesVariant::SimplexPq(_) => "SIMPLEX_PQ",
         };
         log::trace!(
             target: "validator",
@@ -875,7 +876,7 @@ impl TopBlockDescrStuff {
         let total_weight: u64 =
             rtos_block::checked_validator_weight_sum(subset.validators.iter().map(|v| v.weight))?;
         let weight = match check_crypto_signatures(
-            signatures_variant.pure_signatures(),
+            signatures_variant.pure_signatures()?,
             &subset.validators,
             &checked_data,
         ) {
@@ -907,13 +908,13 @@ impl TopBlockDescrStuff {
         *res_flags |= 0x10; // signatures checked ok
 
         // Check weight
-        if !self.is_fake && weight != signatures_variant.pure_signatures().weight() {
+        if !self.is_fake && weight != signatures_variant.pure_signatures()?.weight() {
             self.signarutes_validation_result.store(-1, atomic::Ordering::Relaxed);
             fail!(
                 "ShardTopBlockDescr for {} has incorrect signature weight {} \
                 (actual weight is {weight})",
                 self.proof_for(),
-                signatures_variant.pure_signatures().weight()
+                signatures_variant.pure_signatures()?.weight()
             );
         }
 
