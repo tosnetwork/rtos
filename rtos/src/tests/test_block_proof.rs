@@ -247,35 +247,22 @@ async fn test_pq_proof_verifies_with_governing_state_and_key_block() {
         )
         .unwrap();
         let engine = CachedProofEngine { handle: cached_handle.clone(), proof: proof.clone() };
-        let cached = crate::boot::download_and_check_key_block_proof(
-            &engine,
-            proof.id(),
-            Some(&master),
-            Some(&key_proof),
-        )
-        .await;
-        if mutation == 0 {
-            assert!(cached.is_ok(), "valid cached proof rejected: {cached:?}");
-        } else {
-            // A cached invalid proof must reach the replacement-download path,
-            // never become a trusted governing proof merely by existing on disk.
-            assert!(cached.unwrap_err().to_string().contains("replacement download reached"));
-        }
-        let boot_result =
-            crate::boot::check_boot_proof(proof.id(), &proof, Some(&master), Some(&key_proof));
+        let history =
+            super::BootstrapAuthority::from_checkpoint(key_proof.id(), key_proof.clone()).unwrap();
+        let cached =
+            crate::boot::download_and_check_key_block_proof(&engine, proof.id(), &history).await;
+        // This fixture is an ordinary block: even its valid final certificate
+        // must not promote it to a governing key-block authority.
+        assert!(cached.unwrap_err().to_string().contains("replacement download reached"));
+        let boot_result = history.authenticate_block(proof.id(), proof.clone());
         assert_eq!(boot_result.is_ok(), mutation == 0, "boot mutation {mutation}: {boot_result:?}");
-        assert!(crate::boot::check_boot_proof(proof.id(), &proof, None, None).is_err());
         let mut different_id = proof.id().clone();
         different_id.file_hash = UInt256::default();
-        assert!(crate::boot::check_boot_proof(
-            &different_id,
-            &proof,
-            Some(&master),
-            Some(&key_proof)
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("requested block identity"));
+        assert!(history
+            .authenticate_block(&different_id, proof.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("requested block identity"));
         let state_result = proof.check_with_master_state(&master);
         let key_result = proof.check_with_prev_key_block_proof(&key_proof);
         assert_eq!(
@@ -449,5 +436,165 @@ impl crate::engine_traits::EngineOperations for CheckpointCacheEngine {
         _: bool,
     ) -> rtos_block::Result<BlockProofStuff> {
         Ok(self.proof.clone())
+    }
+}
+
+fn bootstrap_fixture_proof(
+    row: &serde_json::Value,
+    signed: bool,
+    corrupt: bool,
+) -> BlockProofStuff {
+    use rtos_block::*;
+    let bytes = hex::decode(row["block_boc"].as_str().unwrap()).unwrap();
+    let root = read_single_root_boc(&bytes).unwrap();
+    let block = Block::construct_from_cell(root.clone()).unwrap();
+    let info = block.read_info().unwrap();
+    let id = BlockIdExt::with_params(
+        info.shard().clone(),
+        info.seq_no(),
+        root.repr_hash().clone(),
+        UInt256::calc_file_hash(&bytes),
+    );
+    let signatures = signed.then(|| {
+        let mut signature = hex::decode(row["signature"].as_str().unwrap()).unwrap();
+        if corrupt {
+            signature[0] ^= 1;
+        }
+        BlockSignaturesVariant::SimplexPq(BlockSignaturesSimplexPq {
+            validator_info: ValidatorBaseInfo::with_params(
+                row["subset_hash"].as_u64().unwrap() as u32,
+                7,
+            ),
+            session_id: UInt256::from_slice(
+                &hex::decode(row["session"].as_str().unwrap()).unwrap(),
+            ),
+            slot: row["slot"].as_u64().unwrap() as u32,
+            candidate_data: BlockSignaturesSimplex::bytes_to_cell_tree(
+                &hex::decode(row["candidate"].as_str().unwrap()).unwrap(),
+            )
+            .unwrap(),
+            sig_count: 1,
+            sig_weight: 2,
+            signatures: vec![PqBlockSignaturePair {
+                validator_id: UInt256::from([2; 32]),
+                algorithm_id: 1,
+                signature,
+            }],
+        })
+    });
+    BlockProofStuff::new(
+        BlockProof::with_params(
+            id,
+            MerkleProof::create(&root, |_| true).unwrap().serialize().unwrap(),
+            signatures,
+        ),
+        !signed,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_bootstrap_authority_authenticates_successive_key_blocks() {
+    use super::BootstrapAuthority;
+    let data: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tl/rtos_api/tests/data/bootstrap-history.json"
+    ))
+    .unwrap();
+    let row = |name: &str| {
+        data["cases"].as_array().unwrap().iter().find(|row| row["name"] == name).unwrap()
+    };
+    let anchor =
+        bootstrap_fixture_proof(&serde_json::json!({"block_boc":data["anchor_boc"]}), false, false);
+    let history = BootstrapAuthority::from_checkpoint(anchor.id(), anchor.clone()).unwrap();
+    let first = bootstrap_fixture_proof(row("first"), true, false);
+    let second = bootstrap_fixture_proof(row("second"), true, false);
+    let next = history.advance_key_block(first.id(), first.clone()).unwrap();
+    assert_eq!(next.id(), first.id());
+    assert_eq!(next.anchor(), anchor.id());
+    let last = next.advance_key_block(second.id(), second.clone()).unwrap();
+    assert_eq!(last.id(), second.id());
+    assert_eq!(last.anchor(), anchor.id());
+    assert!(
+        history.advance_key_block(second.id(), second.clone()).is_err(),
+        "skipped governing epoch accepted"
+    );
+    assert!(next.advance_key_block(first.id(), first.clone()).is_err(), "replay accepted");
+    let corrupt = bootstrap_fixture_proof(row("first"), true, true);
+    assert!(
+        history.advance_key_block(corrupt.id(), corrupt.clone()).is_err(),
+        "corrupt signature accepted"
+    );
+    assert_eq!(history.id(), anchor.id());
+    let bad_config = bootstrap_fixture_proof(row("bad-next-config"), true, false);
+    history.authenticate_block(bad_config.id(), bad_config.clone()).unwrap();
+    assert!(
+        history.advance_key_block(bad_config.id(), bad_config.clone()).is_err(),
+        "invalid governing configuration promoted"
+    );
+
+    // Exercise the real cached-proof consumer, including a valid key-block hit.
+    let handles = crate::collator_test_bundle::create_block_handle_storage(None).unwrap();
+    let meta = storage::types::BlockMeta::for_import(942, 0, 0, true, true, false);
+    let handle = handles.create_handle(first.id().clone(), meta, None).unwrap().unwrap();
+    let engine = CachedProofEngine { handle: handle.clone(), proof: first.clone() };
+    let (_, cached) =
+        crate::boot::download_and_check_key_block_proof(&engine, first.id(), &history)
+            .await
+            .unwrap();
+    assert_eq!(cached.id(), first.id());
+    assert_eq!(cached.anchor(), anchor.id());
+    let engine = CachedProofEngine { handle, proof: corrupt };
+    assert!(crate::boot::download_and_check_key_block_proof(&engine, first.id(), &history)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("replacement download reached"));
+}
+
+#[test]
+fn test_bootstrap_authority_starts_from_pinned_zerostate() {
+    use super::BootstrapAuthority;
+    use rtos_block::*;
+    let data: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tl/rtos_api/tests/data/bootstrap-history.json"
+    ))
+    .unwrap();
+    let row = data["cases"].as_array().unwrap().iter().find(|r| r["name"] == "from-zero").unwrap();
+    for wrong_global in [false, true] {
+        let mut state = ShardStateUnsplit::default();
+        state.set_global_id(if wrong_global { 0 } else { -239 });
+        state.set_shard(ShardIdent::masterchain());
+        let mut custom = McStateExtra::default();
+        custom.config = pq_fixture::config();
+        state.write_custom(Some(&custom)).unwrap();
+        let root = state.serialize().unwrap();
+        let bytes = write_boc(&root).unwrap();
+        let pin = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            0,
+            root.repr_hash().clone(),
+            UInt256::calc_file_hash(&bytes),
+        );
+        let zero = crate::shard_state::ShardStateStuff::deserialize_zerostate(
+            pin.clone(),
+            &bytes,
+            #[cfg(feature = "telemetry")]
+            &crate::collator_test_bundle::create_engine_telemetry(),
+            &crate::collator_test_bundle::create_engine_allocated(),
+        )
+        .unwrap();
+        let result = BootstrapAuthority::from_zerostate(&pin, zero.clone());
+        if wrong_global {
+            assert!(result.is_err());
+            continue;
+        }
+        let history = result.unwrap();
+        let proof = bootstrap_fixture_proof(row, true, false);
+        let next = history.advance_key_block(proof.id(), proof.clone()).unwrap();
+        assert_eq!(next.id(), proof.id());
+        assert_eq!(next.anchor(), &pin);
+        let mut wrong_pin = pin;
+        wrong_pin.file_hash = UInt256::from([77; 32]);
+        assert!(BootstrapAuthority::from_zerostate(&wrong_pin, zero).is_err());
     }
 }

@@ -27,6 +27,126 @@ use std::sync::Arc;
 #[path = "tests/test_block_proof.rs"]
 mod tests;
 
+/// An authenticated bootstrap position, rooted in an explicit local pin.
+/// Private fields prevent parsed peer proofs from being promoted by assignment.
+/// A checkpoint pin supplies out-of-band authority, not proof of earlier history.
+#[derive(Clone)]
+pub(crate) struct BootstrapAuthority {
+    anchor: BlockIdExt,
+    global_id: i32,
+    source: BootstrapSource,
+}
+
+#[derive(Clone)]
+enum BootstrapSource {
+    Zerostate(Arc<ShardStateStuff>),
+    KeyBlock(BlockProofStuff),
+}
+
+/// Signature-authenticated masterchain proof under a particular bootstrap history.
+/// This is not full execution validity and cannot by itself authorize signing.
+#[derive(Debug)]
+pub(crate) struct VerifiedMasterchainProof {
+    proof: BlockProofStuff,
+    anchor: BlockIdExt,
+    global_id: i32,
+}
+
+impl std::fmt::Debug for BootstrapAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootstrapAuthority")
+            .field("anchor", &self.anchor)
+            .field("current", self.id())
+            .finish()
+    }
+}
+
+impl BootstrapAuthority {
+    pub(crate) fn from_zerostate(pin: &BlockIdExt, state: Arc<ShardStateStuff>) -> Result<Self> {
+        if !pin.shard().is_masterchain_ext() {
+            fail!("Bootstrap requires a masterchain zerostate");
+        }
+        state.verify_zerostate(pin)?;
+        let global_id = state.state()?.global_id();
+        match state.config_params()?.config(19)? {
+            Some(rtos_block::ConfigParamEnum::ConfigParam19(id)) if id == global_id as u32 => {}
+            _ => fail!("Bootstrap zerostate global_id disagrees with Param19"),
+        }
+        Ok(Self { anchor: pin.clone(), global_id, source: BootstrapSource::Zerostate(state) })
+    }
+
+    pub(crate) fn from_checkpoint(pin: &BlockIdExt, proof: BlockProofStuff) -> Result<Self> {
+        proof.check_trusted_checkpoint(pin)?;
+        let global_id = proof.virtualize_block()?.0.global_id();
+        Ok(Self { anchor: pin.clone(), global_id, source: BootstrapSource::KeyBlock(proof) })
+    }
+
+    pub(crate) fn id(&self) -> &BlockIdExt {
+        match &self.source {
+            BootstrapSource::Zerostate(state) => state.block_id(),
+            BootstrapSource::KeyBlock(proof) => proof.id(),
+        }
+    }
+    pub(crate) fn anchor(&self) -> &BlockIdExt {
+        &self.anchor
+    }
+    pub(crate) fn key_block_proof(&self) -> Option<&BlockProofStuff> {
+        match &self.source {
+            BootstrapSource::KeyBlock(proof) => Some(proof),
+            _ => None,
+        }
+    }
+    pub(crate) fn config(&self) -> Result<ConfigParams> {
+        match &self.source {
+            BootstrapSource::Zerostate(state) => Ok(state.config_params()?.clone()),
+            BootstrapSource::KeyBlock(proof) => proof.get_config_params(),
+        }
+    }
+
+    pub(crate) fn authenticate_block(
+        &self,
+        expected: &BlockIdExt,
+        proof: BlockProofStuff,
+    ) -> Result<VerifiedMasterchainProof> {
+        if proof.id() != expected {
+            fail!("Boot proof does not match requested block identity");
+        }
+        if proof.is_link() || !expected.shard().is_masterchain_ext() {
+            fail!("Bootstrap successor requires a full masterchain proof");
+        }
+        if proof.virtualize_block()?.0.global_id() != self.global_id {
+            fail!("Bootstrap successor belongs to a different global_id");
+        }
+        match &self.source {
+            BootstrapSource::Zerostate(state) => proof.check_with_master_state(state)?,
+            BootstrapSource::KeyBlock(previous) => {
+                proof.check_with_prev_key_block_proof(previous)?
+            }
+        }
+        Ok(VerifiedMasterchainProof {
+            proof,
+            anchor: self.anchor.clone(),
+            global_id: self.global_id,
+        })
+    }
+
+    pub(crate) fn advance_key_block(
+        &self,
+        expected: &BlockIdExt,
+        proof: BlockProofStuff,
+    ) -> Result<Self> {
+        let verified = self.authenticate_block(expected, proof)?;
+        // Authority can advance only after signatures authenticate the new block,
+        // and its actual header/config qualify it as a governing key block.
+        verified.proof.check_trusted_checkpoint(expected)?;
+        Ok(Self {
+            anchor: verified.anchor,
+            global_id: verified.global_id,
+            source: BootstrapSource::KeyBlock(verified.proof),
+        })
+    }
+}
+
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct BlockProofStuff {
     proof: BlockProof,

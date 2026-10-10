@@ -10,9 +10,13 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    block::BlockStuff, block_proof::BlockProofStuff, engine::Engine,
-    engine_traits::EngineOperations, shard_state::ShardStateStuff,
-    shard_states_keeper::calc_pss_split_parts, validator::accept_block::create_new_proof_link,
+    block::BlockStuff,
+    block_proof::{BlockProofStuff, BootstrapAuthority},
+    engine::Engine,
+    engine_traits::EngineOperations,
+    shard_state::ShardStateStuff,
+    shard_states_keeper::calc_pss_split_parts,
+    validator::accept_block::create_new_proof_link,
     CHECK,
 };
 use rtos_block::{error, fail, BlockIdExt, Result, ShardIdent, UInt256, SHARD_FULL};
@@ -145,14 +149,25 @@ async fn get_key_blocks(
     engine: &dyn EngineOperations,
     mut handle: Arc<BlockHandle>,
     zero_state: Option<&Arc<ShardStateStuff>>,
-    mut prev_block_proof: Option<BlockProofStuff>,
+    prev_block_proof: Option<BlockProofStuff>,
 ) -> Result<Vec<Arc<BlockHandle>>> {
     const MAX_RETRIES: usize = 100;
+    let mut history = match prev_block_proof {
+        Some(proof) => BootstrapAuthority::from_checkpoint(engine.init_mc_block_id(), proof)?,
+        None => BootstrapAuthority::from_zerostate(
+            engine.zerostate_id()?,
+            zero_state.ok_or_else(|| error!("Zero state is not set"))?.clone(),
+        )?,
+    };
+    if handle.id() != history.id() {
+        fail!("Bootstrap handle differs from authenticated history");
+    }
+    log::debug!(target: "boot", "bootstrap authority anchored at {}", history.anchor());
     let mut hardfork_iter = engine.hardforks().iter();
     let mut hardfork = hardfork_iter.next();
     let mut key_blocks = vec![handle.clone()];
     let mut stuck_count = 0;
-    let init_block_seqno = prev_block_proof.as_ref().map_or(0, |proof| proof.id().seq_no);
+    let init_block_seqno = history.id().seq_no;
     'main_loop: loop {
         if engine.check_stop() {
             fail!("Boot was stopped");
@@ -218,14 +233,7 @@ async fn get_key_blocks(
                     }
                 }
                 //let prev_time = handle.gen_utime();
-                match download_and_check_key_block_proof(
-                    engine,
-                    block_id,
-                    zero_state,
-                    prev_block_proof.as_ref(),
-                )
-                .await
-                {
+                match download_and_check_key_block_proof(engine, block_id, &history).await {
                     Ok((next_handle, proof)) => {
                         handle = next_handle;
                         CHECK!(handle.is_key_block()?);
@@ -234,7 +242,7 @@ async fn get_key_blocks(
                         //     engine.set_init_mc_block_id(block_id);
                         // }
                         key_blocks.push(handle.clone());
-                        prev_block_proof = Some(proof);
+                        history = proof;
                     }
                     Err(err) => {
                         log::warn!(target: "boot", "cannot get block proof link for {}: {}", block_id, err);
@@ -252,10 +260,12 @@ async fn get_key_blocks(
             if (engine.sync_blocks_before() > engine.now() - utime)
                 || (2 * engine.key_block_utime_step() > engine.now() - utime)
             {
-                if let Some(p) = prev_block_proof {
+                if history.id().seq_no != 0 {
+                    let p = &history;
                     log::info!(target: "boot", "downloading last known block to update overlays: {}", p.id());
                     match engine.download_block(&p.id(), Some(5)).await {
                         Ok((block, _)) => {
+                            block.verify_expected_id(history.id())?;
                             engine
                                 .update_public_overlays(block.id(), &block.read_config_params()?)
                                 .await?;
@@ -265,10 +275,7 @@ async fn get_key_blocks(
                         }
                     }
                 } else {
-                    let config = zero_state
-                        .ok_or_else(|| error!("Zero state is not set"))?
-                        .config_params()?;
-                    engine.update_public_overlays(handle.id(), config).await?;
+                    engine.update_public_overlays(handle.id(), &history.config()?).await?;
                 };
                 return Ok(key_blocks);
             }
@@ -591,37 +598,21 @@ pub(crate) async fn download_zerostate(
     }
 }
 
-/// Validate a boot successor using the same authenticated governing input for
-/// cached and downloaded proofs. Cache presence does not confer authority.
-pub(crate) fn check_boot_proof(
-    block_id: &BlockIdExt,
-    proof: &BlockProofStuff,
-    zero_state: Option<&Arc<ShardStateStuff>>,
-    prev_block_proof: Option<&BlockProofStuff>,
-) -> Result<()> {
-    if proof.id() != block_id {
-        fail!("Boot proof does not match requested block identity");
-    }
-    if let Some(previous) = prev_block_proof {
-        proof.check_with_prev_key_block_proof(previous)
-    } else if let Some(zero_state) = zero_state {
-        proof.check_with_master_state(zero_state)
-    } else {
-        fail!("Boot proof has no authenticated governing input");
-    }
-}
-
 /// download key block proof, check it and store
 pub(crate) async fn download_and_check_key_block_proof(
     engine: &dyn EngineOperations,
     block_id: &BlockIdExt,
-    zero_state: Option<&Arc<ShardStateStuff>>,
-    prev_block_proof: Option<&BlockProofStuff>,
-) -> Result<(Arc<BlockHandle>, BlockProofStuff)> {
+    history: &BootstrapAuthority,
+) -> Result<(Arc<BlockHandle>, BootstrapAuthority)> {
     if let Some(handle) = engine.load_block_handle(block_id)? {
         if let Ok(proof) = engine.load_block_proof(&handle, false).await {
-            match check_boot_proof(block_id, &proof, zero_state, prev_block_proof) {
-                Ok(()) => return Ok((handle, proof)),
+            match history.advance_key_block(block_id, proof) {
+                Ok(next) => {
+                    if handle.id() != block_id {
+                        fail!("Cached key-block handle identity mismatch");
+                    }
+                    return Ok((handle, next));
+                }
                 Err(err) => log::warn!(target: "boot", "cached proof failed verification: {}", err),
             }
         }
@@ -631,18 +622,24 @@ pub(crate) async fn download_and_check_key_block_proof(
             fail!("Boot was stopped");
         }
         let proof = engine.download_block_proof(block_id, false, true).await?;
-        let result = check_boot_proof(block_id, &proof, zero_state, prev_block_proof);
+        let result = history.advance_key_block(block_id, proof);
         match result {
-            Ok(_) => {
+            Ok(next) => {
+                let proof = next
+                    .key_block_proof()
+                    .ok_or_else(|| error!("Verified key block is missing"))?;
                 let handle = engine
-                    .store_block_proof(block_id, None, &proof)
+                    .store_block_proof(block_id, None, proof)
                     .await?
                     .to_non_created()
                     .ok_or_else(|| {
                         error!("INTERNAL ERROR: Bad result in store block {} proof", block_id)
                     })?;
+                if handle.id() != block_id {
+                    fail!("Stored key-block handle identity mismatch");
+                }
                 engine.save_last_applied_mc_block_id(handle.id())?;
-                return Ok((handle, proof));
+                return Ok((handle, next));
             }
             Err(err) => {
                 log::warn!(target: "boot", "check_proof error: {}", err);
