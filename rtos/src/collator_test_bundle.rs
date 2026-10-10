@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project naming and AUTH configuration consumer tests.
+ * RTOS project modifications (2026-10-10): project naming, AUTH and workchain execution tests.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -1923,3 +1923,7 @@ pub async fn try_validate(
 #[cfg(test)]
 #[path = "validator/tests/test_auth_policy.rs"]
 mod auth_policy_tests;
+
+#[cfg(test)]
+#[path = "tests/test_workchain_execution_callers.rs"]
+mod workchain_execution_callers;

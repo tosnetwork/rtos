@@ -1,5 +1,6 @@
 /*
- * RTOS project modifications (2026-10-10): naming and AUTH policy transition checks.
+ * RTOS project modifications (2026-10-10): naming, AUTH and execution-descriptor
+ * transition validation, and local workchain execution admission.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -460,6 +461,7 @@ impl ValidateQuery {
         // 2. learn latest masterchain state and block id
         let mc_data = self.get_ref_mc_state(base).await?;
         base.config_params = mc_data.config().clone();
+        base.config_params.validate_local_workchain_execution(base.shard().workchain_id())?;
         base.block_limits = base.config_params.block_limits(base.shard().is_masterchain())?;
         base.limits = base.config_params.size_limits_config()?;
         base.special_smartcontracts = base.config_params.fundamental_smc_addr()?;
@@ -6242,6 +6244,9 @@ impl ValidateQuery {
         base.prev_state_extra
             .config
             .validate_auth_policy_transition(&base.next_state_extra.config)?;
+        base.prev_state_extra
+            .config
+            .validate_workchain_execution_transition(&base.next_state_extra.config)?;
         let new_accounts = base.next_state()?.read_accounts()?;
         let config_address = base.prev_state_extra.config.config_address()?;
         let new_config_address = base.next_state_extra.config.config_address()?;

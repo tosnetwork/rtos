@@ -1,5 +1,6 @@
 /*
- * RTOS project modifications (2026-10-10): naming and AUTH policy transition checks.
+ * RTOS project modifications (2026-10-10): naming, AUTH and execution-descriptor
+ * transition validation, and local workchain execution admission.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -1781,6 +1782,7 @@ impl Collator {
         self.check_stop_flag()?;
 
         let (now, now_ms) = self.init_utime(&mc_data, &prev_data)?;
+        mc_data.config().validate_local_workchain_execution(self.shard.workchain_id())?;
         let config = BlockchainConfig::with_params(
             mc_data.config().capabilities(),
             supported_version(),
@@ -4612,6 +4614,7 @@ impl Collator {
                 );
             }
             old_config.validate_auth_policy_transition(&new_config)?;
+            old_config.validate_workchain_execution_transition(&new_config)?;
             let is_key_block =
                 new_config.important_config_parameters_changed(state_extra.config(), false)?;
             if is_key_block {

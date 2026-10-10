@@ -1,5 +1,5 @@
 /*
- * RTOS storage fee and AUTH policy adaptations (2026-10-10).
+ * RTOS storage fee, AUTH policy, and workchain descriptor validation (2026-10-10).
  * Copyright (C) 2026 TOS Blockchain Teams.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
@@ -510,6 +510,9 @@ impl ConfigParams {
     ) -> Result<bool> {
         if let Err(error) = self.validate_auth_policy_config() {
             log::warn!(target: "block", "invalid AUTH configuration: {error}");
+            return Ok(false);
+        }
+        if self.validate_workchain_descriptor_config().is_err() {
             return Ok(false);
         }
         if !relax_par0 {
@@ -2208,7 +2211,9 @@ impl Default for WorkchainFormat {
 
 impl Deserializable for WorkchainFormat {
     fn construct_from(slice: &mut SliceData) -> Result<Self> {
-        slice.get_next_bits(3)?;
+        if slice.get_next_int(3)? != 0 {
+            fail!("invalid workchain format tag");
+        }
         match slice.get_next_bit()? {
             true => Ok(WorkchainFormat::Basic(WorkchainFormat1::construct_from(slice)?)),
             false => Ok(WorkchainFormat::Extended(WorkchainFormat0::construct_from(slice)?)),
@@ -2649,16 +2654,26 @@ impl Deserializable for WorkchainDescr {
         let mut max = Number8::default();
         max.read_from(cell)?;
         self.max_split = max.as_u8();
-        cell.get_next_bit()?; // basic
+        let basic = cell.get_next_bit()?;
         self.active = cell.get_next_bit()?;
         self.accept_msgs = cell.get_next_bit()?;
         let mut flags = Number13::default();
         flags.read_from(cell)?;
         self.flags = flags.as_u16();
+        if self.flags != 0
+            || self.monitor_min_split > self.min_split
+            || self.min_split > self.max_split
+            || self.max_split > MAX_SPLIT_DEPTH
+        {
+            fail!("invalid workchain descriptor flags or split bounds");
+        }
         self.zerostate_root_hash.read_from(cell)?;
         self.zerostate_file_hash.read_from(cell)?;
         self.version.read_from(cell)?;
         self.format.read_from(cell)?;
+        if basic != self.basic() {
+            fail!("workchain descriptor basic bit does not match format");
+        }
         if tag == WORKCHAIN_DESCRIPTOR_TAG_2 {
             self.split_merge_timings = Some(WcSplitMergeTimings::construct_from(cell)?);
             let mut persistent_state_split_depth = Number8::default();
@@ -2920,6 +2935,9 @@ impl ConfigParam12 {
 impl Deserializable for ConfigParam12 {
     fn read_from(&mut self, slice: &mut SliceData) -> Result<()> {
         self.workchains.read_from(slice)?;
+        if !slice.is_empty_cell() {
+            fail!("trailing workchain configuration data");
+        }
         Ok(())
     }
 }
