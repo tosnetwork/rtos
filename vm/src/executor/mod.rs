@@ -27,6 +27,7 @@ pub mod gas;
 mod globals;
 mod math;
 pub use math::DivMode;
+mod lms_fee;
 mod null;
 mod poseidon2;
 mod pq;

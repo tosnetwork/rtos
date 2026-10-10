@@ -565,3 +565,7 @@ mod test_falcon512_transaction;
 #[cfg(test)]
 #[path = "tests/test_poseidon2_transaction.rs"]
 mod test_poseidon2_transaction;
+
+#[cfg(test)]
+#[path = "tests/test_lms_fee_transaction.rs"]
+mod test_lms_fee_transaction;

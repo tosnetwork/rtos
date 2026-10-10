@@ -24,6 +24,7 @@ use crate::{
         exceptions::*,
         gas::*,
         globals::*,
+        lms_fee::*,
         math::*,
         null::*,
         poseidon2::*,
@@ -996,7 +997,10 @@ impl Handlers {
                 .set(0x26, execute_ristretto_255_pushl)
                 .add_subset(
                     0x31,
-                    Handlers::new().set(0x00, execute_pq_mldsa44).set(0x01, execute_pq_falcon512),
+                    Handlers::new()
+                        .set(0x00, execute_pq_mldsa44)
+                        .set(0x01, execute_pq_falcon512)
+                        .set(0x03, execute_lms_fee_hash),
                 )
                 .add_subset(
                     0x32,

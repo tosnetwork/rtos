@@ -55,3 +55,9 @@ profile used by crypto/pq/lms-fee.cpp in the pinned reference revision above,
 under LGPL-2.0-or-later. It admits only one-level HSS with LMS_SHA256_M32_H20
 and LMOTS_SHA256_N32_W4. SHA-256 uses the RustCrypto sha2 crate. No signing,
 stateful key management or tree generation is included.
+
+The LMS fixtures include two publicly committed H20/W4 valid proofs from the
+pinned reference test/rescue-fee-gate/suite-scenarios.tsv, with its GPLv3
+license retained at tests/data/TOS-LICENSE.txt. Additional synthetic equations
+reconstruct public roots with Python hashlib from those public proof bytes;
+they are not independently published known-answer tests or generated keys.
