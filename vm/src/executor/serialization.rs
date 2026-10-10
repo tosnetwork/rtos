@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and builder-capacity execution compatibility.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -443,7 +443,9 @@ fn check_b(engine: &mut Engine, name: &'static str, how: u8) -> Status {
     }
     engine.load_instruction(instruction)?;
     fetch_stack(engine, params)?;
-    // TODO: right order of type check
+    // Validate the top reference count before bits and builder. A capacity
+    // request may exceed the physical four-reference cell limit.
+    let r = if how.bit(REFS) { engine.cmd.var(0).as_integer_value(0..=7)? } else { 0 };
     let l = if how.bit(CMD) {
         engine.cmd.length()
     } else if how.bit(BITS) {
@@ -451,7 +453,6 @@ fn check_b(engine: &mut Engine, name: &'static str, how: u8) -> Status {
     } else {
         0
     };
-    let r = if how.bit(REFS) { engine.cmd.var(0).as_integer_value(0..=4)? } else { 0 };
     let b = engine.cmd.var(params - 1).as_builder()?;
     let mut status = true;
     if how.bit(BITS) {
