@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -27,7 +27,6 @@ use rand::{
     Rng,
 };
 use rtos_api::{
-    deserialize_typed, serialize_boxed_append,
     ton::{
         overlay::{
             membercertificate::MemberCertificate, node::Node as OverlayNodeV1,
@@ -36,12 +35,11 @@ use rtos_api::{
         ton_node::Broadcast,
         validator::Telemetry,
     },
-    BoxedDeserialize, BoxedSerialize, Deserializer,
+    BoxedDeserialize, BoxedSerialize,
 };
 use rtos_block::{fail, KeyId, KeyOption, Result};
 use std::{
     collections::VecDeque,
-    io::Cursor,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -648,7 +646,7 @@ impl OverlayClient {
         D: BoxedDeserialize,
     {
         let (answer, roundtrip) = self.send_rldp_query(request, peer, attempt, v2).await?;
-        match Deserializer::new(&mut Cursor::new(answer)).read_boxed() {
+        match self.ctx.overlay_node().wire_profile().deserialize_value(&answer) {
             Ok(data) => {
                 peer.query_success(roundtrip, true);
                 Ok(data)
@@ -670,9 +668,19 @@ impl OverlayClient {
         loop {
             match self.ctx.overlay_node().wait_for_broadcast(&self.ctx.id).await? {
                 Some(info) => {
-                    if let Ok(answer) = deserialize_typed::<Broadcast>(&info.data) {
+                    if let Ok(answer) = self
+                        .ctx
+                        .overlay_node()
+                        .wire_profile()
+                        .deserialize_typed::<Broadcast>(&info.data)
+                    {
                         return Ok(Some((answer, info.recv_from)));
-                    } else if let Ok(_telemetry) = deserialize_typed::<Telemetry>(&info.data) {
+                    } else if let Ok(_telemetry) = self
+                        .ctx
+                        .overlay_node()
+                        .wire_profile()
+                        .deserialize_typed::<Telemetry>(&info.data)
+                    {
                         log::debug!(
                             "Telemetry received from {} in overlay {}, but not supported yet",
                             info.recv_from,
@@ -704,7 +712,7 @@ impl OverlayClient {
         T: BoxedSerialize + std::fmt::Debug,
     {
         let mut query = self.ctx.overlay_node().get_query_prefix(&self.ctx.id)?;
-        serialize_boxed_append(&mut query, &request.object)?;
+        self.ctx.overlay_node().wire_profile().serialize_append(&mut query, &request.object)?;
         let request_str = if log::log_enabled!(log::Level::Debug) || cfg!(feature = "telemetry") {
             std::any::type_name::<T>().to_string()
         } else {

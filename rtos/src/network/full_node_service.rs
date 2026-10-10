@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -13,7 +13,9 @@ use crate::{
     engine_traits::EngineOperations,
     network::neighbours::{PROTOCOL_VERSION_MAJOR, PROTOCOL_VERSION_MINOR},
 };
-use adnl::common::{AdnlPeers, Answer, QueryAnswer, QueryResult, Subscriber, TaggedByteVec};
+use adnl::common::{
+    AdnlPeers, Answer, QueryAnswer, QueryResult, Subscriber, TaggedByteVec, TaggedTlObject,
+};
 #[cfg(feature = "telemetry")]
 use rtos_api::BoxedSerialize;
 use rtos_api::{
@@ -601,10 +603,12 @@ impl FullNodeOverlayService {
                 let now = std::time::Instant::now();
                 let answer = match consumer(self, query).await {
                     Ok(answer) => {
-                        let answer = TaggedByteVec {
-                            object: serialize_boxed(&answer)?,
+                        #[cfg(feature = "telemetry")]
+                        let tag = answer.bare_object().constructor();
+                        let answer = TaggedTlObject {
+                            object: answer,
                             #[cfg(feature = "telemetry")]
-                            tag: answer.bare_object().constructor(),
+                            tag,
                         };
                         log::trace!("consume_query: consumed {}", query_str);
                         #[cfg(feature = "telemetry")]
@@ -612,7 +616,7 @@ impl FullNodeOverlayService {
                             query_str,
                             true,
                             now.elapsed(),
-                            answer.object.len(),
+                            serialize_boxed(&answer.object)?.len(),
                         );
                         answer
                     }
@@ -628,7 +632,7 @@ impl FullNodeOverlayService {
                         return Err(e);
                     }
                 };
-                Ok(QueryResult::Consumed(QueryAnswer::Ready(Some(Answer::Raw(answer)))))
+                Ok(QueryResult::Consumed(QueryAnswer::Ready(Some(Answer::Object(answer)))))
             }
             Err(query) => Err(query),
         })

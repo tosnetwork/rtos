@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -1587,6 +1587,7 @@ impl<T> Queue<T> {
 }
 
 struct QuerySendContext {
+    profile: rtos_api::WireProfile,
     channel: Option<Arc<AdnlChannel>>,
     method: AdnlSendMethodDetailed,
     query_id: QueryId,
@@ -3215,6 +3216,27 @@ impl AdnlNode {
         timeout_ms: Option<u64>,
         method: AdnlSendMethod,
     ) -> Result<AdnlReplyWithStatus> {
+        self.query_with_prefix_profile_get_status(
+            prefix,
+            query,
+            peers,
+            timeout_ms,
+            method,
+            rtos_api::WireProfile::Legacy,
+        )
+        .await
+    }
+
+    /// Query using an explicitly bound namespace codec for both request and reply.
+    pub async fn query_with_prefix_profile_get_status(
+        self: &Arc<AdnlNode>,
+        prefix: Option<&[u8]>,
+        query: &TaggedTlObject,
+        peers: &AdnlPeers,
+        timeout_ms: Option<u64>,
+        method: AdnlSendMethod,
+        profile: rtos_api::WireProfile,
+    ) -> Result<AdnlReplyWithStatus> {
         async fn wait_query(
             node: &Arc<AdnlNode>,
             context: &Arc<QuerySendContext>,
@@ -3269,14 +3291,20 @@ impl AdnlNode {
             AdnlSendMethod::Safe => AdnlSendMethodDetailed::Safe,
         };
         let context =
-            self.send_query_with_method(prefix, query, peers, timeout_ms, method.clone())?;
+            self.send_query_with_method(prefix, query, peers, timeout_ms, method.clone(), profile)?;
 
         // Send in backup context if required
         match context.repeat {
             MessageRepeat::Required => {
                 method = AdnlSendMethodDetailed::FastNormal;
-                match self.send_query_with_method(prefix, query, peers, timeout_ms, method.clone())
-                {
+                match self.send_query_with_method(
+                    prefix,
+                    query,
+                    peers,
+                    timeout_ms,
+                    method.clone(),
+                    profile,
+                ) {
                     Err(e) => {
                         log::warn!(
                             target: TARGET,
@@ -4315,7 +4343,10 @@ impl AdnlNode {
         );
         if let Some(removed) = self.queries.remove(&context.query_id) {
             let reply = match removed.val() {
-                Query::Received(answer) => Some(deserialize_boxed(answer)?),
+                Query::Received(answer) => Some(match context.profile {
+                    rtos_api::WireProfile::Legacy => deserialize_boxed(answer)?,
+                    profile => profile.deserialize(answer)?,
+                }),
                 Query::Timeout => {
                     if let MessageRepeat::Required = context.repeat {
                         None
@@ -4679,8 +4710,9 @@ impl AdnlNode {
         peers: &AdnlPeers,
         timeout_ms: Option<u64>,
         method: AdnlSendMethodDetailed,
+        profile: rtos_api::WireProfile,
     ) -> Result<Arc<QuerySendContext>> {
-        let (query_id, msg) = Query::build(prefix, &query)?;
+        let (query_id, msg) = Query::build(prefix, &query, profile)?;
         let (ping, query) = Query::new();
         self.queries.insert(query_id, query);
         log::info!(
@@ -4698,7 +4730,7 @@ impl AdnlNode {
         };
         self.queue_monitor_queries
             .push((timeout_ms.unwrap_or(Self::TIMEOUT_QUERY_MAX_MS), query_id));
-        let ret = QuerySendContext { channel, method, query_id, repeat, reply_ping: ping };
+        let ret = QuerySendContext { channel, method, query_id, repeat, reply_ping: ping, profile };
         Ok(Arc::new(ret))
     }
 

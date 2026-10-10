@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project naming and authenticated Plumtree transport dispatch.
+ * RTOS project modifications (2026-10-10): project naming and authenticated Plumtree transport dispatch; explicit target wire profile integration.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -189,12 +189,26 @@ impl OverlayUtils {
         shard: i64,
         zero_state_file_hash: &[u8; 32],
     ) -> Result<OverlayId> {
+        Self::calc_overlay_id_with_profile(
+            workchain,
+            shard,
+            zero_state_file_hash,
+            rtos_api::WireProfile::Legacy,
+        )
+    }
+
+    pub fn calc_overlay_id_with_profile(
+        workchain: i32,
+        shard: i64,
+        zero_state_file_hash: &[u8; 32],
+        profile: rtos_api::WireProfile,
+    ) -> Result<OverlayId> {
         let overlay = ShardPublicOverlayId {
             shard,
             workchain,
             zero_state_file_hash: UInt256::with_array(*zero_state_file_hash),
         };
-        hash(overlay)
+        Ok(*UInt256::calc_file_hash(&profile.serialize(&overlay.into_boxed())?).as_array())
     }
 
     /// Calculate overlay short ID for public shard overlay
@@ -204,8 +218,28 @@ impl OverlayUtils {
         shard: i64,
         zero_state_file_hash: &[u8; 32],
     ) -> Result<Arc<OverlayShortId>> {
+        Self::calc_overlay_short_id_with_profile(
+            workchain,
+            shard,
+            zero_state_file_hash,
+            rtos_api::WireProfile::Legacy,
+        )
+    }
+
+    pub fn calc_overlay_short_id_with_profile(
+        workchain: i32,
+        shard: i64,
+        zero_state_file_hash: &[u8; 32],
+        profile: rtos_api::WireProfile,
+    ) -> Result<Arc<OverlayShortId>> {
         let overlay_key = OverlayKey {
-            name: Self::calc_overlay_id(workchain, shard, zero_state_file_hash)?.to_vec(),
+            name: Self::calc_overlay_id_with_profile(
+                workchain,
+                shard,
+                zero_state_file_hash,
+                profile,
+            )?
+            .to_vec(),
         };
         Ok(OverlayShortId::from_data(hash(overlay_key)?))
     }
@@ -1382,6 +1416,7 @@ impl<'a> OverlayParams<'a> {
 
 /// Overlay Node
 pub struct OverlayNode {
+    wire_profile: rtos_api::WireProfile,
     adnl: Arc<AdnlNode>,
     consumers: lockfree::map::Map<Arc<OverlayShortId>, ConsumerObject>,
     node_key: Arc<dyn KeyOption>,
@@ -1419,6 +1454,21 @@ impl OverlayNode {
         zero_state_file_hash: &[u8; 32],
         key_tag: usize,
     ) -> Result<Arc<Self>> {
+        Self::with_params_and_profile(
+            adnl,
+            zero_state_file_hash,
+            key_tag,
+            rtos_api::WireProfile::Legacy,
+        )
+    }
+
+    /// Bind the wire domain before any overlay is created or advertised.
+    pub fn with_params_and_profile(
+        adnl: Arc<AdnlNode>,
+        zero_state_file_hash: &[u8; 32],
+        key_tag: usize,
+        wire_profile: rtos_api::WireProfile,
+    ) -> Result<Arc<Self>> {
         let node_key = adnl.key_by_tag(key_tag)?;
         #[cfg(feature = "telemetry")]
         let telemetry = OverlayTelemetry {
@@ -1442,6 +1492,7 @@ impl OverlayNode {
             stats_transfer: Arc::new(AtomicU64::new(0)),
         };
         let ret = Self {
+            wire_profile,
             adnl,
             consumers: lockfree::map::Map::new(),
             node_key,
@@ -1455,6 +1506,10 @@ impl OverlayNode {
             allocated: Arc::new(allocated),
         };
         Ok(Arc::new(ret))
+    }
+
+    pub fn wire_profile(&self) -> rtos_api::WireProfile {
+        self.wire_profile
     }
 
     /// Add overlay data consumer
@@ -1697,12 +1752,22 @@ impl OverlayNode {
 
     /// Calculate overlay ID for public overlay
     pub fn calc_overlay_id(&self, workchain: i32, shard: i64) -> Result<OverlayId> {
-        OverlayUtils::calc_overlay_id(workchain, shard, &self.zero_state_file_hash)
+        OverlayUtils::calc_overlay_id_with_profile(
+            workchain,
+            shard,
+            &self.zero_state_file_hash,
+            self.wire_profile,
+        )
     }
 
     /// Calculate overlay short ID for public overlay
     pub fn calc_overlay_short_id(&self, workchain: i32, shard: i64) -> Result<Arc<OverlayShortId>> {
-        OverlayUtils::calc_overlay_short_id(workchain, shard, &self.zero_state_file_hash)
+        OverlayUtils::calc_overlay_short_id_with_profile(
+            workchain,
+            shard,
+            &self.zero_state_file_hash,
+            self.wire_profile,
+        )
     }
 
     /// Delete private_overlay
@@ -1902,7 +1967,18 @@ impl OverlayNode {
                 query.tag,
             )
             .await?;
-        self.adnl.query_with_prefix(Some(&overlay.query_prefix), query, &peers, timeout_ms).await
+        Ok(self
+            .adnl
+            .query_with_prefix_profile_get_status(
+                Some(&overlay.query_prefix),
+                query,
+                &peers,
+                timeout_ms,
+                crate::node::AdnlSendMethod::Fast,
+                self.wire_profile,
+            )
+            .await?
+            .reply)
     }
 
     /// Send query via QUIC
@@ -1926,9 +2002,12 @@ impl OverlayNode {
             )
             .await?;
         let mut data = overlay.query_prefix.clone();
-        serialize_boxed_append(&mut data, &query.object)?;
+        self.wire_profile.serialize_append(&mut data, &query.object)?;
         match quic.query(data, Some(&self.adnl), &peers, timeout_ms).await? {
-            Some(raw) => Ok(Some(deserialize_boxed(&raw)?)),
+            Some(raw) => Ok(Some(match self.wire_profile {
+                rtos_api::WireProfile::Legacy => deserialize_boxed(&raw)?,
+                profile => profile.deserialize(&raw)?,
+            })),
             None => Ok(None),
         }
     }
@@ -2555,11 +2634,13 @@ impl Subscriber for OverlayNode {
             None
         };
 
-        let (first, mut postfix_offset) = deserialize_boxed_with_suffix(suffix)?;
+        let (first, mut postfix_offset) = self.wire_profile.deserialize_with_suffix(suffix)?;
         let mut second: Option<TLObject> = None;
         let mut have_postfix = false;
         if postfix_offset < suffix.len() {
-            if let Ok((s, pos2)) = deserialize_boxed_with_suffix(&suffix[postfix_offset..]) {
+            if let Ok((s, pos2)) =
+                self.wire_profile.deserialize_with_suffix(&suffix[postfix_offset..])
+            {
                 second = Some(s);
                 postfix_offset += pos2;
             }
@@ -2665,6 +2746,29 @@ impl Subscriber for OverlayNode {
                 Err(message) => fail!("Unsupported message {message} in overlay {overlay_id}"),
                 r => r,
             }
+        }
+    }
+
+    async fn try_consume_raw_query(
+        &self,
+        bytes: &[u8],
+        peers: &AdnlPeers,
+    ) -> Result<Option<QueryAnswer>> {
+        if self.wire_profile == rtos_api::WireProfile::Legacy {
+            return Ok(None);
+        }
+        // Overlay prefix constructors are unchanged across domains. Only claim
+        // actual overlay queries; unrelated ADNL/DHT namespaces remain untouched.
+        let Ok((prefix, _)) = deserialize_boxed_with_suffix(bytes) else {
+            return Ok(None);
+        };
+        if !prefix.is::<OverlayQuery>() && !prefix.is::<OverlayQueryWithExtra>() {
+            return Ok(None);
+        }
+        let objects = self.wire_profile.deserialize_bundle(bytes)?;
+        match self.try_consume_query_bundle(objects, peers).await? {
+            QueryResult::Consumed(answer) => Ok(Some(answer.with_profile(self.wire_profile)?)),
+            _ => fail!("Unconsumed query in target overlay namespace"),
         }
     }
 
@@ -3052,3 +3156,7 @@ impl OverlayNode {
         overlay.execute_plumtree(actions).await
     }
 }
+
+#[cfg(test)]
+#[path = "wire_profile_tests.rs"]
+mod wire_profile_tests;

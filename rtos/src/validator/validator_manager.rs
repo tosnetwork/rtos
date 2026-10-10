@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming; typed Simplex protocol and membership admission.
+ * RTOS project modifications (2026-10-10): project and crate naming; typed Simplex protocol and membership admission; explicit target wire profile integration.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -127,6 +127,7 @@ fn build_runtime_simplex_session_options(
     protocol.admits_runtime()?;
     let np = &cfg.noncritical_params;
     Ok(SimplexSessionOptions {
+        wire_profile: rtos_api::WireProfile::T0,
         proto_version: catchain_options.proto_version as u32,
         slots_per_leader_window: cfg.slots_per_leader_window,
         target_rate: Duration::from_millis(np.target_rate_ms as u64),

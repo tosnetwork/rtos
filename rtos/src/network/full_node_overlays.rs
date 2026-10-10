@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -29,8 +29,14 @@ use adnl::{
     node::AdnlSendMethod,
     DhtSearchPolicy, OverlayUtils,
 };
+#[cfg(feature = "telemetry")]
 use rtos_api::{
-    serialize_boxed,
+    ton::ton_node::broadcast::{
+        BlockBroadcast, BlockBroadcastCompressed, BlockBroadcastCompressedV2,
+    },
+    BoxedSerialize, Constructor,
+};
+use rtos_api::{
     ton::{
         engine::validator::customoverlay::CustomOverlay,
         ton_node::{
@@ -41,13 +47,6 @@ use rtos_api::{
         },
     },
     IntoBoxed,
-};
-#[cfg(feature = "telemetry")]
-use rtos_api::{
-    ton::ton_node::broadcast::{
-        BlockBroadcast, BlockBroadcastCompressed, BlockBroadcastCompressedV2,
-    },
-    BoxedSerialize, Constructor,
 };
 use rtos_block::{
     base64_encode, error, AccountIdPrefixFull, BlockIdExt, BlockSignaturesVariant, Cell,
@@ -168,15 +167,17 @@ impl FullNodeOverlaysRouter {
                             let wc = shard.workchain_id();
                             let pfx = shard.shard_prefix_with_tag() as i64;
                             let zerostate_file_hash = self.engine.zerostate_id()?.file_hash();
-                            let id_full = OverlayUtils::calc_overlay_id(
+                            let id_full = OverlayUtils::calc_overlay_id_with_profile(
                                 wc,
                                 pfx,
                                 zerostate_file_hash.as_slice(),
+                                self.network.context().stack.overlay.wire_profile(),
                             )?;
-                            let id = OverlayUtils::calc_overlay_short_id(
+                            let id = OverlayUtils::calc_overlay_short_id_with_profile(
                                 wc,
                                 pfx,
                                 zerostate_file_hash.as_slice(),
+                                self.network.context().stack.overlay.wire_profile(),
                             )?;
                             log::info!(
                                 "Creating public overlay for shard {}, id {}, full id {}",
@@ -760,8 +761,9 @@ impl FullNodeOverlaysRouter {
 
                 if fast_sync_client.is_some() || !custom_overlays.is_empty() {
                     let broadcast = TaggedByteSlice {
-                        object: &serialize_boxed(
+                        object: &self.network.context().stack.overlay.wire_profile().serialize(
                             &build_block_broadcast_compressed(
+                                self.network.context().stack.overlay.wire_profile(),
                                 block,
                                 proof,
                                 catchain_seqno,
@@ -789,7 +791,7 @@ impl FullNodeOverlaysRouter {
 
                 let client = self.overlay_client(block.id().shard()).await?;
                 let broadcast = TaggedByteSlice {
-                    object: &serialize_boxed(
+                    object: &self.network.context().stack.overlay.wire_profile().serialize(
                         &build_block_broadcast(
                             block,
                             proof,
@@ -806,9 +808,11 @@ impl FullNodeOverlaysRouter {
             }
             BlockSignaturesVariant::Simplex(_) => {
                 // Use V2 format for simplex signatures (required for proper verification)
-                let broadcast_data = serialize_boxed(
-                    &build_block_broadcast_compressed_v2(block, proof, signatures)?.into_boxed(),
-                )?;
+                let broadcast_data =
+                    self.network.context().stack.overlay.wire_profile().serialize(
+                        &build_block_broadcast_compressed_v2(block, proof, signatures)?
+                            .into_boxed(),
+                    )?;
                 let broadcast = TaggedByteSlice {
                     object: &broadcast_data,
                     #[cfg(feature = "telemetry")]
@@ -843,7 +847,7 @@ impl FullNodeOverlaysRouter {
         log::debug!("Sending top shard blocks broadcast {}...", tbd.proof_for());
 
         let broadcast = TaggedByteSlice {
-            object: &serialize_boxed(
+            object: &self.network.context().stack.overlay.wire_profile().serialize(
                 &NewShardBlockBroadcast { block: tbd.new_shard_block()? }.into_boxed(),
             )?,
             #[cfg(feature = "telemetry")]
@@ -869,7 +873,7 @@ impl FullNodeOverlaysRouter {
         data: &[u8],
     ) -> Result<()> {
         let broadcast = TaggedByteSlice {
-            object: &serialize_boxed(
+            object: &self.network.context().stack.overlay.wire_profile().serialize(
                 &ExternalMessageBroadcast { message: ExternalMessage { data: data.to_vec() } }
                     .into_boxed(),
             )?,
@@ -921,7 +925,13 @@ impl FullNodeOverlaysRouter {
             )?
             .into_boxed();
             let broadcast = TaggedByteSlice {
-                object: &serialize_boxed(&broadcast)?,
+                object: &self
+                    .network
+                    .context()
+                    .stack
+                    .overlay
+                    .wire_profile()
+                    .serialize(&broadcast)?,
                 #[cfg(feature = "telemetry")]
                 tag: broadcast.bare_object().constructor(),
             };
@@ -970,7 +980,13 @@ impl FullNodeOverlaysRouter {
             }
             .into_boxed();
             let broadcast = TaggedByteSlice {
-                object: &serialize_boxed(&broadcast)?,
+                object: &self
+                    .network
+                    .context()
+                    .stack
+                    .overlay
+                    .wire_profile()
+                    .serialize(&broadcast)?,
                 #[cfg(feature = "telemetry")]
                 tag: OutMsgQueueProofBroadcast::constructor_const(),
             };

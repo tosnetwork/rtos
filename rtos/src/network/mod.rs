@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -40,7 +40,7 @@ use rtos_api::{
         },
         Bool,
     },
-    Deserializer, IntoBoxed, Serializer,
+    Deserializer, IntoBoxed, WireProfile,
 };
 use rtos_block::{
     boc_compression::{boc_compress, boc_decompress, CompressionAlgorithm},
@@ -57,12 +57,15 @@ pub const MAX_COMPRESSED_SIZE: usize = 16 << 20; // 16 MB
 // It may conflict with limits in the network configuration.
 pub const MAX_BLOCK_SIZE: usize = 4 << 20; // 4 MB.
 
-fn decompress_block_broadcast(broadcast: BlockBroadcastCompressed) -> Result<BlockBroadcast> {
+fn decompress_block_broadcast(
+    broadcast: BlockBroadcastCompressed,
+    profile: WireProfile,
+) -> Result<BlockBroadcast> {
     let data = lz4_decompress(
         &broadcast.compressed,
         Lz4DecompressMode::WithMaxSize(MAX_COMPRESSED_SIZE as i32),
     )?;
-    let decompressed = Deserializer::new(&mut Cursor::new(data)).read_boxed::<Data>()?.only();
+    let decompressed = profile.deserialize_value::<Data>(&data)?.only();
 
     let mut roots = read_boc(&decompressed.proof_data)?.roots;
     if roots.len() != 2 {
@@ -244,6 +247,7 @@ fn build_block_broadcast(
 }
 
 fn build_block_broadcast_compressed(
+    profile: WireProfile,
     block: &BlockStuff,
     proof: &BlockProofStuff,
     catchain_seqno: u32,
@@ -259,8 +263,7 @@ fn build_block_broadcast_compressed(
         proof_data: boc,
     }.into_boxed();
 
-    let mut bytes = Vec::new();
-    Serializer::new(&mut bytes).write_boxed(&data)?;
+    let bytes = profile.serialize(&data)?;
     let compressed = lz4_compress(bytes, false)?;
 
     Ok(BlockBroadcastCompressed {

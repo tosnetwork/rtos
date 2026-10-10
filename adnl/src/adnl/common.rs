@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project naming and bounded Plumtree consumer admission.
+ * RTOS project modifications (2026-10-10): project naming and bounded Plumtree consumer admission; explicit target wire profile integration.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -12,7 +12,7 @@
 use core::ops::Range;
 use rand::Rng;
 use rtos_api::{
-    deserialize_boxed_bundle, serialize_boxed, serialize_boxed_append,
+    deserialize_boxed_bundle, serialize_boxed,
     ton::{
         adnl::{
             message::message::{Answer as AdnlAnswerMessage, Query as AdnlQueryMessage},
@@ -813,14 +813,15 @@ impl Query {
     pub(crate) fn build(
         prefix: Option<&[u8]>,
         query_body: &TaggedTlObject,
+        profile: rtos_api::WireProfile,
     ) -> Result<(QueryId, TaggedAdnlMessage)> {
         let query_id: QueryId = rand::thread_rng().gen();
         let query = if let Some(prefix) = prefix {
             let mut prefix = prefix.to_vec();
-            serialize_boxed_append(&mut prefix, &query_body.object)?;
+            profile.serialize_append(&mut prefix, &query_body.object)?;
             prefix
         } else {
-            serialize_boxed(&query_body.object)?
+            profile.serialize(&query_body.object)?
         };
         let msg = TaggedAdnlMessage {
             object: AdnlQueryMessage {
@@ -899,6 +900,14 @@ impl Query {
         query: &[u8],
         peers: &AdnlPeers,
     ) -> Result<Option<QueryAnswer>> {
+        // A namespace-owning subscriber may select a strict wire profile before
+        // the historical generic decoder sees the query body. Errors are terminal:
+        // an invalid target request must never fall back to the legacy decoder.
+        for subscriber in subscribers {
+            if let Some(answer) = subscriber.try_consume_raw_query(query, peers).await? {
+                return Ok(Some(answer));
+            }
+        }
         let mut queries = deserialize_boxed_bundle(query)?;
         if queries.len() == 1 {
             let mut query = queries.remove(0);
@@ -933,6 +942,41 @@ pub struct TimedAnswer<A> {
 pub enum QueryAnswer {
     Pending(tokio::task::JoinHandle<Result<TimedAnswer<Answer>>>),
     Ready(Option<Answer>),
+}
+
+impl QueryAnswer {
+    /// Encode typed answers in the namespace's profile. Raw answers are already
+    /// wire bytes: their producer must use that same profile. Pending answers
+    /// remain asynchronous; no subscriber/overlay mutex is held while awaiting.
+    pub fn with_profile(self, profile: rtos_api::WireProfile) -> Result<Self> {
+        if profile == rtos_api::WireProfile::Legacy {
+            return Ok(self);
+        }
+        fn encode(
+            answer: Option<Answer>,
+            profile: rtos_api::WireProfile,
+        ) -> Result<Option<Answer>> {
+            Ok(match answer {
+                Some(Answer::Object(value)) => Some(Answer::Raw(TaggedByteVec {
+                    object: profile.serialize(&value.object)?,
+                    #[cfg(feature = "telemetry")]
+                    tag: value.tag,
+                })),
+                other => other,
+            })
+        }
+        Ok(match self {
+            Self::Ready(answer) => Self::Ready(encode(answer, profile)?),
+            Self::Pending(handle) => Self::Pending(tokio::spawn(async move {
+                let result = handle.await??;
+                Ok(TimedAnswer {
+                    answer: encode(result.answer, profile)?,
+                    #[cfg(feature = "telemetry")]
+                    actual_start_at: result.actual_start_at,
+                })
+            })),
+        })
+    }
 }
 
 /// ADNL/RLDP query answer finalizer
@@ -1079,6 +1123,15 @@ pub trait Subscriber: Send + Sync {
     /// Try consume TL object: object -> consumed yes/no
     async fn try_consume_object(&self, _object: TLObject, _peers: &AdnlPeers) -> Result<bool> {
         Ok(false)
+    }
+    /// Select a namespace-specific codec before generic TL decoding. `None`
+    /// means not claimed; `Some(Ready(None))` means consumed without an answer.
+    async fn try_consume_raw_query(
+        &self,
+        _bytes: &[u8],
+        _peers: &AdnlPeers,
+    ) -> Result<Option<QueryAnswer>> {
+        Ok(None)
     }
     /// Try consume query: object -> result
     async fn try_consume_query(&self, object: TLObject, _peers: &AdnlPeers) -> Result<QueryResult> {

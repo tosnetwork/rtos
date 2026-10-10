@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; explicit target wire profile integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -431,6 +431,7 @@ impl OverlayNetworkImpl {
 */
 
 pub(crate) struct OverlayManagerImpl {
+    wire_profile: rtos_api::WireProfile,
     overlay_networks: spin::Mutex<HashMap<Arc<PrivateOverlayShortId>, Arc<OverlayNetworkImpl>>>,
     task_sender: crossbeam_channel::Sender<Box<dyn FnOnce() + Send + 'static>>,
     stopper: Arc<AtomicBool>,
@@ -481,6 +482,10 @@ impl OverlayManagerImpl {
 }
 
 impl ConsensusOverlayManager for OverlayManagerImpl {
+    fn wire_profile(&self) -> rtos_api::WireProfile {
+        self.wire_profile
+    }
+
     /// Start an overlay for the given local_id and overlay_short_id
     fn start_overlay(
         &self,
@@ -536,6 +541,13 @@ impl ConsensusOverlayManager for OverlayManagerImpl {
 impl OverlayManagerImpl {
     /// Create a new OverlayManagerImpl
     pub(crate) fn create(num_threads: usize) -> ConsensusOverlayManagerPtr {
+        Self::create_with_profile(num_threads, rtos_api::WireProfile::Legacy)
+    }
+
+    pub(crate) fn create_with_profile(
+        num_threads: usize,
+        wire_profile: rtos_api::WireProfile,
+    ) -> ConsensusOverlayManagerPtr {
         let (tx, rx) = crossbeam_channel::unbounded::<Box<dyn FnOnce() + Send + 'static>>();
 
         let stopper = Arc::new(AtomicBool::new(false));
@@ -566,6 +578,7 @@ impl OverlayManagerImpl {
         }
 
         Arc::new(OverlayManagerImpl {
+            wire_profile,
             overlay_networks: spin::Mutex::new(HashMap::new()),
             task_sender: tx,
             stopper,
