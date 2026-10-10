@@ -129,6 +129,11 @@ impl FullNodeOverlaysRouter {
         Ok(overlays_router)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_block_download_queries(&self) -> usize {
+        self.service.test_block_download_queries()
+    }
+
     pub async fn overlay_client(
         self: &Arc<Self>,
         shard: &ShardIdent,

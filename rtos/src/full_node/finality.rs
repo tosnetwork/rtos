@@ -58,13 +58,14 @@ struct Entry {
     expires: Instant,
     next_attempt: Instant,
     delay: Duration,
-    active: bool,
 }
 
 /// Owned by one engine generation. Nothing here is persisted as verified proof.
 #[derive(Default)]
 pub(crate) struct PendingFinality {
     entries: HashMap<BlockIdExt, VecDeque<Entry>>,
+    // Recovery ownership outlives evidence replacement and expiry.
+    active: HashMap<BlockIdExt, u64>,
     next_generation: u64,
     workers: usize,
     authority_state: Option<BlockIdExt>,
@@ -156,7 +157,9 @@ impl PendingFinality {
         }
         let verified = matches!(&signatures, NetworkSignatureSet::Classical(_));
         let old = self.entries.get(&id);
-        let cached = old.and_then(|items| items.iter().find(|item| item.verified));
+        let cached = old.and_then(|items| {
+            items.iter().filter(|item| item.verified).max_by_key(|item| item.signatures.is_final())
+        });
         let replace = if verified {
             match cached {
                 Some(item) if item.signatures.is_final() || !signatures.is_final() => {
@@ -168,9 +171,12 @@ impl PendingFinality {
             if cached.is_some_and(|item| item.signatures.is_final() || !signatures.is_final()) {
                 fail!("Finality cache retains stronger authenticated evidence");
             }
-            if old.is_some_and(|items| items.iter().any(|item| !item.verified && item.peer == peer))
-            {
-                fail!("Finality sender already has pending evidence for this block");
+            if old.is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.peer == peer && item.signatures.is_final() == signatures.is_final()
+                })
+            }) {
+                fail!("Finality sender already has this evidence role pending for this block");
             }
             false
         };
@@ -181,7 +187,9 @@ impl PendingFinality {
         } else {
             old.into_iter().flatten().filter(|item| item.peer == peer).map(|item| item.charge).sum()
         };
-        if block_sender_bytes > CARRIER_BYTES - charge {
+        // One approval and one final candidate can coexist while authentication
+        // waits for the header. Untrusted role flags never replace evidence.
+        if block_sender_bytes > 2 * CARRIER_BYTES - charge {
             fail!("Finality sender/block byte budget exceeded");
         }
         let retained = self
@@ -218,7 +226,6 @@ impl PendingFinality {
             expires: now + RETENTION,
             next_attempt: now,
             delay: Duration::from_millis(500),
-            active: false,
         });
         Ok(generation)
     }
@@ -228,11 +235,10 @@ impl PendingFinality {
         let next = self
             .entries
             .iter()
-            .flat_map(|(id, entries)| {
-                // One in-flight attempt per block preserves sender arrival order
-                // and prevents duplicate expensive signature checks for that block.
-                entries.front().filter(|entry| !entry.active).map(move |entry| (id, entry))
-            })
+            .filter(|(id, _)| !self.active.contains_key(*id))
+            // A temporarily failing attempt must not hide another sender/role
+            // behind the front entry. Retry deadlines provide bounded fairness.
+            .flat_map(|(id, entries)| entries.iter().map(move |entry| (id, entry)))
             .min_by_key(|(_, entry)| (entry.next_attempt, entry.generation));
         let Some((id, entry)) = next else {
             return Work::Stop;
@@ -249,8 +255,9 @@ impl PendingFinality {
             .iter_mut()
             .find(|entry| entry.generation == generation)
             .unwrap();
-        entry.active = true;
-        Work::Run(id, entry.clone())
+        let entry = entry.clone();
+        self.active.insert(id.clone(), generation);
+        Work::Run(id, entry)
     }
 
     fn mark_verified(&mut self, id: &BlockIdExt, generation: u64) {
@@ -263,7 +270,14 @@ impl PendingFinality {
         }
     }
 
+    fn release_work(&mut self, id: &BlockIdExt, generation: u64) {
+        if self.active.get(id) == Some(&generation) {
+            self.active.remove(id);
+        }
+    }
+
     fn complete(&mut self, id: &BlockIdExt, generation: u64, accepted: bool) {
+        self.release_work(id, generation);
         let clear = accepted
             && self.entries.get(id).is_some_and(|items| {
                 items
@@ -278,18 +292,19 @@ impl PendingFinality {
     }
 
     fn retry(&mut self, id: &BlockIdExt, generation: u64, now: Instant) {
+        self.release_work(id, generation);
         if let Some(entry) = self
             .entries
             .get_mut(id)
             .and_then(|entries| entries.iter_mut().find(|entry| entry.generation == generation))
         {
-            entry.active = false;
             entry.next_attempt = (now + entry.delay).min(entry.expires);
             entry.delay = (entry.delay * 2).min(Duration::from_secs(8));
         }
     }
 
     fn remove(&mut self, id: &BlockIdExt, generation: u64) {
+        self.release_work(id, generation);
         if let Some(items) = self.entries.get_mut(id) {
             items.retain(|item| item.generation != generation);
             if items.is_empty() {
@@ -428,6 +443,7 @@ async fn wait_stopped(engine: &Arc<dyn EngineOperations>) {
     }
 }
 
+#[cfg(test)]
 async fn recover(
     engine: &Arc<dyn EngineOperations>,
     id: &BlockIdExt,
@@ -456,7 +472,13 @@ async fn recover_authenticated(
             // Failure to establish trusted context is retriable. Once context
             // agrees with the hash-bound header, a bad certificate is retired;
             // it must not keep occupying this sender's slot until expiry.
-            let context = super::shard_client::pq_broadcast_context(&state, id, &header)?;
+            let context = super::shard_client::resolve_pq_broadcast_context(
+                engine.as_ref(),
+                &state,
+                id,
+                &header,
+            )
+            .await?;
             if let Err(error) = context.verify_network(pq) {
                 log::debug!("Discarding invalid pending finality for {id}: {error}");
                 return Ok(false);

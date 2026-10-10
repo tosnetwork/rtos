@@ -551,24 +551,6 @@ pub(crate) fn validate_brodcast_v2(
 }
 
 /// Authenticate network evidence only after a hash-bound header is available.
-pub(crate) fn validate_pq_broadcast(
-    signatures: &rtos_api::pq_finality::PqNetworkSignatureSet,
-    mc_state: &ShardStateStuff,
-    block_id: &BlockIdExt,
-    block: &rtos_block::Block,
-) -> Result<rtos_api::pq_finality::VerifiedPqNetworkSignatures> {
-    let block_info = block.read_info()?;
-    let context = pq_broadcast_context(mc_state, block_id, block)?;
-    if signatures.validator_info().catchain_seqno != block_info.gen_catchain_seqno()
-        || signatures.validator_info().validator_list_hash_short
-            != block_info.gen_validator_list_hash_short()
-    {
-        fail!("PQ broadcast certificate differs from hash-bound header validator coordinates");
-    }
-
-    context.verify_network(signatures)
-}
-
 pub(crate) fn pq_broadcast_context(
     mc_state: &ShardStateStuff,
     block_id: &BlockIdExt,
@@ -600,6 +582,28 @@ pub(crate) fn pq_broadcast_context(
         fail!("PQ broadcast header disagrees with the trusted governing validator set");
     }
     Ok(context)
+}
+
+pub(crate) async fn resolve_pq_broadcast_context(
+    engine: &dyn EngineOperations,
+    mc_state: &ShardStateStuff,
+    block_id: &BlockIdExt,
+    block: &rtos_block::Block,
+) -> Result<rtos_api::pq_finality::PqVerificationContext> {
+    let extra = mc_state.shard_state_extra()?;
+    let current_epoch = if extra.after_key_block {
+        mc_state.block_id().seq_no()
+    } else {
+        extra.last_key_block.as_ref().map(|key| key.seq_no).unwrap_or(0)
+    };
+    let epoch = block.read_info()?.prev_key_block_seqno();
+    if epoch == current_epoch {
+        return pq_broadcast_context(mc_state, block_id, block);
+    }
+    if epoch > current_epoch {
+        fail!("PQ broadcast governing epoch is not yet applied");
+    }
+    engine.historical_pq_broadcast_context(block_id, block).await
 }
 
 /// Process V2 block broadcast with variant signature support.
@@ -681,7 +685,14 @@ async fn process_block_broadcast_v2_inner(
             validate_brodcast_v2(signatures, &last_applied_mc_state, &broadcast.id)?;
         }
         NetworkSignatureSet::PostQuantum(signatures) => {
-            validate_pq_broadcast(signatures, &last_applied_mc_state, &broadcast.id, &virt_block)?;
+            resolve_pq_broadcast_context(
+                engine.as_ref(),
+                &last_applied_mc_state,
+                &broadcast.id,
+                &virt_block,
+            )
+            .await?
+            .verify_network(signatures)?;
         }
     }
 

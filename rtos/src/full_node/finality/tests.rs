@@ -74,11 +74,17 @@ fn pending_finality_reserved_capacity_uses_transport_identity_and_exact_coordina
     assert!(!store.reserved(&state, &child_id, &carrier.validator_info, &transport).unwrap());
 }
 
+struct DownloadGate {
+    entered: tokio::sync::mpsc::UnboundedSender<usize>,
+    release: tokio::sync::Semaphore,
+}
+
 struct RecoveryEngine {
     state: Arc<ShardStateStuff>,
     block: BlockStuff,
     stopped: AtomicBool,
     downloads: AtomicUsize,
+    gate: Option<DownloadGate>,
     stores: AtomicUsize,
     observed: tokio::sync::Notify,
     #[cfg(feature = "telemetry")]
@@ -99,7 +105,11 @@ impl EngineOperations for RecoveryEngine {
     ) -> Result<(BlockStuff, BlockProofStuff)> {
         assert_eq!(id, self.block.id());
         assert_eq!(limit, Some(1));
-        self.downloads.fetch_add(1, Ordering::SeqCst);
+        let attempt = self.downloads.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(gate) = &self.gate {
+            gate.entered.send(attempt).unwrap();
+            gate.release.acquire().await.unwrap().forget();
+        }
         let block = BlockStuff::deserialize_block_checked(id.clone(), self.block.data_arc())?;
         let proof = create_new_proof_link(&block)?;
         self.observed.notify_one();
@@ -128,6 +138,7 @@ fn engine() -> (Arc<RecoveryEngine>, BlockSignaturesSimplexPq) {
             block,
             stopped: AtomicBool::new(false),
             downloads: AtomicUsize::new(0),
+            gate: None,
             stores: AtomicUsize::new(0),
             observed: tokio::sync::Notify::new(),
             #[cfg(feature = "telemetry")]
@@ -157,12 +168,13 @@ async fn pq_finality_regular_download_checks_before_storage() {
         &PqApproval::from_notarization_fields(approve).unwrap(),
     )
     .unwrap();
-    let verified = super::super::shard_client::validate_pq_broadcast(
-        &approval,
+    let verified = super::super::shard_client::pq_broadcast_context(
         &state,
         block.id(),
         block.block().unwrap(),
     )
+    .unwrap()
+    .verify_network(&approval)
     .unwrap();
     assert!(!verified.is_final());
     assert!(verified.into_final().is_err());
@@ -265,6 +277,7 @@ async fn authenticated_max_parented_finality_download_and_admission() {
         block,
         stopped: AtomicBool::new(false),
         downloads: AtomicUsize::new(0),
+        gate: None,
         stores: AtomicUsize::new(0),
         observed: tokio::sync::Notify::new(),
         #[cfg(feature = "telemetry")]
@@ -402,4 +415,245 @@ fn pending_verified_upgrade_is_atomic_and_does_not_renew_equal_strength() {
     store.complete(&id, old, true);
     assert_eq!(store.entries[&id][0].generation, new);
     assert!(store.admit(id, peer(4), classical(false), 4096, false, now).is_err());
+}
+
+fn wire(id: &BlockIdExt, signatures: &NetworkSignatureSet) -> BlockFinalityBroadcast {
+    BlockFinalityBroadcast {
+        id: id.clone(),
+        signature_set: match signatures {
+            NetworkSignatureSet::PostQuantum(value) => value.to_node().into_boxed(),
+            NetworkSignatureSet::Classical(value) => {
+                crate::network::pack_signature_set(value).unwrap()
+            }
+        },
+    }
+}
+
+async fn deliver(
+    engine: &Arc<RecoveryEngine>,
+    pending: &SharedPendingFinality,
+    signatures: &NetworkSignatureSet,
+) -> Result<()> {
+    let wire = wire(engine.block.id(), signatures);
+    let size = WireProfile::T0.serialize(&wire.clone().into_boxed()).unwrap().len();
+    receive(engine.clone(), pending.clone(), wire, peer(80), size).await
+}
+
+async fn wait_attempt(rx: &mut tokio::sync::mpsc::UnboundedReceiver<usize>, expected: usize) {
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap(),
+        Some(expected)
+    );
+}
+
+async fn stop_workers(engine: &Arc<RecoveryEngine>, pending: &SharedPendingFinality) {
+    engine.stopped.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while pending.lock().workers != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(pending.lock().entries.is_empty());
+    assert!(pending.lock().active.is_empty());
+}
+
+#[tokio::test]
+async fn pq_same_sender_upgrade_waits_for_header_without_losing_finality() {
+    let (mut engine, carrier) = engine();
+    let (_, _, _, _, approval) = node_fixture("current", "notarize");
+    let approval = NetworkSignatureSet::PostQuantum(
+        PqNetworkSignatureSet::from_approval(
+            &PqApproval::from_notarization_fields(approval).unwrap(),
+        )
+        .unwrap(),
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    Arc::get_mut(&mut engine).unwrap().gate =
+        Some(DownloadGate { entered: tx, release: tokio::sync::Semaphore::new(0) });
+    let pending: SharedPendingFinality = Default::default();
+    deliver(&engine, &pending, &approval).await.unwrap();
+    wait_attempt(&mut rx, 1).await;
+    let original_expiry = pending.lock().entries[engine.block.id()][0].expires;
+    deliver(&engine, &pending, &evidence(&carrier)).await.unwrap();
+    assert!(deliver(&engine, &pending, &evidence(&carrier)).await.is_err());
+    {
+        let mut store = pending.lock();
+        assert_eq!(store.entries[engine.block.id()].len(), 2);
+        assert_eq!(store.entries[engine.block.id()][0].expires, original_expiry);
+        assert!(matches!(store.work(Instant::now()), Work::Stop));
+    }
+    // The first authenticated approval reaches the real storage boundary and
+    // retries. The queued final gets the next attempt, without waiting 60 s.
+    engine.gate.as_ref().unwrap().release.add_permits(1);
+    wait_attempt(&mut rx, 2).await;
+    assert_eq!(engine.stores.load(Ordering::SeqCst), 1);
+    {
+        let store = pending.lock();
+        let active = store.active[engine.block.id()];
+        assert!(store.entries[engine.block.id()]
+            .iter()
+            .any(|entry| entry.generation == active && entry.signatures.is_final()));
+    }
+    engine.gate.as_ref().unwrap().release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.stores.load(Ordering::SeqCst) < 2 {
+            engine.observed.notified().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(pending.lock().entries[engine.block.id()]
+        .iter()
+        .any(|entry| entry.verified && entry.signatures.is_final()));
+    stop_workers(&engine, &pending).await;
+}
+
+fn classical_fixture() -> (Arc<RecoveryEngine>, NetworkSignatureSet, NetworkSignatureSet) {
+    use rtos_block::*;
+    let (engine, carrier) = engine();
+    let mut inner = Arc::try_unwrap(engine).ok().unwrap();
+    let keys: Vec<_> = (1..=3)
+        .map(|n| Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[n; 32]).unwrap())
+        .collect();
+    let validators: Vec<_> = keys
+        .iter()
+        .map(|key| {
+            ValidatorDescr::with_params(
+                SigPubKey::from_bytes(key.pub_key().unwrap()).unwrap(),
+                1,
+                None,
+            )
+        })
+        .collect();
+    let mut state = inner.state.state().unwrap().clone();
+    let mut extra = state.read_custom().unwrap().unwrap();
+    let set = ValidatorSet::new(0, u32::MAX, 3, validators).unwrap();
+    extra
+        .config
+        .set_config(ConfigParamEnum::ConfigParam34(ConfigParam34 { cur_validators: set.clone() }))
+        .unwrap();
+    state.write_custom(Some(&extra)).unwrap();
+    let (subset, subset_hash) = set
+        .calc_subset(
+            &extra.config.catchain_config().unwrap(),
+            inner.block.id().shard().shard_prefix_with_tag(),
+            0,
+            7,
+        )
+        .unwrap();
+    inner.state = ShardStateStuff::from_state(
+        inner.state.block_id().clone(),
+        state,
+        #[cfg(feature = "telemetry")]
+        &crate::collator_test_bundle::create_engine_telemetry(),
+        &crate::collator_test_bundle::create_engine_allocated(),
+    )
+    .unwrap();
+    let make = |is_final| {
+        let mut value = BlockSignaturesSimplex::with_params(
+            ValidatorBaseInfo::with_params(subset_hash, 7),
+            BlockSignaturesPure::with_weight(subset.iter().map(|member| member.weight).sum()),
+            carrier.session_id.clone(),
+            carrier.slot,
+            carrier.candidate_data.clone(),
+            is_final,
+        );
+        let message = crate::validating_utils::build_checked_data(
+            &BlockSignaturesVariant::Simplex(value.clone()),
+            inner.block.id(),
+        )
+        .unwrap();
+        for member in &subset {
+            let identity = member.compute_node_id_short().unwrap();
+            let key = keys.iter().find(|key| key.id().data() == identity.as_slice()).unwrap();
+            value.pure_signatures.add_sigpair(CryptoSignaturePair::with_params(
+                UInt256::from_slice(key.id().data()),
+                CryptoSignature::from_bytes(&key.sign(&message).unwrap()).unwrap(),
+            ));
+        }
+        NetworkSignatureSet::Classical(BlockSignaturesVariant::Simplex(value))
+    };
+    let approval = make(false);
+    let finality = make(true);
+    (Arc::new(inner), approval, finality)
+}
+
+#[tokio::test]
+async fn authenticated_replacement_keeps_inflight_recovery_ownership() {
+    let (mut engine, approval, finality) = classical_fixture();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    Arc::get_mut(&mut engine).unwrap().gate =
+        Some(DownloadGate { entered: tx, release: tokio::sync::Semaphore::new(0) });
+    let pending: SharedPendingFinality = Default::default();
+    deliver(&engine, &pending, &approval).await.unwrap();
+    wait_attempt(&mut rx, 1).await;
+    let owner = pending.lock().active[engine.block.id()];
+    deliver(&engine, &pending, &finality).await.unwrap();
+    {
+        let mut store = pending.lock();
+        assert_eq!(store.active[engine.block.id()], owner);
+        let replacement = &store.entries[engine.block.id()][0];
+        assert!(replacement.verified && replacement.signatures.is_final());
+        assert_ne!(replacement.generation, owner);
+        assert!(
+            matches!(store.work(Instant::now()), Work::Stop),
+            "replacement cannot start before old recovery exits"
+        );
+    }
+    engine.gate.as_ref().unwrap().release.add_permits(1);
+    wait_attempt(&mut rx, 2).await;
+    assert_eq!(engine.stores.load(Ordering::SeqCst), 1);
+    assert_ne!(pending.lock().active[engine.block.id()], owner);
+    engine.gate.as_ref().unwrap().release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.stores.load(Ordering::SeqCst) < 2 {
+            engine.observed.notified().await;
+        }
+    })
+    .await
+    .unwrap();
+    stop_workers(&engine, &pending).await;
+}
+
+#[tokio::test]
+async fn invalid_final_upgrade_preserves_authenticated_approval() {
+    let (mut engine, mut carrier) = engine();
+    let (_, _, _, _, notar) = node_fixture("current", "notarize");
+    let approval = NetworkSignatureSet::PostQuantum(
+        PqNetworkSignatureSet::from_approval(&PqApproval::from_notarization_fields(notar).unwrap())
+            .unwrap(),
+    );
+    carrier.signatures[0].signature[0] ^= 1;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    Arc::get_mut(&mut engine).unwrap().gate =
+        Some(DownloadGate { entered: tx, release: tokio::sync::Semaphore::new(0) });
+    let pending: SharedPendingFinality = Default::default();
+    deliver(&engine, &pending, &approval).await.unwrap();
+    wait_attempt(&mut rx, 1).await;
+    deliver(&engine, &pending, &evidence(&carrier)).await.unwrap();
+    let expiry = pending.lock().entries[engine.block.id()][0].expires;
+    engine.gate.as_ref().unwrap().release.add_permits(1);
+    wait_attempt(&mut rx, 2).await;
+    assert_eq!(engine.stores.load(Ordering::SeqCst), 1);
+    engine.gate.as_ref().unwrap().release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if pending.lock().entries[engine.block.id()].len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    {
+        let store = pending.lock();
+        let retained = &store.entries[engine.block.id()][0];
+        assert!(retained.verified && !retained.signatures.is_final());
+        assert_eq!(retained.expires, expiry);
+    }
+    assert_eq!(engine.stores.load(Ordering::SeqCst), 1, "invalid final must not reach storage");
+    stop_workers(&engine, &pending).await;
 }
