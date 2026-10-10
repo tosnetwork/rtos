@@ -14,6 +14,9 @@ pub use types::*;
 pub mod cell;
 pub use cell::*;
 
+pub mod pq_bytes;
+pub use pq_bytes::*;
+
 pub mod crypto;
 pub use crypto::*;
 
