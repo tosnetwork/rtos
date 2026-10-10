@@ -386,7 +386,6 @@ async fn test_awaiters_pool_stale_completion_keeps_replacement_owner() {
     assert!(pool.ops_awaiters.get(&42).is_none());
 }
 
-
 #[tokio::test]
 async fn test_awaiters_pool_owner_observes_first_published_result() {
     let pool = AwaitersPool::<u32, u32>::new(
@@ -396,16 +395,19 @@ async fn test_awaiters_pool_owner_observes_first_published_result() {
         create_engine_allocated(),
     );
     for operation_fails in [false, true] {
-        let result = pool.do_or_wait(&42, None, async {
-            // Publish while the operation is being polled, so select must take
-            // the operation's Ready branch after the shunt has already won.
-            pool.shunt(&42, || Ok(1))?;
-            if operation_fails {
-                Err(error!("later operation failure"))
-            } else {
-                Ok(2)
-            }
-        }).await.unwrap();
+        let result = pool
+            .do_or_wait(&42, None, async {
+                // Publish while the operation is being polled, so select must take
+                // the operation's Ready branch after the shunt has already won.
+                pool.shunt(&42, || Ok(1))?;
+                if operation_fails {
+                    Err(error!("later operation failure"))
+                } else {
+                    Ok(2)
+                }
+            })
+            .await
+            .unwrap();
         assert_eq!(result, Some(1), "owner must agree with its already notified waiters");
         assert!(pool.ops_awaiters.get(&42).is_none());
     }
