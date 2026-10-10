@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; typed Simplex protocol and membership admission.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -750,9 +750,8 @@ struct OverlayListenerImpl {
     in_messages_count: metrics::Counter,
     in_broadcasts_count: metrics::Counter,
     in_queries_count: metrics::Counter,
-    /// When true, candidate broadcasts on the consensus private overlay are dropped
-    /// (block-sync overlay carries candidates exclusively)
-    enable_observers: bool,
+    /// Version 1 routes candidates exclusively through the block-sync overlay.
+    protocol: consensus_common::simplex_protocol::SimplexProtocol,
     /// Counter for dropped candidate broadcasts on the consensus overlay
     in_broadcasts_dropped_observers: metrics::Counter,
 }
@@ -806,8 +805,8 @@ impl ConsensusOverlayListener for OverlayListenerImpl {
         self.in_bytes.increment(data.data().len() as u64);
 
         // Drop candidates on the consensus overlay when block-sync is the canonical path
-        // (C++ ref: `private-overlay.cpp` early-return when `enable_observers`)
-        if self.enable_observers
+        // (C++ ref: `private-overlay.cpp` early-return when block sync is enabled)
+        if self.protocol.uses_block_sync()
             && source == consensus_common::BroadcastSource::ConsensusOverlay
             && is_candidate_payload(data)
         {
@@ -4372,8 +4371,8 @@ pub(crate) struct ReceiverSettings {
     pub max_leader_window_desync: u32,
     /// Use QUIC overlay transport for this session (else ADNL UDP).
     pub use_quic: bool,
-    /// enable the dedicated block-sync overlay for candidate broadcasts.
-    pub enable_observers: bool,
+    /// ConfigParam 30 transport semantics, independent of `proto_version`.
+    pub protocol: consensus_common::simplex_protocol::SimplexProtocol,
     /// `requestCandidate` retry pacing and rate-limit configuration.
     pub candidate_resolve_config: CandidateResolveConfig,
     /// Label set attached to per-session metrics republished to the global
@@ -4400,7 +4399,7 @@ impl ReceiverSettings {
             slots_per_leader_window: options.slots_per_leader_window,
             max_leader_window_desync: options.max_leader_window_desync,
             use_quic: options.use_quic,
-            enable_observers: options.enable_observers,
+            protocol: options.protocol,
             candidate_resolve_config: CandidateResolveConfig::from_session_options(options),
             prometheus_labels: options.prometheus_labels,
         }
@@ -4741,6 +4740,24 @@ impl ReceiverWrapper {
         settings: ReceiverSettings,
     ) -> Result<ReceiverPtr> {
         let ids: Vec<crate::SimplexSessionNode> = ids.iter().cloned().map(Into::into).collect();
+        settings.protocol.admits_runtime()?;
+        let ordered_adnl: Vec<_> = ids.iter().map(|node| node.adnl_id.clone()).collect();
+        let membership = consensus_common::simplex_protocol::SimplexMembership::new(
+            &ordered_adnl,
+            ordered_adnl.iter().cloned(),
+        )?;
+        let local_node = ids
+            .iter()
+            .find(|node| {
+                if node.identity.pq_key().is_some() {
+                    &node.adnl_id == local_key.id()
+                } else {
+                    node.identity.id() == local_key.id()
+                }
+            })
+            .ok_or_else(|| error!("Local key not found in node list"))?;
+        let local_idx = membership.validator_index(&local_node.adnl_id)?;
+
         // Destructure once at the top so the rest of the function reads as if
         // each setting were still a free-standing parameter.
         let ReceiverSettings {
@@ -4753,7 +4770,7 @@ impl ReceiverWrapper {
             slots_per_leader_window,
             max_leader_window_desync,
             use_quic,
-            enable_observers,
+            protocol,
             candidate_resolve_config,
             prometheus_labels,
         } = settings;
@@ -4776,7 +4793,7 @@ impl ReceiverWrapper {
             overlay_id.to_hex_string(),
             overlay_short_id,
             use_quic,
-            enable_observers,
+            protocol.uses_block_sync(),
         );
 
         // Create task queues
@@ -4828,7 +4845,7 @@ impl ReceiverWrapper {
             in_messages_count,
             in_broadcasts_count,
             in_queries_count,
-            enable_observers,
+            protocol,
             in_broadcasts_dropped_observers,
         });
 
@@ -4860,19 +4877,6 @@ impl ReceiverWrapper {
             transport_type,
             None,
         )?;
-
-        // Find local index
-        let local_key_hash = local_key.id();
-        let local_idx =
-            ids.iter()
-                .position(|n| {
-                    if n.identity.pq_key().is_some() {
-                        &n.adnl_id == local_key_hash
-                    } else {
-                        n.identity.id() == local_key_hash
-                    }
-                })
-                .ok_or_else(|| error!("Local key not found in node list"))? as u32;
 
         let local_adnl_id = ids[local_idx as usize].adnl_id.clone();
 
@@ -5341,3 +5345,47 @@ mod payload_classifier_tests {
 #[cfg(test)]
 #[path = "tests/test_live_pq_receiver.rs"]
 mod live_pq_tests;
+
+#[cfg(test)]
+mod protocol_broadcast_tests {
+    use super::*;
+    use consensus_common::simplex_protocol::SimplexProtocol;
+
+    #[test]
+    fn typed_protocol_preserves_actual_broadcast_callback_routing() {
+        for protocol in [SimplexProtocol::Private, SimplexProtocol::BlockSync] {
+            for source in [
+                consensus_common::BroadcastSource::ConsensusOverlay,
+                consensus_common::BroadcastSource::BlockSyncOverlay,
+            ] {
+                let metrics = MetricsHandle::new(None);
+                let queues = Arc::new(ReceiverTaskQueues::new(&metrics));
+                let listener = OverlayListenerImpl {
+                    session_id: UInt256::default(),
+                    task_queues: queues.clone(),
+                    protocol,
+                    in_messages_bytes: metrics::Counter::noop(),
+                    in_broadcasts_bytes: metrics::Counter::noop(),
+                    in_queries_bytes: metrics::Counter::noop(),
+                    in_bytes: metrics::Counter::noop(),
+                    in_messages_count: metrics::Counter::noop(),
+                    in_broadcasts_count: metrics::Counter::noop(),
+                    in_queries_count: metrics::Counter::noop(),
+                    in_broadcasts_dropped_observers: metrics::Counter::noop(),
+                };
+                let tag = rtos_api::ton::consensus::candidatedata::Empty::constructor_const();
+                let payload = consensus_common::ConsensusCommonFactory::create_block_payload(
+                    tag.to_le_bytes().to_vec(),
+                );
+                listener.on_broadcast(rtos_block::KeyId::from_data([1; 32]), &payload, source);
+                let expected = !(protocol.uses_block_sync()
+                    && source == consensus_common::BroadcastSource::ConsensusOverlay);
+                assert_eq!(
+                    queues.task_receiver.try_recv().is_ok(),
+                    expected,
+                    "{protocol:?} {source:?}"
+                );
+            }
+        }
+    }
+}

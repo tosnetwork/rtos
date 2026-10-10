@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; typed Simplex protocol and membership admission.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -136,6 +136,7 @@ impl Default for ReceiverTestConfig {
 struct ReceiverStats {
     /// Number of votes received
     votes_received: AtomicU32,
+    received_vote_bytes: Mutex<Vec<(u32, Vec<u8>)>>,
     /// Number of broadcasts received
     broadcasts_received: AtomicU32,
     /// Number of certificates received
@@ -160,6 +161,7 @@ impl ReceiverStats {
     fn new(receiver_idx: u32) -> Self {
         Self {
             votes_received: AtomicU32::new(0),
+            received_vote_bytes: Mutex::new(Vec::new()),
             broadcasts_received: AtomicU32::new(0),
             certificates_received: AtomicU32::new(0),
             received_certificates: Mutex::new(Vec::new()),
@@ -208,6 +210,11 @@ impl TestReceiverListener {
 
 impl ReceiverListener for TestReceiverListener {
     fn on_vote(&self, source_idx: u32, vote: TlVoteBoxed, _raw_vote: RawVoteData) {
+        self.stats
+            .received_vote_bytes
+            .lock()
+            .unwrap()
+            .push((source_idx, serialize_boxed(&vote).unwrap()));
         let count = self.stats.votes_received.fetch_add(1, Ordering::Relaxed) + 1;
         log::trace!(
             "Receiver {} received vote from source {}: count={}, vote={:?}",
@@ -363,6 +370,24 @@ impl ReceiverInstance {
         private_key: PrivateKey,
         overlay_manager: ConsensusOverlayManagerPtr,
     ) -> Result<Self, Error> {
+        Self::create_with_protocol(
+            idx,
+            session_id,
+            nodes,
+            private_key,
+            overlay_manager,
+            Default::default(),
+        )
+    }
+
+    fn create_with_protocol<N: Clone + Into<crate::SimplexSessionNode>>(
+        idx: u32,
+        session_id: SessionId,
+        nodes: &[N],
+        private_key: PrivateKey,
+        overlay_manager: ConsensusOverlayManagerPtr,
+        protocol: consensus_common::simplex_protocol::SimplexProtocol,
+    ) -> Result<Self, Error> {
         let (listener, stats) = TestReceiverListener::create(idx);
         let listener_arc: Arc<dyn ReceiverListener + Send + Sync> = listener.clone();
         let listener_weak: ReceiverListenerPtr = Arc::downgrade(&listener_arc);
@@ -386,6 +411,7 @@ impl ReceiverInstance {
             crate::receiver::ReceiverSettings {
                 max_candidate_size,
                 max_candidate_query_answer_size,
+                protocol,
                 ..Default::default()
             },
         )?;
@@ -2009,51 +2035,149 @@ fn test_receiver_standstill_cache_does_not_overwrite_existing_certificate() {
 #[test]
 fn pq_live_receiver_verifies_votes_and_serves_candidates() {
     use crate::pq_fixture as f;
-    let (nodes, keys) = f::members();
-    let overlay = SessionFactory::create_in_process_overlay_manager(2);
-    let receiver0 =
-        ReceiverInstance::create(0, f::session(), &nodes, keys[0].clone(), overlay.clone())
-            .unwrap();
-    let receiver1 =
-        ReceiverInstance::create(1, f::session(), &nodes, keys[1].clone(), overlay).unwrap();
-    receiver0.receiver.set_ingress_progress_slot(99);
-    receiver1.receiver.set_ingress_progress_slot(99);
-    thread::sleep(Duration::from_millis(200));
-    let TlVoteBoxed::Consensus_Simplex_Vote(vote) = f::vote("skip", "skip", 0, f::CONTEXT);
-    receiver0.receiver.send_vote(vote);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while receiver1.stats.votes_received.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert_eq!(receiver1.stats.votes_received.load(Ordering::Relaxed), 1);
-    let empty = rtos_api::ton::consensus::candidatedata::Empty {
-        slot: 99,
-        parent: TlCandidateId { slot: 98, hash: UInt256::from([5; 32]) }.into_boxed(),
-        block: f::block_id("empty"),
-        signature: f::bytes(&f::row("empty", "candidate", 1, f::CONTEXT), "signature"),
-    }
-    .into_boxed();
-    let payload = serialize_boxed(&empty).unwrap();
-    receiver0._listener.set_query_fallback_payloads(
-        99,
-        f::candidate_hash("empty"),
-        payload,
-        serialize_boxed(&f::signatures("empty", "notarize", f::CONTEXT)).unwrap(),
-    );
-    receiver1.receiver.request_candidate(99, f::candidate_hash("empty"));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while receiver1.stats.broadcasts_received.load(Ordering::Relaxed) == 0
-        && Instant::now() < deadline
+    for (protocol, wrong_member) in [
+        consensus_common::simplex_protocol::SimplexProtocol::Private,
+        consensus_common::simplex_protocol::SimplexProtocol::BlockSync,
+    ]
+    .into_iter()
+    .flat_map(|protocol| [(protocol, false), (protocol, true)])
     {
-        thread::sleep(Duration::from_millis(10));
+        let (nodes, keys) = f::members();
+        for (node, key) in nodes.iter().zip(&keys) {
+            assert_eq!(&node.adnl_id, key.id());
+            assert_ne!(node.identity.id(), key.id());
+            assert_ne!(node.identity.pq_key().unwrap().key_id.as_slice(), key.id().data());
+        }
+        let overlay = SessionFactory::create_in_process_overlay_manager(2);
+        let receiver0 = ReceiverInstance::create_with_protocol(
+            0,
+            f::session(),
+            &nodes,
+            keys[0].clone(),
+            overlay.clone(),
+            protocol,
+        )
+        .unwrap();
+        let receiver1 = ReceiverInstance::create_with_protocol(
+            1,
+            f::session(),
+            &nodes,
+            keys[1].clone(),
+            overlay,
+            protocol,
+        )
+        .unwrap();
+        receiver0.receiver.set_ingress_progress_slot(99);
+        receiver1.receiver.set_ingress_progress_slot(99);
+        thread::sleep(Duration::from_millis(200));
+        let TlVoteBoxed::Consensus_Simplex_Vote(vote) = f::vote("skip", "skip", 0, f::CONTEXT);
+        receiver0.receiver.send_vote(vote);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while receiver1.stats.votes_received.load(Ordering::Relaxed) == 0
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(receiver1.stats.votes_received.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *receiver1.stats.received_vote_bytes.lock().unwrap(),
+            vec![(0, serialize_boxed(&f::vote("skip", "skip", 0, f::CONTEXT)).unwrap())]
+        );
+        let empty = rtos_api::ton::consensus::candidatedata::Empty {
+            slot: 99,
+            parent: TlCandidateId { slot: 98, hash: UInt256::from([5; 32]) }.into_boxed(),
+            block: f::block_id("empty"),
+            signature: f::bytes(&f::row("empty", "candidate", 1, f::CONTEXT), "signature"),
+        }
+        .into_boxed();
+        let payload = serialize_boxed(&empty).unwrap();
+        receiver0._listener.set_query_fallback_payloads(
+            99,
+            f::candidate_hash("empty"),
+            payload,
+            serialize_boxed(&f::signatures("empty", "notarize", f::CONTEXT)).unwrap(),
+        );
+        receiver1.receiver.request_candidate(99, f::candidate_hash("empty"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while receiver1.stats.broadcasts_received.load(Ordering::Relaxed) == 0
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(receiver1.stats.broadcasts_received.load(Ordering::Relaxed), 1);
+        let TlVoteBoxed::Consensus_Simplex_Vote(mut invalid) = if wrong_member {
+            f::vote("skip", "skip", 1, f::CONTEXT)
+        } else {
+            f::vote("empty", "notarize", 0, f::CONTEXT)
+        };
+        if !wrong_member {
+            invalid.signature[0] ^= 1;
+        }
+        receiver0.receiver.send_vote(invalid);
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(receiver1.stats.votes_received.load(Ordering::Relaxed), 1);
+        receiver0.stop();
+        receiver1.stop();
     }
-    assert_eq!(receiver1.stats.broadcasts_received.load(Ordering::Relaxed), 1);
-    let TlVoteBoxed::Consensus_Simplex_Vote(mut invalid) =
-        f::vote("empty", "notarize", 0, f::CONTEXT);
-    invalid.signature[0] ^= 1;
-    receiver0.receiver.send_vote(invalid);
-    thread::sleep(Duration::from_millis(300));
-    assert_eq!(receiver1.stats.votes_received.load(Ordering::Relaxed), 1);
-    receiver0.stop();
-    receiver1.stop();
+}
+
+#[test]
+fn test_receiver_typed_protocol_and_membership_fail_before_overlay_start() {
+    use consensus_common::simplex_protocol::SimplexProtocol;
+    struct NoOverlayStart(AtomicU32);
+    impl consensus_common::ConsensusOverlayManager for NoOverlayStart {
+        fn start_overlay(
+            &self,
+            _: &PrivateKey,
+            _: &Arc<adnl::PrivateOverlayShortId>,
+            _: &[consensus_common::ConsensusNode],
+            _: consensus_common::ConsensusOverlayListenerPtr,
+            _: consensus_common::ConsensusOverlayLogReplayListenerPtr,
+            _: consensus_common::OverlayTransportType,
+            _: Option<consensus_common::BlockSyncOverlayParams>,
+        ) -> rtos_block::Result<consensus_common::ConsensusOverlayPtr> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(error!("Unexpected overlay start"))
+        }
+        fn stop_overlay(
+            &self,
+            _: &Arc<adnl::PrivateOverlayShortId>,
+            _: &consensus_common::ConsensusOverlayPtr,
+        ) {
+        }
+    }
+    let overlay = Arc::new(NoOverlayStart(AtomicU32::new(0)));
+    let key = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
+    let outsider = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
+    let node = SessionNode { public_key: key.clone(), adnl_id: key.id().clone(), weight: 1 };
+    let (listener, _) = TestReceiverListener::create(0);
+    let listener: Arc<dyn ReceiverListener + Send + Sync> = listener;
+    let create = |nodes: Vec<SessionNode>, protocol, local: &PrivateKey| {
+        crate::receiver::ReceiverWrapper::create(
+            UInt256::rand(),
+            &ShardIdent::masterchain(),
+            &nodes,
+            local,
+            overlay.clone(),
+            Arc::downgrade(&listener),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+            crate::receiver::ReceiverSettings { protocol, ..Default::default() },
+        )
+    };
+    for protocol in [SimplexProtocol::Private, SimplexProtocol::BlockSync] {
+        let error = create(vec![node.clone(), node.clone()], protocol, &key).err().unwrap();
+        assert!(error.to_string().contains("Duplicate Simplex"), "{error}");
+        let error = create(vec![node.clone()], protocol, &outsider).err().unwrap();
+        assert!(error.to_string().contains("Local key not found"), "{error}");
+        assert_eq!(overlay.0.load(Ordering::SeqCst), 0);
+    }
+    let error = create(vec![node], SimplexProtocol::PrivateObserversPlumtree, &key).err().unwrap();
+    assert!(error.to_string().contains("protocol version 2 runtime"), "{error}");
+    assert_eq!(overlay.0.load(Ordering::SeqCst), 0);
+    let options = crate::SessionOptions {
+        protocol: SimplexProtocol::PrivateObserversPlumtree,
+        ..Default::default()
+    };
+    assert!(options.validate().unwrap_err().to_string().contains("protocol version 2 runtime"));
 }

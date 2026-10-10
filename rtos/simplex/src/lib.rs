@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): naming and durable own-decision journal integration.
+ * RTOS project modifications (2026-10-10): naming, durable own-decision journals and typed protocol admission.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -485,9 +485,8 @@ pub struct SessionOptions {
     /// Default: false
     pub use_quic: bool,
 
-    /// `SimplexConfig.protocol_version == 1` (ConfigParam 30).
-    /// Default: false (use consensus private overlay for candidate propagation).
-    pub enable_observers: bool,
+    /// ConfigParam 30 semantics, independent of the carrier envelope version.
+    pub protocol: consensus_common::simplex_protocol::SimplexProtocol,
 
     /// Cooldown between repeated health alerts of the same anomaly type.
     /// Default: 30 seconds
@@ -587,7 +586,7 @@ impl Default for SessionOptions {
             empty_block_mc_lag_threshold: None,
             wait_for_db_init: false,
             use_quic: false,
-            enable_observers: false,
+            protocol: Default::default(),
             health_alert_cooldown: Duration::from_secs(30),
             health_stall_warning_secs: 15,
             health_stall_error_secs: 60,
@@ -610,6 +609,7 @@ impl Default for SessionOptions {
 impl SessionOptions {
     /// Validate options and return error if invalid
     pub fn validate(&self) -> Result<()> {
+        self.protocol.admits_runtime()?;
         if self.proto_version > 1 {
             fail!("Simplex supports protocol versions 0 and 1 only");
         }

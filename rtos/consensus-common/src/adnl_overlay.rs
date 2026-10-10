@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; typed Simplex protocol and membership admission.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -1013,6 +1013,12 @@ impl AdnlOverlay {
         transport_type: OverlayTransportType,
         block_sync_params: Option<crate::BlockSyncOverlayParams>,
     ) -> Result<Arc<Self>> {
+        if let Some(params) = &block_sync_params {
+            params.membership()?;
+            if params.overlay_id.is_none() {
+                fail!("Block-sync overlay identity is missing");
+            }
+        }
         // Set by simplex via with_overlay_id; None = no block-sync overlay.
         let block_sync_overlay_id = block_sync_params.as_ref().and_then(|p| p.overlay_id.clone());
         let local_id = local_validator_key.id();
@@ -1048,6 +1054,14 @@ impl AdnlOverlay {
 
         let local_adnl_key = local_adnl_key
             .ok_or_else(|| error!("Local ADNL key not found in nodes for local_id: {local_id}"))?;
+
+        if let Some(params) = &block_sync_params {
+            let current: Vec<_> = nodes.iter().map(|node| node.adnl_id.clone()).collect();
+            if params.current_set != current {
+                fail!("Block-sync validator order differs from consensus session");
+            }
+            params.membership()?.validator_index(local_adnl_key.id())?;
+        }
 
         log::debug!(
             target: LOG_TARGET,

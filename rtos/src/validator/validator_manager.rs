@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project and crate naming; typed Simplex protocol and membership admission.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -121,11 +121,10 @@ fn build_runtime_simplex_session_options(
     catchain_options: &CatchainSessionOptions,
 ) -> Result<SimplexSessionOptions> {
     cfg.validate_protocol_version()?;
-    // Version 2 requires a different relay and persistent session namespace.
-    // Refuse admission until those paths are implemented together.
-    if cfg.protocol_version == 2 {
-        fail!("Simplex protocol version 2 runtime is not implemented");
-    }
+    let protocol = consensus_common::simplex_protocol::SimplexProtocol::try_from(u32::from(
+        cfg.protocol_version,
+    ))?;
+    protocol.admits_runtime()?;
     let np = &cfg.noncritical_params;
     Ok(SimplexSessionOptions {
         proto_version: catchain_options.proto_version as u32,
@@ -153,7 +152,7 @@ fn build_runtime_simplex_session_options(
         max_collated_data_size: catchain_options.max_collated_data_size as usize,
         use_callback_thread: false,
         use_quic: cfg.use_quic,
-        enable_observers: cfg.protocol_version == 1,
+        protocol,
         no_empty_blocks_on_error_timeout: Duration::from_millis(
             np.no_empty_blocks_on_error_timeout_ms as u64,
         ),
@@ -1471,7 +1470,7 @@ impl ValidatorManagerImpl {
             // C++ parity: manager.cpp builds overlay_members + block-sync-overlay.cpp
             // builds authorized_keys from bus.validator_set (current set only)
             // Network requires observers - fail loudly if we can't honour it.
-            let block_sync_params = if cfg.protocol_version == 1 {
+            let block_sync_params = if opts.protocol.uses_block_sync() {
                 let p = consensus_common::BlockSyncOverlayParams::from_config(
                     config_params,
                     cfg.slots_per_leader_window,
