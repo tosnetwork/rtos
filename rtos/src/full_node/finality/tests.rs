@@ -149,8 +149,6 @@ fn engine() -> (Arc<RecoveryEngine>, BlockSignaturesSimplexPq) {
             stores: AtomicUsize::new(0),
             store_gate: None,
             stores_completed: AtomicUsize::new(0),
-            store_gate: None,
-            stores_completed: AtomicUsize::new(0),
             observed: tokio::sync::Notify::new(),
             #[cfg(feature = "telemetry")]
             telemetry: Default::default(),
@@ -290,6 +288,8 @@ async fn authenticated_max_parented_finality_download_and_admission() {
         downloads: AtomicUsize::new(0),
         gate: None,
         stores: AtomicUsize::new(0),
+        store_gate: None,
+        stores_completed: AtomicUsize::new(0),
         observed: tokio::sync::Notify::new(),
         #[cfg(feature = "telemetry")]
         telemetry: Default::default(),
