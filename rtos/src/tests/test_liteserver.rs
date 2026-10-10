@@ -3253,3 +3253,6 @@ async fn run_smc_method_preserves_signed_method_id() -> Result<()> {
 mod absence_reference;
 #[path = "test_liteserver_wire_profile.rs"]
 mod wire_profile_tests;
+
+#[path = "test_liteserver_transaction_boundaries.rs"]
+mod transaction_boundaries;
