@@ -10150,11 +10150,13 @@ fn pq_live_recovery_rejects_vote_context_and_member_before_application() {
 
 #[test]
 fn pq_live_recovery_requires_finality_before_any_state_mutation() {
-    use crate::database::{
-        Bootstrap, CandidateInfoRecord, FinalCertRecord, FinalizedBlockRecord, NotarCertRecord,
-        SkipCertRecord,
+    use crate::{
+        database::{
+            Bootstrap, CandidateInfoRecord, FinalCertRecord, FinalizedBlockRecord, NotarCertRecord,
+            SkipCertRecord,
+        },
+        pq_fixture as f,
     };
-    use crate::pq_fixture as f;
     let id = crate::block::RawCandidateId {
         slot: SlotIndex::new(99),
         hash: f::candidate_hash("ordinary"),
@@ -10299,10 +10301,12 @@ fn pq_live_session_stops_on_invalid_recovery_record() {
 
 #[test]
 fn pq_live_recovery_authenticates_finalized_parent_chains_and_role_flags() {
-    use crate::database::{
-        Bootstrap, CandidateInfoRecord, FinalCertRecord, FinalizedBlockRecord, NotarCertRecord,
+    use crate::{
+        database::{
+            Bootstrap, CandidateInfoRecord, FinalCertRecord, FinalizedBlockRecord, NotarCertRecord,
+        },
+        pq_fixture as f,
     };
-    use crate::pq_fixture as f;
     use rtos_api::ton::consensus::simplex::{
         certificate::Certificate, unsignedvote::FinalizeVote, votesignature::VoteSignature,
         votesignatureset::VoteSignatureSet,
