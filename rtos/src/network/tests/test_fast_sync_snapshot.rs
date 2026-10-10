@@ -1,0 +1,264 @@
+/*
+ * Copyright (C) 2026 RTOS contributors.
+ * Licensed under the GNU General Public License v3.0.
+ * See the LICENSE file in the root of this repository.
+ */
+use super::*;
+use crate::{
+    collator_test_bundle::create_engine_allocated,
+    validator::validator_manager::emulator_network_bootstrap::EmulatorNetworkBootstrap,
+};
+use rtos_block::{PqConsensusKey, UInt256};
+use std::sync::atomic::AtomicUsize;
+
+struct SnapshotEngine {
+    zero: BlockIdExt,
+    fail_after: AtomicUsize,
+}
+impl EngineOperations for SnapshotEngine {
+    fn zerostate_id(&self) -> Result<&BlockIdExt> {
+        let left = self.fail_after.fetch_sub(1, Ordering::SeqCst);
+        if left == 1 {
+            return Err(error!("injected later overlay construction failure"));
+        }
+        Ok(&self.zero)
+    }
+    fn check_stop(&self) -> bool {
+        true
+    }
+}
+
+struct Fixture {
+    router: Arc<FullNodeOverlaysRouter>,
+    engine: Arc<SnapshotEngine>,
+    bootstrap: EmulatorNetworkBootstrap,
+}
+impl Fixture {
+    async fn new() -> Result<Self> {
+        let bootstrap = EmulatorNetworkBootstrap::build(2)?;
+        let allocated = create_engine_allocated();
+        #[cfg(feature = "telemetry")]
+        let telemetry = crate::collator_test_bundle::create_engine_telemetry();
+        let network = NodeNetwork::new(
+            bootstrap.load_node_config().await?,
+            tokio_util::sync::CancellationToken::new(),
+            #[cfg(feature = "telemetry")]
+            telemetry.clone(),
+            allocated.clone(),
+        )
+        .await?;
+        let engine = Arc::new(SnapshotEngine {
+            zero: bootstrap.zerostate_id.clone(),
+            fail_after: AtomicUsize::new(usize::MAX),
+        });
+        let router = Arc::new(FullNodeOverlaysRouter {
+            engine: engine.clone(),
+            network,
+            service: Arc::new(FullNodeOverlayService::new(engine.clone(), false)),
+            policy: DhtSearchPolicy::default(),
+            public_overlays: lockfree::map::Map::new(),
+            fast_sync_overlays: lockfree::map::Map::new(),
+            custom_overlays: lockfree::map::Map::new(),
+            public_overlays_awaiters: AwaitersPool::new(
+                "snapshot fixture",
+                #[cfg(feature = "telemetry")]
+                telemetry,
+                allocated,
+            ),
+            fast_sync_snapshot: tokio::sync::Mutex::new(None),
+            monitor_min_split_for_fast_sync: AtomicU8::new(0),
+            last_known_keyblock_id: tokio::sync::Mutex::new(None),
+            actual_monitor_min_split: AtomicU8::new(0),
+            monitor_min_split_worker_started: AtomicBool::new(false),
+            fast_sync_peer_resolver: tokio::sync::Mutex::new(None),
+        });
+        Ok(Self { router, engine, bootstrap })
+    }
+    fn member(&self, index: usize) -> ValidatorDescr {
+        ValidatorDescr::with_pq_params(
+            UInt256::from([20 + index as u8; 32]),
+            PqConsensusKey {
+                algorithm_id: 1,
+                key_id: UInt256::from([30 + index as u8; 32]),
+                public_key: vec![40 + index as u8; 1312],
+            },
+            1,
+            UInt256::from(*self.bootstrap.validators[index].adnl_key.id().data()),
+        )
+    }
+    async fn stop(&self) {
+        self.router.clear_fast_sync_overlays();
+        self.router.network.stop_adnl().await;
+    }
+}
+fn set(members: Vec<ValidatorDescr>) -> ValidatorSet {
+    ValidatorSet::with_cc_seqno(0, u32::MAX, members.len() as u16, 0, members).unwrap()
+}
+fn overlay(router: &FullNodeOverlaysRouter, shard: &ShardIdent) -> Arc<FastSyncOverlayClient> {
+    router.fast_sync_overlays.get(shard).unwrap().val().clone()
+}
+fn assert_replaced(old: &Arc<FastSyncOverlayClient>, new: &Arc<FastSyncOverlayClient>) {
+    assert!(!Arc::ptr_eq(old, new), "configuration change must replace the actual overlay");
+    assert!(old.client().cancellation_token().is_cancelled(), "previous authority must be revoked");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_sync_snapshot_previous_next_and_transport_changes_replace_live_overlays() -> Result<()>
+{
+    let f = Fixture::new().await?;
+    let empty = ValidatorSet::default();
+    let current = set(vec![f.member(0)]);
+    let previous = set(vec![f.member(1)]);
+    let key = f.router.find_transport_key(&[&current]).await?.unwrap();
+    f.router
+        .update_fast_sync_overlays(&empty, &current, &empty, 0, Some(&key), false, false)
+        .await?;
+    let mut master = overlay(&f.router, &ShardIdent::MASTERCHAIN);
+    let mut shard = overlay(&f.router, &ShardIdent::BASE_WORKCHAIN);
+    f.router
+        .update_fast_sync_overlays(&empty, &current, &empty, 0, Some(&key), false, false)
+        .await?;
+    assert!(Arc::ptr_eq(&master, &overlay(&f.router, &ShardIdent::MASTERCHAIN)));
+    for (prev, next, mc, base) in [
+        (&previous, &empty, false, false),
+        (&empty, &previous, false, false),
+        (&empty, &previous, true, false),
+        (&empty, &previous, true, true),
+    ] {
+        f.router.update_fast_sync_overlays(prev, &current, next, 0, Some(&key), mc, base).await?;
+        let new_master = overlay(&f.router, &ShardIdent::MASTERCHAIN);
+        let new_shard = overlay(&f.router, &ShardIdent::BASE_WORKCHAIN);
+        assert_replaced(&master, &new_master);
+        assert_replaced(&shard, &new_shard);
+        assert_eq!(new_master.use_twostep(), mc);
+        assert_eq!(new_shard.use_twostep(), base);
+        assert!(new_master.client().neighbours().contains(f.bootstrap.validators[1].adnl_key.id()));
+        master = new_master;
+        shard = new_shard;
+    }
+    f.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_sync_snapshot_local_rotation_and_loss_revoke_old_authority() -> Result<()> {
+    let f = Fixture::new().await?;
+    let empty = ValidatorSet::default();
+    let current = set(vec![f.member(0), f.member(1)]);
+    let first = f.bootstrap.validators[0].adnl_key.clone();
+    let second = f.bootstrap.validators[1].adnl_key.clone();
+    for key in [&first, &second] {
+        f.router
+            .network
+            .context()
+            .stack
+            .adnl
+            .add_key(key.clone(), 900 + usize::from(key.id() == second.id()))?;
+    }
+    f.router
+        .update_fast_sync_overlays(&empty, &current, &empty, 0, Some(&first), false, false)
+        .await?;
+    let master = overlay(&f.router, &ShardIdent::MASTERCHAIN);
+    f.router
+        .update_fast_sync_overlays(&empty, &current, &empty, 0, Some(&second), false, false)
+        .await?;
+    let rotated = overlay(&f.router, &ShardIdent::MASTERCHAIN);
+    assert_replaced(&master, &rotated);
+    f.router.update_fast_sync_overlays(&empty, &current, &empty, 0, None, false, false).await?;
+    assert_eq!(f.router.fast_sync_overlays.iter().count(), 0);
+    assert!(rotated.client().cancellation_token().is_cancelled());
+    f.router
+        .update_fast_sync_overlays(&empty, &current, &empty, 0, Some(&second), false, false)
+        .await?;
+    assert_eq!(f.router.fast_sync_overlays.iter().count(), 2);
+    f.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_sync_snapshot_failure_revokes_partial_generation_and_retries() -> Result<()> {
+    let f = Fixture::new().await?;
+    let empty = ValidatorSet::default();
+    let current = set(vec![f.member(0)]);
+    let key = f.router.find_transport_key(&[&current]).await?.unwrap();
+    f.router
+        .update_fast_sync_overlays(&empty, &current, &empty, 0, Some(&key), false, false)
+        .await?;
+    let old = overlay(&f.router, &ShardIdent::MASTERCHAIN);
+    f.engine.fail_after.store(2, Ordering::SeqCst);
+    let error = f
+        .router
+        .update_fast_sync_overlays(&empty, &current, &empty, 1, Some(&key), false, false)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("injected later overlay"));
+    assert!(old.client().cancellation_token().is_cancelled());
+    assert_eq!(f.router.fast_sync_overlays.iter().count(), 0);
+    assert!(f.router.fast_sync_snapshot.lock().await.is_none());
+    assert!(f
+        .router
+        .network
+        .context()
+        .stack
+        .overlay
+        .get_query_prefix(&Arc::new(old.id().clone()))
+        .is_err());
+    f.engine.fail_after.store(usize::MAX, Ordering::SeqCst);
+    f.router
+        .update_fast_sync_overlays(&empty, &current, &empty, 1, Some(&key), false, false)
+        .await?;
+    assert_eq!(f.router.fast_sync_overlays.iter().count(), 3);
+    f.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_sync_snapshot_prior_only_pq_custody_is_rechecked_without_chain_changes() -> Result<()>
+{
+    use rtos_block::{ConfigParam32, ConfigParam34, ConfigParamEnum};
+    let f = Fixture::new().await?;
+    let previous = set(vec![f.member(0)]);
+    let mut remote = f.member(1);
+    remote.adnl_addr = Some(UInt256::from([199; 32]));
+    let current = set(vec![remote]);
+    let mut config = f.bootstrap.config_params().clone();
+    config
+        .set_config(ConfigParamEnum::ConfigParam32(ConfigParam32::with_validator_set(previous)))?;
+    config
+        .set_config(ConfigParamEnum::ConfigParam34(ConfigParam34::with_validator_set(current)))?;
+    // The PQ stable ID and consensus key ID are absent from this classical
+    // keyring. Only the separately configured ADNL private key is local.
+    let transport = f.bootstrap.validators[0].adnl_key.id();
+    assert!(!f.router.network.config_handler().get_actual_validator_key_ids()?.contains(transport));
+    f.router.update_private_overlays(&config).await?;
+    let initial = overlay(&f.router, &ShardIdent::MASTERCHAIN);
+    assert_eq!(
+        f.router.fast_sync_snapshot.lock().await.as_ref().unwrap().local_key.as_ref(),
+        Some(transport)
+    );
+    let handler = f.router.network.config_handler();
+    handler
+        .add_validator_adnl_key(
+            f.bootstrap.validators[0].validator_key.id().data(),
+            f.bootstrap.validators[1].adnl_key.id().data(),
+        )
+        .await?;
+    // Same config; the transport key remains loaded in ADNL, but its local
+    // configuration has been revoked. Cached presence must not authorize it.
+    assert!(f.router.network.context().stack.adnl.key_by_id(transport).is_ok());
+    f.router.update_private_overlays(&config).await?;
+    assert_eq!(f.router.fast_sync_overlays.iter().count(), 0);
+    assert!(initial.client().cancellation_token().is_cancelled());
+    handler
+        .add_validator_adnl_key(
+            f.bootstrap.validators[0].validator_key.id().data(),
+            transport.data(),
+        )
+        .await?;
+    f.router.update_private_overlays(&config).await?;
+    assert_eq!(f.router.fast_sync_overlays.iter().count(), 2);
+    let recovered = overlay(&f.router, &ShardIdent::MASTERCHAIN);
+    assert_replaced(&initial, &recovered);
+    f.stop().await;
+    Ok(())
+}
