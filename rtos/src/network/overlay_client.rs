@@ -148,6 +148,11 @@ pub(crate) struct OverlayInitGate {
 }
 
 impl OverlayClient {
+    #[cfg(test)]
+    pub(crate) fn cancellation_token(&self) -> &tokio_util::sync::CancellationToken {
+        &self.ctx.cancellation_token
+    }
+
     pub(crate) async fn new_public(
         id: Arc<OverlayShortId>,
         id_full: OverlayId,

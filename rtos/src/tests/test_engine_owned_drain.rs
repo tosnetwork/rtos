@@ -733,7 +733,8 @@ async fn partial_engine_construction(stage: &'static str, cancel: bool) {
         let path = dir.path().join("config.json");
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        let (key, _) = rtos_block::get_key_option_factory().generate_with_json().unwrap();
+        let (key, _) =
+            secrets_vault::vault_block::get_key_option_factory().generate_with_json().unwrap();
         value["control_server"] = serde_json::to_value(
             adnl::server::AdnlServerConfigJson::with_params(address.to_string(), key, None, None),
         )

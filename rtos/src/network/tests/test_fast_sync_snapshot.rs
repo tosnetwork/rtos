@@ -73,10 +73,15 @@ impl Fixture {
             fail_after: AtomicUsize::new(usize::MAX),
             applied: std::sync::RwLock::new(None),
         });
+        let tasks = Arc::new(OwnedTasks::new(network.cancellation_token().child_token()));
         let router = Arc::new(FullNodeOverlaysRouter {
+            tasks: tasks.clone(),
+            init_gate: Default::default(),
+            public_generations: Default::default(),
+            fast_sync_retiring: Default::default(),
             engine: engine.clone(),
             network,
-            service: Arc::new(FullNodeOverlayService::new(engine.clone(), false)),
+            service: Arc::new(FullNodeOverlayService::new(engine.clone(), false, tasks)),
             policy: DhtSearchPolicy::default(),
             public_overlays: lockfree::map::Map::new(),
             fast_sync_overlays: lockfree::map::Map::new(),
@@ -141,7 +146,7 @@ impl Fixture {
     }
 
     async fn stop(&self) {
-        self.router.clear_fast_sync_overlays().await.unwrap();
+        self.router.stop_and_wait().await.unwrap();
         self.router.network.stop_adnl().await.unwrap();
     }
 }
@@ -373,7 +378,7 @@ async fn fast_sync_snapshot_real_engine_pq_transport_startup_and_keyring_notific
     .await?;
     let result: Result<()> = async {
         let router = engine.overlays_router()?;
-        let first = overlay(router, &ShardIdent::MASTERCHAIN);
+        let first = overlay(&router, &ShardIdent::MASTERCHAIN);
         assert_eq!(
             router.fast_sync_snapshot.lock().await.as_ref().unwrap().local_key.as_ref(),
             Some(bootstrap.validators[0].adnl_key.id())
