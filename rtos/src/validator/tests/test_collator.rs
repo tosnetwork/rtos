@@ -1045,6 +1045,18 @@ fn collated_fixture_v2_reference(block: &Block) -> Result<Block> {
         "921aa09f23fc31a13569bed64684dfd0c0893f94c7908ffbb25fa359d2f8697e" => {
             (737272, 3647972037, 3789780191)
         }
+        "d27493e29456e09f05a7fdf1d51a94106cea621b6e59e6a11f5da30eeb787bf2" => {
+            (3, 4227316980, 3494234678)
+        }
+        "2bc2034d35d9beea3332e4464d587014cd58166bc96813f685f3d894ca28236e" => {
+            (538538, 1099449383, 2445650682)
+        }
+        "5ca9034ead92ee9dd60274f64e1c76dfb379bf231347ff6c47c35f68c6e5e9a7" => {
+            (827790, 1215464393, 3836108309)
+        }
+        "db9fc78ebe9d551090769bb6278023bdcc56bf90a9e0ee8e1cd7d0b75f0d7aac" => {
+            (828809, 1161427525, 2019956406)
+        }
         _ => panic!("unrecognized historical collated fixture {root}"),
     };
     let mut migrated = block.clone();
@@ -1054,6 +1066,20 @@ fn collated_fixture_v2_reference(block: &Block) -> Result<Block> {
     info.set_gen_validator_list_hash_short(new_hash);
     migrated.write_info(&info)?;
     Ok(migrated)
+}
+
+async fn try_validate_historical_bundle(bundle: Arc<CollatorTestBundle>) {
+    let error =
+        try_validate_by_bundle(bundle.clone()).await.err().expect("legacy hash is rejected");
+    assert!(error.to_string().contains("validator set hash"), "{error}");
+    let mut candidate = bundle.candidate().unwrap().clone();
+    let migrated =
+        collated_fixture_v2_reference(&Block::construct_from_bytes(&candidate.data).unwrap())
+            .unwrap();
+    candidate.data = migrated.write_to_bytes().unwrap();
+    candidate.block_id.root_hash = migrated.serialize().unwrap().repr_hash().clone();
+    candidate.block_id.file_hash = UInt256::calc_file_hash(&candidate.data);
+    crate::collator_test_bundle::try_validate(bundle, candidate).await.unwrap();
 }
 
 #[cfg(not(feature = "xp25"))]
@@ -1198,7 +1224,7 @@ async fn test_collated_data2() {
         )
         .unwrap(),
     );
-    try_validate_by_bundle(bundle).await.unwrap();
+    try_validate_historical_bundle(bundle).await;
 }
 
 #[ignore]
@@ -1223,7 +1249,7 @@ async fn test_collated_data_validate_unchanged_account() {
     init_test_log();
     let path = "src/tests/static/0.8000000000000000_66163599_2bc2034d_collator_test_bundle";
     let bundle = CollatorTestBundle::load(path).unwrap();
-    try_validate_by_bundle(Arc::new(bundle)).await.unwrap();
+    try_validate_historical_bundle(Arc::new(bundle)).await;
 }
 
 // full-collated-data validation where a subtree shared with the new state is pruned in
@@ -1235,7 +1261,7 @@ async fn test_validate_pruned_shared_subtree_storage_stat() {
     init_test_log();
     let path = "src/tests/static/0.8000000000000000_76189835_5ca9034e_collator_test_bundle";
     let bundle = CollatorTestBundle::load(path).unwrap();
-    try_validate_by_bundle(Arc::new(bundle)).await.unwrap();
+    try_validate_historical_bundle(Arc::new(bundle)).await;
 }
 
 #[cfg(not(feature = "xp25"))]
@@ -1244,7 +1270,7 @@ async fn test_validate_pruned_dispatch_queue() {
     init_test_log();
     let path = "src/tests/static/0.8000000000000000_76770988_db9fc78e_collator_test_bundle";
     let bundle = CollatorTestBundle::load(path).unwrap();
-    try_validate_by_bundle(Arc::new(bundle)).await.unwrap();
+    try_validate_historical_bundle(Arc::new(bundle)).await;
 }
 
 #[cfg(not(feature = "xp25"))]
@@ -1264,6 +1290,9 @@ async fn test_collated_data_reference_subsets() {
         "0.8000000000000000_56703839_5b25cdef_collator_test_bundle",
         "0.8000000000000000_57120589_921aa09f_collator_test_bundle",
         "0.6000000000000000_439_d27493e2_collator_test_bundle",
+        "0.8000000000000000_66163599_2bc2034d_collator_test_bundle",
+        "0.8000000000000000_76189835_5ca9034e_collator_test_bundle",
+        "0.8000000000000000_76770988_db9fc78e_collator_test_bundle",
     ] {
         let bundle = CollatorTestBundle::load(&format!("src/tests/static/{name}")).unwrap();
         let state = bundle.load_last_applied_mc_state().await.unwrap();

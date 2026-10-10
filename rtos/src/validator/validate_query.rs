@@ -454,7 +454,25 @@ impl ValidateQuery {
         }
 
         // 4. unpack block candidate (while necessary data is being loaded)
-        Self::unpack_block_candidate(base, &mut self.block_candidate)
+        let base = Self::unpack_block_candidate(base, &mut self.block_candidate)?;
+        let expected_cc = self.validator_set.catchain_seqno();
+        if base.info.gen_catchain_seqno() != expected_cc {
+            reject_query!(
+                "block catchain sequence {} differs from expected {}",
+                base.info.gen_catchain_seqno(),
+                expected_cc
+            );
+        }
+        let expected_hash =
+            ValidatorSet::calc_subset_hash_short(self.validator_set.list(), expected_cc)?;
+        if base.info.gen_validator_list_hash_short() != expected_hash {
+            reject_query!(
+                "block validator set hash {} differs from expected {}",
+                base.info.gen_validator_list_hash_short(),
+                expected_hash
+            );
+        }
+        Ok(base)
     }
 
     async fn init_mc_data(&mut self, base: &mut ValidateBase) -> Result<McData> {
@@ -7160,3 +7178,7 @@ impl ValidateQuery {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_candidate_header.rs"]
+mod candidate_header_tests;
