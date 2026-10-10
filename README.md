@@ -1,8 +1,5 @@
 # RTOS
 
-RTOS is the TOS network's Rust node project, derived from
-[RSquad/ton-rust-node](https://github.com/RSquad/ton-rust-node).
-
 This checkout currently contains the upstream node with RTOS project, crate,
 binary, and deployment names. TOS protocol adaptation and validator compatibility
 have not yet been completed or validated. The inherited network examples and
