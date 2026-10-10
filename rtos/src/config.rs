@@ -1414,10 +1414,20 @@ impl NodeConfigHandler {
         let gate = self.scheduler.admission.lock().unwrap();
         // Accepted subscribers may need a key lookup while writes are draining.
         // The scheduler closes the receiver after their actual completion.
-        if !gate.open && (!gate.started || !matches!(&task.1, Task::GetKey(_))) {
+        if !gate.open
+            && (!gate.started || !scheduler::in_callback() || !matches!(&task.1, Task::GetKey(_)))
+        {
             fail!("Configuration scheduler is stopping");
         }
         self.sender.send(task).map_err(|_| error!("Configuration scheduler is closed"))
+    }
+
+    fn dispatch_config_event(&self, subscriber: Arc<dyn NodeConfigSubscriber>, event: ConfigEvent) {
+        self.scheduler.spawn_callback(&self.runtime_handle, async move {
+            if let Err(error) = subscriber.event(event).await {
+                log::warn!("Configuration subscriber event failed: {error}");
+            }
+        });
     }
 
     pub(crate) fn stop(&self) {
@@ -1775,14 +1785,10 @@ impl NodeConfigHandler {
                     .map_err(|e| error!("Invalid ADNL key Id {adnl_key_id}: {e}"))?,
             );
             for subscriber in subscribers.iter() {
-                if let Err(e) = subscriber
-                    .event(ConfigEvent::RemoveValidatorAdnlKey(adnl_key_id.clone(), election_id))
-                    .await
-                {
-                    log::warn!(
-                        "revision_validator_keys: RemoveValidatorAdnlKey subscriber error: {e}"
-                    );
-                }
+                self.dispatch_config_event(
+                    subscriber.clone(),
+                    ConfigEvent::RemoveValidatorAdnlKey(adnl_key_id.clone(), election_id),
+                );
             }
         }
         Ok(())
@@ -1804,16 +1810,10 @@ impl NodeConfigHandler {
         let adnl_key_id = KeyId::from_data(*validator_adnl_key_hash);
 
         for subscriber in subscribers.iter() {
-            let subscriber = subscriber.clone();
-            let adnl_key_id = adnl_key_id.clone();
-            self.scheduler.spawn_callback(&self.runtime_handle, async move {
-                if let Err(e) = subscriber
-                    .event(ConfigEvent::AddValidatorAdnlKey(adnl_key_id, election_id))
-                    .await
-                {
-                    log::warn!("add_validator_adnl_key_and_save subscriber error: {e:?}");
-                }
-            });
+            self.dispatch_config_event(
+                subscriber.clone(),
+                ConfigEvent::AddValidatorAdnlKey(adnl_key_id.clone(), election_id),
+            );
         }
 
         // check validator keys — remove oldest if more than 2
@@ -1938,20 +1938,12 @@ impl NodeConfigHandler {
                     let adnl_key_id = base64_decode(validator_adnl_key_id)?;
                     let adnl_key_id = KeyId::from_data(adnl_key_id[..].try_into()?);
                     let election_id = key.election_id;
-                    let subscribers = subscribers.to_vec();
-                    self.scheduler.spawn_callback(&self.runtime_handle, async move {
-                        for subscriber in subscribers.iter() {
-                            if let Err(e) = subscriber
-                                .event(ConfigEvent::AddValidatorAdnlKey(
-                                    adnl_key_id.clone(),
-                                    election_id,
-                                ))
-                                .await
-                            {
-                                log::warn!("load_config subscriber error: {e:?}");
-                            }
-                        }
-                    });
+                    for subscriber in subscribers {
+                        self.dispatch_config_event(
+                            subscriber.clone(),
+                            ConfigEvent::AddValidatorAdnlKey(adnl_key_id.clone(), election_id),
+                        );
+                    }
                 }
             }
         }

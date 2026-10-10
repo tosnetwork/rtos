@@ -11,6 +11,14 @@ use std::{
 use tokio::{runtime::Handle, sync::mpsc::UnboundedReceiver, task::JoinHandle};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
+tokio::task_local! {
+    static IN_CALLBACK: ();
+}
+
+pub(super) fn in_callback() -> bool {
+    IN_CALLBACK.try_with(|_| true).unwrap_or(false)
+}
+
 pub(super) struct Admission {
     pub open: bool,
     pub started: bool,
@@ -24,6 +32,7 @@ pub(super) struct ConfigScheduler {
     pub callbacks: TaskTracker,
     worker: TaskTracker,
     errors: Mutex<Vec<String>>,
+    callback_tail: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 impl Default for ConfigScheduler {
@@ -34,6 +43,7 @@ impl Default for ConfigScheduler {
             callbacks: TaskTracker::new(),
             worker: TaskTracker::new(),
             errors: Mutex::new(Vec::new()),
+            callback_tail: Mutex::new(None),
         }
     }
 }
@@ -65,7 +75,17 @@ impl ConfigScheduler {
     ) {
         // Only the admitted scheduler creates callbacks. Closing public admission
         // does not prevent callbacks required by an already accepted write.
-        let worker = runtime.spawn(future);
+        // Preserve event submission order, including key removal after add.
+        // A failed callback still releases the next callback in the chain.
+        let (finished, next) = tokio::sync::oneshot::channel();
+        let previous = self.callback_tail.lock().unwrap().replace(next);
+        let worker = runtime.spawn(async move {
+            let _finished = finished;
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            IN_CALLBACK.scope((), future).await;
+        });
         let owner = self.clone();
         let token = self.callbacks.token();
         runtime.spawn(async move {

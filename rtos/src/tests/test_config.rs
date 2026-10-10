@@ -212,18 +212,29 @@ struct HeldConfigSubscriber {
     release: tokio::sync::Semaphore,
     completed: atomic::AtomicBool,
     panic: bool,
+    events: std::sync::Mutex<Vec<u8>>,
 }
 
 #[async_trait::async_trait]
 impl NodeConfigSubscriber for HeldConfigSubscriber {
-    async fn event(&self, _: ConfigEvent) -> Result<bool> {
+    async fn event(&self, event: ConfigEvent) -> Result<bool> {
         self.entered.notify_one();
         self.release.acquire().await.unwrap().forget();
         if self.panic {
             panic!("controlled configuration subscriber failure");
         }
         // This uses the real GetKey request queue after public admission closed.
-        assert!(self.handler.get_key_raw([7; 32]).await.is_none());
+        let (key_id, kind) = match event {
+            ConfigEvent::AddValidatorAdnlKey(id, _) => (id, 1),
+            ConfigEvent::RemoveValidatorAdnlKey(id, _) => (id, 2),
+        };
+        let key = self
+            .handler
+            .get_key_raw(*key_id.data())
+            .await
+            .expect("accepted callback lookup must still be served during shutdown");
+        assert_eq!(key.id(), &key_id);
+        self.events.lock().unwrap().push(kind);
         self.completed.store(true, atomic::Ordering::Release);
         Ok(true)
     }
@@ -231,11 +242,15 @@ impl NodeConfigSubscriber for HeldConfigSubscriber {
 
 fn scheduler_subscriber_config() -> TonNodeConfig {
     let mut config = scheduler_test_config();
+    // Public deterministic test key, never a node/operator secret.
+    let (json, key) =
+        Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[71; 32]).unwrap();
+    config.validator_key_ring = Some(HashMap::from([(base64_encode(key.id().data()), json)]));
     config.validator_keys = Some(vec![ValidatorKeysJson {
         expire_at: i32::MAX,
         election_id: 1001,
         validator_key_id: base64_encode([8; 32]),
-        validator_adnl_key_id: Some(base64_encode([7; 32])),
+        validator_adnl_key_id: Some(base64_encode(key.id().data())),
     }]);
     config
 }
@@ -251,6 +266,7 @@ async fn config_scheduler_drain_serves_accepted_callback_lookup_after_cancelled_
         release: tokio::sync::Semaphore::new(0),
         completed: atomic::AtomicBool::new(false),
         panic: false,
+        events: Default::default(),
     });
     handler.clone().start_sheduler(context, vec![subscriber.clone()]).unwrap();
     subscriber.entered.notified().await;
@@ -285,6 +301,7 @@ async fn config_scheduler_subscriber_panic_is_sticky_after_real_join() {
         release: tokio::sync::Semaphore::new(1),
         completed: atomic::AtomicBool::new(false),
         panic: true,
+        events: Default::default(),
     });
     handler.clone().start_sheduler(context, vec![subscriber.clone()]).unwrap();
     subscriber.entered.notified().await;
@@ -318,6 +335,7 @@ async fn config_scheduler_partial_load_failure_drains_started_callbacks() {
         release: tokio::sync::Semaphore::new(0),
         completed: atomic::AtomicBool::new(false),
         panic: false,
+        events: Default::default(),
     });
     assert!(handler.clone().start_sheduler(context, vec![subscriber.clone()]).is_err());
     subscriber.entered.notified().await;
@@ -383,4 +401,52 @@ async fn config_scheduler_dropped_inbox_and_current_answer_wake_callers() {
     current.request();
     drop(PendingAnswer::new(current.clone()));
     assert!(matches!(current.wait(&mut current_answer, true).await, Some(None)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_scheduler_removal_callback_is_ordered_and_can_reenter_lookup_during_stop() {
+    let config = scheduler_subscriber_config();
+    let key_id = KeyId::from_data(
+        base64_decode(
+            config.validator_keys.as_ref().unwrap()[0].validator_adnl_key_id.as_ref().unwrap(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap(),
+    );
+    let (handler, context) =
+        NodeConfigHandler::create(config, tokio::runtime::Handle::current()).unwrap();
+    let subscriber = Arc::new(HeldConfigSubscriber {
+        handler: handler.clone(),
+        entered: Default::default(),
+        release: tokio::sync::Semaphore::new(0),
+        completed: atomic::AtomicBool::new(false),
+        panic: false,
+        events: Default::default(),
+    });
+    handler.clone().start_sheduler(context, vec![subscriber.clone()]).unwrap();
+    subscriber.entered.notified().await;
+    // This is the same dispatch method used by actual validator-key retirement.
+    handler.dispatch_config_event(
+        subscriber.clone(),
+        ConfigEvent::RemoveValidatorAdnlKey(key_id.clone(), 1001),
+    );
+    handler.stop();
+    for _ in 0..16 {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), handler.get_key_raw(*key_id.data()))
+                .await
+                .unwrap()
+                .is_none(),
+            "external reads must not prolong shutdown"
+        );
+    }
+    assert!(subscriber.events.lock().unwrap().is_empty());
+    subscriber.release.add_permits(2);
+    tokio::time::timeout(Duration::from_secs(3), handler.stop_and_wait()).await.unwrap().unwrap();
+    assert_eq!(*subscriber.events.lock().unwrap(), vec![1, 2]);
+    let weak = Arc::downgrade(&handler);
+    drop(subscriber);
+    drop(handler);
+    assert!(weak.upgrade().is_none());
 }
