@@ -35,7 +35,7 @@ impl BenchEngine {
         let ss = ShardStateUnsplit::with_ident(ShardIdent::masterchain());
         let cell = ss.serialize().expect("serialize shard state");
         let bytes = rtos_block::write_boc(&cell).expect("write boc");
-        let root_hash = cell.repr_hash();
+        let root_hash = cell.repr_hash().clone();
         let file_hash = UInt256::calc_file_hash(&bytes);
 
         let mc_block_id =

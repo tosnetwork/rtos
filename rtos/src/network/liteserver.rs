@@ -1712,27 +1712,18 @@ impl LiteServerQuerySubscriber {
 
             let info = visit_block_info(&blk)?;
             let lt_u = lt as u64;
-            if lt_u < info.start_lt() || lt_u > info.end_lt() {
-                fail!(
-                    "lt {lt} is outside block {block_id} range [{}..={}]",
-                    info.start_lt(),
-                    info.end_lt()
-                );
+            // Absence is a successful proof-bearing answer, including LT outside
+            // the block's open interval. Only malformed data is an error.
+            let mut tx_boc = Vec::new();
+            if info.start_lt() < lt_u && lt_u < info.end_lt() {
+                let acc_key = SliceData::from_raw(account_id.id.as_slice().to_vec(), 256);
+                let account_blocks = blk.read_extra()?.read_account_blocks()?;
+                if let Some(acc_block) = account_blocks.get(&acc_key)? {
+                    if let Some(slice) = acc_block.transactions().get_as_slice(&lt_u)? {
+                        tx_boc = write_boc(&slice.reference(0)?)?;
+                    }
+                }
             }
-
-            let acc_key = SliceData::from_raw(account_id.id.as_slice().to_vec(), 256);
-            let account_blocks = blk.read_extra()?.read_account_blocks()?;
-
-            let acc_block = account_blocks
-                .get(&acc_key)?
-                .ok_or_else(|| error!("account not found in block {}", block_id))?;
-
-            let slice = acc_block.transactions().get_as_slice(&lt_u)?.ok_or_else(|| {
-                error!("transaction with lt {} not found in block {}", lt, block_id)
-            })?;
-
-            let tx_cell = slice.reference(0)?;
-            let tx_boc = write_boc(&tx_cell)?;
 
             let proof_bytes = MerkleProof::create_by_usage_tree(&root, &usage)?.write_to_bytes()?;
 
@@ -1947,6 +1938,12 @@ impl LiteServerQuerySubscriber {
     ) -> Result<TransactionList> {
         if count_i32 <= 0 {
             fail!("count must be > 0");
+        }
+        if account_id.workchain == INVALID_WORKCHAIN_ID {
+            fail!("invalid workchain specified");
+        }
+        if lt_i64 == 0 {
+            return Ok(TransactionList { ids: Vec::new(), transactions: Vec::new() });
         }
         let count = usize::try_from(count_i32)
             .map_err(|_| error!("count is too large for this platform"))?;

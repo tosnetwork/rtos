@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
             let mut reader = BocReader::new();
             cells_index.resize(boc_header.cells_count, (UInt256::default(), 0));
             let mut cs = ss_db_.clone().create_fast_cell_storage(cells_index)?;
-            let root = reader.read_inmem_to_storage(data_, &mut cs)?.withdraw_single_root()?;
+            let root = reader.read_to_storage(&data_, &mut cs)?.withdraw_single_root()?;
 
             Ok((root, cs))
         })

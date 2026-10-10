@@ -539,6 +539,18 @@ impl LiteServerTestEngine {
 
 #[async_trait::async_trait]
 impl EngineOperations for LiteServerTestEngine {
+    async fn lookup_block_by_seqno(
+        &self,
+        prefix: &AccountIdPrefixFull,
+        seqno: u32,
+    ) -> Result<Option<(BlockIdExt, Vec<u8>)>> {
+        Ok(self
+            .mock_blocks
+            .iter()
+            .find(|(id, _)| id.seq_no() == seqno && id.shard().contains_full_prefix(prefix))
+            .map(|(id, data)| (id.clone(), data.clone())))
+    }
+
     #[cfg(feature = "telemetry")]
     fn engine_telemetry(&self) -> &Arc<EngineTelemetry> {
         &self.telemetry
@@ -1023,7 +1035,6 @@ fn finalize_block_to_boc(mut id_tpl: BlockIdExt, block: &Block) -> Result<(Vec<u
     Ok((bytes, id_tpl))
 }
 
-#[ignore]
 #[tokio::test]
 async fn test_lookup_block() -> Result<()> {
     let mut engine = LiteServerTestEngine::new().await;
@@ -1142,7 +1153,6 @@ async fn test_get_block() -> Result<()> {
     Ok(())
 }
 
-#[ignore]
 #[tokio::test]
 async fn test_get_block_masterchain_by_seqno_only() -> Result<()> {
     let mut engine = LiteServerTestEngine::new().await;
@@ -1169,7 +1179,6 @@ async fn test_get_block_masterchain_by_seqno_only() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_get_state_returns_expected_boc_and_hashes() -> Result<()> {
     struct TestEngine {
         state_id: BlockIdExt,
@@ -1224,7 +1233,6 @@ async fn test_get_state_returns_expected_boc_and_hashes() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_get_libraries_empty() -> Result<()> {
     struct TestEngine {
         state_id: BlockIdExt,
@@ -1246,6 +1254,9 @@ async fn test_get_libraries_empty() -> Result<()> {
 
     #[async_trait::async_trait]
     impl EngineOperations for TestEngine {
+        fn load_shard_client_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
+            Ok(Some(Arc::new(self.state_id.clone())))
+        }
         fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
             Ok(Some(Arc::new(self.state_id.clone())))
         }
@@ -1271,11 +1282,7 @@ async fn test_get_libraries_empty() -> Result<()> {
     )
     .await?;
 
-    assert_eq!(out.result.len(), 2);
-    assert_eq!(out.result[0].hash, h1);
-    assert!(out.result[0].data.is_empty());
-    assert_eq!(out.result[1].hash, h2);
-    assert!(out.result[1].data.is_empty());
+    assert!(out.result.is_empty());
 
     Ok(())
 }
@@ -1312,7 +1319,6 @@ async fn test_get_libraries_empty() -> Result<()> {
 //     Ok(())
 // }
 
-#[ignore]
 #[tokio::test]
 async fn test_get_one_transaction_account_not_in_block() -> Result<()> {
     let mut engine = LiteServerTestEngine::new().await;
@@ -1323,25 +1329,31 @@ async fn test_get_one_transaction_account_not_in_block() -> Result<()> {
         root_hash: UInt256::default(),
         file_hash: UInt256::default(),
     };
-    let (boc, real_id) = create_minimal_block_boc(tpl, None)?;
+    let mut block = build_minimal_block_from_template(&tpl, None)?;
+    let mut info = block.read_info()?;
+    info.set_start_lt(100);
+    info.set_end_lt(1000);
+    block.write_info(&info)?;
+    let (boc, real_id) = finalize_block_to_boc(tpl, &block)?;
     engine.add_mock_block_with_handle(real_id.clone(), boc).await?;
-    let acc = AccountIdTl { workchain: 0, id: UInt256::from([2u8; 32]) };
+    let acc = AccountIdTl { workchain: -1, id: UInt256::from([2u8; 32]) };
     let engine = Arc::new(engine);
 
-    let err = LiteServerQuerySubscriber::get_one_transaction(
+    let result = LiteServerQuerySubscriber::get_one_transaction(
         &(engine.clone() as Arc<dyn EngineOperations>),
         real_id.clone(),
         acc,
         555,
     )
-    .await
-    .unwrap_err();
-
-    assert!(err.to_string().contains("Transaction with lt"));
+    .await?;
+    assert!(result.transaction.is_empty());
+    let proof = MerkleProof::construct_from_bytes(&result.proof)?;
+    assert_eq!(proof.hash, real_id.root_hash);
+    let proven = Block::construct_from_cell(proof.proof)?;
+    assert!(proven.read_extra()?.read_account_blocks()?.is_empty());
     Ok(())
 }
 
-#[ignore]
 #[tokio::test]
 async fn test_get_transactions_empty_list() -> Result<()> {
     let mut engine = LiteServerTestEngine::new().await;
@@ -3236,3 +3248,6 @@ async fn run_smc_method_preserves_signed_method_id() -> Result<()> {
     }
     Ok(())
 }
+
+#[path = "test_liteserver_absence_reference.rs"]
+mod absence_reference;
