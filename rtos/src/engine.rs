@@ -92,6 +92,8 @@ struct StorageDictInfo {
 
 pub type SplitQueues = Option<(OutMsgQueue, OutMsgQueue, ahash::AHashSet<UInt256>)>;
 pub struct Engine {
+    #[cfg(test)]
+    pub(crate) parent_apply_test_gate: std::sync::Mutex<Option<Arc<parent_apply_tests::ApplyGate>>>,
     db: Arc<InternalDb>,
     candidate_db: CandidateDbPool,
     network: Arc<NodeNetwork>,
@@ -733,6 +735,8 @@ impl Engine {
             MessagesPool::new(now, external_messages_maximum_queue_length);
         let candidate_db = CandidateDbPool::with_path(db.db_root_dir()?);
         let engine = Arc::new(Engine {
+            #[cfg(test)]
+            parent_apply_test_gate: std::sync::Mutex::new(None),
             db,
             candidate_db,
             shard_states_awaiters: AwaitersPool::new(
@@ -1337,6 +1341,8 @@ impl Engine {
         pre_apply: bool,
         recursion_depth: u32,
     ) -> Result<()> {
+        #[cfg(test)]
+        self.hold_owned_parent_apply_for_test(handle.id()).await;
         block.verify_expected_id(handle.id())?;
         if handle.id().shard().is_masterchain() {
             crate::block_proof::check_applied_masterchain(self.as_ref(), handle.id()).await?;
@@ -3194,3 +3200,7 @@ pub async fn start_metrics_server(
 
     MetricsServer { shutdown: tx, join }
 }
+
+#[cfg(test)]
+#[path = "tests/test_parent_apply.rs"]
+pub(crate) mod parent_apply_tests;

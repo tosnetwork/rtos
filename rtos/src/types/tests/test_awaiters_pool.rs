@@ -302,3 +302,111 @@ async fn test_awaiters_pool_shunt() {
         }
     }
 }
+
+#[tokio::test]
+async fn test_awaiters_pool_cancelled_owner_releases_waiters_and_allows_retry() {
+    let pool = Arc::new(AwaitersPool::new(
+        "cancelled-owner",
+        #[cfg(feature = "telemetry")]
+        create_engine_telemetry(),
+        create_engine_allocated(),
+    ));
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let owner_pool = pool.clone();
+    let owner = tokio::spawn(async move {
+        owner_pool
+            .do_or_wait(&42_u32, None, async move {
+                entered.send(()).unwrap();
+                std::future::pending::<Result<u32>>().await
+            })
+            .await
+    });
+    ready.await.unwrap();
+    let (subscribed, registered) = tokio::sync::oneshot::channel();
+    let subscribed = std::sync::Mutex::new(Some(subscribed));
+    let waiter_pool = pool.clone();
+    let waiter = tokio::spawn(async move {
+        waiter_pool
+            .wait(&42, None, || {
+                if let Some(tx) = subscribed.lock().unwrap().take() {
+                    tx.send(()).unwrap();
+                }
+                Ok(false)
+            })
+            .await
+    });
+    registered.await.unwrap();
+    owner.abort();
+    assert!(owner.await.unwrap_err().is_cancelled());
+    let cancelled = tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .expect("cancelled owner must notify its existing waiters")
+        .unwrap()
+        .unwrap_err();
+    assert!(cancelled.to_string().contains("operation cancelled"), "{cancelled}");
+    let result =
+        tokio::time::timeout(Duration::from_secs(2), pool.do_or_wait(&42, None, async { Ok(7) }))
+            .await
+            .expect("retry must acquire a fresh owner")
+            .unwrap();
+    assert_eq!(result, Some(7));
+    assert!(pool.ops_awaiters.get(&42).is_none());
+}
+
+#[tokio::test]
+async fn test_awaiters_pool_stale_completion_keeps_replacement_owner() {
+    let pool = AwaitersPool::<u32, u32>::new(
+        "stale-owner",
+        #[cfg(feature = "telemetry")]
+        create_engine_telemetry(),
+        create_engine_allocated(),
+    );
+    let old = OperationAwaiters::new(
+        true,
+        #[cfg(feature = "telemetry")]
+        &pool.telemetry,
+        &pool.allocated,
+    );
+    pool.ops_awaiters.insert(42, old.clone());
+    pool.finalize(&42, &old, Ok(1));
+    let replacement = OperationAwaiters::new(
+        true,
+        #[cfg(feature = "telemetry")]
+        &pool.telemetry,
+        &pool.allocated,
+    );
+    pool.ops_awaiters.insert(42, replacement.clone());
+    // A cancelled old owner can finish after a shunt and same-key replacement.
+    pool.finalize(&42, &old, Err(error!("late cancellation")));
+    let current = pool.ops_awaiters.get(&42).expect("old completion removed replacement");
+    assert!(Arc::ptr_eq(&current.1, &replacement));
+    assert_eq!(*old.rx.borrow().as_ref().unwrap().as_ref().unwrap(), 1);
+    assert!(replacement.rx.borrow().is_none());
+    pool.finalize(&42, &replacement, Ok(2));
+    assert!(pool.ops_awaiters.get(&42).is_none());
+}
+
+
+#[tokio::test]
+async fn test_awaiters_pool_owner_observes_first_published_result() {
+    let pool = AwaitersPool::<u32, u32>::new(
+        "first-result",
+        #[cfg(feature = "telemetry")]
+        create_engine_telemetry(),
+        create_engine_allocated(),
+    );
+    for operation_fails in [false, true] {
+        let result = pool.do_or_wait(&42, None, async {
+            // Publish while the operation is being polled, so select must take
+            // the operation's Ready branch after the shunt has already won.
+            pool.shunt(&42, || Ok(1))?;
+            if operation_fails {
+                Err(error!("later operation failure"))
+            } else {
+                Ok(2)
+            }
+        }).await.unwrap();
+        assert_eq!(result, Some(1), "owner must agree with its already notified waiters");
+        assert!(pool.ops_awaiters.get(&42).is_none());
+    }
+}

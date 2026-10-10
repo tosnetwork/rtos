@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): bound native parent-apply stack and child lifetime.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -56,39 +56,34 @@ async fn check_prev_blocks(
     pre_apply: bool,
     recursion_depth: u32,
 ) -> Result<()> {
-    match prev_ids {
-        (prev1_id, Some(prev2_id)) => {
-            let apply_prev_futures = vec![
-                engine.clone().download_and_apply_block_internal(
-                    prev1_id,
-                    mc_seq_no,
-                    pre_apply,
-                    recursion_depth + 1,
-                ),
-                engine.clone().download_and_apply_block_internal(
-                    prev2_id,
-                    mc_seq_no,
-                    pre_apply,
-                    recursion_depth + 1,
-                ),
-            ];
-            futures::future::join_all(apply_prev_futures)
-                .await
-                .into_iter()
-                .find(|r| r.is_err())
-                .unwrap_or(Ok(()))?;
-        }
-        (prev_id, None) => {
-            engine
-                .clone()
-                .download_and_apply_block_internal(
-                    prev_id,
-                    mc_seq_no,
-                    pre_apply,
-                    recursion_depth + 1,
-                )
-                .await?;
-        }
+    // A boxed recursive future still polls every ready ancestor on the same
+    // native stack. Poll each parent as a separate task, retaining the existing
+    // logical recursion bound in Engine. Dropping this set aborts all children;
+    // plain detached JoinHandles would let apply continue after cancellation.
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, id) in std::iter::once(&prev_ids.0).chain(prev_ids.1.iter()).enumerate() {
+        let engine = engine.clone();
+        let id = id.clone();
+        tasks.spawn(async move {
+            let result = engine
+                .download_and_apply_block_internal(&id, mc_seq_no, pre_apply, recursion_depth + 1)
+                .await;
+            (index, result)
+        });
+    }
+    let mut results = [None, None];
+    while let Some(result) = tasks.join_next().await {
+        let (index, result) = match result {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => fail!("Parent apply task cancelled: {error}"),
+        };
+        results[index] = Some(result);
+    }
+    // Merge parents still run concurrently and both finish before returning.
+    // Preserve the original left-before-right error precedence, not completion order.
+    for result in results.into_iter().flatten() {
+        result?;
     }
     Ok(())
 }
@@ -254,3 +249,7 @@ pub fn set_prev_ids(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/test_parent_apply_tasks.rs"]
+mod tests;
