@@ -6,6 +6,9 @@ license = "LGPL-2.0-or-later"
 repository = "https://github.com/tosnetwork/rtos"
 description = "Bounded PQ verification with a pinned portable native backend"
 
+[dependencies]
+sha2 = "0.10"
+
 [build-dependencies]
 cc = "1.2"
 
