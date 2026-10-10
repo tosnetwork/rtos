@@ -1,0 +1,19 @@
+This directory derives from pq-code-package/slhdsa-c revision
+174c02e42257f95c210963272877c49dbb50070f, under the ISC license (LICENSE).
+Fixed import source: T0 revision 8f083dc06bff16705710a01de15eb3123d5d696b,
+third-party/slhdsa-c. Original copyright and SPDX headers are retained.
+Upstream: https://github.com/pq-code-package/slhdsa-c
+
+Verification-only adaptation:
+- slh_dsa.c: remove signing, key generation, size/identifier helpers other
+  than signature size, and internal (no context prefix) verification API.
+- slh_sha2.c: retain only SHA2-128s parameter table and verification hashes;
+  remove SHA-512 and signing-only routines, set unused signing callbacks to
+  NULL, and remove private-key initialization and the other-width hash path.
+- sha2_256.c: remove SHA-224 and unused one-shot hash entry points.
+- slh_dsa.h: expose only the fixed parameter, signature size, and verifier.
+All retained algorithm bodies are unchanged except the verification-only
+initialization in sha2_mk_var. Other headers are byte-identical upstream files.
+The adapter namespaces global native symbols to avoid cross-backend collision.
+The public interface accepts only Pure SLH-DSA-SHA2-128s verification with
+bounded input lengths; no signing, private keys, RNG, prehash or other suite.

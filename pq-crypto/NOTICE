@@ -55,3 +55,12 @@ profile used by crypto/pq/lms-fee.cpp in the pinned reference revision above,
 under LGPL-2.0-or-later. It admits only one-level HSS with LMS_SHA256_M32_H20
 and LMOTS_SHA256_N32_W4. SHA-256 uses the RustCrypto sha2 crate. No signing,
 stateful key management or tree generation is included.
+
+SLH-DSA-SHA2-128s uses pq-code-package/slhdsa-c revision
+174c02e42257f95c210963272877c49dbb50070f (ISC), imported through fixed T0
+8f083dc06bff16705710a01de15eb3123d5d696b. See native/slhdsa-c/NOTICE and LICENSE
+for the verification-only adaptation and retained copyright notices.
+Public test fixtures include the Pure SHA2-128s group from NIST ACVP-Server
+v1.1.0.40, commit d98cad66639bf9d0822129c4bcae7a169fcf9ca6, and reproducible
+boundary signatures generated with Cloudflare CIRCL v1.6.4 (BSD-3-Clause).
+The latter use the public test seed 000102...2f and deterministic signing.

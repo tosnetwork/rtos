@@ -9,6 +9,7 @@ use std::{error::Error, fmt, os::raw::c_int};
 
 pub mod falcon512;
 pub mod lms_fee;
+pub mod slhdsa128s;
 
 pub const PUBLIC_KEY_BYTES: usize = 1312;
 pub const SIGNATURE_BYTES: usize = 2420;
