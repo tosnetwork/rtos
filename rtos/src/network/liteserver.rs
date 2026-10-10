@@ -185,6 +185,19 @@ bitflags::bitflags! {
     }
 }
 
+// Explicit protocol statuses for transaction query validation. Other query
+// families retain their existing error mapping.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct TransactionQueryError {
+    code: i32,
+    message: String,
+}
+
+fn transaction_query_error(code: i32, message: impl Into<String>) -> anyhow::Error {
+    TransactionQueryError { code, message: message.into() }.into()
+}
+
 fn make_liteserver_error(code: i32, message: String) -> TLObject {
     ErrorEnum::LiteServer_Error(LSError { code, message }).into_tl_object()
 }
@@ -198,6 +211,9 @@ fn format_block_for_error(id: &BlockId) -> String {
 }
 
 fn map_liteserver_error(err: &anyhow::Error) -> (i32, String) {
+    if let Some(status) = err.downcast_ref::<TransactionQueryError>() {
+        return (status.code, status.message.clone());
+    }
     const CODE: i32 = 500;
     const PREFIX: &str = "LITE_SERVER_";
 
@@ -1709,11 +1725,13 @@ impl LiteServerQuerySubscriber {
         }
         let prefix64 = account_id.id.prefix64();
         if !block_id.shard().contains_prefix(account_id.workchain, prefix64) {
-            fail!(
-                "block {block_id} cannot contain account {}:{:x}",
-                account_id.workchain,
-                account_id.id,
-            );
+            return Err(transaction_query_error(
+                -400,
+                format!(
+                    "block {block_id} cannot contain account {}:{:x}",
+                    account_id.workchain, account_id.id,
+                ),
+            ));
         }
 
         let handle = engine
@@ -1952,10 +1970,10 @@ impl LiteServerQuerySubscriber {
         mut hash: UInt256,
     ) -> Result<TransactionList> {
         if count_i32 < 0 {
-            fail!("count must be >= 0");
+            return Err(transaction_query_error(0, "Variable of type # can't be negative"));
         }
         if account_id.workchain == INVALID_WORKCHAIN_ID {
-            fail!("invalid workchain specified");
+            return Err(transaction_query_error(-400, "invalid workchain specified"));
         }
         if count_i32 == 0 || lt_i64 == 0 {
             return Ok(TransactionList { ids: Vec::new(), transactions: Vec::new() });
@@ -2022,18 +2040,18 @@ impl LiteServerQuerySubscriber {
             // search for a transaction with exactly the right lt
             while let Some(slice) = acc_block.transactions().get_as_slice(&lt)? {
                 let cell = slice.reference(0)?;
-                // check hash if exist
-                if !hash.is_zero() && *cell.repr_hash() != hash {
-                    fail!(
-                        "transaction hash mismatch: prev_trans_lt/hash invalid \
-                        for wc={workchain_id}, lt={lt}"
-                    );
+                // The requested transaction hash is exact, including zero.
+                if *cell.repr_hash() != hash {
+                    return Err(transaction_query_error(-400, "transaction hash mismatch"));
                 }
 
                 // unpacking and monotony prev_trans_lt
                 let tr = Transaction::construct_from_cell(cell.clone())?;
                 if tr.prev_trans_lt() >= lt {
-                    fail!("previous transaction time is not less than the current one");
+                    return Err(transaction_query_error(
+                        -400,
+                        "previous transaction time is not less than the current one",
+                    ));
                 }
                 found_any_in_this_block = true;
 
@@ -2060,7 +2078,10 @@ impl LiteServerQuerySubscriber {
         }
 
         if roots.is_empty() {
-            fail!("cannot locate transaction for account {account_id:x}");
+            return Err(transaction_query_error(
+                -400,
+                "cannot locate transaction in block with specified logical time",
+            ));
         }
         let transactions =
             tokio::task::spawn_blocking(move || BocWriter::with_roots(roots)?.write_to_vec())
@@ -3080,7 +3101,42 @@ impl Subscriber for LiteServerQuerySubscriber {
         } else {
             None
         };
-        let query = self.wire_profile.deserialize(data)?;
+        // Decode the constructor through the configured domain before applying
+        // this query's natural-number rule. Negative count must fail before
+        // decoding the remaining fields, including a truncated account.
+        let query = {
+            let mut reader = data;
+            let mut decoder = rtos_api::Deserializer::with_profile(&mut reader, self.wire_profile);
+            let constructor = decoder.read_constructor()?;
+            if constructor == GetTransactions::constructor_const()
+                || constructor == GetOneTransaction::constructor_const()
+            {
+                let decoded = (|| -> Result<TLObject> {
+                    if constructor == GetTransactions::constructor_const() {
+                        let count = decoder.read_bare::<i32>()?;
+                        if count < 0 {
+                            return Err(transaction_query_error(
+                                0,
+                                "Variable of type # can't be negative",
+                            ));
+                        }
+                    }
+                    self.wire_profile.deserialize(data)
+                })();
+                match decoded {
+                    Ok(query) => query,
+                    Err(error) => {
+                        let reply = make_liteserver_error(0, error.to_string());
+                        return Ok(QueryResult::Consumed(
+                            QueryAnswer::Ready(Some(Answer::Object(TaggedObject::from(reply))))
+                                .with_profile(self.wire_profile)?,
+                        ));
+                    }
+                }
+            } else {
+                self.wire_profile.deserialize(data)?
+            }
+        };
 
         // Three query categories:
         // 1. immediate — lightweight, processed inline without semaphore
