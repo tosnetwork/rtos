@@ -185,10 +185,10 @@ where
         Ok(())
     }
 
-    fn finalize(&self, id: &I, op_awaiters: &OperationAwaiters<R>, value: Result<R>) {
+    fn finalize(&self, id: &I, op_awaiters: &OperationAwaiters<R>, value: Result<R>) -> bool {
         // A shunt and the original owner may finish concurrently. Keep the
         // first result and never remove a newer operation using the same key.
-        op_awaiters.tx.send_if_modified(|slot| {
+        let published = op_awaiters.tx.send_if_modified(|slot| {
             if slot.is_some() {
                 false
             } else {
@@ -197,6 +197,15 @@ where
             }
         });
         self.remove_matching(id, op_awaiters);
+        published
+    }
+
+    fn published_result(&self, op_awaiters: &OperationAwaiters<R>) -> Result<R> {
+        match &*op_awaiters.rx.borrow() {
+            Some(Ok(r)) => Ok(r.clone()),
+            Some(Err(e)) => Err(error!("{}", e)),
+            None => Err(error!("{}: operation completed without a result", self.description)),
+        }
     }
 
     fn remove_matching(&self, id: &I, op_awaiters: &OperationAwaiters<R>) {
@@ -274,18 +283,17 @@ where
                     Err(ref e) => Err(error!("{}", e)), // The Error doesn't impl Clone,
                                                         // so it is impossible to clone full result
                 };
-                self.finalize(id, op_awaiters, r);
-                result
+                if self.finalize(id, op_awaiters, r) {
+                    result
+                } else {
+                    self.published_result(op_awaiters)
+                }
             }
             _ = rx.changed() => {
                 log::trace!("{}: do_operation: shunt {}", self.description, id);
                 // Value already published to `tx` by the external `shunt`,
                 // which also removed the entry — nothing to finalize here.
-                match &*op_awaiters.rx.borrow() {
-                    Some(Ok(r)) => Ok(r.clone()),
-                    Some(Err(e)) => Err(error!("{}", e)),
-                    None => Err(error!("{}: do_operation: shunt: no result", self.description)),
-                }
+                self.published_result(op_awaiters)
             }
         };
         cleanup.0 = None;
