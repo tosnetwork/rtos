@@ -17,7 +17,7 @@ use rtos_assembler::compile_code_to_cell;
 use rtos_block::{
     AccountId, AccountStatus, BuilderData, Cell, Coins, CurrencyCollection, GetRepresentationHash,
     HashmapE, MsgAddressInt, Serializable, SimpleLib, SliceData, StateInit, Status, TrComputePhase,
-    Transaction, DICT_HASH_MIN_CELLS, SENDMSG_ORDINARY, SET_LIB_CODE_ADD_PRIVATE,
+    Transaction, DICT_HASH_MIN_CELLS, SENDMSG_ORDINARY,
 };
 use std::sync::LazyLock;
 
@@ -191,40 +191,9 @@ fn set_library_test() {
     */
 }
 
-#[ignore]
 #[test]
 fn set_ext_library_test() {
-    // library code and data
-    let mut state_lib = HashmapE::with_bit_len(256);
-    state_lib.setref(LIBRARY_CELL.repr_hash().into(), LIBRARY_CELL.clone()).unwrap();
-
-    let code = format!(
-        "
-        ACCEPT
-        PUSHCTR C4
-        HASHCU
-        PUSHINT {}
-        CHANGELIB
-    ",
-        SET_LIB_CODE_ADD_PRIVATE
-    );
-
-    let code = compile_code_to_cell(&code).unwrap();
-    let start_balance = 1_000_000_000;
-
-    let acc_id = SENDER_ACCOUNT.clone();
-    let mut acc = create_test_account(start_balance, acc_id.clone(), code, LIBRARY_CELL.to_owned());
-    let msg = create_int_msg(THIRD_ACCOUNT.clone(), acc_id, 20_000_000, false, BLOCK_LT - 2);
-    let msg_cell = msg.serialize().unwrap();
-
-    let tr_lt = BLOCK_LT + 1;
-    assert_eq!(acc.libraries().len().unwrap(), 0);
-    let mut params = execute_params(tr_lt);
-    params.state_libs = state_lib;
-    let trans =
-        execute_with_params(SIMPLE_MC_STATE.to_owned(), Some(msg_cell), &mut acc, &params).unwrap();
-    assert_eq!(trans.out_msgs.len().unwrap(), 0);
-    assert_eq!(acc.libraries().len().unwrap(), 1);
+    ignored_reference::check_libraries();
 }
 
 #[test]
@@ -385,65 +354,9 @@ fn test_library_cell_code() {
     assert_eq!(trans.gas_used().unwrap(), 236);
 }
 
-fn storage_fee_instruction(
-    start_balance: u64,
-    begin_due: u64,
-    bounce: bool,
-    storage_phase_due: bool,
-) {
-    let storage_fees_collected = 158514102;
-    let code = format!(
-        "
-        ACCEPT
-        STORAGEFEES
-        PUSHINT {}
-        CMP
-        THROWIFNOT 62
-    ",
-        storage_fees_collected
-    );
-
-    let acc_id = SENDER_ACCOUNT.clone();
-    let in_msg = create_int_msg(acc_id.clone(), acc_id.clone(), 10_000_000, false, BLOCK_LT - 2);
-    let code = compile_code_to_cell(&code).unwrap();
-    let data = in_msg.serialize().unwrap();
-
-    let mut acc = create_test_account(start_balance, acc_id.clone(), code, data);
-    acc.set_due_payment(Some(Coins::from(begin_due)));
-
-    let msg = create_int_msg(SENDER_ACCOUNT.clone(), acc_id, 200_000_000, bounce, BLOCK_LT - 2);
-
-    let acc_before = acc.clone();
-    let trans = execute(&msg, &mut acc, BLOCK_LT + 1);
-    check_account_and_transaction_balances(&acc_before, &acc, &msg, None);
-    let trans = trans.unwrap();
-
-    let descr = trans.read_description().unwrap();
-    if let TrComputePhase::Vm(vm) = descr.compute_phase_ref().unwrap() {
-        assert_eq!(vm.exit_code, 62, "{:#?}", descr);
-    } else {
-        panic!("wrong transaction description")
-    }
-
-    let storage_ph = get_tr_descr(&trans).storage_ph.unwrap();
-    assert_eq!(storage_ph.storage_fees_due.is_some(), storage_phase_due);
-    assert_eq!(
-        Coins::from(storage_fees_collected),
-        storage_ph.storage_fees_collected + storage_ph.storage_fees_due.unwrap_or_default()
-    );
-}
-
-#[ignore = "need to investigate later"]
 #[test]
 fn test_storage_fee_instruction() {
-    storage_fee_instruction(200_000_000, 0, false, false);
-    storage_fee_instruction(200_000_000, 0, true, false);
-
-    storage_fee_instruction(141782075, 0, false, false);
-    storage_fee_instruction(141782075, 0, true, true);
-
-    storage_fee_instruction(60000000, 1000, false, false);
-    storage_fee_instruction(60000000, 1000, true, true);
+    ignored_reference::check_storage();
 }
 
 #[test]
@@ -792,3 +705,6 @@ fn test_change_library_with_big_tree_and_flag16() {
         .expect_action_failed(43) // RESULT_CODE_LIB_EXCEEDED_LIMITS
         .expect_no_bounce();
 }
+
+#[path = "test_ignored_reference.rs"]
+pub(super) mod ignored_reference;

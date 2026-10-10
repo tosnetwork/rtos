@@ -1518,9 +1518,15 @@ fn outmsg_action_handler(
     // we cannot send all balance from account and from message simultaneously ?
     if (mode & !SENDMSG_VALID_FLAGS) != 0
         || mode.bit(SENDMSG_REMAINING_MSG_BALANCE | SENDMSG_ALL_BALANCE)
-        || (mode.bit(SENDMSG_DELETE_IF_EMPTY) && mode.non(SENDMSG_ALL_BALANCE))
     {
         log::error!(target: "executor", "outmsg mode has unsupported flags");
+        return Err(RESULT_CODE_UNSUPPORTED);
+    }
+    // Carry/delete modes apply only to internal messages. Bit 32 alone is a
+    // valid internal flag; deletion still requires the all-balance combination.
+    if msg.ext_out_header().is_some()
+        && mode & !(SENDMSG_PAY_FEE_SEPARATELY | SENDMSG_IGNORE_ERROR | SENDMSG_BOUNCE_IF_FAIL) != 0
+    {
         return Err(RESULT_CODE_UNSUPPORTED);
     }
     let check_skip_invalid = move |code: i32| {
