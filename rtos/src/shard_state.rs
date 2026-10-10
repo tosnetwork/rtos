@@ -80,6 +80,28 @@ impl ShardStateStuff {
         )
     }
 
+    /// Check a snapshot against a state root obtained from an authenticated
+    /// block. The caller must authenticate that block and its complete ID;
+    /// accepting an RPC-supplied root does not establish authority.
+    pub fn verify_state_root(
+        &self,
+        expected_block: &BlockIdExt,
+        expected_root: &UInt256,
+    ) -> Result<()> {
+        if self.block_id() != expected_block {
+            fail!("Snapshot block identity differs from authenticated block");
+        }
+        if self.root.repr_hash() != expected_root {
+            fail!("Snapshot root differs from authenticated block state root");
+        }
+        if self.shard_state.seq_no() != expected_block.seq_no
+            || self.shard_state.shard() != expected_block.shard()
+        {
+            fail!("Snapshot header differs from authenticated block identity");
+        }
+        Ok(())
+    }
+
     /// Rebind a decoded/cached zerostate to the caller's pinned identity.
     /// Original BOC bytes must separately pass file-hash verification when
     /// imported; re-encoding cached cells is not the original file.

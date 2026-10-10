@@ -334,7 +334,7 @@ async fn download_wc_zerostates(
 }
 
 /// Download persistent master block & state, enumerate shards and download block & state for each
-async fn download_start_blocks_and_states(
+pub(crate) async fn download_start_blocks_and_states(
     engine: &dyn EngineOperations,
     mc_handle: &Arc<BlockHandle>,
     pss_downloading_threads: usize,
@@ -349,6 +349,7 @@ async fn download_start_blocks_and_states(
     // Download master block to obtain shards list
 
     let (mc_block, _proof) = engine.download_block(mc_handle.id(), None).await?;
+    mc_block.verify_expected_id(mc_handle.id())?;
     engine.store_block(&mc_block).await?.to_any();
     let top_blocks = mc_block.top_blocks_all()?;
     let pss_split_depth =
@@ -375,6 +376,7 @@ async fn download_start_blocks_and_states(
 
             // If block is already exists in db, it will be just loaded
             let (block, proof) = engine.download_block(block_id, None).await?;
+            block.verify_expected_id(block_id)?;
             let handle = engine.store_block(&block).await?.to_any();
             engine.store_block_proof(block_id, Some(handle.clone()), &proof).await?;
 

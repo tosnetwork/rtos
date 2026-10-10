@@ -357,7 +357,9 @@ impl ShardStatesKeeper {
         header_boc: Arc<Vec<u8>>,
     ) -> Result<Arc<ShardStateStuff>> {
         if handle.has_state() && handle.has_persistent_state() {
-            return Ok(self.load_state(handle.id()).await?);
+            let state = self.load_state(handle.id()).await?;
+            state.verify_state_root(handle.id(), root_hash)?;
+            return Ok(state);
         }
         log::info!(
             "check_and_store_state_header: restore head, length: {}, {}...",
@@ -402,9 +404,9 @@ impl ShardStatesKeeper {
         if state_root.repr_hash() != root_hash {
             fail!("Invalid state hash {:x} != {:x}", state_root.repr_hash(), root_hash);
         }
-        let state_stuff = ShardStateStuff::from_state(
+        let state_stuff = ShardStateStuff::from_root_cell(
             handle.id().clone(),
-            state,
+            state_root,
             #[cfg(feature = "telemetry")]
             &self.telemetry,
             &self.allocated,
@@ -428,7 +430,9 @@ impl ShardStatesKeeper {
         cells_index: Vec<(UInt256, u16)>,
     ) -> Result<(Arc<ShardStateStuff>, Vec<(UInt256, u16)>)> {
         if handle.has_state() && handle.has_persistent_state() {
-            return Ok((self.load_state(handle.id()).await?, cells_index));
+            let state = self.load_state(handle.id()).await?;
+            state.verify_state_root(handle.id(), root_hash)?;
+            return Ok((state, cells_index));
         }
 
         let now = std::time::Instant::now();

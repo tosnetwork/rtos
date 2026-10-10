@@ -134,3 +134,65 @@ fn test_construct_and_check_prev_stuff_shard() {
     assert_eq!(stuff.prev.len(), 1);
     assert!(!stuff._after_split);
 }
+
+#[tokio::test]
+async fn test_snapshot_boot_rejects_unchecked_block_file_and_header() {
+    let block = BlockStuff::read_block_from_file(
+        "src/tests/static/F2BC2888EAE466FC172140A90949EDBC7091D81CCB4194A225C56C0F1D095097.boc",
+    )
+    .unwrap();
+    block.verify_expected_id(block.id()).unwrap();
+    for mutation in 0..3 {
+        let mut id = block.id().clone();
+        match mutation {
+            0 => id.file_hash = UInt256::default(),
+            1 => id.seq_no += 1,
+            _ => id.shard_id = ShardIdent::full(0),
+        }
+        let unchecked =
+            BlockStuff::deserialize_block(id.clone(), Arc::new(block.data().to_vec())).unwrap();
+        let error = unchecked.verify_expected_id(&id).unwrap_err().to_string();
+        assert!(error.contains(if mutation == 0 { "file hash" } else { "header" }));
+        if mutation == 0 {
+            let handles = crate::collator_test_bundle::create_block_handle_storage(None).unwrap();
+            let handle = handles
+                .create_handle(id, storage::types::BlockMeta::default(), None)
+                .unwrap()
+                .unwrap();
+            let engine = BadSnapshotBlockEngine {
+                block: unchecked,
+                writes: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let error = crate::boot::download_start_blocks_and_states(&engine, &handle, 1)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("file hash"), "unexpected bootstrap error: {error}");
+            assert_eq!(engine.writes.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+    }
+    let mut another = block.id().clone();
+    another.root_hash = UInt256::default();
+    assert!(block.verify_expected_id(&another).is_err());
+}
+
+struct BadSnapshotBlockEngine {
+    block: BlockStuff,
+    writes: std::sync::atomic::AtomicUsize,
+}
+#[async_trait::async_trait]
+impl crate::engine_traits::EngineOperations for BadSnapshotBlockEngine {
+    fn set_sync_status(&self, _: u32) {}
+    async fn download_block(
+        &self,
+        _: &BlockIdExt,
+        _: Option<u32>,
+    ) -> Result<(BlockStuff, crate::block_proof::BlockProofStuff)> {
+        Ok((self.block.clone(), crate::block_proof::BlockProofStuff::default()))
+    }
+    async fn store_block(&self, _: &BlockStuff) -> Result<crate::internal_db::BlockResult> {
+        self.writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        rtos_block::fail!("unexpected state bootstrap write")
+    }
+    // State download methods remain unimplemented: the invalid block must
+    // already be rejected before storage or download is attempted.
+}

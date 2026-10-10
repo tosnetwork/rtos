@@ -521,6 +521,10 @@ impl EngineOperations for Engine {
                     let proof =
                         self.load_block_proof(&handle, !id.shard().is_masterchain()).await?;
                     log::trace!("download_block {} loaded from DB", id);
+                    block.verify_expected_id(id)?;
+                    if proof.id() != id {
+                        fail!("Downloaded block proof identity mismatch");
+                    }
                     return Ok((block, proof));
                 }
             }
@@ -530,6 +534,10 @@ impl EngineOperations for Engine {
                     let block = BlockStuff::deserialize_block(id.clone(), block_data.clone())?;
                     let proof = create_new_proof_link(&block)?;
                     log::trace!("download_block {} loaded from candidates cache", id);
+                    block.verify_expected_id(id)?;
+                    if proof.id() != id {
+                        fail!("Downloaded block proof identity mismatch");
+                    }
                     return Ok((block, proof));
                 }
             }
@@ -540,6 +548,10 @@ impl EngineOperations for Engine {
                 .await?
             {
                 log::trace!("download_block {} downloaded", id);
+                block.verify_expected_id(id)?;
+                if proof.id() != id {
+                    fail!("Downloaded block proof identity mismatch");
+                }
                 return Ok((block, proof));
             }
         }

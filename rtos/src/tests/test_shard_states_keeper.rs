@@ -107,3 +107,107 @@ async fn test_pss_storer() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_snapshot_cache_and_merge_require_authenticated_state_identity() -> Result<()> {
+    #[cfg(feature = "telemetry")]
+    use crate::collator_test_bundle::create_engine_telemetry;
+    use crate::collator_test_bundle::{create_block_handle_storage, create_engine_allocated};
+    use rtos_block::write_boc;
+    let dir = tempfile::tempdir()?;
+    let engine = TestEngine::new_db_dir(dir.path().to_str().unwrap(), None).await?;
+    let stopper = Arc::new(Stopper::new());
+    let keeper = ShardStatesKeeper::new(
+        engine.db.clone(),
+        false,
+        true,
+        0,
+        0,
+        ShardStatesCacheMode::Moderate,
+        u64::MAX,
+        stopper.clone(),
+        100,
+        #[cfg(feature = "telemetry")]
+        create_engine_telemetry(),
+        create_engine_allocated(),
+    )?;
+    let handles = create_block_handle_storage(None)?;
+    let id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        42,
+        UInt256::from([1; 32]),
+        UInt256::from([2; 32]),
+    );
+    let handle =
+        handles.create_handle(id.clone(), storage::types::BlockMeta::default(), None)?.unwrap();
+    handle.set_state();
+    handle.set_persistent_state();
+    for mutation in 0..5 {
+        let mut header = ShardStateUnsplit::with_ident(id.shard().clone());
+        header.set_seq_no(if mutation == 3 { 43 } else { 42 });
+        if mutation == 4 {
+            header.set_shard(ShardIdent::full(0));
+        }
+        let mut claimed = id.clone();
+        if mutation == 2 {
+            claimed.file_hash = UInt256::from([3; 32]);
+        }
+        let state = ShardStateStuff::from_state(
+            claimed,
+            header,
+            #[cfg(feature = "telemetry")]
+            &keeper.telemetry,
+            &keeper.allocated,
+        )?;
+        let expected_root =
+            if mutation == 1 { UInt256::default() } else { state.root_cell().repr_hash().clone() };
+        keeper.states.insert(id.clone(), (state.clone(), handle.clone()));
+        let whole =
+            keeper.check_and_store_state(&handle, &expected_root, Arc::new(vec![]), vec![]).await;
+        let split =
+            keeper.merge_and_check_state(&handle, &expected_root, &[], Arc::new(vec![])).await;
+        if mutation == 0 {
+            assert!(Arc::ptr_eq(&whole?.0, &state));
+            assert!(Arc::ptr_eq(&split?, &state));
+        } else {
+            let expected = match mutation {
+                1 => "Snapshot root",
+                2 => "Snapshot block identity",
+                _ => "Snapshot header",
+            };
+            assert!(
+                whole.err().unwrap().to_string().contains(expected),
+                "whole mutation {mutation}"
+            );
+            assert!(
+                split.err().unwrap().to_string().contains(expected),
+                "split mutation {mutation}"
+            );
+        }
+    }
+    // The reconstructed root alone cannot authorize contradictory state metadata.
+    // Check the uncached split path and ensure it rejects before setting state flags.
+    for wrong_header in [true, false] {
+        let mut header = ShardStateUnsplit::with_ident(ShardIdent::masterchain());
+        header.set_seq_no(if wrong_header { 44 } else { 42 });
+        let root = header.serialize()?;
+        let mut block_id = id.clone();
+        block_id.root_hash = UInt256::from([if wrong_header { 5 } else { 6 }; 32]);
+        let h =
+            handles.create_handle(block_id, storage::types::BlockMeta::default(), None)?.unwrap();
+        let proof = MerkleProof::create(&root, |_| true)?.serialize()?;
+        let result = keeper
+            .merge_and_check_state(&h, root.repr_hash(), &[], Arc::new(write_boc(&proof)?))
+            .await;
+        if wrong_header {
+            assert!(result.is_err());
+            assert!(!h.has_state(), "invalid snapshot was stored before header rejection");
+        } else {
+            result?.verify_state_root(h.id(), root.repr_hash())?;
+            assert!(h.has_state());
+        }
+    }
+    stopper.set_stop();
+    engine.db.stop_states_db().await;
+    Ok(())
+}

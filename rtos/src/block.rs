@@ -86,6 +86,22 @@ impl BlockStuff {
         Ok(Self { id, block, root, data })
     }
 
+    /// Bind block bytes and embedded coordinates to an authenticated expected ID.
+    /// This checks identity, not finality or execution validity of that ID.
+    pub fn verify_expected_id(&self, expected: &BlockIdExt) -> Result<()> {
+        if self.id() != expected || self.root.repr_hash() != expected.root_hash() {
+            fail!("Block differs from authenticated expected identity");
+        }
+        if UInt256::calc_file_hash(self.data()) != expected.file_hash {
+            fail!("Block file hash differs from authenticated expected identity");
+        }
+        let info = self.block.read_info()?;
+        if info.seq_no() != expected.seq_no || info.shard() != expected.shard() {
+            fail!("Block header differs from authenticated expected identity");
+        }
+        Ok(())
+    }
+
     pub fn block(&self) -> Result<&Block> {
         Ok(&self.block)
     }
