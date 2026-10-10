@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): gate registrations before operand decoding.
+ * RTOS project modifications (2026-10-10): historical instruction base gas ordering.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -1355,7 +1355,16 @@ impl Engine {
 
     fn basic_use_gas(&mut self, mut bits: usize) -> Result<()> {
         bits += self.cc.code().pos().saturating_sub(self.cmd_code.pos());
-        self.try_use_gas(Gas::basic_gas_price(bits, 0))
+        let gas = Gas::basic_gas_price(bits, 0);
+        if self.block_version >= 4 {
+            self.try_use_gas(gas)
+        } else {
+            // Historical dispatch charges base gas without checking exhaustion.
+            // Operand errors and additional costs run before the instruction's
+            // final gas check; explicitly checked gas paths remain unchanged.
+            self.use_gas(gas);
+            Ok(())
+        }
     }
 
     fn extract_instruction(&mut self) -> Status {
