@@ -189,3 +189,66 @@ fn test_add_hint_treats_pruned_shared_cell_as_preexisting() {
     let expected = rebuilt.calc_dict().unwrap().unwrap().repr_hash().clone();
     assert_eq!(with_hint.calc_dict().unwrap().unwrap().repr_hash(), &expected);
 }
+
+// Independent C++ reference vectors cover every ordered list of up to three roots.
+// The graph includes repeated child edges, shared descendants, and roots that are
+// themselves descendants of other roots. Compare incremental updates with the
+// reference commitment, including when no dictionary has been flushed yet.
+#[test]
+fn test_storage_root_multiplicity_reference() {
+    let shared = leaf(1);
+    let a = node(2, &[shared.clone(), shared.clone()]);
+    let b = node(3, &[shared.clone(), a.clone()]);
+    let c = node(4, &[a.clone(), b.clone(), shared.clone()]);
+    let nodes = [shared, a, b, c];
+    let mut states: Vec<super::StorageRoots> = vec![Default::default()];
+    for n in 1..=3 {
+        for k in 0..(1usize << (2 * n)) {
+            states.push((0..n).map(|i| nodes[(k >> (2 * i)) & 3].clone()).collect());
+        }
+    }
+    let expected: Vec<_> = include_str!("data/storage_stat/root-multiplicity.tsv")
+        .lines()
+        .map(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            (
+                fields[0].parse::<usize>().unwrap(),
+                fields[1].parse::<u64>().unwrap(),
+                fields[2].parse::<u64>().unwrap(),
+                fields[3].to_ascii_lowercase(),
+            )
+        })
+        .collect();
+    assert_eq!(expected.len(), states.len());
+    let check = |stat: &mut AccountStorageStat, target: usize, context: &str| {
+        let hash = stat
+            .calc_dict()
+            .unwrap()
+            .map(|c| c.repr_hash().to_hex_string())
+            .unwrap_or_else(|| "0".repeat(64));
+        let (index, cells, bits, expected_hash) = &expected[target];
+        assert_eq!(*index, target);
+        assert_eq!((stat.total_cells(), stat.total_bits()), (*cells, *bits), "{context}");
+        assert_eq!(&hash, expected_hash, "{context}");
+    };
+    for mode in 0..3 {
+        for (from, old) in states.iter().enumerate() {
+            for (to, new) in states.iter().enumerate() {
+                let mut stat = AccountStorageStat::default();
+                stat.replace_roots(old.clone()).unwrap();
+                if mode != 0 {
+                    stat.calc_dict().unwrap();
+                }
+                if mode == 2 {
+                    // Imported dictionary: only the committed trie has cell counts.
+                    stat.cache.clear();
+                }
+                stat.replace_roots(new.clone()).unwrap();
+                check(&mut stat, to, &format!("mode {mode}: {from} -> {to}"));
+                // Continue from the updated cache/dictionary, not a fresh instance.
+                stat.replace_roots(old.clone()).unwrap();
+                check(&mut stat, from, &format!("mode {mode}: {from} -> {to} -> {from}"));
+            }
+        }
+    }
+}
