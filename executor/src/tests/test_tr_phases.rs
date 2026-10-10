@@ -578,6 +578,7 @@ fn init_test_gas(acc_balance: u128, msg_balance: u128) -> Gas {
         msg_balance == 0,
         false,
         true,
+        BLOCKCHAIN_CONFIG.block_version(),
         BLOCKCHAIN_CONFIG.get_gas_config(false),
     )
 }

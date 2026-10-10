@@ -325,6 +325,7 @@ pub trait TransactionExecutor {
             is_external,
             is_special,
             is_ordinary,
+            self.config().block_version(),
             gas_config,
         );
         if gas.get_gas_limit() == 0 && gas.get_gas_credit() == 0 {
@@ -1864,6 +1865,7 @@ fn init_gas(
     is_external: bool,
     is_special: bool,
     is_ordinary: bool,
+    version: u32,
     gas_info: &GasLimitsPrices,
 ) -> Gas {
     let (gas_limit, max_gas_threshold) = if let Some(gas_limit) = override_gas(acc, now) {
@@ -1876,7 +1878,7 @@ fn init_gas(
     } else {
         gas_info.calc_gas(acc_balance, gas_limit, max_gas_threshold).min(gas_limit)
     };
-    let gas_limit = if !is_ordinary || is_special {
+    let gas_limit = if !is_ordinary || (is_special && version >= 5) {
         gas_max
     } else {
         gas_max.min(gas_info.calc_gas(msg_balance, gas_limit, max_gas_threshold))

@@ -553,3 +553,7 @@ mod test_incoming_storage;
 #[cfg(test)]
 #[path = "tests/test_exotic_actions.rs"]
 mod test_exotic_actions;
+
+#[cfg(test)]
+#[path = "tests/test_opcode_gates.rs"]
+mod test_opcode_gates;

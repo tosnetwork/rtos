@@ -100,12 +100,7 @@ pub(super) fn execute_sha256u(engine: &mut Engine) -> Status {
 // SHA256C (c - x): hash concatenated bytes, independently of cell boundaries.
 pub(super) fn execute_sha256c(engine: &mut Engine) -> Status {
     if engine.block_version() < TVM_VERSION_14 {
-        if engine.block_version() >= 4 {
-            engine.try_use_gas(Gas::basic_gas_price(0, 0))?;
-        } else {
-            engine.use_gas(Gas::basic_gas_price(0, 0));
-        }
-        fail!(ExceptionCode::InvalidOpcode);
+        return engine.reject_unavailable_instruction();
     }
     engine.load_instruction(Instruction::new("SHA256C"))?;
     fetch_stack(engine, 1)?;

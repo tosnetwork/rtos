@@ -2,7 +2,6 @@
 // RTOS modifications: use the self-contained, verification-only backend.
 use super::{
     engine::{storage::fetch_stack, Engine},
-    gas::gas_state::Gas,
     types::Instruction,
 };
 use crate::stack::StackItem;
@@ -60,12 +59,7 @@ pub(super) fn execute_pq_mldsa44(engine: &mut Engine) -> Status {
     // invalid-instruction charge can exhaust gas before exception dispatch;
     // older versions charge the exception too before detecting exhaustion.
     if engine.block_version() < 16 {
-        if engine.block_version() >= 4 {
-            engine.try_use_gas(Gas::basic_gas_price(0, 0))?;
-        } else {
-            engine.use_gas(Gas::basic_gas_price(0, 0));
-        }
-        fail!(ExceptionCode::InvalidOpcode);
+        return engine.reject_unavailable_instruction();
     }
     engine.load_instruction(Instruction::new("PQCHECKSIG_MLDSA44"))?;
     if engine.cc.stack.depth() < 4 {
