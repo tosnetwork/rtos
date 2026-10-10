@@ -1,0 +1,21 @@
+[package]
+repository = "https://github.com/tosnetwork/rtos"
+name = "control-client"
+version = "0.6.0"
+edition = "2024"
+license = 'GPL-3.0'
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive", "rc"] }
+serde_json = "1.0.145"
+anyhow = "1.0"
+async-trait = "0.1"
+tracing = "0.1"
+adnl = { features = ["client"], path = "../../adnl" }
+rtos_block = { path = "../../block" }
+rtos_api = { path = "../../tl/rtos_api" }
+common = { path = "../common" }
+hex = "0.4.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

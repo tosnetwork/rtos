@@ -1,0 +1,554 @@
+/*
+ * RTOS project modifications (2026-10-10): project and crate naming.
+ * Copyright (C) 2025-2026 RSquad Blockchain Lab.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ * See the LICENSE file in the root of this repository.
+ *
+ * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
+ */
+//! Certificate types for Simplex consensus vote aggregation
+//!
+//! This module implements vote aggregation certificates matching the C++ reference
+//! implementation (`certificate.h`, `certificate.cpp`).
+//!
+//! ## Type Hierarchy
+//!
+//! ```text
+//! VoteSignature (single validator signature)
+//! ├── validator_idx: ValidatorIndex    // Index into validator set (compact)
+//! └── signature: Vec<u8>               // Ed25519 signature bytes
+//!
+//! Certificate<T> (aggregated signatures meeting threshold)
+//! ├── vote: T                          // The vote being certified
+//! └── signatures: Vec<VoteSignature>   // Aggregated signatures (>= 2/3 weight)
+//! ```
+//!
+//! ## Type Aliases
+//!
+//! - `NotarCert = Certificate<NotarizeVote>` - Notarization certificate
+//! - `FinalCert = Certificate<FinalizeVote>` - Finalization certificate
+//! - `SkipCert = Certificate<SkipVote>` - Skip certificate
+//!
+//! ## Usage
+//!
+//! Certificates are created when vote weight reaches 2/3 threshold.
+//! They are serialized to TL for:
+//! - Block finalization notifications (`BlockFinalized` event)
+//! - Candidate resolver responses (`candidateAndCert.notar`)
+//!
+//! ## TL Schema
+//!
+//! ```tl
+//! consensus.simplex.voteSignature who:int signature:bytes = consensus.simplex.VoteSignature;
+//! consensus.simplex.voteSignatureSet votes:(vector consensus.simplex.VoteSignature) = consensus.simplex.VoteSignatureSet;
+//! consensus.simplex.certificate vote:consensus.simplex.UnsignedVote signatures:consensus.simplex.VoteSignatureSet = consensus.simplex.Certificate;
+//! ```
+//!
+//! ## C++ Reference
+//!
+//! - `certificate.h`: `Certificate<T>` template struct
+//! - `certificate.cpp`: TL serialization, signature verification
+
+use crate::{
+    block::{SlotIndex, ValidatorIndex},
+    session_description::SessionDescription,
+    simplex_state::{FinalizeVote, NotarizeVote, SkipVote, Vote},
+    utils::{serialize_unsigned_vote, vote_to_tl_unsigned},
+    SessionId,
+};
+use rtos_api::{
+    deserialize_typed,
+    ton::consensus::simplex::{
+        certificate::Certificate as TlCertificate, votesignature::VoteSignature as TlVoteSignature,
+        votesignatureset::VoteSignatureSet, Certificate as CertificateBoxed, UnsignedVote,
+        VoteSignature as VoteSignatureBoxed, VoteSignatureSet as VoteSignatureSetBoxed,
+    },
+    IntoBoxed,
+};
+use rtos_block::{fail, Result, UInt256};
+use std::sync::Arc;
+
+// ======================================================================
+// Vote signature
+// ======================================================================
+// A single validator's signature over a vote: a compact validator index
+// plus Ed25519 bytes, with TL conversion. Reference: C++
+// `Certificate<T>::VoteSignature` in `certificate.h`.
+
+/// Single vote signature from a validator
+///
+/// Reference: C++ `Certificate<T>::VoteSignature` in `certificate.h`
+///
+/// Uses validator **index** (not public key) for compact serialization.
+/// Validator public key is looked up from SessionDescription when verifying.
+///
+/// # TL Schema
+///
+/// ```tl
+/// consensus.simplex.voteSignature who:int signature:bytes = consensus.simplex.VoteSignature;
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VoteSignature {
+    /// Validator index (position in validator set)
+    ///
+    /// Must be valid for the session's validator set (0 <= idx < num_validators).
+    pub validator_idx: ValidatorIndex,
+
+    /// Ed25519 signature bytes over session-scoped vote
+    ///
+    /// Signature is computed over: `session_id || serialize(UnsignedVote)`
+    pub signature: Vec<u8>,
+}
+
+impl VoteSignature {
+    /// Create a new VoteSignature
+    #[inline]
+    pub fn new(validator_idx: ValidatorIndex, signature: Vec<u8>) -> Self {
+        Self { validator_idx, signature }
+    }
+
+    /// Create from TL object
+    ///
+    /// # Arguments
+    ///
+    /// * `tl` - TL VoteSignature object
+    ///
+    /// # Returns
+    ///
+    /// VoteSignature with validator index and signature bytes
+    pub fn from_tl(tl: &VoteSignatureBoxed) -> Self {
+        Self {
+            validator_idx: ValidatorIndex::new(*tl.who() as u32),
+            signature: tl.signature().clone(),
+        }
+    }
+
+    /// Convert to TL object
+    ///
+    /// # Returns
+    ///
+    /// Boxed TL VoteSignature object
+    pub fn to_tl(&self) -> VoteSignatureBoxed {
+        TlVoteSignature {
+            who: self.validator_idx.value() as i32,
+            signature: self.signature.clone(),
+        }
+        .into_boxed()
+    }
+}
+
+// ======================================================================
+// Certificate type & aliases
+// ======================================================================
+// The generic `Certificate<T>` (a vote plus its >= 2/3-weight aggregated
+// signatures) and the Notar / Final / Skip cert + `Arc` pointer aliases.
+// Reference: C++ `Certificate<T>` template struct in `certificate.h`.
+
+/// Certificate of aggregated vote signatures
+///
+/// Reference: C++ `Certificate<T>` template struct in `certificate.h`
+///
+/// A certificate proves that >= 2/3 of validators (by weight) have voted
+/// for the same thing. Certificates are the basis for consensus finality.
+///
+/// # Type Parameters
+///
+/// - `T` - The vote type being certified (NotarizeVote, FinalizeVote, or SkipVote)
+///
+/// # Invariants
+///
+/// - `signatures` must have total weight >= 2/3 of total validator weight
+/// - No duplicate validators in `signatures`
+/// - All signatures must be valid for the vote
+///
+/// # TL Schema
+///
+/// ```tl
+/// consensus.simplex.certificate vote:consensus.simplex.UnsignedVote
+///     signatures:consensus.simplex.VoteSignatureSet = consensus.simplex.Certificate;
+/// ```
+#[derive(Clone, Debug)]
+pub(crate) struct Certificate<T> {
+    /// The vote being certified
+    #[allow(dead_code)] // Used in to_tl() for full serialization
+    pub vote: T,
+
+    /// Aggregated signatures (must have >= 2/3 weight)
+    pub signatures: Vec<VoteSignature>,
+}
+
+/// Type alias for notarization certificate
+///
+/// Proves >= 2/3 voted to notarize a specific block
+pub(crate) type NotarCert = Certificate<NotarizeVote>;
+
+/// Type alias for finalization certificate
+///
+/// Proves >= 2/3 voted to finalize a specific block
+pub(crate) type FinalCert = Certificate<FinalizeVote>;
+
+/// Type alias for skip certificate
+///
+/// Proves >= 2/3 voted to skip a specific slot
+pub(crate) type SkipCert = Certificate<SkipVote>;
+
+/// Pointer type for NotarCert
+#[allow(dead_code)]
+pub(crate) type NotarCertPtr = Arc<NotarCert>;
+
+/// Pointer type for FinalCert
+#[allow(dead_code)]
+pub(crate) type FinalCertPtr = Arc<FinalCert>;
+
+/// Pointer type for SkipCert
+#[allow(dead_code)]
+pub(crate) type SkipCertPtr = Arc<SkipCert>;
+
+// ======================================================================
+// Construction & accessors
+// ======================================================================
+// Unverified construction (`new`, `from_tl_bytes_for_candidate`), weight
+// accounting, and the signature-set TL projection.
+impl NotarCert {
+    /// Deserialize NotarCert from TL VoteSignatureSet bytes.
+    ///
+    /// This creates a NotarCert from raw bytes WITHOUT verification.
+    /// Used only for recovery where the certificate was already verified
+    /// when originally stored.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - Raw TL-serialized VoteSignatureSet bytes (boxed)
+    ///
+    /// # Returns
+    ///
+    /// NotarCert with signatures extracted from the TL bytes
+    pub fn from_tl_bytes_for_candidate(
+        bytes: &[u8],
+        slot: SlotIndex,
+        block_hash: UInt256,
+    ) -> Result<Self> {
+        let tl_boxed: VoteSignatureSetBoxed = deserialize_typed(bytes)?;
+        let signatures: Vec<VoteSignature> =
+            tl_boxed.votes().iter().map(VoteSignature::from_tl).collect();
+
+        Ok(Self::new(NotarizeVote { slot, block_hash }, signatures))
+    }
+}
+
+impl<T: Clone> Certificate<T> {
+    /// Create a new Certificate
+    ///
+    /// # Arguments
+    ///
+    /// * `vote` - The vote being certified
+    /// * `signatures` - Vector of vote signatures
+    ///
+    /// # Note
+    ///
+    /// This does NOT verify signatures or weight threshold.
+    /// Use `from_tl()` for verified construction.
+    #[inline]
+    pub fn new(vote: T, signatures: Vec<VoteSignature>) -> Self {
+        Self { vote, signatures }
+    }
+
+    /// Get total weight of signatures
+    ///
+    /// # Arguments
+    ///
+    /// * `desc` - Session description for validator weight lookup
+    ///
+    /// # Returns
+    ///
+    /// Sum of weights for all validators in signatures
+    pub fn total_weight(&self, desc: &SessionDescription) -> u64 {
+        self.signatures.iter().map(|sig| desc.get_node_weight(sig.validator_idx)).sum()
+    }
+
+    /// Check if certificate has sufficient weight (>= 2/3)
+    ///
+    /// # Arguments
+    ///
+    /// * `desc` - Session description for weight calculation
+    ///
+    /// # Returns
+    ///
+    /// true if total signature weight >= 2/3 threshold
+    #[allow(dead_code)] // Available for validation in future
+    pub fn has_sufficient_weight(&self, desc: &SessionDescription) -> bool {
+        self.total_weight(desc) >= desc.get_threshold_66()
+    }
+
+    /// Convert signatures to TL VoteSignatureSet
+    ///
+    /// Reference: C++ `Certificate<T>::to_tl_vote_signature_set()`
+    ///
+    /// Used by candidate resolver to send just signatures (not full certificate).
+    ///
+    /// # Returns
+    ///
+    /// Boxed TL VoteSignatureSet object
+    pub fn to_tl_vote_signature_set(&self) -> VoteSignatureSetBoxed {
+        let tl_sigs: Vec<VoteSignatureBoxed> =
+            self.signatures.iter().map(|sig| sig.to_tl()).collect();
+        VoteSignatureSet { votes: tl_sigs.into() }.into_boxed()
+    }
+}
+
+// ======================================================================
+// Vote-type TL conversion
+// ======================================================================
+// `ToTlUnsignedVote`: convert FSM vote types to a TL `UnsignedVote` (and
+// back to the `Vote` enum), implemented for each concrete vote type.
+
+/// Trait for converting FSM vote types to TL
+pub(crate) trait ToTlUnsignedVote: Clone {
+    /// Convert to TL UnsignedVote
+    fn to_tl_unsigned(&self) -> Result<UnsignedVote>;
+
+    /// Convert to FSM Vote enum
+    #[allow(dead_code)]
+    fn to_vote(&self) -> Vote;
+}
+
+impl ToTlUnsignedVote for NotarizeVote {
+    fn to_tl_unsigned(&self) -> Result<UnsignedVote> {
+        vote_to_tl_unsigned(&Vote::Notarize(self.clone()))
+    }
+
+    fn to_vote(&self) -> Vote {
+        Vote::Notarize(self.clone())
+    }
+}
+
+impl ToTlUnsignedVote for FinalizeVote {
+    fn to_tl_unsigned(&self) -> Result<UnsignedVote> {
+        vote_to_tl_unsigned(&Vote::Finalize(self.clone()))
+    }
+
+    fn to_vote(&self) -> Vote {
+        Vote::Finalize(self.clone())
+    }
+}
+
+impl ToTlUnsignedVote for SkipVote {
+    fn to_tl_unsigned(&self) -> Result<UnsignedVote> {
+        vote_to_tl_unsigned(&Vote::Skip(self.clone()))
+    }
+
+    fn to_vote(&self) -> Vote {
+        Vote::Skip(self.clone())
+    }
+}
+
+impl ToTlUnsignedVote for Vote {
+    fn to_tl_unsigned(&self) -> Result<UnsignedVote> {
+        vote_to_tl_unsigned(self)
+    }
+
+    fn to_vote(&self) -> Vote {
+        self.clone()
+    }
+}
+
+// ======================================================================
+// TL serialization
+// ======================================================================
+// `Certificate::to_tl` for any certifiable vote type.
+
+impl<T: ToTlUnsignedVote> Certificate<T> {
+    /// Convert to TL Certificate
+    ///
+    /// Reference: C++ `Certificate<T>::to_tl()`
+    ///
+    /// # Returns
+    ///
+    /// Result with boxed TL Certificate object, or error if vote conversion fails
+    #[allow(dead_code)] // Available for full serialization in future
+    pub fn to_tl(&self) -> Result<CertificateBoxed> {
+        Ok(TlCertificate {
+            vote: self.vote.to_tl_unsigned()?,
+            signatures: self.to_tl_vote_signature_set(),
+        }
+        .into_boxed())
+    }
+}
+
+// ======================================================================
+// Deserialization with verification
+// ======================================================================
+// `from_tl_signatures`: rebuild and fully verify a typed certificate
+// (index bounds, duplicate detection, signatures, >= 2/3 weight).
+
+impl<T: ToTlUnsignedVote> Certificate<T> {
+    /// Deserialize from TL VoteSignatureSet with signature verification
+    ///
+    /// Reference: C++ `Certificate<T>::from_tl(voteSignatureSet&&, T vote, const Bus& bus)`
+    ///
+    /// # Arguments
+    ///
+    /// * `tl_sigs` - TL VoteSignatureSet object
+    /// * `vote` - The vote being certified (caller provides, verified against signatures)
+    /// * `desc` - Session description for validator lookup
+    /// * `session_id` - Session ID for signature verification
+    ///
+    /// # Returns
+    ///
+    /// Ok(Certificate) if:
+    /// - All validator indices are valid
+    /// - No duplicate validators
+    /// - All signatures verify
+    /// - Total weight >= 2/3 threshold
+    ///
+    /// # Errors
+    ///
+    /// - Invalid validator index
+    /// - Duplicate validator in signatures
+    /// - Invalid signature
+    /// - Insufficient weight (< 2/3)
+    pub fn from_tl_signatures(
+        tl_sigs: &VoteSignatureSetBoxed,
+        vote: T,
+        desc: &SessionDescription,
+        session_id: &SessionId,
+    ) -> Result<Self> {
+        let votes_vec = tl_sigs.votes();
+
+        // Get vote bytes for signature verification
+        // Wrap in dataToSign(session_id, vote_bytes) - matches C++ types.cpp
+        let unsigned_vote = vote.to_tl_unsigned()?;
+        let raw_vote_bytes = serialize_unsigned_vote(&unsigned_vote);
+        let vote_bytes = crate::utils::create_data_to_sign(session_id, &raw_vote_bytes);
+
+        let num_validators = desc.get_total_nodes();
+        let mut voted = vec![false; num_validators];
+        let mut signatures = Vec::with_capacity(votes_vec.len());
+        let mut voted_weight: u64 = 0;
+
+        for tl_sig in votes_vec.iter() {
+            let sig = VoteSignature::from_tl(tl_sig);
+            let validator_idx = sig.validator_idx;
+
+            // Check validator index bounds
+            if validator_idx.value() as usize >= num_validators {
+                fail!(
+                    "Invalid validator index {} in certificate (num_validators={})",
+                    validator_idx,
+                    num_validators
+                )
+            }
+
+            // Check for duplicates
+            if voted[validator_idx.value() as usize] {
+                fail!("Duplicate validator index {} in certificate", validator_idx)
+            }
+            voted[validator_idx.value() as usize] = true;
+
+            // Verify signature
+            let validator_key = desc.get_source_public_key(validator_idx);
+            if validator_key.verify(&vote_bytes, &sig.signature).is_err() {
+                fail!("Invalid vote signature for validator {}", validator_idx)
+            }
+
+            voted_weight += desc.get_node_weight(validator_idx);
+            signatures.push(sig);
+        }
+
+        // Check weight threshold
+        let threshold = desc.get_threshold_66();
+        if voted_weight < threshold {
+            fail!(
+                "Not enough signatures in certificate: weight {} < threshold {}",
+                voted_weight,
+                threshold
+            )
+        }
+
+        Ok(Self { vote, signatures })
+    }
+}
+
+// ======================================================================
+// Generic-vote parse & verify
+// ======================================================================
+// `Certificate<Vote>::from_tl`: parse and verify a TL certificate whose
+// vote variant is not known at compile time (C++-strict reject policy).
+
+impl Certificate<Vote> {
+    /// Parse and verify certificate from TL Certificate
+    ///
+    /// **Validation Policy (C++ strict)**:
+    /// - Invalid validator index: Reject
+    /// - Duplicate validator index: Reject
+    /// - Invalid signatures: Reject the entire certificate
+    /// - Insufficient weight (< 2/3): Reject the entire certificate
+    ///
+    /// Reference: C++ `Certificate<Vote>::from_tl(certificate&&, const Bus& bus)`
+    ///
+    /// # Arguments
+    /// * `tl_cert` - TL Certificate object
+    /// * `desc` - Session description for validator lookup and weight computation
+    /// * `session_id` - Session ID for signature verification
+    ///
+    /// # Returns
+    /// `Ok(Certificate<Vote>)` if valid, `Err` with a description if rejected
+    pub fn from_tl(
+        tl_cert: &CertificateBoxed,
+        desc: &SessionDescription,
+        session_id: &SessionId,
+    ) -> Result<Self> {
+        let unsigned_vote = tl_cert.vote();
+
+        // Parse vote from TL
+        let vote = crate::utils::tl_unsigned_to_vote(unsigned_vote)?;
+
+        // Get vote bytes for signature verification
+        // Wrap in dataToSign(session_id, vote_bytes) - matches C++ types.cpp
+        let raw_vote_bytes = serialize_unsigned_vote(unsigned_vote);
+        let vote_bytes = crate::utils::create_data_to_sign(session_id, &raw_vote_bytes);
+
+        // Parse and verify signatures
+        let votes_vec = tl_cert.signatures().votes();
+        let num_validators = desc.get_total_nodes();
+        let mut voted = vec![false; num_validators];
+        let mut signatures = Vec::with_capacity(votes_vec.len());
+        let mut voted_weight: u64 = 0;
+
+        for tl_sig in votes_vec.iter() {
+            let sig = VoteSignature::from_tl(tl_sig);
+            let validator_idx = sig.validator_idx;
+
+            // C++ strict: reject invalid validator index
+            if validator_idx.value() as usize >= num_validators {
+                fail!("Invalid validator index {} in certificate", validator_idx)
+            }
+
+            // C++ strict: reject duplicates
+            if voted[validator_idx.value() as usize] {
+                fail!("Duplicate validator index {} in certificate", validator_idx)
+            }
+
+            // Verify signature - REJECT the entire certificate if any signature is invalid
+            let validator_key = desc.get_source_public_key(validator_idx);
+            if validator_key.verify(&vote_bytes, &sig.signature).is_err() {
+                fail!("Invalid vote signature for validator {}", validator_idx)
+            }
+
+            // Mark as voted and accumulate weight
+            voted[validator_idx.value() as usize] = true;
+            voted_weight += desc.get_node_weight(validator_idx);
+            signatures.push(sig);
+        }
+
+        // Check weight threshold - REJECT if insufficient weight after processing
+        let threshold = desc.get_threshold_66();
+        if voted_weight < threshold {
+            // Match C++ behavior (`certificate.cpp`): reject with a generic message.
+            fail!("Not enough signatures in certificate")
+        }
+
+        Ok(Self { vote, signatures })
+    }
+}

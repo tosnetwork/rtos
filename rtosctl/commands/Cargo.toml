@@ -1,0 +1,36 @@
+[package]
+repository = "https://github.com/tosnetwork/rtos"
+name = "commands"
+version = "0.6.0"
+edition = "2024"
+license = 'GPL-3.0'
+
+[dependencies]
+serde = { features = ["derive", "rc"], version = "1.0" }
+serde_json = "1.0"
+anyhow = "1.0"
+clap = { version = "4.4", features = ["derive", "env"] }
+tracing = "0.1"
+base64 = "0.22.1"
+colored = "2.0"
+reqwest = { version = "0.12.24", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+common = { path = "../common" }
+control-client = { path = "../control-client" }
+rtos-http-api-client = { path = "../rtos-http-api-client" }
+adnl = { features = ["client"], path = "../../adnl" }
+rtos_block = { path = "../../block" }
+contracts = { path = "../contracts" }
+rtos_block_json = { version = "0.9.41", path = "../../block-json" }
+service = { path = "../service" }
+secrets-vault = { path = '../../secrets-vault', default-features = false, features = [
+    "file-storage-json",
+    "hashicorp-storage",
+] }
+scopeguard = "1"
+rpassword = "7"
+
+# TODO: remove after debug
+tokio = { version = "1.48.0", features = ["full"] }

@@ -1,0 +1,526 @@
+/*
+ * RTOS project modifications (2026-10-10): project and crate naming.
+ * Copyright (C) 2025-2026 RSquad Blockchain Lab.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ * See the LICENSE file in the root of this repository.
+ *
+ * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
+ */
+use crate::commands::rtosctl::utils::{
+    DEPLOY_TIMEOUT, load_config_vault_rpc_client, make_wallet, toncore_pool_slot_from_cli_flags,
+    wait_for_deploy, wallet_info,
+};
+use colored::Colorize;
+use common::{
+    TonWalletVersion,
+    app_config::PoolConfig,
+    task_cancellation::CancellationCtx,
+    ton_utils::{nanotons_to_tons_f64, tons_f64_to_nanotons},
+};
+use contracts::{SingleNominatorWrapper, TonWallet, resolve_toncore_pool};
+use rtos_block::{Cell, MsgAddressInt, write_boc};
+use rtos_http_api_client::v2::data_models::AccountState;
+use std::{cell::RefCell, collections::HashMap, path::Path, rc::Rc, sync::Arc};
+
+#[derive(clap::Args, Clone)]
+#[command(about = "Deploy contracts (wallet, nominator pool)")]
+pub struct DeployCmd {
+    #[command(subcommand)]
+    action: DeployAction,
+}
+
+#[derive(clap::Subcommand, Clone)]
+enum DeployAction {
+    Wallet(DeployWalletsCmd),
+    Pool(DeployPoolCmd),
+}
+
+#[derive(clap::Args, Clone)]
+#[command(group(clap::ArgGroup::new("target").required(true).args(&["node", "all"])))]
+struct DeployWalletsCmd {
+    #[arg(
+        short = 'c',
+        long = "config",
+        help = "Path to the configuration file",
+        default_value = "rtosctl-config.json",
+        env = "CONFIG_PATH",
+        global = true
+    )]
+    config: String,
+
+    #[arg(long = "verbose", help = "Print progress", required = false)]
+    verbose: bool,
+
+    #[arg(long = "node", help = "Node name to get the wallet to deploy")]
+    node: Option<String>,
+
+    #[arg(long = "all", help = "Deploy all wallets")]
+    all: bool,
+}
+
+#[derive(clap::Args, Clone)]
+struct DeployPoolCmd {
+    #[arg(
+        short = 'c',
+        long = "config",
+        help = "Path to the configuration file",
+        default_value = "rtosctl-config.json",
+        env = "CONFIG_PATH",
+        global = true
+    )]
+    config: String,
+
+    #[arg(long = "verbose", help = "Print progress", required = false)]
+    verbose: bool,
+    #[arg(
+        short = 'b',
+        long = "binding",
+        help = "Binding name (resolves validator wallet and pool from config)"
+    )]
+    binding: String,
+    #[arg(long = "amount", help = "Amount of TOS to transfer for deployment")]
+    amount: f64,
+    #[arg(
+        long = "owner",
+        help = "SNP: pool owner address (required for Single Nominator Pool deploy)"
+    )]
+    owner: Option<MsgAddressInt>,
+    #[arg(
+        long = "pool-even",
+        conflicts_with = "pool_odd",
+        help = "TOSCore nominator: deploy the pool for even validation rounds (default if neither flag is set)"
+    )]
+    pool_even: bool,
+    #[arg(
+        long = "pool-odd",
+        conflicts_with = "pool_even",
+        help = "TOSCore nominator: deploy the pool for odd validation rounds"
+    )]
+    pool_odd: bool,
+}
+
+impl DeployCmd {
+    pub async fn run(&self, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
+        match &self.action {
+            DeployAction::Wallet(cmd) => cmd.run(cancellation_ctx).await,
+            DeployAction::Pool(cmd) => cmd.run(cancellation_ctx).await,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct DeployWalletResult {
+    pub config: String,
+    pub details: HashMap<String, DeployWalletResultDetails>,
+}
+
+#[derive(serde::Serialize)]
+struct DeployWalletResultDetails {
+    pub version: TonWalletVersion,
+    pub subwallet_id: u32,
+    pub workchain: i32,
+    pub account_state: AccountState,
+    pub address: String,
+    pub balance: u64,
+    pub deployed: bool,
+    pub error: Option<String>,
+}
+
+impl DeployWalletsCmd {
+    const MIN_BALANCE: u64 = 100_000_000;
+
+    pub async fn run(&self, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
+        let mut uninitialized_wallets: Vec<(Arc<dyn TonWallet>, u64, String)> = Vec::new();
+        let (config, vault, rpc_client) =
+            load_config_vault_rpc_client(Path::new(&self.config)).await?;
+        let mut res_details = HashMap::new();
+
+        if self.verbose {
+            println!(
+                "  {:<10} {:<7} {:<12} {:<9} {:<14} {}",
+                "Node".bold(),
+                "Version".bold(),
+                "Subwallet ID".bold(),
+                "Workchain".bold(),
+                "State".bold(),
+                "Address:".bold(),
+            );
+
+            println!("  {}", "─".repeat(124).dimmed());
+        }
+
+        // Get wallets account state
+        for (node_id, wallet_cfg) in &config.wallets {
+            if cancellation_ctx.is_cancelled() {
+                anyhow::bail!("Task cancelled");
+            }
+
+            if let Some(node_filter) = &self.node
+                && node_filter != node_id
+            {
+                continue;
+            }
+
+            let (wallet_address, wallet_info, secret) =
+                wallet_info(rpc_client.clone(), wallet_cfg, vault.clone()).await?;
+
+            if self.verbose {
+                println!(
+                    "  {:<10} {:<7} {:<12} {:<9} {:<14} {}",
+                    node_id,
+                    format!("{}", wallet_cfg.version),
+                    wallet_cfg.subwallet_id,
+                    wallet_cfg.workchain,
+                    format!("{}", &wallet_info.account_state),
+                    wallet_address
+                );
+            }
+
+            let mut deployed = false;
+            if wallet_info.account_state == AccountState::Uninitialized {
+                let wallet = make_wallet(rpc_client.clone(), wallet_cfg, secret, node_id).await?;
+
+                uninitialized_wallets.push((
+                    Arc::new(wallet),
+                    wallet_info.balance,
+                    node_id.clone(),
+                ));
+            } else if wallet_info.account_state == AccountState::Active {
+                deployed = true;
+            }
+
+            res_details.insert(
+                node_id.clone(),
+                DeployWalletResultDetails {
+                    version: wallet_cfg.version,
+                    subwallet_id: wallet_cfg.subwallet_id,
+                    workchain: wallet_cfg.workchain,
+                    account_state: wallet_info.account_state,
+                    address: wallet_address.to_string(),
+                    balance: wallet_info.balance,
+                    deployed,
+                    error: None,
+                },
+            );
+        }
+
+        if self.verbose && !uninitialized_wallets.is_empty() {
+            println!(
+                "\n{}: {}",
+                "Trying to deploy uninitialized wallets".bold(),
+                uninitialized_wallets.len()
+            );
+        }
+
+        // Deploy
+        let mut wallets_to_wait: Vec<(Arc<dyn TonWallet>, String)> = Vec::new();
+        for (wallet, balance, node_id) in &uninitialized_wallets {
+            if cancellation_ctx.is_cancelled() {
+                anyhow::bail!("Task cancelled");
+            }
+
+            let res = res_details.get_mut(node_id).unwrap();
+            let wallet_addr = wallet.address().await?;
+            if *balance < Self::MIN_BALANCE {
+                if self.verbose {
+                    println!("Failed to deploy wallet {}, balance is too low", wallet_addr);
+                }
+
+                res.deployed = false;
+                res.error = Some("Failed to deploy wallet, balance is too low".to_string());
+                continue;
+            }
+
+            if self.verbose {
+                println!("Deploy wallet {}...", wallet_addr);
+            }
+
+            let msg_boc =
+                write_boc(&wallet.deploy_message(Self::MIN_BALANCE / 10, Cell::default()).await?)?;
+
+            rpc_client.send_boc(&msg_boc).await?;
+
+            wallets_to_wait.push((wallet.clone(), node_id.clone()));
+        }
+
+        // Wait for wallets deploy
+        if self.verbose && !wallets_to_wait.is_empty() {
+            println!("\n{}: {}...", "Wait for wallets deploy".bold(), wallets_to_wait.len());
+        }
+
+        for (wallet, node_id) in &wallets_to_wait {
+            wait_for_deploy(
+                rpc_client.clone(),
+                &wallet.address().await?,
+                &cancellation_ctx,
+                self.verbose,
+                DEPLOY_TIMEOUT,
+            )
+            .await?;
+
+            let res = res_details.get_mut(node_id).unwrap();
+            res.deployed = true;
+            res.account_state = AccountState::Active;
+        }
+
+        let result = DeployWalletResult { config: self.config.clone(), details: res_details };
+        match serde_json::to_string_pretty(&result) {
+            Ok(s) => println!("{}", s),
+            Err(_) => {
+                tracing::error!("Failed to serialize result")
+            }
+        };
+
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize, Default)]
+struct DeployPoolResult {
+    pub config: String,
+    pub account_state: AccountState,
+    pub address: String,
+    #[serde(default)]
+    pub targets: Vec<DeployPoolTargetResult>,
+    pub deployed: bool,
+    pub error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct DeployPoolTargetResult {
+    pub address: String,
+    pub account_state: AccountState,
+    pub deployed: bool,
+}
+
+impl DeployPoolCmd {
+    pub async fn run(&self, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
+        // Suppress the returned error because the error is already printed to the stdout in json format
+        let _ = self.run_with_result(cancellation_ctx).await;
+        Ok(())
+    }
+    pub async fn run_with_result(&self, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
+        let res = Rc::new(RefCell::new(DeployPoolResult {
+            config: self.config.clone(),
+            ..Default::default()
+        }));
+        let set_err = |e: anyhow::Error| {
+            res.borrow_mut().error = Some(format!("{:#}", e));
+            e
+        };
+
+        scopeguard::defer! {
+            let result = res.borrow();
+            match serde_json::to_string_pretty(&*result) {
+                Ok(s) => println!("{}", s),
+                Err(_) => {
+                    tracing::error!("Failed to serialize result")
+                }
+            };
+        }
+
+        let (config, vault, rpc_client) =
+            load_config_vault_rpc_client(Path::new(&self.config)).await.map_err(set_err)?;
+
+        let binding_cfg = config
+            .bindings
+            .get(&self.binding)
+            .ok_or_else(|| anyhow::anyhow!("Binding '{}' not found", self.binding))
+            .map_err(set_err)?;
+
+        let pool_name = binding_cfg
+            .pool
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Binding '{}' has no pool configured", self.binding))
+            .map_err(set_err)?;
+
+        let pool_cfg = config
+            .pools
+            .get(pool_name)
+            .ok_or_else(|| anyhow::anyhow!("Pool '{}' not found", pool_name))
+            .map_err(set_err)?;
+
+        if !matches!(pool_cfg, PoolConfig::TOSCore { .. }) && (self.pool_even || self.pool_odd) {
+            return Err(set_err(anyhow::anyhow!(
+                "--pool-even and --pool-odd apply only to TOSCore nominator"
+            )));
+        }
+
+        let wallet_name = binding_cfg.wallet.as_str();
+        let wallet_cfg = config
+            .wallets
+            .get(wallet_name)
+            .ok_or_else(|| anyhow::anyhow!("Wallet '{}' not found", wallet_name))
+            .map_err(set_err)?;
+
+        if self.verbose {
+            println!("Update wallet info ...");
+        }
+
+        let (wallet_address, wallet_info, secret) =
+            wallet_info(rpc_client.clone(), wallet_cfg, vault.clone()).await.map_err(set_err)?;
+        if cancellation_ctx.is_cancelled() {
+            anyhow::bail!("Task cancelled");
+        }
+
+        let mut deploy_targets: Vec<(MsgAddressInt, rtos_block::StateInit)> = match pool_cfg {
+            PoolConfig::TOSCore { pools } => {
+                let mut targets = Vec::new();
+                for slot in pools.iter() {
+                    let Some(cfg) = slot else { continue };
+                    match (&cfg.address, &cfg.params) {
+                        (_, Some(params)) => {
+                            let resolved = resolve_toncore_pool(
+                                &wallet_address,
+                                cfg.address.as_deref(),
+                                *params,
+                                cfg.deploy_mode,
+                            )
+                            .map_err(set_err)?;
+                            targets.push((resolved.address, resolved.state_init));
+                        }
+                        (Some(address), None) => {
+                            return Err(set_err(anyhow::anyhow!(
+                                "TOSCore pool slot has address '{}' but no deploy params",
+                                address
+                            )));
+                        }
+                        (None, None) => {}
+                    }
+                }
+                targets
+            }
+            PoolConfig::SNP { .. } => {
+                let owner = self.owner.as_ref().ok_or_else(|| {
+                    set_err(anyhow::anyhow!(
+                        "SNP deploy requires --owner (use TOSCore pool for deploy without --owner)"
+                    ))
+                })?;
+                let (pool_address, state_init) =
+                    SingleNominatorWrapper::calculate_address_and_state(-1, owner, &wallet_address)
+                        .map_err(set_err)?;
+                vec![(pool_address, state_init)]
+            }
+        };
+
+        if matches!(pool_cfg, PoolConfig::TOSCore { pools } if pools[1].is_some()) {
+            let slot = toncore_pool_slot_from_cli_flags(self.pool_even, self.pool_odd);
+            let one = deploy_targets
+                .get(slot)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("TOSCore nominator deploy: invalid pool slot {}", slot)
+                })
+                .map_err(set_err)?;
+            deploy_targets = vec![one];
+        }
+
+        if wallet_info.account_state != AccountState::Active {
+            res.borrow_mut().error =
+                Some(format!("Wallet '{}' state {}", wallet_address, wallet_info.account_state));
+            return Ok(());
+        }
+
+        let amount_to_send_nano = tons_f64_to_nanotons(self.amount);
+
+        // Keep deploy side-effect free. Validator deposits should be performed
+        // explicitly via the dedicated deposit-validator command.
+        let deploy_body = Cell::default();
+
+        let wallet = make_wallet(rpc_client.clone(), wallet_cfg, secret, &self.binding)
+            .await
+            .map_err(set_err)?;
+        let mut seqno = wallet_info.seqno;
+
+        for (i, (pool_address, state_init)) in deploy_targets.iter().enumerate() {
+            let mut target_result = DeployPoolTargetResult {
+                address: pool_address.to_string(),
+                account_state: AccountState::Uninitialized,
+                deployed: false,
+            };
+            res.borrow_mut().address = target_result.address.clone();
+
+            if self.verbose {
+                println!("Update pool info [{}/{}] ...", i + 1, deploy_targets.len());
+            }
+
+            let pool_info =
+                rpc_client.get_address_information(pool_address).await.map_err(set_err)?;
+            res.borrow_mut().account_state = pool_info.state.clone();
+            target_result.account_state = pool_info.state.clone();
+
+            if pool_info.state == AccountState::Active {
+                if self.verbose {
+                    println!("The pool '{}' is already deployed", pool_address);
+                }
+                target_result.deployed = true;
+                res.borrow_mut().targets.push(target_result);
+                continue;
+            } else if pool_info.state == AccountState::Frozen {
+                res.borrow_mut().targets.push(target_result);
+                return Err(set_err(anyhow::anyhow!("The pool '{}' is frozen", pool_address)));
+            }
+
+            if cancellation_ctx.is_cancelled() {
+                return Err(set_err(anyhow::anyhow!("Task cancelled")));
+            }
+
+            let current_balance =
+                rpc_client.get_address_information(&wallet_address).await.map_err(set_err)?.balance;
+            if current_balance < amount_to_send_nano {
+                return Err(set_err(anyhow::anyhow!(
+                    "Wallet '{}' balance {:.4}_TOS is too low",
+                    wallet_address,
+                    nanotons_to_tons_f64(current_balance)
+                )));
+            }
+
+            if self.verbose {
+                println!(
+                    "Deploy pool [{}/{}]: address={} ...",
+                    i + 1,
+                    deploy_targets.len(),
+                    pool_address
+                );
+            }
+
+            let msg_boc = write_boc(
+                &wallet
+                    .build_message(
+                        pool_address.clone(),
+                        amount_to_send_nano,
+                        deploy_body.clone(),
+                        false,
+                        seqno,
+                        None,
+                        Some(state_init.clone()),
+                    )
+                    .await
+                    .map_err(set_err)?,
+            )
+            .map_err(set_err)?;
+
+            rpc_client.send_boc(&msg_boc).await.map_err(set_err)?;
+            wait_for_deploy(
+                rpc_client.clone(),
+                pool_address,
+                &cancellation_ctx,
+                self.verbose,
+                DEPLOY_TIMEOUT,
+            )
+            .await
+            .map_err(set_err)?;
+
+            seqno = seqno.map(|s| s + 1);
+            target_result.account_state = AccountState::Active;
+            target_result.deployed = true;
+            res.borrow_mut().targets.push(target_result);
+        }
+
+        res.borrow_mut().deployed = true;
+        res.borrow_mut().account_state = AccountState::Active;
+
+        Ok(())
+    }
+}

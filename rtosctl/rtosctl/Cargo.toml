@@ -1,0 +1,20 @@
+[package]
+repository = "https://github.com/tosnetwork/rtos"
+build = '../../common/build/build.rs'
+name = "rtosctl"
+description = "Tool for managing RTOS node"
+version = "0.6.0"
+edition = "2024"
+license = 'GPL-3.0'
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+clap = { version = "4.4", features = ["derive"] }
+tracing = "0.1"
+anyhow = "1.0"
+common = { path = "../common" }
+commands = { path = "../commands" }
+secrets-vault = { path = '../../secrets-vault', default-features = false, features = [
+    "file-storage-json",
+    "hashicorp-storage",
+] }

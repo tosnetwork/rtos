@@ -1,0 +1,24 @@
+[package]
+repository = "https://github.com/tosnetwork/rtos"
+build = '../common/build/build.rs'
+edition = '2021'
+license = 'GPL-3.0'
+name = 'rtos_block_json'
+version = '0.9.41'
+
+[dependencies]
+anyhow = '1.0'
+hex = '0.4'
+log = '^0.4'
+metrics = '0.24'
+num = '0.4'
+num-traits = '0.2'
+serde = '1.0'
+serde_derive = '1.0'
+serde_json = { features = [ 'preserve_order' ], version = '1.0' }
+thiserror = '1.0'
+rtos_block = { path = '../block' }
+rtos_api = { path = '../tl/rtos_api' }
+
+[dev-dependencies]
+pretty_assertions = '1.4'

@@ -1,0 +1,22 @@
+FROM rust:slim AS builder
+
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev
+
+COPY . /rtosctl
+WORKDIR /rtosctl
+
+RUN cargo build --release --package rtosctl --locked
+
+FROM debian:stable-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /rtosctl/target/release/rtosctl /usr/local/bin/
+
+WORKDIR /rtosctl
+

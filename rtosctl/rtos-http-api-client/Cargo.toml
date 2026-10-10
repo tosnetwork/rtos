@@ -1,0 +1,27 @@
+[package]
+repository = "https://github.com/tosnetwork/rtos"
+name = "rtos-http-api-client"
+version = "0.6.0"
+edition = "2024"
+license = 'GPL-3.0'
+
+[dependencies]
+serde = { version = "1.0" }
+serde_json = "1.0.145"
+base64 = "0.22"
+anyhow = "1.0"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+rtos_block = { path = "../../block" }
+rtos_api = { path = "../../tl/rtos_api" }
+common = { path = "../common" }
+toncenter-rs = { git = "https://github.com/RSquad/toncenter-rs.git", branch = "main" }
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+] }

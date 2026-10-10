@@ -1,0 +1,632 @@
+/*
+ * RTOS project modifications (2026-10-10): project and crate naming.
+ * Copyright (C) 2025-2026 RSquad Blockchain Lab.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ * See the LICENSE file in the root of this repository.
+ *
+ * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
+ */
+use crate::commands::rtosctl::{
+    output_format::OutputFormat,
+    utils::{
+        SEND_TIMEOUT, api_delete, api_get, api_post, fetch_network_max_factor, get_wallet_config,
+        load_config_vault_rpc_client, make_wallet, require_config,
+        resolve_pool_address_from_config, resolve_service_url, toncore_pool_slot_from_cli_flags,
+        vault_secret_missing, wait_for_seqno_change, wallet_info, warn_missing_secret,
+    },
+};
+use anyhow::Context;
+use colored::Colorize;
+use common::{
+    TonWalletVersion,
+    app_config::ElectionsConfig,
+    task_cancellation::CancellationCtx,
+    time_format,
+    ton_utils::{display_tons, tons_f64_to_nanotons},
+};
+use contracts::{ElectorWrapper, ElectorWrapperImpl, TonWallet, contract_provider, nominator};
+use rtos_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, Cell, MsgAddressInt, write_boc};
+use rtos_http_api_client::v2::data_models::AccountState;
+use service::elections::providers::{DefaultElectionsProvider, ElectionsProvider};
+use std::{io::Write, path::Path, str::FromStr};
+
+const WALLET_SEND_GAS: u64 = 1_000_000; // 0.001 TOS
+/// Value in nanotons required by elector to execute stake operations.
+const ELECTOR_STAKE_FEE: u64 = 1_000_000_000;
+/// Gas fee consumed by nominator pool.
+const NPOOL_COMPUTE_FEE: u64 = 200_000_000;
+/// Gas fee consumed by wallet to send message to nominator pool.
+const WALLET_COMPUTE_FEE: u64 = 100_000_000;
+
+#[derive(clap::Args, Clone)]
+#[command(about = "Manage wallets in the configuration")]
+pub struct WalletCmd {
+    #[command(subcommand)]
+    action: WalletAction,
+}
+
+#[derive(clap::Subcommand, Clone)]
+pub enum WalletAction {
+    /// Add a wallet to the configuration
+    Add(WalletAddCmd),
+    /// List all configured wallets
+    Ls(WalletLsCmd),
+    /// Remove a wallet from the configuration
+    Rm(WalletRmCmd),
+    /// Send TOS
+    Send(WalletSendCmd),
+    /// Send election stake via nominator pool
+    Stake(WalletStakeCmd),
+}
+
+#[derive(clap::Args, Clone)]
+#[command(about = "Add a wallet to the configuration")]
+pub struct WalletAddCmd {
+    #[arg(short = 'n', long = "name", help = "Wallet name (unique identifier)")]
+    name: String,
+    #[arg(short = 's', long = "secret-name", help = "Vault secret name for wallet key")]
+    secret_name: String,
+    #[arg(
+        short = 'v',
+        long = "version",
+        default_value = "V3R2",
+        help = "Wallet version (case insensitive) [possible values: V1R3, V3R2, V4R2, V5R1]"
+    )]
+    version: TonWalletVersion,
+    #[arg(short = 'i', long = "subwallet-id", default_value = "42", help = "Subwallet ID")]
+    subwallet_id: u32,
+    #[arg(short = 'w', long = "workchain", default_value = "-1", help = "Workchain ID")]
+    workchain: i32,
+}
+
+#[derive(clap::Args, Clone)]
+#[command(about = "List all configured wallets")]
+pub struct WalletLsCmd {
+    #[arg(long = "format", default_value = "table", help = "Output format: table or json")]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Clone)]
+#[command(about = "Remove a wallet from the configuration")]
+pub struct WalletRmCmd {
+    #[arg(short = 'n', long = "name", help = "Wallet name")]
+    name: String,
+}
+
+#[derive(clap::Args, Clone)]
+#[command(about = "Send TOS")]
+pub struct WalletSendCmd {
+    #[arg(short = 'f', long = "from", help = "Wallet name")]
+    from: String,
+    #[arg(short = 't', long = "to", help = "Destination address")]
+    to: String,
+    #[arg(short = 'a', long = "amount", help = "Amount in TOS")]
+    amount: f64,
+    #[arg(
+        short = 'b',
+        long = "bounce",
+        help = "Bounce transfer to the sender if recipient fails to process it"
+    )]
+    bounce: bool,
+}
+
+#[derive(clap::Args, Clone)]
+#[command(about = "Send election stake via nominator pool")]
+pub struct WalletStakeCmd {
+    #[arg(short = 'b', long = "binding", help = "Binding name")]
+    binding: String,
+    #[arg(short = 'a', long = "amount", help = "Stake amount in TOS")]
+    amount: f64,
+    #[arg(
+        short = 'm',
+        long = "max-factor",
+        default_value = "3.0",
+        help = "Max factor from 1.0 up to the network limit (config param 17)"
+    )]
+    max_factor: f32,
+    #[arg(
+        long = "pool-even",
+        conflicts_with = "pool_odd",
+        help = "TOSCore nominator: use the pool for even validation rounds (default if neither flag is set)"
+    )]
+    pool_even: bool,
+    #[arg(
+        long = "pool-odd",
+        conflicts_with = "pool_even",
+        help = "TOSCore nominator: use the pool for odd validation rounds"
+    )]
+    pool_odd: bool,
+}
+
+impl WalletCmd {
+    pub async fn run(
+        &self,
+        config_path: Option<&str>,
+        cancellation_ctx: CancellationCtx,
+        url: Option<&str>,
+        token: Option<&str>,
+    ) -> anyhow::Result<()> {
+        match &self.action {
+            WalletAction::Add(cmd) => cmd.run(url, token, config_path).await,
+            WalletAction::Ls(cmd) => cmd.run(url, token, config_path).await,
+            WalletAction::Rm(cmd) => cmd.run(url, token, config_path).await,
+            WalletAction::Send(cmd) => {
+                cmd.run(require_config(config_path)?, cancellation_ctx).await
+            }
+            WalletAction::Stake(cmd) => {
+                cmd.run(require_config(config_path)?, cancellation_ctx).await
+            }
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct WalletAddBody<'a> {
+    name: &'a str,
+    secret: &'a str,
+    version: String,
+    subwallet_id: u32,
+    workchain: i32,
+}
+
+impl WalletAddCmd {
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let body = WalletAddBody {
+            name: &self.name,
+            secret: &self.secret_name,
+            version: self.version.to_string(),
+            subwallet_id: self.subwallet_id,
+            workchain: self.workchain,
+        };
+        api_post(&base_url, "/v1/wallets", token, &body).await?;
+
+        if vault_secret_missing(&self.secret_name).await {
+            warn_missing_secret(&self.secret_name);
+        }
+        println!("\n{} Wallet '{}' added\n", "OK".green().bold(), self.name);
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WalletView {
+    name: String,
+    secret: String,
+    version: String,
+    state: Option<String>,
+    balance: Option<u64>,
+    address: Option<String>,
+}
+
+/// Bounceable base64url display for wallet list.
+fn format_wallet_ls_address(addr: &Option<String>) -> Option<String> {
+    let s = addr.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+    MsgAddressInt::from_str(&s)
+        .ok()
+        .and_then(|a| a.to_string_custom(ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE).ok())
+        .or(Some(s))
+}
+
+impl WalletLsCmd {
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let body = api_get(&base_url, "/v1/wallets", token).await?;
+        let resp: serde_json::Value = serde_json::from_str(&body)?;
+        let mut views: Vec<WalletView> = serde_json::from_value(resp["result"].clone())?;
+        for v in &mut views {
+            v.address = format_wallet_ls_address(&v.address);
+        }
+
+        if views.is_empty() {
+            match self.format {
+                OutputFormat::Json => println!("[]"),
+                OutputFormat::Table => println!("\n{}\n", "No wallets configured".yellow()),
+            }
+            return Ok(());
+        }
+
+        match self.format {
+            OutputFormat::Json => {
+                println!("{}", serde_json::to_string_pretty(&views)?);
+            }
+            OutputFormat::Table => {
+                print_wallets_table_from_views(&views);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn print_wallets_table_from_views(views: &[WalletView]) {
+    println!("\n{} {} ({})\n", "OK".green().bold(), "Wallets:".green(), views.len());
+    println!(
+        "  {:<20} {:<22} {:<8} {:<9} {:<14} {}",
+        "Name".cyan().bold(),
+        "Secret".cyan().bold(),
+        "Version".cyan().bold(),
+        "State".cyan().bold(),
+        "Balance".cyan().bold(),
+        "Address".cyan().bold(),
+    );
+    println!("  {}", "─".repeat(125).dimmed());
+
+    for v in views {
+        println!(
+            "  {:<20} {:<22} {:<8} {:<9} {:<14} {}",
+            v.name,
+            v.secret,
+            v.version,
+            v.state.as_deref().map(|s| s.white()).unwrap_or_else(|| "-".red()),
+            v.balance.map(|b| display_tons(b).white()).unwrap_or_else(|| "-".red()),
+            v.address.as_deref().map(|s| s.white()).unwrap_or_else(|| "-".red()),
+        );
+    }
+    println!();
+}
+
+impl WalletRmCmd {
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        api_delete(&base_url, &format!("/v1/wallets/{}", self.name), token).await?;
+        println!("\n{} Wallet '{}' removed\n", "OK".green().bold(), self.name);
+        Ok(())
+    }
+}
+
+impl WalletSendCmd {
+    pub async fn run(&self, path: &Path, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
+        let (config, vault, rpc_client) = load_config_vault_rpc_client(path).await?;
+
+        let from_wallet_cfg =
+            get_wallet_config(&self.from, &config.wallets, config.master_wallet.as_ref())?;
+
+        let (from_wallet_address, from_wallet_info, from_secret) =
+            wallet_info(rpc_client.clone(), from_wallet_cfg, vault.clone()).await?;
+
+        if !(1..=from_wallet_info.balance.saturating_sub(WALLET_SEND_GAS))
+            .contains(&tons_f64_to_nanotons(self.amount))
+        {
+            anyhow::bail!(
+                "Wrong amount value {} TOS. Wallet balance is {} TOS",
+                self.amount,
+                display_tons(from_wallet_info.balance)
+            )
+        }
+
+        let to_wallet_address =
+            self.to.parse::<MsgAddressInt>().context("Invalid destination address")?;
+
+        let from_wallet =
+            make_wallet(rpc_client.clone(), from_wallet_cfg, from_secret, &self.from).await?;
+
+        if from_wallet_info.account_state == AccountState::Frozen {
+            anyhow::bail!("wallet '{}' is frozen", self.from);
+        }
+
+        if from_wallet_info.account_state == AccountState::Uninitialized {
+            anyhow::bail!("wallet '{}' is uninitialized", self.from);
+        }
+
+        println!(
+            "\n{}\n  From:   {} ({})\n  To:     {}\n  Amount: {:.9} TOS\n  Bounce: {}\n",
+            "Transfer summary:".cyan().bold(),
+            self.from,
+            from_wallet_address,
+            to_wallet_address,
+            self.amount,
+            self.bounce,
+        );
+
+        if !confirm("Confirm transfer?")? {
+            println!("{}", "Transfer cancelled".yellow());
+            return Ok(());
+        }
+
+        let msg = from_wallet
+            .build_message(
+                to_wallet_address,
+                tons_f64_to_nanotons(self.amount),
+                Cell::default(),
+                self.bounce,
+                None,
+                None,
+                None,
+            )
+            .await?;
+
+        let msg_boc = write_boc(&msg)?;
+        rpc_client.send_boc(&msg_boc).await?;
+
+        wait_for_seqno_change(
+            rpc_client.clone(),
+            &from_wallet_address,
+            from_wallet_info.seqno,
+            &cancellation_ctx,
+            SEND_TIMEOUT,
+        )
+        .await?;
+
+        println!("{} Transfer complete", "OK".green().bold());
+        Ok(())
+    }
+}
+
+impl WalletStakeCmd {
+    pub async fn run(&self, path: &Path, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
+        let (config, vault, rpc_client) = load_config_vault_rpc_client(path).await?;
+        let network_max_factor = fetch_network_max_factor(&rpc_client).await?;
+        ElectionsConfig { max_factor: self.max_factor, ..Default::default() }
+            .validate(Some(network_max_factor))?;
+
+        // Resolve binding → wallet, pool, node
+        let binding = config
+            .bindings
+            .get(&self.binding)
+            .ok_or_else(|| anyhow::anyhow!("Binding '{}' not found", self.binding))?;
+
+        let wallet_cfg =
+            get_wallet_config(&binding.wallet, &config.wallets, config.master_wallet.as_ref())?;
+
+        let pool_name = binding
+            .pool
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Binding '{}' has no pool configured", self.binding))?;
+        let pool_cfg = config
+            .pools
+            .get(pool_name)
+            .ok_or_else(|| anyhow::anyhow!("Pool '{}' not found", pool_name))?;
+
+        let adnl_cfg = config
+            .nodes
+            .get(&self.binding)
+            .ok_or_else(|| anyhow::anyhow!("Node '{}' not found", self.binding))?;
+
+        // Wallet and pool addresses
+        let (wallet_address, wallet_info_res, wallet_secret) =
+            wallet_info(rpc_client.clone(), wallet_cfg, vault.clone()).await?;
+        if wallet_info_res.account_state != AccountState::Active {
+            anyhow::bail!("Wallet '{}' is {}", binding.wallet, wallet_info_res.account_state);
+        }
+        let pool_slot = toncore_pool_slot_from_cli_flags(self.pool_even, self.pool_odd);
+        let pool_address = resolve_pool_address_from_config(pool_cfg, &wallet_address, pool_slot)?;
+        let pool_addr_bytes = pool_address.address().clone().storage().to_vec();
+
+        // Connect to validator node via control protocol
+        let adnl_client_cfg = adnl_cfg
+            .to_node_adnl_config(Some(vault.clone()))
+            .await
+            .context("ADNL client config")?;
+        let mut provider = DefaultElectionsProvider::new(adnl_client_cfg);
+
+        // Get active election ID from elector via RPC
+        let elector = ElectorWrapperImpl::new(contract_provider!(rpc_client.clone()));
+        let election_id =
+            elector.get_active_election_id().await.context("get_active_election_id")?;
+        if election_id == 0 {
+            anyhow::bail!("No active elections");
+        }
+        let elections_info = elector.elections_info().await.context("elections_info")?;
+        if elections_info.finished {
+            anyhow::bail!("Elections are already finished");
+        }
+
+        let stake_nanotons = tons_f64_to_nanotons(self.amount);
+        if stake_nanotons < elections_info.min_stake {
+            anyhow::bail!(
+                "Stake {:.4} TOS is below minimum {:.4} TOS",
+                self.amount,
+                elections_info.min_stake as f64 / 1_000_000_000.0
+            );
+        }
+
+        // Get election parameters for key expiration
+        let cfg15 = provider.election_parameters().await.context("election_parameters")?;
+        const KEY_EXPIRED_LAG: u64 = 300;
+        let key_expired_at = election_id + cfg15.validators_elected_for as u64 + KEY_EXPIRED_LAG;
+
+        // Find or generate validator key
+        let validator_config = provider.validator_config().await.context("validator_config")?;
+        let existing_key = validator_config.find(election_id);
+
+        let (key_id, pub_key, adnl_addr) = match existing_key {
+            Some(entry) => {
+                let pub_key =
+                    provider.export_public_key(&entry.key_id).await.context("export_public_key")?;
+                let adnl_addr = entry
+                    .adnl_addr()
+                    .ok_or_else(|| anyhow::anyhow!("Validator key has no ADNL address"))?;
+                println!(
+                    "{} Reusing existing validator key for election {}: {}",
+                    "Info:".cyan().bold(),
+                    election_id,
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &pub_key)
+                );
+                (entry.key_id, pub_key, adnl_addr)
+            }
+            None => {
+                println!(
+                    "\n{} No validator key found for election {}",
+                    "Warning:".yellow().bold(),
+                    election_id
+                );
+                if !confirm("Generate new validator key?")? {
+                    anyhow::bail!("Aborted: no validator key for this election");
+                }
+                let (key_id, pub_key) = provider
+                    .new_validator_key(election_id, key_expired_at)
+                    .await
+                    .context("new_validator_key")?;
+                let adnl_addr = provider
+                    .new_adnl_addr(key_id.clone(), key_expired_at)
+                    .await
+                    .context("new_adnl_addr")?;
+                println!(
+                    "{} Generated validator key: {}\n{} Generated ADNL address: {}",
+                    "Info:".cyan().bold(),
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &pub_key),
+                    "Info:".cyan().bold(),
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &adnl_addr),
+                );
+                (key_id, pub_key, adnl_addr)
+            }
+        };
+
+        // Check if already participating
+        if let Some(p) = elections_info.participants.iter().find(|p| p.pub_key == pub_key) {
+            println!(
+                "\n{} Already participating with stake {:.4} TOS",
+                "Warning:".yellow().bold(),
+                p.stake as f64 / 1_000_000_000.0
+            );
+        }
+
+        // Build election bid: sign data with validator key
+        let max_factor_raw = (self.max_factor * 65536.0) as u32;
+
+        let mut sign_data = 0x654C5074u32.to_be_bytes().to_vec();
+        sign_data.extend_from_slice(&(election_id as u32).to_be_bytes());
+        sign_data.extend_from_slice(&max_factor_raw.to_be_bytes());
+        sign_data.extend_from_slice(&pool_addr_bytes);
+        sign_data.extend_from_slice(&adnl_addr);
+
+        let signature = provider.sign(key_id, sign_data).await.context("sign election bid")?;
+
+        // Build NEW_STAKE payload for nominator pool
+        let payload = nominator::new_stake(&nominator::NewStakeParams {
+            query_id: time_format::now(),
+            stake_amount: stake_nanotons,
+            validator_pubkey: &pub_key,
+            stake_at: election_id as u32,
+            max_factor: max_factor_raw,
+            adnl_addr: &adnl_addr,
+            signature: &signature,
+        })?;
+
+        // Build wallet message to nominator pool (wallet sends only gas, pool has the stake)
+        let wallet =
+            make_wallet(rpc_client.clone(), wallet_cfg, wallet_secret, &binding.wallet).await?;
+        let fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
+        if wallet_info_res.balance < fee + WALLET_COMPUTE_FEE {
+            anyhow::bail!(
+                "Insufficient wallet balance: required {:.4} TOS, available {:.4} TOS",
+                (fee + WALLET_COMPUTE_FEE) as f64 / 1_000_000_000.0,
+                display_tons(wallet_info_res.balance)
+            );
+        }
+        let msg = wallet.message(pool_address.clone(), fee, payload).await?;
+        let msg_boc = write_boc(&msg)?;
+
+        // Confirmation
+        println!(
+            "\n{}\n  Binding:     {}\n  Wallet:      {} ({})\n  Pool:        {}\n  Election ID: {} ({})\n  Stake:       {:.9} TOS\n  Max Factor:  {:.2}\n  Min Stake:   {:.4} TOS\n",
+            "Stake summary:".cyan().bold(),
+            self.binding,
+            binding.wallet,
+            wallet_address,
+            pool_address,
+            election_id,
+            time_format::format_ts(election_id),
+            self.amount,
+            self.max_factor,
+            elections_info.min_stake as f64 / 1_000_000_000.0,
+        );
+
+        if !confirm("Confirm stake?")? {
+            println!("{}", "Stake cancelled".yellow());
+            return Ok(());
+        }
+
+        println!("{} Sending message to wallet...", "DOING".blue().bold());
+        // Send via control protocol
+        provider.send_boc(&msg_boc).await.context("send stake message")?;
+
+        wait_for_seqno_change(
+            rpc_client.clone(),
+            &wallet_address,
+            wallet_info_res.seqno,
+            &cancellation_ctx,
+            SEND_TIMEOUT,
+        )
+        .await?;
+
+        println!(
+            "{} Message delivered, waiting for stake to appear in elector...",
+            "OK   ".green().bold()
+        );
+
+        let previous_stake = elections_info
+            .participants
+            .iter()
+            .find(|p| p.pub_key == pub_key)
+            .map(|p| p.stake)
+            .unwrap_or(0);
+        let expected_stake = previous_stake + stake_nanotons;
+
+        let stake_timeout = tokio::time::Duration::from_secs(60);
+        wait_for_stake_accepted(
+            &elector,
+            &pub_key,
+            expected_stake,
+            &cancellation_ctx,
+            stake_timeout,
+        )
+        .await?;
+
+        println!("{} Stake accepted by elector", "OK   ".green().bold());
+        let _ = provider.shutdown().await;
+        Ok(())
+    }
+}
+
+const STAKE_POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(3);
+
+async fn wait_for_stake_accepted(
+    elector: &ElectorWrapperImpl,
+    pub_key: &[u8],
+    expected_stake: u64,
+    cancellation_ctx: &CancellationCtx,
+    max_wait: tokio::time::Duration,
+) -> anyhow::Result<()> {
+    let poll = async {
+        loop {
+            if cancellation_ctx.is_cancelled() {
+                anyhow::bail!("Task cancelled");
+            }
+            tokio::time::sleep(STAKE_POLL_INTERVAL).await;
+            let info = elector.elections_info().await.context("elections_info")?;
+            if let Some(p) = info.participants.iter().find(|p| p.pub_key == pub_key) {
+                if p.stake >= expected_stake {
+                    return Ok(());
+                }
+            }
+        }
+    };
+    tokio::time::timeout(max_wait, poll)
+        .await
+        .map_err(|_| anyhow::anyhow!("Timeout waiting for stake to appear in elector"))?
+}
+
+fn confirm(prompt: &str) -> anyhow::Result<bool> {
+    print!("{prompt} [y/N]: ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
+}

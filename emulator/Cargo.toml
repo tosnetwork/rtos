@@ -1,0 +1,22 @@
+[package]
+repository = "https://github.com/tosnetwork/rtos"
+build = '../common/build/build.rs'
+edition = "2021"
+license = 'GPL-3.0'
+name = "emulator"
+version = "0.1.0"
+
+[lib]
+name = "emulator"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = '1.0'
+log = '0.4'
+log4rs = '1.2'
+serde_json = '1.0'
+thiserror = '1.0'
+rtos_block = { path = '../block' }
+rtos_block_json = { path = '../block-json' }
+rtos_executor = { path = '../executor' }
+rtos_vm = { path = '../vm' }

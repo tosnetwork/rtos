@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    'adnl',
+    'assembler',
+    'block',
+    'block-json',
+    'executor',
+    'emulator',
+    'lockfree',
+    'rtos',
+    'rtos/catchain',
+    'rtos/consensus-common',
+    'rtos/simplex',
+    'rtos/storage',
+    'rtos/tests/compat_test',
+    'rtos/validator-session',
+    'rtosctl/commands',
+    'rtosctl/common',
+    'rtosctl/contracts',
+    'rtosctl/control-client',
+    'rtosctl/rtosctl', 
+    'rtosctl/service',
+    'rtosctl/rtos-http-api-client',
+    'secrets-vault',
+    'tl/rtos_api',
+    'vm',
+]
+resolver = '2'
+
+[profile.bench]
+debug = true
+
+#Uncomment for profiling
+#[profile.release]
+#debug = 1
