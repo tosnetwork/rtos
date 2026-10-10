@@ -291,3 +291,84 @@ async fn engine_owned_drain_cancelled_waiter_retains_server_and_sticky_failure()
     assert!(weak.upgrade().is_none());
     stopped(open(dir.path()).await).await;
 }
+
+async fn server_construction_race(cancel_startup: bool) {
+    struct SocketServer {
+        stop: tokio::sync::oneshot::Sender<()>,
+        worker: tokio::task::JoinHandle<()>,
+        exits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Stoppable for SocketServer {
+        fn name(&self) -> &'static str {
+            "held socket server"
+        }
+        async fn shutdown(self: Box<Self>) {
+            self.stop.send(()).unwrap();
+            self.worker.await.unwrap();
+            self.exits.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    config(dir.path());
+    let engine = open(dir.path()).await;
+    let (entered, address) = tokio::sync::oneshot::channel();
+    let (release, held) = tokio::sync::oneshot::channel();
+    let exits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let worker_exits = exits.clone();
+    let starting_engine = engine.clone();
+    let starting = tokio::spawn(async move {
+        starting_engine
+            .start_owned_server("held constructor", async move {
+                let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = socket.local_addr().unwrap();
+                let (stop, wait) = tokio::sync::oneshot::channel();
+                let worker = tokio::spawn(async move {
+                    wait.await.unwrap();
+                    drop(socket);
+                });
+                entered.send(address).unwrap();
+                held.await.unwrap();
+                Ok(Box::new(SocketServer { stop, worker, exits: worker_exits })
+                    as Box<dyn Stoppable>)
+            })
+            .await
+    });
+    let address = tokio::time::timeout(Duration::from_secs(5), address).await.unwrap().unwrap();
+    assert!(std::net::TcpListener::bind(address).is_err());
+    if cancel_startup {
+        starting.abort();
+    } else {
+        engine.start_shutdown().unwrap();
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), engine.clone().wait_stop()).await.is_err(),
+        "shutdown forgot a constructor that already owns a live socket worker"
+    );
+    assert_eq!(exits.load(Ordering::SeqCst), 0);
+    assert!(engine.start_owned_server("late constructor", async { unreachable!() }).await.is_err());
+    release.send(()).unwrap();
+    let result = starting.await;
+    if cancel_startup {
+        assert!(result.unwrap_err().is_cancelled());
+    } else {
+        assert!(result.unwrap().is_err(), "stopped constructor became externally ready");
+    }
+    stopped(engine.clone()).await;
+    assert_eq!(exits.load(Ordering::SeqCst), 1);
+    drop(std::net::TcpListener::bind(address).expect("server socket leaked"));
+    let weak = Arc::downgrade(&engine);
+    drop(engine);
+    assert!(weak.upgrade().is_none());
+    stopped(open(dir.path()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_owned_drain_cancelled_server_constructor_waiter_preserves_live_worker() {
+    server_construction_race(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_owned_drain_concurrent_server_constructor_and_stop_closes_admission() {
+    server_construction_race(false).await;
+}

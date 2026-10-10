@@ -91,6 +91,18 @@ struct StorageDictInfo {
 }
 
 pub type SplitQueues = Option<(OutMsgQueue, OutMsgQueue, ahash::AHashSet<UInt256>)>;
+// Cancellation of startup starts retained cleanup instead of dropping resources.
+struct EngineShutdownGuard(Option<Arc<Engine>>);
+impl Drop for EngineShutdownGuard {
+    fn drop(&mut self) {
+        if let Some(engine) = self.0.take() {
+            if let Err(error) = engine.start_shutdown() {
+                engine.stopper.report_service_failure(0, format!("start shutdown: {error}"));
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct EngineOwners {
     stopping: bool,
@@ -109,6 +121,7 @@ pub struct Engine {
     candidate_db: CandidateDbPool,
     network: Arc<NodeNetwork>,
     owned_services: std::sync::Mutex<EngineOwners>,
+    server_constructors: crate::types::owned_tasks::OwnedTasks,
     shutdown_started: std::sync::Mutex<bool>,
     shutdown_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
     ingress_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
@@ -825,6 +838,7 @@ impl Engine {
             archives_life_time_hours,
             network,
             owned_services: std::sync::Mutex::new(EngineOwners::default()),
+            server_constructors: Default::default(),
             shutdown_started: std::sync::Mutex::new(false),
             shutdown_tasks: Arc::new(crate::types::owned_tasks::OwnedTasks::default()),
             ingress_tasks: Arc::new(crate::types::owned_tasks::OwnedTasks::new(
@@ -919,11 +933,13 @@ impl Engine {
         self.monitor_min_split.load(Ordering::Relaxed)
     }
 
-    pub async fn wait_stop(self: Arc<Self>) -> Result<()> {
+    fn start_shutdown(self: &Arc<Self>) -> Result<Arc<crate::types::owned_tasks::OwnedTasks>> {
         let tasks = self.shutdown_tasks.clone();
         {
             let mut started = self.shutdown_started.lock().unwrap();
             if !*started {
+                self.stopper.set_stop();
+                self.server_constructors.stop();
                 let engine = self.clone();
                 let result_owner = tasks.clone();
                 tasks.spawn("Engine shutdown", async move {
@@ -934,7 +950,44 @@ impl Engine {
                 *started = true;
             }
         }
-        tasks.wait().await
+        Ok(tasks)
+    }
+
+    pub async fn wait_stop(self: Arc<Self>) -> Result<()> {
+        self.start_shutdown()?.wait().await
+    }
+
+    async fn start_owned_server(
+        self: &Arc<Self>,
+        name: &'static str,
+        constructor: impl std::future::Future<Output = Result<Box<dyn Stoppable>>> + Send + 'static,
+    ) -> Result<()> {
+        let mut guard = EngineShutdownGuard(Some(self.clone()));
+        let engine = self.clone();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        self.server_constructors.spawn(name, async move {
+            let result = match constructor.await {
+                Ok(server) => {
+                    engine.servers.push(server);
+                    Ok(())
+                }
+                Err(error) => {
+                    let message = format!("{name} construction: {error}");
+                    engine.stopper.report_service_failure(0, message.clone());
+                    Err(message)
+                }
+            };
+            let _ = sent.send(result);
+        })?;
+        received
+            .await
+            .map_err(|error| error!("{name} constructor completion: {error}"))?
+            .map_err(|error| error!("{error}"))?;
+        if self.stopper.check_stop() {
+            fail!("Engine stopped during {name} construction");
+        }
+        guard.0.take();
+        Ok(())
     }
 
     async fn wait_stop_inner(self: Arc<Self>) -> Result<()> {
@@ -956,6 +1009,12 @@ impl Engine {
             queue.stop();
         }
 
+        // Constructors admitted before close finish and register their server
+        // even when the original startup waiter was cancelled. None can register
+        // after this join, so taking the shutdown owners is race-free.
+        if let Err(error) = self.server_constructors.wait().await {
+            self.stopper.report_service_failure(0, format!("server constructors: {error}"));
+        }
         // stop servers
         let mut tasks = Vec::new();
         while let Some(server) = self.servers.pop() {
@@ -2592,6 +2651,7 @@ pub async fn run(
     // Create engine
     let truncate_db = flags.truncate_db;
     let engine = Engine::new(node_config, flags, stopper.clone()).await?;
+    let mut startup_guard = EngineShutdownGuard(Some(engine.clone()));
     if let Some(mc_seq_no) = truncate_db {
         engine.truncate_database(mc_seq_no).await?;
     }
@@ -2602,36 +2662,50 @@ pub async fn run(
         #[cfg(all(target_os = "linux", feature = "telemetry"))]
         proc_status_logger();
 
-        // control server
+        // Each constructor is owned before its first poll. A cancelled startup
+        // can neither abandon a live server nor race late registration with stop.
         if let Some(config) = control_server_config {
-            let server = ControlServer::with_params(
-                config,
-                DataSource::Engine(engine.clone()),
-                engine.network().config_handler(),
-                engine.network().config_handler(),
-                Some(engine.network()),
-            )
-            .await?;
-            engine.servers.push(Box::new(server));
+            let owner = engine.clone();
+            engine
+                .start_owned_server("control", async move {
+                    let server = ControlServer::with_params(
+                        config,
+                        DataSource::Engine(owner.clone()),
+                        owner.network().config_handler(),
+                        owner.network().config_handler(),
+                        Some(owner.network()),
+                    )
+                    .await?;
+                    Ok(Box::new(server) as Box<dyn Stoppable>)
+                })
+                .await?;
         }
-
-        // liteserver
         if let Some(config) = lite_server_config {
-            let server =
-                LiteServer::with_params(config, liteserver_runtime, engine.clone()).await?;
-            engine.servers.push(Box::new(server));
+            let owner = engine.clone();
+            engine
+                .start_owned_server("lite", async move {
+                    let server = LiteServer::with_params(config, liteserver_runtime, owner).await?;
+                    Ok(Box::new(server) as Box<dyn Stoppable>)
+                })
+                .await?;
         }
-
-        // jsonrpc server
         if let Some(config) = json_rpc_server_config {
-            let server = RpcServer::start(config, engine.clone()).await?;
-            engine.servers.push(Box::new(server));
+            let owner = engine.clone();
+            engine
+                .start_owned_server("JSON RPC", async move {
+                    let server = RpcServer::start(config, owner).await?;
+                    Ok(Box::new(server) as Box<dyn Stoppable>)
+                })
+                .await?;
         }
-
-        // metrics server (Prometheus + health probes)
         if let Some((address, handle)) = metrics {
-            let server = start_metrics_server(engine.clone(), address, handle).await;
-            engine.servers.push(Box::new(server));
+            let owner = engine.clone();
+            engine
+                .start_owned_server("metrics", async move {
+                    Ok(Box::new(start_metrics_server(owner, address, handle).await)
+                        as Box<dyn Stoppable>)
+                })
+                .await?;
         }
 
         // Overlays
@@ -2708,7 +2782,7 @@ pub async fn run(
     }
     .await;
 
-    match result {
+    let result = match result {
         Err(e) => {
             // Always wait for engine stop
             match engine_ret.wait_stop().await {
@@ -2739,7 +2813,9 @@ pub async fn run(
             });
             Ok((engine_ret, join_engine))
         }
-    }
+    };
+    startup_guard.0.take();
+    result
 }
 
 #[cfg(target_os = "linux")]
