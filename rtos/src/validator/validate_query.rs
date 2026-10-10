@@ -2150,8 +2150,6 @@ impl ValidateQuery {
         CHECK!(&base.config_params, inited);
         // C++ parity: allow_same_timestamp_ = global_version_ >= 13.
         // Depends only on the global protocol version, not on consensus type.
-        // When true, also skips the future-time check (base.now > engine.now + 15)
-        // which C++ simplex testnet does not have.
         let allow_same_timestamp = {
             #[cfg(feature = "xp25")]
             {
@@ -2204,19 +2202,6 @@ impl ValidateQuery {
             )
         }
 
-        // C++ parity: C++ variants (mainnet, simplex-testnet, alpenglow-work) do not
-        // reject blocks for being too far in the future. To stay compatible with blocks
-        // produced by C++ collators, we only emit a warning instead of rejecting.
-        if !allow_same_timestamp {
-            let now = self.engine.now();
-            if base.now() > now + 15 {
-                log::warn!(
-                    "block has creation time {} too much in the future (local time is {now})",
-                    base.now(),
-                );
-            }
-        }
-
         if base.info.start_lt() <= mc_data.state.state()?.gen_lt() {
             reject_query!(
                 "block has start_lt {} less than or equal to lt {} \
@@ -2264,6 +2249,11 @@ impl ValidateQuery {
                 )
             }
             _ => {}
+        }
+        // The fixed reference applies this local wall-clock bound at every
+        // protocol version. It withholds validation, not evidence of misbehavior.
+        if base.now() > self.engine.now().wrapping_add(30) {
+            soft_reject_query!("gen_utime {} is too far in the future", base.now());
         }
         Ok(())
     }
@@ -7176,3 +7166,7 @@ impl ValidateQuery {
 #[cfg(test)]
 #[path = "tests/test_candidate_header.rs"]
 mod candidate_header_tests;
+
+#[cfg(test)]
+#[path = "tests/test_candidate_nonempty.rs"]
+mod candidate_nonempty_tests;
