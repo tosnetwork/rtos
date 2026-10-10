@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): naming and durable own-decision journal integration.
+ * RTOS project modifications (2026-10-10): wait for database completion before testing continuation effects.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -588,12 +588,14 @@ impl crate::task_queue::TaskQueue<crate::task_queue::CallbackTaskPtr> for TestCa
 // Mock Database
 // ============================================================================
 
-/// Mock database for tests (in-memory, no persistence)
+const TEST_DB_WATCHDOG: Duration = Duration::from_secs(30);
+
+/// Real temporary RocksDB database used by the session tests.
 struct MockDb;
 
 impl MockDb {
     fn new() -> crate::database::SimplexDbPtr {
-        // Create a temporary database in memory
+        // Open an independent on-disk database and asynchronous worker.
         let temp_dir = env::temp_dir().join(format!("test_db_{}", rand::random::<u64>()));
         fs::create_dir_all(&temp_dir).unwrap();
         crate::database::SimplexDb::open(&temp_dir, "test").unwrap()
@@ -725,32 +727,42 @@ impl TestFixture {
         self.receiver.drain_actions()
     }
 
-    /// Drain `pending_async_db_results` by polling the registry while the
-    /// background storage thread flushes in-flight writes. Used by tests that
-    /// exercise `*_async()` continuations migrated to the SXMAIN async-DB-results
-    /// registry — without this, post-persist side-effects (broadcast, cache,
-    /// standstill update) would not have run by the time the test asserts on
-    /// receiver actions.
+    /// Wait for actual FIFO storage completion, then run registry continuations.
+    /// The watchdog diagnoses a stalled worker; elapsed time never authorizes a
+    /// write. Individual results still flow through the production registry.
     fn drain_pending_async_db_results(&mut self) {
-        for _ in 0..200 {
+        self.drain_pending_async_db_results_with_watchdog(TEST_DB_WATCHDOG);
+    }
+
+    fn drain_pending_async_db_results_with_watchdog(&mut self, watchdog: Duration) {
+        let deadline = std::time::Instant::now() + watchdog;
+        loop {
             self.processor.process_pending_async_db_results();
             if self.processor.database.pending_is_empty() {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            let registered: Vec<_> = self
+                .processor
+                .database
+                .pending_iter()
+                .map(|entry| (entry.id, entry.op_label))
+                .collect();
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .expect("DB completion drain watchdog expired");
+            self.processor.database.db().sync(Some(remaining)).unwrap_or_else(|err| {
+                panic!("DB completion barrier failed for {registered:?}: {err}")
+            });
+            self.processor.process_pending_async_db_results();
+            for (id, label) in registered {
+                assert!(
+                    !self.processor.database.pending_iter().any(|entry| entry.id == id),
+                    "storage barrier did not complete registered DB result id={id} label={label}",
+                );
+            }
+            // Continuations may have queued more writes. They require their own
+            // completion barrier; a prior barrier says nothing about later work.
         }
-        // 200 polls * 5 ms = ~1 s budget (orders of magnitude above the observed
-        // continuation latency). If anything is still queued, a registered
-        // continuation never completed — fail loudly instead of letting the test
-        // assert against half-applied side-effects (the original `break` silently
-        // hid such stalls).
-        assert!(
-            self.processor.database.pending_is_empty(),
-            "drain_pending_async_db_results: {} entr{} still pending after 200 polls (~1s); \
-             a registered continuation never completed",
-            self.processor.database.pending_count(),
-            if self.processor.database.pending_count() == 1 { "y" } else { "ies" },
-        );
     }
 }
 
@@ -7340,9 +7352,11 @@ fn test_process_received_notar_cert_aborts_when_persist_fails() {
             .processor
             .database
             .db()
-            .load_notar_cert_by_id(&candidate_id, Duration::from_secs(1))
-            .expect("notar cert lookup must succeed")
-            .is_none(),
+            .load_notar_certs_async()
+            .wait_timeout(TEST_DB_WATCHDOG)
+            .expect("DB certificate scan watchdog expired")
+            .expect("notar cert scan must succeed")
+            .is_empty(),
         "failed persist must not leave notar cert in DB"
     );
 }
@@ -10861,4 +10875,233 @@ fn own_journal_real_candidate_recovery_uses_durable_carrier() {
             assert_eq!(h.calls.load(Ordering::SeqCst), 1);
         }
     }
+}
+
+/// Hold the real DB worker inside a callback. Simplex disables the separate
+/// callback thread, so subsequent storage operations remain queued until release.
+struct TestDbWorkerGate {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    expired: Arc<AtomicBool>,
+}
+
+impl TestDbWorkerGate {
+    fn hold(fixture: &TestFixture) -> Self {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let expired = Arc::new(AtomicBool::new(false));
+        let worker_expired = expired.clone();
+        fixture.processor.database.db().storage.get(
+            b"test-worker-gate".to_vec(),
+            Some(Box::new(move |result| {
+                let _ = entered_tx.send(result.is_ok());
+                if release_rx.recv_timeout(TEST_DB_WATCHDOG).is_err() {
+                    worker_expired.store(true, Ordering::SeqCst);
+                }
+            })),
+        );
+        assert!(entered_rx
+            .recv_timeout(TEST_DB_WATCHDOG)
+            .expect("DB worker must enter the callback"));
+        Self { release: Some(release_tx), expired }
+    }
+    fn release(mut self) {
+        assert!(!self.expired.load(Ordering::SeqCst), "DB worker gate watchdog expired");
+        self.release.take().unwrap().send(()).expect("DB worker must still await release");
+    }
+}
+
+impl Drop for TestDbWorkerGate {
+    fn drop(&mut self) {
+        // Release on assertion unwind too, before the fixture drops and joins DB.
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+fn queued_notar_event(slot: SlotIndex) -> crate::simplex_state::NotarizationReachedEvent {
+    let block_hash = UInt256::rand();
+    let signatures = (0..3)
+        .map(|i| crate::certificate::VoteSignature::new(ValidatorIndex::new(i), vec![i as u8]))
+        .collect();
+    let vote = crate::simplex_state::NotarizeVote { slot, block_hash: block_hash.clone() };
+    let certificate = Arc::new(crate::certificate::Certificate { vote, signatures });
+    crate::simplex_state::NotarizationReachedEvent { slot, block_hash, certificate }
+}
+
+#[test]
+fn test_real_db_worker_completion_gates_notar_relay() {
+    let mut fixture = TestFixture::new(4);
+    fixture.processor.set_time(fixture.processor.now());
+    let gate = TestDbWorkerGate::hold(&fixture);
+    fixture.processor.handle_notarization_reached(queued_notar_event(SlotIndex::new(230)));
+    fixture.processor.process_pending_async_db_results();
+    assert_eq!(fixture.processor.database.pending_count(), 1);
+    assert!(fixture
+        .drain_receiver_actions()
+        .iter()
+        .all(|a| !matches!(a, ReceiverAction::SendCertificate { .. })));
+    gate.release();
+    fixture.drain_pending_async_db_results();
+    assert_eq!(
+        fixture
+            .drain_receiver_actions()
+            .iter()
+            .filter(|a| matches!(a, ReceiverAction::SendCertificate { .. }))
+            .count(),
+        1
+    );
+    assert!(!fixture
+        .processor
+        .database
+        .db()
+        .load_notar_certs_async()
+        .wait_timeout(TEST_DB_WATCHDOG)
+        .expect("DB read watchdog expired")
+        .unwrap()
+        .is_empty());
+    fixture.processor.process_pending_async_db_results();
+    assert!(fixture.drain_receiver_actions().is_empty());
+}
+
+#[test]
+fn test_real_db_worker_late_completion_does_not_bypass_deadline() {
+    let mut fixture = TestFixture::new(4);
+    fixture.processor.set_time(fixture.processor.now());
+    let gate = TestDbWorkerGate::hold(&fixture);
+    let errors_before = fixture.processor.telemetry.session_errors_count.load(Ordering::Relaxed);
+    fixture.processor.handle_notarization_reached(queued_notar_event(SlotIndex::new(231)));
+    fixture.processor.process_pending_async_db_results();
+    assert_eq!(fixture.processor.database.pending_count(), 1);
+    fixture.advance_time(DEFAULT_ASYNC_DB_WRITE_TIMEOUT + Duration::from_secs(1));
+    fixture.processor.process_pending_async_db_results();
+    assert!(fixture.processor.database.pending_is_empty());
+    assert_eq!(
+        fixture.processor.telemetry.session_errors_count.load(Ordering::Relaxed),
+        errors_before + 1
+    );
+    assert!(fixture
+        .drain_receiver_actions()
+        .iter()
+        .all(|a| !matches!(a, ReceiverAction::SendCertificate { .. })));
+    gate.release();
+    fixture.processor.database.db().sync(Some(TEST_DB_WATCHDOG)).unwrap();
+    // A timeout does not cancel an already queued write. Its eventual durability
+    // must not revive the expired continuation or authorize a late relay.
+    assert!(!fixture
+        .processor
+        .database
+        .db()
+        .load_notar_certs_async()
+        .wait_timeout(TEST_DB_WATCHDOG)
+        .expect("DB read watchdog expired")
+        .unwrap()
+        .is_empty());
+    fixture.processor.process_pending_async_db_results();
+    assert!(fixture
+        .drain_receiver_actions()
+        .iter()
+        .all(|a| !matches!(a, ReceiverAction::SendCertificate { .. })));
+}
+
+#[test]
+#[should_panic(expected = "storage barrier did not complete registered DB result")]
+fn test_db_completion_drain_rejects_uncompleted_manual_result() {
+    let mut fixture = TestFixture::new(4);
+    fixture.processor.post_async_db_result(
+        "uncompleted_manual_result",
+        ManualAsyncResult::pending(),
+        DEFAULT_ASYNC_DB_WRITE_TIMEOUT,
+        |_, _| panic!("uncompleted manual result must not run its continuation"),
+    );
+    fixture.drain_pending_async_db_results();
+}
+
+#[test]
+fn test_db_completion_drain_waits_for_chained_real_writes() {
+    let mut fixture = TestFixture::new(4);
+    let completed = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let count = completed.clone();
+    let result =
+        fixture.processor.database.db().storage.set(b"test-first-write".to_vec(), vec![1], None);
+    fixture.processor.post_async_db_result(
+        "first_real_write",
+        result,
+        DEFAULT_ASYNC_DB_WRITE_TIMEOUT,
+        move |processor, result| {
+            result.unwrap();
+            count.fetch_add(1, Ordering::Relaxed);
+            let next =
+                processor.database.db().storage.set(b"test-second-write".to_vec(), vec![2], None);
+            processor.post_async_db_result(
+                "second_real_write",
+                next,
+                DEFAULT_ASYNC_DB_WRITE_TIMEOUT,
+                move |_, result| {
+                    result.unwrap();
+                    count.fetch_add(1, Ordering::Relaxed);
+                },
+            );
+        },
+    );
+    fixture.drain_pending_async_db_results();
+    assert_eq!(completed.load(Ordering::Relaxed), 2);
+    assert!(fixture.processor.database.pending_is_empty());
+}
+
+#[test]
+fn test_db_completion_drain_preserves_real_storage_error() {
+    let mut fixture = TestFixture::new(4);
+    fixture.processor.database.db().close(Some(TEST_DB_WATCHDOG)).unwrap();
+    let result =
+        fixture.processor.database.db().storage.set(b"closed-db-write".to_vec(), vec![1], None);
+    let failed = Arc::new(AtomicBool::new(false));
+    let observed = failed.clone();
+    fixture.processor.post_async_db_result(
+        "closed_db_write",
+        result,
+        DEFAULT_ASYNC_DB_WRITE_TIMEOUT,
+        move |_, result| {
+            assert!(result.unwrap_err().to_string().contains("closed"));
+            observed.store(true, Ordering::SeqCst);
+        },
+    );
+    fixture.drain_pending_async_db_results();
+    assert!(failed.load(Ordering::SeqCst));
+    assert!(fixture.processor.database.pending_is_empty());
+}
+
+#[test]
+fn test_db_completion_watchdog_reports_blocked_worker_without_relay() {
+    let mut fixture = TestFixture::new(4);
+    fixture.processor.set_time(fixture.processor.now());
+    let gate = TestDbWorkerGate::hold(&fixture);
+    fixture.processor.handle_notarization_reached(queued_notar_event(SlotIndex::new(232)));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture.drain_pending_async_db_results_with_watchdog(Duration::from_millis(100));
+    }));
+    let panic = outcome.expect_err("a blocked DB worker must trip the diagnostic watchdog");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(message.contains("DB completion barrier failed"), "unexpected panic: {message}");
+    assert_eq!(fixture.processor.database.pending_count(), 1);
+    assert!(fixture
+        .drain_receiver_actions()
+        .iter()
+        .all(|a| !matches!(a, ReceiverAction::SendCertificate { .. })));
+    // The diagnostic did not complete or discard the production result. Releasing
+    // the worker makes it observable and permits the original continuation once.
+    gate.release();
+    fixture.drain_pending_async_db_results();
+    assert_eq!(
+        fixture
+            .drain_receiver_actions()
+            .iter()
+            .filter(|a| matches!(a, ReceiverAction::SendCertificate { .. }))
+            .count(),
+        1
+    );
 }
