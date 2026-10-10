@@ -1877,6 +1877,10 @@ impl Loader {
         check_eq!(slice.get_next_int(24)?, 0xf93100);
         Ok(Instruction::new("PQCHECKSIG_MLDSA44"))
     }
+    pub(super) fn pq_falcon512(&mut self, slice: &mut SliceData) -> Result<Instruction> {
+        check_eq!(slice.get_next_int(24)?, 0xf93101);
+        Ok(Instruction::new("PQCHECKSIG_FALCON512_PADDED"))
+    }
     create_handler_2!(chksignu, 0xf910, "CHKSIGNU");
     create_handler_2!(chksigns, 0xf911, "CHKSIGNS");
     create_handler_2!(cdatasizeq, 0xf940, "CDATASIZEQ");

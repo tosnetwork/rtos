@@ -557,3 +557,7 @@ mod test_exotic_actions;
 #[cfg(test)]
 #[path = "tests/test_opcode_gates.rs"]
 mod test_opcode_gates;
+
+#[cfg(test)]
+#[path = "tests/test_falcon512_transaction.rs"]
+mod test_falcon512_transaction;

@@ -90,3 +90,36 @@ pub(super) fn execute_pq_mldsa44(engine: &mut Engine) -> Status {
     engine.cc.stack.push(StackItem::boolean(valid));
     Ok(())
 }
+
+pub(super) fn execute_pq_falcon512(engine: &mut Engine) -> Status {
+    use rtos_pq_crypto::falcon512::{MAX_MESSAGE_BYTES, PUBLIC_KEY_BYTES, SIGNATURE_BYTES};
+    if engine.block_version() < 19 {
+        return engine.reject_unavailable_instruction();
+    }
+    engine.load_instruction(Instruction::new("PQCHECKSIG_FALCON512_PADDED"))?;
+    if engine.cc.stack.depth() < 3 {
+        fail!(ExceptionCode::StackUnderflow);
+    }
+    engine.try_use_gas(20_000)?;
+    fetch_stack(engine, 3)?;
+    // Type-check all three values before decoding any, in top-to-bottom order.
+    let key = engine.cmd.var(0).as_cell()?.clone();
+    let signature = engine.cmd.var(1).as_cell()?.clone();
+    let message = engine.cmd.var(2).as_cell()?.clone();
+    let key = read_bytes(engine, key, PUBLIC_KEY_BYTES)?;
+    let signature = read_bytes(engine, signature, SIGNATURE_BYTES)?;
+    let message = read_bytes(engine, message, MAX_MESSAGE_BYTES)?;
+    if key.len() != PUBLIC_KEY_BYTES || signature.len() != SIGNATURE_BYTES {
+        fail!(ExceptionCode::CellUnderflow, "incorrect Falcon-512 input length");
+    }
+    let valid = match rtos_pq_crypto::falcon512::verify(&message, &signature, &key) {
+        Ok(valid) => valid,
+        Err(rtos_pq_crypto::falcon512::VerifyError::Backend(_)) => {
+            fail!(ExceptionCode::FatalError, "Falcon-512 verifier backend failure");
+        }
+        Err(_) => fail!(ExceptionCode::CellUnderflow, "incorrect Falcon-512 input length"),
+    };
+    // Deliberately do not consult chksig_always_succeed or the classic free-call allowance.
+    engine.cc.stack.push(StackItem::boolean(valid));
+    Ok(())
+}
