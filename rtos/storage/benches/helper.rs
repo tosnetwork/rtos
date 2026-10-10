@@ -99,7 +99,7 @@ pub fn generate_boc(need_cells: u32, rng: &mut impl rand::RngCore) -> Cell {
 
             total_cells += 1;
             let cell = builder.into_cell().unwrap();
-            hashes.insert(cell.repr_hash());
+            hashes.insert(cell.repr_hash().clone());
             next_level_cells.push(cell);
         }
         bottom_level = false;

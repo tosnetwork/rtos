@@ -15,8 +15,8 @@ use rtos_block::{
     Transaction, TransactionDescr,
 };
 use rtos_executor::{
-    BlockchainConfig, ExecuteParams, OrdinaryTransactionExecutor, TickTockTransactionExecutor,
-    TransactionExecutor,
+    BlockchainConfig, ExecuteParams, ExecutorError, OrdinaryTransactionExecutor,
+    TickTockTransactionExecutor, TransactionExecutor,
 };
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +32,7 @@ fn replay_transaction_by_files(
     config: &str,
 ) {
     let config = read_config(config).unwrap();
-    let mc_state_proof = mc_state_proof_cell_with_config(config);
+    let mc_state_proof = mc_state_proof_cell_with_config(config, None);
     replay_transaction(c, acc, acc_after, tr, "", mc_state_proof);
 }
 
@@ -373,7 +373,7 @@ fn replay_block(data: BlockData) -> Status {
                     ..Default::default()
                 },
             )?;
-            if account.serialize()?.repr_hash() != tr.read_state_update()?.new_hash {
+            if *account.serialize()?.repr_hash() != tr.read_state_update()?.new_hash {
                 fail!("new hash mismatch");
             }
         }
