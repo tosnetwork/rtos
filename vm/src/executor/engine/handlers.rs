@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): complete HASHEXT and exact GETPARAMLONG registration.
+ * RTOS project modifications (2026-10-10): exact control-register opcode ranges and prior opcode fixes.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -617,16 +617,15 @@ impl Handlers {
                     .set(0x12, execute_setnumvarargs)
                     .set(0x1E, execute_bless)
                     .set(0x1F, execute_blessva)
-                    .set_range(0x40..0x50, execute_pushctr)
-                    .set_range(0x50..0x60, execute_popctr)
-                    .set_range(0x60..0x70, execute_setcontctr)
-                    .set_range(0x70..0x76, execute_setretctr)
-                    .set(0x77, execute_setretctr)
-                    .set_range(0x80..0x90, execute_setaltctr)
-                    .set_range(0x90..0xA0, execute_popsave)
-                    .set_range(0xA0..0xB0, execute_save)
-                    .set_range(0xB0..0xC0, execute_savealt)
-                    .set_range(0xC0..0xD0, execute_saveboth)
+                    .set_control_registers(0x40, execute_pushctr)
+                    .set_control_registers(0x50, execute_popctr)
+                    .set_control_registers(0x60, execute_setcontctr)
+                    .set_control_registers(0x70, execute_setretctr)
+                    .set_control_registers(0x80, execute_setaltctr)
+                    .set_control_registers(0x90, execute_popsave)
+                    .set_control_registers(0xA0, execute_save)
+                    .set_control_registers(0xB0, execute_savealt)
+                    .set_control_registers(0xC0, execute_saveboth)
                     // 0xEDE0
                     .set(0xE0, execute_pushctrx)
                     .set(0xE1, execute_popctrx)
@@ -1092,6 +1091,12 @@ impl Handlers {
     fn set(&mut self, code: u8, handler: ExecuteHandler) -> &mut Handlers {
         self.register_handler(code, handler);
         self
+    }
+
+    // Immediate control-register instructions only encode c0..c5 and c7.
+    // Unregistered holes must fail lookup before instruction gas or operands.
+    fn set_control_registers(&mut self, prefix: u8, handler: ExecuteHandler) -> &mut Handlers {
+        self.set_range(prefix..prefix + 6, handler).set(prefix + 7, handler)
     }
 
     fn set_range(&mut self, codes: Range<u8>, handler: ExecuteHandler) -> &mut Handlers {
