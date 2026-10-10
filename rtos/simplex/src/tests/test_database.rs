@@ -747,3 +747,65 @@ fn test_simplexdb_drop_without_close_still_flushes() {
     assert_eq!(records.len(), 10, "every write must persist across drop-without-close");
     reopened.mark_for_destroy();
 }
+
+#[test]
+fn pq_strict_bootstrap_preserves_records_and_classical_loader_policy() {
+    let (path, db) = create_test_db("pq_strict_bootstrap");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let load = || db.load_pq_bootstrap_cancellable(&cancel, Duration::from_millis(10));
+    assert!(load().unwrap().is_empty());
+    let id = create_candidate_id(1, 42);
+    db.save_finalized_block_async(&FinalizedBlockRecord {
+        candidate_id: id.clone(),
+        block_id: create_block_id(1),
+        parent: None,
+        is_final: true,
+    })
+    .unwrap()
+    .wait()
+    .unwrap();
+    db.save_candidate_info_async(&CandidateInfoRecord {
+        candidate_id: id.clone(),
+        leader_idx: 0,
+        candidate_hash_data: create_candidate_hash_data(),
+        signature: vec![0; 2420],
+    })
+    .unwrap()
+    .wait()
+    .unwrap();
+    db.save_notar_cert_async(&id, &create_notar_cert(1, &id.hash, 2)).unwrap().wait().unwrap();
+    db.save_final_cert_async(&id, &create_final_cert(1, &id.hash, 2)).unwrap().wait().unwrap();
+    db.save_skip_cert_async(SlotIndex::new(2), &create_skip_cert(2, 2)).unwrap().wait().unwrap();
+    let data = vec![1, 2, 3];
+    db.save_vote_async(&VoteRecord {
+        vote_hash: UInt256::calc_file_hash(&data),
+        data,
+        node_idx: ValidatorIndex::new(0),
+        seqno: 0,
+    })
+    .unwrap()
+    .wait()
+    .unwrap();
+    db.save_pool_state_async(&PoolStateRecord::default()).unwrap().wait().unwrap();
+    db.storage.set(serialize_candidate_payload_key(&id).unwrap(), vec![3, 4], None).wait().unwrap();
+    let bootstrap = load().unwrap();
+    assert_eq!(bootstrap.finalized_blocks.len(), 1);
+    assert_eq!(bootstrap.candidate_infos.len(), 1);
+    assert_eq!(bootstrap.notar_certs.len(), 1);
+    assert_eq!(bootstrap.final_certs.len(), 1);
+    assert_eq!(bootstrap.skip_certs.len(), 1);
+    assert_eq!(bootstrap.votes.len(), 1);
+    assert_eq!(bootstrap.candidate_payloads.len(), 1);
+    assert!(bootstrap.pool_state.is_some());
+    // This is a decoding test, not signature authentication: the bootstrap must
+    // retain all records for the separate preflight, including synthetic bytes.
+    let bad_key = serialize_candidate_info_key(&create_candidate_id(3, 44)).unwrap();
+    db.storage.set(bad_key, vec![0], None).wait().unwrap();
+    assert!(load().is_err());
+    let classical = db.load_bootstrap_cancellable(&cancel, Duration::from_millis(10)).unwrap();
+    assert_eq!(classical.candidate_infos.len(), 1);
+    assert_eq!(classical.finalized_blocks.len(), 1);
+    db.close(Some(Duration::from_secs(10))).unwrap();
+    drop(db);
+    fs::remove_dir_all(path).unwrap();
+}

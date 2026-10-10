@@ -327,6 +327,16 @@ impl Bootstrap {
 // Conversions between domain record types and their TL key / value wire
 // representations.
 
+/// Reject suffixes and noncanonical envelopes before any typed conversion can
+/// drop a field or convert a certificate into its recovery representation.
+fn strict_db_object<T: rtos_api::AnyBoxedSerialize>(bytes: &[u8]) -> Result<T> {
+    let (object, consumed) = rtos_api::deserialize_typed_with_suffix::<T>(bytes)?;
+    if consumed != bytes.len() || serialize_boxed(&object)? != bytes {
+        return Err(error!("PQ bootstrap: noncanonical database record"));
+    }
+    Ok(object)
+}
+
 /// Convert RawCandidateId to TL CandidateId
 fn raw_candidate_id_to_tl(id: &RawCandidateId) -> CandidateId {
     CandidateId { slot: id.slot.value() as i32, hash: id.hash.clone().into() }
@@ -1540,6 +1550,91 @@ impl SimplexDb {
             bootstrap.pool_state.is_some()
         );
 
+        Ok(bootstrap)
+    }
+
+    /// Load every record from a PQ session database without discarding malformed
+    /// input or repairing history before authentication. This database is private
+    /// to one session; unknown keys also fail closed. Classical recovery retains
+    /// its historical permissive loader below.
+    pub fn load_pq_bootstrap_cancellable(
+        &self,
+        cancel: &dyn consensus_common::Cancellable,
+        step: Duration,
+    ) -> Result<Bootstrap> {
+        let records =
+            self.storage.get_by_prefix(Vec::new(), None).wait_cancellable(cancel, step)?;
+        let mut bootstrap = Bootstrap::default();
+        for (key, value) in records {
+            let tag = key.get(..4).ok_or_else(|| error!("PQ bootstrap: truncated database key"))?;
+            let tag = u32::from_le_bytes(tag.try_into().unwrap());
+            if tag == prefix_finalized_block() {
+                strict_db_object::<FinalizedBlockKeyBoxed>(&key)?;
+                strict_db_object::<FinalizedBlockValueBoxed>(&value)?;
+                bootstrap.finalized_blocks.push(deserialize_finalized_block(&key, &value)?);
+            } else if tag == prefix_candidate_info() {
+                strict_db_object::<CandidateInfoKeyBoxed>(&key)?;
+                strict_db_object::<CandidateInfoValueBoxed>(&value)?;
+                bootstrap.candidate_infos.push(deserialize_candidate_info(&key, &value)?);
+            } else if tag == prefix_vote() {
+                let vote_key = strict_db_object::<VoteKeyBoxed>(&key)?.only();
+                let entry = strict_db_object::<VoteValueBoxed>(&value)?;
+                let signed_bytes = match &entry {
+                    VoteValueBoxed::Consensus_Simplex_Db_Vote(vote) => vote.data.clone(),
+                    VoteValueBoxed::Consensus_Simplex_Db_Cert(cert) => {
+                        serialize_boxed(&cert.cert.clone().into_boxed())?
+                    }
+                };
+                if vote_key.vote_hash != UInt256::calc_file_hash(&signed_bytes) {
+                    return Err(error!("PQ bootstrap: vote/certificate key hash mismatch"));
+                }
+                match deserialize_vote_storage_entry(&key, &value)? {
+                    VoteStorageEntry::Vote(vote) => {
+                        if vote.seqno < 0 {
+                            return Err(error!("PQ bootstrap: negative vote sequence"));
+                        }
+                        bootstrap.votes.push(vote);
+                    }
+                    VoteStorageEntry::NotarCert(cert) => bootstrap.notar_certs.push(cert),
+                    VoteStorageEntry::FinalCert(cert) => bootstrap.final_certs.push(cert),
+                    VoteStorageEntry::SkipCert(cert) => bootstrap.skip_certs.push(cert),
+                }
+            } else if tag == prefix_pool_state() {
+                strict_db_object::<PoolStateKey>(&key)?;
+                strict_db_object::<PoolStateValueBoxed>(&value)?;
+                if bootstrap.pool_state.is_some() {
+                    return Err(error!("PQ bootstrap: duplicate pool state"));
+                }
+                bootstrap.pool_state = Some(deserialize_pool_state(&value)?);
+            } else if tag == prefix_candidate_payload() {
+                strict_db_object::<CandidatePayloadKeyBoxed>(&key)?;
+                // Raw candidate bytes are authenticated by the recovery preflight.
+                bootstrap
+                    .candidate_payloads
+                    .push((deserialize_candidate_payload_key(&key)?, value));
+            } else {
+                return Err(error!("PQ bootstrap: unknown database key tag {tag:08x}"));
+            }
+        }
+        bootstrap.finalized_blocks.sort_by_key(|record| record.candidate_id.slot);
+        let mut expected_parent = None;
+        for record in &bootstrap.finalized_blocks {
+            if record.parent != expected_parent {
+                return Err(error!("PQ bootstrap: inconsistent finalized chain"));
+            }
+            expected_parent = Some(record.candidate_id.clone());
+        }
+        bootstrap.notar_certs.sort_by_key(|record| record.candidate_id.slot);
+        bootstrap.final_certs.sort_by_key(|record| record.candidate_id.slot);
+        bootstrap.skip_certs.sort_by_key(|record| record.slot);
+        bootstrap.votes.sort_by_key(|record| record.seqno);
+        if let Some(last) = bootstrap.votes.last() {
+            let next = last
+                .seqno
+                .checked_add(1)
+                .ok_or_else(|| error!("PQ bootstrap: vote sequence overflow"))?;
+            self.next_vote_seqno.store(next, Ordering::Relaxed);
+        }
         Ok(bootstrap)
     }
 

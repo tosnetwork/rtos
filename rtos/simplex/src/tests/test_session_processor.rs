@@ -10414,3 +10414,234 @@ fn pq_live_recovery_authenticates_finalized_parent_chains_and_role_flags() {
         }
     }
 }
+
+/// A failed PQ bootstrap must never even attempt network registration. Returning
+/// an error also bounds a regression: the test cannot leave a live session behind.
+struct RejectBootstrapOverlay(std::sync::atomic::AtomicUsize);
+impl consensus_common::ConsensusOverlayManager for RejectBootstrapOverlay {
+    fn start_overlay(
+        &self,
+        _key: &consensus_common::PrivateKey,
+        _id: &Arc<adnl::PrivateOverlayShortId>,
+        _nodes: &[consensus_common::ConsensusNode],
+        _listener: consensus_common::ConsensusOverlayListenerPtr,
+        _replay: consensus_common::ConsensusOverlayLogReplayListenerPtr,
+        _transport: consensus_common::OverlayTransportType,
+        _sync: Option<consensus_common::BlockSyncOverlayParams>,
+    ) -> rtos_block::Result<consensus_common::ConsensusOverlayPtr> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(rtos_block::error!("unexpected overlay registration after corrupt PQ bootstrap"))
+    }
+    fn stop_overlay(
+        &self,
+        _id: &Arc<adnl::PrivateOverlayShortId>,
+        _overlay: &consensus_common::ConsensusOverlayPtr,
+    ) {
+    }
+}
+
+#[test]
+fn pq_live_session_rejects_raw_corruption_before_overlay_or_replay() {
+    use crate::pq_fixture as f;
+    use consensus_common::{AsyncKeyValueStorageOptions, ConsensusCommonFactory};
+    use rtos_api::ton::consensus::{
+        candidateparent::CandidateParent,
+        simplex::{
+            certificate::Certificate,
+            db::{self, key},
+        },
+    };
+    let candidate_id = || TlCandidateId { slot: 99, hash: f::candidate_hash("empty") };
+    let vote = serialize_boxed(&f::vote("empty", "notarize", 0, f::CONTEXT)).unwrap();
+    let certificate = Certificate {
+        vote: f::vote("empty", "finalize", 0, f::CONTEXT).vote().clone(),
+        signatures: f::signatures("empty", "finalize", f::CONTEXT),
+    };
+    let cert_bytes = serialize_boxed(&certificate.clone().into_boxed()).unwrap();
+    let vote_key = |data: &[u8]| {
+        serialize_boxed(&key::vote::Vote { vote_hash: UInt256::calc_file_hash(data) }.into_boxed())
+            .unwrap()
+    };
+    let finalized_key = serialize_boxed(
+        &key::finalizedblock::FinalizedBlock { candidateId: candidate_id() }.into_boxed(),
+    )
+    .unwrap();
+    let finalized = |parent| {
+        serialize_boxed(
+            &db::finalizedblock::FinalizedBlock {
+                block_id: f::block_id("empty"),
+                parent,
+                is_final: rtos_api::ton::Bool::BoolTrue,
+            }
+            .into_boxed(),
+        )
+        .unwrap()
+    };
+    let info_row = f::row("empty", "candidate", 1, f::CONTEXT);
+    let info = rtos_api::deserialize_typed(&f::bytes(&info_row, "candidate")).unwrap();
+    let payload = serialize_boxed(
+        &rtos_api::ton::consensus::candidatedata::Empty {
+            slot: 99,
+            parent: TlCandidateId { slot: 98, hash: UInt256::from([5; 32]) }.into_boxed(),
+            block: f::block_id("empty"),
+            signature: f::bytes(&info_row, "signature"),
+        }
+        .into_boxed(),
+    )
+    .unwrap();
+    let templates = vec![
+        (
+            "vote",
+            vote_key(&vote),
+            serialize_boxed(&db::vote::Vote { data: vote, node_idx: 0, seqno: 0 }.into_boxed())
+                .unwrap(),
+        ),
+        (
+            "certificate",
+            vote_key(&cert_bytes),
+            serialize_boxed(&db::vote::Cert { cert: certificate }.into_boxed()).unwrap(),
+        ),
+        (
+            "candidate_info",
+            serialize_boxed(
+                &key::candidate_resolver::candidateinfo::CandidateInfo {
+                    candidateId: candidate_id(),
+                }
+                .into_boxed(),
+            )
+            .unwrap(),
+            serialize_boxed(
+                &db::candidate_resolver::candidateinfo::CandidateInfo {
+                    leader_id: 1,
+                    candidate_hash_data: info,
+                    signature: f::bytes(&info_row, "signature"),
+                }
+                .into_boxed(),
+            )
+            .unwrap(),
+        ),
+        (
+            "finalized",
+            finalized_key.clone(),
+            finalized(rtos_api::ton::consensus::CandidateParent::Consensus_CandidateWithoutParents),
+        ),
+        (
+            "pool",
+            serialize_boxed(&key::PoolState::default()).unwrap(),
+            serialize_boxed(
+                &db::poolstate::PoolState { first_nonannounced_window: 0 }.into_boxed(),
+            )
+            .unwrap(),
+        ),
+        (
+            "payload",
+            serialize_boxed(
+                &key::candidate::Candidate { candidateId: candidate_id() }.into_boxed(),
+            )
+            .unwrap(),
+            payload,
+        ),
+    ];
+    let mut cases = Vec::new();
+    cases.push(("valid_vote".into(), templates[0].1.clone(), templates[0].2.clone()));
+    cases.push(("valid_payload".into(), templates[5].1.clone(), templates[5].2.clone()));
+    for (name, key, value) in &templates[..2] {
+        let mut wrong_key = key.clone();
+        *wrong_key.last_mut().unwrap() ^= 1;
+        cases.push((format!("{name}/wrong_key_hash"), wrong_key, value.clone()));
+    }
+    for (name, key, value) in templates {
+        for mutation in ["truncated_key", "key_suffix", "truncated_value", "value_suffix"] {
+            let (mut key, mut value) = (key.clone(), value.clone());
+            match mutation {
+                "truncated_key" => key.truncate(4),
+                "key_suffix" => key.push(0x99),
+                "truncated_value" => value.truncate(1),
+                _ => value.push(0x99),
+            }
+            // The pool singleton has no key body; a four-byte key is valid.
+            if name == "pool" && mutation == "truncated_key" {
+                continue;
+            }
+            cases.push((format!("{name}/{mutation}"), key, value));
+        }
+    }
+    cases.push((
+        "filtered_finalized_parent".into(),
+        finalized_key,
+        finalized(
+            CandidateParent {
+                id: TlCandidateId { slot: 98, hash: UInt256::from([5; 32]) }.into_boxed(),
+            }
+            .into_boxed(),
+        ),
+    ));
+    cases.push(("unknown_key".into(), vec![0x42; 4], vec![0]));
+    cases.push(("short_key".into(), vec![0x42], vec![0]));
+    for version in [0, 1] {
+        for (name, key, value) in &cases {
+            let path = std::env::temp_dir()
+                .join(format!("rtos-pq-strict-{}", UInt256::rand().to_hex_string()));
+            let open_storage = || {
+                ConsensusCommonFactory::create_async_key_value_storage(
+                    &path,
+                    &f::session().to_hex_string(),
+                    AsyncKeyValueStorageOptions { use_callback_thread: false },
+                )
+            };
+            let storage = open_storage().unwrap();
+            storage.set(key.clone(), value.clone(), None).wait().unwrap();
+            storage.sync(Some(Duration::from_secs(10))).unwrap();
+            let before = storage.get_by_prefix(Vec::new(), None).wait().unwrap();
+            storage.close(Some(Duration::from_secs(10))).unwrap();
+            drop(storage);
+            let listener = RecordingListener::new();
+            let dyn_listener: Arc<dyn consensus_common::SessionListener + Send + Sync> =
+                listener.clone();
+            let overlay = Arc::new(RejectBootstrapOverlay(std::sync::atomic::AtomicUsize::new(0)));
+            let (nodes, keys) = f::members();
+            let result = crate::SessionFactory::create_session(
+                &SessionOptions {
+                    wait_for_db_init: true,
+                    use_callback_thread: false,
+                    proto_version: version,
+                    ..Default::default()
+                },
+                &f::session(),
+                &ShardIdent::masterchain(),
+                nodes,
+                &keys[0],
+                path.to_str().unwrap().to_owned(),
+                overlay.clone(),
+                Arc::downgrade(&dyn_listener),
+                None,
+                7,
+            );
+            assert!(result.is_err(), "v{version} {name}: corrupt bootstrap started");
+            assert_eq!(
+                overlay.0.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(name.starts_with("valid_")),
+                "v{version} {name}: unexpected overlay registration count"
+            );
+            assert_eq!(listener.event_count(), 0, "v{version} {name}: listener called");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let storage = loop {
+                match open_storage() {
+                    Ok(storage) => break storage,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(20))
+                    }
+                    Err(e) => panic!("v{version} {name}: stopped session retained database: {e}"),
+                }
+            };
+            assert_eq!(
+                storage.get_by_prefix(Vec::new(), None).wait().unwrap(),
+                before,
+                "v{version} {name}: failed recovery changed database"
+            );
+            storage.close(Some(Duration::from_secs(10))).unwrap();
+            drop(storage);
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+}
