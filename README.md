@@ -47,6 +47,19 @@ cargo test --release --package validator_session -- --nocapture --test-threads=1
 cargo test --release -- --nocapture --test-threads=1
 ```
 
+## Database network binding
+
+Use a separate, initially empty database directory for each network. Before
+starting networking or opening the database, RTOS records the complete configured
+masterchain zerostate identity in `rtos-network.bin` and syncs it to disk. A
+subsequent start must match that identity. `rtos-network.lock` prevents concurrent
+RTOS starts using the same directory while the engine is alive.
+
+A nonempty directory without a binding record, or an incomplete or mismatched
+record, is rejected. Automatic adoption of legacy databases is not supported;
+use a fresh directory until an authenticated migration path is available. This
+local binding does not authenticate copied snapshots or replace chain verification.
+
 ## Documentation
 
 - [Release guidelines](RELEASE.md) — versioning, branching, and release process

@@ -162,6 +162,8 @@ pub struct Engine {
     /// the collector worker thread in deployments that don't need consensus
     /// stats
     trace_collector: Option<simplex::TraceCollector>,
+    // Drop after the engine-owned database/network fields.
+    _network_binding: crate::network_db::DbNetworkBinding,
 }
 
 struct DownloadContext<'a, T> {
@@ -595,6 +597,10 @@ impl Engine {
         let boot_from_zerostate = general_config.boot_from_zerostate();
         let global_config = general_config.load_global_config()?;
         let zero_state_id = global_config.zero_state()?;
+        let network_binding = crate::network_db::DbNetworkBinding::acquire(
+            std::path::Path::new(&db_config.db_directory),
+            &zero_state_id,
+        )?;
         let test_bundles_config = general_config.test_bundles_config().clone();
         let session_logs_file = general_config.session_logs_file();
         // Spawn the trace collector worker only when an on-disk session-stats
@@ -761,6 +767,7 @@ impl Engine {
 
             servers: lockfree::queue::Queue::new(),
             stopper,
+            _network_binding: network_binding,
             zerostate_id: zero_state_id,
             init_mc_block_id,
             hardforks,

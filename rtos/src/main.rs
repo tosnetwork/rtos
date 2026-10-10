@@ -23,6 +23,7 @@ mod full_node;
 mod internal_db;
 mod macros;
 mod network;
+mod network_db;
 mod rng;
 mod rpc_server;
 mod shard_state;
