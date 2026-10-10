@@ -1148,9 +1148,9 @@ fn test_new_consensus_config_all_with_v2() {
 }
 
 #[test]
-fn test_simplex_config_enable_observers_round_trip() {
+fn test_simplex_config_protocol_version_round_trip() {
     let config = SimplexConfig {
-        enable_observers: true,
+        protocol_version: 2,
         use_quic: true,
         slots_per_leader_window: 4,
         ..Default::default()
@@ -1158,35 +1158,32 @@ fn test_simplex_config_enable_observers_round_trip() {
     let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();
     let config2 = SimplexConfig::construct_from_cell(cell).unwrap();
     assert_eq!(config, config2);
-    assert!(config2.enable_observers);
+    assert_eq!(config2.protocol_version, 2);
     assert!(config2.use_quic);
 }
 
-/// Verifies the v2 flag-byte wire layout:
-/// MSB->LSB = 6 zero flag bits, enable_observers (bit 1), use_quic (bit 0).
+/// Five reserved bits, two protocol bits, one transport bit.
 #[test]
 fn test_simplex_config_v2_flag_byte_layout() {
-    fn flag_byte(enable_observers: bool, use_quic: bool) -> u8 {
-        let cfg = SimplexConfig { enable_observers, use_quic, ..Default::default() };
-        let cell = cfg.write_to_new_cell().unwrap().into_cell().unwrap();
-        let mut s = SliceData::load_cell(cell).unwrap();
-        let tag = s.get_next_byte().unwrap();
-        assert_eq!(tag, 0x22);
-        s.get_next_byte().unwrap()
+    for version in 0..=3 {
+        for use_quic in [false, true] {
+            let cfg = SimplexConfig { protocol_version: version, use_quic, ..Default::default() };
+            let cell = cfg.serialize().unwrap();
+            let mut s = SliceData::load_cell_ref(&cell).unwrap();
+            assert_eq!(s.get_next_byte().unwrap(), 0x22);
+            assert_eq!(s.get_next_byte().unwrap(), version * 2 + u8::from(use_quic));
+            let parsed = SimplexConfig::construct_from_cell(cell).unwrap();
+            assert_eq!(parsed, cfg);
+            assert_eq!(parsed.validate_protocol_version().is_ok(), version <= 2);
+        }
     }
-    assert_eq!(flag_byte(false, false), 0x00);
-    assert_eq!(flag_byte(false, true), 0x01);
-    assert_eq!(flag_byte(true, false), 0x02);
-    assert_eq!(flag_byte(true, true), 0x03);
 }
 
-/// v1 (`simplex_config#21`) had no enable_observers; we keep lenient decode
-/// to preserve archive replay
 #[test]
-fn test_deserialize_v1_cell_enable_observers_is_false() {
-    let cell = build_v1_cell(true, 300, 4, 1000, 100);
-    let config = SimplexConfig::construct_from_cell(cell).unwrap();
-    assert!(!config.enable_observers);
+fn test_deserialize_v1_protocol_version_zero() {
+    let config =
+        SimplexConfig::construct_from_cell(build_v1_cell(true, 300, 4, 1000, 100)).unwrap();
+    assert_eq!(config.protocol_version, 0);
     assert!(config.use_quic);
 }
 
@@ -1223,4 +1220,118 @@ fn test_new_consensus_config_all_mixed_v1_mc_v2_shard() {
         shard.noncritical_params.max_leader_window_desync,
         NoncriticalParams::default().max_leader_window_desync
     );
+}
+
+// Version 2 used to disappear because bit 2 was treated as a reserved flag.
+#[test]
+fn test_simplex_protocol_version_wire_regression() {
+    let mut b = BuilderData::new();
+    b.append_u8(0x22).unwrap();
+    b.append_u8(0x04).unwrap();
+    b.append_u32(4).unwrap();
+    b.append_bit_zero().unwrap();
+    let cfg = SimplexConfig::construct_from_cell(b.into_cell().unwrap()).unwrap();
+    let mut encoded = SliceData::load_cell(cfg.serialize().unwrap()).unwrap();
+    assert_eq!(encoded.get_next_byte().unwrap(), 0x22);
+    assert_eq!(encoded.get_next_byte().unwrap(), 0x04);
+}
+
+fn raw_simplex_v2(flags: u8, slots: u32, params: Option<Cell>) -> Cell {
+    let mut b = BuilderData::new();
+    b.append_u8(0x22).unwrap();
+    b.append_u8(flags).unwrap();
+    b.append_u32(slots).unwrap();
+    if let Some(cell) = params {
+        b.append_bit_one().unwrap();
+        b.checked_append_reference(cell).unwrap();
+    } else {
+        b.append_bit_zero().unwrap();
+    }
+    b.into_cell().unwrap()
+}
+
+fn config_with_raw_simplex(mc: Cell, shard: Cell) -> ConfigParams {
+    let mut wrapper = BuilderData::new();
+    wrapper.append_u8(0x10).unwrap();
+    wrapper.append_bit_one().unwrap();
+    wrapper.checked_append_reference(mc).unwrap();
+    wrapper.append_bit_one().unwrap();
+    wrapper.checked_append_reference(shard).unwrap();
+    let mut value = BuilderData::new();
+    value.checked_append_reference(wrapper.into_cell().unwrap()).unwrap();
+    let mut config = ConfigParams::default();
+    config.config_params.set_builder(30u32.write_to_bitstring().unwrap(), &value).unwrap();
+    config
+}
+
+#[test]
+fn test_simplex_selected_original_cell_hash() {
+    let sparse = raw_simplex_v2(4, 4, None);
+    let mut params = HashmapE::with_bit_len(8);
+    params.set(200u8.write_to_bitstring().unwrap(), &123u32.write_to_bitstring().unwrap()).unwrap();
+    let extended = raw_simplex_v2(4, 4, params.data().cloned());
+    let config = config_with_raw_simplex(sparse.clone(), extended.clone());
+    let mc = config.selected_simplex_config(true).unwrap().unwrap();
+    let shard = config.selected_simplex_config(false).unwrap().unwrap();
+    assert_eq!(mc.config, shard.config);
+    assert_eq!(mc.cell_hash(), sparse.repr_hash());
+    assert_eq!(shard.cell_hash(), extended.repr_hash());
+    assert_ne!(mc.cell_hash(), shard.cell_hash());
+    assert_ne!(mc.cell_hash(), mc.config.serialize().unwrap().repr_hash());
+}
+
+#[test]
+fn test_simplex_rejects_invalid_critical_fields_and_unknown_tags() {
+    for flags in [8, 16, 32, 64, 128, 255] {
+        assert!(SimplexConfig::construct_from_cell(raw_simplex_v2(flags, 4, None)).is_err());
+    }
+    assert!(SimplexConfig::construct_from_cell(raw_simplex_v2(0, 0, None)).is_err());
+    assert!(SimplexConfig::construct_from_cell(build_v1_cell(false, 300, 0, 1000, 100)).is_err());
+    let invalid = SimplexConfig { protocol_version: 4, ..Default::default() };
+    assert!(invalid.serialize().is_err());
+    let invalid = SimplexConfig { slots_per_leader_window: 0, ..Default::default() };
+    assert!(invalid.serialize().is_err());
+    let unknown = BuilderData::with_raw(vec![0x23], 8).unwrap().into_cell().unwrap();
+    let config = config_with_raw_simplex(unknown, raw_simplex_v2(0, 4, None));
+    assert!(config.get_mc_simplex_config().is_err());
+    assert!(config.get_shard_simplex_config().unwrap().is_some());
+}
+
+#[test]
+fn test_simplex_rejects_noncritical_trailing_data() {
+    for key in [0u8, 200] {
+        let mut params = HashmapE::with_bit_len(8);
+        let mut value = BuilderData::new();
+        value.append_u32(300).unwrap();
+        value.append_bit_one().unwrap();
+        params.set_builder(key.write_to_bitstring().unwrap(), &value).unwrap();
+        assert!(SimplexConfig::construct_from_cell(raw_simplex_v2(0, 4, params.data().cloned()))
+            .is_err());
+    }
+}
+
+#[test]
+fn test_simplex_selected_rejects_trailing_cells_and_malformed_wrapper() {
+    let valid = raw_simplex_v2(0, 4, None);
+    let mut trailing = BuilderData::from_cell(&valid).unwrap();
+    trailing.append_bit_one().unwrap();
+    let config = config_with_raw_simplex(trailing.into_cell().unwrap(), valid.clone());
+    assert!(config.selected_simplex_config(true).is_err());
+    let mut malformed = ConfigParams::default();
+    malformed
+        .config_params
+        .set_builder(30u32.write_to_bitstring().unwrap(), &BuilderData::new())
+        .unwrap();
+    assert!(malformed.selected_simplex_config(true).is_err());
+    let mut null = BuilderData::new();
+    null.append_u8(0x20).unwrap();
+    let config = config_with_raw_simplex(null.into_cell().unwrap(), valid);
+    assert!(config.selected_simplex_config(true).unwrap().is_none());
+    let mut legacy = BuilderData::new();
+    legacy.append_u8(0x21).unwrap();
+    legacy.append_u8(2).unwrap();
+    for value in [300u32, 4, 1000, 100] {
+        legacy.append_u32(value).unwrap();
+    }
+    assert!(SimplexConfig::construct_from_cell(legacy.into_cell().unwrap()).is_err());
 }

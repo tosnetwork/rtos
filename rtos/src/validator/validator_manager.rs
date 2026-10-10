@@ -117,9 +117,15 @@ fn build_runtime_simplex_session_options(
     shard: &ShardIdent,
     cfg: &SimplexConfig,
     catchain_options: &CatchainSessionOptions,
-) -> SimplexSessionOptions {
+) -> Result<SimplexSessionOptions> {
+    cfg.validate_protocol_version()?;
+    // Version 2 requires a different relay and persistent session namespace.
+    // Refuse admission until those paths are implemented together.
+    if cfg.protocol_version == 2 {
+        fail!("Simplex protocol version 2 runtime is not implemented");
+    }
     let np = &cfg.noncritical_params;
-    SimplexSessionOptions {
+    Ok(SimplexSessionOptions {
         proto_version: catchain_options.proto_version as u32,
         slots_per_leader_window: cfg.slots_per_leader_window,
         target_rate: Duration::from_millis(np.target_rate_ms as u64),
@@ -145,7 +151,7 @@ fn build_runtime_simplex_session_options(
         max_collated_data_size: catchain_options.max_collated_data_size as usize,
         use_callback_thread: false,
         use_quic: cfg.use_quic,
-        enable_observers: cfg.enable_observers,
+        enable_observers: cfg.protocol_version == 1,
         no_empty_blocks_on_error_timeout: Duration::from_millis(
             np.no_empty_blocks_on_error_timeout_ms as u64,
         ),
@@ -153,7 +159,7 @@ fn build_runtime_simplex_session_options(
         // MC sessions use internal consensus-finalized tracking and keep this unset.
         empty_block_mc_lag_threshold: simplex_empty_block_lag_threshold(shard),
         ..Default::default()
-    }
+    })
 }
 
 fn validation_state_phase_label(status: ValidatorGroupStatus) -> &'static str {
@@ -1392,21 +1398,8 @@ impl ValidatorManagerImpl {
         self.is_accelerated_consensus_enabled(mc_state_extra)
     }
 
-    /// Select consensus options based on ConfigParam 30 (NewConsensusConfigAll).
-    ///
-    /// Returns `ConsensusOptions::Simplex` when ConfigParam 30 contains a valid
-    /// SimplexConfig (v1 or v2) for the given shard.  Otherwise, returns
-    /// `ConsensusOptions::Catchain` — the node must remain fully catchain-compatible
-    /// as long as the on-chain config can switch between the two at any time.
-    ///
-    /// C++ reference: `validator/manager.cpp` — `ValidatorManagerImpl::create_validator_group`
-    ///   - calls `last_masterchain_state_->get_new_consensus_config(shard.workchain)`
-    ///   - if present → `IValidatorGroup::create_bridge` (simplex)
-    ///   - if absent  → `IValidatorGroup::create_catchain`
-    ///
-    /// Noncritical params override (not yet implemented):
-    ///   C++ ref: `validator/validator-options.hpp` —
-    ///   `ValidatorManagerOptionsImpl::get_noncritical_params`
+    /// Select consensus only from a successfully decoded governing configuration.
+    /// Missing, malformed and unsupported configurations cannot start a group.
     fn select_consensus_options(
         &self,
         session_id: &UInt256,
@@ -1416,37 +1409,11 @@ impl ValidatorManagerImpl {
         _cc_seqno: u32,
         cur_subset: &ValidatorSet,
     ) -> Result<(ConsensusOptions, Option<consensus_common::BlockSyncOverlayParams>)> {
-        // C++ ref: mc-config.cpp — Config::get_new_consensus_config reads ConfigParam 30
-        // directly without checking global_version.  Absence of the param
-        // (or a parse error) falls through to the catchain path below.
-        let config_params = match mc_state.config_params() {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                log::trace!(
-                    target: "validator_manager",
-                    "Could not get config_params from mc_state: {}, using catchain",
-                    e
-                );
-                #[cfg(test)]
-                if let Some(options) =
-                    self.override_with_emulator_consensus_options(shard, "catchain", None)
-                {
-                    return Ok((options, None));
-                }
-                return Ok((ConsensusOptions::Catchain(catchain_options.clone()), None));
-            }
-        };
+        let config_params = mc_state.config_params()?;
+        let simplex_cfg = config_params.selected_simplex_config(shard.is_masterchain())?;
 
-        // C++ ref: get_new_consensus_config(wc) selects mc or shard inner config,
-        // then tries simplex_config#21 / simplex_config_v2#22.
-        // Absence -> catchain fallback (the node must stay catchain-compatible).
-        let simplex_cfg: Option<SimplexConfig> = if shard.is_masterchain() {
-            config_params.get_mc_simplex_config().ok().flatten()
-        } else {
-            config_params.get_shard_simplex_config().ok().flatten()
-        };
-
-        if let Some(cfg) = simplex_cfg {
+        if let Some(selected) = simplex_cfg {
+            let cfg = selected.config;
             log::trace!(
                 target: "validator_manager",
                 "Simplex config found for {}: target_rate={}ms, slots_per_window={}, first_block_timeout={}ms",
@@ -1462,7 +1429,7 @@ impl ValidatorManagerImpl {
             //
             // TODO: C++ also applies per-shard/cc_seqno overrides here via
             // get_noncritical_params() in validator-options.hpp.
-            let opts = build_runtime_simplex_session_options(shard, &cfg, catchain_options);
+            let opts = build_runtime_simplex_session_options(shard, &cfg, catchain_options)?;
             #[cfg(test)]
             if let Some(options) =
                 self.override_with_emulator_consensus_options(shard, "simplex", Some(opts.clone()))
@@ -1476,7 +1443,7 @@ impl ValidatorManagerImpl {
             // C++ parity: manager.cpp builds overlay_members + block-sync-overlay.cpp
             // builds authorized_keys from bus.validator_set (current set only)
             // Network requires observers - fail loudly if we can't honour it.
-            let block_sync_params = if cfg.enable_observers {
+            let block_sync_params = if cfg.protocol_version == 1 {
                 let p = consensus_common::BlockSyncOverlayParams::from_config(
                     config_params,
                     cfg.slots_per_leader_window,
@@ -1501,21 +1468,13 @@ impl ValidatorManagerImpl {
             return Ok((ConsensusOptions::Simplex(opts), block_sync_params));
         }
 
-        // No simplex config -> catchain fallback.
-        // This is the expected path when testnet has empty ConfigParam 30 or when
-        // ConfigParam 30 contains null_consensus_config#20.
-        log::trace!(
-            target: "validator_manager",
-            "No simplex config for {}, using catchain",
-            shard
-        );
         #[cfg(test)]
         if let Some(options) =
             self.override_with_emulator_consensus_options(shard, "catchain", None)
         {
             return Ok((options, None));
         }
-        Ok((ConsensusOptions::Catchain(catchain_options.clone()), None))
+        fail!("no admitted Simplex configuration for {shard}")
     }
 
     async fn update_validation_status(

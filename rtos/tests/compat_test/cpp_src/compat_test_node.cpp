@@ -27,7 +27,7 @@
  *   {"cmd": "compute_candidate_id_to_sign", "slot": 1, "hash": "HEX_64"}
  *   {"cmd": "compute_block_sync_overlay_id", "session_id": "HEX_64"}
  *   {"cmd": "parse_simplex_config_v2", "data": "BASE64_BOC"}
- *   {"cmd": "build_simplex_config_v2", "enable_observers": false, "use_quic": true, "slots_per_leader_window": 4}
+ *   {"cmd": "build_simplex_config_v2", "protocol_version": 0, "use_quic": true, "slots_per_leader_window": 4}
  *   {"cmd": "compute_block_sync_overlay_members",
  *           "prev": [{"key": "HEX_32", "addr": "HEX_32_OR_EMPTY"}, ...],
  *           "curr": [...], "next": [...]}
@@ -1158,7 +1158,7 @@ void CompatTestNode::cmd_parse_simplex_config_v2(td::JsonObject &obj) {
 
     std::ostringstream oss;
     oss << "{\"result\": {"
-        << "\"enable_observers\": " << (rec.enable_observers ? "true" : "false")
+        << "\"protocol_version\": " << rec.protocol_version
         << ", \"use_quic\": " << (rec.use_quic ? "true" : "false")
         << ", \"slots_per_leader_window\": " << rec.slots_per_leader_window
         << "}}";
@@ -1166,13 +1166,13 @@ void CompatTestNode::cmd_parse_simplex_config_v2(td::JsonObject &obj) {
 }
 
 void CompatTestNode::cmd_build_simplex_config_v2(td::JsonObject &obj) {
-    auto enable_observers = get_bool(obj, "enable_observers", false);
+    auto protocol_version = get_int(obj, "protocol_version", 0);
     auto use_quic = get_bool(obj, "use_quic", false);
     auto slots = static_cast<unsigned>(get_int(obj, "slots_per_leader_window", 4));
 
     block::gen::NewConsensusConfig::Record_simplex_config_v2 rec;
     rec.flags = 0;
-    rec.enable_observers = enable_observers;
+    rec.protocol_version = protocol_version;
     rec.use_quic = use_quic;
     rec.slots_per_leader_window = slots;
     // Empty HashmapE 8 uint32 = single zero bit.

@@ -265,7 +265,7 @@ pub enum CppCommand {
     },
 
     #[serde(rename = "build_simplex_config_v2")]
-    BuildSimplexConfigV2 { enable_observers: bool, use_quic: bool, slots_per_leader_window: u32 },
+    BuildSimplexConfigV2 { protocol_version: u8, use_quic: bool, slots_per_leader_window: u32 },
 
     #[serde(rename = "compute_block_sync_overlay_members")]
     ComputeBlockSyncOverlayMembers {
@@ -924,11 +924,11 @@ impl CppTestNode {
 
     /// Ask C++ to unpack a `simplex_config_v2#22` cell. Returns the critical
     /// fields the wire-format test cares about
-    pub fn parse_simplex_config_v2(&mut self, boc_b64: &str) -> Result<(bool, bool, u32)> {
+    pub fn parse_simplex_config_v2(&mut self, boc_b64: &str) -> Result<(u8, bool, u32)> {
         let result =
             self.expect_result(&CppCommand::ParseSimplexConfigV2 { data: boc_b64.to_string() })?;
-        let enable_observers = result["enable_observers"].as_bool().ok_or_else(|| {
-            CompatTestError::InvalidResponse("Expected 'enable_observers'".to_string())
+        let protocol_version = result["protocol_version"].as_u64().ok_or_else(|| {
+            CompatTestError::InvalidResponse("Expected 'protocol_version'".to_string())
         })?;
         let use_quic = result["use_quic"]
             .as_bool()
@@ -936,19 +936,25 @@ impl CppTestNode {
         let slots = result["slots_per_leader_window"].as_u64().ok_or_else(|| {
             CompatTestError::InvalidResponse("Expected 'slots_per_leader_window'".to_string())
         })?;
-        Ok((enable_observers, use_quic, slots as u32))
+        Ok((
+            u8::try_from(protocol_version)
+                .map_err(|_| CompatTestError::InvalidResponse("Invalid protocol version".into()))?,
+            use_quic,
+            u32::try_from(slots)
+                .map_err(|_| CompatTestError::InvalidResponse("Invalid slots".into()))?,
+        ))
     }
 
     /// Ask C++ to build a `simplex_config_v2#22` cell from the given fields
     /// and return the resulting standard-BOC bytes (base64)
     pub fn build_simplex_config_v2(
         &mut self,
-        enable_observers: bool,
+        protocol_version: u8,
         use_quic: bool,
         slots_per_leader_window: u32,
     ) -> Result<Vec<u8>> {
         let result = self.expect_result(&CppCommand::BuildSimplexConfigV2 {
-            enable_observers,
+            protocol_version,
             use_quic,
             slots_per_leader_window,
         })?;

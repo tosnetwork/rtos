@@ -483,7 +483,7 @@ pub struct SessionOptions {
     /// Default: false
     pub use_quic: bool,
 
-    /// `SimplexConfig.enable_observers` (ConfigParam 30).
+    /// `SimplexConfig.protocol_version == 1` (ConfigParam 30).
     /// Default: false (use consensus private overlay for candidate propagation).
     pub enable_observers: bool,
 

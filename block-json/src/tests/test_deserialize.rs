@@ -798,3 +798,28 @@ fn test_parse_block_proof_with_simplex_signatures() {
     // Verify proof_for matches
     assert_eq!(parsed_proof.proof_for, proof.proof_for);
 }
+
+#[test]
+fn test_simplex_protocol_version_json_round_trip_and_rejection() {
+    for version in 0..=3 {
+        let mut cp = prepare_config_params();
+        let mut value = get_config_param30();
+        value.mc.as_mut().unwrap().protocol_version = version;
+        cp.set_config(ConfigParamEnum::ConfigParam30(value)).unwrap();
+        let encoded = serialize_config_param(&cp, 30).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let parsed = parse_config_with_mandatory_params(json.as_object().unwrap(), &[30]).unwrap();
+        assert_eq!(cp.config(30).unwrap(), parsed.config(30).unwrap());
+        // A malformed present field must never become protocol version zero.
+        for invalid in [
+            serde_json::json!(256),
+            serde_json::json!(-1),
+            serde_json::json!("2"),
+            serde_json::json!(null),
+        ] {
+            let mut bad = json.clone();
+            bad["p30"]["mc"]["protocol_version"] = invalid;
+            assert!(parse_config_with_mandatory_params(bad.as_object().unwrap(), &[30]).is_err());
+        }
+    }
+}

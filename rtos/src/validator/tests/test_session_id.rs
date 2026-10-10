@@ -708,12 +708,14 @@ fn test_runtime_simplex_options_keep_cpp_empty_block_policy() {
         &ShardIdent::masterchain(),
         &SimplexConfig::default(),
         &catchain_options,
-    );
+    )
+    .unwrap();
     assert_eq!(mc_opts.empty_block_mc_lag_threshold, None);
 
     let shard = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
     let shard_opts =
-        build_runtime_simplex_session_options(&shard, &SimplexConfig::default(), &catchain_options);
+        build_runtime_simplex_session_options(&shard, &SimplexConfig::default(), &catchain_options)
+            .unwrap();
     assert_eq!(shard_opts.empty_block_mc_lag_threshold, Some(8));
 }
 

@@ -979,7 +979,7 @@ pub struct ValidatorGroup {
     /// Set by the validation queue on prolonged inactivity, cleared on any action.
     pub stalled: Arc<AtomicBool>,
     /// Block-sync overlay membership and authorization; `Some` only when this shard has
-    /// `simplex_config_v2.enable_observers=true`
+    /// `simplex_config_v2.protocol_version=1`
     block_sync_overlay_params: Option<consensus_common::BlockSyncOverlayParams>,
 }
 

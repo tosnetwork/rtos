@@ -9,21 +9,23 @@
  */
 //! Cross-implementation wire-format tests for `simplex_config_v2#22`.
 //!
-//! The v2 format steals one bit from `flags` (7 -> 6) and inserts `enable_observers`
-//! between `flags` and `use_quic`. Net flag-byte layout (MSB->LSB):
-//!     bits 7..2 = flags (6 zero bits today)
-//!     bit 1     = enable_observers
-//!     bit 0     = use_quic
-//!
-//! A bit-order mistake here is silent in single-implementation tests, so we
-//! cross-check both directions against the C++ TL-B codec.
+//! The target schema uses five reserved bits, two protocol-version bits and
+//! one transport bit. Both directions are checked against the C++ TL-B codec.
 
 use base64::Engine;
 use compat_test::{skip_if_no_cpp, CppTestNode};
 use rtos_block::{read_single_root_boc, write_boc, Deserializable, Serializable, SimplexConfig};
 
-const CASES: &[(bool, bool, u32)] =
-    &[(false, false, 4), (false, true, 4), (true, false, 8), (true, true, 16)];
+const CASES: &[(u8, bool, u32)] = &[
+    (0, false, 4),
+    (0, true, 4),
+    (1, false, 8),
+    (1, true, 16),
+    (2, false, 4),
+    (2, true, 8),
+    (3, false, 4),
+    (3, true, 4),
+];
 
 fn rust_cell_to_b64(cfg: &SimplexConfig) -> String {
     let cell = cfg.write_to_new_cell().unwrap().into_cell().unwrap();
@@ -39,9 +41,9 @@ fn test_rust_built_simplex_config_v2_parses_in_cpp() {
 
     let mut cpp = CppTestNode::spawn(15920).expect("spawn C++");
 
-    for &(enable_observers, use_quic, slots) in CASES {
+    for &(protocol_version, use_quic, slots) in CASES {
         let cfg = SimplexConfig {
-            enable_observers,
+            protocol_version,
             use_quic,
             slots_per_leader_window: slots,
             ..Default::default()
@@ -51,9 +53,9 @@ fn test_rust_built_simplex_config_v2_parses_in_cpp() {
         let (cpp_eo, cpp_uq, cpp_slots) = cpp.parse_simplex_config_v2(&boc_b64).expect("cpp parse");
         assert_eq!(
             (cpp_eo, cpp_uq, cpp_slots),
-            (enable_observers, use_quic, slots),
-            "Rust->C++ field mismatch (enable_observers={}, use_quic={}, slots={})",
-            enable_observers,
+            (protocol_version, use_quic, slots),
+            "Rust->C++ field mismatch (protocol_version={}, use_quic={}, slots={})",
+            protocol_version,
             use_quic,
             slots
         );
@@ -71,13 +73,13 @@ fn test_cpp_built_simplex_config_v2_parses_in_rust() {
 
     let mut cpp = CppTestNode::spawn(15921).expect("spawn C++");
 
-    for &(enable_observers, use_quic, slots) in CASES {
+    for &(protocol_version, use_quic, slots) in CASES {
         let boc =
-            cpp.build_simplex_config_v2(enable_observers, use_quic, slots).expect("cpp build");
+            cpp.build_simplex_config_v2(protocol_version, use_quic, slots).expect("cpp build");
         let cell = read_single_root_boc(&boc).expect("rust read_single_root_boc");
         let cfg = SimplexConfig::construct_from_cell(cell).expect("rust deser");
 
-        assert_eq!(cfg.enable_observers, enable_observers);
+        assert_eq!(cfg.protocol_version, protocol_version);
         assert_eq!(cfg.use_quic, use_quic);
         assert_eq!(cfg.slots_per_leader_window, slots);
     }

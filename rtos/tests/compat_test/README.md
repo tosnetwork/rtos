@@ -239,7 +239,7 @@ Wire-format test for the `consensus.blockSyncOverlayId` TL type:
 - The block-sync overlay short-id is distinct from the legacy `consensus.overlayId` short-id for the same `session_id` (so the two overlays don't collide).
 
 ### 16. SimplexConfig v2 Wire (`test_simplex_config_v2_wire`)
-Bit-layout test for the v2 flag byte. The flag byte goes from `flags:(## 7) use_quic:Bool` to `flags:(## 6) enable_observers:Bool use_quic:Bool`. Both directions are exercised across all 4 `(enable_observers, use_quic)` combinations:
+Bit-layout test for the v2 flag byte. The target flag byte is `flags:(## 5) protocol_version:(## 2) use_quic:Bool`. Both directions exercise all 8 `(protocol_version, use_quic)` combinations. This requires a reference built with the target schema:
 - Rust-built `simplex_config_v2#22` cells unpack on C++ to the same field values.
 - C++-built cells deserialize on Rust to the same field values.
 

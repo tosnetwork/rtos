@@ -1332,3 +1332,71 @@ async fn test_real_engine_progresses_with_emulated_consensus() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_manager_rejects_unadmitted_simplex_configurations() -> Result<()> {
+    let mut bootstrap = EmulatorNetworkBootstrap::build(4)?;
+    let engine = Arc::new(BootstrapTestEngine::new(&bootstrap).await?);
+    let manager = ValidatorManagerImpl::create(
+        engine.clone(),
+        tokio::runtime::Handle::current(),
+        ValidatorManagerConfig::default(),
+    );
+    let select = |state: &ShardStateStuff| {
+        manager.select_consensus_options(
+            &UInt256::default(),
+            &ShardIdent::masterchain(),
+            state,
+            &CatchainSessionOptions::default(),
+            0,
+            &bootstrap.validator_set,
+        )
+    };
+    // Valid codec input, but no runtime may silently reinterpret these versions.
+    for version in [2, 3] {
+        let mut config = bootstrap.config_params.clone();
+        config.set_config(ConfigParamEnum::ConfigParam30(NewConsensusConfigAll {
+            mc: Some(SimplexConfig { protocol_version: version, ..Default::default() }),
+            shard: None,
+        }))?;
+        // Build the state from the modified governing config, not a direct options helper.
+        let mut state = engine.build_masterchain_state(&bootstrap, 0)?.state()?.clone();
+        let mut extra = state.read_custom()?.unwrap();
+        extra.config = config;
+        state.write_custom(Some(&extra))?;
+        let cell = state.serialize()?;
+        let id = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            0,
+            cell.repr_hash().clone(),
+            UInt256::calc_file_hash(&rtos_block::write_boc(&cell)?),
+        );
+        let state = ShardStateStuff::from_state(
+            id,
+            state,
+            #[cfg(feature = "telemetry")]
+            &engine.telemetry,
+            &engine.allocated,
+        )?;
+        let error = select(&state).err().expect("manager must refuse the version").to_string();
+        assert!(error.contains(&format!("protocol version {version}")), "{error}");
+    }
+    // No configured Simplex is not permission to enter classical consensus.
+    bootstrap
+        .config_params
+        .set_config(ConfigParamEnum::ConfigParam30(NewConsensusConfigAll::default()))?;
+    let state = engine.build_masterchain_state(&bootstrap, 0)?;
+    assert!(manager
+        .select_consensus_options(
+            &UInt256::default(),
+            &ShardIdent::masterchain(),
+            &state,
+            &CatchainSessionOptions::default(),
+            0,
+            &bootstrap.validator_set,
+        )
+        .is_err());
+    assert!(manager.current_sessions.is_empty());
+    assert!(manager.future_sessions.is_empty());
+    Ok(())
+}

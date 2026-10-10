@@ -667,8 +667,15 @@ impl StateParser {
 
     fn parse_simplex_config(p: &PathMap) -> Result<SimplexConfig> {
         let d = NoncriticalParams::default();
+        let protocol_version = match p.map.get("protocol_version") {
+            None => 0,
+            Some(value) => match value.as_u64() {
+                Some(version @ 0..=3) => version as u8,
+                _ => fail!("protocol_version must be an integer in 0..=3"),
+            },
+        };
         Ok(SimplexConfig {
-            enable_observers: p.get_num32("enable_observers").unwrap_or(0) != 0,
+            protocol_version,
             use_quic: p.get_num32("use_quic").unwrap_or(0) != 0,
             slots_per_leader_window: p.get_num32("slots_per_leader_window")?,
             noncritical_params: NoncriticalParams {

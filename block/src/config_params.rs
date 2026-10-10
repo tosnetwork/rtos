@@ -385,22 +385,30 @@ impl ConfigParams {
         }
     }
 
-    /// Get simplex config for masterchain from ConfigParam 30.
-    /// Returns None if config is missing or is null_consensus_config (use catchain).
-    pub fn get_mc_simplex_config(&self) -> Result<Option<SimplexConfig>> {
-        match self.config(30)? {
-            Some(ConfigParamEnum::ConfigParam30(cfg)) => Ok(cfg.mc),
-            _ => Ok(None),
+    /// Select the original referenced Param30 cell without re-encoding it.
+    /// Session derivation must hash this cell, including unknown noncritical keys.
+    pub fn selected_simplex_config(
+        &self,
+        masterchain: bool,
+    ) -> Result<Option<SelectedSimplexConfig>> {
+        let Some(mut value) = self.config_params.get(30u32.write_to_bitstring()?)? else {
+            return Ok(None);
+        };
+        if value.remaining_bits() != 0 || value.remaining_references() != 1 {
+            fail!("invalid ConfigParam30 dictionary value");
         }
+        let mut wrapper = SliceData::load_cell(value.checked_drain_reference()?)?;
+        let (mc, shard) = read_consensus_config_cells(&mut wrapper)?;
+        let selected = if masterchain { mc } else { shard };
+        selected.map(SelectedSimplexConfig::from_cell).transpose().map(Option::flatten)
     }
 
-    /// Get simplex config for shards (basechain) from ConfigParam 30.
-    /// Returns None if config is missing or is null_consensus_config (use catchain).
+    pub fn get_mc_simplex_config(&self) -> Result<Option<SimplexConfig>> {
+        Ok(self.selected_simplex_config(true)?.map(|selected| selected.config))
+    }
+
     pub fn get_shard_simplex_config(&self) -> Result<Option<SimplexConfig>> {
-        match self.config(30)? {
-            Some(ConfigParamEnum::ConfigParam30(cfg)) => Ok(cfg.shard),
-            _ => Ok(None),
-        }
+        Ok(self.selected_simplex_config(false)?.map(|selected| selected.config))
     }
 
     pub fn serialize_single_param(&self) -> Result<(Cell, u32)> {
@@ -3887,13 +3895,10 @@ impl NoncriticalParams {
 /// Unified Simplex consensus config — the single output type
 /// produced by deserializing either `simplex_config#21` (v1) or
 /// `simplex_config_v2#22` (v2) from ConfigParam 30.
-///
-/// Mirrors C++ `NewConsensusConfig` in `ton-types.h`: critical fields
-/// (`use_quic`, `slots_per_leader_window`) live at top level; all tunable
-/// timing/rate parameters live inside `noncritical_params`.
+/// Critical protocol fields are separate from noncritical timing parameters.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SimplexConfig {
-    pub enable_observers: bool,
+    pub protocol_version: u8,
     pub use_quic: bool,
     pub slots_per_leader_window: u32,
     pub noncritical_params: NoncriticalParams,
@@ -3902,7 +3907,7 @@ pub struct SimplexConfig {
 impl Default for SimplexConfig {
     fn default() -> Self {
         Self {
-            enable_observers: false,
+            protocol_version: 0,
             use_quic: false,
             slots_per_leader_window: 4,
             noncritical_params: NoncriticalParams::default(),
@@ -3910,16 +3915,73 @@ impl Default for SimplexConfig {
     }
 }
 
-/// Maximum noncritical param key defined in the C++ reference.
-const NONCRITICAL_PARAMS_MAX_KEY: u8 = 14;
+impl SimplexConfig {
+    /// Parsing preserves future versions; consensus admission must call this check.
+    pub fn validate_protocol_version(&self) -> Result<()> {
+        if self.protocol_version > 2 {
+            fail!("unsupported Simplex protocol version {}", self.protocol_version);
+        }
+        Ok(())
+    }
+}
+
+/// Parsed configuration and its original cell. This is not an authenticated config.
+/// The caller must obtain Param30 from a verified governing masterchain state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectedSimplexConfig {
+    pub config: SimplexConfig,
+    original_cell: Cell,
+}
+
+impl SelectedSimplexConfig {
+    pub fn cell(&self) -> &Cell {
+        &self.original_cell
+    }
+
+    pub fn cell_hash(&self) -> &UInt256 {
+        self.original_cell.repr_hash()
+    }
+
+    fn from_cell(cell: Cell) -> Result<Option<Self>> {
+        let mut slice = SliceData::load_cell_ref(&cell)?;
+        if slice.clone().get_next_byte()? == 0x20 {
+            slice.get_next_byte()?;
+            ensure_config_slice_empty(&slice)?;
+            return Ok(None);
+        }
+        let config = SimplexConfig::construct_from(&mut slice)?;
+        ensure_config_slice_empty(&slice)?;
+        Ok(Some(Self { config, original_cell: cell }))
+    }
+}
+
+fn ensure_config_slice_empty(slice: &SliceData) -> Result<()> {
+    if slice.remaining_bits() != 0 || slice.remaining_references() != 0 {
+        fail!("consensus config has trailing data");
+    }
+    Ok(())
+}
+
+fn read_consensus_config_cells(slice: &mut SliceData) -> Result<(Option<Cell>, Option<Cell>)> {
+    let tag = slice.get_next_byte()?;
+    if tag != NEW_CONSENSUS_CONFIG_ALL_TAG {
+        fail!("invalid consensus config wrapper tag {tag:#x}");
+    }
+    let mc = if slice.get_next_bit()? { Some(slice.checked_drain_reference()?) } else { None };
+    let shard = if slice.get_next_bit()? { Some(slice.checked_drain_reference()?) } else { None };
+    ensure_config_slice_empty(slice)?;
+    Ok((mc, shard))
+}
 
 /// Always serializes as simplex_config_v2#22 (the current on-chain format).
 impl Serializable for SimplexConfig {
     fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
+        if self.protocol_version > 3 || self.slots_per_leader_window == 0 {
+            fail!("invalid Simplex critical fields");
+        }
         cell.append_u8(SIMPLEX_CONFIG_V2_TAG)?;
-        // TL-B layout: 6 zero flag bits, then enable_observers (bit 1), then use_quic (bit 0).
-        let flags_byte =
-            (if self.enable_observers { 1u8 } else { 0u8 }) << 1 | (self.use_quic as u8);
+        // Five reserved bits, two protocol-version bits, one transport bit.
+        let flags_byte = (self.protocol_version << 1) | u8::from(self.use_quic);
         cell.append_u8(flags_byte)?;
         self.slots_per_leader_window.write_to(cell)?;
         let raw_map = self.noncritical_params.to_raw_map();
@@ -3941,15 +4003,21 @@ impl Deserializable for SimplexConfig {
         let tag = slice.get_next_byte()?;
         match tag {
             SIMPLEX_CONFIG_TAG => {
-                // Legacy v1: bit 0 = use_quic; enable_observers did not exist.
+                // Legacy constructor always selects protocol version zero.
                 let flags_byte = slice.get_next_byte()?;
+                if flags_byte & !1 != 0 {
+                    fail!("nonzero Simplex reserved flags");
+                }
                 let use_quic = (flags_byte & 1) != 0;
                 let target_rate_ms = u32::construct_from(slice)?;
                 let slots_per_leader_window = u32::construct_from(slice)?;
+                if slots_per_leader_window == 0 {
+                    fail!("zero Simplex leader window");
+                }
                 let first_block_timeout_ms = u32::construct_from(slice)?;
                 let max_leader_window_desync = u32::construct_from(slice)?;
                 Ok(Self {
-                    enable_observers: false,
+                    protocol_version: 0,
                     use_quic,
                     slots_per_leader_window,
                     noncritical_params: NoncriticalParams {
@@ -3961,24 +4029,31 @@ impl Deserializable for SimplexConfig {
                 })
             }
             SIMPLEX_CONFIG_V2_TAG => {
-                // v2 flag-byte layout (BlockSync): 6 zero flag bits, enable_observers (bit 1), use_quic (bit 0).
+                // Five reserved bits, two version bits, one transport bit.
                 let flags_byte = slice.get_next_byte()?;
                 let use_quic = (flags_byte & 0x01) != 0;
-                let enable_observers = (flags_byte & 0x02) != 0;
+                if flags_byte & !7 != 0 {
+                    fail!("nonzero Simplex reserved flags");
+                }
+                let protocol_version = (flags_byte >> 1) & 3;
                 let slots_per_leader_window = u32::construct_from(slice)?;
+                if slots_per_leader_window == 0 {
+                    fail!("zero Simplex leader window");
+                }
                 let has_params = slice.get_next_bit()?;
                 let params_cell =
                     if has_params { Some(slice.checked_drain_reference()?) } else { None };
                 let params_map = HashmapE::with_hashmap(8, params_cell);
                 let mut raw = BTreeMap::new();
-                for key_idx in 0..=NONCRITICAL_PARAMS_MAX_KEY {
-                    let key = SliceData::from_raw(vec![key_idx], 8);
-                    if let Some(mut vs) = params_map.get(key)? {
-                        raw.insert(key_idx, u32::construct_from(&mut vs)?);
-                    }
-                }
+                params_map.iterate_slices(|mut key, mut value| {
+                    let key = key.get_next_byte()?;
+                    let parameter = u32::construct_from(&mut value)?;
+                    ensure_config_slice_empty(&value)?;
+                    raw.insert(key, parameter);
+                    Ok(true)
+                })?;
                 Ok(Self {
-                    enable_observers,
+                    protocol_version,
                     use_quic,
                     slots_per_leader_window,
                     noncritical_params: NoncriticalParams::from_raw_map(&raw),
@@ -3996,8 +4071,7 @@ impl Deserializable for SimplexConfig {
 ///       shard:(Maybe ^NewConsensusConfig) = NewConsensusConfigAll;
 ///       _ NewConsensusConfigAll = ConfigParam 30;
 ///
-/// Note: If the inner config is null_consensus_config#20, we store None
-/// (Rust only supports SimplexConfig; null consensus falls back to catchain)
+/// A null inner config is represented as None. Unknown tags are errors.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NewConsensusConfigAll {
     pub mc: Option<SimplexConfig>,
@@ -4027,31 +4101,15 @@ impl Serializable for NewConsensusConfigAll {
 
 impl Deserializable for NewConsensusConfigAll {
     fn construct_from(slice: &mut SliceData) -> Result<Self> {
-        let tag = slice.get_next_byte()?;
-        if tag != NEW_CONSENSUS_CONFIG_ALL_TAG {
-            fail!(Self::invalid_tag(tag as u32));
-        }
-        let mut result = Self::default();
-        // mc:(Maybe ^NewConsensusConfig)
-        if slice.get_next_bit()? {
-            let cell = slice.checked_drain_reference()?;
-            let mut inner = SliceData::load_cell(cell)?;
-            let inner_tag = inner.clone().get_next_byte()?;
-            if inner_tag == SIMPLEX_CONFIG_TAG || inner_tag == SIMPLEX_CONFIG_V2_TAG {
-                result.mc = Some(SimplexConfig::construct_from(&mut inner)?);
-            }
-            // else null_consensus_config#20 or unknown → None (catchain fallback)
-        }
-        // shard:(Maybe ^NewConsensusConfig)
-        if slice.get_next_bit()? {
-            let cell = slice.checked_drain_reference()?;
-            let mut inner = SliceData::load_cell(cell)?;
-            let inner_tag = inner.clone().get_next_byte()?;
-            if inner_tag == SIMPLEX_CONFIG_TAG || inner_tag == SIMPLEX_CONFIG_V2_TAG {
-                result.shard = Some(SimplexConfig::construct_from(&mut inner)?);
-            }
-        }
-        Ok(result)
+        let (mc, shard) = read_consensus_config_cells(slice)?;
+        Ok(Self {
+            mc: mc.map(SelectedSimplexConfig::from_cell).transpose()?.flatten().map(|s| s.config),
+            shard: shard
+                .map(SelectedSimplexConfig::from_cell)
+                .transpose()?
+                .flatten()
+                .map(|s| s.config),
+        })
     }
 }
 
