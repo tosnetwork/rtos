@@ -64,3 +64,9 @@ Public test fixtures include the Pure SHA2-128s group from NIST ACVP-Server
 v1.1.0.40, commit d98cad66639bf9d0822129c4bcae7a169fcf9ca6, and reproducible
 boundary signatures generated with Cloudflare CIRCL v1.6.4 (BSD-3-Clause).
 The latter use the public test seed 000102...2f and deterministic signing.
+
+The LMS fixtures include two publicly committed H20/W4 valid proofs from the
+pinned reference test/rescue-fee-gate/suite-scenarios.tsv, with its GPLv3
+license retained at tests/data/TOS-LICENSE.txt. Additional synthetic equations
+reconstruct public roots with Python hashlib from those public proof bytes;
+they are not independently published known-answer tests or generated keys.
