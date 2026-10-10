@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): naming and WAL-durable write acknowledgements.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -304,6 +304,9 @@ pub struct RocksDbAsyncKeyValueStorage {
     /// slip through and enqueue after `close()`'s drain, but `Drop` always
     /// re-runs `sync_internal` so the late task is still persisted.
     is_closed: Arc<AtomicBool>,
+    /// Only a completed successful close may make repeated close idempotent.
+    /// A pending or failed synchronization must never be reported as success.
+    close_succeeded: AtomicBool,
     /// DB processing thread stopped flag
     db_thread_stopped: Arc<AtomicBool>,
     /// Callback thread stopped flag (always present, set true immediately if no callback thread)
@@ -481,6 +484,7 @@ impl RocksDbAsyncKeyValueStorage {
             pending_count,
             is_stop_requested,
             is_closed,
+            close_succeeded: AtomicBool::new(false),
             db_thread_stopped,
             callback_thread_stopped,
             mark_for_destroy,
@@ -834,19 +838,25 @@ impl RocksDbAsyncKeyValueStorage {
 
         let start_time = std::time::Instant::now();
 
-        // 1. Wait for DB queue to drain
+        // 1. Drain earlier DB work and synchronize its WAL before acknowledging.
         let db_sync = StorageAsyncResultImpl::<()>::new();
         let db_sync_clone = db_sync.clone();
         let storage_id = self.storage_id.clone();
 
-        self.post_task(Box::new(move |_db, metrics, _callback_tx| {
+        self.post_task(Box::new(move |db, metrics, _callback_tx| {
             metrics.syncs.increment(1);
             log::trace!(
                 target: LOG_TARGET,
-                "AsyncKeyValueStorage {}: DB sync marker reached",
+                "AsyncKeyValueStorage {}: synchronizing WAL",
                 storage_id
             );
-            db_sync_clone.set(Ok(()));
+            use std::ops::Deref;
+            db_sync_clone.set(
+                db.deref()
+                    .deref()
+                    .flush_wal(true)
+                    .map_err(|e| rtos_block::error!("sync: WAL synchronization failed: {}", e)),
+            );
         }));
 
         // Wait for DB queue with optional timeout
@@ -1098,7 +1108,9 @@ impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
 
             // Access underlying rocksdb through Deref chain
             use std::ops::Deref;
-            match db.deref().deref().put(&key, &value) {
+            let mut options = rocksdb::WriteOptions::default();
+            options.set_sync(true);
+            match db.deref().deref().put_opt(&key, &value, &options) {
                 Ok(()) => {
                     result_clone.set(Ok(()));
                     if let Some(callback) = on_complete {
@@ -1154,7 +1166,9 @@ impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
 
             // Access underlying rocksdb through Deref chain
             use std::ops::Deref;
-            match db.deref().deref().delete(&key) {
+            let mut options = rocksdb::WriteOptions::default();
+            options.set_sync(true);
+            match db.deref().deref().delete_opt(&key, &options) {
                 Ok(()) => {
                     result_clone.set(Ok(()));
                     if let Some(callback) = on_complete {
@@ -1190,15 +1204,20 @@ impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
     }
 
     fn close(&self, timeout: Option<Duration>) -> Result<()> {
-        // One-shot transition: first caller flips the gate; later callers
-        // (including repeated `close()`) short-circuit to Ok.
+        // Closing admission and completing durable shutdown are different
+        // states. A second caller must not turn a pending or failed first
+        // synchronization into an apparent success.
         if self.is_closed.swap(true, Ordering::SeqCst) {
             log::debug!(
                 target: LOG_TARGET,
                 "AsyncKeyValueStorage {}: close: already closed",
                 self.storage_id
             );
-            return Ok(());
+            return if self.close_succeeded.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(rtos_block::error!("close: previous close is pending or failed"))
+            };
         }
 
         log::info!(
@@ -1217,6 +1236,9 @@ impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
         // our marker is also fine: it lands in the FIFO channel before any
         // future `Drop`-side marker, so `Drop` persists it.
         let result = self.sync_internal(timeout);
+        if result.is_ok() {
+            self.close_succeeded.store(true, Ordering::SeqCst);
+        }
         match &result {
             Ok(()) => log::info!(
                 target: LOG_TARGET,

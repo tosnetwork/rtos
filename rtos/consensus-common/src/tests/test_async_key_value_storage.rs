@@ -7,6 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 //! Unit tests for RocksDB-based async key-value storage.
+//! RTOS additions (2026-10-10): durable acknowledgement and abrupt-exit probes.
 
 use crate::{AsyncKeyValueStorageOptions, ConsensusCommonFactory};
 use std::{
@@ -37,6 +38,98 @@ fn create_test_options() -> AsyncKeyValueStorageOptions {
 
 fn create_test_options_no_callback_thread() -> AsyncKeyValueStorageOptions {
     AsyncKeyValueStorageOptions { use_callback_thread: false }
+}
+
+/// The child exits without Drop/close after acknowledgement. This exercises
+/// actual WAL recovery, but process exit alone does not emulate power loss.
+/// External syscall fault tests reuse this entry point with a fresh test DB.
+#[test]
+#[cfg(unix)]
+fn test_wal_acknowledgements_and_abrupt_exit() {
+    const TEST: &str = "async_key_value_storage::tests::test_wal_acknowledgements_and_abrupt_exit";
+    if let Some(path) = std::env::var_os("RTOS_WAL_PROBE_DB") {
+        let mode = std::env::var("RTOS_WAL_PROBE_MODE").unwrap();
+        let storage = ConsensusCommonFactory::create_async_key_value_storage(
+            PathBuf::from(path),
+            "wal-probe",
+            create_test_options(),
+        )
+        .unwrap();
+        let timeout = Duration::from_secs(10);
+        storage
+            .set(b"keep".to_vec(), b"durable".to_vec(), None)
+            .wait_timeout(timeout)
+            .expect("initial write timed out")
+            .unwrap();
+        storage
+            .set(b"erase".to_vec(), b"old".to_vec(), None)
+            .wait_timeout(timeout)
+            .expect("initial write timed out")
+            .unwrap();
+        if mode != "normal" {
+            // Only the external fault harness supplies this path. Arming after
+            // open/seed avoids mistaking a DB initialization error for an
+            // acknowledgement or explicit WAL synchronization failure.
+            let arm = std::env::var_os("RTOS_WAL_FAIL_ARM").expect("fault arm path");
+            std::fs::write(arm, b"armed").unwrap();
+        }
+        eprintln!("WAL_PROBE_OPERATION {mode}");
+        match mode.as_str() {
+            "normal" | "set" | "erase" => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let callback = Some(Box::new(move |result: crate::Result<()>| {
+                    tx.send(result.is_ok()).unwrap();
+                }) as crate::StorageWriteCallback);
+                let pending = if mode == "set" {
+                    storage.set(b"new".to_vec(), b"value".to_vec(), callback)
+                } else {
+                    storage.erase(b"erase".to_vec(), callback)
+                };
+                let acknowledged = pending.wait_timeout(timeout).expect("write timed out");
+                let callback_ok = rx.recv_timeout(timeout).expect("missing callback");
+                assert_eq!(acknowledged.is_ok(), mode == "normal", "{acknowledged:?}");
+                assert_eq!(callback_ok, mode == "normal");
+            }
+            "sync" => assert!(storage.sync(Some(timeout)).is_err()),
+            "close" => {
+                assert!(storage.close(Some(timeout)).is_err());
+                assert!(storage.is_closed());
+                assert!(storage.close(Some(timeout)).is_err());
+                assert!(storage.set(b"late".to_vec(), vec![], None).wait().is_err());
+            }
+            _ => panic!("unknown WAL probe mode"),
+        }
+        if mode == "normal" {
+            storage.sync(Some(timeout)).unwrap();
+        }
+        eprintln!("WAL_PROBE_ACKNOWLEDGED {mode}");
+        // _exit skips both Rust drops and C atexit handlers. Calling exit while
+        // RocksDB worker threads remain live can race native global teardown;
+        // that would test shutdown cleanup instead of abrupt WAL recovery.
+        unsafe extern "C" {
+            fn _exit(status: std::ffi::c_int) -> !;
+        }
+        unsafe { _exit(77) }
+    }
+
+    let path = create_test_db_path("wal_abrupt_exit");
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST, "--nocapture"])
+        .env("RTOS_WAL_PROBE_DB", &path)
+        .env("RTOS_WAL_PROBE_MODE", "normal")
+        .output()
+        .unwrap();
+    assert_eq!(child.status.code(), Some(77), "{child:?}");
+    assert!(String::from_utf8_lossy(&child.stderr).contains("WAL_PROBE_ACKNOWLEDGED normal"));
+    let storage = ConsensusCommonFactory::create_async_key_value_storage(
+        &path,
+        "wal-probe",
+        create_test_options(),
+    )
+    .unwrap();
+    assert_eq!(storage.get(b"keep".to_vec(), None).wait().unwrap(), Some(b"durable".to_vec()));
+    assert_eq!(storage.get(b"erase".to_vec(), None).wait().unwrap(), None);
+    storage.mark_for_destroy();
 }
 
 // ============================================================================
@@ -995,6 +1088,45 @@ fn test_close_is_idempotent() {
 
     assert!(storage.is_closed());
 
+    storage.mark_for_destroy();
+}
+
+#[test]
+fn test_close_does_not_acknowledge_pending_barrier() {
+    let path = create_test_db_path("close_pending");
+    let storage = ConsensusCommonFactory::create_async_key_value_storage(
+        &path,
+        "close_pending",
+        create_test_options(),
+    )
+    .unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    storage
+        .set(
+            b"key".to_vec(),
+            b"value".to_vec(),
+            Some(Box::new(move |result| {
+                result.unwrap();
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            })),
+        )
+        .wait()
+        .unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let closing = storage.clone();
+    let close = std::thread::spawn(move || closing.close(Some(Duration::from_secs(10))));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !storage.is_closed() {
+        assert!(std::time::Instant::now() < deadline, "close never closed admission");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let repeated = storage.close(Some(Duration::from_secs(1)));
+    release_tx.send(()).unwrap();
+    close.join().unwrap().unwrap();
+    assert!(repeated.is_err(), "pending close was incorrectly acknowledged");
+    storage.close(Some(Duration::from_secs(5))).unwrap();
     storage.mark_for_destroy();
 }
 

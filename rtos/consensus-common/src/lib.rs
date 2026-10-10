@@ -493,6 +493,9 @@ pub trait AsyncKeyValueStorage: Send + Sync {
     // =========================================================================
 
     /// Sets key-value pair (async).
+    /// A successful result or callback acknowledges a synchronized WAL write,
+    /// not merely queue insertion. An error or timeout must not authorize a
+    /// dependent external action; the write may have reached storage nonetheless.
     ///
     /// # Arguments
     ///
@@ -507,6 +510,7 @@ pub trait AsyncKeyValueStorage: Send + Sync {
     ) -> StorageAsyncResultPtr<()>;
 
     /// Deletes key from storage (async).
+    /// Success has the same WAL durability guarantee as `set`.
     fn erase(
         &self,
         key: StorageKey,
@@ -519,7 +523,9 @@ pub trait AsyncKeyValueStorage: Send + Sync {
 
     /// Flushes all pending operations (**BLOCKING** with optional timeout).
     ///
-    /// Waits until all queued tasks AND callbacks complete.
+    /// Synchronizes the WAL after earlier queued DB tasks, then waits for earlier
+    /// callbacks. Concurrently enqueued operations may fall after this barrier.
+    /// This does not replace checking the results of individual writes.
     ///
     /// # Arguments
     ///
@@ -528,7 +534,7 @@ pub trait AsyncKeyValueStorage: Send + Sync {
     /// # Returns
     ///
     /// * `Ok(())` if sync completed
-    /// * `Err(e)` if timeout expired
+    /// * `Err(e)` if synchronization failed or the timeout expired
     fn sync(&self, timeout: Option<Duration>) -> Result<()>;
 
     /// Returns count of pending operations.
@@ -543,11 +549,13 @@ pub trait AsyncKeyValueStorage: Send + Sync {
     /// C++ parity: `td::KeyValueAsync::close()` (see PR #2237 / `bridge.cpp::destroy_inner()`).
     ///
     /// Semantics:
-    /// 1. Drains the in-flight task and callback queues (by running `sync(timeout)`).
-    /// 2. Flips an internal gate so that any subsequent
+    /// 1. Flips an internal gate so that any subsequent
     ///    `get` / `get_by_prefix` / `set` / `erase` / `sync` call
     ///    returns an already-resolved `Err` without touching the DB thread.
-    /// 3. Is idempotent: repeated `close()` calls short-circuit to `Ok(())`.
+    /// 2. Synchronizes earlier queued DB writes and drains earlier callbacks.
+    /// 3. Is idempotent after successful completion. A repeated call while the
+    ///    first close is pending or after it failed returns an error; admission
+    ///    stays closed. A failed close must not authorize deletion or signing.
     ///
     /// Rationale (see docs `docs/local-docs/features/simplex-consensus/plans/
     /// alpenglow-implementation-plan.md` row `CONSENSUS-DB-CLEANUP-1`): shutting
