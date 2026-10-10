@@ -611,6 +611,8 @@ async fn fast_sync_snapshot_registration_expiring_during_lookup_cannot_publish()
     handler
         .add_validator_adnl_key(local.validator_key.id().data(), local.adnl_key.id().data())
         .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), handler.wait_test_subscribers())
+        .await??;
     let mut config = f.bootstrap.config_params().clone();
     config.set_config(ConfigParamEnum::ConfigParam34(ConfigParam34::with_validator_set(set(
         vec![f.member(0)],

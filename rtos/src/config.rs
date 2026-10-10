@@ -1482,6 +1482,23 @@ impl NodeConfigHandler {
         result
     }
 
+    /// A test barrier after callbacks scheduled by commands already acknowledged.
+    /// This preserves actor admission and the real ordered subscriber path.
+    #[cfg(test)]
+    pub(crate) async fn wait_test_subscribers(&self) -> Result<()> {
+        let (sent, received) = tokio::sync::oneshot::channel();
+        {
+            let admission = self.scheduler.admission.lock().unwrap();
+            if !admission.open {
+                fail!("Configuration scheduler stopped before subscriber barrier");
+            }
+            self.scheduler.spawn_callback(&self.runtime_handle, async move {
+                let _ = sent.send(());
+            });
+        }
+        received.await.map_err(|error| error!("Subscriber barrier: {error}"))
+    }
+
     pub(crate) fn validator_transport_revision(&self) -> Result<u64> {
         self.validator_transport_revision
             .lock()
