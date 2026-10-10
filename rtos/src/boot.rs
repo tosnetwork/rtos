@@ -579,8 +579,28 @@ pub(crate) async fn download_zerostate(
     }
 }
 
+/// Validate a boot successor using the same authenticated governing input for
+/// cached and downloaded proofs. Cache presence does not confer authority.
+pub(crate) fn check_boot_proof(
+    block_id: &BlockIdExt,
+    proof: &BlockProofStuff,
+    zero_state: Option<&Arc<ShardStateStuff>>,
+    prev_block_proof: Option<&BlockProofStuff>,
+) -> Result<()> {
+    if proof.id() != block_id {
+        fail!("Boot proof does not match requested block identity");
+    }
+    if let Some(previous) = prev_block_proof {
+        proof.check_with_prev_key_block_proof(previous)
+    } else if let Some(zero_state) = zero_state {
+        proof.check_with_master_state(zero_state)
+    } else {
+        fail!("Boot proof has no authenticated governing input");
+    }
+}
+
 /// download key block proof, check it and store
-async fn download_and_check_key_block_proof(
+pub(crate) async fn download_and_check_key_block_proof(
     engine: &dyn EngineOperations,
     block_id: &BlockIdExt,
     zero_state: Option<&Arc<ShardStateStuff>>,
@@ -588,7 +608,10 @@ async fn download_and_check_key_block_proof(
 ) -> Result<(Arc<BlockHandle>, BlockProofStuff)> {
     if let Some(handle) = engine.load_block_handle(block_id)? {
         if let Ok(proof) = engine.load_block_proof(&handle, false).await {
-            return Ok((handle, proof));
+            match check_boot_proof(block_id, &proof, zero_state, prev_block_proof) {
+                Ok(()) => return Ok((handle, proof)),
+                Err(err) => log::warn!(target: "boot", "cached proof failed verification: {}", err),
+            }
         }
     }
     loop {
@@ -596,13 +619,7 @@ async fn download_and_check_key_block_proof(
             fail!("Boot was stopped");
         }
         let proof = engine.download_block_proof(block_id, false, true).await?;
-        let result = if let Some(prev_block_proof) = prev_block_proof {
-            proof.check_with_prev_key_block_proof(prev_block_proof)
-        } else if let Some(zero_state) = zero_state {
-            proof.check_with_master_state(zero_state)
-        } else {
-            unreachable!("Impossible variant")
-        };
+        let result = check_boot_proof(block_id, &proof, zero_state, prev_block_proof);
         match result {
             Ok(_) => {
                 let handle = engine

@@ -14,7 +14,7 @@ use crate::{block::BlockStuff, block_proof::BlockProofStuff};
 mod pq_fixture;
 
 #[test]
-fn test_check_master_blocks_proof() {
+fn test_reject_legacy_master_blocks_proof() {
     let name = "src/tests/static/test_master_block_proof/key_block__3082181";
     let key_block = BlockStuff::read_block_from_file(name).unwrap();
 
@@ -30,12 +30,19 @@ fn test_check_master_blocks_proof() {
         let bytes = std::fs::read(&name).unwrap();
         let block_proof = BlockProofStuff::deserialize(block.id(), bytes, false).unwrap();
 
-        block_proof.check_with_prev_key_block_proof(&key_block_proof).unwrap();
+        // Historical fixtures use the old validator-set commitment. Target
+        // V2 must reject it; block's legacy subset tests separately verify the
+        // original member selection and cryptographic signatures.
+        assert!(block_proof
+            .check_with_prev_key_block_proof(&key_block_proof)
+            .unwrap_err()
+            .to_string()
+            .contains("Bad validator set hash"));
     }
 }
 
 #[test]
-fn test_check_master_blocks_proof_shuffle() {
+fn test_reject_legacy_master_blocks_proof_shuffle() {
     let name = "src/tests/static/test_master_block_proof_shuffle/key_block__3236530";
     let key_block = BlockStuff::read_block_from_file(name).unwrap();
 
@@ -55,7 +62,14 @@ fn test_check_master_blocks_proof_shuffle() {
         .unwrap();
         let block_proof = BlockProofStuff::deserialize(block.id(), bytes, false).unwrap();
 
-        block_proof.check_with_prev_key_block_proof(&key_block_proof).unwrap();
+        // Historical fixtures use the old validator-set commitment. Target
+        // V2 must reject it; block's legacy subset tests separately verify the
+        // original member selection and cryptographic signatures.
+        assert!(block_proof
+            .check_with_prev_key_block_proof(&key_block_proof)
+            .unwrap_err()
+            .to_string()
+            .contains("Bad validator set hash"));
     }
 }
 
@@ -151,8 +165,8 @@ fn test_pq_proof_requires_authenticated_finality_context() {
     assert!(error.to_string().contains("trusted governing session context"), "{error}");
 }
 
-#[test]
-fn test_pq_proof_verifies_with_governing_state_and_key_block() {
+#[tokio::test]
+async fn test_pq_proof_verifies_with_governing_state_and_key_block() {
     use rtos_block::*;
     let config = pq_fixture::config();
     let mut state = ShardStateUnsplit::default();
@@ -207,6 +221,11 @@ fn test_pq_proof_verifies_with_governing_state_and_key_block() {
         false,
     )
     .unwrap();
+    let handles = crate::collator_test_bundle::create_block_handle_storage(None).unwrap();
+    let cached_handle = handles
+        .create_handle(pq_fixture::block_id(), storage::types::BlockMeta::default(), None)
+        .unwrap()
+        .unwrap();
     let root = pq_fixture::target_block().serialize().unwrap();
     let merkle = MerkleProof::create(&root, |_| true).unwrap().serialize().unwrap();
     for mutation in 0..4 {
@@ -226,6 +245,36 @@ fn test_pq_proof_verifies_with_governing_state_and_key_block() {
             false,
         )
         .unwrap();
+        let engine = CachedProofEngine { handle: cached_handle.clone(), proof: proof.clone() };
+        let cached = crate::boot::download_and_check_key_block_proof(
+            &engine,
+            proof.id(),
+            Some(&master),
+            Some(&key_proof),
+        )
+        .await;
+        if mutation == 0 {
+            assert!(cached.is_ok(), "valid cached proof rejected: {cached:?}");
+        } else {
+            // A cached invalid proof must reach the replacement-download path,
+            // never become a trusted governing proof merely by existing on disk.
+            assert!(cached.unwrap_err().to_string().contains("replacement download reached"));
+        }
+        let boot_result =
+            crate::boot::check_boot_proof(proof.id(), &proof, Some(&master), Some(&key_proof));
+        assert_eq!(boot_result.is_ok(), mutation == 0, "boot mutation {mutation}: {boot_result:?}");
+        assert!(crate::boot::check_boot_proof(proof.id(), &proof, None, None).is_err());
+        let mut different_id = proof.id().clone();
+        different_id.file_hash = UInt256::default();
+        assert!(crate::boot::check_boot_proof(
+            &different_id,
+            &proof,
+            Some(&master),
+            Some(&key_proof)
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("requested block identity"));
         let state_result = proof.check_with_master_state(&master);
         let key_result = proof.check_with_prev_key_block_proof(&key_proof);
         assert_eq!(
@@ -277,4 +326,37 @@ fn test_pq_proof_refuses_later_governing_epoch_even_with_same_keys() {
         .unwrap_err()
         .to_string()
         .contains("different key-block epoch"));
+}
+
+struct CachedProofEngine {
+    handle: std::sync::Arc<storage::block_handle_db::BlockHandle>,
+    proof: BlockProofStuff,
+}
+
+#[async_trait::async_trait]
+impl crate::engine_traits::EngineOperations for CachedProofEngine {
+    fn load_block_handle(
+        &self,
+        _: &rtos_block::BlockIdExt,
+    ) -> rtos_block::Result<Option<std::sync::Arc<storage::block_handle_db::BlockHandle>>> {
+        Ok(Some(self.handle.clone()))
+    }
+    async fn load_block_proof(
+        &self,
+        _: &std::sync::Arc<storage::block_handle_db::BlockHandle>,
+        _: bool,
+    ) -> rtos_block::Result<BlockProofStuff> {
+        Ok(self.proof.clone())
+    }
+    fn check_stop(&self) -> bool {
+        false
+    }
+    async fn download_block_proof(
+        &self,
+        _: &rtos_block::BlockIdExt,
+        _: bool,
+        _: bool,
+    ) -> rtos_block::Result<BlockProofStuff> {
+        rtos_block::fail!("replacement download reached")
+    }
 }
