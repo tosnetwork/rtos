@@ -514,3 +514,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         Ok(stack)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_pq_mldsa44_transaction.rs"]
+mod pq_mldsa44_tests;

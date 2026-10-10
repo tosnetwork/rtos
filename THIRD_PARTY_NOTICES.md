@@ -78,3 +78,17 @@ and `validator/pq-finality-verification.h` under LGPL-2.0-or-later. The
 contributor notice is retained. Its public deterministic test fixtures use
 seeds 0xa0/0xa1 repeated 32 times with the same native test-signing backend;
 they are not independent cryptographic or chain-authentication references.
+
+`vm/src/executor/pq.rs` adapts the ML-DSA-44 instruction and canonical byte-chain
+reader from the fixed reference's `tosctl/src/vm/src/executor/pq.rs`, retaining
+its GPL-3.0-only contributor notice. RTOS uses the existing self-contained
+`rtos_pq_crypto` backend rather than the reference VM's external build paths.
+The assembler mnemonic and decoder follow the reference instruction F93100.
+The VM differential fixture derives from the public crypto corpus acknowledged
+above and public malformed-input scenarios; generation and reference build
+provenance are recorded in memo. The transaction body fixtures use the same
+public OpenSSL verification vector and a deliberately corrupted signature.
+On 2026-10-10, RTOS encoded those public vectors as VM Cell BOCs, added malformed
+structure and gas/version boundary cases, and recorded reference execution
+outcomes. The ACVP notice and Wycheproof license are also retained beside the
+VM fixture. NIST is acknowledged as the source of the ACVP material.

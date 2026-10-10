@@ -4670,6 +4670,7 @@ dependencies = [
  "rtos_api",
  "rtos_assembler",
  "rtos_block",
+ "rtos_pq_crypto",
  "serde_json",
  "thiserror 1.0.69",
 ]
