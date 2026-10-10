@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): restore bounded arithmetic gas regression.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -584,14 +584,13 @@ fn test_out_of_gas_inside_ret_of_catch_block() {
 //     .expect_failure(ExceptionCode::OutOfGas);
 // }
 
-#[ignore]
 #[test]
-fn test_my_gas() {
+fn test_arithmetic_with_sufficient_gas() {
     let code = "ZERO ADDCONST 2";
     test_case(code)
         .with_gas(Gas::test_with_limit(105))
-        .expect_gas(1000000000, 105, 0, 82)
-        .expect_failure(ExceptionCode::OutOfGas);
+        .expect_gas(1000000000, 105, 0, 56)
+        .expect_int_stack(&[2]);
 }
 
 #[test]
