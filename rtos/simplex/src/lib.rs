@@ -256,6 +256,7 @@ pub use consensus_common::SessionId;
 pub use consensus_common::SessionListener;
 /// Session node description
 pub use consensus_common::SessionNode;
+mod identity;
 /// Validator block candidate
 pub use consensus_common::ValidatorBlockCandidate;
 /// Validator block candidate callback
@@ -268,6 +269,7 @@ pub use consensus_common::ValidatorBlockCandidatePtr;
 pub use consensus_common::ValidatorBlockId;
 /// Validator weight type
 pub use consensus_common::ValidatorWeight;
+pub use identity::SimplexSessionNode;
 use rtos_block::{fail, BlockIdExt, Result, ShardIdent};
 use std::{
     sync::{Arc, Weak},
@@ -608,6 +610,9 @@ impl Default for SessionOptions {
 impl SessionOptions {
     /// Validate options and return error if invalid
     pub fn validate(&self) -> Result<()> {
+        if self.proto_version > 1 {
+            fail!("Simplex supports protocol versions 0 and 1 only");
+        }
         if self.slots_per_leader_window == 0 {
             fail!("slots_per_leader_window must be >= 1")
         }
@@ -842,11 +847,11 @@ impl SessionFactory {
     /// block ID that anchors external-block bounds (same MC block for an
     /// MC session).
     #[allow(clippy::too_many_arguments)]
-    pub fn create_session(
+    pub fn create_session<N: Into<SimplexSessionNode>>(
         options: &SessionOptions,
         session_id: &SessionId,
         shard: &ShardIdent,
-        ids: Vec<SessionNode>,
+        ids: Vec<N>,
         local_key: &PrivateKey,
         db_path: String,
         overlay_manager: ConsensusOverlayManagerPtr,
@@ -858,7 +863,7 @@ impl SessionFactory {
             options,
             session_id,
             shard,
-            ids,
+            ids.into_iter().map(Into::into).collect(),
             local_key,
             db_path,
             overlay_manager,
@@ -883,3 +888,7 @@ impl SessionFactory {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "tests/pq_fixture.rs"]
+pub(crate) mod pq_fixture;

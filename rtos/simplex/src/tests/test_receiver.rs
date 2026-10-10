@@ -356,10 +356,10 @@ struct ReceiverInstance {
 }
 
 impl ReceiverInstance {
-    fn create(
+    fn create<N: Clone + Into<crate::SimplexSessionNode>>(
         idx: u32,
         session_id: SessionId,
-        nodes: &[SessionNode],
+        nodes: &[N],
         private_key: PrivateKey,
         overlay_manager: ConsensusOverlayManagerPtr,
     ) -> Result<Self, Error> {
@@ -2004,4 +2004,56 @@ fn test_receiver_standstill_cache_does_not_overwrite_existing_certificate() {
         "expected only slot 1 certificate to be replayed (no overwrite), got {:?}",
         slots
     );
+}
+
+#[test]
+fn pq_live_receiver_verifies_votes_and_serves_candidates() {
+    use crate::pq_fixture as f;
+    let (nodes, keys) = f::members();
+    let overlay = SessionFactory::create_in_process_overlay_manager(2);
+    let receiver0 =
+        ReceiverInstance::create(0, f::session(), &nodes, keys[0].clone(), overlay.clone())
+            .unwrap();
+    let receiver1 =
+        ReceiverInstance::create(1, f::session(), &nodes, keys[1].clone(), overlay).unwrap();
+    receiver0.receiver.set_ingress_progress_slot(99);
+    receiver1.receiver.set_ingress_progress_slot(99);
+    thread::sleep(Duration::from_millis(200));
+    let TlVoteBoxed::Consensus_Simplex_Vote(vote) = f::vote("skip", "skip", 0, f::CONTEXT);
+    receiver0.receiver.send_vote(vote);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while receiver1.stats.votes_received.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(receiver1.stats.votes_received.load(Ordering::Relaxed), 1);
+    let empty = rtos_api::ton::consensus::candidatedata::Empty {
+        slot: 99,
+        parent: TlCandidateId { slot: 98, hash: UInt256::from([5; 32]) }.into_boxed(),
+        block: f::block_id("empty"),
+        signature: f::bytes(&f::row("empty", "candidate", 1, f::CONTEXT), "signature"),
+    }
+    .into_boxed();
+    let payload = serialize_boxed(&empty).unwrap();
+    receiver0._listener.set_query_fallback_payloads(
+        99,
+        f::candidate_hash("empty"),
+        payload,
+        serialize_boxed(&f::signatures("empty", "notarize", f::CONTEXT)).unwrap(),
+    );
+    receiver1.receiver.request_candidate(99, f::candidate_hash("empty"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while receiver1.stats.broadcasts_received.load(Ordering::Relaxed) == 0
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(receiver1.stats.broadcasts_received.load(Ordering::Relaxed), 1);
+    let TlVoteBoxed::Consensus_Simplex_Vote(mut invalid) =
+        f::vote("empty", "notarize", 0, f::CONTEXT);
+    invalid.signature[0] ^= 1;
+    receiver0.receiver.send_vote(invalid);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(receiver1.stats.votes_received.load(Ordering::Relaxed), 1);
+    receiver0.stop();
+    receiver1.stop();
 }

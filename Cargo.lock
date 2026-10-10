@@ -968,6 +968,7 @@ dependencies = [
  "rocksdb",
  "rtos_api",
  "rtos_block",
+ "rtos_pq_crypto",
  "secrets-vault",
  "serde_json",
  "spin 0.7.1",

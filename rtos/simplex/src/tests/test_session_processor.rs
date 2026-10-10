@@ -469,9 +469,12 @@ impl consensus_common::SessionListener for RecordingListener {
         root_hash: UInt256,
         _file_hash: UInt256,
         _data: BlockPayloadPtr,
-        signatures: BlockSignaturesVariant,
+        signatures: consensus_common::SessionFinality,
         _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
     ) {
+        let consensus_common::SessionFinality::Carrier(signatures) = signatures else {
+            panic!("classical test received PQ approval")
+        };
         let is_final = match signatures {
             BlockSignaturesVariant::SimplexPq(_) => {
                 panic!("classical test harness received PQ signatures")
@@ -2453,7 +2456,7 @@ fn test_candidate_decision_fail_drops_late_failure_for_finalized_block() {
         collated_file_hash: UInt256::rand(),
         data: vec![1, 2, 3],
         collated_data: vec![4, 5, 6],
-        creator,
+        creator: creator.into(),
     };
     let raw_candidate = crate::block::RawCandidate::new(
         candidate_id.clone(),
@@ -2509,7 +2512,7 @@ fn make_test_non_empty_candidate(
         collated_file_hash: UInt256::rand(),
         data: vec![1, 2, 3],
         collated_data: vec![4, 5, 6],
-        creator,
+        creator: creator.into(),
     };
     crate::block::RawCandidate::new(candidate_id, parent_id, ValidatorIndex::new(0), block, vec![])
 }
@@ -4343,9 +4346,13 @@ fn make_signed_block_broadcast_with_parent(
     let session_id = fixture.processor.session_id().clone();
     let leader_idx = fixture.processor.runtime.description().get_leader(SlotIndex::new(slot));
     let leader_key = fixture.processor.runtime.description().get_source_public_key(leader_idx);
-    let signature =
-        crate::utils::sign_candidate_u32(&session_id, slot, &candidate_hash, leader_key)
-            .expect("signing failed");
+    let signature = crate::utils::sign_candidate_u32(
+        &session_id,
+        slot,
+        &candidate_hash,
+        leader_key.classical_key().unwrap(),
+    )
+    .expect("signing failed");
 
     let candidate_id = RawCandidateId { slot: SlotIndex::new(slot), hash: candidate_hash };
     let block = crate::block::BlockCandidate {
@@ -4390,9 +4397,13 @@ fn make_signed_empty_block_broadcast_with_parent(
     let session_id = fixture.processor.session_id().clone();
     let leader_idx = fixture.processor.runtime.description().get_leader(SlotIndex::new(slot));
     let leader_key = fixture.processor.runtime.description().get_source_public_key(leader_idx);
-    let signature =
-        crate::utils::sign_candidate_u32(&session_id, slot, &candidate_hash, leader_key)
-            .expect("signing failed");
+    let signature = crate::utils::sign_candidate_u32(
+        &session_id,
+        slot,
+        &candidate_hash,
+        leader_key.classical_key().unwrap(),
+    )
+    .expect("signing failed");
 
     let candidate_id = RawCandidateId { slot: SlotIndex::new(slot), hash: candidate_hash };
     let raw_candidate = crate::block::RawCandidate::new_empty(
@@ -6029,7 +6040,7 @@ fn test_finalized_callback_fires_then_record_eventually_persists() {
             _root_hash: UInt256,
             _file_hash: UInt256,
             _data: BlockPayloadPtr,
-            _signatures: BlockSignaturesVariant,
+            _signatures: consensus_common::SessionFinality,
             _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
         ) {
             self.callback_invoked.store(true, Ordering::Relaxed);
@@ -9913,4 +9924,493 @@ fn test_stop_is_idempotent_and_does_not_double_increment_errors() {
         fixture.processor.database.db().is_closed(),
         "db must remain closed across double-stop",
     );
+}
+
+#[test]
+fn pq_live_controller_retains_full_signatures_and_role() {
+    use crate::pq_fixture as f;
+    let fixture = TestFixture::new(2);
+    for version in [0, 1] {
+        for kind in ["empty", "ordinary", "shard_empty", "shard_ordinary"] {
+            let description = f::description(f::block_id(kind).shard().clone(), version);
+            assert!(description
+                .get_legacy_signing_key()
+                .unwrap_err()
+                .to_string()
+                .contains("Disabled"));
+            let controller = crate::consensus_controller::ConsensusController::new(
+                fixture.processor.callbacks.clone(),
+                description.clone(),
+                fixture.processor.telemetry.clone(),
+                None,
+                None,
+                None,
+                41,
+                None,
+            );
+            for (role, is_final) in [("finalize", true), ("notarize", false)] {
+                let signatures: Vec<_> = (0..2)
+                    .map(|i| {
+                        (
+                            description.get_source_public_key_hash(ValidatorIndex::new(i)).clone(),
+                            consensus_common::ConsensusCommonFactory::create_block_payload(
+                                f::bytes(&f::row(kind, role, i as usize, f::CONTEXT), "signature"),
+                            ),
+                        )
+                    })
+                    .collect();
+                let data = f::bytes(&f::row(kind, role, 0, f::CONTEXT), "candidate");
+                let result = controller.build_finality_for_test(
+                    &signatures,
+                    SlotIndex::new(99),
+                    data.clone(),
+                    is_final,
+                );
+                if !is_final && f::block_id(kind).shard().is_masterchain() {
+                    assert!(result.is_err());
+                    continue;
+                }
+                match result.unwrap() {
+                    consensus_common::SessionFinality::Carrier(
+                        BlockSignaturesVariant::SimplexPq(carrier),
+                    ) => {
+                        assert!(is_final);
+                        assert_eq!(carrier.signatures[0].signature.len(), 2420);
+                        assert_eq!(carrier.sig_weight, 3);
+                        description
+                            .pq_context()
+                            .unwrap()
+                            .for_block(f::block_id(kind))
+                            .unwrap()
+                            .verify_final(&carrier)
+                            .unwrap();
+                    }
+                    consensus_common::SessionFinality::PqApproval(approval) => {
+                        assert!(!is_final);
+                        description
+                            .pq_context()
+                            .unwrap()
+                            .for_block(f::block_id(kind))
+                            .unwrap()
+                            .verify_approval(&approval)
+                            .unwrap();
+                    }
+                    _ => panic!("PQ finality downgraded"),
+                }
+                assert!(controller
+                    .build_finality_for_test(
+                        &signatures,
+                        SlotIndex::new(99),
+                        data.clone(),
+                        !is_final
+                    )
+                    .is_err());
+                assert!(controller
+                    .build_finality_for_test(
+                        &signatures[..1],
+                        SlotIndex::new(99),
+                        data.clone(),
+                        is_final
+                    )
+                    .is_err());
+                assert!(controller
+                    .build_finality_for_test(
+                        &[signatures[0].clone(), signatures[0].clone()],
+                        SlotIndex::new(99),
+                        data,
+                        is_final
+                    )
+                    .is_err());
+            }
+        }
+    }
+    assert!(SessionOptions { proto_version: 2, ..Default::default() }.validate().is_err());
+}
+
+fn make_pq_processor_for_test(db: crate::database::SimplexDbPtr) -> SessionProcessor {
+    make_pq_processor_with_description_for_test(
+        db,
+        crate::pq_fixture::description(ShardIdent::masterchain(), 0),
+    )
+}
+fn make_pq_processor_with_description_for_test(
+    db: crate::database::SimplexDbPtr,
+    description: Arc<SessionDescription>,
+) -> SessionProcessor {
+    let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = Arc::new(MockListener);
+    let stop = Arc::new(AtomicBool::new(false));
+    let callbacks = Arc::new(crate::session_callbacks::SessionCallbacks::new(
+        description.get_session_id().clone(),
+        stop.clone(),
+        false,
+        Arc::new(TestCallbackQueue),
+        Arc::downgrade(&listener),
+    ));
+    SessionProcessor::new(
+        description.clone(),
+        make_start_prev_blocks(description.get_shard(), description.get_initial_block_seqno()),
+        TestTaskQueue::new(),
+        MockReceiver::new(),
+        stop,
+        db,
+        0,
+        Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+        callbacks,
+        None,
+        7,
+    )
+    .unwrap()
+}
+#[test]
+fn pq_live_processor_candidate_persistence_and_authenticated_recovery() {
+    use crate::pq_fixture as f;
+    let path =
+        std::env::temp_dir().join(format!("rtos-pq-processor-{}", UInt256::rand().to_hex_string()));
+    let db = crate::database::SimplexDb::open(&path, "pq-test").unwrap();
+    let candidate = rtos_api::ton::consensus::candidatedata::Empty {
+        slot: 99,
+        parent: TlCandidateId { slot: 98, hash: UInt256::from([5; 32]) }.into_boxed(),
+        block: f::block_id("empty"),
+        signature: f::bytes(&f::row("empty", "candidate", 1, f::CONTEXT), "signature"),
+    }
+    .into_boxed();
+    let expected = serialize_boxed(&candidate).unwrap();
+    let mut processor = make_pq_processor_for_test(db.clone());
+    processor.on_candidate_received(1, candidate, None);
+    db.sync(Some(Duration::from_secs(10))).unwrap();
+    let id =
+        crate::block::RawCandidateId { slot: SlotIndex::new(99), hash: f::candidate_hash("empty") };
+    assert_eq!(
+        db.load_candidate_payload_by_id(&id, Duration::from_secs(10)).unwrap().unwrap(),
+        expected
+    );
+    let metadata = db.load_candidate_info_by_id(&id, Duration::from_secs(10)).unwrap().unwrap();
+    assert_eq!(metadata.signature.len(), 2420);
+    assert_eq!(metadata.leader_idx, 1);
+    drop(processor);
+    db.close(Some(Duration::from_secs(10))).unwrap();
+    drop(db);
+    let db = crate::database::SimplexDb::open(&path, "pq-test").unwrap();
+    let bootstrap = db.load_bootstrap().unwrap();
+    assert_eq!(bootstrap.candidate_payloads.len(), 1);
+    let mut restored = make_pq_processor_for_test(db.clone());
+    let description = f::description(ShardIdent::masterchain(), 0);
+    crate::startup_recovery::SessionStartupRecoveryProcessor::new(
+        f::session(),
+        description.clone(),
+        bootstrap.clone(),
+    )
+    .apply_bootstrap(&mut restored)
+    .unwrap();
+    for alteration in 0..3 {
+        let mut bad = bootstrap.clone();
+        match alteration {
+            0 => bad.candidate_infos[0].signature[0] ^= 1,
+            1 => bad.candidate_infos[0].leader_idx = 0,
+            _ => bad.candidate_payloads[0].0.hash = UInt256::from([33; 32]),
+        }
+        let mut target = make_pq_processor_for_test(db.clone());
+        assert!(crate::startup_recovery::SessionStartupRecoveryProcessor::new(
+            f::session(),
+            description.clone(),
+            bad
+        )
+        .apply_bootstrap(&mut target)
+        .is_err());
+    }
+    drop(restored);
+    db.close(Some(Duration::from_secs(10))).unwrap();
+    drop(db);
+    std::fs::remove_dir_all(path).unwrap();
+}
+#[test]
+fn pq_live_recovery_rejects_vote_context_and_member_before_application() {
+    use crate::pq_fixture as f;
+    for (index, context) in [(0, f::CONTEXT), (0, "TOS-AUTH-ML-DSA-44-v1"), (2, f::CONTEXT)] {
+        let vote = f::vote("empty", "notarize", 0, context);
+        let data = serialize_boxed(&vote).unwrap();
+        let mut bootstrap = crate::database::Bootstrap::default();
+        bootstrap.votes.push(crate::database::VoteRecord {
+            vote_hash: UInt256::calc_file_hash(&data),
+            data,
+            node_idx: ValidatorIndex::new(index),
+            seqno: 0,
+        });
+        let db = MockDb::new();
+        let mut target = make_pq_processor_for_test(db);
+        let result = crate::startup_recovery::SessionStartupRecoveryProcessor::new(
+            f::session(),
+            f::description(ShardIdent::masterchain(), 0),
+            bootstrap,
+        )
+        .apply_bootstrap(&mut target);
+        assert_eq!(result.is_ok(), index == 0 && context == f::CONTEXT, "{result:?}");
+    }
+}
+
+#[test]
+fn pq_live_recovery_requires_finality_before_any_state_mutation() {
+    use crate::database::{
+        Bootstrap, CandidateInfoRecord, FinalCertRecord, FinalizedBlockRecord, NotarCertRecord,
+        SkipCertRecord,
+    };
+    use crate::pq_fixture as f;
+    let id = crate::block::RawCandidateId {
+        slot: SlotIndex::new(99),
+        hash: f::candidate_hash("ordinary"),
+    };
+    let data = f::bytes(&f::row("ordinary", "candidate", 1, f::CONTEXT), "candidate");
+    let candidate_hash_data = rtos_api::deserialize_typed(&data).unwrap();
+    let info = CandidateInfoRecord {
+        candidate_id: id.clone(),
+        leader_idx: 1,
+        candidate_hash_data,
+        signature: f::bytes(&f::row("ordinary", "candidate", 1, f::CONTEXT), "signature"),
+    };
+    let parent = match &info.candidate_hash_data {
+        rtos_api::ton::consensus::CandidateHashData::Consensus_CandidateHashDataOrdinary(data) => {
+            match &data.parent {
+                rtos_api::ton::consensus::CandidateParent::Consensus_CandidateParent(parent) => {
+                    Some(crate::block::RawCandidateId {
+                        slot: SlotIndex::new(*parent.id.slot() as u32),
+                        hash: parent.id.hash().clone(),
+                    })
+                }
+                _ => None,
+            }
+        }
+        _ => unreachable!(),
+    };
+    let mut valid = Bootstrap::default();
+    valid.candidate_infos.push(info);
+    valid.finalized_blocks.push(FinalizedBlockRecord {
+        candidate_id: id.clone(),
+        block_id: f::block_id("ordinary"),
+        parent,
+        is_final: true,
+    });
+    let certificate = |role: &str, context: &str| {
+        serialize_boxed(
+            &rtos_api::ton::consensus::simplex::certificate::Certificate {
+                vote: f::vote("ordinary", role, 0, context).vote().clone(),
+                signatures: f::signatures("ordinary", role, context),
+            }
+            .into_boxed(),
+        )
+        .unwrap()
+    };
+    valid.final_certs.push(FinalCertRecord {
+        candidate_id: id.clone(),
+        cert_bytes: certificate("finalize", f::CONTEXT),
+    });
+    for alteration in 0..6 {
+        let mut bootstrap = valid.clone();
+        match alteration {
+            0 => {}
+            1 => bootstrap.final_certs.clear(),
+            2 => bootstrap.final_certs[0].cert_bytes = certificate("notarize", f::CONTEXT),
+            3 => {
+                bootstrap.final_certs[0].cert_bytes =
+                    certificate("finalize", "TOS-AUTH-ML-DSA-44-v1")
+            }
+            4 => bootstrap
+                .skip_certs
+                .push(SkipCertRecord { slot: SlotIndex::new(99), cert_bytes: vec![0] }),
+            _ => bootstrap
+                .notar_certs
+                .push(NotarCertRecord { candidate_id: id.clone(), notar_cert_bytes: vec![0] }),
+        }
+        let mut target = make_pq_processor_for_test(MockDb::new());
+        let before = target.simplex_state.get_first_non_finalized_slot();
+        let result = crate::startup_recovery::SessionStartupRecoveryProcessor::new(
+            f::session(),
+            f::description(ShardIdent::masterchain(), 0),
+            bootstrap,
+        )
+        .apply_bootstrap(&mut target);
+        assert_eq!(result.is_ok(), alteration == 0, "alteration {alteration}: {result:?}");
+        if alteration != 0 {
+            assert_eq!(target.simplex_state.get_first_non_finalized_slot(), before);
+            assert!(crate::startup_recovery::StartupRecoveryBackend::candidate_book(&target)
+                .received(&id)
+                .is_none());
+        }
+    }
+}
+
+#[test]
+fn pq_live_session_stops_on_invalid_recovery_record() {
+    use crate::pq_fixture as f;
+    let path =
+        std::env::temp_dir().join(format!("rtos-pq-startup-{}", UInt256::rand().to_hex_string()));
+    let db = crate::database::SimplexDb::open(&path, &f::session().to_hex_string()).unwrap();
+    let data = serialize_boxed(&f::vote("empty", "notarize", 0, "TOS-AUTH-ML-DSA-44-v1")).unwrap();
+    db.save_vote_async(&crate::database::VoteRecord {
+        vote_hash: UInt256::calc_file_hash(&data),
+        data,
+        node_idx: ValidatorIndex::new(0),
+        seqno: 0,
+    })
+    .unwrap()
+    .wait()
+    .unwrap();
+    db.close(Some(Duration::from_secs(10))).unwrap();
+    drop(db);
+    let listener = RecordingListener::new();
+    let dyn_listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = listener.clone();
+    let (nodes, keys) = f::members();
+    let session = crate::SessionFactory::create_session(
+        &SessionOptions {
+            wait_for_db_init: true,
+            use_callback_thread: false,
+            ..Default::default()
+        },
+        &f::session(),
+        &ShardIdent::masterchain(),
+        nodes,
+        &keys[0],
+        path.to_str().unwrap().to_owned(),
+        crate::SessionFactory::create_in_process_overlay_manager(1),
+        Arc::downgrade(&dyn_listener),
+        None,
+        7,
+    );
+    assert!(session.is_err(), "invalid PQ recovery must fail before overlay registration");
+    assert_eq!(listener.event_count(), 0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let db = loop {
+        match crate::database::SimplexDb::open(&path, &f::session().to_hex_string()) {
+            Ok(db) => break db,
+            Err(error) if std::time::Instant::now() < deadline => {
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("stopped session retained DB: {error}"),
+        }
+    };
+    let bootstrap = db.load_bootstrap().unwrap();
+    assert_eq!(bootstrap.votes.len(), 1, "failed recovery must not sign/persist additional votes");
+    assert!(bootstrap.finalized_blocks.is_empty());
+    assert!(bootstrap.candidate_infos.is_empty());
+    db.close(Some(Duration::from_secs(10))).unwrap();
+    drop(db);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn pq_live_recovery_authenticates_finalized_parent_chains_and_role_flags() {
+    use crate::database::{
+        Bootstrap, CandidateInfoRecord, FinalCertRecord, FinalizedBlockRecord, NotarCertRecord,
+    };
+    use crate::pq_fixture as f;
+    use rtos_api::ton::consensus::simplex::{
+        certificate::Certificate, unsignedvote::FinalizeVote, votesignature::VoteSignature,
+        votesignatureset::VoteSignatureSet,
+    };
+    let data: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../tl/rtos_api/tests/data/live-pq-chain.json"))
+            .unwrap();
+    let row = |kind: &str, role: &str, index: usize| {
+        data["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["kind"] == kind && r["role"] == role && r["index"] == index)
+            .unwrap()
+    };
+    let info = |kind: &str, slot: u32| {
+        let r = row(kind, "candidate", (slot % 2) as usize);
+        let bytes = f::bytes(r, "candidate");
+        CandidateInfoRecord {
+            candidate_id: crate::block::RawCandidateId {
+                slot: SlotIndex::new(slot),
+                hash: UInt256::calc_file_hash(&bytes),
+            },
+            leader_idx: slot % 2,
+            candidate_hash_data: rtos_api::deserialize_typed(&bytes).unwrap(),
+            signature: f::bytes(r, "signature"),
+        }
+    };
+    let signatures = |kind: &str, role: &str, count: usize| {
+        VoteSignatureSet {
+            votes: (0..count)
+                .map(|i| {
+                    VoteSignature {
+                        who: i as i32,
+                        signature: f::bytes(row(kind, role, i), "signature"),
+                    }
+                    .into_boxed()
+                })
+                .collect(),
+        }
+        .into_boxed()
+    };
+    for kind in ["empty", "ordinary"] {
+        let parent = info("parent", 98);
+        let child = info(kind, 99);
+        let mut valid = Bootstrap::default();
+        valid.candidate_infos = vec![parent.clone(), child.clone()];
+        valid.finalized_blocks = vec![
+            FinalizedBlockRecord {
+                candidate_id: parent.candidate_id.clone(),
+                block_id: parent.candidate_hash_data.block().clone(),
+                parent: None,
+                is_final: kind == "empty",
+            },
+            FinalizedBlockRecord {
+                candidate_id: child.candidate_id.clone(),
+                block_id: child.candidate_hash_data.block().clone(),
+                parent: Some(parent.candidate_id.clone()),
+                is_final: true,
+            },
+        ];
+        valid.notar_certs.push(NotarCertRecord {
+            candidate_id: parent.candidate_id.clone(),
+            notar_cert_bytes: serialize_boxed(&signatures("parent", "notarize", 2)).unwrap(),
+        });
+        let final_cert = |count| {
+            serialize_boxed(
+                &Certificate {
+                    vote: FinalizeVote {
+                        id: TlCandidateId { slot: 99, hash: child.candidate_id.hash.clone() }
+                            .into_boxed(),
+                    }
+                    .into_boxed(),
+                    signatures: signatures(kind, "finalize", count),
+                }
+                .into_boxed(),
+            )
+            .unwrap()
+        };
+        valid.final_certs.push(FinalCertRecord {
+            candidate_id: child.candidate_id.clone(),
+            cert_bytes: final_cert(2),
+        });
+        for alteration in 0..6 {
+            let mut bootstrap = valid.clone();
+            match alteration {
+                0 => {}
+                1 => bootstrap.final_certs.clear(),
+                2 => bootstrap.notar_certs.clear(),
+                3 => bootstrap.final_certs[0].cert_bytes = final_cert(1),
+                4 => bootstrap.finalized_blocks[0].is_final = true,
+                _ => bootstrap.final_certs[0].cert_bytes.push(0),
+            }
+            let description = f::description(parent.candidate_hash_data.block().shard().clone(), 0);
+            let mut target =
+                make_pq_processor_with_description_for_test(MockDb::new(), description.clone());
+            let before = target.simplex_state.get_first_non_finalized_slot();
+            let result = crate::startup_recovery::SessionStartupRecoveryProcessor::new(
+                f::session(),
+                description,
+                bootstrap,
+            )
+            .apply_bootstrap(&mut target);
+            let succeeds = alteration == 0 || (alteration == 4 && kind == "empty");
+            assert_eq!(result.is_ok(), succeeds, "{kind}/{alteration}: {result:?}");
+            if !succeeds {
+                assert_eq!(target.simplex_state.get_first_non_finalized_slot(), before);
+            }
+        }
+    }
 }

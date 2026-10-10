@@ -185,7 +185,7 @@ impl SessionListener for Recorder {
         };
 
         let candidate = ValidatorBlockCandidate {
-            public_key: source_info.source.clone(),
+            public_key: source_info.source.classical_key().unwrap().clone(),
             id: block_id,
             collated_file_hash: UInt256::default(),
             data: ConsensusCommonFactory::create_empty_block_payload(),
@@ -241,12 +241,12 @@ impl SessionListener for Recorder {
         _root_hash: BlockHash,
         _file_hash: BlockHash,
         _data: BlockPayloadPtr,
-        signatures: BlockSignaturesVariant,
+        signatures: consensus_common::SessionFinality,
         approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
     ) {
         let validators = self.validators.lock().unwrap().clone();
         let (slot_from_variant, candidate_data_bytes) = match &signatures {
-            BlockSignaturesVariant::Simplex(s) => {
+            consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::Simplex(s)) => {
                 (s.slot, s.candidate_data_bytes().expect("candidate data bytes"))
             }
             _ => panic!("emulator must produce Simplex signatures"),

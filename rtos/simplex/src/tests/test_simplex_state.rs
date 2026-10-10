@@ -169,7 +169,7 @@ fn create_test_candidate(
         collated_file_hash: UInt256::default(),
         data: vec![],
         collated_data: vec![],
-        creator: Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap(),
+        creator: Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap().into(),
     };
 
     Candidate::new(
@@ -188,7 +188,7 @@ fn create_stub_block(block_id: BlockIdExt) -> crate::block::BlockCandidate {
         collated_file_hash: UInt256::default(),
         data: vec![],
         collated_data: vec![],
-        creator: Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap(),
+        creator: Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap().into(),
     }
 }
 

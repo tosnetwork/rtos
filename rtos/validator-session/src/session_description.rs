@@ -201,7 +201,7 @@ impl SessionDescription for SessionDescriptionImpl {
         self.sources
             .iter()
             .map(|source| CatchainNode {
-                public_key: source.public_key.clone(),
+                public_key: source.public_key.clone().into(),
                 adnl_id: source.adnl_id.clone(),
             })
             .collect()

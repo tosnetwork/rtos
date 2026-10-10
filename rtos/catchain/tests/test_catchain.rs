@@ -96,7 +96,7 @@ async fn test_catchain_creation() {
             let public_key = parse_hex_as_public_key_raw(hex);
             let adnl_id = get_public_key_hash(&public_key);
 
-            source_ids.push(CatchainNode { public_key, adnl_id });
+            source_ids.push(CatchainNode { public_key: public_key.into(), adnl_id });
         }
     }
     let local_key = source_ids[0].public_key.clone();
@@ -111,7 +111,7 @@ async fn test_catchain_creation() {
         &options,
         &session_id,
         source_ids,
-        &local_key,
+        local_key.classical_key().unwrap(),
         db_path,
         db_suffix,
         allow_unsafe_self_blocks_resync,

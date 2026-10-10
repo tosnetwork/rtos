@@ -2219,7 +2219,7 @@ impl SessionProcessorImpl {
                     .get_current_round_node_priority(&self.description, source_idx);
 
                 let source_info = crate::BlockSourceInfo {
-                    source: validator_public_key,
+                    source: validator_public_key.into(),
                     priority: crate::BlockCandidatePriority {
                         round: self.current_round,
                         first_block_round: self.first_block_round,
@@ -2947,7 +2947,7 @@ impl SessionProcessorImpl {
             .virtual_state
             .get_current_round_node_priority(&self.description, self.get_local_idx());
         let source_info = crate::BlockSourceInfo {
-            source: self.description.get_source_public_key(self.get_local_idx()).clone(),
+            source: self.description.get_source_public_key(self.get_local_idx()).clone().into(),
             priority: crate::BlockCandidatePriority {
                 round,
                 first_block_round: self.first_block_round,
@@ -3527,7 +3527,7 @@ impl SessionProcessorImpl {
                     .virtual_state
                     .get_current_round_node_priority(&self.description, source_idx);
                 let source_info = crate::BlockSourceInfo {
-                    source: source_public_key,
+                    source: source_public_key.into(),
                     priority: crate::BlockCandidatePriority {
                         round,
                         first_block_round: self.first_block_round,

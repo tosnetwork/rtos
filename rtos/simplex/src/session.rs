@@ -68,7 +68,7 @@ use crate::{
     task_queue::{CallbackTaskPtr, CallbackTaskQueuePtr, TaskPtr, TaskQueue, TaskQueuePtr},
     trace_collector::TraceCollector,
     ActivityNodePtr, ConsensusOverlayManagerPtr, ConsensusSession, LogReplayOptions, MetricsHandle,
-    PrivateKey, SessionId, SessionListenerPtr, SessionNode, SessionOptions, SessionPtr,
+    PrivateKey, SessionId, SessionListenerPtr, SessionOptions, SessionPtr,
     SessionReplayListenerPtr, SimplexSession,
 };
 use consensus_common::{
@@ -459,7 +459,7 @@ impl SessionImpl {
         mut options: SessionOptions,
         session_id: SessionId,
         shard: ShardIdent,
-        ids: Vec<SessionNode>,
+        ids: Vec<crate::SimplexSessionNode>,
         local_key: PrivateKey,
         overlay_manager: ConsensusOverlayManagerPtr,
         receiver_listener: ReceiverListenerPtr,
@@ -563,21 +563,31 @@ impl SessionImpl {
             max_candidate_size,
             max_candidate_query_answer_size,
         );
-        let receiver = match crate::receiver::ReceiverWrapper::create(
-            session_id.clone(),
-            &shard,
-            &ids,
-            &local_key,
-            overlay_manager.clone(),
-            receiver_listener,
-            panicked_flag.clone(),
-            health_counters.clone(),
-            receiver_settings,
-        ) {
-            Ok(r) => r,
-            Err(err) => {
-                fail_startup(err, "failed to create receiver");
-                return;
+        let pq_session = ids.iter().any(|node| node.identity.pq_key().is_some());
+        let create_receiver = || {
+            crate::receiver::ReceiverWrapper::create(
+                session_id.clone(),
+                &shard,
+                &ids,
+                &local_key,
+                overlay_manager.clone(),
+                receiver_listener.clone(),
+                panicked_flag.clone(),
+                health_counters.clone(),
+                receiver_settings,
+            )
+        };
+        // Classical restart keeps its early overlay registration. PQ input is
+        // authenticated first, so corrupt recovery cannot expose a live receiver.
+        let mut early_receiver = if pq_session {
+            None
+        } else {
+            match create_receiver() {
+                Ok(receiver) => Some(receiver),
+                Err(err) => {
+                    fail_startup(err, "failed to create receiver");
+                    return;
+                }
             }
         };
 
@@ -599,6 +609,44 @@ impl SessionImpl {
                 }
                 return;
             }
+        };
+
+        if pq_session {
+            let authentication = SessionDescription::new(
+                &options,
+                session_id.clone(),
+                1,
+                &ids,
+                local_key.clone(),
+                &shard,
+                session_creation_time,
+                Some(metrics_receiver.clone()),
+            )
+            .and_then(|description| description.bind_pq_session(catchain_seqno))
+            .and_then(|description| {
+                SessionStartupRecoveryProcessor::new(
+                    session_id.clone(),
+                    Arc::new(description),
+                    bootstrap.clone(),
+                )
+                .authenticate_pq_input()
+            });
+            if let Err(err) = authentication {
+                should_stop_flag.store(true, Ordering::Release);
+                let _ = db.close(Some(Duration::from_secs(10)));
+                fail_startup(err, "PQ bootstrap authentication failed before overlay registration");
+                return;
+            }
+        }
+        let receiver = match early_receiver.take() {
+            Some(receiver) => receiver,
+            None => match create_receiver() {
+                Ok(receiver) => receiver,
+                Err(err) => {
+                    fail_startup(err, "failed to create receiver");
+                    return;
+                }
+            },
         };
 
         // Phase 4: Check if this is a fresh start
@@ -681,7 +729,9 @@ impl SessionImpl {
             &shard,
             session_creation_time,
             Some(metrics_receiver.clone()),
-        ) {
+        )
+        .and_then(|d| d.bind_pq_session(catchain_seqno))
+        {
             Ok(d) => Arc::new(d),
             Err(err) => {
                 fail_startup(err, "failed to create SessionDescription");
@@ -726,6 +776,12 @@ impl SessionImpl {
             let finalized_count = recovery_processor.finalized_block_count();
 
             if let Err(err) = recovery_processor.apply_bootstrap(&mut processor) {
+                if processor.get_description().pq_context().is_some() {
+                    should_stop_flag.store(true, Ordering::Release);
+                    processor.stop(false);
+                    fail_startup(err, "PQ recovery authentication failed; session stopped");
+                    return;
+                }
                 // Recovery failure is logged but not fatal - continue with potentially
                 // inconsistent state rather than failing the entire session startup.
                 log::error!(
@@ -1123,7 +1179,7 @@ impl SessionImpl {
         options: &SessionOptions,
         session_id: &SessionId,
         shard: &ShardIdent,
-        ids: Vec<SessionNode>,
+        ids: Vec<crate::SimplexSessionNode>,
         local_key: &PrivateKey,
         db_path: String,
         overlay_manager: ConsensusOverlayManagerPtr,
@@ -1139,6 +1195,7 @@ impl SessionImpl {
             db_path
         );
 
+        options.validate()?;
         let session_creation_time = SystemTime::now();
 
         // Ensure panics in SX threads are logged as FATAL with backtrace.
@@ -1162,7 +1219,8 @@ impl SessionImpl {
         let start_flag = Arc::new(AtomicBool::new(false));
         let deferred_start_info = Arc::new(Mutex::new(None));
         let main_processing_thread_stopped = Arc::new(AtomicBool::new(false));
-        let callbacks_processing_thread_stopped = Arc::new(AtomicBool::new(false));
+        // The callback worker is not spawned until main-loop initialization succeeds.
+        let callbacks_processing_thread_stopped = Arc::new(AtomicBool::new(true));
         let panicked_flag = Arc::new(AtomicBool::new(false));
 
         // Create callbacks aspect. Owns the SXCB callback task queue, the
@@ -1309,6 +1367,7 @@ impl SessionImpl {
 
         // Conditionally start callbacks thread based on use_callback_thread option
         if callbacks_for_worker_loop.use_callback_thread() {
+            callbacks_processing_thread_stopped.store(false, Ordering::Release);
             log::info!(
                 "SimplexSession {}: Starting callback processing thread (use_callback_thread=true)",
                 session_id.to_hex_string()

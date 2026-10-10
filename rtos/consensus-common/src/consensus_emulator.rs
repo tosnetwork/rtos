@@ -796,7 +796,7 @@ impl EmulatorCore {
     /// roundless mode (slots are not grouped into Catchain-style rounds).
     fn build_source_info(&self, leader_idx: usize) -> BlockSourceInfo {
         BlockSourceInfo {
-            source: self.validators[leader_idx].public_key.clone(),
+            source: self.validators[leader_idx].public_key.clone().into(),
             priority: BlockCandidatePriority {
                 round: u32::MAX, // Simplex roundless mode
                 first_block_round: 0,
@@ -1430,7 +1430,7 @@ impl EmulatorCore {
                 root_hash,
                 file_hash,
                 data,
-                signatures,
+                signatures.into(),
                 signed,
             );
         }));

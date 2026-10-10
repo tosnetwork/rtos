@@ -1398,7 +1398,7 @@ impl CatchainProcessor {
         sources.reserve(ids.len());
 
         for i in 0..ids.len() {
-            sources.push(utils::get_public_key_hash(&ids[i].public_key));
+            sources.push(utils::get_public_key_hash(ids[i].public_key.classical_key()?));
 
             if sources[i] == local_id {
                 local_idx = i;

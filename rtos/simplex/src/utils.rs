@@ -37,9 +37,7 @@
 //! This matches C++ reference implementation (`consensus-types.cpp`).
 //!
 
-use crate::{
-    AsyncCollationRequest, AsyncRequest, PrivateKey, PublicKey, SessionId, ValidatorWeight,
-};
+use crate::{AsyncCollationRequest, AsyncRequest, PrivateKey, SessionId, ValidatorWeight};
 use rtos_api::{
     ton::{
         consensus::{
@@ -194,10 +192,10 @@ pub fn check_session_signature(
     session_id: &SessionId,
     data: &[u8],
     signature: &[u8],
-    public_key: &PublicKey,
+    public_key: &impl consensus_common::SimplexSignatureVerifier,
 ) -> bool {
     let data_to_sign = create_data_to_sign(session_id, data);
-    public_key.verify(&data_to_sign, signature).is_ok()
+    public_key.verify_simplex(&data_to_sign, signature).is_ok()
 }
 
 /// Create a session-scoped signature
@@ -268,7 +266,7 @@ pub fn check_candidate_signature(
     slot: SlotIndex,
     candidate_hash: &UInt256,
     signature: &[u8],
-    public_key: &PublicKey,
+    public_key: &impl consensus_common::SimplexSignatureVerifier,
 ) -> bool {
     let id_to_sign = create_candidate_id_to_sign(slot, candidate_hash);
     check_session_signature(session_id, &id_to_sign, signature, public_key)
@@ -833,7 +831,7 @@ pub fn sign_vote(
 pub fn verify_vote_signature(
     tl_vote: &tl_simplex::Vote,
     session_id: &SessionId,
-    public_key: &PublicKey,
+    public_key: &impl consensus_common::SimplexSignatureVerifier,
 ) -> bool {
     let tl_simplex::Vote::Consensus_Simplex_Vote(ref inner) = tl_vote;
 
@@ -844,7 +842,7 @@ pub fn verify_vote_signature(
     let data_to_sign = create_data_to_sign(session_id, &vote_data);
 
     // Verify the session-wrapped data
-    public_key.verify(&data_to_sign, &inner.signature).is_ok()
+    public_key.verify_simplex(&data_to_sign, &inner.signature).is_ok()
 }
 
 /// Extract the FSM vote from a signed TL vote

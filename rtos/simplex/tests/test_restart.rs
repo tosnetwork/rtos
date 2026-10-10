@@ -269,11 +269,13 @@ impl SessionListener for RestartSingleSessionListener {
         _root_hash: BlockHash,
         _file_hash: BlockHash,
         data: BlockPayloadPtr,
-        signatures: BlockSignaturesVariant,
+        signatures: consensus_common::SessionFinality,
         _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
     ) {
         let slot = match &signatures {
-            BlockSignaturesVariant::Simplex(s) => s.slot,
+            consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::Simplex(s)) => {
+                s.slot
+            }
             _ => unreachable!(
                 "Non-Simplex BlockSignaturesVariant encountered in Simplex restart integration test"
             ),

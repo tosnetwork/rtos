@@ -38,7 +38,7 @@ pub struct OnBlockFinalized {
     pub root_hash: BlockHash,
     pub file_hash: BlockHash,
     pub data: BlockPayloadPtr,
-    pub signatures: BlockSignaturesVariant,
+    pub signatures: consensus_common::SessionFinality,
     pub approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
 }
 
@@ -295,7 +295,7 @@ impl SessionListener for ValidatorSessionListener {
         root_hash: BlockHash,
         file_hash: BlockHash,
         data: BlockPayloadPtr,
-        signatures: BlockSignaturesVariant,
+        signatures: consensus_common::SessionFinality,
         approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
     ) {
         let round = source_info.priority.round;

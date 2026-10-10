@@ -3692,7 +3692,7 @@ impl CollationController {
             &self.session_id(),
             slot,
             &candidate_hash,
-            self.description.get_local_key(),
+            self.description.get_legacy_signing_key()?,
         )
         .map_err(|e| error!("failed to sign candidate: {e}"))?;
 
@@ -3799,7 +3799,7 @@ impl CollationController {
             &self.session_id(),
             slot,
             &candidate_hash,
-            self.description.get_local_key(),
+            self.description.get_legacy_signing_key()?,
         )
         .map_err(|e| error!("failed to sign candidate: {e}"))?;
 

@@ -308,7 +308,8 @@ fn run_overlay_test(
         let public_key = get_key_option_factory().from_public_key(public_key_bytes);
         let adnl_id =
             test_nodes[i].stack.adnl.key_by_tag(test_nodes[i].adnl_tag).unwrap().id().clone();
-        consensus_nodes.push(ConsensusNode { adnl_id: adnl_id.clone(), public_key });
+        consensus_nodes
+            .push(ConsensusNode { adnl_id: adnl_id.clone(), public_key: public_key.into() });
     }
 
     let random_data: [u8; 32] = rand::random();
@@ -324,7 +325,7 @@ fn run_overlay_test(
         let (listener, weak_listener, msg_count, query_count, broadcast_count) =
             make_listener(consensus_node.public_key.id().clone());
         let overlay = test_nodes[i].overlay_manager.start_overlay(
-            &consensus_node.public_key,
+            consensus_node.public_key.classical_key().unwrap(),
             &overlay_short_id,
             &consensus_nodes,
             weak_listener,
@@ -520,7 +521,8 @@ fn test_adnl_overlay_network_disable_toggle() -> Result<()> {
         let public_key = get_key_option_factory().from_public_key(public_key_bytes);
         let adnl_id =
             test_nodes[i].stack.adnl.key_by_tag(test_nodes[i].adnl_tag).unwrap().id().clone();
-        consensus_nodes.push(ConsensusNode { adnl_id: adnl_id.clone(), public_key });
+        consensus_nodes
+            .push(ConsensusNode { adnl_id: adnl_id.clone(), public_key: public_key.into() });
     }
 
     let overlay_short_id = KeyId::from_data(rand::random());
@@ -533,7 +535,7 @@ fn test_adnl_overlay_network_disable_toggle() -> Result<()> {
         let (listener, weak_listener, msg_count, _query_count, _broadcast_count) =
             make_listener(consensus_node.public_key.id().clone());
         let overlay = test_nodes[i].overlay_manager.start_overlay(
-            &consensus_node.public_key,
+            consensus_node.public_key.classical_key().unwrap(),
             &overlay_short_id,
             &consensus_nodes,
             weak_listener,
@@ -717,7 +719,8 @@ fn run_adnl_overlay_performance_test(
         let public_key = get_key_option_factory().from_public_key(public_key_bytes);
         let adnl_id =
             test_nodes[i].stack.adnl.key_by_tag(test_nodes[i].adnl_tag).unwrap().id().clone();
-        consensus_nodes.push(ConsensusNode { adnl_id: adnl_id.clone(), public_key });
+        consensus_nodes
+            .push(ConsensusNode { adnl_id: adnl_id.clone(), public_key: public_key.into() });
     }
 
     let random_data: [u8; 32] = rand::random();
@@ -729,7 +732,7 @@ fn run_adnl_overlay_performance_test(
     for (i, consensus_node) in consensus_nodes.iter().enumerate() {
         let (listener, weak_listener, ..) = make_performance_listener();
         let overlay = test_nodes[i].overlay_manager.start_overlay(
-            &consensus_node.public_key,
+            consensus_node.public_key.classical_key().unwrap(),
             &overlay_short_id,
             &consensus_nodes,
             weak_listener,

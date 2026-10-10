@@ -713,13 +713,6 @@ impl ValidatorGroupImpl {
     ) -> Result<SessionHolderPtr> {
         use super::consensus::ConsensusFactory;
 
-        let nodes: Vec<SessionNode> = g
-            .validator_set
-            .list()
-            .iter()
-            .map(validatordescr_to_session_node)
-            .collect::<Result<_>>()?;
-
         let block_sync_params_with_identity = g
             .block_sync_overlay_params
             .clone()
@@ -730,6 +723,13 @@ impl ValidatorGroupImpl {
 
         match &g.consensus_options {
             ConsensusOptions::Catchain(catchain_options) => {
+                let nodes: Vec<SessionNode> = g
+                    .validator_set
+                    .list()
+                    .iter()
+                    .map(validatordescr_to_session_node)
+                    .collect::<Result<_>>()?;
+
                 let overlay_manager: ConsensusOverlayManagerPtr =
                     Arc::new(ConsensusOverlayManagerImpl::new(
                         g.engine.validator_network(),
@@ -750,6 +750,19 @@ impl ValidatorGroupImpl {
                 )
             }
             ConsensusOptions::Simplex(simplex_options) => {
+                let nodes = g
+                    .validator_set
+                    .list()
+                    .iter()
+                    .map(|member| {
+                        if matches!(member.key, rtos_block::ValidatorKey::Pq(_)) {
+                            simplex::SimplexSessionNode::from_descriptor(member)
+                        } else {
+                            validatordescr_to_session_node(member).map(Into::into)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
                 let overlay_manager: ConsensusOverlayManagerPtr =
                     Arc::new(ConsensusOverlayManagerImpl::new(
                         g.engine.validator_network(),
@@ -771,6 +784,13 @@ impl ValidatorGroupImpl {
             }
             #[cfg(test)]
             ConsensusOptions::Emulator(emulator_options) => {
+                let nodes: Vec<SessionNode> = g
+                    .validator_set
+                    .list()
+                    .iter()
+                    .map(validatordescr_to_session_node)
+                    .collect::<Result<_>>()?;
+
                 ConsensusFactory::create_emulator_based_session(
                     emulator_options,
                     &g.session_id,
@@ -949,6 +969,7 @@ impl ValidatorGroupImpl {
 pub struct ValidatorGroup {
     general_session_info: Arc<GeneralSessionInfo>,
     local_key: PrivateKey,
+    local_identity: Option<consensus_common::ValidatorIdentity>,
     consensus_options: ConsensusOptions,
     is_accelerated_consensus_enabled: bool,
     session_id: SessionId,
@@ -957,6 +978,9 @@ pub struct ValidatorGroup {
 
     engine: Arc<dyn EngineOperations>,
     validator_set: ValidatorSet,
+    // Constructed once from the manager's governing session identity and subset.
+    // An invalid PQ snapshot remains an error, never a classical fallback.
+    pq_session: std::result::Result<Option<rtos_api::pq_finality::PqSessionContext>, String>,
     #[allow(dead_code)]
     allow_unsafe_self_blocks_resync: bool,
 
@@ -1074,13 +1098,46 @@ impl ValidatorGroup {
         let (accepted_mc_block_tx, _accepted_mc_block_rx) = tokio::sync::watch::channel(None);
 
         log::trace!(target: "validator", "Creating validator group: {}, consensus_type: {}", id, consensus_type);
+        let pq_session = if validator_set
+            .list()
+            .iter()
+            .any(|v| matches!(v.key, rtos_block::ValidatorKey::Pq(_)))
+        {
+            rtos_api::pq_finality::PqSessionContext::from_authenticated_session_members(
+                session_id.clone(),
+                general_session_info.shard.clone(),
+                general_session_info.catchain_seqno,
+                validator_set.list().to_vec(),
+            )
+            .map(Some)
+            .map_err(|e| e.to_string())
+        } else {
+            Ok(None)
+        };
+        let local_identity = if matches!(&pq_session, Ok(Some(_))) {
+            validator_set
+                .list()
+                .iter()
+                .find(|v| {
+                    v.adnl_addr
+                        .as_ref()
+                        .is_some_and(|adnl| adnl.as_slice() == local_key.id().data())
+                })
+                .and_then(|v| consensus_common::ValidatorIdentity::from_descriptor(v).ok())
+        } else if matches!(&pq_session, Ok(None)) {
+            Some(local_key.clone().into())
+        } else {
+            None
+        };
         ValidatorGroup {
             shard: general_session_info.shard.clone(),
             general_session_info,
             local_key,
+            local_identity,
             validator_list_id,
             session_id,
             validator_set,
+            pq_session,
             consensus_options,
             is_accelerated_consensus_enabled: is_accelerated,
             engine,
@@ -1966,7 +2023,13 @@ impl ValidatorGroup {
             data: data.data().clone(),
             collated_file_hash: catchain::utils::get_hash(collated_data.data()),
             collated_data: collated_data.data().to_vec(),
-            created_by: UInt256::from(source.pub_key().expect("source must contain pub_key")),
+            created_by: match source.block_creator() {
+                Ok(id) => id,
+                Err(error) => {
+                    callback(Err(error));
+                    return;
+                }
+            },
         };
 
         log::trace!(
@@ -2236,7 +2299,7 @@ impl ValidatorGroup {
         source_info: &validator_session::BlockSourceInfo,
         is_masterchain: bool,
         candidate: &super::BlockCandidate,
-        source: &PublicKey,
+        source: &consensus_common::ValidatorIdentity,
         cc_seqno: u32,
         validator_set: &ValidatorSet,
         engine: &Arc<dyn EngineOperations>,
@@ -2283,12 +2346,16 @@ impl ValidatorGroup {
             }
         }
 
-        let vb_candidate = validator_query_candidate_to_validator_block_candidate(
-            source.clone(),
-            candidate.clone(),
-        );
-
-        engine.save_block_candidate(session_id, vb_candidate)?;
+        // This Ed25519 cache serves validator-session::get_approved_candidate.
+        // Simplex stores the original signed candidate in its own DB and serves
+        // it through the candidate resolver, retaining the PQ identity/bytes.
+        if let consensus_common::ValidatorIdentity::Classical(key) = source {
+            let vb_candidate = validator_query_candidate_to_validator_block_candidate(
+                key.clone(),
+                candidate.clone(),
+            );
+            engine.save_block_candidate(session_id, vb_candidate)?;
+        }
 
         last_validation_time.fetch_max(
             validation_completion_time
@@ -2312,7 +2379,7 @@ impl ValidatorGroup {
     pub async fn on_block_committed(
         &self,
         round: u32,
-        source: PublicKey,
+        source: consensus_common::ValidatorIdentity,
         root_hash: BlockHash,
         file_hash: BlockHash,
         data: BlockPayloadPtr,
@@ -2331,7 +2398,8 @@ impl ValidatorGroup {
         let next_block_descr = self.get_next_block_descr(Some(&root_hash)).await;
 
         let data_vec = data.data().to_vec();
-        let we_generated = source.id() == self.local_key.id();
+        let we_generated =
+            self.local_identity.as_ref().is_some_and(|local| source.id() == local.id());
 
         log::info!(
             target: "validator",
@@ -2474,12 +2542,12 @@ impl ValidatorGroup {
         &self,
         block_id: BlockIdExt,
         round: u32,
-        source: PublicKey,
+        source: consensus_common::ValidatorIdentity,
         _root_hash: BlockHash,
         _file_hash: BlockHash,
         data: BlockPayloadPtr,
-        signatures: BlockSignaturesVariant,
-        approve_sig_set: Vec<(PublicKeyHash, BlockPayloadPtr)>,
+        signatures: consensus_common::SessionFinality,
+        _approve_sig_set: Vec<(PublicKeyHash, BlockPayloadPtr)>,
     ) {
         let is_simplex_group = self
             .group_impl
@@ -2495,6 +2563,42 @@ impl ValidatorGroup {
             return;
         }
 
+        let pq_context = match &self.pq_session {
+            Ok(context) => context.clone(),
+            Err(error) => {
+                log::error!("invalid PQ session context: {error}");
+                return;
+            }
+        };
+        let authenticated = match (&signatures, &pq_context) {
+            (
+                consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(
+                    carrier,
+                )),
+                Some(context),
+            ) => context
+                .for_block(block_id.clone())
+                .and_then(|v| v.verify_final(carrier))
+                .map(|_| ()),
+            (consensus_common::SessionFinality::PqApproval(approval), Some(context)) => context
+                .for_block(block_id.clone())
+                .and_then(|v| v.verify_approval(approval))
+                .map(|_| ()),
+            (
+                consensus_common::SessionFinality::Carrier(
+                    BlockSignaturesVariant::Ordinary(_) | BlockSignaturesVariant::Simplex(_),
+                ),
+                None,
+            ) => Ok(()),
+            _ => Err(rtos_block::error!(
+                "session finality algorithm does not match authenticated committee"
+            )),
+        };
+        if let Err(error) = authenticated {
+            log::error!("rejected live finality for {block_id}: {error}");
+            return;
+        }
+        let is_approval = matches!(&signatures, consensus_common::SessionFinality::PqApproval(_));
         // Important: do not block ValidationAction queue on out-of-order acceptance.
         // This path can involve downloads/apply and must run in detached task.
         let engine = self.engine.clone();
@@ -2503,11 +2607,11 @@ impl ValidatorGroup {
         let group_impl = self.group_impl.clone();
         let accepted_mc_seqno_tx = self.accepted_mc_seqno_tx.clone();
         let accepted_mc_block_tx = self.accepted_mc_block_tx.clone();
-        let local_key = self.local_key.clone();
         let source_id = source.id().clone();
         let data_vec = data.data().to_vec();
         let data_opt = if data_vec.is_empty() { None } else { Some(data_vec) };
-        let we_generated = source.id() == local_key.id();
+        let we_generated =
+            self.local_identity.as_ref().is_some_and(|local| source.id() == local.id());
         let block_seqno = block_id.seq_no;
         let (send_block_broadcast, last_notified_mc_finalized_seqno) = self
             .group_impl
@@ -2589,13 +2693,13 @@ impl ValidatorGroup {
                     }
                 };
 
-            let result = run_accept_block_query(
+            let result = super::accept_block::accept_session_block(
                 block_id.clone(),
                 accept_data,
                 prevs,
                 validator_set,
                 signatures,
-                approve_sig_set,
+                pq_context,
                 send_block_broadcast,
                 engine,
             )
@@ -2609,6 +2713,9 @@ impl ValidatorGroup {
                         accepted block_id={block_id} source={source_id} round={round}"
                     );
 
+                    if is_approval {
+                        return;
+                    }
                     // Prune only after apply, so the finalized block's state is in
                     // the DB and can serve as the engine anchor for subsequent blocks.
                     state_resolver_cache.lock().await.prune_finalized(&block_id);

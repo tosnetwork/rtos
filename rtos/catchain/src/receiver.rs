@@ -3427,7 +3427,7 @@ impl ReceiverImpl {
         sources.reserve(ids.len());
 
         for i in 0..ids.len() {
-            sources.push(utils::get_public_key_hash(&ids[i].public_key));
+            sources.push(utils::get_public_key_hash(ids[i].public_key.classical_key()?));
 
             if sources[i] == local_id {
                 local_idx = i;
@@ -3529,7 +3529,7 @@ impl ReceiverImpl {
         let local_key_id_finder = || {
             let local_id = local_key.id();
             for (i, id) in ids.iter().enumerate() {
-                if utils::get_public_key_hash(&id.public_key) == *local_id {
+                if *id.public_key.id() == *local_id {
                     return (local_id, i);
                 }
             }
@@ -3551,7 +3551,7 @@ impl ReceiverImpl {
             let source_id = sources.len();
             let source = crate::receiver_source::ReceiverSource::create(
                 source_id,
-                id.public_key.clone(),
+                id.public_key.classical_key()?.clone(),
                 &id.adnl_id,
             );
 

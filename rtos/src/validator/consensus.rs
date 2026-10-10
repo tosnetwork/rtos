@@ -557,11 +557,11 @@ impl ConsensusFactory {
     ///
     /// Returns a `SessionHolderPtr` for direct access to `SessionHolder` methods.
     #[allow(clippy::too_many_arguments)]
-    pub fn create_simplex_based_session(
+    pub fn create_simplex_based_session<N: Into<simplex::SimplexSessionNode>>(
         options: &SimplexSessionOptions,
         session_id: &SessionId,
         shard: &ShardIdent,
-        nodes: Vec<SessionNode>,
+        nodes: Vec<N>,
         local_key: &PrivateKey,
         db_root: String,
         catchain_seqno: u32,
@@ -758,11 +758,11 @@ impl ConsensusFactory {
 
     /// Create a simplex consensus session
     #[allow(clippy::too_many_arguments)]
-    pub fn create_simplex_session(
+    pub fn create_simplex_session<N: Into<simplex::SimplexSessionNode>>(
         options: &SimplexSessionOptions,
         session_id: &SessionId,
         shard: &ShardIdent,
-        nodes: Vec<SessionNode>,
+        nodes: Vec<N>,
         local_key: &PrivateKey,
         db_path: String,
         overlay_manager: ConsensusOverlayManagerPtr,

@@ -1031,7 +1031,9 @@ impl AdnlOverlay {
         let mut peers = Vec::new();
 
         for node in nodes {
-            if node.public_key.id() == local_id {
+            if (node.public_key.pq_key().is_some() && &node.adnl_id == local_id)
+                || (node.public_key.pq_key().is_none() && node.public_key.id() == local_id)
+            {
                 // Found local node - extract ADNL key
                 local_adnl_key = Some(stack.adnl.key_by_id(&node.adnl_id)?);
                 log::trace!(
@@ -1242,7 +1244,16 @@ impl AdnlOverlay {
             // Build ADNL key → validator key mapping for two-step broadcast receive
             let adnl_to_validator: HashMap<PublicKeyHash, PublicKeyHash> = nodes
                 .iter()
-                .map(|node| (node.adnl_id.clone(), node.public_key.id().clone()))
+                .map(|node| {
+                    (
+                        node.adnl_id.clone(),
+                        if node.public_key.pq_key().is_some() {
+                            node.adnl_id.clone()
+                        } else {
+                            node.public_key.id().clone()
+                        },
+                    )
+                })
                 .collect();
 
             AdnlOverlay {

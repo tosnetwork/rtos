@@ -243,7 +243,7 @@ fn test_catchain_network(
     for desc in &node_descs {
         nodes.push(CatchainNode {
             adnl_id: desc.adnl_id.clone(),
-            public_key: desc.private_key.clone(),
+            public_key: desc.private_key.clone().into(),
         });
         private_keys.push(desc.private_key.clone());
     }

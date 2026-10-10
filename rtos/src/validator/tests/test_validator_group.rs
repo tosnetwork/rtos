@@ -308,7 +308,7 @@ async fn on_generate_slot_reports_error_when_already_collating() {
 
     let source = Ed25519KeyOption::<ZeroizingBytes>::generate().expect("generate key");
     let source_info = validator_session::BlockSourceInfo {
-        source,
+        source: source.into(),
         priority: consensus_common::BlockCandidatePriority {
             round: 0,
             priority: 0,
@@ -1017,4 +1017,104 @@ fn test_metric_label_covers_all_states() {
     for (status, expected_label) in states {
         assert_eq!(status.metric_label(), expected_label, "metric_label mismatch for {}", status);
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pq_live_group_uses_stable_local_identity_through_accept_and_broadcast() {
+    use super::accept_block::live_pq_tests::{node_fixture, PqAcceptEngine};
+    use std::sync::atomic::AtomicUsize;
+    let (block, state, _, full_set, carrier) = node_fixture("current", "finalize");
+    let config = state.shard_state_extra().unwrap().config.clone();
+    let (members, _) = full_set
+        .calc_subset(
+            &config.catchain_config().unwrap(),
+            block.id().shard().shard_prefix_with_tag(),
+            0,
+            7,
+        )
+        .unwrap();
+    let source = consensus_common::ValidatorIdentity::from_descriptor(
+        members.iter().find(|v| v.validator_id().unwrap() == UInt256::from([1; 32])).unwrap(),
+    )
+    .unwrap();
+    let set = ValidatorSet::with_cc_seqno(0, 100000, 2, 7, members).unwrap();
+    let transport = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x50; 32]).unwrap();
+    assert_ne!(source.id(), transport.id());
+    let storage = crate::collator_test_bundle::create_block_handle_storage(None).unwrap();
+    let handle = storage
+        .create_handle(block.id().clone(), storage::types::BlockMeta::default(), None)
+        .unwrap()
+        .unwrap();
+    handle.set_data();
+    handle.set_state();
+    let engine = Arc::new(PqAcceptEngine {
+        handle,
+        state,
+        proof: Default::default(),
+        proofs: AtomicUsize::new(0),
+        tops: AtomicUsize::new(0),
+        broadcasts: AtomicUsize::new(0),
+    });
+    let info = Arc::new(GeneralSessionInfo {
+        shard: block.id().shard().clone(),
+        opts_hash: UInt256::default(),
+        catchain_seqno: 7,
+        key_seqno: 10,
+        max_vertical_seqno: 0,
+    });
+    let group = ValidatorGroup::new(
+        info,
+        transport,
+        carrier.session_id.clone(),
+        UInt256::default(),
+        set,
+        0,
+        ConsensusOptions::Simplex(Default::default()),
+        engine.clone(),
+        false,
+        None,
+    );
+    assert_eq!(group.local_identity.as_ref().unwrap().id(), source.id());
+    let mut corrupt = carrier.clone();
+    corrupt.signatures[0].signature[0] ^= 1;
+    group
+        .on_block_finalized(
+            block.id().clone(),
+            99,
+            source.clone(),
+            block.id().root_hash.clone(),
+            block.id().file_hash.clone(),
+            ConsensusCommonFactory::create_block_payload(
+                block.block().unwrap().write_to_bytes().unwrap(),
+            ),
+            consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(corrupt)),
+            vec![],
+        )
+        .await;
+    assert_eq!(engine.proofs.load(Ordering::Relaxed), 0);
+    group
+        .on_block_finalized(
+            block.id().clone(),
+            99,
+            source,
+            block.id().root_hash.clone(),
+            block.id().file_hash.clone(),
+            ConsensusCommonFactory::create_block_payload(
+                block.block().unwrap().write_to_bytes().unwrap(),
+            ),
+            consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(carrier)),
+            vec![],
+        )
+        .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while engine.broadcasts.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(engine.proofs.load(Ordering::Relaxed), 1);
+    assert_eq!(engine.tops.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        engine.broadcasts.load(Ordering::Relaxed),
+        1,
+        "local PQ creator must retain broadcast ownership"
+    );
 }

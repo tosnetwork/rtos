@@ -121,7 +121,7 @@ fn make_non_empty_raw(
         collated_file_hash: UInt256::rand(),
         data: vec![1, 2, 3],
         collated_data: vec![4, 5, 6],
-        creator: nodes[0].public_key.clone(),
+        creator: nodes[0].public_key.clone().into(),
     };
     RawCandidate::new(candidate_id, parent_id, ValidatorIndex::new(0), block, vec![])
 }

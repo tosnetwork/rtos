@@ -41,7 +41,7 @@ fn test_on_block_finalized_enqueues_explicit_block_identity() {
         BlockIdExt::with_params(ShardIdent::masterchain(), 42, UInt256::rand(), UInt256::rand());
     let source = Ed25519KeyOption::<ZeroizingBytes>::generate().expect("generate key");
     let source_info = BlockSourceInfo {
-        source,
+        source: source.into(),
         priority: consensus_common::BlockCandidatePriority {
             round: 10,
             priority: 0,
@@ -59,7 +59,7 @@ fn test_on_block_finalized_enqueues_explicit_block_identity() {
         root_hash.clone(),
         file_hash.clone(),
         data.clone(),
-        signatures,
+        signatures.into(),
         Vec::new(),
     );
 
@@ -71,7 +71,8 @@ fn test_on_block_finalized_enqueues_explicit_block_identity() {
             assert_eq!(finalized.file_hash, file_hash);
             assert_eq!(finalized.data.data(), data.data());
             match finalized.signatures {
-                BlockSignaturesVariant::Ordinary(_) => {}
+                consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::Ordinary(_)) => {
+                }
                 other => panic!("unexpected signatures variant in queued action: {:?}", other),
             }
         }

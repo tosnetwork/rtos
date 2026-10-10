@@ -39,7 +39,9 @@ use crate::{
     ValidatorBlockCandidateDecisionCallback,
 };
 use consensus_common::{check_execution_time, CandidateObservedFlags, CollationParentHint};
-use rtos_block::{BlockIdExt, BlockSignaturesVariant};
+use rtos_block::BlockIdExt;
+#[cfg(test)]
+use rtos_block::BlockSignaturesVariant;
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -289,7 +291,7 @@ impl SessionCallbacks {
         root_hash: BlockHash,
         file_hash: BlockHash,
         data: BlockPayloadPtr,
-        signatures_variant: BlockSignaturesVariant,
+        signatures_variant: consensus_common::SessionFinality,
         approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
     ) {
         check_execution_time!(20_000);
