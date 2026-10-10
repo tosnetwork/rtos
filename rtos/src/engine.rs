@@ -496,7 +496,7 @@ impl Engine {
     const CANDIDATES_CACHE_SIZE: usize = 128;
     #[cfg(feature = "telemetry")]
     const TIMEOUT_TELEMETRY_SEC: u64 = 30;
-    const MAX_MONITOR_MIN_SPLIT: u8 = 6;
+    pub(crate) const MAX_MONITOR_MIN_SPLIT: u8 = 6;
     const STORAGE_DICTS_CACHE_SIZE: u64 = 1 << 24;
     const MIN_CACHED_STORAGE_DICT_CELLS: u64 = 4000;
 

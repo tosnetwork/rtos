@@ -478,3 +478,32 @@ fn test_block_broadcast_compression_v2_simplex() {
         panic!("Expected Simplex signatures");
     }
 }
+
+#[test]
+fn test_monitor_split_bound() {
+    for value in 0..=crate::engine::Engine::MAX_MONITOR_MIN_SPLIT {
+        super::check_monitor_min_split(value).unwrap();
+    }
+    assert!(super::check_monitor_min_split(7).is_err());
+    assert!(super::check_monitor_min_split(u8::MAX).is_err());
+}
+
+#[test]
+fn test_monitor_position_initial_zero_and_conflicting_identity() {
+    let mut id = rtos_block::BlockIdExt::with_params(
+        rtos_block::ShardIdent::masterchain(),
+        0,
+        rtos_block::UInt256::from([1; 32]),
+        rtos_block::UInt256::from([2; 32]),
+    );
+    assert!(super::monitor_update_needed(None, &id).unwrap());
+    assert!(!super::monitor_update_needed(Some(&id), &id).unwrap());
+    let original = id.clone();
+    id.file_hash = rtos_block::UInt256::from([3; 32]);
+    assert!(super::monitor_update_needed(Some(&original), &id).is_err());
+    id.seq_no = 1;
+    assert!(super::monitor_update_needed(Some(&original), &id).unwrap());
+    assert!(!super::monitor_update_needed(Some(&id), &original).unwrap());
+    id.shard_id = rtos_block::ShardIdent::full(0);
+    assert!(super::monitor_update_needed(None, &id).is_err());
+}

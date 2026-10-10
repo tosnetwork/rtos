@@ -1154,3 +1154,212 @@ async fn test_live_proof_history_cache_never_caches_incoming_certificates() {
         "same-height substituted history reused cached authority"
     );
 }
+
+struct MonitorProofEngine {
+    pin: rtos_block::BlockIdExt,
+    zero: Option<std::sync::Arc<crate::shard_state::ShardStateStuff>>,
+    proofs: Vec<BlockProofStuff>,
+    advertised: Vec<rtos_block::BlockIdExt>,
+    stored: parking_lot::Mutex<Vec<rtos_block::BlockIdExt>>,
+    handles: storage::block_handle_db::BlockHandleStorage,
+    fail_store: bool,
+    stopped: bool,
+}
+
+#[async_trait::async_trait]
+impl crate::engine_traits::EngineOperations for MonitorProofEngine {
+    fn zerostate_id(&self) -> rtos_block::Result<&rtos_block::BlockIdExt> {
+        Ok(self.zero.as_ref().unwrap().block_id())
+    }
+    async fn load_mc_zero_state(
+        &self,
+    ) -> rtos_block::Result<std::sync::Arc<crate::shard_state::ShardStateStuff>> {
+        Ok(self.zero.as_ref().unwrap().clone())
+    }
+
+    fn init_mc_block_id(&self) -> &rtos_block::BlockIdExt {
+        &self.pin
+    }
+    fn check_stop(&self) -> bool {
+        self.stopped
+    }
+    fn load_block_handle(
+        &self,
+        _: &rtos_block::BlockIdExt,
+    ) -> rtos_block::Result<Option<std::sync::Arc<storage::block_handle_db::BlockHandle>>> {
+        Ok(None)
+    }
+    async fn download_next_key_blocks_ids(
+        &self,
+        id: &rtos_block::BlockIdExt,
+    ) -> rtos_block::Result<Vec<rtos_block::BlockIdExt>> {
+        Ok(self.advertised.iter().filter(|next| next.seq_no > id.seq_no).cloned().collect())
+    }
+    async fn download_block_proof(
+        &self,
+        id: &rtos_block::BlockIdExt,
+        link: bool,
+        key: bool,
+    ) -> rtos_block::Result<BlockProofStuff> {
+        assert!(key);
+        assert_eq!(link, id == &self.pin);
+        self.proofs
+            .iter()
+            .find(|proof| proof.id().seq_no == id.seq_no)
+            .cloned()
+            .ok_or_else(|| rtos_block::error!("Missing monitor fixture"))
+    }
+    async fn store_block_proof(
+        &self,
+        id: &rtos_block::BlockIdExt,
+        _: Option<std::sync::Arc<storage::block_handle_db::BlockHandle>>,
+        proof: &BlockProofStuff,
+    ) -> rtos_block::Result<crate::internal_db::BlockResult> {
+        assert_eq!(id, proof.id());
+        if self.fail_store {
+            rtos_block::fail!("Injected monitor storage failure");
+        }
+        self.stored.lock().push(id.clone());
+        let handle = self
+            .handles
+            .create_handle(id.clone(), storage::types::BlockMeta::default(), None)?
+            .unwrap();
+        Ok(crate::internal_db::BlockResult::with_status(
+            handle,
+            crate::internal_db::DataStatus::Updated,
+        ))
+    }
+}
+
+fn monitor_fixture() -> (MonitorProofEngine, serde_json::Value) {
+    let data: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tl/rtos_api/tests/data/bootstrap-history.json"
+    ))
+    .unwrap();
+    let anchor =
+        bootstrap_fixture_proof(&serde_json::json!({"block_boc":data["anchor_boc"]}), false, false);
+    let first = bootstrap_fixture_proof(&data["cases"][1], true, false);
+    let second = bootstrap_fixture_proof(&data["cases"][2], true, false);
+    (
+        MonitorProofEngine {
+            pin: anchor.id().clone(),
+            zero: None,
+            advertised: vec![first.id().clone(), second.id().clone()],
+            proofs: vec![anchor, first, second],
+            stored: Default::default(),
+            handles: crate::collator_test_bundle::create_block_handle_storage(None).unwrap(),
+            fail_store: false,
+            stopped: false,
+        },
+        data,
+    )
+}
+
+#[tokio::test]
+async fn test_monitor_history_authenticates_before_storage_and_resumes() {
+    use crate::network::full_node_overlays::advance_monitor_history;
+    let (mut engine, data) = monitor_fixture();
+    let mut history = None;
+    engine.proofs[2] = bootstrap_fixture_proof(&data["cases"][2], true, true);
+    assert!(advance_monitor_history(&engine, &mut history).await.is_err());
+    assert_eq!(history.as_ref().unwrap().id(), engine.proofs[1].id());
+    assert_eq!(*engine.stored.lock(), vec![engine.proofs[1].id().clone()]);
+    engine.proofs[2] = bootstrap_fixture_proof(&data["cases"][2], true, false);
+    advance_monitor_history(&engine, &mut history).await.unwrap();
+    assert_eq!(history.as_ref().unwrap().id(), engine.proofs[2].id());
+    assert_eq!(history.as_ref().unwrap().anchor(), &engine.pin);
+    assert_eq!(engine.stored.lock().len(), 2);
+    advance_monitor_history(&engine, &mut history).await.unwrap();
+    assert_eq!(engine.stored.lock().len(), 2);
+    engine.pin.file_hash = rtos_block::UInt256::from([77; 32]);
+    assert!(advance_monitor_history(&engine, &mut history).await.is_err());
+    assert!(history.is_none(), "Changed pin must discard previous authority");
+    assert_eq!(engine.stored.lock().len(), 2);
+}
+
+#[tokio::test]
+async fn test_monitor_history_rejects_untrusted_successors_before_storage() {
+    use crate::network::full_node_overlays::advance_monitor_history;
+    for mutation in 0..8 {
+        let (mut engine, data) = monitor_fixture();
+        match mutation {
+            0 => engine.proofs[1] = bootstrap_fixture_proof(&data["cases"][1], true, true),
+            1 => engine.proofs[1] = bootstrap_fixture_proof(&data["cases"][1], false, false),
+            2 => {
+                engine.proofs[1] = bootstrap_fixture_proof(&data["cases"][3], true, false);
+                engine.advertised[0] = engine.proofs[1].id().clone();
+            }
+            3 => engine.advertised[0].file_hash = rtos_block::UInt256::from([77; 32]),
+            4 => {
+                engine.advertised.remove(0);
+            }
+            5 => engine.advertised = vec![engine.advertised[0].clone(); 6],
+            6 => engine.fail_store = true,
+            7 => engine.stopped = true,
+            _ => unreachable!(),
+        }
+        let mut history = None;
+        let result = advance_monitor_history(&engine, &mut history).await;
+        assert!(result.is_err(), "monitor mutation {mutation} accepted");
+        assert!(engine.stored.lock().is_empty(), "monitor mutation {mutation} reached storage");
+        assert_eq!(history.as_ref().unwrap().id(), &engine.pin);
+    }
+}
+
+#[tokio::test]
+async fn test_monitor_history_starts_from_complete_zerostate_pin() {
+    use crate::network::full_node_overlays::advance_monitor_history;
+    use rtos_block::*;
+    let data: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tl/rtos_api/tests/data/archive-authority.json"
+    ))
+    .unwrap();
+    let bytes = hex::decode(data["zerostate"].as_str().unwrap()).unwrap();
+    let root = read_single_root_boc(&bytes).unwrap();
+    let pin = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        0,
+        root.repr_hash().clone(),
+        UInt256::calc_file_hash(&bytes),
+    );
+    let zero = crate::shard_state::ShardStateStuff::deserialize_zerostate(
+        pin.clone(),
+        &bytes,
+        #[cfg(feature = "telemetry")]
+        &crate::collator_test_bundle::create_engine_telemetry(),
+        &crate::collator_test_bundle::create_engine_allocated(),
+    )
+    .unwrap();
+    let (mut engine, _) = monitor_fixture();
+    engine.pin = pin;
+    engine.zero = Some(zero);
+    engine.proofs = [0, 2]
+        .into_iter()
+        .map(|i| bootstrap_fixture_proof(&data["cases"][i], true, false))
+        .collect();
+    engine.advertised = engine.proofs.iter().map(|p| p.id().clone()).collect();
+    let mut history = None;
+    advance_monitor_history(&engine, &mut history).await.unwrap();
+    assert_eq!(history.as_ref().unwrap().id(), engine.proofs[1].id());
+    assert_eq!(history.as_ref().unwrap().anchor(), &engine.pin);
+    assert_eq!(engine.stored.lock().len(), 2);
+    engine.pin.file_hash = UInt256::from([88; 32]);
+    assert!(advance_monitor_history(&engine, &mut history).await.is_err());
+    assert!(history.is_none());
+    assert_eq!(engine.stored.lock().len(), 2);
+}
+
+#[tokio::test]
+async fn test_monitor_history_rejects_foreign_cached_authority() {
+    let (mut engine, _) = monitor_fixture();
+    let mut history = Some(
+        super::BootstrapAuthority::from_checkpoint(&engine.pin, engine.proofs[0].clone()).unwrap(),
+    );
+    engine.pin.file_hash = rtos_block::UInt256::from([99; 32]);
+    engine.advertised.clear();
+    assert!(crate::network::full_node_overlays::advance_monitor_history(&engine, &mut history)
+        .await
+        .is_err());
+    assert!(history.is_none());
+    assert!(engine.stored.lock().is_empty());
+}

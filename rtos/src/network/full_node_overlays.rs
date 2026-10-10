@@ -9,7 +9,7 @@
  */
 use crate::{
     block::BlockStuff,
-    block_proof::BlockProofStuff,
+    block_proof::{BlockProofStuff, BootstrapAuthority},
     engine_traits::EngineOperations,
     network::{
         build_block_broadcast, build_block_broadcast_compressed,
@@ -61,7 +61,6 @@ use std::{
         atomic::{AtomicBool, AtomicU8, Ordering},
         Arc,
     },
-    time::Duration,
 };
 
 /// The router encapsulates work with full node overlays at the logical level. It abstracts creation,
@@ -88,7 +87,7 @@ pub struct FullNodeOverlaysRouter {
     public_overlays_awaiters: AwaitersPool<ShardIdent, Arc<FullNodeOverlayClient>>,
     validators: tokio::sync::Mutex<ValidatorSet>,
     monitor_min_split_for_fast_sync: AtomicU8,
-    last_known_keyblock_id: tokio::sync::Mutex<BlockIdExt>,
+    last_known_keyblock_id: tokio::sync::Mutex<Option<BlockIdExt>>,
     actual_monitor_min_split: AtomicU8,
     monitor_min_split_worker_started: AtomicBool,
     fast_sync_peer_resolver: tokio::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
@@ -119,7 +118,7 @@ impl FullNodeOverlaysRouter {
             public_overlays_awaiters,
             validators: tokio::sync::Mutex::new(ValidatorSet::default()),
             monitor_min_split_for_fast_sync: AtomicU8::new(0),
-            last_known_keyblock_id: tokio::sync::Mutex::new(BlockIdExt::default()),
+            last_known_keyblock_id: tokio::sync::Mutex::new(None),
             actual_monitor_min_split,
             monitor_min_split_worker_started: AtomicBool::new(false),
             fast_sync_peer_resolver: tokio::sync::Mutex::new(None),
@@ -136,6 +135,15 @@ impl FullNodeOverlaysRouter {
         shard: &ShardIdent,
     ) -> Result<Arc<FullNodeOverlayClient>> {
         let shard = trim_shard(shard, self.actual_monitor_min_split.load(Ordering::Relaxed))?;
+        self.overlay_client_for_shard(shard).await
+    }
+
+    // Configuration updates create the requested physical shard before
+    // publishing the new query depth; they must not trim it to the old depth.
+    async fn overlay_client_for_shard(
+        self: &Arc<Self>,
+        shard: ShardIdent,
+    ) -> Result<Arc<FullNodeOverlayClient>> {
         loop {
             match self.public_overlays.get(&shard) {
                 Some(guard) => {
@@ -216,121 +224,33 @@ impl FullNodeOverlaysRouter {
             return;
         }
 
-        async fn try_update(router: &Arc<FullNodeOverlaysRouter>) -> Result<()> {
-            let last_known_id: BlockIdExt;
-            {
-                let id = tokio::time::timeout(
-                    Duration::from_millis(100),
-                    router.last_known_keyblock_id.lock(),
-                )
-                .await?;
-                last_known_id = id.clone();
-                let _ = id;
+        async fn try_update(
+            router: &Arc<FullNodeOverlaysRouter>,
+            history: &mut Option<BootstrapAuthority>,
+        ) -> Result<()> {
+            let result = advance_monitor_history(router.engine.as_ref(), history).await;
+            if let Some(authority) = history {
+                // Publish the authenticated prefix even when a later download
+                // fails. Read config from its proof, without trusting new bytes.
+                let min_split = authority.config()?.base_workchain()?.monitor_min_split();
+                router.update_public_overlays(authority.id(), min_split).await?;
             }
-
-            let handle = router
-                .engine
-                .load_block_handle(&last_known_id)?
-                .ok_or_else(|| error!("Can't load block handle for key block {}", last_known_id))?;
-            let mut proof = router.engine.load_block_proof(&handle, false).await?;
-            let mut updated = false;
-            let mut attempts = 10;
-            'top: while attempts > 0 {
-                let mut ids = match router.engine.download_next_key_blocks_ids(proof.id()).await {
-                    Err(e) => {
-                        log::trace!(
-                            "Monitor min split worker: no newer key blocks found after {}, error occurred: {e}",
-                            proof.id(),
-                        );
-                        break 'top;
-                    }
-                    Ok(ids) => ids,
-                };
-                if ids.is_empty() {
-                    log::trace!(
-                        "Monitor min split worker: no newer key blocks found after {}",
-                        proof.id()
-                    );
-                    attempts -= 1;
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    continue;
-                };
-
-                ids.sort();
-                for new_id in ids {
-                    if new_id.seq_no <= proof.id().seq_no {
-                        attempts -= 1;
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        continue 'top;
-                    }
-                    log::trace!(
-                        "Monitor min split worker: downloading newer key block {}...",
-                        new_id,
-                    );
-                    let Ok(new_proof) =
-                        router.engine.download_block_proof(&new_id, false, true).await
-                    else {
-                        log::warn!(
-                            "Monitor min split worker: failed to download newer key block {}",
-                            new_id,
-                        );
-                        attempts -= 1;
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        continue 'top;
-                    };
-                    log::trace!("Monitor min split worker: checking newer key block {}", new_id,);
-                    if new_proof.check_with_prev_key_block_proof(&proof).is_err() {
-                        log::warn!(
-                            "Monitor min split worker: newer key block {} check failed",
-                            new_id,
-                        );
-                        attempts -= 1;
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        continue 'top;
-                    }
-                    router.engine.store_block_proof(new_proof.id(), None, &new_proof).await?;
-                    attempts = 10;
-                    proof = new_proof;
-                    updated = true;
-                    log::debug!(
-                        "Monitor min split worker: newer key block {} downloaded and checked",
-                        new_id,
-                    );
-                }
-            }
-            if !updated {
-                log::trace!("Monitor min split worker: no newer key blocks.");
-            } else {
-                let (block, _) = router.engine.download_block(&proof.id(), Some(5)).await?;
-                router
-                    .update_public_overlays(
-                        proof.id(),
-                        block.read_config_params()?.base_workchain()?.monitor_min_split(),
-                    )
-                    .await?;
-            }
-            Ok(())
+            result
         }
 
         spawn_cancelable(self.network.cancellation_token().child_token(), async move {
-            {
-                let mut id = self.last_known_keyblock_id.lock().await;
-                *id = last_known_keyblock_id;
-                log::info!(
-                    "Starting monitor min split worker: last known keyblock: {}, monitor min split {}",
-                    id,
-                    last_known_monitor_min_split
-                );
-                let _ = id;
-            }
-
+            log::info!(
+                "Starting monitor min split worker: last observed keyblock {}, monitor min split {}",
+                last_known_keyblock_id, last_known_monitor_min_split
+            );
+            let mut history = None;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 if self.engine.check_sync().await.unwrap_or(false) {
                     log::trace!("Monitor min split worker: node is in sync - skipping iteration");
                 } else {
                     log::trace!("Monitor min split worker: attempt to get newer key blocks...");
-                    if let Err(e) = try_update(&self).await {
+                    if let Err(e) = try_update(&self, &mut history).await {
                         log::warn!("Monitor min split worker: {}", e);
                     }
                 }
@@ -343,24 +263,18 @@ impl FullNodeOverlaysRouter {
         keyblock_id: &BlockIdExt,
         new_mms: u8,
     ) -> Result<()> {
-        // Start the worker if not started yet
-        self.clone().start_monitor_min_split_worker(keyblock_id.clone(), new_mms);
-        {
-            let mut last_known_id = self.last_known_keyblock_id.lock().await;
-            if last_known_id.seq_no >= keyblock_id.seq_no {
-                log::info!(
-                    "Skipping monitor min split update for key block {}: last known key block is {}",
-                    keyblock_id,
-                    *last_known_id
-                );
-                return Ok(());
-            }
-            *last_known_id = keyblock_id.clone();
-            let _ = last_known_id;
+        check_monitor_min_split(new_mms)?;
+        // Serialize updates and commit the cursor only after overlay work
+        // succeeds, so a failed creation can be retried at the same key block.
+        let mut last_known_id = self.last_known_keyblock_id.lock().await;
+        if !monitor_update_needed(last_known_id.as_ref(), keyblock_id)? {
+            return Ok(());
         }
+        self.clone().start_monitor_min_split_worker(keyblock_id.clone(), new_mms);
 
         let old_mms = self.actual_monitor_min_split.load(Ordering::Relaxed);
         if old_mms == new_mms {
+            *last_known_id = Some(keyblock_id.clone());
             return Ok(());
         }
         log::info!("Updating monitor min split from {} to {}", old_mms, new_mms);
@@ -378,11 +292,12 @@ impl FullNodeOverlaysRouter {
             let to_add = calc_new_shards(old_mms, new_mms)?;
             let mut tasks = Vec::new();
             for new in &to_add {
-                tasks.push(self.overlay_client(new));
+                tasks.push(self.overlay_client_for_shard(new.clone()));
             }
             futures::future::try_join_all(tasks).await?;
         }
         self.actual_monitor_min_split.store(new_mms, Ordering::Relaxed);
+        *last_known_id = Some(keyblock_id.clone());
         Ok(())
     }
 
@@ -1115,6 +1030,85 @@ impl FullNodeOverlaysRouter {
             trim_shard(shard, self.monitor_min_split_for_fast_sync.load(Ordering::Relaxed)).ok()?;
         self.fast_sync_overlays.get(&shard).map(|g| g.val().clone())
     }
+}
+
+/// Advance only from the configured local pin or an authority previously
+/// authenticated by this worker. Peer IDs and database cursors only locate data.
+/// Bound work per poll and retain progress even if a later peer response fails.
+pub(crate) async fn advance_monitor_history(
+    engine: &dyn EngineOperations,
+    history: &mut Option<BootstrapAuthority>,
+) -> Result<()> {
+    let pin = engine.init_mc_block_id();
+    if history.as_ref().is_some_and(|authority| authority.anchor() != pin) {
+        *history = None;
+    }
+    if history.is_none() {
+        *history = Some(if pin.seq_no == 0 {
+            if pin != engine.zerostate_id()? {
+                rtos_block::fail!("Monitor pin differs from network zerostate");
+            }
+            BootstrapAuthority::from_zerostate(pin, engine.load_mc_zero_state().await?)?
+        } else {
+            BootstrapAuthority::from_checkpoint(
+                pin,
+                crate::boot::load_history_proof(engine, pin, true, true).await?,
+            )?
+        });
+    }
+    let mut remaining = 100usize;
+    while remaining > 0 {
+        if engine.check_stop() {
+            rtos_block::fail!("Monitor history authentication stopped");
+        }
+        let authority = history.as_ref().unwrap();
+        let mut ids = engine.download_next_key_blocks_ids(authority.id()).await?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        if ids.len() > 5 {
+            rtos_block::fail!("Monitor key-block response exceeds request limit");
+        }
+        ids.sort_by_key(|id| id.seq_no);
+        for id in ids {
+            if engine.check_stop() {
+                rtos_block::fail!("Monitor history authentication stopped");
+            }
+            if remaining == 0 {
+                return Ok(());
+            }
+            let authority = history.as_ref().unwrap();
+            if !id.shard().is_masterchain_ext() || id.seq_no <= authority.id().seq_no {
+                rtos_block::fail!("Monitor key-block response does not advance the masterchain");
+            }
+            let proof = crate::boot::load_history_proof(engine, &id, false, true).await?;
+            let next = authority.advance_key_block(&id, proof.clone())?;
+            engine.store_block_proof(&id, None, &proof).await?;
+            *history = Some(next);
+            remaining -= 1;
+        }
+    }
+    Ok(())
+}
+
+fn monitor_update_needed(previous: Option<&BlockIdExt>, next: &BlockIdExt) -> Result<bool> {
+    if !next.shard().is_masterchain_ext() {
+        rtos_block::fail!("Monitor update requires a full masterchain identity");
+    }
+    if let Some(previous) = previous {
+        if previous.seq_no == next.seq_no && previous != next {
+            rtos_block::fail!("Conflicting monitor key-block identity at the same height");
+        }
+        return Ok(previous.seq_no < next.seq_no);
+    }
+    Ok(true)
+}
+
+fn check_monitor_min_split(value: u8) -> Result<()> {
+    if value > crate::engine::Engine::MAX_MONITOR_MIN_SPLIT {
+        rtos_block::fail!("Unsupported monitor_min_split {}", value);
+    }
+    Ok(())
 }
 
 fn calc_new_shards(old_min_split: u8, new_min_split: u8) -> Result<HashSet<ShardIdent>> {
