@@ -967,6 +967,20 @@ impl Engine {
         self.overlays_router()?.overlay_client(shard).await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn initialize_test_full_node_overlays(self: &Arc<Self>) -> Result<()> {
+        // Isolated Engine fixtures have authenticated their own bootstrap state
+        // but do not run the top-level service/boot loop. Use the production
+        // router constructor, including ordinary query service registration.
+        let router = FullNodeOverlaysRouter::new(
+            self.clone(),
+            self.network.clone(),
+            DhtSearchPolicy::default(),
+        )
+        .await?;
+        self.overlays_router.set(router).map_err(|_| error!("Overlays router already set"))
+    }
+
     pub fn overlays_router(&self) -> Result<&Arc<FullNodeOverlaysRouter>> {
         self.overlays_router
             .get()

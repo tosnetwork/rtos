@@ -341,6 +341,16 @@ pub trait EngineOperations: Sync + Send {
             .map(|_| ())
     }
 
+    async fn historical_pq_broadcast_context(
+        &self,
+        id: &BlockIdExt,
+        block: &rtos_block::Block,
+    ) -> Result<rtos_api::pq_finality::PqVerificationContext> {
+        crate::block_proof::MasterchainProofVerifier::default()
+            .pq_broadcast_context(self, id, block)
+            .await
+    }
+
     async fn load_actual_config_params(&self) -> Result<ConfigParams> {
         match self.load_last_applied_mc_block_id()? {
             Some(block_id) => {

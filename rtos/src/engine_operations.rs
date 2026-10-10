@@ -94,6 +94,14 @@ impl EngineOperations for Engine {
         self.masterchain_proof_verifier.verify(self, proof).await.map(|_| ())
     }
 
+    async fn historical_pq_broadcast_context(
+        &self,
+        id: &BlockIdExt,
+        block: &rtos_block::Block,
+    ) -> Result<rtos_api::pq_finality::PqVerificationContext> {
+        self.masterchain_proof_verifier.pq_broadcast_context(self, id, block).await
+    }
+
     // Global node's state
 
     fn set_sync_status(&self, status: u32) {
