@@ -54,6 +54,31 @@ mod tests {
         assert_eq!(owner.wait().await.unwrap_err().to_string(), first);
         assert!(!owner.spawn("late", async {}));
     }
+
+    #[tokio::test]
+    async fn quic_owned_enqueue_racing_shutdown_cannot_register_late_sender() {
+        let owner = QuicTasks::new(Handle::current(), CancellationToken::new());
+        let (queued, queue_observed) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let enqueuer = owner.clone();
+        let worker = std::thread::spawn(move || {
+            enqueuer
+                .admit(|| {
+                    queued.send(()).unwrap();
+                    held.recv().unwrap();
+                })
+                .unwrap();
+        });
+        queue_observed.recv().unwrap();
+        let closer = owner.clone();
+        let stop = std::thread::spawn(move || closer.close());
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        stop.join().unwrap();
+        assert!(!owner.spawn("sender after close", async { panic!("late sender polled") }));
+        assert!(owner.admit(|| panic!("late queue mutation")).is_none());
+        owner.wait().await.unwrap();
+    }
 }
 
 impl QuicTasks {
@@ -87,6 +112,16 @@ impl QuicTasks {
             }
         });
         true
+    }
+
+    /// Perform a synchronous enqueue under the same gate as worker admission.
+    /// The closure must not spawn through this owner or await another task.
+    pub fn admit<T>(&self, operation: impl FnOnce() -> T) -> Option<T> {
+        let open = self.open.lock().unwrap();
+        if !*open || self.cancellation.is_cancelled() {
+            return None;
+        }
+        Some(operation())
     }
 
     pub fn spawn_cancelable(

@@ -1004,24 +1004,28 @@ impl QuicNode {
 
         // Slow path: no connection (or it just died) — enqueue for the sender task
         // which will establish the connection and deliver
-        if !outbound.send_queue.try_push(data) {
-            self.transport_errors.queue_full.inc();
-            fail!("QUIC send queue full for peer {}", peers.other());
-        }
+        let start_sender = self
+            .tasks
+            .admit(|| -> Result<bool> {
+                if !outbound.send_queue.try_push(data) {
+                    self.transport_errors.queue_full.inc();
+                    fail!("QUIC send queue full for peer {}", peers.other());
+                }
+                Ok(outbound
+                    .sender_state
+                    .active
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok())
+            })
+            .ok_or_else(|| error!("QUIC transport is shut down"))??;
         self.msg_stats.record(tag, size, addr, true, MsgKind::Message);
 
-        // Spawn sender task if not already running (CAS guarantees at most one per peer)
-        if outbound
-            .sender_state
-            .active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+        if start_sender {
             let quic = self.clone();
             let send_queue = outbound.send_queue.clone();
             let sender_state = outbound.sender_state.clone();
             let outbound_conns = state.outbound.clone();
-            self.tasks.spawn_cancelable(
+            if !self.tasks.spawn_cancelable(
                 "sender",
                 Self::run_sender_task(
                     quic,
@@ -1031,7 +1035,13 @@ impl QuicNode {
                     sender_state,
                     outbound_conns,
                 ),
-            );
+            ) {
+                // Shutdown can close admission between enqueue and registration.
+                // No sender was created; release the reservation and report failure.
+                outbound.sender_state.active.store(false, Ordering::Release);
+                while outbound.send_queue.pop().is_some() {}
+                fail!("QUIC transport stopped before sender registration");
+            }
         }
 
         Ok(None)
