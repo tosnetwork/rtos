@@ -675,9 +675,16 @@ async fn run_get_method_impl(
     if account.status() != AccountStatus::AccStateActive {
         return Ok(run_get_method_inactive_response(&acc_ctx, method_id, std_stack));
     }
-    let result =
-        rtos_vm::run_smc_method(&account, mc_state_cell, method_id, stack, gen_utime, gen_lt)?
-            .into_run_result()?;
+    let result = rtos_vm::run_smc_method_with_block_id(
+        &account,
+        mc_state_cell,
+        &acc_ctx.mc_block_id,
+        method_id,
+        stack,
+        gen_utime,
+        gen_lt,
+    )?
+    .into_run_result()?;
     let stack =
         if std_stack { serialize_stack_std(result.stack)? } else { serialize_stack(result.stack)? };
 
@@ -1915,9 +1922,10 @@ async fn get_token_data(p: GetTokenDataParams, ctx: Ctx) -> JsonResult {
     for (ty, method_name) in &TYPES_METHODS {
         let method_id = ton_method_id(&method_name);
 
-        let res = rtos_vm::run_smc_method(
+        let res = rtos_vm::run_smc_method_with_block_id(
             &account,
             mc_state_cell.clone(),
+            &acc_ctx.mc_block_id,
             method_id,
             Vec::<StackEntry>::new(),
             gen_utime,

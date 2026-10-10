@@ -1316,3 +1316,121 @@ curl -sS -X POST http://127.0.0.1:8083/jsonRPC   -H 'Content-Type: application/j
 {"ok":true,"result":{"@type":"raw.fullAccountState","balance":0,"extra_currencies":[],"code":"","data":"","last_transaction_id":{"@type":"internal.transactionId","lt":"0","hash":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},"block_id":{"@type":"ton.blockIdExt","workchain":-1,"shard":"-9223372036854775808","seqno":1222,"root_hash":"zQwPCY+igXv5ffPbyKw0uZAJrYRov7hZiNZDdoA9qCA=","file_hash":"cqTg6ycNgUQAD6++ItOkOKo0pj73aD+695D0UarjXjw="},"frozen_hash":"","sync_utime":1760953103,"@extra":"1760953115.6070707:0:0.669076554920487","state":"uninitialized"},"jsonrpc":"2.0","id":"1"}
 
 */
+
+#[tokio::test(flavor = "current_thread")]
+async fn run_get_method_uses_pinned_masterchain_identifier() {
+    // DROP PUSHCTR c7 FIRST PUSHINT 13 INDEXVAR FIRST FIRST PUSHINT 3 INDEXVAR
+    // Return the current masterchain block root hash from the actual VM context.
+    let bytes = hex::decode("30ed476f10800d6f816f106f10736f81").unwrap();
+    let code = BuilderData::with_raw(bytes.clone(), bytes.len() * 8).unwrap().into_cell().unwrap();
+    let mut init = StateInit::default();
+    init.set_code(code);
+    let address = MsgAddressInt::with_standart(None, -1, [0x5a; 32].into()).unwrap();
+    let account = Account::active(
+        address,
+        rtos_block::CurrencyCollection::with_coins(10_000_000_000u64),
+        0,
+        0,
+        init,
+        1000,
+    )
+    .unwrap();
+    for version in [8, 9, 17] {
+        let mut config = ConfigParams::default();
+        config
+            .set_config(ConfigParamEnum::ConfigParam8(ConfigParam8 {
+                global_version: GlobalVersion { version, capabilities: 0 },
+            }))
+            .unwrap();
+        let master_state = gen_master_state(
+            GenMasterStateParams {
+                config,
+                accounts: &[&account],
+                after_key_block: true,
+                ..Default::default()
+            },
+            #[cfg(feature = "telemetry")]
+            Some(create_engine_telemetry()),
+            Some(create_engine_allocated()),
+        );
+        let expected = rtos_vm::stack::integer::IntegerData::from_unsigned_bytes_be(
+            master_state.block_id().root_hash().as_slice(),
+        );
+        let engine: Arc<dyn EngineOperations> = Arc::new(MockEngine::new(vec![master_state]));
+        let ctx = ctx_with_engine(engine);
+        let params = RunGetMethodParams {
+            address: account_address(&account),
+            method: UIntOrStr::Int(0),
+            stack: Vec::new(),
+            seqno: None,
+        };
+        let response = run_get_method(params, ctx.clone()).await.unwrap();
+        assert_eq!(response["exit_code"], 0, "{version}: {response}");
+        assert_eq!(
+            response["stack"],
+            serde_json::json!([["num", format!("0x{}", expected.to_str_radix(16))]]),
+            "{version}"
+        );
+        let params = RunGetMethodStdParams {
+            address: account_address(&account),
+            method: UIntOrStr::Int(0),
+            stack: Vec::new(),
+            seqno: None,
+        };
+        let response = run_get_method_std(params, ctx).await.unwrap();
+        assert_eq!(response["exit_code"], 0, "{version}: {response}");
+        assert_eq!(
+            response["stack"][0]["number"]["number"],
+            expected.to_str_radix(10),
+            "{version}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn token_getter_uses_pinned_masterchain_identifier() {
+    // Return whether the current block root is zero as total_supply, followed
+    // by valid mintable/admin/content/wallet-code fields.
+    let bytes =
+        hex::decode("30ed476f10800d6f816f106f10736f81c000a37f70c8cb01c9d070c8cb08c9c8c9").unwrap();
+    let mut init = StateInit::default();
+    init.set_code(
+        BuilderData::with_raw(bytes.clone(), bytes.len() * 8).unwrap().into_cell().unwrap(),
+    );
+    let account = Account::active(
+        MsgAddressInt::with_standart(None, -1, [0x5a; 32].into()).unwrap(),
+        rtos_block::CurrencyCollection::with_coins(10_000_000_000u64),
+        0,
+        0,
+        init,
+        1000,
+    )
+    .unwrap();
+    let mut config = ConfigParams::default();
+    config
+        .set_config(ConfigParamEnum::ConfigParam8(ConfigParam8 {
+            global_version: GlobalVersion { version: 17, capabilities: 0 },
+        }))
+        .unwrap();
+    let state = gen_master_state(
+        GenMasterStateParams {
+            config,
+            accounts: &[&account],
+            after_key_block: true,
+            ..Default::default()
+        },
+        #[cfg(feature = "telemetry")]
+        Some(create_engine_telemetry()),
+        Some(create_engine_allocated()),
+    );
+    assert_ne!(state.block_id().root_hash(), &UInt256::default());
+    let engine: Arc<dyn EngineOperations> = Arc::new(MockEngine::new(vec![state]));
+    let response = get_token_data(
+        GetTokenDataParams { address: account_address(&account) },
+        ctx_with_engine(engine),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response["contract_type"], "jetton_master");
+    assert_eq!(response["total_supply"], 0);
+}

@@ -3069,3 +3069,103 @@ fn test_vm_stack_boc_roundtrip_bigints() {
         );
     }
 }
+
+struct GetterContextTestEngine(Arc<ShardStateStuff>);
+#[async_trait::async_trait]
+impl EngineOperations for GetterContextTestEngine {
+    async fn load_and_pin_state(&self, id: &BlockIdExt) -> Result<PinnedShardStateGuard> {
+        assert_eq!(id, self.0.block_id());
+        PinnedShardStateGuard::new(self.0.clone(), Arc::new(AllowStateGcSmartResolver::new(10)))
+    }
+}
+
+#[tokio::test]
+async fn run_smc_method_uses_node_context_and_pinned_identifier() -> Result<()> {
+    // DROP PUSHCTR c7: return the exact context used by the VM.
+    let mut init = rtos_block::StateInit::default();
+    init.set_code(BuilderData::with_raw(vec![0x30, 0xed, 0x47], 24)?.into_cell()?);
+    let account = Account::active(
+        MsgAddressInt::with_standart(None, -1, [0x5a; 32].into())?,
+        CurrencyCollection::with_coins(10_000_000_000u64),
+        0,
+        0,
+        init,
+        1000,
+    )?;
+    for version in [3, 4, 5, 6, 8, 9, 10, 11, 14, 15, 16, 17, 19] {
+        let mut config = ConfigParams::default();
+        config.set_config(ConfigParamEnum::ConfigParam8(rtos_block::ConfigParam8 {
+            global_version: rtos_block::GlobalVersion { version, capabilities: 0 },
+        }))?;
+        let state = gen_master_state(
+            GenMasterStateParams {
+                config,
+                accounts: &[&account],
+                after_key_block: true,
+                ..Default::default()
+            },
+            #[cfg(feature = "telemetry")]
+            None,
+            None,
+        );
+        let id = state.block_id().clone();
+        let engine: Arc<dyn EngineOperations> = Arc::new(GetterContextTestEngine(state));
+        for full in [false, true] {
+            let mut mode = RunSmcMethodMode::RESULT | RunSmcMethodMode::INIT_C7;
+            if full {
+                mode |= RunSmcMethodMode::FULL_C7;
+            }
+            let result = LiteServerQuerySubscriber::run_smc_method(
+                &engine,
+                mode.bits(),
+                id.clone(),
+                AccountIdTl { workchain: -1, id: [0x5a; 32].into() },
+                12345,
+                write_boc(&serialize_vm_stack(&[])?)?,
+            )
+            .await?;
+            assert_eq!(result.exit_code, 0, "v{version}: full={full}");
+            let stack = deserialize_vm_stack_boc(result.result.as_ref().unwrap())?;
+            let context = stack[0].as_tuple()?[0].as_tuple()?;
+            assert_eq!(
+                context.len(),
+                if version < 4 {
+                    10
+                } else if version < 6 {
+                    14
+                } else if version < 11 {
+                    17
+                } else {
+                    18
+                }
+            );
+            if version >= 4 {
+                let root = context[13].as_tuple()?[0].as_tuple()?[0].as_tuple()?[3].as_integer()?;
+                assert_eq!(
+                    root,
+                    &rtos_vm::stack::integer::IntegerData::from_unsigned_bytes_be(
+                        id.root_hash().as_slice()
+                    )
+                );
+            }
+            let mut cs =
+                SliceData::load_cell(read_single_root_boc(result.init_c7.as_ref().unwrap())?)?;
+            let response = read_vm_stack_value(&mut cs)?;
+            if full {
+                assert_eq!(response, stack[0], "full c7 v{version}");
+            } else {
+                let fields = response.as_tuple()?[0].as_tuple()?;
+                assert_eq!(fields.len(), 10, "redacted c7 v{version}");
+                assert!(fields[9].is_null());
+                assert!(fields[6].as_integer().is_ok());
+                for index in [0, 1, 2, 3, 4, 5, 7, 8] {
+                    assert_eq!(
+                        fields[index], context[index],
+                        "redacted c7 field {index} v{version}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
