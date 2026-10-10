@@ -1,11 +1,13 @@
 // Copyright 2026 TOS Blockchain Teams. SPDX-License-Identifier: LGPL-2.0-or-later
-//! Bounded verification using the pinned portable ML-DSA-44 C backend.
+//! Bounded verification using pinned portable cryptographic backends.
 //!
 //! This crate verifies a signature under a supplied public key. It does not
 //! establish that the key is authorized by a network, session, or validator set.
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::{error::Error, fmt, os::raw::c_int};
+
+pub mod falcon512;
 
 pub const PUBLIC_KEY_BYTES: usize = 1312;
 pub const SIGNATURE_BYTES: usize = 2420;

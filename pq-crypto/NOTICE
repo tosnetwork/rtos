@@ -31,3 +31,21 @@ The context-binding fixture uses a public deterministic test seed. It was
 created with the same native backend and is not an independent crypto reference.
 Detailed import hashes, corpus generation and test evidence are maintained at
 https://github.com/tosnetwork/memo/tree/main/rtos.
+
+Falcon-512 padded verification uses the official Falcon-impl-20211101 source
+archive (SHA-256 d9f982bd825b9903b57b686d6d26018dac173a1dff09f224cc39302f9d85a595),
+as vendored by tosnetwork/tos at the fixed revision above. The selected
+codec/common/shake/vrfy sources and headers are unmodified MIT-licensed copies;
+see native/falcon-reference/LICENSE and the source headers. Only verification
+code is compiled; signing, key generation, RNG and floating-point code are not
+linked. The fixed-profile adapter adapts crypto/pq/falcon512-native.c with an
+RTOS symbol namespace. This is original Falcon, not FN-DSA or FIPS certification.
+
+The Falcon fixtures extract the 100 published Falcon-512 round-3 KAT answers
+(SHA-256 dd75c946fdedef4ec46a2bee7e10c65c9126f1a839b9ced6921fd45f7354b5cd).
+RTOS converted signed-message framing to detached signatures, padded to 666
+bytes with zeroes, and added message mutation controls. Coefficients and
+nonces are unchanged. The original submission and source are MIT licensed
+(see native/falcon-reference/LICENSE). An additional 28 fixed-profile cases
+come from the pinned reference test/pq-falcon512/vectors.json; its GPLv3
+license text is retained at tests/data/TOS-LICENSE.txt.
