@@ -220,20 +220,15 @@ fn deserialize_mc_entry(block_id: BlockIdExt, raw: RawEntry) -> Result<McEntry> 
     })
 }
 
-fn validate_mc_range(
-    entries: &[McEntry],
-    key_proof: &Option<BlockProofStuff>,
-    zerostate: &Arc<crate::shard_state::ShardStateStuff>,
-) -> Result<()> {
-    entries.par_iter().try_for_each(|e| match key_proof {
-        None => e.proof.check_with_master_state(zerostate),
-        Some(kb) => e.proof.check_with_prev_key_block_proof(kb),
-    })
+fn validate_mc_range(entries: &[McEntry], validator: &ValidatorState) -> Result<()> {
+    entries.par_iter().try_for_each(|e| validator.authenticate_mc_proof(&e.block_id, &e.proof))
 }
 
 fn check_mc_chain(entries: &[McEntry], expected_first_prev: &BlockIdExt) -> Result<()> {
     if let Some(first) = entries.first() {
-        if first.prev_block_id != *expected_first_prev {
+        if first.prev_block_id != *expected_first_prev
+            || expected_first_prev.seq_no.checked_add(1) != Some(first.block_id.seq_no)
+        {
             fail!(
                 "MC chain gap between packages: block {} prev_ref = {} but expected {}",
                 first.block_id,
@@ -243,7 +238,9 @@ fn check_mc_chain(entries: &[McEntry], expected_first_prev: &BlockIdExt) -> Resu
         }
     }
     for w in entries.windows(2) {
-        if w[1].prev_block_id != w[0].block_id {
+        if w[1].prev_block_id != w[0].block_id
+            || w[0].block_id.seq_no.checked_add(1) != Some(w[1].block_id.seq_no)
+        {
             fail!(
                 "MC chain gap: block {} prev_ref = {} but expected {}",
                 w[1].block_id,
@@ -267,40 +264,20 @@ fn parse_mc_entries(
     entries.sort_by_key(|e| e.block_id.seq_no());
     check_mc_chain(&entries, &expected_first_prev)?;
 
-    let rest_start = if entries.first().map(|e| e.is_key).unwrap_or(false) {
-        let block_id = &entries[0].block_id;
-        if !skip {
-            // Skip re-validation if this key block is already the current validation root (resume).
-            let already_done = validator
-                .current_key_block_proof()
-                .map(|kp| kp.id().seq_no() >= block_id.seq_no())
-                .unwrap_or(false);
-            if !already_done {
-                let is_hardfork = validator.is_hardfork(block_id);
-                if is_hardfork {
-                    log::info!(
-                        target: TARGET,
-                        "Hard fork block {} accepted as new validation root",
-                        block_id,
-                    );
-                } else {
-                    let key_proof = validator.current_key_block_proof().cloned();
-                    let zerostate = Arc::clone(validator.zerostate());
-                    validate_mc_range(&entries[..1], &key_proof, &zerostate)?;
-                }
-            }
-        }
-        validator.set_key_block_proof(entries[0].proof.clone());
+    if skip {
+        fail!("Archive import requires proof validation");
+    }
+    if entries.iter().skip(1).any(|entry| entry.is_key) {
+        fail!("Archive group may contain a key block only at its start");
+    }
+    let mut staged = validator.clone();
+    let rest_start = if entries.first().is_some_and(|entry| entry.is_key) {
+        staged.validate_mc_proof(&entries[0].block_id, &entries[0].proof)?;
         1
     } else {
         0
     };
-
-    if !skip {
-        let key_proof = validator.current_key_block_proof().cloned();
-        let zerostate = Arc::clone(validator.zerostate());
-        validate_mc_range(&entries[rest_start..], &key_proof, &zerostate)?;
-    }
+    validate_mc_range(&entries[rest_start..], &staged)?;
 
     let mut processed = Vec::with_capacity(entries.len());
     let mut key_block: Option<KeyBlockData> = None;
@@ -308,7 +285,7 @@ fn parse_mc_entries(
 
     for entry in entries {
         if entry.is_key {
-            if Some(&entry.block_id) != validator.current_key_block_proof().map(|kp| kp.id()) {
+            if Some(&entry.block_id) != staged.current_key_block_proof().map(|kp| kp.id()) {
                 fail!("Second key block {} in package", entry.block_id);
             }
             key_block = Some(KeyBlockData {
@@ -336,6 +313,7 @@ fn parse_mc_entries(
             mc_block_id: e.block_id.clone(),
             shard_tops: mc_shard_tops.last().map(|(_, tops)| tops.clone()).unwrap_or_default(),
         })?;
+    *validator = staged;
     Ok((processed, key_block, mc_shard_tops, last_group_state))
 }
 
@@ -513,6 +491,9 @@ impl Ingester {
         mut validator: ValidatorState,
         mut last_group_state: LastGroupState,
     ) -> Result<ValidatorState> {
+        if self.skip_validation {
+            fail!("Archive import requires proof validation");
+        }
         let mut prefetch: Option<
             tokio::task::JoinHandle<
                 Result<(HashMap<BlockIdExt, RawEntry>, Vec<HashMap<BlockIdExt, RawEntry>>)>,
@@ -831,3 +812,7 @@ impl Ingester {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "authority_tests.rs"]
+mod authority_tests;

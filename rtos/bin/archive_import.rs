@@ -63,7 +63,7 @@ fn main() {
             Arg::new("skip-validation")
                 .long("skip-validation")
                 .action(ArgAction::SetTrue)
-                .help("Skip block proof validation (for re-importing already validated archives)"),
+                .help("Unsupported: imported node data requires proof validation"),
         )
         .arg(Arg::new("copy").long("copy").action(ArgAction::SetTrue).help(
             "Copy source .pack files instead of moving them. Use for keeping original \

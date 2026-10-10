@@ -7,76 +7,96 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::{block_proof::BlockProofStuff, shard_state::ShardStateStuff};
-use rtos_block::{BlockIdExt, BlockInfo, Result};
-use std::sync::Arc;
+use crate::{
+    block_proof::{BlockProofStuff, BootstrapAuthority},
+    shard_state::ShardStateStuff,
+};
+use rtos_block::{fail, BlockIdExt, BlockInfo, Result};
+use std::{future::Future, sync::Arc};
 
+#[derive(Clone)]
 pub struct ValidatorState {
-    zerostate: Arc<ShardStateStuff>,
-    current_key_block_proof: Option<BlockProofStuff>,
-    hardforks: Vec<BlockIdExt>,
+    authority: BootstrapAuthority,
 }
 
 impl ValidatorState {
-    pub fn new(zerostate: Arc<ShardStateStuff>, hardforks: Vec<BlockIdExt>) -> Self {
-        Self { zerostate, current_key_block_proof: None, hardforks }
-    }
-
-    pub(crate) fn is_hardfork(&self, block_id: &BlockIdExt) -> bool {
-        self.hardforks.iter().any(|hf| hf == block_id)
-    }
-
-    pub(crate) fn zerostate(&self) -> &Arc<ShardStateStuff> {
-        &self.zerostate
+    pub fn new(pin: &BlockIdExt, zerostate: Arc<ShardStateStuff>) -> Result<Self> {
+        Ok(Self { authority: BootstrapAuthority::from_zerostate(pin, zerostate)? })
     }
 
     pub(crate) fn current_key_block_proof(&self) -> Option<&BlockProofStuff> {
-        self.current_key_block_proof.as_ref()
+        self.authority.key_block_proof()
     }
 
-    pub fn set_key_block_proof(&mut self, proof: BlockProofStuff) {
-        self.current_key_block_proof = Some(proof);
+    pub(crate) fn authenticate_mc_proof(
+        &self,
+        expected: &BlockIdExt,
+        proof: &BlockProofStuff,
+    ) -> Result<()> {
+        self.authority.authenticate_block(expected, proof.clone())?;
+        Ok(())
     }
 
-    pub fn validate_mc_proof(&mut self, proof: &BlockProofStuff) -> Result<BlockInfo> {
-        let (virt_block, _virt_root) = proof.virtualize_block()?;
-        let info = virt_block.read_info()?;
-
-        let prev_key_block_seqno = info.prev_key_block_seqno();
-
-        if prev_key_block_seqno == 0 {
-            proof.check_with_master_state(&self.zerostate)?;
+    pub fn validate_mc_proof(
+        &mut self,
+        expected: &BlockIdExt,
+        proof: &BlockProofStuff,
+    ) -> Result<BlockInfo> {
+        let info = proof.virtualize_block()?.0.read_info()?;
+        if info.key_block() {
+            self.authority = self.authority.advance_key_block(expected, proof.clone())?;
         } else {
-            let prev_key_proof = self.current_key_block_proof.as_ref().ok_or_else(|| {
-                rtos_block::error!(
-                    "No key block proof available for validation of block {} \
-                     (prev_key_block_seqno = {})",
-                    proof.id(),
-                    prev_key_block_seqno
-                )
-            })?;
-            proof.check_with_prev_key_block_proof(prev_key_proof)?;
+            self.authenticate_mc_proof(expected, proof)?;
         }
-
-        if info.key_block() {
-            self.current_key_block_proof = Some(proof.clone());
-        }
-
         Ok(info)
     }
 
-    pub fn extract_mc_info(&mut self, proof: &BlockProofStuff) -> Result<BlockInfo> {
-        let (virt_block, _virt_root) = proof.virtualize_block()?;
-        let info = virt_block.read_info()?;
-
-        if info.key_block() {
-            self.current_key_block_proof = Some(proof.clone());
+    /// Reconstruct the governing history at the actual resume boundary. Archive
+    /// indexes only locate data; a later key proof never becomes a resume root.
+    /// Discovery retains IDs, then reloads and authenticates proofs forwards.
+    pub(crate) async fn restore_to<F, Fut>(
+        &mut self,
+        seqno: u32,
+        mut lookup: F,
+    ) -> Result<BlockIdExt>
+    where
+        F: FnMut(u32) -> Fut,
+        Fut: Future<Output = Result<BlockProofStuff>>,
+    {
+        if seqno == self.authority.id().seq_no {
+            return Ok(self.authority.id().clone());
         }
-
-        Ok(info)
-    }
-
-    pub fn validate_shard_proof_link(&self, proof: &BlockProofStuff) -> Result<()> {
-        proof.check_proof_link()
+        let target = lookup(seqno).await?;
+        if target.id().seq_no != seqno || !target.id().shard().is_masterchain_ext() {
+            fail!("Archive resume proof has the wrong requested position");
+        }
+        let mut epoch = target.virtualize_block()?.0.read_info()?.prev_key_block_seqno();
+        if epoch >= seqno {
+            fail!("Archive resume epoch must precede the target");
+        }
+        let mut ids = Vec::new();
+        while epoch > self.authority.id().seq_no {
+            let proof = lookup(epoch).await?;
+            if proof.id().seq_no != epoch || !proof.id().shard().is_masterchain_ext() {
+                fail!("Archive key index returned the wrong requested position");
+            }
+            let info = proof.virtualize_block()?.0.read_info()?;
+            if !info.key_block() || info.prev_key_block_seqno() >= epoch {
+                fail!("Archive governing history is not a descending key-block chain");
+            }
+            ids.push(proof.id().clone());
+            epoch = info.prev_key_block_seqno();
+        }
+        if epoch != self.authority.id().seq_no {
+            fail!("Archive resume predates its authenticated authority");
+        }
+        let mut staged = self.clone();
+        for id in ids.into_iter().rev() {
+            let proof = lookup(id.seq_no).await?;
+            staged.validate_mc_proof(&id, &proof)?;
+        }
+        staged.validate_mc_proof(target.id(), &target)?;
+        *self = staged;
+        Ok(target.id().clone())
     }
 }

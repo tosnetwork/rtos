@@ -26,8 +26,8 @@ use crate::{
 use crate::{collator_test_bundle::create_engine_telemetry, engine_traits::EngineTelemetry};
 use ingester::{Ingester, LastGroupState};
 use rtos_block::{
-    error, AccountIdPrefixFull, Block, BlockIdExt, Deserializable, Result, ShardIdent, UInt256,
-    WorkchainDescr, MASTERCHAIN_ID, SHARD_FULL,
+    error, AccountIdPrefixFull, BlockIdExt, Result, ShardIdent, UInt256, WorkchainDescr,
+    MASTERCHAIN_ID, SHARD_FULL,
 };
 use std::{
     collections::HashMap,
@@ -40,7 +40,6 @@ use storage::{
         archive_manager::ArchiveManager,
         db_provider::EpochDbProvider,
         epoch::{ArchivalModeConfig, EpochRouter},
-        ARCHIVE_PACKAGE_SIZE,
     },
     block_handle_db::{
         BlockHandleDb, BlockHandleStorage, NodeStateDb, BLOCK_HANDLE_DB_NAME,
@@ -93,6 +92,7 @@ async fn build_initial_group_state(
     zerostate: &ShardStateStuff,
     archive_manager: &ArchiveManager,
     last_imported: u32,
+    validator: &mut ValidatorState,
 ) -> Result<LastGroupState> {
     if last_imported == 0 {
         let shard_tops = read_wc_zerostates_from_config(zerostate)?;
@@ -106,11 +106,31 @@ async fn build_initial_group_state(
     }
 
     let mc_prefix = AccountIdPrefixFull { workchain_id: MASTERCHAIN_ID, prefix: 0 };
+    let authenticated_id = validator
+        .restore_to(last_imported, |seqno| {
+            let mc_prefix = mc_prefix.clone();
+            async move {
+                let (id, data) = archive_manager
+                    .lookup_proof_by_seqno(&mc_prefix, seqno)
+                    .await?
+                    .ok_or_else(|| error!("Missing archive resume proof at {}", seqno))?;
+                BlockProofStuff::deserialize(&id, data, false)
+            }
+        })
+        .await?;
     let (block_id, block_data) = archive_manager
         .lookup_block_by_seqno(&mc_prefix, last_imported)
         .await?
         .ok_or_else(|| error!("Cannot find MC block at seqno {}", last_imported))?;
-    let block = Block::construct_from_bytes(&block_data)?;
+    if block_id != authenticated_id {
+        rtos_block::fail!("Archive resume block/proof identity mismatch");
+    }
+    let block = crate::block::BlockStuff::deserialize_block_checked(
+        block_id.clone(),
+        Arc::new(block_data),
+    )?;
+    block.verify_expected_id(&authenticated_id)?;
+    let block = block.block()?;
     let extra = block
         .read_extra()?
         .read_custom()?
@@ -147,6 +167,7 @@ fn process_zerostates(
         &engine_telemetry,
         &engine_allocated,
     )?;
+    ValidatorState::new(&expected_mc_zerostate_id, mc_zerostate.clone())?;
     log::info!(target: TARGET, "MC zerostate loaded successfully");
 
     // Load and validate workchain zerostates
@@ -213,6 +234,11 @@ fn process_zerostates(
 
 /// Returns the node_db Arc so the caller can wait for all background tasks to release it.
 pub async fn run_import(config: ImportConfig) -> Result<Arc<RocksDb>> {
+    if config.skip_validation {
+        rtos_block::fail!(
+            "Archive import requires proof validation; --skip-validation is unsupported"
+        );
+    }
     log::info!(
         target: TARGET,
         "Loading global config from {}",
@@ -221,15 +247,9 @@ pub async fn run_import(config: ImportConfig) -> Result<Arc<RocksDb>> {
     let global_config = TonNodeGlobalConfig::from_json_file(&config.global_config_path)
         .map_err(|e| error!("Cannot load global config: {}", e))?;
     let expected_zerostate_id = global_config.zero_state()?;
-    let mut hardforks = global_config.hardforks()?;
-    hardforks.sort_by_key(|hf| hf.seq_no());
-    log::info!(
-        target: TARGET,
-        "Global config: zerostate={}, {} hard fork(s)",
-        expected_zerostate_id,
-        hardforks.len(),
-    );
-
+    // Bind the destination before opening databases or creating epoch archives.
+    let _network_binding =
+        crate::network_db::DbNetworkBinding::acquire(&config.node_db_path, &expected_zerostate_id)?;
     #[cfg(feature = "telemetry")]
     let engine_telemetry = create_engine_telemetry();
     let engine_allocated = create_engine_allocated();
@@ -336,7 +356,7 @@ pub async fn run_import(config: ImportConfig) -> Result<Arc<RocksDb>> {
     let groups = scanner::group_by_archive_id(packages)?;
     log::info!(target: TARGET, "Grouped into {} archive groups", groups.len());
 
-    let mut validator_state = ValidatorState::new(mc_zerostate.clone(), hardforks);
+    let mut validator_state = ValidatorState::new(&expected_zerostate_id, mc_zerostate.clone())?;
     let mut skip_count = 0;
 
     let last_imported = if let Some(max_mc) = archive_manager.get_max_mc_seqno().await {
@@ -348,12 +368,6 @@ pub async fn run_import(config: ImportConfig) -> Result<Arc<RocksDb>> {
             .map(|id| id.seq_no())
             .unwrap_or(max_mc);
         let max_seqno = max_mc.min(shard_client_seqno);
-        if max_seqno > groups.last().unwrap().archive_id + ARCHIVE_PACKAGE_SIZE as u32 {
-            log::warn!(target: TARGET,
-                "Existing import detected with max MC seqno {}, which is beyond the last archive group ({}), skipping all groups",
-                max_seqno, groups.last().unwrap().archive_id);
-            return Ok(node_db);
-        }
         skip_count =
             groups.iter().take_while(|g| g.archive_id < max_seqno).count().saturating_sub(1);
 
@@ -364,36 +378,18 @@ pub async fn run_import(config: ImportConfig) -> Result<Arc<RocksDb>> {
             skip_count,
         );
 
-        // Restore key block proof regardless of skip_count: files may have been moved
-        // and the scanned list may start mid-chain.
-        if !config.skip_validation {
-            if let Some(key_seqno) = archive_manager.get_max_key_block_seqno().await {
-                let mc_prefix = AccountIdPrefixFull { workchain_id: MASTERCHAIN_ID, prefix: 0 };
-                let (block_id, proof_data) = archive_manager
-                    .lookup_proof_by_seqno(&mc_prefix, key_seqno)
-                    .await?
-                    .ok_or_else(|| {
-                        error!(
-                            "Key block seqno {} found in index but proof not readable",
-                            key_seqno,
-                        )
-                    })?;
-                let proof = BlockProofStuff::deserialize(&block_id, proof_data, false)?;
-                log::info!(
-                    target: TARGET,
-                    "Restored key block proof: {}",
-                    block_id,
-                );
-                validator_state.set_key_block_proof(proof);
-            }
-        }
         groups[skip_count].archive_id.saturating_sub(1)
     } else {
         0
     };
 
-    let initial_group_state =
-        build_initial_group_state(&mc_zerostate, &archive_manager, last_imported).await?;
+    let initial_group_state = build_initial_group_state(
+        &mc_zerostate,
+        &archive_manager,
+        last_imported,
+        &mut validator_state,
+    )
+    .await?;
 
     let ingester = Ingester::new(
         archive_manager,
