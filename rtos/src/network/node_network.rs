@@ -355,19 +355,22 @@ impl NodeNetwork {
         // it can register a new endpoint after the old endpoints were stopped.
         let config_result = self.config_handler.stop_and_wait().await;
         let workers_result = self.tasks.wait().await;
-        if let Some(quic) = &self.network_context.stack.quic {
+        let quic_result = if let Some(quic) = &self.network_context.stack.quic {
             log::info!("Stopping QUIC...");
-            quic.shutdown();
-        }
+            quic.shutdown_and_wait().await
+        } else {
+            Ok(())
+        };
         log::info!("Node network loops stopped. Stopping adnl...");
         self.network_context.stack.adnl.stop().await;
         log::info!("Stopped adnl");
-        match (config_result, workers_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (config, workers) => Err(error!(
-                "Network shutdown: config={:?}; workers={:?}",
+        match (config_result, workers_result, quic_result) {
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
+            (config, workers, quic) => Err(error!(
+                "Network shutdown: config={:?}; workers={:?}; QUIC={:?}",
                 config.err(),
-                workers.err()
+                workers.err(),
+                quic.err()
             )),
         }
     }
