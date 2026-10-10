@@ -150,8 +150,15 @@ impl ConsensusKeyStore {
         self.refused_after_expiry.load(Ordering::Relaxed)
     }
     pub fn sign_consensus(&self, message: &[u8]) -> Result<ConsensusSignature, Error> {
-        let signature =
-            self.sign_within_deadline(message, SIMPLEX_CONTEXT, system_clock, native_sign)?;
+        self.sign_consensus_with(message, system_clock, native_sign)
+    }
+    fn sign_consensus_with(
+        &self,
+        message: &[u8],
+        clock: impl Fn() -> Option<u64>,
+        backend: impl FnOnce(&[u8], &[u8], &[u8; SECRET_BYTES]) -> Result<[u8; SIGNATURE_BYTES], Error>,
+    ) -> Result<ConsensusSignature, Error> {
+        let signature = self.sign_within_deadline(message, SIMPLEX_CONTEXT, clock, backend)?;
         self.signatures_produced.fetch_add(1, Ordering::Relaxed);
         Ok(signature)
     }
@@ -196,19 +203,54 @@ pub(crate) fn native_sign(
     context: &[u8],
     secret: &[u8; SECRET_BYTES],
 ) -> Result<[u8; SIGNATURE_BYTES], Error> {
-    // Only the three frozen public entry points reach this private routine.
+    native_sign_with(message, context, secret, os_random, native_signature)
+}
+
+fn os_random(bytes: &mut [u8]) -> Result<(), Error> {
+    getrandom::getrandom(bytes).map_err(|_| Error::Randomness)
+}
+
+fn native_sign_with(
+    message: &[u8],
+    context: &[u8],
+    secret: &[u8; SECRET_BYTES],
+    random_source: impl FnOnce(&mut [u8]) -> Result<(), Error>,
+    backend: impl FnOnce(
+        &mut [u8; SIGNATURE_BYTES],
+        &[u8],
+        &[u8],
+        &[u8; 32],
+        &[u8; SECRET_BYTES],
+    ) -> i32,
+) -> Result<[u8; SIGNATURE_BYTES], Error> {
+    // Production fixes both callbacks above. No runtime provider or public RNG
+    // override exists; failure tests execute this exact production sequence.
     assert!(matches!(context, SIMPLEX_CONTEXT | CONFIG_VOTE_CONTEXT | ELECTION_CONTEXT));
     let mut prefix = Vec::with_capacity(2 + context.len());
     prefix.extend_from_slice(&[0, context.len() as u8]);
     prefix.extend_from_slice(context);
     let mut random = Zeroizing::new([0; 32]);
-    getrandom::getrandom(random.as_mut()).map_err(|_| Error::Randomness)?;
+    random_source(random.as_mut())?;
     let mut signature = [0; SIGNATURE_BYTES];
+    let code = backend(&mut signature, message, &prefix, &random, secret);
+    if code != 0 {
+        return Err(Error::Backend(code));
+    }
+    Ok(signature)
+}
+
+fn native_signature(
+    signature: &mut [u8; SIGNATURE_BYTES],
+    message: &[u8],
+    prefix: &[u8],
+    random: &[u8; 32],
+    secret: &[u8; SECRET_BYTES],
+) -> i32 {
     let empty = 0;
     let message_ptr = if message.is_empty() { &empty } else { message.as_ptr() };
     // SAFETY: fixed-size output, secret and randomness match the C ABI; input
     // slice lengths are exact, no buffers alias, and no pointer escapes the call.
-    let code = unsafe {
+    unsafe {
         rtos_pq_consensus_native_signature_internal(
             signature.as_mut_ptr(),
             message_ptr,
@@ -219,17 +261,60 @@ pub(crate) fn native_sign(
             secret.as_ptr(),
             0,
         )
-    };
-    if code != 0 {
-        return Err(Error::Backend(code));
     }
-    Ok(signature)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
+    fn randomness_failure_never_enters_native_or_counts_signature() {
+        let key = ConsensusKeyStore::from_seed(&[111; 32], 0).unwrap();
+        key.sign_consensus(b"baseline success").unwrap();
+        let entered = std::cell::Cell::new(false);
+        let result =
+            key.sign_consensus_with(b"must not sign", system_clock, |message, context, secret| {
+                native_sign_with(
+                    message,
+                    context,
+                    secret,
+                    |random| {
+                        random[..8].fill(0x55);
+                        Err(Error::Randomness)
+                    },
+                    |_, _, _, _, _| {
+                        entered.set(true);
+                        0
+                    },
+                )
+            });
+        assert_eq!(result, Err(Error::Randomness));
+        assert!(!entered.get());
+        assert_eq!(key.consensus_signatures_produced(), 1);
+    }
+    #[test]
+    fn native_failure_never_returns_partial_output_or_counts_signature() {
+        let key = ConsensusKeyStore::from_seed(&[112; 32], 0).unwrap();
+        key.sign_consensus(b"baseline success").unwrap();
+        let entered = std::cell::Cell::new(false);
+        let result = key.sign_consensus_with(
+            b"backend failure",
+            system_clock,
+            |message, context, secret| {
+                native_sign_with(message, context, secret, os_random, |out, _, _, _, _| {
+                    entered.set(true);
+                    out.fill(0x55);
+                    -4
+                })
+            },
+        );
+        assert_eq!(result, Err(Error::Backend(-4)));
+        assert!(entered.get());
+        assert_eq!(key.consensus_signatures_produced(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn poisoned_registry_aborts() {
         use std::os::unix::process::ExitStatusExt;
         if std::env::var_os("RTOS_PQ_REGISTRY_POISON_CHILD").is_some() {
