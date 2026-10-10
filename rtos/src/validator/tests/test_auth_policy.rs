@@ -107,6 +107,31 @@ fn read_auth_candidate(name: &str) -> Result<BlockCandidate> {
     let collated_data = std::fs::read(format!("{dir}/{name}.collated.boc"))?;
     let root = read_single_root_boc(&data)?;
     let info = rtos_block::Block::construct_from_cell(root.clone())?.read_info()?;
+    // Migrate only missing time metadata in the frozen historical test input.
+    // The configuration transition under test and the block bytes stay intact.
+    let mut roots = if collated_data.is_empty() {
+        Vec::new()
+    } else {
+        rtos_block::read_boc(&collated_data)?.roots
+    };
+    let metadata = roots
+        .iter()
+        .filter_map(|cell| rtos_block::ConsensusExtraData::construct_from_cell(cell.clone()).ok())
+        .collect::<Vec<_>>();
+    if metadata.is_empty() {
+        roots.push(
+            rtos_block::ConsensusExtraData {
+                flags: 0,
+                gen_utime_ms: u64::from(info.gen_utime()) * 1000,
+            }
+            .serialize()?,
+        );
+    } else {
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].gen_utime_ms / 1000, u64::from(info.gen_utime()));
+    }
+    let collated_data =
+        rtos_block::BocWriter::with_flags(roots, rtos_block::BocFlags::Crc32)?.write_to_vec()?;
     Ok(BlockCandidate {
         block_id: BlockIdExt::with_params(
             info.shard().clone(),

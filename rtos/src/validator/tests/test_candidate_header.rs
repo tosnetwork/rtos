@@ -176,6 +176,7 @@ async fn candidate_full_reference_variants() {
         ("metadata-past-second", with_consensus_metadata(&migrated, &[now - 1]), false),
         ("metadata-next-second", with_consensus_metadata(&migrated, &[now + 1000]), false),
         ("metadata-duplicate", with_consensus_metadata(&migrated, &[now, now + 1]), false),
+        ("metadata-identical-duplicate", with_consensus_metadata(&migrated, &[now, now]), false),
     ];
     for (name, cc, hash) in [
         ("hash-bit", 3, SUBSET_HASH ^ 1),
