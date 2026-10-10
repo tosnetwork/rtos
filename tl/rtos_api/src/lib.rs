@@ -36,9 +36,7 @@ pub mod secure;
 pub mod session_identity;
 mod wire_profile;
 pub use wire_profile::WireProfile;
-#[rustfmt::skip]
-#[allow(non_camel_case_types)]
-pub mod ton;
+include!(concat!(env!("OUT_DIR"), "/ton_module.rs"));
 mod ton_prelude;
 
 include!("../../../common/src/info.rs");
