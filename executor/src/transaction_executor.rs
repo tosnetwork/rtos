@@ -2086,7 +2086,11 @@ fn check_changed_state_limits(
     original: &Account,
     version: u32,
 ) -> Result<bool> {
-    if acc.storage_roots() == original.storage_roots() {
+    // Root roles matter: moving a library root into data still changes the state.
+    if acc.code() == original.code()
+        && acc.data() == original.data()
+        && acc.libraries().root() == original.libraries().root()
+    {
         return Ok(true);
     }
     if !check_account_size_limits(cfg, acc, version)? {

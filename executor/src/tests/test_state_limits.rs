@@ -265,6 +265,8 @@ fn state_limit_complete_transactions() {
     frozen_library_cases(&code, &mut rows);
     merkle_cases(&code, &mut rows);
     public_library_cases(&code, &mut rows);
+    root_role_cases(&code, &mut rows);
+    assert_eq!(rows.len(), 2802);
     if let Some(path) = std::env::var_os("RTOS_STATE_LIMIT_EXPORT") {
         std::fs::write(path, rows.join("\n") + "\n").unwrap();
     }
@@ -454,5 +456,64 @@ fn frozen_library_cases(code: &Cell, rows: &mut Vec<String>) {
                 run(&name, cfg, account, msg, false, rows);
             }
         }
+    }
+}
+
+fn root_role_cases(code: &Cell, rows: &mut Vec<String>) {
+    for wc in [0, -1] {
+        for limit in [1, 100] {
+            let name = format!("root-role-wc{wc}-limit{limit}");
+            let address = MsgAddressInt::with_standart(None, wc, [0x5d; 32].into()).unwrap();
+            let base = config(14, false, &address);
+            let mut raw = base.raw_config().clone();
+            let mut limits = raw.size_limits_config().unwrap();
+            limits.max_acc_state_cells = limit;
+            limits.max_mc_acc_state_cells = limit;
+            raw.set_config(ConfigParamEnum::ConfigParam43(limits)).unwrap();
+            let cfg = BlockchainConfig::with_config(raw).unwrap();
+            let library = Cell::default();
+            let mut init = StateInit::default();
+            init.set_code(code.clone());
+            init.set_library_code(library.clone(), true).unwrap();
+            let library_root = init.libraries().root().cloned().unwrap();
+            let account = Account::active(
+                address.clone(),
+                CurrencyCollection::with_coins(10_000_000_000u64),
+                0,
+                100,
+                init,
+                cfg.size_limits_config().acc_state_cells_for_storage_dict,
+            )
+            .unwrap();
+            let mut candidate = account.clone();
+            candidate.set_data(library_root.clone());
+            *candidate.library_mut().unwrap() = StateInit::default().libraries().clone();
+            assert_eq!(candidate.storage_roots(), account.storage_roots());
+            assert_ne!(candidate.data(), account.data());
+            let mut actions = OutActions::new();
+            actions.push_back(OutAction::new_change_library(
+                0,
+                None,
+                Some(library.repr_hash().clone()),
+            ));
+            let mut body = BuilderData::new();
+            body.checked_append_reference(actions.serialize().unwrap()).unwrap();
+            body.checked_append_reference(library_root).unwrap();
+            let mut msg = message(address, true);
+            msg.set_body(SliceData::load_builder(body).unwrap());
+            run(&name, cfg, account, msg, false, rows);
+        }
+    }
+}
+
+#[test]
+fn root_role_changes_are_checked() {
+    let code =
+        rtos_assembler::compile_code_to_cell("DROP LDREF LDREF ENDS POPROOT POPCTR c5").unwrap();
+    let mut rows = Vec::new();
+    root_role_cases(&code, &mut rows);
+    assert_eq!(rows.len(), 4);
+    if let Some(path) = std::env::var_os("RTOS_STATE_LIMIT_EXPORT") {
+        std::fs::write(path, rows.join("\n") + "\n").unwrap();
     }
 }
