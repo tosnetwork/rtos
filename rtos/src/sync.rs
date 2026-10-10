@@ -438,7 +438,7 @@ pub(crate) async fn start_sync(
                                     target: TARGET,
                                     "Cannot apply downloaded package for MC seq_no = {seq_no_recv}: {e}"
                                 );
-                                download(&mut sync_context, seq_no_recv, None);
+                                download(&mut sync_context, seq_no_recv, None)?;
                                 None
                             }
                         }

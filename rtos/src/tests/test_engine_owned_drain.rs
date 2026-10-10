@@ -596,3 +596,114 @@ async fn engine_owned_drain_service_start_panic_preserves_failure_without_hangin
     assert!(weak.upgrade().is_none());
     stopped(open(dir.path()).await).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_owned_drain_cancelled_real_run_releases_metrics_and_database() {
+    let dir = tempfile::tempdir().unwrap();
+    config(dir.path());
+    let config = TonNodeConfig::from_file(
+        dir.path().to_str().unwrap(),
+        "config.json",
+        None,
+        "config.json",
+        None,
+    )
+    .await
+    .unwrap();
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reserved.local_addr().unwrap();
+    drop(reserved);
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let stopper = Arc::new(Stopper::new());
+    let task_stopper = stopper.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let task = tokio::spawn(async move {
+        run(
+            config,
+            None,
+            runtime.clone(),
+            runtime,
+            EngineFlags { initial_sync_disabled: true, force_check_db: false, truncate_db: None },
+            task_stopper,
+            Some((address, handle)),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            assert!(!task.is_finished(), "real startup ended before opening its metrics service");
+            if tokio::net::TcpStream::connect(address).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    // Engine, state keeper and retained service supervisors all own this Stopper.
+    // The caller's reference is the only survivor after cancelled-run cleanup.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while Arc::strong_count(&stopper) != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cancelled real run retained Engine/database/service ownership");
+    drop(
+        std::net::TcpListener::bind(address).expect("real metrics listener survived cancelled run"),
+    );
+    stopped(open(dir.path()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_owned_drain_failed_parent_retains_accepted_child_until_join() {
+    let dir = tempfile::tempdir().unwrap();
+    config(dir.path());
+    let engine = open(dir.path()).await;
+    let (release, held) = tokio::sync::oneshot::channel();
+    let owner = engine.clone();
+    let task = engine
+        .register_service_task(
+            "failing service parent",
+            Engine::MASK_SERVICE_MASTERCHAIN_CLIENT,
+            Box::new(move || {
+                tokio::spawn(async move {
+                    owner
+                        .register_service_task(
+                            "accepted child",
+                            0,
+                            Box::new(move || {
+                                tokio::spawn(async move {
+                                    held.await.unwrap();
+                                })
+                            }),
+                        )
+                        .unwrap();
+                    panic!("controlled parent failure after child admission");
+                })
+            }),
+        )
+        .unwrap();
+    assert!(task.await.unwrap_err().is_panic());
+    assert!(tokio::time::timeout(Duration::from_millis(30), engine.clone().wait_stop())
+        .await
+        .is_err());
+    assert!(!engine.state_db_stop_started.load(Ordering::Acquire));
+    release.send(()).unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(15), engine.clone().wait_stop())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("failing service parent"));
+    assert_ne!(
+        engine.stopper.stop.load(Ordering::Acquire) & Engine::MASK_SERVICE_MASTERCHAIN_CLIENT,
+        0
+    );
+    let weak = Arc::downgrade(&engine);
+    drop(engine);
+    assert!(weak.upgrade().is_none());
+    stopped(open(dir.path()).await).await;
+}
