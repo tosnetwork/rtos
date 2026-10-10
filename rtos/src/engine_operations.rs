@@ -470,6 +470,8 @@ impl EngineOperations for Engine {
         pre_apply: bool,
         recursion_depth: u32,
     ) -> Result<()> {
+        #[cfg(test)]
+        self.hold_parent_apply_for_test(handle.id(), recursion_depth).await;
         // if it is pre-apply we are waiting for `state_inited` or `applied`
         // otherwise - only for applied
         while !((pre_apply && handle.has_state()) || handle.is_applied()) {
@@ -509,6 +511,8 @@ impl EngineOperations for Engine {
         pre_apply: bool,
         recursion_depth: u32,
     ) -> Result<()> {
+        #[cfg(test)]
+        self.hold_parent_apply_for_test(id, recursion_depth).await;
         self.download_and_apply_block_worker(id, mc_seq_no, pre_apply, recursion_depth).await
     }
 

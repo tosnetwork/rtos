@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): naming and cancellation-safe operation ownership.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -56,6 +56,17 @@ impl<R: Clone> OperationAwaiters<R> {
         #[cfg(feature = "telemetry")]
         telemetry.awaiters.update(allocated.awaiters.load(Ordering::Relaxed));
         Arc::new(ret)
+    }
+}
+
+// Cancellation and panic must release an operation's ownership just like its
+// ordinary completion. The closure borrows the exact entry, never only its key.
+struct OperationCleanup<F: FnOnce()>(Option<F>);
+impl<F: FnOnce()> Drop for OperationCleanup<F> {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.0.take() {
+            cleanup();
+        }
     }
 }
 
@@ -175,8 +186,22 @@ where
     }
 
     fn finalize(&self, id: &I, op_awaiters: &OperationAwaiters<R>, value: Result<R>) {
-        let _ = op_awaiters.tx.send(Some(value));
-        self.ops_awaiters.remove(id);
+        // A shunt and the original owner may finish concurrently. Keep the
+        // first result and never remove a newer operation using the same key.
+        op_awaiters.tx.send_if_modified(|slot| {
+            if slot.is_some() {
+                false
+            } else {
+                *slot = Some(value);
+                true
+            }
+        });
+        self.remove_matching(id, op_awaiters);
+    }
+
+    fn remove_matching(&self, id: &I, op_awaiters: &OperationAwaiters<R>) {
+        self.ops_awaiters
+            .remove_with(id, |(_, current)| std::ptr::eq(current.as_ref(), op_awaiters));
     }
 
     async fn wait_operation(
@@ -221,7 +246,7 @@ where
         // External finalization paths (Ok(None)) own the cleanup, since the
         // value sender (`do_operation`/`shunt`) won't fire for them.
         if matches!(result, Ok(None)) {
-            self.ops_awaiters.remove(id);
+            self.remove_matching(id, op_awaiters);
         }
         result
     }
@@ -234,7 +259,14 @@ where
     ) -> Result<R> {
         log::trace!("{}: do_operation: doing... {}", self.description, id);
         let mut rx = op_awaiters.rx.clone();
-        tokio::select! {
+        let mut cleanup = OperationCleanup(Some(|| {
+            self.finalize(
+                id,
+                op_awaiters,
+                Err(error!("{}: operation cancelled {}", self.description, id)),
+            );
+        }));
+        let result = tokio::select! {
             result = operation => {
                 log::trace!("{}: do_operation: done {}", self.description, id);
                 let r = match result {
@@ -255,6 +287,8 @@ where
                     None => Err(error!("{}: do_operation: shunt: no result", self.description)),
                 }
             }
-        }
+        };
+        cleanup.0 = None;
+        result
     }
 }

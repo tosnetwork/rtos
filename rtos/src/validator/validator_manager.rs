@@ -3009,4 +3009,4 @@ mod test_session_id;
 
 #[cfg(test)]
 #[path = "tests/emulator_network_bootstrap.rs"]
-mod emulator_network_bootstrap;
+pub(crate) mod emulator_network_bootstrap;
