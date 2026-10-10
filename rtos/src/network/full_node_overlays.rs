@@ -769,19 +769,34 @@ impl FullNodeOverlaysRouter {
         }
     }
 
-    // Transport authorization is independent of consensus signing custody.
-    // Re-read configured identities each time: a cached validator-list context
-    // cannot establish that a removed or rotated local key is still eligible.
+    // The full-node ADNL identity and unexpired classical validator transport
+    // registrations are existing local transport authorities. Neither grants
+    // PQ voting custody; that separately requires held validator/key bindings.
+    // Re-read registrations so cached list contexts cannot retain revoked keys.
     async fn find_transport_key(
         &self,
         sets: &[&ValidatorSet],
     ) -> Result<Option<Arc<dyn KeyOption>>> {
         let handler = self.network.config_handler();
-        let local_ids = handler.get_actual_validator_adnl_key_ids()?;
+        let now = rtos_block::UnixTime::now();
+        let local_ids = handler
+            .get_actual_validator_keys()?
+            .into_iter()
+            .filter(|entry| i64::from(entry.expire_at) > now as i64)
+            .filter_map(|entry| entry.validator_adnl_key_id)
+            .map(|id| {
+                let bytes = rtos_block::base64_decode(&id)?;
+                Ok(KeyId::from_data(bytes.as_slice().try_into()?))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let context = self.network.context();
+        let primary = context.stack.adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)?;
         for validators in sets {
             let (members, _) =
                 fast_sync_transport_authority(validators.list(), rtos_api::WireProfile::T0)?;
+            if members.contains(primary.id()) {
+                return Ok(Some(primary.clone()));
+            }
             for id in members {
                 if !local_ids.contains(&id) {
                     continue;

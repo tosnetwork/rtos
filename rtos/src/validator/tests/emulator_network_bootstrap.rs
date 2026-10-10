@@ -137,6 +137,7 @@ impl EmulatorNetworkBootstrap {
         let (base_state_id, base_state_boc) = make_basechain_zerostate()?;
         let mut config_params = make_config_params(&validator_set, &base_state_id)?;
         configure(&mut config_params, &validators)?;
+        let validator_set = config_params.validator_set()?;
         let (zerostate_id, zerostate_boc) = make_masterchain_zerostate(
             config_params.clone(),
             &validator_set,

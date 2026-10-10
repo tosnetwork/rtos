@@ -1398,6 +1398,7 @@ pub struct NodeConfigHandlerContext {
 }
 
 pub struct NodeConfigHandler {
+    validator_transport_changed: tokio::sync::Notify,
     runtime_handle: tokio::runtime::Handle,
     sender: tokio::sync::mpsc::UnboundedSender<(Arc<Wait<Answer>>, Task)>,
     key_ring: Arc<lockfree::map::Map<String, Arc<dyn KeyOption>>>,
@@ -1411,6 +1412,7 @@ impl NodeConfigHandler {
     ) -> Result<(Arc<Self>, NodeConfigHandlerContext)> {
         let (sender, reader) = tokio::sync::mpsc::unbounded_channel();
         let config_handler = Arc::new(NodeConfigHandler {
+            validator_transport_changed: tokio::sync::Notify::new(),
             runtime_handle,
             sender,
             key_ring: Arc::new(lockfree::map::Map::new()),
@@ -1418,6 +1420,14 @@ impl NodeConfigHandler {
         });
 
         Ok((config_handler, NodeConfigHandlerContext { reader, config }))
+    }
+
+    pub(crate) async fn validator_transport_changed(&self) {
+        self.validator_transport_changed.notified().await;
+    }
+
+    pub(crate) fn notify_validator_transport_changed(&self) {
+        self.validator_transport_changed.notify_one();
     }
 
     pub fn get_validator_status(&self) -> bool {
@@ -1984,6 +1994,7 @@ impl NodeConfigHandler {
                             &name,
                         )
                         .await;
+                        self.notify_validator_transport_changed();
                         Answer::ImportPrivateKey(result)
                     }
                     Task::AddValidatorAdnlKey(key, adnl_key) => {
@@ -1996,6 +2007,7 @@ impl NodeConfigHandler {
                             &subscribers,
                         )
                         .await;
+                        self.notify_validator_transport_changed();
                         Answer::Result(result)
                     }
                     Task::AddValidatorKey(key, election_id, expire_at) => {
@@ -2007,6 +2019,7 @@ impl NodeConfigHandler {
                             expire_at,
                         )
                         .await;
+                        self.notify_validator_transport_changed();
                         Answer::Result(result)
                     }
                     Task::GetKey(key_data) => {

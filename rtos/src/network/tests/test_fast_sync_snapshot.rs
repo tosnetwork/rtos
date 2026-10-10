@@ -222,8 +222,8 @@ async fn fast_sync_snapshot_failure_revokes_partial_generation_and_retries() -> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fast_sync_snapshot_prior_only_pq_custody_is_rechecked_without_chain_changes() -> Result<()>
-{
+async fn fast_sync_snapshot_prior_only_transport_registration_is_rechecked_without_chain_changes(
+) -> Result<()> {
     use rtos_block::{ConfigParam32, ConfigParam34, ConfigParamEnum};
     let f = Fixture::new().await?;
     let previous = set(vec![f.member(0)]);
@@ -235,8 +235,9 @@ async fn fast_sync_snapshot_prior_only_pq_custody_is_rechecked_without_chain_cha
         .set_config(ConfigParamEnum::ConfigParam32(ConfigParam32::with_validator_set(previous)))?;
     config
         .set_config(ConfigParamEnum::ConfigParam34(ConfigParam34::with_validator_set(current)))?;
-    // The PQ stable ID and consensus key ID are absent from this classical
-    // keyring. Only the separately configured ADNL private key is local.
+    // This is an unexpired classical validator transport registration, which
+    // can authorize fast-sync even when the chain descriptor uses PQ keys.
+    // No PQ consensus identity or held signing key is inferred from it.
     let transport = f.bootstrap.validators[0].adnl_key.id();
     assert!(!f.router.network.config_handler().get_actual_validator_key_ids()?.contains(transport));
     f.router.update_private_overlays(&config).await?;
@@ -344,4 +345,73 @@ async fn fast_sync_snapshot_real_engine_pq_transport_startup_and_keyring_notific
     tokio::time::timeout(Duration::from_secs(30), join).await??;
     tokio::time::timeout(Duration::from_secs(30), engine.wait_stop()).await??;
     result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_sync_snapshot_rejects_expired_missing_and_implicit_transport_registration(
+) -> Result<()> {
+    let f = Fixture::new().await?;
+    let registered = set(vec![f.member(0)]);
+    let empty = ValidatorSet::default();
+    let handler = f.router.network.config_handler();
+    let local = &f.bootstrap.validators[0];
+    let key = f.router.find_transport_key(&[&registered]).await?.unwrap();
+    f.router
+        .update_fast_sync_overlays(&empty, &registered, &empty, 0, Some(&key), false, false)
+        .await?;
+    let old = overlay(&f.router, &ShardIdent::MASTERCHAIN);
+    // Updating a registration clears its ADNL field; put that field back so
+    // expiration, rather than missing registration, is the cause of rejection.
+    handler.add_validator_key(local.validator_key.id().data(), 1, 1).await?;
+    handler
+        .add_validator_adnl_key(local.validator_key.id().data(), local.adnl_key.id().data())
+        .await?;
+    let no_key = f.router.find_transport_key(&[&registered]).await?;
+    assert!(no_key.is_none(), "expired classical registration must not authorize transport");
+    f.router
+        .update_fast_sync_overlays(&empty, &registered, &empty, 0, no_key.as_ref(), false, false)
+        .await?;
+    assert!(old.client().cancellation_token().is_cancelled());
+    assert_eq!(f.router.fast_sync_overlays.iter().count(), 0);
+
+    handler.add_validator_key(local.validator_key.id().data(), 1, i32::MAX).await?;
+    let mut implicit = f.member(0);
+    implicit.adnl_addr = Some(UInt256::from(*local.validator_key.id().data()));
+    assert!(
+        f.router.find_transport_key(&[&set(vec![implicit])]).await?.is_none(),
+        "a classical signing key must not become a transport fallback without registration"
+    );
+    handler.add_validator_adnl_key(local.validator_key.id().data(), &[198; 32]).await?;
+    let mut missing = f.member(0);
+    missing.adnl_addr = Some(UInt256::from([198; 32]));
+    assert!(
+        f.router.find_transport_key(&[&set(vec![missing])]).await?.is_none(),
+        "an ADNL ID without its local private key is not custody"
+    );
+    f.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_sync_snapshot_primary_adnl_is_an_independent_transport_source() -> Result<()> {
+    let f = Fixture::new().await?;
+    let primary = f.router.network.context().stack.adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)?;
+    assert!(!f
+        .router
+        .network
+        .config_handler()
+        .get_actual_validator_adnl_key_ids()?
+        .contains(primary.id()));
+    let mut descriptor = f.member(0);
+    descriptor.adnl_addr = Some(UInt256::from(*primary.id().data()));
+    let previous = set(vec![descriptor]);
+    let key = f.router.find_transport_key(&[&previous]).await?.unwrap();
+    assert_eq!(key.id(), primary.id());
+    let empty = ValidatorSet::default();
+    f.router
+        .update_fast_sync_overlays(&previous, &empty, &empty, 0, Some(&key), false, false)
+        .await?;
+    assert_eq!(f.router.fast_sync_overlays.iter().count(), 2);
+    f.stop().await;
+    Ok(())
 }
