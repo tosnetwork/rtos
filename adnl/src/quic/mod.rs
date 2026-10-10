@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and bounded Plumtree wire/repair envelopes.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -21,7 +21,7 @@ use crate::{
 pub use rate_limiter::QuicRateLimitConfig;
 use rate_limiter::{ConnectionRateLimiters, RateLimiter};
 use rtos_api::{
-    deserialize_boxed, serialize_boxed,
+    deserialize_quic_envelope, serialize_boxed,
     ton::quic::{
         answer::Answer as QuicAnswer,
         request::{Message as QuicMessage, Query as QuicQuery},
@@ -511,6 +511,12 @@ pub struct QuicNode {
 }
 
 impl QuicNode {
+    // A legal 16 MiB Plumtree payload needs TL carrier/member/QUIC envelopes.
+    // Supported Ed25519 source + bounded certificate + certified-overlay prefix
+    // occupy at most 624 bytes (see overlay::plumtree envelope tests). Keep a
+    // fixed 4096-byte allowance; every stream still has a hard allocation cap.
+    const MAX_WIRE_MESSAGE_BYTES: usize = rtos_api::MAX_QUIC_ENVELOPE_BYTES;
+
     pub const OFFSET_PORT: u16 = 1000;
 
     /// How often the background checker scans outbound connections for dead ones.
@@ -1003,6 +1009,23 @@ impl QuicNode {
         peers: &AdnlPeers,
         timeout_ms: Option<u64>,
     ) -> Result<Option<Vec<u8>>> {
+        self.query_with_answer_limit(data, adnl, peers, timeout_ms, Self::MAX_WIRE_MESSAGE_BYTES)
+            .await
+    }
+
+    /// The bound includes the outer QUIC TL answer envelope. Repair callers
+    /// derive it from authenticated advertised size before any response read.
+    pub(crate) async fn query_with_answer_limit(
+        self: &Arc<Self>,
+        data: Vec<u8>,
+        adnl: Option<&AdnlNode>,
+        peers: &AdnlPeers,
+        timeout_ms: Option<u64>,
+        answer_limit: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        if answer_limit == 0 || answer_limit > Self::MAX_WIRE_MESSAGE_BYTES {
+            fail!("Invalid QUIC answer byte limit");
+        }
         self.ensure_peer_registered(adnl, peers)?;
         let addr = self.addr_by_key(peers.other())?;
         let tag = extract_inner_tag(&data);
@@ -1010,7 +1033,7 @@ impl QuicNode {
         let timeout_ms = timeout_ms.unwrap_or(Self::DEFAULT_QUERY_TIMEOUT_MS);
         let wire = serialize_boxed(&QuicQuery { data: data.into() }.into_boxed())?;
         self.msg_stats.record(tag, size, addr, true, MsgKind::Query);
-        let response = match self.send_query_raw(wire, peers, timeout_ms).await {
+        let response = match self.send_query_raw(wire, peers, timeout_ms, answer_limit).await {
             Ok(r) => r,
             Err(e) => {
                 self.msg_stats.record(tag, 0, addr, false, MsgKind::NoAnswer);
@@ -1021,7 +1044,7 @@ impl QuicNode {
             self.msg_stats.record(tag, 0, addr, false, MsgKind::NoAnswer);
             return Ok(None);
         }
-        let obj = deserialize_boxed(&response)
+        let obj = deserialize_quic_envelope(&response)
             .map_err(|e| error!("Cannot deserialise QUIC answer: {e}"))?;
         match obj.downcast::<QuicResponse>() {
             Ok(QuicResponse::Quic_Answer(answer)) => {
@@ -1661,7 +1684,7 @@ impl QuicNode {
         log::debug!(target: TARGET, "process_incoming_stream from {addr}: reading data...");
         let buf = match tokio::time::timeout(
             Duration::from_secs(5),
-            recv.read_to_end(16 * 1024 * 1024), // 16MB limit
+            recv.read_to_end(Self::MAX_WIRE_MESSAGE_BYTES), // Payload plus bounded TL envelope
         )
         .await
         {
@@ -1683,7 +1706,7 @@ impl QuicNode {
         if buf.is_empty() {
             return Ok(());
         }
-        let obj = deserialize_boxed(&buf)
+        let obj = deserialize_quic_envelope(&buf)
             .map_err(|e| error!("Cannot deserialize QUIC message from {addr}: {e}"))?;
         log::debug!(
             target: TARGET,
@@ -1766,23 +1789,25 @@ impl QuicNode {
         addr: SocketAddr,
         msg_stats: &MsgStats,
     ) -> Result<()> {
-        let buf =
-            match tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(16 * 1024 * 1024))
-                .await
-            {
-                Ok(result) => result.map_err(|e| error!("QUIC uni read from {addr}: {e}"))?,
-                Err(_) => {
-                    log::warn!(
-                        target: TARGET,
-                        "process_incoming_uni_stream from {addr}: read timed out after 5s"
-                    );
-                    return Ok(());
-                }
-            };
+        let buf = match tokio::time::timeout(
+            Duration::from_secs(5),
+            recv.read_to_end(Self::MAX_WIRE_MESSAGE_BYTES),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|e| error!("QUIC uni read from {addr}: {e}"))?,
+            Err(_) => {
+                log::warn!(
+                    target: TARGET,
+                    "process_incoming_uni_stream from {addr}: read timed out after 5s"
+                );
+                return Ok(());
+            }
+        };
         if buf.is_empty() {
             return Ok(());
         }
-        let obj = deserialize_boxed(&buf)
+        let obj = deserialize_quic_envelope(&buf)
             .map_err(|e| error!("Cannot deserialize QUIC uni-stream from {addr}: {e}"))?;
         match obj.downcast::<Request>() {
             Ok(Request::Quic_Message(msg)) => {
@@ -2031,6 +2056,7 @@ impl QuicNode {
         data: Vec<u8>,
         peers: &AdnlPeers,
         timeout_ms: u64,
+        answer_limit: usize,
     ) -> Result<Vec<u8>> {
         let addr = self.addr_by_key(peers.other())?;
         let state = self.local_key_state(peers.local())?;
@@ -2040,7 +2066,8 @@ impl QuicNode {
         match self.ensure_outbound_connection(peers).await? {
             QuicOutboundConnection { conn: Some(ref conn), .. } => {
                 let result =
-                    tokio::time::timeout(timeout, Self::send_via_stream(conn, &data)).await;
+                    tokio::time::timeout(timeout, Self::send_via_stream(conn, &data, answer_limit))
+                        .await;
                 match result {
                     Ok(Ok(response)) => return Ok(response),
                     Ok(Err(e)) => {
@@ -2072,7 +2099,7 @@ impl QuicNode {
         // Retry once with a fresh connection
         match self.ensure_outbound_connection(peers).await? {
             QuicOutboundConnection { conn: Some(ref conn), .. } => {
-                Self::send_via_stream(conn, &data).await
+                Self::send_via_stream(conn, &data, answer_limit).await
             }
             _ => fail!("Cannot create QUIC connection to {} in foreground (retry)", peers.other()),
         }
@@ -2122,7 +2149,11 @@ impl QuicNode {
 
     /// Request-response send: opens a bidirectional stream, writes data,
     /// and waits for the peer's response. Used by `send_query_raw()`.
-    async fn send_via_stream(conn: &quinn::Connection, data: &[u8]) -> Result<Vec<u8>> {
+    async fn send_via_stream(
+        conn: &quinn::Connection,
+        data: &[u8],
+        answer_limit: usize,
+    ) -> Result<Vec<u8>> {
         log::debug!(
             target: TARGET,
             "send_via_stream: opening bi-stream to {:?}, data_len={}",
@@ -2134,7 +2165,7 @@ impl QuicNode {
         send.finish().map_err(|e| error!("QUIC stream finish: {e}"))?;
         let response = match tokio::time::timeout(
             Duration::from_secs(30),
-            recv.read_to_end(16 * 1024 * 1024), // 16MB limit
+            recv.read_to_end(answer_limit), // Authenticated caller limit, capped at MAX_WIRE_MESSAGE_BYTES
         )
         .await
         {

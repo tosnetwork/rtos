@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and scoped QUIC envelope byte budgets.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -28,7 +28,7 @@ use std::{
 };
 
 const MAX_DEBUG_BYTES_LEN: usize = 4;
-const MAX_TL_BYTES_LEN: usize = 16 << 20; // 16 MB
+pub(crate) const MAX_TL_BYTES_LEN: usize = 16 << 20; // 16 MB
 const MAX_TL_VECTOR_LEN: i32 = 1 << 20; // 1,048,576
 const MAX_INITIAL_VECTOR_CAP: i32 = 1024;
 
@@ -343,7 +343,7 @@ impl BareDeserialize for bytes {
                 (len, 8)
             }
         };
-        if len > MAX_TL_BYTES_LEN {
+        if len > de.bytes_limit {
             fail!("Too big length {len} of TL bytes")
         }
         let mut buf = Vec::new();

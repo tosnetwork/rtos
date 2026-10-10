@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and bounded Plumtree consumer admission.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -505,6 +505,8 @@ pub(crate) struct AsyncReceiver<T> {
     subscribers: lockfree::queue::Queue<Arc<tokio::sync::Barrier>>,
     sync: AtomicU32,
     started_receiving: AtomicBool,
+    pending_items: AtomicUsize,
+    bounded_closed: std::sync::Mutex<bool>,
     alive_tasks: AtomicU32,
     total_spawned: AtomicU64,
 }
@@ -532,6 +534,8 @@ impl<T: Send + 'static> AsyncReceiver<T> {
             subscribers: lockfree::queue::Queue::new(),
             sync: AtomicU32::new(0),
             started_receiving: AtomicBool::new(false),
+            pending_items: AtomicUsize::new(0),
+            bounded_closed: std::sync::Mutex::new(false),
             alive_tasks: AtomicU32::new(0),
             total_spawned: AtomicU64::new(0),
         })
@@ -549,6 +553,7 @@ impl<T: Send + 'static> AsyncReceiver<T> {
         let _guard = SyncGuard::new(&self.sync);
         loop {
             if let Some(data) = self.data.pop() {
+                self.pending_items.fetch_sub(1, Ordering::AcqRel);
                 break Ok(data);
             }
             let subscriber = Arc::new(tokio::sync::Barrier::new(2));
@@ -558,10 +563,39 @@ impl<T: Send + 'static> AsyncReceiver<T> {
     }
 
     pub(crate) fn stop(self: &Arc<Self>) {
+        // Serialize bounded admission with the closing sentinel. Previously
+        // admitted values precede it; no bounded value can be queued after it.
+        let mut closed = self.bounded_closed.lock().unwrap();
+        *closed = true;
         self.do_push(None)
     }
 
+    /// Reserve queue capacity atomically before accepting a bounded producer.
+    /// Existing producers retain their prior admission behavior.
+    pub(crate) fn try_push_bounded(self: &Arc<Self>, data: T, limit: usize) -> bool {
+        let closed = self.bounded_closed.lock().unwrap();
+        if *closed || !self.started_receiving.load(Ordering::Acquire) {
+            return false;
+        }
+        if self
+            .pending_items
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < limit).then_some(count + 1)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        self.do_push_reserved(Some(data));
+        true
+    }
+
     fn do_push(self: &Arc<Self>, data: Option<T>) {
+        self.pending_items.fetch_add(1, Ordering::AcqRel);
+        self.do_push_reserved(data);
+    }
+
+    fn do_push_reserved(self: &Arc<Self>, data: Option<T>) {
         self.data.push(data);
         if self.sync.load(Ordering::Relaxed) == 0 {
             return;
@@ -1520,5 +1554,124 @@ where
                 _ = cancellation_token.cancelled() => {}
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod bounded_receiver_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn concurrent_bounded_admission_and_drain() {
+        let receiver = AsyncReceiver::new();
+        assert!(!receiver.try_push_bounded(0usize, 4));
+        // Polling the actual consumer establishes the subscription.
+        let mut first = Box::pin(receiver.pop());
+        assert!(matches!(futures::poll!(&mut first), std::task::Poll::Pending));
+        let admitted = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for value in 0..32 {
+                let receiver = receiver.clone();
+                let admitted = admitted.clone();
+                // Push wakes use the caller's runtime; enter it in each thread.
+                let runtime = tokio::runtime::Handle::current();
+                scope.spawn(move || {
+                    let _runtime = runtime.enter();
+                    if receiver.try_push_bounded(value, 4) {
+                        admitted.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(admitted.load(Ordering::Relaxed), 4);
+        first.await.unwrap().unwrap();
+        for _ in 0..3 {
+            receiver.pop().await.unwrap().unwrap();
+        }
+        assert_eq!(receiver.pending_items.load(Ordering::Acquire), 0);
+        for i in 0..4 {
+            assert!(receiver.try_push_bounded(i, 4));
+        }
+        assert!(!receiver.try_push_bounded(5, 4));
+        receiver.stop();
+        for i in 0..4 {
+            assert_eq!(receiver.pop().await.unwrap(), Some(i));
+        }
+        assert_eq!(receiver.pop().await.unwrap(), None);
+        assert_eq!(receiver.pending_items.load(Ordering::Acquire), 0);
+        assert!(!receiver.try_push_bounded(6, 4), "closed producer cannot refill drained budget");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bounded_concurrent_producers_drain_and_close() {
+        let receiver = AsyncReceiver::new();
+        let reader = receiver.clone();
+        let draining = tokio::spawn(async move {
+            let mut count = 0;
+            while reader.pop().await.unwrap().is_some() {
+                count += 1;
+            }
+            count
+        });
+        while !receiver.started_receiving.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        let admitted = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for producer in 0..8 {
+                let receiver = receiver.clone();
+                let admitted = &admitted;
+                let runtime = tokio::runtime::Handle::current();
+                scope.spawn(move || {
+                    let _runtime = runtime.enter();
+                    for value in 0..128 {
+                        if receiver.try_push_bounded((producer, value), 4) {
+                            admitted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        receiver.stop();
+        assert_eq!(draining.await.unwrap(), admitted.load(Ordering::Relaxed));
+        assert_eq!(receiver.pending_items.load(Ordering::Acquire), 0);
+        assert!(!receiver.try_push_bounded((9, 0), 4));
+    }
+
+    #[tokio::test]
+    async fn bounded_rejection_close_and_drop_release_values() {
+        struct Value(Arc<AtomicUsize>);
+        impl Drop for Value {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let receiver = AsyncReceiver::new();
+        assert!(!receiver.try_push_bounded(Value(dropped.clone()), 2));
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        let mut first = Box::pin(receiver.pop());
+        assert!(matches!(futures::poll!(&mut first), std::task::Poll::Pending));
+        assert!(receiver.try_push_bounded(Value(dropped.clone()), 2));
+        drop(first.await.unwrap().unwrap());
+        assert_eq!(receiver.pending_items.load(Ordering::Acquire), 0);
+        assert!(receiver.try_push_bounded(Value(dropped.clone()), 2));
+        assert!(receiver.try_push_bounded(Value(dropped.clone()), 2));
+        assert!(!receiver.try_push_bounded(Value(dropped.clone()), 2));
+        receiver.stop();
+        assert!(!receiver.try_push_bounded(Value(dropped.clone()), 2));
+        // Two accepted values remain owned by the queue; rejection destroys
+        // its argument immediately and dropping the queue releases both.
+        assert_eq!(dropped.load(Ordering::Relaxed), 4);
+        let weak = Arc::downgrade(&receiver);
+        drop(receiver);
+        for _ in 0..100 {
+            if weak.upgrade().is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(weak.upgrade().is_none());
+        assert_eq!(dropped.load(Ordering::Relaxed), 6);
     }
 }

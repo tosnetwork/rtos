@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): project naming and scoped QUIC envelope decoding.
  * Copyright (C) 2019-2023 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -97,12 +97,13 @@ impl Debug for InvalidConstructor {
 pub struct Deserializer<'r> {
     reader: &'r mut dyn Read,
     pos: usize,
+    bytes_limit: usize,
 }
 
 impl<'r> Deserializer<'r> {
     /// Create `Deserializer` with given `io::Read` trait object
     pub fn new(reader: &'r mut dyn Read) -> Self {
-        Deserializer { reader, pos: 0 }
+        Deserializer { reader, pos: 0, bytes_limit: ton_prelude::MAX_TL_BYTES_LEN }
     }
 
     /// Read `ConstructorNumber` from reader
@@ -487,6 +488,34 @@ fn downcast_with_error<D: AnyBoxedSerialize>(object: TLObject) -> Result<D> {
             fail!("Want to get {}, but we have TLObject {:?}", type_name::<D>(), object)
         }
     }
+}
+
+/// Maximum transport envelope: a 16 MiB application payload plus bounded TL headers.
+pub const MAX_QUIC_ENVELOPE_BYTES: usize = (16 << 20) + 4096;
+
+/// Decode only a QUIC message/query/answer envelope with its explicit byte budget.
+/// The extracted payload must subsequently use the ordinary TL decoder, whose
+/// per-field 16 MiB bound is unchanged. Trailing envelope bytes are rejected.
+pub fn deserialize_quic_envelope(bytes: impl AsRef<[u8]>) -> Result<TLObject> {
+    let bytes = bytes.as_ref();
+    if bytes.len() > MAX_QUIC_ENVELOPE_BYTES || bytes.len() < 4 {
+        fail!("Invalid QUIC envelope byte length");
+    }
+    let constructor = u32::from_le_bytes(bytes[..4].try_into()?);
+    if constructor != <ton::quic::request::Message as Constructor>::constructor_const()
+        && constructor != <ton::quic::request::Query as Constructor>::constructor_const()
+        && constructor != <ton::quic::answer::Answer as Constructor>::constructor_const()
+    {
+        fail!("Unsupported QUIC envelope constructor");
+    }
+    let mut reader = bytes;
+    let mut de = Deserializer::new(&mut reader);
+    de.bytes_limit = MAX_QUIC_ENVELOPE_BYTES;
+    let object = de.read_boxed()?;
+    if de.pos != bytes.len() {
+        fail!("Trailing bytes after QUIC envelope");
+    }
+    Ok(object)
 }
 
 /// Deserialize boxed TL object from bytes
