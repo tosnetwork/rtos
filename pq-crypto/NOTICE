@@ -49,3 +49,12 @@ nonces are unchanged. The original submission and source are MIT licensed
 (see native/falcon-reference/LICENSE). An additional 28 fixed-profile cases
 come from the pinned reference test/pq-falcon512/vectors.json; its GPLv3
 license text is retained at tests/data/TOS-LICENSE.txt.
+
+SLH-DSA-SHA2-128s uses pq-code-package/slhdsa-c revision
+174c02e42257f95c210963272877c49dbb50070f (ISC), imported through fixed T0
+8f083dc06bff16705710a01de15eb3123d5d696b. See native/slhdsa-c/NOTICE and LICENSE
+for the verification-only adaptation and retained copyright notices.
+Public test fixtures include the Pure SHA2-128s group from NIST ACVP-Server
+v1.1.0.40, commit d98cad66639bf9d0822129c4bcae7a169fcf9ca6, and reproducible
+boundary signatures generated with Cloudflare CIRCL v1.6.4 (BSD-3-Clause).
+The latter use the public test seed 000102...2f and deterministic signing.

@@ -27,4 +27,10 @@ fn main() {
         .file(native.join("falcon512-native.c"))
         .files(["codec.c", "common.c", "shake.c", "vrfy.c"].map(|f| falcon.join(f)))
         .compile("rtos_falcon512_verify");
+    cc::Build::new()
+        .std("c99")
+        .include(&native)
+        .include(native.join("slhdsa-c"))
+        .file(native.join("slhdsa128s-native.c"))
+        .compile("rtos_slhdsa128s_verify");
 }
