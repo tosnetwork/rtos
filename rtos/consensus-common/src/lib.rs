@@ -13,6 +13,8 @@
 //! validator-session and simplex consensus implementations.
 
 // Internal modules
+mod validator_identity;
+pub use validator_identity::{SimplexSignatureVerifier, ValidatorIdentity};
 mod activity_node;
 mod adnl_overlay;
 mod async_key_value_storage;
@@ -599,8 +601,8 @@ pub struct ConsensusNode {
     /// ADNL node short ID
     pub adnl_id: PublicKeyHash,
 
-    /// Node public key
-    pub public_key: PublicKey,
+    /// Consensus membership identity, never a transport signing key.
+    pub public_key: ValidatorIdentity,
 }
 
 // ============================================================================
@@ -1287,8 +1289,8 @@ pub struct BlockCandidatePriority {
 /// Block source information combining validator identity and priority
 #[derive(Debug, Clone)]
 pub struct BlockSourceInfo {
-    /// Source validator public key
-    pub source: PublicKey,
+    /// Authenticated consensus identity, separate from transport keys.
+    pub source: ValidatorIdentity,
 
     /// Priority information
     pub priority: BlockCandidatePriority,
@@ -1509,8 +1511,9 @@ pub trait SessionListener: Send + Sync {
     ) {
     }
 
-    /// A block has been finalized (FinalCert observed) and is ready for
-    /// validator-side acceptance (Simplex only).
+    /// A block is ready for validator-side acceptance (Simplex only).
+    /// `SessionFinality` distinguishes a final certificate from a temporary
+    /// shard approval; an approval must never produce a final proof or broadcast.
     ///
     /// Called immediately when a finalization certificate is collected for a
     /// slot, regardless of whether predecessors have been committed yet.
@@ -1526,7 +1529,7 @@ pub trait SessionListener: Send + Sync {
         root_hash: BlockHash,
         file_hash: BlockHash,
         data: BlockPayloadPtr,
-        signatures: BlockSignaturesVariant,
+        signatures: SessionFinality,
         approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
     ) {
     }
@@ -2118,3 +2121,16 @@ pub trait Emulator: Session {
 
 /// Pointer to a consensus emulator.
 pub type EmulatorPtr = Arc<dyn Emulator + Send + Sync>;
+
+/// Finalized delivery retains the signed role. PQ approvals are live-only and
+/// cannot be serialized as a final signature set or promoted to chain finality.
+#[derive(Clone, Debug)]
+pub enum SessionFinality {
+    Carrier(BlockSignaturesVariant),
+    PqApproval(rtos_api::pq_finality::PqApproval),
+}
+impl From<BlockSignaturesVariant> for SessionFinality {
+    fn from(value: BlockSignaturesVariant) -> Self {
+        Self::Carrier(value)
+    }
+}

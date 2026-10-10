@@ -18,7 +18,7 @@ fn make_validator_node(
     public_key: Arc<dyn KeyOption>,
     adnl_key: Arc<dyn KeyOption>,
 ) -> CatchainNode {
-    CatchainNode { public_key, adnl_id: adnl_key.id().clone() }
+    CatchainNode { public_key: public_key.into(), adnl_id: adnl_key.id().clone() }
 }
 
 #[test]

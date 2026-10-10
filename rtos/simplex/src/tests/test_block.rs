@@ -495,7 +495,7 @@ fn test_raw_candidate_with_block() {
         collated_file_hash: UInt256::default(),
         data: vec![1, 2, 3],
         collated_data: vec![4, 5, 6],
-        creator: create_test_public_key(),
+        creator: create_test_public_key().into(),
     };
     let candidate = RawCandidate::new(id, None, ValidatorIndex::new(0), block, vec![0xAA; 64]);
     assert!(!candidate.is_empty());
@@ -536,7 +536,7 @@ fn test_raw_candidate_resolve() {
         collated_file_hash: UInt256::from([0x33u8; 32]),
         data: vec![],
         collated_data: vec![],
-        creator: create_test_public_key(),
+        creator: create_test_public_key().into(),
     };
     let block_id_expected = block.id.clone();
     let raw_candidate = RawCandidate::new(id, None, ValidatorIndex::new(0), block, vec![0xCC; 64]);
@@ -623,7 +623,7 @@ fn test_raw_candidate_id_create_empty_block() {
         collated_file_hash: UInt256::from([0x33u8; 32]),
         data: vec![1, 2, 3],
         collated_data: vec![4, 5, 6],
-        creator: create_test_public_key(),
+        creator: create_test_public_key().into(),
     };
     let id4 = RawCandidateId::create(SlotIndex::new(42), Some(&block), Some(&parent));
     assert_ne!(id1.hash, id4.hash);

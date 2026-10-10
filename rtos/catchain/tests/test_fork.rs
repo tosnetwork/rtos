@@ -66,7 +66,7 @@ impl CatchainInstance {
             &options,
             &session_id,
             nodes.clone(),
-            &nodes[local_idx].public_key,
+            nodes[local_idx].public_key.classical_key().unwrap(),
             db_path,
             db_suffix,
             allow_unsafe_self_blocks_resync,
@@ -273,7 +273,8 @@ fn test_catchain_attempt(attempt_idx: usize) {
             Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate private key");
         let adnl_id = private_key.id();
 
-        let catchain_node = CatchainNode { adnl_id: adnl_id.clone(), public_key: private_key };
+        let catchain_node =
+            CatchainNode { adnl_id: adnl_id.clone(), public_key: private_key.into() };
 
         nodes.push(catchain_node);
     }

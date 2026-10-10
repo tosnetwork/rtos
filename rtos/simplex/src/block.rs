@@ -76,7 +76,7 @@
 //! - **Empty blocks**: `candidateHashDataEmpty(block, parent:CandidateId)` - note: parent is CandidateId directly!
 //!
 
-use crate::{PrivateKey, PublicKey, SessionId};
+use crate::{PrivateKey, SessionId};
 use rtos_api::{
     ton::{
         consensus::{
@@ -635,7 +635,7 @@ pub struct BlockCandidate {
 
     /// Creator's public key (leader)
     #[allow(dead_code)]
-    pub creator: PublicKey,
+    pub creator: consensus_common::ValidatorIdentity,
 }
 
 /// Block content variant for RawCandidate
@@ -853,7 +853,7 @@ impl RawCandidate {
     pub fn deserialize(
         data: &[u8],
         session_id: &SessionId,
-        leader_key: &PublicKey,
+        leader_key: &(impl Clone + Into<consensus_common::ValidatorIdentity>),
         leader_idx: ValidatorIndex,
         shard: &ShardIdent,
         max_size: usize,
@@ -867,7 +867,7 @@ impl RawCandidate {
         Self::from_tl(
             &candidate_tl,
             session_id,
-            leader_key,
+            &Into::<consensus_common::ValidatorIdentity>::into(leader_key.clone()),
             leader_idx,
             shard,
             max_size,
@@ -891,7 +891,7 @@ impl RawCandidate {
     pub fn from_tl(
         candidate_tl: &CandidateData,
         session_id: &SessionId,
-        leader_key: &PublicKey,
+        leader_key: &(impl Clone + Into<consensus_common::ValidatorIdentity>),
         leader_idx: ValidatorIndex,
         shard: &ShardIdent,
         max_size: usize,
@@ -933,7 +933,7 @@ impl RawCandidate {
             session_id,
             &id_to_sign,
             candidate_tl.signature(),
-            leader_key,
+            &Into::<consensus_common::ValidatorIdentity>::into(leader_key.clone()),
         ) {
             fail!("Candidate broadcast signature is not valid")
         }
@@ -981,7 +981,7 @@ impl RawCandidate {
     /// Matches C++ reference: `RawCandidate::deserialize()` in `consensus-types.cpp`
     fn extract_block_data(
         candidate_tl: &CandidateData,
-        leader_key: &PublicKey,
+        leader_key: &(impl Clone + Into<consensus_common::ValidatorIdentity>),
         shard: &ShardIdent,
         max_size: usize,
         proto_version: u32,
@@ -1008,7 +1008,7 @@ impl RawCandidate {
                         collated_file_hash: info.collated_file_hash,
                         data: info.data,
                         collated_data: info.collated_data,
-                        creator: leader_key.clone(),
+                        creator: leader_key.clone().into(),
                     })),
                     None => Err(error!("Failed to extract block info from candidate bytes")),
                 }

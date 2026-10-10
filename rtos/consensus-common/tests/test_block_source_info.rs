@@ -26,7 +26,7 @@ fn test_block_source_info_creation() {
         Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key");
     let public_key: PublicKey = private_key;
     let priority = BlockCandidatePriority { round: 5, first_block_round: 3, priority: 0 };
-    let info = BlockSourceInfo { source: public_key.clone(), priority };
+    let info = BlockSourceInfo { source: public_key.clone().into(), priority };
 
     assert_eq!(info.priority.round, 5);
     assert_eq!(info.priority.first_block_round, 3);
@@ -43,12 +43,12 @@ fn test_first_block_round_tracking() {
 
     // Round 0, first_block_round = 0 (initial state)
     let p0 = BlockCandidatePriority { round: 0, first_block_round: 0, priority: 0 };
-    let info0 = BlockSourceInfo { source: public_key.clone(), priority: p0 };
+    let info0 = BlockSourceInfo { source: public_key.clone().into(), priority: p0 };
     assert_eq!(info0.priority.first_block_round, 0);
 
     // After committing round 0, first_block_round becomes 1
     let p1 = BlockCandidatePriority { round: 1, first_block_round: 1, priority: 0 };
-    let info1 = BlockSourceInfo { source: public_key.clone(), priority: p1 };
+    let info1 = BlockSourceInfo { source: public_key.clone().into(), priority: p1 };
     assert_eq!(info1.priority.first_block_round, 1);
     assert_eq!(info1.priority.round, info1.priority.first_block_round);
 
@@ -58,7 +58,7 @@ fn test_first_block_round_tracking() {
         first_block_round: 1, // first_block_round stays at 1
         priority: 0,
     };
-    let info2 = BlockSourceInfo { source: public_key, priority: p2 };
+    let info2 = BlockSourceInfo { source: public_key.into(), priority: p2 };
     assert_eq!(info2.priority.first_block_round, 1);
     assert!(info2.priority.round > info2.priority.first_block_round);
 }

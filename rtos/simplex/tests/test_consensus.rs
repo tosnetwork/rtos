@@ -701,7 +701,7 @@ impl SessionListener for SessionInstance {
         root_hash: BlockHash,
         _file_hash: BlockHash,
         data: BlockPayloadPtr,
-        signatures: BlockSignaturesVariant,
+        signatures: consensus_common::SessionFinality,
         _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
     ) {
         assert_eq!(
@@ -709,7 +709,9 @@ impl SessionListener for SessionInstance {
             "on_block_finalized: round must be SIMPLEX_ROUNDLESS in roundless mode"
         );
         let slot = match &signatures {
-            BlockSignaturesVariant::Simplex(s) => s.slot,
+            consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::Simplex(s)) => {
+                s.slot
+            }
             _ => 0,
         };
 
@@ -834,7 +836,7 @@ impl SessionListener for SessionInstanceListener {
         root_hash: BlockHash,
         file_hash: BlockHash,
         data: BlockPayloadPtr,
-        signatures: BlockSignaturesVariant,
+        signatures: consensus_common::SessionFinality,
         approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
     ) {
         assert_eq!(
@@ -845,7 +847,9 @@ impl SessionListener for SessionInstanceListener {
         let data_bytes = data.data();
         let is_empty = data_bytes.is_empty();
         let slot = match &signatures {
-            BlockSignaturesVariant::Simplex(s) => s.slot,
+            consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::Simplex(s)) => {
+                s.slot
+            }
             _ => 0,
         };
 

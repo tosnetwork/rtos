@@ -984,3 +984,180 @@ fn validate_proof_link(
 
     Ok(prev_stuff.prev)
 }
+
+/// Accept a live Simplex delivery. The caller supplies its immutable manager
+/// context, independently of the untrusted signature carrier. Authentication
+/// deliberately precedes block-handle shortcuts, downloads and storage writes.
+#[allow(clippy::too_many_arguments)]
+pub async fn accept_session_block(
+    id: BlockIdExt,
+    data: Option<Vec<u8>>,
+    prev: Vec<BlockIdExt>,
+    validator_set: ValidatorSet,
+    finality: consensus_common::SessionFinality,
+    context: Option<rtos_api::pq_finality::PqSessionContext>,
+    send_block_broadcast: bool,
+    engine: Arc<dyn EngineOperations>,
+) -> Result<()> {
+    use consensus_common::SessionFinality;
+    let is_pq = matches!(
+        &finality,
+        SessionFinality::PqApproval(_)
+            | SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(_))
+    );
+    if !is_pq {
+        if context.is_some() {
+            fail!("PQ session cannot accept classical finality");
+        }
+        let SessionFinality::Carrier(carrier) = finality else { unreachable!() };
+        return accept_block(
+            id,
+            data,
+            prev,
+            validator_set,
+            carrier,
+            vec![],
+            send_block_broadcast,
+            engine,
+        )
+        .await;
+    }
+    let context =
+        context.ok_or_else(|| error!("PQ acceptance requires authenticated session context"))?;
+    let verifier = context.for_block(id.clone())?;
+    let final_carrier = match &finality {
+        SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(carrier)) => {
+            verifier.verify_final(carrier)?;
+            Some(BlockSignaturesVariant::SimplexPq(carrier.clone()))
+        }
+        SessionFinality::PqApproval(approval) => {
+            verifier.verify_approval(approval)?;
+            None
+        }
+        _ => unreachable!(),
+    };
+    if prev.is_empty() || prev.len() > 2 {
+        fail!("`prev` has invalid length");
+    }
+    let existing = engine.load_block_handle(&id)?;
+    if existing.as_ref().is_some_and(|h| h.is_applied()) {
+        return Ok(());
+    }
+    let block = match data {
+        Some(data) => BlockStuff::deserialize_block(id.clone(), Arc::new(data))?,
+        None => match &existing {
+            Some(handle) if handle.has_data() => engine.load_block(handle).await?,
+            _ => engine.download_block(&id, Some(10)).await?.0,
+        },
+    };
+    precheck_header(&block, &prev, false, false)?;
+    // Verify before constructing even a signature-free proof link. The live
+    // approval has no serialized signature representation.
+    let proof = create_pq_session_proof(&block, &finality, &verifier)?;
+    let mut handle = match existing {
+        Some(handle) if handle.has_data() => handle,
+        _ => engine
+            .store_block(&block)
+            .await?
+            .to_non_created()
+            .ok_or_else(|| error!("PQ accept block handle mismatch"))?,
+    };
+    engine.store_block_prev1(&handle, &prev[0])?;
+    if prev.len() == 2 {
+        engine.store_block_prev2(&handle, &prev[1])?;
+    }
+    if !handle.has_state() {
+        calc_and_store_state(&handle, &block, &(prev[0].clone(), prev.get(1).cloned()), &engine)
+            .await?;
+    }
+    // A previously notarized shard may already have state. Final signatures
+    // still need processing; has_state is not a finality or authentication gate.
+    handle = engine
+        .store_block_proof(&id, Some(handle), &proof)
+        .await?
+        .to_non_created()
+        .ok_or_else(|| error!("PQ accept proof handle mismatch"))?;
+    let Some(carrier) = final_carrier else {
+        return Ok(());
+    };
+    if id.shard().is_masterchain() {
+        engine.clone().apply_block(&handle, &block, id.seq_no(), false).await?;
+    } else {
+        let state = choose_mc_state(&block, &engine).await?;
+        if let Some(tbd) = create_top_shard_block_description(
+            &block,
+            carrier.clone(),
+            &state,
+            prev,
+            engine.deref(),
+        )
+        .await?
+        {
+            let tbd =
+                Arc::new(TopBlockDescrStuff::new(tbd, block.id(), false, send_block_broadcast)?);
+            tbd.validate(&state)?;
+            engine
+                .send_top_shard_block_description(tbd, validator_set.catchain_seqno(), false)
+                .await?;
+        }
+    }
+    if send_block_broadcast {
+        engine.send_block_broadcast(&block, &proof, &carrier).await?;
+    }
+    Ok(())
+}
+
+fn create_pq_session_proof(
+    block: &BlockStuff,
+    finality: &consensus_common::SessionFinality,
+    context: &rtos_api::pq_finality::PqVerificationContext,
+) -> Result<BlockProofStuff> {
+    use consensus_common::SessionFinality;
+    let signatures = match finality {
+        SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(carrier)) => {
+            let verified = context.verify_final(carrier)?;
+            if verified.block_id() != block.id() {
+                fail!("PQ proof target differs from verified target");
+            }
+            Some(BlockSignaturesVariant::SimplexPq(carrier.clone()))
+        }
+        SessionFinality::PqApproval(approval) => {
+            let verified = context.verify_approval(approval)?;
+            if verified.block_id() != block.id() {
+                fail!("PQ approval target differs from verified target");
+            }
+            if block.id().shard().is_masterchain() {
+                fail!("masterchain requires final votes");
+            }
+            None
+        }
+        _ => fail!("PQ proof requires PQ finality"),
+    };
+    let usage = UsageTree::with_root(block.root_cell().clone());
+    let parsed = Block::construct_from_cell(usage.root_cell())?;
+    visit_block_for_proof(&parsed, block.id())?;
+    if block.id().shard().is_masterchain()
+        && !parsed.read_info()?.key_block()
+        && parsed
+            .read_extra()?
+            .read_custom()?
+            .ok_or_else(|| error!("masterchain extra missing"))?
+            .is_key_block()
+    {
+        fail!("non-key masterchain block declares key_block=true");
+    }
+    let merkle = MerkleProof::create(block.root_cell(), |hash| usage.contains(hash))?;
+    let is_link = !block.id().shard().is_masterchain();
+    BlockProofStuff::new(
+        BlockProof {
+            proof_for: block.id().clone(),
+            root: merkle.serialize()?,
+            signatures: if is_link { None } else { signatures },
+        },
+        is_link,
+    )
+}
+
+#[cfg(test)]
+#[path = "../tests/test_live_pq_accept.rs"]
+pub(crate) mod live_pq_tests;

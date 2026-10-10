@@ -205,7 +205,7 @@ fn run_overlay_test(manager: ConsensusOverlayManagerPtr) -> Result<()> {
         let public_key = Ed25519KeyOption::<ZeroizingBytes>::from_public_key(public_key_bytes);
         let adnl_id = public_key.id();
         node_ids.push(adnl_id.clone());
-        nodes.push(ConsensusNode { adnl_id: adnl_id.clone(), public_key });
+        nodes.push(ConsensusNode { adnl_id: adnl_id.clone(), public_key: public_key.into() });
     }
 
     let random_data: [u8; 32] = rand::random();
@@ -222,7 +222,7 @@ fn run_overlay_test(manager: ConsensusOverlayManagerPtr) -> Result<()> {
             make_listener(node.public_key.id().clone());
         const TRANSPORT_TYPE: OverlayTransportType = OverlayTransportType::Catchain;
         let overlay = manager.start_overlay(
-            &node.public_key,
+            node.public_key.classical_key().unwrap(),
             &overlay_short_id,
             &nodes,
             weak_listener,
@@ -420,7 +420,7 @@ fn run_overlay_performance_test(manager: ConsensusOverlayManagerPtr) -> Result<(
         let public_key = Ed25519KeyOption::<ZeroizingBytes>::from_public_key(public_key_bytes);
         let adnl_id = public_key.id();
         node_ids.push(adnl_id.clone());
-        nodes.push(ConsensusNode { adnl_id: adnl_id.clone(), public_key });
+        nodes.push(ConsensusNode { adnl_id: adnl_id.clone(), public_key: public_key.into() });
     }
 
     let random_data: [u8; 32] = rand::random();
@@ -433,7 +433,7 @@ fn run_overlay_performance_test(manager: ConsensusOverlayManagerPtr) -> Result<(
         let (listener, weak_listener, ..) = make_performance_listener();
         const TRANSPORT_TYPE: OverlayTransportType = OverlayTransportType::Catchain;
         let overlay = manager.start_overlay(
-            &node.public_key,
+            node.public_key.classical_key().unwrap(),
             &overlay_short_id,
             &nodes,
             weak_listener,

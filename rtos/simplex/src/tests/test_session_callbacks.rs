@@ -196,7 +196,7 @@ impl SessionListener for RecordingListener {
         _root_hash: BlockHash,
         _file_hash: BlockHash,
         _data: BlockPayloadPtr,
-        _signatures: BlockSignaturesVariant,
+        _signatures: consensus_common::SessionFinality,
         _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
     ) {
         self.block_finalized_calls.fetch_add(1, Ordering::Relaxed);
@@ -282,7 +282,7 @@ fn make_listener() -> (Arc<RecordingListener>, SessionListenerPtr) {
 fn make_test_source_info() -> BlockSourceInfo {
     let key = Ed25519KeyOption::<ZeroizingBytes>::generate().expect("key gen");
     BlockSourceInfo {
-        source: key,
+        source: key.into(),
         priority: BlockCandidatePriority { round: 0, first_block_round: 0, priority: 0 },
     }
 }
@@ -481,7 +481,7 @@ fn notify_block_finalized_dispatches_to_listener_inline() {
         root_hash,
         file_hash,
         ConsensusCommonFactory::create_empty_block_payload(),
-        make_test_signatures(),
+        make_test_signatures().into(),
         Vec::new(),
     );
 
@@ -531,7 +531,7 @@ fn notify_block_finalized_drops_silently_when_listener_dropped_before_dispatch_w
         UInt256::default(),
         UInt256::default(),
         ConsensusCommonFactory::create_empty_block_payload(),
-        make_test_signatures(),
+        make_test_signatures().into(),
         Vec::new(),
     );
 

@@ -86,7 +86,11 @@ pub fn check_crypto_signatures(
 pub fn validatordescr_to_consensus_node(descr: &ValidatorDescr) -> Result<ConsensusNode> {
     Ok(ConsensusNode {
         adnl_id: get_adnl_id(descr)?,
-        public_key: sigpubkey_to_publickey(descr.public_key()?),
+        public_key: if descr.pq_key().is_some() {
+            consensus_common::ValidatorIdentity::from_descriptor(descr)?
+        } else {
+            sigpubkey_to_publickey(descr.public_key()?).into()
+        },
     })
 }
 
@@ -570,7 +574,9 @@ mod pq_descriptor_tests {
         );
         member.validate_consensus().unwrap();
         assert_eq!(get_adnl_id(&member).unwrap().data(), &[2; 32]);
-        assert!(validatordescr_to_consensus_node(&member).is_err());
+        let overlay_node = validatordescr_to_consensus_node(&member).unwrap();
+        assert!(overlay_node.public_key.classical_key().is_err());
+        assert_eq!(overlay_node.public_key.id().data(), &[1; 32]);
         assert!(validatordescr_to_session_node(&member).is_err());
         assert!(get_group_members_by_validator_descrs(&[member], &mut Vec::new()).is_err());
     }

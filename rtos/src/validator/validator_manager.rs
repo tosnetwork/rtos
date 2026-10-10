@@ -1030,7 +1030,7 @@ impl ValidatorManagerImpl {
         log::info!(target: "validator_manager", "Updating {} validator list (id {:x}):", name, list_id);
         for x in &nodes_res {
             log::debug!(target: "validator_manager", "pk: {}, pk_id: {}, adnl_id: {}",
-                hex::encode(x.public_key.pub_key().unwrap()),
+                format!("{:?}", x.public_key),
                 hex::encode(x.public_key.id().data()),
                 hex::encode(x.adnl_id.data())
             );

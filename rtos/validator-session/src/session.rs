@@ -1201,7 +1201,7 @@ impl SessionImpl {
         let catchain_nodes = ids
             .iter()
             .map(|source| CatchainNode {
-                public_key: source.public_key.clone(),
+                public_key: source.public_key.clone().into(),
                 adnl_id: source.adnl_id.clone(),
             })
             .collect();
@@ -1323,7 +1323,7 @@ impl SessionImpl {
 
             nodes.push(SessionNode {
                 adnl_id: node.adnl_id.clone(),
-                public_key: node.public_key.clone(),
+                public_key: node.public_key.classical_key()?.clone(),
                 weight,
             });
         }

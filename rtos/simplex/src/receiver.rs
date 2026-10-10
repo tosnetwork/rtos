@@ -58,8 +58,8 @@ use crate::{
     block::{SlotIndex, ValidatorIndex},
     utils::ACTIVITY_THRESHOLD,
     ActivityNodePtr, BlockPayloadPtr, ConsensusOverlayListener, ConsensusOverlayLogReplayListener,
-    ConsensusOverlayManagerPtr, MetricsHandle, PrivateKey, PublicKey, PublicKeyHash, RawVoteData,
-    SessionId, SessionNode, SessionOptions, ValidatorWeight,
+    ConsensusOverlayManagerPtr, MetricsHandle, PrivateKey, PublicKeyHash, RawVoteData, SessionId,
+    SessionOptions, ValidatorWeight,
 };
 use consensus_common::{
     check_execution_time, instrument,
@@ -3994,7 +3994,7 @@ impl ReceiverImpl {
             }
             voted[idx as usize] = true;
             let src = &sources[idx as usize];
-            if src.public_key.verify(&signed, &sig.signature).is_err() {
+            if src.public_key.verify_simplex(&signed, &sig.signature).is_err() {
                 return Err(format!("invalid signature for validator {idx}"));
             }
             voted_weight = voted_weight.saturating_add(src.weight);
@@ -4104,7 +4104,7 @@ struct SourceStats {
     /// ADNL ID
     adnl_id: PublicKeyHash,
     /// Public key (for signature verification)
-    public_key: PublicKey,
+    public_key: consensus_common::ValidatorIdentity,
     /// Weight
     weight: ValidatorWeight,
     /// Incoming messages count
@@ -4145,13 +4145,13 @@ impl SourceStats {
     fn new(
         source_idx: u32,
         adnl_id: PublicKeyHash,
-        public_key: PublicKey,
+        public_key: impl Into<consensus_common::ValidatorIdentity>,
         weight: ValidatorWeight,
     ) -> Self {
         Self {
             source_idx,
             adnl_id,
-            public_key,
+            public_key: public_key.into(),
             weight,
             in_messages: 0,
             out_messages: 0,
@@ -4729,10 +4729,10 @@ impl ReceiverWrapper {
     /// The notar certificate cache starts empty and is populated via
     /// `cache_notarization_cert()` calls from the startup recovery processor.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn create(
+    pub(crate) fn create<N: Clone + Into<crate::SimplexSessionNode>>(
         session_id: SessionId,
         shard: &ShardIdent,
-        ids: &[SessionNode],
+        ids: &[N],
         local_key: &PrivateKey,
         overlay_manager: ConsensusOverlayManagerPtr,
         listener: ReceiverListenerPtr,
@@ -4740,6 +4740,7 @@ impl ReceiverWrapper {
         health_counters: Arc<ReceiverHealthCounters>,
         settings: ReceiverSettings,
     ) -> Result<ReceiverPtr> {
+        let ids: Vec<crate::SimplexSessionNode> = ids.iter().cloned().map(Into::into).collect();
         // Destructure once at the top so the rest of the function reads as if
         // each setting were still a free-standing parameter.
         let ReceiverSettings {
@@ -4767,7 +4768,7 @@ impl ReceiverWrapper {
         let metrics_receiver = MetricsHandle::new(Some(RECEIVER_METRICS_IDLE_TIMEOUT));
 
         // Compute overlay ID (must match C++ implementation)
-        let (overlay_id, overlay_short_id) = Self::compute_overlay_id(&session_id, ids)?;
+        let (overlay_id, overlay_short_id) = Self::compute_overlay_id(&session_id, &ids)?;
 
         log::info!(
             "SimplexReceiver {}: overlay_id={}, overlay_short_id={}, quic={}, blocksync_overlay={}",
@@ -4839,7 +4840,7 @@ impl ReceiverWrapper {
         // Convert SessionNode to ConsensusNode for overlay manager
         let consensus_nodes: Vec<ConsensusNode> = ids
             .iter()
-            .map(|n| ConsensusNode { adnl_id: n.adnl_id.clone(), public_key: n.public_key.clone() })
+            .map(|n| ConsensusNode { adnl_id: n.adnl_id.clone(), public_key: n.identity.clone() })
             .collect();
 
         // Start overlay
@@ -4864,7 +4865,13 @@ impl ReceiverWrapper {
         let local_key_hash = local_key.id();
         let local_idx =
             ids.iter()
-                .position(|n| n.public_key.id() == local_key_hash)
+                .position(|n| {
+                    if n.identity.pq_key().is_some() {
+                        &n.adnl_id == local_key_hash
+                    } else {
+                        n.identity.id() == local_key_hash
+                    }
+                })
                 .ok_or_else(|| error!("Local key not found in node list"))? as u32;
 
         let local_adnl_id = ids[local_idx as usize].adnl_id.clone();
@@ -4877,12 +4884,13 @@ impl ReceiverWrapper {
 
         for (idx, node) in ids.iter().enumerate() {
             let idx = idx as u32;
-            let pubkey_hash = node.public_key.id();
+            let pubkey_hash =
+                if node.identity.pq_key().is_some() { &node.adnl_id } else { node.identity.id() };
 
             sources.push(SourceStats::new(
                 idx,
                 node.adnl_id.clone(),
-                node.public_key.clone(),
+                node.identity.clone(),
                 node.weight,
             ));
             adnl_to_idx.insert(node.adnl_id.clone(), idx);
@@ -5204,9 +5212,9 @@ impl ReceiverWrapper {
     ///
     /// CRITICAL: Must match C++ implementation exactly.
     /// See: rtos-cpp/validator/consensus/private-overlay.cpp
-    fn compute_overlay_id(
+    fn compute_overlay_id<N: Clone + Into<crate::SimplexSessionNode>>(
         session_id: &SessionId,
-        nodes: &[SessionNode],
+        nodes: &[N],
     ) -> Result<(SessionId, PublicKeyHash)> {
         // C++ reference (`validator/consensus/private-overlay.cpp`):
         // - overlay_seed = tl::overlayId(session_id, nodes_short_ids_in_validator_set_order)
@@ -5214,8 +5222,18 @@ impl ReceiverWrapper {
         // - overlay_short_id = overlay_full_id.compute_short_id()
         //
         // IMPORTANT: Do NOT sort nodes here; order must match validator set (SessionDescription).
-        let nodes_int256: Vec<UInt256> =
-            nodes.iter().map(|n| UInt256::from(*n.public_key.id().data())).collect();
+        let nodes_int256: Vec<UInt256> = nodes
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .map(|n: crate::SimplexSessionNode| {
+                UInt256::from(*if n.identity.pq_key().is_some() {
+                    n.adnl_id.data()
+                } else {
+                    n.identity.id().data()
+                })
+            })
+            .collect();
 
         // Create overlay seed TL object (consensus.overlayId)
         let overlay_seed =
@@ -5319,3 +5337,7 @@ mod payload_classifier_tests {
         assert!(!is_candidate_payload(&payload));
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_live_pq_receiver.rs"]
+mod live_pq_tests;

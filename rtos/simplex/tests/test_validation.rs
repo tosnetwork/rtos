@@ -209,7 +209,7 @@ impl SessionListener for ValidationTestListener {
         _root_hash: BlockHash,
         _file_hash: BlockHash,
         _data: BlockPayloadPtr,
-        _signatures: BlockSignaturesVariant,
+        _signatures: consensus_common::SessionFinality,
         _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
     ) {
         let slot = source_info.priority.round;

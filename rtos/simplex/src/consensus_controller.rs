@@ -1242,19 +1242,22 @@ impl ConsensusController {
         }
 
         // Sign the vote with the session-scoped signature.
-        let signed_vote =
-            match sign_vote(&vote, self.session_id(), self.description.get_local_key()) {
-                Ok(v) => v.only(), // Extract inner Vote from Vote_
-                Err(e) => {
-                    log::error!(
-                        "Session {} broadcast_vote: failed to sign vote: {}",
-                        self.session_id().to_hex_string(),
-                        e
-                    );
-                    self.telemetry.increment_error();
-                    return;
-                }
-            };
+        let signed_vote = match self
+            .description
+            .get_legacy_signing_key()
+            .and_then(|key| sign_vote(&vote, self.session_id(), key))
+        {
+            Ok(v) => v.only(), // Extract inner Vote from Vote_
+            Err(e) => {
+                log::error!(
+                    "Session {} broadcast_vote: failed to sign vote: {}",
+                    self.session_id().to_hex_string(),
+                    e
+                );
+                self.telemetry.increment_error();
+                return;
+            }
+        };
 
         backend.persist_our_vote(&signed_vote);
 
@@ -2249,7 +2252,7 @@ impl ConsensusController {
         slot: SlotIndex,
         candidate_hash_data_bytes: Vec<u8>,
         is_final: bool,
-    ) -> Result<BlockSignaturesVariant> {
+    ) -> Result<consensus_common::SessionFinality> {
         // INVARIANT: Must have at least one signature
         assert!(
             !raw_signatures.is_empty(),
@@ -2263,6 +2266,59 @@ impl ConsensusController {
             "build_simplex_signatures_variant: candidate_hash_data_bytes must not be empty for slot={}",
             slot
         );
+
+        if self.description.get_source_public_key(ValidatorIndex::from(0usize)).pq_key().is_some() {
+            let context = self
+                .description
+                .pq_context()
+                .ok_or_else(|| rtos_block::error!("PQ session context missing"))?;
+            let mut weight = 0;
+            let mut pairs = Vec::with_capacity(raw_signatures.len());
+            let mut seen = std::collections::HashSet::new();
+            for (node_id, signature) in raw_signatures {
+                if !seen.insert(node_id) {
+                    rtos_block::fail!("duplicate PQ finalized signer");
+                }
+                let index = self.description.get_source_index(node_id)?;
+                let identity = self.description.get_source_public_key(index);
+                let key =
+                    identity.pq_key().ok_or_else(|| rtos_block::error!("mixed PQ finality"))?;
+                weight = rtos_block::checked_add_validator_weight(
+                    weight,
+                    self.description.get_node_weight(index),
+                )?;
+                pairs.push(rtos_block::PqBlockSignaturePair {
+                    validator_id: (*node_id.data()).into(),
+                    algorithm_id: key.algorithm_id,
+                    signature: signature.data().to_vec(),
+                });
+            }
+            let data = rtos_block::BlockSignaturesSimplexPq {
+                validator_info: context.validator_info(),
+                sig_count: pairs.len().try_into()?,
+                sig_weight: weight,
+                signatures: pairs,
+                session_id: self.session_id().clone(),
+                slot: slot.value() as u32,
+                candidate_data: BlockSignaturesSimplex::bytes_to_cell_tree(
+                    &candidate_hash_data_bytes,
+                )?,
+            };
+            let candidate: rtos_api::ton::consensus::CandidateHashData =
+                rtos_api::Deserializer::new(&mut std::io::Cursor::new(&candidate_hash_data_bytes))
+                    .read_boxed()?;
+            let verifier = context.for_block(candidate.block().clone())?;
+            return if is_final {
+                verifier.verify_final(&data)?;
+                Ok(consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(
+                    data,
+                )))
+            } else {
+                let approval = rtos_api::pq_finality::PqApproval::from_notarization_fields(data)?;
+                verifier.verify_approval(&approval)?;
+                Ok(consensus_common::SessionFinality::PqApproval(approval))
+            };
+        }
 
         let mut pure_signatures = BlockSignaturesPure::new();
         let mut valid_sig_count = 0u32;
@@ -2354,7 +2410,7 @@ impl ConsensusController {
             is_final,
         );
 
-        Ok(BlockSignaturesVariant::Simplex(simplex_signatures))
+        Ok(BlockSignaturesVariant::Simplex(simplex_signatures).into())
     }
 
     /*
@@ -2383,6 +2439,15 @@ impl ConsensusController {
 // session-processor unit tests; production fields stay private).
 #[cfg(test)]
 impl ConsensusController {
+    pub(crate) fn build_finality_for_test(
+        &self,
+        signatures: &[(PublicKeyHash, BlockPayloadPtr)],
+        slot: SlotIndex,
+        data: Vec<u8>,
+        is_final: bool,
+    ) -> Result<consensus_common::SessionFinality> {
+        self.build_simplex_signatures_variant(signatures, slot, data, is_final)
+    }
     /* Callback injection */
 
     /// Re-point the controller at a rebuilt callbacks aspect.

@@ -15,8 +15,7 @@
 use crate::{
     block::{SlotIndex, ValidatorIndex, WindowIndex},
     utils::{threshold_33, threshold_66},
-    MetricsHandle, PrivateKey, PublicKey, PublicKeyHash, SessionId, SessionNode, SessionOptions,
-    ValidatorWeight,
+    MetricsHandle, PrivateKey, PublicKeyHash, SessionId, SessionOptions, ValidatorWeight,
 };
 use rtos_block::{error, fail, Result, ShardIdent};
 use std::{
@@ -37,7 +36,7 @@ struct Source {
     /// Public key hash for the node
     id: PublicKeyHash,
     /// Public key of the node
-    public_key: PublicKey,
+    public_key: consensus_common::ValidatorIdentity,
     /// ADNL identifier
     #[allow(dead_code)]
     adnl_id: PublicKeyHash,
@@ -54,6 +53,8 @@ struct Source {
 pub(crate) struct SessionDescription {
     /// Session identifier
     session_id: SessionId,
+    pq_members: Vec<rtos_block::ValidatorDescr>,
+    pq_context: Option<rtos_api::pq_finality::PqSessionContext>,
     /// Session options
     options: SessionOptions,
     /// Initial block seqno (first block produced by this session)
@@ -101,23 +102,30 @@ impl SessionDescription {
     /// * `shard` - Shard identifier
     /// * `session_creation_time` - When the session was created
     /// * `metrics_receiver` - Optional metrics handle
-    pub fn new(
+    pub fn new<N: Clone + Into<crate::SimplexSessionNode>>(
         options: &SessionOptions,
         session_id: SessionId,
         initial_block_seqno: u32,
-        nodes: &[SessionNode],
+        nodes: &[N],
         local_key: PrivateKey,
         shard: &ShardIdent,
         session_creation_time: SystemTime,
         metrics_receiver: Option<MetricsHandle>,
     ) -> Result<Self> {
+        let nodes: Vec<crate::SimplexSessionNode> = nodes.iter().cloned().map(Into::into).collect();
         let session_id_str = session_id.to_hex_string();
 
         log::info!("Session {} options: {:?}", session_id_str, options);
 
         // Find local index for logging (may be missing if node is not in validator set)
         let local_id = local_key.id();
-        let local_idx = nodes.iter().position(|n| n.public_key.id() == local_id);
+        let local_idx = nodes.iter().position(|n| {
+            if n.identity.pq_key().is_some() {
+                &n.adnl_id == local_id
+            } else {
+                n.identity.id() == local_id
+            }
+        });
 
         // Calculate weights (same as old log_creation_info)
         let total_weight =
@@ -144,11 +152,16 @@ impl SessionDescription {
                 idx,
                 node.weight,
                 node.adnl_id,
-                node.public_key.id(),
+                node.identity.id(),
                 is_local
             );
         }
 
+        if nodes.iter().any(|n| n.identity.pq_key().is_some())
+            && nodes.iter().any(|n| n.identity.pq_key().is_none())
+        {
+            fail!("mixed classical/PQ Simplex committee is not supported");
+        }
         let options = *options;
         let local_id = local_id;
 
@@ -159,9 +172,9 @@ impl SessionDescription {
 
         for (node_index, node) in nodes.iter().enumerate() {
             let source = Source {
-                public_key: node.public_key.clone(),
+                public_key: node.identity.clone(),
                 adnl_id: node.adnl_id.clone(),
-                id: node.public_key.id().clone(),
+                id: node.identity.id().clone(),
                 weight: node.weight,
             };
 
@@ -174,8 +187,8 @@ impl SessionDescription {
             sources.push(source);
         }
 
-        let self_idx = match rev_sources.get(local_id) {
-            Some(&idx) => idx,
+        let self_idx = match local_idx {
+            Some(idx) => ValidatorIndex::from(idx),
             None => {
                 fail!(
                     "SessionDescription::new: can't find validator with local ID {} in sources",
@@ -186,7 +199,10 @@ impl SessionDescription {
 
         let metrics_receiver = metrics_receiver.unwrap_or_else(|| MetricsHandle::new(None));
 
+        let pq_members = nodes.iter().filter_map(|n| n.descriptor.clone()).collect();
         Ok(Self {
+            pq_members,
+            pq_context: None,
             session_id,
             options,
             initial_block_seqno,
@@ -215,6 +231,22 @@ impl SessionDescription {
     */
 
     /// Get session identifier
+    pub fn bind_pq_session(mut self, catchain_seqno: u32) -> Result<Self> {
+        if !self.pq_members.is_empty() {
+            self.pq_context =
+                Some(rtos_api::pq_finality::PqSessionContext::from_authenticated_session_members(
+                    self.session_id.clone(),
+                    self.shard.clone(),
+                    catchain_seqno,
+                    self.pq_members.clone(),
+                )?);
+        }
+        Ok(self)
+    }
+    pub fn pq_context(&self) -> Option<&rtos_api::pq_finality::PqSessionContext> {
+        self.pq_context.as_ref()
+    }
+
     pub fn get_session_id(&self) -> &SessionId {
         &self.session_id
     }
@@ -225,8 +257,11 @@ impl SessionDescription {
     }
 
     /// Get local validator's private key
-    pub fn get_local_key(&self) -> &PrivateKey {
-        &self.local_key
+    pub fn get_legacy_signing_key(&self) -> Result<&PrivateKey> {
+        if self.sources[self.self_idx.value() as usize].public_key.pq_key().is_some() {
+            fail!("PQ consensus signer is Disabled");
+        }
+        Ok(&self.local_key)
     }
 
     /// Get session creation time
@@ -253,7 +288,10 @@ impl SessionDescription {
     }
 
     /// Get source public key by index
-    pub fn get_source_public_key(&self, src_idx: ValidatorIndex) -> &PublicKey {
+    pub fn get_source_public_key(
+        &self,
+        src_idx: ValidatorIndex,
+    ) -> &consensus_common::ValidatorIdentity {
         &self.sources[src_idx.value() as usize].public_key
     }
 

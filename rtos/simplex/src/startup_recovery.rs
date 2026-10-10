@@ -228,6 +228,18 @@ impl SessionStartupRecoveryProcessor {
         map
     }
 
+    /// Authenticate PQ disk input before registering a live overlay. The
+    /// provisional description needs only trusted membership/session/options;
+    /// initial block height is not part of any verification preimage.
+    pub(crate) fn authenticate_pq_input(&self) -> Result<()> {
+        if self.description.pq_context().is_some() {
+            self.verify_pq_bootstrap(
+                self.bootstrap.as_ref().ok_or_else(|| error!("bootstrap consumed"))?,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Get the number of finalized blocks in bootstrap.
     pub(crate) fn finalized_block_count(&self) -> usize {
         self.bootstrap.as_ref().map(|b| b.finalized_blocks.len()).unwrap_or(0)
@@ -291,6 +303,10 @@ impl SessionStartupRecoveryProcessor {
             "Session {}: applying bootstrap recovery",
             self.session_id.to_hex_string()
         );
+
+        if self.description.pq_context().is_some() {
+            self.verify_pq_bootstrap(&bootstrap)?;
+        }
 
         self.recovery_begin_startup_replay(backend);
 
@@ -475,6 +491,182 @@ impl SessionStartupRecoveryProcessor {
             self.session_id.to_hex_string()
         );
 
+        Ok(())
+    }
+
+    fn decode_pq_record<T: rtos_api::AnyBoxedSerialize>(bytes: &[u8]) -> Result<T> {
+        let (value, consumed) = rtos_api::deserialize_typed_with_suffix(bytes)?;
+        if consumed != bytes.len() {
+            rtos_block::fail!("PQ recovery trailing record bytes");
+        }
+        Ok(value)
+    }
+
+    /// Disk records retain untrusted bytes until checked under this session.
+    /// This is authentication of recovery input, not an intent journal or a
+    /// claim of atomicity across the existing asynchronous record writes.
+    fn verify_pq_bootstrap(&self, bootstrap: &Bootstrap) -> Result<()> {
+        // Authenticate every persisted vote/certificate before touching the FSM,
+        // receiver caches, finalized cursor, or listener callbacks.
+        for record in &bootstrap.votes {
+            if UInt256::calc_file_hash(&record.data) != record.vote_hash {
+                rtos_block::fail!("PQ recovery vote key mismatch");
+            }
+            if record.node_idx.value() as usize >= self.description.get_total_nodes() {
+                rtos_block::fail!("PQ recovery vote signer out of bounds");
+            }
+            let vote: TlVoteBoxed = Self::decode_pq_record(&record.data)?;
+            if !crate::utils::verify_vote_signature(
+                &vote,
+                &self.session_id,
+                self.description.get_source_public_key(record.node_idx),
+            ) {
+                rtos_block::fail!("PQ recovery invalid vote signature/session");
+            }
+            if Self::deserialize_vote_record(record).is_none() {
+                rtos_block::fail!("PQ recovery invalid vote encoding");
+            }
+        }
+        let mut finals = HashSet::new();
+        for record in &bootstrap.final_certs {
+            let tl: CertificateBoxed = Self::decode_pq_record(&record.cert_bytes)?;
+            let cert =
+                SimplexCertificate::<Vote>::from_tl(&tl, &self.description, &self.session_id)?;
+            match cert.vote {
+                Vote::Finalize(v)
+                    if v.slot == record.candidate_id.slot
+                        && v.block_hash == record.candidate_id.hash => {}
+                _ => rtos_block::fail!("PQ recovery final certificate key/role mismatch"),
+            }
+            finals.insert(record.candidate_id.clone());
+        }
+        for record in &bootstrap.skip_certs {
+            let tl: CertificateBoxed = Self::decode_pq_record(&record.cert_bytes)?;
+            let cert =
+                SimplexCertificate::<Vote>::from_tl(&tl, &self.description, &self.session_id)?;
+            match cert.vote {
+                Vote::Skip(v) if v.slot == record.slot => {}
+                _ => rtos_block::fail!("PQ recovery skip certificate key/role mismatch"),
+            }
+        }
+        let mut notars = HashSet::new();
+        for record in &bootstrap.notar_certs {
+            let _: rtos_api::ton::consensus::simplex::VoteSignatureSet =
+                Self::decode_pq_record(&record.notar_cert_bytes)?;
+            let parsed = crate::certificate::NotarCert::from_tl_bytes_for_candidate(
+                &record.notar_cert_bytes,
+                record.candidate_id.slot,
+                record.candidate_id.hash.clone(),
+            )?;
+            crate::certificate::NotarCert::from_tl_signatures(
+                &parsed.to_tl_vote_signature_set(),
+                parsed.vote,
+                &self.description,
+                &self.session_id,
+            )?;
+            notars.insert(record.candidate_id.clone());
+        }
+        let mut parents = HashMap::new();
+        for info in &bootstrap.candidate_infos {
+            let leader = self.description.get_leader(info.candidate_id.slot);
+            if info.leader_idx != leader.value() {
+                rtos_block::fail!("PQ recovery wrong candidate leader");
+            }
+            let bytes = serialize_boxed(&info.candidate_hash_data)?;
+            if UInt256::calc_file_hash(&bytes) != info.candidate_id.hash
+                || info.candidate_hash_data.block().shard() != self.description.get_shard()
+            {
+                rtos_block::fail!("PQ recovery candidate identity mismatch");
+            }
+            if !crate::utils::check_candidate_signature(
+                &self.session_id,
+                info.candidate_id.slot,
+                &info.candidate_id.hash,
+                &info.signature,
+                self.description.get_source_public_key(leader),
+            ) {
+                rtos_block::fail!("PQ recovery invalid candidate signature");
+            }
+            let parent = match &info.candidate_hash_data {
+                CandidateHashData::Consensus_CandidateHashDataEmpty(empty) => {
+                    Some(RawCandidateId {
+                        slot: SlotIndex::new(empty.parent.slot as u32),
+                        hash: empty.parent.hash.clone(),
+                    })
+                }
+                _ => Self::extract_parent_id_from_ordinary_hash_data(&info.candidate_hash_data)?
+                    .map(|(slot, hash)| RawCandidateId { slot, hash }),
+            };
+            if parent.as_ref().is_some_and(|p| p.slot >= info.candidate_id.slot) {
+                rtos_block::fail!("PQ recovery non-decreasing candidate parent");
+            }
+            if parents.insert(info.candidate_id.clone(), parent).is_some() {
+                rtos_block::fail!("PQ recovery duplicate candidate metadata");
+            }
+        }
+        for (id, bytes) in &bootstrap.candidate_payloads {
+            let _: CandidateData = Self::decode_pq_record(bytes)?;
+            let leader = self.description.get_leader(id.slot);
+            let candidate = crate::block::RawCandidate::deserialize(
+                bytes,
+                &self.session_id,
+                self.description.get_source_public_key(leader),
+                leader,
+                self.description.get_shard(),
+                self.description.opts().max_block_size
+                    + self.description.opts().max_collated_data_size,
+                self.description.opts().proto_version,
+            )?;
+            if candidate.id != *id {
+                rtos_block::fail!("PQ recovery payload key mismatch");
+            }
+        }
+        // A leader signature authenticates a proposal, never finality. Final
+        // certificates support their target and notarized ancestors linked by
+        // authenticated candidate metadata. There is no trusted engine anchor
+        // in this API: a GC snapshot missing this evidence must fail closed.
+        let mut supported = finals.clone();
+        for finalized in &finals {
+            let mut cursor = finalized;
+            while let Some(Some(parent)) = parents.get(cursor) {
+                if !notars.contains(parent) && !finals.contains(parent) {
+                    break;
+                }
+                supported.insert(parent.clone());
+                cursor = parent;
+            }
+        }
+        for record in &bootstrap.finalized_blocks {
+            if !supported.contains(&record.candidate_id) {
+                rtos_block::fail!("PQ recovery finalized record lacks authenticated finality");
+            }
+            if record.is_final
+                && !bootstrap.candidate_infos.iter().any(|info| {
+                    finals.contains(&info.candidate_id)
+                        && info.candidate_hash_data.block() == &record.block_id
+                })
+            {
+                rtos_block::fail!("PQ recovery final flag lacks matching block FinalCert");
+            }
+            let info = bootstrap
+                .candidate_infos
+                .iter()
+                .find(|info| info.candidate_id == record.candidate_id)
+                .ok_or_else(|| error!("PQ recovery finalized candidate metadata missing"))?;
+            if info.candidate_hash_data.block() != &record.block_id {
+                rtos_block::fail!("PQ recovery finalized block mismatch");
+            }
+            let parent = match &info.candidate_hash_data {
+                CandidateHashData::Consensus_CandidateHashDataEmpty(empty) => {
+                    Some((empty.parent.slot as u32, empty.parent.hash.clone()))
+                }
+                _ => Self::extract_parent_id_from_ordinary_hash_data(&info.candidate_hash_data)?
+                    .map(|(slot, hash)| (slot.value(), hash)),
+            };
+            if parent != record.parent.as_ref().map(|p| (p.slot.value(), p.hash.clone())) {
+                rtos_block::fail!("PQ recovery finalized parent mismatch");
+            }
+        }
         Ok(())
     }
 
@@ -740,6 +932,22 @@ impl SessionStartupRecoveryProcessor {
         let mut failed = 0u32;
 
         for vote_record in votes {
+            if self.description.pq_context().is_some() {
+                if vote_record.node_idx.value() as usize >= self.description.get_total_nodes() {
+                    rtos_block::fail!("PQ recovery vote signer out of bounds");
+                }
+                let boxed = deserialize_boxed(vote_record.data.as_slice())?;
+                let tl = boxed
+                    .downcast::<TlVoteBoxed>()
+                    .map_err(|_| error!("PQ recovery invalid vote record"))?;
+                if !crate::utils::verify_vote_signature(
+                    &tl,
+                    &self.session_id,
+                    self.description.get_source_public_key(vote_record.node_idx),
+                ) {
+                    rtos_block::fail!("PQ recovery invalid vote signature/session");
+                }
+            }
             // Deserialize vote
             let (vote, signature) = match Self::deserialize_vote_record(vote_record) {
                 Some((v, s)) => (v, s),
@@ -880,6 +1088,19 @@ impl SessionStartupRecoveryProcessor {
         let mut parse_errors = 0u32;
 
         for cert in notar_certs {
+            if self.description.pq_context().is_some() {
+                let parsed = crate::certificate::NotarCert::from_tl_bytes_for_candidate(
+                    &cert.notar_cert_bytes,
+                    cert.candidate_id.slot,
+                    cert.candidate_id.hash.clone(),
+                )?;
+                crate::certificate::NotarCert::from_tl_signatures(
+                    &parsed.to_tl_vote_signature_set(),
+                    parsed.vote.clone(),
+                    &self.description,
+                    &self.session_id,
+                )?;
+            }
             // 1. Cache raw bytes in receiver for network queries
             self.recovery_cache_notarization_cert(
                 backend,

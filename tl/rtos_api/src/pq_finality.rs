@@ -15,6 +15,7 @@ use std::{collections::HashMap, io::Cursor};
 
 /// Immutable expected context, derived from the caller's governing configuration.
 /// Construction validates protocol consistency, not the origin of the config.
+#[derive(Clone, Debug)]
 pub struct PqVerificationContext {
     block_id: BlockIdExt,
     session_id: UInt256,
@@ -22,6 +23,96 @@ pub struct PqVerificationContext {
     subset_hash: u32,
     total_weight: u64,
     validators: Vec<ValidatorDescr>,
+}
+
+/// Immutable membership and session identity supplied by the authenticated session
+/// manager. This validates consistency; it does not authenticate its caller.
+#[derive(Clone, Debug)]
+pub struct PqSessionContext {
+    shard: rtos_block::ShardIdent,
+    session_id: UInt256,
+    catchain_seqno: u32,
+    subset_hash: u32,
+    validators: Vec<ValidatorDescr>,
+    total_weight: u64,
+}
+impl PqSessionContext {
+    /// `session_id` and `validators` must be the manager's authenticated, frozen
+    /// governing-session snapshot, never values extracted from a peer carrier.
+    pub fn from_authenticated_session_members(
+        session_id: UInt256,
+        shard: rtos_block::ShardIdent,
+        catchain_seqno: u32,
+        validators: Vec<ValidatorDescr>,
+    ) -> Result<Self> {
+        rtos_block::validate_validator_list(&validators)?;
+        if validators.iter().any(|v| !matches!(v.key, ValidatorKey::Pq(_))) {
+            fail!("PQ session requires an entirely PQ governing subset");
+        }
+        let subset_hash =
+            rtos_block::ValidatorSet::calc_subset_hash_short(&validators, catchain_seqno)?;
+        let total_weight = checked_validator_weight_sum(validators.iter().map(|v| v.weight))?;
+        Ok(Self { session_id, shard, catchain_seqno, subset_hash, validators, total_weight })
+    }
+    pub fn for_block(&self, block_id: BlockIdExt) -> Result<PqVerificationContext> {
+        if block_id.shard() != &self.shard {
+            fail!("PQ block shard differs from authenticated session shard");
+        }
+        Ok(PqVerificationContext {
+            block_id,
+            session_id: self.session_id.clone(),
+            catchain_seqno: self.catchain_seqno,
+            subset_hash: self.subset_hash,
+            total_weight: self.total_weight,
+            validators: self.validators.clone(),
+        })
+    }
+    pub fn validator_info(&self) -> rtos_block::ValidatorBaseInfo {
+        rtos_block::ValidatorBaseInfo::with_params(self.subset_hash, self.catchain_seqno)
+    }
+}
+
+/// Live-only notarization quorum. This type intentionally has no serialization
+/// or conversion into the final-only on-chain #13 signature carrier.
+#[derive(Clone, Debug)]
+pub struct PqApproval {
+    data: BlockSignaturesSimplexPq,
+}
+impl PqApproval {
+    /// The field layout shares resource bounds with #13; its signature role is
+    /// always Notarize, independently of how these untrusted bytes were obtained.
+    pub fn from_notarization_fields(data: BlockSignaturesSimplexPq) -> Result<Self> {
+        data.serialize()?;
+        Ok(Self { data })
+    }
+    pub fn session_id(&self) -> &UInt256 {
+        &self.data.session_id
+    }
+    pub fn slot(&self) -> u32 {
+        self.data.slot
+    }
+}
+
+#[derive(Debug)]
+pub struct VerifiedPqApproval {
+    block_id: BlockIdExt,
+    session_id: UInt256,
+    slot: u32,
+    weight: u64,
+}
+impl VerifiedPqApproval {
+    pub fn block_id(&self) -> &BlockIdExt {
+        &self.block_id
+    }
+    pub fn session_id(&self) -> &UInt256 {
+        &self.session_id
+    }
+    pub fn slot(&self) -> u32 {
+        self.slot
+    }
+    pub fn weight(&self) -> u64 {
+        self.weight
+    }
 }
 
 /// A verified final signature quorum under a particular supplied context.
@@ -61,11 +152,51 @@ impl PqVerificationContext {
         previous_key_block_seqno: u32,
         catchain_seqno: u32,
     ) -> Result<Self> {
+        Self::from_governing_validator_set(
+            global_id,
+            config,
+            config.validator_set()?,
+            block_id,
+            vertical_seqno,
+            previous_key_block_seqno,
+            catchain_seqno,
+        )
+    }
+
+    /// The caller must independently authorize next-set use (e.g. the trusted
+    /// top-shard-descriptor validation mode). The carrier cannot enable it.
+    pub fn from_governing_next_validator_set(
+        global_id: i32,
+        config: &ConfigParams,
+        block_id: BlockIdExt,
+        vertical_seqno: u32,
+        previous_key_block_seqno: u32,
+        catchain_seqno: u32,
+    ) -> Result<Self> {
+        Self::from_governing_validator_set(
+            global_id,
+            config,
+            config.next_validator_set()?,
+            block_id,
+            vertical_seqno,
+            previous_key_block_seqno,
+            catchain_seqno,
+        )
+    }
+
+    fn from_governing_validator_set(
+        global_id: i32,
+        config: &ConfigParams,
+        set: rtos_block::ValidatorSet,
+        block_id: BlockIdExt,
+        vertical_seqno: u32,
+        previous_key_block_seqno: u32,
+        catchain_seqno: u32,
+    ) -> Result<Self> {
         match config.config(19)? {
             Some(ConfigParamEnum::ConfigParam19(id)) if id == global_id as u32 => {}
             _ => fail!("PQ governing global_id disagrees with missing or mismatched Param19"),
         }
-        let set = config.validator_set()?;
         rtos_block::validate_validator_list(set.list())?;
         let (validators, subset_hash) = set.calc_subset(
             &config.catchain_config()?,
@@ -109,6 +240,29 @@ impl PqVerificationContext {
     /// Verify a persisted #13 carrier, which can only represent final votes.
     /// All supplied signers are checked, including weight beyond the threshold.
     pub fn verify_final(&self, carrier: &BlockSignaturesSimplexPq) -> Result<VerifiedPqSignatures> {
+        let weight = self.verify_role(carrier, true)?;
+        Ok(VerifiedPqSignatures {
+            block_id: self.block_id.clone(),
+            session_id: self.session_id.clone(),
+            slot: carrier.slot,
+            weight,
+        })
+    }
+
+    pub fn verify_approval(&self, approval: &PqApproval) -> Result<VerifiedPqApproval> {
+        if self.block_id.shard().is_masterchain() {
+            fail!("masterchain requires final votes");
+        }
+        let weight = self.verify_role(&approval.data, false)?;
+        Ok(VerifiedPqApproval {
+            block_id: self.block_id.clone(),
+            session_id: self.session_id.clone(),
+            slot: approval.data.slot,
+            weight,
+        })
+    }
+
+    fn verify_role(&self, carrier: &BlockSignaturesSimplexPq, is_final: bool) -> Result<u64> {
         // Public carrier fields may have been built manually, bypassing decoding.
         // Serialization enforces all structural/resource limits in that case too.
         carrier.serialize()?;
@@ -121,7 +275,7 @@ impl PqVerificationContext {
         if carrier.session_id != self.session_id {
             fail!("PQ carried session differs from governing expected session");
         }
-        let message = final_vote_preimage(&self.block_id, carrier)?;
+        let message = vote_preimage(&self.block_id, carrier, is_final)?;
         let mut members = HashMap::new();
         let mut weights = Vec::with_capacity(self.validators.len());
         for member in &self.validators {
@@ -145,12 +299,7 @@ impl PqVerificationContext {
         if !has_quorum(weight, self.total_weight) {
             fail!("PQ insufficient verified weight: {weight} of {}", self.total_weight);
         }
-        Ok(VerifiedPqSignatures {
-            block_id: self.block_id.clone(),
-            session_id: self.session_id.clone(),
-            slot: carrier.slot,
-            weight,
-        })
+        Ok(weight)
     }
 }
 
@@ -160,8 +309,22 @@ pub fn final_vote_preimage(
     block_id: &BlockIdExt,
     carrier: &BlockSignaturesSimplexPq,
 ) -> Result<Vec<u8>> {
+    vote_preimage(block_id, carrier, true)
+}
+
+pub fn approval_vote_preimage(block_id: &BlockIdExt, approval: &PqApproval) -> Result<Vec<u8>> {
+    vote_preimage(block_id, &approval.data, false)
+}
+
+fn vote_preimage(
+    block_id: &BlockIdExt,
+    carrier: &BlockSignaturesSimplexPq,
+    is_final: bool,
+) -> Result<Vec<u8>> {
     use crate::ton::consensus::{
-        candidateid::CandidateId, datatosign::DataToSign, simplex::unsignedvote::FinalizeVote,
+        candidateid::CandidateId,
+        datatosign::DataToSign,
+        simplex::unsignedvote::{FinalizeVote, NotarizeVote},
     };
     let bytes = carrier.candidate_bytes()?;
     let mut input = Cursor::new(bytes.as_slice());
@@ -179,7 +342,11 @@ pub fn final_vote_preimage(
     }
     let id = CandidateId { slot: carrier.slot as i32, hash: UInt256::calc_file_hash(&canonical) }
         .into_boxed();
-    let vote = crate::serialize_boxed(&FinalizeVote { id }.into_boxed())?;
+    let vote = if is_final {
+        crate::serialize_boxed(&FinalizeVote { id }.into_boxed())?
+    } else {
+        crate::serialize_boxed(&NotarizeVote { id }.into_boxed())?
+    };
     crate::serialize_boxed(
         &DataToSign { session_id: carrier.session_id.clone(), data: vote }.into_boxed(),
     )

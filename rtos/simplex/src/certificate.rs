@@ -461,7 +461,7 @@ impl<T: ToTlUnsignedVote> Certificate<T> {
 
             // Verify signature
             let validator_key = desc.get_source_public_key(validator_idx);
-            if validator_key.verify(&vote_bytes, &sig.signature).is_err() {
+            if validator_key.verify_simplex(&vote_bytes, &sig.signature).is_err() {
                 fail!("Invalid vote signature for validator {}", validator_idx)
             }
 
@@ -551,7 +551,7 @@ impl Certificate<Vote> {
 
             // Verify signature - REJECT the entire certificate if any signature is invalid
             let validator_key = desc.get_source_public_key(validator_idx);
-            if validator_key.verify(&vote_bytes, &sig.signature).is_err() {
+            if validator_key.verify_simplex(&vote_bytes, &sig.signature).is_err() {
                 fail!("Invalid vote signature for validator {}", validator_idx)
             }
 

@@ -534,6 +534,39 @@ impl TopBlockDescrStuff {
         res_flags: &mut u8,
         mode: Mode,
     ) -> Result<i32> {
+        // Recheck PQ authentication against the supplied governing state even
+        // for cached, fake or SKIP_CHECK_SIG paths. No peer field is authority.
+        let pq_verified = if let Some(BlockSignaturesVariant::SimplexPq(carrier)) =
+            self.tbd.signatures()
+        {
+            let cc_seqno = last_mc_state
+                .shard_state_extra()?
+                .shards()
+                .calc_shard_cc_seqno(self.proof_for().shard())?;
+            let check = |next: bool| -> Result<rtos_api::pq_finality::VerifiedPqSignatures> {
+                let create = if next {
+                    rtos_api::pq_finality::PqVerificationContext::from_governing_next_validator_set
+                } else {
+                    rtos_api::pq_finality::PqVerificationContext::from_governing_config
+                };
+                create(
+                    last_mc_state.state()?.global_id(),
+                    last_mc_state.config_params()?,
+                    self.proof_for().clone(),
+                    self.info.vert_seq_no,
+                    self.info.prev_key_block_seqno,
+                    cc_seqno,
+                )?
+                .verify_final(carrier)
+            };
+            Some(match check(false) {
+                Ok(verified) => verified,
+                Err(_) if mode.intersects(Mode::ALLOW_NEXT_VSET) => check(true)?,
+                Err(error) => return Err(error),
+            })
+        } else {
+            None
+        };
         log::trace!(
             target: "validator",
             "TopBlockDescrStuff::validate_internal proof_for: {}, mc block: {}, mode: {:?}",
@@ -830,6 +863,11 @@ impl TopBlockDescrStuff {
             )
         }
 
+        if pq_verified.is_some() {
+            *res_flags |= 0x10;
+            return Ok(clen as i32);
+        }
+
         // check range
 
         // check signatures
@@ -941,6 +979,7 @@ struct ParsedProof {
 
 #[derive(Debug, Default)]
 struct BriefBlockInfo {
+    prev_key_block_seqno: u32,
     vert_seq_no: u32,
     gen_utime: u32,
     #[cfg(feature = "xp25")]
@@ -950,6 +989,7 @@ struct BriefBlockInfo {
 impl From<&BlockInfo> for BriefBlockInfo {
     fn from(info: &BlockInfo) -> Self {
         Self {
+            prev_key_block_seqno: info.prev_key_block_seqno(),
             vert_seq_no: info.vert_seq_no(),
             gen_utime: info.gen_utime(),
             #[cfg(feature = "xp25")]

@@ -191,7 +191,7 @@ impl LogHeader {
                 for node_desc in session_desc.node_ids.iter_mut() {
                     if node_desc.public_key.id() == local_id {
                         log::trace!("...resolve private key for {}", node_desc.public_key.id());
-                        node_desc.public_key = local_key.clone();
+                        node_desc.public_key = local_key.clone().into();
                     }
                 }
             }
@@ -675,7 +675,7 @@ impl LogPlayerImpl {
                         utils::parse_hex_as_public_key(captures.get(3).unwrap().as_str());
                     let adnl_id =
                         utils::parse_hex_as_public_key_hash(captures.get(4).unwrap().as_str());
-                    let consensus_node = ConsensusNode { public_key, adnl_id };
+                    let consensus_node = ConsensusNode { public_key: public_key.into(), adnl_id };
 
                     add_node_clone(session_id, consensus_node, weight);
 
@@ -718,7 +718,7 @@ impl LogPlayerImpl {
                     let public_key = utils::parse_hex_as_public_key(hex.trim());
                     let hex = &captures.get(4).unwrap().as_str();
                     let adnl_id = utils::parse_hex_as_public_key_hash(hex.trim());
-                    let consensus_node = ConsensusNode { public_key, adnl_id };
+                    let consensus_node = ConsensusNode { public_key: public_key.into(), adnl_id };
                     let weight = captures.get(5).unwrap().as_str().parse::<ValidatorWeight>()?;
 
                     add_node(session_id, consensus_node, weight);
