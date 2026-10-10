@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): naming and durable own-decision journal integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -242,6 +242,7 @@ pub struct PoolStateRecord {
 /// Use `split()` to decompose into component-specific bootstrap data.
 #[derive(Debug, Clone, Default)]
 pub struct Bootstrap {
+    pub own_journal: Vec<(Vec<u8>, Vec<u8>)>,
     /// Finalized blocks (sorted by slot)
     pub finalized_blocks: Vec<FinalizedBlockRecord>,
     /// Candidate info records
@@ -310,7 +311,8 @@ impl Bootstrap {
 
     /// Check if this is a fresh start (no persisted state)
     pub fn is_empty(&self) -> bool {
-        self.finalized_blocks.is_empty()
+        self.own_journal.is_empty()
+            && self.finalized_blocks.is_empty()
             && self.candidate_infos.is_empty()
             && self.notar_certs.is_empty()
             && self.final_certs.is_empty()
@@ -620,7 +622,7 @@ pub type SimplexDbPtr = Arc<SimplexDb>;
 ///
 pub struct SimplexDb {
     /// Underlying async key-value storage
-    storage: AsyncKeyValueStoragePtr,
+    pub(crate) storage: AsyncKeyValueStoragePtr,
     /// Storage ID (for logging)
     storage_id: String,
     /// Monotonic vote seqno counter (C++ parity: db.cpp next_seqno_)
@@ -1525,6 +1527,7 @@ impl SimplexDb {
         }
 
         let bootstrap = Bootstrap {
+            own_journal: Vec::new(),
             finalized_blocks,
             candidate_infos,
             notar_certs,
@@ -1568,7 +1571,10 @@ impl SimplexDb {
         for (key, value) in records {
             let tag = key.get(..4).ok_or_else(|| error!("PQ bootstrap: truncated database key"))?;
             let tag = u32::from_le_bytes(tag.try_into().unwrap());
-            if tag == prefix_finalized_block() {
+            if tag == u32::from_le_bytes(*crate::signing_coordinator::PREFIX) {
+                crate::signing_coordinator::validate_record(&key, &value)?;
+                bootstrap.own_journal.push((key, value));
+            } else if tag == prefix_finalized_block() {
                 strict_db_object::<FinalizedBlockKeyBoxed>(&key)?;
                 strict_db_object::<FinalizedBlockValueBoxed>(&value)?;
                 bootstrap.finalized_blocks.push(deserialize_finalized_block(&key, &value)?);
@@ -1779,6 +1785,7 @@ impl SimplexDb {
         }
 
         let bootstrap = Bootstrap {
+            own_journal: Vec::new(),
             finalized_blocks,
             candidate_infos,
             notar_certs,

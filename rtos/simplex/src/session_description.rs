@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): naming and durable own-decision journal integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -54,6 +54,8 @@ pub(crate) struct SessionDescription {
     /// Session identifier
     session_id: SessionId,
     pq_members: Vec<rtos_block::ValidatorDescr>,
+    own_signing:
+        std::sync::Mutex<Option<std::sync::Arc<crate::signing_coordinator::SigningCoordinator>>>,
     pq_context: Option<rtos_api::pq_finality::PqSessionContext>,
     /// Session options
     options: SessionOptions,
@@ -202,6 +204,7 @@ impl SessionDescription {
         let pq_members = nodes.iter().filter_map(|n| n.descriptor.clone()).collect();
         Ok(Self {
             pq_members,
+            own_signing: std::sync::Mutex::new(None),
             pq_context: None,
             session_id,
             options,
@@ -245,6 +248,91 @@ impl SessionDescription {
     }
     pub fn pq_context(&self) -> Option<&rtos_api::pq_finality::PqSessionContext> {
         self.pq_context.as_ref()
+    }
+
+    pub fn is_pq(&self) -> bool {
+        self.sources[self.self_idx.value() as usize].public_key.pq_key().is_some()
+    }
+
+    pub fn sign_own_vote(
+        &self,
+        vote: &crate::simplex_state::Vote,
+    ) -> Result<rtos_api::ton::consensus::simplex::vote::Vote> {
+        if !self.is_pq() {
+            return Ok(crate::utils::sign_vote(
+                vote,
+                &self.session_id,
+                self.get_legacy_signing_key()?,
+            )?
+            .only());
+        }
+        let guard = self.own_signing.lock().map_err(|_| error!("signer capability poisoned"))?;
+        guard.as_ref().ok_or_else(|| error!("PQ consensus signer is Disabled"))?.vote(vote)
+    }
+
+    pub fn seal_own_candidate(
+        &self,
+        candidate: rtos_api::ton::consensus::CandidateData,
+    ) -> Result<rtos_api::ton::consensus::CandidateData> {
+        let slot = *candidate.slot();
+        if slot < 0 || self.get_leader(SlotIndex::new(slot as u32)) != self.get_self_idx() {
+            fail!("candidate signer is not session leader");
+        }
+        let guard = self.own_signing.lock().map_err(|_| error!("signer capability poisoned"))?;
+        guard
+            .as_ref()
+            .ok_or_else(|| error!("PQ consensus signer is Disabled"))?
+            .candidate(candidate)
+    }
+
+    pub fn recover_own_journal(&self, bootstrap: &mut crate::database::Bootstrap) -> Result<()> {
+        let guard = self.own_signing.lock().map_err(|_| error!("signer capability poisoned"))?;
+        match guard.as_ref() {
+            Some(signer) => signer.recover_bootstrap(bootstrap, self.self_idx),
+            None if bootstrap.own_journal.is_empty() => Ok(()),
+            None => fail!("own journal requires authenticated binding"),
+        }
+    }
+
+    pub fn verify_own_journal(&self, raw: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        let guard = self.own_signing.lock().map_err(|_| error!("signer capability poisoned"))?;
+        match guard.as_ref() {
+            Some(signer) => signer.verify_bootstrap(raw),
+            None if raw.is_empty() => Ok(()),
+            None => {
+                fail!("own signing journal requires authenticated network and ownership binding")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn install_test_coordinator(
+        &self,
+        coordinator: std::sync::Arc<crate::signing_coordinator::SigningCoordinator>,
+    ) -> Result<()> {
+        coordinator.check_session(self)?;
+        let mut guard =
+            self.own_signing.lock().map_err(|_| error!("signer capability poisoned"))?;
+        if guard.is_some() {
+            fail!("signer capability already installed");
+        }
+        *guard = Some(coordinator);
+        Ok(())
+    }
+
+    pub(crate) fn committee_digest(&self) -> rtos_block::UInt256 {
+        let mut data = Vec::new();
+        for source in &self.sources {
+            data.extend_from_slice(source.id.data());
+            data.extend_from_slice(source.adnl_id.data());
+            data.extend_from_slice(&source.weight.to_le_bytes());
+            if let Some(key) = source.public_key.pq_key() {
+                data.extend_from_slice(&key.algorithm_id.to_le_bytes());
+                data.extend_from_slice(key.key_id.as_slice());
+                data.extend_from_slice(&key.public_key);
+            }
+        }
+        rtos_block::UInt256::calc_file_hash(&data)
     }
 
     pub fn get_session_id(&self) -> &SessionId {

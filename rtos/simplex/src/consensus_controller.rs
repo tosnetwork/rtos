@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): naming and durable own-decision journal integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -112,7 +112,7 @@ use crate::{
         SkipCertificateReachedEvent, Vote,
     },
     trace_collector::TraceCollector,
-    utils::{extract_vote_and_signature, sign_vote, threshold_66, verify_vote_signature},
+    utils::{extract_vote_and_signature, threshold_66, verify_vote_signature},
     BlockCandidatePriority, BlockHash, BlockPayloadPtr, BlockSourceInfo, PublicKeyHash,
     RawVoteData, SessionId, SIMPLEX_ROUNDLESS,
 };
@@ -1242,12 +1242,8 @@ impl ConsensusController {
         }
 
         // Sign the vote with the session-scoped signature.
-        let signed_vote = match self
-            .description
-            .get_legacy_signing_key()
-            .and_then(|key| sign_vote(&vote, self.session_id(), key))
-        {
-            Ok(v) => v.only(), // Extract inner Vote from Vote_
+        let signed_vote = match self.description.sign_own_vote(&vote) {
+            Ok(v) => v,
             Err(e) => {
                 log::error!(
                     "Session {} broadcast_vote: failed to sign vote: {}",
@@ -1259,7 +1255,11 @@ impl ConsensusController {
             }
         };
 
-        backend.persist_our_vote(&signed_vote);
+        // PQ publication is already gated by durable intent and exact bytes.
+        // Classical persistence retains its legacy asynchronous behavior.
+        if !self.description.is_pq() {
+            backend.persist_our_vote(&signed_vote);
+        }
 
         log::trace!(
             "Session {} broadcast_vote: sending signed vote",

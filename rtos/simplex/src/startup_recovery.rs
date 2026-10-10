@@ -1,5 +1,5 @@
 /*
- * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-10): naming and durable own-decision journal integration.
  * Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -276,7 +276,7 @@ impl SessionStartupRecoveryProcessor {
         backend: &mut dyn StartupRecoveryBackend,
     ) -> Result<()> {
         // Take bootstrap (consumes it)
-        let bootstrap = match self.bootstrap.take() {
+        let mut bootstrap = match self.bootstrap.take() {
             Some(b) => b,
             None => {
                 log::warn!(
@@ -306,6 +306,9 @@ impl SessionStartupRecoveryProcessor {
 
         if self.description.pq_context().is_some() {
             self.verify_pq_bootstrap(&bootstrap)?;
+            self.description.recover_own_journal(&mut bootstrap)?;
+            self.verify_pq_bootstrap(&bootstrap)?;
+            self.candidate_info_map = Self::build_candidate_info_map(&bootstrap.candidate_infos);
         }
 
         self.recovery_begin_startup_replay(backend);
@@ -506,6 +509,7 @@ impl SessionStartupRecoveryProcessor {
     /// This is authentication of recovery input, not an intent journal or a
     /// claim of atomicity across the existing asynchronous record writes.
     fn verify_pq_bootstrap(&self, bootstrap: &Bootstrap) -> Result<()> {
+        self.description.verify_own_journal(&bootstrap.own_journal)?;
         // Authenticate every persisted vote/certificate before touching the FSM,
         // receiver caches, finalized cursor, or listener callbacks.
         for record in &bootstrap.votes {
