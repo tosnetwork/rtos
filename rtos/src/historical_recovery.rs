@@ -17,6 +17,8 @@ use rtos_block::{
 use std::sync::{Arc, LazyLock, Mutex};
 use storage::{bounded_cell::CellReadBudget, types::PersistentStatePartId};
 mod serialize;
+#[cfg(test)]
+pub(crate) mod test_hooks;
 
 static REQUESTS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
@@ -108,7 +110,10 @@ impl Request {
                     engine.as_ref(),
                     check.as_ref(),
                     &budget,
-                )
+                )?;
+                #[cfg(test)]
+                test_hooks::after_sync(engine.as_ref())?;
+                Ok::<_, anyhow::Error>(())
             })
             .await
             .map_err(|e| error!("Historical capsule durability owner failed: {e}"))??;
@@ -478,6 +483,8 @@ pub(crate) async fn authenticate_retired(
             .map_err(|e| error!("Historical source evidence owner failed: {e}"))??;
             let admission = DurableHistoryAdmission::from_source(&identity, source)?;
             request.commit(admission).await?;
+            #[cfg(test)]
+            test_hooks::completed(owner.as_ref());
             Ok(identity)
         },
     )?
@@ -488,6 +495,8 @@ pub(crate) async fn authenticate_retired(
 impl Request {
     async fn commit(self: Arc<Self>, admission: DurableHistoryAdmission) -> Result<()> {
         tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            test_hooks::before_commit(self.engine.as_ref())?;
             // Retain actual source/node authority and request ownership until
             // every admitted capsule's final directory sync has completed.
             let mut prepared =
@@ -502,6 +511,8 @@ impl Request {
                     std::mem::take(&mut state.proofs),
                     &self.budget,
                 )?;
+                #[cfg(test)]
+                test_hooks::after_sync(self.engine.as_ref())?;
             }
             Ok::<_, anyhow::Error>(())
         })

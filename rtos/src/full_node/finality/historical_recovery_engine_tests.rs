@@ -3,6 +3,22 @@
 //! never construct historical admission or authenticated state capabilities.
 use super::*;
 
+fn retained_source_bytes(namespace: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut result = std::collections::BTreeMap::new();
+    let mut dirs = vec![namespace.to_owned()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                result.insert(path.clone(), std::fs::read(path).unwrap());
+            }
+        }
+    }
+    result
+}
+
 async fn recover_source(mode: u8) {
     let signer = std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER").unwrap();
     let pair = Pair::with_source_options("included", false, true, true, true).await;
@@ -228,6 +244,72 @@ async fn recover_source(mode: u8) {
             assert!(!entries.is_empty(), "history recovery does not release full canonical debt");
             assert!(closes.is_empty(), "history storage must not mint close/custody authority");
         } else {
+            if mode == 4 {
+                use crate::historical_recovery::test_hooks;
+                let before = retained_source_bytes(&namespace);
+                let baseline = test_hooks::available_requests();
+                let mut control = test_hooks::install(engine.as_ref(), true, false);
+                let owner = engine.clone();
+                let source = record.clone();
+                let observer = tokio::spawn(async move {
+                    owner.authenticate_retired_source_with_history(source).await
+                });
+                tokio::time::timeout(Duration::from_secs(60), control.entered.take().unwrap())
+                    .await
+                    .expect("actual commit owner must reach gate")
+                    .unwrap();
+                observer.abort();
+                assert!(observer.await.unwrap_err().is_cancelled());
+                assert_eq!(
+                    test_hooks::available_requests() + 1,
+                    baseline,
+                    "cancelled observer must not return live request admission"
+                );
+                assert!(
+                    simplex::finality_recovery::scan_finality_recovery_namespace(&namespace)
+                        .unwrap()
+                        .is_none(),
+                    "real source owner remains locked until actual IO completes"
+                );
+                assert_eq!(retained_source_bytes(&namespace), before);
+                control.release();
+                tokio::time::timeout(Duration::from_secs(60), control.completed())
+                    .await
+                    .expect("cancelled observer's actual owned commit must finish");
+                assert_eq!(test_hooks::available_requests(), baseline);
+                assert!(simplex::finality_recovery::scan_finality_recovery_namespace(&namespace)
+                    .unwrap()
+                    .is_some());
+                assert_eq!(control.syncs(), 1);
+                assert_eq!(retained_source_bytes(&namespace), before);
+            }
+            if mode == 5 {
+                let before = retained_source_bytes(&namespace);
+                let control =
+                    crate::historical_recovery::test_hooks::install(engine.as_ref(), false, true);
+                let error = engine
+                    .clone()
+                    .authenticate_retired_source_with_history(record.clone())
+                    .await
+                    .err()
+                    .expect("uncertain capsule sync must refuse success");
+                assert_eq!(
+                    error.downcast_ref::<std::io::Error>().and_then(|e| e.raw_os_error()),
+                    Some(5)
+                );
+                assert_eq!(control.syncs(), 1);
+                assert_eq!(retained_source_bytes(&namespace), before);
+                // The first attempt genuinely persisted bytes before the
+                // application-visible EIO. Reading them is not durability ACK:
+                // retry must execute the same real file/directory barriers.
+                engine
+                    .clone()
+                    .authenticate_retired_source_with_history(record.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(control.syncs(), 2);
+                assert_eq!(retained_source_bytes(&namespace), before);
+            }
             let authenticated = engine
                 .clone()
                 .authenticate_retired_source_with_history(record.clone())
@@ -316,4 +398,16 @@ async fn historical_recovery_source_actual_pack_gc_remote_replay_and_cold_capsul
 #[ignore = "real node WAL/full canonical authorization; RTOS_PUBLIC_FIXTURE_SIGNER required"]
 async fn historical_recovery_full_canonical_exact_debt_and_domain_controls() {
     recover_source(3).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real owned historical commit cancellation; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_cancelled_observer_retains_source_and_budget_until_commit() {
+    recover_source(4).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "actual capsule sync boundary uncertainty; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_uncertain_sync_preserves_debt_and_rebarriers_before_retry() {
+    recover_source(5).await;
 }
