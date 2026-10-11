@@ -146,3 +146,50 @@ async fn persistent_repair_archive_owner_cancel_waiter_and_shutdown_drain() {
     close(engine).await;
     drop(dir);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_repair_archive_metadata_wal_failure_retains_loose_and_cold_recovers() {
+    use storage::archives::package_entry_id::{GetFileName, PackageEntryId};
+    let Fixture { dir, engine, target, .. } = fixture(false).await;
+    let id = target.id().clone();
+    let handle = engine.load_block_handle(&id).unwrap().unwrap();
+    assert!(!handle.is_archived());
+    let proof = engine.load_block_proof(&handle, false).await.unwrap();
+    let base = PathBuf::from(engine.db_root_dir().unwrap()).join("archive/unapplied");
+    let body_path = base.join(PackageEntryId::Block(&id).filename_short());
+    let proof_path = base.join(PackageEntryId::Proof(&id).filename_short());
+    let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_worker = observed.clone();
+    engine.db().set_publication_sync_observer(Some(Arc::new(move |point, _| {
+        if point == storage::durability::SyncPoint::Wal {
+            observed_worker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(std::io::Error::from_raw_os_error(5).into());
+        }
+        Ok(())
+    })));
+    let error = engine.db().archive_block(&id, None).await.unwrap_err();
+    assert!(error.to_string().contains("Failed to move block"));
+    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(handle.is_archived(), "failure occurred after metadata flag/enqueue, at actual WAL sync");
+    assert_eq!(std::fs::read(&body_path).unwrap(), target.data());
+    assert_eq!(std::fs::read(&proof_path).unwrap(), proof.data());
+    engine.db().set_publication_sync_observer(None);
+    assert!(engine.db().archive_block(&id, None).await.unwrap_err().to_string().contains("admission stopped"),
+        "unknown WAL result must not be hidden by the in-memory archived flag");
+    assert!(engine.clone().wait_stop().await.is_err(), "actual migration failure must reach Engine shutdown");
+    drop(handle);
+    let weak = Arc::downgrade(&engine);
+    drop(engine);
+    assert!(weak.upgrade().is_none());
+    let engine = open_engine(dir.path()).await;
+    let run = std::panic::AssertUnwindSafe(async {
+        let handle = engine.load_block_handle(&id).unwrap().unwrap();
+        assert_eq!(engine.load_block(&handle).await.unwrap().data(), target.data());
+        assert_eq!(engine.load_block_proof(&handle, false).await.unwrap().data(), proof.data());
+        engine.db().sync_publication_metadata(&handle).await.unwrap();
+        assert_eq!(std::fs::read(&body_path).unwrap(), target.data());
+        assert_eq!(std::fs::read(&proof_path).unwrap(), proof.data());
+    }).catch_unwind().await;
+    close(engine).await;
+    run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
