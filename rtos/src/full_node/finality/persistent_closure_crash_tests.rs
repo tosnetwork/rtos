@@ -509,7 +509,7 @@ async fn canonical_after_offer(
             // The original schema digest covers the full body, exact carrier,
             // role/origin/domain, timestamp, last MC and candidate-sent flag.
             assert_eq!(digest, request.source_digest);
-            assert!(!canonical.data.is_empty());
+            assert!(!canonical.data.data().is_empty());
             let (active, after) = inspect_closure_progress(engine.db(), domain).unwrap();
             assert_eq!(after, closed);
             assert!(!original.released);
