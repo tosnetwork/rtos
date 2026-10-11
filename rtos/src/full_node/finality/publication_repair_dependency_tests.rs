@@ -444,3 +444,68 @@ async fn bounded_state_actual_engine_cold_warm_and_budget_rejection() {
         std::panic::resume_unwind(panic);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mc_live_repair_bounded_writer_pin_survives_gc_and_transfers_to_custody() {
+    let Fixture { dir: _dir, engine, parent, target, request } = fixture(false).await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let parent_pin = engine.load_and_pin_state(parent.id()).await.unwrap();
+        engine.shard_states_keeper().test_retire_history_state(target.id());
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while engine.db().test_contains_dynamic_state_record(target.id()).unwrap() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("actual GC must remove target before bounded reconstruction");
+        let _bounded_only = crate::publication_repair::require_bounded_durability(&engine);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        engine.db().set_publication_sync_observer(Some(Arc::new(move |point, _| {
+            if point == storage::durability::SyncPoint::Wal {
+                if let Some(entered) = entered_tx.lock().unwrap().take() {
+                    let _ = entered.send(());
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+            }
+            Ok(())
+        })));
+        let owner = engine.clone();
+        let repair = tokio::spawn(async move { repair_mc_final(owner, request).await });
+        tokio::time::timeout(Duration::from_secs(15), entered_rx).await.unwrap().unwrap();
+        // The bounded writer has committed its atomic index/cells batch and is
+        // paused at the real WAL boundary. Check the actual GC decision too:
+        // queue serialization alone would postpone deletion while WAL is paused.
+        assert!(!engine.shard_states_keeper().allow_state_gc(target.id()).unwrap());
+        assert!(engine.db().test_contains_dynamic_state_record(target.id()).unwrap());
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert!(engine.db().test_contains_dynamic_state_record(target.id()).unwrap());
+        release_tx.send(()).unwrap();
+        let custody = repair.await.unwrap().unwrap();
+        engine.db().set_publication_sync_observer(None);
+        assert_eq!(
+            custody.state_root(),
+            &target.block().unwrap().read_state_update().unwrap().new_hash
+        );
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert!(engine.db().test_contains_dynamic_state_record(target.id()).unwrap());
+        drop(custody);
+        assert!(engine.shard_states_keeper().allow_state_gc(target.id()).unwrap());
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while engine.db().test_contains_dynamic_state_record(target.id()).unwrap() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("dropping custody must release the transferred repair pin");
+        drop(parent_pin);
+    })
+    .catch_unwind()
+    .await;
+    close(engine).await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

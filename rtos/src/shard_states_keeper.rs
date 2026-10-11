@@ -43,7 +43,7 @@ use storage::{
     shardstate_db_async::{AllowStateGcResolver, SsNotificationCallback},
     types::PersistentStatePartId,
 };
-struct StateReadLease {
+pub(crate) struct StateReadLease {
     id: BlockIdExt,
     resolver: Arc<AllowStateGcSmartResolver>,
     active: bool,
@@ -334,6 +334,21 @@ impl ShardStatesKeeper {
     /// Pin an existing physical state without cache fallback or catch-up writes.
     /// Repair callers must not turn a missing dependency into recursive recovery.
     /// Synchronous and called only by the Engine-owned blocking reader.
+    pub(crate) fn reserve_repair_target(
+        &self,
+        candidate: &crate::publication_repair::PreparedRepairCandidate,
+    ) -> Result<Option<StateReadLease>> {
+        // Candidate fields/constructor are private to authenticated repair.
+        self.db.with_absent_repair_target(candidate.block_id(), || {
+            self.gc_resolver.reserve_absent_repair_state(candidate.block_id())?;
+            Ok(StateReadLease {
+                id: candidate.block_id().clone(),
+                resolver: self.gc_resolver.clone(),
+                active: true,
+            })
+        })
+    }
+
     pub(crate) fn load_and_pin_bounded_state(
         &self,
         id: &BlockIdExt,

@@ -329,10 +329,11 @@ async fn mc_live_repair_missing_root_preflights_budget_before_rebuilding_durable
         pair.receiver = open_engine(&pair._dir.path().join("receiver")).await;
         // Local body/fullproof still exist, so no network setup is needed here.
         assert!(!pair.receiver.db().test_contains_dynamic_state_record(pair.master.id()).unwrap());
+        let _bounded_only = crate::publication_repair::require_bounded_durability(&pair.receiver);
         crate::publication_repair::limit_next_candidate_for_test(&pair.receiver, 0);
         let failure = repair_mc_final(pair.receiver.clone(), expected.clone()).await;
         assert!(
-            matches!(failure, Err(ref error) if error.to_string().contains("cell/byte budget"))
+            matches!(failure, Err(ref error) if crate::history_read_budget::stops_fallback(error))
         );
         assert!(
             !pair.receiver.db().test_contains_dynamic_state_record(pair.master.id()).unwrap(),

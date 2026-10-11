@@ -57,7 +57,7 @@ use storage::{
     },
     db::{
         filedb::FileDb,
-        node::{open_node_db, CELLS_CF_NAME, CELLSCOUNTERS_CF_NAME},
+        node::{open_node_db, CELLSCOUNTERS_CF_NAME, CELLS_CF_NAME},
         rocksdb::{AccessType, RocksDb, CATCHAINS_DB_NAME},
     },
     dynamic_boc_rc_db::AsyncCellsStorageAdapter,
@@ -370,11 +370,7 @@ impl InternalDb {
         let can_create_db = access_type == AccessType::ReadWrite;
         // Existing dynamic counter CFs still need their merge operator when
         // this startup selects archival state storage.
-        let db = open_node_db(
-            &config.db_directory,
-            &config.cells_db_config,
-            access_type.clone(),
-        )?;
+        let db = open_node_db(&config.db_directory, &config.cells_db_config, access_type.clone())?;
         let db_catchain = RocksDb::new(
             config.db_directory.as_str(),
             CATCHAINS_DB_NAME,
@@ -705,6 +701,53 @@ impl InternalDb {
         Ok(())
     }
 
+    /// Repair-only linkage checks use the authenticated candidate's request budget.
+    pub(crate) fn repair_candidate_links(
+        &self,
+        handle: &Arc<BlockHandle>,
+        candidate: &crate::publication_repair::PreparedRepairCandidate,
+    ) -> Result<()> {
+        if handle.id() != candidate.block_id()
+            || !handle.is_applied()
+            || !handle.id().shard().is_masterchain()
+        {
+            fail!("Repair linkage handle does not match applied masterchain candidate");
+        }
+        let previous = candidate.previous_blocks();
+        if previous.len() != 1 {
+            fail!("Invalid masterchain repair predecessors");
+        }
+        let parent = self
+            .load_block_handle(&previous[0])?
+            .ok_or_else(|| error!("Applied repair predecessor handle missing"))?;
+        // Validate every existing link before mutating any linkage or flags.
+        let check = |db: &BlockInfoDb, id: &BlockIdExt, expected: &BlockIdExt| -> Result<()> {
+            let reservation = candidate
+                .budget()
+                .reserve(crate::history_read_budget::ReadKind::Metadata, BlockIdExt::SIZE)?;
+            if reservation.allowance() != BlockIdExt::SIZE {
+                return Err(
+                    crate::history_read_budget::HistoryBudgetExceeded("linkage bytes").into()
+                );
+            }
+            if let Some(bytes) = db.try_get(id)? {
+                validate_repair_linkage(&bytes, expected)?;
+                reservation.finish(&bytes)?;
+            } else {
+                reservation.finish(&[])?;
+            }
+            Ok(())
+        };
+        check(&self.prev1_block_db, handle.id(), &previous[0])?;
+        check(&self.next1_block_db, parent.id(), handle.id())?;
+        self.prev1_block_db.put(handle.id(), &previous[0].serialize())?;
+        self.next1_block_db.put(parent.id(), &handle.id().serialize())?;
+        handle.set_prev1();
+        parent.set_next1();
+        self.store_block_handle(&parent, None)?;
+        Ok(())
+    }
+
     pub async fn sync_publication_metadata(&self, handle: &Arc<BlockHandle>) -> Result<()> {
         // Explicitly serialize current flags even if they were already set in
         // memory before an earlier writer failure/crash.
@@ -719,6 +762,174 @@ impl InternalDb {
 
     /// Read physical artifacts despite handle flags; repair a missing body/link
     /// from authenticated evidence. Preserve an existing Final proof on Approval.
+    /// Repair-only exact-byte persistence. No old proof parser or ordinary apply.
+    pub(crate) async fn ensure_repair_artifacts(
+        &self,
+        candidate: &crate::publication_repair::PreparedRepairCandidate,
+    ) -> Result<Arc<BlockHandle>> {
+        let budget = candidate.budget();
+        let block = candidate.block();
+        let proof = candidate.proof();
+        let handle =
+            self.load_block_handle(block.id())?.ok_or_else(|| error!("Repair handle absent"))?;
+        if !handle.is_applied() || proof.is_link() || proof.id() != block.id() {
+            fail!("Invalid repair artifact capability");
+        }
+        let body_id = PackageEntryId::Block(block.id());
+        let proof_id = PackageEntryId::Proof(block.id());
+        // Repeat bounded physical admission immediately before replacement.
+        // Never use an unbounded parse/metadata shortcut at this entry point.
+        for (entry, kind) in [
+            (&body_id, crate::history_read_budget::ReadKind::State),
+            (&proof_id, crate::history_read_budget::ReadKind::Proof),
+        ] {
+            let read = budget.reserve(kind, 16 * 1024 * 1024)?;
+            let outcome = self
+                .archive_manager
+                .get_file_bounded(
+                    &handle,
+                    entry,
+                    storage::archives::bounded_read::ArchiveReadLimits {
+                        data_bytes: read.allowance(),
+                        filename_bytes: 512,
+                    },
+                )
+                .await;
+            match outcome {
+                Ok(bytes) => read.finish(&bytes)?,
+                Err(error) if crate::history_read_budget::stops_fallback(&error) => {
+                    return Err(error)
+                }
+                Err(error) => {
+                    if let Some(evidence) = error
+                        .downcast_ref::<storage::archives::bounded_read::ArchiveReadNotStarted>(
+                    ) {
+                        read.refund_not_started(evidence)?;
+                    }
+                    // Missing/corrupt local artifacts may be replaced only by
+                    // this capability's already authenticated Final bytes.
+                }
+            }
+        }
+        {
+            let _body = handle.block_file_lock().write().await;
+            let _proof = handle.proof_file_lock().write().await;
+            handle.reset_archived();
+            self.archive_manager
+                .replace_file_durable(&body_id, block.data())
+                .await
+                .map_err(publication_durability_failure)?;
+            self.archive_manager
+                .replace_file_durable(&proof_id, proof.data())
+                .await
+                .map_err(publication_durability_failure)?;
+            handle.set_data();
+            handle.set_proof();
+        }
+        self.archive_manager
+            .sync_file(&handle, &body_id, self.publication_sync_observer().as_deref())
+            .await
+            .map_err(publication_durability_failure)?;
+        self.archive_manager
+            .sync_file(&handle, &proof_id, self.publication_sync_observer().as_deref())
+            .await
+            .map_err(publication_durability_failure)?;
+        let body =
+            budget.reserve(crate::history_read_budget::ReadKind::State, block.data().len())?;
+        let raw = self
+            .load_block_data_raw_bounded(
+                &handle,
+                storage::archives::bounded_read::ArchiveReadLimits {
+                    data_bytes: body.allowance(),
+                    filename_bytes: 512,
+                },
+            )
+            .await?;
+        body.finish(&raw)?;
+        if raw.as_slice() != block.data() {
+            fail!("Durable repair body changed");
+        }
+        let proof_read =
+            budget.reserve(crate::history_read_budget::ReadKind::Proof, proof.data().len())?;
+        let raw = self
+            .load_block_proof_raw_bounded(
+                &handle,
+                false,
+                storage::archives::bounded_read::ArchiveReadLimits {
+                    data_bytes: proof_read.allowance(),
+                    filename_bytes: 512,
+                },
+            )
+            .await?;
+        proof_read.finish(&raw)?;
+        if raw.as_slice() != proof.data() {
+            fail!("Durable repair proof changed");
+        }
+        Ok(handle)
+    }
+
+    pub(crate) fn has_repair_state_index(&self, id: &BlockIdExt) -> Result<bool> {
+        match &self.state_db {
+            StateDb::Dynamic(db) => db.contains_state_record(id),
+            StateDb::Archive(db) => db.contains_state_record(id),
+        }
+    }
+
+    pub(crate) fn with_absent_repair_target<T>(
+        &self,
+        id: &BlockIdExt,
+        reserve: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        match &self.state_db {
+            StateDb::Dynamic(db) => db.with_absent_state(id, reserve),
+            StateDb::Archive(db) => db.with_absent_state(id, reserve),
+        }
+    }
+
+    pub(crate) async fn store_repair_candidate(
+        &self,
+        candidate: &crate::publication_repair::PreparedRepairCandidate,
+    ) -> Result<()> {
+        let budget = candidate.budget().clone();
+        let id = candidate.block_id();
+        let limits = rtos_block::merkle_apply_budget::MerkleApplyLimits {
+            max_entries: budget.limits().cells,
+            max_depth: budget.limits().depth,
+        };
+        match &self.state_db {
+            StateDb::Dynamic(db) => {
+                db.put_bounded_observed(
+                    id,
+                    candidate.root().clone(),
+                    limits,
+                    budget,
+                    self.publication_sync_observer(),
+                )
+                .await
+            }
+            StateDb::Archive(db) => {
+                db.put_bounded_observed(
+                    id,
+                    candidate.root().clone(),
+                    limits,
+                    budget,
+                    self.publication_sync_observer(),
+                )
+                .await
+            }
+        }
+        .map_err(|error| {
+            if error
+                .downcast_ref::<storage::dynamic_boc_rc_db::BoundedStateWriteFailure>()
+                .is_some()
+            {
+                publication_durability_failure(error)
+            } else {
+                error
+            }
+        })
+    }
+
     pub async fn ensure_publication_artifacts(
         &self,
         block: &BlockStuff,
@@ -1909,3 +2120,32 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests/test_node_db_recovery.rs"]
 mod node_db_recovery_tests;
+
+// The pinned DB slice is checked before deserialization; no attacker-sized Vec.
+fn validate_repair_linkage(bytes: &[u8], expected: &BlockIdExt) -> Result<()> {
+    if bytes.len() != BlockIdExt::SIZE {
+        fail!("Invalid repair linkage record length");
+    }
+    if BlockIdExt::deserialize(bytes)? != *expected {
+        fail!("Conflicting persisted repair linkage");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod repair_linkage_tests {
+    use super::*;
+    #[test]
+    fn repair_linkage_exact_record_and_full_identity() {
+        let expected = BlockIdExt::default();
+        let bytes = expected.serialize();
+        validate_repair_linkage(&bytes, &expected).unwrap();
+        let mut oversized = bytes.to_vec();
+        oversized.extend_from_slice(&[0; 1024]);
+        assert!(validate_repair_linkage(&oversized, &expected).is_err());
+        assert!(validate_repair_linkage(&bytes[..bytes.len() - 1], &expected).is_err());
+        let mut wrong = expected.clone();
+        wrong.file_hash = UInt256::from([1; 32]);
+        assert!(validate_repair_linkage(&wrong.serialize(), &expected).is_err());
+    }
+}

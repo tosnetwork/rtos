@@ -1234,6 +1234,8 @@ impl EngineOperations for Engine {
         self: Arc<Self>,
         accepted: &crate::validator::accept_block::AcceptedSessionBlock,
     ) -> Result<()> {
+        #[cfg(test)]
+        crate::publication_repair::assert_ordinary_durability_allowed(self.as_ref());
         let (handle, persisted_proof) =
             self.db().ensure_publication_artifacts(accepted.block(), accepted.proof()).await?;
         if persisted_proof.is_link() {
