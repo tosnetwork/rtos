@@ -154,6 +154,20 @@ pub trait PrivateOverlayOperations: Sync + Send {
         block_sync_params: Option<BlockSyncOverlayParams>,
     ) -> Result<Arc<dyn CatchainOverlay + Send>>;
 
+    /// Stop the exact registered generation; unsupported implementations must not
+    /// claim success or allow session database ownership to be released.
+    fn stop_catchain_client_checked(
+        &self,
+        _id: &Arc<PrivateOverlayShortId>,
+        _overlay: &consensus_common::ConsensusOverlayPtr,
+    ) -> Result<()> {
+        rtos_block::fail!("Checked consensus overlay shutdown is unavailable")
+    }
+
+    fn catchain_client_drained(&self, _overlay: &consensus_common::ConsensusOverlayPtr) -> bool {
+        false
+    }
+
     fn stop_catchain_client(&self, overlay_short_id: &Arc<PrivateOverlayShortId>);
 }
 
