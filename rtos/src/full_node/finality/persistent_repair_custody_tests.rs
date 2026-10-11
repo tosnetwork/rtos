@@ -273,3 +273,6 @@ mod crash_tests;
 mod archive_tests;
 #[path = "persistent_ledger_startup_tests.rs"]
 mod ledger_startup_tests;
+
+#[path = "persistent_startup_owner_tests.rs"]
+mod startup_owner_tests;
