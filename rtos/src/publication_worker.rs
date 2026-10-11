@@ -1285,11 +1285,26 @@ fn canonical_record_inner(
     let rtos_api::ton::ton_node::SignatureSet::TonNode_SignatureSet_SimplexPq(fields) = wire else {
         fail!("Canonical retention requires a PQ carrier");
     };
-    let verifier = runtime
-        .pq_context()
-        .ok_or_else(|| error!("Canonical retention needs PQ runtime"))?
-        .for_block(record.block_id.clone())?;
-    let verified = verifier.verify_network(&PqNetworkSignatureSet::from_node(fields)?)?;
+    let context = runtime.pq_context()
+        .ok_or_else(|| error!("Canonical retention needs PQ runtime"))?;
+    let verifier = match budget {
+        Some(budget) => context.for_block_bounded(
+            record.block_id.clone(), &crate::bounded_session_derivation::ConfigBudget(budget),
+        )?,
+        None => context.for_block(record.block_id.clone())?,
+    };
+    let network = match budget {
+        Some(budget) => PqNetworkSignatureSet::from_node_bounded(
+            fields, &crate::bounded_session_derivation::ConfigBudget(budget),
+        )?,
+        None => PqNetworkSignatureSet::from_node(fields)?,
+    };
+    let verified = match budget {
+        Some(budget) => verifier.verify_network_bounded(
+            &network, &crate::bounded_session_derivation::ConfigBudget(budget),
+        )?,
+        None => verifier.verify_network(&network)?,
+    };
     if verified.is_final() != record.carrier.is_final() {
         fail!("Canonical carrier role mismatch");
     }
