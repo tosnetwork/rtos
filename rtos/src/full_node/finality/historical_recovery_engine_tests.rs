@@ -282,6 +282,31 @@ async fn recover_scenario(scenario: RecoveryScenario) {
             assert!(engine.db().test_contains_dynamic_state_record(&target).unwrap());
             return (record, target, target_root.repr_hash().clone(), closing, namespace);
         }
+        // Ordinary apply queues dynamic-state persistence when the cache is
+        // enabled. An initially absent record is not evidence of completed GC:
+        // a large state's original PutState may still be saving its cells.
+        let mut states_to_retire = vec![&target];
+        if mode == 6 {
+            states_to_retire.push(pair.master.id());
+        }
+        if let Some(middle) = &hole {
+            states_to_retire.push(middle);
+        }
+        for id in states_to_retire {
+            let handle = engine.load_block_handle(id).unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while !handle.has_saved_state()
+                    || !engine.db().test_contains_dynamic_state_record(id).unwrap()
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.unwrap_or_else(|_| panic!(
+                "ordinary state must finish persistence before GC: {id}; saved={}, contains={:?}",
+                handle.has_saved_state(), engine.db().test_contains_dynamic_state_record(id)
+            ));
+            assert!(engine.db().test_contains_dynamic_state_record(id).unwrap(),
+                "GC must start from a physically present ordinary state: {id}");
+        }
         engine.shard_states_keeper().test_retire_history_state(&target);
         tokio::time::timeout(Duration::from_secs(20), async {
             while engine.db().test_contains_dynamic_state_record(&target).unwrap() {
