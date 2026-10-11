@@ -228,14 +228,29 @@ async fn recover_scenario(scenario: RecoveryScenario) {
                 .unwrap()
                 .as_secs(),
         };
-        if scenario == RecoveryScenario::CorruptOrdinaryState {
-            // Keep the damaged historical target behind a healthy applied head,
-            // so startup does not need its root before the recovery call.
+        if matches!(scenario, RecoveryScenario::CorruptOrdinaryState | RecoveryScenario::AutonomousColdStartup) {
+            // Publication-worker startup loads the ordinary applied head. Keep
+            // the historical MC2 target behind a genuinely applied, saved MC3.
             for owner in [&pair.provider, &pair.receiver, pair.observer.as_ref().unwrap()] {
                 let handle = owner.store_block(&next_block).await.unwrap().to_any();
                 owner.store_block_proof(&next, Some(handle), &next_proof).await.unwrap();
                 owner.clone().download_and_apply_block(&next, next.seq_no(), false).await.unwrap();
             }
+        }
+        if matches!(scenario, RecoveryScenario::CorruptOrdinaryState | RecoveryScenario::AutonomousColdStartup) {
+            let handle = engine.load_block_handle(&next).unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while !handle.has_saved_state()
+                    || !engine.db().test_contains_dynamic_state_record(&next).unwrap()
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.unwrap_or_else(|_| panic!(
+                "healthy applied head must be physically saved: {next}; saved={}, contains={:?}",
+                handle.has_saved_state(), engine.db().test_contains_dynamic_state_record(&next)
+            ));
+            assert_eq!(engine.load_last_applied_mc_block_id().unwrap().unwrap().as_ref(), &next);
+            assert_eq!(next.seq_no(), target.seq_no() + 1);
         }
         let sink = engine.clone().durable_finality_sink(runtime.clone()).await.unwrap();
         let confirm =
@@ -791,6 +806,9 @@ async fn recover_scenario(scenario: RecoveryScenario) {
     })
     .catch_unwind()
     .await;
+    let healthy_head = (run.is_ok() && matches!(scenario,
+        RecoveryScenario::CorruptOrdinaryState | RecoveryScenario::AutonomousColdStartup))
+        .then(|| pair.provider.load_last_applied_mc_block_id().unwrap().unwrap());
     if matches!(
         scenario,
         RecoveryScenario::AutonomousColdStartup
@@ -833,6 +851,10 @@ async fn recover_scenario(scenario: RecoveryScenario) {
     // below joins every peer and verifies offline evidence.
     let cold = open_engine(&directory.path().join("provider")).await;
     let result = std::panic::AssertUnwindSafe(async {
+        if let Some(head) = &healthy_head {
+            assert_eq!(cold.load_last_applied_mc_block_id().unwrap().as_ref(), Some(head));
+            assert!(cold.db().test_contains_dynamic_state_record(head).unwrap());
+        }
         assert_eq!(
             cold.db().test_contains_dynamic_state_record(&target).unwrap(),
             scenario == RecoveryScenario::CorruptOrdinaryState
@@ -885,6 +907,10 @@ async fn recover_scenario(scenario: RecoveryScenario) {
         } else {
             cold.clone().authenticate_retired_source_with_history(record.clone()).await.unwrap();
         }
+        if let Some(head) = &healthy_head {
+            assert_eq!(cold.load_last_applied_mc_block_id().unwrap().as_ref(), Some(head));
+            assert!(cold.db().test_contains_dynamic_state_record(head).unwrap());
+        }
         assert_eq!(
             crate::retired_history::authenticate_state(cold.as_ref(), &target)
                 .await
@@ -927,8 +953,15 @@ async fn recover_scenario(scenario: RecoveryScenario) {
     {
         let offline = open_engine(&directory.path().join("provider")).await;
         let check = offline.clone().authenticate_retired_source_with_history(record).await;
+        let observed_head = offline.load_last_applied_mc_block_id();
+        let head_present = healthy_head.as_ref()
+            .map(|head| offline.db().test_contains_dynamic_state_record(head));
         offline.clone().wait_stop().await.unwrap();
         check.unwrap();
+        if let Some(head) = &healthy_head {
+            assert_eq!(observed_head.unwrap().as_ref(), Some(head));
+            assert!(head_present.unwrap().unwrap());
+        }
     }
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
