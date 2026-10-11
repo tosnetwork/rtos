@@ -73,9 +73,11 @@ struct Usage {
     reserved_cells: usize,
     reserved_cell_bytes: usize,
     proofs: HashSet<UInt256>,
-    graphs: HashSet<UInt256>,
 }
 pub struct HistoryReadBudget {
+    // Keep the table outside usage: BudgetMap charges through this budget,
+    // which locks usage. Lock order is graphs then usage, never the reverse.
+    graphs: Mutex<rtos_block::merkle_apply_budget::BudgetMap<()>>,
     provenance: Mutex<Option<crate::repair_provenance::Trace>>,
     replay_proofs: Mutex<Option<Vec<crate::block_proof::BlockProofStuff>>>,
     limits: HistoryReadLimits,
@@ -313,6 +315,7 @@ impl HistoryReadBudget {
     }
     pub fn new(limits: HistoryReadLimits) -> Arc<Self> {
         Arc::new(Self {
+            graphs: Mutex::new(rtos_block::merkle_apply_budget::BudgetMap::new(limits.cells)),
             limits,
             provenance: Mutex::new(None),
             replay_proofs: Mutex::new(None),
@@ -457,24 +460,34 @@ impl HistoryReadBudget {
     fn graph_inner(&self, root: &Cell) -> Result<()> {
         // Cell depth authenticates every referenced path, including a DAG node
         // visited earlier at a shallower path; a visited-set alone does not.
+        rtos_block::merkle_apply_budget::require_materialized(root)?;
         if root.repr_depth() > self.limits.depth {
             return Err(HistoryBudgetExceeded("cell depth").into());
         }
-        let mut stack = vec![root.clone()];
+        // Each unique cell contributes at most four references to the pending
+        // traversal. Capacity growth is charged at the actual allocation size.
+        let mut stack = rtos_block::merkle_apply_budget::BudgetStack::new(
+            self.limits.cells.saturating_mul(4).max(1),
+        );
+        stack.push(root.clone(), self)?;
         while let Some(cell) = stack.pop() {
             self.step()?;
-            let mut u = self.usage.lock().map_err(|_| error!("History accounting poisoned"))?;
-            if u.graphs.contains(cell.repr_hash()) {
+            rtos_block::merkle_apply_budget::require_materialized(&cell)?;
+            let mut graphs =
+                self.graphs.lock().map_err(|_| error!("History graph table poisoned"))?;
+            if graphs.get(cell.repr_hash(), self)?.is_some() {
                 continue;
             }
+            let mut u = self.usage.lock().map_err(|_| error!("History accounting poisoned"))?;
             let cell_limit = self.limits.cells.saturating_sub(u.reserved_cells);
             let byte_limit = self.limits.cell_bytes.saturating_sub(u.reserved_cell_bytes);
             add(&mut u.cells, 1, cell_limit, "cell count")?;
             add(&mut u.cell_bytes, (cell.bit_length() + 7) / 8 + 32, byte_limit, "cell bytes")?;
-            u.graphs.insert(cell.repr_hash().clone());
             drop(u);
+            graphs.insert(cell.repr_hash().clone(), (), self)?;
+            drop(graphs);
             for index in 0..cell.references_count() {
-                stack.push(cell.reference(index)?);
+                stack.push(cell.reference(index)?, self)?;
             }
         }
         Ok(())
@@ -625,11 +638,12 @@ impl storage::bounded_cell::CellReadBudget for HistoryReadBudget {
         Ok(())
     }
     fn complete_cell(&self, cell: &Cell) -> Result<()> {
-        self.usage
-            .lock()
-            .map_err(|_| error!("History accounting poisoned"))?
-            .graphs
-            .insert(cell.repr_hash().clone());
+        rtos_block::merkle_apply_budget::require_materialized(cell)?;
+        self.graphs.lock().map_err(|_| error!("History graph table poisoned"))?.insert(
+            cell.repr_hash().clone(),
+            (),
+            self,
+        )?;
         Ok(())
     }
     fn step(&self) -> Result<()> {
@@ -688,6 +702,52 @@ mod tests {
         assert_eq!(budget.usage.lock().unwrap().proof_bytes, 4);
         assert!(budget.reserve(ReadKind::Proof, 4).is_err());
 
+        Ok(())
+    }
+    #[test]
+    fn history_budget_graph_table_and_stack_growth_are_cumulative() -> Result<()> {
+        use rtos_block::IBitstring;
+        // Sixteen distinct leaves plus five parents force table and stack growth.
+        let mut branches = Vec::new();
+        for branch in 0..4u32 {
+            let mut parent = rtos_block::BuilderData::new();
+            for leaf in 0..4u32 {
+                let mut child = rtos_block::BuilderData::new();
+                child.append_u32(branch * 4 + leaf)?;
+                parent.checked_append_reference(child.into_cell()?)?;
+            }
+            branches.push(parent.into_cell()?);
+        }
+        let mut builder = rtos_block::BuilderData::new();
+        for branch in branches {
+            builder.checked_append_reference(branch)?;
+        }
+        let root = builder.into_cell()?;
+        let budget = HistoryReadBudget::new(Default::default());
+        budget.graph(&root)?;
+        let first_bytes = budget.usage.lock().unwrap().cell_bytes;
+        let count = budget.usage.lock().unwrap().cells;
+        assert_eq!(count, 21);
+        assert_eq!(budget.graphs.lock().unwrap().len(), 21);
+        assert!(first_bytes > 21 * 36, "table replacement and stack storage are admitted");
+        budget.graph(&root)?;
+        assert_eq!(budget.usage.lock().unwrap().cells, count);
+        let both_bytes = budget.usage.lock().unwrap().cell_bytes;
+        assert!(both_bytes > first_bytes, "even a deduplicated graph creates a charged stack");
+        let exact = HistoryReadBudget::new(HistoryReadLimits {
+            cell_bytes: both_bytes,
+            ..Default::default()
+        });
+        exact.graph(&root)?;
+        exact.graph(&root)?;
+        assert_eq!(exact.usage.lock().unwrap().cell_bytes, both_bytes);
+        let short = HistoryReadBudget::new(HistoryReadLimits {
+            cell_bytes: both_bytes - 1,
+            ..Default::default()
+        });
+        short.graph(&root)?;
+        assert!(stops_fallback(&short.graph(&root).unwrap_err()));
+        assert!(short.graph(&root).is_err());
         Ok(())
     }
     #[test]

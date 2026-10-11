@@ -119,10 +119,10 @@ fn decode_bounded_pair(
             if id != &value.id {
                 fail!("Block with another id was received");
             }
-            check_lz4_expansion(&value.compressed, limits.expanded_bytes)?;
-            let decompressed = lz4_decompress(
+            let decompressed = decompress_pair_payload(
                 &value.compressed,
-                Lz4DecompressMode::WithMaxSize(limits.expanded_bytes as i32),
+                limits.expanded_bytes,
+                history.as_ref().map(|h| h.budget.as_ref()),
             )?;
             NetworkDownloadLimits::check_bytes(decompressed.len(), limits.expanded_bytes)?;
             let mut roots = if let Some(history) = history.as_mut() {
@@ -271,8 +271,31 @@ impl NetworkDownloadLimits {
     }
 }
 
+// Admission precedes the preflight scan, then the decoder's input/output
+// work. A work unit covers at most 64 bytes, matching bounded BOC bulk work.
+fn decompress_pair_payload(
+    input: &[u8],
+    limit: usize,
+    budget: Option<&HistoryReadBudget>,
+) -> Result<Vec<u8>> {
+    let admit = |bytes: usize| -> Result<()> {
+        if let Some(budget) = budget {
+            rtos_block::config_read_budget::steps(
+                &crate::bounded_session_derivation::ConfigBudget(budget),
+                bytes.div_ceil(64).max(1),
+            )?;
+        }
+        Ok(())
+    };
+    admit(input.len())?;
+    let expanded = check_lz4_expansion(input, limit)?;
+    admit(input.len())?;
+    admit(expanded)?;
+    lz4_decompress(input, Lz4DecompressMode::WithMaxSize(i32::try_from(limit)?))
+}
+
 // Preflight the raw LZ4 block without allocating its advertised output.
-fn check_lz4_expansion(input: &[u8], limit: usize) -> Result<()> {
+fn check_lz4_expansion(input: &[u8], limit: usize) -> Result<usize> {
     fn length(input: &[u8], pos: &mut usize, initial: usize) -> Result<usize> {
         let mut value = initial;
         if initial == 15 {
@@ -315,7 +338,7 @@ fn check_lz4_expansion(input: &[u8], limit: usize) -> Result<()> {
             .ok_or_else(|| error!("LZ4 length overflow"))?;
         NetworkDownloadLimits::check_bytes(output, limit)?;
     }
-    Ok(())
+    Ok(output)
 }
 
 struct LimitedBocOutput {
@@ -1558,6 +1581,38 @@ mod bounded_download_tests {
         let mut output = LimitedBocOutput { bytes: Vec::new(), limit: encoded.len() - 1 };
         assert!(BocWriter::with_root(&cell).unwrap().write(&mut output).is_err());
         assert!(output.bytes.len() < encoded.len());
+    }
+    #[test]
+    fn bounded_history_lz4_admits_scan_and_decode_before_work() {
+        use crate::history_read_budget::{stops_fallback, HistoryReadLimits};
+        let denied = HistoryReadBudget::new(HistoryReadLimits { steps: 0, ..Default::default() });
+        let error = decompress_pair_payload(&[0xf0], 4096, Some(&denied)).unwrap_err();
+        assert!(stops_fallback(&error), "zero budget rejects before malformed-token inspection");
+        assert!(!stops_fallback(&decompress_pair_payload(&[0xf0], 4096, None).unwrap_err()));
+        let plain = vec![7; 4096];
+        let compressed = rtos_block::lz4_compress(&plain, false).unwrap();
+        let one_decode = 2 * compressed.len().div_ceil(64).max(1) + plain.len().div_ceil(64);
+        let budget = HistoryReadBudget::new(HistoryReadLimits {
+            steps: 2 * one_decode,
+            ..Default::default()
+        });
+        assert_eq!(decompress_pair_payload(&compressed, 4096, Some(&budget)).unwrap(), plain);
+        assert_eq!(decompress_pair_payload(&compressed, 4096, Some(&budget)).unwrap(), plain);
+        assert!(stops_fallback(
+            &decompress_pair_payload(&compressed, 4096, Some(&budget)).unwrap_err()
+        ));
+        let short = HistoryReadBudget::new(HistoryReadLimits {
+            steps: one_decode - 1,
+            ..Default::default()
+        });
+        assert!(stops_fallback(
+            &decompress_pair_payload(&compressed, 4096, Some(&short)).unwrap_err()
+        ));
+        let budget = HistoryReadBudget::new(Default::default());
+        assert!(decompress_pair_payload(&compressed, 1024, Some(&budget))
+            .unwrap_err()
+            .downcast_ref::<adnl::ResponseLimitExceeded>()
+            .is_some());
     }
     #[test]
     fn bounded_download_lz4_preflight_rejects_before_expansion() {
