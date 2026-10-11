@@ -1095,3 +1095,17 @@ impl CellsTempStorage for AsyncCellsStorageAdapter {
         self.boc_db.cell_db().storing_loader()
     }
 }
+
+#[path = "bounded_boc_writer.rs"]
+mod bounded_writer;
+
+/// A bounded write reached the physical commit/sync boundary and failed.
+/// The request must reopen rather than retry as an ordinary state write.
+#[derive(Debug)]
+pub struct BoundedStateWriteFailure(anyhow::Error);
+impl std::fmt::Display for BoundedStateWriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Bounded state write durability failure: {}", self.0)
+    }
+}
+impl std::error::Error for BoundedStateWriteFailure {}

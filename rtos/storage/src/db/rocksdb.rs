@@ -360,6 +360,16 @@ pub struct RocksDbTable<K> {
 }
 
 impl<K: DbKey + Send + Sync> RocksDbTable<K> {
+    pub(crate) fn put_in_batch(
+        &self,
+        batch: &mut WriteBatch,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        batch.put_cf(&self.cf()?, key, value);
+        Ok(())
+    }
+
     pub fn sync_wal(&self) -> Result<()> {
         self.db.sync_wal()
     }

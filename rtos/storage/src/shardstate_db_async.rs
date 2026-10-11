@@ -160,6 +160,14 @@ impl Default for CellsDbConfig {
 }
 
 enum StateCommand {
+    BoundedPut {
+        id: BlockIdExt,
+        root: Cell,
+        limits: rtos_block::merkle_apply_budget::MerkleApplyLimits,
+        budget: Arc<dyn rtos_block::merkle_apply_budget::MerkleApplyBudget>,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+        observer: crate::durability::SyncObservation,
+    },
     Work(Job, Option<Arc<dyn Callback>>),
     Barrier(tokio::sync::oneshot::Sender<Result<()>>, crate::durability::SyncObservation),
 }
@@ -466,6 +474,58 @@ impl ShardStateDb {
         }
     }
 
+    /// Admit and enqueue one bounded state save. The command owns its budget
+    /// until the actual serialized writer and WAL sync finish, even if this
+    /// observation future is dropped. Budget failures are never retried through
+    /// the ordinary writer.
+    pub async fn put_bounded(
+        &self,
+        id: &BlockIdExt,
+        root: Cell,
+        limits: rtos_block::merkle_apply_budget::MerkleApplyLimits,
+        budget: Arc<dyn rtos_block::merkle_apply_budget::MerkleApplyBudget>,
+    ) -> Result<()> {
+        self.put_bounded_observed(id, root, limits, budget, None).await
+    }
+
+    async fn put_bounded_observed(
+        &self,
+        id: &BlockIdExt,
+        root: Cell,
+        limits: rtos_block::merkle_apply_budget::MerkleApplyLimits,
+        budget: Arc<dyn rtos_block::merkle_apply_budget::MerkleApplyBudget>,
+        observer: crate::durability::SyncObservation,
+    ) -> Result<()> {
+        budget.workspace(1024)?;
+        while self.in_queue.load(Ordering::Relaxed) >= self.config.states_db_queue_len {
+            if self.stop.load(Ordering::Relaxed) & Self::MASK_STOPPED != 0 {
+                fail!("Stopped");
+            }
+            tokio::time::sleep(Duration::from_millis(Self::PUT_QUEUE_POLL_INTERVAL_MS)).await;
+        }
+        if self.stop.load(Ordering::Relaxed) & Self::MASK_STOPPED != 0 {
+            fail!("Stopped");
+        }
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.in_queue.fetch_add(1, Ordering::Relaxed);
+        if self
+            .storer
+            .send(StateCommand::BoundedPut {
+                id: id.clone(),
+                root,
+                limits,
+                budget,
+                reply,
+                observer,
+            })
+            .is_err()
+        {
+            self.in_queue.fetch_sub(1, Ordering::Relaxed);
+            fail!("Bounded state writer stopped");
+        }
+        receiver.await.map_err(|e| error!("Bounded state writer failed: {e}"))?
+    }
+
     pub async fn put(
         &self,
         id: &BlockIdExt,
@@ -614,6 +674,59 @@ impl ShardStateDb {
                 tokio::time::timeout(Duration::from_millis(500), receiver.recv()).await
             {
                 let (mut job, callback) = match command {
+                    StateCommand::BoundedPut { id, root, limits, budget, reply, observer } => {
+                        self.in_queue.fetch_sub(1, Ordering::Relaxed);
+                        let result = tokio::task::block_in_place(|| {
+                            if let Some(prior) = self.write_failure.borrow().as_ref() {
+                                fail!("Earlier state write failed: {prior}");
+                            }
+                            let existing_index = self.shardstate_db.try_get(&id)?;
+                            if let Some(existing) = &existing_index {
+                                if existing.len() != DbEntry::SIZE {
+                                    fail!("Bounded state index length mismatch");
+                                }
+                                let entry = DbEntry::deserialize(existing)?;
+                                if entry.block_id != id {
+                                    fail!("Bounded state index block identity mismatch");
+                                }
+                                if entry.cell_id != *root.repr_hash() {
+                                    fail!("Bounded state index root mismatch");
+                                }
+                            }
+                            let entry = DbEntry::with_params(
+                                id.clone(),
+                                root.repr_hash().clone(),
+                                UnixTime::now(),
+                            );
+                            self.dynamic_boc_db.save_boc_bounded(
+                                &root,
+                                limits,
+                                budget.as_ref(),
+                                existing_index.is_none(),
+                                observer.as_deref(),
+                                |batch| {
+                                    self.shardstate_db.put_in_batch(
+                                        batch,
+                                        id.key(),
+                                        &entry.serialize(),
+                                    )
+                                },
+                            )
+                        });
+                        if let Err(error) = &result {
+                            if error
+                                .downcast_ref::<crate::dynamic_boc_rc_db::BoundedStateWriteFailure>(
+                                )
+                                .is_some()
+                            {
+                                self.write_failure.send_replace(Some(error.to_string()));
+                            }
+                        }
+                        // Per-request rejection is terminal for this command,
+                        // not a permanent ordinary-writer retry loop.
+                        let _ = reply.send(result);
+                        continue;
+                    }
                     StateCommand::Work(job, callback) => (job, callback),
                     StateCommand::Barrier(reply, observer) => {
                         // The state index and cells share this physical DB (new()).
@@ -745,3 +858,7 @@ impl ShardStateDb {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_bounded_state_writer.rs"]
+mod bounded_writer_tests;

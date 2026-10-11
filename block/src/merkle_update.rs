@@ -341,6 +341,246 @@ impl MerkleUpdate {
         self.apply_with_factory(old_root, &(Arc::new(DefaultCellsFactory) as Arc<dyn CellsFactory>))
     }
 
+    /// Apply using request-owned allocation/work admission. Unlike the ordinary
+    /// path this never follows ambient loaders or uses recursive traversal.
+    pub fn apply_for_bounded(
+        &self,
+        old_root: &Cell,
+        limits: &crate::merkle_apply_budget::MerkleApplyLimits,
+        budget: &dyn crate::merkle_apply_budget::MerkleApplyBudget,
+    ) -> Result<(Cell, MerkleUpdateApplyMetrics)> {
+        use crate::merkle_apply_budget::{
+            require_materialized, BudgetMap, BudgetStack, MerkleApplyLimitExceeded,
+            NEW_CELL_ALLOCATION,
+        };
+        let depth_limit = limits.max_depth.min(budget.max_depth());
+        let stack_limit = usize::from(depth_limit)
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(1))
+            .ok_or(MerkleApplyLimitExceeded("stack overflow"))?;
+        for root in [old_root, &self.old, &self.new] {
+            require_materialized(root)?;
+            if root.repr_depth() > depth_limit {
+                return Err(MerkleApplyLimitExceeded("graph depth").into());
+            }
+        }
+        if self.old_hash != *old_root.repr_hash() {
+            fail!(BlockError::WrongMerkleUpdate("old bag's hash mismatch".to_owned()));
+        }
+        let mut metrics = MerkleUpdateApplyMetrics::default();
+        let mut known = BudgetMap::new(limits.max_entries);
+        // Check both update skeletons before collecting the retained parent graph.
+        for (is_old, root) in [(true, &self.old), (false, &self.new)] {
+            let mut seen = BudgetMap::new(limits.max_entries);
+            let mut stack = BudgetStack::new(stack_limit);
+            stack.push((root.clone(), 0u8, 0u16), budget)?;
+            while let Some((cell, merkle_depth, depth)) = stack.pop() {
+                budget.step()?;
+                require_materialized(&cell)?;
+                if depth > depth_limit {
+                    return Err(MerkleApplyLimitExceeded("check depth").into());
+                }
+                if seen.get(cell.repr_hash(), budget)?.is_some() {
+                    continue;
+                }
+                seen.insert(cell.repr_hash().clone(), (), budget)?;
+                if is_old {
+                    known.insert(cell.hash(merkle_depth as usize).clone(), (), budget)?;
+                }
+                if cell.cell_type() == CellType::PrunedBranch {
+                    if is_old {
+                        metrics.old_pruned += 1;
+                    } else {
+                        metrics.new_pruned += 1;
+                        if u16::from(cell.level()) == u16::from(merkle_depth) + 1
+                            && known.get(cell.hash(merkle_depth as usize), budget)?.is_none()
+                        {
+                            fail!(
+                                "old and new trees mismatch {:x}",
+                                cell.hash(merkle_depth as usize)
+                            );
+                        }
+                    }
+                    continue;
+                }
+                if !is_old {
+                    metrics.new_cells += 1;
+                }
+                let child_depth =
+                    depth.checked_add(1).ok_or(MerkleApplyLimitExceeded("depth overflow"))?;
+                let md = merkle_depth
+                    .checked_add(u8::from(cell.is_merkle()))
+                    .ok_or(MerkleApplyLimitExceeded("merkle depth overflow"))?;
+                for index in (0..cell.references_count()).rev() {
+                    budget.step()?;
+                    stack.push((cell.reference(index)?, md, child_depth), budget)?;
+                }
+            }
+        }
+        metrics.old_cells = known.len().saturating_sub(metrics.old_pruned);
+        // Validate all parent descendants independently of the legacy collection
+        // pruning/order: reused branches must not conceal a loader.
+        {
+            let mut seen = BudgetMap::new(limits.max_entries);
+            let mut stack = BudgetStack::new(stack_limit);
+            stack.push((old_root.clone(), 0u16), budget)?;
+            while let Some((cell, depth)) = stack.pop() {
+                budget.step()?;
+                require_materialized(&cell)?;
+                if depth > depth_limit {
+                    return Err(MerkleApplyLimitExceeded("retained graph depth").into());
+                }
+                if seen.get(cell.repr_hash(), budget)?.is_some() {
+                    continue;
+                }
+                seen.insert(cell.repr_hash().clone(), (), budget)?;
+                for i in (0..cell.references_count()).rev() {
+                    budget.step()?;
+                    stack.push(
+                        (
+                            cell.reference(i)?,
+                            depth
+                                .checked_add(1)
+                                .ok_or(MerkleApplyLimitExceeded("depth overflow"))?,
+                        ),
+                        budget,
+                    )?;
+                }
+            }
+        }
+        let mut retained = BudgetMap::new(limits.max_entries);
+        let mut seen = BudgetMap::new(limits.max_entries);
+        let mut stack = BudgetStack::new(stack_limit);
+        stack.push((old_root.clone(), 0u8, 0u16), budget)?;
+        while let Some((cell, md, depth)) = stack.pop() {
+            budget.step()?;
+            require_materialized(&cell)?;
+            if depth > depth_limit {
+                return Err(MerkleApplyLimitExceeded("parent depth").into());
+            }
+            if seen.get(cell.repr_hash(), budget)?.is_some() {
+                continue;
+            }
+            seen.insert(cell.repr_hash().clone(), (), budget)?;
+            let hash = cell.hash(md as usize);
+            if known.get(hash, budget)?.is_some() {
+                retained.insert(hash.clone(), cell.clone(), budget)?;
+            }
+            if known.get(hash, budget)?.is_some() {
+                let child_md = md
+                    .checked_add(u8::from(cell.is_merkle()))
+                    .ok_or(MerkleApplyLimitExceeded("merkle depth overflow"))?;
+                let child_depth =
+                    depth.checked_add(1).ok_or(MerkleApplyLimitExceeded("depth overflow"))?;
+                for i in (0..cell.references_count()).rev() {
+                    budget.step()?;
+                    stack.push((cell.reference(i)?, child_md, child_depth), budget)?;
+                }
+            }
+        }
+        if self.new_hash == self.old_hash {
+            return Ok((old_root.clone(), MerkleUpdateApplyMetrics::default()));
+        }
+        struct Frame {
+            cell: Cell,
+            next: usize,
+            md: u8,
+            depth: u16,
+            builder: BuilderData,
+        }
+        fn frame(
+            cell: Cell,
+            md: u8,
+            depth: u16,
+            budget: &dyn crate::merkle_apply_budget::MerkleApplyBudget,
+        ) -> Result<Frame> {
+            require_materialized(&cell)?;
+            budget.new_cell(NEW_CELL_ALLOCATION)?;
+            let mut builder = BuilderData::new();
+            builder.set_type(cell.cell_type());
+            Ok(Frame { cell, next: 0, md, depth, builder })
+        }
+        let mut frames = BudgetStack::new(usize::from(depth_limit) + 1);
+        let mut built = BudgetMap::new(limits.max_entries);
+        frames.push(frame(self.new.clone(), 0, 0, budget)?, budget)?;
+        let result =
+            loop {
+                budget.step()?;
+                let mut current =
+                    frames.pop().ok_or_else(|| error!("Empty bounded apply traversal"))?;
+                if current.next < current.cell.references_count() {
+                    let child = current.cell.reference(current.next)?;
+                    require_materialized(&child)?;
+                    current.next += 1;
+                    let md = current
+                        .md
+                        .checked_add(u8::from(current.cell.is_merkle()))
+                        .ok_or(MerkleApplyLimitExceeded("merkle depth overflow"))?;
+                    let depth = current
+                        .depth
+                        .checked_add(1)
+                        .ok_or(MerkleApplyLimitExceeded("depth overflow"))?;
+                    if depth > depth_limit {
+                        return Err(MerkleApplyLimitExceeded("construction depth").into());
+                    }
+                    let ready =
+                        match child.cell_type() {
+                            CellType::Ordinary
+                            | CellType::MerkleProof
+                            | CellType::MerkleUpdate
+                            | CellType::LibraryReference => {
+                                built.get(child.hash(md as usize), budget)?.cloned()
+                            }
+                            CellType::PrunedBranch => {
+                                let mask = child.level_mask().mask();
+                                let bit = 1u8
+                                    .checked_shl(u32::from(md))
+                                    .ok_or(MerkleApplyLimitExceeded("merkle mask overflow"))?;
+                                if mask & bit != 0 {
+                                    let level = child
+                                        .level()
+                                        .checked_sub(1)
+                                        .ok_or_else(|| error!("Invalid pruned level"))?;
+                                    let hash = child.hash(level as usize);
+                                    Some(retained.get(hash, budget)?.cloned().ok_or_else(|| {
+                                        error!("Can't load cell with hash {hash:x}")
+                                    })?)
+                                } else {
+                                    budget.new_cell(NEW_CELL_ALLOCATION)?;
+                                    Some(BuilderData::from_cell(&child)?.finalize(depth_limit)?)
+                                }
+                            }
+                            _ => fail!("Unknown cell type while applying bounded merkle update"),
+                        };
+                    if let Some(cell) = ready {
+                        current.builder.checked_append_reference(cell)?;
+                        frames.push(current, budget)?;
+                    } else {
+                        frames.push(current, budget)?;
+                        frames.push(frame(child, md, depth, budget)?, budget)?;
+                    }
+                } else {
+                    current.builder.append_bytestring(&SliceData::load_cell_ref(&current.cell)?)?;
+                    let cell = current.builder.finalize(depth_limit)?;
+                    if let Some(parent) = frames.last_mut() {
+                        built.insert(
+                            current.cell.hash(current.md as usize).clone(),
+                            cell.clone(),
+                            budget,
+                        )?;
+                        parent.builder.checked_append_reference(cell)?;
+                    } else {
+                        break cell;
+                    }
+                }
+            };
+        if result.repr_hash() != &self.new_hash {
+            fail!(BlockError::WrongMerkleUpdate("new bag's hash mismatch".to_owned()));
+        }
+        metrics.created_new_cells = built.len();
+        Ok((result, metrics))
+    }
+
     /// Applies update to given tree of cells by returning new updated one
     pub fn apply_with_factory(
         &self,

@@ -911,6 +911,11 @@ pub struct Cell {
     tagged_pointer: usize,
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_HEAP_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 unsafe impl Send for Cell {}
 unsafe impl Sync for Cell {}
 
@@ -1550,6 +1555,8 @@ impl Cell {
         match arena {
             None => unsafe {
                 let p = std::alloc::alloc(layout);
+                #[cfg(test)]
+                TEST_HEAP_ALLOCATIONS.with(|count| count.set(count.get() + 1));
                 if p.is_null() {
                     log::error!("FATAL! Cell allocation of {} bytes failed", size);
                     std::process::exit(0xFF);
@@ -2936,6 +2943,17 @@ impl Cell {
     #[allow(dead_code)]
     pub fn is_pruned(&self) -> bool {
         self.cell_type() == CellType::PrunedBranch
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_heap_allocations() -> usize {
+        TEST_HEAP_ALLOCATIONS.with(std::cell::Cell::get)
+    }
+
+    /// True only for an owned data cell whose references cannot invoke a loader.
+    /// Budgeted graph operations reject virtual/usage/loaded/lazy and arena cells.
+    pub fn is_materialized_data_cell(&self) -> bool {
+        self.is_data_cell() && self.is_heap()
     }
 
     /// True if this is a `LazyLoadCell` — regardless of whether its inner
