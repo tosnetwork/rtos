@@ -1280,3 +1280,185 @@ async fn publication_source_only_crash_recovers_without_retired_key_and_rejects_
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publication_reopen_repairs_lost_artifacts_for_completed_and_expired_ready() {
+    use crate::propagation_outbox::{
+        Limits, PropagationOutbox, PublicationEffect, PublicationKind, PublicationStage,
+        PublicationTarget,
+    };
+    use storage::archives::package_entry_id::{GetFileName, PackageEntryId};
+    for final_role in [false, true] {
+        for completed in [false, true] {
+            for lose_proof in [false, true] {
+                let SpoolFixture { dir, engine, runtime, block, row, state_root } =
+                    SpoolFixture::new(1).await;
+                let domain = spool_domain(&runtime);
+                let mut draft = spool_draft(&runtime, &block, &row, final_role);
+                // Retention expiry governs sends, not durable acceptance repair.
+                draft.created_at_unix_secs -= Limits::default().max_retention_secs + 5;
+                let result = std::panic::AssertUnwindSafe(async {
+                    let sink = engine.clone().durable_finality_sink(runtime.clone()).await.unwrap();
+                    let id = stage_spool(&sink, draft).await.unwrap();
+                    let accepted = engine.clone().await_publication(id.clone()).await.unwrap();
+                    assert_eq!(accepted.phase(), AcceptancePhase::Preapplied);
+                    assert_eq!(accepted.is_final(), final_role);
+                    let proof = accepted.proof();
+                    (
+                        id,
+                        proof.is_link(),
+                        proof.data().to_vec(),
+                        std::path::PathBuf::from(engine.db_root_dir().unwrap())
+                            .join("archive/unapplied"),
+                    )
+                })
+                .catch_unwind()
+                .await;
+                engine.clone().wait_stop().await.unwrap();
+                drop(engine);
+                let (id, is_link, proof_bytes, unapplied) =
+                    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+
+                // Set up a persisted stage through the real ledger API while no
+                // owner exists. Completed here is a test input, NOT evidence of
+                // real network delivery. Only artifact repair is under test.
+                let setup = open_engine(dir.path()).await;
+                let result = std::panic::AssertUnwindSafe(async {
+                    let ledger = PropagationOutbox::open(
+                        setup.db().clone(),
+                        domain.clone(),
+                        Limits::default(),
+                    )
+                    .unwrap();
+                    let (delivery, stored) = ledger.delivery(&id).unwrap().unwrap();
+                    assert_eq!(stored.stage, PublicationStage::AcceptedDraft);
+                    let effects = vec![PublicationEffect {
+                        kind: PublicationKind::Candidate,
+                        target: PublicationTarget::Public,
+                    }];
+                    ledger.resolve_draft(delivery.record_id, effects.clone()).unwrap();
+                    if completed {
+                        assert!(ledger.checkpoint_sent(delivery.record_id, &effects).unwrap());
+                    }
+                    let stored = ledger.delivery(&id).unwrap().unwrap().1;
+                    assert_eq!(
+                        stored.stage,
+                        if completed {
+                            PublicationStage::Completed
+                        } else {
+                            PublicationStage::Ready
+                        }
+                    );
+                    assert!(
+                        stored.record.expires_at_unix_secs
+                            < std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs()
+                    );
+                    stored
+                })
+                .catch_unwind()
+                .await;
+                setup.clone().wait_stop().await.unwrap();
+                drop(setup);
+                let before = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+
+                let body_path = unapplied.join(PackageEntryId::Block(block.id()).filename_short());
+                let proof_path = unapplied.join(
+                    if is_link {
+                        PackageEntryId::ProofLink(block.id())
+                    } else {
+                        PackageEntryId::Proof(block.id())
+                    }
+                    .filename_short(),
+                );
+                assert_eq!(std::fs::read(&body_path).unwrap(), block.data());
+                assert_eq!(std::fs::read(&proof_path).unwrap(), proof_bytes);
+                let lost_path = if lose_proof { &proof_path } else { &body_path };
+                // Explicit missing-file simulation after clean stop. This is
+                // not a claim about hardware power-loss or fsync crash ordering.
+                std::fs::rename(lost_path, dir.path().join("simulated-lost-artifact")).unwrap();
+
+                let reopened = open_engine(dir.path()).await;
+                let result = std::panic::AssertUnwindSafe(async {
+                    let handle = reopened.load_block_handle(block.id()).unwrap().unwrap();
+                    assert!(handle.has_data() && handle.has_state());
+                    assert!(if is_link { handle.has_proof_link() } else { handle.has_proof() });
+                    assert!(!handle.is_applied());
+                    assert_eq!(inspect_spool(&reopened, &domain, &id), before);
+                    if lose_proof {
+                        assert!(reopened
+                            .db()
+                            .load_block_proof_raw(&handle, is_link)
+                            .await
+                            .is_err());
+                    } else {
+                        assert!(reopened.db().load_block_data_raw(&handle).await.is_err());
+                    }
+                    // No query and no enable: startup's background acceptance
+                    // pass must revisit Completed and expired Ready on its own.
+                    reopened.ensure_publication_worker().await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(20), async {
+                        loop {
+                            let body = reopened.db().load_block_data_raw(&handle).await;
+                            let proof = reopened.db().load_block_proof_raw(&handle, is_link).await;
+                            if body.as_ref().is_ok_and(|data| data == block.data())
+                                && proof.as_ref().is_ok_and(|data| data == &proof_bytes)
+                            {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    })
+                    .await
+                    .expect("disabled startup did not repair expired/completed physical artifacts");
+                    let repaired = reopened.db().load_block_proof(&handle, is_link).await.unwrap();
+                    if is_link {
+                        repaired.check_proof_link().unwrap();
+                    } else {
+                        repaired.check_proof_as_link().unwrap();
+                    }
+                    assert_eq!(reopened.db().load_block_data(&handle).await.unwrap(), block);
+                    assert_eq!(
+                        inspect_spool(&reopened, &domain, &id),
+                        before,
+                        "artifact repair changed delivery identity, stage or frozen effects"
+                    );
+                    assert_eq!(
+                        reopened.load_state(block.id()).await.unwrap().root_cell().repr_hash(),
+                        &state_root
+                    );
+                })
+                .catch_unwind()
+                .await;
+                // Join the actual actor and all storage writers before the
+                // second DB reopen is treated as a durability observation.
+                reopened.clone().wait_stop().await.unwrap();
+                drop(reopened);
+                result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+
+                let reopened = open_engine(dir.path()).await;
+                let result = std::panic::AssertUnwindSafe(async {
+                    let handle = reopened.load_block_handle(block.id()).unwrap().unwrap();
+                    assert_eq!(reopened.db().load_block_data(&handle).await.unwrap(), block);
+                    assert_eq!(
+                        reopened.db().load_block_proof_raw(&handle, is_link).await.unwrap(),
+                        proof_bytes
+                    );
+                    assert_eq!(inspect_spool(&reopened, &domain, &id), before);
+                    assert!(!handle.is_applied());
+                    assert_eq!(
+                        reopened.load_state(block.id()).await.unwrap().root_cell().repr_hash(),
+                        &state_root
+                    );
+                })
+                .catch_unwind()
+                .await;
+                reopened.clone().wait_stop().await.unwrap();
+                drop(reopened);
+                result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            }
+        }
+    }
+}
