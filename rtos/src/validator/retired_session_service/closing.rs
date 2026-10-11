@@ -106,10 +106,9 @@ async fn replay_namespace(
                 continue;
             }
         };
-        // Legacy references without an authenticated recovery binding still
-        // need the full historical session recovery path.
-        if request.domain.recovery_binding.is_some()
-            && request.canonical.role == FinalityDeliveryRole::Final
+        // Legacy ACKs may lack coordinates; only an exact existing node close
+        // can supply them below, followed by the same history authentication.
+        if request.canonical.role == FinalityDeliveryRole::Final
             && request.canonical.block_id.shard().is_masterchain()
         {
             candidates.push((id, locator));
@@ -128,7 +127,15 @@ async fn replay_namespace(
                 continue;
             }
             let authentication = async {
-                let request = locator.request()?;
+                let mut request = locator.request()?;
+                if request.domain.recovery_binding.is_none() {
+                    let db = engine.db().clone();
+                    // Keep actual IO owned by this closure job through join;
+                    // the authentication timeout must not detach this read.
+                    request = tokio::task::spawn_blocking(move || {
+                        crate::propagation_outbox::load_legacy_close_request(&db, &request)
+                    }).await.map_err(|error| error!("Legacy close read join: {error}"))??;
+                }
                 tokio::time::timeout(
                     AUTH_TIMEOUT,
                     authenticate_closing_runtime(engine.as_ref(), &request, &namespace),

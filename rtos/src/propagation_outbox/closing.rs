@@ -15,6 +15,23 @@ pub(crate) struct ClosingRecord {
     pub released: bool,
 }
 
+/// Comparison-only upgrade of legacy source coordinates against an existing
+/// node close. This returns no source confirmation or storage custody authority.
+pub(super) fn restore_legacy_request(
+    request: &consensus_common::finality_delivery::CloseFinalityRequest,
+    record: &ClosingRecord,
+) -> Result<consensus_common::finality_delivery::CloseFinalityRequest> {
+    let expected = record.offer().request;
+    let mut comparable = expected.clone();
+    if request.domain.recovery_binding.is_none() {
+        comparable.domain.recovery_binding = None;
+    }
+    if *request != comparable {
+        fail!("Legacy source close conflicts with node evidence");
+    }
+    Ok(expected)
+}
+
 impl ClosingRecord {
     pub(crate) fn offer(&self) -> consensus_common::finality_delivery::CloseOffer {
         use consensus_common::finality_delivery::{
@@ -544,6 +561,33 @@ mod tests {
             },
         ))
     }
+    #[test]
+    fn close_legacy_coordinates_require_exact_original_evidence() -> Result<()> {
+        let store = open(Arc::new(Disk::default()));
+        let (_, _, record) = setup(&store, 1)?;
+        let expected = record.offer().request;
+        let mut legacy = expected.clone();
+        legacy.domain.recovery_binding = None;
+        assert_eq!(restore_legacy_request(&legacy, &record)?, expected);
+        for index in 0..7 {
+            let mut wrong = legacy.clone();
+            match index {
+                0 => wrong.source_digest = UInt256::from([91; 32]),
+                1 => wrong.created_at_unix_secs += 1,
+                2 => wrong.canonical.node_receipt = UInt256::from([92; 32]),
+                3 => wrong.canonical.role = FinalityDeliveryRole::Approval,
+                4 => wrong.domain.session_id = UInt256::from([93; 32]),
+                5 => wrong.canonical.block_id.file_hash = UInt256::from([94; 32]),
+                _ => wrong.domain.pin.global_id += 1,
+            }
+            assert!(restore_legacy_request(&wrong, &record).is_err());
+        }
+        let mut wrong_anchor = expected.clone();
+        wrong_anchor.domain.recovery_binding.as_mut().unwrap().governing_masterchain = id(9);
+        assert!(restore_legacy_request(&wrong_anchor, &record).is_err());
+        Ok(())
+    }
+
     #[test]
     fn close_atomic_reopen_replay_and_active_quota() -> Result<()> {
         let disk = Arc::new(Disk::default());
