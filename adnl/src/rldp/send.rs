@@ -371,6 +371,29 @@ impl SendPartV2 {
         Ok(ret)
     }
 
+    // ACK accounting releases the peer-wide window before waking siblings.
+    pub(crate) fn on_ack_and_wake(
+        &mut self,
+        ack: SendAckV2,
+        peer: &Arc<RldpPeer>,
+        min_timeout_ms: u64,
+        states: &[Arc<SendPartStateV2>],
+        progress: &AtomicU64,
+    ) -> Result<u32> {
+        let new_received = self.on_ack(ack, peer, min_timeout_ms)?;
+        if new_received > 0 {
+            progress.fetch_add(1, Ordering::Relaxed);
+            for state in states {
+                // STARTED is the only active status: finished and idle parts
+                // must not receive a shared-window wakeup.
+                if state.part() != self.state.part() && state.is_started() {
+                    state.ack_ping();
+                }
+            }
+        }
+        Ok(new_received)
+    }
+
     pub(crate) fn on_ack(
         &mut self,
         ack: SendAckV2,
@@ -900,6 +923,120 @@ impl SendTransfer {
             let state = Arc::new(state);
             let part = SendPartV1::new(data, transfer_id, state.clone());
             Ok((Self::V1(part), SendTransferState::V1(state)))
+        }
+    }
+}
+
+#[cfg(test)]
+mod sibling_wake_tests {
+    use super::*;
+    use crate::rldp::stat::{StatsConfigV2, StatsV2};
+
+    #[test]
+    fn rldp_sibling_wake_real_ack_releases_shared_window() {
+        let (tx, _jobs) = tokio::sync::mpsc::unbounded_channel();
+        let peer = Arc::new(RldpPeer {
+            outbound_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            tx,
+            stats: StatsV2::new(StatsConfigV2::default(), 1000).unwrap(),
+            counter: Arc::new(AtomicU64::new(0)).into(),
+        });
+        let mut parts = Vec::new();
+        let mut states = Vec::new();
+        // Tiny real FEC parts keep this regression independent of large-part
+        // encoding cost. All share the same transfer and peer congestion state.
+        let data: Arc<[u8]> = vec![42u8; 4096].into();
+        for part in 0..4 {
+            let (ack_ping, ack_pong) = tokio::sync::mpsc::unbounded_channel();
+            let state = Arc::new(SendPartStateV2 {
+                part,
+                ack_ping,
+                core: SendPartState { seqno_send: AtomicU32::new(0) },
+                status: AtomicU8::new(SendPartStateV2::STATUS_IDLE),
+                counter: Arc::new(AtomicU64::new(0)).into(),
+            });
+            parts.push(
+                SendPartV2::new(
+                    data.clone(),
+                    ack_pong,
+                    part as usize * 1024..(part as usize + 1) * 1024,
+                    [7; 32],
+                    state.clone(),
+                )
+                .unwrap(),
+            );
+            states.push(state);
+        }
+        parts[0].start().unwrap();
+        parts[1].start().unwrap();
+        parts[3].start().unwrap();
+        states[3].set_finished(true);
+        assert!(matches!(parts[3].ack_pong.try_recv(), Ok(None)));
+        let info = match parts[0].prepare_chunk(&peer).unwrap() {
+            SendActionV2::Send((bytes, info)) => {
+                assert!(!bytes.is_empty());
+                info
+            }
+            _ => panic!("initial packet unexpectedly delayed"),
+        };
+        let seqno = info.seqno;
+        parts[0].on_send(info, peer.stats.timestamp_micros(), &peer).unwrap();
+        assert!(peer.stats.is_only_probe()); // Initial window is shared and zero.
+                                             // Establish a sibling waiting for a future probe deadline. The ACK
+                                             // must make normal sending eligible without waiting for that deadline.
+        parts[1].probe_at_micros = u64::MAX;
+        assert!(matches!(parts[1].prepare_chunk(&peer).unwrap(), SendActionV2::Wait(_)));
+        assert!(matches!(
+            parts[1].ack_pong.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        struct WakeCount(AtomicU64);
+        impl std::task::Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let wakes = Arc::new(WakeCount(AtomicU64::new(0)));
+        let waker = std::task::Waker::from(wakes.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(parts[1].ack_pong.poll_recv(&mut context).is_pending());
+        states[0].set_recv_info(seqno, 1, 1);
+        let ack = parts[0].ack_pong.try_recv().unwrap().unwrap();
+        let progress = AtomicU64::new(0);
+        assert_eq!(parts[0].on_ack_and_wake(ack, &peer, 1000, &states, &progress).unwrap(), 1);
+        assert_eq!(progress.load(Ordering::Acquire), 1);
+        assert_eq!(parts[0].in_flight_symbols, 0);
+        assert!(!peer.stats.is_only_probe());
+        assert_eq!(wakes.0.load(Ordering::Acquire), 1);
+        assert!(matches!(parts[1].ack_pong.try_recv(), Ok(None)));
+        match parts[1].prepare_chunk(&peer).unwrap() {
+            SendActionV2::Send((bytes, info)) => {
+                assert!(!bytes.is_empty());
+                assert!(!info.is_probe);
+            }
+            _ => panic!("sibling did not resume after real ACK"),
+        }
+        for i in [0, 2, 3] {
+            assert!(matches!(
+                parts[i].ack_pong.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        }
+        states[0].set_recv_info(seqno, 1, 1);
+        let duplicate = parts[0].ack_pong.try_recv().unwrap().unwrap();
+        assert_eq!(
+            parts[0].on_ack_and_wake(duplicate, &peer, 1000, &states, &progress).unwrap(),
+            0
+        );
+        assert_eq!(progress.load(Ordering::Acquire), 1);
+        for part in &mut parts {
+            assert!(matches!(
+                part.ack_pong.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
         }
     }
 }
