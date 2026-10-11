@@ -353,7 +353,7 @@ fn bounded_signature_boc_size(root: &Cell, budget: &dyn ConfigReadBudget) -> Res
         if seen.get(&cell.repr_hash(), &b)?.is_some() {
             continue;
         }
-        seen.insert(cell.repr_hash(), (), &b)?;
+        seen.insert(cell.repr_hash().clone(), (), &b)?;
         data += 2 + cell.bit_length().div_ceil(8);
         refs += cell.references_count();
         if data > PQ_SIGNATURE_BOC_MAX_BYTES {
