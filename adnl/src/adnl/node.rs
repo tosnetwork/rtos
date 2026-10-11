@@ -3942,7 +3942,7 @@ impl AdnlNode {
                 _ => true,
             }
         } else if let Some(msgs) = pkt.messages.as_ref() {
-            for msg in msgs.0.iter() {
+            for msg in msgs.iter() {
                 match msg {
                     AdnlMessage::Adnl_Message_Custom(_) => (),
                     AdnlMessage::Adnl_Message_Nop => (),
@@ -4647,7 +4647,7 @@ impl AdnlNode {
         }
         #[cfg(feature = "dump")]
         let msg = if Self::need_dump(&pkt) && self.dump.is_some() {
-            Some(format!("Send packet, priority {}\n{:?}", priority, pkt))
+            Some(format!("Send packet, method {method}\n{pkt:?}"))
         } else {
             None
         };
