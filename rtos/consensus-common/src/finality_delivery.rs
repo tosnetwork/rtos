@@ -15,6 +15,8 @@ pub struct FinalizedDeliveryDraft {
     pub finality: SessionFinality,
     pub last_mc_finalized_seqno: u32,
     pub candidate_already_sent: bool,
+    /// Frozen by source retention; retries must not extend publication lifetime.
+    pub created_at_unix_secs: u64,
 }
 
 /// Success identifies a durable node record, not an authentication token.
