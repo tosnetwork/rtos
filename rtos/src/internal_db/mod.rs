@@ -251,6 +251,7 @@ impl Clone for StateDb {
 pub struct InternalDb {
     catchain_db: Arc<RocksDb>,
     block_handle_storage: Arc<BlockHandleStorage>,
+    propagation_outbox_writer: Arc<AtomicBool>,
     prev1_block_db: BlockInfoDb,
     prev2_block_db: BlockInfoDb,
     next1_block_db: BlockInfoDb,
@@ -266,6 +267,17 @@ pub struct InternalDb {
     #[cfg(feature = "telemetry")]
     telemetry: Arc<EngineTelemetry>,
     allocated: Arc<EngineAlloc>,
+}
+
+/// Exclusive in-process owner of the durable publication snapshot. The RocksDB
+/// database lock already excludes independently opened processes; this guard
+/// prevents two outbox instances sharing one InternalDb from losing updates.
+pub(crate) struct PropagationOutboxWriterLease(Arc<AtomicBool>);
+
+impl Drop for PropagationOutboxWriterLease {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl InternalDb {
@@ -447,6 +459,7 @@ impl InternalDb {
         let result = Self {
             catchain_db: db_catchain,
             block_handle_storage,
+            propagation_outbox_writer: Arc::new(AtomicBool::new(false)),
             prev1_block_db: BlockInfoDb::with_db(db.clone(), PREV1_BLOCK_DB_NAME, can_create_db)?,
             prev2_block_db: BlockInfoDb::with_db(db.clone(), PREV2_BLOCK_DB_NAME, can_create_db)?,
             next1_block_db: BlockInfoDb::with_db(db.clone(), NEXT1_BLOCK_DB_NAME, can_create_db)?,
@@ -1387,6 +1400,29 @@ impl InternalDb {
     pub fn save_validator_state_raw(&self, key: &'static str, data: &[u8]) -> Result<()> {
         let _tc = time_checker!(|| format!("save_validator_state_raw {}", key), 30);
         self.block_handle_storage.save_validator_state_raw(key, data)
+    }
+
+    pub fn save_validator_state_raw_sync(&self, key: &'static str, data: &[u8]) -> Result<()> {
+        self.block_handle_storage.save_validator_state_raw_sync(key, data)
+    }
+
+    pub fn load_validator_state_raw_bounded(
+        &self,
+        key: &'static str,
+        maximum: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        self.block_handle_storage.load_validator_state_raw_bounded(key, maximum)
+    }
+
+    pub(crate) fn claim_propagation_outbox_writer(&self) -> Result<PropagationOutboxWriterLease> {
+        if self
+            .propagation_outbox_writer
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            fail!("A propagation outbox writer already owns this database");
+        }
+        Ok(PropagationOutboxWriterLease(self.propagation_outbox_writer.clone()))
     }
 
     pub async fn get_archive_id(&self, mc_seq_no: u32, shard: &ShardIdent) -> Option<u64> {

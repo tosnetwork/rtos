@@ -13,7 +13,7 @@ use crate::{db::DbKey, error::StorageError, traits::Serializable, types::DbSlice
 use adnl::common::add_unbound_object_to_map;
 use rocksdb::{
     BoundColumnFamily, Cache, DBWithThreadMode, IteratorMode, MultiThreaded, Options,
-    SnapshotWithThreadMode, WriteBatch,
+    SnapshotWithThreadMode, WriteBatch, WriteOptions,
 };
 use rtos_block::{error, fail, BlockIdExt, Result};
 use std::{
@@ -442,6 +442,27 @@ impl<K: DbKey + Send + Sync> RocksDbTable<K> {
             }
         }
         fail!("Attempt to write into dropped table {}", self.family)
+    }
+
+    /// Atomically replace one value and wait for its WAL durability barrier.
+    /// Unlike put_raw, success includes RocksDB's synchronous WAL write. WAL
+    /// must remain enabled: sync without WAL would not persist this memtable.
+    pub fn put_raw_sync(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        if let Some(lock) = self.db.locks.get(&self.family) {
+            let lock = lock.val();
+            if lock.fetch_add(1, Ordering::Relaxed) >= 0 {
+                let result = (|| {
+                    let mut options = WriteOptions::default();
+                    options.disable_wal(false);
+                    options.set_sync(true);
+                    self.db.put_cf_opt(&self.cf()?, key, value, &options)?;
+                    Ok(())
+                })();
+                lock.fetch_sub(1, Ordering::Relaxed);
+                return result;
+            }
+        }
+        fail!("Attempt to synchronously write into dropped table {}", self.family)
     }
 
     /// Puts value into collection by the key

@@ -25,6 +25,7 @@ pub mod internal_db;
 pub mod macros;
 pub mod network;
 mod network_db;
+pub mod propagation_outbox;
 pub mod rng;
 pub mod rpc_server;
 pub mod shard_state;

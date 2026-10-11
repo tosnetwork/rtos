@@ -689,6 +689,27 @@ impl BlockHandleStorage {
         self.validator_state_db.put_raw(key.as_bytes(), data)
     }
 
+    pub fn save_validator_state_raw_sync(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.delete_state(key)?;
+        self.validator_state_db.put_raw_sync(key.as_bytes(), data)
+    }
+
+    pub fn load_validator_state_raw_bounded(
+        &self,
+        key: &str,
+        maximum: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        match self.validator_state_db.try_get_raw(key.as_bytes())? {
+            Some(value) => {
+                if value.len() > maximum {
+                    fail!("Validator metadata {key} exceeds its {maximum} byte limit");
+                }
+                Ok(Some(value.to_vec()))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn drop_validator_state_raw(&self, key: &str) -> Result<()> {
         self.delete_state(key)?;
         self.validator_state_db.delete_raw(key.as_bytes())
