@@ -143,6 +143,7 @@ pub struct Engine {
     background_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
     ingress_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
     persistence_tasks: crate::types::owned_tasks::OwnedTasks,
+    publication_worker: std::sync::Mutex<Option<Arc<crate::publication_worker::PublicationWorker>>>,
 
     shard_states_awaiters: AwaitersPool<BlockIdExt, Arc<ShardStateStuff>>,
     block_applying_awaiters: AwaitersPool<BlockIdExt, ()>,
@@ -926,6 +927,7 @@ impl Engine {
                     shutdown_started: std::sync::Mutex::new(false),
                     shutdown_tasks: Arc::new(crate::types::owned_tasks::OwnedTasks::default()),
                     background_tasks: Arc::new(Default::default()),
+                    publication_worker: std::sync::Mutex::new(None),
                     ingress_tasks: Arc::new(crate::types::owned_tasks::OwnedTasks::new(
                         tokio_util::sync::CancellationToken::new(),
                     )),
@@ -1155,9 +1157,49 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) async fn ensure_publication_worker(
+        self: &Arc<Self>,
+    ) -> Result<Arc<crate::publication_worker::PublicationWorker>> {
+        if self.stopper.check_stop() { fail!("Engine publication admission stopped"); }
+        let existing = self.publication_worker.lock().unwrap().clone();
+        if let Some(worker) = existing {
+            worker.ready().await?;
+            return Ok(worker);
+        }
+        // Boot authenticated the applied state. A nonzero checkpoint need not
+        // retain zerostate data; use actual state global ID, never submitted data.
+        let state = self.load_last_applied_mc_state().await?;
+        let domain = crate::propagation_outbox::OutboxDomain {
+            zerostate: self.zerostate_id.clone(),
+            global_id: state.state()?.global_id(),
+            wire_profile: self.network.wire_profile(),
+        };
+        let worker = {
+            let mut slot = self.publication_worker.lock().unwrap();
+            if self.stopper.check_stop() { fail!("Engine publication admission stopped"); }
+            match slot.as_ref() {
+                Some(worker) => worker.clone(),
+                None => {
+                    let worker = crate::publication_worker::PublicationWorker::start(self, domain)?;
+                    *slot = Some(worker.clone());
+                    worker
+                }
+            }
+        };
+        worker.ready().await?;
+        Ok(worker)
+    }
+
+    pub(crate) async fn enable_publication_worker(self: &Arc<Self>) -> Result<()> {
+        self.ensure_publication_worker().await?.enable();
+        Ok(())
+    }
+
     async fn wait_stop_inner(self: Arc<Self>) -> Result<()> {
         // set stop flag
         self.stopper.set_stop();
+        let publication_worker = self.publication_worker.lock().unwrap().clone();
+        if let Some(worker) = &publication_worker { worker.stop(); }
         self.background_tasks.stop();
         self.ingress_tasks.stop();
         let finality_tasks = self.pending_finality.lock().tasks.clone();
@@ -1242,6 +1284,14 @@ impl Engine {
         if let Err(error) = self.service_tasks.wait().await {
             self.stopper.report_service_failure(0, format!("service ownership: {error}"));
         }
+        // Publication acceptance may write shard state. Its actor and every
+        // admitted blocking WAL operation must finish before state DB shutdown.
+        if let Some(worker) = publication_worker {
+            if let Err(error) = worker.wait().await {
+                self.stopper.report_service_failure(0, format!("publication worker: {error}"));
+            }
+        }
+        self.publication_worker.lock().unwrap().take();
         // An unknown validator teardown retains its bit and blocks DB shutdown.
         let _ = self.stopper.clone().wait_stop_except(Self::MASK_SERVICE_SHARDSTATE_GC).await;
         #[cfg(test)]
@@ -2921,6 +2971,10 @@ pub async fn run(
                 )
                 .await?;
 
+            // Durable admission precedes validator callbacks. Network replay is
+            // enabled only after fast-sync initialization below.
+            engine.ensure_publication_worker().await?;
+
             // Start validator manager, which will start validator sessions when necessary
             start_validator_manager(
                 Arc::clone(&engine) as Arc<dyn EngineOperations>,
@@ -2960,6 +3014,7 @@ pub async fn run(
             resend_top_shard_blocks_worker(engine.clone())?;
 
             overlays_router.special_update_fastsync_overlays().await?;
+            engine.enable_publication_worker().await?;
 
             // blocks download clients
             engine.set_sync_status(Engine::SYNC_STATUS_SYNC_BLOCKS);

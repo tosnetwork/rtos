@@ -1114,6 +1114,13 @@ impl EngineOperations for Engine {
         self.overlay_client(&shard).await?.download_archive(masterchain_seqno, &shard).await
     }
 
+    async fn submit_publication(
+        self: Arc<Self>,
+        record: crate::propagation_outbox::PublicationRecord,
+    ) -> Result<crate::validator::accept_block::AcceptedSessionBlock> {
+        self.ensure_publication_worker().await?.submit(record).await
+    }
+
     async fn resolve_propagation_targets(
         &self,
         id: &BlockIdExt,

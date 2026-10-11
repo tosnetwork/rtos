@@ -921,6 +921,13 @@ pub trait EngineOperations: Sync + Send {
         unimplemented!()
     }
 
+    async fn submit_publication(
+        self: Arc<Self>,
+        _record: crate::propagation_outbox::PublicationRecord,
+    ) -> Result<crate::validator::accept_block::AcceptedSessionBlock> {
+        rtos_block::fail!("Durable publication submission is unavailable")
+    }
+
     async fn resolve_propagation_targets(
         &self,
         id: &BlockIdExt,
