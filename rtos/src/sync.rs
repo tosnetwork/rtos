@@ -961,36 +961,66 @@ async fn save_block_owned(
     };
     crate::block_proof::check_block_proof_pair(engine.as_ref(), block_id, &block, &proof).await?;
     #[cfg(test)]
-    archive_drain_tests::hold(engine, false).await;
+    archive_drain_tests::hold(engine, false).await?;
     let worker_engine = engine.clone();
     let block_id = block_id.clone();
-    crate::types::service_tasks::spawn_owned(
-        engine.as_ref(),
+    let (sent, received) = tokio::sync::oneshot::channel();
+    let (acknowledge, observed) = tokio::sync::oneshot::channel();
+    let completion = engine.register_service_task(
         "authenticated archive block",
-        async move {
-            let engine = worker_engine;
-            let handle = engine.store_block(&block).await?.to_non_created().ok_or_else(|| {
-                error!("INTERNAL ERROR: mismatch in block {} store result during sync", block_id)
-            })?;
-            #[cfg(test)]
-            archive_drain_tests::hold(&engine, true).await;
-            let handle = engine
-                .store_block_proof(&block_id, Some(handle), &proof)
-                .await?
-                .to_non_created()
-                .ok_or_else(|| {
-                    error!(
+        0,
+        Box::new(move || {
+            tokio::spawn(async move {
+                let result = async {
+                    let engine = worker_engine.clone();
+                    let handle =
+                        engine.store_block(&block).await?.to_non_created().ok_or_else(|| {
+                            error!(
+                                "INTERNAL ERROR: mismatch in block {} store result during sync",
+                                block_id
+                            )
+                        })?;
+                    #[cfg(test)]
+                    archive_drain_tests::hold(&engine, true).await?;
+                    let handle = engine
+                        .store_block_proof(&block_id, Some(handle), &proof)
+                        .await?
+                        .to_non_created()
+                        .ok_or_else(|| {
+                            error!(
                         "INTERNAL ERROR: mismatch in block {} proof store result during sync",
                         block_id
                     )
-                })?;
-            if apply_mc {
-                engine.clone().apply_block(&handle, &block, block_id.seq_no(), false).await?;
-            }
-            Ok((handle, block, proof))
-        },
-    )?
-    .await?
+                        })?;
+                    if apply_mc {
+                        engine
+                            .clone()
+                            .apply_block(&handle, &block, block_id.seq_no(), false)
+                            .await?;
+                    }
+                    Ok((handle, block, proof))
+                }
+                .await;
+                let failure = result.as_ref().err().map(|error| format!("{error:#}"));
+                let _ = sent.send(result);
+                // Sending is not consumption: the observer can be cancelled with
+                // a queued result. Its acknowledgement is emitted synchronously
+                // after receiving, and dropped on cancellation before receiving.
+                if observed.await.is_err() {
+                    if let Some(error) = failure {
+                        worker_engine.report_service_failure(
+                            0,
+                            format!("Unobserved archive import failure: {error}"),
+                        );
+                    }
+                }
+            })
+        }),
+    )?;
+    let result = received.await?;
+    let _ = acknowledge.send(());
+    completion.await?;
+    result
 }
 
 #[cfg(test)]

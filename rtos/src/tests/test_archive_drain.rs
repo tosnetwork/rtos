@@ -34,6 +34,7 @@ async fn check_imported_block(db: &InternalDb, id: &BlockIdExt) -> Result<Option
 }
 
 struct Gate {
+    fail: bool,
     stored: bool,
     entered: Notify,
     release: Semaphore,
@@ -45,28 +46,59 @@ fn gates() -> &'static Mutex<HashMap<usize, Arc<Gate>>> {
 fn key(engine: &Arc<dyn EngineOperations>) -> usize {
     Arc::as_ptr(engine) as *const () as usize
 }
-pub(super) async fn hold(engine: &Arc<dyn EngineOperations>, stored: bool) {
+pub(super) async fn hold(engine: &Arc<dyn EngineOperations>, stored: bool) -> Result<()> {
     let gate = gates().lock().unwrap().get(&key(engine)).cloned();
     if let Some(gate) = gate.filter(|gate| gate.stored == stored) {
         gate.entered.notify_one();
         gate.release.acquire().await.unwrap().forget();
+        if gate.fail {
+            fail!("injected failure after accepted archive storage");
+        }
+    }
+    Ok(())
+}
+
+// Ensure assertion failures and causal controls also close real OS workers before
+// the test runtime drops. This guard owns no fabricated completion condition.
+struct TestEngine(Arc<Engine>);
+impl std::ops::Deref for TestEngine {
+    type Target = Arc<Engine>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for TestEngine {
+    fn drop(&mut self) {
+        let engine = self.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let joined = std::thread::spawn(move || {
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(30), engine.wait_stop()).await
+            })
+        })
+        .join();
+        if !matches!(joined, Ok(Ok(_))) {
+            eprintln!("archive fixture cleanup failed: {joined:?}");
+        }
     }
 }
 
-async fn open(dir: &Path) -> Arc<Engine> {
+async fn open(dir: &Path) -> TestEngine {
     let config =
         TonNodeConfig::from_file(dir.to_str().unwrap(), "config.json", None, "config.json", None)
             .await
             .unwrap();
-    Engine::new(
-        config,
-        EngineFlags { initial_sync_disabled: true, force_check_db: false, truncate_db: None },
-        Arc::new(Stopper::new()),
+    TestEngine(
+        Engine::new(
+            config,
+            EngineFlags { initial_sync_disabled: true, force_check_db: false, truncate_db: None },
+            Arc::new(Stopper::new()),
+        )
+        .await
+        .unwrap(),
     )
-    .await
-    .unwrap()
 }
-async fn prepare(dir: &Path, fixture: &Fixture, wrong_pin: bool) -> Arc<Engine> {
+async fn prepare(dir: &Path, fixture: &Fixture, wrong_pin: bool) -> TestEngine {
     fixture.prepare(dir, &dir.join("archives")).await.unwrap();
     let (adnl, _) =
         adnl::node::AdnlNodeConfig::with_ip_address_and_private_key_tags("127.0.0.1:0", vec![1, 2])
@@ -171,7 +203,12 @@ async fn archive_drain_cancel_before_admission_has_no_block_writes() {
     let fixture = Fixture::new();
     let engine = prepare(dir.path(), &fixture, false).await;
     let ops: Arc<dyn EngineOperations> = engine.clone();
-    let gate = Arc::new(Gate { stored: false, entered: Notify::new(), release: Semaphore::new(0) });
+    let gate = Arc::new(Gate {
+        fail: false,
+        stored: false,
+        entered: Notify::new(),
+        release: Semaphore::new(0),
+    });
     gates().lock().unwrap().insert(key(&ops), gate.clone());
     let maps = maps(dir.path()).await;
     let id = fixture.id(1, false);
@@ -190,7 +227,7 @@ async fn archive_drain_cancel_before_admission_has_no_block_writes() {
     drop(engine);
     let reopened = open(dir.path()).await;
     assert!(reopened.load_block_handle(&id).unwrap().is_none());
-    stop(reopened).await;
+    stop(reopened.clone()).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -199,7 +236,12 @@ async fn archive_drain_cancel_after_store_waits_for_real_apply_and_reopen() {
     let fixture = Fixture::new();
     let engine = prepare(dir.path(), &fixture, false).await;
     let ops: Arc<dyn EngineOperations> = engine.clone();
-    let gate = Arc::new(Gate { stored: true, entered: Notify::new(), release: Semaphore::new(0) });
+    let gate = Arc::new(Gate {
+        fail: false,
+        stored: true,
+        entered: Notify::new(),
+        release: Semaphore::new(0),
+    });
     gates().lock().unwrap().insert(key(&ops), gate.clone());
     let maps = maps(dir.path()).await;
     let id = fixture.id(1, false);
@@ -228,7 +270,7 @@ async fn archive_drain_cancel_after_store_waits_for_real_apply_and_reopen() {
     drop(engine);
     let reopened = open(dir.path()).await;
     assert_applied(&reopened, &fixture).await;
-    stop(reopened).await;
+    stop(reopened.clone()).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -258,7 +300,7 @@ async fn archive_drain_bad_proof_and_wrong_pin_do_not_write_first_block() {
         drop(engine);
         let reopened = open(dir.path()).await;
         assert!(reopened.load_block_handle(&id).unwrap().is_none());
-        stop(reopened).await;
+        stop(reopened.clone()).await;
     }
 }
 
@@ -268,7 +310,12 @@ async fn archive_drain_shutdown_rejects_authenticated_but_unaccepted_block() {
     let fixture = Fixture::new();
     let engine = prepare(dir.path(), &fixture, false).await;
     let ops: Arc<dyn EngineOperations> = engine.clone();
-    let gate = Arc::new(Gate { stored: false, entered: Notify::new(), release: Semaphore::new(0) });
+    let gate = Arc::new(Gate {
+        fail: false,
+        stored: false,
+        entered: Notify::new(),
+        release: Semaphore::new(0),
+    });
     gates().lock().unwrap().insert(key(&ops), gate.clone());
     let maps = maps(dir.path()).await;
     let previous = fixture.id(0, false);
@@ -287,7 +334,7 @@ async fn archive_drain_shutdown_rejects_authenticated_but_unaccepted_block() {
     drop(engine);
     let reopened = open(dir.path()).await;
     assert!(reopened.load_block_handle(&fixture.id(1, false)).unwrap().is_none());
-    stop(reopened).await;
+    stop(reopened.clone()).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -304,5 +351,47 @@ async fn archive_drain_corrupt_package_fails_before_admission() {
     drop(engine);
     let reopened = open(dir.path()).await;
     assert!(reopened.load_block_handle(&fixture.id(1, false)).unwrap().is_none());
-    stop(reopened).await;
+    stop(reopened.clone()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn archive_drain_unobserved_accepted_failure_is_sticky_and_retryable_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new();
+    let engine = prepare(dir.path(), &fixture, false).await;
+    let ops: Arc<dyn EngineOperations> = engine.clone();
+    let gate = Arc::new(Gate {
+        fail: true,
+        stored: true,
+        entered: Notify::new(),
+        release: Semaphore::new(0),
+    });
+    gates().lock().unwrap().insert(key(&ops), gate.clone());
+    let package_maps = maps(dir.path()).await;
+    let previous = fixture.id(0, false);
+    let worker = tokio::spawn({
+        let ops = ops.clone();
+        async move { import_first(ops, package_maps, previous).await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), gate.entered.notified()).await.unwrap();
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    gate.release.add_permits(1);
+    let error = tokio::time::timeout(Duration::from_secs(30), engine.clone().wait_stop())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("Unobserved archive import failure"), "{error:#}");
+    assert_eq!(
+        engine.load_last_applied_mc_block_id().unwrap().unwrap().as_ref(),
+        &fixture.id(0, false)
+    );
+    assert!(!engine.load_block_handle(&fixture.id(1, false)).unwrap().unwrap().is_applied());
+    gates().lock().unwrap().remove(&key(&ops));
+    drop(ops);
+    drop(engine);
+    let reopened = open(dir.path()).await;
+    import_first(reopened.clone(), maps(dir.path()).await, fixture.id(0, false)).await.unwrap();
+    assert_applied(&reopened, &fixture).await;
+    stop(reopened.clone()).await;
 }
