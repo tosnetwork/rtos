@@ -24,6 +24,7 @@ mod internal_db;
 mod macros;
 mod network;
 mod network_db;
+mod propagation_outbox;
 mod rng;
 mod rpc_server;
 mod shard_state;
