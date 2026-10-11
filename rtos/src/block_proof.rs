@@ -19,7 +19,8 @@ use crate::{
 };
 use rtos_block::{
     error, fail, write_boc, Block, BlockIdExt, BlockInfo, BlockProof, BlockSignaturesVariant,
-    BocReader, Cell, ConfigParams, Deserializable, HashmapType, MerkleProof, Result, Serializable, UInt256,
+    BocReader, Cell, ConfigParams, Deserializable, HashmapType, MerkleProof, Result, Serializable,
+    UInt256,
 };
 use std::sync::Arc;
 
@@ -213,6 +214,7 @@ impl Default for MasterchainProofVerifier {
 /// the PQ verifier. Serialized outbox metadata cannot construct this receipt.
 pub struct PqPublicationContext {
     zerostate: BlockIdExt,
+    history_init: BlockIdExt,
     global_id: i32,
     protocol: consensus_common::simplex_protocol::SimplexProtocol,
     profile: UInt256,
@@ -220,6 +222,10 @@ pub struct PqPublicationContext {
 }
 
 impl PqPublicationContext {
+    /// Local trust checkpoint used while authenticating the governing history.
+    pub fn history_init(&self) -> &BlockIdExt {
+        &self.history_init
+    }
     pub fn zerostate(&self) -> &BlockIdExt {
         &self.zerostate
     }
@@ -392,6 +398,7 @@ impl MasterchainProofVerifier {
         }
         Ok(PqPublicationContext {
             zerostate: engine.zerostate_id()?.clone(),
+            history_init: engine.init_mc_block_id().clone(),
             global_id: authority.global_id,
             protocol,
             profile: identity.config_hash,
