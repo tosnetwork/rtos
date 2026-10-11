@@ -280,6 +280,14 @@ impl PendingFinalityStore {
 
 }
 
+/// Persist bounded, untrusted recovery evidence through the real source WAL.
+/// This does not authenticate the record or grant publication authority. Engine
+/// must authenticate history before node takeover. An active namespace owner
+/// causes an error; this helper never bypasses the live session's lock.
+pub fn retain_pending_finality(namespace: &Path, record: &PendingFinalityRecord) -> Result<PendingFinalityRecord> {
+    PendingFinalityStore::open(namespace)?.retain(record)
+}
+
 /// A scan result holds the source ownership lock until authenticated node takeover
 /// and acknowledgement, or drop. Failed authentication must leave it untouched.
 pub struct PendingFinalityRecovery {
