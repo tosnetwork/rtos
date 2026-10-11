@@ -13,10 +13,11 @@
 //! validator-session and simplex consensus implementations.
 
 // Internal modules
-pub mod simplex_protocol;
-pub mod thread_owner;
 mod async_owner;
 pub mod overlay_owner;
+pub mod session_runtime;
+pub mod simplex_protocol;
+pub mod thread_owner;
 mod validator_identity;
 pub use validator_identity::{SimplexSignatureVerifier, ValidatorIdentity};
 mod activity_node;
@@ -1065,10 +1066,16 @@ pub trait ConsensusOverlayManager {
         block_sync_params: Option<BlockSyncOverlayParams>,
     ) -> Result<ConsensusOverlayPtr>;
 
-    fn stop_overlay_checked(&self, _id: &Arc<PrivateOverlayShortId>, _overlay: &ConsensusOverlayPtr) -> Result<()> {
+    fn stop_overlay_checked(
+        &self,
+        _id: &Arc<PrivateOverlayShortId>,
+        _overlay: &ConsensusOverlayPtr,
+    ) -> Result<()> {
         Err(rtos_block::error!("Overlay does not implement checked drain"))
     }
-    fn overlay_drained(&self, _overlay: &ConsensusOverlayPtr) -> bool { false }
+    fn overlay_drained(&self, _overlay: &ConsensusOverlayPtr) -> bool {
+        false
+    }
 
     /// Stop existing overlay
     fn stop_overlay(
