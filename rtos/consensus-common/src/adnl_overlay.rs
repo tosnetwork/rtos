@@ -1250,12 +1250,28 @@ impl AdnlOverlay {
         registration.ids.clear(); // The constructed overlay now owns teardown.
 
         // Add consumer to overlay node for message handling
-        overlay.stack.overlay.add_consumer(&overlay_id, overlay.consumer.clone())?;
+        if !overlay
+            .stack
+            .overlay
+            .add_consumer_for_generation(&overlay.lower_generation, overlay.consumer.clone())?
+        {
+            fail!("Consensus consumer was already registered");
+        }
 
         if let (Some(bs_id), Some(bs_consumer)) =
             (&overlay.block_sync_overlay_id, &overlay.block_sync_consumer)
         {
-            overlay.stack.overlay.add_consumer(bs_id, bs_consumer.clone())?;
+            let generation = overlay
+                .lower_block_sync_generation
+                .as_ref()
+                .ok_or_else(|| error!("Missing block-sync generation"))?;
+            if !overlay
+                .stack
+                .overlay
+                .add_consumer_for_generation(generation, bs_consumer.clone())?
+            {
+                fail!("Block-sync consumer was already registered");
+            }
         }
 
         // Periodic stats dump (lives as long as the overlay's stop flag is unset)

@@ -545,6 +545,7 @@ declare_counted!(
 
 declare_counted!(
     struct Overlay {
+        consumer: OnceLock<Arc<dyn Subscriber>>,
         tasks: Arc<AdnlTasks>,
         inbound_caps: Arc<std::sync::Mutex<Vec<Arc<KeyId>>>>,
         adnl: Arc<AdnlNode>,
@@ -1452,6 +1453,11 @@ impl OverlayShutdown {
 
 /// Overlay Node
 pub struct OverlayNode {
+    #[cfg(test)]
+    send_admission_gate: std::sync::Mutex<Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>>,
+    #[cfg(test)]
+    receive_admission_gate:
+        std::sync::Mutex<Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>>,
     generations: std::sync::Mutex<()>,
     retired: std::sync::Mutex<HashMap<Arc<OverlayShortId>, std::sync::Weak<AdnlTasks>>>,
     wire_profile: rtos_api::WireProfile,
@@ -1538,6 +1544,10 @@ impl OverlayNode {
             stats_transfer: Arc::new(AtomicU64::new(0)),
         };
         let ret = Self {
+            #[cfg(test)]
+            send_admission_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            receive_admission_gate: std::sync::Mutex::new(None),
             wire_profile,
             adnl,
             consumers: lockfree::map::Map::new(),
@@ -1556,6 +1566,22 @@ impl OverlayNode {
         Ok(Arc::new(ret))
     }
 
+    #[cfg(test)]
+    async fn pause_after_send_admission(&self) {
+        let gate = self.send_admission_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.0.notify_one();
+            gate.1.notified().await;
+        }
+    }
+    #[cfg(test)]
+    async fn pause_after_receive_admission(&self) {
+        let gate = self.receive_admission_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.0.notify_one();
+            gate.1.notified().await;
+        }
+    }
     pub fn wire_profile(&self) -> rtos_api::WireProfile {
         self.wire_profile
     }
@@ -1566,16 +1592,42 @@ impl OverlayNode {
         overlay_id: &Arc<OverlayShortId>,
         consumer: Arc<dyn Subscriber>,
     ) -> Result<bool> {
-        log::debug!(target: TARGET, "Add consumer {} to overlay", overlay_id);
-        add_counted_object_to_map(&self.consumers, overlay_id.clone(), || {
-            let ret = ConsumerObject {
+        let _generation = self.generations.lock().unwrap();
+        let overlay = self.get_overlay(overlay_id, "Consumer registration for unknown overlay")?;
+        self.add_consumer_locked(&overlay, consumer)
+    }
+    pub fn add_consumer_for_generation(
+        &self,
+        generation: &OverlayShutdown,
+        consumer: Arc<dyn Subscriber>,
+    ) -> Result<bool> {
+        let _generation = self.generations.lock().unwrap();
+        let overlay =
+            self.get_overlay(&generation.id, "Consumer registration for unknown generation")?;
+        if !Arc::ptr_eq(&overlay.tasks, &generation.tasks) {
+            fail!("Consumer generation was replaced");
+        }
+        self.add_consumer_locked(&overlay, consumer)
+    }
+    fn add_consumer_locked(
+        &self,
+        overlay: &Arc<Overlay>,
+        consumer: Arc<dyn Subscriber>,
+    ) -> Result<bool> {
+        let _lease = overlay.tasks.enter()?;
+        let added = add_counted_object_to_map(&self.consumers, overlay.overlay_id.clone(), || {
+            Ok(ConsumerObject {
                 object: consumer.clone(),
                 counter: self.allocated.consumers.clone().into(),
-            };
-            #[cfg(feature = "telemetry")]
-            self.telemetry.consumers.update(self.allocated.consumers.load(Ordering::Relaxed));
-            Ok(ret)
-        })
+            })
+        })?;
+        if added {
+            overlay
+                .consumer
+                .set(consumer)
+                .map_err(|_| error!("Overlay consumer is already bound"))?;
+        }
+        Ok(added)
     }
 
     /// Add overlay for local workchain
@@ -1963,16 +2015,14 @@ impl OverlayNode {
         data: &TaggedByteSlice<'_>,
         overlay_id: &Arc<OverlayShortId>,
     ) -> Result<()> {
-        let _lease = self.get_overlay(overlay_id, "Overlay admission")?.tasks.enter()?;
+        let overlay = self.get_overlay(overlay_id, "Overlay admission")?;
+        let _lease = overlay.tasks.enter()?;
+        #[cfg(test)]
+        self.pause_after_send_admission().await;
         #[cfg(feature = "telemetry")]
         let tag = data.tag;
         let (peers, data) = self
-            .prepare_to_send_message(
-                dst,
-                data,
-                overlay_id,
-                "Sending ADNL message to unknown overlay",
-            )
+            .prepare_to_send_message(dst, data, &overlay, "Sending ADNL message to unknown overlay")
             .await?;
         self.adnl
             .send_custom(
@@ -1993,17 +2043,15 @@ impl OverlayNode {
         data: &TaggedByteSlice<'_>,
         overlay_id: &Arc<OverlayShortId>,
     ) -> Result<()> {
-        let _lease = self.get_overlay(overlay_id, "Overlay admission")?.tasks.enter()?;
+        let overlay = self.get_overlay(overlay_id, "Overlay admission")?;
+        let _lease = overlay.tasks.enter()?;
+        #[cfg(test)]
+        self.pause_after_send_admission().await;
         let Some(quic) = self.quic.get() else {
             fail!("QUIC sender is not set in overlay node");
         };
         let (peers, data) = self
-            .prepare_to_send_message(
-                dst,
-                data,
-                overlay_id,
-                "Sending QUIC message to unknown overlay",
-            )
+            .prepare_to_send_message(dst, data, &overlay, "Sending QUIC message to unknown overlay")
             .await?;
         quic.message(data, Some(&self.adnl), &peers).await?;
         Ok(())
@@ -2018,16 +2066,14 @@ impl OverlayNode {
         v2: bool,
         roundtrip: Option<u64>,
     ) -> Result<u64> {
-        let _lease = self.get_overlay(overlay_id, "Overlay admission")?.tasks.enter()?;
+        let overlay = self.get_overlay(overlay_id, "Overlay admission")?;
+        let _lease = overlay.tasks.enter()?;
+        #[cfg(test)]
+        self.pause_after_send_admission().await;
         #[cfg(feature = "telemetry")]
         let tag = data.tag;
         let (peers, data) = self
-            .prepare_to_send_message(
-                dst,
-                data,
-                overlay_id,
-                "Sending RLDP message to unknown overlay",
-            )
+            .prepare_to_send_message(dst, data, &overlay, "Sending RLDP message to unknown overlay")
             .await?;
         let Some(rldp) = self.rldp.get() else {
             fail!("RLDP sender is not set in overlay node");
@@ -2053,11 +2099,14 @@ impl OverlayNode {
         overlay_id: &Arc<OverlayShortId>,
         timeout_ms: Option<u64>,
     ) -> Result<Option<TLObject>> {
-        let _lease = self.get_overlay(overlay_id, "Overlay admission")?.tasks.enter()?;
+        let overlay = self.get_overlay(overlay_id, "Overlay admission")?;
+        let _lease = overlay.tasks.enter()?;
+        #[cfg(test)]
+        self.pause_after_send_admission().await;
         let (peers, overlay) = self
             .prepare_to_send(
                 dst,
-                overlay_id,
+                &overlay,
                 "Sending ADNL query to unknown overlay",
                 #[cfg(feature = "telemetry")]
                 query.tag,
@@ -2085,14 +2134,17 @@ impl OverlayNode {
         overlay_id: &Arc<OverlayShortId>,
         timeout_ms: Option<u64>,
     ) -> Result<Option<TLObject>> {
-        let _lease = self.get_overlay(overlay_id, "Overlay admission")?.tasks.enter()?;
+        let overlay = self.get_overlay(overlay_id, "Overlay admission")?;
+        let _lease = overlay.tasks.enter()?;
+        #[cfg(test)]
+        self.pause_after_send_admission().await;
         let Some(quic) = self.quic.get() else {
             fail!("QUIC sender is not set in overlay node");
         };
         let (peers, overlay) = self
             .prepare_to_send(
                 dst,
-                overlay_id,
+                &overlay,
                 "Sending QUIC query to unknown overlay",
                 #[cfg(feature = "telemetry")]
                 query.tag,
@@ -2119,11 +2171,14 @@ impl OverlayNode {
         v2: bool,
         roundtrip: Option<u64>,
     ) -> Result<(Option<Vec<u8>>, u64)> {
-        let _lease = self.get_overlay(overlay_id, "Overlay admission")?.tasks.enter()?;
+        let overlay = self.get_overlay(overlay_id, "Overlay admission")?;
+        let _lease = overlay.tasks.enter()?;
+        #[cfg(test)]
+        self.pause_after_send_admission().await;
         let (peers, _) = self
             .prepare_to_send(
                 dst,
-                overlay_id,
+                &overlay,
                 "Sending RLDP query to unknown overlay",
                 #[cfg(feature = "telemetry")]
                 data.tag,
@@ -2244,6 +2299,7 @@ impl OverlayNode {
         };
         let quic = if overlay_type.quic_requested() { self.quic.get().cloned() } else { None };
         let overlay = Overlay {
+            consumer: OnceLock::new(),
             tasks: AdnlTasks::with_runtime(
                 params.runtime.clone().unwrap_or_else(tokio::runtime::Handle::current),
             ),
@@ -2608,11 +2664,10 @@ impl OverlayNode {
     async fn prepare_to_send(
         &self,
         dst: &Arc<KeyId>,
-        overlay_id: &Arc<OverlayShortId>,
-        err_msg: &str,
+        overlay: &Arc<Overlay>,
+        _err_msg: &str,
         #[cfg(feature = "telemetry")] tag: u32,
     ) -> Result<(AdnlPeers, Arc<Overlay>)> {
-        let overlay = self.get_overlay(overlay_id, err_msg)?;
         let peers = overlay
             .prepare_to_send(
                 dst,
@@ -2621,21 +2676,21 @@ impl OverlayNode {
                 tag,
             )
             .await?;
-        Ok((peers, overlay))
+        Ok((peers, overlay.clone()))
     }
 
     async fn prepare_to_send_message(
         &self,
         dst: &Arc<KeyId>,
         data: &TaggedByteSlice<'_>,
-        overlay_id: &Arc<OverlayShortId>,
-        err_msg: &str,
+        overlay: &Arc<Overlay>,
+        _err_msg: &str,
     ) -> Result<(AdnlPeers, Vec<u8>)> {
         let (peers, overlay) = self
             .prepare_to_send(
                 dst,
-                overlay_id,
-                err_msg,
+                overlay,
+                _err_msg,
                 #[cfg(feature = "telemetry")]
                 data.tag,
             )
@@ -2712,6 +2767,8 @@ impl Subscriber for OverlayNode {
         }
         let overlay = self.get_overlay(&overlay_id, "Message to unknown overlay")?;
         let _lease = overlay.tasks.enter()?;
+        #[cfg(test)]
+        self.pause_after_receive_admission().await;
         if (overlay.flags & Overlay::FLAG_OVERLAY_OTHER_WORKCHAIN) != 0 {
             return Ok(true);
         }
@@ -2728,8 +2785,8 @@ impl Subscriber for OverlayNode {
         }
 
         let suffix = &data[suffix_offset..];
-        let consumer = if let Some(consumer) = self.consumers.get(&overlay_id) {
-            let consumer = consumer.val().object.clone();
+        let consumer = if let Some(consumer) = overlay.consumer.get() {
+            let consumer = consumer.clone();
             if overlay.overlay_type.is_private() {
                 match consumer.try_consume_custom(suffix, peers).await {
                     Err(e) => {
@@ -2923,6 +2980,8 @@ impl Subscriber for OverlayNode {
             fail!("Query to unknown overlay {}", overlay_id)
         };
         let _lease = overlay.tasks.enter()?;
+        #[cfg(test)]
+        self.pause_after_receive_admission().await;
         if !self.check_overlay_adnl_address(&overlay, peers.local()) {
             return Ok(QueryResult::Consumed(QueryAnswer::Ready(None)));
         }
@@ -3004,8 +3063,8 @@ impl Subscriber for OverlayNode {
         if other_workchain {
             return Ok(QueryResult::Consumed(QueryAnswer::Ready(None)));
         }
-        let consumer = if let Some(consumer) = self.consumers.get(&overlay_id) {
-            consumer.val().object.clone()
+        let consumer = if let Some(consumer) = overlay.consumer.get() {
+            consumer.clone()
         } else {
             fail!(
                 "No dedicated consumer for query {object:?} from {} in overlay {overlay_id}",
