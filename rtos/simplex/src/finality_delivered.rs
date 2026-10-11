@@ -222,6 +222,10 @@ impl PendingFinalityStore {
             file.write_all(&bytes)?;
             file.sync_all()?;
             drop(file);
+            #[cfg(test)]
+            if let Some(gate) = self.confirmed_rename_gate.lock().unwrap().take() {
+                gate.wait();
+            }
             std::fs::rename(temp, &path)?;
             #[cfg(test)]
             if self.fail_confirmed_once.swap(false, Ordering::AcqRel) {
@@ -319,7 +323,7 @@ impl PendingFinalityStore {
                 fail!("Conflicting Delivered generation");
             }
         } else {
-            let paths = self.paths()?;
+            let paths = self.paths_under_mutation()?;
             let compact: Vec<_> = paths
                 .iter()
                 .filter(|p| {
@@ -828,6 +832,101 @@ mod tests {
         let offer = CloseOffer { request, generation: 1 };
         (dir, runtime, store, record, offer)
     }
+    fn concurrent_confirmed_scan(unlocked_control: bool) {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (_dir, runtime, store, record, offer) = setup();
+        let id = record.id().unwrap();
+        let namespace = store.directory.parent().unwrap().to_owned();
+        let reference = store.close_locator(&id).unwrap().unwrap().reference;
+        drop(store.commit_delivered(&runtime, &reference, &offer).unwrap());
+        let (writer_entered_tx, writer_entered) = mpsc::channel();
+        let (writer_release, writer_release_rx) = mpsc::channel();
+        *store.confirmed_rename_gate.lock().unwrap() =
+            Some(SourceIoGate { entered: writer_entered_tx, release: writer_release_rx });
+        let (scan_entered_tx, scan_entered) = mpsc::channel();
+        let (scan_release, scan_release_rx) = mpsc::channel();
+        if unlocked_control {
+            *store.scan_metadata_gate.lock().unwrap() =
+                Some(SourceIoGate { entered: scan_entered_tx.clone(), release: scan_release_rx });
+        } else {
+            *store.scan_started.lock().unwrap() = Some(scan_entered_tx.clone());
+        }
+        let owner = store.clone();
+        let writer_id = id.clone();
+        let writer_offer = offer.clone();
+        let mut writer =
+            Some(std::thread::spawn(move || owner.mark_node_confirmed(&writer_id, &writer_offer)));
+        let mut reader = None;
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            writer_entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(
+                store.mutation.try_lock().is_err(),
+                "actual confirmed writer owns mutation through sync/rename"
+            );
+            assert!(store.delivered_path(&id).with_extension("tmp").exists());
+            let scan_store = store.clone();
+            reader = Some(std::thread::spawn(move || {
+                // The negative control invokes exactly the former unsynchronized
+                // enumeration, not a copied algorithm or swallowed IO error.
+                if unlocked_control {
+                    scan_store.paths_under_mutation()
+                } else {
+                    scan_store.paths()
+                }
+            }));
+            scan_entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            writer_release.send(()).unwrap();
+            writer.take().unwrap().join().unwrap().unwrap();
+            let _ = scan_release.send(());
+            let result = reader.take().unwrap().join().unwrap();
+            if unlocked_control {
+                let error = result.expect_err("old scan must lose its actual tmp entry to rename");
+                assert_eq!(
+                    error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                    std::io::ErrorKind::NotFound
+                );
+                assert!(format!("{error:#}").contains(".tmp"), "path-specific failure: {error:#}");
+            } else {
+                assert_eq!(result.unwrap(), vec![store.delivered_path(&id)]);
+            }
+            assert!(DeliveredDisk::read(&store.delivered_path(&id)).unwrap().node_confirmed);
+        }));
+        // Every failure releases both real filesystem owners before unwinding.
+        let _ = writer_release.send(());
+        let _ = scan_release.send(());
+        if let Some(task) = writer.take() {
+            let _ = task.join();
+        }
+        if let Some(task) = reader.take() {
+            let _ = task.join();
+        }
+        run.unwrap();
+        drop(store);
+        let reopened = PendingFinalityStore::open(&namespace).unwrap();
+        assert!(reopened.confirmed_without_backup(&id).unwrap());
+        assert_eq!(
+            reopened
+                .delivered_reference(&id)
+                .unwrap()
+                .unwrap()
+                .metadata_record()
+                .unwrap()
+                .id()
+                .unwrap(),
+            id
+        );
+    }
+
+    #[test]
+    fn source_delivered_scan_serializes_actual_confirmed_rename() {
+        concurrent_confirmed_scan(false);
+    }
+    #[test]
+    fn source_delivered_unlocked_scan_reproduces_tmp_rename_enoent() {
+        concurrent_confirmed_scan(true);
+    }
+
     #[test]
     fn source_delivered_exact_binding_sync_reopen_and_old_backup() {
         let (_dir, runtime, store, record, offer) = super::tests::setup();
