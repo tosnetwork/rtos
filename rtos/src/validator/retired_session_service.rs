@@ -19,6 +19,8 @@ use std::{
     time::Duration,
 };
 
+mod closing;
+
 const MAX_ACTIVE: usize = 8;
 const SCAN_BATCH: usize = 64;
 const RETRY: Duration = Duration::from_secs(1);
@@ -36,6 +38,7 @@ pub(crate) struct RecoveryServiceSnapshot {
 pub(crate) struct RetiredSessionService {
     status: Mutex<RecoveryServiceSnapshot>,
     initialized: tokio::sync::watch::Sender<bool>,
+    close_cursors: Arc<Mutex<std::collections::BTreeMap<PathBuf, rtos_block::UInt256>>>,
 }
 
 impl RetiredSessionService {
@@ -43,6 +46,7 @@ impl RetiredSessionService {
         let service = Arc::new(Self {
             status: Mutex::new(Default::default()),
             initialized: tokio::sync::watch::channel(false).0,
+            close_cursors: Arc::new(Mutex::new(Default::default())),
         });
         let owner = service.clone();
         let task_engine = engine.clone();
@@ -78,8 +82,11 @@ impl RetiredSessionService {
 
     async fn run(self: Arc<Self>, engine: Arc<Engine>) {
         let mut active = Vec::new();
+        let mut closures = Vec::new();
         let result =
-            std::panic::AssertUnwindSafe(self.run_inner(&engine, &mut active)).catch_unwind().await;
+            std::panic::AssertUnwindSafe(self.run_inner(&engine, &mut active, &mut closures))
+                .catch_unwind()
+                .await;
         self.initialized.send_replace(true);
         if !matches!(result, Ok(Ok(()))) {
             // Stop all admission, but do not declare this service drained yet.
@@ -87,7 +94,7 @@ impl RetiredSessionService {
         }
         // Keep every session and its namespace lease until the real blocking
         // shutdown certifies drain. Caller cancellation cannot detach this work.
-        while !active.is_empty() {
+        while !active.is_empty() || !closures.is_empty() {
             let cleanup =
                 std::panic::AssertUnwindSafe(self.poll_owners(engine.stopper(), &mut active, true))
                     .catch_unwind()
@@ -97,7 +104,8 @@ impl RetiredSessionService {
                 // A cleanup panic cannot become a terminal service exemption.
                 log::error!("Retired recovery cleanup failed; retaining all unresolved owners");
             }
-            if !active.is_empty() {
+            self.poll_closures(&engine, &mut closures);
+            if !active.is_empty() || !closures.is_empty() {
                 tokio::time::sleep(RETRY).await;
             }
         }
@@ -118,6 +126,7 @@ impl RetiredSessionService {
         &self,
         engine: &Arc<Engine>,
         active: &mut Vec<ActiveRecovery>,
+        closures: &mut Vec<closing::ActiveClosure>,
     ) -> Result<()> {
         let directory = PathBuf::from(engine.db_root_dir()?).join("catchains/consensus/v2");
         let mut cursor = None;
@@ -126,7 +135,9 @@ impl RetiredSessionService {
                 return Ok(());
             }
             self.poll_owners(engine.stopper(), active, false).await?;
-            self.status.lock().unwrap_or_else(|e| e.into_inner()).active = active.len();
+            self.poll_closures(engine, closures);
+            self.status.lock().unwrap_or_else(|e| e.into_inner()).active =
+                active.len() + closures.len();
             let root = directory.clone();
             let after = cursor.clone();
             // This join belongs to the actor; no timeout abandons blocking IO.
@@ -138,14 +149,16 @@ impl RetiredSessionService {
                 Ok(entries) => {
                     let first_pass_deadline = tokio::time::Instant::now() + AUTH_TIMEOUT;
                     for path in entries {
-                        if engine.check_stop() || active.len() >= MAX_ACTIVE {
+                        if engine.check_stop() || active.len() + closures.len() >= MAX_ACTIVE {
                             break;
                         }
                         cursor = Some(path.clone());
-                        if active.iter().any(|owner| owner.namespace == path) {
+                        if active.iter().any(|owner| owner.namespace == path)
+                            || closures.iter().any(|owner| owner.namespace == path)
+                        {
                             continue;
                         }
-                        if let Err(error) = self.admit(engine, &path, active).await {
+                        if let Err(error) = self.admit(engine, &path, active, closures).await {
                             self.deferred(&path, &error);
                         }
                         // Initial boot makes a bounded attempt, then permits the
@@ -159,7 +172,7 @@ impl RetiredSessionService {
             {
                 let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
                 status.passes += 1;
-                status.active = active.len();
+                status.active = active.len() + closures.len();
             }
             self.initialized.send_replace(true);
             tokio::time::sleep(RETRY).await;
@@ -171,6 +184,7 @@ impl RetiredSessionService {
         engine: &Arc<Engine>,
         namespace: &std::path::Path,
         active: &mut Vec<ActiveRecovery>,
+        closures: &mut Vec<closing::ActiveClosure>,
     ) -> Result<()> {
         let path = namespace.to_owned();
         let record = tokio::task::spawn_blocking(move || {
@@ -179,6 +193,7 @@ impl RetiredSessionService {
         .await
         .map_err(|e| error!("Retired source scan join: {e}"))??;
         let Some(record) = record else {
+            self.admit_closure(engine, namespace, closures);
             return Ok(());
         };
         let authenticated = tokio::time::timeout(
@@ -443,6 +458,7 @@ mod tests {
             let service = RetiredSessionService {
                 status: Mutex::new(Default::default()),
                 initialized: tokio::sync::watch::channel(false).0,
+                close_cursors: Arc::new(Mutex::new(Default::default())),
             };
             let stopper = crate::engine::Stopper::new();
             let new_owner = |name: &str| ActiveRecovery {
