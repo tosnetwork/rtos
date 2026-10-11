@@ -985,6 +985,99 @@ fn validate_proof_link(
     Ok(prev_stuff.prev)
 }
 
+/// Persistent state achieved by acceptance; finality and MC inclusion differ.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcceptancePhase {
+    Preapplied,
+    Applied,
+}
+
+enum AcceptedFinality {
+    Final {
+        carrier: rtos_block::BlockSignaturesSimplexPq,
+        _verified: rtos_api::pq_finality::VerifiedPqSignatures,
+    },
+    Approval {
+        _verified: rtos_api::pq_finality::VerifiedPqApproval,
+    },
+}
+
+/// Created only after governing-context verification and successful persistence.
+/// Private fields bind the exact publication carrier to its verification result.
+pub struct AcceptedSessionBlock {
+    block: BlockStuff,
+    proof: BlockProofStuff,
+    finality: AcceptedFinality,
+    prev: Vec<BlockIdExt>,
+    phase: AcceptancePhase,
+    already_present: bool,
+}
+
+impl AcceptedSessionBlock {
+    pub fn block(&self) -> &BlockStuff {
+        &self.block
+    }
+    pub fn proof(&self) -> &BlockProofStuff {
+        &self.proof
+    }
+    pub fn phase(&self) -> AcceptancePhase {
+        self.phase
+    }
+    /// True when an already-applied block was reconstructed without reapplying.
+    pub fn already_present(&self) -> bool {
+        self.already_present
+    }
+    pub fn is_final(&self) -> bool {
+        matches!(&self.finality, AcceptedFinality::Final { .. })
+    }
+    pub fn network_signatures(&self) -> Result<rtos_api::pq_finality::PqNetworkSignatureSet> {
+        match &self.finality {
+            AcceptedFinality::Final { carrier, .. } => {
+                rtos_api::pq_finality::PqNetworkSignatureSet::from_final_fields(carrier)
+            }
+            AcceptedFinality::Approval { .. } => {
+                fail!("Approval cannot authorize finality publication")
+            }
+        }
+    }
+    fn final_carrier(&self) -> Result<BlockSignaturesVariant> {
+        match &self.finality {
+            AcceptedFinality::Final { carrier, .. } => {
+                Ok(BlockSignaturesVariant::SimplexPq(carrier.clone()))
+            }
+            AcceptedFinality::Approval { .. } => fail!("Approval has no final carrier"),
+        }
+    }
+    /// A separately retryable dissemination effect, never part of persistence.
+    pub async fn publish_shard_description(
+        &self,
+        engine: Arc<dyn EngineOperations>,
+        locally_generated: bool,
+    ) -> Result<()> {
+        if self.block.id().shard().is_masterchain() {
+            return Ok(());
+        }
+        let carrier = self.final_carrier()?;
+        let cc_seqno = self.network_signatures()?.validator_info().catchain_seqno;
+        let state = choose_mc_state(&self.block, &engine).await?;
+        if let Some(tbd) = create_top_shard_block_description(
+            &self.block,
+            carrier,
+            &state,
+            self.prev.clone(),
+            engine.deref(),
+        )
+        .await?
+        {
+            let tbd =
+                Arc::new(TopBlockDescrStuff::new(tbd, self.block.id(), false, locally_generated)?);
+            tbd.validate(&state)?;
+            engine.send_top_shard_block_description(tbd, cc_seqno, false).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Accept a live Simplex delivery. The caller supplies its immutable manager
 /// context, independently of the untrusted signature carrier. Authentication
 /// deliberately precedes block-handle shortcuts, downloads and storage writes.
@@ -1024,25 +1117,48 @@ pub async fn accept_session_block(
     }
     let context =
         context.ok_or_else(|| error!("PQ acceptance requires authenticated session context"))?;
+    let accepted =
+        accept_pq_session_block(id, data, prev, finality, context, engine.clone()).await?;
+    // Legacy callers keep their existing dissemination behavior. The v2 path
+    // consumes the accepted result separately so transport failure cannot undo it.
+    if accepted.is_final() {
+        accepted.publish_shard_description(engine.clone(), send_block_broadcast).await?;
+        if send_block_broadcast {
+            let carrier = accepted.final_carrier()?;
+            engine.send_block_broadcast(accepted.block(), accepted.proof(), &carrier).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Authenticate and persist a live PQ delivery, independently of network sends.
+/// The context must come from the manager's authenticated governing snapshot.
+/// A final certificate does not by itself prove full execution qualification.
+pub async fn accept_pq_session_block(
+    id: BlockIdExt,
+    data: Option<Vec<u8>>,
+    prev: Vec<BlockIdExt>,
+    finality: consensus_common::SessionFinality,
+    context: rtos_api::pq_finality::PqSessionContext,
+    engine: Arc<dyn EngineOperations>,
+) -> Result<AcceptedSessionBlock> {
+    use consensus_common::SessionFinality;
     let verifier = context.for_block(id.clone())?;
-    let final_carrier = match &finality {
+    let authenticated = match &finality {
         SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(carrier)) => {
-            verifier.verify_final(carrier)?;
-            Some(BlockSignaturesVariant::SimplexPq(carrier.clone()))
+            let verified = verifier.verify_final(carrier)?;
+            AcceptedFinality::Final { carrier: carrier.clone(), _verified: verified }
         }
         SessionFinality::PqApproval(approval) => {
-            verifier.verify_approval(approval)?;
-            None
+            AcceptedFinality::Approval { _verified: verifier.verify_approval(approval)? }
         }
-        _ => unreachable!(),
+        _ => fail!("PQ acceptance requires PQ finality"),
     };
     if prev.is_empty() || prev.len() > 2 {
         fail!("`prev` has invalid length");
     }
     let existing = engine.load_block_handle(&id)?;
-    if existing.as_ref().is_some_and(|h| h.is_applied()) {
-        return Ok(());
-    }
+    let already_applied = existing.as_ref().is_some_and(|h| h.is_applied());
     let block = match data {
         Some(data) => BlockStuff::deserialize_block(id.clone(), Arc::new(data))?,
         None => match &existing {
@@ -1054,6 +1170,18 @@ pub async fn accept_session_block(
     // Verify before constructing even a signature-free proof link. The live
     // approval has no serialized signature representation.
     let proof = create_pq_session_proof(&block, &finality, &verifier)?;
+    if already_applied {
+        // Rebuild a verified publication result on retry without repeating apply
+        // or replacing an already-final persisted proof with an approval link.
+        return Ok(AcceptedSessionBlock {
+            block,
+            proof,
+            finality: authenticated,
+            prev,
+            phase: AcceptancePhase::Applied,
+            already_present: true,
+        });
+    }
     let mut handle = match existing {
         Some(handle) if handle.has_data() => handle,
         _ => engine
@@ -1077,34 +1205,21 @@ pub async fn accept_session_block(
         .await?
         .to_non_created()
         .ok_or_else(|| error!("PQ accept proof handle mismatch"))?;
-    let Some(carrier) = final_carrier else {
-        return Ok(());
-    };
-    if id.shard().is_masterchain() {
+    let is_final = matches!(&authenticated, AcceptedFinality::Final { .. });
+    if is_final && id.shard().is_masterchain() {
         engine.clone().apply_block(&handle, &block, id.seq_no(), false).await?;
-    } else {
-        let state = choose_mc_state(&block, &engine).await?;
-        if let Some(tbd) = create_top_shard_block_description(
-            &block,
-            carrier.clone(),
-            &state,
-            prev,
-            engine.deref(),
-        )
-        .await?
-        {
-            let tbd =
-                Arc::new(TopBlockDescrStuff::new(tbd, block.id(), false, send_block_broadcast)?);
-            tbd.validate(&state)?;
-            engine
-                .send_top_shard_block_description(tbd, validator_set.catchain_seqno(), false)
-                .await?;
-        }
     }
-    if send_block_broadcast {
-        engine.send_block_broadcast(&block, &proof, &carrier).await?;
-    }
-    Ok(())
+    // Shard finality is still preapplied until authenticated MC inclusion.
+    let phase =
+        if handle.is_applied() { AcceptancePhase::Applied } else { AcceptancePhase::Preapplied };
+    Ok(AcceptedSessionBlock {
+        block,
+        proof,
+        finality: authenticated,
+        prev,
+        phase,
+        already_present: false,
+    })
 }
 
 fn create_pq_session_proof(
