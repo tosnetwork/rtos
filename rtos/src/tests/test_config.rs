@@ -659,3 +659,105 @@ async fn config_scheduler_rotation_keeps_shared_key_until_last_role_is_retired()
     drop(handler);
     assert!(weak.upgrade().is_none());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_scheduler_vault_rotation_retains_shared_private_key() {
+    const CHILD: &str = "RTOS_CONFIG_VAULT_ROTATION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // The vault factory is process-global. Only the child sees this public
+        // fixture's encrypted file, without altering concurrent tests' backend.
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!(
+            "file://{}?master_key={}",
+            dir.path().join("vault.json").display(),
+            "42".repeat(32)
+        );
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "config::tests::config_scheduler_vault_rotation_retains_shared_private_key",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("VAULT_URL", url)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "vault rotation child timed out: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("vault rotation child completed"));
+        return;
+    }
+    let vault = get_vault().expect("child must use the real encrypted file vault");
+    let mut config = scheduler_test_config();
+    let mut keys = Vec::new();
+    for seed in [181u8, 182] {
+        let (json, key) = get_key_option_factory().from_private_key_with_json(&[seed; 32]).unwrap();
+        let id = base64_encode(key.id().data());
+        SecretsVaultConfig::save_private_key(&id, &json, &key).await.unwrap();
+        config.validator_key_ring.as_mut().unwrap().insert(id, json);
+        keys.push(key);
+    }
+    let shared = base64_encode(keys[0].id().data());
+    let other = base64_encode(keys[1].id().data());
+    let private_id = make_secret_id!(SecretsVaultConfig::SID_PRIVATE_KEYS, &shared);
+    let metadata_id = make_secret_id!(SecretsVaultConfig::SID_VALIDATOR_KEYS, &shared);
+    for (election_id, validator) in [(1001, &shared), (1002, &shared), (1003, &other)] {
+        let registration = ValidatorKeysJson {
+            expire_at: i32::MAX,
+            election_id,
+            validator_key_id: validator.clone(),
+            validator_adnl_key_id: Some(shared.clone()),
+        };
+        SecretsVaultConfig::save_validator_key(&registration).await.unwrap();
+        config.validator_keys.as_mut().unwrap().push(registration);
+    }
+    for election in 1001..=1003 {
+        let id = if election == 1003 { &other } else { &shared };
+        assert!(config.remove_validator_key(id.clone(), election).await.unwrap());
+        let retired = config.remove_key_from_key_ring(&shared).await.unwrap();
+        assert_eq!(retired, election == 1003);
+        vault.flush().await.unwrap();
+        // A second backend instance reads the actual persisted file after every
+        // transition, including the interval with only an ADNL role remaining.
+        let reopened = secrets_vault::vault_builder::SecretVaultBuilder::from_url(
+            &std::env::var("VAULT_URL").unwrap(),
+            BlockCryptoFactory {}.new_crypto().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reopened.exists(&private_id).await.unwrap(), election < 1003);
+        assert_eq!(reopened.exists(&metadata_id).await.unwrap(), election < 1002);
+        if election < 1003 {
+            let restored = reopened.load(&private_id).await.unwrap();
+            let Secret::Blob { blob } = restored else { panic!("expected stored private key") };
+            let data = blob.data();
+            let locked = data.lock().unwrap();
+            assert_eq!(&locked[..32], &[181u8; 32]);
+        }
+    }
+    // Idempotent cleanup tolerates records already absent in the real backend.
+    assert!(config.remove_key_from_key_ring(&shared).await.unwrap());
+    println!("vault rotation child completed");
+}
