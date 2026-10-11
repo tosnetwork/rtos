@@ -962,6 +962,52 @@ mod tests {
         );
         reopened.resolve(&id).unwrap();
         assert_eq!(reopened.pending_count().unwrap(), 0);
+        // Resolving the certificate does not prove that its complete output set
+        // was sealed. Legacy completed evidence must remain discoverable.
+        let reconstruction = scan_finality_recovery(directory.path()).unwrap();
+        assert_eq!(reconstruction.len(), 1);
+        macro_rules! same_field {
+            ($($field:ident),+ $(,)?) => { $(assert_eq!(reconstruction[0].$field, records[0].$field);)+ };
+        }
+        same_field!(
+            pin,
+            binding,
+            protocol,
+            carrier_version,
+            wire_profile,
+            profile,
+            session_id,
+            local_adnl,
+            local_validator_index,
+            prev_blocks,
+            start_masterchain,
+            namespace
+        );
+        drop(uncertain_reopen);
+        drop(reopened);
+        let reopened = FinalityIntentStore::new(&namespace);
+        assert_eq!(reopened.pending_count().unwrap(), 0);
+        assert_eq!(reopened.legacy_output_count().unwrap(), 1);
+        assert_eq!(
+            reopened.pending_with_legacy_outputs().unwrap(),
+            original,
+            "cold reconstruction must replay the exact first certificate"
+        );
+        reopened
+            .seal_outputs(
+                &id,
+                vec![ExpectedFinalityOutput::new(
+                    &draft.block_id,
+                    true,
+                    &draft.source_info.source.block_creator().unwrap(),
+                )],
+            )
+            .unwrap();
+        assert!(
+            !reopened.output_is_released(&id).unwrap(),
+            "sealing expected outputs does not manufacture Delivered confirmation"
+        );
+        assert_eq!(reopened.legacy_output_count().unwrap(), 0);
         assert!(scan_finality_recovery(directory.path()).unwrap().is_empty());
         assert_eq!(reopened.paths().unwrap().len(), 1, "canonical resolved evidence retained");
         std::fs::write(&reopened.paths().unwrap()[0], b"{broken").unwrap();
