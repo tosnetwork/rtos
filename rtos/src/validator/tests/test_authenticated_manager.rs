@@ -322,6 +322,7 @@ fn install_signed_manager_successor(engine: &BootstrapTestEngine, bootstrap: &Em
     anyhow::ensure!(fixture["zero"] == previous.block_id().to_string(), "signed fixture genesis differs");
     let expected = engine.build_masterchain_state(bootstrap, 1)?;
     let mut expected = expected.state()?.clone();
+    expected.set_gen_lt(2);
     let mut extra = expected.read_custom()?.unwrap();
     extra.prev_blocks.set(&0, &rtos_block::KeyExtBlkRef { key: true, blk_ref: ext_blk_ref(previous.block_id()) },
         &rtos_block::KeyMaxLt { key: true, max_end_lt: 0 })?;
