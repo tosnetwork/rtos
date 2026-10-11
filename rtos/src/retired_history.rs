@@ -559,7 +559,7 @@ impl Store {
         let mut extra = encoded.len() as u64;
         for (hash, bytes) in &blobs {
             let path = self.root.join(format!("{hash}.blob"));
-            if path.exists() {
+            if path.try_exists()? {
                 let existing = match budget {
                     Some(budget) => self.budget_file(&path, bytes.len(), crate::history_read_budget::ReadKind::State, budget)?,
                     None => bounded_read(&path, bytes.len())?,
@@ -578,7 +578,7 @@ impl Store {
         }
         for (hash, bytes) in blobs {
             let name = format!("{hash}.blob");
-            if !self.root.join(&name).exists() {
+            if !self.root.join(&name).try_exists()? {
                 self.atomic_write(&name, &bytes)?;
             } else {
                 File::open(self.root.join(name))?.sync_all()?;
@@ -642,7 +642,7 @@ pub(crate) async fn authenticate_capsule_with_budget<E: EngineOperations + ?Size
     budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
 ) -> Result<Option<VerifiedMasterchainState>> {
     let path = root(engine)?;
-    if !path.exists() {
+    if !path.try_exists()? {
         return Ok(None);
     }
     let domain = Domain::from_engine(engine)?;
@@ -703,7 +703,7 @@ pub(crate) async fn load_proof_with_budget<E: EngineOperations + ?Sized>(
     budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
 ) -> Result<Option<BlockProofStuff>> {
     let path = root(engine)?;
-    if !path.exists() {
+    if !path.try_exists()? {
         return Ok(None);
     }
     let domain = Domain::from_engine(engine)?;
@@ -733,7 +733,7 @@ pub(crate) async fn lookup_hint_with_budget<E: EngineOperations + ?Sized>(
     budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
 ) -> Result<Option<Arc<ShardStateStuff>>> {
     let path = root(engine)?;
-    if !path.exists() {
+    if !path.try_exists()? {
         return Ok(None);
     }
     let domain = Domain::from_engine(engine)?;
@@ -926,6 +926,42 @@ mod tests {
             semaphore.close();
             assert!(!is_retryable(&capacity_error(semaphore.try_acquire().unwrap_err(), kind)));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retired_history_root_io_error_is_not_missing_evidence() {
+        struct PathOnlyEngine(String);
+        #[async_trait::async_trait]
+        impl EngineOperations for PathOnlyEngine {
+            fn db_root_dir(&self) -> Result<&str> { Ok(&self.0) }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let engine = PathOnlyEngine(dir.path().to_str().unwrap().to_owned());
+        let path = dir.path().join("retired-history-v1");
+        let budget = crate::history_read_budget::HistoryReadBudget::new(Default::default());
+        // Truly absent evidence remains a lookup miss, before domain or IO jobs.
+        for budget in [None, Some(&budget)] {
+            assert!(authenticate_capsule_with_budget(&engine, &identity(1), budget).await.unwrap().is_none());
+            assert!(load_proof_with_budget(&engine, &identity(1), false, budget).await.unwrap().is_none());
+            assert!(lookup_hint_with_budget(&engine, 1, budget).await.unwrap().is_none());
+        }
+        // A real ELOOP used to be swallowed by Path::exists. None of these
+        // entry points may report absence and allow a remote fallback instead.
+        std::os::unix::fs::symlink("retired-history-v1", &path).unwrap();
+        let expected = std::fs::metadata(&path).unwrap_err().raw_os_error().unwrap();
+        for budget in [None, Some(&budget)] {
+            let errors = [
+                authenticate_capsule_with_budget(&engine, &identity(1), budget).await.err(),
+                load_proof_with_budget(&engine, &identity(1), false, budget).await.err(),
+                lookup_hint_with_budget(&engine, 1, budget).await.err(),
+            ];
+            for error in errors {
+                let error = error.expect("root IO error must not become missing evidence");
+                assert_eq!(error.downcast_ref::<std::io::Error>().and_then(|e| e.raw_os_error()), Some(expected));
+            }
+        }
+        assert_eq!(std::fs::read_link(&path).unwrap(), PathBuf::from("retired-history-v1"));
     }
 
     #[test]
