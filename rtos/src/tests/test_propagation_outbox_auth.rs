@@ -103,7 +103,7 @@ async fn fixture(final_role: bool) -> (HistoryEngine, UnverifiedRecord) {
     )
     .unwrap();
     let engine = HistoryEngine {
-        zero: Arc::new(zero),
+        zero,
         pin,
         wire: WireProfile::T0,
         deny_history: false,
