@@ -516,6 +516,7 @@ impl SessionImpl {
         authenticated_runtime: Option<
             Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
         >,
+        #[cfg(test)] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
     ) {
         log::info!(
             "SimplexSession main loop is started (session_id is {}); \
@@ -604,6 +605,17 @@ impl SessionImpl {
                 fail_startup(err, "failed to open SimplexDb");
                 return;
             }
+        };
+
+        #[cfg(test)]
+        let test_coordinator = match test_signer {
+            Some(profile) => match authenticated_runtime.as_deref()
+                .ok_or_else(|| error!("Isolated signer requires authenticated runtime"))
+                .and_then(|runtime| profile.open(runtime, db.clone())) {
+                Ok(coordinator) => Some(coordinator),
+                Err(error) => { fail_startup(error, "isolated signer admission failed"); return; }
+            },
+            None => None,
         };
 
         // Check if we should stop before loading bootstrap
@@ -696,6 +708,13 @@ impl SessionImpl {
                 authenticated_runtime.as_deref(),
             )
             .and_then(|description| description.bind_pq_session(catchain_seqno))
+            .and_then(|description| {
+                #[cfg(test)]
+                if let Some(coordinator) = &test_coordinator {
+                    description.install_test_coordinator(coordinator.clone())?;
+                }
+                Ok(description)
+            })
             .and_then(|description| {
                 SessionStartupRecoveryProcessor::new(
                     session_id.clone(),
@@ -808,6 +827,13 @@ impl SessionImpl {
             authenticated_runtime.as_deref(),
         )
         .and_then(|d| d.bind_pq_session(catchain_seqno))
+        .and_then(|description| {
+            #[cfg(test)]
+            if let Some(coordinator) = &test_coordinator {
+                description.install_test_coordinator(coordinator.clone())?;
+            }
+            Ok(description)
+        })
         {
             Ok(d) => Arc::new(d),
             Err(err) => {
@@ -1295,6 +1321,28 @@ impl SessionImpl {
             Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
         >,
     ) -> Result<SessionPtr> {
+        Self::create_with_profile(options, session_id, shard, ids, local_key, db_path,
+            overlay_manager, listener, trace_collector, catchain_seqno, authenticated_runtime,
+            #[cfg(test)] None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_with_profile(
+        options: &SessionOptions,
+        session_id: &SessionId,
+        shard: &ShardIdent,
+        ids: Vec<crate::SimplexSessionNode>,
+        local_key: &PrivateKey,
+        db_path: String,
+        overlay_manager: ConsensusOverlayManagerPtr,
+        listener: SessionListenerPtr,
+        trace_collector: Option<TraceCollector>,
+        catchain_seqno: u32,
+        authenticated_runtime: Option<
+            Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        >,
+        #[cfg(test)] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
+    ) -> Result<SessionPtr> {
         log::info!(
             "Creating SimplexSession (session_id is {}, shard={}, nodes_count={}, db_path={})",
             session_id.to_hex_string(),
@@ -1442,6 +1490,7 @@ impl SessionImpl {
                         trace_collector,
                         catchain_seqno,
                         authenticated_runtime,
+                        #[cfg(test)] test_signer,
                     );
                 }));
 

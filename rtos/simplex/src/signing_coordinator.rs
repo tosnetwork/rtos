@@ -299,6 +299,30 @@ impl Signer {
         }))
     }
 }
+/// Isolated test capability: compiled out of production and never sourced from
+/// node configuration. It exercises the actual session worker/journal/custody path.
+#[cfg(test)]
+pub(crate) struct TestSessionSigner {
+    pub store: std::sync::Arc<rtos_pq_consensus::ConsensusKeyStore>,
+    pub owner_root: std::path::PathBuf,
+    pub generation: u64,
+    pub initialize: bool,
+}
+#[cfg(test)]
+impl TestSessionSigner {
+    pub(crate) fn open(self, runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+        db: SimplexDbPtr) -> Result<std::sync::Arc<SigningCoordinator>> {
+        let binding = SigningBinding::from_authenticated_runtime(runtime, self.generation, u64::from(self.store.expire_at()))?;
+        let member = &runtime.committee()[binding.local_index as usize];
+        let stable = member.validator_id()?;
+        let mut custody = rtos_pq_consensus::PqConsensusCustody::default();
+        custody.install(stable.clone(), self.store.clone(), 0, self.store.expire_at())?;
+        let signer = Signer::from_test_custody(&custody, &stable, member)?;
+        Ok(std::sync::Arc::new(SigningCoordinator::open(db, binding,
+            ValidatorIdentity::from_descriptor(member)?, &self.owner_root, self.initialize, signer)?))
+    }
+}
+
 struct State {
     header: Header,
     records: BTreeMap<Vec<u8>, Record>,
