@@ -50,6 +50,9 @@ impl PreparedRepairCandidate {
     pub(crate) fn budget(&self) -> &Arc<crate::history_read_budget::HistoryReadBudget> {
         &self.budget
     }
+    pub(crate) fn previous_blocks(&self) -> &[BlockIdExt] {
+        self.accepted.previous_blocks()
+    }
     pub(crate) fn block_id(&self) -> &BlockIdExt {
         self.accepted.block().id()
     }
@@ -406,7 +409,7 @@ async fn repair_owned(
     }
     handle.set_state();
     handle.set_state_saved();
-    engine.db().repair_publication_links(&handle, candidate.accepted.previous_blocks())?;
+    engine.db().repair_candidate_links(&handle, &candidate)?;
     engine.db().sync_publication_metadata(&handle).await?;
     drop(target_reservation); // transfer to the verified target's existing pin
     drop(existing_target);

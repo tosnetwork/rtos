@@ -701,6 +701,53 @@ impl InternalDb {
         Ok(())
     }
 
+    /// Repair-only linkage checks use the authenticated candidate's request budget.
+    pub(crate) fn repair_candidate_links(
+        &self,
+        handle: &Arc<BlockHandle>,
+        candidate: &crate::publication_repair::PreparedRepairCandidate,
+    ) -> Result<()> {
+        if handle.id() != candidate.block_id()
+            || !handle.is_applied()
+            || !handle.id().shard().is_masterchain()
+        {
+            fail!("Repair linkage handle does not match applied masterchain candidate");
+        }
+        let previous = candidate.previous_blocks();
+        if previous.len() != 1 {
+            fail!("Invalid masterchain repair predecessors");
+        }
+        let parent = self
+            .load_block_handle(&previous[0])?
+            .ok_or_else(|| error!("Applied repair predecessor handle missing"))?;
+        // Validate every existing link before mutating any linkage or flags.
+        let check = |db: &BlockInfoDb, id: &BlockIdExt, expected: &BlockIdExt| -> Result<()> {
+            let reservation = candidate
+                .budget()
+                .reserve(crate::history_read_budget::ReadKind::Metadata, BlockIdExt::SIZE)?;
+            if reservation.allowance() != BlockIdExt::SIZE {
+                return Err(
+                    crate::history_read_budget::HistoryBudgetExceeded("linkage bytes").into()
+                );
+            }
+            if let Some(bytes) = db.try_get(id)? {
+                validate_repair_linkage(&bytes, expected)?;
+                reservation.finish(&bytes)?;
+            } else {
+                reservation.finish(&[])?;
+            }
+            Ok(())
+        };
+        check(&self.prev1_block_db, handle.id(), &previous[0])?;
+        check(&self.next1_block_db, parent.id(), handle.id())?;
+        self.prev1_block_db.put(handle.id(), &previous[0].serialize())?;
+        self.next1_block_db.put(parent.id(), &handle.id().serialize())?;
+        handle.set_prev1();
+        parent.set_next1();
+        self.store_block_handle(&parent, None)?;
+        Ok(())
+    }
+
     pub async fn sync_publication_metadata(&self, handle: &Arc<BlockHandle>) -> Result<()> {
         // Explicitly serialize current flags even if they were already set in
         // memory before an earlier writer failure/crash.
@@ -2073,3 +2120,32 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests/test_node_db_recovery.rs"]
 mod node_db_recovery_tests;
+
+// The pinned DB slice is checked before deserialization; no attacker-sized Vec.
+fn validate_repair_linkage(bytes: &[u8], expected: &BlockIdExt) -> Result<()> {
+    if bytes.len() != BlockIdExt::SIZE {
+        fail!("Invalid repair linkage record length");
+    }
+    if BlockIdExt::deserialize(bytes)? != *expected {
+        fail!("Conflicting persisted repair linkage");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod repair_linkage_tests {
+    use super::*;
+    #[test]
+    fn repair_linkage_exact_record_and_full_identity() {
+        let expected = BlockIdExt::default();
+        let bytes = expected.serialize();
+        validate_repair_linkage(&bytes, &expected).unwrap();
+        let mut oversized = bytes.to_vec();
+        oversized.extend_from_slice(&[0; 1024]);
+        assert!(validate_repair_linkage(&oversized, &expected).is_err());
+        assert!(validate_repair_linkage(&bytes[..bytes.len() - 1], &expected).is_err());
+        let mut wrong = expected.clone();
+        wrong.file_hash = UInt256::from([1; 32]);
+        assert!(validate_repair_linkage(&wrong.serialize(), &expected).is_err());
+    }
+}
