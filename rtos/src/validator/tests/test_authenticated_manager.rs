@@ -44,30 +44,40 @@ fn configure(bootstrap: &mut EmulatorNetworkBootstrap, observer: &PrivateKey) ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_manager_creates_transport_only_observer_and_retires_real_groups() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(false, None, false).await
+    run_authenticated_manager_observer_lifecycle(false, None, false, None).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_manager_retries_transient_sink_initialization_on_same_group() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(true, None, false).await
+    run_authenticated_manager_observer_lifecycle(true, None, false, None).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_manager_retries_normal_loser_after_recovery_admission_on_same_state() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(false, Some(0), false).await
+    run_authenticated_manager_observer_lifecycle(false, Some(0), false, None).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_manager_retries_existing_future_after_recovery_admission_on_same_state() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(false, Some(1), false).await
+    run_authenticated_manager_observer_lifecycle(false, Some(1), false, None).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_manager_retries_idle_future_without_namespace_notification() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(false, None, true).await
+    run_authenticated_manager_observer_lifecycle(false, None, true, None).await
 }
 
-async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, admission_race: Option<u32>, idle_retry: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authenticated_manager_current_busy_preserves_group_in_real_invocation() -> Result<()> {
+    run_authenticated_manager_observer_lifecycle(false, None, false, Some(true)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authenticated_manager_current_authentication_error_exits_real_invocation() -> Result<()> {
+    run_authenticated_manager_observer_lifecycle(false, None, false, Some(false)).await
+}
+
+async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, admission_race: Option<u32>, idle_retry: bool, current_retry: Option<bool>) -> Result<()> {
     use adnl::{node::AdnlNode, DhtNode, OverlayNode, RldpNode, NetworkStack};
     let _ = env_logger::builder().is_test(true).try_init();
     eprintln!("manager lifecycle: begin admission_race={admission_race:?}");
@@ -123,6 +133,52 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
         anyhow::ensure!(manager.authenticated_transport_key(&wrong_binding, &[]).is_err(),
             "configured stable identity was accepted with wrong governing ADNL");
         engine.install_masterchain_state(state.clone(), None)?;
+        if let Some(retryable) = current_retry {
+            engine.fail_current_history_busy_once.store(true, Ordering::SeqCst);
+            let error = manager.update_shards(state.clone()).await.expect_err("controlled current busy");
+            anyhow::ensure!(crate::retired_history::is_retryable(&error));
+            let original = manager.current_sessions.values().find(|g| {
+                g.authenticated_runtime().is_some_and(|r| r.shard().is_masterchain())
+            }).ok_or_else(|| error!("failed current group ownership missing"))?.clone();
+            anyhow::ensure!(!original.snapshot().await.has_engine);
+            anyhow::ensure!(!original.is_start_pending().await);
+            let baseline = engine.validator_network.authenticated_created.load(Ordering::SeqCst);
+            let mut existing = 0;
+            for group in manager.current_sessions.values().chain(manager.future_sessions.values()) {
+                if group.snapshot().await.has_engine { existing += 1; }
+            }
+            if retryable {
+                engine.fail_current_history_busy_once.store(true, Ordering::SeqCst);
+                let completion = async {
+                    let result = tokio::time::timeout(Duration::from_secs(8), async {
+                        while engine.validator_network.authenticated_created.load(Ordering::SeqCst) < baseline + 4 - existing {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }).await;
+                    engine.stop.store(true, Ordering::SeqCst);
+                    result.map_err(|e| error!("current busy invocation did not recover: {e}"))
+                };
+                let (invoked, completed) = tokio::join!(manager.invoke(), completion);
+                invoked?;
+                completed?;
+                anyhow::ensure!(original.snapshot().await.has_engine);
+                let runtime = original.authenticated_runtime().unwrap();
+                anyhow::ensure!(engine.namespace_registry.reserve(runtime)?.is_none());
+            } else {
+                engine.fail_current_history_auth.store(true, Ordering::SeqCst);
+                let error = tokio::time::timeout(Duration::from_secs(3), manager.invoke()).await
+                    .map_err(|e| error!("permanent authentication rejection was retried: {e}"))?
+                    .expect_err("authentication failure must leave invocation");
+                anyhow::ensure!(error.to_string().contains("permanent historical authentication"));
+                anyhow::ensure!(!crate::retired_history::is_retryable(&error));
+                anyhow::ensure!(!original.snapshot().await.has_engine);
+                anyhow::ensure!(!original.is_start_pending().await);
+            }
+            let runtime = original.authenticated_runtime().unwrap();
+            anyhow::ensure!(Arc::ptr_eq(&original, manager.current_sessions.get(runtime.session_id()).unwrap()),
+                "invocation replaced original group instead of retaining ownership");
+            return Ok(());
+        }
         engine.fail_future_history_until_released.store(idle_retry, Ordering::SeqCst);
         let failed_group = if fail_initial_sink {
             engine.fail_finality_sink_once.store(true, Ordering::SeqCst);
@@ -304,7 +360,7 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
     // Drive the outer production spawn entry with the real configuration
     // handler's false validator status. Only explicit transport eligibility can
     // get through its initial wait and create these additional real sessions.
-    let spawned = if result.is_ok() && stopped.is_ok() {
+    let spawned = if result.is_ok() && stopped.is_ok() && current_retry.is_none() {
         let baseline = engine.validator_network.authenticated_created.load(Ordering::SeqCst);
         engine.fail_future_history_once.store(true, Ordering::SeqCst);
         let mut manager_config = ValidatorManagerConfig::default();

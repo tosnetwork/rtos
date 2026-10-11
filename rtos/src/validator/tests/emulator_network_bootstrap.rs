@@ -673,6 +673,8 @@ struct BootstrapTestEngine {
     validator_network: Arc<BootstrapValidatorNetwork>,
     transport_config: Option<Arc<crate::config::NodeConfigHandler>>,
     fail_finality_sink_once: AtomicBool,
+    fail_current_history_busy_once: AtomicBool,
+    fail_current_history_auth: AtomicBool,
     fail_future_history_once: AtomicBool,
     fail_future_history_until_released: AtomicBool,
     future_history_failure_seen: AtomicBool,
@@ -738,6 +740,8 @@ impl BootstrapTestEngine {
             validator_network: Arc::new(BootstrapValidatorNetwork::new(local_keys)),
             transport_config: None,
             fail_finality_sink_once: AtomicBool::new(false),
+            fail_current_history_busy_once: AtomicBool::new(false),
+            fail_current_history_auth: AtomicBool::new(false),
             fail_future_history_once: AtomicBool::new(false),
             fail_future_history_until_released: AtomicBool::new(false),
             future_history_failure_seen: AtomicBool::new(false),
@@ -1055,6 +1059,15 @@ impl EngineOperations for BootstrapTestEngine {
     async fn prepare_retired_history(self: Arc<Self>, runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>, start: BlockIdExt) -> Result<()> {
         let shard = runtime.shard().clone();
         let cc = runtime.catchain_seqno();
+        if runtime.shard().is_masterchain() && cc == 0 {
+            if self.fail_current_history_auth.load(Ordering::SeqCst) {
+                fail!("Injected permanent historical authentication rejection");
+            }
+            if self.fail_current_history_busy_once.swap(false, Ordering::SeqCst) {
+                return Err(anyhow::Error::new(crate::retired_history::RetryableHistoryError::WriterBusy)
+                    .context("Injected current history writer contention"));
+            }
+        }
         if runtime.shard().is_masterchain() && cc == 1
             && (self.fail_future_history_until_released.load(Ordering::SeqCst)
                 || self.fail_future_history_once.swap(false, Ordering::SeqCst)) {
