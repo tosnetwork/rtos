@@ -464,7 +464,7 @@ async fn persistent_closure_cold_service_after_released_exit74() {
 }
 
 /// A separate cold-read contract: this intentionally supplies an independently
-/// authenticated runtime only to the real canonical lookup. The background
+/// authenticated runtime only to the read-only canonical verification. The background
 /// service tests above continue to recover without such external input.
 async fn canonical_after_offer(
     provider: &Path,
@@ -489,24 +489,12 @@ async fn canonical_after_offer(
             )
             .await
             .unwrap();
-            let worker = engine.ensure_publication_worker().await.unwrap();
-            let sink = worker.sink(runtime.clone());
-            let (send, receive) = tokio::sync::oneshot::channel();
-            sink.retain_canonical(
-                request.canonical.clone(),
-                Box::new(move |result| {
-                    let _ = send.send(result);
-                }),
-            )
-            .unwrap();
-            let canonical = tokio::time::timeout(Duration::from_secs(30), receive)
-                .await
-                .expect("real canonical owner must complete")
-                .expect("real canonical callback must run")
-                .expect("offer-before-source-sync must retain replayable canonical evidence");
-            // Check the actual owned lookup before any Offered/active marker.
-            // Moving deletion into offer must fail above with Unknown canonical
-            // delivery, rather than being caught only by a stage assertion.
+            let canonical = crate::publication_worker::inspect_canonical_record(
+                engine.db(), domain, &runtime, &request.canonical,
+            ).expect("offer-before-source-sync must retain replayable canonical evidence");
+            // Verify real DB payload using production canonical authentication
+            // before any Offered/active marker. Early deletion must fail with
+            // Cold canonical delivery missing, not only a stage assertion.
             assert_eq!(canonical.request, request.canonical);
             assert_eq!(&canonical.request.block_id, expected_id);
             assert_eq!(canonical.created_at_unix_secs, note["created"].as_u64().unwrap());

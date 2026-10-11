@@ -1174,6 +1174,21 @@ fn effect_from_destination(destination: PropagationDestination) -> Result<Public
 }
 /// Reconstruct only the original evidence under this sink's authenticated
 /// runtime. A delivery ID and disk fields alone never grant authority.
+/// Cold-read verification only: no writer, retention transaction or capability.
+#[cfg(test)]
+pub(crate) fn inspect_canonical_record(
+    db: &Arc<crate::internal_db::InternalDb>,
+    domain: &crate::propagation_outbox::OutboxDomain,
+    runtime: &AuthenticatedSessionRuntime,
+    request: &CanonicalFinalityRequest,
+) -> Result<CanonicalFinalityRecord> {
+    let limits = Limits::default();
+    let (delivery, entry) = crate::propagation_outbox::inspect_delivery(
+        db, domain, &limits, &request.node_receipt,
+    )?.ok_or_else(|| error!("Cold canonical delivery missing"))?;
+    canonical_record(runtime, request, &delivery, &entry, &limits)
+}
+
 fn canonical_record(
     runtime: &AuthenticatedSessionRuntime,
     request: &CanonicalFinalityRequest,
