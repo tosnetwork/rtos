@@ -406,3 +406,7 @@ mod tests {
         store.resolve(&trigger).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "finality_output_capacity_tests.rs"]
+mod capacity_tests;

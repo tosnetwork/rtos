@@ -427,6 +427,40 @@ impl InternalDb {
             allocated.storage.clone(),
         ));
 
+        let last_unneeded_key_block_id =
+            block_handle_storage.load_full_node_state(LAST_UNNEEDED_KEY_BLOCK)?.unwrap_or_default();
+        let db_root_path = Arc::new(PathBuf::from(&config.db_directory));
+        let db_provider: Arc<dyn ArchiveDbProvider> =
+            if let Some(ref archival_config) = config.archival_mode {
+                let router = Arc::new(EpochRouter::new(archival_config).await?);
+                Arc::new(EpochDbProvider::new(router))
+            } else {
+                Arc::new(SingleDbProvider::new(db.clone(), db_root_path.clone()))
+            };
+        let archive_manager = Arc::new(
+            ArchiveManager::with_data(
+                db.clone(),
+                db_root_path,
+                db_provider,
+                last_unneeded_key_block_id.seq_no(),
+                monitor_min_split,
+                #[cfg(feature = "telemetry")]
+                telemetry.storage.clone(),
+                allocated.storage.clone(),
+            )
+            .await?,
+        );
+
+        // Complete every fallible passive constructor before starting the
+        // self-owned dynamic state worker. A rejected archive must release the
+        // node DB without leaving a worker holding its RocksDB lock.
+        let prev1_block_db = BlockInfoDb::with_db(db.clone(), PREV1_BLOCK_DB_NAME, can_create_db)?;
+        let prev2_block_db = BlockInfoDb::with_db(db.clone(), PREV2_BLOCK_DB_NAME, can_create_db)?;
+        let next1_block_db = BlockInfoDb::with_db(db.clone(), NEXT1_BLOCK_DB_NAME, can_create_db)?;
+        let next2_block_db = BlockInfoDb::with_db(db.clone(), NEXT2_BLOCK_DB_NAME, can_create_db)?;
+        let shard_top_blocks_db = ShardTopBlocksDb::with_db(
+            db.clone(), SHARD_TOP_BLOCKS_DB_NAME, can_create_db,
+        )?;
         let state_db = if config.archival_mode.is_some() {
             let (archive_cells_opts, archive_cells_cache) =
                 storage::cell_db::CellDb::build_cf_options(
@@ -460,30 +494,7 @@ impl InternalDb {
                 allocated.storage.clone(),
             )?)
         };
-        let last_unneeded_key_block_id =
-            block_handle_storage.load_full_node_state(LAST_UNNEEDED_KEY_BLOCK)?.unwrap_or_default();
-        let db_root_path = Arc::new(PathBuf::from(&config.db_directory));
-        let db_provider: Arc<dyn ArchiveDbProvider> =
-            if let Some(ref archival_config) = config.archival_mode {
-                let router = Arc::new(EpochRouter::new(archival_config).await?);
-                Arc::new(EpochDbProvider::new(router))
-            } else {
-                Arc::new(SingleDbProvider::new(db.clone(), db_root_path.clone()))
-            };
-        let archive_manager = Arc::new(
-            ArchiveManager::with_data(
-                db.clone(),
-                db_root_path,
-                db_provider,
-                last_unneeded_key_block_id.seq_no(),
-                monitor_min_split,
-                #[cfg(feature = "telemetry")]
-                telemetry.storage.clone(),
-                allocated.storage.clone(),
-            )
-            .await?,
-        );
-
+        // No fallible operations follow successful state-worker admission.
         let result = Self {
             archive_tasks: Arc::default(),
             archive_admission: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -501,20 +512,16 @@ impl InternalDb {
             publication_sync_observer: std::sync::Mutex::new(None),
             #[cfg(test)]
             bounded_repair_sync_observer: std::sync::Mutex::new(None),
-            prev1_block_db: BlockInfoDb::with_db(db.clone(), PREV1_BLOCK_DB_NAME, can_create_db)?,
-            prev2_block_db: BlockInfoDb::with_db(db.clone(), PREV2_BLOCK_DB_NAME, can_create_db)?,
-            next1_block_db: BlockInfoDb::with_db(db.clone(), NEXT1_BLOCK_DB_NAME, can_create_db)?,
-            next2_block_db: BlockInfoDb::with_db(db.clone(), NEXT2_BLOCK_DB_NAME, can_create_db)?,
+            prev1_block_db,
+            prev2_block_db,
+            next1_block_db,
+            next2_block_db,
             shard_state_persistent_db: Arc::new(FileDb::with_path(
                 Path::new(config.db_directory.as_str()).join(SHARD_STATE_PERSISTENT_DB_NAME),
             )),
             state_db,
             archive_manager,
-            shard_top_blocks_db: ShardTopBlocksDb::with_db(
-                db,
-                SHARD_TOP_BLOCKS_DB_NAME,
-                can_create_db,
-            )?,
+            shard_top_blocks_db,
             full_node_state_db,
             cells_gc_interval: Arc::new(AtomicU32::new(config.cells_gc_interval_sec)),
             config,
