@@ -43,6 +43,9 @@ impl AuthenticatedRetiredSession {
     }
 }
 
+type IdentityDerivation =
+    (AuthenticatedSessionRuntime, Arc<ShardStateStuff>, Option<rtos_block::DecodedSessionConfig>);
+
 /// Rebuild only historical session identity. No source floor, session worker,
 /// signer or current transport secret is created/required by this operation.
 async fn authenticate_identity(
@@ -51,14 +54,15 @@ async fn authenticate_identity(
     binding: &SessionRecoveryBinding,
     local_adnl: &rtos_block::UInt256,
     history: Option<&crate::historical_recovery::Request>,
-) -> Result<(AuthenticatedSessionRuntime, Arc<ShardStateStuff>)> {
+) -> Result<IdentityDerivation> {
     match history {
         Some(history) => {
             let verified = history.prepare(&binding.governing_masterchain).await?;
             derive_identity(engine, pin, binding, local_adnl, &verified, Some(history.budget()))
         }
         None => {
-            let verified = authenticate_recovered_state(engine, &binding.governing_masterchain).await?;
+            let verified =
+                authenticate_recovered_state(engine, &binding.governing_masterchain).await?;
             derive_identity(engine, pin, binding, local_adnl, &verified, None)
         }
     }
@@ -71,7 +75,7 @@ fn derive_identity(
     local_adnl: &rtos_block::UInt256,
     verified: &crate::block_proof::VerifiedMasterchainState,
     request: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
-) -> Result<(AuthenticatedSessionRuntime, Arc<ShardStateStuff>)> {
+) -> Result<IdentityDerivation> {
     if &pin.zerostate != engine.zerostate_id()? {
         fail!("Closing/retired network pin mismatch");
     }
@@ -97,10 +101,15 @@ fn derive_identity(
     }
     let config = state.config_params()?;
     let budget = request.map(|b| crate::bounded_session_derivation::ConfigBudget(b.as_ref()));
-    let decoded = budget.as_ref().map(|b| config.session_config_bounded(coordinates.shard.is_masterchain(), b)).transpose()?;
+    let decoded = budget
+        .as_ref()
+        .map(|b| config.session_config_bounded(coordinates.shard.is_masterchain(), b))
+        .transpose()?;
     let ordinary = if decoded.is_none() {
         Some((config.validator_set()?, config.next_validator_set()?, config.catchain_config()?))
-    } else { None };
+    } else {
+        None
+    };
     let (current, next, catchain) = match (&decoded, &ordinary) {
         (Some(config), _) => (&config.current, &config.next, &config.catchain),
         (_, Some((current, next, catchain))) => (current, next, catchain),
@@ -110,7 +119,9 @@ fn derive_identity(
         (extra.validator_info.catchain_seqno, catchain.mc_catchain_lifetime)
     } else {
         let cc = match &budget {
-            Some(budget) => extra.shards().calc_shard_cc_seqno_bounded(&coordinates.shard, budget)?,
+            Some(budget) => {
+                extra.shards().calc_shard_cc_seqno_bounded(&coordinates.shard, budget)?
+            }
             None => extra.shards().calc_shard_cc_seqno(&coordinates.shard)?,
         };
         (cc, catchain.shard_catchain_lifetime)
@@ -132,30 +143,59 @@ fn derive_identity(
         fail!("Retired session catchain is outside current/next schedule");
     };
     let runtime_pin = SessionNetworkPin {
-        global_id: state.state()?.global_id(), zerostate: engine.zerostate_id()?.clone(),
+        global_id: state.state()?.global_id(),
+        zerostate: engine.zerostate_id()?.clone(),
     };
     let runtime_coordinates = SessionCoordinates {
-        shard: &coordinates.shard, catchain_seqno: coordinates.catchain_seqno,
-        vertical_seqno: coordinates.vertical_seqno, last_key_block_seqno: key_seqno,
+        shard: &coordinates.shard,
+        catchain_seqno: coordinates.catchain_seqno,
+        vertical_seqno: coordinates.vertical_seqno,
+        last_key_block_seqno: key_seqno,
         new_catchain_ids: coordinates.new_catchain_ids,
     };
+    if let Some(budget) = &budget {
+        rtos_block::config_read_budget::ConfigReadBudget::workspace(
+            budget,
+            std::mem::size_of::<KeyId>() + 2 * std::mem::size_of::<usize>(),
+        )?;
+    }
     let runtime = match (&decoded, &budget) {
         (Some(decoded), Some(budget)) => {
-            let (validators, _) = set.calc_subset_bounded(catchain,
-                coordinates.shard.shard_prefix_with_tag(), coordinates.shard.workchain_id(),
-                coordinates.catchain_seqno, budget)?;
-            AuthenticatedSessionRuntime::from_decoded_config_bounded(runtime_pin, decoded,
-                runtime_coordinates, validators, KeyId::from_data(*local_adnl.as_array()), budget)?
+            let (validators, _) = set.calc_subset_bounded(
+                catchain,
+                coordinates.shard.shard_prefix_with_tag(),
+                coordinates.shard.workchain_id(),
+                coordinates.catchain_seqno,
+                budget,
+            )?;
+            AuthenticatedSessionRuntime::from_decoded_config_bounded(
+                runtime_pin,
+                decoded,
+                runtime_coordinates,
+                validators,
+                KeyId::from_data(*local_adnl.as_array()),
+                budget,
+            )?
         }
         _ => {
-            let subset = try_calc_subset_for_workchain_standard(set, config,
-                &coordinates.shard, coordinates.catchain_seqno)?
-                .ok_or_else(|| error!("Retired session committee unavailable"))?;
-            AuthenticatedSessionRuntime::from_authenticated_config(runtime_pin, config,
-                runtime_coordinates, subset.validators, KeyId::from_data(*local_adnl.as_array()))?
+            let subset = try_calc_subset_for_workchain_standard(
+                set,
+                config,
+                &coordinates.shard,
+                coordinates.catchain_seqno,
+            )?
+            .ok_or_else(|| error!("Retired session committee unavailable"))?;
+            AuthenticatedSessionRuntime::from_authenticated_config(
+                runtime_pin,
+                config,
+                runtime_coordinates,
+                subset.validators,
+                KeyId::from_data(*local_adnl.as_array()),
+            )?
         }
-    }.bind_recovery_anchor(binding.governing_masterchain.clone())?;
-    Ok((runtime, state))
+    }
+    .bind_recovery_anchor(binding.governing_masterchain.clone())?;
+    Ok((runtime, state, decoded))
 }
 
 /// Authenticate a closed source's confirmation identity without retaining its
@@ -187,8 +227,9 @@ pub(crate) async fn authenticate_closing_runtime_in_request(
         .recovery_binding
         .as_ref()
         .ok_or_else(|| error!("Closing identity lacks authenticated recovery anchor"))?;
-    let (runtime, _) =
-        authenticate_identity(engine, &domain.pin, binding, &request.canonical.local_adnl, history).await?;
+    let (runtime, _, _) =
+        authenticate_identity(engine, &domain.pin, binding, &request.canonical.local_adnl, history)
+            .await?;
     validate_closing_identity(&runtime, request, history.map(|h| h.budget()))?;
     let root = PathBuf::from(engine.db_root_dir()?).join("catchains");
     let expected = PathBuf::from(
@@ -225,12 +266,19 @@ fn validate_closing_identity(
     let mut source_member = false;
     for member in runtime.committee() {
         let matches = match history {
-            Some(history) => member.validator_id_bounded(
-                &crate::bounded_session_derivation::ConfigBudget(history.as_ref()))?
-                == request.canonical.source_validator,
-            None => member.validator_id().ok().as_ref() == Some(&request.canonical.source_validator),
+            Some(history) => {
+                member.validator_id_bounded(&crate::bounded_session_derivation::ConfigBudget(
+                    history.as_ref(),
+                ))? == request.canonical.source_validator
+            }
+            None => {
+                member.validator_id().ok().as_ref() == Some(&request.canonical.source_validator)
+            }
         };
-        if matches { source_member = true; break; }
+        if matches {
+            source_member = true;
+            break;
+        }
     }
     if runtime.protocol() != domain.protocol
         || runtime.carrier_version() != domain.carrier_version
@@ -254,6 +302,22 @@ pub(crate) fn validate_close_recovery_binding(
     binding: &crate::repair_lease_binding::RepairLeaseBinding,
     verified: &crate::block_proof::VerifiedMasterchainState,
 ) -> Result<()> {
+    validate_close_recovery_binding_inner(engine, binding, verified, None)
+}
+pub(crate) fn validate_close_recovery_binding_with_budget(
+    engine: &dyn EngineOperations,
+    binding: &crate::repair_lease_binding::RepairLeaseBinding,
+    verified: &crate::block_proof::VerifiedMasterchainState,
+    budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
+) -> Result<()> {
+    validate_close_recovery_binding_inner(engine, binding, verified, Some(budget))
+}
+fn validate_close_recovery_binding_inner(
+    engine: &dyn EngineOperations,
+    binding: &crate::repair_lease_binding::RepairLeaseBinding,
+    verified: &crate::block_proof::VerifiedMasterchainState,
+    budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+) -> Result<()> {
     use consensus_common::finality_delivery::FinalityCloseDomain;
     binding.validate()?;
     let domain = &binding.domain;
@@ -266,8 +330,8 @@ pub(crate) fn validate_close_recovery_binding(
     };
     let pin =
         SessionNetworkPin { zerostate: domain.zerostate.clone(), global_id: domain.global_id };
-    let (runtime, _) =
-        derive_identity(engine, &pin, &recovery, &binding.canonical.local_adnl, verified, None)?;
+    let (runtime, _, _) =
+        derive_identity(engine, &pin, &recovery, &binding.canonical.local_adnl, verified, budget)?;
     let request = CloseFinalityRequest {
         canonical: binding.canonical.clone(),
         domain: FinalityCloseDomain {
@@ -282,7 +346,7 @@ pub(crate) fn validate_close_recovery_binding(
         source_digest: binding.source_digest.clone(),
         created_at_unix_secs: binding.created_at_unix_secs,
     };
-    validate_closing_identity(&runtime, &request, None)
+    validate_closing_identity(&runtime, &request, budget)
 }
 
 pub(crate) async fn authenticate_retired_session(
@@ -305,7 +369,7 @@ pub(crate) async fn authenticate_retired_session_in_request(
         fail!("Retired session protocol/wire unsupported");
     }
     let binding = &record.binding;
-    let (runtime, state) =
+    let (runtime, state, decoded) =
         authenticate_identity(engine, &record.pin, binding, &record.local_adnl, history).await?;
     let coordinates = &binding.coordinates;
     let config = state.config_params()?;
@@ -342,37 +406,72 @@ pub(crate) async fn authenticate_retired_session_in_request(
         Some(history) => history.prepare(&record.start_masterchain).await?,
         None => Arc::new(authenticate_recovered_state(engine, &record.start_masterchain).await?),
     };
-    if start.state().block_id() != state.block_id()
-        && !start.state().has_prev_block(state.block_id())?
-    {
-        fail!("Retired session start does not descend from governing anchor");
-    }
+    authenticate_start_descent(
+        start.state(),
+        state.block_id(),
+        history.map(|h| h.budget().as_ref()),
+    )?;
     let parents = match history {
         Some(history) => crate::bounded_session_derivation::authenticated_start_parents(
-            start.state(), &coordinates.shard, history.budget())?,
+            start.state(),
+            &coordinates.shard,
+            history.budget(),
+        )?,
         None => authenticated_start_parents(start.state(), &coordinates.shard)?,
     };
     if record.prev_blocks != parents {
         fail!("Retired session previous block floor mismatch");
     }
     let options = match history {
-        Some(history) => {
-            let budget = crate::bounded_session_derivation::ConfigBudget(history.budget().as_ref());
-            let decoded = config.session_config_bounded(coordinates.shard.is_masterchain(), &budget)?;
-            super::validator_manager::build_historical_simplex_options_decoded(&decoded, &coordinates.shard)?
+        Some(_) => {
+            // Identity derivation already decoded the exact governing options.
+            // Reuse them; do not parse current/next/previous committees again.
+            let decoded =
+                decoded.as_ref().ok_or_else(|| error!("Missing bounded identity config"))?;
+            super::validator_manager::build_historical_simplex_options_decoded(
+                decoded,
+                &coordinates.shard,
+            )?
         }
-        None => super::validator_manager::build_historical_simplex_options(config, &coordinates.shard)?,
+        None => {
+            super::validator_manager::build_historical_simplex_options(config, &coordinates.shard)?
+        }
     };
     options.validate_authenticated(&runtime)?;
     if let Some(history) = history {
         use rtos_block::merkle_apply_budget::MerkleApplyBudget;
-        let bytes = record.prev_blocks.len().checked_mul(std::mem::size_of::<BlockIdExt>())
+        let bytes = record
+            .prev_blocks
+            .len()
+            .checked_mul(std::mem::size_of::<BlockIdExt>())
             .and_then(|n| n.checked_add(record.namespace.as_os_str().len()))
             .and_then(|n| n.checked_add(4096))
             .ok_or_else(|| error!("Historical locator clone workspace overflow"))?;
         history.budget().workspace(bytes)?;
     }
     Ok(AuthenticatedRetiredSession { runtime: Arc::new(runtime), options, record: record.clone() })
+}
+
+fn authenticate_start_descent(
+    start: &ShardStateStuff,
+    governing: &BlockIdExt,
+    budget: Option<&crate::history_read_budget::HistoryReadBudget>,
+) -> Result<()> {
+    if start.block_id() == governing {
+        return Ok(());
+    }
+    if let Some(budget) = budget {
+        // has_prev_block decodes a fixed-size KeyExtBlkRef at a 32-bit key.
+        // Admit all possible path visits and label scratch before entering it.
+        rtos_block::config_read_budget::lookup(
+            &crate::bounded_session_derivation::ConfigBudget(budget),
+            32,
+        )?;
+    }
+    if !start.has_prev_block(governing)? {
+        fail!("Retired session start does not descend from governing anchor");
+    }
+    Ok(())
 }
 
 /// Same effective-shard parent ordering used by manager::update_shards.
@@ -418,7 +517,9 @@ fn authenticated_start_parents(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rtos_block::{Deserializable, Serializable, ShardStateUnsplit, UInt256, ValidatorSet};
+    use rtos_block::{
+        Deserializable, HashmapAugType, Serializable, ShardStateUnsplit, UInt256, ValidatorSet,
+    };
 
     struct HistoryEngine {
         state: Arc<ShardStateStuff>,
@@ -806,9 +907,14 @@ mod tests {
         let engine = history(0)?;
         for observer in [false, true] {
             let mut record = locator(&engine, 7, false, observer)?;
-            let (expected, _) =
-                authenticate_identity(&engine, &record.pin, &record.binding, &record.local_adnl, None)
-                    .await?;
+            let (expected, _, _) = authenticate_identity(
+                &engine,
+                &record.pin,
+                &record.binding,
+                &record.local_adnl,
+                None,
+            )
+            .await?;
             let request = closing_request(&record, expected.committee()[0].validator_id()?);
             // The closing API has no start/prev inputs. These invalid consensus
             // replay coordinates must still fail the original session API.
@@ -826,7 +932,7 @@ mod tests {
     async fn closing_identity_rejects_domain_anchor_coordinates_role_and_namespace() -> Result<()> {
         let engine = history(0)?;
         let record = locator(&engine, 7, false, false)?;
-        let (runtime, _) =
+        let (runtime, _, _) =
             authenticate_identity(&engine, &record.pin, &record.binding, &record.local_adnl, None)
                 .await?;
         let valid = closing_request(&record, runtime.committee()[0].validator_id()?);
@@ -885,8 +991,14 @@ mod tests {
         let record = locator(&engine, 7, false, false)?;
         let verified =
             authenticate_recovered_state(&engine, &record.binding.governing_masterchain).await?;
-        let (runtime, _) =
-            derive_identity(&engine, &record.pin, &record.binding, &record.local_adnl, &verified, None)?;
+        let (runtime, _, _) = derive_identity(
+            &engine,
+            &record.pin,
+            &record.binding,
+            &record.local_adnl,
+            &verified,
+            None,
+        )?;
         let request = closing_request(&record, runtime.committee()[0].validator_id()?);
         let binding = RepairLeaseBinding {
             record_id: 1,
@@ -912,6 +1024,17 @@ mod tests {
             close_generation: 1,
         };
         validate_close_recovery_binding(&engine, &binding, &verified)?;
+        let budget = crate::history_read_budget::HistoryReadBudget::new(Default::default());
+        validate_close_recovery_binding_with_budget(&engine, &binding, &verified, &budget)?;
+        let empty = crate::history_read_budget::HistoryReadBudget::new(
+            crate::history_read_budget::HistoryReadLimits { steps: 0, ..Default::default() },
+        );
+        let error =
+            validate_close_recovery_binding_with_budget(&engine, &binding, &verified, &empty)
+                .unwrap_err();
+        assert!(error
+            .downcast_ref::<crate::history_read_budget::HistoryBudgetExceeded>()
+            .is_some());
         for variant in 0..5 {
             let mut bad = binding.clone();
             match variant {
@@ -926,6 +1049,58 @@ mod tests {
                 "case {variant}"
             );
         }
+        Ok(())
+    }
+    #[test]
+    fn retired_session_start_descent_charges_distinct_anchor_lookup_to_shared_budget() -> Result<()>
+    {
+        use crate::history_read_budget::{
+            HistoryBudgetExceeded, HistoryReadBudget, HistoryReadLimits,
+        };
+        let original = history(0)?;
+        let mut state = original.state.state()?.clone();
+        let mut extra = state.read_custom()?.unwrap();
+        extra.prev_blocks.add_fake_id(7, true)?;
+        let governing = extra.prev_blocks.get(&7)?.unwrap().master_block_id().1;
+        state.set_seq_no(8);
+        state.write_custom(Some(&extra))?;
+        let root = state.serialize()?;
+        let id = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            8,
+            root.repr_hash().clone(),
+            UInt256::calc_file_hash(&rtos_block::write_boc(&root)?),
+        );
+        let start = ShardStateStuff::from_root_cell(
+            id.clone(),
+            root,
+            #[cfg(feature = "telemetry")]
+            &crate::collator_test_bundle::create_engine_telemetry(),
+            &crate::collator_test_bundle::create_engine_allocated(),
+        )?;
+        authenticate_start_descent(&start, &governing, None)?;
+        let budget = HistoryReadBudget::new(HistoryReadLimits { steps: 33, ..Default::default() });
+        authenticate_start_descent(&start, &governing, Some(&budget))?;
+        let error = authenticate_start_descent(&start, &governing, Some(&budget)).unwrap_err();
+        assert!(error.downcast_ref::<HistoryBudgetExceeded>().is_some());
+        let empty = HistoryReadBudget::new(HistoryReadLimits { steps: 0, ..Default::default() });
+        // Identical full IDs use the already authenticated state, no dictionary read.
+        authenticate_start_descent(&start, &id, Some(&empty))?;
+        let mut substituted = governing.clone();
+        substituted.file_hash = UInt256::default();
+        assert!(authenticate_start_descent(&start, &substituted, None).is_err());
+        let missing = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            6,
+            UInt256::default(),
+            UInt256::default(),
+        );
+        assert!(authenticate_start_descent(
+            &start,
+            &missing,
+            Some(&HistoryReadBudget::new(Default::default()))
+        )
+        .is_err());
         Ok(())
     }
 }

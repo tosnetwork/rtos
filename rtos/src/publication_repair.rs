@@ -586,10 +586,11 @@ pub(crate) async fn obtain_durable_mc_custody(
                 Some(&budget),
             )
             .await?;
-            crate::validator::retired_session_auth::validate_close_recovery_binding(
+            crate::validator::retired_session_auth::validate_close_recovery_binding_with_budget(
                 owner.as_ref(),
                 &binding,
                 &source_state,
+                &budget,
             )?;
             let live = repair_owned(owner.clone(), request, admission, budget.clone()).await?;
             if live.block.block()?.read_extra()?.created_by() != &binding.canonical.source_validator
@@ -728,10 +729,11 @@ pub(crate) async fn reopen_durable_mc_custody(
             Some(&budget),
         )
         .await?;
-        crate::validator::retired_session_auth::validate_close_recovery_binding(
+        crate::validator::retired_session_auth::validate_close_recovery_binding_with_budget(
             owner.as_ref(),
             &binding,
             &source_state,
+            &budget,
         )?;
         let live = repair_owned(owner.clone(), request, admission, budget.clone()).await?;
         if live.block.block()?.read_extra()?.created_by() != &binding.canonical.source_validator {
