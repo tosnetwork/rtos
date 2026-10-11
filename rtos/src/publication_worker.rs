@@ -1379,6 +1379,27 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
     #[test]
+    fn publication_worker_canonical_completion_survives_owner_and_callback_failure() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        drop(CanonicalCompletion(Some(Box::new(move |result| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            assert!(result.is_err());
+            panic!("source callback failed after recording completion");
+        }))));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let counter = calls.clone();
+        CanonicalCompletion(Some(Box::new(move |result| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            assert!(result.is_err());
+            panic!("source callback failed after explicit completion");
+        })))
+        .finish(Err(error!("canonical write failed")));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn publication_worker_rejected_draft_does_not_complete() {
         use std::sync::atomic::AtomicUsize;
         let calls = Arc::new(AtomicUsize::new(0));
