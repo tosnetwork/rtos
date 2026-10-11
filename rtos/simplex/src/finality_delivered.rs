@@ -301,7 +301,7 @@ impl PendingFinalityStore {
             fail!("Delivered conflicts with canonical reference");
         }
         let disk =
-            DeliveredDisk { schema: 1, reference: reference.clone(), generation: offer.generation };
+            DeliveredDisk { schema: 1, reference: reference.clone(), generation: offer.generation, node_confirmed: false };
         let bytes = serde_json::to_vec(&disk)?;
         if bytes.len() as u64 > MAX_REFERENCE_BYTES {
             fail!("Delivered exceeds record quota");

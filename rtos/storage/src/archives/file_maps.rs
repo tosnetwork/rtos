@@ -27,7 +27,7 @@ use adnl::{
     common::{add_unbound_object_to_map_with_update, CountedObject, Counter},
     declare_counted,
 };
-use rtos_block::{error, BlockIdExt, Result, ShardIdent, LT_ALIGN};
+use rtos_block::{error, fail, BlockIdExt, Result, ShardIdent, LT_ALIGN};
 use std::{
     fmt::Display,
     path::PathBuf,
