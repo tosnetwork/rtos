@@ -1831,6 +1831,19 @@ impl ValidatorGroup {
     }
 
     #[cfg(test)]
+    pub(crate) fn install_durable_finality_sink_for_test(
+        &self,
+        sink: consensus_common::finality_delivery::DurableFinalitySinkPtr,
+    ) -> bool {
+        self.durable_finality_sink.set(sink).is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retirement_scans_started_for_test(&self) -> usize {
+        self.retirement_scans_started.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
     pub(crate) fn inject_retirement_panic_for_test(&self) {
         self.panic_in_retirement_for_test.store(true, Ordering::Release);
     }

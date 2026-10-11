@@ -1,17 +1,109 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Retirement preparation through the production group path: a real source
-//! circulates one masterchain event to node Released, then a real
-//! authenticated group, built by `pre_create_engine` with a real engine
-//! reservation and durable sink, is stopped for retirement preparation.
+//! circulates one masterchain event through the real node, and real
+//! authenticated groups, built by `pre_create_engine` with a real engine
+//! reservation and durable sink, are stopped for retirement preparation.
 use super::*;
 use crate::validator::{
     consensus::ConsensusOptions, retirement_preparation::RetirementOutcome,
     validator_group::ValidatorGroup, validator_utils::GeneralSessionInfo,
 };
+use consensus_common::finality_delivery::{
+    CanonicalFinalityCompletion, CanonicalFinalityRequest, CloseFinalityRequest,
+    DurableFinalitySink, DurableFinalitySinkPtr, FinalityCloseCompletion,
+    FinalityTerminalCompletion, FinalityTerminalLookup, FinalizedDeliveryCompletion,
+};
+
+type LookupResult = rtos_block::Result<FinalityTerminalLookup>;
+
+/// The first held lookup: the node's answer once it arrives, and the caller's
+/// completion that the test releases.
+#[derive(Default)]
+struct Held {
+    answer: Option<LookupResult>,
+    completion: Option<FinalityTerminalCompletion>,
+}
+
+/// Forwards every call to the real engine sink. The first `lookup_terminal`
+/// is answered by the real node, but its delivery to the caller is held until
+/// the test releases it.
+struct HoldingSink {
+    inner: DurableFinalitySinkPtr,
+    held: Arc<std::sync::Mutex<Held>>,
+    armed: std::sync::atomic::AtomicBool,
+}
+impl HoldingSink {
+    fn new(inner: DurableFinalitySinkPtr) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            held: Arc::new(std::sync::Mutex::new(Held::default())),
+            armed: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+    /// True once a caller's lookup is admitted and the node has answered it.
+    fn holding(&self) -> bool {
+        let held = self.held.lock().unwrap();
+        held.completion.is_some() && held.answer.is_some()
+    }
+    fn release(&self) {
+        let (answer, completion) = {
+            let mut held = self.held.lock().unwrap();
+            (held.answer.take(), held.completion.take())
+        };
+        completion.expect("a held lookup")(answer.expect("the node answered the held lookup"));
+    }
+    async fn wait_holding(&self) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while !self.holding() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("no lookup reached the group's sink");
+    }
+}
+impl DurableFinalitySink for HoldingSink {
+    fn stage(
+        &self,
+        draft: FinalizedDeliveryDraft,
+        completion: FinalizedDeliveryCompletion,
+    ) -> Result<()> {
+        self.inner.stage(draft, completion)
+    }
+    fn retain_canonical(
+        &self,
+        request: CanonicalFinalityRequest,
+        completion: CanonicalFinalityCompletion,
+    ) -> Result<()> {
+        self.inner.retain_canonical(request, completion)
+    }
+    fn offer_close(
+        &self,
+        request: CloseFinalityRequest,
+        completion: FinalityCloseCompletion,
+    ) -> Result<()> {
+        self.inner.offer_close(request, completion)
+    }
+    fn lookup_terminal(
+        &self,
+        request: CloseFinalityRequest,
+        completion: FinalityTerminalCompletion,
+    ) -> Result<()> {
+        if !self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            return self.inner.lookup_terminal(request, completion);
+        }
+        self.held.lock().unwrap().completion = Some(completion);
+        let held = self.held.clone();
+        self.inner.lookup_terminal(
+            request,
+            Box::new(move |answer| held.lock().unwrap().answer = Some(answer)),
+        )
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires explicit public fixture signer and real multi-Engine network/WAL"]
-async fn retirement_preparation_real_group_prepares_and_survives_panic() {
+async fn retirement_preparation_real_group_handoff_and_refusals() {
     let signer = std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER")
         .expect("set RTOS_PUBLIC_FIXTURE_SIGNER to the archived public-only fixture signer");
     assert!(Path::new(&signer).is_file());
@@ -67,13 +159,74 @@ async fn retirement_preparation_real_group_prepares_and_survives_panic() {
             global_id: -239,
             wire_profile: WireProfile::T0,
         };
+        let open_driver = || async {
+            let sink = engine.clone().durable_finality_sink(runtime.clone()).await.unwrap();
+            let confirm =
+                engine.ensure_publication_worker().await.unwrap().delivered_sink(runtime.clone());
+            FinalityDeliveryTestDriver::open(runtime.clone(), &namespace, sink, confirm)
+        };
+        let source_locked = || async { open_driver().await.is_err() };
+        let lease_held = || engine.reserve_normal_session_namespace(&runtime).unwrap().is_none();
+        let make_group = || {
+            let options = crate::validator::validator_manager::build_historical_simplex_options(
+                &zero.config_params().unwrap(),
+                &pair.anchor.shard(),
+            )
+            .unwrap();
+            let info = Arc::new(GeneralSessionInfo {
+                shard: pair.anchor.shard().clone(),
+                opts_hash: UInt256::default(),
+                catchain_seqno: cc,
+                key_seqno: 0,
+                max_vertical_seqno: 0,
+            });
+            let set = ValidatorSet::with_cc_seqno(
+                0,
+                u32::MAX,
+                u16::try_from(committee.len()).unwrap(),
+                cc,
+                committee.clone(),
+            )
+            .unwrap();
+            Arc::new(
+                ValidatorGroup::new(
+                    info,
+                    local_key.clone(),
+                    runtime.session_id().clone(),
+                    UInt256::default(),
+                    set,
+                    0,
+                    ConsensusOptions::Simplex(options),
+                    engine.clone(),
+                    false,
+                    None,
+                )
+                .with_authenticated_runtime(runtime.clone())
+                .unwrap(),
+            )
+        };
+        let holding_group = || async {
+            let group = make_group();
+            let sink = HoldingSink::new(
+                engine.clone().durable_finality_sink(runtime.clone()).await.unwrap(),
+            );
+            assert!(group.install_durable_finality_sink_for_test(sink.clone()));
+            (group, sink)
+        };
+        let stop = |group: Arc<ValidatorGroup>| async move {
+            let rt = tokio::runtime::Handle::current();
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                group.stop_for_retirement_preparation(rt),
+            )
+            .await
+            .expect("retirement stop did not finish")
+            .unwrap();
+        };
+
         // A preexisting validator namespace, as a running session leaves it.
         FinalityDeliveryTestDriver::provision_validator_namespace(&runtime, &namespace).unwrap();
-        let sink = engine.clone().durable_finality_sink(runtime.clone()).await.unwrap();
-        let confirm =
-            engine.ensure_publication_worker().await.unwrap().delivered_sink(runtime.clone());
-        let driver =
-            FinalityDeliveryTestDriver::open(runtime.clone(), &namespace, sink, confirm).unwrap();
+        let driver = open_driver().await.unwrap();
         driver.prepare_intents(false).unwrap();
         engine.enable_publication_worker().await.unwrap();
         let parent = pair.master.id().clone();
@@ -121,6 +274,51 @@ async fn retirement_preparation_real_group_prepares_and_survives_panic() {
         })
         .await
         .expect("actual source/node retention did not produce reference");
+        // Stop at the canonical reference: no closing maintenance yet.
+        drop(driver);
+
+        // (a) The group's own session admits a closing lookup at startup; its
+        // delivery is held across the retirement stop.
+        let (group, sink) = holding_group().await;
+        group.clone().pre_create_engine().await.unwrap();
+        assert!(group.has_session_for_test().await, "production construction created a session");
+        group
+            .clone()
+            .start_session(
+                vec![parent.clone()],
+                parent.clone(),
+                std::time::SystemTime::now(),
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .unwrap();
+        sink.wait_holding().await;
+        assert!(lease_held(), "the group holds the engine lease");
+        let stopping = tokio::spawn(stop(group.clone()));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!stopping.is_finished(), "stop waits for the admitted source callback");
+        assert_eq!(group.retirement_scans_started_for_test(), 0, "no scan while it is held");
+        assert!(lease_held(), "the lease stays registered through the held callback");
+        sink.release();
+        stopping.await.unwrap();
+        match group.take_retirement_outcome().unwrap() {
+            Some(RetirementOutcome::Refused(refused)) => {
+                assert!(refused.drained(), "the callback drained before the proof: {}", refused.refusal());
+                assert!(refused.holds_reservation());
+                assert!(lease_held());
+                drop(group);
+                assert!(refused.abandon().is_ok());
+            }
+            Some(RetirementOutcome::Prepared(owner)) => {
+                drop(group);
+                owner.abandon();
+            }
+            None => panic!("retirement stop produced no outcome"),
+        }
+        assert!(!lease_held(), "abandon released the lease");
+
+        // Finish the event to node Released through the real source.
+        let driver = open_driver().await.unwrap();
         let closed = tokio::time::timeout(Duration::from_secs(120), async {
             loop {
                 driver.maintain().unwrap();
@@ -137,70 +335,17 @@ async fn retirement_preparation_real_group_prepares_and_survives_panic() {
         let offer = closed[0].offer();
         drop(driver);
 
-        // The production group path: options from the same config, real
-        // reservation, real durable sink and a real authenticated session.
-        let make_group = || {
-            let options = crate::validator::validator_manager::build_historical_simplex_options(
-                &zero.config_params().unwrap(),
-                &pair.anchor.shard(),
-            )
-            .unwrap();
-            let info = Arc::new(GeneralSessionInfo {
-                shard: pair.anchor.shard().clone(),
-                opts_hash: UInt256::default(),
-                catchain_seqno: cc,
-                key_seqno: 0,
-                max_vertical_seqno: 0,
-            });
-            let set = ValidatorSet::with_cc_seqno(
-                0,
-                u32::MAX,
-                u16::try_from(committee.len()).unwrap(),
-                cc,
-                committee.clone(),
-            )
-            .unwrap();
-            Arc::new(
-                ValidatorGroup::new(
-                    info,
-                    local_key.clone(),
-                    runtime.session_id().clone(),
-                    UInt256::default(),
-                    set,
-                    0,
-                    ConsensusOptions::Simplex(options),
-                    engine.clone(),
-                    false,
-                    None,
-                )
-                .with_authenticated_runtime(runtime.clone())
-                .unwrap(),
-            )
-        };
-        let source_locked = || async {
-            let sink = engine.clone().durable_finality_sink(runtime.clone()).await.unwrap();
-            let confirm =
-                engine.ensure_publication_worker().await.unwrap().delivered_sink(runtime.clone());
-            FinalityDeliveryTestDriver::open(runtime.clone(), &namespace, sink, confirm).is_err()
-        };
-        let stop = |group: Arc<ValidatorGroup>| async move {
-            let rt = tokio::runtime::Handle::current();
-            tokio::time::timeout(
-                Duration::from_secs(60),
-                group.stop_for_retirement_preparation(rt),
-            )
-            .await
-            .expect("retirement stop did not finish")
-            .unwrap();
-        };
-
-        let group = make_group();
+        // (b) Prepared, with the first waiter cancelled while the reconciling
+        // lookup is held: the shared teardown task completes the handoff.
+        let (group, sink) = holding_group().await;
         group.clone().pre_create_engine().await.unwrap();
-        assert!(group.has_session_for_test().await, "production construction created a session");
-        assert!(
-            engine.reserve_normal_session_namespace(&runtime).unwrap().is_none(),
-            "the group holds the engine lease"
-        );
+        let first = tokio::spawn(stop(group.clone()));
+        sink.wait_holding().await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(source_locked().await, "the pending scan holds the source store lock");
+        assert!(lease_held());
+        sink.release();
         stop(group.clone()).await;
         let owner = match group.take_retirement_outcome().unwrap() {
             Some(RetirementOutcome::Prepared(owner)) => owner,
@@ -212,40 +357,59 @@ async fn retirement_preparation_real_group_prepares_and_survives_panic() {
         let preparation = owner.preparation().unwrap();
         assert_eq!(preparation.inventory().len(), 1);
         assert_eq!(preparation.inventory()[0].offer, offer);
-        assert!(
-            engine.reserve_normal_session_namespace(&runtime).unwrap().is_none(),
-            "a prepared namespace stays closed to new sessions"
-        );
+        assert!(lease_held(), "a prepared namespace stays closed to new sessions");
         assert!(source_locked().await, "the preparation holds the source store lock");
         drop(group);
         owner.abandon();
         assert!(!source_locked().await, "abandon released the source store lock");
+        assert!(!lease_held());
 
         // A preparation that panics after a verified drain keeps the lease in
         // its stable owner; the drained refusal may then release it.
         let group = make_group();
         group.clone().pre_create_engine().await.unwrap();
-        assert!(group.has_session_for_test().await);
         group.inject_retirement_panic_for_test();
         stop(group.clone()).await;
         let refused = match group.take_retirement_outcome().unwrap() {
             Some(RetirementOutcome::Refused(refused)) => refused,
-            Some(RetirementOutcome::Prepared(_)) => {
-                panic!("an injected panic issued a preparation")
-            }
+            Some(RetirementOutcome::Prepared(_)) => panic!("an injected panic issued a preparation"),
             None => panic!("retirement stop produced no outcome"),
         };
         assert!(refused.refusal().to_string().contains("panicked"), "{}", refused.refusal());
         assert!(refused.drained(), "the drain was verified before the panic");
         assert!(refused.holds_reservation(), "the stable owner kept the lease through the panic");
-        assert!(engine.reserve_normal_session_namespace(&runtime).unwrap().is_none());
+        assert!(lease_held());
         drop(group);
         assert!(refused.abandon().is_ok());
-        let lease = engine
-            .reserve_normal_session_namespace(&runtime)
-            .unwrap()
-            .expect("abandoning a drained refusal releases the lease");
-        lease.release();
+        assert!(!lease_held());
+
+        // (c) Corrupt node custody: the real lookup fails, and the refusal keeps
+        // the scan with its locks and the lease.
+        let group = make_group();
+        group.clone().pre_create_engine().await.unwrap();
+        engine.db().save_validator_state_raw("PropagationOutboxV1", b"corrupt custody").unwrap();
+        stop(group.clone()).await;
+        let refused = match group.take_retirement_outcome().unwrap() {
+            Some(RetirementOutcome::Refused(refused)) => refused,
+            Some(RetirementOutcome::Prepared(_)) => panic!("corrupt custody issued a preparation"),
+            None => panic!("retirement stop produced no outcome"),
+        };
+        assert!(
+            matches!(
+                refused.refusal(),
+                simplex::finality_delivery::source_retirement::RetirementRefusal::CustodyUnverified { .. }
+            ),
+            "{}",
+            refused.refusal()
+        );
+        assert!(refused.drained());
+        assert!(refused.holds_scan(), "the refused scan is retained");
+        assert!(source_locked().await, "with its source store lock");
+        assert!(lease_held());
+        drop(group);
+        assert!(refused.abandon().is_ok());
+        assert!(!source_locked().await);
+        assert!(!lease_held());
     })
     .catch_unwind()
     .await;
