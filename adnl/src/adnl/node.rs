@@ -2806,6 +2806,9 @@ impl AdnlNode {
                 });
             }
         }
+        if self.tasks.is_closed() {
+            fail!("ADNL stopped during startup");
+        }
         startup.committed = true;
         Ok(())
     }
