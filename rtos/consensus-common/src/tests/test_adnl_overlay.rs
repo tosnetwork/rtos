@@ -186,3 +186,134 @@ async fn overlay_owned_real_processor_panic_sticky_after_join() {
     );
     overlay.stack.adnl.stop_checked().await.unwrap();
 }
+
+struct ImmediateListener;
+impl crate::ConsensusOverlayListener for ImmediateListener {
+    fn on_message(&self, _: PublicKeyHash, _: &BlockPayloadPtr) {}
+    fn on_broadcast(&self, _: PublicKeyHash, _: &BlockPayloadPtr, _: crate::BroadcastSource) {}
+    fn on_query(&self, _: PublicKeyHash, _: &BlockPayloadPtr, callback: QueryResponseCallback) {
+        callback(Ok(ConsensusCommonFactory::create_block_payload(
+            serialize_boxed(&ConsensusRequestError::Consensus_RequestError).unwrap(),
+        )));
+    }
+}
+struct Replay;
+impl crate::ConsensusOverlayLogReplayListener for Replay {
+    fn on_time_changed(&self, _: SystemTime) {}
+}
+async fn response_still_works(overlay: &ConsensusOverlayPtr) {
+    use rtos_api::AnyBoxedSerialize;
+    let implementation = overlay.get_impl().downcast_ref::<AdnlOverlay>().unwrap();
+    let peers = AdnlPeers::with_keys(
+        implementation.local_adnl_key.id().clone(),
+        KeyId::from_data([115; 32]),
+    );
+    let response = implementation
+        .process_query(ConsensusRequestError::Consensus_RequestError.into_tl_object(), &peers)
+        .await
+        .unwrap();
+    let QueryResult::Consumed(QueryAnswer::Pending(response)) = response else {
+        panic!("expected real response worker")
+    };
+    assert!(tokio::time::timeout(Duration::from_secs(5), response)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .answer
+        .is_some());
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlay_owned_manager_concurrent_creation_and_old_stop_preserve_new_generation() {
+    let listener: Arc<dyn crate::ConsensusOverlayListener + Send + Sync> =
+        Arc::new(ImmediateListener);
+    let baseline = real_overlay(Arc::downgrade(&listener), 112).await;
+    let stack = baseline.stack.clone();
+    let manager =
+        AdnlOverlayManager::create(tokio::runtime::Handle::current(), stack.clone(), None, true)
+            .unwrap();
+    let key = baseline.local_validator_key.clone();
+    let nodes = vec![ConsensusNode { adnl_id: key.id().clone(), public_key: key.clone().into() }];
+    let replay: Arc<dyn crate::ConsensusOverlayLogReplayListener + Send + Sync> = Arc::new(Replay);
+    let id = KeyId::from_data([113; 32]);
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let mut starts = Vec::new();
+    for _ in 0..2 {
+        let (manager, key, nodes, id, listener, replay, barrier) = (
+            manager.clone(),
+            key.clone(),
+            nodes.clone(),
+            id.clone(),
+            listener.clone(),
+            replay.clone(),
+            barrier.clone(),
+        );
+        starts.push(tokio::task::spawn_blocking(move || {
+            barrier.wait();
+            manager
+                .start_overlay(
+                    &key,
+                    &id,
+                    &nodes,
+                    Arc::downgrade(&listener),
+                    Arc::downgrade(&replay),
+                    OverlayTransportType::Catchain,
+                    None,
+                )
+                .unwrap()
+        }));
+    }
+    let first = starts.remove(0).await.unwrap();
+    let second = starts.remove(0).await.unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    response_still_works(&first).await;
+    // A different constructor cannot claim and later roll back this live ID.
+    assert!(AdnlOverlay::new(
+        tokio::runtime::Handle::current(),
+        stack.clone(),
+        id.clone(),
+        key.clone(),
+        Arc::downgrade(&listener),
+        &nodes,
+        None,
+        true,
+        Arc::new(PeerStorage::new()),
+        OverlayTransportType::Catchain,
+        None
+    )
+    .is_err());
+    response_still_works(&first).await;
+    let (m, i, o) = (manager.clone(), id.clone(), first.clone());
+    tokio::task::spawn_blocking(move || m.stop_overlay_checked(&i, &o)).await.unwrap().unwrap();
+    let replacement = manager
+        .start_overlay(
+            &key,
+            &id,
+            &nodes,
+            Arc::downgrade(&listener),
+            Arc::downgrade(&replay),
+            OverlayTransportType::Catchain,
+            None,
+        )
+        .unwrap();
+    assert!(!Arc::ptr_eq(&first, &replacement));
+    let (m, i, o) = (manager.clone(), id.clone(), first.clone());
+    tokio::task::spawn_blocking(move || m.stop_overlay_checked(&i, &o)).await.unwrap().unwrap();
+    response_still_works(&replacement).await;
+    let current = manager
+        .start_overlay(
+            &key,
+            &id,
+            &nodes,
+            Arc::downgrade(&listener),
+            Arc::downgrade(&replay),
+            OverlayTransportType::Catchain,
+            None,
+        )
+        .unwrap();
+    assert!(Arc::ptr_eq(&current, &replacement));
+    let (m, i, o) = (manager.clone(), id.clone(), replacement.clone());
+    tokio::task::spawn_blocking(move || m.stop_overlay_checked(&i, &o)).await.unwrap().unwrap();
+    tokio::task::spawn_blocking(move || baseline.stop_checked()).await.unwrap().unwrap();
+    stack.adnl.stop_checked().await.unwrap();
+}
