@@ -637,22 +637,24 @@ impl ConsensusFactory {
         listener: SessionListenerPtr,
         trace_collector: Option<simplex::TraceCollector>,
         delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
+        delivered_sink: Option<simplex::finality_delivery::DeliveredCompletionSink>,
     ) -> std::result::Result<SessionHolderPtr, simplex::SessionCreationFailure> {
         options.validate_authenticated(&runtime).map_err(simplex::SessionCreationFailure::before_worker)?;
         let mut options = options.clone();
         options.use_callback_thread = false;
         options.wait_for_db_init = true;
         let db_path = runtime.runtime_directory(&db_root).map_err(simplex::SessionCreationFailure::before_worker)?;
-        let session = simplex::SessionFactory::create_authenticated_session_checked(
-            &options,
-            runtime,
-            local_transport_key,
-            db_path,
-            overlay_manager,
-            listener,
-            trace_collector,
-            delivery_sink,
-        )?;
+        let session = if let Some(delivered) = delivered_sink {
+            simplex::SessionFactory::create_authenticated_session_with_delivered_checked(
+                &options, runtime, local_transport_key, db_path, overlay_manager,
+                listener, trace_collector, delivery_sink, delivered,
+            )?
+        } else {
+            simplex::SessionFactory::create_authenticated_session_checked(
+                &options, runtime, local_transport_key, db_path, overlay_manager,
+                listener, trace_collector, delivery_sink,
+            )?
+        };
         Ok(Arc::new(SessionHolder::simplex(session)))
     }
 

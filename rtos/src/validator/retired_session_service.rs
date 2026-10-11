@@ -191,7 +191,9 @@ impl RetiredSessionService {
         let Some(key) = engine.adnl_key_by_id(runtime.local_adnl()) else {
             fail!("Historical transport key unavailable; source remains retained");
         };
-        let sink = engine.ensure_publication_worker().await?.historical_sink(&authenticated)?;
+        let worker = engine.ensure_publication_worker().await?;
+        let sink = worker.historical_sink(&authenticated)?;
+        let delivered_sink = worker.delivered_sink(runtime.clone());
         let db_root = PathBuf::from(engine.db_root_dir()?).join("catchains");
         let db_root =
             db_root.to_str().ok_or_else(|| error!("Recovery DB path is not UTF-8"))?.to_owned();
@@ -219,7 +221,7 @@ impl RetiredSessionService {
             started: tokio::time::Instant::now(),
         });
         let constructor = tokio::task::spawn_blocking(move || {
-            simplex::SessionFactory::create_finality_recovery_session_checked(
+            simplex::SessionFactory::create_finality_recovery_session_with_delivered_checked(
                 authenticated.options(),
                 runtime,
                 &key,
@@ -228,6 +230,7 @@ impl RetiredSessionService {
                 overlay,
                 weak_listener,
                 sink,
+                delivered_sink,
             )
         });
         active.last_mut().expect("admitted recovery owner").constructing = Some(constructor);

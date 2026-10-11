@@ -1338,6 +1338,15 @@ impl EngineOperations for Engine {
         }
         Ok(self.ensure_publication_worker().await?.sink(runtime))
     }
+    async fn durable_finality_delivered_sink(
+        self: Arc<Self>,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+    ) -> Result<Option<simplex::finality_delivery::DeliveredCompletionSink>> {
+        // Reuse the same authenticated local transport/domain admission as the
+        // ordinary source factory. This callback cannot be obtained from disk metadata.
+        self.clone().durable_finality_sink(runtime.clone()).await?;
+        Ok(Some(self.ensure_publication_worker().await?.delivered_sink(runtime)))
+    }
     async fn await_publication(
         self: Arc<Self>,
         delivery_id: UInt256,

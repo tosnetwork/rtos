@@ -783,6 +783,7 @@ impl ValidatorGroupImpl {
                         listener,
                         g.engine.trace_collector(),
                         g.durable_finality_sink.get().cloned(),
+                        g.delivered_finality_sink.get().cloned().flatten(),
                     );
                     return match created {
                         Ok(session) => Ok(session),
@@ -1039,6 +1040,8 @@ pub struct ValidatorGroup {
     namespace_admission: Mutex<NormalNamespaceAdmission>,
     durable_finality_sink:
         tokio::sync::OnceCell<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
+    delivered_finality_sink:
+        tokio::sync::OnceCell<Option<simplex::finality_delivery::DeliveredCompletionSink>>,
     #[allow(dead_code)]
     allow_unsafe_self_blocks_resync: bool,
 
@@ -1260,6 +1263,7 @@ impl ValidatorGroup {
             pq_session,
             authenticated_runtime: None,
             durable_finality_sink: tokio::sync::OnceCell::new(),
+            delivered_finality_sink: tokio::sync::OnceCell::new(),
             namespace_admission: Mutex::new(NormalNamespaceAdmission::default()),
             candidate_relays: Mutex::new(Default::default()),
             consensus_options,
@@ -1441,6 +1445,9 @@ impl ValidatorGroup {
         }
         self.durable_finality_sink
             .get_or_try_init(|| self.engine.clone().durable_finality_sink(runtime.clone()))
+            .await?;
+        self.delivered_finality_sink
+            .get_or_try_init(|| self.engine.clone().durable_finality_delivered_sink(runtime.clone()))
             .await?;
         Ok(())
     }

@@ -1030,6 +1030,14 @@ pub trait EngineOperations: Sync + Send {
     ) -> Result<consensus_common::finality_delivery::DurableFinalitySinkPtr> {
         rtos_block::fail!("Durable finality sink is unavailable")
     }
+    /// Optional on compatibility engines; an absent callback preserves source
+    /// retention and never permits a Delivered transition.
+    async fn durable_finality_delivered_sink(
+        self: Arc<Self>,
+        _runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+    ) -> Result<Option<simplex::finality_delivery::DeliveredCompletionSink>> {
+        Ok(None)
+    }
     async fn await_publication(
         self: Arc<Self>,
         _delivery_id: UInt256,

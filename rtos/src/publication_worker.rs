@@ -1,6 +1,8 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! One bounded publication actor. Accepted blocking writes retain their real join
 //! independently of the caller's response future. Idle loops never own Engine.
+mod closing;
+
 use crate::{
     engine::Engine,
     engine_traits::EngineOperations,
@@ -22,6 +24,8 @@ use crate::{
 use consensus_common::{
     finality_delivery::{
         CanonicalFinalityCompletion, CanonicalFinalityRecord, CanonicalFinalityRequest,
+        CloseFinalityRequest, CloseOffer, FinalityCloseCompletion, FinalityCloseDomain,
+        FinalityTerminalCompletion, FinalityTerminalLookup,
         DurableFinalitySink, DurableFinalitySinkPtr, FinalityDeliveryRole,
         FinalizedDeliveryCompletion, FinalizedDeliveryDraft,
     },
@@ -84,7 +88,41 @@ impl Drop for CanonicalCompletion {
         }
     }
 }
+/// Accepted closing callbacks retain the actor's real IO owner. Admission
+/// rejection disarms this guard, as with the existing source draft callback.
+struct ClosingCompletion<T>(Option<Box<dyn FnOnce(Result<T>) + Send>>);
+impl<T> ClosingCompletion<T> {
+    fn finish(mut self, result: Result<T>) {
+        if let Some(callback) = self.0.take() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(result)));
+        }
+    }
+}
+impl<T> Drop for ClosingCompletion<T> {
+    fn drop(&mut self) {
+        if let Some(callback) = self.0.take() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                callback(Err(error!("Publication close owner stopped before durable completion")))
+            }));
+        }
+    }
+}
 enum Submission {
+    Terminal {
+        request: CloseFinalityRequest,
+        runtime: Arc<AuthenticatedSessionRuntime>,
+        completion: ClosingCompletion<FinalityTerminalLookup>,
+    },
+    OfferClose {
+        request: CloseFinalityRequest,
+        runtime: Arc<AuthenticatedSessionRuntime>,
+        completion: ClosingCompletion<CloseOffer>,
+    },
+    SourceDelivered {
+        confirmation: simplex::finality_delivery::DeliveredConfirmation,
+        runtime: Arc<AuthenticatedSessionRuntime>,
+        completion: ClosingCompletion<()>,
+    },
     Canonical {
         request: CanonicalFinalityRequest,
         runtime: Arc<AuthenticatedSessionRuntime>,
@@ -107,6 +145,9 @@ enum Submission {
 impl Submission {
     fn reject(self) {
         match self {
+            Self::Terminal { completion, .. } => completion.finish(Err(error!("Publication closing shutdown"))),
+            Self::OfferClose { completion, .. } => completion.finish(Err(error!("Publication closing shutdown"))),
+            Self::SourceDelivered { completion, .. } => completion.finish(Err(error!("Publication closing shutdown"))),
             Self::Canonical { completion, .. } => {
                 completion.finish(Err(error!("Publication retention shutdown")))
             }
@@ -130,6 +171,17 @@ struct SessionSink {
     historical: bool,
 }
 impl DurableFinalitySink for SessionSink {
+    fn lookup_terminal(&self, request: CloseFinalityRequest, completion: FinalityTerminalCompletion) -> Result<()> {
+        self.worker.admit_draft(Submission::Terminal {
+            request, runtime: self.runtime.clone(), completion: ClosingCompletion(Some(completion)),
+        })
+    }
+    fn offer_close(&self, request: CloseFinalityRequest, completion: FinalityCloseCompletion) -> Result<()> {
+        self.worker.admit_draft(Submission::OfferClose {
+            request, runtime: self.runtime.clone(), completion: ClosingCompletion(Some(completion)),
+        })
+    }
+
     fn retain_canonical(
         &self,
         request: CanonicalFinalityRequest,
@@ -318,6 +370,9 @@ impl PublicationWorker {
             Err(_) => request,
         };
         match rejected {
+            Submission::Terminal { mut completion, .. } => { completion.0.take(); }
+            Submission::OfferClose { mut completion, .. } => { completion.0.take(); }
+            Submission::SourceDelivered { mut completion, .. } => { completion.0.take(); }
             Submission::Draft { mut completion, .. } => {
                 completion.0.take();
             }
@@ -478,6 +533,15 @@ impl State {
     }
     async fn submit_one(&self, store: &Arc<PropagationOutbox>, command: Submission) {
         match command {
+            Submission::Terminal { request, runtime, completion } => {
+                completion.finish(self.lookup_terminal(store, &runtime, &request).await);
+            }
+            Submission::OfferClose { request, runtime, completion } => {
+                completion.finish(self.offer_close(store, &runtime, request).await);
+            }
+            Submission::SourceDelivered { confirmation, runtime, completion } => {
+                completion.finish(self.confirm_delivered(store, &runtime, confirmation).await);
+            }
             Submission::Canonical { request, runtime, completion } => {
                 let result = async {
                     if self.stop.is_cancelled() {
