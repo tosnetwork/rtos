@@ -24,7 +24,8 @@ pub mod propagation;
 mod out_msg_queue_cleaner;
 pub mod out_msg_queue_manager;
 pub mod state_resolver_cache;
-mod session_publication;
+pub(crate) mod session_publication;
+pub(crate) use session_publication::recover_retained_finality;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
 pub mod validate_query;

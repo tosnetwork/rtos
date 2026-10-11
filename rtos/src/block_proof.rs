@@ -220,6 +220,7 @@ pub struct PqPublicationContext {
     profile: UInt256,
     committee: Vec<rtos_block::ValidatorDescr>,
     slots_per_leader_window: u32,
+    carrier_version: u32,
     verifier: rtos_api::pq_finality::PqVerificationContext,
 }
 
@@ -245,6 +246,9 @@ impl PqPublicationContext {
     }
     pub fn slots_per_leader_window(&self) -> u32 {
         self.slots_per_leader_window
+    }
+    pub fn carrier_version(&self) -> u32 {
+        self.carrier_version
     }
     pub fn verifier(&self) -> &rtos_api::pq_finality::PqVerificationContext {
         &self.verifier
@@ -416,6 +420,7 @@ impl MasterchainProofVerifier {
             profile: identity.config_hash,
             committee,
             slots_per_leader_window,
+            carrier_version: u32::from(config.consensus_config()?.proto_version),
             verifier,
         })
     }

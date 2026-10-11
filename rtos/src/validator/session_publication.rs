@@ -1,300 +1,171 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
-//! Freeze exact publication effects before durable acceptance of a v2 callback.
-use super::propagation::{PropagationEvent, PropagationKind, PropagationPlan, PropagationTarget};
+//! Recover retained source deliveries before opening new consensus sessions.
 use crate::{
     block::{construct_and_check_prev_stuff, BlockStuff},
     engine_traits::EngineOperations,
-    propagation_outbox::{
-        Limits, OutboxDomain, PublicationEffect, PublicationKind, PublicationRecord,
-        PublicationTarget, StoredCarrier,
-    },
+    propagation_outbox::{Limits, OutboxDomain, PublicationRecord, RecoveryOrigin, StoredCarrier},
 };
-use consensus_common::{
-    session_runtime::{AuthenticatedSessionRuntime, LocalRole},
-    SessionFinality,
-};
-use rtos_api::{pq_finality::PqNetworkSignatureSet, IntoBoxed};
-use rtos_block::{error, fail, BlockIdExt, BlockSignaturesVariant, Result};
-use std::{
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use rtos_block::{error, fail, Result};
+use std::{path::PathBuf, sync::Arc};
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn prepare_publication(
-    runtime: &AuthenticatedSessionRuntime,
-    id: BlockIdExt,
-    data: &[u8],
-    prev: &[BlockIdExt],
-    finality: &SessionFinality,
-    engine: &Arc<dyn EngineOperations>,
-    locally_generated: bool,
-    last_mc: u32,
-    candidate_already_sent: bool,
-) -> Result<Option<PublicationRecord>> {
-    let limits = Limits::default();
-    if data.is_empty() || data.len() > limits.max_block_bytes {
-        fail!("Publication block exceeds its durable limit");
-    }
-    let block = BlockStuff::deserialize_block_checked(id.clone(), Arc::new(data.to_vec()))?;
-    block.verify_expected_id(&id)?;
-    let (_, actual) = construct_and_check_prev_stuff(block.root_cell(), &id, false)?;
-    if actual.prev != prev
-        || block.block()?.global_id() != runtime.pin().global_id
-        || &runtime.pin().zerostate != engine.zerostate_id()?
-    {
-        fail!("Publication body or pin differs from the authenticated session");
-    }
-    let verifier = runtime
-        .pq_context()
-        .ok_or_else(|| error!("Publication needs a PQ session"))?
-        .for_block(id.clone())?;
-    let (network, slot, is_final) = match finality {
-        SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(carrier)) => {
-            verifier.verify_final(carrier)?;
-            (PqNetworkSignatureSet::from_final_fields(carrier)?, carrier.slot, true)
+/// Source files are untrusted. The node reauthenticates governing history and
+/// evidence before its WAL receipt permits the source copy to be removed.
+/// Retired sessions participate even when this node no longer runs a validator.
+pub(crate) async fn recover_retained_finality(engine: Arc<dyn EngineOperations>) -> Result<()> {
+    let root = PathBuf::from(engine.db_root_dir()?).join("catchains");
+    loop {
+        if engine.check_stop() {
+            fail!("Retained finality recovery stopped before admission");
         }
-        SessionFinality::PqApproval(approval) => {
-            verifier.verify_approval(approval)?;
-            (PqNetworkSignatureSet::from_approval(approval)?, approval.slot(), false)
+        let scan_root = root.clone();
+        let pending = owned_source_io(engine.as_ref(), "scan retained finality", move || {
+            simplex::finality_delivery::scan_pending_finality(&scan_root)
+        })
+        .await?;
+        if pending.is_empty() {
+            return Ok(());
         }
-        _ => fail!("Publication requires PQ quorum evidence"),
-    };
-    if locally_generated {
-        let leader =
-            (slot / runtime.slots_per_leader_window()) as usize % runtime.committee().len();
-        if !matches!(runtime.local_role(), LocalRole::Validator(index) if index as usize == leader)
-        {
-            fail!("Publication creator does not match the authenticated leader");
-        }
-    }
-    let plan = PropagationPlan::for_event(
-        runtime.protocol(),
-        PropagationEvent::Finalized,
-        &id,
-        true,
-        locally_generated,
-        is_final,
-        last_mc,
-        candidate_already_sent,
-    );
-    let destinations = engine.resolve_propagation_targets(&id, &plan).await?;
-    let mut effects = Vec::with_capacity(destinations.len());
-    for destination in destinations {
-        plan.for_destination(&destination)?;
-        let kind = match destination.kind {
-            PropagationKind::Candidate => PublicationKind::Candidate,
-            PropagationKind::Block => PublicationKind::Block,
-            PropagationKind::Finality => PublicationKind::Finality,
-            PropagationKind::ShardDescription => PublicationKind::ShardDescription,
-        };
-        let target = match destination.target {
-            PropagationTarget::Public => PublicationTarget::Public,
-            PropagationTarget::FastSync => PublicationTarget::FastSync,
-            PropagationTarget::Custom(name) if !name.is_empty() => PublicationTarget::Custom(name),
-            PropagationTarget::Custom(_) => {
-                fail!("Durable publication requires a named custom target")
+        for source in pending {
+            if engine.check_stop() {
+                fail!("Retained finality recovery stopped before admission");
             }
-            PropagationTarget::ShardDescription => PublicationTarget::ShardDescription,
-        };
-        effects.push(PublicationEffect { kind, target });
+            let retained = source.record();
+            let block = BlockStuff::deserialize_block_checked(
+                retained.block_id.clone(),
+                Arc::new(retained.data.clone()),
+            )?;
+            block.verify_expected_id(&retained.block_id)?;
+            let (_, previous) =
+                construct_and_check_prev_stuff(block.root_cell(), &retained.block_id, false)?;
+            let locally_generated = match retained.local_validator_index {
+                None => false,
+                Some(_) => {
+                    let bindings = engine.consensus_transport_bindings()?;
+                    let binding = bindings
+                        .iter()
+                        .find(|binding| {
+                            binding.adnl_key_id.data() == retained.local_adnl.as_slice()
+                        })
+                        .ok_or_else(|| {
+                            error!("Retained validator transport is no longer configured")
+                        })?;
+                    binding.validator_id == retained.source_validator
+                }
+            };
+            let record = PublicationRecord {
+                domain: OutboxDomain {
+                    zerostate: retained.pin.zerostate.clone(),
+                    global_id: retained.pin.global_id,
+                    wire_profile: retained.wire_profile,
+                },
+                protocol: retained.protocol,
+                profile: retained.profile.clone(),
+                session_id: retained.session_id.clone(),
+                block_id: retained.block_id.clone(),
+                block_data: retained.data.clone(),
+                proof_data: None,
+                prev: previous.prev,
+                carrier: if retained.is_final {
+                    StoredCarrier::Final(retained.signature_set.clone())
+                } else {
+                    StoredCarrier::Approval(retained.signature_set.clone())
+                },
+                locally_generated,
+                created_at_unix_secs: retained.created_at_unix_secs,
+                expires_at_unix_secs: retained
+                    .created_at_unix_secs
+                    .checked_add(Limits::default().max_retention_secs)
+                    .ok_or_else(|| error!("Retained finality retention overflow"))?,
+                // The node freezes exact destinations after historical authentication.
+                effects: Vec::new(),
+            };
+            let origin = RecoveryOrigin {
+                carrier_version: retained.carrier_version,
+                local_adnl: retained.local_adnl.clone(),
+                source_validator: retained.source_validator.clone(),
+                local_validator_index: retained.local_validator_index,
+            };
+            let receipt = engine
+                .clone()
+                .recover_finality_delivery(
+                    record,
+                    retained.last_mc_finalized_seqno,
+                    retained.candidate_already_sent,
+                    origin,
+                )
+                .await?;
+            // Never remove the only source copy after mere queue admission.
+            owned_source_io(engine.as_ref(), "ack retained finality", move || {
+                source.acknowledge(receipt)
+            })
+            .await?;
+        }
+        // The scanner is bounded; drain another batch before admitting new sessions.
     }
-    effects.sort();
-    effects.dedup();
-    if effects.is_empty() {
-        return Ok(None);
-    }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let bytes = runtime.wire_profile().serialize(&network.to_node().into_boxed())?;
-    Ok(Some(PublicationRecord {
-        domain: OutboxDomain {
-            zerostate: runtime.pin().zerostate.clone(),
-            global_id: runtime.pin().global_id,
-            wire_profile: runtime.wire_profile(),
-        },
-        protocol: runtime.protocol(),
-        profile: runtime.profile().clone(),
-        session_id: runtime.session_id().clone(),
-        block_id: id,
-        block_data: data.to_vec(),
-        proof_data: None,
-        prev: prev.to_vec(),
-        carrier: if is_final {
-            StoredCarrier::Final(bytes)
-        } else {
-            StoredCarrier::Approval(bytes)
-        },
-        locally_generated,
-        created_at_unix_secs: now,
-        expires_at_unix_secs: now
-            .checked_add(limits.max_retention_secs)
-            .ok_or_else(|| error!("Publication retention deadline overflow"))?,
-        effects,
-    }))
+}
+
+/// Engine owns the actual blocking join even if this result waiter is dropped.
+async fn owned_source_io<T: Send + 'static>(
+    engine: &dyn EngineOperations,
+    name: &'static str,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let (sent, received) = tokio::sync::oneshot::channel();
+    engine.register_service_task(
+        name,
+        0,
+        Box::new(move || {
+            tokio::task::spawn_blocking(move || {
+                let _ = sent.send(work());
+            })
+        }),
+    )?;
+    received.await.map_err(|error| error!("Retained finality worker completion: {error}"))?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use consensus_common::session_runtime::SessionNetworkPin;
-    use rtos_api::session_identity::SessionCoordinates;
-    use rtos_block::*;
-    struct Resolver(BlockIdExt);
+    struct IoEngine(crate::types::service_tasks::ServiceTasks);
     #[async_trait::async_trait]
-    impl EngineOperations for Resolver {
-        fn zerostate_id(&self) -> Result<&BlockIdExt> {
-            Ok(&self.0)
-        }
-        async fn resolve_propagation_targets(
+    impl EngineOperations for IoEngine {
+        fn register_service_task(
             &self,
-            _: &BlockIdExt,
-            plan: &PropagationPlan,
-        ) -> Result<Vec<super::super::propagation::PropagationDestination>> {
-            use super::super::propagation::PropagationDestination;
-            let mut targets = Vec::new();
-            for kind in
-                [PropagationKind::Candidate, PropagationKind::Block, PropagationKind::Finality]
-            {
-                if plan.targets_for(kind).public {
-                    targets
-                        .push(PropagationDestination { kind, target: PropagationTarget::Public });
-                }
-            }
-            Ok(targets)
+            name: &'static str,
+            mask: u32,
+            start: Box<dyn FnOnce() -> tokio::task::JoinHandle<()> + Send>,
+        ) -> Result<tokio::task::JoinHandle<()>> {
+            self.0.register(name, mask, start)
         }
     }
-    #[tokio::test]
-    async fn session_publication_freezes_authenticated_effects_and_rejects_wrong_body() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../full_node/finality/testdata/v2-propagation-recovery.json"
-        ))
-        .unwrap();
-        let bytes = |v: &serde_json::Value| hex::decode(v.as_str().unwrap()).unwrap();
-        let config = ConfigParams::construct_from_cell(
-            read_single_root_boc(&bytes(&fixture["config_boc"])).unwrap(),
-        );
-        let config = config.unwrap();
-        let zero_data = bytes(&fixture["state_boc"]);
-        let zero = BlockIdExt::with_params(
-            ShardIdent::masterchain(),
-            0,
-            read_single_root_boc(&zero_data).unwrap().repr_hash().clone(),
-            UInt256::calc_file_hash(&zero_data),
-        );
-        let row = &fixture["rows"][0];
-        let candidate_bytes = bytes(&row["candidate"]);
-        let candidate: rtos_api::ton::consensus::CandidateHashData =
-            rtos_api::WireProfile::T0.deserialize_typed(&candidate_bytes).unwrap();
-        let id = candidate.block().clone();
-        let data = bytes(&row["block_boc"]);
-        let block =
-            BlockStuff::deserialize_block_checked(id.clone(), Arc::new(data.clone())).unwrap();
-        let (committee, _) = config
-            .validator_set()
-            .unwrap()
-            .calc_subset(
-                &config.catchain_config().unwrap(),
-                id.shard().shard_prefix_with_tag(),
-                id.shard().workchain_id(),
-                7,
-            )
-            .unwrap();
-        let local = committee[0].adnl_addr().unwrap();
-        let runtime = AuthenticatedSessionRuntime::from_authenticated_config(
-            SessionNetworkPin {
-                global_id: block.block().unwrap().global_id(),
-                zerostate: zero.clone(),
-            },
-            &config,
-            SessionCoordinates {
-                shard: id.shard(),
-                catchain_seqno: 7,
-                vertical_seqno: 0,
-                last_key_block_seqno: 0,
-                new_catchain_ids: false,
-            },
-            committee,
-            local,
-        )
-        .unwrap();
-        let engine: Arc<dyn EngineOperations> = Arc::new(Resolver(zero));
-        let prev = vec![block.construct_prev_id().unwrap().0];
-        let mut carrier = BlockSignaturesSimplexPq {
-            validator_info: runtime.pq_context().unwrap().validator_info(),
-            sig_count: row["signatures"].as_array().unwrap().len() as u32,
-            sig_weight: row["weight"].as_u64().unwrap(),
-            session_id: runtime.session_id().clone(),
-            slot: 99,
-            candidate_data: BlockSignaturesSimplex::bytes_to_cell_tree(&candidate_bytes).unwrap(),
-            signatures: row["signatures"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|s| {
-                    let mut id = [0; 32];
-                    id[..4]
-                        .copy_from_slice(&(s["index"].as_u64().unwrap() as u32 + 1).to_le_bytes());
-                    PqBlockSignaturePair {
-                        validator_id: id.into(),
-                        algorithm_id: 1,
-                        signature: bytes(&s["signature"]),
-                    }
-                })
-                .collect(),
-        };
-        let finality = SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(carrier.clone()));
-        let intent = prepare_publication(
-            &runtime,
-            id.clone(),
-            &data,
-            &prev,
-            &finality,
-            &engine,
-            false,
-            0,
-            true,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            intent.effects,
-            vec![PublicationEffect {
-                kind: PublicationKind::Finality,
-                target: PublicationTarget::Public
-            }]
-        );
-        assert_eq!(intent.block_data, data);
-        assert_eq!(intent.session_id, runtime.session_id().clone());
-        assert!(intent.carrier.is_final());
-        let mut wrong = data.clone();
-        wrong[0] ^= 1;
-        assert!(prepare_publication(
-            &runtime,
-            id.clone(),
-            &wrong,
-            &prev,
-            &finality,
-            &engine,
-            false,
-            0,
-            false
-        )
-        .await
-        .is_err());
-        carrier.signatures[0].signature[0] ^= 1;
-        assert!(prepare_publication(
-            &runtime,
-            id,
-            &data,
-            &prev,
-            &SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(carrier)),
-            &engine,
-            false,
-            0,
-            false
-        )
-        .await
-        .is_err());
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retained_finality_cancelled_waiter_keeps_source_io_owned() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let engine = Arc::new(IoEngine(crate::types::service_tasks::ServiceTasks::new(Arc::new(
+            crate::engine::Stopper::default(),
+        ))));
+        let completed = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_engine = engine.clone();
+        let worker_completed = completed.clone();
+        let waiter = tokio::spawn(async move {
+            owned_source_io(worker_engine.as_ref(), "held source acknowledgement", move || {
+                let _ = entered_tx.send(());
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                worker_completed.store(true, Ordering::Release);
+                Ok(())
+            })
+            .await
+        });
+        entered_rx.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        let drained_early = tokio::time::timeout(Duration::from_millis(20), engine.0.wait()).await;
+        release_tx.send(()).unwrap();
+        engine.0.wait().await.unwrap();
+        assert!(drained_early.is_err(), "source IO outlived its Engine drain barrier");
+        assert!(completed.load(Ordering::Acquire));
     }
 }
