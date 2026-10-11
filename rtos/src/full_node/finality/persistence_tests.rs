@@ -377,6 +377,10 @@ fn write_recovery_config(dir: &std::path::Path, mc_id: &BlockIdExt, network: boo
     } else {
         "127.0.0.1:0".to_owned()
     };
+    // QUIC otherwise derives ADNL + offset, which may already belong to another
+    // socket. Ask the OS for a separate available port for each fixture.
+    let quic_socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let quic_address = format!("127.0.0.1:{}", quic_socket.local_addr().unwrap().port());
     let (adnl, _) = adnl::node::AdnlNodeConfig::with_ip_address_and_private_key_tags(
         &address,
         vec![NodeNetwork::TAG_DHT_KEY, NodeNetwork::TAG_OVERLAY_KEY],
@@ -386,6 +390,7 @@ fn write_recovery_config(dir: &std::path::Path, mc_id: &BlockIdExt, network: boo
     std::fs::write(dir.join("global.json"),serde_json::to_vec(&serde_json::json!({"@type":"config.global","dht":{"@type":"dht.config.global","k":6,"a":3,"static_nodes":{"@type":"dht.nodes","nodes":[]}},"validator":{"@type":"validator.config.global","zero_state":anchor,"hardforks":[]}})).unwrap()).unwrap();
     std::fs::write(dir.join("config.json"),serde_json::to_vec(&serde_json::json!({
         "ton_global_config_name":"global.json","boot_from_zerostate":true,"internal_db_path":dir.join("db"),"restore_db":false,"sync_by_archives":false,"adnl_node":adnl,
+        "ip_address_quic":quic_address,
         "validator_keys":[],"validator_key_ring":{},"json_rpc_server":null,"control_server":null,"lite_server":null,
         "test_bundles_config":{"collator":{"path":""},"validator":{"path":""}}
     })).unwrap()).unwrap();

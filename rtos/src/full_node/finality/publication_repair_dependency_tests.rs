@@ -306,32 +306,37 @@ async fn mc_live_repair_dependency_missing_target_only_child_never_returns_custo
             .chain(cells(zero.root_cell()).into_keys())
             .collect();
         let all = cells(target_state.root_cell());
-        let child = all
+        let children = all
             .iter()
             .filter(|(hash, _)| {
                 *hash != target_state.root_cell().repr_hash() && !excluded.contains(*hash)
             })
-            .min_by_key(|(_, cell)| cell.references_count())
             .map(|(hash, _)| hash.clone())
-            .expect("fixture needs target-only descendant");
+            .collect::<Vec<_>>();
+        assert!(!children.is_empty(), "fixture needs target-only descendants");
         (
             PathBuf::from(engine.db_root_dir().unwrap()),
-            child,
+            children,
             target_state.root_cell().repr_hash().clone(),
         )
     })
     .catch_unwind()
     .await;
     close(engine).await;
-    let (root, child, expected_root) =
+    let (root, mut children, expected_root) =
         setup.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     let db = RocksDb::new(&root, NODE_DB_NAME, None, AccessType::ReadWrite).unwrap();
     let table = db.clone().table::<UInt256>("cells_db_v6", false).unwrap();
-    let bytes = table
-        .try_get_raw(child.as_slice())
-        .unwrap()
-        .expect("actual target cell must exist")
-        .to_vec();
+    // Select a physically stored descendant after shutdown, rather than an
+    // arbitrary logical cell from the cached state graph.
+    assert!(table.try_get_raw(expected_root.as_slice()).unwrap().is_some());
+    children.sort();
+    let (child, bytes) = children
+        .into_iter()
+        .find_map(|child| {
+            table.try_get_raw(child.as_slice()).unwrap().map(|bytes| (child, bytes.to_vec()))
+        })
+        .expect("fixture needs a physically stored target-only descendant");
     table.delete_raw(child.as_slice()).unwrap();
     db.sync_wal().unwrap();
     drop(table);
