@@ -1066,6 +1066,18 @@ pub trait ConsensusOverlayManager {
         block_sync_params: Option<BlockSyncOverlayParams>,
     ) -> Result<ConsensusOverlayPtr>;
 
+    fn start_authenticated_overlay(
+        &self,
+        _local_transport_key: &PrivateKey,
+        _overlay_short_id: &Arc<PrivateOverlayShortId>,
+        _runtime: Arc<session_runtime::AuthenticatedSessionRuntime>,
+        _listener: ConsensusOverlayListenerPtr,
+        _replay_listener: ConsensusOverlayLogReplayListenerPtr,
+        _transport_type: OverlayTransportType,
+    ) -> Result<ConsensusOverlayPtr> {
+        Err(rtos_block::error!("Authenticated private overlay is unsupported"))
+    }
+
     fn stop_overlay_checked(
         &self,
         _id: &Arc<PrivateOverlayShortId>,

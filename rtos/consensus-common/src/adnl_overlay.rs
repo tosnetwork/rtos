@@ -807,9 +807,10 @@ struct AdnlOverlay {
     shutdown_started: Mutex<bool>,
     shutdown_errors: Arc<Mutex<Vec<String>>>,
     cleanup_complete: Arc<AtomicBool>,
-    stack: Arc<NetworkStack>,                //ADNL network stack
-    overlay_id: Arc<PrivateOverlayShortId>,  //private overlay short identifier
-    local_id: PublicKeyHash,                 //local validator key hash
+    stack: Arc<NetworkStack>,               //ADNL network stack
+    overlay_id: Arc<PrivateOverlayShortId>, //private overlay short identifier
+    local_id: PublicKeyHash,                //local validator key hash
+    private_runtime: Option<Arc<crate::session_runtime::AuthenticatedSessionRuntime>>,
     local_validator_key: Arc<dyn KeyOption>, //local validator key for signing broadcasts
     local_adnl_key: Arc<dyn KeyOption>,      //local ADNL key for two-step broadcast signing
     adnl_to_validator: HashMap<PublicKeyHash, PublicKeyHash>, //ADNL key hash to validator key hash
@@ -947,6 +948,48 @@ impl AdnlOverlay {
         transport_type: OverlayTransportType,
         block_sync_params: Option<crate::BlockSyncOverlayParams>,
     ) -> Result<Arc<Self>> {
+        Self::new_with_runtime(
+            runtime_handle,
+            stack,
+            overlay_id,
+            local_validator_key,
+            listener,
+            nodes,
+            broadcast_hops,
+            track_private_peers,
+            peer_storage,
+            transport_type,
+            block_sync_params,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_runtime(
+        runtime_handle: tokio::runtime::Handle,
+        stack: Arc<NetworkStack>,
+        overlay_id: Arc<PrivateOverlayShortId>,
+        local_validator_key: PrivateKey,
+        listener: ConsensusOverlayListenerPtr,
+        nodes: &[ConsensusNode],
+        broadcast_hops: Option<u8>,
+        track_private_peers: bool,
+        peer_storage: Arc<PeerStorage>,
+        transport_type: OverlayTransportType,
+        block_sync_params: Option<crate::BlockSyncOverlayParams>,
+        private_runtime: Option<Arc<crate::session_runtime::AuthenticatedSessionRuntime>>,
+    ) -> Result<Arc<Self>> {
+        if let Some(runtime) = &private_runtime {
+            if runtime.protocol()
+                != crate::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
+                || runtime.local_adnl() != local_validator_key.id()
+                || runtime.overlay_short_id()? != overlay_id
+                || runtime.wire_profile() != stack.overlay.wire_profile()
+                || block_sync_params.is_some()
+            {
+                fail!("Private runtime overlay binding mismatch");
+            }
+        }
         if let Some(params) = &block_sync_params {
             params.membership()?;
             if params.overlay_id.is_none() {
@@ -986,6 +1029,15 @@ impl AdnlOverlay {
             peers.push(node.adnl_id.clone());
         }
 
+        if let Some(runtime) = &private_runtime {
+            local_adnl_key = Some(stack.adnl.key_by_id(runtime.local_adnl())?);
+            peers = runtime
+                .members()
+                .iter()
+                .filter(|id| *id != runtime.local_adnl())
+                .cloned()
+                .collect();
+        }
         let local_adnl_key = local_adnl_key
             .ok_or_else(|| error!("Local ADNL key not found in nodes for local_id: {local_id}"))?;
 
@@ -1052,7 +1104,34 @@ impl AdnlOverlay {
             overlay_id: &overlay_id,
             runtime: Some(runtime_handle.clone()),
         };
-        if !stack.overlay.add_private_overlay(params, &local_adnl_key, &peers, use_quic, None)? {
+        let candidate_check: Option<Arc<dyn BroadcastCheck>> =
+            private_runtime.as_ref().map(|runtime| {
+                let current_set: Vec<_> = nodes
+                    .iter()
+                    .map(|node| {
+                        if node.public_key.pq_key().is_some() {
+                            node.adnl_id.clone()
+                        } else {
+                            node.public_key.id().clone()
+                        }
+                    })
+                    .collect();
+                Arc::new(BlockSyncCheck {
+                    overlay_id: overlay_id.clone(),
+                    authorized: current_set.iter().cloned().collect(),
+                    max_payload_size: runtime.max_candidate_size(),
+                    current_set,
+                    slots_per_leader_window: runtime.slots_per_leader_window(),
+                    stats: None,
+                }) as Arc<dyn BroadcastCheck>
+            });
+        if !stack.overlay.add_private_overlay(
+            params,
+            &local_adnl_key,
+            &peers,
+            use_quic,
+            candidate_check,
+        )? {
             fail!("Overlay id is already registered");
         }
         let mut registration =
@@ -1227,6 +1306,7 @@ impl AdnlOverlay {
                 stack,
                 overlay_id: overlay_id.clone(),
                 local_id,
+                private_runtime: private_runtime.clone(),
                 local_validator_key,
                 local_adnl_key: local_adnl_key.clone(),
                 adnl_to_validator,
@@ -2281,6 +2361,49 @@ impl ConsensusOverlayManager for AdnlOverlayManager {
             overlay.clone().run_wait_block_sync_broadcast();
         }
 
+        Ok(overlay)
+    }
+
+    fn start_authenticated_overlay(
+        &self,
+        key: &PrivateKey,
+        id: &Arc<PrivateOverlayShortId>,
+        runtime: Arc<crate::session_runtime::AuthenticatedSessionRuntime>,
+        listener: ConsensusOverlayListenerPtr,
+        _replay: ConsensusOverlayLogReplayListenerPtr,
+        transport: OverlayTransportType,
+    ) -> Result<ConsensusOverlayPtr> {
+        let _lifecycle = self.lifecycle.lock().unwrap();
+        if let Some(existing) = self.overlays.lock().get(id) {
+            let same = existing.private_runtime.as_ref().is_some_and(|old| {
+                old.pin() == runtime.pin()
+                    && old.session_id() == runtime.session_id()
+                    && old.profile() == runtime.profile()
+                    && old.local_adnl() == runtime.local_adnl()
+                    && old.members() == runtime.members()
+            });
+            if !same {
+                fail!("Existing overlay belongs to a different runtime");
+            }
+            return Ok(existing.clone());
+        }
+        let nodes = runtime.consensus_nodes()?;
+        let overlay = AdnlOverlay::new_with_runtime(
+            self.runtime_handle.clone(),
+            self.stack.clone(),
+            id.clone(),
+            key.clone(),
+            listener,
+            &nodes,
+            self.broadcast_hops,
+            self.track_private_peers,
+            self.peers_storage.clone(),
+            transport,
+            None,
+            Some(runtime),
+        )?;
+        self.overlays.lock().insert(id.clone(), overlay.clone());
+        overlay.clone().run_wait_broadcast();
         Ok(overlay)
     }
 

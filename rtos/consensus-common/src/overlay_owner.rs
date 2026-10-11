@@ -56,6 +56,25 @@ impl ConsensusOverlayManager for OverlayOwner {
         self.overlays.lock().unwrap().push((id.clone(), overlay.clone()));
         Ok(overlay)
     }
+    fn start_authenticated_overlay(
+        &self,
+        key: &PrivateKey,
+        id: &Arc<adnl::PrivateOverlayShortId>,
+        runtime: Arc<crate::session_runtime::AuthenticatedSessionRuntime>,
+        listener: ConsensusOverlayListenerPtr,
+        replay: ConsensusOverlayLogReplayListenerPtr,
+        transport: OverlayTransportType,
+    ) -> Result<ConsensusOverlayPtr> {
+        let open = self.open.lock().unwrap();
+        if !*open {
+            return Err(rtos_block::error!("Overlay owner admission is closed"));
+        }
+        let overlay = self
+            .inner
+            .start_authenticated_overlay(key, id, runtime, listener, replay, transport)?;
+        self.overlays.lock().unwrap().push((id.clone(), overlay.clone()));
+        Ok(overlay)
+    }
     fn stop_overlay(&self, id: &Arc<adnl::PrivateOverlayShortId>, overlay: &ConsensusOverlayPtr) {
         if let Err(error) = self.stop_overlay_checked(id, overlay) {
             log::error!("Overlay shutdown: {error}");
@@ -129,7 +148,9 @@ mod tests {
             stopped: AtomicUsize::new(0),
         });
         let owner = OverlayOwner::new(inner.clone());
-        let key = rtos_block::Ed25519KeyOption::<rtos_block::ZeroizingBytes>::from_private_key(&[33; 32]).unwrap();
+        let key =
+            rtos_block::Ed25519KeyOption::<rtos_block::ZeroizingBytes>::from_private_key(&[33; 32])
+                .unwrap();
         let id = rtos_block::KeyId::from_data([34; 32]);
         let listener: Arc<dyn ConsensusOverlayListener + Send + Sync> = Arc::new(Listener);
         let replay: Arc<dyn ConsensusOverlayLogReplayListener + Send + Sync> = Arc::new(Listener);

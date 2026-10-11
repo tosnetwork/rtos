@@ -33,6 +33,7 @@ pub struct AuthenticatedSessionRuntime {
     protocol: SimplexProtocol,
     carrier_version: u32,
     slots_per_leader_window: u32,
+    max_candidate_size: u32,
     wire_profile: WireProfile,
     committee: Vec<ValidatorDescr>,
     members: Vec<PublicKeyHash>,
@@ -102,6 +103,11 @@ impl AuthenticatedSessionRuntime {
             protocol,
             carrier_version,
             slots_per_leader_window: selected.config.slots_per_leader_window,
+            max_candidate_size: config
+                .consensus_config()?
+                .max_block_bytes
+                .saturating_add(config.consensus_config()?.max_collated_bytes)
+                .saturating_add(crate::BLOCK_SYNC_BROADCAST_SIZE_MARGIN),
             wire_profile: WireProfile::T0,
             committee,
             members: members.into_iter().collect(),
@@ -110,6 +116,41 @@ impl AuthenticatedSessionRuntime {
             local_adnl,
             pq_context,
         })
+    }
+    pub fn consensus_nodes(&self) -> Result<Vec<crate::ConsensusNode>> {
+        self.committee
+            .iter()
+            .map(|member| {
+                Ok(crate::ConsensusNode {
+                    adnl_id: member.adnl_addr()?,
+                    public_key: crate::ValidatorIdentity::from_descriptor(member)?,
+                })
+            })
+            .collect()
+    }
+    pub fn overlay_short_id(&self) -> Result<PublicKeyHash> {
+        use rtos_api::IntoBoxed;
+        let nodes = self
+            .consensus_nodes()?
+            .into_iter()
+            .map(|node| {
+                UInt256::from(*if node.public_key.pq_key().is_some() {
+                    node.adnl_id.data()
+                } else {
+                    node.public_key.id().data()
+                })
+            })
+            .collect();
+        let seed = rtos_api::ton::consensus::overlayid::OverlayId {
+            session_id: self.session.clone(),
+            nodes,
+        };
+        let name = rtos_api::serialize_boxed(&seed.into_boxed())?;
+        let key = rtos_api::ton::pub_::publickey::Overlay { name }.into_boxed();
+        Ok(rtos_block::KeyId::from_data(adnl::common::hash_boxed(&key)?))
+    }
+    pub fn max_candidate_size(&self) -> u32 {
+        self.max_candidate_size
     }
     pub fn pin(&self) -> &SessionNetworkPin {
         &self.pin
@@ -129,7 +170,9 @@ impl AuthenticatedSessionRuntime {
     pub fn protocol(&self) -> SimplexProtocol {
         self.protocol
     }
-    pub fn slots_per_leader_window(&self) -> u32 { self.slots_per_leader_window }
+    pub fn slots_per_leader_window(&self) -> u32 {
+        self.slots_per_leader_window
+    }
     pub fn carrier_version(&self) -> u32 {
         self.carrier_version
     }
