@@ -1826,6 +1826,13 @@ impl ValidatorGroup {
         let min_ts = min_ts.max(request.get_creation_time());
 
         let is_simplex = self.is_simplex();
+        // V2 candidate propagation requires the separately authenticated PQ
+        // callback; collation/validation success alone cannot authorize relay.
+        let legacy_candidate_broadcast = !matches!(
+            &self.consensus_options,
+            ConsensusOptions::Simplex(options)
+                if options.protocol == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
+        );
         if is_simplex {
             match &parent {
                 CollationParentHint::Implicit => {
@@ -2055,7 +2062,7 @@ impl ValidatorGroup {
                                     let now = UnixTime::now();
                                     last_collation_time.fetch_max(now, Ordering::Relaxed);
 
-                                    if need_send_candidate_broadcast(&source_info, is_masterchain) {
+                                    if legacy_candidate_broadcast && need_send_candidate_broadcast(&source_info, is_masterchain) {
                                         let validator_set_hash =
                                             ValidatorSet::calc_subset_hash_short(
                                                 validator_set.list(),
@@ -2269,6 +2276,13 @@ impl ValidatorGroup {
         let cc_seqno = self.general_session_info.catchain_seqno;
         let is_masterchain = self.shard.is_masterchain();
         let is_simplex = self.is_simplex();
+        // V2 candidate propagation requires the separately authenticated PQ
+        // callback; collation/validation success alone cannot authorize relay.
+        let legacy_candidate_broadcast = !matches!(
+            &self.consensus_options,
+            ConsensusOptions::Simplex(options)
+                if options.protocol == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
+        );
         let (expected_current_round, prev_block_ids, mc_block_id_opt, min_ts) = group_impl
             .execute_sync(|group_impl| {
                 (
@@ -2378,6 +2392,7 @@ impl ValidatorGroup {
                         &next_block_descr,
                         &source_info,
                         is_masterchain,
+                        legacy_candidate_broadcast,
                         &candidate,
                         &source,
                         cc_seqno,
@@ -2458,6 +2473,7 @@ impl ValidatorGroup {
                         &next_block_descr,
                         &source_info,
                         is_masterchain,
+                        legacy_candidate_broadcast,
                         &candidate,
                         &source,
                         cc_seqno,
@@ -2518,6 +2534,7 @@ impl ValidatorGroup {
         next_block_descr: &str,
         source_info: &validator_session::BlockSourceInfo,
         is_masterchain: bool,
+        legacy_candidate_broadcast: bool,
         candidate: &super::BlockCandidate,
         source: &consensus_common::ValidatorIdentity,
         cc_seqno: u32,
@@ -2527,7 +2544,8 @@ impl ValidatorGroup {
         last_validation_time: &AtomicU64,
         validation_completion_time: SystemTime,
     ) -> Result<SystemTime> {
-        if need_send_candidate_broadcast(source_info, is_masterchain) {
+        if legacy_candidate_broadcast && need_send_candidate_broadcast(source_info, is_masterchain)
+        {
             match read_single_root_boc(&candidate.data) {
                 Ok(block_root) => {
                     let validator_set_hash =
