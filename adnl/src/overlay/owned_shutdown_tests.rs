@@ -521,13 +521,19 @@ async fn overlay_owned_outbound_uses_admitted_generation_after_id_replacement() 
     let new = overlay.overlay_generation(&id).unwrap();
     gate.1.notify_one();
     let source = bounded(observed.recv()).await.unwrap();
-    assert_eq!(&source, old_key.id(), "old admission switched to replacement transport key");
-    bounded(overlay.delete_private_overlay_checked(&new)).await.unwrap();
-    assert!(new.drained());
-    assert!(!old.drained());
+    // Preserve the held-generation assertions on the valid path, but release
+    // real network workers before reporting a source mismatch. Otherwise a
+    // regression panics with the observer held and runtime teardown cannot join.
+    if &source == old_key.id() {
+        bounded(overlay.delete_private_overlay_checked(&new)).await.unwrap();
+        assert!(new.drained());
+        assert!(!old.drained());
+    }
     observer.release.notify_one();
     assert!(bounded(query).await.unwrap().unwrap().is_some());
     bounded(overlay.delete_private_overlay_checked(&old)).await.unwrap();
+    bounded(overlay.delete_private_overlay_checked(&new)).await.unwrap();
     adnl.stop_checked().await.unwrap();
     remote.stop_checked().await.unwrap();
+    assert_eq!(&source, old_key.id(), "old admission switched to replacement transport key");
 }
