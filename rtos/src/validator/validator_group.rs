@@ -1591,6 +1591,7 @@ impl ValidatorGroup {
         let session = self.group_impl.execute_sync(|gi| gi.session.clone()).await;
         // Session::stop joins OS threads. It must not block a Tokio worker which
         // those threads may still need in order to finish their callbacks.
+        let namespace_session = session.clone();
         let session_exit = rt.spawn_blocking(move || {
             if let Some(session) = session {
                 let result = if destroy_database {
@@ -1598,12 +1599,7 @@ impl ValidatorGroup {
                 } else {
                     session.stop_checked()
                 };
-                // Node-owned accepted completions can outlive the OS workers.
-                // Keep the reservation until their actual source stores release.
-                while session.threads_drained() && !session.namespace_drained() {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                (session.namespace_drained(), result)
+                (session.threads_drained(), result)
             } else {
                 (true, Ok(()))
             }
@@ -1620,20 +1616,26 @@ impl ValidatorGroup {
         // consensus workers exited. Only its returned result certifies the join.
         let (drained, result) =
             session_result.map_err(|e| error!("consensus session teardown failed: {e}"))?;
-        let group_for_cleanup = self.clone();
-        let construction_drained = rt.spawn_blocking(move || {
-            let mut admission = group_for_cleanup.namespace_admission.lock().unwrap();
-            if let Some(failure) = admission.failed.as_mut() {
-                while !failure.retry_cleanup() {
-                    // Accepted node work owns its completion independently of
-                    // the failed constructor; its receipt must release first.
-                    std::thread::sleep(Duration::from_millis(10));
+        if drained {
+            if let Some(session) = namespace_session {
+                // Node WAL tasks may need the blocking pool themselves. Wait
+                // asynchronously for their independent source lock receipt.
+                while !session.namespace_drained() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
-            admission.failed = None;
-            true
-        }).await.map_err(|error| error!("Normal constructor cleanup join failed: {error}"))?;
-        let drained = drained && construction_drained;
+        }
+        loop {
+            let group_for_cleanup = self.clone();
+            let construction_drained = rt.spawn_blocking(move || {
+                let mut admission = group_for_cleanup.namespace_admission.lock().unwrap();
+                let complete = admission.failed.as_mut().map_or(true, |failure| failure.retry_cleanup());
+                if complete { admission.failed = None; }
+                complete
+            }).await.map_err(|error| error!("Normal constructor cleanup join failed: {error}"))?;
+            if construction_drained { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         // Candidate cleanup can still touch this namespace after workers have
         // joined. Keep admission closed until that last operation has finished.
         let database_result = if drained && destroy_database {

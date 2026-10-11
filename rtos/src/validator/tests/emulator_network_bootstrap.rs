@@ -873,7 +873,9 @@ impl consensus_common::finality_delivery::DurableFinalitySink for BootstrapUnava
 impl EngineOperations for BootstrapTestEngine {
     fn reserve_normal_session_namespace(&self, runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime)
         -> Result<Option<crate::validator::finality_recovery_owner::RecoveryReservation>> {
-        let gate = self.normal_admission_gate.lock().unwrap().take();
+        let gate = if runtime.shard().is_masterchain() && runtime.catchain_seqno() == 0 {
+            self.normal_admission_gate.lock().unwrap().take()
+        } else { None };
         if let Some((entered, release)) = gate {
             let _ = entered.send(Arc::new(runtime.clone()));
             release.recv_timeout(Duration::from_secs(10)).map_err(|e| error!("normal admission test gate: {e}"))?;
