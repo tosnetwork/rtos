@@ -1187,6 +1187,14 @@ impl EngineOperations for Engine {
         self.finality_recovery_registry().wait_changed(seen).await
     }
 
+    async fn prepare_retired_history(
+        self: Arc<Self>,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        start_mc: BlockIdExt,
+    ) -> Result<()> {
+        crate::retired_history::prepare(self, runtime, start_mc).await
+    }
+
     async fn durable_finality_sink(
         self: Arc<Self>,
         runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,

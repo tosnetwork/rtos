@@ -1403,6 +1403,32 @@ impl ValidatorGroup {
         Arc::downgrade(&self.callback)
     }
 
+    async fn prepare_retired_history(&self, start_mc: Option<&BlockIdExt>) -> Result<()> {
+        let Some(runtime) = self.authenticated_runtime.as_ref().filter(|runtime| {
+            runtime.protocol()
+                == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
+        }) else {
+            return Ok(());
+        };
+        if self.stop_requested.is_cancelled() {
+            fail!("Retired history preparation rejected after group stop");
+        }
+        let governing = &runtime
+            .recovery_binding()
+            .ok_or_else(|| error!("Authenticated session has no historical anchor"))?
+            .governing_masterchain;
+        // Future groups must protect governing history before their actual
+        // start MC is known. Starting later additionally commits that exact MC.
+        self.engine
+            .clone()
+            .prepare_retired_history(runtime.clone(), start_mc.unwrap_or(governing).clone())
+            .await?;
+        if self.stop_requested.is_cancelled() {
+            fail!("Group stopped during retired history preparation");
+        }
+        Ok(())
+    }
+
     async fn prepare_durable_finality_sink(&self) -> Result<()> {
         let Some(runtime) = self.authenticated_runtime.as_ref().filter(|runtime| {
             runtime.protocol()
@@ -1422,6 +1448,7 @@ impl ValidatorGroup {
     /// Pre-create the consensus engine without starting the validation queue.
     /// Called for future-validator groups to warm up the session ahead of time.
     pub async fn pre_create_engine(self: Arc<ValidatorGroup>) -> Result<()> {
+        self.prepare_retired_history(None).await?;
         self.prepare_durable_finality_sink().await?;
         let callback = self.make_validator_session_callback();
         self.group_impl
@@ -1445,7 +1472,12 @@ impl ValidatorGroup {
         min_ts: SystemTime,
         rt: tokio::runtime::Handle,
     ) -> Result<()> {
-        if let Err(error) = self.prepare_durable_finality_sink().await {
+        let prepared = async {
+            self.prepare_retired_history(Some(&min_masterchain_block_id)).await?;
+            self.prepare_durable_finality_sink().await
+        }
+        .await;
+        if let Err(error) = prepared {
             self.group_impl.execute_sync(|group| group.release_start_reservation()).await;
             return Err(error);
         }

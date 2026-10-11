@@ -948,6 +948,17 @@ pub trait EngineOperations: Sync + Send {
         std::future::pending().await
     }
 
+    /// Persist independently authenticated history before a v2 source can
+    /// retain certificate debt. Implementations must own outstanding I/O even
+    /// if the group preparing this session is cancelled.
+    async fn prepare_retired_history(
+        self: Arc<Self>,
+        _runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        _start_mc: BlockIdExt,
+    ) -> Result<()> {
+        rtos_block::fail!("Retired history preparation unsupported")
+    }
+
     async fn durable_finality_sink(
         self: Arc<Self>,
         _runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
