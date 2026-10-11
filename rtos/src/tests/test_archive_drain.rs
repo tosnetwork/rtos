@@ -34,7 +34,7 @@ async fn check_imported_block(db: &InternalDb, id: &BlockIdExt) -> Result<Option
 }
 
 struct Gate {
-    stored: bool,
+    stage: u8,
     entered: Notify,
     release: Semaphore,
 }
@@ -45,13 +45,29 @@ fn gates() -> &'static Mutex<HashMap<usize, Arc<Gate>>> {
 fn key(engine: &Arc<dyn EngineOperations>) -> usize {
     Arc::as_ptr(engine) as *const () as usize
 }
-pub(super) async fn hold(engine: &Arc<dyn EngineOperations>, stored: bool) -> Result<()> {
+pub(super) async fn hold(engine: &Arc<dyn EngineOperations>, stage: u8) -> Result<()> {
     let gate = gates().lock().unwrap().get(&key(engine)).cloned();
-    if let Some(gate) = gate.filter(|gate| gate.stored == stored) {
+    if let Some(gate) = gate.filter(|gate| gate.stage == stage) {
         gate.entered.notify_one();
         gate.release.acquire().await.unwrap().forget();
     }
     Ok(())
+}
+
+struct GateRegistration {
+    key: usize,
+    gate: Arc<Gate>,
+}
+impl Drop for GateRegistration {
+    fn drop(&mut self) {
+        gates().lock().unwrap().remove(&self.key);
+        // Unblock an accepted real worker before TestEngine's shutdown guard runs.
+        self.gate.release.add_permits(1);
+    }
+}
+fn install(engine: &Arc<dyn EngineOperations>, gate: &Arc<Gate>) -> GateRegistration {
+    gates().lock().unwrap().insert(key(engine), gate.clone());
+    GateRegistration { key: key(engine), gate: gate.clone() }
 }
 
 // Ensure assertion failures and causal controls also close real OS workers before
@@ -199,8 +215,8 @@ async fn archive_drain_cancel_before_admission_has_no_block_writes() {
     let fixture = Fixture::new();
     let engine = prepare(dir.path(), &fixture, false).await;
     let ops: Arc<dyn EngineOperations> = engine.clone();
-    let gate = Arc::new(Gate { stored: false, entered: Notify::new(), release: Semaphore::new(0) });
-    gates().lock().unwrap().insert(key(&ops), gate.clone());
+    let gate = Arc::new(Gate { stage: 0, entered: Notify::new(), release: Semaphore::new(0) });
+    let _registration = install(&ops, &gate);
     let maps = maps(dir.path()).await;
     let id = fixture.id(1, false);
     let worker = tokio::spawn({
@@ -227,8 +243,8 @@ async fn archive_drain_cancel_after_store_waits_for_real_apply_and_reopen() {
     let fixture = Fixture::new();
     let engine = prepare(dir.path(), &fixture, false).await;
     let ops: Arc<dyn EngineOperations> = engine.clone();
-    let gate = Arc::new(Gate { stored: true, entered: Notify::new(), release: Semaphore::new(0) });
-    gates().lock().unwrap().insert(key(&ops), gate.clone());
+    let gate = Arc::new(Gate { stage: 1, entered: Notify::new(), release: Semaphore::new(0) });
+    let _registration = install(&ops, &gate);
     let maps = maps(dir.path()).await;
     let id = fixture.id(1, false);
     let worker = tokio::spawn({
@@ -296,8 +312,8 @@ async fn archive_drain_shutdown_rejects_authenticated_but_unaccepted_block() {
     let fixture = Fixture::new();
     let engine = prepare(dir.path(), &fixture, false).await;
     let ops: Arc<dyn EngineOperations> = engine.clone();
-    let gate = Arc::new(Gate { stored: false, entered: Notify::new(), release: Semaphore::new(0) });
-    gates().lock().unwrap().insert(key(&ops), gate.clone());
+    let gate = Arc::new(Gate { stage: 0, entered: Notify::new(), release: Semaphore::new(0) });
+    let _registration = install(&ops, &gate);
     let maps = maps(dir.path()).await;
     let previous = fixture.id(0, false);
     let worker = tokio::spawn({
@@ -341,8 +357,8 @@ async fn archive_drain_unobserved_accepted_failure_is_sticky_and_retryable_after
     let fixture = Fixture::new();
     let engine = prepare(dir.path(), &fixture, false).await;
     let ops: Arc<dyn EngineOperations> = engine.clone();
-    let gate = Arc::new(Gate { stored: true, entered: Notify::new(), release: Semaphore::new(0) });
-    gates().lock().unwrap().insert(key(&ops), gate.clone());
+    let gate = Arc::new(Gate { stage: 1, entered: Notify::new(), release: Semaphore::new(0) });
+    let _registration = install(&ops, &gate);
     let package_maps = maps(dir.path()).await;
     let previous = fixture.id(0, false);
     let worker = tokio::spawn({
@@ -381,4 +397,43 @@ async fn archive_drain_unobserved_accepted_failure_is_sticky_and_retryable_after
     import_first(reopened.clone(), maps(dir.path()).await, fixture.id(0, false)).await.unwrap();
     assert_applied(&reopened, &fixture).await;
     stop(reopened.clone()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn archive_drain_received_error_requires_acknowledgement() {
+    for cancel_before_ack in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new();
+        let engine = prepare(dir.path(), &fixture, false).await;
+        let ops: Arc<dyn EngineOperations> = engine.clone();
+        let gate = Arc::new(Gate { stage: 2, entered: Notify::new(), release: Semaphore::new(0) });
+        let _registration = install(&ops, &gate);
+        use storage::archives::package_entry_id::{GetFileName, PackageEntryId};
+        let obstruction = dir
+            .path()
+            .join("db/archive/unapplied")
+            .join(PackageEntryId::Proof(fixture.id(1, false)).filename_short());
+        std::fs::create_dir(&obstruction).unwrap();
+        let package_maps = maps(dir.path()).await;
+        let previous = fixture.id(0, false);
+        let worker = tokio::spawn({
+            let ops = ops.clone();
+            async move { import_first(ops, package_maps, previous).await }
+        });
+        tokio::time::timeout(Duration::from_secs(30), gate.entered.notified()).await.unwrap();
+        if cancel_before_ack {
+            worker.abort();
+            assert!(worker.await.unwrap_err().is_cancelled());
+            let error = engine.clone().wait_stop().await.unwrap_err();
+            assert!(error.to_string().contains("Unobserved archive import failure"), "{error:#}");
+        } else {
+            gate.release.add_permits(1);
+            let error = worker.await.unwrap().unwrap_err();
+            assert!(error.to_string().contains("Is a directory"), "{error:#}");
+            // The error was returned in the same poll that acknowledged it;
+            // normal sync retry errors must not poison Engine shutdown.
+            stop(engine.clone()).await;
+        }
+        assert!(!engine.load_block_handle(&fixture.id(1, false)).unwrap().unwrap().is_applied());
+    }
 }

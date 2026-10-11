@@ -961,7 +961,7 @@ async fn save_block_owned(
     };
     crate::block_proof::check_block_proof_pair(engine.as_ref(), block_id, &block, &proof).await?;
     #[cfg(test)]
-    archive_drain_tests::hold(engine, false).await?;
+    archive_drain_tests::hold(engine, 0).await?;
     let worker_engine = engine.clone();
     let block_id = block_id.clone();
     let (sent, received) = tokio::sync::oneshot::channel();
@@ -981,7 +981,7 @@ async fn save_block_owned(
                             )
                         })?;
                     #[cfg(test)]
-                    archive_drain_tests::hold(&engine, true).await?;
+                    archive_drain_tests::hold(&engine, 1).await?;
                     let handle = engine
                         .store_block_proof(&block_id, Some(handle), &proof)
                         .await?
@@ -1018,8 +1018,12 @@ async fn save_block_owned(
         }),
     )?;
     let result = received.await?;
+    #[cfg(test)]
+    archive_drain_tests::hold(engine, 2).await?;
+    // No suspension point is allowed between acknowledgement and returning the
+    // result to sync. The real worker remains owned by ServiceTasks.
     let _ = acknowledge.send(());
-    completion.await?;
+    drop(completion);
     result
 }
 
