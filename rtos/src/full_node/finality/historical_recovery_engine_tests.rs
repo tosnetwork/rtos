@@ -840,10 +840,12 @@ async fn recover_scenario(scenario: RecoveryScenario) {
     let (record, target, expected, closing, namespace) =
         run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     let Pair { _dir: directory, receiver, provider, observer, .. } = pair;
+    let provider_db_root = PathBuf::from(provider.db_root_dir().unwrap());
     drop(provider);
     if scenario == RecoveryScenario::CorruptOrdinaryState {
         let checked = std::panic::AssertUnwindSafe(ordinary_corruption_cold_check(
             &directory.path().join("provider"),
+            &provider_db_root,
             &receiver,
             observer.as_ref().unwrap(),
             &record,
@@ -1110,7 +1112,8 @@ async fn historical_recovery_foreign_parent_response_cannot_replace_exact_target
 }
 
 async fn ordinary_corruption_cold_check(
-    root: &Path,
+    fixture_root: &Path,
+    db_root: &Path,
     receiver: &Arc<Engine>,
     observer: &Arc<Engine>,
     record: &simplex::finality_recovery::SessionRecoveryRecord,
@@ -1125,7 +1128,12 @@ async fn ordinary_corruption_cold_check(
         },
         shardstate_db_async::CellsDbConfig,
     };
-    let open_raw = || open_node_db(root, &CellsDbConfig::default(), AccessType::ReadWrite).unwrap();
+    // Engine configuration lives at fixture_root; open_node_db expects the
+    // actual internal_db_path and appends NODE_DB_NAME itself. Capture that
+    // path from the warm Engine rather than guessing from the config directory.
+    assert!(db_root.join(storage::db::rocksdb::NODE_DB_NAME).join("CURRENT").is_file(),
+        "expected the existing cold node database under {}", db_root.display());
+    let open_raw = || open_node_db(db_root, &CellsDbConfig::default(), AccessType::ReadWrite).unwrap();
     let db = open_raw();
     let index =
         db.clone().table::<BlockIdExt>(crate::internal_db::SHARDSTATE_DB_NAME, false).unwrap();
@@ -1147,8 +1155,9 @@ async fn ordinary_corruption_cold_check(
             })
             .collect::<Vec<_>>()
     };
-    let engine = open_engine(root).await;
+    let engine = open_engine(fixture_root).await;
     let run = std::panic::AssertUnwindSafe(async {
+        assert_eq!(Path::new(engine.db_root_dir().unwrap()), db_root);
         assert!(engine.db().test_contains_dynamic_state_record(target).unwrap());
         let head = engine.load_last_applied_mc_block_id().unwrap();
         let before_queries = queries();

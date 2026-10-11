@@ -107,6 +107,34 @@ async fn bounded_pss_real_peer_exact_parts_and_missing_tail() {
     }
 }
 
+// These injections enter the real subscriber response path. The ordinary
+// responder checks its advertised maximum before sending any RLDP answer, so
+// an oversized response produces no answer, not a client-side decode error.
+fn assert_provider_refused_answer(
+    pair: &Pair,
+    observation_start: usize,
+    offset: Option<i64>,
+    size: usize,
+    error: &anyhow::Error,
+) {
+    let observations = pair.provider.overlays_router().unwrap().test_pss_observations();
+    assert!(
+        observations[observation_start..].iter().any(|(id, at, bytes)| {
+            id == pair.master.id() && *at == offset && *bytes == Some(size)
+        }),
+        "real provider must consume the exact oversize injection: {observations:?}"
+    );
+    let peer = pair
+        .provider
+        .network()
+        .context()
+        .stack
+        .adnl
+        .key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)
+        .unwrap();
+    assert_eq!(error.to_string(), format!("No bounded RLDP answer from {}", peer.id()));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bounded_pss_real_peer_rejects_wire_size_and_signed_length() {
     let pair = Pair::with_propagation_profile("included", false, true).await;
@@ -115,15 +143,36 @@ async fn bounded_pss_real_peer_rejects_wire_size_and_signed_length() {
         let id = PersistentStatePartId::WholeState(pair.master.id().clone());
         for n in [-1, 0, 65] {
             size(&pair, n);
-            assert!(client
-                .check_persistent_state_bounded(&id, pair.master.id(), 64)
-                .await
-                .is_err());
+            let error =
+                client.check_persistent_state_bounded(&id, pair.master.id(), 64).await.unwrap_err();
+            match n {
+                -1 => assert!(
+                    error.downcast_ref::<std::num::TryFromIntError>().is_some(),
+                    "{error:#}"
+                ),
+                0 => assert_eq!(error.to_string(), "Empty advertised PSS"),
+                65 => {
+                    let limit = error
+                        .downcast_ref::<adnl::ResponseLimitExceeded>()
+                        .expect("advertised length must exceed caller budget");
+                    assert_eq!((limit.limit, limit.actual), (64, 65));
+                }
+                _ => unreachable!(),
+            }
         }
+        let observations = pair.provider.overlays_router().unwrap().test_pss_observations().len();
         inject(&pair, None, vec![0x71; 129]);
         let oversized =
             client.check_persistent_state_bounded(&id, pair.master.id(), 64).await.unwrap_err();
-        assert!(oversized.downcast_ref::<adnl::ResponseLimitExceeded>().is_some(), "{oversized:#}");
+        assert_provider_refused_answer(&pair, observations, None, 129, &oversized);
+        // A normal response after refusal must still traverse the same peer.
+        size(&pair, 64);
+        let (_, total) = client
+            .check_persistent_state_bounded(&id, pair.master.id(), 64)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(total, 64);
         let mut trailing = WireProfile::T0
             .serialize(
                 &rtos_api::ton::ton_node::PersistentStateSize::TonNode_PersistentStateSizeNotFound,
@@ -138,6 +187,7 @@ async fn bounded_pss_real_peer_rejects_wire_size_and_signed_length() {
             .await
             .unwrap()
             .unwrap();
+        let observations = pair.provider.overlays_router().unwrap().test_pss_observations().len();
         inject(&pair, Some(0), vec![0x71; 65]);
         let error = client
             .download_persistent_state_part_bounded(
@@ -151,15 +201,38 @@ async fn bounded_pss_real_peer_rejects_wire_size_and_signed_length() {
             )
             .await
             .unwrap_err();
-        assert!(error.downcast_ref::<adnl::ResponseLimitExceeded>().is_some(), "{error:#}");
+        assert_provider_refused_answer(&pair, observations, Some(0), 65, &error);
+        inject(&pair, Some(0), vec![0x72; 64]);
+        let restored = client
+            .download_persistent_state_part_bounded(
+                &id,
+                pair.master.id(),
+                0,
+                64,
+                &peer,
+                0,
+                adnl::QueryResponseLimits { wire_bytes: 64, decoded_bytes: 64 },
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored, vec![0x72; 64]);
         // Neither wire nor decoded allocation may exceed the requested slice.
         for limits in [
             adnl::QueryResponseLimits { wire_bytes: 65, decoded_bytes: 64 },
             adnl::QueryResponseLimits { wire_bytes: 64, decoded_bytes: 65 },
         ] {
-            let error = client.download_persistent_state_part_bounded(
-                &id, pair.master.id(), 0, 64, &peer, 0, limits,
-            ).await.unwrap_err();
+            let error = client
+                .download_persistent_state_part_bounded(
+                    &id,
+                    pair.master.id(),
+                    0,
+                    64,
+                    &peer,
+                    0,
+                    limits,
+                )
+                .await
+                .unwrap_err();
             assert_eq!(error.to_string(), "Invalid bounded PSS slice size");
         }
         // All overflow checks precede network admission; no response is injected.
