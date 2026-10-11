@@ -230,6 +230,12 @@ pub trait Receiver: Send + Sync {
     /// Stop receiver
     fn stop(&self);
 
+    /// Join receiver workers and report terminal failures.
+    fn stop_checked(&self) -> Result<()> {
+        self.stop();
+        Ok(())
+    }
+
     /// Destroy DB
     fn destroy_db(&self);
 }
@@ -373,6 +379,18 @@ pub trait Catchain: Send + Sync {
 
     /// Stop the Catchain (blocks until complete, preserves DB)
     fn stop(&self);
+
+    /// Join workers and retain terminal errors.
+    fn stop_checked(&self) -> Result<()> {
+        self.stop();
+        Ok(())
+    }
+
+    /// Destroy storage after joining workers.
+    fn destroy_checked(&self) -> Result<()> {
+        self.destroy();
+        Ok(())
+    }
 
     /// Async stop the Catchain (non-blocking, preserves DB)
     fn stop_async(&self);

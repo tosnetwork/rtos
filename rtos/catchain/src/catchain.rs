@@ -249,9 +249,9 @@ type CatchainTaskQueuesPtr = Arc<CatchainTaskQueues>;
 */
 
 pub(crate) struct CatchainImpl {
+    threads: consensus_common::thread_owner::ThreadOwner,
     task_queues: CatchainTaskQueuesPtr, //task queues for catchain
     should_stop_flag: Arc<AtomicBool>, //atomic flag to indicate that Catchain thread should be stopped
-    main_thread_is_stopped_flag: Arc<AtomicBool>, //atomic flag to indicate that Catchain thread has been stopped
     _main_thread_overloaded_flag: Arc<AtomicBool>, //indicates that catchain main thrad is overloaded
     destroy_db_flag: Arc<AtomicBool>,              //indicates catchain has to destroy DB
     session_id: SessionId,                         //session ID
@@ -1486,36 +1486,32 @@ impl Catchain for CatchainImpl {
     }
 
     fn stop(&self) {
-        self.stop_async();
-
-        loop {
-            if self.main_thread_is_stopped_flag.load(Ordering::SeqCst) {
-                break;
-            }
-
-            log::info!(
-                "...waiting for Catchain threads (session_id is {:x}), main={}",
-                self.session_id,
-                self.main_thread_is_stopped_flag.load(Ordering::SeqCst),
-            );
-
-            const CHECKING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
-
-            std::thread::sleep(CHECKING_INTERVAL);
+        if let Err(error) = self.stop_checked() {
+            log::error!("Catchain shutdown: {error}");
         }
+    }
 
-        //waiting for receiver to stop
-
-        self.receiver.stop();
-
-        log::info!("Catchain has been stopped (session_id is {:x})", self.session_id);
+    fn stop_checked(&self) -> Result<()> {
+        self.stop_async();
+        let main = self.threads.join();
+        let receiver = self.receiver.stop_checked();
+        let errors: Vec<_> =
+            [main, receiver].into_iter().filter_map(|r| r.err().map(|e| e.to_string())).collect();
+        if !errors.is_empty() {
+            return Err(rtos_block::error!("{}", errors.join("; ")));
+        }
+        Ok(())
     }
 
     fn destroy(&self) {
-        // Set destroy flag first (once true, cannot be unset)
+        if let Err(error) = self.destroy_checked() {
+            log::error!("Catchain destroy: {error}");
+        }
+    }
+
+    fn destroy_checked(&self) -> Result<()> {
         self.destroy_db_flag.store(true, Ordering::SeqCst);
-        // Then perform blocking stop
-        self.stop();
+        self.stop_checked()
     }
 
     /*
@@ -1634,9 +1630,9 @@ impl CatchainImpl {
         )?;
 
         let body: CatchainImpl = CatchainImpl {
+            threads: consensus_common::thread_owner::ThreadOwner::new(should_stop_flag.clone()),
             task_queues: task_queues.clone(),
             should_stop_flag: should_stop_flag.clone(),
-            main_thread_is_stopped_flag: main_thread_is_stopped_flag.clone(),
             _main_thread_overloaded_flag: main_thread_overloaded_flag.clone(),
             destroy_db_flag: destroy_db_flag.clone(),
             session_id: session_id.clone(),
@@ -1654,10 +1650,13 @@ impl CatchainImpl {
         let task_queues_for_main_loop = task_queues.clone();
 
         let stop_flag_for_main_loop = should_stop_flag.clone();
-        let _main_thread = std::thread::Builder::new()
-            .name(format!("{}:{:x}", MAIN_LOOP_NAME, session_id))
-            .stack_size(CATCHAIN_MAIN_LOOP_THREAD_STACK_SIZE)
-            .spawn(move || {
+        catchain.threads.spawn(
+            std::thread::Builder::new()
+                .name(format!("{}:{:x}", MAIN_LOOP_NAME, session_id))
+                .stack_size(CATCHAIN_MAIN_LOOP_THREAD_STACK_SIZE),
+            format!("{}:{:x}", MAIN_LOOP_NAME, session_id),
+            main_thread_is_stopped_flag.clone(),
+            move || {
                 CatchainProcessor::main_loop(
                     task_queues_for_main_loop,
                     stop_flag_for_main_loop,
@@ -1673,7 +1672,8 @@ impl CatchainImpl {
                     metrics_receiver,
                     receiver,
                 );
-            });
+            },
+        )?;
 
         Ok(catchain)
     }

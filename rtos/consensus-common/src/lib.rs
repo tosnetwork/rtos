@@ -14,6 +14,7 @@
 
 // Internal modules
 pub mod simplex_protocol;
+pub mod thread_owner;
 mod validator_identity;
 pub use validator_identity::{SimplexSignatureVerifier, ValidatorIdentity};
 mod activity_node;
@@ -1604,6 +1605,18 @@ pub trait Session: fmt::Display + Send + Sync {
     /// Stop the session (blocks until all threads have stopped)
     /// Database is preserved for potential restart/recovery.
     fn stop(&self);
+
+    /// Join workers and preserve terminal failures for subsequent callers.
+    fn stop_checked(&self) -> Result<()> {
+        self.stop();
+        Ok(())
+    }
+
+    /// Destroy after joining, reporting any terminal worker failure.
+    fn destroy_checked(&self) -> Result<()> {
+        self.destroy();
+        Ok(())
+    }
 
     /// Request session stop without waiting (non-blocking)
     /// Database is preserved for potential restart/recovery.
