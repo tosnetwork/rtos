@@ -35,6 +35,10 @@ mod validator;
 
 mod ext_messages;
 
+// Shared archive fixtures also build in this binary's test crate.
+#[cfg(test)]
+use rtos::archive_import;
+
 #[cfg(not(feature = "xp25"))]
 mod shard_blocks;
 #[cfg(feature = "xp25")]
