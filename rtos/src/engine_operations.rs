@@ -1108,6 +1108,14 @@ impl EngineOperations for Engine {
         self.overlay_client(&shard).await?.download_archive(masterchain_seqno, &shard).await
     }
 
+    async fn resolve_propagation_targets(
+        &self,
+        id: &BlockIdExt,
+        plan: &crate::validator::propagation::PropagationPlan,
+    ) -> Result<Vec<crate::validator::propagation::PropagationDestination>> {
+        self.overlays_router()?.resolve_propagation_targets(id, plan).await
+    }
+
     async fn propagate_accepted_session_block(
         &self,
         accepted: &crate::validator::accept_block::AcceptedSessionBlock,
@@ -1118,14 +1126,10 @@ impl EngineOperations for Engine {
             Ok(router) => router.propagate_accepted_session_block(accepted, plan).await,
             Err(error) => {
                 let mut outcome =
-                    PropagationOutcome::failed(PropagationKind::Block, plan.block_targets, &error);
+                    PropagationOutcome::failed_for_plan(PropagationKind::Block, plan, &error);
                 outcome.receipts.extend(
-                    PropagationOutcome::failed(
-                        PropagationKind::Finality,
-                        plan.finality_targets,
-                        &error,
-                    )
-                    .receipts,
+                    PropagationOutcome::failed_for_plan(PropagationKind::Finality, plan, &error)
+                        .receipts,
                 );
                 if plan.send_shard_description {
                     outcome.record(
@@ -1147,11 +1151,9 @@ impl EngineOperations for Engine {
         use crate::validator::propagation::*;
         match self.overlays_router() {
             Ok(router) => router.relay_validated_candidate(candidate, plan).await,
-            Err(error) => PropagationOutcome::failed(
-                PropagationKind::Candidate,
-                plan.candidate_targets,
-                error,
-            ),
+            Err(error) => {
+                PropagationOutcome::failed_for_plan(PropagationKind::Candidate, plan, error)
+            }
         }
     }
 

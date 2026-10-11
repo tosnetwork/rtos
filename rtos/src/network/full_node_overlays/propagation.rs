@@ -203,6 +203,51 @@ fn pq_finality_wire(signatures: &PqNetworkSignatureSet) -> Result<(Vec<u8>, [u8;
 }
 
 impl FullNodeOverlaysRouter {
+    pub async fn resolve_propagation_targets(
+        self: &Arc<Self>,
+        id: &BlockIdExt,
+        plan: &PropagationPlan,
+    ) -> Result<Vec<PropagationDestination>> {
+        let _lease = self.tasks.enter()?;
+        self.refresh_fast_sync_from_applied_state().await?;
+        if let Some(destination) = plan.destination() {
+            return Ok(vec![destination.clone()]);
+        }
+        let mut names: Vec<_> = self
+            .custom_overlays
+            .iter()
+            .filter(|guard| guard.val().sends_blocks_to(id.shard()))
+            .map(|guard| guard.key().clone())
+            .collect();
+        names.sort();
+        let mut destinations = Vec::new();
+        for kind in [PropagationKind::Candidate, PropagationKind::Block, PropagationKind::Finality]
+        {
+            let targets = plan.targets_for(kind);
+            if targets.public {
+                destinations
+                    .push(PropagationDestination { kind, target: PropagationTarget::Public });
+            }
+            if targets.fast_sync && self.fast_sync_overlay(id.shard()).is_some() {
+                destinations
+                    .push(PropagationDestination { kind, target: PropagationTarget::FastSync });
+            }
+            if targets.custom {
+                destinations.extend(names.iter().cloned().map(|name| PropagationDestination {
+                    kind,
+                    target: PropagationTarget::Custom(name),
+                }));
+            }
+        }
+        if plan.send_shard_description {
+            destinations.push(PropagationDestination {
+                kind: PropagationKind::ShardDescription,
+                target: PropagationTarget::ShardDescription,
+            });
+        }
+        Ok(destinations)
+    }
+
     async fn propagate_wire(
         self: &Arc<Self>,
         id: &BlockIdExt,
@@ -211,10 +256,11 @@ impl FullNodeOverlaysRouter {
         protocol: SimplexProtocol,
         bytes: &[u8],
         simple_id: Option<[u8; 32]>,
+        destination: Option<&PropagationDestination>,
     ) -> PropagationOutcome {
         let _admission = match self.tasks.enter() {
             Ok(lease) => lease,
-            Err(error) => return failed_targets(kind, targets, error),
+            Err(error) => return failed_selected(kind, targets, destination, error),
         };
         let mut outcome = PropagationOutcome::default();
         let plumtree =
@@ -268,11 +314,30 @@ impl FullNodeOverlaysRouter {
                 .await;
                 status(result)
             } else {
-                PropagationStatus::Skipped("No eligible fast-sync overlay".into())
+                if destination.is_some() {
+                    PropagationStatus::Deferred("Resolved fast-sync overlay is unavailable".into())
+                } else {
+                    PropagationStatus::Skipped("No eligible fast-sync overlay".into())
+                }
             };
             outcome.record(kind, PropagationTarget::FastSync, receipt);
         }
         if targets.custom {
+            if let Some(PropagationDestination {
+                target: PropagationTarget::Custom(name), ..
+            }) = destination
+            {
+                let receipt = match self.custom_overlays.get(name) {
+                    Some(guard) if guard.val().sends_blocks_to(id.shard()) => {
+                        status(guard.val().send_propagation_broadcast(&tagged).await)
+                    }
+                    _ => PropagationStatus::Deferred(
+                        "Resolved custom overlay is absent or no longer matches this shard".into(),
+                    ),
+                };
+                outcome.record(kind, PropagationTarget::Custom(name.clone()), receipt);
+                return outcome;
+            }
             let mut selected = false;
             for guard in self.custom_overlays.iter() {
                 let client = guard.val();
@@ -309,7 +374,7 @@ impl FullNodeOverlaysRouter {
         // A bounded single cache also bounds sessions. Cancellation before the
         // receipt leaves the entry retryable; successful retries are idempotent.
         let mut cache = self.candidate_relays.lock().await;
-        if cache.contains(candidate.block().id()) {
+        if plan.destination().is_none() && cache.contains(candidate.block().id()) {
             let mut outcome = PropagationOutcome::default();
             outcome.record(
                 PropagationKind::Candidate,
@@ -341,14 +406,20 @@ impl FullNodeOverlaysRouter {
                         plan.protocol,
                         &bytes,
                         None,
+                        plan.destination(),
                     )
                     .await;
-                if outcome.attempted() && !outcome.needs_retry() {
+                if plan.destination().is_none() && outcome.attempted() && !outcome.needs_retry() {
                     cache.record_sent(candidate.block().id().clone());
                 }
                 outcome
             }
-            Err(error) => failed_targets(PropagationKind::Candidate, plan.candidate_targets, error),
+            Err(error) => failed_selected(
+                PropagationKind::Candidate,
+                plan.candidate_targets,
+                plan.destination(),
+                error,
+            ),
         }
     }
 
@@ -383,12 +454,14 @@ impl FullNodeOverlaysRouter {
                                         plan.protocol,
                                         &bytes,
                                         None,
+                                        plan.destination(),
                                     )
                                     .await
                                 }
-                                Err(error) => failed_targets(
+                                Err(error) => failed_selected(
                                     PropagationKind::Block,
                                     plan.block_targets,
+                                    plan.destination(),
                                     error,
                                 ),
                             };
@@ -406,12 +479,14 @@ impl FullNodeOverlaysRouter {
                                     plan.protocol,
                                     &bytes,
                                     Some(id),
+                                    plan.destination(),
                                 )
                                 .await
                             }
-                            Err(error) => failed_targets(
+                            Err(error) => failed_selected(
                                 PropagationKind::Finality,
                                 plan.finality_targets,
+                                plan.destination(),
                                 error,
                             ),
                         };
@@ -420,17 +495,13 @@ impl FullNodeOverlaysRouter {
                 }
                 Err(error) => {
                     outcome.receipts.extend(
-                        PropagationOutcome::failed(
-                            PropagationKind::Block,
-                            plan.block_targets,
-                            &error,
-                        )
-                        .receipts,
+                        PropagationOutcome::failed_for_plan(PropagationKind::Block, plan, &error)
+                            .receipts,
                     );
                     outcome.receipts.extend(
-                        PropagationOutcome::failed(
+                        PropagationOutcome::failed_for_plan(
                             PropagationKind::Finality,
-                            plan.finality_targets,
+                            plan,
                             &error,
                         )
                         .receipts,
@@ -467,10 +538,29 @@ impl FullNodeOverlaysRouter {
     }
 }
 
-pub(crate) fn failed_targets(
+pub(crate) fn failed_selected(
     kind: PropagationKind,
     targets: TargetSet,
-    error: anyhow::Error,
+    destination: Option<&PropagationDestination>,
+    error: impl std::fmt::Display,
+) -> PropagationOutcome {
+    if let Some(destination) = destination.filter(|d| d.kind == kind) {
+        let mut outcome = PropagationOutcome::default();
+        outcome.record(
+            kind,
+            destination.target.clone(),
+            PropagationStatus::Failed(error.to_string()),
+        );
+        outcome
+    } else {
+        failed_targets(kind, targets, error)
+    }
+}
+
+fn failed_targets(
+    kind: PropagationKind,
+    targets: TargetSet,
+    error: impl std::fmt::Display,
 ) -> PropagationOutcome {
     let mut outcome = PropagationOutcome::default();
     let mut selected = vec![];

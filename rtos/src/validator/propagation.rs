@@ -33,8 +33,62 @@ pub struct PropagationPlan {
     pub send_shard_description: bool,
     pub protocol: SimplexProtocol,
     pub locally_generated: bool,
+    exact_destination: Option<PropagationDestination>,
 }
 impl PropagationPlan {
+    pub fn destination(&self) -> Option<&PropagationDestination> {
+        self.exact_destination.as_ref()
+    }
+
+    pub fn targets_for(&self, kind: PropagationKind) -> TargetSet {
+        match kind {
+            PropagationKind::Candidate => self.candidate_targets,
+            PropagationKind::Block => self.block_targets,
+            PropagationKind::Finality => self.finality_targets,
+            PropagationKind::ShardDescription => TargetSet::NONE,
+        }
+    }
+
+    /// Restrict an authenticated plan to one previously resolved destination.
+    /// Durable retry tracks that destination separately; it never re-expands a
+    /// saved custom name into all overlays present after a configuration change.
+    pub fn for_destination(
+        &self,
+        destination: &PropagationDestination,
+    ) -> rtos_block::Result<Self> {
+        let targets = self.targets_for(destination.kind);
+        let allowed = match &destination.target {
+            PropagationTarget::Public => targets.public,
+            PropagationTarget::FastSync => targets.fast_sync,
+            PropagationTarget::Custom(_) => targets.custom,
+            PropagationTarget::ShardDescription => {
+                destination.kind == PropagationKind::ShardDescription && self.send_shard_description
+            }
+        };
+        if !allowed {
+            rtos_block::fail!("Destination is outside the authenticated propagation plan");
+        }
+        let mut plan = self.clone();
+        plan.candidate_targets = TargetSet::NONE;
+        plan.block_targets = TargetSet::NONE;
+        plan.finality_targets = TargetSet::NONE;
+        plan.send_shard_description = false;
+        let selected = match &destination.target {
+            PropagationTarget::Public => TargetSet { public: true, ..TargetSet::NONE },
+            PropagationTarget::FastSync => TargetSet { fast_sync: true, ..TargetSet::NONE },
+            PropagationTarget::Custom(_) => TargetSet::CUSTOM,
+            PropagationTarget::ShardDescription => TargetSet::NONE,
+        };
+        match destination.kind {
+            PropagationKind::Candidate => plan.candidate_targets = selected,
+            PropagationKind::Block => plan.block_targets = selected,
+            PropagationKind::Finality => plan.finality_targets = selected,
+            PropagationKind::ShardDescription => plan.send_shard_description = true,
+        }
+        plan.exact_destination = Some(destination.clone());
+        Ok(plan)
+    }
+
     /// Inputs must describe the authenticated session and candidate. `is_creator`
     /// means a local validator owns the candidate's verified leader index; an
     /// observer must always supply false. Empty consensus candidates have no block.
@@ -56,6 +110,7 @@ impl PropagationPlan {
             send_shard_description: !v2,
             protocol,
             locally_generated: is_creator,
+            exact_destination: None,
         };
         if !nonempty {
             return plan;
@@ -171,6 +226,12 @@ pub enum PropagationTarget {
     ShardDescription,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PropagationDestination {
+    pub kind: PropagationKind,
+    pub target: PropagationTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PropagationStatus {
     /// The transport accepted the send attempt, not an application acknowledgement.
     Sent,
@@ -189,6 +250,24 @@ pub struct PropagationOutcome {
     pub receipts: Vec<PropagationReceipt>,
 }
 impl PropagationOutcome {
+    pub fn failed_for_plan(
+        kind: PropagationKind,
+        plan: &PropagationPlan,
+        error: impl std::fmt::Display,
+    ) -> Self {
+        if let Some(destination) = plan.destination().filter(|d| d.kind == kind) {
+            let mut outcome = Self::default();
+            outcome.record(
+                kind,
+                destination.target.clone(),
+                PropagationStatus::Failed(error.to_string()),
+            );
+            outcome
+        } else {
+            Self::failed(kind, plan.targets_for(kind), error)
+        }
+    }
+
     pub fn failed(
         kind: PropagationKind,
         targets: TargetSet,
@@ -240,6 +319,41 @@ mod tests {
             UInt256::from([2; 32]),
         )
     }
+    #[test]
+    fn propagation_exact_destination_does_not_expand_custom_retry() {
+        let plan = PropagationPlan::for_event(
+            SimplexProtocol::PrivateObserversPlumtree,
+            PropagationEvent::Finalized,
+            &id(10, false),
+            true,
+            true,
+            true,
+            10,
+            false,
+        );
+        let destination = PropagationDestination {
+            kind: PropagationKind::Finality,
+            target: PropagationTarget::Custom("old-name".into()),
+        };
+        let retry = plan.for_destination(&destination).unwrap();
+        assert_eq!(retry.block_targets, TargetSet::NONE);
+        assert_eq!(retry.candidate_targets, TargetSet::NONE);
+        assert_eq!(retry.finality_targets, TargetSet::CUSTOM);
+        assert_eq!(retry.destination(), Some(&destination));
+        let failed =
+            PropagationOutcome::failed_for_plan(PropagationKind::Finality, &retry, "closed");
+        assert_eq!(failed.receipts.len(), 1);
+        assert_eq!(failed.receipts[0].target, destination.target);
+        assert!(failed.needs_retry());
+        assert!(!failed.attempted());
+        assert!(plan
+            .for_destination(&PropagationDestination {
+                kind: PropagationKind::ShardDescription,
+                target: PropagationTarget::ShardDescription,
+            })
+            .is_err());
+    }
+
     #[test]
     fn propagation_v2_creator_observer_and_approval_modes() {
         for creator in [true, false] {

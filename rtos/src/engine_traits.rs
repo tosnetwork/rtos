@@ -915,6 +915,14 @@ pub trait EngineOperations: Sync + Send {
         unimplemented!()
     }
 
+    async fn resolve_propagation_targets(
+        &self,
+        id: &BlockIdExt,
+        plan: &crate::validator::propagation::PropagationPlan,
+    ) -> Result<Vec<crate::validator::propagation::PropagationDestination>> {
+        fail!("Propagation destination resolution is unavailable")
+    }
+
     /// Propagation reports never undo or obscure an already durable acceptance.
     async fn propagate_accepted_session_block(
         &self,
@@ -922,15 +930,15 @@ pub trait EngineOperations: Sync + Send {
         plan: &crate::validator::propagation::PropagationPlan,
     ) -> crate::validator::propagation::PropagationOutcome {
         use crate::validator::propagation::*;
-        let mut outcome = PropagationOutcome::failed(
+        let mut outcome = PropagationOutcome::failed_for_plan(
             PropagationKind::Block,
-            plan.block_targets,
+            plan,
             "Accepted-block propagation is unavailable",
         );
         outcome.receipts.extend(
-            PropagationOutcome::failed(
+            PropagationOutcome::failed_for_plan(
                 PropagationKind::Finality,
-                plan.finality_targets,
+                plan,
                 "Finality propagation is unavailable",
             )
             .receipts,
@@ -951,9 +959,9 @@ pub trait EngineOperations: Sync + Send {
         plan: &crate::validator::propagation::PropagationPlan,
     ) -> crate::validator::propagation::PropagationOutcome {
         use crate::validator::propagation::*;
-        PropagationOutcome::failed(
+        PropagationOutcome::failed_for_plan(
             PropagationKind::Candidate,
-            plan.candidate_targets,
+            plan,
             "Candidate propagation is unavailable",
         )
     }
