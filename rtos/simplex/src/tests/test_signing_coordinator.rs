@@ -83,12 +83,61 @@ pub(crate) fn signer(count: Arc<AtomicUsize>) -> Signer {
         found
     }))
 }
+pub(crate) fn custody_descriptor(
+    store: &rtos_pq_consensus::ConsensusKeyStore,
+) -> rtos_block::ValidatorDescr {
+    let (_, keys) = f::members();
+    rtos_block::ValidatorDescr::with_pq_params(
+        UInt256::from([2; 32]),
+        store.consensus_key().clone(),
+        2,
+        UInt256::from(*keys[1].id().data()),
+    )
+}
+pub(crate) fn custody_description(
+    profile: rtos_api::WireProfile,
+    store: &rtos_pq_consensus::ConsensusKeyStore,
+) -> Arc<SessionDescription> {
+    let (mut nodes, keys) = f::members();
+    nodes[1] = crate::SimplexSessionNode::from_descriptor(&custody_descriptor(store)).unwrap();
+    Arc::new(
+        SessionDescription::new(
+            &SessionOptions { wire_profile: profile, ..Default::default() },
+            f::session(),
+            42,
+            &nodes,
+            keys[1].clone(),
+            &ShardIdent::masterchain(),
+            SystemTime::now(),
+            None,
+        )
+        .unwrap()
+        .bind_pq_session(7)
+        .unwrap(),
+    )
+}
+pub(crate) fn custody_backend(
+    description: &SessionDescription,
+    store: Arc<rtos_pq_consensus::ConsensusKeyStore>,
+) -> Signer {
+    let mut custody = rtos_pq_consensus::PqConsensusCustody::default();
+    custody.install(UInt256::from([2; 32]), store.clone(), 0, store.expire_at()).unwrap();
+    let signer =
+        Signer::from_test_custody(&custody, &UInt256::from([2; 32]), &custody_descriptor(&store))
+            .unwrap();
+    assert_eq!(
+        description.get_source_public_key(description.get_self_idx()).pq_key().unwrap(),
+        store.consensus_key()
+    );
+    signer
+}
 pub(crate) struct Harness {
     pub root: PathBuf,
     pub db: SimplexDbPtr,
     pub description: Arc<SessionDescription>,
     pub coordinator: Arc<SigningCoordinator>,
     pub calls: Arc<AtomicUsize>,
+    pub store: Option<Arc<rtos_pq_consensus::ConsensusKeyStore>>,
 }
 impl Harness {
     pub fn new() -> Self {
@@ -111,29 +160,93 @@ impl Harness {
             )
             .unwrap(),
         );
-        Self { root, db, description, coordinator, calls }
+        Self { root, db, description, coordinator, calls, store: None }
+    }
+    pub fn signature_count(&self) -> usize {
+        self.store
+            .as_ref()
+            .map(|store| store.consensus_signatures_produced() as usize)
+            .unwrap_or_else(|| self.calls.load(Ordering::SeqCst))
+    }
+    pub fn custody(wire_profile: rtos_api::WireProfile) -> Self {
+        Self::custody_with_key(wire_profile, [0x91; 32], 0)
+    }
+    pub fn custody_with_key(
+        wire_profile: rtos_api::WireProfile,
+        seed: [u8; 32],
+        expire_at: u32,
+    ) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("rtos-custody-journal-{}", UInt256::rand()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let seed_path = root.join("public-test.seed");
+        std::fs::write(&seed_path, seed).unwrap();
+        std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let custody = rtos_pq_consensus::PqConsensusCustody::load(
+            UInt256::from([2; 32]),
+            &[rtos_pq_consensus::ConfiguredKey { key_file: seed_path, valid_from: 0, expire_at }],
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32,
+        )
+        .unwrap();
+        let store =
+            custody.held_keys(&UInt256::from([2; 32])).values().next().unwrap().store.clone();
+        let description = custody_description(wire_profile, &store);
+        let db = crate::database::SimplexDb::open(root.join("db"), "own-signing").unwrap();
+        let mut journal_binding = binding(&description);
+        journal_binding.expire_at = u64::from(store.expire_at());
+        let coordinator = Arc::new(
+            SigningCoordinator::open(
+                db.clone(),
+                journal_binding,
+                description.get_source_public_key(description.get_self_idx()).clone(),
+                &root,
+                true,
+                custody_backend(&description, store.clone()),
+            )
+            .unwrap(),
+        );
+        Self {
+            root,
+            db,
+            description,
+            coordinator,
+            calls: Arc::new(AtomicUsize::new(0)),
+            store: Some(store),
+        }
     }
     pub fn reopen(self) -> Self {
-        let Self { root, db, description, coordinator, calls } = self;
+        let Self { root, db, description, coordinator, calls, store } = self;
         let wire_profile = description.opts().wire_profile;
         drop(coordinator);
         drop(description);
         db.close(None).unwrap();
         drop(db);
         let db = crate::database::SimplexDb::open(root.join("db"), "own-signing").unwrap();
-        let description = description_with_profile(wire_profile);
+        let description = match &store {
+            Some(store) => custody_description(wire_profile, store),
+            None => description_with_profile(wire_profile),
+        };
+        let backend = match &store {
+            Some(store) => custody_backend(&description, store.clone()),
+            None => signer(calls.clone()),
+        };
+        let mut journal_binding = binding(&description);
+        if let Some(store) = &store {
+            journal_binding.expire_at = u64::from(store.expire_at());
+        }
         let coordinator = Arc::new(
             SigningCoordinator::open(
                 db.clone(),
-                binding(&description),
+                journal_binding,
                 description.get_source_public_key(description.get_self_idx()).clone(),
                 &root,
                 false,
-                signer(calls.clone()),
+                backend,
             )
             .unwrap(),
         );
-        Self { root, db, description, coordinator, calls }
+        Self { root, db, description, coordinator, calls, store }
     }
 }
 pub(crate) fn vote(role: &str) -> Vote {
@@ -275,20 +388,29 @@ fn own_journal_process_probe() {
         Err(_) | Ok("legacy") => rtos_api::WireProfile::Legacy,
         _ => panic!("unknown isolated probe wire profile"),
     };
-    let d = description_with_profile(profile);
+    let custody_mode = std::env::var("RTOS_SIGNING_PROBE_CUSTODY").is_ok();
+    let store = custody_mode.then(|| load_probe_custody(&root, initialize));
+    let d = store
+        .as_ref()
+        .map(|store| custody_description(profile, store))
+        .unwrap_or_else(|| description_with_profile(profile));
     let db = crate::database::SimplexDb::open(root.join("db"), "own-signing").unwrap();
     let count_path = root.join("sign-count");
-    let signer = Signer::PublicTest(Box::new(move |message| {
-        let n = std::fs::read_to_string(&count_path)
-            .unwrap_or_else(|_| "0".to_owned())
-            .parse::<u32>()
-            .unwrap()
-            + 1;
-        let mut file = File::create(&count_path)?;
-        write!(file, "{n}")?;
-        file.sync_all()?;
-        signer(Arc::new(AtomicUsize::new(0))).sign(message)
-    }));
+    let signer = if let Some(store) = &store {
+        custody_backend(&d, store.clone())
+    } else {
+        Signer::PublicTest(Box::new(move |message| {
+            let n = std::fs::read_to_string(&count_path)
+                .unwrap_or_else(|_| "0".to_owned())
+                .parse::<u32>()
+                .unwrap()
+                + 1;
+            let mut file = File::create(&count_path)?;
+            write!(file, "{n}")?;
+            file.sync_all()?;
+            signer(Arc::new(AtomicUsize::new(0))).sign(message)
+        }))
+    };
     let c = SigningCoordinator::open(
         db,
         binding(&d),
@@ -307,10 +429,13 @@ fn own_journal_process_probe() {
         );
     }
     let candidate = std::env::var("RTOS_SIGNING_PROBE_CANDIDATE").is_ok();
+    let full_candidate = std::env::var("RTOS_SIGNING_PROBE_FULL").is_ok();
+    let role = std::env::var("RTOS_SIGNING_PROBE_ROLE").unwrap_or_else(|_| "notarize".into());
     let result = if candidate {
-        c.candidate(empty()).and_then(|v| profile.serialize(&v))
+        c.candidate(if full_candidate { full() } else { empty() })
+            .and_then(|v| profile.serialize(&v))
     } else {
-        c.vote(&vote("notarize")).and_then(|v| profile.serialize(&v.into_boxed()))
+        c.vote(&vote(&role)).and_then(|v| profile.serialize(&v.into_boxed()))
     };
     match result {
         Ok(bytes) => {
@@ -323,7 +448,7 @@ fn own_journal_process_probe() {
                     .any(|record| record.signed.as_ref() == Some(&bytes)),
                 "probe publication must equal a complete durable carrier"
             );
-            if candidate {
+            if candidate && !full_candidate {
                 let expected = if profile == rtos_api::WireProfile::T0 {
                     0x0740558cu32
                 } else {
@@ -409,7 +534,7 @@ fn own_journal_expiry_and_retirement_survive_clock_rollback() {
 fn own_journal_rejects_every_binding_change_and_damaged_records() {
     let h = Harness::new();
     h.coordinator.vote(&vote("notarize")).unwrap();
-    let Harness { root, db, description, coordinator, calls } = h;
+    let Harness { root, db, description, coordinator, calls, .. } = h;
     drop(coordinator);
     let original = binding(&description);
     let identity = description.get_source_public_key(description.get_self_idx()).clone();
@@ -571,7 +696,7 @@ fn own_journal_detects_removed_nonterminal_intent() {
     let h = Harness::new();
     h.coordinator.vote(&vote("notarize")).unwrap();
     h.coordinator.vote(&vote("skip")).unwrap();
-    let Harness { root, db, description, coordinator, calls } = h;
+    let Harness { root, db, description, coordinator, calls, .. } = h;
     drop(coordinator);
     let rows = db.storage.get_by_prefix(PREFIX.to_vec(), None).wait().unwrap();
     let key = rows
@@ -634,7 +759,7 @@ fn own_journal_failed_retirement_needs_external_monotonic_anchor() {
 fn wire_profile_binding_refuses_old_headers_and_alternate_namespace_without_mutation() {
     let h = Harness::new();
     h.coordinator.candidate(empty()).unwrap();
-    let Harness { root, db, description, coordinator, calls } = h;
+    let Harness { root, db, description, coordinator, calls, .. } = h;
     let b = binding(&description);
     let identity = description.get_source_public_key(description.get_self_idx()).clone();
     let owner = root.join(format!("{}.signer", hex::encode(b.validator)));
@@ -731,4 +856,142 @@ fn target_candidate_reuses_exact_durable_wire_after_restart() {
     assert_eq!(rtos_api::WireProfile::T0.serialize(&again).unwrap(), wire);
     assert_eq!(h.calls.load(Ordering::SeqCst), 1);
     assert!(h.coordinator.check_session(&description()).is_err());
+}
+
+// Public isolated test material; no external secrets or runtime loading switch.
+pub(crate) fn load_probe_custody(
+    root: &Path,
+    initialize: bool,
+) -> Arc<rtos_pq_consensus::ConsensusKeyStore> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let seed_path = root.join("public-test.seed");
+    if initialize {
+        let mut file =
+            OpenOptions::new().write(true).create_new(true).mode(0o600).open(&seed_path).unwrap();
+        file.write_all(&[0x91; 32]).unwrap();
+        file.sync_all().unwrap();
+    }
+    let custody = rtos_pq_consensus::PqConsensusCustody::load(
+        UInt256::from([2; 32]),
+        &[rtos_pq_consensus::ConfiguredKey { key_file: seed_path, valid_from: 0, expire_at: 0 }],
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32,
+    )
+    .unwrap();
+    custody.held_keys(&UInt256::from([2; 32])).values().next().unwrap().store.clone()
+}
+
+#[test]
+fn custody_binding_rejects_wrong_backend_before_journal_creation() {
+    use rtos_pq_consensus::ConsensusKeyStore;
+    for mismatch in ["key", "validator", "algorithm", "deadline"] {
+        let store = Arc::new(ConsensusKeyStore::from_seed(&[0x94; 32], 0).unwrap());
+        let d = custody_description(rtos_api::WireProfile::T0, &store);
+        let mut b = binding(&d);
+        let mut backend = custody_backend(&d, store.clone());
+        match mismatch {
+            "key" => {
+                let other = Arc::new(ConsensusKeyStore::from_seed(&[0x95; 32], 0).unwrap());
+                if let Signer::Custody(signer) = &mut backend {
+                    signer.store = other;
+                }
+            }
+            "validator" => {
+                if let Signer::Custody(signer) = &mut backend {
+                    signer.validator = [9; 32];
+                }
+            }
+            "algorithm" => {
+                if let Signer::Custody(signer) = &mut backend {
+                    signer.algorithm = 99;
+                }
+            }
+            "deadline" => b.expire_at = 4_000_000_000,
+            _ => unreachable!(),
+        }
+        let root = std::env::temp_dir().join(format!("rtos-custody-binding-{}", UInt256::rand()));
+        std::fs::create_dir(&root).unwrap();
+        let db = crate::database::SimplexDb::open(root.join("db"), "binding").unwrap();
+        let result = SigningCoordinator::open(
+            db.clone(),
+            b.clone(),
+            d.get_source_public_key(d.get_self_idx()).clone(),
+            &root,
+            true,
+            backend,
+        );
+        assert!(result.is_err(), "{mismatch}");
+        assert!(!root.join(format!("{}.signer", hex::encode(b.validator))).exists());
+        assert!(db.storage.get_by_prefix(PREFIX.to_vec(), None).wait().unwrap().is_empty());
+        assert_eq!(store.consensus_signatures_produced(), 0);
+        db.close(None).unwrap();
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn custody_randomized_signatures_require_exact_journal_replay() {
+    let h = Harness::custody(rtos_api::WireProfile::T0);
+    let b = binding(&h.description);
+    let preimage = h.coordinator.preimage(&b, &vote_decision(&vote("notarize")).unwrap()).unwrap();
+    let store = h.store.as_ref().unwrap();
+    let first = store.sign_consensus(&preimage).unwrap();
+    let second = store.sign_consensus(&preimage).unwrap();
+    assert_ne!(
+        first.bytes, second.bytes,
+        "real OS-randomized backend must not be replaced by a canned fixture"
+    );
+    let initial = h.coordinator.vote(&vote("notarize")).unwrap();
+    assert_eq!(h.signature_count(), 3);
+    let h = h.reopen();
+    let replay = h.coordinator.vote(&vote("notarize")).unwrap();
+    assert_eq!(
+        rtos_api::serialize_boxed(&initial.into_boxed()).unwrap(),
+        rtos_api::serialize_boxed(&replay.into_boxed()).unwrap()
+    );
+    assert_eq!(h.signature_count(), 3);
+}
+
+#[test]
+fn custody_pending_intent_is_a_durable_conflict_tombstone() {
+    for candidate in [false, true] {
+        let h = Harness::custody(rtos_api::WireProfile::T0);
+        *h.coordinator.fail_at.lock().unwrap() = Some("after_intent");
+        if candidate {
+            assert!(h.coordinator.candidate(empty()).is_err());
+        } else {
+            assert!(h.coordinator.vote(&vote("notarize")).is_err());
+        }
+        let h = h.reopen();
+        if candidate {
+            let mut other = empty();
+            if let CandidateData::Consensus_Empty(ref mut c) = other {
+                c.block.seq_no += 1;
+            }
+            assert!(h.coordinator.candidate(other).is_err());
+        } else {
+            let other =
+                utils::extract_vote(&f::vote("ordinary", "notarize", 1, f::CONTEXT)).unwrap();
+            assert!(h.coordinator.vote(&other).is_err());
+        }
+        assert_eq!(
+            h.signature_count(),
+            0,
+            "a durable conflicting intent must refuse before the signer"
+        );
+    }
+    for (a, b) in [
+        ("notarize", "notarize"),
+        ("notarize", "finalize"),
+        ("finalize", "notarize"),
+        ("finalize", "finalize"),
+    ] {
+        let h = Harness::custody(rtos_api::WireProfile::T0);
+        h.coordinator.vote(&vote(a)).unwrap();
+        let h = h.reopen();
+        let other = utils::extract_vote(&f::vote("ordinary", b, 1, f::CONTEXT)).unwrap();
+        assert!(h.coordinator.vote(&other).is_err());
+        assert_eq!(h.signature_count(), 1);
+    }
 }

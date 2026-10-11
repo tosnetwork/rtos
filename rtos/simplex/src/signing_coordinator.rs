@@ -159,6 +159,7 @@ fn compatible(a: &Decision, b: &Decision) -> bool {
 #[allow(dead_code)] // Production construction deliberately remains Disabled.
 pub(crate) enum Signer {
     Disabled,
+    Custody(CustodySigner),
     #[cfg(test)]
     PublicTest(Box<dyn Fn(&[u8]) -> Result<Vec<u8>> + Send + Sync>),
 }
@@ -169,9 +170,88 @@ impl Signer {
                 let _ = bytes;
                 fail!("PQ consensus signer is Disabled")
             }
+            Self::Custody(signer) => {
+                let signature = signer.store.sign_consensus(bytes)?;
+                #[cfg(test)]
+                signer.observe_probe_signature(bytes, &signature.bytes)?;
+                if u32::from(signature.algorithm_id) != signer.algorithm {
+                    fail!("custody returned an unexpected signature algorithm");
+                }
+                Ok(signature.bytes.to_vec())
+            }
             #[cfg(test)]
             Self::PublicTest(sign) => sign(bytes),
         }
+    }
+}
+/// The adapter has no production provisioning constructor. The only current
+/// factory is test-only; enabling it at runtime needs authenticated provisioning.
+pub(crate) struct CustodySigner {
+    validator: [u8; 32],
+    algorithm: u32,
+    store: std::sync::Arc<rtos_pq_consensus::ConsensusKeyStore>,
+}
+#[cfg(test)]
+impl CustodySigner {
+    fn observe_probe_signature(&self, bytes: &[u8], signature: &[u8]) -> Result<()> {
+        if std::env::var("RTOS_SIGNING_PROBE_CUSTODY").is_err() {
+            return Ok(());
+        }
+        let root = std::path::PathBuf::from(std::env::var("RTOS_SIGNING_PROBE_ROOT")?);
+        let count_path = root.join("sign-count");
+        let count: u64 =
+            std::fs::read_to_string(&count_path).unwrap_or_else(|_| "0".into()).parse()?;
+        let mut count_file = File::create(count_path)?;
+        write!(count_file, "{}", count + 1)?;
+        count_file.sync_all()?;
+        let mut output = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join("native-signatures.jsonl"))?;
+        writeln!(
+            output,
+            "{}",
+            serde_json::json!({
+                "preimage": hex::encode(bytes), "signature": hex::encode(signature),
+                "public_key": hex::encode(&self.store.consensus_key().public_key),
+                "native_count_this_process": self.store.consensus_signatures_produced(),
+            })
+        )?;
+        output.sync_all()?;
+        Ok(())
+    }
+}
+impl Signer {
+    fn check_binding(&self, binding: &SigningBinding) -> Result<()> {
+        if let Self::Custody(signer) = self {
+            let key = signer.store.consensus_key();
+            if signer.validator != binding.validator
+                || signer.algorithm != binding.algorithm
+                || *key.key_id.as_array() != binding.key_id
+                || key.public_key != binding.public_key
+                || u64::from(signer.store.expire_at()) != binding.expire_at
+                || signer.store.expired_now()
+            {
+                fail!("custody/signing journal identity or deadline mismatch");
+            }
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn from_test_custody(
+        custody: &rtos_pq_consensus::PqConsensusCustody,
+        validator: &UInt256,
+        descriptor: &rtos_block::ValidatorDescr,
+    ) -> Result<Self> {
+        let now = u32::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
+        let store = custody
+            .get_matching_store(validator, descriptor, now)
+            .ok_or_else(|| error!("authenticated custody key is unavailable"))?;
+        Ok(Self::Custody(CustodySigner {
+            validator: *validator.as_array(),
+            algorithm: u32::from(store.consensus_key().algorithm_id),
+            store,
+        }))
     }
 }
 struct State {
@@ -225,6 +305,7 @@ impl SigningCoordinator {
             fail!("signing identity/profile binding mismatch");
         }
         binding.wire()?;
+        signer.check_binding(&binding)?;
         ShardIdent::with_tagged_prefix(binding.shard_workchain, binding.shard_prefix)?;
         // The protected directory must already exist; provisioning is outside
         // session cache lifecycle and must not be created by untrusted requests.
