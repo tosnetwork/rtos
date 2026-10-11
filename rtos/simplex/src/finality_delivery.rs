@@ -77,7 +77,7 @@ impl PendingFinalityRecord {
             signature_set: runtime.wire_profile().serialize(&signatures.to_node().into_boxed())?,
             is_final: signatures.is_final(), last_mc_finalized_seqno: draft.last_mc_finalized_seqno,
             candidate_already_sent: draft.candidate_already_sent,
-            created_at_unix_secs: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+            created_at_unix_secs: draft.created_at_unix_secs,
         };
         record.validate()?;
         Ok(record)
