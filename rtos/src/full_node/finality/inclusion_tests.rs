@@ -1,6 +1,7 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 use crate::block_proof::BlockProofStuff;
+use futures::FutureExt;
 use rtos_api::IntoBoxed;
 
 fn decode(value: &serde_json::Value) -> Vec<u8> {
@@ -139,94 +140,111 @@ impl Pair {
         }
         let receiver = open_engine(&receiver_dir).await;
         let provider = open_engine(&provider_dir).await;
-        for engine in [&receiver, &provider] {
-            for bytes in [&mc_data, &decode(&recovery["prev_state_boc"])] {
-                let root = read_single_root_boc(bytes).unwrap();
-                let state = ShardStateUnsplit::construct_from_cell(root.clone()).unwrap();
-                let id = BlockIdExt::with_params(
-                    state.shard().clone(),
-                    state.seq_no(),
-                    root.repr_hash().clone(),
-                    UInt256::calc_file_hash(bytes),
-                );
-                let state = ShardStateStuff::from_root_cell(
-                    id,
-                    root,
-                    #[cfg(feature = "telemetry")]
-                    engine.engine_telemetry(),
-                    engine.engine_allocated(),
-                )
-                .unwrap();
-                let (_, handle) = engine.store_zerostate(state, bytes).await.unwrap();
-                // Match boot.rs::download_zerostate: trusted bootstrap states are
-                // already applied. Successor blocks must still apply normally.
-                assert_eq!(handle.id().seq_no(), 0);
-                engine.set_applied(&handle, 0).await.unwrap();
-            }
-            engine.save_last_applied_mc_block_id(&anchor).unwrap();
-            engine.save_shard_client_mc_block_id(&anchor).unwrap();
-            assert!(!crate::network::check_sync_for_listen_bcasts(engine.as_ref()));
-            engine.set_test_chain_time(Some(1002));
-            assert!(crate::network::check_sync_for_listen_bcasts(engine.as_ref()));
-            engine.initialize_test_full_node_overlays().await.unwrap();
-            if v2 {
-                engine
-                    .overlays_router()
-                    .unwrap()
-                    .refresh_fast_sync_from_applied_state()
-                    .await
-                    .unwrap();
-            }
-        }
-        let handle = provider.store_block(&shard).await.unwrap().to_any();
-        let link = crate::validator::accept_block::create_new_proof_link(&shard).unwrap();
-        provider.store_block_proof(shard.id(), Some(handle), &link).await.unwrap();
-        let handle = provider.store_block(&master).await.unwrap().to_any();
-        provider.store_block_proof(master.id(), Some(handle), &proof).await.unwrap();
-        provider
-            .store_block_next1(&provider.load_block_handle(&anchor).unwrap().unwrap(), master.id())
-            .unwrap();
-        for (local, remote) in [(&receiver, &provider), (&provider, &receiver)] {
-            let local_adnl = &local.network().context().stack.adnl;
-            let remote_adnl = &remote.network().context().stack.adnl;
-            let local_key = local_adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
-            let remote_key = remote_adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
-            if v2 {
-                // Isolated nodes have no external DHT. Supply the peer's actual
-                // advertised route; local endpoint binding still belongs solely
-                // to normal production configuration activation.
-                local
-                    .network()
-                    .context()
-                    .stack
-                    .quic
-                    .as_ref()
-                    .unwrap()
-                    .add_peer_key(
-                        remote_key.id().clone(),
-                        remote.network().context().quic_address.unwrap(),
+        let setup = std::panic::AssertUnwindSafe(async {
+            for engine in [&receiver, &provider] {
+                for bytes in [&mc_data, &decode(&recovery["prev_state_boc"])] {
+                    let root = read_single_root_boc(bytes).unwrap();
+                    let state = ShardStateUnsplit::construct_from_cell(root.clone()).unwrap();
+                    let id = BlockIdExt::with_params(
+                        state.shard().clone(),
+                        state.seq_no(),
+                        root.repr_hash().clone(),
+                        UInt256::calc_file_hash(bytes),
+                    );
+                    let state = ShardStateStuff::from_root_cell(
+                        id,
+                        root,
+                        #[cfg(feature = "telemetry")]
+                        engine.engine_telemetry(),
+                        engine.engine_allocated(),
                     )
                     .unwrap();
+                    let (_, handle) = engine.store_zerostate(state, bytes).await.unwrap();
+                    // Match boot.rs::download_zerostate: trusted bootstrap states are
+                    // already applied. Successor blocks must still apply normally.
+                    assert_eq!(handle.id().seq_no(), 0);
+                    engine.set_applied(&handle, 0).await.unwrap();
+                }
+                engine.save_last_applied_mc_block_id(&anchor).unwrap();
+                engine.save_shard_client_mc_block_id(&anchor).unwrap();
+                assert!(!crate::network::check_sync_for_listen_bcasts(engine.as_ref()));
+                engine.set_test_chain_time(Some(1002));
+                assert!(crate::network::check_sync_for_listen_bcasts(engine.as_ref()));
+                engine.initialize_test_full_node_overlays().await.unwrap();
+                if v2 {
+                    engine
+                        .overlays_router()
+                        .unwrap()
+                        .refresh_fast_sync_from_applied_state()
+                        .await
+                        .unwrap();
+                }
             }
-            let peer = local_adnl
-                .add_peer(local_key.id(), remote_adnl.ip_address_adnl(), None, &remote_key)
-                .unwrap()
+            let handle = provider.store_block(&shard).await.unwrap().to_any();
+            let link = crate::validator::accept_block::create_new_proof_link(&shard).unwrap();
+            provider.store_block_proof(shard.id(), Some(handle), &link).await.unwrap();
+            let handle = provider.store_block(&master).await.unwrap().to_any();
+            provider.store_block_proof(master.id(), Some(handle), &proof).await.unwrap();
+            provider
+                .store_block_next1(
+                    &provider.load_block_handle(&anchor).unwrap().unwrap(),
+                    master.id(),
+                )
                 .unwrap();
-            for shard_id in [shard.id().shard(), anchor.shard()] {
-                let client = local.overlay_client(shard_id).await.unwrap();
-                client.overlay_client().neighbours().add(peer.clone()).unwrap();
-                let id = adnl::OverlayShortId::from_data(*client.overlay_client().id().data());
-                let advertised =
-                    remote.network().context().stack.overlay.get_signed_node(&id, false).unwrap();
-                local
-                    .network()
-                    .context()
-                    .stack
-                    .overlay
-                    .add_public_peer(remote_adnl.ip_address_adnl(), &advertised, &id)
+            for (local, remote) in [(&receiver, &provider), (&provider, &receiver)] {
+                let local_adnl = &local.network().context().stack.adnl;
+                let remote_adnl = &remote.network().context().stack.adnl;
+                let local_key = local_adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
+                let remote_key = remote_adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
+                if v2 {
+                    // Isolated nodes have no external DHT. Supply the peer's actual
+                    // advertised route; local endpoint binding still belongs solely
+                    // to normal production configuration activation.
+                    local
+                        .network()
+                        .context()
+                        .stack
+                        .quic
+                        .as_ref()
+                        .unwrap()
+                        .add_peer_key(
+                            remote_key.id().clone(),
+                            remote.network().context().quic_address.unwrap(),
+                        )
+                        .unwrap();
+                }
+                let peer = local_adnl
+                    .add_peer(local_key.id(), remote_adnl.ip_address_adnl(), None, &remote_key)
                     .unwrap()
                     .unwrap();
+                for shard_id in [shard.id().shard(), anchor.shard()] {
+                    let client = local.overlay_client(shard_id).await.unwrap();
+                    client.overlay_client().neighbours().add(peer.clone()).unwrap();
+                    let id = adnl::OverlayShortId::from_data(*client.overlay_client().id().data());
+                    let advertised = remote
+                        .network()
+                        .context()
+                        .stack
+                        .overlay
+                        .get_signed_node(&id, false)
+                        .unwrap();
+                    local
+                        .network()
+                        .context()
+                        .stack
+                        .overlay
+                        .add_public_peer(remote_adnl.ip_address_adnl(), &advertised, &id)
+                        .unwrap()
+                        .unwrap();
+                }
             }
+        })
+        .catch_unwind()
+        .await;
+        if let Err(panic) = setup {
+            receiver.clone().wait_stop().await.unwrap();
+            provider.clone().wait_stop().await.unwrap();
+            std::panic::resume_unwind(panic);
         }
         Self {
             _dir: dir,
