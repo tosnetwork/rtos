@@ -118,3 +118,51 @@ fn bounded_config_runtime_request_is_cumulative_and_rejects_duplicates() {
     )
     .is_err());
 }
+#[test]
+fn bounded_config_consumer_scope_preserves_unused_bad_sets() {
+    let (pin, mut config, nodes) = fixture();
+    // A protocol-1 live runtime never reads transport sets outside current.
+    config
+        .set_config(ConfigParamEnum::ConfigParam30(NewConsensusConfigAll {
+            mc: Some(SimplexConfig { protocol_version: 1, ..Default::default() }),
+            shard: Some(SimplexConfig { protocol_version: 1, ..Default::default() }),
+        }))
+        .unwrap();
+    for index in [32u32, 36] {
+        let mut wrapper = BuilderData::new();
+        wrapper.checked_append_reference(Cell::default()).unwrap();
+        config.config_params.set_builder(index.write_to_bitstring().unwrap(), &wrapper).unwrap();
+    }
+    let budget = ConfigBudget::new(1_000_000, 32 << 20);
+    let shard = ShardIdent::masterchain();
+    let ordinary = AuthenticatedSessionRuntime::from_authenticated_config(
+        pin.clone(),
+        &config,
+        coords(&shard),
+        nodes.clone(),
+        nodes[0].adnl_addr().unwrap(),
+    )
+    .unwrap();
+    let live = config.runtime_session_config_bounded(true, &budget).unwrap();
+    let bounded = AuthenticatedSessionRuntime::from_decoded_config_bounded(
+        pin,
+        &live,
+        coords(&shard),
+        nodes.clone(),
+        nodes[0].adnl_addr().unwrap(),
+        &budget,
+    )
+    .unwrap();
+    assert!(ordinary.same_admission(&bounded));
+    assert!(config.governing_session_config_bounded(true, &budget).is_ok());
+    // Retired identity needs next even at protocol1 to check requested epoch.
+    assert!(config.session_config_bounded(true, &budget).is_err());
+    config
+        .set_config(ConfigParamEnum::ConfigParam30(NewConsensusConfigAll {
+            mc: Some(SimplexConfig { protocol_version: 2, ..Default::default() }),
+            shard: None,
+        }))
+        .unwrap();
+    assert!(config.runtime_session_config_bounded(true, &budget).is_err());
+    assert!(config.governing_session_config_bounded(true, &budget).is_ok());
+}

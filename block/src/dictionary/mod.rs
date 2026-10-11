@@ -615,6 +615,17 @@ pub trait HashmapType {
         }
     }
 
+    /// Ordinary hashmap traversal with admission before each label allocation.
+    /// The callback admits variable-width value decoding independently.
+    fn iterate_slices_bounded<F>(&self, budget: &dyn crate::config_read_budget::ConfigReadBudget,
+        mut visitor: F) -> Result<bool>
+    where F: FnMut(SliceData, SliceData) -> Result<bool> {
+        if let Some(root) = self.data() {
+            iterate_internal_bounded::<Self,_>(LabelReader::with_cell(root)?, BuilderData::default(),
+                self.bit_len(), &mut |key,value| visitor(SliceData::load_bitstring(key)?,value), budget)
+        } else { Ok(true) }
+    }
+
     /// returns count of objects in tree - don't use it - try is_empty()
     fn len(&self) -> Result<usize> {
         match self.data() {
@@ -1239,6 +1250,39 @@ where
             let mut key = key.clone();
             key.append_bit_bool(i != 0)?;
             if !iterate_internal::<T, F>(cursor.next_reader::<T>(i, &mut 0)?, key, bit_len, found)?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+fn iterate_internal_bounded<T, F>(
+    mut cursor: LabelReader,
+    mut key: BuilderData,
+    mut bit_len: usize,
+    found: &mut F,
+    budget: &dyn crate::config_read_budget::ConfigReadBudget,
+) -> Result<bool>
+where
+    F: FnMut(BuilderData, SliceData) -> Result<bool>,
+    T: HashmapType + ?Sized,
+{
+    budget.step()?;
+    let max = (bit_len + 1).checked_next_power_of_two().ok_or_else(|| crate::error!("Dictionary key overflow"))? - 1;
+    budget.workspace(max / 8 + 1)?;
+    if !cursor.already_read() {
+        key = cursor.get_label_raw(&mut bit_len, key)?;
+    }
+    if bit_len == 0 {
+        found(key, cursor.remainder()?)
+    } else {
+        bit_len -= 1;
+        for i in 0..2 {
+            let mut key = key.clone();
+            key.append_bit_bool(i != 0)?;
+            if !iterate_internal_bounded::<T, F>(cursor.next_reader::<T>(i, &mut 0)?, key, bit_len, found, budget)?
             {
                 return Ok(false);
             }
