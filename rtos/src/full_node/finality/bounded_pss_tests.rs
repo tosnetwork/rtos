@@ -152,6 +152,16 @@ async fn bounded_pss_real_peer_rejects_wire_size_and_signed_length() {
             .await
             .unwrap_err();
         assert!(error.downcast_ref::<adnl::ResponseLimitExceeded>().is_some(), "{error:#}");
+        // Neither wire nor decoded allocation may exceed the requested slice.
+        for limits in [
+            adnl::QueryResponseLimits { wire_bytes: 65, decoded_bytes: 64 },
+            adnl::QueryResponseLimits { wire_bytes: 64, decoded_bytes: 65 },
+        ] {
+            let error = client.download_persistent_state_part_bounded(
+                &id, pair.master.id(), 0, 64, &peer, 0, limits,
+            ).await.unwrap_err();
+            assert_eq!(error.to_string(), "Invalid bounded PSS slice size");
+        }
         // All overflow checks precede network admission; no response is injected.
         for offset in [usize::MAX, i64::MAX as usize] {
             assert!(client
