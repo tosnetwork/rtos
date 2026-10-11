@@ -19,6 +19,26 @@ use std::{
     time::Instant,
 };
 
+// Guards retain the unflagged value on errors and unwinding.
+struct CountLock<'a> {
+    atomic: &'a AtomicU32,
+    value: u32,
+}
+impl Drop for CountLock<'_> {
+    fn drop(&mut self) {
+        self.atomic.store(self.value, Ordering::Release);
+    }
+}
+struct StateLock<'a> {
+    atomic: &'a AtomicU8,
+    value: u8,
+}
+impl Drop for StateLock<'_> {
+    fn drop(&mut self) {
+        self.atomic.store(self.value, Ordering::Release);
+    }
+}
+
 struct AtomicFixedPoint(AtomicU64);
 
 impl Default for AtomicFixedPoint {
@@ -130,21 +150,24 @@ impl BandwidthStats {
                 // Locked, concurrent use
                 continue;
             }
-            self.delivered_at_micros.store(timestamp_micros, Ordering::Relaxed);
+            let mut lock = CountLock { atomic: &self.delivered_count, value: delivered_count };
             let max_delivered_at_micros = max_packet.bandwidth_info.delivered_at_micros;
             if self.paused_at_micros.load(Ordering::Relaxed) < max_delivered_at_micros {
                 self.paused_at_micros.store(0, Ordering::Relaxed);
             }
             let passed_micros = max(
-                max_packet.sent_at_micros - max_packet.bandwidth_info.first_sent_at_micros, // sent
-                timestamp_micros - max_delivered_at_micros,                                 // ack
-            ) as u32;
+                max_packet
+                    .sent_at_micros
+                    .saturating_sub(max_packet.bandwidth_info.first_sent_at_micros), // sent
+                timestamp_micros.saturating_sub(max_delivered_at_micros), // ack
+            );
             if passed_micros == 0 {
                 fail!("Zero delivery time")
             }
-            let delivered =
-                delivered_count + new_received - max_packet.bandwidth_info.delivered_count;
-            let rate = delivered * 1000000 / passed_micros;
+            let next_count = delivered_count.wrapping_add(new_received) & !Self::LOCK_BIT;
+            let delivered = next_count.wrapping_sub(max_packet.bandwidth_info.delivered_count)
+                & !Self::LOCK_BIT;
+            let rate = ((delivered as u64) * 1000000 / passed_micros).min(u32::MAX as u64) as u32;
             if !max_packet.bandwidth_info.is_paused
                 || (rate >= self.windowed_max.load(Ordering::Relaxed))
             {
@@ -153,14 +176,8 @@ impl BandwidthStats {
                     self.windowed_max.store(windowed_max, Ordering::Relaxed)
                 }
             }
-            self.delivered_count
-                .compare_exchange(
-                    delivered_count | Self::LOCK_BIT,
-                    delivered_count + new_received,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                )
-                .ok();
+            self.delivered_at_micros.store(timestamp_micros, Ordering::Relaxed);
+            lock.value = next_count;
             break;
         }
         //  bdw_stats.on_packet_ack(packets_.max_packet().bdw_packet_info, packets_.max_packet().sent_at, now);
@@ -255,7 +272,7 @@ impl Bbr {
                 // Locked, concurrent use
                 continue;
             }
-            let old_state = state;
+            let mut lock = StateLock { atomic: &self.state, value: state };
             let mut probe_bandwidth_cycle_changed = false;
             let (mut cycle_at_micros, mut cycle) = self.probe_bandwidth_cycle.get();
             loop {
@@ -270,7 +287,7 @@ impl Bbr {
                         if in_flight_count < window(bandwidth_max, roundtrip_min_micros, 1.0) {
                             cycle = rand::rngs::SmallRng::from_entropy()
                                 .gen_range(1..Self::MAX_CYCLES - 1);
-                            cycle_at_micros = timestamp_micros;
+                            cycle_at_micros = cycle_at_micros.max(timestamp_micros);
                             probe_bandwidth_cycle_changed = true;
                             state = Self::STATE_PROBE_BANDWIDTH;
                             continue;
@@ -279,7 +296,7 @@ impl Bbr {
                     _ => {
                         if cycle_at_micros + (roundtrip_min_micros as u64) < timestamp_micros {
                             cycle = (cycle + 1) % Self::MAX_CYCLES;
-                            cycle_at_micros = timestamp_micros;
+                            cycle_at_micros = cycle_at_micros.max(timestamp_micros);
                             probe_bandwidth_cycle_changed = true
                         }
                     } //TODO: ProbeRoundtrip state
@@ -287,25 +304,12 @@ impl Bbr {
                 break;
             }
             if probe_bandwidth_cycle_changed {
-                if !self
-                    .probe_bandwidth_cycle
-                    .update(cycle_at_micros, cycle, |at_micros, _| at_micros < cycle_at_micros)
-                {
-                    continue;
-                }
+                // All cycle writers hold state. Equal timestamps (including the
+                // initial zero) are valid for the DRAIN -> PROBE transition.
+                self.probe_bandwidth_cycle.update(cycle_at_micros, cycle, |_, _| true);
             }
-            if self
-                .state
-                .compare_exchange(
-                    old_state | Self::LOCK_BIT,
-                    state,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                break (state, cycle);
-            }
+            lock.value = state;
+            break (state, cycle);
         };
 
         let speed = match state {
@@ -500,6 +504,13 @@ impl MinMaxStat {
     fn update(&self, timestamp_micros: &mut u64) {
         loop {
             let (next, next_timestamp_micros) = self.next.get();
+            let (_, current_timestamp_micros) = self.current.get();
+            if current_timestamp_micros > next_timestamp_micros {
+                // Recover an older pair of windows (or a concurrent rotation)
+                // without repeatedly trying to move current backwards.
+                self.next.update(next, current_timestamp_micros);
+                continue;
+            }
             if *timestamp_micros < next_timestamp_micros {
                 *timestamp_micros = next_timestamp_micros;
             }
@@ -1029,4 +1040,118 @@ impl StatsConfigV2 {
     const INITIAL_BANDWIDTH: u32 = 100;
     const INITIAL_ROUNDTRIP_MICROS: u32 = 500000;
     const PACKET_TRESHOLD: u32 = 3;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn packet() -> SendPacketV2 {
+        SendPacketV2 {
+            bandwidth_info: PacketBandwidthInfo {
+                delivered_count: 0,
+                delivered_at_micros: 0,
+                first_sent_at_micros: 0,
+                is_paused: false,
+            },
+            sent_at_micros: 0,
+        }
+    }
+
+    #[test]
+    fn rldp_stat_zero_delivery_releases_lock() {
+        let stats = BandwidthStats::new(100);
+        assert!(stats.update(packet(), 1, 0).unwrap_err().to_string().contains("Zero delivery"));
+        assert_eq!(stats.delivered_count.load(Ordering::Acquire), 0);
+        stats.update(packet(), 1, 1000).unwrap();
+        assert_eq!(stats.on_send(1000).delivered_count, 1);
+    }
+
+    #[test]
+    fn rldp_stat_rate_uses_wide_arithmetic() {
+        let stats = BandwidthStats::new(100);
+        stats.update(packet(), 5000, 1_000_000).unwrap();
+        assert_eq!(stats.delivered_count.load(Ordering::Acquire), 5000);
+        assert_eq!(stats.windowed_max.load(Ordering::Acquire), 5000);
+        let saturated = BandwidthStats::new(100);
+        saturated.update(packet(), 5000, 1).unwrap();
+        assert_eq!(saturated.windowed_max.load(Ordering::Acquire), u32::MAX);
+        let long = BandwidthStats::new(100);
+        long.update(packet(), 5000, 1u64 << 32).unwrap();
+        assert_eq!(long.windowed_max.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn rldp_stat_guards_release_on_unwind() {
+        let count = AtomicU32::new(BandwidthStats::LOCK_BIT | 7);
+        let state = AtomicU8::new(Bbr::LOCK_BIT | Bbr::STATE_DRAIN);
+        assert!(std::panic::catch_unwind(|| {
+            let _count = CountLock { atomic: &count, value: 7 };
+            let _state = StateLock { atomic: &state, value: Bbr::STATE_DRAIN };
+            panic!("controlled guard unwind");
+        })
+        .is_err());
+        assert_eq!(count.load(Ordering::Acquire), 7);
+        assert_eq!(state.load(Ordering::Acquire), Bbr::STATE_DRAIN);
+    }
+
+    #[test]
+    fn rldp_stat_stale_windows_and_zero_cycle() {
+        const CHILD: &str = "RTOS_RLDP_STAT_WATCHDOG_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // A regression can spin before returning: contain it in a process,
+            // kill and reap on the deadline instead of leaking a test thread.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rldp::stat::tests::rldp_stat_stale_windows_and_zero_cycle",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "stat child: {status}");
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let status = child.wait().unwrap();
+                    panic!("stat operation failed to terminate: {status}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let rtt = RoundtripStats::new(1_000_000).unwrap();
+        let bandwidth = BandwidthStats::new(100);
+        for (existing, now) in [(0, 0), (50, 25), (50, 50)] {
+            let bbr = Bbr::new();
+            bbr.state.store(Bbr::STATE_DRAIN, Ordering::Release);
+            bbr.probe_bandwidth_cycle.update(existing, 0, |_, _| true);
+            bbr.step(&rtt, &bandwidth, 0, now);
+            assert_eq!(bbr.state.load(Ordering::Acquire), Bbr::STATE_PROBE_BANDWIDTH);
+            assert_eq!(bbr.probe_bandwidth_cycle.get().0, existing.max(now));
+            bbr.step(&rtt, &bandwidth, 0, existing.max(now) + 1_000_001);
+            assert_eq!(bbr.state.load(Ordering::Acquire) & Bbr::LOCK_BIT, 0);
+            assert_eq!(bbr.probe_bandwidth_cycle.get().0, existing.max(now) + 1_000_001);
+        }
+        let windows = MinMaxStat::with_params(1, CmpOrdering::Greater);
+        windows.current.update(9, 2000);
+        windows.next.update(7, 1000);
+        let mut time = 2500;
+        windows.update(&mut time);
+        assert_eq!(windows.current.get(), (9, 2000));
+        assert_eq!(windows.next.get(), (7, 2000));
+        time = 3500;
+        windows.update(&mut time);
+        assert_eq!(windows.current.get(), (7, 2000));
+        assert_eq!(windows.next.get(), (0, 3500));
+        assert_eq!(windows.on_value(8, 3500), 8);
+        time = 6001;
+        windows.update(&mut time);
+        assert_eq!(windows.current.get(), (0, 6001));
+        assert_eq!(windows.next.get(), (0, 6001));
+    }
 }
