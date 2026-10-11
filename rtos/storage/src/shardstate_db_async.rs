@@ -307,14 +307,18 @@ impl ShardStateDb {
 
                         let now = std::time::Instant::now();
                         let callback = SsNotificationCallback::new();
-                        if let Err(e) = self.storer.send(StateCommand::Work(
-                            Job::DeleteState(id.clone()),
-                            Some(callback.clone()),
-                        )) {
+                        if self
+                            .storer
+                            .send(StateCommand::Work(
+                                Job::DeleteState(id.clone()),
+                                Some(callback.clone()),
+                            ))
+                            .is_err()
+                        {
                             log::error!(
                                 target: TARGET,
                                 "Can't send state to delete from db, id {}",
-                                e.0.0.block_id()
+                                id
                             );
                         } else {
                             #[cfg(feature = "telemetry")]
