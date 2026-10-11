@@ -378,7 +378,7 @@ impl RawSocket {
                 f.runtime.clone(),
                 Arc::downgrade(&events),
                 Arc::downgrade(&replay),
-                OverlayTransportType::Quic,
+                OverlayTransportType::SimplexQuic,
             )
             .unwrap();
         Self { manager, overlay, id, _listener: listener }
