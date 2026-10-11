@@ -24,7 +24,16 @@ struct State {
 }
 
 #[derive(Default)]
-pub(crate) struct BroadcastFaults(Mutex<State>, Mutex<Option<RepairLoss>>);
+pub(crate) struct BroadcastFaults(
+    Mutex<State>,
+    Mutex<Option<RepairLoss>>,
+    Mutex<Option<RepairCapture>>,
+);
+
+struct RepairCapture {
+    peer: [u8; 32],
+    replies: Vec<Vec<u8>>,
+}
 
 struct RepairLoss {
     peer: [u8; 32],
@@ -40,6 +49,48 @@ pub(crate) struct RepairReceipts {
 }
 
 impl BroadcastFaults {
+    pub fn capture_repair_replies(&self, peer: [u8; 32]) {
+        *self.2.lock().unwrap() = Some(RepairCapture { peer, replies: vec![] });
+    }
+
+    pub fn repair_replies(&self) -> Vec<Vec<u8>> {
+        self.2.lock().unwrap().as_ref().map(|capture| capture.replies.clone()).unwrap_or_default()
+    }
+
+    fn record_repair_reply(
+        &self,
+        bytes: &[u8],
+        peers: &AdnlPeers,
+        answer: &Option<QueryAnswer>,
+    ) -> Result<()> {
+        let mut capture = self.2.lock().unwrap();
+        let Some(capture) =
+            capture.as_mut().filter(|capture| capture.peer == *peers.other().data())
+        else {
+            return Ok(());
+        };
+        let Ok(objects) = rtos_api::WireProfile::T0.deserialize_bundle(bytes) else {
+            return Ok(());
+        };
+        if objects.len() != 2 || !objects[1].is::<rtos_api::ton::rpc::overlay::RepairPlumtreePart>()
+        {
+            return Ok(());
+        }
+        let wire = match answer {
+            Some(QueryAnswer::Ready(Some(adnl::common::Answer::Raw(data)))) => data.object.clone(),
+            Some(QueryAnswer::Ready(Some(adnl::common::Answer::Object(data)))) => {
+                rtos_api::serialize_boxed(&data.object)?
+            }
+            _ => return Ok(()),
+        };
+        assert!(
+            wire.len() <= 16_384 && capture.replies.len() < 32,
+            "repair capture exceeded fixture budget"
+        );
+        capture.replies.push(wire);
+        Ok(())
+    }
+
     pub fn configure(&self, peer: [u8; 32], prefix: Vec<u8>, drops: usize) {
         assert!(!prefix.is_empty());
         *self.0.lock().unwrap() = State {
@@ -156,6 +207,7 @@ impl Subscriber for ObservedOverlay {
         let budget = self.faults.repair_budget(bytes, peers);
         // Let the real overlay authenticate the query and build its reply first.
         let result = self.overlay.try_consume_raw_query(bytes, peers).await?;
+        self.faults.record_repair_reply(bytes, peers, &result)?;
         if let (Some(budget), Some(_)) = (budget, result.as_ref()) {
             use std::sync::atomic::Ordering;
             if budget.built.fetch_add(1, Ordering::AcqRel) == 0 {

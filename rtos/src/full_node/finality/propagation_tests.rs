@@ -83,6 +83,9 @@ async fn propagation_authenticated_normal_finality_applies_by_mc_and_reopens() {
             prefix.clone(),
             0,
         );
+        let receiver_transport = pair.receiver.network().context().stack.adnl
+            .key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
+        pair.provider.network().test_broadcast_faults.capture_repair_replies(*receiver_transport.id().data());
         let context = governing_session(&pair).await;
         let previous = pair.shard.construct_prev_id().unwrap().0;
         let mut bad = pair.shard_carrier.clone();
@@ -149,28 +152,23 @@ async fn propagation_authenticated_normal_finality_applies_by_mc_and_reopens() {
         assert!(sent(&outcome, PropagationKind::Finality), "{outcome:?}");
         assert!(!outcome.needs_retry(), "{outcome:?}");
         let (expected_wire, expected_id) = pair.finality_wire();
-        let received = tokio::time::timeout(Duration::from_secs(15), async {
+        // New neighbours learn via IHAVE and request the retained carrier. That
+        // Simple response travels on a query stream, not try_consume_custom.
+        let carrier_wire = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                let receipts = pair.receiver.network().test_broadcast_faults.receipts();
-                if receipts.iter().any(|r| r.simple_id == Some(expected_id)) {
-                    break receipts;
+                for wire in pair.provider.network().test_broadcast_faults.repair_replies() {
+                    if let Ok(rtos_api::ton::overlay::Broadcast::Overlay_BroadcastPlumtreeSimple(carrier)) =
+                        WireProfile::T0.deserialize_typed::<rtos_api::ton::overlay::Broadcast>(&wire) {
+                        if carrier.broadcast_id.as_array() == &expected_id { return wire; }
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        })
-        .await
-        .unwrap_or_else(|error| {
-            panic!(
-                "normal finality carrier missing: {error}; expected={expected_id:?}; actual={:?}",
-                pair.receiver.network().test_broadcast_faults.receipts()
-            )
-        });
-        let receipt = received
-            .iter()
-            .find(|r| r.simple_id == Some(expected_id) && !r.dropped && r.error.is_none())
-            .expect("normal sender must emit the T0 certificate-bound simple transport ID");
-        let carrier: rtos_api::ton::overlay::Broadcast =
-            WireProfile::T0.deserialize_typed(&receipt.wire[prefix.len()..]).unwrap();
+        }).await.unwrap_or_else(|error| panic!(
+            "normal repair carrier missing: {error}; expected={expected_id:?}; inbound={:?}; replies={}",
+            pair.receiver.network().test_broadcast_faults.receipts(),
+            pair.provider.network().test_broadcast_faults.repair_replies().len()));
+        let carrier: rtos_api::ton::overlay::Broadcast = WireProfile::T0.deserialize_typed(&carrier_wire).unwrap();
         let rtos_api::ton::overlay::Broadcast::Overlay_BroadcastPlumtreeSimple(carrier) = carrier
         else {
             panic!("finality must use simple Plumtree");
@@ -180,7 +178,7 @@ async fn propagation_authenticated_normal_finality_applies_by_mc_and_reopens() {
             let directory = std::path::PathBuf::from(directory);
             std::fs::create_dir_all(&directory).unwrap();
             std::fs::write(directory.join("normal.finality"), &carrier.data).unwrap();
-            std::fs::write(directory.join("normal.plumtree"), &receipt.wire[prefix.len()..])
+            std::fs::write(directory.join("normal.plumtree"), &carrier_wire)
                 .unwrap();
             std::fs::write(directory.join("normal.transport-id"), expected_id).unwrap();
         }
