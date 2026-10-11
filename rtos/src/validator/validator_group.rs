@@ -674,6 +674,12 @@ impl ValidatorGroupImpl {
         true
     }
 
+    // Admission failed before touching the consensus engine. Release only the
+    // start reservation: a pre-created session is still owned and must be kept.
+    fn release_start_reservation(&mut self) {
+        self.start_pending = false;
+    }
+
     fn reset_after_start_failure(&mut self) {
         log::warn!(target: "validator",
             "SESSION_LIFECYCLE: reset_after_failure shard={} cc_seqno={} session_id={:x} \
@@ -1410,7 +1416,10 @@ impl ValidatorGroup {
         min_ts: SystemTime,
         rt: tokio::runtime::Handle,
     ) -> Result<()> {
-        self.prepare_durable_finality_sink().await?;
+        if let Err(error) = self.prepare_durable_finality_sink().await {
+            self.group_impl.execute_sync(|group| group.release_start_reservation()).await;
+            return Err(error);
+        }
         self.clone().spawn_root_task(&rt.clone(), async move {
             let callback = self.make_validator_session_callback();
             self.group_impl

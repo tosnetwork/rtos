@@ -35,6 +35,15 @@ fn configure(bootstrap: &mut EmulatorNetworkBootstrap, observer: &PrivateKey) ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_manager_creates_transport_only_observer_and_retires_real_groups() -> Result<()> {
+    run_authenticated_manager_observer_lifecycle(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authenticated_manager_retries_transient_sink_initialization_on_same_group() -> Result<()> {
+    run_authenticated_manager_observer_lifecycle(true).await
+}
+
+async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool) -> Result<()> {
     use adnl::{node::AdnlNode, DhtNode, OverlayNode, RldpNode, NetworkStack};
     let observer: PrivateKey = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71; 32])?;
     let mut bootstrap = EmulatorNetworkBootstrap::build(2)?;
@@ -83,7 +92,22 @@ async fn authenticated_manager_creates_transport_only_observer_and_retires_real_
             "configured stable identity was accepted with wrong governing ADNL");
         let state = engine.build_masterchain_state(&bootstrap, 0)?;
         engine.install_masterchain_state(state.clone(), None)?;
+        let failed_group = if fail_initial_sink {
+            engine.fail_finality_sink_once.store(true, Ordering::SeqCst);
+            let error = manager.update_shards(state.clone()).await.err()
+                .ok_or_else(|| error!("Expected sink initialization failure"))?;
+            anyhow::ensure!(error.to_string().contains("Injected transient finality sink"));
+            let (id, group) = manager.current_sessions.iter().next()
+                .ok_or_else(|| error!("Partially started group ownership was lost"))?;
+            anyhow::ensure!(!group.is_start_pending().await, "failed sink left a permanently pending start");
+            anyhow::ensure!(!group.snapshot().await.has_engine, "failed admission created consensus engine");
+            Some((id.clone(), group.clone()))
+        } else { None };
         manager.update_shards(state.clone()).await?;
+        if let Some((id, original)) = failed_group {
+            let retried = manager.current_sessions.get(&id).ok_or_else(|| error!("Failed group was lost during retry"))?;
+            anyhow::ensure!(Arc::ptr_eq(&original, retried), "Retry replaced the group instead of releasing its reservation");
+        }
         anyhow::ensure!(manager.validator_list_status.curr.is_none(), "fixture must have no PQ signing identity");
         anyhow::ensure!(manager.current_sessions.len() == 2, "expected MC + shard actual observer groups");
         anyhow::ensure!(manager.owned_current_shards == 0, "observer incorrectly marked validator");

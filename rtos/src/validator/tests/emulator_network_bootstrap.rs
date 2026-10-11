@@ -672,6 +672,7 @@ struct BootstrapTestEngine {
     db: Arc<InternalDb>,
     validator_network: Arc<BootstrapValidatorNetwork>,
     transport_config: Option<Arc<crate::config::NodeConfigHandler>>,
+    fail_finality_sink_once: AtomicBool,
     states: RwLock<HashMap<BlockIdExt, Arc<ShardStateStuff>>>,
     blocks: RwLock<HashMap<BlockIdExt, BlockStuff>>,
     last_applied_mc_block_id: RwLock<Option<Arc<BlockIdExt>>>,
@@ -730,6 +731,7 @@ impl BootstrapTestEngine {
             db,
             validator_network: Arc::new(BootstrapValidatorNetwork::new(local_keys)),
             transport_config: None,
+            fail_finality_sink_once: AtomicBool::new(false),
             states: RwLock::new(HashMap::new()),
             blocks: RwLock::new(HashMap::new()),
             last_applied_mc_block_id: RwLock::new(None),
@@ -869,6 +871,9 @@ impl EngineOperations for BootstrapTestEngine {
         self: Arc<Self>,
         _runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
     ) -> Result<consensus_common::finality_delivery::DurableFinalitySinkPtr> {
+        if self.fail_finality_sink_once.swap(false, Ordering::SeqCst) {
+            fail!("Injected transient finality sink initialization failure");
+        }
         Ok(Arc::new(BootstrapUnavailableFinalitySink))
     }
 

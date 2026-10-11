@@ -949,6 +949,22 @@ fn test_prepare_start_rejects_duplicate_pending_start() {
 }
 
 #[test]
+fn test_sink_admission_failure_retains_precreated_session_owner() {
+    let mut group = make_group_impl_for_start_tests();
+    let session = Arc::new(MockSimplexSession::default());
+    let holder = Arc::new(super::consensus::SessionHolder::simplex(session.clone()));
+    group.session = Some(holder.clone());
+    group.status = ValidatorGroupStatus::EngineCreated;
+    assert!(group.prepare_start());
+    group.release_start_reservation();
+    assert!(!group.start_pending);
+    assert!(group.status == ValidatorGroupStatus::EngineCreated);
+    assert!(Arc::ptr_eq(group.session.as_ref().unwrap(), &holder));
+    assert_eq!(session.stop_calls.load(Ordering::SeqCst), 0);
+    assert!(group.prepare_start(), "existing engine must remain retryable");
+}
+
+#[test]
 fn test_reset_after_start_failure_restores_retryable_state() {
     let mut group = make_group_impl_for_start_tests();
 
