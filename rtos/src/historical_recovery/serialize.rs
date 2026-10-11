@@ -82,6 +82,60 @@ mod tests {
     use crate::history_read_budget::HistoryReadLimits;
     use rtos_block::BuilderData;
     #[test]
+    fn historical_bounded_large_snapshot_uses_default_request_budget_twice() -> Result<()> {
+        // Match the multipart Engine fixture's real, non-deduplicated graph.
+        // This isolates default request accounting; it is not an Engine test.
+        let mut level = (0..18_000u32)
+            .map(|index| {
+                let mut bytes = vec![0x63; 127];
+                bytes[..4].copy_from_slice(&index.to_be_bytes());
+                BuilderData::with_raw(bytes, 127 * 8)?.into_cell()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        while level.len() > 1 {
+            level = level
+                .chunks(2)
+                .map(|children| {
+                    if children.len() == 1 {
+                        return Ok(children[0].clone());
+                    }
+                    let mut parent = BuilderData::new();
+                    for child in children {
+                        parent.checked_append_reference(child.clone())?;
+                    }
+                    parent.into_cell()
+                })
+                .collect::<Result<Vec<_>>>()?;
+        }
+        let root = level.pop().unwrap();
+        let raw = rtos_block::write_boc(&root)?;
+        assert!(raw.len() > 2 << 20);
+        let budget = HistoryReadBudget::new(HistoryReadLimits::default());
+        assert_eq!(budget.limits().steps, 4_000_000);
+        assert_eq!(budget.limits().cell_bytes, 128 << 20);
+        let first = budget.parse_boc(&raw)?;
+        let retained = serialize(&first, &budget)?;
+        let second = budget.parse_boc(&retained)?;
+        assert_eq!(root.repr_hash(), second.repr_hash());
+        assert_eq!(root.repr_depth(), second.repr_depth());
+        // A reused owner must eventually refuse; never silently reset quotas.
+        let mut refused = false;
+        for _ in 0..4 {
+            match budget.parse_boc(&retained) {
+                Ok(_) => (),
+                Err(error) => {
+                    assert!(crate::history_read_budget::stops_fallback(&error), "{error:#}");
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused, "repeated physical decoding escaped the cumulative budget");
+        assert!(budget.parse_boc(&retained).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn historical_bounded_serialization_roundtrips_shared_dag() -> Result<()> {
         let leaf = Cell::default();
         let mut parent = BuilderData::new();
