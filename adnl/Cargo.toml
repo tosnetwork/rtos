@@ -45,7 +45,7 @@ secrets-vault = { path = '../secrets-vault', default-features = false, features 
 
 [dev-dependencies]
 log4rs = '1.2'
-adnl = { path = ".", features = [ 'server' ] }
+adnl = { path = ".", default-features = false, features = [ 'server' ] }
 
 [features]
 client = [  ]

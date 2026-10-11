@@ -441,15 +441,16 @@ impl NodeNetwork {
             Ok(())
         };
         log::info!("Node network loops stopped. Stopping adnl...");
-        self.network_context.stack.adnl.stop().await;
+        let adnl_result = self.network_context.stack.adnl.stop_checked().await;
         log::info!("Stopped adnl");
-        match (config_result, workers_result, quic_result) {
-            (Ok(()), Ok(()), Ok(())) => Ok(()),
-            (config, workers, quic) => Err(error!(
-                "Network shutdown: config={:?}; workers={:?}; QUIC={:?}",
+        match (config_result, workers_result, quic_result, adnl_result) {
+            (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
+            (config, workers, quic, adnl) => Err(error!(
+                "Network shutdown: config={:?}; workers={:?}; QUIC={:?}; ADNL={:?}",
                 config.err(),
                 workers.err(),
-                quic.err()
+                quic.err(),
+                adnl.err()
             )),
         }
     }
