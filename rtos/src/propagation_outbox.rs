@@ -964,6 +964,17 @@ fn decode_snapshot(bytes: &[u8], domain: &OutboxDomain, limits: &Limits) -> Resu
     }) {
         fail!("Delivery stage without identity");
     }
+    // The version-1 writer required nonempty effects; version-2 introduced
+    // empty Prepared only through a Draft with a retained Delivery identity.
+    // Otherwise mark_accepted would create an identity-less Completed record
+    // that cannot be decoded on the next restart.
+    if entries.iter().any(|entry| {
+        entry.stage == PublicationStage::Prepared
+            && entry.record.effects.is_empty()
+            && !delivery_records.contains(&entry.id)
+    }) {
+        fail!("Empty Prepared publication requires a delivery identity");
+    }
     if input.offset != payload.len() {
         fail!("Trailing outbox snapshot bytes");
     }
@@ -1270,6 +1281,59 @@ mod tests {
         let mut entry = store.delivery(&identity)?.unwrap().1;
         entry.pending.push(effect(PublicationKind::Block));
         assert!(validate_recovery_record(&entry, &Limits::default()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn outbox_empty_prepared_requires_identity_but_preserves_v2_empty_intent() -> Result<()> {
+        let limits = Limits::default();
+        let mut empty = record(1);
+        empty.effects.clear();
+        let snapshot = Snapshot {
+            next_id: 2,
+            entries: vec![UnverifiedRecord {
+                id: RecordId(1),
+                stage: PublicationStage::Prepared,
+                record: empty.clone(),
+                pending: Vec::new(),
+            }],
+            deliveries: Vec::new(),
+        };
+        let encoded = encode_snapshot(&snapshot, &domain(), &limits)?;
+        for version in [1u16, 2, 3] {
+            let mut invalid = encoded.clone();
+            if version == 1 {
+                invalid.truncate(invalid.len() - DIGEST_BYTES - 4);
+                invalid.extend_from_slice(&[0; DIGEST_BYTES]);
+            }
+            invalid[8..10].copy_from_slice(&version.to_le_bytes());
+            checksum(&mut invalid);
+            let error = decode_snapshot(&invalid, &domain(), &limits).err().unwrap();
+            assert!(error.to_string().contains("Empty Prepared publication requires"));
+        }
+        // Reproduce the actual version-2 writer's legal Draft -> Prepared([])
+        // output, including its stable delivery mapping. Acceptance must still
+        // discharge this historical empty intent and survive another reopen.
+        let identity = delivery_id(&empty)?;
+        let mut legal = snapshot;
+        legal.deliveries.push(Delivery {
+            delivery_id: identity.clone(),
+            record_id: RecordId(1),
+            last_mc: 7,
+            candidate_already_sent: true,
+            origin: None,
+        });
+        let mut bytes = encode_snapshot(&legal, &domain(), &limits)?;
+        bytes[8..10].copy_from_slice(&2u16.to_le_bytes());
+        checksum(&mut bytes);
+        let disk = Arc::new(MemoryStore::default());
+        *disk.bytes.lock().unwrap() = Some(bytes);
+        let store = memory(disk.clone(), limits.clone());
+        assert_eq!(store.delivery(&identity)?.unwrap().1.stage, PublicationStage::Prepared);
+        store.mark_accepted(RecordId(1))?;
+        drop(store);
+        let reopened = memory(disk, limits);
+        assert_eq!(reopened.delivery(&identity)?.unwrap().1.stage, PublicationStage::Completed);
         Ok(())
     }
 
