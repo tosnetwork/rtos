@@ -44,6 +44,7 @@ impl EngineOperations for DummyEngine {
 struct MockSimplexSession {
     requests: Mutex<Vec<(BlockIdExt, EnsureCandidateAvailabilityOptions)>>,
     stopped: AtomicBool,
+    drained: AtomicBool,
     stop_calls: std::sync::atomic::AtomicUsize,
     panic_on_stop: AtomicBool,
     stop_gate: Mutex<Option<(tokio::sync::oneshot::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
@@ -56,6 +57,20 @@ impl Display for MockSimplexSession {
 }
 
 impl Session for MockSimplexSession {
+    fn stop_checked(&self) -> Result<()> {
+        self.stop();
+        Ok(())
+    }
+
+    fn destroy_checked(&self) -> Result<()> {
+        self.stop_checked()
+    }
+
+    fn threads_drained(&self) -> bool {
+        // A stop request is not the held synchronous worker's completion proof.
+        self.drained.load(Ordering::Acquire)
+    }
+
     fn start(&self, _prev_blocks: Vec<BlockIdExt>, _min_masterchain_block_id: BlockIdExt) {}
 
     fn stop(&self) {
@@ -66,6 +81,7 @@ impl Session for MockSimplexSession {
             release.recv_timeout(Duration::from_secs(10)).expect("stop gate watchdog");
         }
         self.stopped.store(true, Ordering::Relaxed);
+        self.drained.store(true, Ordering::Release);
     }
 
     fn stop_async(&self) {
