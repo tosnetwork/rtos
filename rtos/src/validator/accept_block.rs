@@ -998,6 +998,7 @@ enum AcceptedFinality {
         _verified: rtos_api::pq_finality::VerifiedPqSignatures,
     },
     Approval {
+        carrier: rtos_api::pq_finality::PqApproval,
         _verified: rtos_api::pq_finality::VerifiedPqApproval,
     },
 }
@@ -1035,10 +1036,16 @@ impl AcceptedSessionBlock {
             AcceptedFinality::Final { carrier, .. } => {
                 rtos_api::pq_finality::PqNetworkSignatureSet::from_final_fields(carrier)
             }
-            AcceptedFinality::Approval { .. } => {
-                fail!("Approval cannot authorize finality publication")
+            AcceptedFinality::Approval { carrier, .. } => {
+                rtos_api::pq_finality::PqNetworkSignatureSet::from_approval(carrier)
             }
         }
+    }
+    pub fn final_network_signatures(&self) -> Result<rtos_api::pq_finality::PqNetworkSignatureSet> {
+        if !self.is_final() {
+            fail!("Approval cannot authorize finality publication");
+        }
+        self.network_signatures()
     }
     fn final_carrier(&self) -> Result<BlockSignaturesVariant> {
         match &self.finality {
@@ -1117,6 +1124,25 @@ pub async fn accept_session_block(
     }
     let context =
         context.ok_or_else(|| error!("PQ acceptance requires authenticated session context"))?;
+    // Preserve the legacy already-applied shortcut, but only after authenticating
+    // the supplied evidence. The new result-returning API intentionally rebuilds
+    // publication data instead, so failed dissemination can be retried.
+    let verifier = context.for_block(id.clone())?;
+    match &finality {
+        SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(carrier)) => {
+            verifier.verify_final(carrier)?;
+        }
+        SessionFinality::PqApproval(approval) => {
+            verifier.verify_approval(approval)?;
+        }
+        _ => fail!("PQ acceptance requires PQ finality"),
+    }
+    if prev.is_empty() || prev.len() > 2 {
+        fail!("`prev` has invalid length");
+    }
+    if engine.load_block_handle(&id)?.is_some_and(|handle| handle.is_applied()) {
+        return Ok(());
+    }
     let accepted =
         accept_pq_session_block(id, data, prev, finality, context, engine.clone()).await?;
     // Legacy callers keep their existing dissemination behavior. The v2 path
@@ -1149,9 +1175,10 @@ pub async fn accept_pq_session_block(
             let verified = verifier.verify_final(carrier)?;
             AcceptedFinality::Final { carrier: carrier.clone(), _verified: verified }
         }
-        SessionFinality::PqApproval(approval) => {
-            AcceptedFinality::Approval { _verified: verifier.verify_approval(approval)? }
-        }
+        SessionFinality::PqApproval(approval) => AcceptedFinality::Approval {
+            carrier: approval.clone(),
+            _verified: verifier.verify_approval(approval)?,
+        },
         _ => fail!("PQ acceptance requires PQ finality"),
     };
     if prev.is_empty() || prev.len() > 2 {

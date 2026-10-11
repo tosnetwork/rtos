@@ -465,3 +465,98 @@ async fn pq_live_accept_notarized_state_promotes_only_with_authenticated_final()
     assert_eq!(engine.proofs.load(Ordering::Relaxed), 2);
     assert_eq!(engine.tops.load(Ordering::Relaxed), 1);
 }
+
+#[tokio::test]
+async fn pq_live_accept_result_separates_persistence_publication_and_inclusion() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (block, state, context, _, approval) = node_fixture("current", "notarize");
+    let storage = crate::collator_test_bundle::create_block_handle_storage(None).unwrap();
+    let handle = storage
+        .create_handle(block.id().clone(), storage::types::BlockMeta::default(), None)
+        .unwrap()
+        .unwrap();
+    handle.set_data();
+    handle.set_state();
+    let engine = Arc::new(PqAcceptEngine {
+        handle: handle.clone(),
+        state,
+        proof: Default::default(),
+        proofs: AtomicUsize::new(0),
+        tops: AtomicUsize::new(0),
+        broadcasts: AtomicUsize::new(0),
+    });
+    let prev = BlockIdExt::with_params(
+        block.id().shard().clone(),
+        41,
+        UInt256::from([41; 32]),
+        UInt256::from([42; 32]),
+    );
+    let data = rtos_block::write_boc(block.root_cell()).unwrap();
+    let approved = accept_pq_session_block(
+        block.id().clone(),
+        Some(data.clone()),
+        vec![prev.clone()],
+        SessionFinality::PqApproval(PqApproval::from_notarization_fields(approval).unwrap()),
+        context.clone(),
+        engine.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(approved.phase(), AcceptancePhase::Preapplied);
+    assert!(!approved.is_final());
+    assert!(!approved.network_signatures().unwrap().is_final());
+    assert!(approved.final_network_signatures().is_err());
+    assert_eq!(engine.tops.load(Ordering::Relaxed), 0);
+    assert_eq!(engine.broadcasts.load(Ordering::Relaxed), 0);
+
+    let (_, _, _, _, finality) = node_fixture("current", "finalize");
+    let accepted = accept_pq_session_block(
+        block.id().clone(),
+        Some(data.clone()),
+        vec![prev.clone()],
+        SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(finality.clone())),
+        context.clone(),
+        engine.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(accepted.is_final());
+    assert_eq!(accepted.phase(), AcceptancePhase::Preapplied);
+    assert!(!accepted.already_present());
+    assert!(accepted.final_network_signatures().unwrap().is_final());
+    assert_eq!(engine.proofs.load(Ordering::Relaxed), 2);
+    assert_eq!(engine.tops.load(Ordering::Relaxed), 0);
+    assert_eq!(engine.broadcasts.load(Ordering::Relaxed), 0);
+
+    // This mock represents inclusion already recorded elsewhere; it is not an
+    // execution or MC-proof test. Reconstructing a publication must not rewrite
+    // the accepted proof or require apply to run a second time.
+    handle.set_block_applied();
+    let retried = accept_pq_session_block(
+        block.id().clone(),
+        Some(data.clone()),
+        vec![prev.clone()],
+        SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(finality.clone())),
+        context.clone(),
+        engine.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(retried.already_present());
+    assert_eq!(retried.phase(), AcceptancePhase::Applied);
+    assert_eq!(engine.proofs.load(Ordering::Relaxed), 2);
+    assert_eq!(retried.network_signatures().unwrap().block_id(), block.id());
+    let mut invalid = finality;
+    invalid.signatures[0].signature[0] ^= 1;
+    assert!(accept_pq_session_block(
+        block.id().clone(),
+        Some(data),
+        vec![prev],
+        SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(invalid)),
+        context,
+        engine.clone(),
+    )
+    .await
+    .is_err());
+    assert_eq!(engine.proofs.load(Ordering::Relaxed), 2);
+}
