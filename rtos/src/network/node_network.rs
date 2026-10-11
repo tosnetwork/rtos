@@ -142,6 +142,7 @@ declare_counted!(
 type ValidatorAdnlKeyIds = lockfree::map::Map<i32, ValidatorAdnlKeyId>;
 
 struct ValidatorContext {
+    overlay_lifecycle: std::sync::Mutex<()>,
     private_overlays: Arc<lockfree::map::Map<Arc<OverlayShortId>, Arc<CatchainClient>>>,
     catchain_overlays: Arc<lockfree::map::Map<Arc<PrivateOverlayShortId>, CatchainOverlayPtr>>,
     adnl_key_ids: Arc<ValidatorAdnlKeyIds>,
@@ -292,6 +293,7 @@ impl NodeNetwork {
         )?;
 
         let validator_context = ValidatorContext {
+            overlay_lifecycle: std::sync::Mutex::new(()),
             private_overlays: Arc::new(lockfree::map::Map::new()),
             catchain_overlays: Arc::new(lockfree::map::Map::new()),
             adnl_key_ids: Arc::new(lockfree::map::Map::new()),
@@ -1155,6 +1157,7 @@ impl PrivateOverlayOperations for NodeNetwork {
             })?;
 
         if USE_CATCHAIN_ADNL_OVERLAY {
+            let _lifecycle = self.validator_context.overlay_lifecycle.lock().unwrap();
             let overlay = self.network_context.catchain_overlay_manager.start_overlay(
                 &local_validator_key,
                 overlay_short_id,
@@ -1202,28 +1205,60 @@ impl PrivateOverlayOperations for NodeNetwork {
         Ok(client as Arc<dyn CatchainOverlay + Send>)
     }
 
+    fn stop_catchain_client_checked(
+        &self,
+        id: &Arc<PrivateOverlayShortId>,
+        overlay: &consensus_common::ConsensusOverlayPtr,
+    ) -> Result<()> {
+        let _lifecycle = self.validator_context.overlay_lifecycle.lock().unwrap();
+        let manager = &self.network_context.catchain_overlay_manager;
+        match self.validator_context.catchain_overlays.get(id) {
+            Some(current) if !Arc::ptr_eq(current.val(), overlay) => {
+                fail!("Consensus overlay generation does not match registered id {id}");
+            }
+            Some(_) => {}
+            None if manager.overlay_drained(overlay) => return Ok(()),
+            None => fail!("Consensus overlay is not registered under id {id}"),
+        }
+        let result = manager.stop_overlay_checked(id, overlay);
+        if manager.overlay_drained(overlay) {
+            // Creation and retirement share this lock: the pointer check cannot
+            // race installation of a successor with the same overlay id.
+            if self
+                .validator_context
+                .catchain_overlays
+                .get(id)
+                .is_some_and(|current| Arc::ptr_eq(current.val(), overlay))
+            {
+                self.validator_context.catchain_overlays.remove(id);
+            }
+        }
+        result
+    }
+
+    fn catchain_client_drained(&self, overlay: &consensus_common::ConsensusOverlayPtr) -> bool {
+        self.network_context.catchain_overlay_manager.overlay_drained(overlay)
+    }
+
     fn stop_catchain_client(&self, overlay_short_id: &Arc<PrivateOverlayShortId>) {
         if let Some(catchain_client) =
             self.validator_context.private_overlays.remove(overlay_short_id)
         {
             let client = catchain_client.val().clone();
-
             self.runtime_handle.spawn(async move {
                 client.stop().await;
             });
-        } else if let Some(catchain_overlay) =
-            self.validator_context.catchain_overlays.get(overlay_short_id)
-        {
-            let catchain_overlay = catchain_overlay.val();
-
-            // Stop the catchain overlay using the overlay manager
-            self.network_context
-                .catchain_overlay_manager
-                .stop_overlay(overlay_short_id, catchain_overlay);
-
-            // Remove the catchain overlay from the map
-            let _catchain_overlay =
-                self.validator_context.catchain_overlays.remove(overlay_short_id);
+        } else {
+            let overlay = self
+                .validator_context
+                .catchain_overlays
+                .get(overlay_short_id)
+                .map(|entry| entry.val().clone());
+            if let Some(overlay) = overlay {
+                if let Err(error) = self.stop_catchain_client_checked(overlay_short_id, &overlay) {
+                    log::error!("Consensus overlay shutdown: {error}");
+                }
+            }
         }
     }
 }
