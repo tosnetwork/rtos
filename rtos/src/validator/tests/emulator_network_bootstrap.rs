@@ -849,8 +849,29 @@ impl BootstrapTestEngine {
     }
 }
 
+// This adapter exercises manager startup and retirement only. It has no node
+// publication WAL and must never acknowledge durable finality.
+struct BootstrapUnavailableFinalitySink;
+
+impl consensus_common::finality_delivery::DurableFinalitySink for BootstrapUnavailableFinalitySink {
+    fn stage(
+        &self,
+        _draft: consensus_common::finality_delivery::FinalizedDeliveryDraft,
+        _completion: consensus_common::finality_delivery::FinalizedDeliveryCompletion,
+    ) -> Result<()> {
+        fail!("Bootstrap manager adapter has no publication WAL")
+    }
+}
+
 #[async_trait::async_trait]
 impl EngineOperations for BootstrapTestEngine {
+    async fn durable_finality_sink(
+        self: Arc<Self>,
+        _runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+    ) -> Result<consensus_common::finality_delivery::DurableFinalitySinkPtr> {
+        Ok(Arc::new(BootstrapUnavailableFinalitySink))
+    }
+
     fn zerostate_id(&self) -> Result<&BlockIdExt> { Ok(&self.init_mc_block_id) }
     fn adnl_key_by_id(&self, id: &Arc<rtos_block::KeyId>) -> Option<PrivateKey> {
         self.validator_network.transport_keys.iter().find(|key| key.id() == id).cloned()
