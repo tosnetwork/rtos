@@ -610,6 +610,57 @@ impl ArchiveSlice {
         Ok(Some(entry))
     }
 
+    pub async fn get_file_bounded<B: Borrow<BlockIdExt> + Hash>(
+        &self,
+        handle: &BlockHandle,
+        entry_id: &PackageEntryId<B>,
+        limits: super::bounded_read::ArchiveReadLimits,
+    ) -> Result<Option<PackageEntry>> {
+        self.get_file_raw_bounded(get_mc_seq_no(handle), handle.id().shard(), entry_id, limits).await
+    }
+
+    async fn get_file_raw_bounded<B: Borrow<BlockIdExt> + Hash>(
+        &self,
+        mc_seq_no: u32,
+        shard: &ShardIdent,
+        entry_id: &PackageEntryId<B>,
+        limits: super::bounded_read::ArchiveReadLimits,
+    ) -> Result<Option<PackageEntry>> {
+        let offset_key = entry_id.into();
+        let offset = match self.offsets_db.try_get_value(&offset_key)? {
+            Some(offset) => offset,
+            None => {
+                log::warn!(
+                    target: TARGET,
+                    "Inconsistent archive: offsets_db missing entry {entry_id} \
+                     (slice archive_id={}, shard={shard}, mc_seq_no={mc_seq_no})",
+                    self.archive_id,
+                );
+                return Ok(None);
+            }
+        };
+        let package_info = match self.choose_package(mc_seq_no, shard).await? {
+            ChosenPackage::Info(info) => info,
+            ChosenPackage::Slot(_) => {
+                fail!(
+                    "mc_seq_no {mc_seq_no} is too big to get file {entry_id} from archive {}",
+                    self.archive_id
+                );
+            }
+        };
+        log::debug!(
+            target: TARGET,
+            "Reading package entry: {}, offset: {offset}",
+            package_info.package().get_path()
+        );
+        let entry = package_info.package().read_entry_bounded(offset, limits).await?;
+        if entry.filename() != entry_id.filename() { fail!("Archive entry filename mismatch"); }
+        if entry.data().is_empty() {
+            fail!("Read entry ({}) is corrupted! It can't have zero length!", entry_id);
+        }
+        Ok(Some(entry))
+    }
+
     pub async fn get_slice(&self, archive_id: u64, offset: u64, limit: u32) -> Result<Vec<u8>> {
         if archive_id as u32 != self.archive_id {
             fail!(

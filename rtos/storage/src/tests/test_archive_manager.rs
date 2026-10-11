@@ -848,3 +848,38 @@ async fn test_import_group_boundary_and_resume() -> Result<()> {
     drop(reopened_db);
     Ok(())
 }
+
+#[tokio::test]
+async fn bounded_archive_manager_preserves_flags_and_reads_loose_and_packed() -> Result<()> {
+    use crate::archives::bounded_read::{ArchiveReadLimitExceeded, ArchiveReadLimits};
+    let dir = tempfile::tempdir()?;
+    let (manager, db) = create_manager(dir.path().to_str().unwrap(), "bounded", false).await?;
+    let (handles, _) = create_block_handle_storage(db.clone());
+    let id = BlockIdExt::with_params(ShardIdent::masterchain(), 1,
+        UInt256::with_array([7;32]), UInt256::with_array([8;32]));
+    let handle = handles.create_handle(id.clone(), BlockMeta::with_data(0,0,0,0,0), None)?.unwrap();
+    let entry = PackageEntryId::Proof(&id);
+    manager.add_file(&entry, b"proof").await?;
+    handle.set_proof();
+    handle.set_block_applied();
+    let limits = ArchiveReadLimits { data_bytes: 5, filename_bytes: 1024 };
+    for packed in [false, true] {
+        if packed {
+            manager.move_to_archive(&handle, || Ok(())).await?;
+            handle.set_archived();
+        }
+        assert_eq!(manager.get_file_bounded(&handle, &entry, limits).await?, b"proof");
+        let error = manager.get_file_bounded(&handle, &entry,
+            ArchiveReadLimits { data_bytes: 4, ..limits }).await.unwrap_err();
+        assert!(error.downcast_ref::<ArchiveReadLimitExceeded>().is_some());
+        assert_eq!(handle.is_archived(), packed);
+        assert!(handle.has_proof());
+        let error = manager.get_file_bounded(&handle, &entry,
+            ArchiveReadLimits { filename_bytes: 1, ..limits }).await.unwrap_err();
+        assert!(error.downcast_ref::<ArchiveReadLimitExceeded>().is_some());
+        assert_eq!(manager.get_file(&handle, &entry).await?, b"proof");
+    }
+    drop(handle); drop(handles); drop(manager); drop(db);
+    // TempDir owns cleanup; avoid destroy_rocks_db removing its empty parent.
+    Ok(())
+}

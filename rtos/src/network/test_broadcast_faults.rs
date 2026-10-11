@@ -28,6 +28,7 @@ pub(crate) struct BroadcastFaults(
     Mutex<State>,
     Mutex<Option<RepairLoss>>,
     Mutex<Option<RepairCapture>>,
+    Mutex<Option<([u8; 32], Arc<Mutex<Vec<Vec<u8>>>>)>>,
 );
 
 struct RepairCapture {
@@ -49,6 +50,28 @@ pub(crate) struct RepairReceipts {
 }
 
 impl BroadcastFaults {
+    pub fn capture_candidate_replies(&self, peer: [u8; 32]) -> Arc<Mutex<Vec<Vec<u8>>>> {
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        *self.3.lock().unwrap() = Some((peer, replies.clone()));
+        replies
+    }
+
+    fn candidate_capture(
+        &self,
+        bytes: &[u8],
+        peers: &AdnlPeers,
+    ) -> Option<Arc<Mutex<Vec<Vec<u8>>>>> {
+        let capture = self.3.lock().unwrap();
+        let (peer, replies) = capture.as_ref()?;
+        if peer != peers.other().data() {
+            return None;
+        }
+        let objects = rtos_api::WireProfile::T0.deserialize_bundle(bytes).ok()?;
+        (objects.len() == 2
+            && objects[1].is::<rtos_api::ton::rpc::consensus::simplex::RequestCandidate>())
+        .then(|| replies.clone())
+    }
+
     pub fn capture_repair_replies(&self, peer: [u8; 32]) {
         *self.2.lock().unwrap() = Some(RepairCapture { peer, replies: vec![] });
     }
@@ -207,6 +230,40 @@ impl Subscriber for ObservedOverlay {
         let budget = self.faults.repair_budget(bytes, peers);
         // Let the real overlay authenticate the query and build its reply first.
         let result = self.overlay.try_consume_raw_query(bytes, peers).await?;
+        let result = if let Some(capture) = self.faults.candidate_capture(bytes, peers) {
+            let record = move |answer: &Option<adnl::common::Answer>| -> Result<()> {
+                let wire = match answer {
+                    Some(adnl::common::Answer::Raw(data)) => data.object.clone(),
+                    Some(adnl::common::Answer::Object(data)) => {
+                        rtos_api::WireProfile::T0.serialize(&data.object)?
+                    }
+                    None => return Ok(()),
+                };
+                let mut replies = capture.lock().unwrap();
+                assert!(
+                    wire.len() <= 1 << 20 && replies.len() < 128,
+                    "candidate observation budget"
+                );
+                replies.push(wire);
+                Ok(())
+            };
+            match result {
+                Some(QueryAnswer::Ready(answer)) => {
+                    record(&answer)?;
+                    Some(QueryAnswer::Ready(answer))
+                }
+                Some(QueryAnswer::Pending(task)) => {
+                    Some(QueryAnswer::Pending(tokio::spawn(async move {
+                        let answer = task.await??;
+                        record(&answer.answer)?;
+                        Ok(answer)
+                    })))
+                }
+                None => None,
+            }
+        } else {
+            result
+        };
         self.faults.record_repair_reply(bytes, peers, &result)?;
         if let (Some(budget), Some(_)) = (budget, result.as_ref()) {
             use std::sync::atomic::Ordering;

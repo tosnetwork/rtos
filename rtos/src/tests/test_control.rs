@@ -773,13 +773,19 @@ async fn test_stats() {
         }
     }
 
-    fn check_stats(stats: &Stats, engine: &Arc<TestEngine>, key_id: &Arc<KeyId>, new_format: bool) {
+    fn check_stats(
+        stats: &Stats,
+        engine: &Arc<TestEngine>,
+        key_id: &Arc<KeyId>,
+        new_format: bool,
+        request_started: u64,
+    ) {
         let master_block_id = ControlQuerySubscriber::block_id_to_json(&engine.master_state_id);
         let node_version = format!("\"{}\"", env!("CARGO_PKG_VERSION"));
         let overlay_key = format!("\"{}\"", key_id);
         let supported_capabilities = format!("{}", supported_capabilities());
         let supported_version = format!("{}", supported_version());
-        let timediff = UnixTime::now();
+        let response_received = UnixTime::now();
         let mut ethalon_stats = HashMap::new();
         if !new_format {
             add_ethalon(&mut ethalon_stats, "collation_stats", "{}");
@@ -829,16 +835,16 @@ async fn test_stats() {
             }
             match ethalon.val {
                 "timediff" => {
-                    let ethalon = format!("{}", timediff);
-                    value_ok(&stat.value, &ethalon)
-                        .or_else(|| {
-                            let ethalon = format!("{}", timediff - 1);
-                            value_ok(&stat.value, &ethalon)
-                        })
-                        .or_else(|| {
-                            let ethalon = format!("{}", timediff + 1);
-                            value_ok(&stat.value, &ethalon)
-                        })
+                    // The server samples its clock during the request, not when
+                    // this task is eventually scheduled to inspect the reply.
+                    // Both fixture block timestamps are one second after epoch.
+                    stat.value.parse::<u64>().ok().and_then(|diff| {
+                        diff.checked_add(1)
+                            .filter(|sampled| {
+                                (request_started..=response_received).contains(sampled)
+                            })
+                            .map(|_| ())
+                    })
                 }
                 _ => value_ok(&stat.value, ethalon.val),
             }
@@ -861,12 +867,14 @@ async fn test_stats() {
         let (control, mut client, _, key_id) =
             start_control(DataSource::Engine(engine.clone()), "test_stats").await?;
 
+        let request_started = UnixTime::now();
         let answer: Stats = request(&mut client, GetStats).await?;
-        check_stats(&answer, &engine, &key_id, false);
+        check_stats(&answer, &engine, &key_id, false, request_started);
 
+        let request_started = UnixTime::now();
         let answer: Stats =
             request(&mut client, GetSelectedStats { filter: "*".to_string() }).await?;
-        check_stats(&answer, &engine, &key_id, true);
+        check_stats(&answer, &engine, &key_id, true, request_started);
 
         client.shutdown().await?;
         control.shutdown().await;

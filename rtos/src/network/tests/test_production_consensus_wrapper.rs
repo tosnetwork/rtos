@@ -106,6 +106,9 @@ async fn production_wrapper_held_query_profile_generation_and_sticky_failure() -
         let wrapper =
             Arc::new(ConsensusOverlayManagerImpl::new(network.clone(), list_id.clone(), None));
         let result = std::panic::AssertUnwindSafe(async {
+            // Node construction schedules transport registration callbacks.
+            // Membership selection alone does not guarantee their completion.
+            network.config_handler.wait_test_subscribers().await?;
             let selected = network.set_validator_list(list_id.clone(), &nodes).await?;
             let crate::engine_traits::ValidatorListOutcome::Selected { key, .. } = selected else {
                 fail!("fixture failed to register real local transport");
@@ -119,7 +122,7 @@ async fn production_wrapper_held_query_profile_generation_and_sticky_failure() -
                 .validator_context
                 .sets_contexts
                 .get(&list_id)
-                .unwrap()
+                .expect("transport registration must finish before wrapper dispatch")
                 .val()
                 .validator_adnl_key
                 .id()

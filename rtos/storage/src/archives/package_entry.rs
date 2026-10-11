@@ -81,6 +81,24 @@ impl PackageEntry {
         Ok(Some(Self::with_data(filename, data)))
     }
 
+    pub(super) async fn read_from_bounded<R: tokio::io::AsyncReadExt + Unpin>(
+        reader: &mut R,
+        limits: super::bounded_read::ArchiveReadLimits,
+    ) -> Result<Self> {
+        let mut header = [0; PKG_ENTRY_HEADER_SIZE];
+        reader.read_exact(&mut header).await?;
+        let header = PackageEntryHeader::deserialize(&header)?;
+        // Both lengths are checked before either attacker-sized allocation.
+        let filename_size = super::bounded_read::check_length("filename", u64::from(header.filename_size), limits.filename_bytes)?;
+        let data_size = super::bounded_read::check_length("data", u64::from(header.data_size), limits.data_bytes)?;
+        let mut filename = vec![0; filename_size];
+        reader.read_exact(&mut filename).await?;
+        let filename = String::from_utf8(filename)?;
+        let mut data = vec![0; data_size];
+        reader.read_exact(&mut data).await?;
+        Ok(Self::with_data(filename, data))
+    }
+
     pub(super) async fn write_to<W: tokio::io::AsyncWriteExt + Unpin>(
         &self,
         writer: &mut W,
@@ -116,5 +134,31 @@ impl PackageEntry {
         PKG_ENTRY_HEADER_SIZE as u64
             + self.filename.as_bytes().len() as u64
             + self.data.len() as u64
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use crate::archives::bounded_read::{ArchiveReadLimitExceeded, ArchiveReadLimits};
+    #[tokio::test]
+    async fn bounded_archive_header_rejects_before_payload_read() -> Result<()> {
+        let limits = ArchiveReadLimits { data_bytes: 4, filename_bytes: 8 };
+        for (filename_size, data_size) in [(1, u32::MAX), (u16::MAX, 1)] {
+            // Header only: a payload read would fail with EOF rather than the
+            // typed limit. No attacker-sized payload exists in this fixture.
+            let header = PackageEntryHeader { filename_size, data_size }.serialize();
+            let mut input = header.as_slice();
+            let error = PackageEntry::read_from_bounded(&mut input, limits).await.err().unwrap();
+            assert!(error.downcast_ref::<ArchiveReadLimitExceeded>().is_some());
+            assert!(input.is_empty());
+        }
+        let header = PackageEntryHeader { filename_size: 1, data_size: 4 }.serialize();
+        for length in 0..header.len() {
+            assert!(PackageEntry::read_from_bounded(&mut &header[..length], limits).await.is_err());
+        }
+        let mut invalid = header; invalid[0] ^= 1;
+        assert!(PackageEntry::read_from_bounded(&mut invalid.as_slice(), limits).await.is_err());
+        Ok(())
     }
 }
