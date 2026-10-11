@@ -30,7 +30,7 @@ impl PublicationWorker {
 }
 
 impl State {
-    fn validate_close_runtime(
+    pub(super) fn validate_close_runtime(
         &self,
         runtime: &AuthenticatedSessionRuntime,
         request: &CloseFinalityRequest,
