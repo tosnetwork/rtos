@@ -204,11 +204,10 @@ pub fn authenticate_source_history_debt(
         budget.workspace(
             1024 * std::mem::size_of::<rtos_api::ton::consensus::simplex::VoteSignature>(),
         )?;
-        let (actual, certificate) = decode_intent(&path, &record.namespace, &bytes)?;
+        let (actual, _certificate, wire) = decode_intent_typed(&path, &record.namespace, &bytes)?;
         if !same_record(record, &actual) {
             fail!("Source history certificate locator mismatch");
         }
-        let wire = runtime.wire_profile().deserialize_typed(&certificate)?;
         budget.workspace(
             runtime
                 .committee()
@@ -395,6 +394,41 @@ mod tests {
         let error = authenticate_source_history_debt(&record, &runtime, &DenyVector).err().unwrap();
         assert!(error.to_string().contains("TL vector allocation limit"));
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(authenticate_source_history_debt(&record, &runtime, &Budget).is_ok());
+    }
+    #[test]
+    fn source_history_debt_declared_signature_bytes_rejected_before_allocation() {
+        let root = crate::authenticated_fixture::TestDirectory::new();
+        let (runtime, record, path) = retained(root.path());
+        let original = std::fs::read(&path).unwrap();
+        let mut disk: DiskIntent = serde_json::from_slice(&original).unwrap();
+        let raw = hex::decode(&disk.certificate).unwrap();
+        let wire: rtos_api::ton::consensus::simplex::Certificate =
+            WireProfile::T0.deserialize_value_bounded(&raw, raw.len()).unwrap();
+        let signature = wire.signatures().votes()[0].signature();
+        assert!(signature.len() > 253);
+        let start =
+            raw.windows(signature.len()).position(|bytes| bytes == signature.as_slice()).unwrap();
+        assert_eq!(raw[start - 4], 254, "real fixture signature uses u24 length");
+        let mut malicious = raw[..start - 4].to_vec();
+        malicious.extend_from_slice(&[254, 0xff, 0xff, 0x7f]);
+        assert!(malicious.len() < 1024, "test must remain a small declared-length attack");
+        disk.certificate = hex::encode(malicious);
+        let invalid = serde_json::to_vec(&disk).unwrap();
+        std::fs::write(&path, &invalid).unwrap();
+        // Both the ordinary scanner and gate share the same allocation guard.
+        let scanner_error = read_intent(&path, &record.namespace).err().unwrap();
+        let gate_error =
+            authenticate_source_history_debt(&record, &runtime, &Budget).err().unwrap();
+        for error in [scanner_error, gate_error] {
+            let limit = error
+                .downcast_ref::<rtos_api::DecodeLimitExceeded>()
+                .expect("typed preallocation refusal");
+            assert_eq!(limit.actual, 0x7fffff);
+            assert!(limit.limit < 1024);
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), invalid);
+        std::fs::write(&path, original).unwrap();
         assert!(authenticate_source_history_debt(&record, &runtime, &Budget).is_ok());
     }
 }
