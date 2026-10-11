@@ -71,7 +71,9 @@ fn checked_pss_slice(
     limits: adnl::QueryResponseLimits,
 ) -> Result<(i64, i64)> {
     limits.validate()?;
-    if max_size == 0 || max_size > (1 << 21) || limits.decoded_bytes > max_size {
+    if max_size == 0 || max_size > (1 << 21)
+        || limits.wire_bytes > max_size || limits.decoded_bytes > max_size
+    {
         fail!("Invalid bounded PSS slice size");
     }
     let end = offset.checked_add(max_size).ok_or_else(|| rtos_block::error!("PSS range overflow"))?;
