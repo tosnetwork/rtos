@@ -128,6 +128,11 @@ impl Pair {
             mc_root.repr_hash().clone(),
             UInt256::calc_file_hash(&mc_data),
         );
+        let (master, proof, master_state_root) = if source_transport {
+            persistent_closure_engine_tests::source_bootstrap(&anchor, &mc_root)
+        } else {
+            (master, proof, read_single_root_boc(&decode(&row["state_boc"])).unwrap().repr_hash().clone())
+        };
         let dir = tempfile::tempdir().unwrap();
         let receiver_dir = dir.path().join("receiver");
         let provider_dir = dir.path().join("provider");
@@ -332,10 +337,7 @@ impl Pair {
                 .repr_hash()
                 .clone(),
             master,
-            master_state_root: read_single_root_boc(&decode(&row["state_boc"]))
-                .unwrap()
-                .repr_hash()
-                .clone(),
+            master_state_root,
         }
     }
 
