@@ -366,7 +366,8 @@ impl SourceFinalityDelivery {
         self.intents.retain(&self.runtime, prevs, self.start_masterchain.lock().unwrap().clone().ok_or_else(|| error!("Source start anchor not bound"))?, event)
     }
     pub(crate) fn resolve_intent(&self, id: &crate::block::RawCandidateId) -> Result<()> { self.intents.resolve(id) }
-    pub(crate) fn pending_intents(&self) -> Result<Vec<Vec<u8>>> { self.intents.pending() }
+    pub(crate) fn pending_intent_count(&self) -> Result<usize> { self.intents.pending_count() }
+    pub(crate) fn pending_intents(&self) -> Result<Vec<Vec<u8>>> { self.intents.authenticate_pending(&self.runtime)?; self.intents.pending() }
 
     /// None means not yet durable. Retention precedes every first stage; later
     /// attempts use the exact retained certificate, metadata and creation time.

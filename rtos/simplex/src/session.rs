@@ -740,6 +740,16 @@ impl SessionImpl {
                 Ok(description)
             })
             .and_then(|description| {
+                if authenticated_runtime.is_some() {
+                    for bytes in callbacks.pending_finality_intents()? {
+                        let wire = options.wire_profile.deserialize_typed(&bytes)?;
+                        let verified = crate::certificate::Certificate::<crate::simplex_state::Vote>::from_tl(
+                            &wire, &description, description.get_session_id())?;
+                        if !matches!(verified.vote, crate::simplex_state::Vote::Finalize(_)) {
+                            rtos_block::fail!("Durable source intent is not a FinalCert");
+                        }
+                    }
+                }
                 SessionStartupRecoveryProcessor::new(
                     session_id.clone(),
                     Arc::new(description),
@@ -976,10 +986,10 @@ impl SessionImpl {
 
         loop {
             if recovery_only {
-                match callbacks.pending_finality_intents() {
+                match callbacks.pending_finality_intent_count() {
                     Ok(pending) => {
-                        recovery_pending.store(pending.len(), Ordering::Release);
-                        recovery_complete.store(pending.is_empty(), Ordering::Release);
+                        recovery_pending.store(pending, Ordering::Release);
+                        recovery_complete.store(pending == 0, Ordering::Release);
                     },
                     Err(error) => {
                         processor.stop(false);

@@ -128,9 +128,12 @@ fn read_intent(path: &std::path::Path, namespace: &std::path::Path) -> Result<(S
 pub(crate) struct FinalityIntentStore {
     namespace: PathBuf,
     mutation: Mutex<()>,
+    unresolved: Mutex<Option<std::collections::HashSet<PathBuf>>>,
+    #[cfg(test)]
+    fail_resolve_once: std::sync::atomic::AtomicBool,
 }
 impl FinalityIntentStore {
-    pub(crate) fn new(namespace: &std::path::Path) -> Self { Self { namespace: namespace.to_owned(), mutation: Mutex::new(()) } }
+    pub(crate) fn new(namespace: &std::path::Path) -> Self { Self { namespace: namespace.to_owned(), mutation: Mutex::new(()), unresolved: Mutex::new(None), #[cfg(test)] fail_resolve_once: std::sync::atomic::AtomicBool::new(false) } }
     pub(crate) fn prepare(&self, has_existing_certificates: bool) -> Result<()> {
         let _guard = self.mutation.lock().unwrap();
         let directory = self.namespace.join(DIRECTORY);
@@ -167,6 +170,7 @@ impl FinalityIntentStore {
             read_intent(old, &self.namespace)?.0.validate_runtime(runtime)?;
             File::open(old)?.sync_all()?; File::open(&directory)?.sync_all()?; return Ok(());
         }
+        if let Some(pending) = self.unresolved.lock().unwrap().as_mut() { pending.insert(path.clone()); }
         let bytes = serde_json::to_vec(&record.disk(event)?)?;
         let paths = self.paths()?;
         let total = paths.iter().try_fold(0u64, |n, p| Ok::<_, anyhow::Error>(n + std::fs::metadata(p)?.len()))?;
@@ -174,16 +178,22 @@ impl FinalityIntentStore {
         let temporary = path.with_extension("tmp");
         let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&temporary)?;
         file.write_all(&bytes)?; file.sync_all()?; drop(file); std::fs::rename(temporary, path)?;
-        File::open(&directory)?.sync_all()?; Ok(())
+        File::open(&directory)?.sync_all()?;
+        Ok(())
     }
     pub(crate) fn resolve(&self, id: &crate::block::RawCandidateId) -> Result<()> {
         let _guard = self.mutation.lock().unwrap();
         let directory = self.namespace.join(DIRECTORY);
         let path = directory.join(format!("{}-{}.json", id.slot.value(), id.hash.to_hex_string()));
         let resolved = path.with_extension("resolved");
-        if path.exists() { std::fs::rename(path, &resolved)?; }
+        let was_pending = path.exists();
+        if was_pending { std::fs::rename(&path, &resolved)?; }
+        #[cfg(test)]
+        if self.fail_resolve_once.swap(false, std::sync::atomic::Ordering::AcqRel) { fail!("Injected source resolve sync failure after rename"); }
         read_intent(&resolved, &self.namespace)?;
-        File::open(&resolved)?.sync_all()?; File::open(directory)?.sync_all()?; Ok(())
+        File::open(&resolved)?.sync_all()?; File::open(directory)?.sync_all()?;
+        if let Some(pending) = self.unresolved.lock().unwrap().as_mut() { pending.remove(&path); }
+        Ok(())
     }
     pub(crate) fn pending(&self) -> Result<Vec<Vec<u8>>> {
         let _guard = self.mutation.lock().unwrap();
@@ -192,7 +202,23 @@ impl FinalityIntentStore {
             let (_, certificate) = read_intent(&path, &self.namespace)?;
             if path.extension().and_then(|s| s.to_str()) == Some("json") { pending.push(certificate); }
         }
+        // Initialize once: after a failed rename/fsync transition the in-process
+        // set remains authoritative until resolve retries finish all barriers.
+        let mut cached = self.unresolved.lock().unwrap();
+        if cached.is_none() {
+            *cached = Some(self.paths()?.into_iter().filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json")).collect());
+        }
         Ok(pending)
+    }
+    pub(crate) fn authenticate_pending(&self, runtime: &AuthenticatedSessionRuntime) -> Result<()> {
+        let _guard = self.mutation.lock().unwrap();
+        for path in self.paths()? { read_intent(&path, &self.namespace)?.0.validate_runtime(runtime)?; }
+        Ok(())
+    }
+    pub(crate) fn pending_count(&self) -> Result<usize> {
+        if let Some(pending) = self.unresolved.lock().unwrap().as_ref() { return Ok(pending.len()); }
+        self.pending()?;
+        Ok(self.unresolved.lock().unwrap().as_ref().unwrap().len())
     }
 }
 
@@ -291,7 +317,13 @@ mod tests {
         std::sync::Arc::make_mut(&mut different.certificate).signatures.clear();
         reopened.retain(&runtime, vec![runtime.pin().zerostate.clone()], runtime.pin().zerostate.clone(), &different).unwrap();
         assert_eq!(reopened.pending().unwrap(), original, "reconstruction must not overwrite the first proof");
-        reopened.resolve(&crate::block::RawCandidateId { slot: event.slot, hash }).unwrap();
+        let id = crate::block::RawCandidateId { slot: event.slot, hash };
+        assert_eq!(reopened.pending_count().unwrap(), 1);
+        reopened.fail_resolve_once.store(true, std::sync::atomic::Ordering::Release);
+        assert!(reopened.resolve(&id).is_err());
+        assert_eq!(reopened.pending_count().unwrap(), 1, "rename alone cannot certify durable completion");
+        reopened.resolve(&id).unwrap();
+        assert_eq!(reopened.pending_count().unwrap(), 0);
         assert!(scan_finality_recovery(directory.path()).unwrap().is_empty());
         assert_eq!(reopened.paths().unwrap().len(), 1, "canonical resolved evidence retained");
         std::fs::write(&reopened.paths().unwrap()[0], b"{broken").unwrap();

@@ -419,6 +419,29 @@ async fn source_finality_real_retired_worker_preserves_missing_body_obligation()
         anyhow::ensure!(live_scan?.is_empty(), "live namespace was stealable");
         anyhow::ensure!(crate::finality_recovery::scan_finality_recovery(directory.path())?.len() == 1,
             "checked stop discarded certificate debt");
+        // A canonical but forged source certificate must fail before the factory
+        // exposes a receiver, rather than producing an indefinitely idle owner.
+        use rtos_api::IntoBoxed;
+        let intent_path = std::fs::read_dir(path.join("finality-intents"))?.next().unwrap()?.path();
+        let mut disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&intent_path)?)?;
+        let wire: rtos_api::ton::consensus::simplex::Certificate = options.wire_profile.deserialize_typed(
+            &hex::decode(disk["certificate"].as_str().unwrap())?)?;
+        let mut wire = wire.only();
+        let mut signatures = wire.signatures.only();
+        let mut signature = signatures.votes[0].clone().only();
+        signature.signature[0] ^= 1;
+        signatures.votes[0] = signature.into_boxed();
+        wire.signatures = signatures.into_boxed();
+        disk["certificate"] = hex::encode(options.wire_profile.serialize(&wire.into_boxed())?).into();
+        std::fs::write(&intent_path, serde_json::to_vec(&disk)?)?;
+        let rejected = crate::SessionFactory::create_finality_recovery_session(&options, runtime.clone(), &key,
+            directory.path().to_str().unwrap(), &records[0], manager.clone(), Arc::downgrade(&listener), sink.clone());
+        if let Ok(session) = rejected {
+            session.stop_checked()?;
+            anyhow::bail!("Forged source FinalCert was exposed by recovery factory");
+        }
+        anyhow::ensure!(intent_path.exists(), "Rejected source evidence was deleted");
+
         Ok(())
     })();
     drop(manager);
