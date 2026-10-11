@@ -847,6 +847,10 @@ mod tests {
         assert_eq!(close_source_id(&offer.request).unwrap(), id);
         assert!(!ack.exists());
         assert!(!store.reference_path(&id).exists());
+        // Completed source history cannot be resurrected as a fresh full record.
+        assert!(store.retain(&record).is_err());
+        assert!(store.delivered_path(&id).exists());
+        assert!(!store.directory.join(format!("{}.json", id.to_hex_string())).exists());
         drop(confirmation);
         drop(store);
         // Restore a genuine old backup beside Delivered: exact historical bytes
