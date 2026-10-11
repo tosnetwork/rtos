@@ -573,11 +573,12 @@ struct BootstrapValidatorNetwork {
     contexts: RwLock<HashMap<UInt256, bool>>,
     authenticated: Option<consensus_common::ConsensusOverlayManagerPtr>,
     transport_keys: Vec<PrivateKey>,
+    authenticated_created: std::sync::atomic::AtomicUsize,
 }
 
 impl BootstrapValidatorNetwork {
     fn new(local_keys: Vec<PrivateKey>) -> Self {
-        Self { local_keys, contexts: RwLock::new(HashMap::new()), authenticated: None, transport_keys: Vec::new() }
+        Self { local_keys, contexts: RwLock::new(HashMap::new()), authenticated: None, transport_keys: Vec::new(), authenticated_created: Default::default() }
     }
 
     fn select_local_keys(&self, validators: &[CatchainNode]) -> Vec<PrivateKey> {
@@ -609,8 +610,10 @@ impl PrivateOverlayOperations for BootstrapValidatorNetwork {
         replay: consensus_common::ConsensusOverlayLogReplayListenerPtr,
         _: Option<u8>, transport: OverlayTransportType,
     ) -> Result<consensus_common::ConsensusOverlayPtr> {
-        self.authenticated.as_ref().ok_or_else(|| error!("No authenticated test transport"))?
-            .start_authenticated_overlay(key, id, runtime, listener, replay, transport)
+        let overlay = self.authenticated.as_ref().ok_or_else(|| error!("No authenticated test transport"))?
+            .start_authenticated_overlay(key, id, runtime, listener, replay, transport)?;
+        self.authenticated_created.fetch_add(1, Ordering::SeqCst);
+        Ok(overlay)
     }
     fn stop_catchain_client_checked(&self, id: &Arc<PrivateOverlayShortId>, overlay: &consensus_common::ConsensusOverlayPtr) -> Result<()> {
         self.authenticated.as_ref().ok_or_else(|| error!("No authenticated test transport"))?
@@ -668,6 +671,7 @@ impl PrivateOverlayOperations for BootstrapValidatorNetwork {
 struct BootstrapTestEngine {
     db: Arc<InternalDb>,
     validator_network: Arc<BootstrapValidatorNetwork>,
+    transport_config: Option<Arc<crate::config::NodeConfigHandler>>,
     states: RwLock<HashMap<BlockIdExt, Arc<ShardStateStuff>>>,
     blocks: RwLock<HashMap<BlockIdExt, BlockStuff>>,
     last_applied_mc_block_id: RwLock<Option<Arc<BlockIdExt>>>,
@@ -725,6 +729,7 @@ impl BootstrapTestEngine {
         Ok(Self {
             db,
             validator_network: Arc::new(BootstrapValidatorNetwork::new(local_keys)),
+            transport_config: None,
             states: RwLock::new(HashMap::new()),
             blocks: RwLock::new(HashMap::new()),
             last_applied_mc_block_id: RwLock::new(None),
@@ -860,7 +865,11 @@ impl EngineOperations for BootstrapTestEngine {
     }
 
     fn get_validator_status(&self) -> bool {
-        true
+        self.transport_config.as_ref().map_or(true, |config| config.get_validator_status())
+    }
+
+    fn consensus_transport_bindings(&self) -> Result<Vec<crate::config::ConsensusTransportBinding>> {
+        self.transport_config.as_ref().map_or_else(|| Ok(Vec::new()), |config| config.consensus_transport_bindings())
     }
 
     fn validator_network(&self) -> Arc<dyn PrivateOverlayOperations> {
@@ -1011,6 +1020,16 @@ impl EngineOperations for BootstrapTestEngine {
 
     fn engine_allocated(&self) -> &Arc<crate::engine_traits::EngineAlloc> {
         &self.allocated
+    }
+
+    fn register_service_task(&self, _: &'static str, _: u32,
+        start: Box<dyn FnOnce() -> tokio::task::JoinHandle<()> + Send>) -> Result<tokio::task::JoinHandle<()>> {
+        // Test caller owns and joins the returned actual manager task.
+        Ok(start())
+    }
+
+    async fn wait_next_applied_mc_block(&self, _: &BlockHandle, _: Option<u64>) -> Result<(Arc<BlockHandle>, BlockStuff)> {
+        futures::future::pending().await
     }
 
     fn acquire_stop(&self, _mask: u32) {}

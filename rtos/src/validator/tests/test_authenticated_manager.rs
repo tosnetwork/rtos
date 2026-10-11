@@ -41,6 +41,9 @@ async fn authenticated_manager_creates_transport_only_observer_and_retires_real_
     configure(&mut bootstrap, &observer)?;
     let (_, config) = AdnlNodeConfig::from_ip_address_and_private_keys("127.0.0.1:0", vec![([0x71; 32], 0)])?;
     let adnl = AdnlNode::with_config(config).await?;
+    // Possession of another governing member's transport key does not authorize
+    // selecting it without an explicit local stable-identity binding.
+    adnl.add_key(bootstrap.validators[0].adnl_key.clone(), 1)?;
     let dht = DhtNode::with_adnl_node(adnl.clone(), 0)?;
     let overlay = OverlayNode::with_params_and_profile(adnl.clone(), &[22; 32], 0, rtos_api::WireProfile::T0)?;
     let rldp = RldpNode::with_params(adnl.clone(), vec![overlay.clone()], None)?;
@@ -49,13 +52,35 @@ async fn authenticated_manager_creates_transport_only_observer_and_retires_real_
     adnl.start_over_udp(vec![stack.overlay.clone(), stack.dht.clone(), stack.rldp.clone()]).await?;
     let actual = consensus_common::ConsensusCommonFactory::create_adnl_overlay_manager(
         tokio::runtime::Handle::current(), stack, None, false)?;
+    let (private_json, _) = Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[0x71; 32])?;
+    let local_config = serde_json::from_value(serde_json::json!({
+        "validator_keys": [],
+        "validator_key_ring": { base64_encode(observer.id().data()): private_json },
+        "consensus_transport_bindings": [{
+            "validator_id": base64_encode([1; 32]),
+            "adnl_key_id": base64_encode(observer.id().data()),
+        }],
+    }))?;
+    let (handler, context) = crate::config::NodeConfigHandler::create(local_config, tokio::runtime::Handle::current())?;
+    handler.clone().start_sheduler(context, vec![])?;
     let mut engine = BootstrapTestEngine::new_with_local_keys(&bootstrap, Vec::new()).await?;
+    engine.transport_config = Some(handler.clone());
     let network = Arc::get_mut(&mut engine.validator_network).unwrap();
     network.authenticated = Some(actual);
-    network.transport_keys.push(observer.clone());
+    network.transport_keys.push(bootstrap.validators[0].adnl_key.clone());
+    network.transport_keys.push(handler.consensus_transport_key(observer.id()).await?);
     let engine = Arc::new(engine);
     let mut manager = ValidatorManagerImpl::create(engine.clone(), tokio::runtime::Handle::current(), ValidatorManagerConfig::default());
     let result = async {
+        anyhow::ensure!(!engine.get_validator_status(), "no legacy signing eligibility permitted");
+        let mut wrong_binding = bootstrap.config_params.clone();
+        let mut wrong_previous = wrong_binding.prev_validator_set()?.list().to_vec();
+        wrong_previous[0].adnl_addr = Some(UInt256::from([97; 32]));
+        wrong_binding.set_config(ConfigParamEnum::ConfigParam32(rtos_block::ConfigParam32 {
+            prev_validators: ValidatorSet::with_cc_seqno(0, u32::MAX, 1, 0, wrong_previous)?,
+        }))?;
+        anyhow::ensure!(manager.authenticated_transport_key(&wrong_binding, &[]).is_err(),
+            "configured stable identity was accepted with wrong governing ADNL");
         let state = engine.build_masterchain_state(&bootstrap, 0)?;
         engine.install_masterchain_state(state.clone(), None)?;
         manager.update_shards(state.clone()).await?;
@@ -104,10 +129,35 @@ async fn authenticated_manager_creates_transport_only_observer_and_retires_real_
     let ids = manager.current_sessions.keys().chain(manager.future_sessions.keys()).cloned().collect();
     let stopped = manager.stop_and_remove_sessions(&ids, false).await;
     drop(manager);
+    // Drive the outer production spawn entry with the real configuration
+    // handler's false validator status. Only explicit transport eligibility can
+    // get through its initial wait and create these additional real sessions.
+    let spawned = if result.is_ok() && stopped.is_ok() {
+        let baseline = engine.validator_network.authenticated_created.load(Ordering::SeqCst);
+        let mut manager_config = ValidatorManagerConfig::default();
+        manager_config.update_interval = Duration::from_millis(20);
+        match spawn_validator_manager(engine.clone(), tokio::runtime::Handle::current(), manager_config) {
+            Ok(task) => {
+                let started = tokio::time::timeout(Duration::from_secs(5), async {
+                    while engine.validator_network.authenticated_created.load(Ordering::SeqCst) < baseline + 2 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await;
+                engine.stop.store(true, Ordering::SeqCst);
+                let joined = task.await;
+                started.map_err(|_| error!("outer manager did not create configured observer sessions"))
+                    .and_then(|_| joined.map_err(|error| error!("manager task failed: {error}")))
+            }
+            Err(error) => Err(error),
+        }
+    } else { Ok(()) };
     let drained = adnl.stop_checked().await;
+    let scheduler_stopped = handler.stop_and_wait().await;
     stopped?;
     drained?;
-    result
+    scheduler_stopped?;
+    result?;
+    spawned
 }
 
 #[test]

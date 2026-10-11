@@ -951,8 +951,22 @@ impl ValidatorManagerImpl {
     ) -> Result<Option<PublicKey>> {
         let sets =
             [config.validator_set()?, config.prev_validator_set()?, config.next_validator_set()?];
+        let bindings = self.engine.consensus_transport_bindings()?;
+        for binding in &bindings {
+            let known = sets.iter().flat_map(|set| set.list())
+                .filter(|member| member.validator_id().is_ok_and(|id| id == binding.validator_id))
+                .collect::<Vec<_>>();
+            if !known.is_empty() && !known.iter().any(|member|
+                member.adnl_addr().is_ok_and(|id| id == binding.adnl_key_id)) {
+                fail!("Configured consensus transport differs from governing descriptor");
+            }
+        }
         for member in preferred.iter().chain(sets.iter().flat_map(|set| set.list())) {
             let id = member.adnl_addr()?;
+            let stable = member.validator_id()?;
+            if !bindings.iter().any(|binding| binding.validator_id == stable && binding.adnl_key_id == id) {
+                continue;
+            }
             if let Some(key) = self.engine.adnl_key_by_id(&id) {
                 if key.id() != &id {
                     fail!("Engine returned a transport key with a different identity");
@@ -3114,7 +3128,13 @@ fn spawn_validator_manager(
             target: "validator_manager",
             "checking if current node is a validator during {CHECK_VALIDATOR_TIMEOUT} secs"
         );
-        while !engine.get_validator_status() {
+        while !engine.get_validator_status() && match engine.consensus_transport_bindings() {
+            Ok(bindings) => bindings.is_empty(),
+            Err(error) => {
+                engine.report_service_failure(0, format!("Invalid consensus transport configuration: {error}"));
+                return;
+            }
+        } {
             log::trace!(target: "validator_manager", "Not a validator, waiting...");
             let _ = engine.clear_last_rotation_block_id();
             let _ = engine.clear_destroyed_session_ids();
