@@ -20,7 +20,7 @@ use crate::{
     ActivityNodePtr, BlockHash, BlockHeight, BlockPayloadPtr, CatchainFactory, CatchainNode,
     CatchainOverlayListener, CatchainOverlayLogReplayListener, CatchainOverlayManagerPtr,
     CatchainOverlayPtr, DatabasePtr, Options, PrivateKey, PrivateOverlayShortId, PublicKeyHash,
-    QueryResponseCallback, RawBuffer, ReceivedBlockPtr, Receiver, ReceiverListenerPtr, ReceiverPtr,
+    QueryResponseCallback, RawBuffer, ReceivedBlockPtr, Receiver, ReceiverListenerPtr,
     ReceiverSourcePtr, SessionId,
 };
 use adnl::OverlayUtils;
@@ -273,6 +273,10 @@ impl Receiver for ReceiverWrapper {
         if let Err(error) = self.stop_checked() {
             log::error!("Receiver shutdown: {error}");
         }
+    }
+
+    fn threads_drained(&self) -> bool {
+        self.receiver_threads.owner.is_joined()
     }
 
     fn stop_checked(&self) -> Result<()> {
@@ -732,7 +736,7 @@ impl ReceiverWrapper {
         db_suffix: String,
         allow_unsafe_self_blocks_resync: bool,
         overlay_manager: CatchainOverlayManagerPtr,
-    ) -> Result<ReceiverPtr> {
+    ) -> Result<Arc<Self>> {
         let metrics_receiver = MetricsHandle::new(Some(Duration::from_secs(30)));
         let task_queues = Arc::new(ReceiverTaskQueues::new(metrics_receiver.clone()));
         let mut receiver_threads = ReceiverThreads::new(session_id.clone());
@@ -3836,3 +3840,7 @@ impl Drop for OverlayListenerImpl {
         log::info!("Dropped OverlayListenerImpl for session {}", self.session_id.to_hex_string());
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_receiver_lifecycle.rs"]
+mod lifecycle_tests;

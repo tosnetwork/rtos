@@ -1607,15 +1607,17 @@ pub trait Session: fmt::Display + Send + Sync {
     fn stop(&self);
 
     /// Join workers and preserve terminal failures for subsequent callers.
+    fn threads_drained(&self) -> bool {
+        false
+    }
+
     fn stop_checked(&self) -> Result<()> {
-        self.stop();
-        Ok(())
+        Err(rtos_block::error!("checked shutdown is not implemented"))
     }
 
     /// Destroy after joining, reporting any terminal worker failure.
     fn destroy_checked(&self) -> Result<()> {
-        self.destroy();
-        Ok(())
+        Err(rtos_block::error!("checked destruction is not implemented"))
     }
 
     /// Request session stop without waiting (non-blocking)

@@ -17,8 +17,8 @@ use crate::{
     utils::{self, get_elapsed_time, MetricsDumper, MetricsHandle},
     ActivityNodePtr, Block, BlockExtraId, BlockHash, BlockHeight, BlockPayloadPtr, BlockPtr,
     Catchain, CatchainFactory, CatchainListenerPtr, CatchainNode, CatchainOverlayManagerPtr,
-    CatchainPtr, Options, PrivateKey, PublicKeyHash, QueryResponseCallback, ReceiverListener,
-    ReceiverPtr, SessionId,
+    Options, PrivateKey, PublicKeyHash, QueryResponseCallback, ReceiverListener, ReceiverPtr,
+    SessionId,
 };
 use rand::Rng;
 use rtos_block::{Result, UInt256};
@@ -1491,6 +1491,10 @@ impl Catchain for CatchainImpl {
         }
     }
 
+    fn threads_drained(&self) -> bool {
+        self.threads.is_joined() && self.receiver.threads_drained()
+    }
+
     fn stop_checked(&self) -> Result<()> {
         self.stop_async();
         let main = self.threads.join();
@@ -1602,7 +1606,7 @@ impl CatchainImpl {
         allow_unsafe_self_blocks_resync: bool,
         overlay_manager: CatchainOverlayManagerPtr,
         listener: CatchainListenerPtr,
-    ) -> Result<CatchainPtr> {
+    ) -> Result<Arc<Self>> {
         log::debug!("Creating Catchain...");
 
         let should_stop_flag = Arc::new(AtomicBool::new(false));
@@ -1678,3 +1682,7 @@ impl CatchainImpl {
         Ok(catchain)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_catchain_lifecycle.rs"]
+mod lifecycle_tests;

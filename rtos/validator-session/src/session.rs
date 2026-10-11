@@ -449,6 +449,10 @@ impl consensus_common::Session for SessionImpl {
         self.stop_impl(false); // Stop without destroying DB (preserve for recovery)
     }
 
+    fn threads_drained(&self) -> bool {
+        self.threads.is_joined() && self.catchain.threads_drained()
+    }
+
     fn stop_checked(&self) -> Result<()> {
         self.stop_checked_impl(false)
     }
@@ -1347,3 +1351,7 @@ impl SessionImpl {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_owned_shutdown.rs"]
+mod owned_shutdown_tests;
