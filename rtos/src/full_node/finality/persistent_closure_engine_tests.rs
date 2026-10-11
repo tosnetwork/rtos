@@ -15,6 +15,25 @@ use std::path::{Path, PathBuf};
 #[path = "persistent_closure_chain.rs"]
 mod chain;
 
+// Source circulation must begin with a chain whose catchain schedule agrees
+// with its authenticated recovery anchor. Legacy propagation fixtures use a
+// standalone carrier round and are not valid source-recovery session fixtures.
+pub(super) fn source_bootstrap(
+    anchor: &BlockIdExt,
+    root: &Cell,
+) -> (BlockStuff, BlockProofStuff, UInt256) {
+    let signer = std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER").unwrap();
+    let state = ShardStateUnsplit::construct_from_cell(root.clone()).unwrap();
+    let extra = state.read_custom().unwrap().unwrap();
+    let cc = extra.validator_info.catchain_seqno;
+    let creator = extra.config.validator_set().unwrap().list()[0].validator_id().unwrap();
+    let (id, state, row) = chain::successor(&signer, anchor, root, false, 0, cc, &creator);
+    let block = fixture_block(&row);
+    assert_eq!(block.id(), &id);
+    let proof = BlockProofStuff::deserialize(&id, decode(&row["proof_boc"]), false).unwrap();
+    (block, proof, state.repr_hash().clone())
+}
+
 fn source_directory(namespace: &Path) -> PathBuf {
     namespace.join("finality-pending")
 }
@@ -268,3 +287,6 @@ async fn persistent_closure_engine_real_source_smoke_and_cold_backup() {
 async fn persistent_closure_engine_single_active_session_over_1024() {
     circulation(1025).await;
 }
+
+#[path = "persistent_closure_crash_tests.rs"]
+mod persistent_closure_crash_tests;
