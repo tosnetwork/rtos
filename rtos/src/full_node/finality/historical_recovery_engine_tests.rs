@@ -85,15 +85,22 @@ async fn recover_scenario(scenario: RecoveryScenario) {
         let engine = &pair.provider;
         engine.clone().download_and_apply_block(pair.master.id(), 1, false).await.unwrap();
         let first = engine.load_state(pair.master.id()).await.unwrap();
-        let initial_key = first.shard_state_extra().unwrap().last_key_block.clone()
+        // Fixture mutations run after real GC. Detach their entire graph now;
+        // cloning a DB-backed state preserves lazy loaders into deleted cells.
+        let first_bytes = rtos_block::write_boc(first.root_cell()).unwrap();
+        let first_root = rtos_block::read_single_root_boc(&first_bytes).unwrap();
+        let first_state = ShardStateUnsplit::construct_from_cell(first_root.clone()).unwrap();
+        let first_extra = first_state.read_custom().unwrap().unwrap();
+        drop(first);
+        let initial_key = first_extra.last_key_block.clone()
             .expect("signed MC1 fixture must retain the zerostate key reference");
         assert_eq!(BlockIdExt::from_ext_blk(initial_key), pair.anchor,
             "historical fixture metadata must name the exact epoch-zero anchor");
-        let config = first.config_params().unwrap();
+        let config = &first_extra.config;
         let cc = pair.master.block().unwrap().read_info().unwrap().gen_catchain_seqno();
         let creator = config.validator_set().unwrap().list()[0].validator_id().unwrap();
         let (mut target, mut target_root, row) =
-            chain::successor_with_state_transform(&signer, pair.master.id(), first.root_cell(), false, 0, cc, &creator, |state| {
+            chain::successor_with_state_transform(&signer, pair.master.id(), &first_root, false, 0, cc, &creator, |state| {
                 if scenario == RecoveryScenario::MissingTailAfterFullPart {
                     // Real state data, not peer-advertised padding: every leaf is
                     // unique, and the resulting block/state update is signed.
@@ -141,7 +148,7 @@ async fn recover_scenario(scenario: RecoveryScenario) {
         // publish the exact target snapshot instead.
         let target_snapshot = matches!(scenario, RecoveryScenario::DirectTargetSnapshot | RecoveryScenario::MissingTailAfterFullPart);
         let snapshot_id = if target_snapshot { &target } else { pair.master.id() };
-        let snapshot_root = if target_snapshot { &target_root } else { first.root_cell() };
+        let snapshot_root = if target_snapshot { &target_root } else { &first_root };
         let snapshot_bytes = rtos_block::write_boc(snapshot_root).unwrap();
         if scenario == RecoveryScenario::MissingTailAfterFullPart {
             assert!(snapshot_bytes.len() > 2 << 20);
@@ -363,7 +370,7 @@ async fn recover_scenario(scenario: RecoveryScenario) {
                 wrong_parent.file_hash = UInt256::calc_file_hash(b"another exact parent");
             }
             let (wrong_id, _, wrong_row) = chain::successor_in_domain(
-                &signer, &wrong_parent, first.root_cell(), false, 0, cc, &creator,
+                &signer, &wrong_parent, &first_root, false, 0, cc, &creator,
                 if scenario == RecoveryScenario::WrongRemoteDomain { -238 } else { -239 }, |_| {});
             assert_ne!(wrong_id, target);
             let reply = WireProfile::T0.serialize(&rtos_api::ton::ton_node::datafull::DataFull {
@@ -406,10 +413,11 @@ async fn recover_scenario(scenario: RecoveryScenario) {
         if mode == 8 || mode == 9 {
             let before = retained_source_bytes(&namespace);
             let bytes = if mode == 8 {
-                let mut state = first.state().unwrap().clone();
+                let root = rtos_block::read_single_root_boc(&snapshot_bytes).unwrap();
+                let mut state = ShardStateUnsplit::construct_from_cell(root).unwrap();
                 state.set_gen_time(state.gen_time() + 1);
                 let bytes = rtos_block::write_boc(&state.serialize().unwrap()).unwrap();
-                assert_eq!(bytes.len(), rtos_block::write_boc(first.root_cell()).unwrap().len(),
+                assert_eq!(bytes.len(), snapshot_bytes.len(),
                     "wrong root must pass exact part-length admission");
                 bytes
             } else { Vec::new() };
@@ -451,14 +459,14 @@ async fn recover_scenario(scenario: RecoveryScenario) {
         }
         if mode == 11 || mode == 12 {
             let before = retained_source_bytes(&namespace);
-            let bytes = rtos_block::write_boc(first.root_cell()).unwrap();
+            let bytes = &first_bytes;
             let mut limits = crate::history_read_budget::HistoryReadLimits::default();
             if mode == 11 { limits.state_boc_bytes = bytes.len() * 2 - 1; }
-            else { limits.depth = first.root_cell().repr_depth().checked_sub(1).unwrap(); }
+            else { limits.depth = first_root.repr_depth().checked_sub(1).unwrap(); }
             let request = crate::historical_recovery::Request::test_with_limits(engine.clone(), limits).await.unwrap();
             if mode == 11 {
                 let received = request.test_snapshot(pair.master.id()).await.unwrap().unwrap();
-                assert_eq!(received.root_cell().repr_hash(), first.root_cell().repr_hash(),
+                assert_eq!(received.root_cell().repr_hash(), first_root.repr_hash(),
                     "first actual remote snapshot must fit before cumulative rejection");
             }
             for _ in 0..2 {
