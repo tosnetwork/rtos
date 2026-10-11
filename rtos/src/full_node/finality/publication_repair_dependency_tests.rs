@@ -45,8 +45,8 @@ async fn fixture_backend(key_parent: bool, archive: bool) -> Fixture {
     drop(socket);
     std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     let engine = open_engine(dir.path()).await;
-    assert_eq!(engine.db().is_archival_mode(), archive);
     let setup = std::panic::AssertUnwindSafe(async {
+        assert_eq!(engine.db().is_archival_mode(), archive);
         let zero_state = ShardStateStuff::from_root_cell(
             zero.clone(),
             read_single_root_boc(&zero_bytes).unwrap(),
@@ -590,6 +590,7 @@ async fn mc_live_repair_archive_engine_cold_missing_index_and_corrupt_graph() {
         let graph = db.clone().table::<UInt256>(ARCHIVE_CELLS_CF_NAME, false).unwrap();
         let original_index = index.try_get(target.id()).unwrap().unwrap().to_vec();
         let corrupt = if mode == 2 { target_root.clone() } else { child };
+        let original_raw = graph.try_get(&corrupt).unwrap().unwrap().to_vec();
         if mode == 1 {
             index.delete(target.id()).unwrap();
         } else if mode >= 2 {
@@ -607,7 +608,10 @@ async fn mc_live_repair_archive_engine_cold_missing_index_and_corrupt_graph() {
             let _bounded_only = crate::publication_repair::require_bounded_durability(&engine);
             let repair = repair_mc_final(engine.clone(), request.clone()).await;
             if mode >= 2 {
-                assert!(repair.is_err(), "present index with corrupt graph must not rebuild");
+                let error = repair.err().expect("present index with corrupt graph must not rebuild");
+                assert!(crate::history_read_budget::stops_fallback(&error), "{error:#}");
+                assert_eq!(error.root_cause().to_string(), "Invalid stored cell record length",
+                    "must reject the injected target graph layout, not unrelated authorization: {error:#}");
             } else {
                 let custody = repair.unwrap();
                 assert_eq!(custody.state_root(), &target_root);
@@ -634,12 +638,17 @@ async fn mc_live_repair_archive_engine_cold_missing_index_and_corrupt_graph() {
             );
             let graph = db.clone().table::<UInt256>(ARCHIVE_CELLS_CF_NAME, false).unwrap();
             assert_eq!(graph.try_get(&corrupt).unwrap().unwrap().as_ref(), &[0]);
+            // Restore precisely the withdrawn physical record after proving
+            // failed repair did not mutate either the index or corrupt bytes.
+            graph.put_raw_sync(corrupt.as_slice(), &original_raw).unwrap();
+            db.sync_wal().unwrap();
         } else {
             assert!(index.try_get(target.id()).unwrap().is_some());
         }
         drop(index);
         drop(db);
-        if mode < 2 {
+        {
+            // Every negative case must recover after only its raw fault is undone.
             let engine = open_engine(dir.path()).await;
             let result = std::panic::AssertUnwindSafe(async {
                 let _bounded_only = crate::publication_repair::require_bounded_durability(&engine);
