@@ -1732,20 +1732,13 @@ impl RldpNode {
     ) -> Result<bool> {
         let part = transfer.state().part();
         let on_ack = |transfer: &mut SendPartV2, ack| -> Result<u32> {
-            let new_received = transfer.on_ack(ack, &context.peer, min_timeout_ms)?;
-            if new_received > 0 {
-                context.progress.fetch_add(1, Ordering::Relaxed);
-                for (i, state) in context.part_states.iter().enumerate() {
-                    if i == part as usize {
-                        continue;
-                    }
-                    if !state.is_started() || state.is_finished().is_none() {
-                        continue;
-                    }
-                    context.part_states[i].ack_ping()
-                }
-            }
-            Ok(new_received)
+            transfer.on_ack_and_wake(
+                ack,
+                &context.peer,
+                min_timeout_ms,
+                &context.part_states,
+                &context.progress,
+            )
         };
         let mut updates = 0;
         let mut new_received = 0;
