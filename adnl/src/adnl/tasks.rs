@@ -112,7 +112,7 @@ impl AdnlTasks {
         });
         Ok(())
     }
-    fn failed(self: &Arc<Self>, error: String) {
+    pub(super) fn failed(self: &Arc<Self>, error: String) {
         self.errors.lock().unwrap().push(error);
         self.close();
     }

@@ -1035,6 +1035,7 @@ impl AdnlReceiver for UdpTcpReceiver {
 }
 
 struct UdpTcpSender {
+    tasks: Arc<AdnlTasks>,
     tcp: Option<Arc<TcpSender>>,
     udp: socket2::Socket,
 }
@@ -1045,6 +1046,9 @@ impl AdnlSender for UdpTcpSender {
             match self.udp.send_to(data, &addr) {
                 Ok(usize) => break Ok(usize),
                 Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    if self.tasks.is_closed() {
+                        fail!("ADNL UDP sender stopped");
+                    }
                     thread::yield_now();
                     continue;
                 }
@@ -1079,6 +1083,7 @@ fn create_sender_receiver(
         // The receive thread must observe shutdown even if the sender panics
         // before emitting its wake packet. Stop still awaits its actual join.
         socket.set_read_timeout(Some(TIMEOUT_TCP_SPIN_MS))?;
+        socket.set_write_timeout(Some(TIMEOUT_TCP_SPIN_MS))?;
     }
     let address = node.config().ip_address();
     socket.bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), address.port()).into())?;
@@ -1089,7 +1094,8 @@ fn create_sender_receiver(
         let (tcp_sender, tcp_receiver) = tcp_sender_receiver(node)?;
         (Some(tcp_sender), Some(tcp_receiver))
     };
-    let sender = UdpTcpSender { tcp: tcp_sender, udp: socket.try_clone()? };
+    let sender =
+        UdpTcpSender { tasks: node.tasks().clone(), tcp: tcp_sender, udp: socket.try_clone()? };
     let mut udp = mio::net::UdpSocket::from_std(socket.into());
     if let Some(tcp_receiver) = &mut tcp_receiver {
         tcp_receiver.poll.registry().register(

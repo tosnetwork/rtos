@@ -2433,6 +2433,24 @@ impl AdnlNode {
                 node.send_pipeline.shutdown();
             }
         });
+        let weak = Arc::downgrade(&node);
+        node.tasks.on_stopped(move || {
+            if let Some(node) = weak.upgrade() {
+                while node.send_pipeline.normal.get().is_some() {}
+                while node.send_pipeline.urgent.get().is_some() {}
+                while node.queue_monitor_queries.pop().is_some() {}
+                while node.queue_send_loopback_readers.pop().is_some() {}
+                let queries: Vec<_> = node.queries.iter().map(|entry| *entry.key()).collect();
+                for query in queries {
+                    node.queries.remove(&query);
+                }
+                let transfers: Vec<_> =
+                    node.transfers.iter().map(|entry| entry.key().clone()).collect();
+                for transfer in transfers {
+                    node.transfers.remove(&transfer);
+                }
+            }
+        });
         Ok(node)
     }
 
@@ -2647,8 +2665,8 @@ impl AdnlNode {
                         true,
                     ),
                     Err(e) => {
-                        log::error!(target: TARGET, "ERROR in send queue --> {}", e);
-                        continue;
+                        node.tasks.failed(format!("ADNL send queue: {e}"));
+                        break;
                     }
                 };
                 // Manage the throughput
@@ -3205,6 +3223,7 @@ impl AdnlNode {
         }
 
         async fn get_reply(
+            tasks: &AdnlTasks,
             reader: &mut tokio::sync::mpsc::UnboundedReceiver<(
                 Result<AdnlReplyWithStatus>,
                 Arc<QuerySendContext>,
@@ -3212,7 +3231,11 @@ impl AdnlNode {
             peers: &AdnlPeers,
             query: &TaggedTlObject,
         ) -> Result<AdnlReplyWithStatus> {
-            if let Some((reply_with_status, context)) = reader.recv().await {
+            let received = tokio::select! {
+                _ = tasks.cancelled() => fail!("ADNL stopped while receiving query reply"),
+                received = reader.recv() => received,
+            };
+            if let Some((reply_with_status, context)) = received {
                 match reply_with_status {
                     Err(e) => {
                         log::warn!(
@@ -3283,7 +3306,8 @@ impl AdnlNode {
                                     .send((wait_query(&node, &context, &peers).await, context));
                             });
                         }
-                        let reply_with_status = get_reply(&mut reader, peers, query).await?;
+                        let reply_with_status =
+                            get_reply(&self.tasks, &mut reader, peers, query).await?;
                         // We occasionally can receive both replies, and ordinary the first,
                         // But return first to avoid timeout.
                         // There is a tolerance based on several priority attempts.
@@ -3300,7 +3324,7 @@ impl AdnlNode {
                             });
                             Ok(reply_with_status)
                         } else {
-                            get_reply(&mut reader, peers, query).await
+                            get_reply(&self.tasks, &mut reader, peers, query).await
                         }
                     }
                 }
@@ -4120,11 +4144,12 @@ impl AdnlNode {
                         let node = self.clone();
                         let pending = async move {
                             match answer.try_wait().await {
-                                Err(e) => log::error!(
-                                    target: TARGET,
-                                    "Error processing ADNL query {}: {}",
-                                    query, e
-                                ),
+                                Err(e) => {
+                                    if e.downcast_ref::<tokio::task::JoinError>().is_some() {
+                                        node.tasks.failed(format!("ADNL pending answer: {e}"));
+                                    }
+                                    log::error!(target: TARGET, "Error processing ADNL query {query}: {e}");
+                                }
                                 Ok(msg) => match reply(&node, msg.answer, &peers, &method) {
                                     Err(e) => log::error!(
                                         target: TARGET,
@@ -4838,3 +4863,7 @@ impl Drop for AdnlStartupGuard {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "node_shutdown_tests.rs"]
+mod shutdown_tests;
