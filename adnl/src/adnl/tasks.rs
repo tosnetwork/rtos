@@ -26,9 +26,12 @@ pub(crate) struct AdnlTasks {
 }
 impl AdnlTasks {
     pub fn new() -> Arc<Self> {
+        Self::with_runtime(tokio::runtime::Handle::current())
+    }
+    pub fn with_runtime(runtime: tokio::runtime::Handle) -> Arc<Self> {
         Arc::new(Self {
             open: Mutex::new(true),
-            runtime: tokio::runtime::Handle::current(),
+            runtime,
             workers: TaskTracker::new(),
             cancellation: CancellationToken::new(),
             stopped: CancellationToken::new(),
@@ -137,6 +140,9 @@ impl AdnlTasks {
                 owner.stopped.cancel();
             });
         }
+    }
+    pub fn drained(&self) -> bool {
+        self.stopped.is_cancelled()
     }
     pub fn is_closed(&self) -> bool {
         self.cancellation.is_cancelled()
