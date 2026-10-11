@@ -163,3 +163,74 @@ async fn propagation_authenticated_normal_finality_applies_by_mc_and_reopens() {
     drop(reopened);
     drop(keep_dir);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn propagation_authenticated_approval_uses_block_fec_without_finality() {
+    let pair = Pair::with_propagation_profile("included", false, true).await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/v2-propagation-recovery.json")).unwrap();
+        let mut row = fixture["rows"][0].clone();
+        row["signatures"] = row["approval_signatures"].clone();
+        let carrier = fixture_carrier(&row);
+        let approval =
+            rtos_api::pq_finality::PqApproval::from_notarization_fields(carrier).unwrap();
+        let context = governing_session(&pair).await;
+        let accepted = accept_pq_session_block(
+            pair.shard.id().clone(),
+            Some(pair.shard.data().to_vec()),
+            vec![pair.shard.construct_prev_id().unwrap().0],
+            SessionFinality::PqApproval(approval),
+            context,
+            pair.provider.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!accepted.is_final());
+        assert!(accepted.final_network_signatures().is_err());
+        let plan = PropagationPlan::for_event(
+            SimplexProtocol::PrivateObserversPlumtree,
+            PropagationEvent::Finalized,
+            pair.shard.id(),
+            true,
+            true,
+            false,
+            0,
+            false,
+        );
+        assert!(plan.block_targets.public);
+        assert_eq!(plan.finality_targets, crate::validator::propagation::TargetSet::NONE);
+        let outcome = pair.provider.propagate_accepted_session_block(&accepted, &plan).await;
+        assert!(sent(&outcome, PropagationKind::Block), "{outcome:?}");
+        assert!(!outcome.receipts.iter().any(|r| r.kind == PropagationKind::Finality));
+        assert!(!outcome.needs_retry(), "{outcome:?}");
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if pair
+                    .receiver
+                    .load_block_handle(pair.shard.id())
+                    .unwrap()
+                    .is_some_and(|h| h.has_state())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("authenticated approval block must arrive through normal public FEC");
+        let handle = pair.receiver.load_block_handle(pair.shard.id()).unwrap().unwrap();
+        assert!(!handle.is_applied(), "notarization cannot imply MC inclusion");
+        assert_eq!(
+            pair.receiver.load_state(pair.shard.id()).await.unwrap().root_cell().repr_hash(),
+            &pair.shard_state_root
+        );
+    })
+    .catch_unwind()
+    .await;
+    pair.receiver.clone().wait_stop().await.unwrap();
+    pair.provider.clone().wait_stop().await.unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
