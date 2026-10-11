@@ -26,7 +26,6 @@ fn abrupt_exit(status: std::ffi::c_int) -> ! {
 struct ExitAfterOffer {
     real: DurableFinalitySinkPtr,
     window: i32,
-    namespace: PathBuf,
 }
 impl DurableFinalitySink for ExitAfterOffer {
     fn stage(
@@ -41,22 +40,6 @@ impl DurableFinalitySink for ExitAfterOffer {
         request: CanonicalFinalityRequest,
         done: CanonicalFinalityCompletion,
     ) -> Result<()> {
-        if let Some(destination) = std::env::var_os(ACK_BACKUP) {
-            // Capture the actual synced ACK before canonical compaction removes
-            // it. No payload/receipt is fabricated or decoded and rewritten.
-            let files: Vec<_> = std::fs::read_dir(source_directory(&self.namespace))?
-                .map(|entry| entry.map(|e| e.path()))
-                .collect::<std::io::Result<_>>()?;
-            let acks: Vec<_> = files
-                .into_iter()
-                .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("acked"))
-                .collect();
-            assert_eq!(acks.len(), 1);
-            let destination = PathBuf::from(destination);
-            std::fs::write(&destination, std::fs::read(&acks[0])?)?;
-            std::fs::File::open(&destination)?.sync_all()?;
-            std::fs::File::open(destination.parent().unwrap())?.sync_all()?;
-        }
         self.real.retain_canonical(request, done)
     }
     fn lookup_terminal(
@@ -138,7 +121,7 @@ async fn persistent_closure_crash_child() {
                 .unwrap(),
         );
         let real = engine.clone().durable_finality_sink(runtime.clone()).await.unwrap();
-        let sink = Arc::new(ExitAfterOffer { real, window, namespace: namespace.clone() });
+        let sink = Arc::new(ExitAfterOffer { real, window });
         let real_confirm =
             engine.ensure_publication_worker().await.unwrap().delivered_sink(runtime.clone());
         let confirm: simplex::finality_delivery::DeliveredCompletionSink =
@@ -165,6 +148,9 @@ async fn persistent_closure_crash_child() {
         // A fresh real session factory prepares this provenance directory before
         // source delivery. Reopening parents never manufacture missing provenance.
         source.prepare_intents(false).unwrap();
+        if let Some(destination) = std::env::var_os(ACK_BACKUP) {
+            source.save_next_synced_ack_backup(PathBuf::from(destination));
+        }
         let root = engine.load_state(pair.master.id()).await.unwrap().root_cell().clone();
         let (id, _, row) =
             chain::successor(&signer, pair.master.id(), &root, false, 0, cc, &creator);
