@@ -362,3 +362,49 @@ async fn adnl_owned_partial_transport_startup_closes_registered_threads() {
     drop(node);
     assert!(weak.upgrade().is_none());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adnl_owned_normal_tcp_query_then_transport_owner_release() {
+    let (server, server_port) = node(50).await;
+    let (client, client_port) = node(51).await;
+    server.start_over_udp_tcp(Vec::new()).await.unwrap();
+    client.start_over_udp_tcp(Vec::new()).await.unwrap();
+    let local = client.key_by_tag(0).unwrap();
+    let remote = server.key_by_tag(0).unwrap();
+    client.add_peer(local.id(), server.ip_address_adnl(), None, &remote).unwrap();
+    let peers = AdnlPeers::with_keys(local.id().clone(), remote.id().clone());
+    let query = TaggedTlObject {
+        object: rtos_api::ton::rpc::adnl::Ping { value: 123 }.into_tl_object(),
+        #[cfg(feature = "telemetry")]
+        tag: 0,
+    };
+    let response =
+        bounded(client.query_get_status(&query, &peers, Some(2000), AdnlSendMethod::Safe))
+            .await
+            .unwrap();
+    let pong = response
+        .reply
+        .expect("TCP query returned no answer")
+        .downcast::<rtos_api::ton::adnl::Pong>()
+        .unwrap();
+    assert_eq!(pong.value(), &123);
+    bounded(client.stop_checked()).await.unwrap();
+    bounded(server.stop_checked()).await.unwrap();
+    udp_released(client_port);
+    udp_released(server_port);
+    tcp_released(client_port);
+    tcp_released(server_port);
+    let client_owner = Arc::downgrade(&client.tasks);
+    let server_owner = Arc::downgrade(&server.tasks);
+    let client_weak = Arc::downgrade(&client);
+    let server_weak = Arc::downgrade(&server);
+    drop(client);
+    drop(server);
+    assert!(client_weak.upgrade().is_none() && server_weak.upgrade().is_none());
+    bounded(async {
+        while client_owner.upgrade().is_some() || server_owner.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+}
