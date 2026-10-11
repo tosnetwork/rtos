@@ -308,6 +308,41 @@ fn connect_socket(left: &SpoolFixture, right: &SpoolFixture) {
         )
         .unwrap();
 }
+/// Explicit trusted fixture setup, separate from session admission/recovery.
+/// Uses the same real async RocksDB factory as SimplexDb; no marker-file stand-in.
+async fn provision_socket_namespace(f: &SpoolFixture) {
+    let receipt = authenticate_retired_session(f.engine.as_ref(), &locator(f)).await.unwrap();
+    let runtime = receipt.runtime().clone();
+    let directory = receipt.record().namespace.clone();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        assert!(!directory.exists(), "fresh fixture provisioning must never repair existing state");
+        std::fs::create_dir_all(&directory).unwrap();
+        let database = ConsensusCommonFactory::create_async_key_value_storage(
+            &directory, &runtime.session_id().to_hex_string(),
+            consensus_common::AsyncKeyValueStorageOptions { use_callback_thread: false },
+        ).unwrap();
+        database.close(None).unwrap();
+        drop(database);
+        assert!(directory.join(runtime.session_id().to_hex_string()).join("CURRENT").is_file());
+        let LocalRole::Validator(index) = runtime.local_role() else { panic!("validator fixture required") };
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema":1,"role":"validator","validator_index":Some(index),
+            "local_adnl":hex::encode(runtime.local_adnl().data()),
+            "global_id":runtime.pin().global_id,"zerostate":runtime.pin().zerostate.to_string(),
+            "profile":runtime.profile().to_hex_string(),"session":runtime.session_id().to_hex_string(),
+            "shard_workchain":runtime.shard().workchain_id(),"shard_prefix":runtime.shard().shard_prefix_with_tag(),
+            "catchain_seqno":runtime.catchain_seqno(),"simplex_protocol":runtime.protocol().version(),
+            "carrier_version":runtime.carrier_version(),"wire_profile":runtime.wire_profile() as u8,
+            "slots_per_window":runtime.slots_per_leader_window(),"committee":runtime.committee_digest().unwrap().to_hex_string(),
+        })).unwrap();
+        let mut manifest = std::fs::OpenOptions::new().write(true).create_new(true).open(directory.join("session-runtime.json")).unwrap();
+        manifest.write_all(&bytes).unwrap(); manifest.sync_all().unwrap();
+        std::fs::File::open(&directory).unwrap().sync_all().unwrap();
+        std::fs::File::open(directory.parent().unwrap()).unwrap().sync_all().unwrap();
+    }).await.unwrap();
+}
+
 async fn live_socket_session(
     f: &SpoolFixture,
     listener: &Arc<SocketListener>,
@@ -561,6 +596,7 @@ async fn retired_service_socket_missing_body_reaches_node_wal_and_checked_join()
             ] {
                 connect_socket(left, right);
             }
+            provision_socket_namespace(&provider).await;
             let provider_session = live_socket_session(&provider, &listener).await;
             sessions.push(provider_session.clone());
             raws.push(RawSocket::start(&target));
@@ -601,6 +637,7 @@ async fn retired_service_socket_missing_body_reaches_node_wal_and_checked_join()
             restart_socket_engine(&mut emitter, &provider.engine).await;
             connect_socket(&target, &emitter);
             connect_socket(&emitter, &target);
+            provision_socket_namespace(&target).await;
             let target_session = live_socket_session(&target, &listener).await;
             sessions.push(target_session.clone());
             raws.push(RawSocket::start(&emitter));
