@@ -430,6 +430,12 @@ impl PropagationOutbox {
         Ok(delivery_id)
     }
 
+    /// Observe sticky writer health without cloning any retained entries.
+    pub(crate) fn check_health(&self) -> Result<()> {
+        drop(self.lock()?);
+        Ok(())
+    }
+
     pub fn delivery(&self, id: &UInt256) -> Result<Option<(Delivery, UnverifiedRecord)>> {
         let state = self.lock()?;
         Ok(state.snapshot.deliveries.iter().find(|d| &d.delivery_id == id).map(|d| {
@@ -438,6 +444,24 @@ impl PropagationOutbox {
                 state.snapshot.entries.iter().find(|e| e.id == d.record_id).unwrap().clone(),
             )
         }))
+    }
+
+    /// Borrow an actual full delivery under the writer's healthy-state lock.
+    /// The consumer must admit its budget before cloning or parsing any payload.
+    pub(crate) fn with_history_delivery<T>(
+        &self,
+        id: &UInt256,
+        consume: impl FnOnce(&Delivery, &UnverifiedRecord) -> Result<T>,
+    ) -> Result<T> {
+        let state = self.lock()?;
+        if state.snapshot.closing.iter().any(|closed| &closed.binding.delivery_id == id) {
+            fail!("Compacted closing history requires its existing exact custody evidence");
+        }
+        let delivery = state.snapshot.deliveries.iter().find(|d| &d.delivery_id == id)
+            .ok_or_else(|| error!("Historical debt has no retained full delivery"))?;
+        let entry = state.snapshot.entries.iter().find(|e| e.id == delivery.record_id)
+            .ok_or_else(|| error!("Historical debt has no retained full canonical record"))?;
+        consume(delivery, entry)
     }
 
     /// A delivery mapping is a permanent source reference, including after
@@ -1261,6 +1285,10 @@ mod tests {
         disk.failure.store(2, Ordering::SeqCst);
         assert!(store.stage_draft(record(1), 0, false, None).is_err());
         assert!(store.pending().is_err());
+        assert!(store.check_health().is_err());
+        assert!(store.with_history_delivery::<()>(&delivery_id(&record(1))?, |_, _| {
+            panic!("uncertain WAL must not expose history admission evidence")
+        }).is_err());
         drop(store);
         disk.failure.store(0, Ordering::SeqCst);
         let store = memory(disk, limits);

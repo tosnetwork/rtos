@@ -2,6 +2,8 @@
 //! One bounded publication actor. Accepted blocking writes retain their real join
 //! independently of the caller's response future. Idle loops never own Engine.
 mod closing;
+mod history_debt;
+pub(crate) use history_debt::NodeHistoryDebt;
 
 use crate::{
     engine::Engine,
@@ -108,6 +110,12 @@ impl<T> Drop for ClosingCompletion<T> {
     }
 }
 enum Submission {
+    HistoryDebt {
+        request: CloseFinalityRequest,
+        runtime: Arc<AuthenticatedSessionRuntime>,
+        budget: Arc<crate::history_read_budget::HistoryReadBudget>,
+        response: oneshot::Sender<Result<NodeHistoryDebt>>,
+    },
     Terminal {
         request: CloseFinalityRequest,
         runtime: Arc<AuthenticatedSessionRuntime>,
@@ -145,6 +153,9 @@ enum Submission {
 impl Submission {
     fn reject(self) {
         match self {
+            Self::HistoryDebt { response, .. } => {
+                let _ = response.send(Err(error!("Publication history admission shutdown")));
+            }
             Self::Terminal { completion, .. } => completion.finish(Err(error!("Publication closing shutdown"))),
             Self::OfferClose { completion, .. } => completion.finish(Err(error!("Publication closing shutdown"))),
             Self::SourceDelivered { completion, .. } => completion.finish(Err(error!("Publication closing shutdown"))),
@@ -482,7 +493,7 @@ impl State {
                 let result = work(&store);
                 // Capacity/validation rejection is recoverable. An uncertain disk
                 // result poisons the store and must stop all further transactions.
-                let poisoned = result.is_err() && store.pending().is_err();
+                let poisoned = result.is_err() && store.check_health().is_err();
                 Ok((result, poisoned))
             })
             .await?;
@@ -533,6 +544,10 @@ impl State {
     }
     async fn submit_one(&self, store: &Arc<PropagationOutbox>, command: Submission) {
         match command {
+            Submission::HistoryDebt { request, runtime, budget, response } => {
+                let result = self.history_debt(store, request, runtime, budget).await;
+                let _ = response.send(result);
+            }
             Submission::Terminal { request, runtime, completion } => {
                 completion.finish(self.lookup_terminal(store, &runtime, &request).await);
             }
@@ -1196,6 +1211,17 @@ fn canonical_record(
     entry: &UnverifiedRecord,
     limits: &Limits,
 ) -> Result<CanonicalFinalityRecord> {
+    canonical_record_inner(runtime, request, delivery, entry, limits, None)
+}
+
+fn canonical_record_inner(
+    runtime: &AuthenticatedSessionRuntime,
+    request: &CanonicalFinalityRequest,
+    delivery: &crate::propagation_outbox::Delivery,
+    entry: &UnverifiedRecord,
+    limits: &Limits,
+    budget: Option<&crate::history_read_budget::HistoryReadBudget>,
+) -> Result<CanonicalFinalityRecord> {
     crate::propagation_outbox::validate_recovery_record(entry, limits)?;
     let record = &entry.record;
     let expected_index = match runtime.local_role() {
@@ -1224,10 +1250,12 @@ fn canonical_record(
     {
         fail!("Canonical delivery differs from authenticated source binding");
     }
-    let block = crate::block::BlockStuff::deserialize_block_checked(
-        record.block_id.clone(),
-        Arc::new(record.block_data.clone()),
-    )?;
+    let data = Arc::new(record.block_data.clone());
+    let block = if let Some(budget) = budget {
+        crate::block::BlockStuff::deserialize_block_bounded(record.block_id.clone(), data, budget)?
+    } else {
+        crate::block::BlockStuff::deserialize_block_checked(record.block_id.clone(), data)?
+    };
     block.verify_expected_id(&record.block_id)?;
     let creator = block.block()?.read_extra()?.created_by().clone();
     if creator != request.source_validator
@@ -1244,19 +1272,39 @@ fn canonical_record(
     if previous.prev != record.prev {
         fail!("Canonical body ancestry differs from retained record");
     }
-    let wire: rtos_api::ton::ton_node::SignatureSet =
-        runtime.wire_profile().deserialize_typed(record.carrier.bytes())?;
+    let wire: rtos_api::ton::ton_node::SignatureSet = if budget.is_some() {
+        runtime.wire_profile().deserialize_value_bounded(
+            record.carrier.bytes(), record.carrier.bytes().len(),
+        )?
+    } else {
+        runtime.wire_profile().deserialize_typed(record.carrier.bytes())?
+    };
     if runtime.wire_profile().serialize(&wire)? != record.carrier.bytes() {
         fail!("Noncanonical retained signature carrier");
     }
     let rtos_api::ton::ton_node::SignatureSet::TonNode_SignatureSet_SimplexPq(fields) = wire else {
         fail!("Canonical retention requires a PQ carrier");
     };
-    let verifier = runtime
-        .pq_context()
-        .ok_or_else(|| error!("Canonical retention needs PQ runtime"))?
-        .for_block(record.block_id.clone())?;
-    let verified = verifier.verify_network(&PqNetworkSignatureSet::from_node(fields)?)?;
+    let context = runtime.pq_context()
+        .ok_or_else(|| error!("Canonical retention needs PQ runtime"))?;
+    let verifier = match budget {
+        Some(budget) => context.for_block_bounded(
+            record.block_id.clone(), &crate::bounded_session_derivation::ConfigBudget(budget),
+        )?,
+        None => context.for_block(record.block_id.clone())?,
+    };
+    let network = match budget {
+        Some(budget) => PqNetworkSignatureSet::from_node_bounded(
+            fields, &crate::bounded_session_derivation::ConfigBudget(budget),
+        )?,
+        None => PqNetworkSignatureSet::from_node(fields)?,
+    };
+    let verified = match budget {
+        Some(budget) => verifier.verify_network_bounded(
+            &network, &crate::bounded_session_derivation::ConfigBudget(budget),
+        )?,
+        None => verifier.verify_network(&network)?,
+    };
     if verified.is_final() != record.carrier.is_final() {
         fail!("Canonical carrier role mismatch");
     }

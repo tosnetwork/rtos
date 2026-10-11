@@ -2,7 +2,6 @@
 //! Engine-owned replay of authenticated historical certificate debts.
 use super::{
     consensus_overlay::ConsensusOverlayManagerImpl, finality_recovery_owner::RecoveryReservation,
-    retired_session_auth::authenticate_retired_session,
 };
 use crate::{engine::Engine, engine_traits::EngineOperations};
 use consensus_common::{
@@ -200,7 +199,7 @@ impl RetiredSessionService {
         };
         let authenticated = tokio::time::timeout(
             AUTH_TIMEOUT,
-            authenticate_retired_session(engine.as_ref(), &record),
+            engine.clone().authenticate_retired_source_with_history(record.clone()),
         )
         .await
         .map_err(|_| error!("Retired history is temporarily unavailable"))??;

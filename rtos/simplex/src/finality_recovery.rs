@@ -175,6 +175,15 @@ fn read_intent(
     if bytes.len() as u64 > MAX_INTENT_BYTES {
         fail!("Source recovery intent grew beyond bound");
     }
+    decode_intent(path, namespace, &bytes)
+}
+fn decode_intent(path: &std::path::Path, namespace: &std::path::Path, bytes: &[u8])
+    -> Result<(SessionRecoveryRecord, Vec<u8>)> {
+    let (record, certificate, _) = decode_intent_typed(path, namespace, bytes)?;
+    Ok((record, certificate))
+}
+fn decode_intent_typed(path: &std::path::Path, namespace: &std::path::Path, bytes: &[u8])
+    -> Result<(SessionRecoveryRecord, Vec<u8>, rtos_api::ton::consensus::simplex::Certificate)> {
     let disk: DiskIntent = if path.extension().and_then(|s| s.to_str()) == Some("complete") {
         let completed: CompletedIntent = serde_json::from_slice(&bytes)?;
         if completed.schema != 1 {
@@ -189,7 +198,7 @@ fn read_intent(
     }
     let certificate = hex::decode(disk.certificate)?;
     let wire: rtos_api::ton::consensus::simplex::Certificate =
-        WireProfile::T0.deserialize_typed(&certificate)?;
+        WireProfile::T0.deserialize_value_bounded(&certificate, certificate.len())?;
     if WireProfile::T0.serialize(&wire)? != certificate {
         fail!("Noncanonical source final certificate");
     }
@@ -255,7 +264,7 @@ fn read_intent(
     if record.prev_blocks.is_empty() || record.prev_blocks.len() > 2 {
         fail!("Invalid retained session parents");
     }
-    Ok((record, certificate))
+    Ok((record, certificate, wire))
 }
 
 /// Owned by the same source lifetime as the pending Draft WAL. Scanner uses
@@ -711,6 +720,10 @@ pub fn scan_finality_recovery_namespace(
     }
     Ok(found)
 }
+
+#[path = "source_history_debt.rs"]
+mod history_debt;
+pub use history_debt::{authenticate_source_history_debt, SourceHistoryDebt, SourceHistoryDebtBudget, SourceHistoryDebtBusy};
 
 #[cfg(test)]
 mod tests {

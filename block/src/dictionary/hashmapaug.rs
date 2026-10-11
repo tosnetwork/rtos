@@ -1018,6 +1018,69 @@ pub trait HashmapAugType<
         }
         Ok(None)
     }
+    /// Meter the label before its temporary allocation and each traversed path.
+    /// The callback must separately admit dynamic decoding of its value/augmentation.
+    fn traverse_slices_bounded<F, R>(&self, budget: &dyn crate::config_read_budget::ConfigReadBudget,
+        mut callback: F) -> Result<Option<R>>
+    where F: FnMut(&[u8], usize, SliceData) -> Result<TraverseNextStep<R>> {
+        if let Some(root) = self.data() {
+            Self::traverse_internal_bounded(root, BuilderData::default(), self.bit_len(), &mut callback, budget)
+        } else { Ok(None) }
+    }
+    fn traverse_internal_bounded<F, R>(
+        cell: &Cell,
+        mut key: BuilderData,
+        mut bit_len: usize,
+        callback: &mut F,
+        budget: &dyn crate::config_read_budget::ConfigReadBudget,
+    ) -> Result<Option<R>>
+    where
+        F: FnMut(&[u8], usize, SliceData) -> Result<crate::TraverseNextStep<R>>,
+    {
+        budget.step()?;
+        let max = (bit_len + 1).checked_next_power_of_two().ok_or_else(|| crate::error!("Dictionary key overflow"))? - 1;
+        budget.workspace(max / 8 + 1)?;
+        let mut cursor = LabelReader::with_cell(cell)?;
+        let label = cursor.get_label(bit_len)?;
+        let slice = cursor.remainder()?;
+        let label_length = label.remaining_bits();
+        match label_length.cmp(&bit_len) {
+            Ordering::Less => {
+                bit_len -= label_length + 1;
+
+                let mut aug = slice.clone();
+                aug.checked_drain_reference()?;
+                aug.checked_drain_reference()?;
+                key.checked_append_references_and_data(&label)?;
+                let to_visit = match callback(key.data(), key.length_in_bits(), aug)? {
+                    TraverseNextStep::Stop => return Ok(None),
+                    TraverseNextStep::End(r) => return Ok(Some(r)),
+                    TraverseNextStep::VisitZero => [Some(0), None],
+                    TraverseNextStep::VisitOne => [Some(1), None],
+                    TraverseNextStep::VisitZeroOne => [Some(0), Some(1)],
+                    TraverseNextStep::VisitOneZero => [Some(1), Some(0)],
+                };
+                for i in to_visit.iter().flatten() {
+                    let mut key = key.clone();
+                    key.append_bit_bool(*i != 0)?;
+                    if let Some(r) =
+                        Self::traverse_internal_bounded(&slice.reference(*i)?, key, bit_len, callback, budget)?
+                    {
+                        return Ok(Some(r));
+                    }
+                }
+            }
+            Ordering::Equal => {
+                key.checked_append_references_and_data(&label)?;
+                if let TraverseNextStep::End(r) = callback(key.data(), key.length_in_bits(), slice)?
+                {
+                    return Ok(Some(r));
+                }
+            }
+            _ => fail!(BlockError::InvalidData("label_length > bit_len".to_string())),
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

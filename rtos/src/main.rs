@@ -13,6 +13,7 @@ mod block;
 mod block_proof;
 mod boot;
 pub(crate) mod retired_history;
+pub(crate) mod historical_recovery;
 mod collator_test_bundle;
 mod config;
 mod confirmed_blocks;
@@ -639,3 +640,5 @@ mod repair_lease_binding;
 mod repair_provenance;
 
 mod publication_dependency_leases;
+
+pub(crate) mod bounded_session_derivation;

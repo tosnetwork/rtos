@@ -176,7 +176,7 @@ async fn load_pinned_bounded(
         .map_err(|error| error!("Repair state reader failed: {error}"))?
 }
 
-async fn read_pair(
+pub(crate) async fn read_pair(
     engine: &Engine,
     id: &BlockIdExt,
     budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
@@ -261,12 +261,22 @@ async fn repair_owned(
             let (block, proof) = match local.take() {
                 Some(pair) => pair,
                 None => {
-                    let graph = budget.reserve_network_graph()?;
                     let body = budget
                         .reserve(crate::history_read_budget::ReadKind::State, MAX_ARTIFACT_BYTES)?;
                     let proof_bytes = budget
                         .reserve(crate::history_read_budget::ReadKind::Proof, MAX_ARTIFACT_BYTES)?;
-                    let bytes = body.allowance().min(proof_bytes.allowance()).min(graph.bytes / 2);
+                    let maximum = body.allowance().min(proof_bytes.allowance());
+                    // Wire, decoded TL, compressed expansion and output bytes
+                    // coexist before graph parsing. Admit them before reserving
+                    // the remaining graph capacity on this same request.
+                    rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(
+                        budget.as_ref(),
+                        maximum
+                            .checked_mul(6)
+                            .ok_or_else(|| error!("Repair network workspace overflow"))?,
+                    )?;
+                    let graph = budget.reserve_network_graph()?;
+                    let bytes = maximum.min(graph.bytes / 2);
                     let mut limits =
                         crate::network::full_node_overlay_client::NetworkDownloadLimits::proof(
                             bytes,
@@ -277,11 +287,16 @@ async fn repair_owned(
                     let pair = engine
                         .overlay_client(request.block_id.shard())
                         .await?
-                        .download_block_full_bounded(&request.block_id, false, limits)
+                        .download_block_full_history(
+                            &request.block_id,
+                            false,
+                            limits,
+                            budget.clone(),
+                            graph,
+                        )
                         .await?;
                     body.finish(pair.0.data())?;
                     proof_bytes.finish(pair.1.data())?;
-                    graph.finish_many(&[pair.0.root_cell(), pair.1.root_cell()])?;
                     pair
                 }
             };
@@ -586,10 +601,11 @@ pub(crate) async fn obtain_durable_mc_custody(
                 Some(&budget),
             )
             .await?;
-            crate::validator::retired_session_auth::validate_close_recovery_binding(
+            crate::validator::retired_session_auth::validate_close_recovery_binding_with_budget(
                 owner.as_ref(),
                 &binding,
                 &source_state,
+                &budget,
             )?;
             let live = repair_owned(owner.clone(), request, admission, budget.clone()).await?;
             if live.block.block()?.read_extra()?.created_by() != &binding.canonical.source_validator
@@ -728,10 +744,11 @@ pub(crate) async fn reopen_durable_mc_custody(
             Some(&budget),
         )
         .await?;
-        crate::validator::retired_session_auth::validate_close_recovery_binding(
+        crate::validator::retired_session_auth::validate_close_recovery_binding_with_budget(
             owner.as_ref(),
             &binding,
             &source_state,
+            &budget,
         )?;
         let live = repair_owned(owner.clone(), request, admission, budget.clone()).await?;
         if live.block.block()?.read_extra()?.created_by() != &binding.canonical.source_validator {

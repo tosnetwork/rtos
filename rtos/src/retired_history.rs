@@ -18,6 +18,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use storage::bounded_cell::CellReadBudget;
 
 /// Only bounded admission contention is retriable by the manager. Disk quota,
 /// malformed evidence, failed authentication and ordinary IO errors are not.
@@ -107,9 +108,16 @@ struct Manifest {
     proofs: Vec<ProofRef>,
 }
 struct Evidence {
+    manifest_hash: UInt256,
     manifest: Manifest,
     state: Vec<u8>,
     proofs: Vec<BlockProofStuff>,
+}
+// Only successful pinned authentication creates this capability. It binds the
+// exact bytes and complete file set that a later durability barrier must reread.
+pub(crate) struct CapsuleDurabilityReceipt {
+    manifest_hash: UInt256,
+    manifest: Manifest,
 }
 struct Store {
     root: PathBuf,
@@ -119,6 +127,22 @@ struct Store {
     fail_manifest: bool,
 }
 
+fn charge_digest_work(length: usize, budget: &crate::history_read_budget::HistoryReadBudget) -> Result<()> {
+    // SHA-256 input blocks plus padding; work is cumulative even on rejection.
+    for _ in 0..length / 64 + 2 {
+        budget.step()?;
+    }
+    Ok(())
+}
+fn bounded_digest(
+    bytes: &[u8],
+    budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+) -> Result<UInt256> {
+    if let Some(budget) = budget {
+        charge_digest_work(bytes.len(), budget)?;
+    }
+    Ok(UInt256::calc_file_hash(bytes))
+}
 fn digest(bytes: &[u8]) -> String {
     UInt256::calc_file_hash(bytes).to_hex_string()
 }
@@ -168,10 +192,21 @@ impl Store {
         })
     }
     fn usage(&self) -> Result<(u64, usize)> {
+        self.usage_budget(None)
+    }
+    fn usage_budget(
+        &self,
+        budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+    ) -> Result<(u64, usize)> {
+        use storage::bounded_cell::CellReadBudget;
         let mut bytes = 0u64;
         let mut anchors = 0usize;
         let mut files = 0usize;
         for entry in std::fs::read_dir(&self.root)? {
+            if let Some(budget) = budget {
+                budget.step()?;
+                budget.metadata(512)?;
+            }
             let entry = entry?;
             if !entry.file_type()?.is_file() {
                 fail!("Unexpected retained history directory entry");
@@ -190,6 +225,53 @@ impl Store {
         }
         Ok((bytes, anchors))
     }
+    fn sync_authenticated_capsule(
+        &self,
+        domain: &Domain,
+        id: &BlockIdExt,
+        receipt: &CapsuleDurabilityReceipt,
+        budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
+    ) -> Result<()> {
+        if receipt.manifest.domain != *domain || receipt.manifest.id != id.to_string() {
+            fail!("Authenticated capsule receipt domain/identity mismatch");
+        }
+        self.usage_budget(Some(budget))?;
+        let path = self.root.join(format!("{}.json", anchor_name(domain, id)));
+        let (manifest_bytes, manifest_file) = self.budget_file_open(
+            &path, 2 << 20, crate::history_read_budget::ReadKind::Metadata, budget,
+        )?;
+        if bounded_digest(&manifest_bytes, Some(budget))? != receipt.manifest_hash {
+            fail!("Authenticated capsule manifest changed before durability barrier");
+        }
+        let mut total = 0usize;
+        for (index, hash) in std::iter::once(&receipt.manifest.state)
+            .chain(receipt.manifest.proofs.iter().map(|proof| &proof.blob)).enumerate()
+        {
+            let (bound, kind) = if index == 0 {
+                (self.limits.state_bytes, crate::history_read_budget::ReadKind::State)
+            } else {
+                (self.limits.proof_bytes, crate::history_read_budget::ReadKind::Proof)
+            };
+            let (bytes, file) = self.budget_file_open(
+                &self.root.join(format!("{hash}.blob")), bound, kind, budget,
+            )?;
+            total = total.checked_add(bytes.len()).ok_or_else(|| error!("Capsule size overflow"))?;
+            if total as u64 > self.limits.total_bytes {
+                fail!("Retained history evidence exceeds memory bound");
+            }
+            if bounded_digest(&bytes, Some(budget))?.to_hex_string() != *hash {
+                fail!("Authenticated capsule blob changed before durability barrier");
+            }
+            budget.step()?;
+            // Sync the descriptor whose bytes were checked, not a reopened path.
+            file.sync_all()?;
+        }
+        budget.step()?;
+        manifest_file.sync_all()?;
+        budget.step()?;
+        File::open(&self.root)?.sync_all()?;
+        Ok(())
+    }
     fn blob(&self, hash: &str, bound: usize) -> Result<Vec<u8>> {
         if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
             fail!("Invalid history blob reference");
@@ -207,23 +289,49 @@ impl Store {
         kind: crate::history_read_budget::ReadKind,
         budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
     ) -> Result<Vec<u8>> {
+        self.budget_file_open(path, bound, kind, budget).map(|(bytes, _)| bytes)
+    }
+    fn budget_file_open(
+        &self,
+        path: &Path,
+        bound: usize,
+        kind: crate::history_read_budget::ReadKind,
+        budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
+    ) -> Result<(Vec<u8>, File)> {
         use std::io::Read;
+        budget.step()?;
         let file = File::open(path)?;
         let length = usize::try_from(file.metadata()?.len())?;
-        let reservation = budget.reserve(kind, length.max(1).min(bound))?;
-        let allowance = reservation.allowance();
-        if length > allowance {
+        if length > bound {
             return Err(
                 crate::history_read_budget::HistoryBudgetExceeded("capsule file bytes").into()
             );
         }
-        let mut bytes = Vec::with_capacity(length);
-        file.take(
-            u64::try_from(allowance)?
-                .checked_add(1)
-                .ok_or_else(|| error!("History read limit overflow"))?,
-        )
-        .read_to_end(&mut bytes)?;
+        // The growth probe is real IO as well: reserve its potential byte
+        // before read_exact/read, retaining that charge on any failure.
+        let requested =
+            length.checked_add(1).ok_or_else(|| error!("Capsule read length overflow"))?;
+        let reservation = budget.reserve(kind, requested)?;
+        let allowance = reservation.allowance();
+        if requested > allowance {
+            return Err(
+                crate::history_read_budget::HistoryBudgetExceeded("capsule file bytes").into()
+            );
+        }
+        // Exactly admitted buffer plus stack growth probe: read_to_end would
+        // implicitly grow the allocation if the same file changed during IO.
+        rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(budget.as_ref(), length)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length)?;
+        bytes.resize(length, 0);
+        let mut file = file;
+        file.read_exact(&mut bytes)?;
+        let mut extra = [0u8; 1];
+        if file.read(&mut extra)? != 0 {
+            return Err(
+                crate::history_read_budget::HistoryBudgetExceeded("capsule file growth").into()
+            );
+        }
         if bytes.len() > allowance {
             return Err(
                 crate::history_read_budget::HistoryBudgetExceeded("capsule file growth").into()
@@ -232,8 +340,12 @@ impl Store {
         if bytes.len() != length {
             fail!("Capsule file changed during read");
         }
+        if matches!(kind, crate::history_read_budget::ReadKind::Proof) {
+            // finish() hashes proof bytes for cumulative deduplication.
+            charge_digest_work(bytes.len(), budget)?;
+        }
         reservation.finish(&bytes)?;
-        Ok(bytes)
+        Ok((bytes, file))
     }
     fn blob_budget(
         &self,
@@ -250,7 +362,7 @@ impl Store {
         }
         let bytes =
             self.budget_file(&self.root.join(format!("{hash}.blob")), bound, kind, budget)?;
-        if digest(&bytes) != hash {
+        if bounded_digest(&bytes, Some(budget))?.to_hex_string() != hash {
             fail!("History blob checksum mismatch");
         }
         Ok(bytes)
@@ -264,9 +376,9 @@ impl Store {
         id: &BlockIdExt,
         budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
     ) -> Result<Option<Evidence>> {
-        self.usage()?;
+        self.usage_budget(budget)?;
         let path = self.root.join(format!("{}.json", anchor_name(domain, id)));
-        if !path.exists() {
+        if !path.try_exists()? {
             return Ok(None);
         }
         let bytes = match budget {
@@ -275,7 +387,8 @@ impl Store {
             }
             None => bounded_read(&path, 2 << 20)?,
         };
-        let manifest: Manifest = serde_json::from_slice(&bytes)?;
+        let manifest_hash = bounded_digest(&bytes, budget)?;
+        let manifest = Self::decode_manifest(&bytes, budget)?;
         if manifest.schema != SCHEMA
             || &manifest.domain != domain
             || manifest.id != id.to_string()
@@ -289,7 +402,16 @@ impl Store {
             crate::history_read_budget::ReadKind::State,
             budget,
         )?;
-        let mut proofs = Vec::new();
+        let mut proofs: Vec<BlockProofStuff> = Vec::new();
+        if let Some(budget) = budget {
+            let bytes = manifest
+                .proofs
+                .len()
+                .checked_mul(std::mem::size_of::<BlockProofStuff>())
+                .ok_or_else(|| error!("History proof vector overflow"))?;
+            rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(budget.as_ref(), bytes)?;
+            proofs.try_reserve_exact(manifest.proofs.len())?;
+        }
         let mut total = state.len() as u64;
         for proof in &manifest.proofs {
             let bytes = self.blob_budget(
@@ -303,18 +425,43 @@ impl Store {
                 fail!("Retained history evidence exceeds memory bound");
             }
             let id: BlockIdExt = proof.id.parse()?;
-            if proofs.iter().any(|p: &BlockProofStuff| p.id() == &id) {
-                fail!("Duplicate retained proof identity");
+            for previous in &proofs {
+                if let Some(budget) = budget {
+                    budget.step()?;
+                }
+                if previous.id() == &id {
+                    fail!("Duplicate retained proof identity");
+                }
             }
             proofs.push(match budget {
                 Some(b) => BlockProofStuff::deserialize_bounded(&id, bytes, proof.link, b)?,
                 None => BlockProofStuff::deserialize(&id, bytes, proof.link)?,
             });
         }
-        Ok(Some(Evidence { manifest, state, proofs }))
+        Ok(Some(Evidence { manifest_hash, manifest, state, proofs }))
     }
     /// Metadata lookup is bounded independently of proof/state authentication.
     /// Conflicting full identities at one height are never resolved by order.
+    fn decode_manifest(
+        bytes: &[u8],
+        budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+    ) -> Result<Manifest> {
+        if let Some(budget) = budget {
+            // Each JSON object requires at least two input bytes. Cover
+            // geometric vector growth and string buffers before serde allocates.
+            let workspace = bytes
+                .len()
+                .checked_mul(2 * std::mem::size_of::<ProofRef>() + 8)
+                .and_then(|n| n.checked_add(4096))
+                .ok_or_else(|| error!("History manifest workspace overflow"))?;
+            rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(
+                budget.as_ref(),
+                workspace,
+            )?;
+        }
+        let manifest: Manifest = serde_json::from_slice(bytes)?;
+        Ok(manifest)
+    }
     fn manifests(&self, domain: &Domain) -> Result<Vec<Manifest>> {
         self.manifests_budget(domain, None)
     }
@@ -323,11 +470,16 @@ impl Store {
         domain: &Domain,
         budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
     ) -> Result<Vec<Manifest>> {
-        self.usage()?;
+        use storage::bounded_cell::CellReadBudget;
+        self.usage_budget(budget)?;
         let mut result = Vec::new();
         let mut identities = std::collections::BTreeMap::new();
         let mut read_bytes = 0usize;
         for entry in std::fs::read_dir(&self.root)? {
+            if let Some(budget) = budget {
+                budget.step()?;
+                budget.metadata(512)?;
+            }
             let entry = entry?;
             if entry.path().extension().is_none_or(|e| e != "json") {
                 continue;
@@ -350,7 +502,7 @@ impl Store {
             if read_bytes > 16 << 20 {
                 fail!("History metadata lookup exceeds budget");
             }
-            let manifest: Manifest = serde_json::from_slice(&bytes)?;
+            let manifest = Self::decode_manifest(&bytes, budget)?;
             if &manifest.domain != domain {
                 continue;
             }
@@ -366,6 +518,13 @@ impl Store {
             for id in std::iter::once(Ok(id))
                 .chain(manifest.proofs.iter().map(|p| p.id.parse::<BlockIdExt>()))
             {
+                if let Some(budget) = budget {
+                    budget.step()?;
+                    rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(
+                        budget.as_ref(),
+                        1024,
+                    )?;
+                }
                 let id = id?;
                 if !id.shard().is_masterchain_ext() {
                     fail!("Non-masterchain retained history proof");
@@ -375,6 +534,13 @@ impl Store {
                         fail!("Conflicting retained history identities at height {}", id.seq_no);
                     }
                 }
+            }
+            if let Some(budget) = budget {
+                rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(
+                    budget.as_ref(),
+                    std::mem::size_of::<Manifest>(),
+                )?;
+                result.try_reserve_exact(1)?;
             }
             result.push(manifest);
         }
@@ -397,9 +563,16 @@ impl Store {
         budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
     ) -> Result<Option<BlockProofStuff>> {
         let manifests = self.manifests_budget(domain, budget)?;
+        if let Some(budget) = budget {
+            budget.metadata(256)?;
+        }
+        let identity = id.to_string();
         let mut found: Option<&ProofRef> = None;
         for proof in manifests.iter().flat_map(|m| &m.proofs) {
-            if proof.id != id.to_string() || (proof.link && !allow_link) {
+            if let Some(budget) = budget {
+                budget.step()?;
+            }
+            if proof.id != identity || (proof.link && !allow_link) {
                 continue;
             }
             if let Some(previous) = found {
@@ -451,10 +624,22 @@ impl Store {
         state: Vec<u8>,
         proofs: Vec<BlockProofStuff>,
     ) -> Result<()> {
+        self.commit_budget(domain, id, global_id, state, proofs, None)
+    }
+    fn commit_budget(
+        &self,
+        domain: Domain,
+        id: BlockIdExt,
+        global_id: i32,
+        state: Vec<u8>,
+        proofs: Vec<BlockProofStuff>,
+        budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+    ) -> Result<()> {
+        use storage::bounded_cell::CellReadBudget;
         if state.len() > self.limits.state_bytes || proofs.len() > self.limits.proofs_per_anchor {
             fail!("History evidence exceeds bound");
         }
-        if let Some(existing) = self.read(&domain, &id)? {
+        if let Some(existing) = self.read_budget(&domain, &id, budget)? {
             if existing.state != state || existing.manifest.global_id != global_id {
                 fail!("Conflicting retained history state");
             }
@@ -465,15 +650,26 @@ impl Store {
             File::open(&self.root)?.sync_all()?;
             return Ok(());
         }
-        let (used, anchors) = self.usage()?;
+        let (used, anchors) = self.usage_budget(budget)?;
         if anchors >= self.limits.anchors {
             fail!("Retained history anchor quota exhausted");
         }
         let mut blobs = std::collections::BTreeMap::new();
+        if let Some(budget) = budget {
+            budget.metadata(4096)?;
+        }
         let state_hash = digest(&state);
         blobs.insert(state_hash.clone(), state);
         let mut references = Vec::new();
         for proof in proofs {
+            if let Some(budget) = budget {
+                budget.step()?;
+                budget.metadata(4096)?;
+                rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(
+                    budget.as_ref(),
+                    proof.data().len(),
+                )?;
+            }
             if proof.data().len() > self.limits.proof_bytes {
                 fail!("History proof exceeds bound");
             }
@@ -493,15 +689,31 @@ impl Store {
             state: state_hash,
             proofs: references,
         };
-        let encoded = serde_json::to_vec(&manifest)?;
+        let encoded = if let Some(budget) = budget {
+            let mut writer =
+                crate::historical_recovery::BudgetedBytes::new(2 << 20, budget.clone());
+            serde_json::to_writer(&mut writer, &manifest)?;
+            writer.finish()
+        } else {
+            serde_json::to_vec(&manifest)?
+        };
         if encoded.len() > 2 << 20 {
             fail!("History manifest exceeds bound");
         }
         let mut extra = encoded.len() as u64;
         for (hash, bytes) in &blobs {
             let path = self.root.join(format!("{hash}.blob"));
-            if path.exists() {
-                if bounded_read(&path, bytes.len())? != *bytes {
+            if path.try_exists()? {
+                let existing = match budget {
+                    Some(budget) => self.budget_file(
+                        &path,
+                        bytes.len(),
+                        crate::history_read_budget::ReadKind::State,
+                        budget,
+                    )?,
+                    None => bounded_read(&path, bytes.len())?,
+                };
+                if existing != *bytes {
                     fail!("Existing history blob conflicts");
                 }
             } else {
@@ -515,7 +727,7 @@ impl Store {
         }
         for (hash, bytes) in blobs {
             let name = format!("{hash}.blob");
-            if !self.root.join(&name).exists() {
+            if !self.root.join(&name).try_exists()? {
                 self.atomic_write(&name, &bytes)?;
             } else {
                 File::open(self.root.join(name))?.sync_all()?;
@@ -568,9 +780,28 @@ pub(crate) async fn authenticate_state_with_budget<E: EngineOperations + ?Sized>
     id: &BlockIdExt,
     budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
 ) -> Result<VerifiedMasterchainState> {
+    if let Some(state) = authenticate_capsule_with_budget(engine, id, budget).await? {
+        return Ok(state);
+    }
+    authenticate_ordinary_with_budget(engine, id, budget).await
+}
+
+pub(crate) async fn authenticate_capsule_with_budget<E: EngineOperations + ?Sized>(
+    engine: &E,
+    id: &BlockIdExt,
+    budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+) -> Result<Option<VerifiedMasterchainState>> {
+    Ok(authenticate_capsule_for_request(engine, id, budget).await?.map(|(state, _)| state))
+}
+
+pub(crate) async fn authenticate_capsule_for_request<E: EngineOperations + ?Sized>(
+    engine: &E,
+    id: &BlockIdExt,
+    budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+) -> Result<Option<(VerifiedMasterchainState, CapsuleDurabilityReceipt)>> {
     let path = root(engine)?;
-    if !path.exists() {
-        return authenticate_ordinary_with_budget(engine, id, budget).await;
+    if !path.try_exists()? {
+        return Ok(None);
     }
     let domain = Domain::from_engine(engine)?;
     let expected = id.clone();
@@ -580,7 +811,7 @@ pub(crate) async fn authenticate_state_with_budget<E: EngineOperations + ?Sized>
     })
     .await?;
     let Some(evidence) = evidence else {
-        return authenticate_ordinary_with_budget(engine, id, budget).await;
+        return Ok(None);
     };
     let state = ShardStateStuff::from_root_cell(
         id.clone(),
@@ -612,7 +843,10 @@ pub(crate) async fn authenticate_state_with_budget<E: EngineOperations + ?Sized>
     if verified.state().state()?.global_id() != evidence.manifest.global_id {
         fail!("History global ID mismatch");
     }
-    Ok(verified)
+    Ok(Some((verified, CapsuleDurabilityReceipt {
+        manifest_hash: evidence.manifest_hash,
+        manifest: evidence.manifest,
+    })))
 }
 
 /// Raw evidence only: callers must verify through BootstrapAuthority.
@@ -630,7 +864,7 @@ pub(crate) async fn load_proof_with_budget<E: EngineOperations + ?Sized>(
     budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
 ) -> Result<Option<BlockProofStuff>> {
     let path = root(engine)?;
-    if !path.exists() {
+    if !path.try_exists()? {
         return Ok(None);
     }
     let domain = Domain::from_engine(engine)?;
@@ -647,6 +881,28 @@ pub(crate) async fn load_proof_with_budget<E: EngineOperations + ?Sized>(
     .await
 }
 
+// Preserve stable minimum-sequence selection without allocating a second
+// ID vector or sorting outside the request budget.
+fn select_hint(
+    manifests: Vec<Manifest>,
+    epoch: u32,
+    budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+) -> Result<Option<BlockIdExt>> {
+    let mut selected: Option<BlockIdExt> = None;
+    for manifest in manifests {
+        if let Some(budget) = budget {
+            budget.step()?;
+        }
+        let id: BlockIdExt = manifest.id.parse()?;
+        if id.seq_no >= epoch
+            && selected.as_ref().is_none_or(|previous| id.seq_no < previous.seq_no)
+        {
+            selected = Some(id);
+        }
+    }
+    Ok(selected)
+}
+
 /// Authenticate one selected retained anchor before using its history index.
 pub(crate) async fn lookup_hint<E: EngineOperations + ?Sized>(
     engine: &E,
@@ -660,32 +916,35 @@ pub(crate) async fn lookup_hint_with_budget<E: EngineOperations + ?Sized>(
     budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
 ) -> Result<Option<Arc<ShardStateStuff>>> {
     let path = root(engine)?;
-    if !path.exists() {
+    if !path.try_exists()? {
         return Ok(None);
     }
     let domain = Domain::from_engine(engine)?;
     let read_budget = budget.cloned();
     let selected = owned_io(engine, move || {
         let store = Store::open(path, Limits::default())?;
-        let mut ids = store
-            .manifests_budget(&domain, read_budget.as_ref())?
-            .into_iter()
-            .map(|m| m.id.parse::<BlockIdExt>())
-            .collect::<Result<Vec<_>>>()?;
-        ids.retain(|id| id.seq_no >= epoch);
-        ids.sort_by_key(|id| id.seq_no);
-        Ok(ids.into_iter().next())
+        select_hint(
+            store.manifests_budget(&domain, read_budget.as_ref())?,
+            epoch,
+            read_budget.as_ref(),
+        )
     })
     .await?;
     let Some(id) = selected else {
         return Ok(None);
     };
     let verified = authenticate_state_with_budget(engine, &id, budget).await?;
+    if let Some(budget) = budget {
+        rtos_block::config_read_budget::lookup(
+            &crate::bounded_session_derivation::ConfigBudget(budget.as_ref()),
+            32,
+        )?;
+    }
     verified.state().find_block_id(epoch)?;
     Ok(Some(verified.state().clone()))
 }
 
-async fn authenticate_ordinary_with_budget<E: EngineOperations + ?Sized>(
+pub(crate) async fn authenticate_ordinary_with_budget<E: EngineOperations + ?Sized>(
     engine: &E,
     id: &BlockIdExt,
     budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
@@ -855,6 +1114,109 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retired_history_root_io_error_is_not_missing_evidence() {
+        struct PathOnlyEngine(String);
+        #[async_trait::async_trait]
+        impl EngineOperations for PathOnlyEngine {
+            fn db_root_dir(&self) -> Result<&str> {
+                Ok(&self.0)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let engine = PathOnlyEngine(dir.path().to_str().unwrap().to_owned());
+        let path = dir.path().join("retired-history-v1");
+        let budget = crate::history_read_budget::HistoryReadBudget::new(Default::default());
+        // Truly absent evidence remains a lookup miss, before domain or IO jobs.
+        for budget in [None, Some(&budget)] {
+            assert!(authenticate_capsule_with_budget(&engine, &identity(1), budget)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(load_proof_with_budget(&engine, &identity(1), false, budget)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(lookup_hint_with_budget(&engine, 1, budget).await.unwrap().is_none());
+        }
+        // A real ELOOP used to be swallowed by Path::exists. None of these
+        // entry points may report absence and allow a remote fallback instead.
+        std::os::unix::fs::symlink("retired-history-v1", &path).unwrap();
+        let expected = std::fs::metadata(&path).unwrap_err().raw_os_error().unwrap();
+        for budget in [None, Some(&budget)] {
+            let errors = [
+                authenticate_capsule_with_budget(&engine, &identity(1), budget).await.err(),
+                load_proof_with_budget(&engine, &identity(1), false, budget).await.err(),
+                lookup_hint_with_budget(&engine, 1, budget).await.err(),
+            ];
+            for error in errors {
+                let error = error.expect("root IO error must not become missing evidence");
+                assert_eq!(
+                    error.downcast_ref::<std::io::Error>().and_then(|e| e.raw_os_error()),
+                    Some(expected)
+                );
+            }
+        }
+        assert_eq!(std::fs::read_link(&path).unwrap(), PathBuf::from("retired-history-v1"));
+    }
+
+    #[test]
+    fn retired_history_hint_selection_charges_each_candidate_cumulatively() {
+        use crate::history_read_budget::{
+            HistoryBudgetExceeded, HistoryReadBudget, HistoryReadLimits,
+        };
+        let manifests = || {
+            [9, 3, 7]
+                .into_iter()
+                .map(|seq| Manifest {
+                    schema: SCHEMA,
+                    domain: domain(),
+                    id: identity(seq).to_string(),
+                    global_id: -239,
+                    state: String::new(),
+                    proofs: vec![],
+                })
+                .collect()
+        };
+        assert_eq!(select_hint(manifests(), 4, None).unwrap(), Some(identity(7)));
+        let budget = HistoryReadBudget::new(HistoryReadLimits { steps: 3, ..Default::default() });
+        assert_eq!(select_hint(manifests(), 4, Some(&budget)).unwrap(), Some(identity(7)));
+        assert!(select_hint(manifests(), 4, Some(&budget))
+            .unwrap_err()
+            .downcast_ref::<HistoryBudgetExceeded>()
+            .is_some());
+        assert!(select_hint(manifests(), 10, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn retired_history_default_anchor_quota_rejects_129_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().to_owned(), Limits::default()).unwrap();
+        assert_eq!(store.limits.anchors, 128);
+        for seq in 1..=128 {
+            store.commit(domain(), identity(seq), -239, vec![1, 2, 3], vec![]).unwrap();
+        }
+        let before = store.usage().unwrap();
+        assert_eq!(before.1, 128);
+        let error = store.commit(domain(), identity(129), -239, vec![4, 5, 6], vec![]).unwrap_err();
+        assert!(error.to_string().contains("anchor quota"));
+        assert_eq!(store.usage().unwrap(), before);
+        drop(store);
+        let reopened = Store::open(dir.path().to_owned(), Limits::default()).unwrap();
+        assert_eq!(reopened.usage().unwrap(), before);
+        assert!(reopened.commit(domain(), identity(129), -239, vec![4, 5, 6], vec![]).is_err());
+        // Existing identical debt remains idempotent even at the full bound.
+        reopened.commit(domain(), identity(1), -239, vec![1, 2, 3], vec![]).unwrap();
+        assert_eq!(reopened.usage().unwrap(), before);
+        for seq in 1..=128 {
+            assert_eq!(
+                reopened.read(&domain(), &identity(seq)).unwrap().unwrap().state,
+                vec![1, 2, 3]
+            );
+        }
+    }
+
     #[test]
     fn retired_history_store_reopen_dedup_and_bound() {
         let dir = tempfile::tempdir().unwrap();
@@ -878,6 +1240,37 @@ mod tests {
         assert_eq!(reopened.read(&domain(), &identity(1)).unwrap().unwrap().state, vec![1, 2, 3]);
         let wrong = Domain { init: identity(7).to_string(), ..domain() };
         assert!(reopened.read(&wrong, &identity(1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn retired_history_capsule_reader_charges_directory_and_workspace_before_decode() {
+        use crate::history_read_budget::{
+            HistoryBudgetExceeded, HistoryReadBudget, HistoryReadLimits,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().to_owned(), Limits::default()).unwrap();
+        store.commit(domain(), identity(1), -239, vec![7; 32], vec![]).unwrap();
+        let manifest_path =
+            dir.path().join(format!("{}.json", anchor_name(&domain(), &identity(1))));
+        let before = std::fs::read(&manifest_path).unwrap();
+        for dimension in 0..3 {
+            let mut limits = HistoryReadLimits::default();
+            match dimension {
+                0 => limits.steps = 0,
+                1 => limits.metadata_bytes = 0,
+                _ => limits.cell_bytes = 0,
+            }
+            let budget = HistoryReadBudget::new(limits);
+            let error = store.read_budget(&domain(), &identity(1), Some(&budget)).err().unwrap();
+            assert!(error.downcast_ref::<HistoryBudgetExceeded>().is_some(), "{error:#}");
+            assert!(store.manifests_budget(&domain(), Some(&budget)).is_err());
+            assert_eq!(std::fs::read(&manifest_path).unwrap(), before);
+        }
+        let budget = HistoryReadBudget::new(HistoryReadLimits::default());
+        assert_eq!(
+            store.read_budget(&domain(), &identity(1), Some(&budget)).unwrap().unwrap().state,
+            vec![7; 32]
+        );
     }
 
     #[test]
@@ -962,3 +1355,78 @@ pub(crate) async fn sync_repair_capsule<E: EngineOperations + ?Sized>(
     })
     .await
 }
+
+// Test-only quota injection is scoped to one database path and only the
+// actual recovered-capsule commit. Readers still validate production limits.
+#[cfg(test)]
+static RECOVERED_LIMITS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Limits>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+pub(crate) struct RecoveredLimitsGuard(PathBuf);
+#[cfg(test)]
+impl Drop for RecoveredLimitsGuard {
+    fn drop(&mut self) {
+        RECOVERED_LIMITS.lock().unwrap().remove(&self.0);
+    }
+}
+#[cfg(test)]
+pub(crate) fn test_recovered_capsule_limits(
+    db_root: &Path,
+    limits: Limits,
+) -> RecoveredLimitsGuard {
+    let root = db_root.join("retired-history-v1");
+    let mut configured = RECOVERED_LIMITS.lock().unwrap();
+    assert!(!configured.contains_key(&root), "quota override already installed for database");
+    configured.insert(root.clone(), limits);
+    RecoveredLimitsGuard(root)
+}
+fn recovered_commit_limits(root: &Path) -> Limits {
+    #[cfg(test)]
+    if let Some(limits) = RECOVERED_LIMITS.lock().unwrap().get(root).cloned() {
+        return limits;
+    }
+    let _ = root;
+    Limits::default()
+}
+
+/// Narrow durable admission: a verified state alone cannot call this writer.
+/// The capability retains actual source certificate ownership across this IO.
+pub(crate) fn commit_recovered_capsule(
+    engine: &dyn EngineOperations,
+    admission: &crate::historical_recovery::DurableHistoryAdmission,
+    state: &VerifiedMasterchainState,
+    bytes: Vec<u8>,
+    proofs: Vec<BlockProofStuff>,
+    budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
+) -> Result<()> {
+    let id = state.state().block_id();
+    let global = state.state().state()?.global_id();
+    admission.validate(engine, id, global)?;
+    let root = root(engine)?;
+    let limits = recovered_commit_limits(&root);
+    Store::open(root, limits)?.commit_budget(
+        Domain::from_engine(engine)?,
+        id.clone(),
+        global,
+        bytes,
+        proofs,
+        Some(budget),
+    )
+}
+
+pub(crate) fn sync_recovered_capsule(
+    engine: &dyn EngineOperations,
+    state: &VerifiedMasterchainState,
+    receipt: &CapsuleDurabilityReceipt,
+    budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
+) -> Result<()> {
+    let store = Store::open(root(engine)?, Limits::default())?;
+    store.sync_authenticated_capsule(
+        &Domain::from_engine(engine)?, state.state().block_id(), receipt, budget,
+    )
+}
+
+#[cfg(test)]
+#[path = "retired_history_capsule_barrier_tests.rs"]
+mod capsule_barrier_tests;

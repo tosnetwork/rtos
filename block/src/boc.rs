@@ -483,6 +483,7 @@ macro_rules! define_BocWriter {
             references: usize,
             stored_hashes: usize,
             abort: &'a dyn Fn() -> bool,
+            budget: Option<&'a dyn crate::config_read_budget::ConfigReadBudget>,
             $(
                 $field_name : $field_ty,
             )*
@@ -517,6 +518,7 @@ macro_rules! define_BocWriter {
                     references: 0,
                     stored_hashes: 0,
                     abort,
+                    budget: None,
                     $(
                         $field_name,
                     )*
@@ -560,7 +562,22 @@ macro_rules! define_BocWriter {
                 self.cells.len()
             }
 
+            fn budget_step(&self) -> Result<()> {
+                if let Some(budget) = self.budget { budget.step()?; }
+                Ok(())
+            }
+
             pub fn write<T: Write>(self, dest: &mut T) -> Result<()> {
+                if let Some(budget) = self.budget {
+                    // One work unit handles at most 64 bytes of encoding or CRC.
+                    // Cell/edge traversal is charged separately. The CRC buffer
+                    // may grow once when a final cell write crosses its limit.
+                    crate::config_read_budget::steps(budget, self.calc_boc_size().div_ceil(64))?;
+                    if self.flags.contains(BocFlags::Crc32) {
+                        crate::config_read_budget::steps(budget, self.calc_boc_size().div_ceil(64))?;
+                        budget.workspace(CRC_BUF_SIZE * 3)?;
+                    }
+                }
                 if self.flags.contains(BocFlags::Crc32) {
                     let mut dest_wrapped = IoCrcFilter::new_writer(dest);
                     self.write_ex_impl(&mut dest_wrapped)?;
@@ -572,6 +589,7 @@ macro_rules! define_BocWriter {
 
             pub fn write_to_vec(self) -> Result<Vec<u8>> {
                 let size = self.calc_boc_size();
+                if let Some(budget) = self.budget { budget.workspace(size)?; }
                 let mut v = Vec::with_capacity(size);
                 self.write(&mut v)?;
                 Ok(v)
@@ -643,6 +661,7 @@ macro_rules! define_BocWriter {
 
                 // Root's indexes
                 for index in self.roots_indexes_rev.iter() {
+                    self.budget_step()?;
                     check_abort(self.abort)?;
                     dest.write_all(&((self.cells_count() - *index - 1) as u64).to_be_bytes()[(8-ref_size)..8])?;
                 }
@@ -651,6 +670,7 @@ macro_rules! define_BocWriter {
                 if include_index {
                     let mut offset = 0;
                     for (i, cell_info) in self.cells.iter().rev().enumerate() {
+                        self.budget_step()?;
                         let cell_info = &self.cells[cell_info.new_cell_index as usize];
                         if i & CHECK_ABORT_EACH == 0 {
                             check_abort(self.abort)?;
@@ -669,6 +689,7 @@ macro_rules! define_BocWriter {
 
                 // Cells
                 for (cell_index, cell_info) in self.cells.iter().rev().enumerate() {
+                    self.budget_step()?;
                     if cell_index & CHECK_ABORT_EACH == 0 {
                         check_abort(self.abort)?;
                     }
@@ -676,6 +697,7 @@ macro_rules! define_BocWriter {
 
                     self.write_cell_data(cell_info, dest)?;
                     for i in 0..cell_info.refs_count() {
+                        self.budget_step()?;
                         let child_index = self.cells_count() - 1 - cell_info.refs[i as usize] as usize;
                         //write!(&mut log, " {} ", child_index).unwrap();
                         debug_assert!(child_index > cell_index);
@@ -695,6 +717,7 @@ macro_rules! define_BocWriter {
             fn distribute_weights(&mut self) -> Result<()> {
 
                 for i in (0..self.cells.len()).rev() {
+                    self.budget_step()?;
                     let cell_info = &self.cells[i];
                     let refs = cell_info.refs_count() as usize;
                     let mut fat_children =
@@ -703,6 +726,7 @@ macro_rules! define_BocWriter {
 
                     // Collect child cells with weight > limit
                     for j in 0..refs {
+                        self.budget_step()?;
                         let child_info = &self.cells[cell_info.refs[j] as usize];
                         let limit = (MAX_CELL_DISTR_WEIGHT - 1 + j as u32) / refs as u32;
                         if child_info.weight as u32 <= limit {
@@ -714,6 +738,7 @@ macro_rules! define_BocWriter {
 
                     // Distribute limited weight between fat children
                     for j in &fat_children {
+                        self.budget_step()?;
                         let limit = sum / fat_children.len() as u32;
                         sum += 1;
                         let child_info = &mut self.cells[*j];
@@ -727,9 +752,11 @@ macro_rules! define_BocWriter {
 
                 let flags = self.flags;
                 for i in 0..self.cells.len() {
+                    self.budget_step()?;
                     let cell_info = &self.cells[i];
                     let mut children_weight = 1;
                     for j in 0..cell_info.refs_count() {
+                        self.budget_step()?;
                         children_weight += self.cells[cell_info.refs[j as usize] as usize].weight;
                     }
 
@@ -752,6 +779,7 @@ macro_rules! define_BocWriter {
                 }
 
                 for i in 0..self.roots_indexes_rev.len() {
+                    self.budget_step()?;
                     let cell_info = &mut self.cells[self.roots_indexes_rev[i]];
                     cell_info.flags |= CellInfoFlags::IS_ROOT;
                     if flags.contains(BocFlags::TopHash) &&
@@ -777,13 +805,19 @@ macro_rules! define_BocWriter {
 
                 let mut new_cells_index = 0;
                 for i in 0..self.roots_indexes_rev.len() {
+                    self.budget_step()?;
                     let root_index = self.roots_indexes_rev[i];
                     self.revisit(root_index, RevisitingMode::Previsit, &mut new_cells_index)?;
                     self.revisit(root_index, RevisitingMode::Visit, &mut new_cells_index)?;
                 }
 
+                if let Some(budget) = self.budget {
+                    budget.workspace(self.roots_indexes_rev.len().checked_mul(std::mem::size_of::<usize>())
+                        .ok_or_else(|| error!("BOC roots size overflow"))?)?;
+                }
                 let mut new_roots_indexes = Vec::with_capacity(self.roots_indexes_rev.len());
                 for i in 0..self.roots_indexes_rev.len() {
+                    self.budget_step()?;
                     let root_index = self.roots_indexes_rev[i];
 
                     let new_root_index = self.revisit(root_index, RevisitingMode::Arrange, &mut new_cells_index)?;
@@ -807,6 +841,7 @@ macro_rules! define_BocWriter {
                 new_cells_index: &mut i32,
             ) -> Result<i32> {
 
+                self.budget_step()?;
                 debug_assert!(cell_index < self.cells.len());
 
                 if cell_index & CHECK_ABORT_EACH == 0 {
@@ -826,6 +861,7 @@ macro_rules! define_BocWriter {
                     }
 
                     for i in (0..self.cells[cell_index].refs_count()).rev() {
+                        self.budget_step()?;
                         let child_index = self.cells[cell_index].refs[i as usize] as usize;
                         let child_mode = if self.cells[child_index].weight == 0 {
                             // 2) Special processing for virtual trees leaves (cells with hashes)
@@ -863,12 +899,14 @@ macro_rules! define_BocWriter {
                 //    - already arranged cells
                 //    - cells with hashes
                 for i in (0..self.cells[cell_index].refs_count()).rev() {
+                    self.budget_step()?;
                     let child_index = self.cells[cell_index].refs[i as usize] as usize;
                     self.revisit(child_index, RevisitingMode::Visit, new_cells_index)?;
                 }
 
                 // 6) Arrange. From leaves to roots
                 for i in (0..self.cells[cell_index].refs_count()).rev() {
+                    self.budget_step()?;
                     let child_index = self.cells[cell_index].refs[i as usize] as usize;
                     let child_rs = self.revisit(child_index, RevisitingMode::Arrange, new_cells_index)?;
 
@@ -1041,6 +1079,88 @@ macro_rules! define_BocWriter_cell_impl {
 
 define_BocWriter! {BocWriter, CellInfo<Cell>, Vec<CellInfo<Cell>>, }
 define_BocWriter_cell_impl!(BocWriter);
+
+// Adapter only forwards to the request budget; no independent allowance exists.
+struct BocBudget<'a>(&'a dyn crate::config_read_budget::ConfigReadBudget);
+impl crate::merkle_apply_budget::MerkleApplyBudget for BocBudget<'_> {
+    fn step(&self) -> Result<()> { self.0.step() }
+    fn workspace(&self, bytes: usize) -> Result<()> { self.0.workspace(bytes) }
+    fn new_cell(&self, bytes: usize) -> Result<()> { self.0.workspace(bytes) }
+    fn max_depth(&self) -> u16 { MAX_SAFE_DEPTH }
+}
+
+fn boc_reserve<T>(values: &mut Vec<T>, budget: &dyn crate::config_read_budget::ConfigReadBudget) -> Result<()> {
+    if values.len() == values.capacity() {
+        let capacity = values.capacity().checked_mul(2).unwrap_or(0).max(4);
+        if capacity <= values.len() { fail!("BOC vector capacity overflow"); }
+        budget.workspace(capacity.checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| error!("BOC vector size overflow"))?)?;
+        values.try_reserve_exact(capacity - values.len())?;
+    }
+    Ok(())
+}
+
+impl<'a> BocWriter<'a> {
+    pub fn with_root_bounded(root: &Cell, budget: &'a dyn crate::config_read_budget::ConfigReadBudget) -> Result<Self> {
+        Self::with_flags_bounded([root.clone()], BocFlags::None, budget)
+    }
+
+    pub fn with_flags_bounded(
+        roots: impl IntoIterator<Item = Cell>,
+        mut flags: BocFlags,
+        budget: &'a dyn crate::config_read_budget::ConfigReadBudget,
+    ) -> Result<Self> {
+        // Identical to with_params: TopHash is intentionally disabled.
+        flags.remove(BocFlags::TopHash);
+        let mut writer = Self {
+            flags, roots_indexes_rev: Vec::new(), cells: Vec::new(),
+            cells_index: ahash::AHashMap::new(), data_size: 0, references: 0,
+            stored_hashes: 0, abort: &|| false, budget: Some(budget),
+        };
+        let mut index = crate::merkle_apply_budget::BudgetMap::new(i32::MAX as usize);
+        for root in roots {
+            budget.step()?;
+            crate::merkle_apply_budget::require_materialized(&root)?;
+            if root.repr_depth() > MAX_SAFE_DEPTH { fail!("BOC root depth exceeded"); }
+            let rev = writer.arrange_bounded(root, &mut index, budget)?;
+            boc_reserve(&mut writer.roots_indexes_rev, budget)?;
+            writer.roots_indexes_rev.push(rev as usize);
+        }
+        writer.distribute_weights()?;
+        writer.rearrange_cells()?;
+        Ok(writer)
+    }
+
+    fn arrange_bounded(
+        &mut self, cell: Cell,
+        index: &mut crate::merkle_apply_budget::BudgetMap<u32>,
+        budget: &dyn crate::config_read_budget::ConfigReadBudget,
+    ) -> Result<u32> {
+        budget.step()?;
+        crate::merkle_apply_budget::require_materialized(&cell)?;
+        if cell.virtualization() != 0 { fail!("Virtual cells serialization is prohibited"); }
+        let hash = cell.repr_hash().clone();
+        let adapter = BocBudget(budget);
+        if let Some(i) = index.get(&hash, &adapter)?.copied() {
+            self.cells[i as usize].flags |= CellInfoFlags::SHOULD_CACHE;
+            return Ok(i);
+        }
+        let mut weight = 1;
+        let mut refs = [0; MAX_REFERENCES_COUNT];
+        for (i, slot) in refs.iter_mut().enumerate().take(cell.references_count()) {
+            budget.step()?;
+            let child = self.arrange_bounded(cell.reference(i)?, index, budget)?;
+            *slot = child;
+            weight += self.cells[child as usize].weight as u32;
+        }
+        self.update_counters(&cell)?;
+        let rev = u32::try_from(self.cells.len())?;
+        index.insert(hash, rev, &adapter)?;
+        boc_reserve(&mut self.cells, budget)?;
+        self.cells.push(CellInfo::<Cell>::with_cell(cell, weight.min(MAX_CELL_WEIGHT) as u8, refs));
+        Ok(rev)
+    }
+}
 
 // Chunk size for ChunkedBocWriter. CellInfo<Cell> is ~40 bytes, so one chunk is ~320 KB:
 // large enough to keep per-chunk overhead and index arithmetic low, small enough to avoid
@@ -1439,9 +1559,18 @@ impl<'a> BocReader<'a> {
 
     /// Optimized in-memory BOC deserialization.
     pub fn read(&mut self, data: &[u8]) -> Result<BocReaderResult> {
+        self.read_budgeted(data, None)
+    }
+
+    pub fn read_bounded(&mut self, data: &[u8], budget: &dyn crate::config_read_budget::ConfigReadBudget) -> Result<BocReaderResult> {
+        if self.arena.is_some() { fail!("Bounded BOC reader requires direct cell allocations"); }
+        self.read_budgeted(data, Some(budget))
+    }
+
+    fn read_budgeted(&mut self, data: &[u8], budget: Option<&dyn crate::config_read_budget::ConfigReadBudget>) -> Result<BocReaderResult> {
         // Header
         let mut cursor = Cursor::new(data);
-        let (header, mut flags) = self.read_header(&mut cursor)?;
+        let (header, mut flags) = self.read_header_budgeted(&mut cursor, budget)?;
         let header_len = cursor.position() as usize;
 
         check_abort(self.abort)?;
@@ -1450,6 +1579,7 @@ impl<'a> BocReader<'a> {
 
         // CRC32-C: single call on the whole buffer
         if header.has_crc {
+            if let Some(b) = budget { crate::config_read_budget::steps(b, data.len().div_ceil(64))?; }
             let crc = crc32_digest(&data[..data.len() - 4]);
             let stored = u32::from_le_bytes(
                 data[data.len() - 4..].try_into().map_err(|_| error!("data too short for CRC"))?,
@@ -1473,11 +1603,16 @@ impl<'a> BocReader<'a> {
             header_len
         };
 
+        if let Some(b) = budget {
+            b.workspace(header.cells_count.checked_mul(std::mem::size_of::<usize>())
+                .ok_or_else(|| error!("BOC offsets allocation overflow"))?)?;
+        }
         let offsets = if header.index_included {
             let mut v = Vec::with_capacity(header.cells_count);
             let idx_base = header_len;
             let mut prev: usize = 0;
             for i in 0..header.cells_count {
+                if let Some(b) = budget { b.step()?; }
                 if i & CHECK_ABORT_EACH == 0 {
                     check_abort(self.abort)?;
                 }
@@ -1515,6 +1650,7 @@ impl<'a> BocReader<'a> {
             let mut v = Vec::with_capacity(header.cells_count);
             let mut pos = cells_data_start;
             for i in 0..header.cells_count {
+                if let Some(b) = budget { b.step()?; }
                 if i & CHECK_ABORT_EACH == 0 {
                     check_abort(self.abort)?;
                 }
@@ -1533,10 +1669,15 @@ impl<'a> BocReader<'a> {
 
         // Single-pass cell construction (reverse: leaves → roots)
         let cells_data_end = cells_data_start + header.tot_cells_size;
+        if let Some(b) = budget {
+            b.workspace(header.cells_count.checked_mul(std::mem::size_of::<Cell>())
+                .ok_or_else(|| error!("BOC cells allocation overflow"))?)?;
+        }
         let mut cells: Vec<Cell> = Vec::with_capacity(header.cells_count);
         let mut interrupted = false;
 
         for i in (0..header.cells_count).rev() {
+            if let Some(b) = budget { b.step()?; }
             if i & CHECK_ABORT_EACH == 0 {
                 check_abort(self.abort)?;
             }
@@ -1546,6 +1687,7 @@ impl<'a> BocReader<'a> {
 
             let wire_len = cell::full_len(raw);
             let rc = cell::refs_count(raw);
+            if rc > MAX_REFERENCES_COUNT { fail!("cell reference count exceeds format limit"); }
             if off + wire_len + rc * header.ref_size > cells_data_end {
                 fail!("cell {} wire data exceeds cells area", i);
             }
@@ -1556,7 +1698,7 @@ impl<'a> BocReader<'a> {
             }
 
             // Track IntHashes flag
-            if cell::store_hashes(raw) && !header.roots_indexes.contains(&(i as u32)) {
+            if cell::store_hashes(raw) && !boc_root_contains(&header.roots_indexes, i as u32, budget)? {
                 flags |= BocFlags::IntHashes;
             }
 
@@ -1564,6 +1706,7 @@ impl<'a> BocReader<'a> {
             let refs_off = off + wire_len;
             let mut refs = smallvec::SmallVec::<[Cell; MAX_REFERENCES_COUNT]>::new();
             for k in 0..rc {
+                if let Some(b) = budget { b.step()?; }
                 let ref_idx =
                     read_be_uint_at(data, refs_off + k * header.ref_size, header.ref_size) as usize;
                 if ref_idx >= header.cells_count || ref_idx <= i {
@@ -1579,6 +1722,20 @@ impl<'a> BocReader<'a> {
             }
 
             // Build cell (validates data, allocates, computes hashes, writes refs)
+            if let Some(b) = budget {
+                // Charge actual SHA256 compression blocks, including padding
+                // and the 64-bit length suffix separately for each hash round.
+                // Later level hashes consume the previous 32-byte digest.
+                let rounds = cell::hashes_count(raw);
+                let first = 2 + cell::cell_data_len(raw) + rc * (SHA256_SIZE + DEPTH_SIZE);
+                let later = 2 + SHA256_SIZE + rc * (SHA256_SIZE + DEPTH_SIZE);
+                let blocks = (first + 9).div_ceil(64)
+                    + (rounds - 1) * (later + 9).div_ceil(64);
+                crate::config_read_budget::steps(b, blocks)?;
+                // Copy and validation scans include any supplied stored hashes.
+                crate::config_read_budget::steps(b, wire_len.div_ceil(64))?;
+                b.workspace(crate::merkle_apply_budget::NEW_CELL_ALLOCATION)?;
+            }
             let cell = Cell::with_data_and_refs(
                 raw,
                 true,
@@ -1593,6 +1750,13 @@ impl<'a> BocReader<'a> {
         }
 
         // Collect roots
+        if let Some(b) = budget {
+            if !interrupted {
+                b.workspace(header.roots_indexes.len().checked_mul(std::mem::size_of::<Cell>())
+                    .ok_or_else(|| error!("BOC roots allocation overflow"))?)?;
+                crate::config_read_budget::steps(b, header.roots_indexes.len())?;
+            }
+        }
         let roots = Self::collect_roots(&header, &cells, &mut flags, interrupted)?;
 
         Ok(BocReaderResult { roots, header, flags, interrupted })
@@ -1844,10 +2008,16 @@ impl<'a> BocReader<'a> {
         Ok((header, slice))
     }
 
-    pub fn read_header<T>(&self, src: &mut T) -> Result<(BocHeader, BocFlags)>
-    where
-        T: Read,
-    {
+    pub fn read_header<T: Read>(&self, src: &mut T) -> Result<(BocHeader, BocFlags)> {
+        self.read_header_budgeted(src, None)
+    }
+
+    pub fn read_header_bounded<T: Read>(&self, src: &mut T, budget: &dyn crate::config_read_budget::ConfigReadBudget) -> Result<(BocHeader, BocFlags)> {
+        self.read_header_budgeted(src, Some(budget))
+    }
+
+    fn read_header_budgeted<T: Read>(&self, src: &mut T, budget: Option<&dyn crate::config_read_budget::ConfigReadBudget>) -> Result<(BocHeader, BocFlags)> {
+        if let Some(b) = budget { b.step()?; }
         let magic = src.read_be_u32()?;
         let first_byte = src.read_byte()?;
         let index_included;
@@ -1924,10 +2094,15 @@ impl<'a> BocReader<'a> {
             fail!("tot_cells_size is too big with respect to cells_count");
         }
 
+        if let Some(b) = budget {
+            b.workspace(roots_count.checked_mul(std::mem::size_of::<u32>())
+                .ok_or_else(|| error!("BOC header roots allocation overflow"))?)?;
+        }
         let roots_indexes = if magic == BOC_GENERIC_TAG {
             // root_list:(roots * ##(size * 8))
             let mut roots_indexes = Vec::with_capacity(roots_count);
             for _ in 0..roots_count {
+                if let Some(b) = budget { b.step()?; }
                 let index = src.read_be_uint(ref_size)? as u32;
                 if index as usize >= cells_count {
                     fail!(
@@ -1945,7 +2120,18 @@ impl<'a> BocReader<'a> {
 
         // Each distinct root exempts at most one cell from needing an incoming
         // reference. Repeated root entries do not reduce the cell-data minimum.
-        let distinct_roots = roots_indexes.iter().copied().collect::<HashSet<_>>().len();
+        let distinct_roots = if let Some(b) = budget {
+            let mut roots = crate::merkle_apply_budget::BudgetMap::new(MAX_ROOTS_COUNT);
+            for root in &roots_indexes {
+                b.step()?;
+                let mut key = [0u8; 32];
+                key[..4].copy_from_slice(&root.to_be_bytes());
+                roots.insert(UInt256::from(key), (), &BocBudget(b))?;
+            }
+            roots.len()
+        } else {
+            roots_indexes.iter().copied().collect::<HashSet<_>>().len()
+        };
         let tot_cells_size_minimal = cells_count
             .checked_mul(2)
             .and_then(|size| {
@@ -2191,3 +2377,15 @@ where
 #[cfg(test)]
 #[path = "tests/test_boc.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/test_bounded_boc_writer.rs"]
+mod bounded_writer_tests;
+
+fn boc_root_contains(roots: &[u32], index: u32, budget: Option<&dyn crate::config_read_budget::ConfigReadBudget>) -> Result<bool> {
+    for root in roots {
+        if let Some(b) = budget { b.step()?; }
+        if *root == index { return Ok(true); }
+    }
+    Ok(false)
+}

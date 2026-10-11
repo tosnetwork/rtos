@@ -290,9 +290,8 @@ impl PendingFinalityRecord {
         }
         Ok(())
     }
-    fn encode(&self) -> Result<Vec<u8>> {
-        self.validate()?;
-        let bytes = serde_json::to_vec(&DiskRecord {
+    fn disk_record(&self) -> DiskRecord {
+        DiskRecord {
             schema: 1,
             global_id: self.pin.global_id,
             zerostate: self.pin.zerostate.to_string(),
@@ -311,7 +310,11 @@ impl PendingFinalityRecord {
             last_mc_finalized_seqno: self.last_mc_finalized_seqno,
             candidate_already_sent: self.candidate_already_sent,
             created_at_unix_secs: self.created_at_unix_secs,
-        })?;
+        }
+    }
+    fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(&self.disk_record())?;
         if bytes.len() as u64 > MAX_RECORD_BYTES {
             fail!("Source finality record exceeds bound");
         }
@@ -425,6 +428,80 @@ pub fn canonical_source_identity(
         fail!("Canonical source runtime/origin mismatch");
     }
     Ok((record.id()?, record.canonical_digest()?))
+}
+
+/// Data-only identity calculation for an already bounded/authenticated reply.
+/// `signature_set` must be its original canonical boxed carrier bytes. No body,
+/// signature or Cell parsing occurs, and this result grants no authority.
+/// The caller remains responsible for binding these bytes to the verified reply.
+pub fn canonical_source_identity_bounded(
+    runtime: &AuthenticatedSessionRuntime,
+    reply: &CanonicalFinalityRecord,
+    signature_set: &[u8],
+    budget: &dyn crate::finality_recovery::SourceHistoryDebtBudget,
+) -> Result<(UInt256, UInt256)> {
+    budget.step()?;
+    let data = reply.data.data();
+    if data.len() > (16 << 20) || signature_set.len() > (16 << 20) {
+        fail!("Source finality body/carrier exceeds bound");
+    }
+    let raw_len = data
+        .len()
+        .checked_add(signature_set.len())
+        .ok_or_else(|| error!("Source identity length overflow"))?;
+    // Exact payload copies and hex allocations, plus bounded fixed-size identity
+    // strings/id serialization. JSON itself is counted before allocating below.
+    budget.workspace(raw_len)?;
+    budget
+        .workspace(raw_len.checked_mul(2).ok_or_else(|| error!("Source hex length overflow"))?)?;
+    budget.workspace(4096)?;
+    let record = PendingFinalityRecord {
+        pin: runtime.pin().clone(),
+        protocol: runtime.protocol(),
+        carrier_version: runtime.carrier_version(),
+        wire_profile: runtime.wire_profile(),
+        profile: runtime.profile().clone(),
+        session_id: runtime.session_id().clone(),
+        block_id: reply.request.block_id.clone(),
+        local_adnl: UInt256::from(*runtime.local_adnl().data()),
+        local_validator_index: match runtime.local_role() {
+            consensus_common::session_runtime::LocalRole::Validator(index) => Some(index),
+            consensus_common::session_runtime::LocalRole::Observer => None,
+        },
+        source_validator: reply.request.source_validator.clone(),
+        data: data.to_vec(),
+        signature_set: signature_set.to_vec(),
+        is_final: reply.request.role == FinalityDeliveryRole::Final,
+        last_mc_finalized_seqno: reply.last_mc_finalized_seqno,
+        candidate_already_sent: reply.candidate_already_sent,
+        created_at_unix_secs: reply.created_at_unix_secs,
+    };
+    if record.request(reply.request.node_receipt.clone()) != reply.request {
+        fail!("Canonical source runtime/origin mismatch");
+    }
+    let disk = record.disk_record();
+    struct Count(usize);
+    impl Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("Source JSON length overflow"))?;
+            if self.0 as u64 > MAX_RECORD_BYTES {
+                return Err(std::io::Error::other("Source finality record exceeds bound"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, &disk)?;
+    budget.workspace(count.0)?;
+    let mut bytes = Vec::with_capacity(count.0);
+    serde_json::to_writer(&mut bytes, &disk)?;
+    Ok((record.id()?, UInt256::calc_file_hash(&bytes)))
 }
 
 #[cfg(test)]
@@ -1922,6 +1999,69 @@ impl FinalityDeliveryTestDriver {
     pub fn prepare_intents(&self, has_existing_certificates: bool) -> Result<()> {
         self.0.prepare_intents(has_existing_certificates)
     }
+    /// Bind the actual session-start MC anchor, exactly as the session factory.
+    /// This deliberately does not infer a start from the delivered block.
+    pub fn bind_start(&self, anchor: BlockIdExt) -> Result<()> {
+        self.0.bind_start(anchor)
+    }
+    /// Retain a real signed FinalCert through the production source store.
+    /// No stage, receipt, ACK or consumed confirmation is manufactured here.
+    pub fn retain_final_cert(
+        &self,
+        draft: &FinalizedDeliveryDraft,
+        prev_blocks: &[BlockIdExt],
+    ) -> Result<()> {
+        let SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(proof)) = &draft.finality
+        else {
+            fail!("Source certificate fixture requires a PQ Final carrier");
+        };
+        let runtime = &self.0.runtime;
+        runtime
+            .pq_context()
+            .ok_or_else(|| error!("Source certificate fixture requires PQ runtime"))?
+            .for_block(draft.block_id.clone())?
+            .verify_final(proof)?;
+        let candidate = PqNetworkSignatureSet::from_final_fields(proof)?.to_node().candidate;
+        let hash = UInt256::calc_file_hash(&runtime.wire_profile().serialize(&candidate)?);
+        let mut signatures = Vec::with_capacity(proof.signatures.len());
+        for signature in &proof.signatures {
+            let mut index = None;
+            for (i, member) in runtime.committee().iter().enumerate() {
+                if member.validator_id()? == signature.validator_id {
+                    index = Some(u32::try_from(i)?);
+                    break;
+                }
+            }
+            signatures.push(crate::certificate::VoteSignature {
+                validator_idx: crate::block::ValidatorIndex::new(
+                    index.ok_or_else(|| error!("Unknown source certificate signer"))?,
+                ),
+                signature: signature.signature.clone(),
+            });
+        }
+        let certificate = crate::certificate::Certificate {
+            vote: crate::simplex_state::FinalizeVote {
+                slot: crate::block::SlotIndex::new(proof.slot),
+                block_hash: hash.clone(),
+            },
+            signatures,
+        };
+        // Reuse the exact factory verifier for the converted raw certificate too.
+        crate::certificate::Certificate::<crate::simplex_state::Vote>::from_authenticated_runtime(
+            &certificate.to_tl()?,
+            runtime,
+            &|| Ok(()),
+        )?;
+        self.0.retain_intent(
+            prev_blocks.to_vec(),
+            &crate::simplex_state::BlockFinalizedEvent {
+                slot: crate::block::SlotIndex::new(proof.slot),
+                block_hash: hash,
+                block_id: None,
+                certificate: Arc::new(certificate),
+            },
+        )
+    }
     pub fn maintain(&self) -> Result<()> {
         self.0.maintain_closing()
     }
@@ -1945,3 +2085,7 @@ impl FinalityDeliveryTestDriver {
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "canonical_identity_budget_tests.rs"]
+mod canonical_identity_budget_tests;

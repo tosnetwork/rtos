@@ -37,6 +37,21 @@ impl std::fmt::Display for ArchiveReadNotStarted {
 }
 impl std::error::Error for ArchiveReadNotStarted {}
 
+/// A bounded artifact lookup proved absence before opening its payload.
+/// Only archive routing can mint this evidence; corrupt package contents and
+/// arbitrary storage errors must never acquire missing-artifact semantics.
+#[derive(Debug)]
+pub struct ArchiveArtifactMissing(&'static str);
+impl ArchiveArtifactMissing {
+    pub(super) fn new(location: &'static str) -> Self { Self(location) }
+}
+impl std::fmt::Display for ArchiveArtifactMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Bounded archive artifact absent: {}", self.0)
+    }
+}
+impl std::error::Error for ArchiveArtifactMissing {}
+
 pub fn check_length(resource: &'static str, requested: u64, limit: usize) -> Result<usize> {
     if requested > limit as u64 {
         return Err(ArchiveReadLimitExceeded { resource, requested, limit }.into());

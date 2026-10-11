@@ -26,9 +26,7 @@ use rtos_block::{fail, Result, UInt256};
 use std::{
     cmp::min,
     collections::HashMap,
-    future::Future,
     ops::Range,
-    pin::Pin,
     sync::{
         atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering},
         Arc,
@@ -36,55 +34,6 @@ use std::{
 };
 #[cfg(feature = "debug")]
 use std::{sync::atomic::AtomicPtr, time::Instant};
-
-type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send>>;
-
-// Pool decoupling task count from in-flight transfers; workers spawn on first submit.
-pub(crate) struct SendWorkerPool {
-    queue: Arc<lockfree::queue::Queue<BoxedFut>>,
-    sem: Arc<tokio::sync::Semaphore>,
-    spawned: std::sync::OnceLock<()>,
-}
-
-impl SendWorkerPool {
-    pub(crate) fn new() -> Self {
-        Self {
-            queue: Arc::new(lockfree::queue::Queue::new()),
-            sem: Arc::new(tokio::sync::Semaphore::new(0)),
-            spawned: std::sync::OnceLock::new(),
-        }
-    }
-
-    pub(crate) fn submit<F>(&self, fut: F)
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        self.spawned.get_or_init(|| {
-            let n = num_cpus::get().min(8).max(1);
-            for _ in 0..n {
-                let queue = self.queue.clone();
-                let sem = self.sem.clone();
-                tokio::spawn(async move {
-                    while let Ok(permit) = sem.acquire().await {
-                        permit.forget();
-                        if let Some(fut) = queue.pop() {
-                            fut.await;
-                        }
-                    }
-                });
-            }
-        });
-        self.queue.push(Box::pin(fut));
-        self.sem.add_permits(1);
-    }
-}
-
-impl Drop for SendWorkerPool {
-    fn drop(&mut self) {
-        // Wakes workers with Err; they exit after current future.
-        self.sem.close();
-    }
-}
 
 /// RaptorQ encoder
 pub struct RaptorqEncoder {
@@ -174,6 +123,9 @@ impl RaptorqEncoder {
 }
 
 pub(crate) struct SendContext {
+    pub(super) control: Arc<super::SendControl>,
+    pub(super) permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    pub(super) registration: Arc<super::owned_send::SendRegistration>,
     pub(crate) adnl: Arc<AdnlNode>,
     pub(crate) peers: AdnlPeers,
     pub(crate) pong: tokio::sync::mpsc::UnboundedReceiver<()>,
@@ -335,6 +287,29 @@ pub(crate) struct SendPartV2 {
     total_ack_prev: u32,
     total_lost: u32,
     total_lost_prev: u32,
+    #[cfg(test)]
+    ack_statistics_hook: Option<Box<dyn FnOnce() -> Result<()> + Send>>,
+}
+
+pub(super) struct OwnedSendPart {
+    pub part: SendPartV2,
+    pub peer: Arc<RldpPeer>,
+}
+impl std::ops::Deref for OwnedSendPart {
+    type Target = SendPartV2;
+    fn deref(&self) -> &SendPartV2 {
+        &self.part
+    }
+}
+impl std::ops::DerefMut for OwnedSendPart {
+    fn deref_mut(&mut self) -> &mut SendPartV2 {
+        &mut self.part
+    }
+}
+impl Drop for OwnedSendPart {
+    fn drop(&mut self) {
+        self.part.on_drop(&self.peer);
+    }
 }
 
 impl SendPartV2 {
@@ -367,6 +342,8 @@ impl SendPartV2 {
             total_ack_prev: 0,
             total_lost: 0,
             total_lost_prev: 0,
+            #[cfg(test)]
+            ack_statistics_hook: None,
         };
         Ok(ret)
     }
@@ -417,7 +394,6 @@ impl SendPartV2 {
         } else {
             true
         };
-        let mut new_dropped = 0;
         if update {
             self.seqno_max_recv = Some(ack.max_seqno);
             for i in 0..31 {
@@ -431,7 +407,9 @@ impl SendPartV2 {
                 let seqno = ack.max_seqno - i;
                 let Some(packet) = self.packets.remove(&seqno) else { continue };
                 self.count_ack();
-                new_dropped += 1;
+                // Pair local removal with the shared window before any
+                // fallible statistics update; Drop only owns the remainder.
+                peer.stats.on_drop(1);
                 if max_packet.is_none() {
                     max_packet.replace(packet);
                 }
@@ -520,6 +498,10 @@ impl SendPartV2 {
           return update;
         */
         if let Some(max_packet) = max_packet {
+            #[cfg(test)]
+            if let Some(hook) = self.ack_statistics_hook.take() {
+                hook()?;
+            }
             peer.stats.on_ack(max_packet, new_received, min_timeout_ms)?;
             let sent_at_micros_drop = peer.stats.calc_loss_delay();
             let seqno_drop = ack.max_seqno.saturating_sub(peer.stats.config().packet_threshold);
@@ -544,7 +526,7 @@ impl SendPartV2 {
                 } else {
                     self.count_lost()
                 }
-                new_dropped += 1;
+                peer.stats.on_drop(1);
                 self.seqno_min_sent = self.next_seqno_min_sent(seqno_min_sent)
             }
             let new_ack = self.total_ack - self.total_ack_prev;
@@ -555,9 +537,6 @@ impl SendPartV2 {
                 peer.stats.calc_extra_symbols(new_ack, new_loss, self.get_left_symbols_count()?)?;
         }
         //println!("ACK task {} max {}, recv {}, new recv {}, drop {}", self.state.part, ack.max_seqno, ack.received_count, new_received, new_dropped);
-        if new_dropped > 0 {
-            peer.stats.on_drop(new_dropped)
-        }
         Ok(new_received)
     }
 
@@ -939,6 +918,7 @@ mod sibling_wake_tests {
             outbound_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             tx,
             stats: StatsV2::new(StatsConfigV2::default(), 1000).unwrap(),
+            idle: Arc::new(tokio::sync::Notify::new()),
             counter: Arc::new(AtomicU64::new(0)).into(),
         });
         let mut parts = Vec::new();
@@ -1037,6 +1017,89 @@ mod sibling_wake_tests {
                 part.ack_pong.try_recv(),
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty)
             ));
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn owned_test_transfer(
+    count: u32,
+) -> Result<(SendTransfer, Arc<Vec<Arc<SendPartStateV2>>>)> {
+    let data: Arc<[u8]> = vec![42u8; count as usize * 1024].into();
+    let mut parts = Vec::new();
+    let mut states = Vec::new();
+    for part in 0..count {
+        let (ack_ping, ack_pong) = tokio::sync::mpsc::unbounded_channel();
+        let state = Arc::new(SendPartStateV2 {
+            part,
+            ack_ping,
+            core: SendPartState { seqno_send: AtomicU32::new(0) },
+            status: AtomicU8::new(SendPartStateV2::STATUS_IDLE),
+            counter: Arc::new(AtomicU64::new(0)).into(),
+        });
+        parts.push(SendPartV2::new(
+            data.clone(),
+            ack_pong,
+            part as usize * 1024..(part as usize + 1) * 1024,
+            [7; 32],
+            state.clone(),
+        )?);
+        states.push(state);
+    }
+    Ok((SendTransfer::V2(parts), Arc::new(states)))
+}
+
+#[cfg(test)]
+mod owned_ack_tests {
+    use super::*;
+    use crate::rldp::stat::{StatsConfigV2, StatsV2};
+    #[test]
+    fn rldp_owned_ack_failure_and_panic_release_exact_inflight() {
+        for panic in [false, true] {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let peer = Arc::new(RldpPeer {
+                tx,
+                outbound_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+                stats: StatsV2::new(StatsConfigV2::default(), 1000).unwrap(),
+                idle: Arc::new(tokio::sync::Notify::new()),
+                counter: Arc::new(AtomicU64::new(0)).into(),
+            });
+            let (SendTransfer::V2(mut parts), _) = owned_test_transfer(1).unwrap() else {
+                unreachable!()
+            };
+            let mut part = OwnedSendPart { part: parts.remove(0), peer: peer.clone() };
+            part.start().unwrap();
+            let info = match part.prepare_chunk(&peer).unwrap() {
+                SendActionV2::Send((_, info)) => info,
+                _ => panic!("initial packet delayed"),
+            };
+            let seqno = info.seqno;
+            part.on_send(info, peer.stats.timestamp_micros(), &peer).unwrap();
+            assert!(peer.stats.is_only_probe());
+            part.ack_statistics_hook = Some(Box::new(move || {
+                if panic {
+                    panic!("controlled ACK statistics panic");
+                }
+                fail!("controlled ACK statistics error")
+            }));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                part.on_ack(
+                    SendAckV2 { max_seqno: seqno, received_count: 1, received_mask: 1 },
+                    &peer,
+                    1000,
+                )
+            }));
+            if panic {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_err());
+            }
+            assert_eq!(part.in_flight_symbols, 0);
+            // Initial peer window is exactly zero. Remaining in-flight would
+            // keep probe-only true; subtracting it twice would underflow too.
+            assert!(!peer.stats.is_only_probe());
+            drop(part);
+            assert!(!peer.stats.is_only_probe());
         }
     }
 }

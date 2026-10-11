@@ -84,6 +84,7 @@ pub mod merkle_proof;
 pub use merkle_proof::*;
 
 pub mod merkle_apply_budget;
+pub mod config_read_budget;
 pub mod merkle_update;
 pub use merkle_update::*;
 

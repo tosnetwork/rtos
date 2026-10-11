@@ -735,6 +735,17 @@ pub trait EngineOperations: Sync + Send {
     async fn load_mc_zero_state(&self) -> Result<Arc<ShardStateStuff>> {
         unimplemented!()
     }
+    async fn authenticate_closing_source_with_history(
+        self: Arc<Self>, _request: consensus_common::finality_delivery::CloseFinalityRequest,
+        _namespace: std::path::PathBuf,
+    ) -> Result<Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>> {
+        Err(error!("Owned historical closing recovery unsupported"))
+    }
+    async fn authenticate_retired_source_with_history(
+        self: Arc<Self>, _record: simplex::finality_recovery::SessionRecoveryRecord,
+    ) -> Result<crate::validator::retired_session_auth::AuthenticatedRetiredSession> {
+        Err(error!("Owned historical source recovery unsupported"))
+    }
     async fn load_state_bounded(
         &self,
         _id: &BlockIdExt,

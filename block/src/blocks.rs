@@ -1024,6 +1024,22 @@ impl fmt::Display for ValueFlow {
 }
 
 impl ValueFlow {
+    /// Same full dictionary shape/value validation, without constructing BigInts
+    /// whose numeric results are discarded by read_in_full_depth.
+    pub fn read_in_full_depth_bounded(&self, budget: &dyn crate::config_read_budget::ConfigReadBudget) -> Result<()> {
+        for collection in [&self.from_prev_blk, &self.to_next_blk, &self.imported, &self.exported,
+            &self.fees_collected, &self.fees_imported, &self.recovered, &self.created, &self.minted, &self.burned] {
+            let dict = crate::HashmapE::with_hashmap(32, collection.other.root().cloned());
+            crate::HashmapType::iterate_slices_bounded(&dict, budget, |_, mut value| {
+                // VarUInteger32's decoder checks len<32 then reads exactly len
+                // bytes into BigInt; skip has precisely the same length/read
+                // checks, and no numeric sign/range/canonicality extra rules.
+                crate::VarUInteger32::skip(&mut value)?;
+                Ok(true)
+            })?;
+        }
+        Ok(())
+    }
     pub fn read_in_full_depth(&self) -> Result<()> {
         self.from_prev_blk.other.iterate(|_value| Ok(true))?;
         self.to_next_blk.other.iterate(|_value| Ok(true))?;

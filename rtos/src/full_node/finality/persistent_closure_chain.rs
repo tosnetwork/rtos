@@ -78,6 +78,29 @@ fn sign(
     (carrier, candidate)
 }
 
+// Match the collator's transition: last_key_block names the previous key
+// block, while after_key_block describes the state being produced.
+fn advance_masterchain_history(
+    extra: &mut McStateExtra,
+    parent: &BlockIdExt,
+    parent_end_lt: u64,
+    key: bool,
+    epoch: u32,
+) -> Result<()> {
+    let parent_is_key = parent.seq_no == 0 || epoch == parent.seq_no;
+    let parent_ref = reference(parent, parent_end_lt);
+    extra.prev_blocks.set(
+        &parent.seq_no,
+        &KeyExtBlkRef { key: parent_is_key, blk_ref: parent_ref.clone() },
+        &KeyMaxLt { key: parent_is_key, max_end_lt: parent_end_lt },
+    )?;
+    if extra.after_key_block {
+        extra.last_key_block = Some(parent_ref);
+    }
+    extra.after_key_block = key;
+    Ok(())
+}
+
 pub(super) fn successor(
     signer: &str,
     parent: &BlockIdExt,
@@ -87,25 +110,45 @@ pub(super) fn successor(
     cc: u32,
     creator: &UInt256,
 ) -> (BlockIdExt, Cell, Value) {
+    successor_with_state_transform(signer, parent, old_cell, key, epoch, cc, creator, |_| {})
+}
+
+pub(super) fn successor_with_state_transform(
+    signer: &str,
+    parent: &BlockIdExt,
+    old_cell: &Cell,
+    key: bool,
+    epoch: u32,
+    cc: u32,
+    creator: &UInt256,
+    transform: impl FnOnce(&mut ShardStateUnsplit),
+) -> (BlockIdExt, Cell, Value) {
+    successor_in_domain(signer, parent, old_cell, key, epoch, cc, creator, -239, transform)
+}
+
+pub(super) fn successor_in_domain(
+    signer: &str,
+    parent: &BlockIdExt,
+    old_cell: &Cell,
+    key: bool,
+    epoch: u32,
+    cc: u32,
+    creator: &UInt256,
+    global_id: i32,
+    transform: impl FnOnce(&mut ShardStateUnsplit),
+) -> (BlockIdExt, Cell, Value) {
     let old_state = ShardStateUnsplit::construct_from_cell(old_cell.clone()).unwrap();
     let config = old_state.read_custom().unwrap().unwrap().config;
     let seq = parent.seq_no + 1;
     let mut state = old_state.clone();
+    state.set_global_id(global_id);
     state.set_seq_no(seq);
     state.set_gen_time(old_state.gen_time() + 1);
     state.set_gen_lt(old_state.gen_lt() + 5);
     let mut extra = state.read_custom().unwrap().unwrap();
-    let parent_is_key = parent.seq_no == 0 || epoch == parent.seq_no;
-    extra
-        .prev_blocks
-        .set(
-            &parent.seq_no,
-            &KeyExtBlkRef { key: parent_is_key, blk_ref: reference(parent, old_state.gen_lt()) },
-            &KeyMaxLt { key: parent_is_key, max_end_lt: old_state.gen_lt() },
-        )
-        .unwrap();
-    extra.after_key_block = key;
+    advance_masterchain_history(&mut extra, parent, old_state.gen_lt(), key, epoch).unwrap();
     state.write_custom(Some(&extra)).unwrap();
+    transform(&mut state);
     let state_cell = state.serialize().unwrap();
     let placeholder = BlockIdExt::with_params(
         ShardIdent::masterchain(),
@@ -114,7 +157,7 @@ pub(super) fn successor(
         UInt256::default(),
     );
     let context =
-        PqVerificationContext::from_governing_config(-239, &config, placeholder, 0, epoch, cc)
+        PqVerificationContext::from_governing_config(global_id, &config, placeholder, 0, epoch, cc)
             .unwrap();
     let mut info = BlockInfo::default();
     info.set_seq_no(seq).unwrap();
@@ -137,7 +180,7 @@ pub(super) fn successor(
     *block_extra.created_by_mut() = creator.clone();
     block_extra.write_custom(&custom).unwrap();
     let block = Block::with_params(
-        -239,
+        global_id,
         info,
         ValueFlow::default(),
         MerkleUpdate::create(old_cell, &state_cell).unwrap(),
@@ -146,7 +189,7 @@ pub(super) fn successor(
     .unwrap();
     let (id, bytes) = encode_block(&block);
     let context =
-        PqVerificationContext::from_governing_config(-239, &config, id.clone(), 0, epoch, cc)
+        PqVerificationContext::from_governing_config(global_id, &config, id.clone(), 0, epoch, cc)
             .unwrap();
     let (carrier, candidate) = sign(signer, &context, &id, cc, &config);
     let proof = BlockProof::with_params(
@@ -156,4 +199,54 @@ pub(super) fn successor(
     );
     let row = json!({"id":id.to_string(),"block_boc":hex::encode(bytes),"proof_boc":hex::encode(proof.write_to_bytes().unwrap()),"state_boc":hex::encode(write_boc(&state_cell).unwrap()),"session":hex::encode(context.expected_session_id().as_slice()),"candidate":hex::encode(candidate),"prev_key_block_seqno":epoch});
     (id, state_cell, row)
+}
+
+#[test]
+fn signed_history_fixture_preserves_exact_previous_key_block_across_epochs() -> Result<()> {
+    let fixture: Value =
+        serde_json::from_str(include_str!("testdata/v2-propagation-recovery.json"))?;
+    let bytes = hex::decode(fixture["state_boc"].as_str().unwrap())?;
+    let root = read_single_root_boc(&bytes)?;
+    let state = ShardStateUnsplit::construct_from_cell(root.clone())?;
+    let zero = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        0,
+        root.repr_hash().clone(),
+        UInt256::calc_file_hash(&bytes),
+    );
+    let mut extra = state.read_custom()?.unwrap();
+    assert!(extra.after_key_block, "the actual fixture zerostate is the epoch-zero key anchor");
+    let zero_ref = reference(&zero, state.gen_lt());
+    advance_masterchain_history(&mut extra, &zero, state.gen_lt(), false, 0)?;
+    extra = McStateExtra::construct_from_cell(extra.serialize()?)?;
+    assert_eq!(extra.last_key_block.as_ref(), Some(&zero_ref));
+    assert!(!extra.after_key_block);
+    for (seq, key) in [(1, false), (2, true)] {
+        let parent = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            seq,
+            UInt256::from([seq as u8; 32]),
+            UInt256::from([(seq + 10) as u8; 32]),
+        );
+        advance_masterchain_history(&mut extra, &parent, state.gen_lt() + seq as u64, key, 0)?;
+        extra = McStateExtra::construct_from_cell(extra.serialize()?)?;
+        assert_eq!(
+            extra.last_key_block.as_ref(),
+            Some(&zero_ref),
+            "a newly produced key block is not its own previous key block"
+        );
+        assert_eq!(extra.after_key_block, key);
+    }
+    let key_parent = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        3,
+        UInt256::from([3; 32]),
+        UInt256::from([13; 32]),
+    );
+    let exact = reference(&key_parent, state.gen_lt() + 3);
+    advance_masterchain_history(&mut extra, &key_parent, exact.end_lt, false, 3)?;
+    extra = McStateExtra::construct_from_cell(extra.serialize()?)?;
+    assert_eq!(extra.last_key_block.as_ref(), Some(&exact));
+    assert!(!extra.after_key_block);
+    Ok(())
 }

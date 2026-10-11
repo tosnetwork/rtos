@@ -7,12 +7,54 @@ use crate::{
     session_identity::{derive_session_from_config, SessionCoordinates},
     IntoBoxed,
 };
+use rtos_block::config_read_budget::{self as cb, ConfigReadBudget};
 use rtos_block::{
     checked_validator_weight_sum, error, fail, has_quorum, BlockIdExt, BlockSignaturesSimplexPq,
     ConfigParamEnum, ConfigParams, PqBlockValidatorWeight, Result, Serializable, UInt256,
     ValidatorDescr, ValidatorKey,
 };
 use std::{collections::HashMap, io::Cursor};
+
+/// Count and admit each TL write before an exact output allocation. Preserve
+/// the original budget error (including its typed cause) across the IO adapter.
+fn serialize_budgeted<T: crate::BoxedSerialize>(
+    value: &T,
+    budget: &dyn ConfigReadBudget,
+) -> Result<Vec<u8>> {
+    struct Count<'a> {
+        budget: &'a dyn ConfigReadBudget,
+        length: usize,
+        writes: usize,
+        error: Option<anyhow::Error>,
+    }
+    impl std::io::Write for Count<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Err(error) = self.budget.step() {
+                self.error = Some(error);
+                return Err(std::io::Error::other("TL budget refused"));
+            }
+            self.length = self
+                .length
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("TL length overflow"))?;
+            self.writes += 1;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count { budget, length: 0, writes: 0, error: None };
+    let counted = crate::Serializer::new(&mut count).write_boxed(value);
+    if let Some(error) = count.error {
+        return Err(error);
+    }
+    counted?;
+    cb::steps(budget, count.writes)?;
+    let mut output = cb::vector(budget, count.length)?;
+    crate::Serializer::new(&mut output).write_boxed(value)?;
+    Ok(output)
+}
 
 mod network;
 pub use network::{PqNetworkSignatureSet, VerifiedPqNetworkSignatures};
@@ -58,6 +100,27 @@ impl PqSessionContext {
         let total_weight = checked_validator_weight_sum(validators.iter().map(|v| v.weight))?;
         Ok(Self { session_id, shard, catchain_seqno, subset_hash, validators, total_weight })
     }
+    pub fn from_authenticated_session_members_bounded(
+        session_id: UInt256,
+        shard: rtos_block::ShardIdent,
+        catchain_seqno: u32,
+        validators: Vec<ValidatorDescr>,
+        budget: &dyn rtos_block::config_read_budget::ConfigReadBudget,
+    ) -> Result<Self> {
+        let total_weight =
+            rtos_block::validators::validate_validator_list_bounded(&validators, budget)?;
+        for v in &validators {
+            budget.step()?;
+            if !matches!(v.key, ValidatorKey::Pq(_)) {
+                fail!("PQ session requires an entirely PQ governing subset");
+            }
+        }
+        budget.workspace(12 + validators.len() * 104)?;
+        rtos_block::config_read_budget::steps(budget, validators.len())?;
+        let subset_hash =
+            rtos_block::ValidatorSet::calc_subset_hash_short(&validators, catchain_seqno)?;
+        Ok(Self { session_id, shard, catchain_seqno, subset_hash, validators, total_weight })
+    }
     pub fn for_block(&self, block_id: BlockIdExt) -> Result<PqVerificationContext> {
         if block_id.shard() != &self.shard {
             fail!("PQ block shard differs from authenticated session shard");
@@ -71,6 +134,28 @@ impl PqSessionContext {
             validators: self.validators.clone(),
         })
     }
+    pub fn for_block_bounded(
+        &self,
+        block_id: BlockIdExt,
+        budget: &dyn ConfigReadBudget,
+    ) -> Result<PqVerificationContext> {
+        if block_id.shard() != &self.shard {
+            fail!("PQ block shard differs from authenticated session shard");
+        }
+        let mut validators = cb::vector(budget, self.validators.len())?;
+        for validator in &self.validators {
+            validators.push(validator.clone_bounded(budget)?);
+        }
+        Ok(PqVerificationContext {
+            block_id,
+            session_id: self.session_id.clone(),
+            catchain_seqno: self.catchain_seqno,
+            subset_hash: self.subset_hash,
+            total_weight: self.total_weight,
+            validators,
+        })
+    }
+
     pub fn validator_info(&self) -> rtos_block::ValidatorBaseInfo {
         rtos_block::ValidatorBaseInfo::with_params(self.subset_hash, self.catchain_seqno)
     }
@@ -167,6 +252,63 @@ impl PqVerificationContext {
         )
     }
 
+    /// Same governing inputs as the ordinary path; unused previous/next sets
+    /// are not decoded. The caller retains ownership of this cumulative budget.
+    pub fn from_governing_config_bounded(
+        global_id: i32,
+        config: &ConfigParams,
+        block_id: BlockIdExt,
+        vertical_seqno: u32,
+        previous_key_block_seqno: u32,
+        catchain_seqno: u32,
+        budget: &dyn ConfigReadBudget,
+    ) -> Result<Self> {
+        let decoded =
+            config.governing_session_config_bounded(block_id.shard().is_masterchain(), budget)?;
+        cb::lookup(budget, 32)?;
+        match config.config(19)? {
+            Some(ConfigParamEnum::ConfigParam19(id)) if id == global_id as u32 => {}
+            _ => fail!("PQ governing global_id disagrees with missing or mismatched Param19"),
+        }
+        rtos_block::validators::validate_validator_list_bounded(decoded.current.list(), budget)?;
+        let (validators, subset_hash) = decoded.current.calc_subset_bounded(
+            &decoded.catchain,
+            block_id.shard().shard_prefix_with_tag(),
+            block_id.shard().workchain_id(),
+            catchain_seqno,
+            budget,
+        )?;
+        for validator in &validators {
+            budget.step()?;
+            if !matches!(validator.key, ValidatorKey::Pq(_)) {
+                fail!("PQ finality requires an entirely PQ governing subset");
+            }
+        }
+        let identity = crate::session_identity::derive_session_from_decoded_bounded(
+            global_id,
+            &decoded,
+            SessionCoordinates {
+                shard: block_id.shard(),
+                catchain_seqno,
+                vertical_seqno,
+                last_key_block_seqno: previous_key_block_seqno,
+                new_catchain_ids: false,
+            },
+            &validators,
+            budget,
+        )?;
+        cb::steps(budget, validators.len())?;
+        let total_weight = checked_validator_weight_sum(validators.iter().map(|v| v.weight))?;
+        Ok(Self {
+            block_id,
+            session_id: identity.session_id,
+            catchain_seqno,
+            subset_hash,
+            total_weight,
+            validators,
+        })
+    }
+
     /// The caller must independently authorize next-set use (e.g. the trusted
     /// top-shard-descriptor validation mode). The carrier cannot enable it.
     pub fn from_governing_next_validator_set(
@@ -253,6 +395,75 @@ impl PqVerificationContext {
         })
     }
 
+    pub fn verify_final_bounded(
+        &self,
+        carrier: &BlockSignaturesSimplexPq,
+        budget: &dyn ConfigReadBudget,
+    ) -> Result<VerifiedPqSignatures> {
+        let weight = self.verify_role_bounded(carrier, true, budget)?;
+        Ok(VerifiedPqSignatures {
+            block_id: self.block_id.clone(),
+            session_id: self.session_id.clone(),
+            slot: carrier.slot,
+            weight,
+        })
+    }
+
+    fn verify_role_bounded(
+        &self,
+        carrier: &BlockSignaturesSimplexPq,
+        is_final: bool,
+        budget: &dyn ConfigReadBudget,
+    ) -> Result<u64> {
+        carrier.validate_structure_bounded(budget)?;
+        if carrier.validator_info.catchain_seqno != self.catchain_seqno {
+            fail!("PQ catchain seqno mismatch");
+        }
+        if carrier.validator_info.validator_list_hash_short != self.subset_hash {
+            fail!("PQ validator subset hash mismatch");
+        }
+        if carrier.session_id != self.session_id {
+            fail!("PQ carried session differs from governing expected session");
+        }
+        let message = vote_preimage_with_budget(&self.block_id, carrier, is_final, Some(budget))?;
+        let mut members = cb::vector(budget, self.validators.len())?;
+        let mut weights = cb::vector(budget, self.validators.len())?;
+        for member in &self.validators {
+            budget.step()?;
+            let ValidatorKey::Pq(key) = &member.key else { fail!("PQ member required") };
+            let id = member.validator_id_bounded(budget)?;
+            weights.push(PqBlockValidatorWeight {
+                validator_id: id.clone(),
+                algorithm_id: key.algorithm_id,
+                weight: member.weight,
+            });
+            members.push((id, key));
+        }
+        let weight = carrier.check_structural_membership_and_weight_bounded(&weights, budget)?;
+        for signature in &carrier.signatures {
+            let mut found = None;
+            for (id, key) in &members {
+                budget.step()?;
+                if id == &signature.validator_id {
+                    found = Some(*key);
+                    break;
+                }
+            }
+            let key = found.ok_or_else(|| error!("PQ unknown signer"))?;
+            // One admission per complete fixed-parameter ML-DSA-44 verification.
+            // The backend borrows exact-width key/signature slices and has no
+            // input-sized Rust allocations. Every supplied signer is verified.
+            budget.step()?;
+            if !rtos_pq_crypto::verify_simplex(&message, &signature.signature, &key.public_key)? {
+                fail!("PQ invalid final signature from {}", signature.validator_id);
+            }
+        }
+        if !has_quorum(weight, self.total_weight) {
+            fail!("PQ insufficient verified weight: {weight} of {}", self.total_weight);
+        }
+        Ok(weight)
+    }
+
     pub fn verify_approval(&self, approval: &PqApproval) -> Result<VerifiedPqApproval> {
         if self.block_id.shard().is_masterchain() {
             fail!("masterchain requires final votes");
@@ -325,12 +536,23 @@ fn vote_preimage(
     carrier: &BlockSignaturesSimplexPq,
     is_final: bool,
 ) -> Result<Vec<u8>> {
+    vote_preimage_with_budget(block_id, carrier, is_final, None)
+}
+fn vote_preimage_with_budget(
+    block_id: &BlockIdExt,
+    carrier: &BlockSignaturesSimplexPq,
+    is_final: bool,
+    budget: Option<&dyn ConfigReadBudget>,
+) -> Result<Vec<u8>> {
     use crate::ton::consensus::{
         candidateid::CandidateId,
         datatosign::DataToSign,
         simplex::unsignedvote::{FinalizeVote, NotarizeVote},
     };
-    let bytes = carrier.candidate_bytes()?;
+    let bytes = match budget {
+        Some(budget) => carrier.candidate_bytes_bounded(budget)?,
+        None => carrier.candidate_bytes()?,
+    };
     let mut input = Cursor::new(bytes.as_slice());
     let candidate = crate::Deserializer::new(&mut input)
         .read_boxed::<crate::ton::consensus::CandidateHashData>()?;
@@ -340,18 +562,32 @@ fn vote_preimage(
     if candidate.block() != block_id {
         fail!("PQ candidate block id mismatch");
     }
-    let canonical = crate::serialize_boxed(&candidate)?;
+    let encode_candidate = |budget: Option<&dyn ConfigReadBudget>| match budget {
+        Some(budget) => serialize_budgeted(&candidate, budget),
+        None => crate::serialize_boxed(&candidate),
+    };
+    let canonical = encode_candidate(budget)?;
     if canonical != bytes {
         fail!("PQ candidate encoding is not canonical");
     }
     let id = CandidateId { slot: carrier.slot as i32, hash: UInt256::calc_file_hash(&canonical) }
         .into_boxed();
     let vote = if is_final {
-        crate::serialize_boxed(&FinalizeVote { id }.into_boxed())?
+        let vote = FinalizeVote { id }.into_boxed();
+        match budget {
+            Some(budget) => serialize_budgeted(&vote, budget)?,
+            None => crate::serialize_boxed(&vote)?,
+        }
     } else {
-        crate::serialize_boxed(&NotarizeVote { id }.into_boxed())?
+        let vote = NotarizeVote { id }.into_boxed();
+        match budget {
+            Some(budget) => serialize_budgeted(&vote, budget)?,
+            None => crate::serialize_boxed(&vote)?,
+        }
     };
-    crate::serialize_boxed(
-        &DataToSign { session_id: carrier.session_id.clone(), data: vote }.into_boxed(),
-    )
+    let data = DataToSign { session_id: carrier.session_id.clone(), data: vote }.into_boxed();
+    match budget {
+        Some(budget) => serialize_budgeted(&data, budget),
+        None => crate::serialize_boxed(&data),
+    }
 }

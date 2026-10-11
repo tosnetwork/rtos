@@ -65,9 +65,12 @@ use recv::{RecvContext, RecvTransfer, RecvTransferState};
 mod send;
 pub use send::RaptorqEncoder;
 use send::{
-    SendActionV2, SendContext, SendPartContextV2, SendPartStateV1, SendPartStateV2, SendPartV2,
-    SendTransfer, SendTransferState, SendWorkerPool,
+    OwnedSendPart, SendActionV2, SendContext, SendPartContextV2, SendPartStateV1, SendPartStateV2,
+    SendPartV2, SendTransfer, SendTransferState,
 };
+
+mod owned_send;
+use owned_send::{SendCancelled, SendControl, SendWorkerPool};
 
 mod stat;
 use stat::{StatsConfigV2, StatsV2};
@@ -148,6 +151,30 @@ enum RldpTransfer {
     Done,
 }
 
+// The expiry is an update, never a new registration. A delayed timer must not
+// resurrect an ID removed by the receive owner during shutdown or completion.
+async fn expire_inbound_transfer(
+    transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
+    transfer_id: TransferId,
+    owner: Arc<crate::adnl::tasks::AdnlTasks>,
+    timer: impl std::future::Future<Output = ()>,
+) {
+    tokio::select! {
+        biased;
+        _ = owner.cancelled() => return,
+        _ = timer => {},
+    }
+    transfers.insert_with(transfer_id, |_, _, found| {
+        if found.is_some() {
+            lockfree::map::Preview::New(RldpTransfer::Done)
+        } else {
+            // Also discard a prepared replacement if a concurrent remove won
+            // and insert_with invokes this callback again with no entry.
+            lockfree::map::Preview::Discard
+        }
+    });
+}
+
 #[cfg(feature = "telemetry")]
 #[derive(Default)]
 struct RldpStats {
@@ -182,16 +209,37 @@ impl SendJob {
         pool: &Arc<SendWorkerPool>,
         min_timeout_ms: u64,
     ) {
-        let result = if self.v2 {
-            match RldpNode::fetch_transfer_state_v2(transfers, &self.send_id) {
-                Ok(state) => {
-                    RldpNode::send_loop_v2(self.ctx, state, &peer, pool, min_timeout_ms).await
+        let owner = self.ctx.adnl.tasks().clone();
+        let control = self.ctx.control.clone();
+        let permit = self.ctx.permit.clone();
+        let registration = self.ctx.registration.clone();
+        let result =
+            owned_send::supervise(control.clone(), owner.clone(), control.deadline(), async {
+                control.check()?;
+                if self.v2 {
+                    match RldpNode::fetch_transfer_state_v2(transfers, &self.send_id) {
+                        Ok(state) => {
+                            RldpNode::send_loop_v2(self.ctx, state, &peer, pool, min_timeout_ms)
+                                .await
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    let work_control = control.clone();
+                    let receipt = pool.submit(work_control, async move {
+                        RldpNode::send_loop_v1(self.ctx, &peer, min_timeout_ms).await
+                    })?;
+                    receipt.await.map_err(|_| error!("RLDP v1 owner lost its receipt"))?
                 }
-                Err(e) => Err(e),
-            }
-        } else {
-            RldpNode::send_loop_v1(self.ctx, &peer, min_timeout_ms).await
-        };
+            })
+            .await;
+        if !matches!(result, Ok(true)) {
+            control.cancel(SendCancelled::SiblingFailed);
+        }
+        control.drain().await;
+        let result = control.take_failure().unwrap_or(result);
+        drop(permit);
+        drop(registration);
         self.done.send(result).ok();
     }
 }
@@ -201,6 +249,8 @@ declare_counted!(
         outbound_semaphore: Arc<tokio::sync::Semaphore>,
         tx: tokio::sync::mpsc::UnboundedSender<SendJob>,
         stats: StatsV2,
+        #[cfg(test)]
+        idle: Arc<tokio::sync::Notify>,
     }
 );
 
@@ -262,6 +312,8 @@ pub struct RldpNode {
     #[cfg(feature = "telemetry")]
     telemetry: RldpTelemetry,
     allocated: RldpAlloc,
+    #[cfg(test)]
+    test_control: std::sync::Mutex<Option<Arc<SendControl>>>,
     #[cfg(feature = "debug")]
     loss_fn: Option<LossFn>,
 }
@@ -304,13 +356,14 @@ impl RldpNode {
         let min_timeout_ms = min_timeout_ms.unwrap_or(Self::TIMEOUT_MIN_MS);
         #[cfg(feature = "debug")]
         let timestamp = Box::new(Instant::now());
+        let send_pool = Arc::new(SendWorkerPool::new(adnl.tasks().clone()));
         let ret = Self {
             adnl,
             local_id,
             min_timeout_ms,
             peers: lockfree::map::Map::new(),
             extended_caps: lockfree::map::Map::new(),
-            send_pool: Arc::new(SendWorkerPool::new()),
+            send_pool,
             #[cfg(feature = "telemetry")]
             stats: Arc::new(RldpStats::default()),
             subscribers: Arc::new(subscribers),
@@ -320,6 +373,8 @@ impl RldpNode {
             #[cfg(feature = "telemetry")]
             telemetry,
             allocated,
+            #[cfg(test)]
+            test_control: std::sync::Mutex::new(None),
             #[cfg(feature = "debug")]
             loss_fn,
         };
@@ -347,6 +402,14 @@ impl RldpNode {
         Ok(())
     }
 
+    fn send_control(&self) -> Arc<SendControl> {
+        #[cfg(test)]
+        if let Some(control) = self.test_control.lock().unwrap().clone() {
+            return control;
+        }
+        SendControl::new()
+    }
+
     /// Send message
     pub async fn message(
         &self,
@@ -355,7 +418,7 @@ impl RldpNode {
         v2: bool,
         roundtrip: Option<u64>,
     ) -> Result<u64> {
-        let ret = self.outbound(data, None, peers, v2, roundtrip, None).await;
+        let ret = self.outbound(data, None, peers, v2, roundtrip, None, None).await;
         #[cfg(feature = "telemetry")]
         let prefix = if v2 { "RLDP STAT recv v2" } else { "RLDP STAT recv v1" };
         #[cfg(feature = "telemetry")]
@@ -397,6 +460,8 @@ impl RldpNode {
         let tag = data.tag;
         let peers = peers.clone();
         let node = self.clone();
+        let control = self.send_control();
+        let _cancel = control.guard();
         let (sent, received) = tokio::sync::oneshot::channel();
         self.adnl.tasks().spawn_admitted("bounded RLDP query", token, async move {
             let (done, joined) = tokio::sync::oneshot::channel();
@@ -408,7 +473,15 @@ impl RldpNode {
                 tag,
             };
             let result = node
-                .outbound(&data, Some(limits.wire_bytes as u64), &peers, v2, roundtrip, Some(scope))
+                .outbound(
+                    &data,
+                    Some(limits.wire_bytes as u64),
+                    &peers,
+                    v2,
+                    roundtrip,
+                    Some(scope),
+                    Some(control),
+                )
                 .await;
             // Sender is dropped on every pre-receiver error. A spawned receiver
             // remains admitted to ADNL until its real worker/supervisor joins.
@@ -429,7 +502,7 @@ impl RldpNode {
         roundtrip: Option<u64>,
     ) -> Result<(Option<Vec<u8>>, u64)> {
         let max_answer_size = max_answer_size.or(Some(128 * 1024));
-        let ret = self.outbound(data, max_answer_size, peers, v2, roundtrip, None).await;
+        let ret = self.outbound(data, max_answer_size, peers, v2, roundtrip, None, None).await;
         #[cfg(feature = "telemetry")]
         let prefix = if v2 { "RLDP STAT query v2" } else { "RLDP STAT query v1" };
         #[cfg(feature = "telemetry")]
@@ -672,22 +745,43 @@ impl RldpNode {
                     outbound_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
                     tx,
                     stats: StatsV2::new(StatsConfigV2::default(), min_timeout_ms)?,
+                    #[cfg(test)]
+                    idle: Arc::new(tokio::sync::Notify::new()),
                     counter: self.allocated.peers.clone().into(),
                 });
                 // Weak ref so the task does not keep `tx` (owned by RldpPeer) alive
                 let weak_peer = Arc::downgrade(&ret);
+                #[cfg(test)]
+                let idle = ret.idle.clone();
                 let transfers = transfers.clone();
                 let send_pool = send_pool.clone();
-                tokio::spawn(async move {
+                let owner = self.adnl.tasks().clone();
+                let token = owner.enter()?;
+                let lifetime = owner.clone();
+                owner.spawn_admitted("RLDP peer sender", token, async move {
                     let mut tasks = futures::stream::FuturesUnordered::new();
                     loop {
-                        let Some(peer) = weak_peer.upgrade() else { break };
+                        #[cfg(test)] idle.notify_one();
                         tokio::select! {
                             biased;
+                            _ = lifetime.cancelled() => {
+                                rx.close();
+                                while let Ok(job) = rx.try_recv() {
+                                    job.ctx.control.cancel(SendCancelled::OwnerClosed);
+                                    let _ = job.done.send(Err(SendCancelled::OwnerClosed.into()));
+                                }
+                                break;
+                            }
                             job = rx.recv() => match job {
-                                Some(job) => tasks.push(
-                                    job.run(peer.clone(), &transfers, &send_pool, min_timeout_ms)
-                                ),
+                                Some(job) => {
+                                    // Do not retain our own sender while waiting on rx.
+                                    if let Some(peer) = weak_peer.upgrade() {
+                                        tasks.push(job.run(peer, &transfers, &send_pool, min_timeout_ms));
+                                    } else {
+                                        job.ctx.control.cancel(SendCancelled::OwnerClosed);
+                                        let _ = job.done.send(Err(SendCancelled::OwnerClosed.into()));
+                                    }
+                                },
                                 None => break,
                             },
                             _ = tasks.next(), if !tasks.is_empty() => {}
@@ -758,6 +852,13 @@ impl RldpNode {
         if !inserted {
             return Ok(None);
         }
+        let registration = Arc::new(owned_send::SendRegistration {
+            transfers: self.transfers.clone(),
+            send: *transfer_id,
+            receive: None,
+            owner: self.adnl.tasks().clone(),
+            bounded_permit: None,
+        });
         #[cfg(feature = "telemetry")]
         let all = RldpStats::inc(&self.stats.transfers_recv_all);
         #[cfg(feature = "telemetry")]
@@ -790,7 +891,11 @@ impl RldpNode {
         let send_counter = self.allocated.send_transfers.clone();
         let subscribers = self.subscribers.clone();
         let transfers = self.transfers.clone();
-        tokio::spawn(async move {
+        let owner = self.adnl.tasks().clone();
+        let token = owner.enter()?;
+        let lifetime = owner.clone();
+        owner.spawn_admitted("RLDP inbound", token, async move {
+            let _registration = registration;
             Self::receive_loop(&mut context, v2).await;
             transfers.insert(context.transfer_id, RldpTransfer::Done);
             let send_transfer_id = Self::inbound_loop(
@@ -822,7 +927,10 @@ impl RldpNode {
                 target: TARGET,
                 "{rldp} STAT recv: transfers total {all}, active {now}"
             );
-            tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS * 2)).await;
+            tokio::select! {
+                _ = lifetime.cancelled() => {},
+                _ = tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS * 2)) => {},
+            }
             if let Some(send_transfer_id) = send_transfer_id {
                 transfers.remove(&send_transfer_id);
             }
@@ -830,9 +938,15 @@ impl RldpNode {
         });
         let transfers = self.transfers.clone();
         let transfer_id = *transfer_id;
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS)).await;
-            transfers.insert(transfer_id, RldpTransfer::Done);
+        let lifetime = owner.clone();
+        owner.spawn("RLDP inbound expiry", async move {
+            expire_inbound_transfer(
+                transfers,
+                transfer_id,
+                lifetime,
+                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS)),
+            )
+            .await;
         });
         Ok(Some(queue_sender))
     }
@@ -932,7 +1046,19 @@ impl RldpNode {
         #[cfg(feature = "telemetry")]
         send_metric.update(send_counter.load(Ordering::Relaxed));
         transfers.insert(send_transfer_id, RldpTransfer::Send(send_transfer_state));
+        let control = SendControl::new();
+        let _cancel = control.guard();
+        let registration = Arc::new(owned_send::SendRegistration {
+            transfers: transfers.clone(),
+            send: send_transfer_id,
+            receive: None,
+            owner: context.adnl.tasks().clone(),
+            bounded_permit: None,
+        });
         let context_send = SendContext {
+            registration,
+            control,
+            permit: None,
             adnl: context.adnl.clone(),
             peers: context.peers.clone(),
             pong,
@@ -992,6 +1118,7 @@ impl RldpNode {
         v2: bool,
         roundtrip: Option<u64>,
         bounded: Option<BoundedReceive>,
+        control: Option<Arc<SendControl>>,
     ) -> Result<(Option<Vec<u8>>, u64)> {
         let response_limits = bounded.as_ref().map(|scope| scope.limits);
         let retained_permit = bounded.as_ref().map(|scope| scope.permit.clone());
@@ -1021,7 +1148,13 @@ impl RldpNode {
         if let Some(roundtrip) = roundtrip {
             peer.stats.set_roundtrip(roundtrip)?
         }
-        let _permit = peer.outbound_semaphore.clone().acquire_owned().await?;
+        let control = control.unwrap_or_else(|| self.send_control());
+        let _cancel = control.guard();
+        let permit = tokio::select! {
+            _ = control.cancelled() => { control.check()?; unreachable!() },
+            _ = self.adnl.tasks().cancelled() => return Err(SendCancelled::OwnerClosed.into()),
+            permit = peer.outbound_semaphore.clone().acquire_owned() => Arc::new(permit?),
+        };
         #[cfg(feature = "telemetry")]
         log::trace!(
             target: TARGET,
@@ -1093,7 +1226,17 @@ impl RldpNode {
             );
             (None, None)
         };
+        let registration = Arc::new(owned_send::SendRegistration {
+            transfers: self.transfers.clone(),
+            send: send_transfer_id,
+            receive: recv_transfer_id,
+            owner: self.adnl.tasks().clone(),
+            bounded_permit: retained_permit,
+        });
         let send_context = SendContext {
+            registration: registration.clone(),
+            control: control.clone(),
+            permit: Some(permit.clone()),
             adnl: self.adnl.clone(),
             peers: peers.clone(),
             pong,
@@ -1115,13 +1258,14 @@ impl RldpNode {
             query_id.is_some(),
         );
         let res = match tokio::time::timeout(
-            Duration::from_millis(Self::TIMEOUT_OUTBOUND_HARD_MS),
+            control.deadline(),
             self.outbound_loop(send_context, recv_context, &send_transfer_id, v2, &peer, bounded),
         )
         .await
         {
             Ok(res) => res,
             Err(_) => {
+                control.cancel(SendCancelled::Deadline);
                 log::warn!(
                     target: TARGET,
                     "outbound HARD TIMEOUT after {} ms: transfer {} to {}, query={}, \
@@ -1131,7 +1275,7 @@ impl RldpNode {
                     peers.other(),
                     query_id.is_some(),
                 );
-                Err(error!("outbound hard timeout after {} ms", Self::TIMEOUT_OUTBOUND_HARD_MS))
+                Err(SendCancelled::Deadline.into())
             }
         };
         log::debug!(
@@ -1142,42 +1286,9 @@ impl RldpNode {
             outbound_started_at.elapsed().as_millis(),
             res.is_ok(),
         );
-        if res.is_err() {
-            self.transfers.insert(send_transfer_id, RldpTransfer::Done);
-        }
-        if let Some(recv_transfer_id) = recv_transfer_id {
-            self.transfers.insert(recv_transfer_id, RldpTransfer::Done);
-        }
-        let transfers = self.transfers.clone();
-        if let Some(permit) = retained_permit {
-            let fallback = transfers.clone();
-            let owner = self.adnl.tasks().clone();
-            let cancellation = owner.clone();
-            if !owner.spawn("bounded RLDP transfer expiry", async move {
-                let _permit = permit;
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS * 2)) => {},
-                    _ = cancellation.cancelled() => {},
-                }
-                transfers.remove(&send_transfer_id);
-                if let Some(id) = recv_transfer_id {
-                    transfers.remove(&id);
-                }
-            }) {
-                fallback.remove(&send_transfer_id);
-                if let Some(id) = recv_transfer_id {
-                    fallback.remove(&id);
-                }
-            }
-        } else {
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS * 2)).await;
-                transfers.remove(&send_transfer_id);
-                if let Some(id) = recv_transfer_id {
-                    transfers.remove(&id);
-                }
-            });
-        }
+        // Actual sender/receiver descendants retain their registration. A caller
+        // timeout only cancels them; it cannot release their IDs or permits.
+        drop(registration);
         #[cfg(feature = "telemetry")]
         let all = self.stats.transfers_sent_all.load(Ordering::Relaxed);
         #[cfg(feature = "telemetry")]
@@ -1269,22 +1380,23 @@ impl RldpNode {
         let recv_state = if let Some(mut recv_context) = recv_context {
             let (ping, pong) = tokio::sync::mpsc::unbounded_channel();
             let recv_state = recv_context.recv_transfer.state().clone();
-            if let Some(scope) = bounded {
-                self.adnl.tasks().spawn_admitted(
-                    "bounded RLDP receiver",
-                    scope.token,
-                    async move {
-                        Self::receive_loop(&mut recv_context, v2).await;
-                        let _ = ping.send(recv_context.recv_transfer);
-                        let _ = scope.done.send(());
-                    },
-                );
+            let registration = send_context.registration.clone();
+            let permit = send_context.permit.clone();
+            let control = send_context.control.clone();
+            let token = if let Some(scope) = &bounded {
+                scope.token.clone()
             } else {
-                tokio::spawn(async move {
-                    Self::receive_loop(&mut recv_context, v2).await;
-                    ping.send(recv_context.recv_transfer)
-                });
-            }
+                self.adnl.tasks().enter()?
+            };
+            self.adnl.tasks().spawn_admitted("RLDP outbound receiver", token, async move {
+                let _registration = registration;
+                let _permit = permit;
+                Self::receive_loop_controlled(&mut recv_context, v2, Some(&control)).await;
+                let _ = ping.send(recv_context.recv_transfer);
+                if let Some(scope) = bounded {
+                    let _ = scope.done.send(());
+                }
+            });
             Some((recv_state, pong))
         } else {
             None
@@ -1412,6 +1524,14 @@ impl RldpNode {
     fn print_stats(&self) {}
 
     async fn receive_loop(context: &mut RecvContext, v2: bool) {
+        Self::receive_loop_controlled(context, v2, None).await;
+    }
+
+    async fn receive_loop_controlled(
+        context: &mut RecvContext,
+        v2: bool,
+        control: Option<&Arc<SendControl>>,
+    ) {
         let transfer_str = Self::transfer_string(&context.transfer_id, &context.peers, "from");
         let rldp = if v2 { "RLDPv2" } else { "RLDPv1" };
         let spin = Duration::from_millis(Self::ACK_DELAY_MS);
@@ -1420,6 +1540,9 @@ impl RldpNode {
         let mut packets_received: u32 = 0;
         let mut confirmations_sent: u32 = 0;
         loop {
+            if context.adnl.tasks().is_closed() || control.is_some_and(|c| c.check().is_err()) {
+                break;
+            }
             if (start.elapsed() > Duration::from_millis(Self::TIMEOUT_MAX_MS))
                 && (last_diag.elapsed() > Duration::from_millis(Self::TIMEOUT_WARN_MS))
             {
@@ -1514,7 +1637,7 @@ impl RldpNode {
         min_timeout_ms: u64,
     ) -> Result<bool> {
         let transfer_str = Self::transfer_string(&context.transfer_id, &context.peers, "to");
-        let SendTransfer::V1(transfer) = &mut context.send_transfer else {
+        let SendTransfer::V1(mut transfer) = context.send_transfer else {
             fail!("Unexpected V2 send transfer in V1 send loop")
         };
         let start_ms = peer.stats.v1.timestamp_ms();
@@ -1525,7 +1648,19 @@ impl RldpNode {
         #[cfg(any(feature = "debug", feature = "telemetry"))]
         let mut total_packets: u32 = 0;
         loop {
-            let mut transfer_wave = transfer.start_next_part()?;
+            if context.adnl.tasks().is_closed() {
+                context.control.cancel(SendCancelled::OwnerClosed);
+            }
+            context.control.check()?;
+            let (returned, mut transfer_wave) = owned_send::fec(
+                transfer,
+                context.control.clone(),
+                context.adnl.tasks().clone(),
+                |part| part.start_next_part(),
+            )
+            .await?;
+            transfer = returned;
+            context.control.check()?;
             if transfer_wave == 0 {
                 #[cfg(feature = "debug")]
                 Self::check_timestamp(
@@ -1547,9 +1682,24 @@ impl RldpNode {
                     {
                         last_seqno = transfer.state().seqno_send()
                     }
-                    let (object, do_next) = transfer.prepare_chunk()?;
+                    context.control.check()?;
+                    let (returned, (object, do_next)) = owned_send::fec(
+                        transfer,
+                        context.control.clone(),
+                        context.adnl.tasks().clone(),
+                        |part| {
+                            let (bytes, next) = part.prepare_chunk()?;
+                            Ok((bytes.to_vec(), next))
+                        },
+                    )
+                    .await?;
+                    transfer = returned;
+                    if context.adnl.tasks().is_closed() {
+                        context.control.cancel(SendCancelled::OwnerClosed);
+                    }
+                    context.control.check()?;
                     let chunk = TaggedByteSlice {
-                        object,
+                        object: &object,
                         #[cfg(feature = "telemetry")]
                         tag: context.tag,
                     };
@@ -1576,12 +1726,11 @@ impl RldpNode {
                         break 'part;
                     }
                 }
-                tokio::time::timeout(
-                    Duration::from_millis(Self::SPINNER_V1_SEND_MS),
-                    context.pong.recv(),
-                )
-                .await
-                .ok();
+                tokio::select! {
+                    _ = context.control.cancelled() => { context.control.check()?; unreachable!() },
+                    _ = context.adnl.tasks().cancelled() => return Err(SendCancelled::OwnerClosed.into()),
+                    _ = tokio::time::timeout(Duration::from_millis(Self::SPINNER_V1_SEND_MS), context.pong.recv()) => {},
+                }
                 if transfer.state().is_transfer_finished_or_next_part(part)? {
                     #[cfg(feature = "debug")]
                     Self::check_timestamp(
@@ -1653,15 +1802,25 @@ impl RldpNode {
         let progress = Arc::new(AtomicU64::new(0));
         peer.stats.bbr_step()?;
         let start_ms = peer.stats.v1.timestamp_ms();
-        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<Result<bool>>();
-        let mut pending = 0usize;
-        let ok = loop {
-            while pending < Constraints::MAX_PARTS_IN_TRANSIT {
-                if part_transfers.is_empty() {
-                    break;
+        let control = context.control.clone();
+        let owner = context.adnl.tasks().clone();
+        let mut pending = futures::stream::FuturesUnordered::new();
+        let mut failure: Option<Result<bool>> = None;
+        loop {
+            if owner.is_closed() {
+                control.cancel(SendCancelled::OwnerClosed);
+            }
+            if failure.is_none() {
+                if let Err(error) = control.check() {
+                    failure = Some(Err(error));
                 }
-                let mut transfer = part_transfers.remove(0);
-                let context = SendPartContextV2 {
+            }
+            while failure.is_none()
+                && pending.len() < Constraints::MAX_PARTS_IN_TRANSIT
+                && !part_transfers.is_empty()
+            {
+                let transfer = part_transfers.remove(0);
+                let part_context = SendPartContextV2 {
                     adnl: context.adnl.clone(),
                     part_states: transfer_state.clone(),
                     peer: peer.clone(),
@@ -1675,45 +1834,57 @@ impl RldpNode {
                     total_packets: total_packets.clone(),
                     transfer_str: transfer_str.clone(),
                 };
-                let result_tx = result_tx.clone();
-                pool.submit(async move {
-                    let ret =
-                        Self::send_one_part_v2(&mut transfer, &context, start_ms, min_timeout_ms)
-                            .await;
-                    transfer.on_drop(&context.peer);
-                    result_tx.send(ret).ok();
-                });
-                pending += 1;
-            }
-            if pending == 0 {
-                #[cfg(feature = "debug")]
-                Self::check_timestamp(
-                    &context.timestamp,
-                    format!(
-                        "Send transfer finished, packets {}",
-                        total_packets.load(Ordering::Relaxed)
+                let child_control = control.clone();
+                let permit = context.permit.clone();
+                match pool.submit(control.clone(), async move {
+                    let _permit = permit;
+                    Self::send_one_part_v2(
+                        transfer,
+                        &part_context,
+                        start_ms,
+                        min_timeout_ms,
+                        child_control,
                     )
-                    .as_str(),
-                );
-                break Ok(true);
+                    .await
+                }) {
+                    Ok(receipt) => pending.push(receipt),
+                    Err(error) => {
+                        let mut result = Err(error);
+                        control.record_failure(&mut result);
+                        failure = Some(result);
+                    }
+                }
             }
-            // Wait for any part completion or BBR tick interval
+            if pending.is_empty() {
+                break;
+            }
             tokio::select! {
-                biased;
-                Some(result) = result_rx.recv() => {
-                    pending -= 1;
-                    match result {
-                        Err(e) => break Err(e),
-                        Ok(false) => break Ok(false),
-                        Ok(true) => {}
+                result = pending.next() => {
+                    let result = result.expect("nonempty part set")
+                        .unwrap_or_else(|_| Err(error!("RLDP part owner lost its receipt")));
+                    if !matches!(result, Ok(true)) && failure.is_none() {
+                        failure = Some(result);
+                        control.cancel(SendCancelled::SiblingFailed);
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(Self::SPINNER_MS)) => {}
             }
-            // Inline BBR: runs once per loop iteration (~1ms),
-            // matching C++ which calls loop_bbr() once per actor wakeup
-            peer.stats.bbr_step()?;
-        }?;
+            if failure.is_none() {
+                let step = peer.stats.bbr_step();
+                #[cfg(test)]
+                let step = if control.test_bbr_error.swap(false, Ordering::AcqRel) {
+                    Err(error!("controlled BBR step error"))
+                } else {
+                    step
+                };
+                if let Err(error) = step {
+                    let mut result = Err(error);
+                    control.record_failure(&mut result);
+                    failure = Some(result);
+                }
+            }
+        }
+        let ok = control.take_failure().or(failure).unwrap_or(Ok(true))?;
         #[cfg(feature = "telemetry")]
         log::info!(
             target: TARGET,
@@ -1725,11 +1896,29 @@ impl RldpNode {
     }
 
     async fn send_one_part_v2(
-        transfer: &mut SendPartV2,
+        transfer: SendPartV2,
         context: &SendPartContextV2,
         start_ms: u64,
         min_timeout_ms: u64,
+        control: Arc<SendControl>,
     ) -> Result<bool> {
+        control.check()?;
+        let transfer = OwnedSendPart { part: transfer, peer: context.peer.clone() };
+        #[cfg(test)]
+        let hook = control.test_after_start.lock().unwrap().clone();
+        let (mut transfer, early) =
+            owned_send::fec(transfer, control.clone(), context.adnl.tasks().clone(), move |part| {
+                part.start()?;
+                #[cfg(test)]
+                if let Some(hook) = hook {
+                    return hook(part.state().part());
+                }
+                Ok(None::<bool>)
+            })
+            .await?;
+        if let Some(result) = early {
+            return Ok(result);
+        }
         let part = transfer.state().part();
         let on_ack = |transfer: &mut SendPartV2, ack| -> Result<u32> {
             transfer.on_ack_and_wake(
@@ -1744,8 +1933,11 @@ impl RldpNode {
         let mut new_received = 0;
         let mut last_warn_ms = context.peer.stats.v1.timestamp_ms();
         let mut last_diag_ms = last_warn_ms;
-        transfer.start()?;
         let ok = loop {
+            if context.adnl.tasks().is_closed() {
+                control.cancel(SendCancelled::OwnerClosed);
+            }
+            control.check()?;
             if let Some(ok) = transfer.state().is_finished() {
                 break ok;
             }
@@ -1790,9 +1982,24 @@ impl RldpNode {
                 continue;
             }
             new_received = 0;
-            let (object, is_probe) = match transfer.prepare_chunk(&context.peer)? {
-                SendActionV2::Send((object, is_probe)) => (object, is_probe),
-                SendActionV2::Wait(timeout_micros) => {
+            let peer = context.peer.clone();
+            let (returned, prepared) = owned_send::fec(
+                transfer,
+                control.clone(),
+                context.adnl.tasks().clone(),
+                move |part| {
+                    Ok(match part.prepare_chunk(&peer)? {
+                        SendActionV2::Send((bytes, info)) => Ok((bytes.to_vec(), info)),
+                        SendActionV2::Wait(delay) => Err(delay),
+                    })
+                },
+            )
+            .await?;
+            transfer = returned;
+            control.check()?;
+            let (object, is_probe) = match prepared {
+                Ok(packet) => packet,
+                Err(timeout_micros) => {
                     #[cfg(feature = "debug")]
                     Self::check_timestamp(
                         &context.timestamp,
@@ -1804,13 +2011,13 @@ impl RldpNode {
                         )
                         .as_str(),
                     );
-                    if let Ok(Some(Some(ack))) = tokio::time::timeout(
-                        Duration::from_micros(timeout_micros),
-                        transfer.ack_pong.recv(),
-                    )
-                    .await
-                    {
-                        new_received = on_ack(transfer, ack)?
+                    let received = tokio::select! {
+                        _ = control.cancelled() => { control.check()?; unreachable!() },
+                        _ = context.adnl.tasks().cancelled() => return Err(SendCancelled::OwnerClosed.into()),
+                        received = tokio::time::timeout(Duration::from_micros(timeout_micros), transfer.ack_pong.recv()) => received,
+                    };
+                    if let Ok(Some(Some(ack))) = received {
+                        new_received = on_ack(&mut transfer, ack)?;
                     }
                     continue;
                 }
@@ -1818,7 +2025,7 @@ impl RldpNode {
             #[cfg(any(feature = "debug", feature = "telemetry"))]
             context.total_packets.fetch_add(1, Ordering::Relaxed);
             let chunk = TaggedByteSlice {
-                object,
+                object: &object,
                 #[cfg(feature = "telemetry")]
                 tag: context.tag,
             };
@@ -1826,7 +2033,7 @@ impl RldpNode {
             context.adnl.send_custom(&chunk, &context.peers).await?;
             transfer.on_send(is_probe, sent_at_micros, &context.peer)?;
             if let Ok(Some(ack)) = transfer.ack_pong.try_recv() {
-                new_received = on_ack(transfer, ack)?
+                new_received = on_ack(&mut transfer, ack)?
             }
         };
         #[cfg(feature = "debug")]

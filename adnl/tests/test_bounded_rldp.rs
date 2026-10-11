@@ -123,7 +123,7 @@ fn bounded_rldp_transparent_expansion_checks_advertised_size() {
 }
 
 #[test]
-fn bounded_rldp_cancelled_waiter_keeps_receiver_owned_until_stop() {
+fn bounded_rldp_cancelled_client_drains_while_server_retains_subscriber() {
     let runtime =
         tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
     runtime.block_on(async {
@@ -180,15 +180,35 @@ fn bounded_rldp_cancelled_waiter_keeps_receiver_owned_until_stop() {
             .is_ok();
         caller.abort();
         let _ = caller.await;
-        let node = nodes[0].clone();
-        let stopping = tokio::spawn(async move { node.stop_checked().await });
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        let retained = !stopping.is_finished();
+        let client = nodes[0].clone();
+        let server = nodes[1].clone();
+        let mut client_stop = tokio::spawn(async move { client.stop_checked().await });
+        let mut server_stop = tokio::spawn(async move { server.stop_checked().await });
+        // The gate belongs to the remote subscriber, not the idle client
+        // receiver. Cancelling that receiver may finish normally; the server
+        // must retain the actual subscriber future through its completion.
+        let client_observed =
+            tokio::time::timeout(std::time::Duration::from_secs(10), &mut client_stop).await;
+        let server_observed =
+            tokio::time::timeout(std::time::Duration::from_millis(80), &mut server_stop).await;
+        let client_drained = client_observed.is_ok();
+        let server_retained = server_observed.is_err();
+
+        // Release before any assertion, and collect both real JoinHandles even
+        // when an observation failed. A timeout never drops a live stop owner.
         gate.1.notify_one();
-        let stopped = tokio::time::timeout(std::time::Duration::from_secs(40), stopping).await;
-        nodes[1].stop_checked().await.unwrap();
+        let client_stopped = match client_observed {
+            Ok(result) => result,
+            Err(_) => client_stop.await,
+        };
+        let server_stopped = match server_observed {
+            Ok(result) => result,
+            Err(_) => server_stop.await,
+        };
+        client_stopped.expect("client stop task must join").expect("client must drain");
+        server_stopped.expect("server stop task must join").expect("server must drain");
         assert!(entered, "actual peer must receive the query");
-        assert!(retained, "cancelled observer cannot discard the live receive owner");
-        stopped.expect("bounded receive must terminate and join").unwrap().unwrap();
+        assert!(client_drained, "cancelled idle client receiver must terminate and join");
+        assert!(server_retained, "server stop must retain the gated live subscriber");
     });
 }

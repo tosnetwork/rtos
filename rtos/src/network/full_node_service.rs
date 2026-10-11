@@ -64,6 +64,10 @@ pub struct FullNodeOverlayService {
     bounded_reply: std::sync::Mutex<Option<(Arc<rtos_block::KeyId>, BlockIdExt, bool, Vec<u8>)>>,
     #[cfg(test)]
     bounded_queries: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pss_reply: std::sync::Mutex<Option<(Arc<rtos_block::KeyId>, PersistentStateIdV2, Option<i64>, Vec<u8>)>>,
+    #[cfg(test)]
+    pss_observations: std::sync::Mutex<Vec<(BlockIdExt, Option<i64>, Option<usize>)>>,
 }
 
 impl FullNodeOverlayService {
@@ -82,6 +86,10 @@ impl FullNodeOverlayService {
             bounded_reply: Default::default(),
             #[cfg(test)]
             bounded_queries: Default::default(),
+            #[cfg(test)]
+            pss_reply: Default::default(),
+            #[cfg(test)]
+            pss_observations: Default::default(),
         }
     }
 
@@ -105,6 +113,24 @@ impl FullNodeOverlayService {
     #[cfg(test)]
     pub(crate) fn test_bounded_queries(&self) -> usize {
         self.bounded_queries.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_clear_history_replies(&self) {
+        self.pss_reply.lock().unwrap().take();
+        self.bounded_reply.lock().unwrap().take();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pss_observations(&self) -> Vec<(BlockIdExt, Option<i64>, Option<usize>)> {
+        self.pss_observations.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pss_reply(&self, peer: Arc<rtos_block::KeyId>, state: PersistentStateIdV2, offset: Option<i64>, bytes: Vec<u8>) {
+        let mut reply = self.pss_reply.lock().unwrap();
+        assert!(reply.is_none(), "unused scoped PSS reply");
+        *reply = Some((peer, state, offset, bytes));
     }
 
     // tonNode.getNextBlockDescription prev_block:tonNode.blockIdExt = tonNode.BlockDescription;
@@ -435,6 +461,8 @@ impl FullNodeOverlayService {
                         query.max_size as u64,
                     )
                     .await?;
+                #[cfg(test)]
+                self.pss_observations.lock().unwrap().push((query.state.block.clone(), Some(query.offset), Some(data.len())));
                 let answer = TaggedByteVec {
                     object: data,
                     #[cfg(feature = "telemetry")]
@@ -750,6 +778,25 @@ impl Subscriber for FullNodeOverlayService {
         log::debug!("try_consume_query {:?} from {}", query, adnl_peers.other());
         #[cfg(test)]
         {
+            let pss = if query.is::<DownloadPersistentStateSliceV2>() {
+                let request = query.clone().downcast::<DownloadPersistentStateSliceV2>().unwrap();
+                Some((request.state, Some(request.offset)))
+            } else if query.is::<GetPersistentStateSizeV2>() {
+                Some((query.clone().downcast::<GetPersistentStateSizeV2>().unwrap().state, None))
+            } else { None };
+            if let Some((state, offset)) = pss {
+                self.pss_observations.lock().unwrap().push((state.block.clone(), offset, None));
+                let mut reply = self.pss_reply.lock().unwrap();
+                if reply.as_ref().is_some_and(|(peer, expected, at, _)| {
+                    peer == adnl_peers.other() && expected == &state && at == &offset
+                }) {
+                    let (_, _, _, bytes) = reply.take().unwrap();
+                    self.pss_observations.lock().unwrap().push((state.block.clone(), offset, Some(bytes.len())));
+                    return Ok(QueryResult::Consumed(QueryAnswer::Ready(Some(Answer::Raw(
+                        TaggedByteVec { object: bytes, #[cfg(feature = "telemetry")] tag: 0 },
+                    )))));
+                }
+            }
             let request = if query.is::<DownloadBlockFull>() {
                 Some((query.clone().downcast::<DownloadBlockFull>().unwrap().block, true))
             } else if query.is::<DownloadBlockProof>() {

@@ -238,6 +238,17 @@ impl ArchiveManager {
 
     /// Strict bounded read. Unlike the legacy recovery loader, errors do not
     /// clear handle flags or fall back to another source.
+    #[cfg(any(test, feature = "integration-test-support"))]
+    pub async fn test_remove_archived_artifacts(&self, handle: &BlockHandle) -> Result<()> {
+        if !handle.is_archived() { fail!("Fault fixture requires real archived block"); }
+        let _body = handle.block_file_lock().write().await;
+        let _proof = handle.proof_file_lock().write().await;
+        let id = self.get_package_id(get_mc_seq_no(handle), handle.is_key_block()?).await?;
+        let fd = self.get_file_desc(&id, false).await?.ok_or_else(|| error!("Fault fixture slice absent"))?;
+        fd.archive_slice().test_remove_entry_offset(&PackageEntryId::Block(handle.id()))?;
+        fd.archive_slice().test_remove_entry_offset(&PackageEntryId::Proof(handle.id()))
+    }
+
     pub async fn get_file_bounded<B: Borrow<BlockIdExt> + Hash>(
         &self,
         handle: &BlockHandle,
@@ -252,17 +263,22 @@ impl ArchiveManager {
             _ => fail!("Unsupported bounded archive entry"),
         };
         if handle.is_archived() {
-            let package_id =
-                self.get_package_id(get_mc_seq_no(handle), handle.is_key_block()?).await?;
+            let package_id = if handle.is_key_block()? {
+                PackageId::for_key_block(get_mc_seq_no(handle) / KEY_ARCHIVE_PACKAGE_SIZE)
+            } else {
+                let id = self.file_maps.files().get_closest_id(get_mc_seq_no(handle)).await
+                    .ok_or_else(|| super::bounded_read::ArchiveArtifactMissing::new("package route"))?;
+                PackageId::for_block(id)
+            };
             let fd = self
                 .get_file_desc(&package_id, false)
                 .await?
-                .ok_or_else(|| error!("Bounded archive descriptor missing"))?;
+                .ok_or_else(|| super::bounded_read::ArchiveArtifactMissing::new("descriptor"))?;
             let entry = fd
                 .archive_slice()
                 .get_file_bounded(handle, entry_id, limits)
                 .await?
-                .ok_or_else(|| error!("Bounded archive entry missing"))?;
+                .ok_or_else(|| super::bounded_read::ArchiveArtifactMissing::new("entry offset"))?;
             return Ok(entry.take_data());
         }
         let filename = entry_id.filename_short();

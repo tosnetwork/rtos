@@ -2125,6 +2125,12 @@ impl InternalDb {
     }
 
     #[cfg(test)]
+    pub(crate) async fn test_remove_archived_artifacts(&self, id: &BlockIdExt) -> Result<()> {
+        let handle = self.load_block_handle(id)?.ok_or_else(|| error!("Fault fixture handle absent"))?;
+        self.archive_manager.test_remove_archived_artifacts(&handle).await
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_pause_archive_gc_selection(&self) -> (tokio::sync::oneshot::Receiver<Vec<u32>>, Arc<tokio::sync::Notify>) {
         self.archive_manager.test_pause_gc_selection()
     }

@@ -129,6 +129,12 @@ pub(crate) fn build_historical_simplex_options(config: &rtos_block::ConfigParams
     build_runtime_simplex_session_options(shard, &selected.config, &base)
 }
 
+/// Reuse already decoded, request-budgeted historical parameters.
+pub(crate) fn build_historical_simplex_options_decoded(config: &rtos_block::DecodedSessionConfig, shard: &ShardIdent) -> Result<simplex::SessionOptions> {
+    let base = get_session_options(&config.consensus, &config.catchain, false, &None);
+    build_runtime_simplex_session_options(shard, &config.selected.config, &base)
+}
+
 fn build_runtime_simplex_session_options(
     shard: &ShardIdent,
     cfg: &SimplexConfig,

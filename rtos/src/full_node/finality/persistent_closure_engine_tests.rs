@@ -235,6 +235,17 @@ async fn circulation(events: usize) {
                 crate::propagation_outbox::effects_digest(&[]).unwrap(),
                 "the test must actually complete publication effects"
             );
+            if index == 0 {
+                let before = engine.db().load_validator_state_raw_bounded(
+                    "PropagationOutboxV1", crate::propagation_outbox::Limits::default().max_snapshot_bytes).unwrap();
+                let worker = engine.ensure_publication_worker().await.unwrap();
+                assert!(worker.authorize_closing_history_debt(entry.offer().request,
+                    runtime.clone(), crate::history_read_budget::HistoryReadBudget::new(Default::default()))
+                    .await.is_err(), "real compact Released record must not mint new history admission");
+                let after = engine.db().load_validator_state_raw_bounded(
+                    "PropagationOutboxV1", crate::propagation_outbox::Limits::default().max_snapshot_bytes).unwrap();
+                assert_eq!(after, before, "failed compact admission mutated durable outbox");
+            }
             assert!(generations.insert(entry.lease_generation));
             assert!(engine.load_block_handle(&id).unwrap().unwrap().is_applied());
             assert_eq!(
@@ -311,3 +322,9 @@ mod persistent_closure_crash_tests;
 
 #[path = "persistent_closure_write_failure_tests.rs"]
 mod persistent_closure_write_failure_tests;
+
+#[path = "historical_recovery_engine_tests.rs"]
+mod historical_recovery_engine_tests;
+
+#[path = "historical_closing_cold_tests.rs"]
+mod historical_closing_cold_tests;
