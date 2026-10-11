@@ -379,7 +379,61 @@ impl NodeNetwork {
             }
             return Err(error);
         }
-        Ok(node_network)
+        // Keep key loading and failure cleanup owned even if construction is cancelled.
+        let (ready, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            match node_network.load_consensus_transport_bindings().await {
+                Ok(()) => {
+                    if ready.send(Ok(node_network.clone())).is_err() {
+                        let _ = node_network.stop_adnl().await;
+                    }
+                }
+                Err(error) => {
+                    let result = match node_network.stop_adnl().await {
+                        Ok(()) => Err(error),
+                        Err(cleanup) => Err(error!(
+                            "Consensus transport initialization: {error}; cleanup: {cleanup}"
+                        )),
+                    };
+                    let _ = ready.send(result);
+                }
+            }
+        });
+        receiver.await?
+    }
+
+    async fn load_consensus_transport_bindings(&self) -> Result<()> {
+        for (index, binding) in
+            self.config_handler.consensus_transport_bindings()?.iter().enumerate()
+        {
+            let key = self.config_handler.consensus_transport_key(&binding.adnl_key_id).await?;
+            // Static transport bindings use a separate tag range from positive i32
+            // election identifiers and the default DHT/overlay tags. Never overwrite
+            // an existing tag or register a fictitious validator election.
+            if self.network_context.stack.adnl.key_by_id(&binding.adnl_key_id).is_err() {
+                let tag = (i32::MAX as usize)
+                    .checked_add(1)
+                    .and_then(|base| base.checked_add(index))
+                    .ok_or_else(|| error!("Consensus transport tag overflow"))?;
+                self.network_context.stack.adnl.add_key(key.clone(), tag)?;
+            }
+            if let Some(quic) = &self.network_context.stack.quic {
+                let (_, bind_addr) = Self::compute_quic_bind_addr(
+                    self.network_context.stack.adnl.ip_address_adnl(),
+                    self.network_context.quic_address,
+                )?;
+                Self::bind_quic_key(quic, &key, bind_addr)?;
+            }
+            self.tasks.spawn_handle("consensus transport DHT announcement", || {
+                Self::periodic_store_ip_addr(
+                    self.network_context.stack.dht.clone(),
+                    key,
+                    None,
+                    self.cancellation_token.clone(),
+                )
+            })?;
+        }
+        Ok(())
     }
 
     pub async fn start(&self) -> Result<()> {
