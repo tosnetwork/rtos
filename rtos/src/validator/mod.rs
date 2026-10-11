@@ -19,6 +19,7 @@ mod fabric;
 mod log_parser;
 mod mutex_wrapper;
 pub mod out_msg_queue;
+pub mod propagation;
 mod out_msg_queue_cleaner;
 pub mod out_msg_queue_manager;
 pub mod state_resolver_cache;

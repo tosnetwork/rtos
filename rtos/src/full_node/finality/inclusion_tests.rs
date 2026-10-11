@@ -350,7 +350,7 @@ impl Pair {
             .into_boxed();
         let carrier = rtos_api::ton::ton_node::broadcast::BlockFinalityBroadcast {
             id: self.shard.id().clone(),
-            signature_set,
+            signature_set: signature_set.clone(),
         }
         .into_boxed();
         let wire = WireProfile::T0.serialize(&carrier).unwrap();
@@ -358,7 +358,9 @@ impl Pair {
             id: self.shard.id().clone(),
         }
         .into_boxed();
-        let hash = UInt256::calc_file_hash(&WireProfile::T0.serialize(&identifier).unwrap());
+        let mut identity = WireProfile::T0.serialize(&identifier).unwrap();
+        identity.extend_from_slice(UInt256::calc_file_hash(&WireProfile::T0.serialize(&signature_set).unwrap()).as_slice());
+        let hash = UInt256::calc_file_hash(&identity);
         (wire, *hash.as_array())
     }
 

@@ -436,6 +436,17 @@ impl CustomOverlayClient {
         }
     }
 
+    pub(super) async fn send_propagation_broadcast(
+        &self,
+        data: &TaggedByteSlice<'_>,
+    ) -> Result<()> {
+        let _admission = self.tasks.enter()?;
+        if !self.is_active.load(Ordering::Acquire) {
+            fail!("Custom propagation overlay is not active");
+        }
+        self.send_broadcast(data, 0).await
+    }
+
     pub async fn send_broadcast(&self, data: &TaggedByteSlice<'_>, flags: u32) -> Result<()> {
         if !self.is_active.load(Ordering::Relaxed) {
             return Ok(());

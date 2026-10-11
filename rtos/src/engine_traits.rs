@@ -903,6 +903,49 @@ pub trait EngineOperations: Sync + Send {
         unimplemented!()
     }
 
+    /// Propagation reports never undo or obscure an already durable acceptance.
+    async fn propagate_accepted_session_block(
+        &self,
+        _accepted: &crate::validator::accept_block::AcceptedSessionBlock,
+        plan: &crate::validator::propagation::PropagationPlan,
+    ) -> crate::validator::propagation::PropagationOutcome {
+        use crate::validator::propagation::*;
+        let mut outcome = PropagationOutcome::failed(
+            PropagationKind::Block,
+            plan.block_targets,
+            "Accepted-block propagation is unavailable",
+        );
+        outcome.receipts.extend(
+            PropagationOutcome::failed(
+                PropagationKind::Finality,
+                plan.finality_targets,
+                "Finality propagation is unavailable",
+            )
+            .receipts,
+        );
+        if plan.send_shard_description {
+            outcome.record(
+                PropagationKind::ShardDescription,
+                PropagationTarget::ShardDescription,
+                PropagationStatus::Failed("Shard-description propagation is unavailable".into()),
+            );
+        }
+        outcome
+    }
+
+    async fn relay_validated_candidate(
+        &self,
+        _candidate: &crate::validator::propagation::ValidatedCandidateRelay,
+        plan: &crate::validator::propagation::PropagationPlan,
+    ) -> crate::validator::propagation::PropagationOutcome {
+        use crate::validator::propagation::*;
+        PropagationOutcome::failed(
+            PropagationKind::Candidate,
+            plan.candidate_targets,
+            "Candidate propagation is unavailable",
+        )
+    }
+
     async fn send_block_broadcast(
         &self,
         block: &BlockStuff,

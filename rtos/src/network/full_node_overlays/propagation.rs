@@ -1,0 +1,747 @@
+// Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
+use super::*;
+use crate::validator::propagation::*;
+use adnl::PlumtreeConfig;
+use consensus_common::simplex_protocol::SimplexProtocol;
+use rtos_api::{pq_finality::PqNetworkSignatureSet, WireProfile};
+use rtos_block::{
+    boc_compression::{boc_compress, CompressionAlgorithm},
+    UInt256,
+};
+use std::collections::BTreeMap;
+
+const PAYLOAD_LIMIT: usize = crate::network::MAX_COMPRESSED_SIZE;
+
+#[derive(Clone)]
+pub(super) struct PropagationConfig {
+    mc: bool,
+    shard: bool,
+    public_authority: BTreeMap<[u8; 32], usize>,
+    fast_authority: BTreeMap<[u8; 32], usize>,
+    signer: Option<Arc<dyn KeyOption>>,
+}
+impl PropagationConfig {
+    fn enabled(&self, shard: &ShardIdent) -> bool {
+        if shard.is_masterchain() {
+            self.mc
+        } else {
+            self.shard
+        }
+    }
+    fn same(&self, other: &Self) -> bool {
+        self.mc == other.mc
+            && self.shard == other.shard
+            && self.public_authority == other.public_authority
+            && self.fast_authority == other.fast_authority
+            && self.signer.as_ref().map(|s| s.id()) == other.signer.as_ref().map(|s| s.id())
+    }
+    fn policy(&self, fast: bool) -> PlumtreeConfig {
+        let authority = if fast { &self.fast_authority } else { &self.public_authority };
+        PlumtreeConfig {
+            authorized_keys: authority.clone(),
+            max_untrusted_size: if fast { 0 } else { PAYLOAD_LIMIT },
+            // T0 public policy allows FEC, but untrusted sources require application
+            // authentication; they are not promoted to trusted Plumtree producers.
+            untrusted_flags: if fast { 0 } else { 1 },
+            fixed_members: fast,
+            original_sender: self
+                .signer
+                .as_ref()
+                .is_some_and(|s| authority.contains_key(s.id().data())),
+            eager_limit: 4,
+            max_retained_bytes: 64 << 20,
+            max_broadcasts: 256,
+        }
+    }
+}
+
+impl FullNodeOverlaysRouter {
+    /// Only called with configuration read from the actual applied MC state.
+    /// Consumer ownership is established by client construction before activation.
+    pub(super) async fn update_propagation_config(
+        self: &Arc<Self>,
+        config: &ConfigParams,
+        signer: Option<&Arc<dyn KeyOption>>,
+        binding: &FastSyncRefreshBinding,
+    ) -> Result<()> {
+        let enabled = |c: Option<rtos_block::SimplexConfig>| -> Result<bool> {
+            c.map(|c| {
+                c.validate_protocol_version()?;
+                Ok(c.protocol_version == 2)
+            })
+            .unwrap_or(Ok(false))
+        };
+        let mc = enabled(config.get_mc_simplex_config()?)?;
+        let shard = enabled(config.get_shard_simplex_config()?)?;
+        if (mc || shard) && self.network.context().stack.overlay.wire_profile() != WireProfile::T0 {
+            rtos_block::fail!("v2 full-node propagation requires the pinned T0 wire profile");
+        }
+        let sets =
+            [config.prev_validator_set()?, config.validator_set()?, config.next_validator_set()?];
+        let mut all = Vec::new();
+        for set in &sets {
+            all.extend_from_slice(set.list());
+        }
+        let (public, _) = fast_sync_transport_authority(
+            &all,
+            self.network.context().stack.overlay.wire_profile(),
+        )?;
+        // T0 current_validators_adnl_ is named historically: it contains the
+        // previous/current/next union, not merely ConfigParam34.
+        let desired = PropagationConfig {
+            mc,
+            shard,
+            public_authority: public.iter().map(|k| (*k.data(), PAYLOAD_LIMIT)).collect(),
+            fast_authority: public.iter().map(|k| (*k.data(), PAYLOAD_LIMIT)).collect(),
+            signer: signer.cloned(),
+        };
+        if self.propagation_config_ready.load(Ordering::Acquire)
+            && self
+                .propagation_config
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|old| old.same(&desired))
+        {
+            return Ok(());
+        }
+        self.propagation_config_ready.store(false, Ordering::Release);
+        self.publish_fast_sync(Some(binding), || {
+            *self.propagation_config.write().unwrap() = Some(desired);
+            Ok(())
+        })?;
+        // The transport policy is immutable. Drain each old public generation;
+        // the ordinary creation path installs the new consumer then the policy.
+        let shards: Vec<_> = self.public_overlays.iter().map(|g| g.key().clone()).collect();
+        for shard in shards {
+            let generation =
+                self.public_generations.lock().unwrap().entry(shard.clone()).or_default().clone();
+            {
+                let _generation = generation.lock().await;
+                if let Some(guard) = self.public_overlays.get(&shard) {
+                    guard.val().stop_and_wait().await?;
+                    self.public_overlays.remove(&shard);
+                }
+            }
+            self.overlay_client_for_shard(shard).await?;
+        }
+        // Force fast-sync replacement even when only protocol/policy changed.
+        *self.fast_sync_snapshot.lock().await = None;
+        self.propagation_config_ready.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub(super) fn configure_public_propagation(
+        &self,
+        client: &FullNodeOverlayClient,
+    ) -> Result<()> {
+        let config = self.propagation_config.read().unwrap();
+        if let Some(config) = config.as_ref().filter(|c| c.enabled(client.shard())) {
+            client.overlay_client().configure_plumtree(config.policy(false))?;
+        }
+        Ok(())
+    }
+    pub(super) fn configure_fast_sync_propagation(
+        &self,
+        client: &FastSyncOverlayClient,
+    ) -> Result<()> {
+        let config = self.propagation_config.read().unwrap();
+        if let Some(config) = config.as_ref().filter(|c| c.enabled(client.shard())) {
+            client.client().configure_plumtree(config.policy(true))?;
+        }
+        Ok(())
+    }
+}
+
+/// Structural serialization only. Callers must retain the accepted block token;
+/// this function does not authenticate network signature fields.
+fn pq_block_wire(
+    block: &BlockStuff,
+    proof: &BlockProofStuff,
+    signatures: &PqNetworkSignatureSet,
+) -> Result<Vec<u8>> {
+    if signatures.block_id() != block.id() || proof.id() != block.id() {
+        rtos_block::fail!("Accepted PQ broadcast block/proof/signature identity mismatch");
+    }
+    WireProfile::T0.serialize(
+        &rtos_api::ton::ton_node::broadcast::BlockBroadcastCompressedV2 {
+            id: block.id().clone(),
+            signature_set: signatures.to_node().into_boxed(),
+            proof: proof.data().to_vec(),
+            data_compressed: boc_compress(
+                vec![block.root_cell().clone()],
+                CompressionAlgorithm::ImprovedStructureLZ4,
+            )?,
+        }
+        .into_boxed(),
+    )
+}
+
+fn pq_finality_wire(signatures: &PqNetworkSignatureSet) -> Result<(Vec<u8>, [u8; 32])> {
+    if !signatures.is_final() {
+        rtos_block::fail!("Notarization has no finality broadcast authority");
+    }
+    let signature_set = signatures.to_node().into_boxed();
+    let signature_hash = UInt256::calc_file_hash(&WireProfile::T0.serialize(&signature_set)?);
+    let mut identity = WireProfile::T0.serialize(
+        &rtos_api::ton::ton_node::finalitybroadcastid::FinalityBroadcastId {
+            id: signatures.block_id().clone(),
+        }
+        .into_boxed(),
+    )?;
+    identity.extend_from_slice(signature_hash.as_slice());
+    let transport_id = *UInt256::calc_file_hash(&identity).as_array();
+    let bytes = WireProfile::T0.serialize(
+        &rtos_api::ton::ton_node::broadcast::BlockFinalityBroadcast {
+            id: signatures.block_id().clone(),
+            signature_set,
+        }
+        .into_boxed(),
+    )?;
+    Ok((bytes, transport_id))
+}
+
+impl FullNodeOverlaysRouter {
+    async fn propagate_wire(
+        self: &Arc<Self>,
+        id: &BlockIdExt,
+        kind: PropagationKind,
+        targets: TargetSet,
+        protocol: SimplexProtocol,
+        bytes: &[u8],
+        simple_id: Option<[u8; 32]>,
+    ) -> PropagationOutcome {
+        let _admission = match self.tasks.enter() {
+            Ok(lease) => lease,
+            Err(error) => return failed_targets(kind, targets, error),
+        };
+        let mut outcome = PropagationOutcome::default();
+        let plumtree =
+            protocol == SimplexProtocol::PrivateObserversPlumtree && kind != PropagationKind::Block;
+        let tagged = TaggedByteSlice {
+            object: bytes,
+            #[cfg(feature = "telemetry")]
+            tag: u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+        };
+        let status = |r: Result<()>| match r {
+            Ok(()) => PropagationStatus::Sent,
+            Err(error) => PropagationStatus::Failed(format!("{error:#}")),
+        };
+        if targets.public {
+            let result: Result<()> = async {
+                let client = self.overlay_client(id.shard()).await?;
+                if plumtree {
+                    let config = self
+                        .propagation_config
+                        .read()
+                        .unwrap()
+                        .clone()
+                        .filter(|c| c.enabled(id.shard()))
+                        .ok_or_else(|| error!("No authenticated public Plumtree configuration"))?;
+                    let signer = config
+                        .signer
+                        .ok_or_else(|| error!("No authenticated public transport signer"))?;
+                    client.overlay_client().broadcast_plumtree(&signer, simple_id, bytes).await
+                } else {
+                    client.send_broadcast(&tagged, 0, AdnlSendMethod::Fast).await
+                }
+            }
+            .await;
+            outcome.record(kind, PropagationTarget::Public, status(result));
+        }
+        if targets.fast_sync {
+            let receipt = if let Some(client) = self.fast_sync_overlay(id.shard()) {
+                let result: Result<()> = async {
+                    if plumtree {
+                        let signer = client
+                            .propagation_signer
+                            .as_ref()
+                            .ok_or_else(|| error!("No fast-sync transport signer"))?;
+                        client.client().broadcast_plumtree(signer, simple_id, bytes).await
+                    } else if client.use_twostep() {
+                        client.send_twostep_broadcast(&tagged, 0).await
+                    } else {
+                        client.send_broadcast(&tagged, 0, AdnlSendMethod::Fast).await
+                    }
+                }
+                .await;
+                status(result)
+            } else {
+                PropagationStatus::Skipped("No eligible fast-sync overlay".into())
+            };
+            outcome.record(kind, PropagationTarget::FastSync, receipt);
+        }
+        if targets.custom {
+            let mut selected = false;
+            for guard in self.custom_overlays.iter() {
+                let client = guard.val();
+                if client.sends_blocks_to(id.shard()) {
+                    selected = true;
+                    // T0 custom overlays keep the existing FEC/two-step carrier,
+                    // including when public/fast-sync use Plumtree.
+                    outcome.record(
+                        kind,
+                        PropagationTarget::Custom(guard.key().clone()),
+                        status(client.send_propagation_broadcast(&tagged).await),
+                    );
+                }
+            }
+            if !selected {
+                outcome.record(
+                    kind,
+                    PropagationTarget::Custom(String::new()),
+                    PropagationStatus::Skipped("No eligible custom overlay".into()),
+                );
+            }
+        }
+        outcome
+    }
+
+    pub async fn relay_validated_candidate(
+        self: &Arc<Self>,
+        candidate: &ValidatedCandidateRelay,
+        plan: &PropagationPlan,
+    ) -> PropagationOutcome {
+        if plan.candidate_targets == TargetSet::NONE {
+            return PropagationOutcome::default();
+        }
+        // A bounded single cache also bounds sessions. Cancellation before the
+        // receipt leaves the entry retryable; successful retries are idempotent.
+        let mut cache = self.candidate_relays.lock().await;
+        if cache.contains(candidate.block().id()) {
+            let mut outcome = PropagationOutcome::default();
+            outcome.record(
+                PropagationKind::Candidate,
+                PropagationTarget::Public,
+                PropagationStatus::Skipped("Candidate already relayed".into()),
+            );
+            return outcome;
+        }
+        let prepared: Result<Vec<u8>> = async {
+            let _admission = self.tasks.enter()?;
+            self.refresh_fast_sync_from_applied_state().await?;
+            let value = build_block_candidate_broadcast_compressed(
+                candidate.block().id().clone(),
+                candidate.catchain_seqno(),
+                candidate.validator_set_hash(),
+                candidate.block().root_cell(),
+            )?
+            .into_boxed();
+            self.network.context().stack.overlay.wire_profile().serialize(&value)
+        }
+        .await;
+        match prepared {
+            Ok(bytes) => {
+                let outcome = self
+                    .propagate_wire(
+                        candidate.block().id(),
+                        PropagationKind::Candidate,
+                        plan.candidate_targets,
+                        plan.protocol,
+                        &bytes,
+                        None,
+                    )
+                    .await;
+                if outcome.attempted() && !outcome.needs_retry() {
+                    cache.record_sent(candidate.block().id().clone());
+                }
+                outcome
+            }
+            Err(error) => failed_targets(PropagationKind::Candidate, plan.candidate_targets, error),
+        }
+    }
+
+    pub async fn propagate_accepted_session_block(
+        self: &Arc<Self>,
+        accepted: &crate::validator::accept_block::AcceptedSessionBlock,
+        plan: &PropagationPlan,
+    ) -> PropagationOutcome {
+        let mut outcome = PropagationOutcome::default();
+        if plan.block_targets != TargetSet::NONE || plan.finality_targets != TargetSet::NONE {
+            let prepared: Result<_> = async {
+                let _admission = self.tasks.enter()?;
+                self.refresh_fast_sync_from_applied_state().await?;
+                if self.network.context().stack.overlay.wire_profile() != WireProfile::T0 {
+                    rtos_block::fail!("PQ propagation requires pinned T0 wire profile");
+                }
+                // The accepted wrapper binds verified evidence to these exact bytes;
+                // arbitrary network signature fields cannot enter this boundary.
+                accepted.network_signatures()
+            }
+            .await;
+            match prepared {
+                Ok(signatures) => {
+                    if plan.block_targets != TargetSet::NONE {
+                        let sent =
+                            match pq_block_wire(accepted.block(), accepted.proof(), &signatures) {
+                                Ok(bytes) => {
+                                    self.propagate_wire(
+                                        accepted.block().id(),
+                                        PropagationKind::Block,
+                                        plan.block_targets,
+                                        plan.protocol,
+                                        &bytes,
+                                        None,
+                                    )
+                                    .await
+                                }
+                                Err(error) => failed_targets(
+                                    PropagationKind::Block,
+                                    plan.block_targets,
+                                    error,
+                                ),
+                            };
+                        outcome.receipts.extend(sent.receipts);
+                    }
+                    if plan.finality_targets != TargetSet::NONE {
+                        let finality =
+                            accepted.final_network_signatures().and_then(|s| pq_finality_wire(&s));
+                        let sent = match finality {
+                            Ok((bytes, id)) => {
+                                self.propagate_wire(
+                                    accepted.block().id(),
+                                    PropagationKind::Finality,
+                                    plan.finality_targets,
+                                    plan.protocol,
+                                    &bytes,
+                                    Some(id),
+                                )
+                                .await
+                            }
+                            Err(error) => failed_targets(
+                                PropagationKind::Finality,
+                                plan.finality_targets,
+                                error,
+                            ),
+                        };
+                        outcome.receipts.extend(sent.receipts);
+                    }
+                }
+                Err(error) => {
+                    outcome.receipts.extend(
+                        PropagationOutcome::failed(
+                            PropagationKind::Block,
+                            plan.block_targets,
+                            &error,
+                        )
+                        .receipts,
+                    );
+                    outcome.receipts.extend(
+                        PropagationOutcome::failed(
+                            PropagationKind::Finality,
+                            plan.finality_targets,
+                            &error,
+                        )
+                        .receipts,
+                    );
+                }
+            }
+        }
+        // Separate effects: a failed block/finality send must not silently omit
+        // the legacy shard-description operation or erase its own result.
+        if plan.send_shard_description {
+            if accepted.block().id().is_masterchain() || !accepted.is_final() {
+                outcome.record(
+                    PropagationKind::ShardDescription,
+                    PropagationTarget::ShardDescription,
+                    PropagationStatus::Skipped(
+                        "No finalized shard description for this acceptance".into(),
+                    ),
+                );
+            } else {
+                let result = accepted
+                    .publish_shard_description(self.engine.clone(), plan.locally_generated)
+                    .await;
+                outcome.record(
+                    PropagationKind::ShardDescription,
+                    PropagationTarget::ShardDescription,
+                    match result {
+                        Ok(()) => PropagationStatus::Sent,
+                        Err(error) => PropagationStatus::Failed(format!("{error:#}")),
+                    },
+                );
+            }
+        }
+        outcome
+    }
+}
+
+pub(crate) fn failed_targets(
+    kind: PropagationKind,
+    targets: TargetSet,
+    error: anyhow::Error,
+) -> PropagationOutcome {
+    let mut outcome = PropagationOutcome::default();
+    let mut selected = vec![];
+    if targets.public {
+        selected.push(PropagationTarget::Public);
+    }
+    if targets.fast_sync {
+        selected.push(PropagationTarget::FastSync);
+    }
+    if targets.custom {
+        selected.push(PropagationTarget::Custom(String::new()));
+    }
+    for target in selected {
+        outcome.record(kind, target, PropagationStatus::Failed(format!("{error:#}")));
+    }
+    outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtos_block::{
+        BlockSignaturesSimplex, BlockSignaturesSimplexPq, PqBlockSignaturePair, ValidatorBaseInfo,
+    };
+    fn carrier() -> BlockSignaturesSimplexPq {
+        let data: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../tl/rtos_api/tests/data/live-pq.json"))
+                .unwrap();
+        let rows: Vec<_> = data["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r["kind"] == "ordinary"
+                    && r["role"] == "finalize"
+                    && r["context"] == "TOS-CONSENSUS-SIMPLEX-v1"
+            })
+            .collect();
+        let bytes = |value: &serde_json::Value| hex::decode(value.as_str().unwrap()).unwrap();
+        BlockSignaturesSimplexPq {
+            validator_info: ValidatorBaseInfo::with_params(1, 7),
+            sig_count: 2,
+            sig_weight: 3,
+            slot: 99,
+            session_id: UInt256::from_slice(&bytes(&data["session"])),
+            candidate_data: BlockSignaturesSimplex::bytes_to_cell_tree(&bytes(
+                &rows[0]["candidate"],
+            ))
+            .unwrap(),
+            signatures: rows
+                .iter()
+                .map(|r| PqBlockSignaturePair {
+                    validator_id: UInt256::from([r["index"].as_u64().unwrap() as u8 + 1; 32]),
+                    algorithm_id: 1,
+                    signature: bytes(&r["signature"]),
+                })
+                .collect(),
+        }
+    }
+    #[test]
+    fn propagation_finality_id_binds_certificate_and_approval_stays_nonfinal() {
+        // Carrier test only: no claim that structural decoding grants authority.
+        let carrier = carrier();
+        let final_ = PqNetworkSignatureSet::from_final_fields(&carrier).unwrap();
+        let (bytes, id) = pq_finality_wire(&final_).unwrap();
+        let decoded: rtos_api::ton::ton_node::Broadcast =
+            WireProfile::T0.deserialize_typed(&bytes).unwrap();
+        let rtos_api::ton::ton_node::Broadcast::TonNode_BlockFinalityBroadcast(decoded) = decoded
+        else {
+            panic!("wrong carrier");
+        };
+        assert_eq!(decoded.id, *final_.block_id());
+        let signature_bytes = WireProfile::T0.serialize(&decoded.signature_set).unwrap();
+        let mut identity = WireProfile::T0
+            .serialize(
+                &rtos_api::ton::ton_node::finalitybroadcastid::FinalityBroadcastId {
+                    id: decoded.id,
+                }
+                .into_boxed(),
+            )
+            .unwrap();
+        identity.extend_from_slice(UInt256::calc_file_hash(&signature_bytes).as_slice());
+        assert_eq!(id, *UInt256::calc_file_hash(&identity).as_array());
+        let mut changed = carrier.clone();
+        changed.signatures.reverse();
+        assert_ne!(
+            id,
+            pq_finality_wire(&PqNetworkSignatureSet::from_final_fields(&changed).unwrap())
+                .unwrap()
+                .1
+        );
+        let approval =
+            rtos_api::pq_finality::PqApproval::from_notarization_fields(carrier).unwrap();
+        let approval = PqNetworkSignatureSet::from_approval(&approval).unwrap();
+        assert!(!approval.is_final());
+        assert!(pq_finality_wire(&approval).is_err());
+    }
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+    use crate::{
+        engine::{Engine, EngineFlags, Stopper},
+        shard_state::ShardStateStuff,
+        validator::validator_manager::emulator_network_bootstrap::EmulatorNetworkBootstrap,
+    };
+    use futures::FutureExt;
+    use rtos_block::{
+        ConfigParam34, ConfigParamEnum, NewConsensusConfigAll, PqConsensusKey, SimplexConfig,
+    };
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn propagation_normal_applied_configuration_installs_and_rotates_transport() -> Result<()>
+    {
+        for protocol in [0, 1, 2] {
+            let bootstrap = EmulatorNetworkBootstrap::build_with_config(2, |config, keys| {
+                let corpus: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../../../tl/rtos_api/tests/data/live-pq.json"
+                ))?;
+                let mut members = vec![];
+                for (index, key) in keys.iter().enumerate() {
+                    let row = corpus["rows"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|row| row["index"] == index)
+                        .unwrap();
+                    let public_key = hex::decode(row["public_key"].as_str().unwrap())?;
+                    members.push(ValidatorDescr::with_pq_params(
+                        UInt256::from([index as u8 + 1; 32]),
+                        PqConsensusKey {
+                            algorithm_id: 1,
+                            key_id: rtos_block::derive_consensus_key_id(1, &public_key),
+                            public_key,
+                        },
+                        1,
+                        UInt256::from(*key.adnl_key.id().data()),
+                    ));
+                }
+                config.set_config(ConfigParamEnum::ConfigParam34(
+                    ConfigParam34::with_validator_set(ValidatorSet::new(0, u32::MAX, 2, members)?),
+                ))?;
+                let selected = SimplexConfig {
+                    protocol_version: protocol,
+                    use_quic: true,
+                    ..Default::default()
+                };
+                config.set_config(ConfigParamEnum::ConfigParam30(NewConsensusConfigAll {
+                    mc: Some(selected.clone()),
+                    shard: Some(selected),
+                }))?;
+                Ok(())
+            })?;
+            let mut local: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&bootstrap.config_path)?)?;
+            local["ip_address_quic"] = "127.0.0.1:0".into();
+            for registration in local["validator_keys"].as_array_mut().unwrap() {
+                registration["election_id"] =
+                    (registration["election_id"].as_i64().unwrap() + 1000).into();
+            }
+            std::fs::write(&bootstrap.config_path, serde_json::to_vec(&local)?)?;
+            let engine = Engine::new(
+                bootstrap.load_node_config().await?,
+                EngineFlags {
+                    initial_sync_disabled: true,
+                    force_check_db: false,
+                    truncate_db: None,
+                },
+                Arc::new(Stopper::new()),
+            )
+            .await?;
+            let result = std::panic::AssertUnwindSafe(async {
+                // The trusted, hash-pinned bootstrap is applied exactly as boot does;
+                // no successor is marked applied and no runtime v2 admission is bypassed.
+                let bytes = std::fs::read(bootstrap.config_dir().join("zerostate.boc"))?;
+                let state = ShardStateStuff::deserialize_zerostate(
+                    bootstrap.zerostate_id.clone(),
+                    &bytes,
+                    #[cfg(feature = "telemetry")]
+                    engine.engine_telemetry(),
+                    engine.engine_allocated(),
+                )?;
+                let (_, handle) = engine.store_zerostate(state, &bytes).await?;
+                engine.set_applied(&handle, 0).await?;
+                engine.save_last_applied_mc_block_id(&bootstrap.zerostate_id)?;
+                engine.save_shard_client_mc_block_id(&bootstrap.zerostate_id)?;
+                engine.initialize_test_full_node_overlays().await?;
+                let router = engine.overlays_router()?;
+                router.refresh_fast_sync_from_applied_state().await?;
+                let public = router.overlay_client(&ShardIdent::MASTERCHAIN).await?;
+                let fast = router.fast_sync_overlay(&ShardIdent::MASTERCHAIN).unwrap();
+                let signer = router
+                    .propagation_config
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .signer
+                    .clone()
+                    .unwrap();
+                // Exercise actual signed transport publication after normal config
+                // activation. This transport-only check is not block acceptance or
+                // mixed-network evidence; consensus/full-node consumers remain in place.
+                for client in [public.overlay_client(), fast.client()] {
+                    let sent = client
+                        .broadcast_plumtree(
+                            &signer,
+                            Some([92; 32]),
+                            b"configuration transport probe",
+                        )
+                        .await;
+                    assert_eq!(
+                        sent.is_ok(),
+                        protocol == 2,
+                        "typed protocol must select actual transport activation: {sent:?}"
+                    );
+                }
+                if protocol == 2 {
+                    let other = bootstrap
+                        .validators
+                        .iter()
+                        .find(|k| k.adnl_key.id() != signer.id())
+                        .unwrap();
+                    for registration in &bootstrap.validators {
+                        engine
+                            .network()
+                            .config_handler()
+                            .add_validator_adnl_key(
+                                registration.validator_key.id().data(),
+                                other.adnl_key.id().data(),
+                            )
+                            .await?;
+                    }
+                    router.refresh_fast_sync_from_applied_state().await?;
+                    let replacement = router.overlay_client(&ShardIdent::MASTERCHAIN).await?;
+                    assert!(!Arc::ptr_eq(&public, &replacement));
+                    assert!(public.overlay_client().cancellation_token().is_cancelled());
+                    assert!(fast.client().cancellation_token().is_cancelled());
+                    assert!(public
+                        .overlay_client()
+                        .broadcast_plumtree(&signer, Some([93; 32]), b"retired generation")
+                        .await
+                        .is_err());
+                    let new_signer = router
+                        .propagation_config
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .signer
+                        .clone()
+                        .unwrap();
+                    assert_ne!(signer.id(), new_signer.id());
+                    replacement
+                        .overlay_client()
+                        .broadcast_plumtree(&new_signer, Some([94; 32]), b"replacement generation")
+                        .await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .catch_unwind()
+            .await;
+            let shutdown = engine.wait_stop().await;
+            match result {
+                Ok(result) => {
+                    result?;
+                    shutdown?;
+                }
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+        Ok(())
+    }
+}

@@ -20,7 +20,7 @@
 ///               NodeNetwork                   <- low level node components
 ///                    v
 ///            network protocols
-use crate::types::owned_tasks::OwnedTasks;
+mod propagation;
 use crate::{
     block::BlockStuff,
     block_proof::{BlockProofStuff, BootstrapAuthority},
@@ -36,7 +36,9 @@ use crate::{
         overlay_client::OverlayClient,
         pack_block_signatures,
     },
-    types::{awaiters_pool::AwaitersPool, top_block_descr::TopBlockDescrStuff},
+    types::{
+        awaiters_pool::AwaitersPool, owned_tasks::OwnedTasks, top_block_descr::TopBlockDescrStuff,
+    },
     validator::validator_utils::{compute_validator_list_id, get_adnl_id, sigpubkey_to_publickey},
 };
 #[cfg(feature = "xp25")]
@@ -134,6 +136,9 @@ pub struct FullNodeOverlaysRouter {
     custom_overlays: lockfree::map::Map<String, Arc<CustomOverlayClient>>,
     public_overlays_awaiters: AwaitersPool<ShardIdent, Arc<FullNodeOverlayClient>>,
     fast_sync_snapshot: tokio::sync::Mutex<Option<FastSyncSnapshot>>,
+    propagation_config: std::sync::RwLock<Option<propagation::PropagationConfig>>,
+    propagation_config_ready: AtomicBool,
+    candidate_relays: tokio::sync::Mutex<crate::validator::propagation::CandidateRelayDeduplicator>,
     fast_sync_refresh: tokio::sync::Mutex<()>,
     fast_sync_retiring: Arc<std::sync::Mutex<Vec<Arc<FastSyncOverlayClient>>>>,
     #[cfg(test)]
@@ -198,6 +203,9 @@ impl FullNodeOverlaysRouter {
             custom_overlays: lockfree::map::Map::new(),
             public_overlays_awaiters,
             fast_sync_snapshot: tokio::sync::Mutex::new(None),
+            propagation_config: Default::default(),
+            propagation_config_ready: AtomicBool::new(false),
+            candidate_relays: Default::default(),
             fast_sync_refresh: tokio::sync::Mutex::new(()),
             fast_sync_retiring: Default::default(),
             #[cfg(test)]
@@ -382,6 +390,11 @@ impl FullNodeOverlaysRouter {
                                 shard.clone(),
                                 self.tasks.clone(),
                             )?;
+                            if let Err(error) = self.configure_public_propagation(&fullnode_client)
+                            {
+                                fullnode_client.stop_and_wait().await?;
+                                return Err(error);
+                            }
                             self.public_overlays.insert(shard.clone(), fullnode_client.clone());
 
                             Ok(fullnode_client)
@@ -737,6 +750,7 @@ impl FullNodeOverlaysRouter {
                 let _ = release.await;
             }
         }
+        self.update_propagation_config(config, key.as_ref(), &binding).await?;
         self.update_fast_sync_overlays_checked(
             &prev_vset,
             &this_vset,
@@ -952,7 +966,8 @@ impl FullNodeOverlaysRouter {
 
             let masterchain = ShardIdent::MASTERCHAIN;
             let master = create_overlay(&masterchain, mc_use_quic).await?;
-            pending.overlays.push((masterchain, master));
+            pending.overlays.push((masterchain, master.clone()));
+            self.configure_fast_sync_propagation(&master)?;
             for prefix in 0u64..(1u64 << new_monitor_min_split) {
                 let shard_prefix = if new_monitor_min_split == 0 {
                     0
@@ -965,7 +980,8 @@ impl FullNodeOverlaysRouter {
                     shard_prefix,
                 )?;
                 let overlay = create_overlay(&shard, shard_use_quic).await?;
-                pending.overlays.push((shard, overlay));
+                pending.overlays.push((shard, overlay.clone()));
+                self.configure_fast_sync_propagation(&overlay)?;
             }
 
             self.monitor_min_split_for_fast_sync.store(new_monitor_min_split, Ordering::Relaxed);

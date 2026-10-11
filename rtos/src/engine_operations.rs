@@ -1100,6 +1100,53 @@ impl EngineOperations for Engine {
         self.overlay_client(&shard).await?.download_archive(masterchain_seqno, &shard).await
     }
 
+    async fn propagate_accepted_session_block(
+        &self,
+        accepted: &crate::validator::accept_block::AcceptedSessionBlock,
+        plan: &crate::validator::propagation::PropagationPlan,
+    ) -> crate::validator::propagation::PropagationOutcome {
+        use crate::validator::propagation::*;
+        match self.overlays_router() {
+            Ok(router) => router.propagate_accepted_session_block(accepted, plan).await,
+            Err(error) => {
+                let mut outcome =
+                    PropagationOutcome::failed(PropagationKind::Block, plan.block_targets, &error);
+                outcome.receipts.extend(
+                    PropagationOutcome::failed(
+                        PropagationKind::Finality,
+                        plan.finality_targets,
+                        &error,
+                    )
+                    .receipts,
+                );
+                if plan.send_shard_description {
+                    outcome.record(
+                        PropagationKind::ShardDescription,
+                        PropagationTarget::ShardDescription,
+                        PropagationStatus::Failed(error.to_string()),
+                    );
+                }
+                outcome
+            }
+        }
+    }
+
+    async fn relay_validated_candidate(
+        &self,
+        candidate: &crate::validator::propagation::ValidatedCandidateRelay,
+        plan: &crate::validator::propagation::PropagationPlan,
+    ) -> crate::validator::propagation::PropagationOutcome {
+        use crate::validator::propagation::*;
+        match self.overlays_router() {
+            Ok(router) => router.relay_validated_candidate(candidate, plan).await,
+            Err(error) => PropagationOutcome::failed(
+                PropagationKind::Candidate,
+                plan.candidate_targets,
+                error,
+            ),
+        }
+    }
+
     async fn send_block_broadcast(
         &self,
         block: &BlockStuff,

@@ -437,6 +437,34 @@ impl OverlayClient {
             || self.saving_to_dht_handle.as_ref().map_or(false, |h| h.is_finished())
     }
 
+    pub(crate) fn configure_plumtree(&self, policy: adnl::PlumtreeConfig) -> Result<()> {
+        self.ctx.overlay_node().configure_plumtree(
+            &self.ctx.id,
+            policy,
+            &tokio::runtime::Handle::current(),
+        )
+    }
+
+    pub(crate) async fn broadcast_plumtree(
+        &self,
+        signer: &Arc<dyn KeyOption>,
+        simple_id: Option<[u8; 32]>,
+        data: &[u8],
+    ) -> Result<()> {
+        let _admission = self.tasks.enter()?;
+        self.ctx
+            .overlay_node()
+            .broadcast_plumtree(
+                &self.ctx.id,
+                signer,
+                rtos_api::ton::overlay::Certificate::Overlay_EmptyCertificate,
+                OverlayNode::FLAG_BCAST_ANY_SENDER,
+                simple_id,
+                data,
+            )
+            .await
+    }
+
     pub async fn broadcast(
         &self,
         data: &TaggedByteSlice<'_>,

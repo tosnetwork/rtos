@@ -68,6 +68,7 @@ pub struct FastSyncOverlayClient {
     client: Arc<OverlayClient>,
     engine: Arc<dyn EngineOperations>,
     use_twostep: bool,
+    pub(super) propagation_signer: Option<Arc<dyn KeyOption>>,
     tasks: Arc<OwnedTasks>,
     #[cfg(test)]
     exit_gate: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -143,6 +144,7 @@ impl FastSyncOverlayClient {
             client,
             engine,
             use_twostep,
+            propagation_signer: key.cloned(),
             tasks: Arc::new(OwnedTasks::child(owner, cancellation_token)),
             #[cfg(test)]
             exit_gate: std::sync::Mutex::new(None),
@@ -154,6 +156,10 @@ impl FastSyncOverlayClient {
         }
 
         Ok(result)
+    }
+
+    pub(super) fn shard(&self) -> &ShardIdent {
+        &self.shard
     }
 
     pub fn id(&self) -> &OverlayShortId {
