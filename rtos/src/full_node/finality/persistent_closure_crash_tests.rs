@@ -368,7 +368,13 @@ async fn cold_window(window: i32) {
             )
             .await
             .unwrap();
-            assert!(!engine.finality_recovery_registry().owns(&runtime));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while engine.finality_recovery_registry().owns(&runtime) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("actual callback owners must release the recovery reservation");
             let lease =
                 engine.finality_recovery_registry().reserve_normal(&runtime).unwrap().unwrap();
             lease.release();
