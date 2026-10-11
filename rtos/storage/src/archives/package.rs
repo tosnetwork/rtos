@@ -103,9 +103,12 @@ impl Package {
     }
 
     /// File and directory entries are separate durability obligations.
-    pub async fn sync_durable(&self) -> Result<()> {
+    pub async fn sync_durable(
+        &self,
+        observer: Option<&crate::durability::SyncObserver>,
+    ) -> Result<()> {
         let _guard = self.write_mutex.lock().await;
-        sync_file_and_parents(self.path()).await
+        sync_file_and_parents_observed(self.path(), observer).await
     }
 
     pub fn path(&self) -> &Path {
@@ -276,13 +279,23 @@ mod tests;
 /// Called by an owned storage operation. Synchronize the directory chain as
 /// archive packages may have created more than one new ancestor directory.
 pub(crate) async fn sync_file_and_parents(path: &Path) -> Result<()> {
-    tokio::fs::OpenOptions::new().read(true).write(true).open(path).await?.sync_all().await?;
+    sync_file_and_parents_observed(path, None).await
+}
+pub(crate) async fn sync_file_and_parents_observed(
+    path: &Path,
+    observer: Option<&crate::durability::SyncObserver>,
+) -> Result<()> {
+    let file = tokio::fs::OpenOptions::new().read(true).write(true).open(path).await?;
+    crate::durability::before(observer, crate::durability::SyncPoint::File, path)?;
+    file.sync_all().await?;
     let mut parent = path.parent();
     while let Some(directory) = parent {
         if directory.as_os_str().is_empty() {
             break;
         }
-        tokio::fs::File::open(directory).await?.sync_all().await?;
+        let file = tokio::fs::File::open(directory).await?;
+        crate::durability::before(observer, crate::durability::SyncPoint::Directory, directory)?;
+        file.sync_all().await?;
         parent = directory.parent();
     }
     Ok(())

@@ -185,3 +185,5 @@ pub struct StorageAlloc {
 }
 
 pub(crate) const TARGET: &str = "storage";
+
+pub mod durability;

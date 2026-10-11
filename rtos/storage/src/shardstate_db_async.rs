@@ -161,7 +161,7 @@ impl Default for CellsDbConfig {
 
 enum StateCommand {
     Work(Job, Option<Arc<dyn Callback>>),
-    Barrier(tokio::sync::oneshot::Sender<Result<()>>),
+    Barrier(tokio::sync::oneshot::Sender<Result<()>>, crate::durability::SyncObservation),
 }
 
 pub struct ShardStateDb {
@@ -446,13 +446,19 @@ impl ShardStateDb {
     }
 
     pub async fn sync_pending(&self) -> Result<()> {
+        self.sync_pending_observed(None).await
+    }
+    pub async fn sync_pending_observed(
+        &self,
+        observer: crate::durability::SyncObservation,
+    ) -> Result<()> {
         let mut failure = self.write_failure.subscribe();
         if let Some(error) = failure.borrow().as_ref() {
             fail!("State writer has a failed operation: {error}");
         }
         let (send, receive) = tokio::sync::oneshot::channel();
         self.storer
-            .send(StateCommand::Barrier(send))
+            .send(StateCommand::Barrier(send, observer))
             .map_err(|_| error!("State writer stopped"))?;
         tokio::select! {
             result = receive => result.map_err(|_| error!("State writer failed during durability barrier"))?,
@@ -604,11 +610,11 @@ impl ShardStateDb {
             {
                 let (mut job, callback) = match command {
                     StateCommand::Work(job, callback) => (job, callback),
-                    StateCommand::Barrier(reply) => {
+                    StateCommand::Barrier(reply, observer) => {
                         // The state index and cells share this physical DB (new()).
                         let result = match self.write_failure.borrow().as_ref() {
                             Some(error) => Err(error!("Earlier state write failed: {error}")),
-                            None => self.shardstate_db.sync_wal(),
+                            None => self.shardstate_db.sync_wal_observed(observer.as_deref()),
                         };
                         if let Err(error) = &result {
                             self.write_failure.send_replace(Some(error.to_string()));

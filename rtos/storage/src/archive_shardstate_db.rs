@@ -96,7 +96,13 @@ impl ArchiveShardStateDb {
 
     /// Cells and index are constructed from the same physical DB.
     pub fn sync_wal(&self) -> Result<()> {
-        self.index.sync_wal()
+        self.sync_wal_observed(None)
+    }
+    pub fn sync_wal_observed(
+        &self,
+        observer: Option<&crate::durability::SyncObserver>,
+    ) -> Result<()> {
+        self.index.sync_wal_observed(observer)
     }
 
     pub fn get(&self, id: &BlockIdExt) -> Result<Cell> {

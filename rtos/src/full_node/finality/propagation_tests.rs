@@ -1462,3 +1462,6 @@ async fn publication_reopen_repairs_lost_artifacts_for_completed_and_expired_rea
         }
     }
 }
+
+#[path = "propagation_durability_tests.rs"]
+mod durability_tests;

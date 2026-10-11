@@ -195,6 +195,13 @@ impl RocksDb {
     /// Synchronize writes already submitted to this physical database.
     /// Queue owners must complete their jobs before calling this barrier.
     pub fn sync_wal(&self) -> Result<()> {
+        self.sync_wal_observed(None)
+    }
+    pub fn sync_wal_observed(
+        &self,
+        observer: Option<&crate::durability::SyncObserver>,
+    ) -> Result<()> {
+        crate::durability::before(observer, crate::durability::SyncPoint::Wal, self.db().path())?;
         self.db().flush_wal(true)?;
         Ok(())
     }
@@ -355,6 +362,12 @@ pub struct RocksDbTable<K> {
 impl<K: DbKey + Send + Sync> RocksDbTable<K> {
     pub fn sync_wal(&self) -> Result<()> {
         self.db.sync_wal()
+    }
+    pub fn sync_wal_observed(
+        &self,
+        observer: Option<&crate::durability::SyncObserver>,
+    ) -> Result<()> {
+        self.db.sync_wal_observed(observer)
     }
 
     pub(crate) fn with_db(

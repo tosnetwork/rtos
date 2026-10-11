@@ -266,6 +266,8 @@ pub struct InternalDb {
     catchain_db: Arc<RocksDb>,
     block_handle_storage: Arc<BlockHandleStorage>,
     propagation_outbox_writer: Arc<AtomicBool>,
+    #[cfg(test)]
+    publication_sync_observer: std::sync::Mutex<storage::durability::SyncObservation>,
     prev1_block_db: BlockInfoDb,
     prev2_block_db: BlockInfoDb,
     next1_block_db: BlockInfoDb,
@@ -474,6 +476,8 @@ impl InternalDb {
             catchain_db: db_catchain,
             block_handle_storage,
             propagation_outbox_writer: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            publication_sync_observer: std::sync::Mutex::new(None),
             prev1_block_db: BlockInfoDb::with_db(db.clone(), PREV1_BLOCK_DB_NAME, can_create_db)?,
             prev2_block_db: BlockInfoDb::with_db(db.clone(), PREV2_BLOCK_DB_NAME, can_create_db)?,
             next1_block_db: BlockInfoDb::with_db(db.clone(), NEXT1_BLOCK_DB_NAME, can_create_db)?,
@@ -638,12 +642,33 @@ impl InternalDb {
 
     /// Wait for actual state writes. The caller must retain this future through
     /// shutdown; this is not a cancelable fire-and-forget storage operation.
+    #[cfg(test)]
+    pub(crate) fn set_publication_sync_observer(
+        &self,
+        observer: storage::durability::SyncObservation,
+    ) {
+        *self.publication_sync_observer.lock().unwrap() = observer;
+    }
+    fn publication_sync_observer(&self) -> storage::durability::SyncObservation {
+        #[cfg(test)]
+        {
+            return self.publication_sync_observer.lock().unwrap().clone();
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
     pub async fn sync_publication_state(&self) -> Result<()> {
         match &self.state_db {
-            StateDb::Dynamic(db) => {
-                db.sync_pending().await.map_err(publication_durability_failure)?
-            }
-            StateDb::Archive(db) => db.sync_wal().map_err(publication_durability_failure)?,
+            StateDb::Dynamic(db) => db
+                .sync_pending_observed(self.publication_sync_observer())
+                .await
+                .map_err(publication_durability_failure)?,
+            StateDb::Archive(db) => db
+                .sync_wal_observed(self.publication_sync_observer().as_deref())
+                .map_err(publication_durability_failure)?,
         }
         Ok(())
     }
@@ -689,7 +714,10 @@ impl InternalDb {
         self.block_handle_storage
             .save_handle(handle, None)
             .map_err(publication_durability_failure)?;
-        self.block_handle_storage.sync_pending().await.map_err(publication_durability_failure)
+        self.block_handle_storage
+            .sync_pending_observed(self.publication_sync_observer())
+            .await
+            .map_err(publication_durability_failure)
     }
 
     /// Read physical artifacts despite handle flags; repair a missing body/link
@@ -756,11 +784,11 @@ impl InternalDb {
             }
         }
         self.archive_manager
-            .sync_file(&handle, &body_id)
+            .sync_file(&handle, &body_id, self.publication_sync_observer().as_deref())
             .await
             .map_err(publication_durability_failure)?;
         self.archive_manager
-            .sync_file(&handle, &proof_id)
+            .sync_file(&handle, &proof_id, self.publication_sync_observer().as_deref())
             .await
             .map_err(publication_durability_failure)?;
         Ok((handle, selected))

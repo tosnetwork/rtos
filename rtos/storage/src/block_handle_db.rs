@@ -472,7 +472,7 @@ pub trait Callback: Sync + Send {
 
 enum HandleCommand {
     Work(StoreJob, Option<Arc<dyn Callback>>),
-    Barrier(tokio::sync::oneshot::Sender<Result<()>>),
+    Barrier(tokio::sync::oneshot::Sender<Result<()>>, crate::durability::SyncObservation),
 }
 
 pub struct BlockHandleStorage {
@@ -527,14 +527,18 @@ impl BlockHandleStorage {
             while let Some(command) = reader.recv().await {
                 let (job, callback) = match command {
                     HandleCommand::Work(job, callback) => (job, callback),
-                    HandleCommand::Barrier(reply) => {
+                    HandleCommand::Barrier(reply, observer) => {
                         let result = if failed {
                             Err(error!("Handle storage has an unacknowledged write failure"))
                         } else {
                             handle_db
-                                .sync_wal()
-                                .and_then(|_| full_node_state_db.sync_wal())
-                                .and_then(|_| validator_state_db.sync_wal())
+                                .sync_wal_observed(observer.as_deref())
+                                .and_then(|_| {
+                                    full_node_state_db.sync_wal_observed(observer.as_deref())
+                                })
+                                .and_then(|_| {
+                                    validator_state_db.sync_wal_observed(observer.as_deref())
+                                })
                         };
                         if result.is_err() {
                             failed = true;
@@ -684,9 +688,15 @@ impl BlockHandleStorage {
 
     /// Ordered result-bearing barrier, including physical WALs, not queue admission.
     pub async fn sync_pending(&self) -> Result<()> {
+        self.sync_pending_observed(None).await
+    }
+    pub async fn sync_pending_observed(
+        &self,
+        observer: crate::durability::SyncObservation,
+    ) -> Result<()> {
         let (send, receive) = tokio::sync::oneshot::channel();
         self.storer
-            .send(HandleCommand::Barrier(send))
+            .send(HandleCommand::Barrier(send, observer))
             .map_err(|_| error!("Handle writer stopped"))?;
         receive.await.map_err(|_| error!("Handle writer failed during durability barrier"))?
     }
