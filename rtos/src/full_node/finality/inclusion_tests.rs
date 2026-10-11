@@ -110,6 +110,44 @@ async fn refresh_fixture_public_advertisements(
     }
 }
 
+// Engine::new restores storage/transport but does not execute Engine::run's
+// overlay startup. Reopen fixtures must restore real reachability before the
+// autonomous recovery owner starts; no runtime, record or history is supplied.
+async fn initialize_cold_history_network(cold: &Arc<Engine>, peers: &[&Arc<Engine>]) {
+    assert!(cold.overlays_router().is_err(), "cold fixture unexpectedly started overlays");
+    for &peer in peers {
+        for (local, remote) in [(cold, peer), (peer, cold)] {
+            let local_adnl = &local.network().context().stack.adnl;
+            let remote_adnl = &remote.network().context().stack.adnl;
+            let local_key = local_adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
+            let remote_key = remote_adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
+            local_adnl.add_peer(local_key.id(), remote_adnl.ip_address_adnl(), None, &remote_key).unwrap();
+            local.network().context().stack.quic.as_ref().unwrap().add_peer_key(
+                remote_key.id().clone(), remote.network().context().quic_address.unwrap(),
+            ).unwrap();
+        }
+    }
+    cold.initialize_test_full_node_overlays().await.unwrap();
+    assert!(cold.overlays_router().is_ok(), "cold overlay initialization must finish before recovery");
+    // Public history transport needs no current/historical validator runtime.
+    // In particular, do not refresh private overlays by loading the GC'd head.
+    let shards = [rtos_block::ShardIdent::MASTERCHAIN, rtos_block::ShardIdent::BASE_WORKCHAIN];
+    for &peer in peers {
+        for (local, remote) in [(cold, peer), (peer, cold)] {
+            let remote_key = remote.network().context().stack.adnl
+                .key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
+            for shard in &shards {
+                let client = local.overlay_client(shard).await.unwrap();
+                client.overlay_client().neighbours().add(remote_key.id().clone()).unwrap();
+                assert!(client.overlay_client().neighbours().contains(remote_key.id()));
+            }
+        }
+    }
+    let mut engines = vec![cold];
+    engines.extend_from_slice(peers);
+    refresh_fixture_public_advertisements(&engines, &[&shards[0], &shards[1]]).await;
+}
+
 impl Pair {
     async fn refresh_public_advertisements(&self) {
         let mut engines = vec![&self.provider, &self.receiver];

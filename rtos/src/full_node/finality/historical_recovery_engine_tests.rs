@@ -837,7 +837,15 @@ async fn recover_scenario(scenario: RecoveryScenario) {
             cold.db().test_contains_dynamic_state_record(&target).unwrap(),
             scenario == RecoveryScenario::CorruptOrdinaryState
         );
+        if matches!(scenario, RecoveryScenario::AutonomousColdStartup | RecoveryScenario::QuotaSecondAnchor) {
+            initialize_cold_history_network(&cold, &[&receiver, observer.as_ref().unwrap()]).await;
+            assert!(!cold.db().test_contains_dynamic_state_record(&target).unwrap(),
+                "network startup must not restore ordinary historical state");
+        }
         if scenario == RecoveryScenario::AutonomousColdStartup {
+            let peers = [&receiver, observer.as_ref().unwrap()];
+            let before_queries: usize = peers.iter()
+                .map(|peer| peer.overlays_router().unwrap().test_pss_observations().len()).sum();
             let service = cold.ensure_retired_session_recovery().await.unwrap();
             tokio::time::timeout(Duration::from_secs(90), async {
                 loop {
@@ -858,8 +866,17 @@ async fn recover_scenario(scenario: RecoveryScenario) {
             })
             .await
             .unwrap_or_else(|_| {
-                panic!("autonomous capsule recovery timed out: {:?}", service.snapshot())
+                let observations: Vec<_> = peers.iter().map(|peer| {
+                    let router = peer.overlays_router().unwrap();
+                    (router.test_bounded_queries(), router.test_pss_observations())
+                }).collect();
+                panic!("autonomous capsule recovery timed out: {:?}; router_ready={}; peers={observations:?}",
+                    service.snapshot(), cold.overlays_router().is_ok())
             });
+            let after_queries: usize = peers.iter()
+                .map(|peer| peer.overlays_router().unwrap().test_pss_observations().len()).sum();
+            assert!(after_queries > before_queries, "autonomous cold recovery must contact real history peers");
+            assert!(!cold.db().test_contains_dynamic_state_record(&target).unwrap());
         } else if let Some(request) = closing.clone() {
             cold.clone()
                 .authenticate_closing_source_with_history(request, namespace)

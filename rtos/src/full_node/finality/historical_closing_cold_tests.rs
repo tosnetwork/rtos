@@ -222,6 +222,9 @@ async fn historical_closing_first_cold_full_canonical_recovers_without_source_ru
             .unwrap()
             .is_none());
         assert_eq!(inspect_closure_progress(cold.db(), &domain).unwrap().0.len(), 1);
+        initialize_cold_history_network(&cold, &peers).await;
+        assert_eq!(capsule_manifests(&cold), 0, "network startup cannot prebuild history");
+        assert!(!cold.db().test_contains_dynamic_state_record(&target).unwrap());
         // The sole recovery driver receives neither locator nor runtime.
         let observed = crate::historical_recovery::test_hooks::install(cold.as_ref(), false, false);
         let service = cold.ensure_retired_session_recovery().await.unwrap();
@@ -232,7 +235,12 @@ async fn historical_closing_first_cold_full_canonical_recovers_without_source_ru
         })
         .await
         .unwrap_or_else(|error| {
-            panic!("first-cold closing recovery: {error}; {:?}", service.snapshot())
+            let observations: Vec<_> = peers.iter().map(|peer| {
+                let router = peer.overlays_router().unwrap();
+                (router.test_bounded_queries(), router.test_pss_observations())
+            }).collect();
+            panic!("first-cold closing recovery: {error}; {:?}; router_ready={}; peers={observations:?}",
+                service.snapshot(), cold.overlays_router().is_ok())
         });
         let verified =
             crate::retired_history::authenticate_capsule_with_budget(cold.as_ref(), &target, None)
