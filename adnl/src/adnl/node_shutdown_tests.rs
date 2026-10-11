@@ -479,11 +479,9 @@ async fn adnl_owned_pipeline_panic_returns_worker_and_processing_counts() {
             }
         }
     }).await;
-    assert!(bounded(server.stop_checked())
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("receive pipeline"));
+    let server_result = bounded(server.stop_checked()).await;
+    bounded(client.stop_checked()).await.unwrap();
+    assert!(server_result.unwrap_err().to_string().contains("receive pipeline"));
     assert_eq!(pipeline.workers.load(Ordering::Acquire), 0);
     assert_eq!(pipeline.proc_normal_packets.load(Ordering::Acquire), 0);
     assert_eq!(pipeline.proc_urgent_packets.load(Ordering::Acquire), 0);
