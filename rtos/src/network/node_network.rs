@@ -798,23 +798,37 @@ impl NodeNetwork {
             }
         }
         let stored_key = self.network_context.stack.adnl.key_by_id(&key_id)?;
-        self.tasks.spawn_handle("validator DHT announcement", || {
+        // Publish before spawning: the worker must see its registration even
+        // if it runs before this caller resumes. No await separates publication
+        // from task admission, and the registration mutex also excludes removal.
+        let added =
+            add_counted_object_to_map(&self.validator_context.adnl_key_ids, election_id, || {
+                Ok(ValidatorAdnlKeyId {
+                    key_id: key_id.clone(),
+                    counter: self
+                        .network_context
+                        .engine_allocated
+                        .validator_adnl_keys
+                        .clone()
+                        .into(),
+                })
+            })?;
+        if let Err(error) = self.tasks.spawn_handle("validator DHT announcement", || {
             NodeNetwork::periodic_store_ip_addr(
                 self.network_context.stack.dht.clone(),
                 stored_key,
                 Some((self.validator_context.adnl_key_ids.clone(), election_id)),
                 self.cancellation_token.clone(),
             )
-        })?;
-        // Everything after the awaited lookup is synchronous under the same
-        // async mutex as removal. Failed transport/task setup never reserves an
-        // election ID; a retry can reuse an already-added transport key.
-        add_counted_object_to_map(&self.validator_context.adnl_key_ids, election_id, || {
-            Ok(ValidatorAdnlKeyId {
-                key_id: key_id.clone(),
-                counter: self.network_context.engine_allocated.validator_adnl_keys.clone().into(),
-            })
-        })?;
+        }) {
+            // Roll back only the registration inserted by this attempt. A retry
+            // can reuse the transport key without inheriting a ready marker for
+            // an announcement task that was never admitted.
+            if added {
+                self.validator_context.adnl_key_ids.remove(&election_id);
+            }
+            return Err(error);
+        }
         log::info!(
             "load_and_store_validator_adnl_key: \
             id {key_id} added for elections {election_id}"
