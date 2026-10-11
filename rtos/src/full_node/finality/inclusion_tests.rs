@@ -1088,3 +1088,6 @@ impl SpoolFixture {
 
 #[path = "propagation_tests.rs"]
 mod propagation_tests;
+
+#[path = "retired_service_tests.rs"]
+mod retired_service_tests;
