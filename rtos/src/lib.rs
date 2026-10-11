@@ -55,3 +55,5 @@ include!("../../common/src/info.rs");
 pub mod test_helper;
 
 pub(crate) mod history_read_budget;
+
+mod repair_lease_binding;
