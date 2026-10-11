@@ -253,6 +253,7 @@ fn read_candidate_data_bounded(root: &Cell, budget: &dyn ConfigReadBudget) -> Re
     let mut probe = root.clone();
     for depth in 0..PQ_CANDIDATE_MAX_CHAIN {
         budget.step()?;
+        crate::merkle_apply_budget::require_materialized(&probe)?;
         let mut slice = SliceData::load_cell_ref(&probe)?;
         if slice.remaining_references() > 1 {
             return pq_reject(
@@ -272,6 +273,7 @@ fn read_candidate_data_bounded(root: &Cell, budget: &dyn ConfigReadBudget) -> Re
     let mut current = root.clone();
     for depth in 0..PQ_CANDIDATE_MAX_CHAIN {
         budget.step()?;
+        crate::merkle_apply_budget::require_materialized(&current)?;
         if current.cell_type() != CellType::Ordinary || current.level() != 0 {
             return pq_reject(
                 PqBlockSignatureReasonCode::CandidateTl,
@@ -319,7 +321,7 @@ fn read_candidate_data_bounded(root: &Cell, budget: &dyn ConfigReadBudget) -> Re
     pq_reject(PqBlockSignatureReasonCode::CandidateChainLength, "chain too long")
 }
 
-fn bounded_signature_boc_size(root: &Cell, budget: &dyn ConfigReadBudget) -> Result<()> {
+fn bounded_signature_boc_size(root: &Cell, budget: &dyn ConfigReadBudget) -> Result<usize> {
     use crate::merkle_apply_budget::{BudgetMap, BudgetStack, MerkleApplyBudget};
     struct Adapter<'a>(&'a dyn ConfigReadBudget);
     impl MerkleApplyBudget for Adapter<'_> {
@@ -336,6 +338,7 @@ fn bounded_signature_boc_size(root: &Cell, budget: &dyn ConfigReadBudget) -> Res
             u16::MAX
         }
     }
+    crate::merkle_apply_budget::require_materialized(root)?;
     if root.repr_depth() > crate::MAX_SAFE_DEPTH {
         fail!("Signature BOC exceeds safe depth");
     }
@@ -367,17 +370,19 @@ fn bounded_signature_boc_size(root: &Cell, budget: &dyn ConfigReadBudget) -> Res
     let width = bytes(seen.len());
     let total = data + refs * width;
     // BocWriter::with_root uses no index, CRC, top or internal hashes.
-    if 6 + 4 * width + bytes(total) + total > PQ_SIGNATURE_BOC_MAX_BYTES {
+    let serialized_size = 6 + 4 * width + bytes(total) + total;
+    if serialized_size > PQ_SIGNATURE_BOC_MAX_BYTES {
         return pq_reject(
             PqBlockSignatureReasonCode::CarrierOversize,
             "carrier exceeds hard maximum",
         );
     }
-    Ok(())
+    Ok(serialized_size)
 }
 impl BlockProof {
     pub fn construct_from_cell_bounded(root: Cell, budget: &dyn ConfigReadBudget) -> Result<Self> {
         budget.step()?;
+        crate::merkle_apply_budget::require_materialized(&root)?;
         let mut cell = SliceData::load_cell(root)?;
         let tag = cell.get_next_byte()?;
         if tag != BLOCK_PROOF_TAG {
@@ -387,6 +392,7 @@ impl BlockProof {
         let root = cell.checked_drain_reference()?;
         let signatures = if cell.get_next_bit()? {
             let signature_root = cell.checked_drain_reference()?;
+            crate::merkle_apply_budget::require_materialized(&signature_root)?;
             let mut value = SliceData::load_cell_ref(&signature_root)?;
             let tag = value.clone().get_next_byte()?;
             Some(if tag == BLOCK_SIGNATURES_SIMPLEX_PQ_TAG {
