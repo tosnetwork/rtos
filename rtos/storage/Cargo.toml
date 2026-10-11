@@ -47,6 +47,7 @@ zip = '2.2'
 
 [features]
 default = []
+integration-test-support = []
 telemetry = []
 
 [[bench]]

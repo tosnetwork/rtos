@@ -172,6 +172,15 @@ enum StateCommand {
     Barrier(tokio::sync::oneshot::Sender<Result<()>>, crate::durability::SyncObservation),
 }
 
+#[cfg(any(test, feature = "integration-test-support"))]
+#[derive(Default)]
+struct TestGcBatchProgress {
+    started: u64,
+    completed: u64,
+    watched: Option<BlockIdExt>,
+    watched_epoch: Option<u64>,
+}
+
 pub struct ShardStateDb {
     shardstate_db: Arc<RocksDbTable<BlockIdExt>>,
     dynamic_boc_db: Arc<DynamicBocDb>,
@@ -182,6 +191,8 @@ pub struct ShardStateDb {
     stop: Arc<AtomicU8>,
     config: CellsDbConfig,
     gc_resolver: tokio::sync::OnceCell<Arc<dyn AllowStateGcResolver>>,
+    #[cfg(any(test, feature = "integration-test-support"))]
+    test_gc_batches: std::sync::Mutex<TestGcBatchProgress>,
     #[cfg(feature = "telemetry")]
     telemetry: Arc<StorageTelemetry>,
 }
@@ -225,6 +236,8 @@ impl ShardStateDb {
             stop: Arc::new(AtomicU8::new(0)),
             config,
             gc_resolver: tokio::sync::OnceCell::new(),
+            #[cfg(any(test, feature = "integration-test-support"))]
+            test_gc_batches: Default::default(),
             #[cfg(feature = "telemetry")]
             telemetry,
         });
@@ -305,6 +318,16 @@ impl ShardStateDb {
                         return;
                     }
                 } else {
+                    #[cfg(any(test, feature = "integration-test-support"))]
+                    let batch_epoch = {
+                        let mut progress = self.test_gc_batches.lock().unwrap();
+                        progress.started += 1;
+                        let epoch = progress.started;
+                        if progress.watched.as_ref().is_some_and(|id| to_delete.contains(id)) {
+                            progress.watched_epoch = Some(epoch);
+                        }
+                        epoch
+                    };
                     let interval_ms = (run_gc_interval * 1000) / (to_delete.len() + 1) as u64;
                     while let Some(id) = to_delete.pop() {
                         if !wait_queue(&self.in_queue, &self.stop, self.config.states_db_queue_len)
@@ -370,6 +393,12 @@ impl ShardStateDb {
                                 return;
                             }
                         }
+                    }
+                    // All IDs in this exact batch have completed their actual worker
+                    // callbacks. Publish only here, never after an individual commit.
+                    #[cfg(any(test, feature = "integration-test-support"))]
+                    {
+                        self.test_gc_batches.lock().unwrap().completed = batch_epoch;
                     }
                 }
 
@@ -595,6 +624,21 @@ impl ShardStateDb {
         log::trace!("ShardStateDb put: in_queue {}", in_queue);
 
         Ok(())
+    }
+
+    /// Arm before making the watched state eligible for GC. A batch already
+    /// in progress cannot satisfy this observation retroactively.
+    #[cfg(any(test, feature = "integration-test-support"))]
+    pub fn test_watch_gc_batch(&self, id: &BlockIdExt) {
+        let mut progress = self.test_gc_batches.lock().unwrap();
+        progress.watched = Some(id.clone());
+        progress.watched_epoch = None;
+    }
+
+    #[cfg(any(test, feature = "integration-test-support"))]
+    pub fn test_watched_gc_batch_completed(&self) -> bool {
+        let progress = self.test_gc_batches.lock().unwrap();
+        progress.watched_epoch.is_some_and(|epoch| progress.completed >= epoch)
     }
 
     /// Physical record presence, independent of logical GC eligibility.
