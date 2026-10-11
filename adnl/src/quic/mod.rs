@@ -17,7 +17,7 @@ use crate::{
         QueryAnswer, Subscriber,
     },
     node::AdnlNode,
-    transport::{Connections, SendQueue},
+    transport::SendQueue,
 };
 pub use rate_limiter::QuicRateLimitConfig;
 use rate_limiter::{ConnectionRateLimiters, RateLimiter};
@@ -145,6 +145,36 @@ fn negotiated_sni(conn: &quinn::Connection) -> Option<String> {
     data.server_name
 }
 
+type QuicOutboundKey = (SocketAddr, [u8; 32]);
+
+/// Each local identity owns this registry. Remote identity is part of the key:
+/// several authenticated SNI identities may share a single UDP endpoint.
+struct QuicOutboundConnections {
+    entries: lockfree::map::Map<QuicOutboundKey, QuicOutboundConnection>,
+    admission: Mutex<()>,
+}
+
+impl QuicOutboundConnections {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { entries: lockfree::map::Map::new(), admission: Mutex::new(()) })
+    }
+
+    fn map(&self) -> &lockfree::map::Map<QuicOutboundKey, QuicOutboundConnection> {
+        &self.entries
+    }
+
+    fn set_connection_state(
+        &self,
+        key: QuicOutboundKey,
+        update: impl Fn(&QuicOutboundConnection) -> Result<Option<QuicOutboundConnection>>,
+    ) -> Result<bool> {
+        add_unbound_object_to_map_with_update(self.map(), key, |found| match found {
+            Some(found) => update(found),
+            None => Ok(None),
+        })
+    }
+}
+
 struct QuicOutboundConnection {
     conn: Option<quinn::Connection>,
     send_queue: Arc<QuicSendQueue>,
@@ -239,7 +269,7 @@ impl rustls::client::ResolvesClientCert for QuicCertResolver {
 /// its outbound connection pool keyed by remote SocketAddr.
 struct LocalKeyState {
     client_config: quinn::ClientConfig,
-    outbound: Arc<Connections<QuicOutboundConnection>>,
+    outbound: Arc<QuicOutboundConnections>,
     /// The port this identity's endpoint is bound to (for outbound connect).
     bound_port: u16,
 }
@@ -768,7 +798,7 @@ impl QuicNode {
 
         let local_key_state = Arc::new(LocalKeyState {
             client_config: quinn_client_config,
-            outbound: Connections::new(),
+            outbound: QuicOutboundConnections::new(),
             bound_port: bind_addr.port(),
         });
         add_unbound_object_to_map(
@@ -972,7 +1002,8 @@ impl QuicNode {
         let data = serialize_boxed(&QuicMessage { data: data.into() }.into_boxed())?;
         let addr = self.addr_by_key(peers.other())?;
         let state = self.local_key_state(peers.local())?;
-        let outbound = Self::get_or_create_outbound_connection(&state.outbound, addr)?;
+        let outbound =
+            Self::get_or_create_outbound_connection(&state.outbound, addr, peers.other())?;
         let t_prep = t0.elapsed();
 
         // Fast path: if connection is alive, send directly without queue overhead
@@ -1203,7 +1234,8 @@ impl QuicNode {
     async fn connect(&self, peers: &AdnlPeers, addr: SocketAddr) -> Result<()> {
         let dst = peers.other();
         let state = self.local_key_state(peers.local())?;
-        let outbound = Self::get_or_create_outbound_connection(&state.outbound, addr)?;
+        let outbound =
+            Self::get_or_create_outbound_connection(&state.outbound, addr, peers.other())?;
         // FEC repair can issue many simultaneous queries to a cold peer. Hold
         // one cancellation-safe handshake lease, then recheck the shared live
         // connection. Dropping a cancelled attempt releases the lease so a
@@ -1212,7 +1244,7 @@ impl QuicNode {
 
         // Check if a live connection already exists — avoid creating a duplicate
         // that would be immediately closed and disrupt the peer's accept loop.
-        if let Some(entry) = state.outbound.map().get(&addr) {
+        if let Some(entry) = state.outbound.map().get(&(addr, *peers.other().data())) {
             if let Some(ref conn) = entry.val().conn {
                 if conn.close_reason().is_none() {
                     log::trace!(
@@ -1252,17 +1284,18 @@ impl QuicNode {
             fail!("QUIC RPK mismatch connecting to {addr}: expected {dst}, got {peer_id}");
         }
 
-        let stored = state.outbound.set_connection_state(addr, |found| {
-            if found.conn.is_none() {
-                Ok(Some(QuicOutboundConnection {
-                    conn: Some(conn.clone()),
-                    send_queue: found.send_queue.clone(),
-                    sender_state: found.sender_state.clone(),
-                }))
-            } else {
-                Ok(None)
-            }
-        })?;
+        let stored =
+            state.outbound.set_connection_state((addr, *peers.other().data()), |found| {
+                if found.conn.is_none() {
+                    Ok(Some(QuicOutboundConnection {
+                        conn: Some(conn.clone()),
+                        send_queue: found.send_queue.clone(),
+                        sender_state: found.sender_state.clone(),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            })?;
         if !stored {
             // Another thread won the race. Don't close our connection — the peer
             // may already be using it for inbound stream processing. Park it so
@@ -1300,7 +1333,8 @@ impl QuicNode {
         let addr = self.addr_by_key(peers.other())?;
         let state = self.local_key_state(peers.local())?;
         loop {
-            let conn = Self::get_or_create_outbound_connection(&state.outbound, addr)?;
+            let conn =
+                Self::get_or_create_outbound_connection(&state.outbound, addr, peers.other())?;
             if conn.conn.is_some() {
                 break Ok(conn);
             }
@@ -1478,14 +1512,22 @@ impl QuicNode {
     }
 
     fn get_or_create_outbound_connection(
-        outbound: &Connections<QuicOutboundConnection>,
+        outbound: &QuicOutboundConnections,
         addr: SocketAddr,
+        peer: &Arc<KeyId>,
     ) -> Result<QuicOutboundConnection> {
+        // Serialize lookup/lease acquisition with idle entry eviction. A caller
+        // retains sender_state, keeping its handshake mutex alive until done.
+        let _admission = outbound.admission.lock().map_err(|e| error!("Outbound registry: {e}"))?;
+        let key = (addr, *peer.data());
         loop {
-            match outbound.map().get(&addr) {
+            match outbound.map().get(&key) {
                 Some(entry) => {
                     let found = entry.val();
                     if let Some(ref c) = found.conn {
+                        if peer_key_id_from_connection(c).as_ref() != Some(peer) {
+                            fail!("QUIC cached RPK mismatch for {peer} at {addr}");
+                        }
                         if c.close_reason().is_some() {
                             log::info!(
                                 target: TARGET,
@@ -1506,7 +1548,7 @@ impl QuicNode {
                 None => {
                     let queue = QuicSendQueue::with_capacity(Self::SEND_QUEUE_CAPACITY);
                     let sender_state = SenderState::new();
-                    add_unbound_object_to_map(outbound.map(), addr, || {
+                    add_unbound_object_to_map(outbound.map(), key, || {
                         Ok(QuicOutboundConnection {
                             conn: None,
                             send_queue: queue.clone(),
@@ -1980,7 +2022,7 @@ impl QuicNode {
     /// ABA races: only removes if the stored connection is the exact same one detected
     /// as dead. Returns `true` if the dead connection was removed.
     fn remove_dead_connection(
-        outbound: &Connections<QuicOutboundConnection>,
+        outbound: &QuicOutboundConnections,
         addr: SocketAddr,
         dead_conn: &quinn::Connection,
     ) -> bool {
@@ -1992,7 +2034,8 @@ impl QuicNode {
         if dead_conn.close_reason().is_none() {
             dead_conn.close(0u32.into(), b"dead connection cleanup");
         }
-        match outbound.set_connection_state(addr, |found| {
+        let Some(peer) = peer_key_id_from_connection(dead_conn) else { return false };
+        match outbound.set_connection_state((addr, *peer.data()), |found| {
             if let Some(ref conn) = found.conn {
                 if conn.stable_id() == dead_id {
                     log::info!(
@@ -2046,7 +2089,7 @@ impl QuicNode {
         addr: SocketAddr,
         send_queue: Arc<QuicSendQueue>,
         sender_state: Arc<SenderState>,
-        outbound: Arc<Connections<QuicOutboundConnection>>,
+        outbound: Arc<QuicOutboundConnections>,
     ) {
         log::trace!(target: TARGET, "QUIC sender task started for {addr}");
 
@@ -2120,11 +2163,11 @@ impl QuicNode {
         &self,
         peers: &AdnlPeers,
         addr: SocketAddr,
-        outbound: &Connections<QuicOutboundConnection>,
+        outbound: &QuicOutboundConnections,
         sender_state: &SenderState,
         data: &[u8],
     ) -> std::result::Result<(), SendError> {
-        let entry = Self::get_or_create_outbound_connection(outbound, addr)
+        let entry = Self::get_or_create_outbound_connection(outbound, addr, peers.other())
             .map_err(SendError::Temporary)?;
         match entry.conn {
             Some(ref conn) => {
@@ -2172,7 +2215,7 @@ impl QuicNode {
                     }
                 }
                 log::info!(target: TARGET, "QUIC sender: connected to {addr}");
-                let entry = Self::get_or_create_outbound_connection(outbound, addr)
+                let entry = Self::get_or_create_outbound_connection(outbound, addr, peers.other())
                     .map_err(SendError::Temporary)?;
                 if let Some(ref conn) = entry.conn {
                     Self::send_via_stream_nowait(conn, data).await.map_err(SendError::Temporary)?;
@@ -2485,7 +2528,7 @@ impl QuicNode {
                 for entry in transport.local_keys.iter() {
                     let outbound = &entry.val().outbound;
                     for conn_entry in outbound.map().iter() {
-                        let addr = *conn_entry.key();
+                        let addr = conn_entry.key().0;
                         let state = conn_entry.val();
                         if let Some(ref conn) = state.conn {
                             checked += 1;
@@ -2506,13 +2549,15 @@ impl QuicNode {
                         // Fully remove entry only when connection is cleared, no sender
                         // task is running, and the queue is empty. Re-fetch from map
                         // because remove_dead_connection may have updated the entry.
-                        if let Some(fresh) = outbound.map().get(&addr) {
+                        let _admission = outbound.admission.lock().unwrap();
+                        if let Some(fresh) = outbound.map().get(conn_entry.key()) {
                             let s = fresh.val();
-                            if s.conn.is_none()
+                            if Arc::strong_count(&s.sender_state) == 1
+                                && s.conn.is_none()
                                 && !s.sender_state.active.load(Ordering::Acquire)
                                 && s.send_queue.is_empty()
                             {
-                                outbound.map().remove(&addr);
+                                outbound.map().remove(conn_entry.key());
                             }
                         }
                     }
@@ -2555,7 +2600,7 @@ impl QuicNode {
                 for key_entry in transport.local_keys.iter() {
                     let key_id = key_entry.key();
                     for conn_entry in key_entry.val().outbound.map().iter() {
-                        let addr = *conn_entry.key();
+                        let addr = conn_entry.key().0;
                         if let Some(ref conn) = conn_entry.val().conn {
                             let s = conn.stats();
                             let id = (conn.stable_id(), true);
@@ -2815,7 +2860,11 @@ mod handshake_tests {
                 ids.insert(result??);
             }
             let state = client.local_key_state(&client_id)?;
-            let connection = QuicNode::get_or_create_outbound_connection(&state.outbound, address)?;
+            let connection = QuicNode::get_or_create_outbound_connection(
+                &state.outbound,
+                address,
+                peers.other(),
+            )?;
             Ok::<_, anyhow::Error>((
                 connection.sender_state.handshake_attempts.load(Ordering::Relaxed),
                 ids.len(),
@@ -2851,12 +2900,83 @@ mod handshake_tests {
         .await;
         let state = client.local_key_state(&client_id).unwrap();
         let connection =
-            QuicNode::get_or_create_outbound_connection(&state.outbound, address).unwrap();
+            QuicNode::get_or_create_outbound_connection(&state.outbound, address, peers.other())
+                .unwrap();
         let attempts = connection.sender_state.handshake_attempts.load(Ordering::Relaxed);
         client.shutdown_and_wait().await.unwrap();
         server.shutdown_and_wait().await.unwrap();
         assert!(cancelled);
         assert!(result.unwrap().unwrap().conn.is_some());
         assert_eq!(attempts, 2);
+    }
+
+    struct IdentityRecorder(tokio::sync::mpsc::UnboundedSender<(Arc<KeyId>, Vec<u8>)>);
+
+    #[async_trait::async_trait]
+    impl Subscriber for IdentityRecorder {
+        async fn try_consume_custom(&self, bytes: &[u8], peers: &AdnlPeers) -> Result<bool> {
+            self.0.send((peers.local().clone(), bytes.to_vec()))?;
+            Ok(true)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quic_same_udp_endpoint_keeps_remote_identities_separate() {
+        let (client, client_id, _) = node(185, "127.0.0.1:0".parse().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = QuicNode::new(
+            vec![Arc::new(IdentityRecorder(tx))],
+            CancellationToken::new(),
+            tokio::runtime::Handle::current(),
+            None,
+        );
+        let first = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[186; 32]).unwrap();
+        let second = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[187; 32]).unwrap();
+        let bind = "127.0.0.1:0".parse().unwrap();
+        server.add_key(&[186; 32], first.id(), bind).unwrap();
+        server.add_key(&[187; 32], second.id(), bind).unwrap();
+        let address = server
+            .endpoints
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .endpoint
+            .local_addr()
+            .unwrap();
+        client.add_peer_key(first.id().clone(), address).unwrap();
+        client.add_peer_key(second.id().clone(), address).unwrap();
+        let outcome = async {
+            let first_peers = AdnlPeers::with_keys(client_id.clone(), first.id().clone());
+            let second_peers = AdnlPeers::with_keys(client_id.clone(), second.id().clone());
+            // Cold queued sends must retain their own remote identities too.
+            client.message(vec![3], None, &first_peers).await?;
+            client.message(vec![4], None, &second_peers).await?;
+            let first_conn = client.ensure_outbound_connection(&first_peers).await?.conn.unwrap();
+            // The query connection path must not reuse the first SNI identity.
+            let second_conn = client.ensure_outbound_connection(&second_peers).await?.conn.unwrap();
+            anyhow::ensure!(peer_key_id_from_connection(&first_conn).as_ref() == Some(first.id()));
+            anyhow::ensure!(
+                peer_key_id_from_connection(&second_conn).as_ref() == Some(second.id())
+            );
+            anyhow::ensure!(first_conn.stable_id() != second_conn.stable_id());
+            // Exercise the direct message fast path after both are warm.
+            client.message(vec![1], None, &first_peers).await?;
+            client.message(vec![2], None, &second_peers).await?;
+            let mut received = Vec::new();
+            for _ in 0..4 {
+                received.push(rx.recv().await.unwrap());
+            }
+            anyhow::ensure!(received.contains(&(first.id().clone(), vec![3])));
+            anyhow::ensure!(received.contains(&(second.id().clone(), vec![4])));
+            anyhow::ensure!(received.contains(&(first.id().clone(), vec![1])));
+            anyhow::ensure!(received.contains(&(second.id().clone(), vec![2])));
+            Ok::<_, anyhow::Error>(())
+        };
+        let result = tokio::time::timeout(Duration::from_secs(10), outcome).await;
+        client.shutdown_and_wait().await.unwrap();
+        server.shutdown_and_wait().await.unwrap();
+        result.unwrap().unwrap();
     }
 }
