@@ -10,8 +10,6 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::tasks::AdnlTasks;
-#[cfg(feature = "dump")]
-use crate::dump;
 #[cfg(feature = "telemetry")]
 use crate::telemetry::{TelemetryItem, TelemetryPrinter};
 use crate::{
@@ -4277,7 +4275,7 @@ impl AdnlNode {
                     "{} Recv packet, method {method}\n{:?}\nDump\n{}",
                     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                     pkt,
-                    dump!(&packet.buf[..])
+                    rtos_api::hex_dump!(&packet.buf[..])
                 );
                 dump.sender.send(DumpRecord { alive: true, key_id: other_key.clone(), msg })?;
             }
@@ -4661,7 +4659,7 @@ impl AdnlNode {
                     "{} {}\nDump\n{}",
                     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                     msg,
-                    dump!(&data[..])
+                    rtos_api::hex_dump!(&data[..])
                 );
                 dump.sender.send(DumpRecord {
                     alive: channel.is_some(),
