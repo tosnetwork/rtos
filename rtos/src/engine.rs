@@ -2974,6 +2974,7 @@ pub async fn run(
             // Durable admission precedes validator callbacks. Network replay is
             // enabled only after fast-sync initialization below.
             engine.ensure_publication_worker().await?;
+            crate::validator::recover_retained_finality(engine.clone()).await?;
 
             // Start validator manager, which will start validator sessions when necessary
             start_validator_manager(

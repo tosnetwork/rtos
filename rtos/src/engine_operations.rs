@@ -1114,6 +1114,50 @@ impl EngineOperations for Engine {
         self.overlay_client(&shard).await?.download_archive(masterchain_seqno, &shard).await
     }
 
+    async fn durable_finality_sink(
+        self: Arc<Self>,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+    ) -> Result<consensus_common::finality_delivery::DurableFinalitySinkPtr> {
+        if runtime.pin().zerostate != *self.zerostate_id()?
+            || runtime.wire_profile() != self.validator_network().wire_profile()
+            || runtime.pin().global_id
+                != self.load_last_applied_mc_state().await?.state()?.global_id()
+        {
+            fail!("Finality sink runtime belongs to another Engine domain");
+        }
+        if self.adnl_key_by_id(runtime.local_adnl()).is_none() {
+            fail!("Finality sink local transport key unavailable");
+        }
+        if let consensus_common::session_runtime::LocalRole::Validator(index) = runtime.local_role()
+        {
+            let identity = runtime.committee()[index as usize].validator_id()?;
+            if !self.consensus_transport_bindings()?.iter().any(|binding| {
+                binding.validator_id == identity && &binding.adnl_key_id == runtime.local_adnl()
+            }) {
+                fail!("Finality sink validator transport binding unavailable");
+            }
+        }
+        Ok(self.ensure_publication_worker().await?.sink(runtime))
+    }
+    async fn await_publication(
+        self: Arc<Self>,
+        delivery_id: UInt256,
+    ) -> Result<crate::validator::accept_block::AcceptedSessionBlock> {
+        self.ensure_publication_worker().await?.query(delivery_id).await
+    }
+    async fn recover_finality_delivery(
+        self: Arc<Self>,
+        record: crate::propagation_outbox::PublicationRecord,
+        last_mc: u32,
+        candidate_already_sent: bool,
+        origin: crate::propagation_outbox::RecoveryOrigin,
+    ) -> Result<UInt256> {
+        self.ensure_publication_worker()
+            .await?
+            .recover_draft(record, last_mc, candidate_already_sent, origin)
+            .await
+    }
+
     async fn submit_publication(
         self: Arc<Self>,
         record: crate::propagation_outbox::PublicationRecord,

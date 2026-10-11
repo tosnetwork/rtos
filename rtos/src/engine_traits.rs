@@ -921,6 +921,28 @@ pub trait EngineOperations: Sync + Send {
         unimplemented!()
     }
 
+    async fn durable_finality_sink(
+        self: Arc<Self>,
+        _runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+    ) -> Result<consensus_common::finality_delivery::DurableFinalitySinkPtr> {
+        rtos_block::fail!("Durable finality sink is unavailable")
+    }
+    async fn await_publication(
+        self: Arc<Self>,
+        _delivery_id: UInt256,
+    ) -> Result<crate::validator::accept_block::AcceptedSessionBlock> {
+        rtos_block::fail!("Durable finality query is unavailable")
+    }
+    async fn recover_finality_delivery(
+        self: Arc<Self>,
+        _record: crate::propagation_outbox::PublicationRecord,
+        _last_mc: u32,
+        _candidate_already_sent: bool,
+        _origin: crate::propagation_outbox::RecoveryOrigin,
+    ) -> Result<UInt256> {
+        rtos_block::fail!("Durable finality recovery is unavailable")
+    }
+
     async fn submit_publication(
         self: Arc<Self>,
         _record: crate::propagation_outbox::PublicationRecord,
