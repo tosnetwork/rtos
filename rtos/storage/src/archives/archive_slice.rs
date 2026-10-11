@@ -650,6 +650,13 @@ impl ArchiveSlice {
         Ok(Some(entry))
     }
 
+    #[cfg(any(test, feature = "integration-test-support"))]
+    pub(super) fn test_remove_entry_offset<B: Borrow<BlockIdExt> + Hash>(&self, entry: &PackageEntryId<B>) -> Result<()> {
+        let key = entry.into();
+        if !self.offsets_db.contains(&key)? { fail!("Fault fixture archive entry was absent"); }
+        self.offsets_db.delete(&key)
+    }
+
     pub async fn get_file_bounded<B: Borrow<BlockIdExt> + Hash>(
         &self,
         handle: &BlockHandle,

@@ -3,9 +3,7 @@
 //! never construct historical admission or authenticated state capabilities.
 use super::*;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "real Engine/network historical replay; RTOS_PUBLIC_FIXTURE_SIGNER required"]
-async fn historical_recovery_source_remote_ancestor_replay_and_cold_capsule() {
+async fn recover_source(remote_successor: bool) {
     let signer = std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER").unwrap();
     let pair = Pair::with_source_options("included", false, true, true, true).await;
     let run = std::panic::AssertUnwindSafe(async {
@@ -20,7 +18,7 @@ async fn historical_recovery_source_remote_ancestor_replay_and_cold_capsule() {
         let block = fixture_block(&row);
         let proof =
             BlockProofStuff::deserialize(&target, decode(&row["proof_boc"]), false).unwrap();
-        for owner in [&pair.provider, &pair.receiver] {
+        for owner in [&pair.provider, &pair.receiver, pair.observer.as_ref().unwrap()] {
             owner.clone().download_and_apply_block(pair.master.id(), 1, false).await.unwrap();
             let handle = owner.store_block(&block).await.unwrap().to_any();
             owner.store_block_proof(&target, Some(handle), &proof).await.unwrap();
@@ -131,6 +129,25 @@ async fn historical_recovery_source_remote_ancestor_replay_and_cold_capsule() {
         })
         .await
         .expect("real GC must remove historical target before recovery");
+        if remote_successor {
+            engine.db().test_remove_archived_artifacts(&target).await.unwrap();
+            let handle = engine.load_block_handle(&target).unwrap().unwrap();
+            assert!(handle.has_data() && handle.has_proof() && handle.is_archived());
+            let error = crate::publication_repair::read_pair(
+                engine.as_ref(),
+                &target,
+                &crate::history_read_budget::HistoryReadBudget::new(Default::default()),
+            )
+            .await
+            .err()
+            .expect("actual archived entry absence must be observable");
+            assert!(
+                error
+                    .downcast_ref::<storage::archives::bounded_read::ArchiveArtifactMissing>()
+                    .is_some(),
+                "{error:#}"
+            );
+        }
         let authenticated =
             engine.clone().authenticate_retired_source_with_history(record.clone()).await.unwrap();
         assert_eq!(authenticated.runtime().session_id(), runtime.session_id());
@@ -183,4 +200,16 @@ async fn historical_recovery_source_remote_ancestor_replay_and_cold_capsule() {
     cold.clone().wait_stop().await.unwrap();
     drop(cold);
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real Engine/network historical replay; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_source_remote_ancestor_replay_and_cold_capsule() {
+    recover_source(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real Engine/network historical replay; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_source_remote_successor_missing_local_entries() {
+    recover_source(true).await;
 }
