@@ -1324,3 +1324,7 @@ impl NodeConfigSubscriber for NodeNetwork {
 #[cfg(test)]
 #[path = "tests/test_node_network_validator_list.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/test_production_consensus_wrapper.rs"]
+mod production_wrapper_tests;
