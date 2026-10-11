@@ -131,6 +131,17 @@ pub(crate) struct FinalityIntentStore {
 }
 impl FinalityIntentStore {
     pub(crate) fn new(namespace: &std::path::Path) -> Self { Self { namespace: namespace.to_owned(), mutation: Mutex::new(()) } }
+    pub(crate) fn prepare(&self, has_existing_certificates: bool) -> Result<()> {
+        let _guard = self.mutation.lock().unwrap();
+        let directory = self.namespace.join(DIRECTORY);
+        if !directory.exists() {
+            if has_existing_certificates { fail!("Legacy source certificates lack durable recovery anchors; explicit migration required"); }
+            std::fs::create_dir(&directory)?;
+            File::open(&self.namespace)?.sync_all()?;
+        }
+        self.paths()?;
+        Ok(())
+    }
     fn paths(&self) -> Result<Vec<PathBuf>> {
         let directory = self.namespace.join(DIRECTORY);
         if !directory.exists() { return Ok(Vec::new()); }
@@ -198,9 +209,13 @@ pub fn scan_finality_recovery(root: &std::path::Path) -> Result<Vec<SessionRecov
         if !entry.file_type()?.is_dir() { continue; }
         let namespace = entry.path();
         let owner_path = namespace.join("finality-pending");
-        if !owner_path.exists() { continue; }
+        if !owner_path.exists() {
+            if namespace.join("session-runtime.json").exists() { fail!("Legacy runtime lacks source recovery provenance: {}", namespace.display()); }
+            continue;
+        }
         let Some(_owner) = crate::finality_delivery::PendingFinalityStore::lock(owner_path)? else { continue; };
         let store = FinalityIntentStore::new(&namespace);
+        if !namespace.join(DIRECTORY).is_dir() { fail!("Legacy source lacks final certificate recovery provenance: {}", namespace.display()); }
         let mut found: Option<SessionRecoveryRecord> = None;
         for path in store.paths()? {
             let (record, _) = read_intent(&path, &namespace)?;
@@ -224,6 +239,23 @@ pub fn scan_finality_recovery(root: &std::path::Path) -> Result<Vec<SessionRecov
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_finality_legacy_namespace_is_not_silently_empty_or_upgraded() {
+        let directory = crate::authenticated_fixture::TestDirectory::new();
+        let (runtime, _) = crate::finality_delivery::tests::fixture();
+        let namespace = PathBuf::from(runtime.runtime_directory(directory.path().to_str().unwrap()).unwrap());
+        std::fs::create_dir_all(&namespace).unwrap();
+        std::fs::write(namespace.join("session-runtime.json"), b"{}").unwrap();
+        assert!(scan_finality_recovery(directory.path()).is_err());
+        let owner = crate::finality_delivery::PendingFinalityStore::open(&namespace).unwrap();
+        let store = FinalityIntentStore::new(&namespace);
+        assert!(store.prepare(true).is_err(), "existing certs cannot be assigned invented anchors");
+        assert!(!namespace.join(DIRECTORY).exists());
+        drop(owner);
+        assert!(scan_finality_recovery(directory.path()).is_err());
+        store.prepare(false).unwrap();
+        assert!(scan_finality_recovery(directory.path()).unwrap().is_empty());
+    }
     #[test]
     fn source_finality_cert_intent_survives_restart_and_preserves_first_proof() {
         let directory = crate::authenticated_fixture::TestDirectory::new();

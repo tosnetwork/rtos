@@ -138,6 +138,7 @@ impl SessionCallbacks {
     fn delivery_source(&self) -> rtos_block::Result<Arc<crate::finality_delivery::SourceFinalityDelivery>> {
         self.source_delivery.lock().unwrap().clone().ok_or_else(|| rtos_block::error!("Source delivery not initialized"))
     }
+    pub(crate) fn prepare_finality_intents(&self, has_existing_certificates: bool) -> rtos_block::Result<()> { self.delivery_source()?.prepare_intents(has_existing_certificates) }
     pub(crate) fn bind_delivery_start(&self, anchor: BlockIdExt) -> rtos_block::Result<()> { self.delivery_source()?.bind_start(anchor) }
     pub(crate) fn retain_finality_intent(&self, prevs: Vec<BlockIdExt>, event: &crate::simplex_state::BlockFinalizedEvent) -> rtos_block::Result<()> {
         self.delivery_source()?.retain_intent(prevs, event)
