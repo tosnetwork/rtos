@@ -52,7 +52,7 @@ async fn persistent_repair_custody_process_crash_child() {
         BlockProofStuff::deserialize(control.id(), decode(&row["proof_boc"]), false).unwrap();
     proof.check_proof(engine.as_ref()).await.unwrap();
     let zero = engine.load_state(engine.zerostate_id()).await.unwrap();
-    let control_root =
+    let (control_root, _) =
         control.block().unwrap().read_state_update().unwrap().apply_for(zero.root_cell()).unwrap();
     assert_eq!(
         control_root.repr_hash(),
