@@ -4369,3 +4369,5 @@ pub(crate) fn dump_config(params: &HashmapE) {
 #[cfg(test)]
 #[path = "tests/test_storage_fees.rs"]
 mod storage_fee_tests;
+
+include!("config_params_bounded.rs");

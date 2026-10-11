@@ -639,3 +639,5 @@ mod repair_lease_binding;
 mod repair_provenance;
 
 mod publication_dependency_leases;
+
+pub(crate) mod bounded_session_derivation;

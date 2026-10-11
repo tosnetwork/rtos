@@ -58,6 +58,20 @@ impl PqSessionContext {
         let total_weight = checked_validator_weight_sum(validators.iter().map(|v| v.weight))?;
         Ok(Self { session_id, shard, catchain_seqno, subset_hash, validators, total_weight })
     }
+    pub fn from_authenticated_session_members_bounded(
+        session_id: UInt256, shard: rtos_block::ShardIdent, catchain_seqno: u32,
+        validators: Vec<ValidatorDescr>, budget: &dyn rtos_block::config_read_budget::ConfigReadBudget,
+    ) -> Result<Self> {
+        let total_weight = rtos_block::validators::validate_validator_list_bounded(&validators, budget)?;
+        for v in &validators {
+            budget.step()?;
+            if !matches!(v.key, ValidatorKey::Pq(_)) { fail!("PQ session requires an entirely PQ governing subset"); }
+        }
+        budget.workspace(12 + validators.len() * 104)?;
+        rtos_block::config_read_budget::steps(budget, validators.len())?;
+        let subset_hash = rtos_block::ValidatorSet::calc_subset_hash_short(&validators, catchain_seqno)?;
+        Ok(Self { session_id, shard, catchain_seqno, subset_hash, validators, total_weight })
+    }
     pub fn for_block(&self, block_id: BlockIdExt) -> Result<PqVerificationContext> {
         if block_id.shard() != &self.shard {
             fail!("PQ block shard differs from authenticated session shard");

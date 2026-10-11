@@ -911,3 +911,9 @@ impl ValidatorSetPRNG {
 #[cfg(test)]
 #[path = "tests/test_validators.rs"]
 mod tests;
+
+include!("validators_bounded.rs");
+
+#[cfg(test)]
+#[path = "tests/test_config_bounded.rs"]
+mod config_bounded_tests;

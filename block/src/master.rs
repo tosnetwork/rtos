@@ -1485,3 +1485,5 @@ impl Serializable for LibDescr {
         Ok(())
     }
 }
+
+include!("master_bounded.rs");

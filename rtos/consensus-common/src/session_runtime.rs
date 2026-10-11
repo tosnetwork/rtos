@@ -458,4 +458,7 @@ mod tests {
         assert_eq!(binding.coordinates.new_catchain_ids, coords(&shard).new_catchain_ids);
     }
 
+    include!("session_runtime_bounded_tests.rs");
 }
+
+include!("session_runtime_bounded.rs");
