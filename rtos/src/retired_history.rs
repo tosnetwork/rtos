@@ -19,6 +19,39 @@ use std::{
     sync::Arc,
 };
 
+/// Only bounded admission contention is retriable by the manager. Disk quota,
+/// malformed evidence, failed authentication and ordinary IO errors are not.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RetryableHistoryError {
+    WriterBusy,
+    IoCapacity,
+    PreparationCapacity,
+}
+impl std::fmt::Display for RetryableHistoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::WriterBusy => "Retained history writer busy",
+            Self::IoCapacity => "History IO capacity exhausted",
+            Self::PreparationCapacity => "History preparation capacity exhausted",
+        })
+    }
+}
+impl std::error::Error for RetryableHistoryError {}
+
+pub(crate) fn is_retryable(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RetryableHistoryError>().is_some()
+}
+
+fn capacity_error(
+    error: tokio::sync::TryAcquireError,
+    busy: RetryableHistoryError,
+) -> anyhow::Error {
+    match error {
+        tokio::sync::TryAcquireError::NoPermits => busy.into(),
+        tokio::sync::TryAcquireError::Closed => error!("History admission closed"),
+    }
+}
+
 const SCHEMA: u32 = 1;
 static IO_JOBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 static PREPARATIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
@@ -120,7 +153,12 @@ impl Store {
             .read(true)
             .write(true)
             .open(root.join("owner.lock"))?;
-        lock.try_lock().map_err(|e| error!("Retained history writer busy: {e}"))?;
+        lock.try_lock().map_err(|e| match e {
+            std::fs::TryLockError::WouldBlock => {
+                anyhow::Error::from(RetryableHistoryError::WriterBusy)
+            }
+            std::fs::TryLockError::Error(error) => anyhow::Error::from(error),
+        })?;
         Ok(Self {
             root,
             limits,
@@ -377,7 +415,8 @@ async fn owned_io<E: EngineOperations + ?Sized, T: Send + 'static>(
     engine: &E,
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    let permit = IO_JOBS.try_acquire().map_err(|_| error!("History IO capacity exhausted"))?;
+    let permit =
+        IO_JOBS.try_acquire().map_err(|e| capacity_error(e, RetryableHistoryError::IoCapacity))?;
     let (sent, received) = tokio::sync::oneshot::channel();
     // Register the actual worker before exposing a cancelable observation.
     let completion = engine.register_service_task(
@@ -491,8 +530,9 @@ pub(crate) async fn prepare(
     runtime: Arc<AuthenticatedSessionRuntime>,
     start: BlockIdExt,
 ) -> Result<()> {
-    let permit =
-        PREPARATIONS.try_acquire().map_err(|_| error!("History preparation capacity exhausted"))?;
+    let permit = PREPARATIONS
+        .try_acquire()
+        .map_err(|e| capacity_error(e, RetryableHistoryError::PreparationCapacity))?;
     let task_engine = engine.clone();
     crate::types::service_tasks::spawn_owned(
         engine.as_ref(),
@@ -605,6 +645,32 @@ mod tests {
     }
 
     #[test]
+    fn retired_history_retry_classification_preserves_real_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().to_owned(), Limits::default()).unwrap();
+        let busy = Store::open(dir.path().to_owned(), Limits::default()).err().unwrap();
+        assert!(is_retryable(&busy.context("preparing current session")));
+        drop(store);
+        drop(Store::open(dir.path().to_owned(), Limits::default()).unwrap());
+
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, b"occupied").unwrap();
+        let io_error = Store::open(file, Limits::default()).err().unwrap();
+        assert!(!is_retryable(&io_error));
+
+        for kind in [RetryableHistoryError::IoCapacity, RetryableHistoryError::PreparationCapacity]
+        {
+            let semaphore = tokio::sync::Semaphore::new(1);
+            let permit = semaphore.try_acquire().unwrap();
+            assert!(is_retryable(&capacity_error(semaphore.try_acquire().unwrap_err(), kind)));
+            drop(permit);
+            assert!(semaphore.try_acquire().is_ok());
+            semaphore.close();
+            assert!(!is_retryable(&capacity_error(semaphore.try_acquire().unwrap_err(), kind)));
+        }
+    }
+
+    #[test]
     fn retired_history_store_reopen_dedup_and_bound() {
         let dir = tempfile::tempdir().unwrap();
         let limits = Limits { anchors: 2, ..Limits::default() };
@@ -655,7 +721,8 @@ mod tests {
         let tiny =
             Store::open(dir.path().to_owned(), Limits { total_bytes: 10, ..Limits::default() })
                 .unwrap();
-        assert!(tiny.commit(domain(), identity(1), -239, vec![0; 11], vec![]).is_err());
+        let quota = tiny.commit(domain(), identity(1), -239, vec![0; 11], vec![]).unwrap_err();
+        assert!(!is_retryable(&quota));
         assert!(tiny.read(&domain(), &identity(1)).unwrap().is_none());
         drop(tiny);
         let store = Store::open(dir.path().to_owned(), Limits::default()).unwrap();
@@ -666,7 +733,8 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
         assert!(store.read(&domain(), &identity(1)).is_err());
         std::fs::write(&path, b"{").unwrap();
-        assert!(store.read(&domain(), &identity(1)).is_err());
+        let malformed = store.read(&domain(), &identity(1)).err().unwrap();
+        assert!(!is_retryable(&malformed));
     }
 }
 

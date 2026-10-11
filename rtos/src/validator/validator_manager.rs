@@ -51,7 +51,6 @@ use std::{
     sync::{atomic::Ordering, Arc},
     time::{Duration, SystemTime},
 };
-use tokio::time::timeout;
 
 #[cfg(feature = "xp25")]
 const MC_ACCELERATED_CONSENSUS_ENABLED: bool = true;
@@ -3094,11 +3093,18 @@ impl ValidatorManagerImpl {
                         target: "validator_manager",
                         "Updating shards according to masterblock {seqno}"
                     );
-                    self.update_shards(mc_state).await?;
-                    log::trace!(
-                        target: "validator_manager",
-                        "Shards for masterblock {seqno} updated"
-                    );
+                    match self.update_shards(mc_state).await {
+                        Ok(()) => log::trace!(target: "validator_manager",
+                            "Shards for masterblock {seqno} updated"),
+                        Err(error) if crate::retired_history::is_retryable(&error) => {
+                            // start_session releases its reservation on preparation
+                            // failure. Keep the same group and retry through the
+                            // bounded-frequency production wait path below.
+                            log::warn!(target: "validator_manager",
+                                "History preparation deferred at MC {seqno}: {error}");
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 Err(e) => {
                     if self.engine.validation_status().allows_validate() {
