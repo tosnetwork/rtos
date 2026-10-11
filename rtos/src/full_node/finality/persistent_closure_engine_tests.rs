@@ -19,7 +19,7 @@ fn source_directory(namespace: &Path) -> PathBuf {
     namespace.join("finality-pending")
 }
 fn reference_backup(namespace: &Path) -> Option<(PathBuf, Vec<u8>)> {
-    let directory = source_directory(namespace);
+    let directory = source_directory(namespace).join("references-v1");
     for entry in std::fs::read_dir(directory).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().and_then(|x| x.to_str()) == Some("reference") {
@@ -189,8 +189,12 @@ async fn circulation(events: usize) {
     })
     .catch_unwind()
     .await;
-    pair.provider.clone().wait_stop().await.unwrap();
-    pair.receiver.clone().wait_stop().await.unwrap();
+    let (provider_stop, receiver_stop) = tokio::join!(
+        pair.provider.clone().wait_stop(),
+        pair.receiver.clone().wait_stop(),
+    );
+    provider_stop.unwrap();
+    receiver_stop.unwrap();
     let (runtime, namespace, domain, first, (old_path, old_bytes)) =
         run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     let Pair { _dir: dir, provider, receiver, .. } = pair;
