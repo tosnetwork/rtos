@@ -15,6 +15,12 @@ pub fn runtime(
     } else {
         Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71; 32]).unwrap()
     };
+    runtime_with_members(members, transport)
+}
+
+pub fn runtime_with_members(
+    members: Vec<ValidatorDescr>, transport: crate::PrivateKey,
+) -> (Arc<AuthenticatedSessionRuntime>, crate::PrivateKey, crate::SessionOptions) {
     let selected = SimplexConfig { protocol_version: 2, ..Default::default() };
     let selected_cell = selected.serialize().unwrap();
     let mut wrapper = BuilderData::new();

@@ -57,6 +57,7 @@ pub(crate) struct SessionDescription {
     own_signing:
         std::sync::Mutex<Option<std::sync::Arc<crate::signing_coordinator::SigningCoordinator>>>,
     pq_context: Option<rtos_api::pq_finality::PqSessionContext>,
+    authenticated_runtime: Option<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
     /// Session options
     options: SessionOptions,
     /// Initial block seqno (first block produced by this session)
@@ -230,6 +231,8 @@ impl SessionDescription {
                 let expected = crate::SimplexSessionNode::from_descriptor(member)?;
                 if node.adnl_id != expected.adnl_id
                     || node.identity.id() != expected.identity.id()
+                    || node.identity.pq_key() != expected.identity.pq_key()
+                    || node.descriptor.as_ref() != Some(member)
                     || node.weight != expected.weight
                 {
                     fail!("SessionDescription committee differs from authenticated runtime");
@@ -253,6 +256,7 @@ impl SessionDescription {
             pq_members,
             own_signing: std::sync::Mutex::new(None),
             pq_context: None,
+            authenticated_runtime: runtime.cloned(),
             session_id,
             options,
             initial_block_seqno,
@@ -293,6 +297,10 @@ impl SessionDescription {
         }
         Ok(self)
     }
+    pub(crate) fn authenticated_runtime(&self) -> Option<&consensus_common::session_runtime::AuthenticatedSessionRuntime> {
+        self.authenticated_runtime.as_ref()
+    }
+
     pub fn pq_context(&self) -> Option<&rtos_api::pq_finality::PqSessionContext> {
         self.pq_context.as_ref()
     }

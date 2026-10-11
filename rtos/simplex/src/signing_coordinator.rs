@@ -58,6 +58,36 @@ pub(crate) struct SigningBinding {
 }
 
 impl SigningBinding {
+    /// Construct schema 3 solely from an authenticated runtime. Provisioning and
+    /// custody remain separate capabilities; this does not enable a signer.
+    pub(crate) fn from_authenticated_runtime(
+        runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+        generation: u64,
+        expire_at: u64,
+    ) -> Result<Self> {
+        let consensus_common::session_runtime::LocalRole::Validator(index) = runtime.local_role() else {
+            fail!("Observer cannot own a signing journal");
+        };
+        let member = runtime.committee().get(index as usize)
+            .ok_or_else(|| error!("Runtime validator index is outside committee"))?;
+        let identity = ValidatorIdentity::from_descriptor(member)?;
+        let key = identity.pq_key().ok_or_else(|| error!("Authenticated journal requires PQ key"))?;
+        let pin = runtime.pin();
+        Ok(Self {
+            schema: 3, wire_profile: runtime.wire_profile() as u8,
+            global_id: pin.global_id, zerostate_workchain: pin.zerostate.shard().workchain_id(),
+            zerostate_root: *pin.zerostate.root_hash().as_array(), zerostate_file: *pin.zerostate.file_hash().as_array(),
+            profile: *runtime.profile().as_array(), session: *runtime.session_id().as_array(),
+            committee: *runtime.committee_digest()?.as_array(), validator: *identity.id().data(),
+            algorithm: u32::from(key.algorithm_id), key_id: *key.key_id.as_array(), public_key: key.public_key.clone(),
+            generation, expire_at, shard_workchain: runtime.shard().workchain_id(),
+            shard_prefix: runtime.shard().shard_prefix_with_tag(), protocol: runtime.carrier_version(),
+            simplex_protocol: Some(runtime.protocol().version()), local_adnl: Some(*runtime.local_adnl().data()),
+            local_index: index, validator_count: runtime.committee().len().try_into()?,
+            slots_per_window: runtime.slots_per_leader_window(),
+        })
+    }
+
     fn validate_schema(&self) -> Result<()> {
         match (self.schema, self.simplex_protocol, self.local_adnl) {
             (2, None, None) => Ok(()),
@@ -415,6 +445,12 @@ impl SigningCoordinator {
         description.require_validator_index()?;
         let state = self.state.lock().map_err(|_| error!("journal lock poisoned"))?;
         let b = &state.header.binding;
+        if let Some(runtime) = description.authenticated_runtime() {
+            let expected = SigningBinding::from_authenticated_runtime(runtime, b.generation, b.expire_at)?;
+            if b != &expected {
+                fail!("Signing journal differs from authenticated runtime domain");
+            }
+        }
         if b.session != *description.get_session_id().as_array()
             || b.committee != *description.committee_digest().as_array()
             || b.validator
