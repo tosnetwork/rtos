@@ -633,3 +633,5 @@ mod shutdown_tests {
 }
 
 pub(crate) mod history_read_budget;
+
+mod repair_lease_binding;
