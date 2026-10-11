@@ -139,6 +139,7 @@ struct State {
     limits: Limits,
     ready: tokio::sync::watch::Sender<Option<std::result::Result<(), String>>>,
     cursor: Mutex<(u64, std::collections::BTreeMap<u64, usize>)>,
+    acceptance_turn: AtomicBool,
     acceptance_cursor: Mutex<u64>,
     acceptance_retry: Mutex<std::collections::BTreeMap<u64, tokio::time::Instant>>,
     retry_after: Mutex<std::collections::BTreeMap<(u64, PublicationEffect), tokio::time::Instant>>,
@@ -161,6 +162,7 @@ impl PublicationWorker {
             limits: Limits::default(),
             ready: tokio::sync::watch::channel(None).0,
             cursor: Mutex::new(Default::default()),
+            acceptance_turn: AtomicBool::new(true),
             acceptance_cursor: Mutex::new(0),
             acceptance_retry: Mutex::new(Default::default()),
             retry_after: Mutex::new(Default::default()),
@@ -698,7 +700,15 @@ impl State {
             return;
         }
         let now = tokio::time::Instant::now();
-        let selected = {
+        let now_unix_secs =
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let has_send_work = entries.iter().any(|entry| {
+            entry.stage == PublicationStage::Ready && !entry.record.is_expired(now_unix_secs)
+        });
+        // One slow historical debt cannot consume every scheduling turn while
+        // already-accepted records have effects ready to send.
+        let acceptance_turn = self.acceptance_turn.swap(true, Ordering::AcqRel);
+        let selected = if acceptance_turn || !has_send_work {
             let mut retry = self.acceptance_retry.lock().unwrap();
             retry.retain(|id, _| {
                 entries.iter().any(|e| {
@@ -723,8 +733,11 @@ impl State {
                 retry.insert(entry.id.0, now + RETRY_INTERVAL);
             }
             entry
+        } else {
+            None
         };
         if let Some(entry) = selected {
+            self.acceptance_turn.store(false, Ordering::Release);
             let retry_id = entry.id.0;
             if let Some(engine) = self.engine.upgrade() {
                 let result = async {
@@ -1017,6 +1030,7 @@ mod tests {
             limits: Limits::default(),
             ready: tokio::sync::watch::channel(None).0,
             cursor: Mutex::new(Default::default()),
+            acceptance_turn: AtomicBool::new(true),
             acceptance_cursor: Mutex::new(0),
             acceptance_retry: Mutex::new(Default::default()),
             retry_after: Mutex::new(Default::default()),
