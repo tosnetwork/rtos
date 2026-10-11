@@ -213,9 +213,15 @@ impl Store {
         use std::io::Read;
         let file = File::open(path)?;
         let length = usize::try_from(file.metadata()?.len())?;
-        let reservation = budget.reserve(kind, length.max(1).min(bound))?;
+        if length > bound {
+            return Err(crate::history_read_budget::HistoryBudgetExceeded("capsule file bytes").into());
+        }
+        // The growth probe is real IO as well: reserve its potential byte
+        // before read_exact/read, retaining that charge on any failure.
+        let requested = length.checked_add(1).ok_or_else(|| error!("Capsule read length overflow"))?;
+        let reservation = budget.reserve(kind, requested)?;
         let allowance = reservation.allowance();
-        if length > allowance {
+        if requested > allowance {
             return Err(
                 crate::history_read_budget::HistoryBudgetExceeded("capsule file bytes").into()
             );
@@ -274,7 +280,7 @@ impl Store {
     ) -> Result<Option<Evidence>> {
         self.usage_budget(budget)?;
         let path = self.root.join(format!("{}.json", anchor_name(domain, id)));
-        if !path.exists() {
+        if !path.try_exists()? {
             return Ok(None);
         }
         let bytes = match budget {

@@ -3,7 +3,7 @@
 //! never construct historical admission or authenticated state capabilities.
 use super::*;
 
-async fn recover_source(remote_successor: bool) {
+async fn recover_source(mode: u8) {
     let signer = std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER").unwrap();
     let pair = Pair::with_source_options("included", false, true, true, true).await;
     let run = std::panic::AssertUnwindSafe(async {
@@ -108,7 +108,27 @@ async fn recover_source(remote_successor: bool) {
         driver.prepare_intents(false).unwrap();
         driver.bind_start(target.clone()).unwrap();
         driver.retain_final_cert(&draft, &[target.clone()]).unwrap();
+        if mode == 3 {
+            tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    if driver.poll(draft.clone()).unwrap() && driver.counts().unwrap().1 == 1 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("real node WAL ACK must precede full-canonical recovery");
+        }
         drop(driver);
+        let closing = if mode == 3 {
+            let locators =
+                simplex::finality_delivery::scan_finality_closures_namespace(&namespace).unwrap();
+            assert_eq!(locators.len(), 1);
+            Some(locators[0].request().unwrap())
+        } else {
+            None
+        };
         let record = simplex::finality_recovery::scan_finality_recovery_namespace(&namespace)
             .unwrap()
             .expect("real retained FinalCert provides exact recovery locator");
@@ -129,8 +149,25 @@ async fn recover_source(remote_successor: bool) {
         })
         .await
         .expect("real GC must remove historical target before recovery");
-        if remote_successor {
-            engine.db().test_remove_archived_artifacts(&target).await.unwrap();
+        if mode == 1 || mode == 2 {
+            if mode == 1 {
+                engine.db().test_remove_archived_artifacts(&target).await.unwrap();
+            } else {
+                use storage::archives::{package_id::PackageId, ARCHIVE_SLICE_SIZE};
+                engine.db().archive_block(&target, None).await.unwrap();
+                let pack = PackageId::for_block(0)
+                    .full_path(Path::new(engine.db_root_dir().unwrap()), target.shard())
+                    .unwrap();
+                assert!(pack.exists(), "real applied MC1/MC2 must occupy the GC control package");
+                let cutoff = BlockIdExt::with_params(
+                    ShardIdent::masterchain(),
+                    ARCHIVE_SLICE_SIZE + 3,
+                    UInt256::default(),
+                    UInt256::default(),
+                );
+                engine.db().archive_gc(&cutoff).await.unwrap();
+                assert!(!pack.exists(), "actual archive GC must remove local historical package");
+            }
             let handle = engine.load_block_handle(&target).unwrap().unwrap();
             assert!(handle.has_data() && handle.has_proof() && handle.is_archived());
             let error = crate::publication_repair::read_pair(
@@ -148,9 +185,56 @@ async fn recover_source(remote_successor: bool) {
                 "{error:#}"
             );
         }
-        let authenticated =
-            engine.clone().authenticate_retired_source_with_history(record.clone()).await.unwrap();
-        assert_eq!(authenticated.runtime().session_id(), runtime.session_id());
+        if let Some(request) = &closing {
+            let worker = engine.ensure_publication_worker().await.unwrap();
+            for altered in 0..2 {
+                let mut bad = request.clone();
+                if altered == 0 {
+                    bad.source_digest = UInt256::default();
+                } else {
+                    bad.domain.pin.global_id += 1;
+                }
+                assert!(worker
+                    .authorize_closing_history_debt(
+                        bad,
+                        runtime.clone(),
+                        crate::history_read_budget::HistoryReadBudget::new(Default::default())
+                    )
+                    .await
+                    .is_err());
+                assert!(crate::retired_history::authenticate_capsule_with_budget(
+                    engine.as_ref(),
+                    &target,
+                    None
+                )
+                .await
+                .unwrap()
+                .is_none());
+            }
+            // Only the actual store's exact full canonical debt can authorize
+            // persistence. Pending effects are deliberately not marked complete.
+            let authenticated = engine
+                .clone()
+                .authenticate_closing_source_with_history(request.clone(), namespace.clone())
+                .await
+                .unwrap();
+            assert_eq!(authenticated.session_id(), runtime.session_id());
+            let domain = OutboxDomain {
+                zerostate: pair.anchor.clone(),
+                global_id: -239,
+                wire_profile: WireProfile::T0,
+            };
+            let (entries, closes) = inspect_closure_progress(engine.db(), &domain).unwrap();
+            assert!(!entries.is_empty(), "history recovery does not release full canonical debt");
+            assert!(closes.is_empty(), "history storage must not mint close/custody authority");
+        } else {
+            let authenticated = engine
+                .clone()
+                .authenticate_retired_source_with_history(record.clone())
+                .await
+                .unwrap();
+            assert_eq!(authenticated.runtime().session_id(), runtime.session_id());
+        }
         assert_eq!(engine.load_last_applied_mc_block_id().unwrap(), head);
         assert!(
             !engine.db().test_contains_dynamic_state_record(&target).unwrap(),
@@ -170,12 +254,13 @@ async fn recover_source(remote_successor: bool) {
             .repr_hash(),
             target_root.repr_hash()
         );
-        (record, target, target_root.repr_hash().clone())
+        (record, target, target_root.repr_hash().clone(), closing, namespace)
     })
     .catch_unwind()
     .await;
     pair.stop_all().await;
-    let (record, target, expected) = run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let (record, target, expected, closing, namespace) =
+        run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     let Pair { _dir: directory, receiver, provider, observer, .. } = pair;
     drop(receiver);
     drop(provider);
@@ -184,7 +269,14 @@ async fn recover_source(remote_successor: bool) {
     let cold = open_engine(&directory.path().join("provider")).await;
     let result = std::panic::AssertUnwindSafe(async {
         assert!(!cold.db().test_contains_dynamic_state_record(&target).unwrap());
-        cold.clone().authenticate_retired_source_with_history(record).await.unwrap();
+        if let Some(request) = closing {
+            cold.clone()
+                .authenticate_closing_source_with_history(request, namespace)
+                .await
+                .unwrap();
+        } else {
+            cold.clone().authenticate_retired_source_with_history(record).await.unwrap();
+        }
         assert_eq!(
             crate::retired_history::authenticate_state(cold.as_ref(), &target)
                 .await
@@ -205,11 +297,23 @@ async fn recover_source(remote_successor: bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real Engine/network historical replay; RTOS_PUBLIC_FIXTURE_SIGNER required"]
 async fn historical_recovery_source_remote_ancestor_replay_and_cold_capsule() {
-    recover_source(false).await;
+    recover_source(0).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real Engine/network historical replay; RTOS_PUBLIC_FIXTURE_SIGNER required"]
 async fn historical_recovery_source_remote_successor_missing_local_entries() {
-    recover_source(true).await;
+    recover_source(1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real Engine/network/archive GC; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_source_actual_pack_gc_remote_replay_and_cold_capsule() {
+    recover_source(2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real node WAL/full canonical authorization; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_full_canonical_exact_debt_and_domain_controls() {
+    recover_source(3).await;
 }
