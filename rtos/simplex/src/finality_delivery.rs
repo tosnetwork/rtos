@@ -23,8 +23,9 @@ use std::{
 mod delivered;
 pub use delivered::{
     close_source_id, scan_finality_closures, scan_finality_closures_namespace,
-    scan_finality_closures_namespace_batch, DeliveredCompletion, DeliveredCompletionSink,
-    DeliveredConfirmation, FinalityCloseRecovery,
+    scan_finality_closures_namespace_batch, scan_finality_closures_namespace_report,
+    DeliveredCompletion, DeliveredCompletionSink, DeliveredConfirmation, FinalityCloseRecovery,
+    FinalityClosureBatch,
 };
 
 const MAX_RECORD_BYTES: u64 = 64 << 20;
@@ -1761,5 +1762,54 @@ pub(crate) mod tests {
             scan_pending_finality(directory.path()).is_err(),
             "bad compact index is not an empty source"
         );
+    }
+}
+
+/// Integration-only facade over the real source owner. No receipt can be minted
+/// by this facade; all terminal transitions use the production callbacks and IO.
+#[cfg(feature = "integration-test-support")]
+pub struct FinalityDeliveryTestDriver(Arc<SourceFinalityDelivery>);
+#[cfg(feature = "integration-test-support")]
+impl FinalityDeliveryTestDriver {
+    pub fn open(
+        runtime: Arc<AuthenticatedSessionRuntime>,
+        namespace: &Path,
+        sink: consensus_common::finality_delivery::DurableFinalitySinkPtr,
+        confirm: DeliveredCompletionSink,
+    ) -> Result<Self> {
+        Ok(Self(SourceFinalityDelivery::open_with_delivered(
+            runtime,
+            namespace,
+            sink,
+            Some(confirm),
+        )?))
+    }
+    pub fn poll(&self, draft: FinalizedDeliveryDraft) -> Result<bool> {
+        if self.0.consumed(&draft)? {
+            return Ok(true);
+        }
+        Ok(self.0.poll(draft)?.is_some())
+    }
+    pub fn maintain(&self) -> Result<()> {
+        self.0.maintain_closing()
+    }
+    pub fn counts(&self) -> Result<(usize, usize, usize)> {
+        let paths = self.0.store.paths()?;
+        Ok((
+            paths
+                .iter()
+                .filter(|p| {
+                    matches!(p.extension().and_then(|s| s.to_str()), Some("json" | "acked"))
+                })
+                .count(),
+            paths
+                .iter()
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("reference"))
+                .count(),
+            paths
+                .iter()
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("delivered"))
+                .count(),
+        ))
     }
 }

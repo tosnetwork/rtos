@@ -331,8 +331,7 @@ mod tests {
     fn source_output_set_preserves_ancestor_role_holes_and_rebuilds_legacy() {
         let directory = crate::authenticated_fixture::TestDirectory::new();
         let (runtime, _) = crate::finality_delivery::tests::fixture();
-        let runtime =
-            runtime.as_ref().clone().bind_recovery_anchor(runtime.pin().zerostate.clone()).unwrap();
+        assert!(runtime.recovery_binding().is_some());
         let namespace =
             PathBuf::from(runtime.runtime_directory(directory.path().to_str().unwrap()).unwrap());
         let _owner = crate::finality_delivery::PendingFinalityStore::open(&namespace).unwrap();
