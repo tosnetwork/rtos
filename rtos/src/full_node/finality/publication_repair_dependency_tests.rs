@@ -17,6 +17,10 @@ struct Fixture {
 }
 
 async fn fixture(key_parent: bool) -> Fixture {
+    fixture_backend(key_parent, false).await
+}
+
+async fn fixture_backend(key_parent: bool, archive: bool) -> Fixture {
     let input: serde_json::Value =
         serde_json::from_str(include_str!("testdata/mc-repair-dependencies.json")).unwrap();
     let row = &input["rows"][usize::from(key_parent)];
@@ -30,11 +34,18 @@ async fn fixture(key_parent: bool) -> Fixture {
     config["gc"] = serde_json::json!({"enable_for_archives":false,
         "enable_for_shard_state_persistent":false,
         "cells_gc_config":{"gc_interval_sec":1,"cells_lifetime_sec":0}});
+    if archive {
+        config["archival_mode"] = serde_json::json!({
+            "epoch_size": 20000, "new_epochs_path": dir.path().join("epochs"),
+            "existing_epochs": []
+        });
+    }
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     config["ip_address_quic"] = socket.local_addr().unwrap().to_string().into();
     drop(socket);
     std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     let engine = open_engine(dir.path()).await;
+    assert_eq!(engine.db().is_archival_mode(), archive);
     let setup = std::panic::AssertUnwindSafe(async {
         let zero_state = ShardStateStuff::from_root_cell(
             zero.clone(),
@@ -448,6 +459,16 @@ async fn bounded_state_actual_engine_cold_warm_and_budget_rejection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mc_live_repair_bounded_writer_pin_survives_gc_and_transfers_to_custody() {
     let Fixture { dir: _dir, engine, parent, target, request } = fixture(false).await;
+    struct ReleaseGate(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for ReleaseGate {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+    let mut gate = None;
+    let mut repair = None;
     let result = std::panic::AssertUnwindSafe(async {
         let parent_pin = engine.load_and_pin_state(parent.id()).await.unwrap();
         engine.shard_states_keeper().test_retire_history_state(target.id());
@@ -462,18 +483,19 @@ async fn mc_live_repair_bounded_writer_pin_survives_gc_and_transfers_to_custody(
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let entered_tx = std::sync::Mutex::new(Some(entered_tx));
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        gate = Some(ReleaseGate(Some(release_tx)));
         let release_rx = std::sync::Mutex::new(release_rx);
         engine.db().set_publication_sync_observer(Some(Arc::new(move |point, _| {
             if point == storage::durability::SyncPoint::Wal {
                 if let Some(entered) = entered_tx.lock().unwrap().take() {
                     let _ = entered.send(());
-                    release_rx.lock().unwrap().recv().unwrap();
+                    let _ = release_rx.lock().unwrap().recv();
                 }
             }
             Ok(())
         })));
         let owner = engine.clone();
-        let repair = tokio::spawn(async move { repair_mc_final(owner, request).await });
+        repair = Some(tokio::spawn(async move { repair_mc_final(owner, request).await }));
         tokio::time::timeout(Duration::from_secs(15), entered_rx).await.unwrap().unwrap();
         // The bounded writer has committed its atomic index/cells batch and is
         // paused at the real WAL boundary. Check the actual GC decision too:
@@ -482,8 +504,8 @@ async fn mc_live_repair_bounded_writer_pin_survives_gc_and_transfers_to_custody(
         assert!(engine.db().test_contains_dynamic_state_record(target.id()).unwrap());
         tokio::time::sleep(Duration::from_millis(1300)).await;
         assert!(engine.db().test_contains_dynamic_state_record(target.id()).unwrap());
-        release_tx.send(()).unwrap();
-        let custody = repair.await.unwrap().unwrap();
+        drop(gate.take());
+        let custody = repair.take().unwrap().await.unwrap().unwrap();
         engine.db().set_publication_sync_observer(None);
         assert_eq!(
             custody.state_root(),
@@ -504,8 +526,131 @@ async fn mc_live_repair_bounded_writer_pin_survives_gc_and_transfers_to_custody(
     })
     .catch_unwind()
     .await;
+    // On assertion/timeout panic release the real writer before collecting its
+    // task. A dropped observation future must not strand the DB shutdown.
+    drop(gate.take());
+    engine.db().set_publication_sync_observer(None);
+    if let Some(task) = repair.take() {
+        let _ = task.await;
+    }
     close(engine).await;
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
+    }
+}
+
+fn open_archive_for_fault_injection(root: &Path) -> Arc<RocksDb> {
+    use crate::internal_db::{ARCHIVE_CELLS_CF_NAME, ARCHIVE_STATES_DB_NAME};
+    let (options, cache) = storage::cell_db::CellDb::build_cf_options(
+        storage::shardstate_db_async::CellsDbConfig::default().cells_cache_size_bytes,
+    );
+    let db = RocksDb::new(
+        root,
+        ARCHIVE_STATES_DB_NAME,
+        HashMap::from([(ARCHIVE_CELLS_CF_NAME.to_owned(), options)]),
+        AccessType::ReadWrite,
+    )
+    .unwrap();
+    db.register_cache(cache);
+    db
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mc_live_repair_archive_engine_cold_missing_index_and_corrupt_graph() {
+    use crate::internal_db::{ARCHIVE_CELLS_CF_NAME, ARCHIVE_SHARDSTATE_CF_NAME};
+    // Archive states are append-only. Missing index is an explicit offline
+    // fault, not a claim that ordinary Archive GC removes state records.
+    for mode in 0..4 {
+        let Fixture { dir, engine, parent, target, request } = fixture_backend(false, true).await;
+        let target_root = target.block().unwrap().read_state_update().unwrap().new_hash;
+        let setup = std::panic::AssertUnwindSafe(async {
+            let current = engine.load_state(target.id()).await.unwrap();
+            let parent_state = engine.load_state(parent.id()).await.unwrap();
+            let zero = engine.load_mc_zero_state().await.unwrap();
+            let excluded: HashSet<_> = cells(parent_state.root_cell())
+                .into_keys()
+                .chain(cells(zero.root_cell()).into_keys())
+                .collect();
+            let child = cells(current.root_cell())
+                .into_keys()
+                .find(|hash| hash != &target_root && !excluded.contains(hash))
+                .expect("fixture has a target-only descendant");
+            (
+                PathBuf::from(engine.db_root_dir().unwrap()),
+                child,
+                engine.load_last_applied_mc_block_id().unwrap(),
+            )
+        })
+        .catch_unwind()
+        .await;
+        close(engine).await;
+        let (root, child, head) = setup.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        let db = open_archive_for_fault_injection(&root);
+        let index = db.clone().table::<BlockIdExt>(ARCHIVE_SHARDSTATE_CF_NAME, false).unwrap();
+        let graph = db.clone().table::<UInt256>(ARCHIVE_CELLS_CF_NAME, false).unwrap();
+        let original_index = index.try_get(target.id()).unwrap().unwrap().to_vec();
+        let corrupt = if mode == 2 { target_root.clone() } else { child };
+        if mode == 1 {
+            index.delete(target.id()).unwrap();
+        } else if mode >= 2 {
+            assert!(graph.try_get(&corrupt).unwrap().is_some());
+            graph.put_raw_sync(corrupt.as_slice(), &[0]).unwrap();
+        }
+        db.sync_wal().unwrap();
+        drop(graph);
+        drop(index);
+        drop(db);
+        let engine = open_engine(dir.path()).await;
+        let result = std::panic::AssertUnwindSafe(async {
+            assert!(engine.db().is_archival_mode());
+            assert_eq!(engine.db().has_repair_state_index(target.id()).unwrap(), mode != 1);
+            let _bounded_only = crate::publication_repair::require_bounded_durability(&engine);
+            let repair = repair_mc_final(engine.clone(), request.clone()).await;
+            if mode >= 2 {
+                assert!(repair.is_err(), "present index with corrupt graph must not rebuild");
+            } else {
+                let custody = repair.unwrap();
+                assert_eq!(custody.state_root(), &target_root);
+                assert_eq!(custody.block_id(), target.id());
+                drop(custody);
+                assert!(engine.db().has_repair_state_index(target.id()).unwrap());
+                let handle = engine.load_block_handle(target.id()).unwrap().unwrap();
+                engine.load_block(&handle).await.unwrap();
+                engine.load_block_proof(&handle, false).await.unwrap();
+            }
+            assert!(engine.load_block_handle(target.id()).unwrap().unwrap().is_applied());
+            assert_eq!(engine.load_last_applied_mc_block_id().unwrap(), head);
+        })
+        .catch_unwind()
+        .await;
+        close(engine).await;
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        let db = open_archive_for_fault_injection(&root);
+        let index = db.clone().table::<BlockIdExt>(ARCHIVE_SHARDSTATE_CF_NAME, false).unwrap();
+        if mode >= 2 {
+            assert_eq!(
+                index.try_get(target.id()).unwrap().unwrap().as_ref(),
+                original_index.as_slice()
+            );
+            let graph = db.clone().table::<UInt256>(ARCHIVE_CELLS_CF_NAME, false).unwrap();
+            assert_eq!(graph.try_get(&corrupt).unwrap().unwrap().as_ref(), &[0]);
+        } else {
+            assert!(index.try_get(target.id()).unwrap().is_some());
+        }
+        drop(index);
+        drop(db);
+        if mode < 2 {
+            let engine = open_engine(dir.path()).await;
+            let result = std::panic::AssertUnwindSafe(async {
+                let _bounded_only = crate::publication_repair::require_bounded_durability(&engine);
+                let custody = repair_mc_final(engine.clone(), request).await.unwrap();
+                assert_eq!(custody.state_root(), &target_root);
+                drop(custody);
+            })
+            .catch_unwind()
+            .await;
+            close(engine).await;
+            result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        }
     }
 }
