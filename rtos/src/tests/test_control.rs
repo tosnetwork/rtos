@@ -778,7 +778,7 @@ async fn test_stats() {
         engine: &Arc<TestEngine>,
         key_id: &Arc<KeyId>,
         new_format: bool,
-        request_started: u32,
+        request_started: u64,
     ) {
         let master_block_id = ControlQuerySubscriber::block_id_to_json(&engine.master_state_id);
         let node_version = format!("\"{}\"", env!("CARGO_PKG_VERSION"));
@@ -838,7 +838,7 @@ async fn test_stats() {
                     // The server samples its clock during the request, not when
                     // this task is eventually scheduled to inspect the reply.
                     // Both fixture block timestamps are one second after epoch.
-                    stat.value.parse::<u32>().ok().and_then(|diff| {
+                    stat.value.parse::<u64>().ok().and_then(|diff| {
                         diff.checked_add(1)
                             .filter(|sampled| {
                                 (request_started..=response_received).contains(sampled)
