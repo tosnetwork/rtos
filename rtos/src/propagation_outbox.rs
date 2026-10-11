@@ -406,6 +406,40 @@ fn validate_record(
     Ok(())
 }
 
+fn validate_pending(
+    record: &PublicationRecord,
+    stage: PublicationStage,
+    pending: &[PublicationEffect],
+) -> Result<()> {
+    if pending.is_empty()
+        || pending.windows(2).any(|pair| pair[0] >= pair[1])
+        || pending.iter().any(|effect| !record.effects.contains(effect))
+        || (stage == PublicationStage::Prepared && pending != record.effects)
+    {
+        fail!("Invalid outbox remaining effects");
+    }
+    Ok(())
+}
+
+/// Revalidate externally assembled recovery data with the storage invariants.
+/// Public fields do not prove that an object passed through the bounded decoder.
+pub(crate) fn validate_recovery_record(entry: &UnverifiedRecord, limits: &Limits) -> Result<()> {
+    validate_limits(limits)?;
+    validate_domain(&entry.record.domain)?;
+    validate_record(&entry.record, &entry.record.domain, limits)?;
+    validate_pending(&entry.record, entry.stage, &entry.pending)?;
+    let next_id = entry.id.0.checked_add(1).ok_or_else(|| error!("Outbox ID exhausted"))?;
+    if entry.id.0 == 0 {
+        fail!("Invalid outbox record ID");
+    }
+    encode_snapshot(
+        &Snapshot { next_id, entries: vec![entry.clone()] },
+        &entry.record.domain,
+        limits,
+    )?;
+    Ok(())
+}
+
 struct Encoder {
     bytes: Vec<u8>,
     maximum: usize,
@@ -678,13 +712,7 @@ fn decode_snapshot(bytes: &[u8], domain: &OutboxDomain, limits: &Limits) -> Resu
             effects,
         };
         validate_record(&record, domain, limits)?;
-        if pending.is_empty()
-            || pending.windows(2).any(|pair| pair[0] >= pair[1])
-            || pending.iter().any(|effect| !record.effects.contains(effect))
-            || (stage == PublicationStage::Prepared && pending != record.effects)
-        {
-            fail!("Invalid outbox remaining effects");
-        }
+        validate_pending(&record, stage, &pending)?;
         entries.push(UnverifiedRecord { id, stage, record, pending });
     }
     if input.offset != payload.len() {

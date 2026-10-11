@@ -25,6 +25,7 @@ mod macros;
 mod network;
 mod network_db;
 mod propagation_outbox;
+pub(crate) mod propagation_outbox_auth;
 mod rng;
 mod rpc_server;
 mod shard_state;
