@@ -729,22 +729,34 @@ pub(crate) async fn authenticate_recovered_state_evidence_with_budget<
     captured: Option<&mut Vec<BlockProofStuff>>,
     budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
 ) -> Result<VerifiedMasterchainState> {
-    authenticate_recovered_state_inner(engine, block_id, state, evidence, captured, budget, true).await
+    authenticate_recovered_state_inner(engine, block_id, state, evidence, captured, budget, true)
+        .await
 }
 
 /// Detached history candidates have no ordinary state DB custody. Authentication
 /// is identical; callers may record capsule provenance only after durable commit.
 pub(crate) async fn authenticate_detached_history_state<E: EngineOperations + ?Sized>(
-    engine: &E, block_id: &BlockIdExt,
+    engine: &E,
+    block_id: &BlockIdExt,
     state: Arc<crate::shard_state::ShardStateStuff>,
     captured: &mut Vec<BlockProofStuff>,
     budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
 ) -> Result<VerifiedMasterchainState> {
-    authenticate_recovered_state_inner(engine, block_id, state, None, Some(captured), Some(budget), false).await
+    authenticate_recovered_state_inner(
+        engine,
+        block_id,
+        state,
+        None,
+        Some(captured),
+        Some(budget),
+        false,
+    )
+    .await
 }
 
 async fn authenticate_recovered_state_inner<E: EngineOperations + ?Sized>(
-    engine: &E, block_id: &BlockIdExt,
+    engine: &E,
+    block_id: &BlockIdExt,
     state: Arc<crate::shard_state::ShardStateStuff>,
     evidence: Option<&[BlockProofStuff]>,
     mut captured: Option<&mut Vec<BlockProofStuff>>,
@@ -774,12 +786,12 @@ async fn authenticate_recovered_state_inner<E: EngineOperations + ?Sized>(
             budget.graph(zero.root_cell())?;
             budget.record_state(pin, zero.root_cell())?;
         }
-        BootstrapAuthority::from_zerostate(pin, zero)?
+        BootstrapAuthority::from_zerostate_with_budget(pin, zero, budget.map(Arc::as_ref))?
     } else {
         let proof =
             recovery_evidence_proof(engine, pin, true, true, evidence, &mut captured, budget)
                 .await?;
-        BootstrapAuthority::from_checkpoint(pin, proof)?
+        BootstrapAuthority::from_checkpoint_with_budget(pin, proof, budget.map(Arc::as_ref))?
     };
     if block_id == pin {
         let verified = history.authenticate_current_state(state)?;
@@ -802,7 +814,14 @@ async fn authenticate_recovered_state_inner<E: EngineOperations + ?Sized>(
             .seq_no
             .checked_add(1)
             .ok_or_else(|| error!("Recovery key sequence overflow"))?;
-        let Some(next) = index.get_next_key_block(seq)? else {
+        let next = match budget {
+            Some(budget) => index.get_next_key_block_bounded(
+                seq,
+                &crate::bounded_session_derivation::ConfigBudget(budget),
+            )?,
+            None => index.get_next_key_block(seq)?,
+        };
+        let Some(next) = next else {
             break;
         };
         let next = next.master_block_id().1;
@@ -812,12 +831,20 @@ async fn authenticate_recovered_state_inner<E: EngineOperations + ?Sized>(
         let proof =
             recovery_evidence_proof(engine, &next, false, true, evidence, &mut captured, budget)
                 .await?;
-        history = history.advance_key_block(&next, proof)?;
+        history = history.advance_key_block_with_budget(&next, proof, budget.map(Arc::as_ref))?;
     }
     let proof =
         recovery_evidence_proof(engine, block_id, false, false, evidence, &mut captured, budget)
             .await?;
-    let verified = history.authenticate_block(block_id, proof)?.authenticate_state(state)?;
+    let verified = history
+        .authenticate_block_with_budget(block_id, proof, budget.map(Arc::as_ref))?
+        .authenticate_state(state)?;
+    if let Some(budget) = budget {
+        rtos_block::config_read_budget::lookup(
+            &crate::bounded_session_derivation::ConfigBudget(budget),
+            32,
+        )?;
+    }
     if !verified.state().has_prev_block(pin)? {
         fail!("Authenticated recovered state does not contain the local pin");
     }
@@ -845,12 +872,22 @@ async fn recovery_evidence_proof<E: EngineOperations + ?Sized>(
     if captured.as_ref().is_some_and(|proofs| proofs.len() >= 4096) {
         fail!("Recovery history proof chain exceeds bound");
     }
+    if let Some(budget) = budget {
+        let visits = evidence
+            .map_or(0, |proofs| proofs.len())
+            .checked_add(captured.as_ref().map_or(0, |proofs| proofs.len()))
+            .ok_or_else(|| error!("History evidence traversal overflow"))?;
+        rtos_block::config_read_budget::steps(
+            &crate::bounded_session_derivation::ConfigBudget(budget),
+            visits,
+        )?;
+    }
     let proof = match evidence {
         Some(proofs) => proofs
             .iter()
             .find(|p| p.id() == id)
-            .cloned()
-            .ok_or_else(|| error!("Retained history proof missing for {id}"))?,
+            .ok_or_else(|| error!("Retained history proof missing for {id}"))?
+            .clone_with_budget(budget.map(Arc::as_ref))?,
         None => load_history_proof_with_budget(engine, id, checkpoint, key_block, budget).await?,
     };
     if let Some(budget) = budget {
@@ -871,7 +908,7 @@ async fn recovery_evidence_proof<E: EngineOperations + ?Sized>(
             budget.metadata(std::mem::size_of::<BlockProofStuff>())?;
             captured.try_reserve_exact(1)?;
         }
-        captured.push(proof.clone());
+        captured.push(proof.clone_with_budget(budget.map(Arc::as_ref))?);
     }
     Ok(proof)
 }

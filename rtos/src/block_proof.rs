@@ -17,12 +17,75 @@ use crate::{
     validating_utils::build_checked_data,
     validator::validator_utils::{calc_subset_for_masterchain, ValidatorSubsetInfo},
 };
+use crate::{bounded_session_derivation::ConfigBudget, history_read_budget::HistoryReadBudget};
 use rtos_block::{
     error, fail, write_boc, Block, BlockIdExt, BlockInfo, BlockProof, BlockSignaturesVariant,
     BocReader, Cell, ConfigParams, Deserializable, HashmapType, MerkleProof, Result, Serializable,
     UInt256,
 };
 use std::sync::Arc;
+type ProofBudget<'a> = Option<&'a HistoryReadBudget>;
+
+fn config_lookup(budget: ProofBudget<'_>) -> Result<()> {
+    if let Some(budget) = budget {
+        rtos_block::config_read_budget::lookup(&ConfigBudget(budget), 32)?;
+    }
+    Ok(())
+}
+fn find_history_block(
+    state: &ShardStateStuff,
+    seqno: u32,
+    budget: ProofBudget<'_>,
+) -> Result<BlockIdExt> {
+    config_lookup(budget)?;
+    state.find_block_id(seqno)
+}
+fn proof_subset(
+    config: &ConfigParams,
+    seqno: u32,
+    budget: ProofBudget<'_>,
+) -> Result<ValidatorSubsetInfo> {
+    if let Some(budget) = budget {
+        let budget = ConfigBudget(budget);
+        let validators = config.validator_set_bounded(&budget)?;
+        let (validators, short_hash) = validators.calc_subset_bounded(
+            &config.catchain_config_bounded(&budget)?,
+            rtos_block::SHARD_FULL,
+            rtos_block::MASTERCHAIN_ID,
+            seqno,
+            &budget,
+        )?;
+        Ok(ValidatorSubsetInfo { validators, short_hash })
+    } else {
+        calc_subset_for_masterchain(&config.validator_set()?, config, seqno)
+    }
+}
+fn pq_context(
+    global_id: i32,
+    config: &ConfigParams,
+    id: BlockIdExt,
+    vertical: u32,
+    previous: u32,
+    catchain: u32,
+    budget: ProofBudget<'_>,
+) -> Result<rtos_api::pq_finality::PqVerificationContext> {
+    match budget {
+        Some(budget) => {
+            rtos_api::pq_finality::PqVerificationContext::from_governing_config_bounded(
+                global_id,
+                config,
+                id,
+                vertical,
+                previous,
+                catchain,
+                &ConfigBudget(budget),
+            )
+        }
+        None => rtos_api::pq_finality::PqVerificationContext::from_governing_config(
+            global_id, config, id, vertical, previous, catchain,
+        ),
+    }
+}
 
 #[cfg(test)]
 #[path = "tests/test_block_proof.rs"]
@@ -98,11 +161,20 @@ impl std::fmt::Debug for BootstrapAuthority {
 
 impl BootstrapAuthority {
     pub(crate) fn from_zerostate(pin: &BlockIdExt, state: Arc<ShardStateStuff>) -> Result<Self> {
+        Self::from_zerostate_with_budget(pin, state, None)
+    }
+
+    pub(crate) fn from_zerostate_with_budget(
+        pin: &BlockIdExt,
+        state: Arc<ShardStateStuff>,
+        budget: ProofBudget<'_>,
+    ) -> Result<Self> {
         if !pin.shard().is_masterchain_ext() {
             fail!("Bootstrap requires a masterchain zerostate");
         }
         state.verify_zerostate(pin)?;
         let global_id = state.state()?.global_id();
+        config_lookup(budget)?;
         match state.config_params()?.config(19)? {
             Some(rtos_block::ConfigParamEnum::ConfigParam19(id)) if id == global_id as u32 => {}
             _ => fail!("Bootstrap zerostate global_id disagrees with Param19"),
@@ -111,7 +183,15 @@ impl BootstrapAuthority {
     }
 
     pub(crate) fn from_checkpoint(pin: &BlockIdExt, proof: BlockProofStuff) -> Result<Self> {
-        proof.check_trusted_checkpoint(pin)?;
+        Self::from_checkpoint_with_budget(pin, proof, None)
+    }
+
+    pub(crate) fn from_checkpoint_with_budget(
+        pin: &BlockIdExt,
+        proof: BlockProofStuff,
+        budget: ProofBudget<'_>,
+    ) -> Result<Self> {
+        proof.check_trusted_checkpoint_with_budget(pin, budget)?;
         let global_id = proof.virtualize_block()?.0.global_id();
         Ok(Self { anchor: pin.clone(), global_id, source: BootstrapSource::KeyBlock(proof) })
     }
@@ -164,6 +244,15 @@ impl BootstrapAuthority {
         expected: &BlockIdExt,
         proof: BlockProofStuff,
     ) -> Result<VerifiedMasterchainProof> {
+        self.authenticate_block_with_budget(expected, proof, None)
+    }
+
+    pub(crate) fn authenticate_block_with_budget(
+        &self,
+        expected: &BlockIdExt,
+        proof: BlockProofStuff,
+        budget: ProofBudget<'_>,
+    ) -> Result<VerifiedMasterchainProof> {
         if proof.id() != expected {
             fail!("Boot proof does not match requested block identity");
         }
@@ -174,9 +263,13 @@ impl BootstrapAuthority {
             fail!("Bootstrap successor belongs to a different global_id");
         }
         match &self.source {
-            BootstrapSource::Zerostate(state) => proof.check_with_master_state(state)?,
+            BootstrapSource::Zerostate(state) => {
+                let (block, info) = proof.pre_check_block_proof_with_budget(budget)?;
+                proof.check_with_master_state_(state, &block, &info, budget)?;
+            }
             BootstrapSource::KeyBlock(previous) => {
-                proof.check_with_prev_key_block_proof(previous)?
+                let (block, info) = proof.pre_check_block_proof_with_budget(budget)?;
+                proof.check_with_prev_key_block_proof_(previous, &block, &info, budget)?
             }
         }
         Ok(VerifiedMasterchainProof {
@@ -191,10 +284,19 @@ impl BootstrapAuthority {
         expected: &BlockIdExt,
         proof: BlockProofStuff,
     ) -> Result<Self> {
-        let verified = self.authenticate_block(expected, proof)?;
+        self.advance_key_block_with_budget(expected, proof, None)
+    }
+
+    pub(crate) fn advance_key_block_with_budget(
+        &self,
+        expected: &BlockIdExt,
+        proof: BlockProofStuff,
+        budget: ProofBudget<'_>,
+    ) -> Result<Self> {
+        let verified = self.authenticate_block_with_budget(expected, proof, budget)?;
         // Authority can advance only after signatures authenticate the new block,
         // and its actual header/config qualify it as a governing key block.
-        verified.proof.check_trusted_checkpoint(expected)?;
+        verified.proof.check_trusted_checkpoint_with_budget(expected, budget)?;
         Ok(Self {
             anchor: verified.anchor,
             global_id: verified.global_id,
@@ -300,7 +402,7 @@ impl MasterchainProofVerifier {
         if proof.is_link() || !proof.id().shard().is_masterchain_ext() {
             fail!("Masterchain finality requires a full proof");
         }
-        let (_, info) = proof.pre_check_block_proof()?;
+        let (_, info) = proof.pre_check_block_proof_with_budget(budget.map(Arc::as_ref))?;
         let epoch = info.prev_key_block_seqno();
         if epoch >= proof.id().seq_no {
             fail!("Governing epoch must precede the target masterchain block");
@@ -308,7 +410,11 @@ impl MasterchainProofVerifier {
         let history = self.governing_authority(engine, epoch, budget).await?;
         // A cache hit reuses only the governing authority. Every incoming
         // certificate, including repeat block IDs, must still pass verification.
-        history.authenticate_block(proof.id(), proof.clone())
+        history.authenticate_block_with_budget(
+            proof.id(),
+            proof.clone_with_budget(budget.map(Arc::as_ref))?,
+            budget.map(Arc::as_ref),
+        )
     }
 
     async fn governing_authority<E: EngineOperations + ?Sized>(
@@ -344,6 +450,8 @@ impl MasterchainProofVerifier {
             if let (Some(budget), Ok(state)) = (budget, &ordinary) {
                 budget.graph(state.root_cell())?;
             }
+            // Refusal must propagate, never become a lookup miss and trigger fallback.
+            config_lookup(budget.map(Arc::as_ref))?;
             match ordinary {
                 Ok(state) if state.find_block_id(epoch).is_ok() => Some(state),
                 ordinary => {
@@ -353,7 +461,7 @@ impl MasterchainProofVerifier {
                         Some(state) => Some(state),
                         None => {
                             let state = ordinary?;
-                            state.find_block_id(epoch)?;
+                            find_history_block(&state, epoch, budget.map(Arc::as_ref))?;
                             Some(state)
                         }
                     }
@@ -363,10 +471,10 @@ impl MasterchainProofVerifier {
             None
         };
         let governing = match &hint {
-            Some(state) => state.find_block_id(epoch)?,
+            Some(state) => find_history_block(&state, epoch, budget.map(Arc::as_ref))?,
             None => pin.clone(),
         };
-        let capture = budget.is_some_and(|b| b.provenance_enabled());
+        let capture = budget.is_some(); // Bounded reads reauthenticate and avoid uncharged cache clones.
         let cached = if capture {
             None
         } else {
@@ -407,18 +515,25 @@ impl MasterchainProofVerifier {
                         budget.graph(state.root_cell())?;
                         budget.record_state(pin, state.root_cell())?;
                     }
-                    BootstrapAuthority::from_zerostate(pin, state)?
+                    BootstrapAuthority::from_zerostate_with_budget(
+                        pin,
+                        state,
+                        budget.map(Arc::as_ref),
+                    )?
                 }
-                None => BootstrapAuthority::from_checkpoint(
+                None => BootstrapAuthority::from_checkpoint_with_budget(
                     pin,
                     crate::boot::load_history_proof_with_budget(engine, pin, true, true, budget)
                         .await?,
+                    budget.map(Arc::as_ref),
                 )?,
             };
             if let Some(budget) = budget {
                 history.charge_budget(budget)?;
             }
-            self.remember(history.clone());
+            if budget.is_none() {
+                self.remember(history.clone());
+            }
             while history.id().seq_no < epoch {
                 if let Some(budget) = budget {
                     budget.step()?;
@@ -428,23 +543,31 @@ impl MasterchainProofVerifier {
                 }
                 let state =
                     hint.as_ref().ok_or_else(|| error!("Missing historical proof lookup index"))?;
-                let next = state
-                    .shard_state_extra()?
-                    .prev_blocks
-                    .get_next_key_block(history.id().seq_no + 1)?
-                    .map(|reference| reference.master_block_id().1)
-                    .or_else(|| {
-                        (state.block_id().seq_no == epoch).then(|| state.block_id().clone())
-                    })
-                    .ok_or_else(|| error!("Missing governing key-block history"))?;
+                let index = &state.shard_state_extra()?.prev_blocks;
+                let next = match budget {
+                    Some(budget) => index.get_next_key_block_bounded(
+                        history.id().seq_no + 1,
+                        &ConfigBudget(budget),
+                    )?,
+                    None => index.get_next_key_block(history.id().seq_no + 1)?,
+                }
+                .map(|reference| reference.master_block_id().1)
+                .or_else(|| (state.block_id().seq_no == epoch).then(|| state.block_id().clone()))
+                .ok_or_else(|| error!("Missing governing key-block history"))?;
                 if next.seq_no <= history.id().seq_no || next.seq_no > epoch {
                     fail!("Historical proof index skipped the governing epoch");
                 }
                 let next_proof =
                     crate::boot::load_history_proof_with_budget(engine, &next, false, true, budget)
                         .await?;
-                history = history.advance_key_block(&next, next_proof)?;
-                self.remember(history.clone());
+                history = history.advance_key_block_with_budget(
+                    &next,
+                    next_proof,
+                    budget.map(Arc::as_ref),
+                )?;
+                if budget.is_none() {
+                    self.remember(history.clone());
+                }
             }
             if history.id() != &governing {
                 fail!("Governing proof differs from lookup identity");
@@ -471,33 +594,48 @@ impl MasterchainProofVerifier {
         if epoch < pin.seq_no() {
             fail!("Repair closure precedes pin");
         }
+        rtos_block::config_read_budget::steps(&ConfigBudget(budget), proofs.len())?;
         let mut authority = if pin.seq_no() == 0 {
             if pin != engine.zerostate_id()? {
                 fail!("Repair closure pin mismatch");
             }
             let zero = engine.load_mc_zero_state_bounded(budget.clone()).await?;
             budget.record_state(pin, zero.root_cell())?;
-            BootstrapAuthority::from_zerostate(pin, zero)?
+            BootstrapAuthority::from_zerostate_with_budget(pin, zero, Some(budget))?
         } else {
             let proof = proofs
                 .iter()
                 .find(|p| p.id() == pin)
                 .ok_or_else(|| error!("Repair closure missing checkpoint"))?
-                .clone();
+                .clone_with_budget(Some(budget))?;
             budget.record_history_proof(&proof)?;
-            BootstrapAuthority::from_checkpoint(pin, proof)?
+            BootstrapAuthority::from_checkpoint_with_budget(pin, proof, Some(budget))?
         };
-        proofs.sort_unstable_by_key(|p| p.id().seq_no());
+        for i in 1..proofs.len() {
+            let mut j = i;
+            while j > 0 {
+                budget.step()?;
+                if proofs[j - 1].id().seq_no() <= proofs[j].id().seq_no() {
+                    break;
+                }
+                proofs.swap(j - 1, j);
+                j -= 1;
+            }
+        }
         for proof in proofs {
             budget.step()?;
             if proof.id().seq_no() <= authority.id().seq_no() || proof.id().seq_no() > epoch {
                 continue;
             }
-            if !proof.pre_check_block_proof()?.1.key_block() {
+            if !proof.pre_check_block_proof_with_budget(Some(budget))?.1.key_block() {
                 continue;
             }
             budget.record_history_proof(&proof)?;
-            authority = authority.advance_key_block(proof.id(), proof.clone())?;
+            authority = authority.advance_key_block_with_budget(
+                proof.id(),
+                proof.clone_with_budget(Some(budget))?,
+                Some(budget),
+            )?;
         }
         if authority.id().seq_no() != epoch {
             fail!("Repair closure missing governing key proof");
@@ -538,34 +676,76 @@ impl MasterchainProofVerifier {
         let authority =
             self.governing_authority(engine, info.prev_key_block_seqno(), budget).await?;
         let config = authority.config()?;
-        let selected = config
-            .selected_simplex_config(id.shard().is_masterchain())?
-            .ok_or_else(|| error!("Publication history has no selected Simplex config"))?;
-        let protocol = consensus_common::simplex_protocol::SimplexProtocol::try_from(u32::from(
-            selected.config.protocol_version,
-        ))?;
-        let (committee, _) = config.validator_set()?.calc_subset(
-            &config.catchain_config()?,
-            id.shard().shard_prefix_with_tag(),
-            id.shard().workchain_id(),
-            info.gen_catchain_seqno(),
-        )?;
-        let slots_per_leader_window = selected.config.slots_per_leader_window;
-        if committee.is_empty() || slots_per_leader_window == 0 {
-            fail!("Publication history has no valid leader schedule");
-        }
-        let identity = rtos_api::session_identity::derive_session_from_config(
-            authority.global_id,
-            &config,
-            rtos_api::session_identity::SessionCoordinates {
-                shard: id.shard(),
-                catchain_seqno: info.gen_catchain_seqno(),
-                vertical_seqno: info.vert_seq_no(),
-                last_key_block_seqno: info.prev_key_block_seqno(),
-                new_catchain_ids: false,
-            },
-            &committee,
-        )?;
+        let (protocol, committee, slots_per_leader_window, identity, carrier_version) =
+            if let Some(budget) = budget {
+                let budget = ConfigBudget(budget);
+                let decoded =
+                    config.session_config_bounded(id.shard().is_masterchain(), &budget)?;
+                let (committee, _) = decoded.current.calc_subset_bounded(
+                    &decoded.catchain,
+                    id.shard().shard_prefix_with_tag(),
+                    id.shard().workchain_id(),
+                    info.gen_catchain_seqno(),
+                    &budget,
+                )?;
+                let protocol = consensus_common::simplex_protocol::SimplexProtocol::try_from(
+                    u32::from(decoded.selected.config.protocol_version),
+                )?;
+                let slots = decoded.selected.config.slots_per_leader_window;
+                if committee.is_empty() || slots == 0 {
+                    fail!("Publication history has no valid leader schedule");
+                }
+                let identity = rtos_api::session_identity::derive_session_from_decoded_bounded(
+                    authority.global_id,
+                    &decoded,
+                    rtos_api::session_identity::SessionCoordinates {
+                        shard: id.shard(),
+                        catchain_seqno: info.gen_catchain_seqno(),
+                        vertical_seqno: info.vert_seq_no(),
+                        last_key_block_seqno: info.prev_key_block_seqno(),
+                        new_catchain_ids: false,
+                    },
+                    &committee,
+                    &budget,
+                )?;
+                (protocol, committee, slots, identity, u32::from(decoded.consensus.proto_version))
+            } else {
+                let selected = config
+                    .selected_simplex_config(id.shard().is_masterchain())?
+                    .ok_or_else(|| error!("Publication history has no selected Simplex config"))?;
+                let protocol = consensus_common::simplex_protocol::SimplexProtocol::try_from(
+                    u32::from(selected.config.protocol_version),
+                )?;
+                let (committee, _) = config.validator_set()?.calc_subset(
+                    &config.catchain_config()?,
+                    id.shard().shard_prefix_with_tag(),
+                    id.shard().workchain_id(),
+                    info.gen_catchain_seqno(),
+                )?;
+                let slots_per_leader_window = selected.config.slots_per_leader_window;
+                if committee.is_empty() || slots_per_leader_window == 0 {
+                    fail!("Publication history has no valid leader schedule");
+                }
+                let identity = rtos_api::session_identity::derive_session_from_config(
+                    authority.global_id,
+                    &config,
+                    rtos_api::session_identity::SessionCoordinates {
+                        shard: id.shard(),
+                        catchain_seqno: info.gen_catchain_seqno(),
+                        vertical_seqno: info.vert_seq_no(),
+                        last_key_block_seqno: info.prev_key_block_seqno(),
+                        new_catchain_ids: false,
+                    },
+                    &committee,
+                )?;
+                (
+                    protocol,
+                    committee,
+                    slots_per_leader_window,
+                    identity,
+                    u32::from(config.consensus_config()?.proto_version),
+                )
+            };
         if &identity.session_id != verifier.expected_session_id() {
             fail!("Publication policy differs from authenticated PQ session");
         }
@@ -577,7 +757,7 @@ impl MasterchainProofVerifier {
             profile: identity.config_hash,
             committee,
             slots_per_leader_window,
-            carrier_version: u32::from(config.consensus_config()?.proto_version),
+            carrier_version,
             verifier,
         })
     }
@@ -615,13 +795,14 @@ impl MasterchainProofVerifier {
         if block.global_id() != authority.global_id {
             fail!("PQ broadcast global_id differs from authenticated history");
         }
-        let context = rtos_api::pq_finality::PqVerificationContext::from_governing_config(
+        let context = pq_context(
             authority.global_id,
             &authority.config()?,
             id.clone(),
             info.vert_seq_no(),
             info.prev_key_block_seqno(),
             info.gen_catchain_seqno(),
+            budget.map(Arc::as_ref),
         )?;
         if context.subset_hash() != info.gen_validator_list_hash_short() {
             fail!("PQ broadcast header disagrees with historical governing validator set");
@@ -705,7 +886,7 @@ impl BlockProofStuff {
     ) -> Result<Self> {
         budget.proof_bytes(&data)?;
         let root = budget.parse_boc(&data)?;
-        let proof = BlockProof::construct_from_cell(root.clone())?;
+        let proof = BlockProof::construct_from_cell_bounded(root.clone(), &ConfigBudget(budget))?;
         if &proof.proof_for != block_id || (!block_id.is_masterchain() && !is_link) {
             fail!("Bounded proof identity/type mismatch");
         }
@@ -730,7 +911,7 @@ impl BlockProofStuff {
     ) -> Result<Self> {
         budget.proof_bytes(&data)?;
         let root = budget.parse_local_artifact(&data)?;
-        let proof = BlockProof::construct_from_cell(root.clone())?;
+        let proof = BlockProof::construct_from_cell_bounded(root.clone(), &ConfigBudget(budget))?;
         if &proof.proof_for != block_id || (!block_id.is_masterchain() && !is_link) {
             fail!("Local artifact proof identity/type mismatch");
         }
@@ -815,6 +996,27 @@ impl BlockProofStuff {
         &self.id
     }
 
+    pub(crate) fn clone_with_budget(&self, budget: ProofBudget<'_>) -> Result<Self> {
+        if let Some(budget) = budget {
+            use rtos_block::merkle_apply_budget::MerkleApplyBudget;
+            budget.step()?;
+            if let Some(BlockSignaturesVariant::SimplexPq(carrier)) = &self.proof.signatures {
+                budget.workspace(
+                    carrier
+                        .signatures
+                        .len()
+                        .checked_mul(std::mem::size_of::<rtos_block::PqBlockSignaturePair>())
+                        .ok_or_else(|| error!("Proof clone size overflow"))?,
+                )?;
+                for signature in &carrier.signatures {
+                    budget.step()?;
+                    budget.workspace(signature.signature.len())?;
+                }
+            }
+        }
+        Ok(self.clone())
+    }
+
     pub fn data(&self) -> &[u8] {
         &self.data
     }
@@ -834,7 +1036,12 @@ impl BlockProofStuff {
 
         let (virt_block, virt_block_info) = self.pre_check_block_proof()?;
 
-        self.check_with_prev_key_block_proof_(prev_key_block_proof, &virt_block, &virt_block_info)?;
+        self.check_with_prev_key_block_proof_(
+            prev_key_block_proof,
+            &virt_block,
+            &virt_block_info,
+            None,
+        )?;
 
         log::trace!(
             "Checked proof for block: {}   TIME {}ms",
@@ -859,7 +1066,7 @@ impl BlockProofStuff {
 
         let (virt_block, virt_block_info) = self.pre_check_block_proof()?;
 
-        self.check_with_master_state_(master_state, &virt_block, &virt_block_info)?;
+        self.check_with_master_state_(master_state, &virt_block, &virt_block_info, None)?;
 
         log::trace!(
             "Checked proof for block: {}   TIME {}ms",
@@ -874,15 +1081,24 @@ impl BlockProofStuff {
     /// proof, a peer response, or a database resume cursor. This does not verify
     /// history before the checkpoint or the original full block's file bytes.
     pub(crate) fn check_trusted_checkpoint(&self, expected: &BlockIdExt) -> Result<()> {
+        self.check_trusted_checkpoint_with_budget(expected, None)
+    }
+
+    fn check_trusted_checkpoint_with_budget(
+        &self,
+        expected: &BlockIdExt,
+        budget: ProofBudget<'_>,
+    ) -> Result<()> {
         if self.id() != expected || !expected.shard().is_masterchain_ext() || expected.seq_no == 0 {
             fail!("Checkpoint proof differs from the explicitly pinned masterchain identity");
         }
-        let (block, info) = self.pre_check_block_proof()?;
+        let (block, info) = self.pre_check_block_proof_with_budget(budget)?;
         if !info.key_block() {
             fail!("Checkpoint must be a key block");
         }
-        self.pre_check_key_block_proof(&block)?;
+        self.pre_check_key_block_proof_with_budget(&block, budget)?;
         let config = self.read_config_params(&block)?;
+        config_lookup(budget)?;
         match config.config(19)? {
             Some(rtos_block::ConfigParamEnum::ConfigParam19(id))
                 if id == block.global_id() as u32 => {}
@@ -961,6 +1177,7 @@ impl BlockProofStuff {
         prev_key_block_proof: &BlockProofStuff,
         virt_block: &Block,
         virt_block_info: &BlockInfo,
+        budget: ProofBudget<'_>,
     ) -> Result<()> {
         if !self.id().is_masterchain() {
             fail!(NodeError::InvalidData(format!(
@@ -993,7 +1210,7 @@ impl BlockProofStuff {
         }
 
         let (subset, virt_prev_key_block) =
-            self.process_prev_key_block_proof(prev_key_block_proof)?;
+            self.process_prev_key_block_proof(prev_key_block_proof, budget)?;
 
         if virt_prev_key_block.read_info()?.gen_utime() > virt_block_info.gen_utime() {
             fail!(NodeError::InvalidData(format!(
@@ -1004,7 +1221,7 @@ impl BlockProofStuff {
         }
 
         if virt_block_info.key_block() {
-            self.pre_check_key_block_proof(virt_block)?;
+            self.pre_check_key_block_proof_with_budget(virt_block, budget)?;
         }
 
         if let Some(BlockSignaturesVariant::SimplexPq(carrier)) = &self.proof.signatures {
@@ -1012,18 +1229,22 @@ impl BlockProofStuff {
                 fail!("PQ target global_id differs from governing key block");
             }
             let config = prev_key_block_proof.read_config_params(&virt_prev_key_block)?;
-            let context = rtos_api::pq_finality::PqVerificationContext::from_governing_config(
+            let context = pq_context(
                 virt_prev_key_block.global_id(),
                 &config,
                 self.id.clone(),
                 virt_block_info.vert_seq_no(),
                 virt_block_info.prev_key_block_seqno(),
                 carrier.validator_info.catchain_seqno,
+                budget,
             )?;
-            context.verify_final(carrier)?;
+            match budget {
+                Some(budget) => context.verify_final_bounded(carrier, &ConfigBudget(budget))?,
+                None => context.verify_final(carrier)?,
+            };
             return Ok(());
         }
-        self.check_signatures(&subset)
+        self.check_signatures_with_budget(&subset, budget)
     }
 
     fn check_with_master_state_(
@@ -1031,11 +1252,12 @@ impl BlockProofStuff {
         master_state: &ShardStateStuff,
         virt_block: &Block,
         virt_block_info: &BlockInfo,
+        budget: ProofBudget<'_>,
     ) -> Result<()> {
         if virt_block_info.key_block() {
-            self.pre_check_key_block_proof(virt_block)?;
+            self.pre_check_key_block_proof_with_budget(virt_block, budget)?;
         }
-        let subset = self.process_given_state(master_state, virt_block_info)?;
+        let subset = self.process_given_state(master_state, virt_block_info, budget)?;
         if let Some(BlockSignaturesVariant::SimplexPq(carrier)) = &self.proof.signatures {
             let extra = master_state.shard_state_extra()?;
             let governing_key_seqno = if extra.after_key_block {
@@ -1050,21 +1272,32 @@ impl BlockProofStuff {
             if virt_block.global_id() != global_id {
                 fail!("PQ target global_id differs from governing state");
             }
-            let context = rtos_api::pq_finality::PqVerificationContext::from_governing_config(
+            let context = pq_context(
                 global_id,
                 master_state.config_params()?,
                 self.id.clone(),
                 virt_block_info.vert_seq_no(),
                 virt_block_info.prev_key_block_seqno(),
                 carrier.validator_info.catchain_seqno,
+                budget,
             )?;
-            context.verify_final(carrier)?;
+            match budget {
+                Some(budget) => context.verify_final_bounded(carrier, &ConfigBudget(budget))?,
+                None => context.verify_final(carrier)?,
+            };
             return Ok(());
         }
-        self.check_signatures(&subset)
+        self.check_signatures_with_budget(&subset, budget)
     }
 
     fn pre_check_block_proof(&self) -> Result<(Block, BlockInfo)> {
+        self.pre_check_block_proof_with_budget(None)
+    }
+
+    fn pre_check_block_proof_with_budget(
+        &self,
+        budget: ProofBudget<'_>,
+    ) -> Result<(Block, BlockInfo)> {
         if !self.id().is_masterchain() && self.proof.signatures.is_some() {
             fail!(NodeError::InvalidData(format!(
                 "proof for non-master block {} can't contain signatures",
@@ -1072,7 +1305,12 @@ impl BlockProofStuff {
             )))
         }
         let (virt_block, virt_block_root) = self.virtualize_block()?;
-        let info = Self::pre_check_virtual_block(self.id(), &virt_block, &virt_block_root)?;
+        let info = Self::pre_check_virtual_block_with_budget(
+            self.id(),
+            &virt_block,
+            &virt_block_root,
+            budget,
+        )?;
         Ok((virt_block, info))
     }
 
@@ -1081,6 +1319,18 @@ impl BlockProofStuff {
         virt_block: &Block,
         virt_block_root: &Cell,
     ) -> Result<BlockInfo> {
+        Self::pre_check_virtual_block_with_budget(id, virt_block, virt_block_root, None)
+    }
+    fn pre_check_virtual_block_with_budget(
+        id: &BlockIdExt,
+        virt_block: &Block,
+        virt_block_root: &Cell,
+        budget: ProofBudget<'_>,
+    ) -> Result<BlockInfo> {
+        if let Some(budget) = budget {
+            budget.step()?;
+        }
+
         if *virt_block_root.repr_hash() != id.root_hash {
             fail!(NodeError::InvalidData(format!(
                 "proof for block {} contains a Merkle proof with incorrect root hash: \
@@ -1093,9 +1343,11 @@ impl BlockProofStuff {
 
         let info = virt_block.read_info()?;
         let value_flow = virt_block.read_value_flow()?;
-        value_flow
-            .read_in_full_depth()
-            .map_err(|e| error!("Can't read value flow in full depth: {}", e))?;
+        match budget {
+            Some(budget) => value_flow.read_in_full_depth_bounded(&ConfigBudget(budget)),
+            None => value_flow.read_in_full_depth(),
+        }
+        .map_err(|e| e.context("Can't read value flow in full depth"))?;
         let _state_update = virt_block.read_state_update()?;
 
         if info.version() != 0 {
@@ -1202,7 +1454,30 @@ impl BlockProofStuff {
     }
 
     fn pre_check_key_block_proof(&self, virt_block: &Block) -> Result<()> {
+        self.pre_check_key_block_proof_with_budget(virt_block, None)
+    }
+
+    fn pre_check_key_block_proof_with_budget(
+        &self,
+        virt_block: &Block,
+        budget: ProofBudget<'_>,
+    ) -> Result<()> {
         let config = self.read_config_params(virt_block)?;
+        if let Some(budget) = budget {
+            let budget = ConfigBudget(budget);
+            config
+                .config_validator_set_bounded(34, &budget)?
+                .ok_or_else(|| error!("Key proof lacks current validators Param34"))?;
+            for param in 32..=37 {
+                config.config_validator_set_bounded(param, &budget)?;
+            }
+            config.config_cell_bounded(38, &budget)?;
+            // Param28 is optional here, exactly like config(28) in the ordinary path.
+            if config.config_cell_bounded(28, &budget)?.is_some() {
+                config.catchain_config_bounded(&budget)?;
+            }
+            return Ok(());
+        }
         let _cur_validator_set = config.config(34)?.ok_or_else(|| {
             NodeError::InvalidData(format!(
                 "proof for key block {} contains a Merkle proof \
@@ -1221,8 +1496,10 @@ impl BlockProofStuff {
     fn process_prev_key_block_proof(
         &self,
         prev_key_block_proof: &BlockProofStuff,
+        budget: ProofBudget<'_>,
     ) -> Result<(ValidatorSubsetInfo, Block)> {
-        let (virt_key_block, prev_key_block_info) = prev_key_block_proof.pre_check_block_proof()?;
+        let (virt_key_block, prev_key_block_info) =
+            prev_key_block_proof.pre_check_block_proof_with_budget(budget)?;
 
         if !prev_key_block_info.key_block() {
             fail!(NodeError::InvalidData(format!(
@@ -1231,6 +1508,19 @@ impl BlockProofStuff {
             )))
         }
 
+        if budget.is_some() {
+            let config = prev_key_block_proof.read_config_params(&virt_key_block)?;
+            let subset = proof_subset(
+                &config,
+                self.proof
+                    .signatures
+                    .as_ref()
+                    .map(|s| s.validator_info().catchain_seqno)
+                    .unwrap_or(0),
+                budget,
+            )?;
+            return Ok((subset, virt_key_block));
+        }
         let (validator_set, _cc_config) =
             virt_key_block.read_cur_validator_set_and_cc_conf().map_err(|err| {
                 NodeError::InvalidData(format!(
@@ -1260,6 +1550,13 @@ impl BlockProofStuff {
     }
 
     fn check_signatures(&self, subset: &ValidatorSubsetInfo) -> Result<()> {
+        self.check_signatures_with_budget(subset, None)
+    }
+    fn check_signatures_with_budget(
+        &self,
+        subset: &ValidatorSubsetInfo,
+        budget: ProofBudget<'_>,
+    ) -> Result<()> {
         // Pre checks
         if self.proof.signatures.is_none() {
             fail!(NodeError::InvalidData(format!(
@@ -1277,7 +1574,12 @@ impl BlockProofStuff {
             )));
         }
         let expected_count = signatures.pure_signatures()?.count() as usize;
-        let count = signatures.pure_signatures()?.signatures().count(expected_count)?;
+        let count = match budget {
+            Some(budget) => {
+                signatures.pure_signatures()?.signatures_count_bounded(&ConfigBudget(budget))?
+            }
+            None => signatures.pure_signatures()?.signatures().count(expected_count)?,
+        };
         if expected_count != count {
             fail!(NodeError::InvalidData(format!(
                 "Proof for {}: signature count mismatch: declared: {}, calculated: {}",
@@ -1288,6 +1590,22 @@ impl BlockProofStuff {
         }
 
         // Generate checked_data based on signature variant
+        if let Some(budget) = budget {
+            use rtos_block::merkle_apply_budget::MerkleApplyBudget;
+            // Ordinary preimage is 68 bytes. Classical Simplex's CellString decoder
+            // visits at most 16 cells, each copying at most 127 bytes; its 1024-byte
+            // limit is checked after append, so charge growth through 2048 capacity
+            // (sum of all geometric allocations <=4096), plus each chunk copy.
+            // CandidateHashData is fixed-field; vote/DataToSign are under 256 bytes
+            // each, with both serialization growth sequences charged below.
+            let (steps, workspace) = match signatures {
+                BlockSignaturesVariant::Ordinary(_) => (1, 68),
+                BlockSignaturesVariant::Simplex(_) => (16 + 3, 4096 + 16 * 127 + 2 * 512),
+                BlockSignaturesVariant::SimplexPq(_) => unreachable!(),
+            };
+            rtos_block::config_read_budget::steps(&ConfigBudget(budget), steps)?;
+            budget.workspace(workspace)?;
+        }
         let checked_data = build_checked_data(signatures, &self.id).map_err(|err| {
             NodeError::InvalidData(format!(
                 "Proof for {}: failed to build checked_data: {err}",
@@ -1297,15 +1615,16 @@ impl BlockProofStuff {
 
         let total_weight: u64 =
             rtos_block::checked_validator_weight_sum(subset.validators.iter().map(|v| v.weight))?;
-        let weight = signatures
-            .pure_signatures()?
-            .check_signatures(&subset.validators, &checked_data)
-            .map_err(|err| {
-                NodeError::InvalidData(format!(
-                    "Proof for {}: error while check signatures: {err}",
-                    self.id()
-                ))
-            })?;
+        let weight = match budget {
+            Some(budget) => signatures.pure_signatures()?.check_signatures_bounded(
+                &subset.validators,
+                &checked_data,
+                &ConfigBudget(budget),
+            )?,
+            None => {
+                signatures.pure_signatures()?.check_signatures(&subset.validators, &checked_data)?
+            }
+        };
 
         // Check weight
         if weight != signatures.pure_signatures()?.weight() {
@@ -1331,6 +1650,7 @@ impl BlockProofStuff {
         &self,
         state: &ShardStateStuff,
         block_info: &BlockInfo,
+        budget: ProofBudget<'_>,
     ) -> Result<ValidatorSubsetInfo> {
         // Checks
         if !state.block_id().is_masterchain() {
@@ -1363,6 +1683,17 @@ impl BlockProofStuff {
             )));
         }
 
+        if budget.is_some() {
+            return proof_subset(
+                state.config_params()?,
+                self.proof
+                    .signatures
+                    .as_ref()
+                    .map(|s| s.validator_info().catchain_seqno)
+                    .unwrap_or(0),
+                budget,
+            );
+        }
         let (cur_validator_set, _cc_config) =
             state.state()?.read_cur_validator_set_and_cc_conf()?;
 
@@ -1371,5 +1702,106 @@ impl BlockProofStuff {
             state.config_params()?,
             self.proof.signatures.as_ref().map(|s| s.validator_info().catchain_seqno).unwrap_or(0),
         )
+    }
+}
+
+#[cfg(test)]
+mod history_proof_budget_tests {
+    use super::*;
+    use crate::history_read_budget::{HistoryBudgetExceeded, HistoryReadLimits};
+
+    #[test]
+    fn history_proof_budget_counts_deep_signature_clones_cumulatively() {
+        let mut proof = BlockProofStuff::default();
+        proof.proof.signatures =
+            Some(BlockSignaturesVariant::SimplexPq(rtos_block::BlockSignaturesSimplexPq {
+                signatures: vec![rtos_block::PqBlockSignaturePair {
+                    validator_id: UInt256::default(),
+                    algorithm_id: 1,
+                    signature: vec![7; 2048],
+                }],
+                ..Default::default()
+            }));
+        // A struct-only charge would admit both clones. The first full clone
+        // fits, while the second exhausts the same request's workspace.
+        let budget =
+            HistoryReadBudget::new(HistoryReadLimits { cell_bytes: 3000, ..Default::default() });
+        assert_eq!(proof.clone_with_budget(Some(&budget)).unwrap(), proof);
+        let error = proof.clone_with_budget(Some(&budget)).unwrap_err();
+        assert!(error.downcast_ref::<HistoryBudgetExceeded>().is_some());
+        assert_eq!(proof.clone_with_budget(None).unwrap(), proof);
+    }
+
+    #[test]
+    fn history_proof_budget_preserves_classical_weighted_quorum_and_refuses_exhaustion() {
+        use rtos_block::{
+            BlockSignatures, BlockSignaturesPure, CryptoSignature, CryptoSignaturePair,
+            Ed25519KeyOption, ShardIdent, SigPubKey, ValidatorBaseInfo, ValidatorDescr,
+            ZeroizingBytes,
+        };
+        let keys: Vec<_> =
+            (0..3).map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap()).collect();
+        let subset = ValidatorSubsetInfo {
+            short_hash: 42,
+            validators: keys
+                .iter()
+                .enumerate()
+                .map(|(i, key)| {
+                    ValidatorDescr::with_params(
+                        SigPubKey::from_bytes(key.pub_key().unwrap()).unwrap(),
+                        (i + 1) as u64,
+                        None,
+                    )
+                })
+                .collect(),
+        };
+        let id = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            1,
+            UInt256::from([1; 32]),
+            UInt256::from([2; 32]),
+        );
+        let data = Block::build_data_for_sign(&id.root_hash, &id.file_hash);
+        for (signers, accepted) in [(vec![0, 2], true), (vec![0, 1], false), (vec![0, 0, 2], false)]
+        {
+            let mut signatures = BlockSignaturesPure::default();
+            let mut weight = 0;
+            for i in signers {
+                signatures.add_sigpair(CryptoSignaturePair {
+                    node_id_short: subset.validators[i].compute_node_id_short().unwrap(),
+                    sign: CryptoSignature::from_bytes(&keys[i].sign(&data).unwrap()).unwrap(),
+                });
+                weight += subset.validators[i].weight;
+            }
+            signatures.set_weight(weight);
+            let proof = BlockProofStuff::new(
+                BlockProof::with_ordinary_signatures(
+                    id.clone(),
+                    Cell::default(),
+                    Some(BlockSignatures::with_params(
+                        ValidatorBaseInfo::with_params(42, 0),
+                        signatures,
+                    )),
+                ),
+                false,
+            )
+            .unwrap();
+            assert_eq!(proof.check_signatures(&subset).is_ok(), accepted);
+            assert_eq!(
+                proof
+                    .check_signatures_with_budget(
+                        &subset,
+                        Some(&HistoryReadBudget::new(Default::default()))
+                    )
+                    .is_ok(),
+                accepted
+            );
+            if accepted {
+                let empty =
+                    HistoryReadBudget::new(HistoryReadLimits { steps: 0, ..Default::default() });
+                let error = proof.check_signatures_with_budget(&subset, Some(&empty)).unwrap_err();
+                assert!(error.downcast_ref::<HistoryBudgetExceeded>().is_some());
+            }
+        }
     }
 }
