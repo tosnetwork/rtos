@@ -261,12 +261,24 @@ fn publication_durability_failure(error: anyhow::Error) -> anyhow::Error {
     PublicationDurabilityFailure(error).into()
 }
 
+/// Test observation at the real outbox storage boundary, not a syscall fault.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutboxSyncBoundary {
+    BeforeWrite,
+    AfterSuccessfulSync,
+}
+#[cfg(test)]
+type OutboxSyncObserver = dyn Fn(OutboxSyncBoundary, &[u8]) -> Result<()> + Send + Sync;
+
 pub struct InternalDb {
     #[cfg(test)]
     recovery_node_db: Arc<RocksDb>,
     catchain_db: Arc<RocksDb>,
     block_handle_storage: Arc<BlockHandleStorage>,
     propagation_outbox_writer: Arc<AtomicBool>,
+    #[cfg(test)]
+    outbox_sync_observer: std::sync::Mutex<Option<Arc<OutboxSyncObserver>>>,
     #[cfg(test)]
     publication_sync_observer: std::sync::Mutex<storage::durability::SyncObservation>,
     #[cfg(test)]
@@ -475,6 +487,8 @@ impl InternalDb {
             catchain_db: db_catchain,
             block_handle_storage,
             propagation_outbox_writer: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            outbox_sync_observer: std::sync::Mutex::new(None),
             #[cfg(test)]
             publication_sync_observer: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1953,8 +1967,27 @@ impl InternalDb {
         self.block_handle_storage.save_validator_state_raw(key, data)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_outbox_sync_observer(&self, observer: Option<Arc<OutboxSyncObserver>>) {
+        *self.outbox_sync_observer.lock().unwrap() = observer;
+    }
     pub fn save_validator_state_raw_sync(&self, key: &'static str, data: &[u8]) -> Result<()> {
-        self.block_handle_storage.save_validator_state_raw_sync(key, data)
+        #[cfg(test)]
+        let observer = if key == "PropagationOutboxV1" {
+            self.outbox_sync_observer.lock().unwrap().clone()
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if let Some(observer) = &observer {
+            observer(OutboxSyncBoundary::BeforeWrite, data)?;
+        }
+        self.block_handle_storage.save_validator_state_raw_sync(key, data)?;
+        #[cfg(test)]
+        if let Some(observer) = &observer {
+            observer(OutboxSyncBoundary::AfterSuccessfulSync, data)?;
+        }
+        Ok(())
     }
 
     pub fn load_validator_state_raw_bounded(

@@ -1074,7 +1074,15 @@ pub(crate) fn inspect_closure_progress(
     let Some(bytes) = db.load_validator_state_raw_bounded(KEY, limits.max_snapshot_bytes)? else {
         return Ok((Vec::new(), Vec::new()));
     };
-    let snapshot = decode_snapshot(&bytes, domain, &limits)?;
+    inspect_closure_snapshot(&bytes, domain)
+}
+
+/// Pure validation of the actual bytes about to reach the synchronous DB API.
+#[cfg(test)]
+pub(crate) fn inspect_closure_snapshot(
+    bytes: &[u8], domain: &OutboxDomain,
+) -> Result<(Vec<UnverifiedRecord>, Vec<ClosingRecord>)> {
+    let snapshot = decode_snapshot(bytes, domain, &Limits::default())?;
     Ok((snapshot.entries, snapshot.closing))
 }
 
