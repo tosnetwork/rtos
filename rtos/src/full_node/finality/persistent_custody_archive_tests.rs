@@ -108,42 +108,74 @@ async fn persistent_repair_custody_real_pack_gc_control_and_cold_authentication(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persistent_repair_archive_owner_cancel_waiter_and_shutdown_drain() {
     let Fixture { dir, engine, target, .. } = fixture(false).await;
-    let handle = engine.load_block_handle(target.id()).unwrap().unwrap();
-    assert!(!handle.is_archived(), "repair fixture must require actual migration");
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    struct ReleaseOnDrop(Arc<tokio::sync::Notify>);
-    impl Drop for ReleaseOnDrop {
-        fn drop(&mut self) { self.0.notify_one(); }
-    }
-    let _release_on_failure = ReleaseOnDrop(release.clone());
-    engine.db().test_hold_archive_migration(entered.clone(), release.clone());
-    let caller_engine = engine.clone();
-    let id = target.id().clone();
-    let caller = tokio::spawn(async move { caller_engine.db().archive_block(&id, None).await });
-    entered.notified().await;
-    caller.abort();
-    assert!(caller.await.unwrap_err().is_cancelled());
-    let waiting_engine = engine.clone();
-    let id = target.id().clone();
-    let mut waiting = tokio::spawn(async move { waiting_engine.db().archive_block(&id, None).await });
-    assert!(tokio::time::timeout(Duration::from_millis(50), &mut waiting).await.is_err());
-    let stopping_engine = engine.clone();
-    let mut stopping = tokio::spawn(async move { stopping_engine.wait_stop().await });
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while !engine.db().test_archive_admission_closed() {
-            tokio::task::yield_now().await;
+    let mut caller = None;
+    let mut waiting = None;
+    let mut stopping = None;
+    let mut completed_stop = None;
+    let run = std::panic::AssertUnwindSafe(async {
+        let handle = engine.load_block_handle(target.id()).unwrap().unwrap();
+        assert!(!handle.is_archived(), "repair fixture must require actual migration");
+        engine.db().test_hold_archive_migration(entered.clone(), release.clone());
+        let caller_engine = engine.clone();
+        let id = target.id().clone();
+        caller = Some(tokio::spawn(async move { caller_engine.db().archive_block(&id, None).await }));
+        entered.notified().await;
+        caller.as_ref().unwrap().abort();
+        assert!(caller.take().unwrap().await.unwrap_err().is_cancelled());
+        let waiting_engine = engine.clone();
+        let id = target.id().clone();
+        waiting = Some(tokio::spawn(async move { waiting_engine.db().archive_block(&id, None).await }));
+        if tokio::time::timeout(Duration::from_millis(50), waiting.as_mut().unwrap()).await.is_ok() {
+            waiting.take(); // Already joined by timeout; never poll it twice.
+            panic!("second migration bypassed the held admission permit");
         }
-    }).await.expect("shutdown must close admission even with an active IO owner");
-    assert!(waiting.await.unwrap().unwrap_err().to_string().contains("admission stopped"));
-    assert!(tokio::time::timeout(Duration::from_millis(50), &mut stopping).await.is_err(),
-        "shutdown cannot pass the real admitted migration owner");
-    assert!(!handle.is_archived());
+        let stopping_engine = engine.clone();
+        stopping = Some(tokio::spawn(async move { stopping_engine.wait_stop().await }));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !engine.db().test_archive_admission_closed() {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("shutdown must close admission even with an active IO owner");
+        assert!(waiting.take().unwrap().await.unwrap().unwrap_err().to_string().contains("admission stopped"));
+        if let Ok(result) = tokio::time::timeout(Duration::from_millis(50), stopping.as_mut().unwrap()).await {
+            stopping.take();
+            completed_stop = Some(result);
+            panic!("shutdown passed the real admitted migration owner");
+        }
+        assert!(!handle.is_archived());
+        handle
+    }).catch_unwind().await;
+    // Release before joining anything, including every assertion-failure path.
     release.notify_one();
-    stopping.await.unwrap().unwrap();
+    let mut child_failures = Vec::new();
+    for child in [caller.take(), waiting.take()].into_iter().flatten() {
+        child.abort();
+        if let Err(error) = child.await {
+            if !error.is_cancelled() { child_failures.push(error.to_string()); }
+        }
+    }
+    let stopped = if let Some(result) = completed_stop {
+        result.map_err(|error| rtos_block::error!("shutdown owner: {error}"))
+            .and_then(|result| result)
+    } else if let Some(child) = stopping.take() {
+        child.await.map_err(|error| rtos_block::error!("shutdown owner: {error}"))
+            .and_then(|result| result)
+    } else {
+        engine.clone().wait_stop().await
+    };
+    // A panicked shutdown observation still cannot skip the actual Engine drain.
+    let drained = engine.clone().wait_stop().await;
+    let weak = Arc::downgrade(&engine);
+    drop(engine);
+    let handle = run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    stopped.unwrap();
+    drained.unwrap();
+    assert!(child_failures.is_empty(), "observer failures: {child_failures:?}");
+    assert!(weak.upgrade().is_none());
     assert!(handle.is_archived(), "cancelled observer's actual migration must complete");
     drop(handle);
-    close(engine).await;
     drop(dir);
 }
 
@@ -152,34 +184,41 @@ async fn persistent_repair_archive_metadata_wal_failure_retains_loose_and_cold_r
     use storage::archives::package_entry_id::{GetFileName, PackageEntryId};
     let Fixture { dir, engine, target, .. } = fixture(false).await;
     let id = target.id().clone();
-    let handle = engine.load_block_handle(&id).unwrap().unwrap();
-    assert!(!handle.is_archived());
-    let proof = engine.load_block_proof(&handle, false).await.unwrap();
-    let base = PathBuf::from(engine.db_root_dir().unwrap()).join("archive/unapplied");
-    let body_path = base.join(PackageEntryId::Block(&id).filename_short());
-    let proof_path = base.join(PackageEntryId::Proof(&id).filename_short());
-    let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let observed_worker = observed.clone();
-    engine.db().set_publication_sync_observer(Some(Arc::new(move |point, _| {
-        if point == storage::durability::SyncPoint::Wal {
-            observed_worker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            return Err(std::io::Error::from_raw_os_error(5).into());
-        }
-        Ok(())
-    })));
-    let error = engine.db().archive_block(&id, None).await.unwrap_err();
-    assert!(error.to_string().contains("Failed to move block"));
-    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert!(handle.is_archived(), "failure occurred after metadata flag/enqueue, at actual WAL sync");
-    assert_eq!(std::fs::read(&body_path).unwrap(), target.data());
-    assert_eq!(std::fs::read(&proof_path).unwrap(), proof.data());
+    let run = std::panic::AssertUnwindSafe(async {
+        let handle = engine.load_block_handle(&id).unwrap().unwrap();
+        assert!(!handle.is_archived());
+        let proof = engine.load_block_proof(&handle, false).await.unwrap();
+        let base = PathBuf::from(engine.db_root_dir().unwrap()).join("archive/unapplied");
+        let body_path = base.join(PackageEntryId::Block(&id).filename_short());
+        let proof_path = base.join(PackageEntryId::Proof(&id).filename_short());
+        let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_worker = observed.clone();
+        // Inject EIO at the real WAL boundary; this does not claim an OS syscall
+        // returned EIO. The observer cannot fake a successful synchronization.
+        engine.db().set_publication_sync_observer(Some(Arc::new(move |point, _| {
+            if point == storage::durability::SyncPoint::Wal {
+                observed_worker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(std::io::Error::from_raw_os_error(5).into());
+            }
+            Ok(())
+        })));
+        let error = engine.db().archive_block(&id, None).await.unwrap_err();
+        assert!(error.to_string().contains("Failed to move block"));
+        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(handle.is_archived(), "failure occurred after metadata flag/enqueue, at the WAL boundary");
+        assert_eq!(std::fs::read(&body_path).unwrap(), target.data());
+        assert_eq!(std::fs::read(&proof_path).unwrap(), proof.data());
+        engine.db().set_publication_sync_observer(None);
+        assert!(engine.db().archive_block(&id, None).await.unwrap_err().to_string().contains("admission stopped"),
+            "unknown WAL result must not be hidden by the in-memory archived flag");
+        (proof, body_path, proof_path)
+    }).catch_unwind().await;
     engine.db().set_publication_sync_observer(None);
-    assert!(engine.db().archive_block(&id, None).await.unwrap_err().to_string().contains("admission stopped"),
-        "unknown WAL result must not be hidden by the in-memory archived flag");
-    assert!(engine.clone().wait_stop().await.is_err(), "actual migration failure must reach Engine shutdown");
-    drop(handle);
+    let stopped = engine.clone().wait_stop().await;
     let weak = Arc::downgrade(&engine);
     drop(engine);
+    let (proof, body_path, proof_path) = run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    assert!(stopped.is_err(), "actual migration failure must reach Engine shutdown");
     assert!(weak.upgrade().is_none());
     let engine = open_engine(dir.path()).await;
     let run = std::panic::AssertUnwindSafe(async {
@@ -190,6 +229,8 @@ async fn persistent_repair_archive_metadata_wal_failure_retains_loose_and_cold_r
         assert_eq!(std::fs::read(&body_path).unwrap(), target.data());
         assert_eq!(std::fs::read(&proof_path).unwrap(), proof.data());
     }).catch_unwind().await;
-    close(engine).await;
+    let stopped = engine.clone().wait_stop().await;
+    drop(engine);
     run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    stopped.unwrap();
 }
