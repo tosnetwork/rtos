@@ -1438,10 +1438,22 @@ impl<'a> OverlayParams<'a> {
     }
 }
 
+/// Owned completion receipt for one concrete overlay generation.
+#[derive(Clone)]
+pub struct OverlayShutdown {
+    id: Arc<OverlayShortId>,
+    tasks: Arc<AdnlTasks>,
+}
+impl OverlayShutdown {
+    pub fn drained(&self) -> bool {
+        self.tasks.drained()
+    }
+}
+
 /// Overlay Node
 pub struct OverlayNode {
     generations: std::sync::Mutex<()>,
-    retired: std::sync::Mutex<HashMap<Arc<OverlayShortId>, Arc<AdnlTasks>>>,
+    retired: std::sync::Mutex<HashMap<Arc<OverlayShortId>, std::sync::Weak<AdnlTasks>>>,
     wire_profile: rtos_api::WireProfile,
     adnl: Arc<AdnlNode>,
     consumers: lockfree::map::Map<Arc<OverlayShortId>, ConsumerObject>,
@@ -1813,25 +1825,46 @@ impl OverlayNode {
         self.delete_overlay(overlay_id, true)
     }
 
-    /// Close admission and join the actual task graph of the removed generation.
-    /// The finalizer is retained even if this individual caller is cancelled.
-    pub async fn delete_private_overlay_checked(&self, id: &Arc<OverlayShortId>) -> Result<bool> {
-        let (removed, tasks) = {
-            let _generation = self.generations.lock().unwrap();
-            let removed = self.delete_overlay_locked(id, true)?;
-            let tasks = self.retired.lock().unwrap().get(id).cloned();
-            (removed, tasks)
-        };
-        if let Some(tasks) = tasks {
-            tasks.wait().await?;
-        }
-        Ok(removed)
+    /// Capture a generation before starting teardown. Keep this receipt for
+    /// repeated waiters; an old receipt can never remove a replacement overlay.
+    pub fn overlay_generation(&self, id: &Arc<OverlayShortId>) -> Result<OverlayShutdown> {
+        let overlay = self.get_overlay(id, "Capturing unknown overlay generation")?;
+        Ok(OverlayShutdown { id: id.clone(), tasks: overlay.tasks.clone() })
     }
 
-    pub fn private_overlay_drained(&self, id: &Arc<OverlayShortId>) -> bool {
-        let _generation = self.generations.lock().unwrap();
-        self.overlays.get(id).is_none()
-            && self.retired.lock().unwrap().get(id).is_some_and(|tasks| tasks.drained())
+    pub async fn delete_private_overlay_checked(
+        &self,
+        generation: &OverlayShutdown,
+    ) -> Result<bool> {
+        self.delete_overlay_checked(generation, true).await
+    }
+    pub async fn delete_public_overlay_checked(
+        &self,
+        generation: &OverlayShutdown,
+    ) -> Result<bool> {
+        self.delete_overlay_checked(generation, false).await
+    }
+    async fn delete_overlay_checked(
+        &self,
+        generation: &OverlayShutdown,
+        private: bool,
+    ) -> Result<bool> {
+        let removed = {
+            let _generation = self.generations.lock().unwrap();
+            let same = self
+                .overlays
+                .get(&generation.id)
+                .is_some_and(|current| Arc::ptr_eq(&current.val().tasks, &generation.tasks));
+            if same {
+                self.delete_overlay_locked(&generation.id, private)?
+            } else if generation.tasks.is_closed() {
+                false
+            } else {
+                fail!("Overlay generation belongs to a different owner");
+            }
+        };
+        generation.tasks.wait().await?;
+        Ok(removed)
     }
 
     /// Delete public_overlay
@@ -2188,13 +2221,13 @@ impl OverlayNode {
         self.add_overlay_locked(overlay_type, params)
     }
     fn add_overlay_locked(&self, overlay_type: OverlayType, params: OverlayParams) -> Result<bool> {
-        if let Some(retired) = self.retired.lock().unwrap().get(params.overlay_id) {
-            if !retired.drained() {
+        {
+            let mut retired = self.retired.lock().unwrap();
+            retired.retain(|_, tasks| tasks.upgrade().is_some_and(|tasks| !tasks.drained()));
+            if retired.contains_key(params.overlay_id) {
                 fail!("Previous overlay generation is still draining");
             }
         }
-        self.retired.lock().unwrap().remove(params.overlay_id);
-
         log::debug!(target: TARGET, "Add overlay {} to node", params.overlay_id);
         if !overlay_type.is_public()
             && ((params.flags & Overlay::FLAG_OVERLAY_OTHER_WORKCHAIN) != 0)
@@ -2550,7 +2583,7 @@ impl OverlayNode {
                 fail!("Try to delete private overlay {} as public", overlay_id)
             }
             overlay.tasks.close();
-            self.retired.lock().unwrap().insert(overlay_id.clone(), overlay.tasks.clone());
+            self.retired.lock().unwrap().insert(overlay_id.clone(), Arc::downgrade(&overlay.tasks));
             if let Some(transport) = overlay.plumtree.get() {
                 transport.stopped.store(true, Ordering::Release);
             }
@@ -2984,7 +3017,31 @@ impl Subscriber for OverlayNode {
         };
         match consumer.try_consume_query(object, peers).await {
             Err(msg) => fail!("Unsupported query {msg} in overlay {overlay_id}"),
-            r => r,
+            Ok(QueryResult::Consumed(QueryAnswer::Pending(worker))) => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let response_tasks = overlay.tasks.clone();
+                let future = async move {
+                    let result = match worker.await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            response_tasks.failed(format!("Overlay response worker: {error}"));
+                            Err(error!("Overlay response worker: {error}"))
+                        }
+                    };
+                    let _ = tx.send(result);
+                };
+                if let Err(future) =
+                    overlay.tasks.spawn_or_return("overlay pending response", future)
+                {
+                    // Already accepted by this handler. Closing admission may
+                    // reject the child but cannot detach its real JoinHandle.
+                    future.await;
+                }
+                Ok(QueryResult::Consumed(QueryAnswer::Pending(tokio::spawn(async move {
+                    rx.await.map_err(|_| error!("Overlay response owner failed"))?
+                }))))
+            }
+            result => result,
         }
     }
 }
@@ -3180,7 +3237,9 @@ impl OverlayNode {
         config: PlumtreeConfig,
         _runtime: &tokio::runtime::Handle,
     ) -> Result<()> {
+        let _generation = self.generations.lock().unwrap();
         let overlay = self.get_overlay(overlay_id, "Configuring Plumtree on unknown overlay")?;
+        let _lease = overlay.tasks.enter()?;
         if overlay.flags & Overlay::FLAG_OVERLAY_OTHER_WORKCHAIN != 0 {
             fail!("Plumtree cannot be enabled for an inactive workchain");
         }
@@ -3203,7 +3262,7 @@ impl OverlayNode {
         overlay.plumtree.set(PlumtreeTransport { quic, engine: std::sync::Mutex::new(engine), local, original_sender, stopped: std::sync::atomic::AtomicBool::new(false) })
             .map_err(|_| error!("Plumtree policy is already installed; recreate the overlay to change its authority"))?;
         let weak = Arc::downgrade(&overlay);
-        overlay.tasks.spawn_cancelable("plumtree ticker", async move {
+        let admitted = overlay.tasks.spawn_cancelable("plumtree ticker", async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(50));
             loop {
                 ticker.tick().await;
@@ -3222,6 +3281,12 @@ impl OverlayNode {
                 }
             }
         });
+        if !admitted {
+            if let Some(transport) = overlay.plumtree.get() {
+                transport.stopped.store(true, Ordering::Release);
+            }
+            fail!("Plumtree activation raced overlay failure");
+        }
         Ok(())
     }
 

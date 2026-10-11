@@ -800,6 +800,8 @@ impl Subscriber for AdnlOverlayConsumer {
 */
 
 struct AdnlOverlay {
+    lower_generation: adnl::OverlayShutdown,
+    lower_block_sync_generation: Option<adnl::OverlayShutdown>,
     tasks: Arc<AsyncOwner>,
     shutdown: Arc<AsyncOwner>,
     shutdown_started: Mutex<bool>,
@@ -1150,6 +1152,11 @@ impl AdnlOverlay {
         let local_id = local_id.clone();
         let block_sync_overlay_id_for_cyclic = block_sync_overlay_id.clone();
         let block_sync_stats_for_cyclic = block_sync_stats.clone();
+        let lower_generation = stack.overlay.overlay_generation(&overlay_id)?;
+        let lower_block_sync_generation = block_sync_overlay_id
+            .as_ref()
+            .map(|id| stack.overlay.overlay_generation(id))
+            .transpose()?;
         let overlay = Arc::new_cyclic(|weak_overlay| {
             // Create consumer with weak reference to overlay
             let consumer = Arc::new(AdnlOverlayConsumer::new(
@@ -1210,6 +1217,8 @@ impl AdnlOverlay {
                 .collect();
 
             AdnlOverlay {
+                lower_generation,
+                lower_block_sync_generation,
                 tasks: AsyncOwner::new(runtime_handle.clone()),
                 shutdown: AsyncOwner::new(runtime_handle.clone()),
                 shutdown_started: Mutex::new(false),
@@ -1283,8 +1292,8 @@ impl AdnlOverlay {
         let peers = std::mem::take(&mut *self.peers.lock().unwrap());
         let storage = self.peers_storage.clone();
         let overlay = self.stack.overlay.clone();
-        let id = self.overlay_id.clone();
-        let block_sync = self.block_sync_overlay_id.clone();
+        let generation = self.lower_generation.clone();
+        let block_sync = self.lower_block_sync_generation.clone();
         let errors = self.shutdown_errors.clone();
         let cleanup_complete = self.cleanup_complete.clone();
         let runtime = self.runtime_handle.clone();
@@ -1312,15 +1321,15 @@ impl AdnlOverlay {
                     false
                 }
             };
-            if let Err(error) = overlay.delete_private_overlay_checked(&id).await {
+            if let Err(error) = overlay.delete_private_overlay_checked(&generation).await {
                 errors.lock().unwrap().push(error.to_string());
             }
-            let mut network_drained = overlay.private_overlay_drained(&id);
-            if let Some(id) = block_sync {
-                if let Err(error) = overlay.delete_private_overlay_checked(&id).await {
+            let mut network_drained = generation.drained();
+            if let Some(generation) = block_sync {
+                if let Err(error) = overlay.delete_private_overlay_checked(&generation).await {
                     errors.lock().unwrap().push(error.to_string());
                 }
-                network_drained &= overlay.private_overlay_drained(&id);
+                network_drained &= generation.drained();
             }
             cleanup_complete.store(peers_drained && network_drained, Ordering::Release);
         });
