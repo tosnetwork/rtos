@@ -268,3 +268,6 @@ async fn persistent_closure_engine_real_source_smoke_and_cold_backup() {
 async fn persistent_closure_engine_single_active_session_over_1024() {
     circulation(1025).await;
 }
+
+#[path = "persistent_closure_crash_tests.rs"]
+mod persistent_closure_crash_tests;
