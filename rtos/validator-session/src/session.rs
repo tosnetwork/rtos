@@ -378,6 +378,21 @@ struct LoopbackOverlayManager {
 }
 
 impl CatchainOverlayManager for LoopbackOverlayManager {
+    fn stop_overlay_checked(
+        &self,
+        _: &Arc<PrivateOverlayShortId>,
+        overlay: &CatchainOverlayPtr,
+    ) -> Result<()> {
+        if !self.overlay_drained(overlay) {
+            fail!("Unexpected loopback overlay implementation");
+        }
+        Ok(())
+    }
+    fn overlay_drained(&self, overlay: &CatchainOverlayPtr) -> bool {
+        // Delivery is synchronous on the already-owned consensus worker.
+        overlay.get_impl().is::<LoopbackOverlay>()
+    }
+
     /// Create new overlay
     fn start_overlay(
         &self,

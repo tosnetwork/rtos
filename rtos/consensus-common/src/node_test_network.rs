@@ -555,6 +555,21 @@ impl ToggleableOverlayManager {
 }
 
 impl ConsensusOverlayManager for ToggleableOverlayManager {
+    fn stop_overlay_checked(
+        &self,
+        id: &Arc<PrivateOverlayShortId>,
+        overlay: &ConsensusOverlayPtr,
+    ) -> Result<()> {
+        let result = self.inner.stop_overlay_checked(id, overlay);
+        if self.inner.overlay_drained(overlay) {
+            self.listener_keepalive.lock().unwrap().remove(id);
+        }
+        result
+    }
+    fn overlay_drained(&self, overlay: &ConsensusOverlayPtr) -> bool {
+        self.inner.overlay_drained(overlay)
+    }
+
     fn start_overlay(
         &self,
         local_validator_key: &PrivateKey,

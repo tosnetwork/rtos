@@ -240,3 +240,34 @@ async fn overlay_owned_retirement_index_does_not_accumulate_completed_sessions()
     assert!(receipts.iter().all(OverlayShutdown::drained));
     adnl.stop_checked().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlay_owned_real_fec_encoder_and_distribution_release_generation() {
+    let adnl = node(106).await;
+    let overlay = OverlayNode::with_params(adnl.clone(), &[1; 32], 0).unwrap();
+    let key = adnl.key_by_tag(0).unwrap();
+    let id = KeyId::from_data([107; 32]);
+    overlay.add_private_overlay(OverlayParams::with_id_only(&id), &key, &[], false, None).unwrap();
+    let generation = overlay.overlay_generation(&id).unwrap();
+    let weak = Arc::downgrade(&overlay.get_overlay(&id, "fixture").unwrap());
+    let payload = vec![0x5a; 128 * 1024];
+    let info = overlay
+        .broadcast(
+            &id,
+            &TaggedByteSlice {
+                object: &payload,
+                #[cfg(feature = "telemetry")]
+                tag: 0,
+            },
+            None,
+            0,
+            AdnlSendMethod::Fast,
+        )
+        .await
+        .unwrap();
+    assert!(info.packets > 0, "real FEC encoder was not admitted");
+    bounded(overlay.delete_private_overlay_checked(&generation)).await.unwrap();
+    assert!(generation.drained());
+    assert!(weak.upgrade().is_none());
+    adnl.stop_checked().await.unwrap();
+}
