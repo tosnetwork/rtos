@@ -157,3 +157,55 @@ fn bounded_boc_reader_header_refuses_before_root_list_read() {
     assert_eq!(budget.bytes.load(Ordering::Relaxed), std::mem::size_of::<u32>());
     assert!(BocReader::new().read_bounded(&bytes, &Budget::new(usize::MAX, 0)).is_err());
 }
+
+#[test]
+fn bounded_boc_large_state_repeated_parse_and_reencode_default_work_budget() {
+    let mut level: Vec<_> = (0u32..18_000)
+        .map(|index| {
+            let mut bytes = vec![0x59; 127];
+            bytes[..4].copy_from_slice(&index.to_be_bytes());
+            crate::BuilderData::with_raw(bytes, 1016).unwrap().into_cell().unwrap()
+        })
+        .collect();
+    // Pair off nodes, promoting an unpaired node unchanged: exactly n-1 parents.
+    while level.len() > 1 {
+        level = level
+            .chunks(2)
+            .map(|children| {
+                if children.len() == 1 {
+                    return children[0].clone();
+                }
+                let mut parent = BuilderData::new();
+                for child in children {
+                    parent.checked_append_reference(child.clone()).unwrap();
+                }
+                parent.into_cell().unwrap()
+            })
+            .collect();
+    }
+    let root = level.pop().unwrap();
+    let original = BocWriter::with_root(&root).unwrap().write_to_vec().unwrap();
+    assert!(original.len() > 2 << 20);
+    let run = |budget: &Budget| -> Result<Vec<u8>> {
+        let mut reader = BocReader::new();
+        let first = reader.read_bounded(&original, budget)?.withdraw_single_root()?;
+        let encoded =
+            BocWriter::with_flags_bounded([first], BocFlags::all(), budget)?.write_to_vec()?;
+        let second = reader.read_bounded(&encoded, budget)?.withdraw_single_root()?;
+        assert_eq!(second.repr_hash(), root.repr_hash());
+        Ok(encoded)
+    };
+    // This is the production default work allowance. Workspace and graph
+    // accounting for complete Engine recovery are intentionally separate tests.
+    let measure = Budget::new(4_000_000, usize::MAX);
+    let expected = run(&measure).unwrap();
+    let work = measure.work.load(Ordering::Relaxed);
+    let workspace = measure.bytes.load(Ordering::Relaxed);
+    eprintln!("large bounded BOC: bytes={}, work={}, workspace={}", original.len(), work, workspace);
+    assert!(work < 4_000_000);
+    let exact = Budget::new(work, workspace);
+    assert_eq!(run(&exact).unwrap(), expected);
+    assert!(BocReader::new().read_bounded(&original, &exact).is_err());
+    assert!(run(&Budget::new(work - 1, workspace)).is_err());
+    assert!(BocReader::new().read_bounded(&original, &Budget::new(0, usize::MAX)).is_err());
+}

@@ -569,11 +569,12 @@ macro_rules! define_BocWriter {
 
             pub fn write<T: Write>(self, dest: &mut T) -> Result<()> {
                 if let Some(budget) = self.budget {
-                    // Byte processing includes both encoding and CRC hashing. The CRC
-                    // buffer may grow once when a final cell write crosses its limit.
-                    crate::config_read_budget::steps(budget, self.calc_boc_size())?;
+                    // One work unit handles at most 64 bytes of encoding or CRC.
+                    // Cell/edge traversal is charged separately. The CRC buffer
+                    // may grow once when a final cell write crosses its limit.
+                    crate::config_read_budget::steps(budget, self.calc_boc_size().div_ceil(64))?;
                     if self.flags.contains(BocFlags::Crc32) {
-                        crate::config_read_budget::steps(budget, self.calc_boc_size())?;
+                        crate::config_read_budget::steps(budget, self.calc_boc_size().div_ceil(64))?;
                         budget.workspace(CRC_BUF_SIZE * 3)?;
                     }
                 }
@@ -1578,7 +1579,7 @@ impl<'a> BocReader<'a> {
 
         // CRC32-C: single call on the whole buffer
         if header.has_crc {
-            if let Some(b) = budget { crate::config_read_budget::steps(b, data.len())?; }
+            if let Some(b) = budget { crate::config_read_budget::steps(b, data.len().div_ceil(64))?; }
             let crc = crc32_digest(&data[..data.len() - 4]);
             let stored = u32::from_le_bytes(
                 data[data.len() - 4..].try_into().map_err(|_| error!("data too short for CRC"))?,
@@ -1722,12 +1723,17 @@ impl<'a> BocReader<'a> {
 
             // Build cell (validates data, allocates, computes hashes, writes refs)
             if let Some(b) = budget {
-                // Hash rounds follow the descriptor's level mask. Each round
-                // includes the cell data and the actual child hash/depth inputs.
+                // Charge actual SHA256 compression blocks, including padding
+                // and the 64-bit length suffix separately for each hash round.
+                // Later level hashes consume the previous 32-byte digest.
                 let rounds = cell::hashes_count(raw);
-                let hash_bytes = wire_len + rc * (SHA256_SIZE + DEPTH_SIZE)
-                    + (rounds - 1) * (2 + SHA256_SIZE + rc * (SHA256_SIZE + DEPTH_SIZE));
-                crate::config_read_budget::steps(b, hash_bytes)?;
+                let first = 2 + cell::cell_data_len(raw) + rc * (SHA256_SIZE + DEPTH_SIZE);
+                let later = 2 + SHA256_SIZE + rc * (SHA256_SIZE + DEPTH_SIZE);
+                let blocks = (first + 9).div_ceil(64)
+                    + (rounds - 1) * (later + 9).div_ceil(64);
+                crate::config_read_budget::steps(b, blocks)?;
+                // Copy and validation scans include any supplied stored hashes.
+                crate::config_read_budget::steps(b, wire_len.div_ceil(64))?;
                 b.workspace(crate::merkle_apply_budget::NEW_CELL_ALLOCATION)?;
             }
             let cell = Cell::with_data_and_refs(
