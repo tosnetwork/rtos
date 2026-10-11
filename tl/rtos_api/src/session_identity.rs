@@ -106,6 +106,12 @@ pub fn session_options_bytes(
     config: &rtos_block::ConsensusConfig,
     catchain: &rtos_block::CatchainConfig,
 ) -> Result<Vec<u8>> {
+    crate::serialize_boxed(&session_options_value(config, catchain))
+}
+fn session_options_value(
+    config: &rtos_block::ConsensusConfig,
+    catchain: &rtos_block::CatchainConfig,
+) -> ton::validator_session::Config {
     use ton::validator_session::config::{Config, ConfigNew, ConfigVersioned, ConfigVersionedV2};
     let opts = match config.proto_version {
         0 if !config.new_catchain_ids => Config {
@@ -167,7 +173,7 @@ pub fn session_options_bytes(
         }
         .into_boxed(),
     };
-    crate::serialize_boxed(&opts)
+    opts
 }
 
 /// Use the governing state's intrinsic global ID and exact selected Param30 cell.
@@ -230,4 +236,72 @@ pub fn decode_session_group(bytes: &[u8]) -> Result<ton::validator::Group> {
         fail!("session group has trailing bytes");
     }
     Ok(group)
+}
+
+/// Bounded serialization with exact counting before the output allocation.
+fn serialize_bounded<T: crate::BoxedSerialize>(value: &T,
+    budget: &dyn rtos_block::config_read_budget::ConfigReadBudget) -> Result<Vec<u8>> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| std::io::Error::other("TL length overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut count = Count(0);
+    crate::Serializer::new(&mut count).write_boxed(value)?;
+    let mut output = rtos_block::config_read_budget::vector::<u8>(budget, count.0)?;
+    crate::Serializer::new(&mut output).write_boxed(value)?;
+    Ok(output)
+}
+pub fn derive_session_from_decoded_bounded(
+    global_id: i32, config: &rtos_block::DecodedSessionConfig,
+    mut coordinates: SessionCoordinates<'_>, validators: &[ValidatorDescr],
+    budget: &dyn rtos_block::config_read_budget::ConfigReadBudget,
+) -> Result<SessionIdentity> {
+    use ton::validator::group::{Group, GroupEx, GroupNew};
+    use ton::engine::validator::validator::groupmember::{GroupMember, GroupMemberPQ};
+    rtos_block::validators::validate_validator_list_bounded(validators, budget)?;
+    config.selected.config.validate_protocol_version()?;
+    coordinates.new_catchain_ids = config.consensus.new_catchain_ids;
+    let options = serialize_bounded(&session_options_value(&config.consensus, &config.catchain), budget)?;
+    let options_hash = UInt256::calc_file_hash(&options);
+    // The commitment input is fixed, independent of dictionary/body sizes.
+    const DOMAIN: &[u8] = b"TOS-VALIDATOR-SESSION-CONFIG-v1";
+    let mut commitment = [0u8; b"TOS-VALIDATOR-SESSION-CONFIG-v1".len() + 4 + 32 + 32];
+    // Keep the domain size checked rather than silently changing hash preimages.
+    let mut cursor = std::io::Cursor::new(commitment.as_mut_slice());
+    use std::io::Write;
+    cursor.write_all(DOMAIN)?;
+    cursor.write_all(&global_id.to_le_bytes())?;
+    cursor.write_all(options_hash.as_slice())?;
+    cursor.write_all(config.selected.cell_hash().as_slice())?;
+    let length = cursor.position() as usize;
+    drop(cursor);
+    let config_hash = UInt256::calc_file_hash(&commitment[..length]);
+    let mut members = rtos_block::config_read_budget::vector(budget, validators.len())?;
+    for v in validators {
+        budget.step()?;
+        let weight = i64::try_from(v.weight)?;
+        let adnl = v.adnl_addr.clone().unwrap_or_default();
+        members.push(match &v.key {
+            ValidatorKey::Ed25519(_) => GroupMember { public_key_hash: v.validator_id_bounded(budget)?, adnl, weight }.into_boxed(),
+            ValidatorKey::Pq(key) => GroupMemberPQ { validator_id: v.validator_id_bounded(budget)?, key_id: key.key_id.clone(), adnl, weight }.into_boxed(),
+        });
+    }
+    let workchain = coordinates.shard.workchain_id();
+    let shard = coordinates.shard.shard_prefix_with_tag() as i64;
+    let catchain_seqno = coordinates.catchain_seqno as i32;
+    let vertical_seqno = coordinates.vertical_seqno as i32;
+    let group = if coordinates.new_catchain_ids {
+        GroupNew { workchain, shard, vertical_seqno, last_key_block_seqno: coordinates.last_key_block_seqno as i32,
+            catchain_seqno, config_hash: config_hash.clone(), members }.into_boxed()
+    } else if vertical_seqno == 0 {
+        Group { workchain, shard, catchain_seqno, config_hash: config_hash.clone(), members }.into_boxed()
+    } else {
+        GroupEx { workchain, shard, vertical_seqno, catchain_seqno, config_hash: config_hash.clone(), members }.into_boxed()
+    };
+    let bytes = serialize_bounded(&group, budget)?;
+    Ok(SessionIdentity { config_hash, session_id: UInt256::calc_file_hash(&bytes) })
 }
