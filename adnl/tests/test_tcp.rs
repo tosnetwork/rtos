@@ -115,3 +115,33 @@ fn tcp_session() {
         sleep(Duration::from_millis(200));
     })
 }
+
+#[cfg(all(feature = "client", feature = "server"))]
+#[test]
+fn tcp_ephemeral_listener_reports_actual_endpoint_for_client() {
+    let rt = init_test();
+    rt.block_on(async {
+        let mut server_config: serde_json::Value = serde_json::from_str(ADNL_SERVER_CONFIG).unwrap();
+        server_config["address"] = "127.0.0.1:0".into();
+        let server = AdnlServer::listen(
+            AdnlServerConfig::from_json(&server_config.to_string()).unwrap(),
+            vec![],
+            #[cfg(feature = "telemetry")]
+            "ephemeral test server",
+        ).await.unwrap();
+        let endpoint = server.local_addr();
+        let result: Result<()> = async {
+            assert_ne!(endpoint.port(), 0);
+            assert!(std::net::TcpListener::bind(endpoint).is_err());
+            let mut config: serde_json::Value = serde_json::from_str(ADNL_CLIENT_CONFIG).unwrap();
+            config["server_address"] = endpoint.to_string().into();
+            let (_, config) = AdnlClientConfig::from_json(&config.to_string())?;
+            let mut client = AdnlClient::connect(&config).await?;
+            let ping = request_server(&mut client).await;
+            client.shutdown().await?;
+            ping
+        }.await;
+        server.shutdown().await;
+        result.unwrap();
+    });
+}
