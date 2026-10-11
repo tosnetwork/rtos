@@ -1056,7 +1056,7 @@ impl SpoolFixture {
             }
         };
         let state_root =
-            read_single_root_boc(&decode(&fixture["next_state_boc"])).unwrap().repr_hash();
+            read_single_root_boc(&decode(&fixture["next_state_boc"])).unwrap().repr_hash().clone();
         Self { dir, engine, runtime, block, row, state_root }
     }
 }

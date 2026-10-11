@@ -749,7 +749,7 @@ async fn publication_durable_sink_wal_receipt_reopens_and_accepts_creator_bound_
                         block.block().unwrap().read_extra().unwrap().created_by().clone()
                     );
                     assert_eq!(delivery.origin.as_ref().unwrap().local_validator_index, Some(0));
-                    assert_eq!(stored.record.block_data, block.data().as_slice());
+                    assert_eq!(stored.record.block_data, block.data());
                     assert_eq!(stored.record.carrier.is_final(), final_role);
                     assert!(
                         stored.record.locally_generated,
@@ -779,7 +779,7 @@ async fn publication_durable_sink_wal_receipt_reopens_and_accepts_creator_bound_
                 assert!(!handle.is_applied(), "durable acceptance cannot fake MC inclusion");
                 assert_eq!(
                     reopened.load_state(block.id()).await.unwrap().root_cell().repr_hash(),
-                    state_root
+                    &state_root
                 );
                 let sink = reopened.clone().durable_finality_sink(runtime.clone()).await.unwrap();
                 assert_eq!(
@@ -809,7 +809,7 @@ async fn publication_durable_sink_wal_receipt_reopens_and_accepts_creator_bound_
                 assert_eq!(stored.pending, stored.record.effects);
                 assert_eq!(
                     reopened.load_state(block.id()).await.unwrap().root_cell().repr_hash(),
-                    state_root
+                    &state_root
                 );
                 assert!(!reopened.load_block_handle(block.id()).unwrap().unwrap().is_applied());
             })
