@@ -294,6 +294,23 @@ fn cells(root: &Cell) -> HashMap<UInt256, Cell> {
     found
 }
 
+// Raw fault injection must replay the same merge operands as production.
+// Opening with default CF options can stop WAL recovery at a counter Merge.
+fn open_cells_for_fault_injection(root: &Path) -> Arc<RocksDb> {
+    use storage::{dynamic_boc_rc_db::DynamicBocDb, shardstate_db_async::CellsDbConfig};
+    let config = CellsDbConfig::default();
+    let (cells, cells_cache) = DynamicBocDb::build_cells_cf_options(&config);
+    let (counters, counters_cache) = DynamicBocDb::build_counters_cf_options(&config);
+    let options = HashMap::from([
+        ("cells_db_v6".to_owned(), cells),
+        ("cells_db_v6_counters".to_owned(), counters),
+    ]);
+    let db = RocksDb::new(root, NODE_DB_NAME, options, AccessType::ReadWrite).unwrap();
+    db.register_cache(cells_cache);
+    db.register_cache(counters_cache);
+    db
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mc_live_repair_dependency_missing_target_only_child_never_returns_custody() {
     let Fixture { dir, engine, parent, target, request } = fixture(false).await;
@@ -325,18 +342,13 @@ async fn mc_live_repair_dependency_missing_target_only_child_never_returns_custo
     close(engine).await;
     let (root, mut children, expected_root) =
         setup.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-    let db = RocksDb::new(&root, NODE_DB_NAME, None, AccessType::ReadWrite).unwrap();
+    let db = open_cells_for_fault_injection(&root);
     let table = db.clone().table::<UInt256>("cells_db_v6", false).unwrap();
-    // Select a physically stored descendant after shutdown, rather than an
-    // arbitrary logical cell from the cached state graph.
     assert!(table.try_get_raw(expected_root.as_slice()).unwrap().is_some());
     children.sort();
-    let (child, bytes) = children
-        .into_iter()
-        .find_map(|child| {
-            table.try_get_raw(child.as_slice()).unwrap().map(|bytes| (child, bytes.to_vec()))
-        })
-        .expect("fixture needs a physically stored target-only descendant");
+    let child = children.into_iter().next().unwrap();
+    let bytes = table.try_get_raw(child.as_slice()).unwrap()
+        .expect("selected target-only descendant must physically exist").to_vec();
     table.delete_raw(child.as_slice()).unwrap();
     db.sync_wal().unwrap();
     drop(table);
@@ -359,7 +371,7 @@ async fn mc_live_repair_dependency_missing_target_only_child_never_returns_custo
     .catch_unwind()
     .await;
     close(engine).await;
-    let db = RocksDb::new(&root, NODE_DB_NAME, None, AccessType::ReadWrite).unwrap();
+    let db = open_cells_for_fault_injection(&root);
     let table = db.clone().table::<UInt256>("cells_db_v6", false).unwrap();
     table.put_raw_sync(child.as_slice(), &bytes).unwrap();
     drop(table);
