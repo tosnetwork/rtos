@@ -79,7 +79,7 @@ impl RuntimeManifest {
         }
         Ok(Self { _locked: file })
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-support"))]
     pub(crate) fn provision_test_validator(
         runtime: &AuthenticatedSessionRuntime,
         directory: &Path,
@@ -87,7 +87,13 @@ impl RuntimeManifest {
         if !matches!(runtime.local_role(), LocalRole::Validator(_)) {
             fail!("Test provisioning requires validator role");
         }
-        std::fs::create_dir_all(directory)?;
+        // Explicit fixture provisioning never repairs or completes an existing
+        // namespace. Atomic create_dir rejects existing files, directories and
+        // symlinks before any database or manifest write.
+        if let Some(parent) = directory.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::create_dir(directory)?;
         let database = crate::database::SimplexDb::open(directory, &runtime.session_id().to_hex_string())?;
         database.close(None)?;
         drop(database);
@@ -98,6 +104,9 @@ impl RuntimeManifest {
         file.write_all(&Self::bytes(runtime)?)?;
         file.sync_all()?;
         File::open(directory)?.sync_all()?;
+        if let Some(parent) = directory.parent() {
+            File::open(parent)?.sync_all()?;
+        }
         Ok(())
     }
 }
@@ -138,6 +147,22 @@ mod tests {
         }
         std::fs::remove_file(directory.join("session-runtime.json")).unwrap();
         assert!(RuntimeManifest::open(&observer, &directory).is_err());
+    }
+
+    #[test]
+    fn authenticated_manifest_provisioning_rejects_existing_namespace_unchanged() {
+        let temp = crate::authenticated_fixture::TestDirectory::new();
+        let directory = temp.path().join("existing-validator");
+        let (validator, _, _) = runtime(true);
+        std::fs::create_dir(&directory).unwrap();
+        let sentinel = directory.join("retained-source");
+        std::fs::write(&sentinel, b"original debt").unwrap();
+        let error = RuntimeManifest::provision_test_validator(&validator, &directory).unwrap_err();
+        assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"original debt");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        assert!(!directory.join("session-runtime.json").exists());
+        assert!(!directory.join(validator.session_id().to_hex_string()).exists());
     }
 
     #[test]
