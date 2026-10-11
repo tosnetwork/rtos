@@ -432,7 +432,7 @@ impl State {
             };
             let plan = match validate_plan(&entry) {
                 Ok(plan) => plan,
-                Err(_) => continue,
+                Err(_) => return,
             };
             {
                 if self.stop.is_cancelled() {
@@ -441,7 +441,7 @@ impl State {
                 let destination = destination(&effect);
                 let exact = match plan.for_destination(&destination) {
                     Ok(plan) => plan,
-                    Err(_) => continue,
+                    Err(_) => return,
                 };
                 let Some(outcome) =
                     self.send_while_serving(store, receiver, &engine, &accepted, &exact).await
