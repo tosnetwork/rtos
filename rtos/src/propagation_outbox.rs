@@ -16,7 +16,9 @@ use std::{
 
 const KEY: &str = "PropagationOutboxV1";
 const MAGIC: &[u8; 8] = b"RTOSPBOX";
-pub const SCHEMA_VERSION: u16 = 3;
+pub const SCHEMA_VERSION: u16 = 4;
+mod closing;
+pub(crate) use closing::{canonical_intent_digest, effects_digest, ClosingRecord};
 const DIGEST_BYTES: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,6 +193,8 @@ pub struct Delivery {
 
 #[derive(Clone)]
 struct Snapshot {
+    next_close_generation: u64,
+    closing: Vec<ClosingRecord>,
     next_id: u64,
     entries: Vec<UnverifiedRecord>,
     deliveries: Vec<Delivery>,
@@ -226,7 +230,13 @@ impl PropagationOutbox {
         let snapshot = match store.load(limits.max_snapshot_bytes)? {
             Some(bytes) => decode_snapshot(&bytes, &domain, &limits)?,
             None => {
-                let snapshot = Snapshot { next_id: 1, entries: Vec::new(), deliveries: Vec::new() };
+                let snapshot = Snapshot {
+                    next_close_generation: 1,
+                    closing: Vec::new(),
+                    next_id: 1,
+                    entries: Vec::new(),
+                    deliveries: Vec::new(),
+                };
                 // Retain the domain and ID allocator even with no pending work.
                 store.replace_sync(&encode_snapshot(&snapshot, &domain, &limits)?)?;
                 snapshot
@@ -254,6 +264,7 @@ impl PropagationOutbox {
         }
         validate_record(&record, &self.domain, &self.limits)?;
         let mut state = self.lock()?;
+        closing::reject_terminal_record(&state.snapshot, &record)?;
         if let Some(entry) =
             state.snapshot.entries.iter().find(|entry| entry.record.same_intent(&record))
         {
@@ -380,6 +391,7 @@ impl PropagationOutbox {
         validate_record(&record, &self.domain, &self.limits)?;
         let delivery_id = delivery_id(&record)?;
         let mut state = self.lock()?;
+        closing::reject_terminal_record(&state.snapshot, &record)?;
         if let Some(delivery) =
             state.snapshot.deliveries.iter().find(|d| d.delivery_id == delivery_id)
         {
@@ -434,6 +446,9 @@ impl PropagationOutbox {
     /// its full ACK; an uncertain write poisons this owner just like admission.
     pub(crate) fn retain_delivery(&self, expected: &Delivery) -> Result<()> {
         let mut state = self.lock()?;
+        if state.snapshot.closing.iter().any(|c| c.binding.delivery_id == expected.delivery_id) {
+            fail!("Canonical reference has entered close protocol");
+        }
         if !state.snapshot.deliveries.iter().any(|delivery| delivery == expected) {
             fail!("Canonical source reference differs from durable delivery");
         }
@@ -626,7 +641,13 @@ pub(crate) fn validate_recovery_record(entry: &UnverifiedRecord, limits: &Limits
         fail!("Invalid outbox record ID");
     }
     encode_snapshot(
-        &Snapshot { next_id, entries: vec![entry.clone()], deliveries: Vec::new() },
+        &Snapshot {
+            next_close_generation: 1,
+            closing: Vec::new(),
+            next_id,
+            entries: vec![entry.clone()],
+            deliveries: Vec::new(),
+        },
         &entry.record.domain,
         limits,
     )?;
@@ -762,6 +783,7 @@ fn encode_snapshot(snapshot: &Snapshot, domain: &OutboxDomain, limits: &Limits) 
             }
         }
     }
+    closing::encode_closing(snapshot, domain, limits, &mut out)?;
     let digest = UInt256::calc_file_hash(&out.bytes);
     out.bytes.extend_from_slice(digest.as_slice());
     Ok(out.bytes)
@@ -856,7 +878,7 @@ fn decode_snapshot(bytes: &[u8], domain: &OutboxDomain, limits: &Limits) -> Resu
         fail!("Unknown outbox snapshot magic");
     }
     let version = u16::from_le_bytes(input.take(2)?.try_into()?);
-    if version != 1 && version != 2 && version != SCHEMA_VERSION {
+    if !(1..=SCHEMA_VERSION).contains(&version) {
         fail!("Unknown outbox schema version");
     }
     let wire_profile = match input.byte()? {
@@ -991,10 +1013,15 @@ fn decode_snapshot(bytes: &[u8], domain: &OutboxDomain, limits: &Limits) -> Resu
     }) {
         fail!("Empty Prepared publication requires a delivery identity");
     }
+    let (next_close_generation, closing) = if version >= 4 {
+        closing::decode_closing(&mut input, domain, limits, next_id, &entries, &deliveries)?
+    } else {
+        (1, Vec::new())
+    };
     if input.offset != payload.len() {
         fail!("Trailing outbox snapshot bytes");
     }
-    Ok(Snapshot { next_id, entries, deliveries })
+    Ok(Snapshot { next_close_generation, closing, next_id, entries, deliveries })
 }
 
 /// Test-only observation of the existing atomic DB snapshot. Does not claim a
@@ -1195,7 +1222,7 @@ mod tests {
         store.mark_ready(id)?;
         let mut bytes = disk.load(1 << 20)?.unwrap();
         // v1 layout is the same entry encoding without the v2 delivery table.
-        bytes.truncate(bytes.len() - DIGEST_BYTES - 4);
+        bytes.truncate(bytes.len() - DIGEST_BYTES - 4 - 12);
         bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
         bytes.extend_from_slice(&[0; DIGEST_BYTES]);
         checksum(&mut bytes);
@@ -1276,6 +1303,7 @@ mod tests {
         let identity = store.stage_draft(record(1), 7, false, None)?;
         let id = store.delivery(&identity)?.unwrap().0.record_id;
         let mut bytes = disk.load(1 << 20)?.unwrap();
+        bytes.drain(bytes.len() - DIGEST_BYTES - 12..bytes.len() - DIGEST_BYTES);
         bytes[8..10].copy_from_slice(&2u16.to_le_bytes());
         checksum(&mut bytes);
         *disk.bytes.lock().unwrap() = Some(bytes);
@@ -1284,7 +1312,7 @@ mod tests {
         assert_eq!(store.delivery(&identity)?.unwrap().0.record_id, id);
         store.mark_accepted(id)?;
         let accepted = disk.load(1 << 20)?.unwrap();
-        assert_eq!(&accepted[8..10], &3u16.to_le_bytes());
+        assert_eq!(&accepted[8..10], &SCHEMA_VERSION.to_le_bytes());
         for version in [1u16, 2] {
             let mut invalid = accepted.clone();
             invalid[8..10].copy_from_slice(&version.to_le_bytes());
@@ -1306,6 +1334,8 @@ mod tests {
         let mut empty = record(1);
         empty.effects.clear();
         let snapshot = Snapshot {
+            next_close_generation: 1,
+            closing: Vec::new(),
             next_id: 2,
             entries: vec![UnverifiedRecord {
                 id: RecordId(1),
@@ -1318,6 +1348,7 @@ mod tests {
         let encoded = encode_snapshot(&snapshot, &domain(), &limits)?;
         for version in [1u16, 2, 3] {
             let mut invalid = encoded.clone();
+            invalid.drain(invalid.len() - DIGEST_BYTES - 12..invalid.len() - DIGEST_BYTES);
             if version == 1 {
                 invalid.truncate(invalid.len() - DIGEST_BYTES - 4);
                 invalid.extend_from_slice(&[0; DIGEST_BYTES]);
@@ -1340,6 +1371,7 @@ mod tests {
             origin: None,
         });
         let mut bytes = encode_snapshot(&legal, &domain(), &limits)?;
+        bytes.drain(bytes.len() - DIGEST_BYTES - 12..bytes.len() - DIGEST_BYTES);
         bytes[8..10].copy_from_slice(&2u16.to_le_bytes());
         checksum(&mut bytes);
         let disk = Arc::new(MemoryStore::default());
