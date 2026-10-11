@@ -184,7 +184,9 @@ impl Package {
         offset: u64,
         limits: super::bounded_read::ArchiveReadLimits,
     ) -> Result<PackageEntry> {
-        let mut file = self.open_file().await?;
+        let mut file = tokio::fs::OpenOptions::new().read(true).write(!self.read_only)
+            .open(&self.path).await
+            .map_err(super::bounded_read::ArchiveReadNotStarted::from_open)?;
         read_header(&mut file).await?;
         let start = offset.checked_add(PKG_HEADER_SIZE as u64)
             .ok_or_else(|| error!("Archive entry offset overflow"))?;

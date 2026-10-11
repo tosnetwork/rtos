@@ -343,7 +343,13 @@ impl BareDeserialize for bytes {
                 (len, 8)
             }
         };
-        if len > de.bytes_limit {
+        if let Some(remaining) = de.bytes_budget.as_mut() {
+            let limit = (*remaining).min(de.bytes_limit);
+            if len > limit {
+                return Err(crate::DecodeLimitExceeded { limit, actual: len }.into());
+            }
+            *remaining -= len;
+        } else if len > de.bytes_limit {
             fail!("Too big length {len} of TL bytes")
         }
         let mut buf = Vec::new();

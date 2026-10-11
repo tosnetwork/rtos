@@ -247,6 +247,22 @@ impl WireProfile {
         Ok(value)
     }
 
+    /// Decode with caller-specific declared/aggregate byte limits before Vec allocation.
+    pub fn deserialize_value_bounded<T: crate::BoxedDeserialize>(
+        self,
+        bytes: &[u8],
+        byte_budget: usize,
+    ) -> Result<T> {
+        let mut reader = bytes;
+        let mut de = Deserializer::with_profile(&mut reader, self)
+            .with_bytes_budget(byte_budget.min(bytes.len()));
+        let value = de.read_boxed()?;
+        if de.pos != bytes.len() {
+            fail!("Trailing bytes after wire object");
+        }
+        Ok(value)
+    }
+
     pub fn deserialize_typed<T: AnyBoxedSerialize>(self, bytes: &[u8]) -> Result<T> {
         crate::downcast_with_error(self.deserialize(bytes)?)
     }
