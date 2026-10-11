@@ -291,6 +291,10 @@ pub struct InternalDb {
     state_db: StateDb,
     repair_leases: Arc<crate::publication_dependency_leases::DependencyLeases>,
     archive_manager: Arc<ArchiveManager>,
+    archive_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
+    archive_admission: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    archive_test_gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     shard_top_blocks_db: ShardTopBlocksDb,
     full_node_state_db: Arc<NodeStateDb>,
 
@@ -481,6 +485,10 @@ impl InternalDb {
         );
 
         let result = Self {
+            archive_tasks: Arc::default(),
+            archive_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            archive_test_gate: Default::default(),
             repair_leases,
             #[cfg(test)]
             recovery_node_db: db.clone(),
@@ -595,10 +603,28 @@ impl InternalDb {
         }
     }
 
-    pub async fn stop_states_db(&self) {
+    pub async fn stop_states_db(&self) -> Result<()> {
+        // Close admission first, wake permit waiters, and join every actual IO
+        // owner even if its caller has disappeared. A failed owner must not skip
+        // shutdown of the state worker, nor disappear from the shutdown result.
+        self.archive_admission.close();
+        let archived = self.archive_tasks.wait().await;
         if let StateDb::Dynamic(db) = &self.state_db {
-            db.stop().await
+            db.stop().await;
         }
+        archived
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_archive_admission_closed(&self) -> bool {
+        self.archive_admission.is_closed()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_hold_archive_migration(
+        &self, entered: Arc<tokio::sync::Notify>, release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.archive_test_gate.lock().unwrap() = Some((entered, release));
     }
 
     fn store_block_handle(
@@ -1910,15 +1936,36 @@ impl InternalDb {
         if handle.is_archived() {
             return Ok(());
         }
-        self.archive_manager
-            .move_to_archive(&handle, || {
+        let permit = self.archive_admission.clone().acquire_owned().await
+            .map_err(|_| error!("Archive migration admission stopped"))?;
+        let manager = self.archive_manager.clone();
+        let handles = self.block_handle_storage.clone();
+        let tasks = self.archive_tasks.clone();
+        let block_id = id.clone();
+        #[cfg(test)]
+        let gate = self.archive_test_gate.lock().unwrap().take();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        self.archive_tasks.spawn("archive migration IO", async move {
+            let _permit = permit;
+            #[cfg(test)]
+            if let Some((entered, release)) = gate {
+                entered.notify_one();
+                release.notified().await;
+            }
+            // This worker is not abortable by the observation future. Package IO,
+            // migration flag and deletion gate all live inside its awaited work.
+            let result = manager.move_to_archive(&handle, || {
                 if handle.set_archived() {
-                    self.store_block_handle(&handle, callback.clone())?;
+                    handles.save_handle(&handle, callback.clone())?;
                 }
                 Ok(())
-            })
-            .await
-            .map_err(|err| error!("Failed to move block to archive: {}. Error: {}", id, err))
+            }).await.map_err(|err| error!("Failed to move block to archive: {block_id}. Error: {err}"));
+            if let Err(error) = &result {
+                tasks.record_error(format!("archive migration {block_id}: {error}"));
+            }
+            let _ = sent.send(result);
+        })?;
+        received.await.map_err(|error| error!("Archive migration owner failed: {error}"))?
     }
 
     #[allow(dead_code)]

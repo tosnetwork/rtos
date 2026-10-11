@@ -949,3 +949,35 @@ async fn persistent_repair_custody_archive_logical_protection_survives_pack_and_
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn archive_migration_error_retry_and_live_repair_remigration() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (manager, db) = create_manager(dir.path().to_str().unwrap(), "remigration", false).await?;
+    let (handles, _) = create_block_handle_storage(db);
+    let id = BlockIdExt::with_params(ShardIdent::masterchain(), 1,
+        UInt256::from([1; 32]), UInt256::from([2; 32]));
+    let handle = handles.create_handle(id.clone(), BlockMeta::with_data(0, 0, 0, 0, 0), None)?.unwrap();
+    let entry = PackageEntryId::Proof(&id);
+    manager.add_file(&entry, b"original-proof").await?;
+    handle.set_proof();
+    let loose = manager.unapplied_files_path().join(entry.filename_short());
+    let error = manager.move_to_archive(&handle, || Err(error!("injected metadata failure"))).await.unwrap_err();
+    assert!(error.to_string().contains("injected metadata failure"));
+    assert!(loose.exists(), "failed transition must retain its loose evidence");
+    manager.move_to_archive(&handle, || { handle.set_archived(); Ok(()) }).await?;
+    assert!(handle.is_archived());
+    assert!(!loose.exists());
+    assert_eq!(manager.get_file(&handle, &entry).await?, b"original-proof");
+    manager.move_to_archive(&handle, || panic!("already archived must be idempotent")).await?;
+    // Exercise actual file replacement and routing reset in the same live owner.
+    // These storage bytes are not an authentication/custody fixture.
+    manager.replace_file_durable(&entry, b"repaired-proof").await?;
+    handle.reset_archived();
+    assert_eq!(std::fs::read(&loose)?, b"repaired-proof");
+    manager.move_to_archive(&handle, || { handle.set_archived(); Ok(()) }).await?;
+    assert!(handle.is_archived());
+    assert!(!loose.exists());
+    assert_eq!(manager.get_file(&handle, &entry).await?, b"repaired-proof");
+    Ok(())
+}

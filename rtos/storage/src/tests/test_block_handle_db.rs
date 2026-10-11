@@ -208,3 +208,26 @@ async fn publication_durability_handle_write_failure_is_sticky() {
     drop(db);
     destroy_rocks_db(path.to_str().expect("UTF-8 temporary test path"), "db").await.unwrap();
 }
+
+#[tokio::test]
+async fn archive_migration_guard_retains_exclusive_owner_across_routing_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = RocksDb::new(dir.path(), "migration-owner", None, AccessType::ReadWrite).unwrap();
+    let (handles, _) = create_block_handle_storage(db);
+    let handle = handles.create_handle(BlockIdExt::default(), BlockMeta::default(), None).unwrap().unwrap();
+    let first = handle.try_begin_archive_migration().unwrap();
+    assert!(handle.try_begin_archive_migration().is_none());
+    handle.set_archived();
+    handle.reset_archived();
+    assert!(handle.try_begin_archive_migration().is_none(), "routing reset must not release an active owner");
+    drop(first);
+    let second = handle.try_begin_archive_migration().unwrap();
+    assert!(handle.try_begin_archive_migration().is_none());
+    drop(second);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _owner = handle.try_begin_archive_migration().unwrap();
+        panic!("migration unwinds");
+    }));
+    assert!(result.is_err());
+    assert!(handle.try_begin_archive_migration().is_some());
+}

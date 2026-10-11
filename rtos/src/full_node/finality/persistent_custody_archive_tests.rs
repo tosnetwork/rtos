@@ -103,3 +103,46 @@ async fn persistent_repair_custody_real_pack_gc_control_and_cold_authentication(
     close(engine).await;
     run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_repair_archive_owner_cancel_waiter_and_shutdown_drain() {
+    let Fixture { dir, engine, target, .. } = fixture(false).await;
+    let handle = engine.load_block_handle(target.id()).unwrap().unwrap();
+    assert!(!handle.is_archived(), "repair fixture must require actual migration");
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    struct ReleaseOnDrop(Arc<tokio::sync::Notify>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) { self.0.notify_one(); }
+    }
+    let _release_on_failure = ReleaseOnDrop(release.clone());
+    engine.db().test_hold_archive_migration(entered.clone(), release.clone());
+    let caller_engine = engine.clone();
+    let id = target.id().clone();
+    let caller = tokio::spawn(async move { caller_engine.db().archive_block(&id, None).await });
+    entered.notified().await;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    let waiting_engine = engine.clone();
+    let id = target.id().clone();
+    let mut waiting = tokio::spawn(async move { waiting_engine.db().archive_block(&id, None).await });
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut waiting).await.is_err());
+    let stopping_engine = engine.clone();
+    let mut stopping = tokio::spawn(async move { stopping_engine.wait_stop().await });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !engine.db().test_archive_admission_closed() {
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("shutdown must close admission even with an active IO owner");
+    assert!(waiting.await.unwrap().unwrap_err().to_string().contains("admission stopped"));
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut stopping).await.is_err(),
+        "shutdown cannot pass the real admitted migration owner");
+    assert!(!handle.is_archived());
+    release.notify_one();
+    stopping.await.unwrap().unwrap();
+    assert!(handle.is_archived(), "cancelled observer's actual migration must complete");
+    drop(handle);
+    close(engine).await;
+    drop(dir);
+}
