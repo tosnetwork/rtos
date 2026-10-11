@@ -60,6 +60,7 @@ enum RecoveryScenario {
     AutonomousColdStartup,
     QuotaSecondAnchor,
     CorruptExistingCapsule,
+    CorruptOrdinaryState,
     WrongRemoteDomain,
     WrongRemoteParent,
 }
@@ -213,6 +214,15 @@ async fn recover_scenario(scenario: RecoveryScenario) {
                 .unwrap()
                 .as_secs(),
         };
+        if scenario == RecoveryScenario::CorruptOrdinaryState {
+            // Keep the damaged historical target behind a healthy applied head,
+            // so startup does not need its root before the recovery call.
+            for owner in [&pair.provider, &pair.receiver, pair.observer.as_ref().unwrap()] {
+                let handle = owner.store_block(&next_block).await.unwrap().to_any();
+                owner.store_block_proof(&next, Some(handle), &next_proof).await.unwrap();
+                owner.clone().download_and_apply_block(&next, next.seq_no(), false).await.unwrap();
+            }
+        }
         let sink = engine.clone().durable_finality_sink(runtime.clone()).await.unwrap();
         let confirm =
             engine.ensure_publication_worker().await.unwrap().delivered_sink(runtime.clone());
@@ -254,6 +264,10 @@ async fn recover_scenario(scenario: RecoveryScenario) {
         .await
         .unwrap()
         .is_none());
+        if scenario == RecoveryScenario::CorruptOrdinaryState {
+            assert!(engine.db().test_contains_dynamic_state_record(&target).unwrap());
+            return (record, target, target_root.repr_hash().clone(), closing, namespace);
+        }
         engine.shard_states_keeper().test_retire_history_state(&target);
         tokio::time::timeout(Duration::from_secs(20), async {
             while engine.db().test_contains_dynamic_state_record(&target).unwrap() {
@@ -653,7 +667,9 @@ async fn recover_scenario(scenario: RecoveryScenario) {
     .await;
     if matches!(
         scenario,
-        RecoveryScenario::AutonomousColdStartup | RecoveryScenario::QuotaSecondAnchor
+        RecoveryScenario::AutonomousColdStartup
+            | RecoveryScenario::QuotaSecondAnchor
+            | RecoveryScenario::CorruptOrdinaryState
     ) && run.is_ok()
     {
         pair.provider.clone().wait_stop().await.unwrap();
@@ -664,12 +680,37 @@ async fn recover_scenario(scenario: RecoveryScenario) {
         run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     let Pair { _dir: directory, receiver, provider, observer, .. } = pair;
     drop(provider);
-    // Autonomous first cold boot still needs live peers; all other scenarios
-    // have already joined them and prove offline capsule reauthentication.
-    // No peer is reopened: this must authenticate solely from durable capsule.
+    if scenario == RecoveryScenario::CorruptOrdinaryState {
+        let checked = std::panic::AssertUnwindSafe(ordinary_corruption_cold_check(
+            &directory.path().join("provider"),
+            &receiver,
+            observer.as_ref().unwrap(),
+            &record,
+            &target,
+            &expected,
+            &namespace,
+        ))
+        .catch_unwind()
+        .await;
+        if let Err(panic) = checked {
+            let (a, b) = tokio::join!(
+                receiver.clone().wait_stop(),
+                observer.as_ref().unwrap().clone().wait_stop()
+            );
+            a.unwrap();
+            b.unwrap();
+            std::panic::resume_unwind(panic);
+        }
+    }
+    // Cold startup/quota/ordinary-fault scenarios retain live peers for the
+    // first reopen. All remaining cases already joined peers; the final reopen
+    // below joins every peer and verifies offline evidence.
     let cold = open_engine(&directory.path().join("provider")).await;
     let result = std::panic::AssertUnwindSafe(async {
-        assert!(!cold.db().test_contains_dynamic_state_record(&target).unwrap());
+        assert_eq!(
+            cold.db().test_contains_dynamic_state_record(&target).unwrap(),
+            scenario == RecoveryScenario::CorruptOrdinaryState
+        );
         if scenario == RecoveryScenario::AutonomousColdStartup {
             let service = cold.ensure_retired_session_recovery().await.unwrap();
             tokio::time::timeout(Duration::from_secs(90), async {
@@ -717,7 +758,9 @@ async fn recover_scenario(scenario: RecoveryScenario) {
     drop(cold);
     if matches!(
         scenario,
-        RecoveryScenario::AutonomousColdStartup | RecoveryScenario::QuotaSecondAnchor
+        RecoveryScenario::AutonomousColdStartup
+            | RecoveryScenario::QuotaSecondAnchor
+            | RecoveryScenario::CorruptOrdinaryState
     ) {
         let (a, b) = tokio::join!(receiver.clone().wait_stop(), async {
             if let Some(peer) = observer.as_ref() {
@@ -734,7 +777,9 @@ async fn recover_scenario(scenario: RecoveryScenario) {
     if result.is_ok()
         && matches!(
             scenario,
-            RecoveryScenario::AutonomousColdStartup | RecoveryScenario::QuotaSecondAnchor
+            RecoveryScenario::AutonomousColdStartup
+                | RecoveryScenario::QuotaSecondAnchor
+                | RecoveryScenario::CorruptOrdinaryState
         )
     {
         let offline = open_engine(&directory.path().join("provider")).await;
@@ -863,4 +908,108 @@ async fn historical_recovery_foreign_domain_response_cannot_replace_exact_target
 #[ignore = "real signed different-parent peer block; RTOS_PUBLIC_FIXTURE_SIGNER required"]
 async fn historical_recovery_foreign_parent_response_cannot_replace_exact_target() {
     recover_scenario(RecoveryScenario::WrongRemoteParent).await;
+}
+
+async fn ordinary_corruption_cold_check(
+    root: &Path,
+    receiver: &Arc<Engine>,
+    observer: &Arc<Engine>,
+    record: &simplex::finality_recovery::SessionRecoveryRecord,
+    target: &BlockIdExt,
+    target_root: &UInt256,
+    namespace: &Path,
+) {
+    use storage::{
+        db::{
+            node::{open_node_db, CELLS_CF_NAME},
+            rocksdb::AccessType,
+        },
+        shardstate_db_async::CellsDbConfig,
+    };
+    let open_raw = || open_node_db(root, &CellsDbConfig::default(), AccessType::ReadWrite).unwrap();
+    let db = open_raw();
+    let index =
+        db.clone().table::<BlockIdExt>(crate::internal_db::SHARDSTATE_DB_NAME, false).unwrap();
+    let cells = db.clone().table::<UInt256>(CELLS_CF_NAME, false).unwrap();
+    let original_index = index.try_get(target).unwrap().unwrap().to_vec();
+    let original_raw = cells.try_get(target_root).unwrap().unwrap().to_vec();
+    cells.put_raw_sync(target_root.as_slice(), &[0]).unwrap();
+    db.sync_wal().unwrap();
+    drop(cells);
+    drop(index);
+    drop(db);
+    let before_source = retained_source_bytes(namespace);
+    let queries = || {
+        [receiver, observer]
+            .iter()
+            .map(|peer| {
+                let router = peer.overlays_router().unwrap();
+                (router.test_pss_observations().len(), router.test_bounded_queries())
+            })
+            .collect::<Vec<_>>()
+    };
+    let engine = open_engine(root).await;
+    let run = std::panic::AssertUnwindSafe(async {
+        assert!(engine.db().test_contains_dynamic_state_record(target).unwrap());
+        let head = engine.load_last_applied_mc_block_id().unwrap();
+        let before_queries = queries();
+        let error = engine
+            .clone()
+            .authenticate_retired_source_with_history(record.clone())
+            .await
+            .err()
+            .expect(
+                "existing malformed ordinary graph must not fall back to available history peers",
+            );
+        assert_eq!(
+            error.root_cause().to_string(),
+            "Invalid stored cell record length",
+            "{error:#}"
+        );
+        assert!(crate::history_read_budget::stops_fallback(&error), "{error:#}");
+        assert_eq!(
+            queries(),
+            before_queries,
+            "corrupt existing ordinary state must perform zero remote reads"
+        );
+        assert_eq!(retained_source_bytes(namespace), before_source);
+        assert_eq!(engine.load_last_applied_mc_block_id().unwrap(), head);
+        assert!(crate::retired_history::authenticate_capsule_with_budget(
+            engine.as_ref(),
+            target,
+            None
+        )
+        .await
+        .unwrap()
+        .is_none());
+    })
+    .catch_unwind()
+    .await;
+    engine.clone().wait_stop().await.unwrap();
+    drop(engine);
+    let db = open_raw();
+    let index =
+        db.clone().table::<BlockIdExt>(crate::internal_db::SHARDSTATE_DB_NAME, false).unwrap();
+    let cells = db.clone().table::<UInt256>(CELLS_CF_NAME, false).unwrap();
+    assert_eq!(index.try_get(target).unwrap().unwrap().as_ref(), original_index.as_slice());
+    assert_eq!(cells.try_get(target_root).unwrap().unwrap().as_ref(), &[0]);
+    cells.put_raw_sync(target_root.as_slice(), &original_raw).unwrap();
+    db.sync_wal().unwrap();
+    drop(cells);
+    drop(index);
+    drop(db);
+    if let Err(panic) = run {
+        let (a, b) = tokio::join!(receiver.clone().wait_stop(), observer.clone().wait_stop());
+        a.unwrap();
+        b.unwrap();
+        std::panic::resume_unwind(panic);
+    }
+    // Caller cold-opens again, invokes the same real authentication, joins all
+    // peers, and finally repeats offline. No index or authority was fabricated.
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real cold ordinary graph corruption and exact restoration; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_corrupt_ordinary_index_never_fetches_remote() {
+    recover_scenario(RecoveryScenario::CorruptOrdinaryState).await;
 }
