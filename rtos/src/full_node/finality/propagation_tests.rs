@@ -4,7 +4,8 @@ use super::*;
 use crate::validator::{
     accept_block::{accept_pq_session_block, AcceptancePhase},
     propagation::{
-        PropagationEvent, PropagationKind, PropagationPlan, PropagationStatus, PropagationTarget,
+        PropagationDestination, PropagationEvent, PropagationKind, PropagationPlan,
+        PropagationStatus, PropagationTarget,
     },
 };
 use consensus_common::{simplex_protocol::SimplexProtocol, SessionFinality};
@@ -124,6 +125,20 @@ async fn propagation_authenticated_normal_finality_applies_by_mc_and_reopens() {
             false,
         );
         assert!(!plan.block_targets.public);
+        // A durable exact target that disappeared cannot silently fan out or
+        // become acknowledged as delivered by another current overlay.
+        let missing = PropagationDestination {
+            kind: PropagationKind::Finality,
+            target: PropagationTarget::Custom("removed-overlay".into()),
+        };
+        let deferred = pair
+            .provider
+            .propagate_accepted_session_block(&accepted, &plan.for_destination(&missing).unwrap())
+            .await;
+        assert_eq!(deferred.receipts.len(), 1, "{deferred:?}");
+        assert_eq!(deferred.receipts[0].target, missing.target);
+        assert!(matches!(deferred.receipts[0].status, PropagationStatus::Deferred(_)));
+        assert!(deferred.needs_retry());
         let outcome = pair.provider.propagate_accepted_session_block(&accepted, &plan).await;
         assert!(sent(&outcome, PropagationKind::Finality), "{outcome:?}");
         assert!(!outcome.needs_retry(), "{outcome:?}");
