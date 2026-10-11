@@ -1209,3 +1209,6 @@ mod bounded_download_tests;
 
 #[path = "persistent_closure_engine_tests.rs"]
 mod persistent_closure_engine_tests;
+
+#[path = "bounded_pss_tests.rs"]
+mod bounded_pss_tests;

@@ -65,6 +65,22 @@ impl std::fmt::Display for BoundedBocDecodeRejected {
 }
 impl std::error::Error for BoundedBocDecodeRejected {}
 
+fn checked_pss_slice(
+    offset: usize,
+    max_size: usize,
+    limits: adnl::QueryResponseLimits,
+) -> Result<(i64, i64)> {
+    limits.validate()?;
+    if max_size == 0 || max_size > (1 << 21) || limits.decoded_bytes > max_size {
+        fail!("Invalid bounded PSS slice size");
+    }
+    let end = offset.checked_add(max_size).ok_or_else(|| rtos_block::error!("PSS range overflow"))?;
+    let offset = i64::try_from(offset)?;
+    let size = i64::try_from(max_size)?;
+    i64::try_from(end)?;
+    Ok((offset, size))
+}
+
 /// Per-request bounds. These limit encoded buffers and BOC cardinality, not total heap usage.
 #[derive(Clone, Copy, Debug)]
 pub struct NetworkDownloadLimits {
@@ -835,6 +851,82 @@ impl FullNodeOverlayClient {
                 }
             }
         }
+    }
+
+    /// Single-peer bounded size probe, including WholeState via the V2 query.
+    /// Caller charges one attempt and 128 wire / 12 decoded bytes before entry.
+    /// Peer-advertised size is only a hint, never state authentication.
+    pub async fn check_persistent_state_bounded(
+        &self,
+        id: &PersistentStatePartId,
+        masterchain_block_id: &BlockIdExt,
+        max_bytes: usize,
+    ) -> Result<Option<(Arc<Neighbour>, usize)>> {
+        if max_bytes == 0 { fail!("Empty PSS budget"); }
+        let (peer, _) = self.client.choose_peer(None).await?;
+        let request = TaggedObject {
+            object: GetPersistentStateSizeV2 {
+                state: PersistentStateIdV2 {
+                    block: id.block_id().clone(),
+                    masterchain_block: masterchain_block_id.clone(),
+                    effective_shard: id.part_prefix() as i64,
+                },
+            },
+            #[cfg(feature = "telemetry")]
+            tag: GetPersistentStateSizeV2::constructor_const(),
+        };
+        let bytes = self.client.send_rldp_query_raw_bounded(
+            &request, &peer, 0, true,
+            adnl::QueryResponseLimits { wire_bytes: 128, decoded_bytes: 12 },
+        ).await?;
+        let size: PersistentStateSize = self.client.network_context().stack.overlay.wire_profile().deserialize_value_bounded(&bytes, 12)?;
+        if self.client.network_context().stack.overlay.wire_profile().serialize(&size)? != bytes {
+            fail!("Noncanonical PSS size response");
+        }
+        match size {
+            PersistentStateSize::TonNode_PersistentStateSizeNotFound => Ok(None),
+            PersistentStateSize::TonNode_PersistentStateSize(size) => {
+                let size = usize::try_from(size.size)?;
+                if size == 0 { fail!("Empty advertised PSS"); }
+                if size > max_bytes {
+                    return Err(adnl::ResponseLimitExceeded { limit: max_bytes, actual: size }.into());
+                }
+                Ok(Some((peer, size)))
+            }
+        }
+    }
+
+    /// One bounded PSS slice attempt. The owned caller reserves cumulative
+    /// wire/decoded bytes, part count and attempts before calling this method.
+    /// No retry, state publication or BOC parsing occurs here. A short/empty
+    /// response is returned verbatim for the caller to validate against EOF.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn download_persistent_state_part_bounded(
+        &self,
+        block_id: &PersistentStatePartId,
+        masterchain_block_id: &BlockIdExt,
+        offset: usize,
+        max_size: usize,
+        peer: &Arc<Neighbour>,
+        attempt: u32,
+        limits: adnl::QueryResponseLimits,
+    ) -> Result<Vec<u8>> {
+        let (offset, max_size) = checked_pss_slice(offset, max_size, limits)?;
+        let request = TaggedObject {
+            object: DownloadPersistentStateSliceV2 {
+                state: PersistentStateIdV2 {
+                    block: block_id.block_id().clone(),
+                    masterchain_block: masterchain_block_id.clone(),
+                    // The protocol encodes a shard-prefix bit pattern in `long`.
+                    effective_shard: block_id.part_prefix() as i64,
+                },
+                offset,
+                max_size,
+            },
+            #[cfg(feature = "telemetry")]
+            tag: DownloadPersistentStateSliceV2::constructor_const(),
+        };
+        self.client.send_rldp_query_raw_bounded(&request, peer, attempt, true, limits).await
     }
 
     pub async fn download_persistent_state_part(
