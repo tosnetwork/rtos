@@ -67,6 +67,17 @@ impl AdnlTasks {
             return Err(future);
         }
         let token = self.workers.token();
+        self.spawn_admitted(name, token, future);
+        Ok(())
+    }
+    /// Transfer a lease already admitted by this owner to a retained supervisor.
+    /// Closing admission cannot cancel this ownership handoff.
+    pub fn spawn_admitted(
+        self: &Arc<Self>,
+        name: &'static str,
+        token: TaskTrackerToken,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) {
         let worker = self.runtime.spawn(future);
         let owner = self.clone();
         self.runtime.spawn(async move {
@@ -75,7 +86,6 @@ impl AdnlTasks {
                 owner.failed(format!("{name}: {error}"));
             }
         });
-        Ok(())
     }
     pub fn spawn(
         self: &Arc<Self>,

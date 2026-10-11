@@ -78,6 +78,8 @@ async fn overlay_owned_checked_delete_waits_real_inbound_and_survives_waiter_can
     let adnl = node(96).await;
     let remote = node(97).await;
     let overlay = OverlayNode::with_params(adnl.clone(), &[1; 32], 0).unwrap();
+    let rldp = RldpNode::with_params(adnl.clone(), vec![overlay.clone()], None).unwrap();
+    overlay.set_rldp(rldp.clone()).unwrap();
     let key = adnl.key_by_tag(0).unwrap();
     let other = remote.key_by_tag(0).unwrap();
     adnl.add_peer(key.id(), remote.ip_address_adnl(), None, &other).unwrap();
@@ -117,20 +119,27 @@ async fn overlay_owned_checked_delete_waits_real_inbound_and_survives_waiter_can
     let _ = waiter.await;
     assert!(!generation.drained());
     assert!(overlay
-        .add_private_overlay(OverlayParams::with_id_only(&id), &key, &[], false, None)
-        .is_err());
+        .add_private_overlay(
+            OverlayParams::with_id_only(&id),
+            &key,
+            &[other.id().clone()],
+            false,
+            None
+        )
+        .unwrap());
+    let replacement = overlay.overlay_generation(&id).unwrap();
+    assert_eq!(rldp.inbound_cap_leases_for_test(other.id()), 2);
     consumer.release.notify_one();
     bounded(request).await.unwrap().unwrap();
     bounded(overlay.delete_private_overlay_checked(&generation)).await.unwrap();
     assert!(generation.drained());
+    assert_eq!(rldp.inbound_cap_leases_for_test(other.id()), 1);
     assert!(weak.upgrade().is_none(), "old maintenance and inbound owners still retain generation");
-    assert!(overlay
-        .add_private_overlay(OverlayParams::with_id_only(&id), &key, &[], false, None)
-        .unwrap());
-    let replacement = overlay.overlay_generation(&id).unwrap();
+
     assert!(!bounded(overlay.delete_private_overlay_checked(&generation)).await.unwrap());
     assert!(overlay.overlays.get(&id).is_some());
     bounded(overlay.delete_private_overlay_checked(&replacement)).await.unwrap();
+    assert_eq!(rldp.inbound_cap_leases_for_test(other.id()), 0);
     adnl.stop_checked().await.unwrap();
     remote.stop_checked().await.unwrap();
 }
@@ -270,4 +279,79 @@ async fn overlay_owned_real_fec_encoder_and_distribution_release_generation() {
     assert!(generation.drained());
     assert!(weak.upgrade().is_none());
     adnl.stop_checked().await.unwrap();
+}
+
+struct DelayedPendingConsumer {
+    accepted: Notify,
+    handoff: Notify,
+    child: PendingConsumer,
+}
+#[async_trait::async_trait]
+impl Subscriber for DelayedPendingConsumer {
+    async fn try_consume_query(&self, object: TLObject, peers: &AdnlPeers) -> Result<QueryResult> {
+        self.accepted.notify_one();
+        self.handoff.notified().await;
+        self.child.try_consume_query(object, peers).await
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn overlay_owned_pending_handoff_after_close_survives_cancelled_public_caller() {
+    let adnl = node(108).await;
+    let remote = node(109).await;
+    let overlay = OverlayNode::with_params(adnl.clone(), &[1; 32], 0).unwrap();
+    let key = adnl.key_by_tag(0).unwrap();
+    let other = remote.key_by_tag(0).unwrap();
+    adnl.add_peer(key.id(), remote.ip_address_adnl(), None, &other).unwrap();
+    let id = KeyId::from_data([110; 32]);
+    overlay
+        .add_private_overlay(
+            OverlayParams::with_id_only(&id),
+            &key,
+            &[other.id().clone()],
+            false,
+            None,
+        )
+        .unwrap();
+    let generation = overlay.overlay_generation(&id).unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let resource = Arc::new(());
+    let weak = Arc::downgrade(&resource);
+    let consumer = Arc::new(DelayedPendingConsumer {
+        accepted: Notify::new(),
+        handoff: Notify::new(),
+        child: PendingConsumer { entered: entered.clone(), release: release.clone(), resource },
+    });
+    overlay.add_consumer(&id, consumer.clone()).unwrap();
+    let peers = AdnlPeers::with_keys(key.id().clone(), other.id().clone());
+    let prefix =
+        rtos_api::ton::rpc::overlay::Query { overlay: UInt256::from(*id.data()) }.into_tl_object();
+    let request_owner = overlay.clone();
+    let request = tokio::spawn(async move {
+        request_owner
+            .try_consume_query_bundle(
+                vec![prefix, rtos_api::ton::rpc::adnl::Ping { value: 1 }.into_tl_object()],
+                &peers,
+            )
+            .await
+    });
+    bounded(consumer.accepted.notified()).await;
+    // Close while the real consumer is still awaiting its result handoff.
+    overlay.delete_private_overlay(&id).unwrap();
+    assert!(!generation.drained());
+    consumer.handoff.notify_one();
+    bounded(entered.notified()).await;
+    request.abort();
+    drop(request.await);
+    drop(consumer);
+    let mut waiting = Box::pin(overlay.delete_private_overlay_checked(&generation));
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut waiting).await.is_err());
+    assert!(!generation.drained());
+    assert!(weak.upgrade().is_some());
+    release.notify_one();
+    bounded(waiting).await.unwrap();
+    assert!(generation.drained());
+    assert!(weak.upgrade().is_none());
+    adnl.stop_checked().await.unwrap();
+    remote.stop_checked().await.unwrap();
 }

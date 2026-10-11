@@ -2224,9 +2224,6 @@ impl OverlayNode {
         {
             let mut retired = self.retired.lock().unwrap();
             retired.retain(|_, tasks| tasks.upgrade().is_some_and(|tasks| !tasks.drained()));
-            if retired.contains_key(params.overlay_id) {
-                fail!("Previous overlay generation is still draining");
-            }
         }
         log::debug!(target: TARGET, "Add overlay {} to node", params.overlay_id);
         if !overlay_type.is_public()
@@ -3030,13 +3027,7 @@ impl Subscriber for OverlayNode {
                     };
                     let _ = tx.send(result);
                 };
-                if let Err(future) =
-                    overlay.tasks.spawn_or_return("overlay pending response", future)
-                {
-                    // Already accepted by this handler. Closing admission may
-                    // reject the child but cannot detach its real JoinHandle.
-                    future.await;
-                }
+                overlay.tasks.spawn_admitted("overlay pending response", _lease, future);
                 Ok(QueryResult::Consumed(QueryAnswer::Pending(tokio::spawn(async move {
                     rx.await.map_err(|_| error!("Overlay response owner failed"))?
                 }))))
