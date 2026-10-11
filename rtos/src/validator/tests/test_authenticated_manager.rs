@@ -78,6 +78,12 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool) -
     network.authenticated = Some(actual);
     network.transport_keys.push(bootstrap.validators[0].adnl_key.clone());
     network.transport_keys.push(handler.consensus_transport_key(observer.id()).await?);
+    // This fixture replaces the bootstrap configuration before creating its
+    // manager state. Pin that actual genesis BOC, not the earlier bootstrap
+    // genesis with different configuration, and keep later key references aligned.
+    let state = engine.build_masterchain_state(&bootstrap, 0)?;
+    bootstrap.zerostate_id = state.block_id().clone();
+    engine.init_mc_block_id = state.block_id().clone();
     let engine = Arc::new(engine);
     let mut manager = ValidatorManagerImpl::create(engine.clone(), tokio::runtime::Handle::current(), ValidatorManagerConfig::default());
     let result = async {
@@ -90,7 +96,6 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool) -
         }))?;
         anyhow::ensure!(manager.authenticated_transport_key(&wrong_binding, &[]).is_err(),
             "configured stable identity was accepted with wrong governing ADNL");
-        let state = engine.build_masterchain_state(&bootstrap, 0)?;
         engine.install_masterchain_state(state.clone(), None)?;
         let failed_group = if fail_initial_sink {
             engine.fail_finality_sink_once.store(true, Ordering::SeqCst);
