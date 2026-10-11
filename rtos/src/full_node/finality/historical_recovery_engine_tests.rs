@@ -63,6 +63,9 @@ enum RecoveryScenario {
     CorruptOrdinaryState,
     WrongRemoteDomain,
     WrongRemoteParent,
+    MissingSourceCertificate,
+    InsufficientSourceQuorum,
+    WrongSessionCertificate,
 }
 
 async fn recover_source(mode: u8) {
@@ -579,6 +582,66 @@ async fn recover_scenario(scenario: RecoveryScenario) {
                 assert_eq!(control.syncs(), if mode == 6 { 4 } else { 2 });
                 assert_eq!(retained_source_bytes(&namespace), before);
             }
+            if matches!(scenario, RecoveryScenario::MissingSourceCertificate | RecoveryScenario::InsufficientSourceQuorum | RecoveryScenario::WrongSessionCertificate) {
+                let files = retained_source_bytes(&namespace);
+                let (path, original) = files.iter().find(|(_, bytes)| {
+                    serde_json::from_slice::<serde_json::Value>(bytes).ok()
+                        .is_some_and(|value| value["certificate"].is_string())
+                }).expect("actual retained FinalCert");
+                let capsule_root = Path::new(engine.db_root_dir().unwrap()).join("retired-history-v1");
+                let manifests = || std::fs::read_dir(&capsule_root).unwrap()
+                    .filter_map(|entry| { let path = entry.unwrap().path();
+                        (path.extension().and_then(|v| v.to_str()) == Some("json"))
+                            .then(|| (path.clone(), std::fs::read(path).unwrap()))
+                    }).collect::<std::collections::BTreeMap<_, _>>();
+                let before_capsules = manifests();
+                let variants: &[usize] = if scenario == RecoveryScenario::InsufficientSourceQuorum { &[0, 1] } else { &[0] };
+                for &votes_to_keep in variants {
+                    let withdrawn = pair._dir.path().join("withdrawn-original-source-certificate");
+                    let expected_error;
+                    if scenario == RecoveryScenario::MissingSourceCertificate {
+                        std::fs::rename(path, &withdrawn).unwrap();
+                        expected_error = "Source history has no retained certificate";
+                    } else {
+                        let mut disk: serde_json::Value = serde_json::from_slice(original).unwrap();
+                        let mut wire: rtos_api::ton::consensus::simplex::Certificate = WireProfile::T0
+                            .deserialize_value_bounded(&hex::decode(disk["certificate"].as_str().unwrap()).unwrap(), original.len()).unwrap();
+                        if scenario == RecoveryScenario::InsufficientSourceQuorum {
+                            let rtos_api::ton::consensus::simplex::Certificate::Consensus_Simplex_Certificate(ref mut cert) = wire;
+                            let rtos_api::ton::consensus::simplex::VoteSignatureSet::Consensus_Simplex_VoteSignatureSet(ref mut signatures) = cert.signatures;
+                            let mut retained = signatures.votes.to_vec(); retained.truncate(votes_to_keep);
+                            signatures.votes = retained.into();
+                            expected_error = "Not enough signatures in certificate";
+                        } else {
+                            let (committee, _) = config.validator_set().unwrap().calc_subset(&config.catchain_config().unwrap(), SHARD_FULL, -1, cc).unwrap();
+                            let alternate = AuthenticatedSessionRuntime::from_authenticated_config(
+                                runtime.pin().clone(), config,
+                                rtos_api::session_identity::SessionCoordinates { shard: target.shard(), catchain_seqno: cc, vertical_seqno: 1, last_key_block_seqno: 0, new_catchain_ids: false },
+                                committee, runtime.local_adnl().clone()).unwrap();
+                            assert_ne!(alternate.session_id(), runtime.session_id());
+                            resign_source_certificate(&signer, &alternate, &mut wire);
+                            expected_error = "Invalid vote signature for validator";
+                        }
+                        disk["certificate"] = hex::encode(WireProfile::T0.serialize(&wire).unwrap()).into();
+                        std::fs::write(path, serde_json::to_vec(&disk).unwrap()).unwrap();
+                    }
+                    let negative_source = retained_source_bytes(&namespace);
+                    let failed = std::panic::AssertUnwindSafe(async {
+                        let error = engine.clone().authenticate_retired_source_with_history(record.clone()).await.err()
+                            .expect("invalid source evidence must not authorize capsule commit");
+                        assert!(format!("{error:#}").contains(expected_error), "{error:#}");
+                        assert_eq!(manifests(), before_capsules, "neither governing nor start capsule may be persisted");
+                        assert_eq!(retained_source_bytes(&namespace), negative_source, "no source ACK/repair/rewriting on refusal");
+                        assert_eq!(engine.load_last_applied_mc_block_id().unwrap(), head);
+                        assert!(!engine.db().test_contains_dynamic_state_record(&target).unwrap());
+                    }).catch_unwind().await;
+                    if scenario == RecoveryScenario::MissingSourceCertificate {
+                        std::fs::rename(&withdrawn, path).unwrap();
+                    } else { std::fs::write(path, original).unwrap(); }
+                    assert_eq!(retained_source_bytes(&namespace), files);
+                    failed.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                }
+            }
             if mode == 7 {
                 let files = retained_source_bytes(&namespace);
                 let (path, original) = files.iter().find(|(_, bytes)| {
@@ -1012,4 +1075,77 @@ async fn ordinary_corruption_cold_check(
 #[ignore = "real cold ordinary graph corruption and exact restoration; RTOS_PUBLIC_FIXTURE_SIGNER required"]
 async fn historical_recovery_corrupt_ordinary_index_never_fetches_remote() {
     recover_scenario(RecoveryScenario::CorruptOrdinaryState).await;
+}
+
+// Re-sign the unchanged Finalize vote for another real derived session. Every
+// signature is checked against that session before it is used as a negative.
+fn resign_source_certificate(
+    signer: &str,
+    runtime: &AuthenticatedSessionRuntime,
+    wire: &mut rtos_api::ton::consensus::simplex::Certificate,
+) {
+    let data = simplex::utils::create_data_to_sign(
+        runtime.session_id(),
+        &simplex::utils::serialize_unsigned_vote(wire.vote()),
+    );
+    let rtos_api::ton::consensus::simplex::Certificate::Consensus_Simplex_Certificate(
+        ref mut certificate,
+    ) = wire;
+    let rtos_api::ton::consensus::simplex::VoteSignatureSet::Consensus_Simplex_VoteSignatureSet(
+        ref mut signatures,
+    ) = certificate.signatures;
+    let mut votes = signatures.votes.to_vec();
+    let mut weight = 0u64;
+    for vote in &mut votes {
+        let rtos_api::ton::consensus::simplex::VoteSignature::Consensus_Simplex_VoteSignature(
+            ref mut value,
+        ) = vote;
+        let member = &runtime.committee()[usize::try_from(value.who).unwrap()];
+        let mut signed = None;
+        for index in 0..3 {
+            let output = std::process::Command::new(signer)
+                .args([
+                    index.to_string(),
+                    hex::encode(&data),
+                    hex::encode(b"TOS-CONSENSUS-SIMPLEX-v1"),
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let text = String::from_utf8(output.stdout).unwrap();
+            let mut lines = text.lines();
+            let public = hex::decode(lines.next().unwrap()).unwrap();
+            let signature = hex::decode(lines.next().unwrap()).unwrap();
+            if public == member.pq_key().unwrap().public_key {
+                signed = Some(signature);
+                break;
+            }
+        }
+        let signature = signed.expect("public fixture signer matches committee");
+        ValidatorIdentity::from_descriptor(member)
+            .unwrap()
+            .verify_simplex(&data, &signature)
+            .unwrap();
+        value.signature = signature;
+        weight += member.weight;
+    }
+    let total: u64 = runtime.committee().iter().map(|member| member.weight).sum();
+    assert!(weight * 3 > total * 2, "foreign certificate must retain genuine quorum");
+    signatures.votes = votes.into();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real source absence cannot authorize capsule; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_missing_retained_certificate_preserves_all_capsules() {
+    recover_scenario(RecoveryScenario::MissingSourceCertificate).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real empty and insufficient valid source quorum; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_empty_and_insufficient_source_quorum_preserves_all_capsules() {
+    recover_scenario(RecoveryScenario::InsufficientSourceQuorum).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real differently signed session cert; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_wrong_signed_session_preserves_all_capsules() {
+    recover_scenario(RecoveryScenario::WrongSessionCertificate).await;
 }
