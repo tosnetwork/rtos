@@ -285,6 +285,20 @@ async fn mc_live_repair_missing_root_preflights_budget_before_rebuilding_durable
     let result = std::panic::AssertUnwindSafe(async {
         let (master, shards) = pair.apply_by_normal_clients().await;
         let expected = request(&pair).await;
+        pair.receiver.clone().wait_stop().await.unwrap();
+        master.await.unwrap();
+        shards.await.unwrap();
+        let config_path = pair._dir.path().join("receiver/config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        // GC captures its sleep interval at startup. Updating its atomic after
+        // launch cannot wake the default 900-second sleep already in progress.
+        config["gc"] = serde_json::json!({"enable_for_archives": false,
+            "enable_for_shard_state_persistent": false,
+            "cells_gc_config": {"gc_interval_sec": 1, "cells_lifetime_sec": 0}});
+        std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        drop(std::mem::replace(&mut pair.receiver, pair.provider.clone()));
+        pair.receiver = open_engine(&pair._dir.path().join("receiver")).await;
         // Real GC removes the target dynamic state; the zerostate parent remains.
         pair.receiver.shard_states_keeper().test_retire_history_state(pair.master.id());
         tokio::time::timeout(Duration::from_secs(15), async {
@@ -295,8 +309,6 @@ async fn mc_live_repair_missing_root_preflights_budget_before_rebuilding_durable
         .await
         .expect("real GC must remove target state record");
         pair.receiver.clone().wait_stop().await.unwrap();
-        master.await.unwrap();
-        shards.await.unwrap();
         drop(std::mem::replace(&mut pair.receiver, pair.provider.clone()));
         pair.receiver = open_engine(&pair._dir.path().join("receiver")).await;
         // Local body/fullproof still exist, so no network setup is needed here.
@@ -321,6 +333,104 @@ async fn mc_live_repair_missing_root_preflights_budget_before_rebuilding_durable
             pair.receiver.load_state(pair.master.id()).await.unwrap().root_cell().repr_hash(),
             &pair.master_state_root
         );
+    })
+    .catch_unwind()
+    .await;
+    pair.receiver.clone().wait_stop().await.unwrap();
+    pair.provider.clone().wait_stop().await.unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mc_live_repair_applied_target_rejects_wrong_authenticated_coordinates() {
+    let pair = Pair::with_propagation_profile("included", false, true).await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let (master, shards) = pair.apply_by_normal_clients().await;
+        let expected = request(&pair).await;
+        let before = pair.provider.overlays_router().unwrap().test_block_download_queries();
+        for field in 0..6 {
+            let mut wrong = expected.clone();
+            match field {
+                0 => wrong.profile = UInt256::default(),
+                1 => wrong.session_id = UInt256::default(),
+                2 => wrong.carrier_version += 1,
+                3 => wrong.pin.global_id ^= 1,
+                4 => wrong.history_init.root_hash = UInt256::default(),
+                _ => wrong.protocol = consensus_common::simplex_protocol::SimplexProtocol::Private,
+            }
+            assert!(
+                repair_mc_final(pair.receiver.clone(), wrong).await.is_err(),
+                "coordinate {field}"
+            );
+        }
+        assert_eq!(
+            pair.provider.overlays_router().unwrap().test_block_download_queries(),
+            before,
+            "wrong coordinates must not cause an otherwise unnecessary download"
+        );
+        // Rejections must release admission and leave the authentic request usable.
+        drop(repair_mc_final(pair.receiver.clone(), expected).await.unwrap());
+        pair.receiver.clone().wait_stop().await.unwrap();
+        master.await.unwrap();
+        shards.await.unwrap();
+    })
+    .catch_unwind()
+    .await;
+    pair.receiver.clone().wait_stop().await.unwrap();
+    pair.provider.clone().wait_stop().await.unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mc_live_repair_missing_artifacts_without_peer_defers_without_custody() {
+    let mut pair = Pair::with_propagation_profile("included", false, true).await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let (master, shards) = pair.apply_by_normal_clients().await;
+        let expected = request(&pair).await;
+        let root = std::path::PathBuf::from(pair.receiver.db_root_dir().unwrap());
+        pair.receiver.clone().wait_stop().await.unwrap();
+        master.await.unwrap();
+        shards.await.unwrap();
+        // Genuine applied artifacts disappear; do not clear metadata flags.
+        let mut pending = vec![root.join("archive/packages")];
+        let mut removed = 0;
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "pack") {
+                    std::fs::rename(&path, path.with_extension("withdrawn")).unwrap();
+                    removed += 1;
+                }
+            }
+        }
+        assert!(removed > 0);
+        drop(std::mem::replace(&mut pair.receiver, pair.provider.clone()));
+        pair.receiver = open_engine(&pair._dir.path().join("receiver")).await;
+        pair.receiver.initialize_test_full_node_overlays().await.unwrap();
+        let client = pair.receiver.overlay_client(pair.master.id().shard()).await.unwrap();
+        assert_eq!(
+            client.overlay_client().neighbours().count(),
+            0,
+            "cold receiver must have no supplied peer routes"
+        );
+        let failure = tokio::time::timeout(
+            Duration::from_secs(40),
+            repair_mc_final(pair.receiver.clone(), expected),
+        )
+        .await
+        .expect("owned read deadline must terminate");
+        assert!(failure.is_err(), "no peer cannot yield a custody receipt");
+        let body = root
+            .join("archive/unapplied")
+            .join(PackageEntryId::Block(pair.master.id()).filename_short());
+        assert!(!body.exists(), "failed fetch must not synthesize a body from spool");
+        assert!(pair.receiver.load_block_handle(pair.master.id()).unwrap().unwrap().is_applied());
     })
     .catch_unwind()
     .await;
