@@ -49,6 +49,8 @@ pub(crate) struct DependencyLeases {
     memory: Mutex<Memory>,
     #[cfg(test)]
     observer: Mutex<storage::durability::SyncObservation>,
+    #[cfg(test)]
+    commit_hook: Mutex<Option<Arc<dyn Fn(&LeaseRecord) + Send + Sync>>>,
 }
 impl LeaseRecord {
     pub(crate) fn binding(&self) -> Result<RepairLeaseBinding> {
@@ -159,6 +161,8 @@ impl DependencyLeases {
                 memory: Mutex::new(memory),
                 #[cfg(test)]
                 observer: Mutex::new(None),
+                #[cfg(test)]
+                commit_hook: Mutex::new(None),
             }))
         })();
         if outcome.is_err() {
@@ -196,6 +200,12 @@ impl DependencyLeases {
             fail!("Repair ledger requires cold recovery");
         }
         memory.records.get(&generation).cloned().ok_or_else(|| error!("Unknown repair lease"))
+    }
+    /// Instance-local observation after the actual WAL sync has succeeded.
+    /// Production constructors and persistence semantics are unchanged.
+    #[cfg(test)]
+    pub(crate) fn set_commit_hook(&self, hook: Arc<dyn Fn(&LeaseRecord) + Send + Sync>) {
+        *self.commit_hook.lock().unwrap() = Some(hook);
     }
     pub(crate) fn begin(
         &self,
@@ -294,6 +304,10 @@ impl DependencyLeases {
             memory.poisoned = true;
             self.protection.poison();
             return Err(e);
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.commit_hook.lock().unwrap().clone() {
+            hook(&record);
         }
         memory.next = next;
         memory.bytes = total;

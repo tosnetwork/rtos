@@ -265,3 +265,6 @@ async fn persistent_repair_history_real_local_limits_never_enter_capsule_or_netw
     drop(dir);
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
+
+#[path = "persistent_custody_crash_tests.rs"]
+mod crash_tests;
