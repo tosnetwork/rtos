@@ -195,3 +195,6 @@ async fn retired_service_historical_sink_accepts_without_key_and_reauthenticates
         }
     }
 }
+
+#[path = "publication_history_tests.rs"]
+mod publication_history_tests;
