@@ -295,6 +295,21 @@ impl FullNodeOverlaysRouter {
         self.service.test_block_download_queries()
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_bounded_reply(
+        &self,
+        peer: Arc<rtos_block::KeyId>,
+        id: BlockIdExt,
+        full: bool,
+        bytes: Vec<u8>,
+    ) {
+        self.service.test_bounded_reply(peer, id, full, bytes);
+    }
+    #[cfg(test)]
+    pub(crate) fn test_bounded_queries(&self) -> usize {
+        self.service.test_bounded_queries()
+    }
+
     pub async fn overlay_client(
         self: &Arc<Self>,
         shard: &ShardIdent,

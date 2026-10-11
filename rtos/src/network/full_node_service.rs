@@ -60,6 +60,10 @@ pub struct FullNodeOverlayService {
     tasks: Arc<OwnedTasks>,
     #[cfg(test)]
     block_download_queries: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    bounded_reply: std::sync::Mutex<Option<(Arc<rtos_block::KeyId>, BlockIdExt, bool, Vec<u8>)>>,
+    #[cfg(test)]
+    bounded_queries: std::sync::atomic::AtomicUsize,
 }
 
 impl FullNodeOverlayService {
@@ -74,12 +78,33 @@ impl FullNodeOverlayService {
             tasks,
             #[cfg(test)]
             block_download_queries: Default::default(),
+            #[cfg(test)]
+            bounded_reply: Default::default(),
+            #[cfg(test)]
+            bounded_queries: Default::default(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn test_block_download_queries(&self) -> usize {
         self.block_download_queries.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_bounded_reply(
+        &self,
+        peer: Arc<rtos_block::KeyId>,
+        id: BlockIdExt,
+        full: bool,
+        bytes: Vec<u8>,
+    ) {
+        let mut reply = self.bounded_reply.lock().unwrap();
+        assert!(reply.is_none(), "unused previous scoped reply");
+        *reply = Some((peer, id, full, bytes));
+    }
+    #[cfg(test)]
+    pub(crate) fn test_bounded_queries(&self) -> usize {
+        self.bounded_queries.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     // tonNode.getNextBlockDescription prev_block:tonNode.blockIdExt = tonNode.BlockDescription;
@@ -723,6 +748,32 @@ impl Subscriber for FullNodeOverlayService {
     ) -> Result<QueryResult> {
         let _admission = self.tasks.enter()?;
         log::debug!("try_consume_query {:?} from {}", query, adnl_peers.other());
+        #[cfg(test)]
+        {
+            let request = if query.is::<DownloadBlockFull>() {
+                Some((query.clone().downcast::<DownloadBlockFull>().unwrap().block, true))
+            } else if query.is::<DownloadBlockProof>() {
+                Some((query.clone().downcast::<DownloadBlockProof>().unwrap().block, false))
+            } else {
+                None
+            };
+            if let Some((id, full)) = request {
+                self.bounded_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut injected = self.bounded_reply.lock().unwrap();
+                if injected.as_ref().is_some_and(|(peer, target, kind, _)| {
+                    peer == adnl_peers.other() && target == &id && *kind == full
+                }) {
+                    let (_, _, _, bytes) = injected.take().unwrap();
+                    return Ok(QueryResult::Consumed(QueryAnswer::Ready(Some(Answer::Raw(
+                        TaggedByteVec {
+                            object: bytes,
+                            #[cfg(feature = "telemetry")]
+                            tag: 0,
+                        },
+                    )))));
+                }
+            }
+        }
 
         let query = match self
             .consume_query::<GetNextBlockDescription, _>(query, &Self::get_next_block_description)
