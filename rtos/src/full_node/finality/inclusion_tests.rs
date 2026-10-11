@@ -1124,3 +1124,6 @@ mod publication_repair_tests;
 
 #[path = "bounded_download_tests.rs"]
 mod bounded_download_tests;
+
+#[path = "persistent_closure_engine_tests.rs"]
+mod persistent_closure_engine_tests;

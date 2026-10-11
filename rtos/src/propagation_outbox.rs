@@ -1065,6 +1065,19 @@ pub(crate) fn inspect_delivery(
     }))
 }
 
+/// Read-only coherent observation. Never opens a competing outbox writer.
+#[cfg(test)]
+pub(crate) fn inspect_closure_progress(
+    db: &Arc<InternalDb>, domain: &OutboxDomain,
+) -> Result<(Vec<UnverifiedRecord>, Vec<ClosingRecord>)> {
+    let limits = Limits::default();
+    let Some(bytes) = db.load_validator_state_raw_bounded(KEY, limits.max_snapshot_bytes)? else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let snapshot = decode_snapshot(&bytes, domain, &limits)?;
+    Ok((snapshot.entries, snapshot.closing))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

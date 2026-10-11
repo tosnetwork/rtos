@@ -118,6 +118,7 @@ name = "liteserver_pipeline"
 harness = false
 
 [dev-dependencies]
+simplex = { path = "simplex", features = ["integration-test-support"] }
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 ctor = '0.2'
 tempfile = '3'
