@@ -213,6 +213,32 @@ impl ArchiveManager {
         Ok(())
     }
 
+    /// Strict bounded read. Unlike the legacy recovery loader, errors do not
+    /// clear handle flags or fall back to another source.
+    pub async fn get_file_bounded<B: Borrow<BlockIdExt> + Hash>(
+        &self,
+        handle: &BlockHandle,
+        entry_id: &PackageEntryId<B>,
+        limits: super::bounded_read::ArchiveReadLimits,
+    ) -> Result<Vec<u8>> {
+        let _lock = match entry_id {
+            PackageEntryId::Block(_) => handle.block_file_lock().read().await,
+            PackageEntryId::Proof(_) | PackageEntryId::ProofLink(_) => handle.proof_file_lock().read().await,
+            _ => fail!("Unsupported bounded archive entry"),
+        };
+        if handle.is_archived() {
+            let package_id = self.get_package_id(get_mc_seq_no(handle), handle.is_key_block()?).await?;
+            let fd = self.get_file_desc(&package_id, false).await?
+                .ok_or_else(|| error!("Bounded archive descriptor missing"))?;
+            let entry = fd.archive_slice().get_file_bounded(handle, entry_id, limits).await?
+                .ok_or_else(|| error!("Bounded archive entry missing"))?;
+            return Ok(entry.take_data());
+        }
+        let filename = entry_id.filename_short();
+        super::bounded_read::check_length("filename", filename.len() as u64, limits.filename_bytes)?;
+        super::bounded_read::read_loose(&self.unapplied_files_path.join(filename), limits).await
+    }
+
     pub async fn get_file<B: Borrow<BlockIdExt> + Hash>(
         &self,
         handle: &BlockHandle,
