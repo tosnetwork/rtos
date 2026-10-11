@@ -49,7 +49,7 @@ struct Domain {
     init: String,
 }
 impl Domain {
-    fn from_engine(engine: &dyn EngineOperations) -> Result<Self> {
+    fn from_engine<E: EngineOperations + ?Sized>(engine: &E) -> Result<Self> {
         Ok(Self {
             zero: engine.zerostate_id()?.to_string(),
             init: engine.init_mc_block_id().to_string(),
@@ -193,6 +193,89 @@ impl Store {
         }
         Ok(Some(Evidence { manifest, state, proofs }))
     }
+    /// Metadata lookup is bounded independently of proof/state authentication.
+    /// Conflicting full identities at one height are never resolved by order.
+    fn manifests(&self, domain: &Domain) -> Result<Vec<Manifest>> {
+        self.usage()?;
+        let mut result = Vec::new();
+        let mut identities = std::collections::BTreeMap::new();
+        let mut read_bytes = 0usize;
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if entry.path().extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let bytes = bounded_read(&entry.path(), 2 << 20)?;
+            read_bytes = read_bytes
+                .checked_add(bytes.len())
+                .ok_or_else(|| error!("History metadata budget overflow"))?;
+            if read_bytes > 16 << 20 {
+                fail!("History metadata lookup exceeds budget");
+            }
+            let manifest: Manifest = serde_json::from_slice(&bytes)?;
+            if &manifest.domain != domain {
+                continue;
+            }
+            let id: BlockIdExt = manifest.id.parse()?;
+            if manifest.schema != SCHEMA
+                || !id.shard().is_masterchain_ext()
+                || manifest.proofs.len() > self.limits.proofs_per_anchor
+                || entry.file_name()
+                    != std::ffi::OsString::from(format!("{}.json", anchor_name(domain, &id)))
+            {
+                fail!("Invalid retained history lookup manifest");
+            }
+            for id in std::iter::once(Ok(id))
+                .chain(manifest.proofs.iter().map(|p| p.id.parse::<BlockIdExt>()))
+            {
+                let id = id?;
+                if !id.shard().is_masterchain_ext() {
+                    fail!("Non-masterchain retained history proof");
+                }
+                if let Some(previous) = identities.insert(id.seq_no, id.clone()) {
+                    if previous != id {
+                        fail!("Conflicting retained history identities at height {}", id.seq_no);
+                    }
+                }
+            }
+            result.push(manifest);
+        }
+        Ok(result)
+    }
+
+    fn find_proof(
+        &self,
+        domain: &Domain,
+        id: &BlockIdExt,
+        allow_link: bool,
+    ) -> Result<Option<BlockProofStuff>> {
+        let manifests = self.manifests(domain)?;
+        let mut found: Option<&ProofRef> = None;
+        for proof in manifests.iter().flat_map(|m| &m.proofs) {
+            if proof.id != id.to_string() || (proof.link && !allow_link) {
+                continue;
+            }
+            if let Some(previous) = found {
+                if previous.link == proof.link && previous.blob != proof.blob {
+                    fail!("Conflicting retained proof bytes");
+                }
+                if !previous.link {
+                    continue;
+                }
+            }
+            found = Some(proof);
+        }
+        found
+            .map(|p| {
+                BlockProofStuff::deserialize(
+                    id,
+                    self.blob(&p.blob, self.limits.proof_bytes)?,
+                    p.link,
+                )
+            })
+            .transpose()
+    }
+
     fn atomic_write(&self, name: &str, bytes: &[u8]) -> Result<()> {
         #[cfg(test)]
         if self.fail_manifest && name.ends_with(".json") {
@@ -290,28 +373,39 @@ impl Store {
     }
 }
 
-async fn owned_io<T: Send + 'static>(
-    engine: &dyn EngineOperations,
+async fn owned_io<E: EngineOperations + ?Sized, T: Send + 'static>(
+    engine: &E,
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
     let permit = IO_JOBS.try_acquire().map_err(|_| error!("History IO capacity exhausted"))?;
-    crate::types::service_tasks::spawn_owned(engine, "retired history IO", async move {
-        let _permit = permit;
-        tokio::task::spawn_blocking(work)
-            .await
-            .map_err(|e| error!("Retired history IO join: {e}"))?
-    })?
-    .await
-    .map_err(|e| error!("Retired history owner join: {e}"))?
+    let (sent, received) = tokio::sync::oneshot::channel();
+    // Register the actual worker before exposing a cancelable observation.
+    let completion = engine.register_service_task(
+        "retired history IO",
+        0,
+        Box::new(move || {
+            tokio::spawn(async move {
+                let _permit = permit;
+                let result = tokio::task::spawn_blocking(work)
+                    .await
+                    .map_err(|e| error!("Retired history IO join: {e}"))
+                    .and_then(|result| result);
+                let _ = sent.send(result);
+            })
+        }),
+    )?;
+    completion.await.map_err(|e| error!("Retired history owner join: {e}"))?;
+    received.await.map_err(|e| error!("Retired history result lost: {e}"))?
 }
-fn root(engine: &dyn EngineOperations) -> Result<PathBuf> {
+
+fn root<E: EngineOperations + ?Sized>(engine: &E) -> Result<PathBuf> {
     Ok(PathBuf::from(engine.db_root_dir()?).join("retired-history-v1"))
 }
 
 /// Read-only with respect to acceptance/publication. Missing private evidence
 /// retains the old explicit load/defer behavior; corrupt evidence is not ignored.
-pub(crate) async fn authenticate_state(
-    engine: &dyn EngineOperations,
+pub(crate) async fn authenticate_state<E: EngineOperations + ?Sized>(
+    engine: &E,
     id: &BlockIdExt,
 ) -> Result<VerifiedMasterchainState> {
     let path = root(engine)?;
@@ -340,6 +434,54 @@ pub(crate) async fn authenticate_state(
         fail!("History global ID mismatch");
     }
     Ok(verified)
+}
+
+/// Raw evidence only: callers must verify through BootstrapAuthority.
+pub(crate) async fn load_proof<E: EngineOperations + ?Sized>(
+    engine: &E,
+    id: &BlockIdExt,
+    allow_link: bool,
+) -> Result<Option<BlockProofStuff>> {
+    let path = root(engine)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let domain = Domain::from_engine(engine)?;
+    let id = id.clone();
+    owned_io(engine, move || {
+        Store::open(path, Limits::default())?.find_proof(&domain, &id, allow_link)
+    })
+    .await
+}
+
+/// Authenticate one selected retained anchor before using its history index.
+pub(crate) async fn lookup_hint<E: EngineOperations + ?Sized>(
+    engine: &E,
+    epoch: u32,
+) -> Result<Option<Arc<ShardStateStuff>>> {
+    let path = root(engine)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let domain = Domain::from_engine(engine)?;
+    let selected = owned_io(engine, move || {
+        let store = Store::open(path, Limits::default())?;
+        let mut ids = store
+            .manifests(&domain)?
+            .into_iter()
+            .map(|m| m.id.parse::<BlockIdExt>())
+            .collect::<Result<Vec<_>>>()?;
+        ids.retain(|id| id.seq_no >= epoch);
+        ids.sort_by_key(|id| id.seq_no);
+        Ok(ids.into_iter().next())
+    })
+    .await?;
+    let Some(id) = selected else {
+        return Ok(None);
+    };
+    let verified = authenticate_state(engine, &id).await?;
+    verified.state().find_block_id(epoch)?;
+    Ok(Some(verified.state().clone()))
 }
 
 /// Live authenticated admission only. Two concurrent preparations bound working
@@ -527,3 +669,7 @@ mod tests {
         assert!(store.read(&domain(), &identity(1)).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_retained_publication_history.rs"]
+mod publication_tests;

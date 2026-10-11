@@ -692,8 +692,8 @@ pub async fn cold_boot(
 /// Rebuild authority from the explicit local pin. The recovered state's history
 /// dictionary is only a lookup hint until its own root is authenticated below.
 /// Keep one key proof at a time; no unbounded vector of historical proofs.
-pub(crate) async fn authenticate_recovered_state(
-    engine: &dyn EngineOperations,
+pub(crate) async fn authenticate_recovered_state<E: EngineOperations + ?Sized>(
+    engine: &E,
     block_id: &BlockIdExt,
 ) -> Result<VerifiedMasterchainState> {
     if !block_id.shard().is_masterchain_ext() || block_id.seq_no < engine.init_mc_block_id().seq_no
@@ -706,8 +706,8 @@ pub(crate) async fn authenticate_recovered_state(
 
 /// The same pinned proof verification for either live or independently retained
 /// state. Supplied evidence is untrusted; it never bypasses proof verification.
-pub(crate) async fn authenticate_recovered_state_evidence(
-    engine: &dyn EngineOperations,
+pub(crate) async fn authenticate_recovered_state_evidence<E: EngineOperations + ?Sized>(
+    engine: &E,
     block_id: &BlockIdExt,
     state: Arc<crate::shard_state::ShardStateStuff>,
     evidence: Option<&[BlockProofStuff]>,
@@ -765,8 +765,8 @@ pub(crate) async fn authenticate_recovered_state_evidence(
     Ok(verified)
 }
 
-async fn recovery_evidence_proof(
-    engine: &dyn EngineOperations,
+async fn recovery_evidence_proof<E: EngineOperations + ?Sized>(
+    engine: &E,
     id: &BlockIdExt,
     checkpoint: bool,
     key_block: bool,
@@ -817,6 +817,9 @@ pub(crate) async fn load_history_proof<E: EngineOperations + ?Sized>(
                 return Ok(proof);
             }
         }
+    }
+    if let Some(proof) = crate::retired_history::load_proof(engine, id, checkpoint).await? {
+        return Ok(proof);
     }
     // A checkpoint may use a proof link because its complete ID is pinned.
     // Every unpinned successor requires a finality proof.

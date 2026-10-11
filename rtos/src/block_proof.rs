@@ -295,7 +295,17 @@ impl MasterchainProofVerifier {
             fail!("Governing epoch is outside the locally pinned history");
         }
         let hint = if epoch > pin.seq_no {
-            Some(engine.load_last_applied_mc_state().await?)
+            match engine.load_last_applied_mc_state().await {
+                Ok(state) if state.find_block_id(epoch).is_ok() => Some(state),
+                ordinary => match crate::retired_history::lookup_hint(engine, epoch).await? {
+                    Some(state) => Some(state),
+                    None => {
+                        let state = ordinary?;
+                        state.find_block_id(epoch)?;
+                        Some(state)
+                    }
+                },
+            }
         } else {
             None
         };
