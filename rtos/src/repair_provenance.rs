@@ -45,8 +45,12 @@ pub(crate) struct Trace {
 impl Trace {
     fn insert(&mut self, entry: Dependency, budget: &HistoryReadBudget) -> Result<()> {
         entry.validate()?;
-        for previous in &self.dependencies {
+        let mut position = self.dependencies.len();
+        for (index, previous) in self.dependencies.iter().enumerate() {
             budget.step()?;
+            if position == self.dependencies.len() && previous > &entry {
+                position = index;
+            }
             if previous.kind == entry.kind && previous.id == entry.id {
                 if previous != &entry {
                     fail!("Conflicting authenticated repair dependency");
@@ -59,7 +63,12 @@ impl Trace {
         }
         budget.metadata(1024)?;
         self.dependencies.try_reserve_exact(1)?;
-        self.dependencies.push(entry);
+        // Keep the trace sorted while the request budget is available. Each
+        // shifted entry is admitted before insertion; take() allocates no sort.
+        for _ in position..self.dependencies.len() {
+            budget.step()?;
+        }
+        self.dependencies.insert(position, entry);
         Ok(())
     }
     pub(crate) fn proof(
@@ -79,10 +88,19 @@ impl Trace {
             },
             budget,
         )?;
-        if !self.proofs.iter().any(|p| p.id() == proof.id() && p.is_link() == proof.is_link()) {
+        let mut recorded = false;
+        for previous in &self.proofs {
+            budget.step()?;
+            if previous.id() == proof.id() && previous.is_link() == proof.is_link() {
+                recorded = true;
+                break;
+            }
+        }
+        if !recorded {
             budget.metadata(std::mem::size_of::<BlockProofStuff>())?;
+            let owned = proof.clone_with_budget(Some(budget))?;
             self.proofs.try_reserve_exact(1)?;
-            self.proofs.push(proof.clone());
+            self.proofs.push(owned);
         }
         Ok(())
     }
@@ -163,7 +181,89 @@ impl Trace {
         )
     }
     pub(crate) fn take(&mut self) -> (Vec<Dependency>, Vec<BlockProofStuff>) {
-        self.dependencies.sort_unstable();
         (std::mem::take(&mut self.dependencies), std::mem::take(&mut self.proofs))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history_read_budget::{HistoryBudgetExceeded, HistoryReadLimits};
+    use rtos_block::{
+        BlockProof, BlockSignaturesSimplexPq, BlockSignaturesVariant, Deserializable, Serializable,
+        ShardIdent,
+    };
+
+    #[test]
+    fn provenance_budget_charges_typed_pq_clone_before_retaining_proof() {
+        let vectors = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../block/tests/data/pq-block-signature-vectors.txt"
+        ));
+        let row: Vec<_> = vectors
+            .lines()
+            .find(|line| line.starts_with("valid-1\t"))
+            .unwrap()
+            .split('\t')
+            .collect();
+        let root = rtos_block::read_single_root_boc(&hex::decode(row[4]).unwrap()).unwrap();
+        let carrier = BlockSignaturesSimplexPq::construct_from_cell(root).unwrap();
+        let id = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            1,
+            UInt256::default(),
+            UInt256::default(),
+        );
+        let proof = BlockProof {
+            proof_for: id.clone(),
+            root: Cell::default(),
+            signatures: Some(BlockSignaturesVariant::SimplexPq(carrier)),
+        };
+        let proof = BlockProofStuff::deserialize(
+            &id,
+            rtos_block::write_boc(&proof.serialize().unwrap()).unwrap(),
+            false,
+        )
+        .unwrap();
+        let mut trace = Trace::default();
+        let small =
+            HistoryReadBudget::new(HistoryReadLimits { cell_bytes: 1024, ..Default::default() });
+        let error = trace.proof(&proof, &small).unwrap_err();
+        assert!(error.downcast_ref::<HistoryBudgetExceeded>().is_some());
+        assert!(trace.proofs.is_empty(), "unadmitted deep clone was retained");
+        let mut trace = Trace::default();
+        let ample = HistoryReadBudget::new(Default::default());
+        trace.proof(&proof, &ample).unwrap();
+        trace.proof(&proof, &ample).unwrap();
+        let (dependencies, proofs) = trace.take();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(proofs, vec![proof]);
+    }
+
+    #[test]
+    fn provenance_budget_orders_entries_during_admitted_insertion() {
+        let budget = HistoryReadBudget::new(Default::default());
+        let mut trace = Trace::default();
+        for seq in [9, 1, 7, 1] {
+            let id = BlockIdExt::with_params(
+                ShardIdent::masterchain(),
+                seq,
+                UInt256::default(),
+                UInt256::default(),
+            );
+            trace.bytes("block", &id, &[seq as u8], None, &budget).unwrap();
+        }
+        let (entries, _) = trace.take();
+        assert_eq!(entries.len(), 3);
+        assert!(entries.windows(2).all(|pair| pair[0] < pair[1]));
+        let empty = HistoryReadBudget::new(HistoryReadLimits { steps: 0, ..Default::default() });
+        let mut trace = Trace::default();
+        trace.insert(entries[2].clone(), &budget).unwrap();
+        assert!(trace
+            .insert(entries[0].clone(), &empty)
+            .unwrap_err()
+            .downcast_ref::<HistoryBudgetExceeded>()
+            .is_some());
+        assert_eq!(trace.take().0, vec![entries[2].clone()]);
     }
 }

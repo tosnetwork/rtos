@@ -86,6 +86,23 @@ impl BlockStuff {
             fail!("Bounded block file hash mismatch");
         }
         let root = budget.parse_boc(&data)?;
+        Self::from_parsed_history_root(id, data, root, budget)
+    }
+
+    /// The caller has admitted this exact BOC graph with its shared request
+    /// budget. Decode the fixed block wrapper without parsing the BOC again.
+    pub(crate) fn from_parsed_history_root(
+        id: BlockIdExt,
+        data: Arc<Vec<u8>>,
+        root: Cell,
+        budget: &crate::history_read_budget::HistoryReadBudget,
+    ) -> Result<Self> {
+        use rtos_block::merkle_apply_budget::MerkleApplyBudget;
+        budget.step()?;
+        rtos_block::merkle_apply_budget::require_materialized(&root)?;
+        if UInt256::calc_file_hash(&data) != id.file_hash {
+            fail!("Bounded block file hash mismatch");
+        }
         if root.repr_hash() != &id.root_hash {
             fail!("Bounded block root hash mismatch");
         }
