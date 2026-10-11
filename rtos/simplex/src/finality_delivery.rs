@@ -22,7 +22,8 @@ use std::{
 #[path = "finality_delivered.rs"]
 mod delivered;
 pub use delivered::{
-    close_source_id, scan_finality_closures, DeliveredCompletion, DeliveredCompletionSink,
+    close_source_id, scan_finality_closures, scan_finality_closures_namespace,
+    scan_finality_closures_namespace_batch, DeliveredCompletion, DeliveredCompletionSink,
     DeliveredConfirmation, FinalityCloseRecovery,
 };
 
@@ -431,6 +432,7 @@ pub(crate) struct PendingFinalityStore {
     mutation: Mutex<()>,
     delivered_uncertain: std::sync::atomic::AtomicBool,
     runtime_binding: Mutex<Option<delivered::DiskRecoveryBinding>>,
+    intents: Arc<crate::finality_recovery::FinalityIntentStore>,
     #[cfg(test)]
     fail_delivered_once: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -444,6 +446,9 @@ impl PendingFinalityStore {
         Self::lock(directory)?.ok_or_else(|| error!("Source finality store already owned"))
     }
     pub(crate) fn lock(directory: PathBuf) -> Result<Option<Arc<Self>>> {
+        let intents = Arc::new(crate::finality_recovery::FinalityIntentStore::new(
+            directory.parent().ok_or_else(|| error!("Missing source namespace"))?,
+        ));
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -457,6 +462,7 @@ impl PendingFinalityStore {
                 mutation: Mutex::new(()),
                 delivered_uncertain: std::sync::atomic::AtomicBool::new(false),
                 runtime_binding: Mutex::new(None),
+                intents,
                 #[cfg(test)]
                 fail_delivered_once: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
@@ -910,7 +916,7 @@ pub(crate) struct SourceFinalityDelivery {
     runtime: Arc<AuthenticatedSessionRuntime>,
     store: Arc<PendingFinalityStore>,
     sink: consensus_common::finality_delivery::DurableFinalitySinkPtr,
-    intents: crate::finality_recovery::FinalityIntentStore,
+    intents: Arc<crate::finality_recovery::FinalityIntentStore>,
     start_masterchain: Mutex<Option<BlockIdExt>>,
     stages: Mutex<std::collections::HashMap<UInt256, SourceStage>>,
     delivered_sink: Option<DeliveredCompletionSink>,
@@ -949,6 +955,7 @@ impl SourceFinalityDelivery {
         let store = PendingFinalityStore::open(namespace)?;
         *store.runtime_binding.lock().unwrap() =
             runtime.recovery_binding().map(delivered::DiskRecoveryBinding::from_binding);
+        let intents = store.intents.clone();
         Ok(Arc::new(Self {
             runtime,
             store,
@@ -956,7 +963,7 @@ impl SourceFinalityDelivery {
             delivered_sink,
             closing: Mutex::new(std::collections::HashSet::new()),
             close_cursor: Mutex::new((std::time::Instant::now(), 0)),
-            intents: crate::finality_recovery::FinalityIntentStore::new(namespace),
+            intents,
             start_masterchain: Mutex::new(None),
             stages: Mutex::new(std::collections::HashMap::new()),
             namespace_release: SourceNamespaceRelease(Arc::new(
@@ -1005,11 +1012,16 @@ impl SourceFinalityDelivery {
         self.intents.resolve(id)
     }
     pub(crate) fn pending_intent_count(&self) -> Result<usize> {
-        self.intents.pending_count()
+        Ok(self.intents.pending_count()?
+            + if self.delivered_sink.is_some() { self.intents.legacy_output_count()? } else { 0 })
     }
     pub(crate) fn pending_intents(&self) -> Result<Vec<Vec<u8>>> {
         self.intents.authenticate_pending(&self.runtime)?;
-        self.intents.pending_with_legacy_outputs()
+        if self.delivered_sink.is_some() {
+            self.intents.pending_with_legacy_outputs()
+        } else {
+            self.intents.pending()
+        }
     }
 
     /// None means not yet durable. Retention precedes every first stage; later

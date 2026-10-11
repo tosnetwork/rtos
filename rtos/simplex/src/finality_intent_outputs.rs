@@ -241,7 +241,17 @@ impl FinalityIntentStore {
             .join(OUTPUT_DIRECTORY)
             .join(path.file_name().unwrap())
             .with_extension("outputs");
-        Ok(!output.exists())
+        if output.exists() {
+            Ok(OutputSet::read(&output)?.released)
+        } else {
+            Ok(true)
+        }
+    }
+    pub(crate) fn legacy_output_count(&self) -> Result<usize> {
+        let _guard = self.mutation.lock().unwrap();
+        self.paths()?
+            .iter()
+            .try_fold(0usize, |n, path| Ok(n + usize::from(self.needs_output_rebuild(path)?)))
     }
     pub(crate) fn pending_with_legacy_outputs(&self) -> Result<Vec<Vec<u8>>> {
         let mut pending = self.pending()?;
@@ -250,7 +260,7 @@ impl FinalityIntentStore {
             if self.needs_output_rebuild(&path)? {
                 pending.push(read_intent(&path, &self.namespace)?.1);
             }
-            if pending.len() > MAX_INTENTS {
+            if pending.len() > MAX_INTENTS + MAX_COMPLETED {
                 fail!("Legacy output reconstruction batch bound exceeded");
             }
         }
@@ -273,7 +283,9 @@ impl FinalityIntentStore {
             return Ok(());
         }
         let start = self.output_cursor.fetch_add(16, std::sync::atomic::Ordering::Relaxed);
-        for offset in 0..paths.len().min(16) {
+        // The directory has explicit count/byte bounds. A cold closure must finish
+        // every eligible certificate before it can hide its confirmed locator.
+        for offset in 0..paths.len() {
             let cert = &paths[(start + offset) % paths.len()];
             let path = self
                 .namespace
@@ -309,5 +321,89 @@ impl FinalityIntentStore {
             File::open(cert.parent().unwrap())?.sync_all()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn source_output_set_preserves_ancestor_role_holes_and_rebuilds_legacy() {
+        let directory = crate::authenticated_fixture::TestDirectory::new();
+        let (runtime, _) = crate::finality_delivery::tests::fixture();
+        let runtime =
+            runtime.as_ref().clone().bind_recovery_anchor(runtime.pin().zerostate.clone()).unwrap();
+        let namespace =
+            PathBuf::from(runtime.runtime_directory(directory.path().to_str().unwrap()).unwrap());
+        let _owner = crate::finality_delivery::PendingFinalityStore::open(&namespace).unwrap();
+        let store = FinalityIntentStore::new(&namespace);
+        // Structural cert fixture tests exact source storage, not PQ verification.
+        let event = crate::simplex_state::BlockFinalizedEvent {
+            slot: crate::block::SlotIndex::new(100),
+            block_hash: UInt256::from([7; 32]),
+            block_id: None,
+            certificate: std::sync::Arc::new(crate::certificate::Certificate {
+                vote: crate::simplex_state::FinalizeVote {
+                    slot: crate::block::SlotIndex::new(100),
+                    block_hash: UInt256::from([7; 32]),
+                },
+                signatures: Vec::new(),
+            }),
+        };
+        let trigger =
+            crate::block::RawCandidateId { slot: event.slot, hash: event.block_hash.clone() };
+        store
+            .retain(
+                &runtime,
+                vec![runtime.pin().zerostate.clone()],
+                runtime.pin().zerostate.clone(),
+                &event,
+            )
+            .unwrap();
+        store.resolve(&trigger).unwrap();
+        assert_eq!(store.pending_count().unwrap(), 0);
+        assert_eq!(store.legacy_output_count().unwrap(), 1);
+        assert_eq!(
+            store.pending_with_legacy_outputs().unwrap().len(),
+            1,
+            "old completed certificate must reach real recovery walk"
+        );
+        let mut block = runtime.pin().zerostate.clone();
+        block.seq_no = 1;
+        let source = UInt256::from([3; 32]);
+        let final_output = ExpectedFinalityOutput::new(&block, true, &source);
+        let approval_same_block = ExpectedFinalityOutput::new(&block, false, &source);
+        block.seq_no = 2;
+        let ancestor = ExpectedFinalityOutput::new(&block, false, &source);
+        let outputs = vec![final_output.clone(), approval_same_block.clone(), ancestor.clone()];
+        store.seal_outputs(&trigger, outputs.clone()).unwrap();
+        assert_eq!(store.legacy_output_count().unwrap(), 0);
+        let pending =
+            namespace.join(DIRECTORY).join(format!("100-{}.json", trigger.hash.to_hex_string()));
+        let completed = store.completed_path(&pending);
+        let original = std::fs::read(&completed).unwrap();
+        // A higher ancestor and Final for the same block do not close Approval.
+        store.collect_delivered(&runtime, |output| Ok(output != &approval_same_block)).unwrap();
+        assert_eq!(std::fs::read(&completed).unwrap(), original);
+        assert!(
+            store.seal_outputs(&trigger, vec![final_output]).is_err(),
+            "sealed set cannot shrink after restart"
+        );
+        drop(store);
+        let store = FinalityIntentStore::new(&namespace);
+        store.collect_delivered(&runtime, |_| Ok(true)).unwrap();
+        assert!(!completed.exists());
+        assert!(store.output_is_released(&trigger).unwrap());
+        store
+            .retain(
+                &runtime,
+                vec![runtime.pin().zerostate.clone()],
+                runtime.pin().zerostate.clone(),
+                &event,
+            )
+            .unwrap();
+        assert!(!pending.exists(), "released event replay never recreates large certificate");
+        store.seal_outputs(&trigger, outputs).unwrap();
+        store.resolve(&trigger).unwrap();
     }
 }

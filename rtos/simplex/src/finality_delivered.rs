@@ -435,6 +435,12 @@ impl FinalityCloseRecovery {
                                 receipt,
                                 Box::new(move |result| {
                                     let result = result.and_then(|()| {
+                                        owner
+                                            .store
+                                            .intents
+                                            .collect_delivered(&runtime, |output| {
+                                                owner.store.output_delivered(&runtime, output)
+                                            })?;
                                         owner.store.mark_node_confirmed(&source_id, &expected_offer)
                                     });
                                     drop(owner);
@@ -489,53 +495,78 @@ pub fn scan_finality_closures(root: &Path) -> Result<Vec<FinalityCloseRecovery>>
         return Ok(Vec::new());
     }
     let mut result = Vec::new();
-    let mut total_bytes = 0u64;
-    let mut namespaces = 0usize;
-    for namespace in std::fs::read_dir(base)? {
-        let namespace = namespace?;
+    let mut namespaces = 0;
+    for entry in std::fs::read_dir(base)? {
+        let entry = entry?;
         namespaces += 1;
         if namespaces > MAX_REFERENCES {
-            fail!("Source closure namespace scan bound exceeded");
+            fail!("Closure namespace scan bound");
         }
-        if !namespace.file_type()?.is_dir() {
+        if !entry.file_type()?.is_dir() {
             continue;
         }
-        let directory = namespace.path().join(DIRECTORY);
-        if !directory.exists() {
+        result.extend(scan_finality_closures_namespace(&entry.path())?);
+        if result.len() > MAX_REFERENCES {
+            fail!("Closure aggregate scan bound");
+        }
+    }
+    Ok(result)
+}
+/// Single owned namespace. Callers may select a bounded batch and drop others;
+/// prefer the cursor variant in a long-running recovery service.
+pub fn scan_finality_closures_namespace(namespace: &Path) -> Result<Vec<FinalityCloseRecovery>> {
+    scan_finality_closures_namespace_batch(namespace, None, MAX_REFERENCES)
+}
+/// Stable source-ID order with wraparound. Advance `after` even when an item
+/// fails authentication/admission, so a low-ID failure cannot starve later debt.
+pub fn scan_finality_closures_namespace_batch(
+    namespace: &Path,
+    after: Option<&UInt256>,
+    limit: usize,
+) -> Result<Vec<FinalityCloseRecovery>> {
+    if limit == 0 || limit > MAX_REFERENCES {
+        fail!("Invalid source closure batch limit");
+    }
+    let directory = namespace.join(DIRECTORY);
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let Some(store) = PendingFinalityStore::lock(directory)? else {
+        return Ok(Vec::new());
+    };
+    let mut ids = std::collections::BTreeMap::new();
+    for path in store.paths()? {
+        if !matches!(
+            path.extension().and_then(|s| s.to_str()),
+            Some("acked" | "reference" | "delivered")
+        ) {
             continue;
         }
-        let Some(store) = PendingFinalityStore::lock(directory)? else {
+        let id: UInt256 = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| error!("Closure filename"))?
+            .parse()?;
+        if store.confirmed_without_backup(&id)? {
             continue;
-        };
-        let mut seen = std::collections::HashSet::new();
-        for path in store.paths()? {
-            if !matches!(
-                path.extension().and_then(|s| s.to_str()),
-                Some("acked" | "reference" | "delivered")
-            ) {
-                continue;
+        }
+        ids.insert(id.to_hex_string(), id);
+    }
+    let mut ordered: Vec<_> = ids.into_values().collect();
+    if let Some(after) = after {
+        let key = after.to_hex_string();
+        let split = ordered.partition_point(|id| id.to_hex_string() <= key);
+        ordered.rotate_left(split);
+    }
+    let mut result = Vec::new();
+    let mut bytes = 0u64;
+    for id in ordered.into_iter().take(limit) {
+        if let Some(locator) = store.close_locator(&id)? {
+            bytes += serde_json::to_vec(&locator.reference)?.len() as u64;
+            if bytes > MAX_REFERENCE_TOTAL {
+                fail!("Closure scan byte bound");
             }
-            let id: UInt256 = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| error!("Source closure filename"))?
-                .parse()?;
-            if store.confirmed_without_backup(&id)? {
-                continue;
-            }
-            if !seen.insert(id.clone()) {
-                continue;
-            }
-            if result.len() >= MAX_REFERENCES {
-                return Ok(result);
-            }
-            if let Some(locator) = store.close_locator(&id)? {
-                total_bytes += serde_json::to_vec(&locator.reference)?.len() as u64;
-                if total_bytes > MAX_REFERENCE_TOTAL {
-                    fail!("Source closure scan byte bound exceeded");
-                }
-                result.push(locator);
-            }
+            result.push(locator);
         }
     }
     Ok(result)
@@ -558,9 +589,13 @@ impl SourceFinalityDelivery {
     pub(super) fn lookup_before_replay(
         self: &Arc<Self>,
         id: UInt256,
-        locator: FinalityCloseRecovery,
+        mut locator: FinalityCloseRecovery,
         source_info: consensus_common::BlockSourceInfo,
     ) -> Result<()> {
+        if locator.reference.recovery_binding.is_none() {
+            locator.reference.recovery_binding =
+                self.runtime.recovery_binding().map(DiskRecoveryBinding::from_binding);
+        }
         let request = locator.request()?;
         let expected = request.clone();
         let owner = self.clone();
