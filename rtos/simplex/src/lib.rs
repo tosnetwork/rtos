@@ -902,8 +902,10 @@ impl SessionFactory {
         overlay_manager: ConsensusOverlayManagerPtr,
         listener: SessionListenerPtr,
         trace_collector: Option<TraceCollector>,
+        delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
     ) -> Result<SessionPtr> {
         options.validate_authenticated(&runtime)?;
+        if delivery_sink.is_none() { fail!("Authenticated v2 session requires durable finality sink"); }
         if runtime.local_adnl() != local_transport_key.id() {
             fail!("Local transport key differs from authenticated runtime");
         }
@@ -924,6 +926,7 @@ impl SessionFactory {
             trace_collector,
             runtime.catchain_seqno(),
             Some(runtime.clone()),
+            delivery_sink,
         )
     }
 

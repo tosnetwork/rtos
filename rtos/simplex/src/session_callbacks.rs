@@ -81,6 +81,7 @@ pub(crate) struct SessionCallbacks {
     /// validator-group alive past session teardown; each dispatch
     /// re-checks `upgrade()` and silently drops when the listener is gone.
     listener: SessionListenerPtr,
+    delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
 }
 
 // ======================================================================
@@ -102,7 +103,12 @@ impl SessionCallbacks {
         task_queue: CallbackTaskQueuePtr,
         listener: SessionListenerPtr,
     ) -> Self {
-        Self { session_id, stop_flag, use_callback_thread, task_queue, listener }
+        Self { session_id, stop_flag, use_callback_thread, task_queue, listener, delivery_sink: None }
+    }
+
+    pub(crate) fn with_delivery_sink(mut self, sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>) -> Self {
+        self.delivery_sink = sink;
+        self
     }
 
     /// Clone this callbacks aspect with a different session listener.
@@ -120,6 +126,7 @@ impl SessionCallbacks {
             use_callback_thread: self.use_callback_thread,
             task_queue: self.task_queue.clone(),
             listener,
+            delivery_sink: self.delivery_sink.clone(),
         }
     }
 

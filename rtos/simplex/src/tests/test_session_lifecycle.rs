@@ -217,6 +217,7 @@ async fn authenticated_observer_real_adnl_session_reopens_after_checked_drain() 
                 manager.clone(),
                 Arc::downgrade(&listener),
                 None,
+                Some(Arc::new(RejectFinalitySink)),
             )?;
             let stopped = session.stop_checked();
             let drained = session.threads_drained();
@@ -237,6 +238,7 @@ async fn authenticated_observer_real_adnl_session_reopens_after_checked_drain() 
             manager.clone(),
             Arc::downgrade(&listener),
             None,
+            Some(Arc::new(RejectFinalitySink)),
         );
         if let Ok(session) = rejected {
             session.stop_checked()?;
@@ -278,7 +280,7 @@ async fn authenticated_validator_isolated_worker_signs_and_retains_journal_on_de
     let result = (|| -> Result<()> {
         let create = |initialize| SessionImpl::create_with_profile(&options, runtime.session_id(), runtime.shard(), nodes.clone(),
             &key, path.to_str().unwrap().to_owned(), manager.clone(), Arc::downgrade(&listener), None,
-            runtime.catchain_seqno(), Some(runtime.clone()), Some(crate::signing_coordinator::TestSessionSigner {
+            runtime.catchain_seqno(), Some(runtime.clone()), Some(Arc::new(RejectFinalitySink)), Some(crate::signing_coordinator::TestSessionSigner {
                 store: store.clone(), owner_root: directory.path().to_owned(), generation: 1, initialize,
             }));
         let session = create(true)?;
@@ -316,4 +318,11 @@ async fn authenticated_validator_isolated_worker_signs_and_retains_journal_on_de
     let drained = adnl.stop_checked().await;
     drained.unwrap();
     result.unwrap();
+}
+
+struct RejectFinalitySink;
+impl consensus_common::finality_delivery::DurableFinalitySink for RejectFinalitySink {
+    fn stage(&self, _: consensus_common::finality_delivery::FinalizedDeliveryDraft, _: consensus_common::finality_delivery::FinalizedDeliveryCompletion) -> Result<()> {
+        anyhow::bail!("Lifecycle fixture does not accept finality")
+    }
 }

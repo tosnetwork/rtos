@@ -579,7 +579,7 @@ impl SessionImpl {
         // Authenticated validator journals survive group retirement. Deletion must
         // never erase the only durable record of already signed decisions.
         let may_destroy_database = !authenticated_runtime.as_ref().is_some_and(|runtime|
-            matches!(runtime.local_role(), consensus_common::session_runtime::LocalRole::Validator(_)));
+            runtime.protocol() == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree);
         let _runtime_manifest = match authenticated_runtime.as_ref().filter(|runtime| {
             runtime.protocol()
                 == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
@@ -1302,6 +1302,7 @@ impl SessionImpl {
             trace_collector,
             catchain_seqno,
             None,
+            None,
         )
     }
 
@@ -1320,9 +1321,10 @@ impl SessionImpl {
         authenticated_runtime: Option<
             Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
         >,
+        delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
     ) -> Result<SessionPtr> {
         Self::create_with_profile(options, session_id, shard, ids, local_key, db_path,
-            overlay_manager, listener, trace_collector, catchain_seqno, authenticated_runtime,
+            overlay_manager, listener, trace_collector, catchain_seqno, authenticated_runtime, delivery_sink,
             #[cfg(test)] None)
     }
 
@@ -1341,6 +1343,7 @@ impl SessionImpl {
         authenticated_runtime: Option<
             Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
         >,
+        delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
         #[cfg(test)] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
     ) -> Result<SessionPtr> {
         log::info!(
@@ -1352,7 +1355,10 @@ impl SessionImpl {
         );
 
         match &authenticated_runtime {
-            Some(runtime) => options.validate_authenticated(runtime)?,
+            Some(runtime) => {
+                options.validate_authenticated(runtime)?;
+                if delivery_sink.is_none() { rtos_block::fail!("Authenticated v2 session requires durable finality sink"); }
+            },
             None => options.validate()?,
         }
 
@@ -1394,7 +1400,7 @@ impl SessionImpl {
             options.use_callback_thread,
             callbacks_task_queue.clone(),
             listener,
-        ));
+        ).with_delivery_sink(delivery_sink));
 
         // Create receiver-callback adapter (posts SXRCV events onto SXMAIN).
         // Symmetric counterpart of SessionCallbacks (SXMAIN -> SXCB listener).
