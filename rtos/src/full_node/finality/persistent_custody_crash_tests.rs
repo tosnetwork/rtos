@@ -166,20 +166,26 @@ async fn crash_window(phase: &str) {
             "control must exist before this cold GC opportunity");
         // First cold operation is a genuine GC opportunity, not capability
         // authentication or recreation of the killed child's temporary pins.
+        assert!(!engine.shard_states_keeper().allow_state_gc(&control).unwrap(),
+            "arm the batch observation before the control becomes GC eligible");
+        engine.db().test_watch_state_gc_batch(&control);
         engine.shard_states_keeper().test_retire_history_state(&target);
         assert!(!engine.shard_states_keeper().allow_state_gc(&parent).unwrap());
         assert!(!engine.shard_states_keeper().allow_state_gc(&target).unwrap());
         assert!(engine.shard_states_keeper().allow_state_gc(&control).unwrap());
         tokio::time::timeout(Duration::from_secs(30), async {
-            while engine.db().test_contains_dynamic_state_record(&control).unwrap() {
+            while engine.db().test_contains_dynamic_state_record(&control).unwrap()
+                || !engine.db().test_watched_state_gc_batch_completed()
+            {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("same-cutoff unleased physical state must actually be deleted");
+        .expect("same-cutoff control must be physically deleted and its exact GC batch completed");
         engine.db().archive_gc(&target).await.unwrap();
         for id in [&parent, &target] {
-            assert!(engine.db().test_contains_dynamic_state_record(id).unwrap());
+            assert!(engine.db().test_contains_dynamic_state_record(id).unwrap(),
+                "leased physical state {id} disappeared after the control GC batch completed");
             // Cold physical graph traversal: root/index presence alone is insufficient.
             let state = engine.load_state(id).await.unwrap();
             assert!(!write_boc(state.root_cell()).unwrap().is_empty());
