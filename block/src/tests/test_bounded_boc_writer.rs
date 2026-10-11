@@ -108,3 +108,52 @@ fn bounded_boc_writer_refuses_before_table_and_destination_mutation() {
     assert!(writer.write(&mut destination).is_err());
     assert_eq!(destination, [0xaa]);
 }
+
+#[test]
+fn bounded_boc_reader_matches_flags_roots_and_crc_rejection() {
+    let root = shared_tree();
+    for flags in [BocFlags::None, BocFlags::Index, BocFlags::Crc32, BocFlags::all()] {
+        let bytes = BocWriter::with_flags([root.clone(), root.clone()], flags)
+            .unwrap()
+            .write_to_vec()
+            .unwrap();
+        let ordinary = BocReader::new().read(&bytes).unwrap();
+        let budget = Budget::unlimited();
+        let bounded = BocReader::new().read_bounded(&bytes, &budget).unwrap();
+        assert_eq!(ordinary.roots, bounded.roots);
+        assert_eq!(ordinary.flags, bounded.flags);
+        assert_eq!(ordinary.header.roots_indexes, bounded.header.roots_indexes);
+        if flags.contains(BocFlags::Crc32) {
+            let mut corrupt = bytes;
+            *corrupt.last_mut().unwrap() ^= 1;
+            assert!(BocReader::new().read_bounded(&corrupt, &Budget::unlimited()).is_err());
+        }
+    }
+}
+
+#[test]
+fn bounded_boc_reader_exact_and_cumulative_budget() {
+    let bytes =
+        BocWriter::with_flags([shared_tree()], BocFlags::all()).unwrap().write_to_vec().unwrap();
+    let measure = Budget::unlimited();
+    BocReader::new().read_bounded(&bytes, &measure).unwrap();
+    let work = measure.work.load(Ordering::Relaxed);
+    let storage = measure.bytes.load(Ordering::Relaxed);
+    let exact = Budget::new(work, storage);
+    BocReader::new().read_bounded(&bytes, &exact).unwrap();
+    assert!(BocReader::new().read_bounded(&bytes, &exact).is_err());
+    assert!(BocReader::new().read_bounded(&bytes, &Budget::new(work - 1, storage)).is_err());
+    assert!(BocReader::new().read_bounded(&bytes, &Budget::new(work, storage - 1)).is_err());
+}
+
+#[test]
+fn bounded_boc_reader_header_refuses_before_root_list_read() {
+    let bytes = BocWriter::with_root(&Cell::default()).unwrap().write_to_vec().unwrap();
+    let mut cursor = Cursor::new(bytes.as_slice());
+    let budget = Budget::new(usize::MAX, 0);
+    assert!(BocReader::new().read_header_bounded(&mut cursor, &budget).is_err());
+    // Generic single-byte-width header ends at byte 10; root index is byte 10.
+    assert_eq!(cursor.position(), 10);
+    assert_eq!(budget.bytes.load(Ordering::Relaxed), std::mem::size_of::<u32>());
+    assert!(BocReader::new().read_bounded(&bytes, &Budget::new(usize::MAX, 0)).is_err());
+}
