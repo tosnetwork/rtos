@@ -1050,7 +1050,9 @@ impl AdnlOverlay {
             overlay_id: &overlay_id,
             runtime: Some(runtime_handle.clone()),
         };
-        stack.overlay.add_private_overlay(params, &local_adnl_key, &peers, use_quic, None)?;
+        if !stack.overlay.add_private_overlay(params, &local_adnl_key, &peers, use_quic, None)? {
+            fail!("Overlay id is already registered");
+        }
         let mut registration =
             OverlayRegistration { node: stack.overlay.clone(), ids: vec![overlay_id.clone()] };
 
@@ -1096,13 +1098,15 @@ impl AdnlOverlay {
                         overlay_id: &bs_id,
                         runtime: Some(runtime_handle.clone()),
                     };
-                    stack.overlay.add_private_overlay(
+                    if !stack.overlay.add_private_overlay(
                         bs_overlay_params,
                         &local_adnl_key,
                         &bs_params.members,
                         use_quic,
                         Some(check),
-                    )?;
+                    )? {
+                        fail!("Block-sync overlay id is already registered");
+                    }
                     registration.ids.push(bs_id.clone());
                     log::info!(
                         target: LOG_TARGET,
@@ -2127,6 +2131,7 @@ impl ConsensusOverlay for AdnlOverlay {
 */
 
 pub struct AdnlOverlayManager {
+    lifecycle: Mutex<()>,
     runtime_handle: tokio::runtime::Handle, //runtime handle for spawning tasks
     stack: Arc<NetworkStack>,               // ADNL network stack
     overlays: Arc<spin::Mutex<HashMap<Arc<PrivateOverlayShortId>, Arc<AdnlOverlay>>>>, //active overlays managed by this manager
@@ -2151,6 +2156,7 @@ impl AdnlOverlayManager {
         );
 
         Ok(Arc::new(Self {
+            lifecycle: Mutex::new(()),
             runtime_handle,
             stack,
             overlays: Arc::new(spin::Mutex::new(HashMap::new())),
@@ -2188,6 +2194,7 @@ impl ConsensusOverlayManager for AdnlOverlayManager {
         transport_type: OverlayTransportType,
         block_sync_params: Option<crate::BlockSyncOverlayParams>,
     ) -> Result<ConsensusOverlayPtr> {
+        let _lifecycle = self.lifecycle.lock().unwrap();
         // Searching for existing overlay
         if let Some(existing) = self.overlays.lock().get(overlay_short_id) {
             return Ok(existing.clone());
@@ -2253,13 +2260,20 @@ impl ConsensusOverlayManager for AdnlOverlayManager {
         id: &Arc<PrivateOverlayShortId>,
         overlay: &ConsensusOverlayPtr,
     ) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().unwrap();
         let implementation = overlay
             .get_impl()
             .downcast_ref::<AdnlOverlay>()
             .ok_or_else(|| error!("Unknown overlay implementation"))?;
         let result = implementation.stop_checked();
         if implementation.drained() {
-            self.overlays.lock().remove(id);
+            let mut overlays = self.overlays.lock();
+            if overlays
+                .get(id)
+                .is_some_and(|current| std::ptr::eq(Arc::as_ptr(current), implementation))
+            {
+                overlays.remove(id);
+            }
         }
         result
     }
@@ -2274,17 +2288,8 @@ impl ConsensusOverlayManager for AdnlOverlayManager {
         overlay_short_id: &Arc<PrivateOverlayShortId>,
         overlay: &ConsensusOverlayPtr,
     ) {
-        log::trace!(target: LOG_TARGET, "Stopping overlay: overlay_id={}", overlay_short_id);
-
-        // Try to downcast to our implementation
-        if let Some(overlay_impl) = overlay.get_impl().downcast_ref::<AdnlOverlay>() {
-            overlay_impl.stop();
-            self.overlays.lock().remove(overlay_short_id);
-        } else {
-            log::warn!(
-                target: LOG_TARGET,
-                "Cannot downcast overlay to AdnlOverlay: overlay_id={overlay_short_id}"
-            );
+        if let Err(error) = self.stop_overlay_checked(overlay_short_id, overlay) {
+            log::error!("Overlay stop: {error}");
         }
     }
 }
