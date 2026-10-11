@@ -402,12 +402,13 @@ enum ListenerEvent {
 /// Listener that records all commits and skips for verification
 struct RecordingListener {
     events: Arc<Mutex<Vec<ListenerEvent>>>,
+    authenticated: Mutex<Vec<consensus_common::CandidateAuthenticationEvidence>>,
 }
 
 #[allow(dead_code)]
 impl RecordingListener {
     fn new() -> Arc<Self> {
-        Arc::new(Self { events: Arc::new(Mutex::new(Vec::new())) })
+        Arc::new(Self { events: Arc::new(Mutex::new(Vec::new())), authenticated: Mutex::new(Vec::new()) })
     }
 
     /// Get all recorded events (drains the list)
@@ -422,6 +423,9 @@ impl RecordingListener {
 }
 
 impl consensus_common::SessionListener for RecordingListener {
+    fn on_authenticated_candidate(&self, evidence: consensus_common::CandidateAuthenticationEvidence) {
+        self.authenticated.lock().unwrap().push(evidence);
+    }
     fn on_candidate(
         &self,
         _source_info: BlockSourceInfo,
@@ -11445,6 +11449,88 @@ fn authenticated_observer_processor_accepts_only_valid_pq_quorum_without_signing
         ReceiverAction::SendVote { .. } | ReceiverAction::SendCertificate { .. }
     )));
     assert_eq!(calls, stores.iter().map(|store| store.consensus_signatures_produced()).collect::<Vec<_>>());
+    drop(processor);
+    db.close(None).unwrap();
+}
+
+#[test]
+fn authenticated_observer_nonempty_query_emits_leader_evidence_after_pq_verification() {
+    use rtos_block::Serializable;
+    let directory = crate::authenticated_fixture::TestDirectory::new();
+    let store = rtos_pq_consensus::ConsensusKeyStore::from_seed(&[0xa3; 32], 0).unwrap();
+    let (mut nodes, _) = crate::pq_fixture::members();
+    nodes[1] = crate::SimplexSessionNode::from_descriptor(
+        &crate::signing_coordinator::tests::custody_descriptor(&store),
+    ).unwrap();
+    let observer = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71; 32]).unwrap();
+    let (runtime, transport, options) = crate::authenticated_fixture::runtime_with_members(
+        nodes.iter().map(|node| node.descriptor.clone().unwrap()).collect(), observer,
+    );
+    let description = Arc::new(SessionDescription::new_with_runtime(
+        &options, runtime.session_id().clone(), 1, &nodes, transport, runtime.shard(),
+        SystemTime::now(), None, Some(&runtime),
+    ).unwrap().bind_pq_session(runtime.catchain_seqno()).unwrap());
+    let db = crate::database::SimplexDb::open(directory.path().join("db"), "observer-body").unwrap();
+    let receiver = MockReceiver::new();
+    let mut processor = make_pq_processor_with_description_for_test(db.clone(), description);
+    processor.receiver = receiver.clone();
+    let listener = RecordingListener::new();
+    let listener_dyn: Arc<dyn consensus_common::SessionListener + Send + Sync> = listener.clone();
+    processor.callbacks = Arc::new(crate::session_callbacks::SessionCallbacks::new(
+        runtime.session_id().clone(), Arc::new(AtomicBool::new(false)), false,
+        Arc::new(TestCallbackQueue), Arc::downgrade(&listener_dyn),
+    ));
+    let mut block = rtos_block::Block::default();
+    block.set_global_id(runtime.pin().global_id);
+    let mut info = rtos_block::BlockInfo::default();
+    info.set_seq_no(1).unwrap();
+    info.set_shard(runtime.shard().clone());
+    block.write_info(&info).unwrap();
+    let cell = block.serialize().unwrap();
+    let data = rtos_block::write_boc(&cell).unwrap();
+    let collated = make_test_boc(b"authenticated-observer", BocFlags::Crc32);
+    let slot = SlotIndex::new(options.slots_per_leader_window);
+    let bytes = make_validator_session_candidate_bytes(1, cell.repr_hash().clone(), data.clone(), collated.clone());
+    let hash = crate::utils::compute_candidate_id_hash_from_bytes(
+        slot, &bytes, None, runtime.shard(), 1 << 20, options.proto_version,
+    ).unwrap();
+    let signature = store.sign_consensus(&crate::utils::create_data_to_sign(
+        runtime.session_id(), &crate::utils::create_candidate_id_to_sign(slot, &hash),
+    )).unwrap().bytes.to_vec();
+    let candidate = rtos_api::ton::consensus::candidatedata::Block {
+        slot: slot.value() as i32,
+        parent: rtos_api::ton::consensus::CandidateParent::Consensus_CandidateWithoutParents,
+        candidate: bytes,
+        signature,
+    }.into_boxed();
+    let vote = rtos_api::ton::consensus::simplex::unsignedvote::NotarizeVote {
+        id: TlCandidateId { slot: slot.value() as i32, hash: hash.clone() }.into_boxed(),
+    }.into_boxed();
+    let cert = Certificate { signatures: VoteSignatureSet { votes: vec![VoteSignature {
+        who: 1, signature: store.sign_consensus(&crate::utils::create_data_to_sign(
+            runtime.session_id(), &crate::utils::serialize_unsigned_vote(&vote),
+        )).unwrap().bytes.to_vec(),
+    }.into_boxed()] }.into_boxed(), vote }.into_boxed();
+    let certificate = options.wire_profile.serialize(&cert).unwrap();
+    let mut bad = candidate.clone();
+    let CandidateData::Consensus_Block(ref mut value) = bad else { unreachable!() };
+    value.signature[0] ^= 1;
+    // Query relay comes from member zero; the scheduled author is member one.
+    processor.on_candidate_received(0, bad, Some(certificate.clone()));
+    assert!(listener.authenticated.lock().unwrap().is_empty());
+    processor.on_candidate_received(0, candidate, Some(certificate));
+    let evidence = listener.authenticated.lock().unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].creator_index, 1);
+    assert_eq!(evidence[0].creator_adnl, nodes[1].adnl_id);
+    assert_eq!(evidence[0].data.data().as_slice(), data.as_slice());
+    assert_eq!(evidence[0].collated_data.data().as_slice(), collated.as_slice());
+    assert_eq!(evidence[0].block_id.root_hash(), cell.repr_hash());
+    assert_eq!(evidence[0].session_id, *runtime.session_id());
+    drop(evidence);
+    db.sync(Some(Duration::from_secs(5))).unwrap();
+    processor.process_pending_async_db_results();
+    assert!(!receiver.drain_actions().iter().any(|action| matches!(action, ReceiverAction::SendVote { .. })));
     drop(processor);
     db.close(None).unwrap();
 }
