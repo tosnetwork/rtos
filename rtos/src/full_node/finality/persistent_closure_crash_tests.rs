@@ -11,6 +11,7 @@ use std::io::Write;
 
 const MODE: &str = "RTOS_SOURCE_CLOSE_CRASH_WINDOW";
 const NOTE: &str = "RTOS_SOURCE_CLOSE_CRASH_NOTE";
+const ACK_BACKUP: &str = "RTOS_SOURCE_CLOSE_ACK_BACKUP";
 
 /// Abrupt process loss at an already synchronized cut point. Unlike exit, this
 /// skips C atexit handlers as well as Rust drops while native workers are live.
@@ -147,6 +148,9 @@ async fn persistent_closure_crash_child() {
         // A fresh real session factory prepares this provenance directory before
         // source delivery. Reopening parents never manufacture missing provenance.
         source.prepare_intents(false).unwrap();
+        if let Some(destination) = std::env::var_os(ACK_BACKUP) {
+            source.save_next_synced_ack_backup(PathBuf::from(destination));
+        }
         let root = engine.load_state(pair.master.id()).await.unwrap().root_cell().clone();
         let (id, _, row) =
             chain::successor(&signer, pair.master.id(), &root, false, 0, cc, &creator);
@@ -219,10 +223,10 @@ impl Drop for ChildOwner {
     }
 }
 async fn cold_window(window: i32) {
-    cold_window_mode(window, false).await;
+    cold_window_mode(window, false, false).await;
 }
 
-async fn cold_window_mode(window: i32, canonical_only: bool) {
+async fn cold_window_mode(window: i32, canonical_only: bool, ack_only: bool) {
     let _ = env_logger::builder().is_test(true).try_init();
     let signer =
         std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER").expect("public fixture signer required");
@@ -231,8 +235,14 @@ async fn cold_window_mode(window: i32, canonical_only: bool) {
     let note = dir.path().join("locator.json");
     let stdout = std::fs::File::create(dir.path().join("child.log")).unwrap();
     let stderr = stdout.try_clone().unwrap();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command.env_remove(ACK_BACKUP);
+    if ack_only {
+        assert_eq!(window, 74);
+        command.env(ACK_BACKUP, dir.path().join("original.acked"));
+    }
     let mut child = ChildOwner(
-        std::process::Command::new(std::env::current_exe().unwrap())
+        command
             .args([
                 "persistent_closure_crash_child",
                 "--ignored",
@@ -303,6 +313,26 @@ async fn cold_window_mode(window: i32, canonical_only: bool) {
     std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     let mut previous = None;
     for reopen in 0..2 {
+        if ack_only {
+            // Model an old source backup containing only its genuine full ACK.
+            // Restore identical bytes after all preceding owners have stopped.
+            let references = source_directory(&namespace).join("references-v1");
+            let delivered: Vec<_> = std::fs::read_dir(&references)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("delivered"))
+                .collect();
+            assert_eq!(delivered.len(), 1);
+            let source_id = delivered[0].file_stem().unwrap();
+            let ack =
+                source_directory(&namespace).join(format!("{}.acked", source_id.to_str().unwrap()));
+            std::fs::write(&ack, std::fs::read(dir.path().join("original.acked")).unwrap())
+                .unwrap();
+            std::fs::File::open(&ack).unwrap().sync_all().unwrap();
+            std::fs::remove_file(&delivered[0]).unwrap();
+            std::fs::File::open(&references).unwrap().sync_all().unwrap();
+            std::fs::File::open(source_directory(&namespace)).unwrap().sync_all().unwrap();
+        }
         let engine = open_engine(&provider).await;
         let mut recovery_service = None;
         let run = std::panic::AssertUnwindSafe(async {
@@ -340,7 +370,7 @@ async fn cold_window_mode(window: i32, canonical_only: bool) {
                     .iter()
                     .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("delivered"))
                     .collect();
-                assert_eq!(delivered.len(), usize::from(window != 72));
+                assert_eq!(delivered.len(), usize::from(window != 72 && !ack_only));
                 if let Some(path) = delivered.first() {
                     let disk: serde_json::Value =
                         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
@@ -464,7 +494,7 @@ async fn persistent_closure_cold_service_after_released_exit74() {
 }
 
 /// A separate cold-read contract: this intentionally supplies an independently
-/// authenticated runtime only to the real canonical lookup. The background
+/// authenticated runtime only to the read-only canonical verification. The background
 /// service tests above continue to recover without such external input.
 async fn canonical_after_offer(
     provider: &Path,
@@ -489,24 +519,16 @@ async fn canonical_after_offer(
             )
             .await
             .unwrap();
-            let worker = engine.ensure_publication_worker().await.unwrap();
-            let sink = worker.sink(runtime.clone());
-            let (send, receive) = tokio::sync::oneshot::channel();
-            sink.retain_canonical(
-                request.canonical.clone(),
-                Box::new(move |result| {
-                    let _ = send.send(result);
-                }),
+            let canonical = crate::publication_worker::inspect_canonical_record(
+                engine.db(),
+                domain,
+                &runtime,
+                &request.canonical,
             )
-            .unwrap();
-            let canonical = tokio::time::timeout(Duration::from_secs(30), receive)
-                .await
-                .expect("real canonical owner must complete")
-                .expect("real canonical callback must run")
-                .expect("offer-before-source-sync must retain replayable canonical evidence");
-            // Check the actual owned lookup before any Offered/active marker.
-            // Moving deletion into offer must fail above with Unknown canonical
-            // delivery, rather than being caught only by a stage assertion.
+            .expect("offer-before-source-sync must retain replayable canonical evidence");
+            // Verify real DB payload using production canonical authentication
+            // before any Offered/active marker. Early deletion must fail with
+            // Cold canonical delivery missing, not only a stage assertion.
             assert_eq!(canonical.request, request.canonical);
             assert_eq!(&canonical.request.block_id, expected_id);
             assert_eq!(canonical.created_at_unix_secs, note["created"].as_u64().unwrap());
@@ -543,5 +565,11 @@ async fn canonical_after_offer(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real exit72 child, historical authentication and canonical WAL lookup"]
 async fn persistent_closure_cold_canonical_replay_before_source_sync() {
-    cold_window_mode(72, true).await;
+    cold_window_mode(72, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real Released child and full ACK-only backup with independent cold service"]
+async fn persistent_closure_cold_service_reconciles_old_full_ack_only_twice() {
+    cold_window_mode(74, false, true).await;
 }

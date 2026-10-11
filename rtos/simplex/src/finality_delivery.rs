@@ -434,8 +434,14 @@ pub(crate) struct PendingFinalityStore {
     delivered_uncertain: std::sync::atomic::AtomicBool,
     runtime_binding: Mutex<Option<delivered::DiskRecoveryBinding>>,
     intents: Arc<crate::finality_recovery::FinalityIntentStore>,
+    #[cfg(feature = "integration-test-support")]
+    synced_ack_backup: Mutex<Option<PathBuf>>,
     #[cfg(test)]
     fail_delivered_once: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_delivered_cleanup_once: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_confirmed_once: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_compact_once: std::sync::atomic::AtomicBool,
 }
@@ -464,8 +470,14 @@ impl PendingFinalityStore {
                 delivered_uncertain: std::sync::atomic::AtomicBool::new(false),
                 runtime_binding: Mutex::new(None),
                 intents,
+                #[cfg(feature = "integration-test-support")]
+                synced_ack_backup: Mutex::new(None),
                 #[cfg(test)]
                 fail_delivered_once: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                fail_delivered_cleanup_once: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                fail_confirmed_once: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 fail_compact_once: std::sync::atomic::AtomicBool::new(false),
             }))),
@@ -836,6 +848,15 @@ impl PendingFinalityStore {
             Err(error) => return Err(error.into()),
         }
         File::open(&self.directory)?.sync_all()?;
+        #[cfg(feature = "integration-test-support")]
+        if let Some(destination) = self.synced_ack_backup.lock().unwrap().take() {
+            // Capture only after this real ACK and directory reached sync, while
+            // the source mutation owner still excludes canonical compaction.
+            std::fs::copy(&acknowledged, &destination)?;
+            File::open(&destination)?.sync_all()?;
+            File::open(destination.parent().ok_or_else(|| error!("ACK backup parent"))?)?
+                .sync_all()?;
+        }
         Ok(())
     }
 }
@@ -1798,6 +1819,11 @@ impl FinalityDeliveryTestDriver {
             sink,
             Some(confirm),
         )?))
+    }
+    /// Instance-only fixture observation of the next actual synced full ACK.
+    /// It cannot create receipts or alter the source record being backed up.
+    pub fn save_next_synced_ack_backup(&self, destination: PathBuf) {
+        *self.0.store.synced_ack_backup.lock().unwrap() = Some(destination);
     }
     pub fn poll(&self, draft: FinalizedDeliveryDraft) -> Result<bool> {
         if self.0.consumed(&draft)? {

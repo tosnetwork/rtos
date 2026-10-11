@@ -223,6 +223,10 @@ impl PendingFinalityStore {
             file.sync_all()?;
             drop(file);
             std::fs::rename(temp, &path)?;
+            #[cfg(test)]
+            if self.fail_confirmed_once.swap(false, Ordering::AcqRel) {
+                fail!("Injected source confirmed sync boundary failure");
+            }
             File::open(path.parent().unwrap())?.sync_all()?;
             Ok(())
         })();
@@ -371,6 +375,10 @@ impl PendingFinalityStore {
                 }
             }
             File::open(parent)?.sync_all()?;
+            #[cfg(test)]
+            if self.fail_delivered_cleanup_once.swap(false, Ordering::AcqRel) {
+                fail!("Injected source cleanup sync boundary failure");
+            }
             File::open(&self.directory)?.sync_all()?;
             Ok(())
         })();
@@ -881,6 +889,59 @@ mod tests {
         let confirmation = store.commit_delivered(&runtime, &reference, &offer).unwrap();
         assert_eq!(confirmation.source_id(), &id);
     }
+    #[test]
+    fn source_delivered_cleanup_sync_failure_keeps_recoverable_delivered() {
+        let (_dir, runtime, store, record, offer) = setup();
+        let id = record.id().unwrap();
+        let namespace = store.directory.parent().unwrap().to_owned();
+        let reference = store.close_locator(&id).unwrap().unwrap().reference;
+        let ack = store.directory.join(format!("{}.acked", id.to_hex_string()));
+        let ack_bytes = std::fs::read(&ack).unwrap();
+        store.compact(&record, offer.request.canonical.node_receipt.clone()).unwrap();
+        std::fs::write(&ack, ack_bytes).unwrap();
+        File::open(&ack).unwrap().sync_all().unwrap();
+        File::open(&store.directory).unwrap().sync_all().unwrap();
+        assert!(store.reference_path(&id).exists());
+        store.fail_delivered_cleanup_once.store(true, Ordering::Release);
+        let error = store.commit_delivered(&runtime, &reference, &offer).err().unwrap();
+        assert_eq!(error.to_string(), "Injected source cleanup sync boundary failure");
+        assert!(!store.reference_path(&id).exists());
+        assert!(!store.directory.join(format!("{}.acked", id.to_hex_string())).exists());
+        let path = store.delivered_path(&id);
+        let before = std::fs::read(&path).unwrap();
+        assert!(!DeliveredDisk::read(&path).unwrap().node_confirmed);
+        assert!(store.commit_delivered(&runtime, &reference, &offer).is_err());
+        assert!(store.mark_node_confirmed(&id, &offer).is_err());
+        drop(store);
+        let store = PendingFinalityStore::open(&namespace).unwrap();
+        let receipt = store.commit_delivered(&runtime, &reference, &offer).unwrap();
+        assert_eq!(receipt.offer(), &offer);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn source_delivered_confirmed_sync_failure_requires_cold_resync() {
+        let (_dir, runtime, store, record, offer) = setup();
+        let id = record.id().unwrap();
+        let namespace = store.directory.parent().unwrap().to_owned();
+        let reference = store.close_locator(&id).unwrap().unwrap().reference;
+        drop(store.commit_delivered(&runtime, &reference, &offer).unwrap());
+        store.fail_confirmed_once.store(true, Ordering::Release);
+        let error = store.mark_node_confirmed(&id, &offer).unwrap_err();
+        assert_eq!(error.to_string(), "Injected source confirmed sync boundary failure");
+        // Rename happened; true on disk must not override this owner's poison.
+        let path = store.delivered_path(&id);
+        assert!(DeliveredDisk::read(&path).unwrap().node_confirmed);
+        assert!(store.commit_delivered(&runtime, &reference, &offer).is_err());
+        assert!(store.mark_node_confirmed(&id, &offer).is_err());
+        let bytes = std::fs::read(&path).unwrap();
+        drop(store);
+        let store = PendingFinalityStore::open(&namespace).unwrap();
+        drop(store.commit_delivered(&runtime, &reference, &offer).unwrap());
+        store.mark_node_confirmed(&id, &offer).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
     struct TerminalSink(CloseOffer);
     impl DurableFinalitySink for TerminalSink {
         fn stage(

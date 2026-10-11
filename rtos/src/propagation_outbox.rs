@@ -1041,6 +1041,28 @@ fn decode_snapshot(bytes: &[u8], domain: &OutboxDomain, limits: &Limits) -> Resu
     Ok(Snapshot { next_close_generation, closing, next_id, entries, deliveries })
 }
 
+/// Load legacy close coordinates from the existing bounded node ledger only.
+/// The caller must authenticate the returned historical coordinates and still
+/// execute normal custody/confirmation checks; this read grants no capability.
+pub(crate) fn load_legacy_close_request(
+    db: &Arc<InternalDb>,
+    request: &consensus_common::finality_delivery::CloseFinalityRequest,
+) -> Result<consensus_common::finality_delivery::CloseFinalityRequest> {
+    let limits = Limits::default();
+    let domain = OutboxDomain {
+        zerostate: request.domain.pin.zerostate.clone(),
+        global_id: request.domain.pin.global_id,
+        wire_profile: request.domain.wire_profile,
+    };
+    let bytes = db.load_validator_state_raw_bounded(KEY, limits.max_snapshot_bytes)?
+        .ok_or_else(|| error!("Legacy source close has no node ledger"))?;
+    let snapshot = decode_snapshot(&bytes, &domain, &limits)?;
+    let record = snapshot.closing.iter()
+        .find(|record| record.binding.delivery_id == request.canonical.node_receipt)
+        .ok_or_else(|| error!("Legacy source close has no exact node closing record"))?;
+    closing::restore_legacy_request(request, record)
+}
+
 /// Test-only observation of the existing atomic DB snapshot. Does not claim a
 /// writer, create a database key, or replace any state. Stop/join the actual
 /// writer before treating an observed in-progress write as a durability proof.
