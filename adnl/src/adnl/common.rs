@@ -676,101 +676,82 @@ pub struct AtomicPair {
     atomic2: AtomicU64,
 }
 
+// The second value owns the lock bit. Publishing it with Release makes both
+// values visible to the next reader/writer acquiring the lock.
+struct AtomicPairGuard<'a> {
+    pair: &'a AtomicPair,
+    value2: u64,
+}
+
+impl Drop for AtomicPairGuard<'_> {
+    fn drop(&mut self) {
+        self.pair.atomic2.store(self.value2, Ordering::Release);
+    }
+}
+
 impl AtomicPair {
     const LOCK_BIT: u64 = 0x8000000000000000;
 
     pub fn new(value1: u64, value2: u64) -> Self {
+        assert_eq!(value2 & Self::LOCK_BIT, 0, "AtomicPair value uses the lock bit");
         Self { atomic1: AtomicU64::new(value1), atomic2: AtomicU64::new(value2) }
     }
 
-    pub fn get(&self) -> (u64, u64) {
+    fn lock(&self) -> AtomicPairGuard<'_> {
         loop {
-            let value2 = self.atomic2.fetch_or(Self::LOCK_BIT, Ordering::Relaxed);
-            if (value2 & Self::LOCK_BIT) != 0 {
-                // Locked, concurrent use
-                continue;
+            let value2 = self.atomic2.load(Ordering::Relaxed);
+            if value2 & Self::LOCK_BIT == 0
+                && self
+                    .atomic2
+                    .compare_exchange_weak(
+                        value2,
+                        value2 | Self::LOCK_BIT,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                return AtomicPairGuard { pair: self, value2 };
             }
-            let value1 = self.atomic1.load(Ordering::Relaxed);
-            self.atomic2
-                .compare_exchange(
-                    value2 | Self::LOCK_BIT,
-                    value2,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .ok();
-            break (value1, value2);
+            std::hint::spin_loop();
         }
     }
 
+    pub fn get(&self) -> (u64, u64) {
+        let guard = self.lock();
+        (self.atomic1.load(Ordering::Relaxed), guard.value2)
+    }
+
+    /// The checker runs exactly once under the pair lock and must not reenter
+    /// this pair. A rejected or panicking checker leaves both values unchanged.
     pub fn update(&self, update1: u64, update2: u64, checker: impl Fn(u64, u64) -> bool) -> bool {
-        loop {
-            let old_value1 = self.atomic1.load(Ordering::Relaxed);
-            if !checker(old_value1, update1) {
-                break false;
-            }
-            let old_value2 = self.atomic2.fetch_or(Self::LOCK_BIT, Ordering::Relaxed);
-            if (old_value2 & Self::LOCK_BIT) != 0 {
-                // Locked, concurrent use
-                continue;
-            }
-            self.atomic1.store(update1, Ordering::Relaxed);
-            self.atomic2
-                .compare_exchange(
-                    old_value2 | Self::LOCK_BIT,
-                    update2,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .ok();
-            break true;
+        self.update_before_lock(update1, update2, checker, || {})
+    }
+
+    fn update_before_lock(
+        &self,
+        update1: u64,
+        update2: u64,
+        checker: impl Fn(u64, u64) -> bool,
+        before_lock: impl FnOnce(),
+    ) -> bool {
+        assert_eq!(update2 & Self::LOCK_BIT, 0, "AtomicPair value uses the lock bit");
+        // Also supplies a deterministic scheduling seam for concurrency tests.
+        before_lock();
+        let mut guard = self.lock();
+        let old_value1 = self.atomic1.load(Ordering::Relaxed);
+        if !checker(old_value1, update1) {
+            return false;
         }
-        /*
-                loop {
-                    let old_value1 = self.atomic1.load(Ordering::Relaxed);
-                    if !checker(old_value1, update1) {
-                        break false
-                    }
-                    let old_value2 = self.atomic2.fetch_or(Self::LOCK_BIT, Ordering::Relaxed);
-                    if (old_value2 & Self::LOCK_BIT) != 0 {
-                        // Locked for write, concurrent change
-                        continue
-                    }
-                    if self.atomic1.compare_exchange(
-                        old_value1,
-                        update1,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed
-                    ).is_err() {
-                        // Concurrent change, restore data
-                        self.atomic2.compare_exchange(
-                            old_value2 | Self::LOCK_BIT,
-                            old_value2,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed
-                        ).ok();
-                        continue
-                    }
-                    if self.atomic2.compare_exchange(
-                       old_value2 | Self::LOCK_BIT,
-                       update2,
-                       Ordering::Relaxed,
-                       Ordering::Relaxed
-                    ).is_err() {
-                        // Concurrent change, restore data
-                        self.atomic1.compare_exchange(
-                            update1,
-                            old_value1,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed
-                        ).ok();
-                        continue
-                    }
-                    break true
-                }
-        */
+        self.atomic1.store(update1, Ordering::Relaxed);
+        guard.value2 = update2;
+        true
     }
 }
+
+#[cfg(test)]
+#[path = "atomic_pair_tests.rs"]
+mod atomic_pair_tests;
 
 /// Counted object
 pub trait CountedObject {
