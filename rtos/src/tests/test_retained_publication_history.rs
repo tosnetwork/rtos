@@ -60,6 +60,7 @@ fn bootstrap_fixture_proof(
 struct CapsuleEngine {
     directory: tempfile::TempDir,
     pin: BlockIdExt,
+    zero: BlockIdExt,
     allocated: Arc<EngineAlloc>,
     #[cfg(feature = "telemetry")]
     telemetry: Arc<crate::engine_traits::EngineTelemetry>,
@@ -73,7 +74,7 @@ impl EngineOperations for CapsuleEngine {
         &self.pin
     }
     fn zerostate_id(&self) -> Result<&BlockIdExt> {
-        Ok(&self.pin)
+        Ok(&self.zero)
     }
     fn engine_allocated(&self) -> &Arc<EngineAlloc> {
         &self.allocated
@@ -131,9 +132,15 @@ async fn retained_publication_nonzero_epoch_cold_cache_and_revocation() {
     let latest = bootstrap_fixture_proof(&warm, true, false);
     let state = hex::decode(warm["state_boc"].as_str().unwrap()).unwrap();
     let global_id = ShardStateUnsplit::construct_from_bytes(&state).unwrap().global_id();
+    // A checkpoint pin and network zerostate are independent local inputs.
+    let network: serde_json::Value =
+        serde_json::from_str(include_str!("../validator/tests/data/manager-history.json")).unwrap();
+    let zero: BlockIdExt = network["zero"].as_str().unwrap().parse().unwrap();
+    assert_eq!(zero.seq_no, 0);
     let mut engine = CapsuleEngine {
         directory: tempfile::tempdir().unwrap(),
         pin: anchor.id().clone(),
+        zero,
         allocated: crate::collator_test_bundle::create_engine_allocated(),
         #[cfg(feature = "telemetry")]
         telemetry: crate::collator_test_bundle::create_engine_telemetry(),
@@ -189,6 +196,13 @@ async fn retained_publication_nonzero_epoch_cold_cache_and_revocation() {
     // Checkpoint lookup permits its pinned link; successors never accept links.
     assert!(crate::boot::load_history_proof(&engine, &engine.pin, true, true).await.is_ok());
     assert!(crate::boot::load_history_proof(&engine, &engine.pin, false, true).await.is_err());
+    let original_zero = engine.zero.clone();
+    engine.zero.file_hash = UInt256::from([98; 32]);
+    assert!(crate::block_proof::MasterchainProofVerifier::default()
+        .pq_broadcast_context(&engine, target.id(), &block)
+        .await
+        .is_err());
+    engine.zero = original_zero;
     engine.pin.file_hash = UInt256::from([99; 32]);
     assert!(crate::block_proof::MasterchainProofVerifier::default()
         .pq_broadcast_context(&engine, target.id(), &block)
