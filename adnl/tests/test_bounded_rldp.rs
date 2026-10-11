@@ -239,8 +239,8 @@ impl Subscriber for OversizeWirePeer {
             };
             let complete = serialize_boxed(
                 &rldp2::messagepart::Complete {
-                    transfer_id: part.transfer_id.clone(),
-                    part: part.part,
+                    transfer_id: part.0.transfer_id.clone(),
+                    part: part.0.part,
                 }
                 .into_boxed(),
             )?;
@@ -253,8 +253,8 @@ impl Subscriber for OversizeWirePeer {
             };
             let complete = serialize_boxed(
                 &rldp::messagepart::Complete {
-                    transfer_id: part.transfer_id.clone(),
-                    part: part.part,
+                    transfer_id: part.0.transfer_id.clone(),
+                    part: part.0.part,
                 }
                 .into_boxed(),
             )?;
