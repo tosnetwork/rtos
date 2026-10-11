@@ -94,6 +94,11 @@ impl ArchiveShardStateDb {
         Ok(())
     }
 
+    /// Cells and index are constructed from the same physical DB.
+    pub fn sync_wal(&self) -> Result<()> {
+        self.index.sync_wal()
+    }
+
     pub fn get(&self, id: &BlockIdExt) -> Result<Cell> {
         let data = self.index.get(id)?;
         let db_entry = DbEntry::deserialize(&data)?;

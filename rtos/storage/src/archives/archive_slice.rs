@@ -536,7 +536,24 @@ impl ArchiveSlice {
                 Ok(())
             })
             .await?;
+        // Relocation may delete the loose copy immediately after this returns.
+        // Commit package directory entries and the provider's index WAL first.
+        self.sync_block_package(block_handle).await?;
         Ok(entry.take_data())
+    }
+
+    pub async fn sync_block_package(&self, handle: &BlockHandle) -> Result<()> {
+        let package = match self.choose_package(get_mc_seq_no(handle), handle.id().shard()).await? {
+            ChosenPackage::Info(info) => info,
+            ChosenPackage::Slot(_) => fail!("Required archive package is absent"),
+        };
+        package.package().sync_durable().await?;
+        // These tables belong to this archive's actual provider DB (which can
+        // differ from the node DB in archival epoch mode).
+        self.entry_db.sync_wal()?;
+        self.offsets_db.sync_wal()?;
+        self.package_status_db.sync_wal()?;
+        Ok(())
     }
 
     pub async fn get_file<B: Borrow<BlockIdExt> + Hash>(

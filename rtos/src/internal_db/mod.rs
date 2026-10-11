@@ -248,6 +248,20 @@ impl Clone for StateDb {
     }
 }
 
+/// An acknowledged storage operation has uncertain durability. Publication must
+/// stop and reopen instead of treating this as a transient network failure.
+#[derive(Debug)]
+pub(crate) struct PublicationDurabilityFailure(anyhow::Error);
+impl std::fmt::Display for PublicationDurabilityFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Publication storage durability failed: {}", self.0)
+    }
+}
+impl std::error::Error for PublicationDurabilityFailure {}
+fn publication_durability_failure(error: anyhow::Error) -> anyhow::Error {
+    PublicationDurabilityFailure(error).into()
+}
+
 pub struct InternalDb {
     catchain_db: Arc<RocksDb>,
     block_handle_storage: Arc<BlockHandleStorage>,
@@ -620,6 +634,136 @@ impl InternalDb {
     pub fn load_block_handle(&self, id: &BlockIdExt) -> Result<Option<Arc<BlockHandle>>> {
         let _tc = time_checker!(|| format!("load_block_handle {}", id), 30);
         self.block_handle_storage.load_handle_by_id(id)
+    }
+
+    /// Wait for actual state writes. The caller must retain this future through
+    /// shutdown; this is not a cancelable fire-and-forget storage operation.
+    pub async fn sync_publication_state(&self) -> Result<()> {
+        match &self.state_db {
+            StateDb::Dynamic(db) => {
+                db.sync_pending().await.map_err(publication_durability_failure)?
+            }
+            StateDb::Archive(db) => db.sync_wal().map_err(publication_durability_failure)?,
+        }
+        Ok(())
+    }
+
+    pub fn repair_publication_links(
+        &self,
+        handle: &Arc<BlockHandle>,
+        previous: &[BlockIdExt],
+    ) -> Result<()> {
+        if previous.is_empty() || previous.len() > 2 {
+            fail!("Invalid publication predecessors");
+        }
+        let repair = |db: &BlockInfoDb, id: &BlockIdExt, expected: &BlockIdExt| -> Result<()> {
+            if let Some(existing) = self.load_block_linkage(id, db, "publication linkage check")? {
+                if existing != *expected {
+                    fail!("Conflicting persisted publication linkage");
+                }
+            }
+            db.put(id, &expected.serialize())
+        };
+        repair(&self.prev1_block_db, handle.id(), &previous[0])?;
+        handle.set_prev1();
+        if let Some(second) = previous.get(1) {
+            repair(&self.prev2_block_db, handle.id(), second)?;
+            handle.set_prev2();
+        }
+        // Applied masterchain blocks have exactly one predecessor and next1.
+        // Shard receipts are preapplied and cannot invent inclusion/next links.
+        if handle.is_applied() && handle.id().is_masterchain() {
+            let parent = self
+                .load_block_handle(&previous[0])?
+                .ok_or_else(|| error!("Applied publication predecessor handle missing"))?;
+            repair(&self.next1_block_db, parent.id(), handle.id())?;
+            parent.set_next1();
+            self.store_block_handle(&parent, None)?;
+        }
+        Ok(())
+    }
+
+    pub async fn sync_publication_metadata(&self, handle: &Arc<BlockHandle>) -> Result<()> {
+        // Explicitly serialize current flags even if they were already set in
+        // memory before an earlier writer failure/crash.
+        self.block_handle_storage
+            .save_handle(handle, None)
+            .map_err(publication_durability_failure)?;
+        self.block_handle_storage.sync_pending().await.map_err(publication_durability_failure)
+    }
+
+    /// Read physical artifacts despite handle flags; repair a missing body/link
+    /// from authenticated evidence. Preserve an existing Final proof on Approval.
+    pub async fn ensure_publication_artifacts(
+        &self,
+        block: &BlockStuff,
+        proof: &BlockProofStuff,
+    ) -> Result<(Arc<BlockHandle>, BlockProofStuff)> {
+        let handle = self
+            .create_or_load_block_handle(block.id(), Some(block.block()?), None, None)?
+            .to_non_updated()
+            .ok_or_else(|| error!("Publication handle missing"))?;
+        let body_id = PackageEntryId::Block(block.id());
+        let preserve_final = proof.is_link() && handle.has_proof();
+        let is_link = proof.is_link() && !preserve_final;
+        let proof_id = if is_link {
+            PackageEntryId::ProofLink(block.id())
+        } else {
+            PackageEntryId::Proof(block.id())
+        };
+        let old_body = self.archive_manager.get_file(&handle, &body_id).await;
+        let old_proof = self
+            .archive_manager
+            .get_file(&handle, &proof_id)
+            .await
+            .and_then(|bytes| BlockProofStuff::deserialize(block.id(), bytes, is_link))
+            .and_then(|stored| {
+                if stored.is_link() {
+                    stored.check_proof_link()?;
+                } else {
+                    stored.check_proof_as_link()?;
+                }
+                Ok(stored)
+            });
+        let proof_ok = old_proof.is_ok();
+        let selected = match old_proof {
+            Ok(stored) => stored,
+            Err(error) if preserve_final => {
+                fail!("Cannot reconstruct missing Final proof from Approval: {error}");
+            }
+            Err(_) => proof.clone(),
+        };
+        let body_ok = old_body.as_ref().is_ok_and(|bytes| bytes.as_slice() == block.data());
+        // Rewriting both artifacts when leaving a damaged archive prevents an
+        // archived flag reset from orphaning the other still-valid artifact.
+        if !body_ok || !proof_ok {
+            let _body = handle.block_file_lock().write().await;
+            let _proof = handle.proof_file_lock().write().await;
+            handle.reset_archived();
+            self.archive_manager
+                .replace_file_durable(&body_id, block.data())
+                .await
+                .map_err(publication_durability_failure)?;
+            self.archive_manager
+                .replace_file_durable(&proof_id, selected.data())
+                .await
+                .map_err(publication_durability_failure)?;
+            handle.set_data();
+            if is_link {
+                handle.set_proof_link();
+            } else {
+                handle.set_proof();
+            }
+        }
+        self.archive_manager
+            .sync_file(&handle, &body_id)
+            .await
+            .map_err(publication_durability_failure)?;
+        self.archive_manager
+            .sync_file(&handle, &proof_id)
+            .await
+            .map_err(publication_durability_failure)?;
+        Ok((handle, selected))
     }
 
     pub async fn store_block_data(

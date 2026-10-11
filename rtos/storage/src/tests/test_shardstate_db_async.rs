@@ -111,3 +111,74 @@ async fn test_shardstate_db_async() -> Result<()> {
     destroy_rocks_db(DB_PATH, DB_NAME).await.unwrap();
     Ok(())
 }
+
+struct StateDurabilityPause {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+#[async_trait::async_trait]
+impl crate::shardstate_db_async::Callback for StateDurabilityPause {
+    async fn invoke(&self, _job: crate::shardstate_db_async::Job) {
+        self.entered.notify_one();
+        self.release.notified().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn publication_durability_state_barrier_waits_for_actual_completion() -> Result<()> {
+    let path = std::env::temp_dir().join(format!("rtos-state-barrier-{}", std::process::id()));
+    let db = RocksDb::new(&path, "db", None, AccessType::ReadWrite)?;
+    let store = ShardStateDb::new(
+        db.clone(),
+        "states",
+        "cells",
+        "counters",
+        CellsDbConfig::default(),
+        #[cfg(feature = "telemetry")]
+        Arc::new(StorageTelemetry::default()),
+        Arc::new(StorageAlloc::default()),
+    )?;
+    let pause =
+        Arc::new(StateDurabilityPause { entered: Default::default(), release: Default::default() });
+    let id = BlockIdExt::default();
+    store.put(&id, Cell::default(), Some(pause.clone())).await?;
+    pause.entered.notified().await;
+    let copy = store.clone();
+    let mut barrier = tokio::spawn(async move { copy.sync_pending().await });
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut barrier).await.is_err());
+    pause.release.notify_one();
+    barrier.await.unwrap()?;
+    assert_eq!(store.get(&id)?.repr_hash(), Cell::default().repr_hash());
+    store.stop().await;
+    drop(store);
+    drop(db);
+    destroy_rocks_db(&path, "db").await?;
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn publication_durability_state_failure_cannot_ack_a_barrier() -> Result<()> {
+    let path = std::env::temp_dir().join(format!("rtos-state-failure-{}", std::process::id()));
+    let db = RocksDb::new(&path, "db", None, AccessType::ReadWrite)?;
+    let store = ShardStateDb::new(
+        db.clone(),
+        "states",
+        "cells",
+        "counters",
+        CellsDbConfig::default(),
+        #[cfg(feature = "telemetry")]
+        Arc::new(StorageTelemetry::default()),
+        Arc::new(StorageAlloc::default()),
+    )?;
+    db.drop_table("states")?;
+    store.put(&BlockIdExt::default(), Cell::default(), None).await?;
+    assert!(tokio::time::timeout(Duration::from_secs(5), store.sync_pending()).await?.is_err());
+    assert!(store.sync_pending().await.is_err());
+    store.stop().await;
+    drop(store);
+    drop(db);
+    destroy_rocks_db(&path, "db").await?;
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

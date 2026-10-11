@@ -102,6 +102,12 @@ impl Package {
         Ok(())
     }
 
+    /// File and directory entries are separate durability obligations.
+    pub async fn sync_durable(&self) -> Result<()> {
+        let _guard = self.write_mutex.lock().await;
+        sync_file_and_parents(self.path()).await
+    }
+
     pub fn path(&self) -> &Path {
         self.path.as_path()
     }
@@ -266,3 +272,18 @@ pub async fn read_package_from<R: tokio::io::AsyncReadExt + Unpin>(
 #[cfg(test)]
 #[path = "../tests/test_package.rs"]
 mod tests;
+
+/// Called by an owned storage operation. Synchronize the directory chain as
+/// archive packages may have created more than one new ancestor directory.
+pub(crate) async fn sync_file_and_parents(path: &Path) -> Result<()> {
+    tokio::fs::OpenOptions::new().read(true).write(true).open(path).await?.sync_all().await?;
+    let mut parent = path.parent();
+    while let Some(directory) = parent {
+        if directory.as_os_str().is_empty() {
+            break;
+        }
+        tokio::fs::File::open(directory).await?.sync_all().await?;
+        parent = directory.parent();
+    }
+    Ok(())
+}

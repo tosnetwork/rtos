@@ -470,6 +470,11 @@ pub trait Callback: Sync + Send {
     async fn invoke(&self, job: StoreJob, ok: bool);
 }
 
+enum HandleCommand {
+    Work(StoreJob, Option<Arc<dyn Callback>>),
+    Barrier(tokio::sync::oneshot::Sender<Result<()>>),
+}
+
 pub struct BlockHandleStorage {
     handle_db: Arc<BlockHandleDb>,
     handle_cache: Arc<BlockHandleCache>,
@@ -477,7 +482,7 @@ pub struct BlockHandleStorage {
     full_node_state_db: Arc<NodeStateDb>,
     validator_state_db: Arc<NodeStateDb>,
     state_cache: lockfree::map::Map<String, Arc<BlockIdExt>>,
-    storer: tokio::sync::mpsc::UnboundedSender<(StoreJob, Option<Arc<dyn Callback>>)>,
+    storer: tokio::sync::mpsc::UnboundedSender<HandleCommand>,
     #[cfg(feature = "telemetry")]
     telemetry: Arc<StorageTelemetry>,
     allocated: Arc<StorageAlloc>,
@@ -518,7 +523,26 @@ impl BlockHandleStorage {
                 db.put_raw(handle.id().root_hash().as_slice(), &handle.serialize())
             }
 
-            while let Some((job, callback)) = reader.recv().await {
+            let mut failed = false;
+            while let Some(command) = reader.recv().await {
+                let (job, callback) = match command {
+                    HandleCommand::Work(job, callback) => (job, callback),
+                    HandleCommand::Barrier(reply) => {
+                        let result = if failed {
+                            Err(error!("Handle storage has an unacknowledged write failure"))
+                        } else {
+                            handle_db
+                                .sync_wal()
+                                .and_then(|_| full_node_state_db.sync_wal())
+                                .and_then(|_| validator_state_db.sync_wal())
+                        };
+                        if result.is_err() {
+                            failed = true;
+                        }
+                        let _ = reply.send(result);
+                        continue;
+                    }
+                };
                 let ok = match &job {
                     StoreJob::SaveHandle(handle) => {
                         if let Err(e) = save_handle(handle, &handle_db) {
@@ -577,6 +601,7 @@ impl BlockHandleStorage {
                         }
                     }
                 };
+                failed |= !ok;
                 if let Some(callback) = callback {
                     callback.invoke(job, ok).await;
                 }
@@ -606,14 +631,14 @@ impl BlockHandleStorage {
     pub fn drop_validator_state(&self, key: String) -> Result<()> {
         self.delete_state(&key)?;
         self.storer
-            .send((StoreJob::DropValidatorState(key), None))
+            .send(HandleCommand::Work(StoreJob::DropValidatorState(key), None))
             .map_err(|_| error!("Cannot drop validator state: storer thread dropped"))
     }
 
     pub fn drop_full_node_state(&self, key: String) -> Result<()> {
         self.delete_state(&key)?;
         self.storer
-            .send((StoreJob::DropFullNodeState(key), None))
+            .send(HandleCommand::Work(StoreJob::DropFullNodeState(key), None))
             .map_err(|_| error!("Cannot drop fullnode state: storer thread dropped"))
     }
 
@@ -657,6 +682,15 @@ impl BlockHandleStorage {
         Ok(self.validator_state_db.try_get_raw(key.as_bytes())?.map(|value| value.to_vec()))
     }
 
+    /// Ordered result-bearing barrier, including physical WALs, not queue admission.
+    pub async fn sync_pending(&self) -> Result<()> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.storer
+            .send(HandleCommand::Barrier(send))
+            .map_err(|_| error!("Handle writer stopped"))?;
+        receive.await.map_err(|_| error!("Handle writer failed during durability barrier"))?
+    }
+
     pub fn save_handle(
         &self,
         handle: &Arc<BlockHandle>,
@@ -666,21 +700,21 @@ impl BlockHandleStorage {
             return self.handle_db.put_raw(handle.id().root_hash().as_slice(), &handle.serialize());
         }
         self.storer
-            .send((StoreJob::SaveHandle(handle.clone()), callback))
+            .send(HandleCommand::Work(StoreJob::SaveHandle(handle.clone()), callback))
             .map_err(|_| error!("Cannot store handle {}: storer thread dropped", handle.id()))
     }
 
     pub fn save_full_node_state(&self, key: String, id: &BlockIdExt) -> Result<()> {
         let refid = self.create_state(key.clone(), id)?;
         self.storer
-            .send((StoreJob::SaveFullNodeState((key, refid)), None))
+            .send(HandleCommand::Work(StoreJob::SaveFullNodeState((key, refid)), None))
             .map_err(|_| error!("Cannot store full node state {}: storer thread dropped", id))
     }
 
     pub fn save_validator_state(&self, key: String, id: &BlockIdExt) -> Result<()> {
         let refid = self.create_state(key.clone(), id)?;
         self.storer
-            .send((StoreJob::SaveValidatorState((key, refid)), None))
+            .send(HandleCommand::Work(StoreJob::SaveValidatorState((key, refid)), None))
             .map_err(|_| error!("Cannot store validator state {}: storer thread dropped", id))
     }
 
@@ -718,7 +752,7 @@ impl BlockHandleStorage {
     pub fn drop_handle(&self, id: BlockIdExt, callback: Option<Arc<dyn Callback>>) -> Result<()> {
         let _ = self.handle_cache.remove(id.root_hash());
         self.storer
-            .send((StoreJob::DropHandle(id.clone()), callback))
+            .send(HandleCommand::Work(StoreJob::DropHandle(id.clone()), callback))
             .map_err(|_| error!("Cannot drop handle {}: storer thread dropped", id))?;
         Ok(())
     }

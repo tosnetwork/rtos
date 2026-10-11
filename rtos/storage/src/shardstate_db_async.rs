@@ -159,10 +159,16 @@ impl Default for CellsDbConfig {
     }
 }
 
+enum StateCommand {
+    Work(Job, Option<Arc<dyn Callback>>),
+    Barrier(tokio::sync::oneshot::Sender<Result<()>>),
+}
+
 pub struct ShardStateDb {
     shardstate_db: Arc<RocksDbTable<BlockIdExt>>,
     dynamic_boc_db: Arc<DynamicBocDb>,
-    storer: tokio::sync::mpsc::UnboundedSender<(Job, Option<Arc<dyn Callback>>)>,
+    storer: tokio::sync::mpsc::UnboundedSender<StateCommand>,
+    write_failure: tokio::sync::watch::Sender<Option<String>>,
     in_queue: AtomicU32,
     stop: Arc<AtomicU8>,
     config: CellsDbConfig,
@@ -204,6 +210,7 @@ impl ShardStateDb {
             shardstate_db: Arc::new(RocksDbTable::with_db(db.clone(), shardstate_db_cf, true)?),
             dynamic_boc_db: Arc::new(dynamic_boc_db),
             storer: sender,
+            write_failure: tokio::sync::watch::channel(None).0,
             in_queue: AtomicU32::new(0),
             stop: Arc::new(AtomicU8::new(0)),
             config,
@@ -300,9 +307,10 @@ impl ShardStateDb {
 
                         let now = std::time::Instant::now();
                         let callback = SsNotificationCallback::new();
-                        if let Err(e) =
-                            self.storer.send((Job::DeleteState(id.clone()), Some(callback.clone())))
-                        {
+                        if let Err(e) = self.storer.send(StateCommand::Work(
+                            Job::DeleteState(id.clone()),
+                            Some(callback.clone()),
+                        )) {
                             log::error!(
                                 target: TARGET,
                                 "Can't send state to delete from db, id {}",
@@ -433,6 +441,21 @@ impl ShardStateDb {
         Ok(())
     }
 
+    pub async fn sync_pending(&self) -> Result<()> {
+        let mut failure = self.write_failure.subscribe();
+        if let Some(error) = failure.borrow().as_ref() {
+            fail!("State writer has a failed operation: {error}");
+        }
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.storer
+            .send(StateCommand::Barrier(send))
+            .map_err(|_| error!("State writer stopped"))?;
+        tokio::select! {
+            result = receive => result.map_err(|_| error!("State writer failed during durability barrier"))?,
+            _ = failure.changed() => Err(error!("State writer failed before durability barrier: {:?}", *failure.borrow())),
+        }
+    }
+
     pub async fn put(
         &self,
         id: &BlockIdExt,
@@ -469,9 +492,11 @@ impl ShardStateDb {
 
         let in_queue = self.in_queue.fetch_add(1, Ordering::Relaxed) + 1;
 
-        self.storer.send((Job::PutState(state_root, id.clone()), callback)).map_err(|_| {
-            error!("Can't send state to put into db, id {}, root {:x}", id, root_id)
-        })?;
+        self.storer
+            .send(StateCommand::Work(Job::PutState(state_root, id.clone()), callback))
+            .map_err(|_| {
+                error!("Can't send state to put into db, id {}, root {:x}", id, root_id)
+            })?;
 
         metrics::gauge!("rtos_node_db_shardstate_queue_size").set(in_queue as f64);
         #[cfg(feature = "telemetry")]
@@ -553,7 +578,7 @@ impl ShardStateDb {
 
     async fn worker(
         self: Arc<Self>,
-        mut receiver: tokio::sync::mpsc::UnboundedReceiver<(Job, Option<Arc<dyn Callback>>)>,
+        mut receiver: tokio::sync::mpsc::UnboundedReceiver<StateCommand>,
     ) {
         self.stop.fetch_or(Self::MASK_WORKER, Ordering::Relaxed);
 
@@ -570,9 +595,24 @@ impl ShardStateDb {
             if check_stop() {
                 return;
             }
-            if let Ok(Some((mut job, callback))) =
+            if let Ok(Some(command)) =
                 tokio::time::timeout(Duration::from_millis(500), receiver.recv()).await
             {
+                let (mut job, callback) = match command {
+                    StateCommand::Work(job, callback) => (job, callback),
+                    StateCommand::Barrier(reply) => {
+                        // The state index and cells share this physical DB (new()).
+                        let result = match self.write_failure.borrow().as_ref() {
+                            Some(error) => Err(error!("Earlier state write failed: {error}")),
+                            None => self.shardstate_db.sync_wal(),
+                        };
+                        if let Err(error) = &result {
+                            self.write_failure.send_replace(Some(error.to_string()));
+                        }
+                        let _ = reply.send(result);
+                        continue;
+                    }
+                };
                 let in_queue = self.in_queue.fetch_sub(1, Ordering::Relaxed) - 1;
                 metrics::gauge!("rtos_node_db_shardstate_queue_size").set(in_queue as f64);
                 #[cfg(feature = "telemetry")]
@@ -584,6 +624,7 @@ impl ShardStateDb {
                         Job::PutState(cell, id) => {
                             match self.clone().put_internal(id, cell.clone()) {
                                 Err(e) => {
+                                    self.write_failure.send_replace(Some(e.to_string()));
                                     if check_stop() {
                                         return;
                                     }
@@ -600,6 +641,7 @@ impl ShardStateDb {
                         }
                         Job::DeleteState(id) => {
                             if let Err(e) = self.clone().delete_internal(id) {
+                                self.write_failure.send_replace(Some(e.to_string()));
                                 if check_stop() {
                                     return;
                                 }

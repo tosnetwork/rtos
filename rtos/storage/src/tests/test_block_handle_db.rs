@@ -146,3 +146,67 @@ async fn test_handle_db() {
     drop(db);
     destroy_rocks_db(DB_PATH, DB_NAME).await.unwrap();
 }
+
+struct DurabilityPause {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+#[async_trait::async_trait]
+impl crate::block_handle_db::Callback for DurabilityPause {
+    async fn invoke(&self, _job: crate::block_handle_db::StoreJob, ok: bool) {
+        assert!(ok);
+        self.entered.notify_one();
+        self.release.notified().await;
+    }
+}
+
+#[tokio::test]
+async fn publication_durability_handle_barrier_waits_for_queued_work() {
+    use std::sync::Arc;
+    let path = std::env::temp_dir().join(format!("rtos-handle-barrier-{}", std::process::id()));
+    let db = RocksDb::new(&path, "db", None, AccessType::ReadWrite).unwrap();
+    let (storage, table) = create_block_handle_storage(db.clone());
+    let storage = Arc::new(storage);
+    let handle =
+        storage.create_handle(BlockIdExt::default(), BlockMeta::default(), None).unwrap().unwrap();
+    let paused =
+        Arc::new(DurabilityPause { entered: Default::default(), release: Default::default() });
+    storage.save_handle(&handle, Some(paused.clone())).unwrap();
+    paused.entered.notified().await;
+    handle.set_data();
+    storage.save_handle(&handle, None).unwrap();
+    let copy = storage.clone();
+    let mut barrier = tokio::spawn(async move { copy.sync_pending().await });
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut barrier)
+        .await
+        .is_err());
+    paused.release.notify_one();
+    barrier.await.unwrap().unwrap();
+    assert!(table.len().unwrap() > 0);
+    drop(table);
+    drop(handle);
+    drop(storage);
+    drop(db);
+    destroy_rocks_db(&path, "db").await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn publication_durability_handle_write_failure_is_sticky() {
+    let path = std::env::temp_dir().join(format!("rtos-handle-failure-{}", std::process::id()));
+    let db = RocksDb::new(&path, "db", None, AccessType::ReadWrite).unwrap();
+    let (storage, table) = create_block_handle_storage(db.clone());
+    let handle =
+        storage.create_handle(BlockIdExt::default(), BlockMeta::default(), None).unwrap().unwrap();
+    storage.sync_pending().await.unwrap();
+    db.drop_table("block_handles").unwrap();
+    storage.save_handle(&handle, None).unwrap(); // actual queue admission succeeds
+    assert!(storage.sync_pending().await.is_err()); // actual physical write fails
+    assert!(storage.sync_pending().await.is_err());
+    drop(table);
+    drop(handle);
+    drop(storage);
+    drop(db);
+    destroy_rocks_db(&path, "db").await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}

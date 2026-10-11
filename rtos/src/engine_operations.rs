@@ -1114,6 +1114,72 @@ impl EngineOperations for Engine {
         self.overlay_client(&shard).await?.download_archive(masterchain_seqno, &shard).await
     }
 
+    async fn ensure_publication_acceptance_durable(
+        self: Arc<Self>,
+        accepted: &crate::validator::accept_block::AcceptedSessionBlock,
+    ) -> Result<()> {
+        let (handle, persisted_proof) =
+            self.db().ensure_publication_artifacts(accepted.block(), accepted.proof()).await?;
+        if persisted_proof.is_link() {
+            persisted_proof.check_proof_link()?;
+        } else {
+            persisted_proof.check_proof(self.as_ref()).await?;
+        }
+        self.db().sync_publication_state().await?;
+        let expected = accepted.block().block()?.read_state_update()?.new_hash;
+        let has_persisted_state = self
+            .db()
+            .load_shard_state_dynamic(handle.id())
+            .is_ok_and(|state| state.root_cell().repr_hash() == &expected);
+        if !has_persisted_state {
+            handle.reset_state();
+            let previous = accepted.previous_blocks();
+            let engine: Arc<dyn EngineOperations> = self.clone();
+            crate::full_node::apply_block::calc_and_store_state(
+                &handle,
+                accepted.block(),
+                &(previous[0].clone(), previous.get(1).cloned()),
+                &engine,
+            )
+            .await?;
+            self.db().sync_publication_state().await?;
+        }
+        let persisted = self.db().load_shard_state_dynamic(handle.id())?;
+        if persisted.root_cell().repr_hash() != &expected {
+            fail!("Persisted publication state root mismatch");
+        }
+        // Force lazy descendants to load. A persisted root/index alone does not
+        // establish that all cells required by this state are readable.
+        let mut cells = vec![persisted.root_cell().clone()];
+        let mut visited = std::collections::HashSet::new();
+        while let Some(cell) = cells.pop() {
+            if visited.insert(cell.repr_hash().clone()) {
+                if visited.len() % 512 == 0 {
+                    tokio::task::yield_now().await;
+                }
+                for index in 0..cell.references_count() {
+                    cells.push(cell.reference(index)?);
+                }
+            }
+        }
+        self.db().repair_publication_links(&handle, accepted.previous_blocks())?;
+        self.db().sync_publication_metadata(&handle).await?;
+        Ok(())
+    }
+
+    fn finality_recovery_generation(&self) -> u64 {
+        self.finality_recovery_registry().generation()
+    }
+    fn finality_recovery_owns(
+        &self,
+        runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+    ) -> bool {
+        self.finality_recovery_registry().owns(runtime)
+    }
+    async fn wait_finality_recovery_change(&self, seen: u64) -> Result<()> {
+        self.finality_recovery_registry().wait_changed(seen).await
+    }
+
     async fn durable_finality_sink(
         self: Arc<Self>,
         runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,

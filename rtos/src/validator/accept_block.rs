@@ -1016,6 +1016,9 @@ impl AcceptedSessionBlock {
     pub fn block(&self) -> &BlockStuff {
         &self.block
     }
+    pub(crate) fn previous_blocks(&self) -> &[BlockIdExt] {
+        &self.prev
+    }
     pub fn proof(&self) -> &BlockProofStuff {
         &self.proof
     }

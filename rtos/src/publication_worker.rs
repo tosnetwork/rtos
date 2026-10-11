@@ -140,6 +140,7 @@ struct State {
     ready: tokio::sync::watch::Sender<Option<std::result::Result<(), String>>>,
     cursor: Mutex<(u64, std::collections::BTreeMap<u64, usize>)>,
     acceptance_turn: AtomicBool,
+    acceptance_verified: Mutex<std::collections::BTreeSet<u64>>,
     acceptance_cursor: Mutex<u64>,
     acceptance_retry: Mutex<std::collections::BTreeMap<u64, tokio::time::Instant>>,
     retry_after: Mutex<std::collections::BTreeMap<(u64, PublicationEffect), tokio::time::Instant>>,
@@ -163,6 +164,7 @@ impl PublicationWorker {
             ready: tokio::sync::watch::channel(None).0,
             cursor: Mutex::new(Default::default()),
             acceptance_turn: AtomicBool::new(true),
+            acceptance_verified: Mutex::new(Default::default()),
             acceptance_cursor: Mutex::new(0),
             acceptance_retry: Mutex::new(Default::default()),
             retry_after: Mutex::new(Default::default()),
@@ -612,9 +614,23 @@ impl State {
             validate_creator_claim(&publication, &claims)?;
         }
         // Deliberately not cancelable: this phase can write state/proof data.
-        let (entry, accepted) = accept_authenticated_publication(publication, engine).await?;
+        let (entry, accepted) =
+            accept_authenticated_publication(publication, engine.clone()).await?;
         let id = entry.id;
+        let needs_verification = !self.acceptance_verified.lock().unwrap().contains(&id.0);
+        if needs_verification {
+            if let Err(error) = engine.ensure_publication_acceptance_durable(&accepted).await {
+                if error
+                    .downcast_ref::<crate::internal_db::PublicationDurabilityFailure>()
+                    .is_some()
+                {
+                    self.fatal(error.to_string());
+                }
+                return Err(error);
+            }
+        }
         self.write(store, move |store| store.mark_accepted(id)).await?;
+        self.acceptance_verified.lock().unwrap().insert(id.0);
         Ok(accepted)
     }
     async fn routing_ready(
@@ -729,8 +745,16 @@ impl State {
             return None;
         }
         let enabled = self.enabled.load(Ordering::Acquire);
+        let mut verified = self.acceptance_verified.lock().unwrap();
+        verified.retain(|id| entries.iter().any(|entry| entry.id.0 == *id));
+        // Persisted stages from an older process are not proof that all required
+        // artifacts survived. Expiry/disabled routing never bypass this pass.
         let eligible = |entry: &UnverifiedRecord| {
-            matches!(entry.stage, PublicationStage::DraftDurable | PublicationStage::Prepared)
+            !verified.contains(&entry.id.0)
+                || matches!(
+                    entry.stage,
+                    PublicationStage::DraftDurable | PublicationStage::Prepared
+                )
                 || (enabled && entry.stage == PublicationStage::AcceptedDraft)
         };
         let mut retry = self.acceptance_retry.lock().unwrap();
@@ -1131,6 +1155,7 @@ mod tests {
             ready: tokio::sync::watch::channel(None).0,
             cursor: Mutex::new(Default::default()),
             acceptance_turn: AtomicBool::new(true),
+            acceptance_verified: Mutex::new(Default::default()),
             acceptance_cursor: Mutex::new(0),
             acceptance_retry: Mutex::new(Default::default()),
             retry_after: Mutex::new(Default::default()),
@@ -1232,13 +1257,18 @@ mod tests {
         let entries = vec![draft, prepared, accepted, completed];
         assert_eq!(state.select_acceptance(&entries, now).unwrap().id, RecordId(1));
         assert_eq!(state.select_acceptance(&entries, now).unwrap().id, RecordId(2));
-        assert!(state.select_acceptance(&entries, now).is_none());
-        assert!(state.select_retry(&entries, 100, now).is_none());
-        state.enabled.store(true, Ordering::Release);
         assert_eq!(state.select_acceptance(&entries, now).unwrap().id, RecordId(3));
-        assert!(
-            state.select_acceptance(&entries, now).is_none(),
-            "Completed is not new acceptance debt"
+        assert_eq!(state.select_acceptance(&entries, now).unwrap().id, RecordId(4));
+        assert!(state.select_retry(&entries, 100, now).is_none());
+        state.acceptance_verified.lock().unwrap().extend([3, 4]);
+        assert!(state.select_acceptance(&entries, now + RETRY_INTERVAL).is_some());
+        // A successful per-process verification removes Completed repair debt,
+        // but an AcceptedDraft still needs routing when explicitly enabled.
+        state.enabled.store(true, Ordering::Release);
+        state.acceptance_cursor.lock().unwrap().clone_from(&2);
+        assert_eq!(
+            state.select_acceptance(&entries, now + RETRY_INTERVAL).unwrap().id,
+            RecordId(3)
         );
     }
 
@@ -1256,6 +1286,7 @@ mod tests {
         draft.stage = PublicationStage::DraftDurable;
         let ready = scheduling_entry(3, 200);
         let entries = vec![blocked, draft, ready];
+        state.acceptance_verified.lock().unwrap().insert(3);
         state.acceptance_retry.lock().unwrap().insert(1, now + RETRY_INTERVAL);
         assert_eq!(state.select_acceptance(&entries, now).unwrap().id, RecordId(2));
         assert_eq!(state.select_retry(&entries, 100, now).unwrap().0.id, RecordId(3));
@@ -1263,6 +1294,26 @@ mod tests {
             state.select_acceptance(&entries, now + RETRY_INTERVAL).unwrap().id,
             RecordId(1)
         );
+    }
+
+    #[test]
+    fn publication_worker_revalidates_completed_and_expired_ready_once_per_process() {
+        let worker = state();
+        let now = tokio::time::Instant::now();
+        let mut completed = scheduling_entry(1, 1);
+        completed.stage = PublicationStage::Completed;
+        completed.pending.clear();
+        let expired = scheduling_entry(2, 1);
+        let entries = vec![completed, expired];
+        assert!(!worker.enabled.load(Ordering::Acquire));
+        assert_eq!(worker.select_acceptance(&entries, now).unwrap().id, RecordId(1));
+        worker.acceptance_verified.lock().unwrap().insert(1);
+        assert_eq!(worker.select_acceptance(&entries, now).unwrap().id, RecordId(2));
+        worker.acceptance_verified.lock().unwrap().insert(2);
+        assert!(worker.select_acceptance(&entries, now + RETRY_INTERVAL).is_none());
+        assert!(worker.select_retry(&entries, 100, now).is_none());
+        // A new process must not inherit this in-memory durability evidence.
+        assert_eq!(state().select_acceptance(&entries, now).unwrap().id, RecordId(1));
     }
 
     #[test]

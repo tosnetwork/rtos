@@ -157,6 +157,60 @@ impl ArchiveManager {
         }
     }
 
+    /// Caller holds the corresponding handle file lock. A failed replacement
+    /// never truncates the previous artifact in place.
+    pub async fn replace_file_durable<B: Borrow<BlockIdExt>>(
+        &self,
+        entry_id: &PackageEntryId<B>,
+        bytes: &[u8],
+    ) -> Result<()> {
+        if bytes.is_empty() {
+            fail!("Empty publication artifact");
+        }
+        let path = self.unapplied_files_path.join(entry_id.filename_short());
+        let temporary = path.with_extension("publication-tmp");
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temporary)
+            .await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&temporary, &path).await?;
+        super::package::sync_file_and_parents(&path).await
+    }
+
+    pub async fn sync_file<B: Borrow<BlockIdExt> + Hash>(
+        &self,
+        handle: &BlockHandle,
+        entry_id: &PackageEntryId<B>,
+    ) -> Result<()> {
+        let _guard = match entry_id {
+            PackageEntryId::Block(_) => handle.block_file_lock().write().await,
+            PackageEntryId::Proof(_) | PackageEntryId::ProofLink(_) => {
+                handle.proof_file_lock().write().await
+            }
+            _ => fail!("Unsupported durable publication artifact"),
+        };
+        if handle.is_archived() {
+            let id = self.get_package_id(get_mc_seq_no(handle), handle.is_key_block()?).await?;
+            let descriptor = self
+                .get_file_desc(&id, false)
+                .await?
+                .ok_or_else(|| error!("Required archive descriptor is absent"))?;
+            descriptor.archive_slice().sync_block_package(handle).await?;
+        } else {
+            super::package::sync_file_and_parents(
+                &self.unapplied_files_path.join(entry_id.filename_short()),
+            )
+            .await?;
+        }
+        self.db.sync_wal()?;
+        Ok(())
+    }
+
     pub async fn get_file<B: Borrow<BlockIdExt> + Hash>(
         &self,
         handle: &BlockHandle,

@@ -192,6 +192,13 @@ impl RocksDb {
         RocksDbTable::with_db(self, family, create_if_not_exist)
     }
 
+    /// Synchronize writes already submitted to this physical database.
+    /// Queue owners must complete their jobs before calling this barrier.
+    pub fn sync_wal(&self) -> Result<()> {
+        self.db().flush_wal(true)?;
+        Ok(())
+    }
+
     pub fn db(&self) -> &DBWithThreadMode<MultiThreaded> {
         self.db.as_ref().expect("rocksdb was occasionaly destroyed")
     }
@@ -346,6 +353,10 @@ pub struct RocksDbTable<K> {
 }
 
 impl<K: DbKey + Send + Sync> RocksDbTable<K> {
+    pub fn sync_wal(&self) -> Result<()> {
+        self.db.sync_wal()
+    }
+
     pub(crate) fn with_db(
         db: Arc<RocksDb>,
         family: impl ToString,

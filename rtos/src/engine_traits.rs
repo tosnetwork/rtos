@@ -921,6 +921,26 @@ pub trait EngineOperations: Sync + Send {
         unimplemented!()
     }
 
+    async fn ensure_publication_acceptance_durable(
+        self: Arc<Self>,
+        _accepted: &crate::validator::accept_block::AcceptedSessionBlock,
+    ) -> Result<()> {
+        rtos_block::fail!("Durable publication acceptance is unsupported")
+    }
+
+    fn finality_recovery_generation(&self) -> u64 {
+        0
+    }
+    fn finality_recovery_owns(
+        &self,
+        _runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+    ) -> bool {
+        false
+    }
+    async fn wait_finality_recovery_change(&self, _seen: u64) -> Result<()> {
+        std::future::pending().await
+    }
+
     async fn durable_finality_sink(
         self: Arc<Self>,
         _runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
