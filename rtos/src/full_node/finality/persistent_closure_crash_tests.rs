@@ -12,6 +12,16 @@ use std::io::Write;
 const MODE: &str = "RTOS_SOURCE_CLOSE_CRASH_WINDOW";
 const NOTE: &str = "RTOS_SOURCE_CLOSE_CRASH_NOTE";
 
+/// Abrupt process loss at an already synchronized cut point. Unlike exit, this
+/// skips C atexit handlers as well as Rust drops while native workers are live.
+/// This defines the crash simulation; it does not diagnose prior SIGSEGVs.
+fn abrupt_exit(status: std::ffi::c_int) -> ! {
+    unsafe extern "C" {
+        fn _exit(status: std::ffi::c_int) -> !;
+    }
+    unsafe { _exit(status) }
+}
+
 struct ExitAfterOffer {
     real: DurableFinalitySinkPtr,
     window: i32,
@@ -48,7 +58,7 @@ impl DurableFinalitySink for ExitAfterOffer {
             request,
             Box::new(move |result| {
                 if window == 72 && result.is_ok() {
-                    std::process::exit(72);
+                    abrupt_exit(72);
                 }
                 done(result);
             }),
@@ -118,7 +128,7 @@ async fn persistent_closure_crash_child() {
                 // Receipt cannot be constructed here: source file+directory sync
                 // and original-copy validation have already completed.
                 if window == 73 {
-                    std::process::exit(73);
+                    abrupt_exit(73);
                 }
                 real_confirm(
                     receipt,
@@ -126,7 +136,7 @@ async fn persistent_closure_crash_child() {
                         // Actual node Released WAL ended, but source has not received
                         // the acknowledgement that would sync node_confirmed=true.
                         if window == 74 && result.is_ok() {
-                            std::process::exit(74);
+                            abrupt_exit(74);
                         }
                         done(result);
                     }),
