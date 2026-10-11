@@ -37,21 +37,6 @@ pub(crate) async fn recover_retained_finality(engine: Arc<dyn EngineOperations>)
             block.verify_expected_id(&retained.block_id)?;
             let (_, previous) =
                 construct_and_check_prev_stuff(block.root_cell(), &retained.block_id, false)?;
-            let locally_generated = match retained.local_validator_index {
-                None => false,
-                Some(_) => {
-                    let bindings = engine.consensus_transport_bindings()?;
-                    let binding = bindings
-                        .iter()
-                        .find(|binding| {
-                            binding.adnl_key_id.data() == retained.local_adnl.as_slice()
-                        })
-                        .ok_or_else(|| {
-                            error!("Retained validator transport is no longer configured")
-                        })?;
-                    binding.validator_id == retained.source_validator
-                }
-            };
             let record = PublicationRecord {
                 domain: OutboxDomain {
                     zerostate: retained.pin.zerostate.clone(),
@@ -70,7 +55,10 @@ pub(crate) async fn recover_retained_finality(engine: Arc<dyn EngineOperations>)
                 } else {
                     StoredCarrier::Approval(retained.signature_set.clone())
                 },
-                locally_generated,
+                // The node derives this claim from authenticated historical
+                // membership and the body creator before its first WAL stage.
+                // Current key availability only gates routing, not recovery.
+                locally_generated: false,
                 created_at_unix_secs: retained.created_at_unix_secs,
                 expires_at_unix_secs: retained
                     .created_at_unix_secs
