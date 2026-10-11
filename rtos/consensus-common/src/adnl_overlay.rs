@@ -17,7 +17,7 @@ use crate::{
 use adnl::{
     common::{
         AdnlPeers, Answer, QueryAnswer, QueryResult, Subscriber, TaggedByteSlice, TaggedTlObject,
-        TimedAnswer, Wait,
+        TimedAnswer,
     },
     node::{AdnlNode, AdnlSendMethod},
     BroadcastCheck, CatchainData, DhtNode, NetworkStack, OverlayNode, OverlayParams,
@@ -201,7 +201,6 @@ impl TaskProcessor {
             }
 
             log::debug!(target: LOG_TARGET, "TaskProcessor loop finished: {}", name_clone);
-
         });
 
         Self { name, task_sender, stop_requested, tasks, post_counter }
@@ -243,7 +242,9 @@ impl TaskProcessor {
 
         self.stop_async();
 
-        if let Err(error) = self.tasks.wait_sync() { log::error!("{error}"); }
+        if let Err(error) = self.tasks.wait_sync() {
+            log::error!("{error}");
+        }
     }
 }
 
@@ -371,8 +372,6 @@ impl TaskProcessorManager {
                 target: LOG_TARGET,
                 "TaskProcessorManager {manager_name}: Metrics loop finished"
             );
-
-
         });
     }
 
@@ -450,17 +449,27 @@ impl TaskProcessorManager {
 
         self.stop_async();
 
-        if let Err(error) = self.stop_checked() { log::error!("{error}"); }
+        if let Err(error) = self.stop_checked() {
+            log::error!("{error}");
+        }
     }
 
     fn stop_checked(&self) -> Result<()> {
         self.stop_async();
         let mut errors = Vec::new();
         for processor in self.processors.values() {
-            if let Err(error) = processor.tasks.wait_sync() { errors.push(error.to_string()); }
+            if let Err(error) = processor.tasks.wait_sync() {
+                errors.push(error.to_string());
+            }
         }
-        if let Err(error) = self.tasks.wait_sync() { errors.push(error.to_string()); }
-        if errors.is_empty() { Ok(()) } else { Err(error!("{}", errors.join("; "))) }
+        if let Err(error) = self.tasks.wait_sync() {
+            errors.push(error.to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(error!("{}", errors.join("; ")))
+        }
     }
 
     fn drained(&self) -> bool {
@@ -607,8 +616,6 @@ impl Peer {
         {
             log::warn!(target: LOG_TARGET, "Error deleting peer at loop exit: {:?}", e);
         }
-
-
     }
 
     /// Stop peer resolution loop asynchronously
@@ -620,10 +627,11 @@ impl Peer {
     fn stop_checked(&self) -> Result<()> {
         self.stop_async();
         let result = self.tasks.wait_sync();
-        let cleanup = self.overlay_node.delete_private_peers(&self.src_adnl_addr, &[self.dst_adnl_addr.clone()]);
-        result.and(cleanup)
+        let cleanup = self
+            .overlay_node
+            .delete_private_peers(&self.src_adnl_addr, &[self.dst_adnl_addr.clone()]);
+        result.and(cleanup.map(|_| ()))
     }
-
 }
 
 impl Drop for Peer {
@@ -681,12 +689,17 @@ impl PeerStorage {
         for peer in peers_to_remove {
             if peer.leases.fetch_sub(1, Ordering::AcqRel) == 1 {
                 peers_map.remove(&(peer.src_adnl_addr.clone(), peer.dst_adnl_addr.clone()));
-                if let Err(error) = peer.stop_checked() { errors.push(error.to_string()); }
+                if let Err(error) = peer.stop_checked() {
+                    errors.push(error.to_string());
+                }
             }
         }
-        if errors.is_empty() { Ok(()) } else { Err(error!("{}", errors.join("; "))) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(error!("{}", errors.join("; ")))
+        }
     }
-
 }
 
 /*
@@ -806,7 +819,7 @@ struct AdnlOverlay {
     stop_requested: Arc<AtomicBool>,  //atomic flag indicating if overlay stop is requested
     consumer: Arc<AdnlOverlayConsumer>, //consumer for handling overlay messages
     runtime_handle: tokio::runtime::Handle, //runtime handle for spawning broadcast listeners
-    peers: Mutex<Vec<Arc<Peer>>>,            //active peers with address resolution
+    peers: Mutex<Vec<Arc<Peer>>>,     //active peers with address resolution
     peers_storage: Arc<PeerStorage>,  //peer storage for cleanup
     is_tcp_available: bool,           //flag indicating if TCP or QUIC is available for multicast
     is_quic_available: bool,          //flag indicating if QUIC transport is available
@@ -1220,7 +1233,10 @@ impl AdnlOverlay {
             let stats = stats.clone();
             overlay.tasks.background("block sync metrics", async move {
                 let mut ticker = tokio::time::interval(crate::BLOCK_SYNC_STATS_LOG_INTERVAL);
-                loop { ticker.tick().await; stats.dump(); }
+                loop {
+                    ticker.tick().await;
+                    stats.dump();
+                }
             });
         }
 
@@ -1234,7 +1250,9 @@ impl AdnlOverlay {
 
     fn begin_stop(&self) {
         let mut started = self.shutdown_started.lock().unwrap();
-        if *started { return; }
+        if *started {
+            return;
+        }
         *started = true;
         self.stop_requested.store(true, Ordering::Release);
         self.tasks.close();
@@ -1249,17 +1267,31 @@ impl AdnlOverlay {
         let errors = self.shutdown_errors.clone();
         let runtime = self.runtime_handle.clone();
         self.shutdown.spawn("overlay resource finalizer", async move {
-            if let Err(error) = tasks.wait().await { errors.lock().unwrap().push(error.to_string()); }
+            if let Err(error) = tasks.wait().await {
+                errors.lock().unwrap().push(error.to_string());
+            }
             let errors_for_blocking = errors.clone();
-            let result = runtime.spawn_blocking(move || {
-                if let Err(error) = manager.stop_checked() { errors_for_blocking.lock().unwrap().push(error.to_string()); }
-                if let Err(error) = storage.remove_peers(peers) { errors_for_blocking.lock().unwrap().push(error.to_string()); }
-                if let Err(error) = overlay.delete_private_overlay(&id) { errors_for_blocking.lock().unwrap().push(error.to_string()); }
-                if let Some(id) = block_sync {
-                    if let Err(error) = overlay.delete_private_overlay(&id) { errors_for_blocking.lock().unwrap().push(error.to_string()); }
-                }
-            }).await;
-            if let Err(error) = result { errors.lock().unwrap().push(error.to_string()); }
+            let result = runtime
+                .spawn_blocking(move || {
+                    if let Err(error) = manager.stop_checked() {
+                        errors_for_blocking.lock().unwrap().push(error.to_string());
+                    }
+                    if let Err(error) = storage.remove_peers(peers) {
+                        errors_for_blocking.lock().unwrap().push(error.to_string());
+                    }
+                    if let Err(error) = overlay.delete_private_overlay(&id) {
+                        errors_for_blocking.lock().unwrap().push(error.to_string());
+                    }
+                    if let Some(id) = block_sync {
+                        if let Err(error) = overlay.delete_private_overlay(&id) {
+                            errors_for_blocking.lock().unwrap().push(error.to_string());
+                        }
+                    }
+                })
+                .await;
+            if let Err(error) = result {
+                errors.lock().unwrap().push(error.to_string());
+            }
         });
         self.shutdown.close();
     }
@@ -1268,11 +1300,17 @@ impl AdnlOverlay {
         self.begin_stop();
         self.shutdown.wait_sync()?;
         let errors = self.shutdown_errors.lock().unwrap();
-        if errors.is_empty() { Ok(()) } else { Err(error!("{}", errors.join("; "))) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(error!("{}", errors.join("; ")))
+        }
     }
 
     pub fn stop(&self) {
-        if let Err(error) = self.stop_checked() { log::error!("Overlay shutdown: {error}"); }
+        if let Err(error) = self.stop_checked() {
+            log::error!("Overlay shutdown: {error}");
+        }
     }
 
     fn drained(&self) -> bool {
@@ -1297,24 +1335,36 @@ impl AdnlOverlay {
         let listener = self.listener.clone();
         let peer = peers.other().clone();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let admitted = self.tasks.spawn("accepted incoming query", async move {
+        let admitted = self.tasks.background("incoming query response", async move {
             let result = async move {
-                let listener = listener.upgrade().ok_or_else(|| error!("Overlay listener stopped"))?;
+                let listener =
+                    listener.upgrade().ok_or_else(|| error!("Overlay listener stopped"))?;
                 let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
-                listener.on_query(peer, &crate::ConsensusCommonFactory::create_block_payload(data), Box::new(move |result| {
-                    let _ = answer_tx.send(result);
-                }));
-                // A dropped callback is terminal too. Once accepted, await its actual
-                // completion rather than detaching it when a stop waiter is cancelled.
+                listener.on_query(
+                    peer,
+                    &crate::ConsensusCommonFactory::create_block_payload(data),
+                    Box::new(move |result| {
+                        let _ = answer_tx.send(result);
+                    }),
+                );
+                // The listener owns accepted consensus work. This overlay owns
+                // only response delivery; cancelling it does not cancel that work.
                 let payload = answer_rx.await.map_err(|_| error!("Query callback dropped"))??;
                 let answer = profile.deserialize(payload.data())?;
-                metrics::histogram!("rtos_node_network_consensus_overlay_query_seconds").record(now.elapsed());
-                Ok(TimedAnswer { answer: Some(Answer::Object(answer.into())),
-                    #[cfg(feature = "telemetry")] actual_start_at: None })
-            }.await;
+                metrics::histogram!("rtos_node_network_consensus_overlay_query_seconds")
+                    .record(now.elapsed());
+                Ok(TimedAnswer {
+                    answer: Some(Answer::Object(answer.into())),
+                    #[cfg(feature = "telemetry")]
+                    actual_start_at: None,
+                })
+            }
+            .await;
             let _ = result_tx.send(result);
         });
-        if !admitted { fail!("Overlay query admission closed"); }
+        if !admitted {
+            fail!("Overlay query admission closed");
+        }
         // Protocol API requires a JoinHandle. This proxy owns only the result receiver;
         // the actual accepted operation remains owned above if the caller drops it.
         let handle = self.runtime_handle.spawn(async move {
@@ -1602,7 +1652,9 @@ impl AdnlOverlay {
 }
 
 impl Drop for AdnlOverlay {
-    fn drop(&mut self) { self.begin_stop(); }
+    fn drop(&mut self) {
+        self.begin_stop();
+    }
 }
 
 impl ConsensusOverlay for AdnlOverlay {
@@ -2170,10 +2222,19 @@ impl ConsensusOverlayManager for AdnlOverlayManager {
         Ok(overlay)
     }
 
-    fn stop_overlay_checked(&self, id: &Arc<PrivateOverlayShortId>, overlay: &ConsensusOverlayPtr) -> Result<()> {
-        let implementation = overlay.get_impl().downcast_ref::<AdnlOverlay>().ok_or_else(|| error!("Unknown overlay implementation"))?;
+    fn stop_overlay_checked(
+        &self,
+        id: &Arc<PrivateOverlayShortId>,
+        overlay: &ConsensusOverlayPtr,
+    ) -> Result<()> {
+        let implementation = overlay
+            .get_impl()
+            .downcast_ref::<AdnlOverlay>()
+            .ok_or_else(|| error!("Unknown overlay implementation"))?;
         let result = implementation.stop_checked();
-        if implementation.drained() { self.overlays.lock().remove(id); }
+        if implementation.drained() {
+            self.overlays.lock().remove(id);
+        }
         result
     }
 

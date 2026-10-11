@@ -4444,154 +4444,55 @@ impl Default for ReceiverSettings {
     }
 }
 
-struct ReceiverThreadDesc {
-    thread_prefix: String,
-    stopped: Arc<AtomicBool>,
-    thread_handle: thread::JoinHandle<()>,
-    _activity_node: ActivityNodePtr,
-}
-
 struct ReceiverThreads {
-    threads: Vec<ReceiverThreadDesc>,
+    owner: consensus_common::thread_owner::ThreadOwner,
     stop_flag: Arc<AtomicBool>,
     session_id: SessionId,
     panicked_flag: Arc<AtomicBool>,
 }
-
 impl ReceiverThreads {
     fn new(session_id: SessionId, panicked_flag: Arc<AtomicBool>) -> Self {
+        let stop_flag = Arc::new(AtomicBool::new(false));
         Self {
-            threads: Vec::new(),
-            stop_flag: Arc::new(AtomicBool::new(false)),
+            owner: consensus_common::thread_owner::ThreadOwner::new(stop_flag.clone()),
+            stop_flag,
             session_id,
             panicked_flag,
         }
     }
-
     fn start_thread(
         &mut self,
-        thread_prefix: String,
-        thread_fn: Box<dyn FnOnce(Arc<AtomicBool>, ActivityNodePtr) + Send>,
+        prefix: String,
+        body: Box<dyn FnOnce(Arc<AtomicBool>, ActivityNodePtr) + Send>,
     ) -> Result<Arc<AtomicBool>> {
         let stop = self.stop_flag.clone();
         let stopped = Arc::new(AtomicBool::new(false));
-        let session_id = self.session_id.to_hex_string();
-        let panicked_flag = self.panicked_flag.clone();
-        let activity_node = ConsensusCommonFactory::create_activity_node(format!(
-            "{}_{}",
-            thread_prefix, session_id
-        ));
-        let thread_prefix_clone = thread_prefix.clone();
-        let stopped_clone = stopped.clone();
-        let activity_node_clone = activity_node.clone();
-
-        let handle = thread::Builder::new()
-            .name(format!("{}:{}", thread_prefix, self.session_id.to_hex_string()))
-            .spawn(move || {
+        let panicked = self.panicked_flag.clone();
+        let activity =
+            ConsensusCommonFactory::create_activity_node(format!("{}_{}", prefix, self.session_id));
+        let name = format!("{}:{}", prefix, self.session_id);
+        self.owner.spawn(
+            thread::Builder::new().name(name.clone()),
+            name,
+            stopped.clone(),
+            move || {
                 crate::utils::install_simplex_panic_hook_once();
-
-                log::info!(
-                    "SimplexReceiver {} thread started for session {}",
-                    thread_prefix,
-                    session_id
-                );
-
-                let stop_for_panic = stop.clone();
-                let stopped_for_panic = stopped.clone();
-
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    thread_fn(stop, activity_node);
-                }));
-
-                if let Err(panic_payload) = result {
-                    log::error!(
-                        "FATAL PANIC: caught panic in {}: payload=\"{}\"; forcing receiver stop",
-                        thread::current().name().unwrap_or("<unnamed>"),
-                        crate::utils::panic_payload_to_string(panic_payload.as_ref())
-                    );
-                    panicked_flag.store(true, Ordering::Release);
-                    stop_for_panic.store(true, Ordering::Release);
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| body(stop, activity))) {
+                    panicked.store(true, Ordering::Release);
+                    std::panic::resume_unwind(payload);
                 }
-
-                log::info!(
-                    "SimplexReceiver {} thread exited for session {}",
-                    thread_prefix,
-                    session_id
-                );
-
-                // Always mark thread as stopped (normal exit or panic).
-                stopped_for_panic.store(true, Ordering::Relaxed);
-            })?;
-
-        self.threads.push(ReceiverThreadDesc {
-            thread_prefix: thread_prefix_clone,
-            stopped: stopped_clone.clone(),
-            thread_handle: handle,
-            _activity_node: activity_node_clone,
-        });
-
-        Ok(stopped_clone)
+            },
+        )?;
+        Ok(stopped)
     }
-
     fn stop_threads(&self) {
-        self.stop_flag.store(true, Ordering::Relaxed);
-
-        let all_stopped = self.threads.iter().all(|t| t.stopped.load(Ordering::Relaxed));
-        if all_stopped {
-            return;
+        if let Err(error) = self.owner.join() {
+            self.panicked_flag.store(true, Ordering::Release);
+            log::error!("Simplex receiver join: {error}");
         }
-
-        let session_id = self.session_id.to_hex_string();
-        log::info!("Stopping SimplexReceiver for session {}", session_id);
-
-        loop {
-            let all_stopped = self.threads.iter().all(|t| t.stopped.load(Ordering::Relaxed));
-            if all_stopped {
-                break;
-            }
-
-            let threads_to_dump = self
-                .threads
-                .iter()
-                .filter(|t| !t.stopped.load(Ordering::Relaxed))
-                .map(|t| t.thread_prefix.clone())
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            log::info!(
-                "...waiting for SimplexReceiver threads for session {}: {:?}",
-                session_id,
-                threads_to_dump
-            );
-
-            const CHECKING_INTERVAL: Duration = Duration::from_millis(500);
-            thread::sleep(CHECKING_INTERVAL);
-        }
-
-        log::info!("Stopped SimplexReceiver for session {}", session_id);
     }
-
     fn remove_all_threads(&mut self) {
-        log::info!(
-            "Removing all SimplexReceiver threads for session {}",
-            self.session_id.to_hex_string()
-        );
-
-        for thread in &mut self.threads.drain(..) {
-            if let Err(err) = thread.thread_handle.join() {
-                log::error!(
-                    "Error joining SimplexReceiver thread {} for session {}: {:?}",
-                    thread.thread_prefix,
-                    self.session_id.to_hex_string(),
-                    err
-                );
-            }
-        }
-
-        log::info!(
-            "Removed all SimplexReceiver threads for session {}",
-            self.session_id.to_hex_string()
-        );
+        self.stop_threads();
     }
 }
 

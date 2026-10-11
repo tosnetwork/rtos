@@ -179,6 +179,7 @@ impl ReceiverThreads {
 
 /// Parameters which copied from ReceiverImpl to ReceiverWrapper
 struct ReceiverStartupResult {
+    overlay_short_id: PublicKeyHash,
     out_broadcasts_bytes: metrics::Counter, //outgoing broadcasts traffic
     out_bytes: metrics::Counter,            //outgoing traffic
     local_adnl_id: PublicKeyHash,           //local ADNL ID
@@ -194,7 +195,9 @@ pub(crate) struct ReceiverWrapper {
     out_bytes: metrics::Counter,          //outgoing traffic
     local_adnl_id: PublicKeyHash,         //local ADNL ID
     local_id: PublicKeyHash,              //this node's public key hash (computed from local_key)
-    overlay: CatchainOverlayPtr,          //overlay
+    overlay_manager: CatchainOverlayManagerPtr,
+    overlay_short_id: PublicKeyHash,
+    overlay: CatchainOverlayPtr, //overlay
 }
 
 impl Drop for ReceiverWrapper {
@@ -277,10 +280,18 @@ impl Receiver for ReceiverWrapper {
 
     fn threads_drained(&self) -> bool {
         self.receiver_threads.owner.is_joined()
+            && self.overlay_manager.overlay_drained(&self.overlay)
     }
 
     fn stop_checked(&self) -> Result<()> {
-        self.receiver_threads.stop_threads()
+        let threads = self.receiver_threads.stop_threads();
+        let overlay =
+            self.overlay_manager.stop_overlay_checked(&self.overlay_short_id, &self.overlay);
+        match (threads, overlay) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(a), Err(b)) => Err(error!("{a}; {b}")),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
     }
 
     /// Destroy DB
@@ -613,6 +624,7 @@ impl ReceiverWrapper {
             let receiver = receiver.borrow();
 
             ReceiverStartupResult {
+                overlay_short_id: receiver.overlay_short_id.clone(),
                 out_broadcasts_bytes: receiver.out_broadcasts_bytes.clone(),
                 out_bytes: receiver.out_bytes.clone(),
                 local_adnl_id: receiver
@@ -753,6 +765,7 @@ impl ReceiverWrapper {
         let task_queues_clone = task_queues.clone();
         let metrics_receiver_clone = metrics_receiver.clone();
         let local_id = local_key.id().clone();
+        let overlay_manager_for_wrapper = overlay_manager.clone();
 
         let _processing_thread_stopped = Self::start_processing_thread(
             &mut receiver_threads,
@@ -808,7 +821,9 @@ impl ReceiverWrapper {
             out_bytes: startup_result.out_bytes,
             local_adnl_id: startup_result.local_adnl_id,
             local_id,
+            overlay_short_id: startup_result.overlay_short_id,
             overlay: startup_result.overlay,
+            overlay_manager: overlay_manager_for_wrapper,
         };
 
         Ok(Arc::new(wrapper))

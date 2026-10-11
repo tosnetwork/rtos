@@ -1453,6 +1453,7 @@ impl EmulatorCore {
 */
 
 pub(crate) struct ConsensusEmulatorImpl {
+    checked_stop: Mutex<Option<std::result::Result<(), String>>>,
     /// Session identifier (used in log prefixes and signature payloads).
     session_id: SessionId,
     /// Display name for `Display` impl and log lines.
@@ -1659,6 +1660,7 @@ impl ConsensusEmulatorImpl {
         let main_thread_id = main_thread.thread().id();
         let callbacks_thread_id = callbacks_thread.thread().id();
         let me = Arc::new(Self {
+            checked_stop: Mutex::new(None),
             session_id,
             display_name: display_name.clone(),
             stop_flag,
@@ -1943,6 +1945,35 @@ impl ConsensusEmulatorImpl {
 */
 
 impl Session for ConsensusEmulatorImpl {
+    fn threads_drained(&self) -> bool {
+        self.checked_stop.lock().unwrap().is_some()
+    }
+    fn stop_checked(&self) -> Result<()> {
+        self.stop_flag.store(true, Ordering::Release);
+        let current = thread::current().id();
+        if current == self.main_thread_id || current == self.callbacks_thread_id {
+            return Err(error!("Cannot join emulator from own worker"));
+        }
+        let mut result = self.checked_stop.lock().unwrap();
+        if result.is_none() {
+            let mut errors = Vec::new();
+            for (name, handle) in
+                [("callback", &self.callbacks_thread), ("main", &self.main_thread)]
+            {
+                if let Some(worker) = handle.lock().unwrap().take() {
+                    if worker.join().is_err() {
+                        errors.push(format!("emulator {name} worker panicked"));
+                    }
+                }
+            }
+            *result = Some(if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) });
+        }
+        result.as_ref().unwrap().clone().map_err(|error| error!("{error}"))
+    }
+    fn destroy_checked(&self) -> Result<()> {
+        self.stop_checked()
+    }
+
     fn start(&self, prev_blocks: Vec<BlockIdExt>, _min_masterchain_block_id: BlockIdExt) {
         log::info!("{}: start(prev_blocks_count={})", self.display_name, prev_blocks.len());
         *self.deferred_start.lock().unwrap() = Some(prev_blocks);

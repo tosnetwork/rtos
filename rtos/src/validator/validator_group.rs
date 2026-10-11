@@ -1460,16 +1460,15 @@ impl ValidatorGroup {
         // those threads may still need in order to finish their callbacks.
         let session_exit = rt.spawn_blocking(move || {
             if let Some(session) = session {
-                if destroy_database {
-                    session.destroy();
+                let result = if destroy_database {
+                    session.destroy_checked()
                 } else {
-                    session.stop();
-                }
-                if session.get_simplex_session().is_some_and(|s| s.is_panicked()) {
-                    fail!("consensus session worker panicked");
-                }
+                    session.stop_checked()
+                };
+                (session.threads_drained(), result)
+            } else {
+                (true, Ok(()))
             }
-            Ok::<(), anyhow::Error>(())
         });
         // Never abort a state apply. Idle queue waits wake on stop_requested;
         // accepted actions and all their descendants finish before DB cleanup.
@@ -1481,8 +1480,13 @@ impl ValidatorGroup {
         }
         // A panic/cancellation of the blocking join itself does not prove the
         // consensus workers exited. Only its returned result certifies the join.
-        self.teardown_drained.store(session_result.is_ok(), Ordering::Release);
-        session_result.map_err(|e| error!("consensus session teardown failed: {e}"))??;
+        let (drained, result) =
+            session_result.map_err(|e| error!("consensus session teardown failed: {e}"))?;
+        self.teardown_drained.store(drained, Ordering::Release);
+        result?;
+        if !drained {
+            fail!("consensus session did not prove resource drain");
+        }
         if self.task_panicked.load(Ordering::Acquire) {
             fail!("validator group task panicked during its lifetime");
         }

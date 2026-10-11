@@ -16,6 +16,7 @@
 pub mod simplex_protocol;
 pub mod thread_owner;
 mod async_owner;
+pub mod overlay_owner;
 mod validator_identity;
 pub use validator_identity::{SimplexSignatureVerifier, ValidatorIdentity};
 mod activity_node;
