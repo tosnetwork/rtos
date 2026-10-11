@@ -20,6 +20,8 @@ use std::{
 };
 
 mod closing;
+#[cfg(test)]
+pub(crate) use closing::test_admission_panic_drains_real_source;
 
 const MAX_ACTIVE: usize = 8;
 const SCAN_BATCH: usize = 64;
