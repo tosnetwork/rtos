@@ -885,6 +885,7 @@ impl EngineOperations for BootstrapTestEngine {
             } else { None }
         };
         if let Some((_, entered, release)) = gate {
+            eprintln!("manager admission: gate hit shard={} cc={}", runtime.shard(), runtime.catchain_seqno());
             let _ = entered.send(Arc::new(runtime.clone()));
             release.recv_timeout(Duration::from_secs(10)).map_err(|e| error!("normal admission test gate: {e}"))?;
         }
@@ -1046,7 +1047,12 @@ impl EngineOperations for BootstrapTestEngine {
     }
 
     async fn prepare_retired_history(self: Arc<Self>, runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>, start: BlockIdExt) -> Result<()> {
-        crate::retired_history::prepare(self, runtime, start).await
+        let shard = runtime.shard().clone();
+        let cc = runtime.catchain_seqno();
+        eprintln!("manager history: begin shard={shard} cc={cc} start={start}");
+        let result = crate::retired_history::prepare(self, runtime, start).await;
+        eprintln!("manager history: end shard={shard} cc={cc} result={result:?}");
+        result
     }
 
     async fn load_mc_zero_state(&self) -> Result<Arc<ShardStateStuff>> {

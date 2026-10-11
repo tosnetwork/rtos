@@ -64,6 +64,8 @@ async fn authenticated_manager_retries_existing_future_after_recovery_admission_
 
 async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, admission_race: Option<u32>) -> Result<()> {
     use adnl::{node::AdnlNode, DhtNode, OverlayNode, RldpNode, NetworkStack};
+    let _ = env_logger::builder().is_test(true).try_init();
+    eprintln!("manager lifecycle: begin admission_race={admission_race:?}");
     let observer: PrivateKey = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71; 32])?;
     let mut bootstrap = EmulatorNetworkBootstrap::build(2)?;
     configure(&mut bootstrap, &observer)?;
@@ -132,7 +134,10 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             *engine.normal_admission_gate.lock().unwrap() = Some((target_seqno, entered_tx, release_rx));
             let race = async {
-                let runtime = tokio::time::timeout(Duration::from_secs(10), entered_rx).await??;
+                let runtime = tokio::time::timeout(Duration::from_secs(10), entered_rx).await
+                    .map_err(|e| error!("manager phase=await-normal-admission-gate target_cc={target_seqno}: {e}"))?
+                    .map_err(|e| error!("manager phase=normal-admission-gate-channel target_cc={target_seqno}: {e}"))?;
+                eprintln!("manager lifecycle: gate entered target_cc={target_seqno}");
                 // Normal manager already selected its group. Recovery now wins
                 // actual atomic admission before the normal factory can start.
                 let token = engine.namespace_registry.reserve(&runtime)?.ok_or_else(|| error!("recovery lost gated race"))?;
@@ -140,6 +145,7 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
                 Ok::<_, anyhow::Error>((runtime, token))
             };
             let (updated, race) = tokio::join!(manager.update_shards(state.clone()), race);
+            eprintln!("manager lifecycle: initial update result={updated:?}; race_ok={}", race.is_ok());
             updated?;
             let (runtime, token) = race?;
             let groups = if target_seqno == 0 { &manager.current_sessions } else { &manager.future_sessions };
