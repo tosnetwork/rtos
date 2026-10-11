@@ -427,10 +427,28 @@ pub fn canonical_source_identity(
     Ok((record.id()?, record.canonical_digest()?))
 }
 
+#[cfg(test)]
+struct SourceIoGate {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+#[cfg(test)]
+impl SourceIoGate {
+    fn wait(self) {
+        let _ = self.entered.send(());
+        let _ = self.release.recv(); // disconnected test owner must never strand a writer
+    }
+}
 pub(crate) struct PendingFinalityStore {
     directory: PathBuf,
     _lock: File,
     mutation: Mutex<()>,
+    #[cfg(test)]
+    scan_metadata_gate: Mutex<Option<SourceIoGate>>,
+    #[cfg(test)]
+    scan_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
+    confirmed_rename_gate: Mutex<Option<SourceIoGate>>,
     delivered_uncertain: std::sync::atomic::AtomicBool,
     runtime_binding: Mutex<Option<delivered::DiskRecoveryBinding>>,
     intents: Arc<crate::finality_recovery::FinalityIntentStore>,
@@ -467,6 +485,12 @@ impl PendingFinalityStore {
                 directory,
                 _lock: lock,
                 mutation: Mutex::new(()),
+                #[cfg(test)]
+                scan_metadata_gate: Mutex::new(None),
+                #[cfg(test)]
+                scan_started: Mutex::new(None),
+                #[cfg(test)]
+                confirmed_rename_gate: Mutex::new(None),
                 delivered_uncertain: std::sync::atomic::AtomicBool::new(false),
                 runtime_binding: Mutex::new(None),
                 intents,
@@ -486,6 +510,17 @@ impl PendingFinalityStore {
         }
     }
     fn paths(&self) -> Result<Vec<PathBuf>> {
+        #[cfg(test)]
+        if let Some(started) = self.scan_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let _guard = self.mutation.lock().unwrap();
+        self.paths_under_mutation()
+    }
+    // Caller holds mutation throughout enumeration and all physical metadata
+    // reads. Writers use this entry to avoid recursively locking the mutex.
+    fn paths_under_mutation(&self) -> Result<Vec<PathBuf>> {
+        use anyhow::Context;
         let mut total = 0u64;
         let mut full_count = 0usize;
         let mut reference_total = 0u64;
@@ -495,8 +530,12 @@ impl PendingFinalityStore {
         let mut full_temp_bytes = 0u64;
         let mut reference_temp_bytes = 0u64;
         let mut paths = Vec::new();
-        for entry in std::fs::read_dir(&self.directory)? {
-            let entry = entry?;
+        for entry in std::fs::read_dir(&self.directory)
+            .with_context(|| format!("scan source directory {}", self.directory.display()))?
+        {
+            let entry = entry.with_context(|| {
+                format!("enumerate source directory {}", self.directory.display())
+            })?;
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -504,10 +543,21 @@ impl PendingFinalityStore {
                 continue;
             }
             if name.ends_with(".tmp") {
-                if !entry.file_type()?.is_file() {
+                #[cfg(test)]
+                if let Some(gate) = self.scan_metadata_gate.lock().unwrap().take() {
+                    gate.wait();
+                }
+                if !entry
+                    .file_type()
+                    .with_context(|| format!("source file type {}", path.display()))?
+                    .is_file()
+                {
                     fail!("Invalid source temporary");
                 }
-                let size = entry.metadata()?.len();
+                let size = entry
+                    .metadata()
+                    .with_context(|| format!("source metadata {}", path.display()))?
+                    .len();
                 full_temps += 1;
                 full_temp_bytes += size;
                 if size > MAX_RECORD_BYTES
@@ -520,17 +570,36 @@ impl PendingFinalityStore {
                 continue;
             }
             if name == REFERENCE_DIRECTORY {
-                if !entry.file_type()?.is_dir() {
+                if !entry
+                    .file_type()
+                    .with_context(|| format!("source file type {}", path.display()))?
+                    .is_dir()
+                {
                     fail!("Canonical reference index is not directory");
                 }
-                for entry in std::fs::read_dir(path)? {
-                    let entry = entry?;
+                for entry in std::fs::read_dir(&path)
+                    .with_context(|| format!("scan reference directory {}", path.display()))?
+                {
+                    let entry = entry.with_context(|| {
+                        format!("enumerate source directory {}", self.directory.display())
+                    })?;
                     let path = entry.path();
                     if path.extension().and_then(|s| s.to_str()) == Some("tmp") {
-                        if !entry.file_type()?.is_file() {
+                        #[cfg(test)]
+                        if let Some(gate) = self.scan_metadata_gate.lock().unwrap().take() {
+                            gate.wait();
+                        }
+                        if !entry
+                            .file_type()
+                            .with_context(|| format!("source file type {}", path.display()))?
+                            .is_file()
+                        {
                             fail!("Invalid reference temporary");
                         }
-                        let size = entry.metadata()?.len();
+                        let size = entry
+                            .metadata()
+                            .with_context(|| format!("source metadata {}", path.display()))?
+                            .len();
                         reference_temps += 1;
                         reference_temp_bytes += size;
                         if size > MAX_REFERENCE_BYTES
@@ -542,7 +611,10 @@ impl PendingFinalityStore {
                         }
                         continue;
                     }
-                    if !entry.file_type()?.is_file()
+                    if !entry
+                        .file_type()
+                        .with_context(|| format!("source file type {}", path.display()))?
+                        .is_file()
                         || !matches!(
                             path.extension().and_then(|s| s.to_str()),
                             Some("reference" | "delivered")
@@ -550,7 +622,10 @@ impl PendingFinalityStore {
                     {
                         fail!("Unexpected canonical reference artifact");
                     }
-                    let size = entry.metadata()?.len();
+                    let size = entry
+                        .metadata()
+                        .with_context(|| format!("source metadata {}", path.display()))?
+                        .len();
                     if size > MAX_REFERENCE_BYTES {
                         fail!("Canonical reference exceeds readable bound");
                     }
@@ -567,13 +642,21 @@ impl PendingFinalityStore {
                 }
                 continue;
             }
-            if !entry.file_type()?.is_file()
+            if !entry
+                .file_type()
+                .with_context(|| format!("source file type {}", path.display()))?
+                .is_file()
                 || !matches!(path.extension().and_then(|s| s.to_str()), Some("json" | "acked"))
             {
                 fail!("Unexpected source finality entry");
             }
             total = total
-                .checked_add(entry.metadata()?.len())
+                .checked_add(
+                    entry
+                        .metadata()
+                        .with_context(|| format!("source metadata {}", path.display()))?
+                        .len(),
+                )
                 .ok_or_else(|| error!("Source quota overflow"))?;
             full_count += 1;
             if full_count + full_temps > MAX_RECORDS || total + full_temp_bytes > MAX_TOTAL_BYTES {
@@ -649,7 +732,7 @@ impl PendingFinalityStore {
             };
             let bytes = serde_json::to_vec(&reference)?;
             let references: Vec<_> = self
-                .paths()?
+                .paths_under_mutation()?
                 .into_iter()
                 .filter(|p| {
                     matches!(
@@ -731,13 +814,16 @@ impl PendingFinalityStore {
             return Ok(old);
         }
         let bytes = record.encode()?;
-        let paths = self.paths()?;
+        let paths = self.paths_under_mutation()?;
         for existing in &paths {
             let old = match existing.extension().and_then(|s| s.to_str()) {
                 Some("reference") => CanonicalReference::read(existing)?.metadata_record()?,
                 Some("delivered") => {
-                    let id: UInt256 = existing.file_stem().and_then(|s| s.to_str())
-                        .ok_or_else(|| error!("Invalid source Delivered filename"))?.parse()?;
+                    let id: UInt256 = existing
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .ok_or_else(|| error!("Invalid source Delivered filename"))?
+                        .parse()?;
                     self.delivered_reference(&id)?
                         .ok_or_else(|| error!("Source Delivered disappeared during retention"))?
                         .metadata_record()?
@@ -812,7 +898,7 @@ impl PendingFinalityStore {
             }
             // Account the temporary duplicate too: no unbounded receipt history.
             let paths: Vec<_> = self
-                .paths()?
+                .paths_under_mutation()?
                 .into_iter()
                 .filter(|p| {
                     !matches!(
