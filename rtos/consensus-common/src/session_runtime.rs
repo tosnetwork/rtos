@@ -32,6 +32,7 @@ pub struct AuthenticatedSessionRuntime {
     catchain_seqno: u32,
     protocol: SimplexProtocol,
     carrier_version: u32,
+    slots_per_leader_window: u32,
     wire_profile: WireProfile,
     committee: Vec<ValidatorDescr>,
     members: Vec<PublicKeyHash>,
@@ -100,6 +101,7 @@ impl AuthenticatedSessionRuntime {
             catchain_seqno: coordinates.catchain_seqno,
             protocol,
             carrier_version,
+            slots_per_leader_window: selected.config.slots_per_leader_window,
             wire_profile: WireProfile::T0,
             committee,
             members: members.into_iter().collect(),
@@ -127,6 +129,7 @@ impl AuthenticatedSessionRuntime {
     pub fn protocol(&self) -> SimplexProtocol {
         self.protocol
     }
+    pub fn slots_per_leader_window(&self) -> u32 { self.slots_per_leader_window }
     pub fn carrier_version(&self) -> u32 {
         self.carrier_version
     }
