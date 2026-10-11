@@ -95,6 +95,20 @@ fn admit_canonical_workspace(
         .checked_add(record.carrier.bytes().len())
         .and_then(|n| n.checked_add(record.proof_data.as_ref().map_or(0, Vec::len)))
         .ok_or_else(|| error!("Canonical history payload size overflow"))?;
+    // Limits are configurable: a fixed scratch allowance does not cover
+    // arbitrary retained effect vectors or their cloned snapshot encoding.
+    let effects = record.effects.len().checked_add(entry.pending.len())
+        .and_then(|n| n.checked_mul(std::mem::size_of::<PublicationEffect>()))
+        .ok_or_else(|| error!("Canonical history effect vector overflow"))?;
+    let parents = record.prev.len().checked_mul(std::mem::size_of::<rtos_block::BlockIdExt>())
+        .ok_or_else(|| error!("Canonical history parent vector overflow"))?;
+    bytes = bytes.checked_add(effects).and_then(|n| n.checked_add(parents))
+        .ok_or_else(|| error!("Canonical history container size overflow"))?;
+    // validate_pending checks membership with a linear search for each pending
+    // effect. Admit that upper bound before invoking the shared validator.
+    let membership_steps = record.effects.len().checked_mul(entry.pending.len())
+        .ok_or_else(|| error!("Canonical history effect work overflow"))?;
+    for _ in 0..membership_steps { budget.step()?; }
     for effect in record.effects.iter().chain(&entry.pending) {
         budget.step()?;
         if let PublicationTarget::Custom(name) = &effect.target {
