@@ -1902,6 +1902,55 @@ impl FinalityDeliveryTestDriver {
     pub fn prepare_intents(&self, has_existing_certificates: bool) -> Result<()> {
         self.0.prepare_intents(has_existing_certificates)
     }
+    /// Bind the actual session-start MC anchor, exactly as the session factory.
+    /// This deliberately does not infer a start from the delivered block.
+    pub fn bind_start(&self, anchor: BlockIdExt) -> Result<()> {
+        self.0.bind_start(anchor)
+    }
+    /// Retain a real signed FinalCert through the production source store.
+    /// No stage, receipt, ACK or consumed confirmation is manufactured here.
+    pub fn retain_final_cert(
+        &self,
+        draft: &FinalizedDeliveryDraft,
+        prev_blocks: &[BlockIdExt],
+    ) -> Result<()> {
+        let SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(proof)) = &draft.finality else {
+            fail!("Source certificate fixture requires a PQ Final carrier");
+        };
+        let runtime = &self.0.runtime;
+        runtime.pq_context().ok_or_else(|| error!("Source certificate fixture requires PQ runtime"))?
+            .for_block(draft.block_id.clone())?.verify_final(proof)?;
+        let candidate = PqNetworkSignatureSet::from_final_fields(proof)?.to_node().candidate;
+        let hash = UInt256::calc_file_hash(&runtime.wire_profile().serialize(&candidate)?);
+        let mut signatures = Vec::with_capacity(proof.signatures.len());
+        for signature in &proof.signatures {
+            let mut index = None;
+            for (i, member) in runtime.committee().iter().enumerate() {
+                if member.validator_id()? == signature.validator_id {
+                    index = Some(u32::try_from(i)?);
+                    break;
+                }
+            }
+            signatures.push(crate::certificate::VoteSignature {
+                validator_idx: crate::block::ValidatorIndex::new(index.ok_or_else(|| error!("Unknown source certificate signer"))?),
+                signature: signature.signature.clone(),
+            });
+        }
+        let certificate = crate::certificate::Certificate {
+            vote: crate::simplex_state::FinalizeVote {
+                slot: crate::block::SlotIndex::new(proof.slot), block_hash: hash.clone(),
+            },
+            signatures,
+        };
+        // Reuse the exact factory verifier for the converted raw certificate too.
+        crate::certificate::Certificate::<crate::simplex_state::Vote>::from_authenticated_runtime(
+            &certificate.to_tl()?, runtime, &|| Ok(()),
+        )?;
+        self.0.retain_intent(prev_blocks.to_vec(), &crate::simplex_state::BlockFinalizedEvent {
+            slot: crate::block::SlotIndex::new(proof.slot), block_hash: hash,
+            block_id: None, certificate: Arc::new(certificate),
+        })
+    }
     pub fn maintain(&self) -> Result<()> {
         self.0.maintain_closing()
     }
