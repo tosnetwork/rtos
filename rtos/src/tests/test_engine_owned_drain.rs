@@ -759,10 +759,10 @@ async fn engine_owned_drain_failed_parent_retains_accepted_child_until_join() {
 async fn partial_engine_construction(stage: &'static str, cancel: bool) {
     let dir = tempfile::tempdir().unwrap();
     config(dir.path());
-    let control_address = if stage == "control" {
-        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = socket.local_addr().unwrap();
-        drop(socket);
+    if stage == "control" {
+        // Let the actual status server allocate its endpoint. Reserving and
+        // dropping a temporary listener creates a rebind race with other tests.
+        let address = "127.0.0.1:0";
         let path = dir.path().join("config.json");
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -773,10 +773,7 @@ async fn partial_engine_construction(stage: &'static str, cancel: bool) {
         )
         .unwrap();
         std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
-        Some(address)
-    } else {
-        None
-    };
+    }
     let config = TonNodeConfig::from_file(
         dir.path().to_str().unwrap(),
         "config.json",
@@ -805,7 +802,10 @@ async fn partial_engine_construction(stage: &'static str, cancel: bool) {
     let transport = TransportRefs::new(
         &stopper.construction_network.lock().unwrap().as_ref().unwrap().upgrade().unwrap(),
     );
+    let control_address = *stopper.construction_control_address.lock().unwrap();
+    assert_eq!(control_address.is_some(), stage == "control");
     if let Some(address) = control_address {
+        assert_ne!(address.port(), 0, "must inspect the actual bound endpoint");
         assert!(std::net::TcpListener::bind(address).is_err(), "actual control listener not held");
     }
     if stage == "database" {

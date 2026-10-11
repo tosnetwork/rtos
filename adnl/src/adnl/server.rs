@@ -549,6 +549,7 @@ struct AdnlServerTelemetry {
 /// ADNL server
 pub struct AdnlServer {
     stop: stream_cancel::Trigger,
+    local_addr: SocketAddr,
 }
 
 impl AdnlServer {
@@ -632,14 +633,14 @@ impl AdnlServer {
         let (trigger, tripwire) = stream_cancel::Tripwire::new();
         subscribers.push(Arc::new(AdnlPingSubscriber));
         let subscribers = Arc::new(subscribers);
-        if false {
+        let local_addr = if false {
             Self::listen_by_socket(
                 config,
                 subscribers,
                 tripwire,
                 #[cfg(feature = "telemetry")]
                 telemetry,
-            )?;
+            )?
         } else {
             Self::listen_by_tokio(
                 config,
@@ -648,9 +649,14 @@ impl AdnlServer {
                 #[cfg(feature = "telemetry")]
                 telemetry,
             )
-            .await?;
-        }
-        Ok(Self { stop: trigger })
+            .await?
+        };
+        Ok(Self { stop: trigger, local_addr })
+    }
+
+    /// Actual listening endpoint, including the OS-assigned port when configured with port zero.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
     }
 
     /// Shutdown server
@@ -672,7 +678,7 @@ impl AdnlServer {
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
         tripwire: stream_cancel::Tripwire,
         #[cfg(feature = "telemetry")] telemetry: Arc<AdnlServerTelemetry>,
-    ) -> Result<()> {
+    ) -> Result<SocketAddr> {
         const SOCKET_TCP_BACKLOG: i32 = 20;
         const TIMEOUT_TCP_SPIN_MS: Duration = Duration::from_millis(10);
         let listener = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
@@ -680,6 +686,8 @@ impl AdnlServer {
         listener.set_reuse_address(true)?;
         listener.bind(&config.address.clone().into())?;
         listener.listen(SOCKET_TCP_BACKLOG)?;
+        let local_addr = listener.local_addr()?.as_socket()
+            .ok_or_else(|| error!("ADNL server listener has no IP endpoint"))?;
         tokio::spawn(async move {
             loop {
                 let socket = tokio::select! {
@@ -730,7 +738,7 @@ impl AdnlServer {
             #[cfg(feature = "telemetry")]
             telemetry.stop.store(true, Ordering::Relaxed);
         });
-        Ok(())
+        Ok(local_addr)
     }
 
     async fn listen_by_tokio(
@@ -738,8 +746,9 @@ impl AdnlServer {
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
         tripwire: stream_cancel::Tripwire,
         #[cfg(feature = "telemetry")] telemetry: Arc<AdnlServerTelemetry>,
-    ) -> Result<()> {
+    ) -> Result<SocketAddr> {
         let listener = tokio::net::TcpListener::bind(config.address).await?;
+        let local_addr = listener.local_addr()?;
         tokio::spawn(async move {
             let mut incoming =
                 tokio_stream::wrappers::TcpListenerStream::new(listener).take_until_if(tripwire);
@@ -774,7 +783,7 @@ impl AdnlServer {
             #[cfg(feature = "telemetry")]
             telemetry.stop.store(true, Ordering::Relaxed);
         });
-        Ok(())
+        Ok(local_addr)
     }
 }
 

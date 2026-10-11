@@ -100,6 +100,11 @@ impl ControlServer {
         };
         Ok(ret)
     }
+    #[cfg(test)]
+    pub(crate) fn local_addr(&self) -> std::net::SocketAddr {
+        self.adnl.local_addr()
+    }
+
     pub async fn shutdown(self) {
         self.adnl.shutdown().await
     }

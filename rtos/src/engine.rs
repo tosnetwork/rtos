@@ -429,6 +429,8 @@ pub struct Stopper {
     #[cfg(test)]
     construction_network: std::sync::Mutex<Option<std::sync::Weak<NodeNetwork>>>,
     #[cfg(test)]
+    construction_control_address: std::sync::Mutex<Option<std::net::SocketAddr>>,
+    #[cfg(test)]
     construction_gate: std::sync::Mutex<
         Option<(&'static str, Arc<crate::network::overlay_client::OverlayInitGate>)>,
     >,
@@ -448,6 +450,8 @@ impl Stopper {
             construction_gate: Default::default(),
             #[cfg(test)]
             construction_network: Default::default(),
+            #[cfg(test)]
+            construction_control_address: Default::default(),
         }
     }
 
@@ -773,6 +777,10 @@ impl Engine {
                         Some(&network),
                     )
                     .await?;
+                    #[cfg(test)]
+                    {
+                        *stopper.construction_control_address.lock().unwrap() = Some(server.local_addr());
+                    }
                     status_server = Some(server);
                     #[cfg(test)]
                     stopper.wait_construction_gate("control").await?;
