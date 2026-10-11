@@ -2915,6 +2915,13 @@ impl ValidatorGroup {
             block_id={block_id} source={source_id} round={round}"
         );
 
+        let publication_runtime = self.authenticated_runtime.clone().filter(|runtime| {
+            runtime.protocol()
+                == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
+        });
+        let candidate_already_sent = self.candidate_relays.lock().unwrap().contains(&block_id);
+        let last_accepted_mc =
+            self.group_impl.execute_sync(|group| group.last_accepted_mc_seqno.unwrap_or(0)).await;
         self.spawn_task(&tokio::runtime::Handle::current(), async move {
             let (accept_data, prevs) =
                 match Self::resolve_prev_for_finalized_block(engine.clone(), &block_id, data_opt)
@@ -2931,17 +2938,54 @@ impl ValidatorGroup {
                     }
                 };
 
-            let result = super::accept_block::accept_session_block(
-                block_id.clone(),
-                accept_data,
-                prevs,
-                validator_set,
-                signatures,
-                pq_context,
-                send_block_broadcast,
-                engine,
-            )
-            .await;
+            let result = if let Some(runtime) = publication_runtime {
+                async {
+                    let bytes = accept_data
+                        .ok_or_else(|| error!("Resolved publication block has no bytes"))?;
+                    let intent = super::session_publication::prepare_publication(
+                        &runtime,
+                        block_id.clone(),
+                        &bytes,
+                        &prevs,
+                        &signatures,
+                        &engine,
+                        we_generated,
+                        last_accepted_mc,
+                        candidate_already_sent,
+                    )
+                    .await?;
+                    if let Some(intent) = intent {
+                        // The Engine owns admitted work after this waiter is cancelled.
+                        // Success means acceptance and the Ready WAL checkpoint, not
+                        // successful delivery to every network destination.
+                        engine.clone().submit_publication(intent).await?;
+                    } else {
+                        super::accept_block::accept_pq_session_block(
+                            block_id.clone(),
+                            Some(bytes),
+                            prevs,
+                            signatures,
+                            pq_context.ok_or_else(|| error!("Missing PQ publication context"))?,
+                            engine.clone(),
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                }
+                .await
+            } else {
+                super::accept_block::accept_session_block(
+                    block_id.clone(),
+                    accept_data,
+                    prevs,
+                    validator_set,
+                    signatures,
+                    pq_context,
+                    send_block_broadcast,
+                    engine,
+                )
+                .await
+            };
 
             match result {
                 Ok(()) => {
