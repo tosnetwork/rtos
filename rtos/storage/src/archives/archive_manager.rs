@@ -312,6 +312,22 @@ impl ArchiveManager {
         handle: &BlockHandle,
         mut on_success: impl FnMut() -> Result<()>,
     ) -> Result<()> {
+        // Compatibility entry point: the caller defines the synchronous
+        // completion semantics. It does not imply a metadata WAL barrier.
+        self.move_to_archive_with_completion(handle, || std::future::ready(on_success())).await
+    }
+
+    /// The owned caller can wait for its actual metadata WAL before loose
+    /// evidence is removed. The callback must not claim durability on enqueue.
+    pub async fn move_to_archive_with_completion<F, Fut>(
+        &self,
+        handle: &BlockHandle,
+        mut on_success: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         let _migration = self.db.repair_protection().deletion().await;
         if handle.is_archived() {
             return Ok(());
@@ -348,7 +364,7 @@ impl ArchiveManager {
             None
         };
 
-        on_success()?;
+        on_success().await?;
 
         Self::remove(handle, proof_filename, block_filename).await
     }

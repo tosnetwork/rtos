@@ -1933,14 +1933,15 @@ impl InternalDb {
         let handle = self
             .load_block_handle(id)?
             .ok_or_else(|| error!("Cannot load handle for archiving block {}", id))?;
-        if handle.is_archived() {
-            return Ok(());
-        }
+        // Even an in-memory archived flag cannot bypass closed admission after
+        // an uncertain metadata result. Acquire before inspecting that flag.
         let permit = self.archive_admission.clone().acquire_owned().await
             .map_err(|_| error!("Archive migration admission stopped"))?;
         let manager = self.archive_manager.clone();
         let handles = self.block_handle_storage.clone();
         let tasks = self.archive_tasks.clone();
+        let admission = self.archive_admission.clone();
+        let observer = self.publication_sync_observer();
         let block_id = id.clone();
         #[cfg(test)]
         let gate = self.archive_test_gate.lock().unwrap().take();
@@ -1954,13 +1955,26 @@ impl InternalDb {
             }
             // This worker is not abortable by the observation future. Package IO,
             // migration flag and deletion gate all live inside its awaited work.
-            let result = manager.move_to_archive(&handle, || {
-                if handle.set_archived() {
-                    handles.save_handle(&handle, callback.clone())?;
-                }
-                Ok(())
-            }).await.map_err(|err| error!("Failed to move block to archive: {block_id}. Error: {err}"));
+            use futures::FutureExt;
+            let result = std::panic::AssertUnwindSafe(
+                manager.move_to_archive_with_completion(&handle, || {
+                    let handles = handles.clone();
+                    let handle = handle.clone();
+                    let callback = callback.clone();
+                    let observer = observer.clone();
+                    async move {
+                        if handle.set_archived() {
+                            handles.save_handle(&handle, callback)?;
+                        }
+                        handles.sync_pending_observed(observer).await
+                    }
+                })
+            ).catch_unwind().await
+                .map_err(|_| error!("Archive migration panicked for {block_id}"))
+                .and_then(|result| result)
+                .map_err(|err| error!("Failed to move block to archive: {block_id}. Error: {err}"));
             if let Err(error) = &result {
+                admission.close();
                 tasks.record_error(format!("archive migration {block_id}: {error}"));
             }
             let _ = sent.send(result);
