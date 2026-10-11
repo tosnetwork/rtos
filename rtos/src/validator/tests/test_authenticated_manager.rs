@@ -116,6 +116,12 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool) -
             let runtime = group.authenticated_runtime().ok_or_else(|| error!("runtime missing"))?;
             anyhow::ensure!(runtime.local_role() == LocalRole::Observer);
             anyhow::ensure!(runtime.local_adnl() == observer.id());
+            let recovery = runtime.recovery_binding()
+                .ok_or_else(|| error!("Manager omitted authenticated recovery anchor"))?;
+            anyhow::ensure!(&recovery.governing_masterchain == state.block_id(),
+                "Recovery anchor must name the actual config source state");
+            anyhow::ensure!(&recovery.coordinates.shard == runtime.shard());
+            anyhow::ensure!(recovery.coordinates.catchain_seqno == runtime.catchain_seqno());
         }
         wait_for_manager_sessions(&manager).await?;
         for group in manager.current_sessions.values() {

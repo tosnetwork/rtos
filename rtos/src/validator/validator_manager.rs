@@ -1949,7 +1949,8 @@ impl ValidatorManagerImpl {
                             },
                             vsubset.list().to_vec(),
                             key.id().clone(),
-                        )?;
+                        )?
+                        .bind_recovery_anchor(mc_state.block_id().clone())?;
                         Ok::<_, anyhow::Error>((key, Arc::new(runtime)))
                     }).transpose()?
             } else { None };
@@ -2504,7 +2505,7 @@ impl ValidatorManagerImpl {
                         rtos_api::session_identity::SessionCoordinates { shard: ident, catchain_seqno: *next_cc_seqno,
                             vertical_seqno: max_vertical_seqno, last_key_block_seqno: keyblock_seqno, new_catchain_ids: false },
                         vsubset.list().to_vec(), key.id().clone(),
-                    )?);
+                    )?.bind_recovery_anchor(mc_state.block_id().clone())?);
                     Some((key, runtime))
                 } else { None };
                 let local_id = match &authenticated {
