@@ -661,6 +661,8 @@ impl SessionProcessor {
             SlotIndex::new(0) // Don't clean up if we haven't reached MAX_HISTORY_SLOTS yet
         };
 
+        let up_to_slot = self.consensus.durable_pending_floor().map_or(up_to_slot, |floor| up_to_slot.min(floor));
+
         if up_to_slot.value() == 0 {
             log::trace!(
                 "Session {} cleanup_old_slots: finalized_slot={finalized_slot}, skipping cleanup \
@@ -972,6 +974,11 @@ impl SessionProcessor {
 
         // Process all events produced by FSM
         self.process_simplex_events();
+
+        if self.consensus.durable_pending_floor().is_some() {
+            self.with_consensus_backend(|consensus, backend| consensus.retry_pending_recursive_finalization(backend));
+            self.runtime.set_next_awake_time(now + Duration::from_millis(250));
+        }
 
         // Keep receiver standstill slots aligned even when the FSM tracked
         // interval changes outside the finalization / skip hooks.

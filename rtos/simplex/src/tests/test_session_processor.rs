@@ -11534,3 +11534,67 @@ fn authenticated_observer_nonempty_query_emits_leader_evidence_after_pq_verifica
     drop(processor);
     db.close(None).unwrap();
 }
+
+#[test]
+fn source_finality_controller_waits_for_wal_before_persist_sent_and_gc() {
+    use crate::finality_delivery::tests::{fixture, HeldSink};
+    let temp = crate::authenticated_fixture::TestDirectory::new();
+    let (runtime, draft) = fixture();
+    let namespace = runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap();
+    let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor)
+        .collect::<rtos_block::Result<Vec<_>>>().unwrap();
+    let key = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71; 32]).unwrap();
+    let options = SessionOptions { protocol: runtime.protocol(), proto_version: runtime.carrier_version(),
+        wire_profile: runtime.wire_profile(), slots_per_leader_window: runtime.slots_per_leader_window(),
+        ..Default::default() };
+    let description = Arc::new(SessionDescription::new_with_runtime(&options, runtime.session_id().clone(),
+        1, &nodes, key, runtime.shard(), SystemTime::now(), None, Some(&runtime)).unwrap()
+        .bind_pq_session(runtime.catchain_seqno()).unwrap());
+    let db = crate::database::SimplexDb::open(&namespace, "source-ack").unwrap();
+    let mut processor = make_pq_processor_with_description_for_test(db.clone(), description);
+    let listener = RecordingListener::new();
+    let listener_dyn: Arc<dyn consensus_common::SessionListener + Send + Sync> = listener.clone();
+    let sink = Arc::new(HeldSink::default());
+    let callbacks = Arc::new(crate::session_callbacks::SessionCallbacks::new(runtime.session_id().clone(),
+        Arc::new(AtomicBool::new(false)), false, Arc::new(TestCallbackQueue), Arc::downgrade(&listener_dyn))
+        .with_delivery_sink(Some(sink.clone())));
+    callbacks.initialize_delivery(runtime.clone(), std::path::Path::new(&namespace)).unwrap();
+    processor.consensus.set_callbacks_for_test(callbacks.clone());
+    processor.callbacks = callbacks;
+    let consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(proof)) = &draft.finality else { unreachable!() };
+    let wire = rtos_api::pq_finality::PqNetworkSignatureSet::from_final_fields(proof).unwrap().to_node();
+    let candidate_bytes = rtos_api::serialize_boxed(&wire.candidate).unwrap();
+    let candidate_id = RawCandidateId { slot: SlotIndex::new(proof.slot), hash: UInt256::calc_file_hash(&candidate_bytes) };
+    processor.candidate_book_mut().insert_received(candidate_id.clone(), ReceivedCandidate {
+        slot: candidate_id.slot, source_idx: ValidatorIndex::new(0), candidate_hash_data_bytes: candidate_bytes,
+        block_id: draft.block_id.clone(), root_hash: draft.block_id.root_hash().clone(),
+        file_hash: draft.block_id.file_hash().clone(), data: draft.data.clone(),
+        collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new()),
+        gen_utime_ms: None, receive_time: SystemTime::now(), is_empty: false, parent_id: None,
+    });
+    let certificate = Arc::new(crate::certificate::Certificate {
+        vote: crate::simplex_state::FinalizeVote { slot: candidate_id.slot, block_hash: candidate_id.hash.clone() },
+        signatures: proof.signatures.iter().enumerate().map(|(index, signature)| crate::certificate::VoteSignature {
+            validator_idx: ValidatorIndex::new(index as u32), signature: signature.signature.clone(),
+        }).collect(),
+    });
+    processor.handle_block_finalized(BlockFinalizedEvent { slot: candidate_id.slot, block_hash: candidate_id.hash.clone(),
+        block_id: Some(draft.block_id.clone()), certificate });
+    assert_eq!(sink.0.lock().unwrap().len(), 1);
+    assert!(!processor.consensus.is_finalized_block(&candidate_id));
+    assert!(!processor.consensus.finalized_delivery_sent_contains(&candidate_id));
+    db.sync(Some(Duration::from_secs(5))).unwrap();
+    assert!(db.load_finalized_blocks().unwrap().is_empty(), "source finalized DB must wait for node WAL");
+    processor.cleanup_old_slots(SlotIndex::new(1000));
+    assert!(processor.candidate_book().received(&candidate_id).is_some(), "held finality must retain body ancestry");
+    let (_, complete) = sink.0.lock().unwrap().pop().unwrap();
+    complete(Ok(UInt256::from([7; 32])));
+    processor.with_consensus_backend(|controller, backend| controller.retry_pending_recursive_finalization(backend));
+    assert!(processor.consensus.is_finalized_block(&candidate_id));
+    assert!(processor.consensus.finalized_delivery_sent_contains(&candidate_id));
+    db.sync(Some(Duration::from_secs(5))).unwrap(); processor.process_pending_async_db_results();
+    assert_eq!(db.load_finalized_blocks().unwrap().len(), 1);
+    processor.with_consensus_backend(|controller, backend| controller.retry_pending_recursive_finalization(backend));
+    assert!(sink.0.lock().unwrap().is_empty(), "duplicate retry must not stage again");
+    drop(processor); db.close(None).unwrap();
+}

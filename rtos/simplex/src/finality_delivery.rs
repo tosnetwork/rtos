@@ -185,10 +185,20 @@ impl PendingFinalityStore {
         if path.exists() {
             let old = PendingFinalityRecord::read(&path)?;
             if old.data != record.data { fail!("Conflicting retained body for source finality identity"); }
+            // A prior rename may have succeeded while directory sync failed.
+            // Re-establish durability before returning the retained proof.
+            File::open(&path)?.sync_all()?;
+            File::open(&self.directory)?.sync_all()?;
             return Ok(old);
         }
         let bytes = record.encode()?;
         let paths = self.paths()?;
+        for existing in &paths {
+            let old = PendingFinalityRecord::read(existing)?;
+            if old.block_id.seq_no() == record.block_id.seq_no() && old.block_id != record.block_id {
+                fail!("Conflicting source finality blocks at one seqno");
+            }
+        }
         let total = paths.iter().try_fold(0u64, |total, path| Ok::<_, anyhow::Error>(total + std::fs::metadata(path)?.len()))?;
         if paths.len() >= MAX_RECORDS || total + bytes.len() as u64 > MAX_TOTAL_BYTES { fail!("Source finality backpressure"); }
         let temporary = path.with_extension("tmp");
@@ -199,7 +209,11 @@ impl PendingFinalityStore {
     }
     pub(crate) fn acknowledge(&self, id: &UInt256, _node_receipt: UInt256) -> Result<()> {
         let _guard = self.mutation.lock().unwrap();
-        std::fs::remove_file(self.directory.join(format!("{}.json", id.to_hex_string())))?;
+        match std::fs::remove_file(self.directory.join(format!("{}.json", id.to_hex_string()))) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error.into()),
+        }
         File::open(&self.directory)?.sync_all()?;
         Ok(())
     }
@@ -238,4 +252,227 @@ pub fn scan_pending_finality(root: &Path) -> Result<Vec<PendingFinalityRecovery>
         }
     }
     Ok(records)
+}
+
+
+/// Session-local admission state. Accepted node work owns this Arc, so source
+/// cancellation cannot drop the retention lock or turn an outstanding stage
+/// into an acknowledged delivery.
+pub(crate) struct SourceFinalityDelivery {
+    runtime: Arc<AuthenticatedSessionRuntime>,
+    store: Arc<PendingFinalityStore>,
+    sink: consensus_common::finality_delivery::DurableFinalitySinkPtr,
+    stages: Mutex<std::collections::HashMap<UInt256, SourceStage>>,
+}
+enum SourceStage {
+    Running,
+    Retry(std::time::Instant),
+    Durable(UInt256, FinalizedDeliveryDraft),
+    Acknowledging(UInt256, FinalizedDeliveryDraft),
+}
+impl SourceFinalityDelivery {
+    pub(crate) fn open(runtime: Arc<AuthenticatedSessionRuntime>, namespace: &Path,
+        sink: consensus_common::finality_delivery::DurableFinalitySinkPtr) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self { runtime, store: PendingFinalityStore::open(namespace)?, sink,
+            stages: Mutex::new(std::collections::HashMap::new()) }))
+    }
+    /// None means not yet durable. Retention precedes every first stage; later
+    /// attempts use the exact retained certificate, metadata and creation time.
+    pub(crate) fn poll(self: &Arc<Self>, draft: FinalizedDeliveryDraft)
+        -> Result<Option<(UInt256, FinalizedDeliveryDraft)>> {
+        let record = PendingFinalityRecord::from_draft(&self.runtime, &draft)?;
+        let id = record.id()?;
+        {
+            let mut stages = self.stages.lock().unwrap();
+            match stages.get(&id) {
+                Some(SourceStage::Running) => return Ok(None),
+                Some(SourceStage::Retry(at)) if std::time::Instant::now() < *at => return Ok(None),
+                Some(SourceStage::Acknowledging(receipt, draft)) => {
+                    self.store.acknowledge(&id, receipt.clone())?;
+                    let result = (receipt.clone(), draft.clone());
+                    stages.remove(&id);
+                    return Ok(Some(result));
+                }
+                Some(SourceStage::Durable(_, _)) => {
+                    let Some(SourceStage::Durable(receipt, draft)) = stages.remove(&id) else { unreachable!() };
+                    return Ok(Some((receipt, draft)));
+                }
+                _ => {}
+            }
+            stages.insert(id.clone(), SourceStage::Running);
+        }
+        let prepare = || -> Result<FinalizedDeliveryDraft> {
+            let retained = self.store.retain(&record)?;
+            let wire: rtos_api::ton::ton_node::SignatureSet = retained.wire_profile.deserialize_typed(&retained.signature_set)?;
+            let rtos_api::ton::ton_node::SignatureSet::TonNode_SignatureSet_SimplexPq(value) = wire else { fail!("Retained signature set is not PQ"); };
+            let signatures = PqNetworkSignatureSet::from_node(value)?;
+            let verifier = self.runtime.pq_context().ok_or_else(|| error!("Missing PQ context"))?.for_block(retained.block_id.clone())?;
+            let verified = verifier.verify_network(&signatures)?;
+            let finality = if retained.is_final {
+                SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(verified.into_final()?.0))
+            } else { SessionFinality::PqApproval(verified.into_approval()?.0) };
+            Ok(FinalizedDeliveryDraft {
+                block_id: retained.block_id,
+                source_info: draft.source_info,
+                data: consensus_common::ConsensusCommonFactory::create_block_payload(retained.data),
+                finality,
+                last_mc_finalized_seqno: retained.last_mc_finalized_seqno,
+                candidate_already_sent: retained.candidate_already_sent,
+                created_at_unix_secs: retained.created_at_unix_secs,
+            })
+        };
+        let draft = match prepare() {
+            Ok(draft) => draft,
+            Err(error) => { self.retry(&id); return Err(error); }
+        };
+        let owner = self.clone();
+        let completion_id = id.clone();
+        let completion_draft = draft.clone();
+        if let Err(error) = self.sink.stage(draft, Box::new(move |result| {
+            match result {
+                Ok(receipt) => {
+                    let state = match owner.store.acknowledge(&completion_id, receipt.clone()) {
+                        Ok(()) => SourceStage::Durable(receipt, completion_draft),
+                        Err(error) => {
+                            log::error!("Node WAL durable but source ACK needs retry: {error}");
+                            SourceStage::Acknowledging(receipt, completion_draft)
+                        }
+                    };
+                    owner.stages.lock().unwrap().insert(completion_id, state);
+                },
+                Err(error) => {
+                    log::error!("Durable finality stage failed; retained for recovery: {error}");
+                    owner.retry(&completion_id);
+                }
+            }
+        })) {
+            self.retry(&id);
+            return Err(error);
+        }
+        Ok(None)
+    }
+    fn retry(&self, id: &UInt256) {
+        self.stages.lock().unwrap().insert(id.clone(),
+            SourceStage::Retry(std::time::Instant::now() + std::time::Duration::from_millis(250)));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use consensus_common::finality_delivery::{DurableFinalitySink, FinalizedDeliveryCompletion};
+    use rtos_block::*;
+
+    #[derive(Default)]
+    pub(crate) struct HeldSink(pub(crate) Mutex<Vec<(FinalizedDeliveryDraft, FinalizedDeliveryCompletion)>>);
+    impl DurableFinalitySink for HeldSink {
+        fn stage(&self, draft: FinalizedDeliveryDraft, completion: FinalizedDeliveryCompletion) -> Result<()> {
+            self.0.lock().unwrap().push((draft, completion)); Ok(())
+        }
+    }
+    pub(crate) fn fixture() -> (Arc<AuthenticatedSessionRuntime>, FinalizedDeliveryDraft) {
+        let stores: Vec<_> = [0xa9, 0xaa].iter().map(|seed|
+            rtos_pq_consensus::ConsensusKeyStore::from_seed(&[*seed; 32], 0).unwrap()).collect();
+        let (_, keys) = crate::pq_fixture::members();
+        let members = stores.iter().enumerate().map(|(index, store)| ValidatorDescr::with_pq_params(
+            UInt256::from([index as u8 + 1; 32]), store.consensus_key().clone(), index as u64 + 1,
+            UInt256::from(*keys[index].id().data()),
+        )).collect();
+        let observer = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71; 32]).unwrap();
+        let (runtime, _, _) = crate::authenticated_fixture::runtime_with_members(members, observer);
+        let mut block = Block::default();
+        block.set_global_id(runtime.pin().global_id);
+        let mut info = BlockInfo::default(); info.set_seq_no(1).unwrap(); info.set_shard(runtime.shard().clone());
+        block.write_info(&info).unwrap();
+        let cell = block.serialize().unwrap(); let data = write_boc(&cell).unwrap();
+        let block_id = BlockIdExt::with_params(runtime.shard().clone(), 1, cell.repr_hash().clone(), UInt256::calc_file_hash(&data));
+        let candidate = rtos_api::ton::consensus::candidatehashdata::CandidateHashDataOrdinary {
+            block: block_id.clone(), collated_file_hash: UInt256::default(),
+            parent: rtos_api::ton::consensus::CandidateParent::Consensus_CandidateWithoutParents,
+        }.into_boxed();
+        let candidate_bytes = rtos_api::serialize_boxed(&candidate).unwrap();
+        let vote = rtos_api::ton::consensus::simplex::unsignedvote::FinalizeVote {
+            id: rtos_api::ton::consensus::candidateid::CandidateId {
+                slot: 0, hash: UInt256::calc_file_hash(&candidate_bytes),
+            }.into_boxed(),
+        }.into_boxed();
+        let bytes = crate::utils::create_data_to_sign(runtime.session_id(), &crate::utils::serialize_unsigned_vote(&vote));
+        let signatures = stores.iter().zip(runtime.committee()).map(|(store, member)| PqBlockSignaturePair {
+            validator_id: member.validator_id().unwrap(), algorithm_id: 1,
+            signature: store.sign_consensus(&bytes).unwrap().bytes.to_vec(),
+        }).collect();
+        let finality = BlockSignaturesSimplexPq {
+            validator_info: runtime.pq_context().unwrap().validator_info(), sig_count: 2,
+            sig_weight: runtime.committee().iter().map(|member| member.weight).sum(), signatures,
+            session_id: runtime.session_id().clone(), slot: 0,
+            candidate_data: BlockSignaturesSimplex::bytes_to_cell_tree(&candidate_bytes).unwrap(),
+        };
+        runtime.pq_context().unwrap().for_block(block_id.clone()).unwrap().verify_final(&finality).unwrap();
+        let source_info = consensus_common::BlockSourceInfo {
+            source: crate::SimplexSessionNode::from_descriptor(&runtime.committee()[0]).unwrap().identity,
+            priority: consensus_common::BlockCandidatePriority { round: 0, priority: 0, first_block_round: 0 },
+        };
+        (runtime, FinalizedDeliveryDraft { block_id, source_info,
+            data: consensus_common::ConsensusCommonFactory::create_block_payload(data),
+            finality: SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(finality)),
+            last_mc_finalized_seqno: 41, candidate_already_sent: false, created_at_unix_secs: 123456,
+        })
+    }
+    #[test]
+    fn source_finality_held_stage_survives_owner_drop_until_node_wal() {
+        let temp = crate::authenticated_fixture::TestDirectory::new();
+        let (runtime, draft) = fixture();
+        let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+        let sink = Arc::new(HeldSink::default());
+        let source = SourceFinalityDelivery::open(runtime, &namespace, sink.clone()).unwrap();
+        assert!(source.poll(draft.clone()).unwrap().is_none());
+        assert_eq!(source.store.paths().unwrap().len(), 1);
+        assert!(source.poll(draft).unwrap().is_none());
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        drop(source);
+        assert!(scan_pending_finality(temp.path()).unwrap().is_empty(), "accepted work owns retention lock");
+        let (_, complete) = sink.0.lock().unwrap().pop().unwrap();
+        complete(Err(error!("WAL failed")));
+        let recovered = scan_pending_finality(temp.path()).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].record().created_at_unix_secs, 123456);
+        recovered.into_iter().next().unwrap().acknowledge(UInt256::from([3; 32])).unwrap();
+        assert!(scan_pending_finality(temp.path()).unwrap().is_empty());
+    }
+    #[test]
+    fn source_finality_retry_reuses_exact_retained_proof_and_metadata() {
+        let temp = crate::authenticated_fixture::TestDirectory::new();
+        let (runtime, draft) = fixture();
+        let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+        let sink = Arc::new(HeldSink::default());
+        let source = SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
+        source.poll(draft.clone()).unwrap();
+        let (original, complete) = sink.0.lock().unwrap().pop().unwrap();
+        complete(Err(error!("First stage failed")));
+        std::thread::sleep(std::time::Duration::from_millis(260));
+        let mut changed = draft.clone(); changed.created_at_unix_secs += 500;
+        changed.last_mc_finalized_seqno = 99; changed.candidate_already_sent = true;
+        if let SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(ref mut proof)) = changed.finality { proof.signatures.reverse(); }
+        source.poll(changed).unwrap();
+        let (retried, complete) = sink.0.lock().unwrap().pop().unwrap();
+        assert_eq!(PendingFinalityRecord::from_draft(&runtime, &original).unwrap().encode().unwrap(),
+            PendingFinalityRecord::from_draft(&runtime, &retried).unwrap().encode().unwrap());
+        let receipt = UInt256::from([4; 32]); complete(Ok(receipt.clone()));
+        assert!(source.store.paths().unwrap().is_empty());
+        assert_eq!(source.poll(draft).unwrap().unwrap().0, receipt);
+    }
+    #[test]
+    fn source_finality_scanner_rejects_unknown_schema_without_deleting_evidence() {
+        let temp = crate::authenticated_fixture::TestDirectory::new();
+        let (runtime, draft) = fixture();
+        let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+        let store = PendingFinalityStore::open(&namespace).unwrap();
+        store.retain(&PendingFinalityRecord::from_draft(&runtime, &draft).unwrap()).unwrap();
+        let path = store.paths().unwrap().pop().unwrap();
+        drop(store);
+        let mut disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        disk["schema"] = 99.into(); std::fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        assert!(scan_pending_finality(temp.path()).is_err());
+        assert!(path.exists());
+    }
 }
