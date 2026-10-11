@@ -179,6 +179,24 @@ impl Package {
             })
     }
 
+    pub async fn read_entry_bounded(
+        &self,
+        offset: u64,
+        limits: super::bounded_read::ArchiveReadLimits,
+    ) -> Result<PackageEntry> {
+        let mut file = self.open_file().await?;
+        read_header(&mut file).await?;
+        let start = offset.checked_add(PKG_HEADER_SIZE as u64)
+            .ok_or_else(|| error!("Archive entry offset overflow"))?;
+        let end = start.checked_add(PKG_ENTRY_HEADER_SIZE as u64)
+            .ok_or_else(|| error!("Archive entry header offset overflow"))?;
+        if end > file.metadata().await?.len() { fail!("Truncated archive entry header"); }
+        file.seek(SeekFrom::Start(start)).await?;
+        // Preserve typed limit errors; formatting them into strings loses the
+        // upper resolver's ability to forbid fallback after budget exhaustion.
+        PackageEntry::read_from_bounded(&mut file, limits).await
+    }
+
     pub async fn append_entry(
         &self,
         entry: &PackageEntry,
@@ -299,4 +317,37 @@ pub(crate) async fn sync_file_and_parents_observed(
         parent = directory.parent();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use crate::archives::bounded_read::{ArchiveReadLimitExceeded, ArchiveReadLimits};
+    #[tokio::test]
+    async fn bounded_archive_real_package_limit_offset_and_truncation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("archive.pack");
+        // Real fixed package/entry headers followed by an exact-sized payload.
+        let mut data = 0xAE8F_DD01u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&0x1E8Bu16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes());
+        data.extend_from_slice(b"xabcd");
+        std::fs::write(&path, &data)?;
+        let package = Package::open(path.clone(), true, false).await?;
+        let limits = ArchiveReadLimits { data_bytes: 4, filename_bytes: 1 };
+        let entry = package.read_entry_bounded(0, limits).await?;
+        assert_eq!(entry.filename(), "x"); assert_eq!(entry.data(), b"abcd");
+        let error = package.read_entry_bounded(0, ArchiveReadLimits { data_bytes: 3, ..limits }).await.err().unwrap();
+        assert!(error.downcast_ref::<ArchiveReadLimitExceeded>().is_some());
+        assert!(package.read_entry_bounded(u64::MAX, limits).await.is_err());
+        std::fs::write(&path, &data[..data.len()-1])?;
+        assert!(package.read_entry_bounded(0, limits).await.is_err());
+        // Malicious advertised size rejected even though the file has no body.
+        data.truncate(12); data[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, data)?;
+        let error = package.read_entry_bounded(0, limits).await.err().unwrap();
+        assert!(error.downcast_ref::<ArchiveReadLimitExceeded>().is_some());
+        Ok(())
+    }
 }

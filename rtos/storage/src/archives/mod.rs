@@ -13,6 +13,7 @@ use crate::block_handle_db::BlockHandle;
 mod package_index_db;
 
 pub mod archive_manager;
+pub mod bounded_read;
 pub mod db_provider;
 pub mod epoch;
 pub mod package;

@@ -841,6 +841,26 @@ impl InternalDb {
         BlockStuff::deserialize_block(handle.id().clone(), Arc::new(raw_block))
     }
 
+    /// Physical bounded lookup, independent of stale has-data flags. Budget
+    /// rejection never mutates metadata or falls back to an unlimited loader.
+    pub async fn load_block_data_raw_bounded(
+        &self,
+        handle: &Arc<BlockHandle>,
+        limits: storage::archives::bounded_read::ArchiveReadLimits,
+    ) -> Result<Vec<u8>> {
+        self.archive_manager.get_file_bounded(handle, &PackageEntryId::Block(handle.id()), limits).await
+    }
+
+    pub async fn load_block_proof_raw_bounded(
+        &self,
+        handle: &Arc<BlockHandle>,
+        is_link: bool,
+        limits: storage::archives::bounded_read::ArchiveReadLimits,
+    ) -> Result<Vec<u8>> {
+        let entry = if is_link { PackageEntryId::ProofLink(handle.id()) } else { PackageEntryId::Proof(handle.id()) };
+        self.archive_manager.get_file_bounded(handle, &entry, limits).await
+    }
+
     pub async fn load_block_data_raw(&self, handle: &Arc<BlockHandle>) -> Result<Vec<u8>> {
         let _tc = time_checker!(|| format!("load_block_data_raw {}", handle.id()), 100);
         if !handle.has_data() {
