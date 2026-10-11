@@ -85,6 +85,10 @@ async fn recover_scenario(scenario: RecoveryScenario) {
         let engine = &pair.provider;
         engine.clone().download_and_apply_block(pair.master.id(), 1, false).await.unwrap();
         let first = engine.load_state(pair.master.id()).await.unwrap();
+        let initial_key = first.shard_state_extra().unwrap().last_key_block.clone()
+            .expect("signed MC1 fixture must retain the zerostate key reference");
+        assert_eq!(BlockIdExt::from_ext_blk(initial_key), pair.anchor,
+            "historical fixture metadata must name the exact epoch-zero anchor");
         let config = first.config_params().unwrap();
         let cc = pair.master.block().unwrap().read_info().unwrap().gen_catchain_seqno();
         let creator = config.validator_set().unwrap().list()[0].validator_id().unwrap();
