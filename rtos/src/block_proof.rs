@@ -680,7 +680,7 @@ impl MasterchainProofVerifier {
             if let Some(budget) = budget {
                 let budget = ConfigBudget(budget);
                 let decoded =
-                    config.session_config_bounded(id.shard().is_masterchain(), &budget)?;
+                    config.governing_session_config_bounded(id.shard().is_masterchain(), &budget)?;
                 let (committee, _) = decoded.current.calc_subset_bounded(
                     &decoded.catchain,
                     id.shard().shard_prefix_with_tag(),
