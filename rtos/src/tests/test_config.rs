@@ -525,6 +525,10 @@ async fn config_scheduler_fourth_election_retires_old_key_without_callback_deadl
     })
     .await
     .expect("the fourth registration must not wait on its own GetKey queue");
+    assert!(handler.find(adnl_ids[0].data()).is_err());
+    assert!(handler.find(validator_ids[0].data()).is_err());
+    assert!(handler.sign_data(adnl_ids[0].data(), b"retired key").is_err());
+    assert!(handler.sign_data(validator_ids[0].data(), b"retired key").is_err());
     assert!(handler.get_key_raw(*adnl_ids[0].data()).await.is_none());
     assert!(handler.get_key_raw(*validator_ids[0].data()).await.is_none());
     assert!(handler.get_key_raw(*adnl_ids[3].data()).await.is_some());
@@ -543,6 +547,113 @@ async fn config_scheduler_fourth_election_retires_old_key_without_callback_deadl
     assert!(!saved_ring.contains_key(&base64_encode(adnl_ids[0].data())));
     assert!(!saved_ring.contains_key(&base64_encode(validator_ids[0].data())));
     assert!(saved_ring.contains_key(&base64_encode(adnl_ids[3].data())));
+    let weak = Arc::downgrade(&handler);
+    drop(subscriber);
+    drop(handler);
+    assert!(weak.upgrade().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_scheduler_rotation_keeps_shared_key_until_last_role_is_retired() {
+    assert!(get_vault().is_none(), "isolated fixture requires no global vault");
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = scheduler_test_config();
+    config.configs_dir = dir.path().to_str().unwrap().into();
+    config.file_name = "config.json".into();
+    let mut validators = Vec::new();
+    let mut transports = Vec::new();
+    for index in 0..6u8 {
+        let (json, key) =
+            Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[151 + index; 32])
+                .unwrap();
+        config.validator_key_ring.as_mut().unwrap().insert(base64_encode(key.id().data()), json);
+        validators.push(key.id().clone());
+        let (json, key) =
+            Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[161 + index; 32])
+                .unwrap();
+        config.validator_key_ring.as_mut().unwrap().insert(base64_encode(key.id().data()), json);
+        transports.push(key.id().clone());
+    }
+    // The same private key is used by two validator registrations and two ADNL
+    // bindings. After election 1002 retires, it remains needed only as ADNL.
+    for (index, validator, adnl) in [
+        (0, &validators[0], &validators[0]),
+        (1, &validators[0], &transports[1]),
+        (2, &validators[2], &validators[0]),
+    ] {
+        config.validator_keys.as_mut().unwrap().push(ValidatorKeysJson {
+            expire_at: i32::MAX,
+            election_id: 1001 + index,
+            validator_key_id: base64_encode(validator.data()),
+            validator_adnl_key_id: Some(base64_encode(adnl.data())),
+        });
+    }
+    let (handler, context) =
+        NodeConfigHandler::create(config, tokio::runtime::Handle::current()).unwrap();
+    let subscriber = Arc::new(RotationConfigSubscriber {
+        handler: handler.clone(),
+        retained_key: transports[5].clone(),
+        events: Default::default(),
+    });
+    handler.clone().start_sheduler(context, vec![subscriber.clone()]).unwrap();
+    for index in 3..6 {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            handler
+                .add_validator_key(validators[index].data(), 1001 + index as i32, i32::MAX)
+                .await
+                .unwrap();
+            handler
+                .add_validator_adnl_key(validators[index].data(), transports[index].data())
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        let saved: TonNodeConfig =
+            serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved.validator_keys.as_ref().unwrap().len(), 3);
+        let retained = index < 5;
+        assert_eq!(
+            saved
+                .validator_key_ring
+                .as_ref()
+                .unwrap()
+                .contains_key(&base64_encode(validators[0].data())),
+            retained
+        );
+        assert_eq!(handler.get_key_raw(*validators[0].data()).await.is_some(), retained);
+        assert_eq!(handler.find(validators[0].data()).is_ok(), retained);
+        if retained {
+            let signature =
+                handler.sign_data(validators[0].data(), b"shared transport key").unwrap();
+            handler
+                .find(validators[0].data())
+                .unwrap()
+                .verify(b"shared transport key", &signature)
+                .unwrap();
+        } else {
+            assert!(handler.sign_data(validators[0].data(), b"retired shared key").is_err());
+        }
+        if index >= 4 {
+            assert!(handler.find(transports[1].data()).is_err());
+            assert!(handler.get_key_raw(*transports[1].data()).await.is_none());
+        }
+    }
+    handler.stop_and_wait().await.unwrap();
+    assert_eq!(
+        *subscriber.events.lock().unwrap(),
+        vec![
+            (1, 1001),
+            (1, 1002),
+            (1, 1003),
+            (1, 1004),
+            (1, 1005),
+            (2, 1002),
+            (1, 1006),
+            (2, 1003),
+        ]
+    );
     let weak = Arc::downgrade(&handler);
     drop(subscriber);
     drop(handler);

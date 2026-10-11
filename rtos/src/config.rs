@@ -237,6 +237,23 @@ impl SecretsVaultConfig {
     const TYPE_PRIVATE_KEY: &str = "private_key";
     const TYPE_VALIDATOR_KEY: &str = "validator_key";
 
+    async fn drop_validator_metadata(key_id: &str) -> Result<()> {
+        let Some(vault) = get_vault() else {
+            return Ok(());
+        };
+        let id = make_secret_id!(Self::SID_VALIDATOR_KEYS, key_id);
+        match vault.delete(&id).await {
+            Err(error)
+                if error
+                    .downcast_ref::<VaultError>()
+                    .is_some_and(|error| error.code() == VaultError::NOT_FOUND) =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
     async fn on_drop(key_id: &str) -> Result<()> {
         async fn delete(vault: &SecretVault, sid: &str, key_id: &str) -> Option<anyhow::Error> {
             let secret_id = make_secret_id!(sid, key_id);
@@ -1343,19 +1360,33 @@ impl TonNodeConfig {
             });
             if let Some(pos) = pos {
                 validator_keys.swap_remove(pos);
-                SecretsVaultConfig::on_drop(validator_key_id.as_str()).await?;
+                // A key may span elections. The vault record describes the
+                // remaining registration; pruning an older one must not erase it.
+                if !validator_keys.iter().any(|key| key.validator_key_id == validator_key_id) {
+                    SecretsVaultConfig::drop_validator_metadata(&validator_key_id).await?;
+                }
                 return Ok(true);
             }
         }
         Ok(false)
     }
 
-    async fn remove_key_from_key_ring(&mut self, validator_key_id: &str) -> Result<()> {
-        if let Some(key_ring) = self.validator_key_ring.as_mut() {
-            key_ring.remove(validator_key_id);
-            SecretsVaultConfig::on_drop(validator_key_id).await?;
+    async fn remove_key_from_key_ring(&mut self, key_id: &str) -> Result<bool> {
+        // Retain private material until neither role in any remaining election
+        // references it. A validator key may also be used as an ADNL identity.
+        if self.validator_keys.as_ref().is_some_and(|keys| {
+            keys.iter().any(|key| {
+                key.validator_key_id == key_id
+                    || key.validator_adnl_key_id.as_deref() == Some(key_id)
+            })
+        }) {
+            return Ok(false);
         }
-        Ok(())
+        SecretsVaultConfig::on_drop(key_id).await?;
+        if let Some(key_ring) = self.validator_key_ring.as_mut() {
+            key_ring.remove(key_id);
+        }
+        Ok(true)
     }
 }
 
@@ -1809,7 +1840,9 @@ impl NodeConfigHandler {
             validator_keys.remove(&oldest_key)?;
             Ok(())
         })?;
-        config.remove_key_from_key_ring(&oldest_key.validator_key_id).await?;
+        if config.remove_key_from_key_ring(&oldest_key.validator_key_id).await? {
+            self.key_ring.remove(&oldest_key.validator_key_id);
+        }
         let Some(adnl_key_id) = &oldest_key.validator_adnl_key_id else {
             return Ok(());
         };
@@ -1829,7 +1862,9 @@ impl NodeConfigHandler {
                 is still referenced by another election, skipping removal"
             );
         } else {
-            config.remove_key_from_key_ring(adnl_key_id).await?;
+            if config.remove_key_from_key_ring(adnl_key_id).await? {
+                self.key_ring.remove(adnl_key_id);
+            }
             // Notify subscribers to clean up ADNL/QUIC/DHT state for the
             // removed election entry, only when the ADNL key is actually torn
             // down (avoids spurious removals while the key is still in use).
