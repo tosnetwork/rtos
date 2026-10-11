@@ -1053,6 +1053,10 @@ mod boundary_tests {
         assert_eq!(batch.items.len(), 1);
         drop(batch);
         let store = PendingFinalityStore::open(&namespace).unwrap();
+        // A bare disk scanner has no runtime authority. Bind the authenticated
+        // fixture exactly as the real source owner does before confirming ACK.
+        *store.runtime_binding.lock().unwrap() =
+            runtime.recovery_binding().map(DiskRecoveryBinding::from_binding);
         let locator = store.close_locator(&good).unwrap().unwrap();
         store.commit_delivered(&runtime, &locator.reference, &offer).unwrap();
         store.mark_node_confirmed(&good, &offer).unwrap();
