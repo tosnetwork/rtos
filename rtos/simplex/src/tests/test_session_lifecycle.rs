@@ -355,3 +355,73 @@ impl consensus_common::finality_delivery::DurableFinalitySink for RejectFinality
         anyhow::bail!("Lifecycle fixture does not accept finality")
     }
 }
+
+/// Real session/receiver/private ADNL resources must remain an incomplete
+/// recovery owner while the retained certificate's candidate is unavailable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_finality_real_retired_worker_preserves_missing_body_obligation() {
+    use adnl::{node::{AdnlNode, AdnlNodeConfig}, DhtNode, NetworkStack, OverlayNode, RldpNode};
+    let directory = TestDirectory::new();
+    let (runtime, draft) = crate::finality_delivery::tests::fixture();
+    let key = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71; 32]).unwrap();
+    let options = crate::SessionOptions { protocol: runtime.protocol(), proto_version: runtime.carrier_version(),
+        wire_profile: runtime.wire_profile(), slots_per_leader_window: runtime.slots_per_leader_window(),
+        wait_for_db_init: true, ..Default::default() };
+    let path = std::path::PathBuf::from(runtime.runtime_directory(directory.path().to_str().unwrap()).unwrap());
+    let (_, config) = AdnlNodeConfig::from_ip_address_and_private_keys("127.0.0.1:0", vec![([0x71; 32], 0)]).unwrap();
+    let adnl = AdnlNode::with_config(config).await.unwrap();
+    let dht = DhtNode::with_adnl_node(adnl.clone(), 0).unwrap();
+    let overlay = OverlayNode::with_params_and_profile(adnl.clone(), &[25; 32], 0, rtos_api::WireProfile::T0).unwrap();
+    let rldp = RldpNode::with_params(adnl.clone(), vec![overlay.clone()], None).unwrap();
+    overlay.set_rldp(rldp.clone()).unwrap();
+    let stack = Arc::new(NetworkStack { adnl: adnl.clone(), dht, overlay, rldp, quic: None });
+    adnl.start_over_udp(vec![stack.overlay.clone(), stack.dht.clone(), stack.rldp.clone()]).await.unwrap();
+    let manager = ConsensusCommonFactory::create_adnl_overlay_manager(tokio::runtime::Handle::current(), stack, None, false).unwrap();
+    let listener: Arc<dyn SessionListener + Send + Sync> = Arc::new(Listener::default());
+    let sink = Arc::new(crate::finality_delivery::tests::HeldSink::default());
+    let result = (|| -> Result<()> {
+        let session = crate::SessionFactory::create_authenticated_session(&options, runtime.clone(), &key,
+            path.to_string_lossy().into_owned(), manager.clone(), Arc::downgrade(&listener), None, Some(sink.clone()))?;
+        session.stop_checked()?;
+        anyhow::ensure!(session.threads_drained());
+        let SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(proof)) = &draft.finality else { unreachable!() };
+        let candidate = rtos_api::pq_finality::PqNetworkSignatureSet::from_final_fields(proof)?.to_node().candidate;
+        let hash = UInt256::calc_file_hash(&rtos_api::serialize_boxed(&candidate)?);
+        let event = crate::simplex_state::BlockFinalizedEvent {
+            slot: crate::block::SlotIndex::new(proof.slot), block_hash: hash.clone(), block_id: None,
+            certificate: Arc::new(crate::certificate::Certificate {
+                vote: crate::simplex_state::FinalizeVote { slot: crate::block::SlotIndex::new(proof.slot), block_hash: hash },
+                signatures: proof.signatures.iter().enumerate().map(|(index, signature)| crate::certificate::VoteSignature {
+                    validator_idx: crate::block::ValidatorIndex::new(index as u32), signature: signature.signature.clone(),
+                }).collect(),
+            }),
+        };
+        let source = crate::finality_delivery::SourceFinalityDelivery::open(runtime.clone(), &path, sink.clone())?;
+        source.bind_start(runtime.pin().zerostate.clone())?;
+        source.retain_intent(vec![runtime.pin().zerostate.clone()], &event)?;
+        drop(source);
+        let records = crate::finality_recovery::scan_finality_recovery(directory.path())?;
+        anyhow::ensure!(records.len() == 1);
+        let recovered = crate::SessionFactory::create_finality_recovery_session(&options, runtime.clone(), &key,
+            directory.path().to_str().unwrap(), &records[0], manager.clone(), Arc::downgrade(&listener), sink.clone())?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while recovered.finality_recovery_pending().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pending = recovered.finality_recovery_pending();
+        let premature = recovered.finality_recovery_complete();
+        let staged = sink.0.lock().unwrap().len();
+        let live_scan = crate::finality_recovery::scan_finality_recovery(directory.path());
+        let stop = recovered.stop_checked();
+        let drained = recovered.threads_drained();
+        stop?;
+        anyhow::ensure!(pending == Some(1) && drained && !premature && staged == 0, "missing body incorrectly completed or staged: {pending:?}");
+        anyhow::ensure!(live_scan?.is_empty(), "live namespace was stealable");
+        anyhow::ensure!(crate::finality_recovery::scan_finality_recovery(directory.path())?.len() == 1,
+            "checked stop discarded certificate debt");
+        Ok(())
+    })();
+    drop(manager);
+    adnl.stop_checked().await.unwrap();
+    result.unwrap();
+}

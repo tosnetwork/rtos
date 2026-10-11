@@ -310,6 +310,7 @@ pub(crate) struct SessionImpl {
     /// relative to `SessionProcessor` teardown.
     _callbacks: Arc<SessionCallbacks>,
     recovery_complete: Arc<AtomicBool>,
+    recovery_pending: Arc<std::sync::atomic::AtomicUsize>,
     /// Session identifier
     session_id: SessionId,
     /// Activity node for session lifetime tracking
@@ -390,6 +391,10 @@ impl ConsensusSession for SessionImpl {
 
 impl SimplexSession for SessionImpl {
     fn finality_recovery_complete(&self) -> bool { self.recovery_complete.load(Ordering::Acquire) }
+    fn finality_recovery_pending(&self) -> Option<usize> {
+        let count = self.recovery_pending.load(Ordering::Acquire);
+        (count != usize::MAX).then_some(count)
+    }
     fn ensure_candidate_available(
         &self,
         block_id: BlockIdExt,
@@ -520,6 +525,7 @@ impl SessionImpl {
         >,
         recovery_only: bool,
         recovery_complete: Arc<AtomicBool>,
+        recovery_pending: Arc<std::sync::atomic::AtomicUsize>,
         #[cfg(test)] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
     ) {
         log::info!(
@@ -971,7 +977,10 @@ impl SessionImpl {
         loop {
             if recovery_only {
                 match callbacks.pending_finality_intents() {
-                    Ok(pending) => recovery_complete.store(pending.is_empty(), Ordering::Release),
+                    Ok(pending) => {
+                        recovery_pending.store(pending.len(), Ordering::Release);
+                        recovery_complete.store(pending.is_empty(), Ordering::Release);
+                    },
                     Err(error) => {
                         processor.stop(false);
                         fail_startup(error, "Source recovery progress cannot be established");
@@ -1430,6 +1439,7 @@ impl SessionImpl {
 
         // Create thread synchronization flags
         let recovery_complete = Arc::new(AtomicBool::new(false));
+        let recovery_pending = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let destroy_db_flag = Arc::new(AtomicBool::new(false));
         let start_flag = Arc::new(AtomicBool::new(false));
@@ -1487,6 +1497,7 @@ impl SessionImpl {
             main_task_queue: main_task_queue.clone(),
             _callbacks: callbacks.clone(),
             recovery_complete: recovery_complete.clone(),
+            recovery_pending: recovery_pending.clone(),
             session_id: session_id.clone(),
             _activity_node: session_activity_node.clone(),
             _receiver_listener: receiver_listener,
@@ -1549,6 +1560,7 @@ impl SessionImpl {
                         authenticated_runtime,
                         recovery_only,
                         recovery_complete,
+                        recovery_pending,
                         #[cfg(test)] test_signer,
                     );
                 }));

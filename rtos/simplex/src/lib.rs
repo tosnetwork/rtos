@@ -756,6 +756,9 @@ pub trait SimplexSession: ConsensusSession {
     /// progress only: owners must still checked-stop and join before releasing
     /// the namespace. False also covers sessions not in recovery-only mode.
     fn finality_recovery_complete(&self) -> bool { false }
+    /// Remaining certificate intents after authenticated startup replay. None
+    /// means startup has not completed or this is not a recovery-only session.
+    fn finality_recovery_pending(&self) -> Option<usize> { None }
 
     /// Notify session about the current applied top for its shard
     ///
