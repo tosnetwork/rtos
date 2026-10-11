@@ -761,3 +761,197 @@ async fn config_scheduler_vault_rotation_retains_shared_private_key() {
     assert!(config.remove_key_from_key_ring(&shared).await.unwrap());
     println!("vault rotation child completed");
 }
+
+// This isolated child hook induces a real file-backend write failure.
+pub(super) fn block_retirement_vault_write(namespace: &str) {
+    if std::env::var("RTOS_RETIREMENT_FAIL_NAMESPACE").ok().as_deref() == Some(namespace) {
+        if let Some(path) = std::env::var_os("RTOS_RETIREMENT_BLOCK_PATH") {
+            std::fs::create_dir_all(path).unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_scheduler_vault_failure_retries_retirement() {
+    const CHILD: &str = "RTOS_RETIREMENT_FAILURE_CHILD";
+    let Ok(namespace) = std::env::var(CHILD) else {
+        let mut failures = Vec::new();
+        for namespace in
+            [SecretsVaultConfig::SID_VALIDATOR_KEYS, SecretsVaultConfig::SID_PRIVATE_KEYS]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "config::tests::config_scheduler_vault_failure_retries_retirement",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, namespace)
+                .env(
+                    "VAULT_URL",
+                    format!(
+                        "file://{}?master_key={}",
+                        dir.path().join("vault.json").display(),
+                        "43".repeat(32)
+                    ),
+                )
+                .env("RTOS_RETIREMENT_BLOCK_PATH", dir.path().join("vault.tmp"))
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while child.try_wait().unwrap().is_none() {
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    panic!("retirement child timed out: {:?}", child.wait_with_output().unwrap());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let output = child.wait_with_output().unwrap();
+            eprintln!(
+                "{namespace}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if !output.status.success() {
+                failures.push(namespace);
+            }
+        }
+        assert!(failures.is_empty(), "failed cuts: {failures:?}");
+        return;
+    };
+    let vault = get_vault().expect("actual file vault");
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = scheduler_test_config();
+    config.configs_dir = dir.path().to_str().unwrap().into();
+    config.file_name = "config.json".into();
+    let mut keys = Vec::new();
+    for seed in 191u8..196 {
+        let (_, key) = config
+            .import_private_key(PrivateKey::Pk_Ed25519(Ed25519Private {
+                key: UInt256::with_array([seed; 32]),
+            }))
+            .unwrap();
+        let id = base64_encode(key.id().data());
+        let json = &config.validator_key_ring.as_ref().unwrap()[&id];
+        SecretsVaultConfig::save_private_key(&id, json, &key).await.unwrap();
+        keys.push(key);
+    }
+    // Key 0 retires. Key 1 keeps a role in another election.
+    for (index, adnl) in [(0, 1), (1, 1), (2, 2)] {
+        let entry = ValidatorKeysJson {
+            expire_at: i32::MAX,
+            election_id: 1001 + index as i32,
+            validator_key_id: base64_encode(keys[index].id().data()),
+            validator_adnl_key_id: Some(base64_encode(keys[adnl].id().data())),
+        };
+        SecretsVaultConfig::save_validator_key(&entry).await.unwrap();
+        config.validator_keys.as_mut().unwrap().push(entry);
+    }
+    let (handler, context) =
+        NodeConfigHandler::create(config, tokio::runtime::Handle::current()).unwrap();
+    handler.clone().start_sheduler(context, vec![]).unwrap();
+    handler.add_validator_key(keys[3].id().data(), 1004, i32::MAX).await.unwrap();
+    assert!(handler.find(keys[0].id().data()).is_ok());
+    assert!(handler.get_key_raw(*keys[0].id().data()).await.is_some());
+    assert!(handler.sign_data(keys[0].id().data(), b"before retirement").is_ok());
+    std::env::set_var("RTOS_RETIREMENT_FAIL_NAMESPACE", &namespace);
+    let result = handler.add_validator_adnl_key(keys[3].id().data(), keys[4].id().data()).await;
+    assert!(result.is_err(), "real file write must fail at {namespace}");
+    eprintln!("ACTUAL_VAULT_WRITE_FAILED {namespace}: {}", result.unwrap_err());
+    assert!(
+        handler.find(keys[0].id().data()).is_err(),
+        "pending retirement must deny new runtime lookup"
+    );
+    assert!(handler.sign_data(keys[0].id().data(), b"pending").is_err());
+    assert!(handler.get_key_raw(*keys[0].id().data()).await.is_none());
+    assert!(handler.find(keys[1].id().data()).is_ok());
+    assert!(handler.get_key_raw(*keys[1].id().data()).await.is_some());
+    assert!(handler.sign_data(keys[1].id().data(), b"retained").is_ok());
+    std::env::remove_var("RTOS_RETIREMENT_FAIL_NAMESPACE");
+    std::fs::remove_dir(std::env::var_os("RTOS_RETIREMENT_BLOCK_PATH").unwrap()).unwrap();
+    for _ in 0..2 {
+        handler.add_validator_adnl_key(keys[3].id().data(), keys[4].id().data()).await.unwrap();
+        assert!(handler.find(keys[0].id().data()).is_err());
+        assert!(handler.sign_data(keys[0].id().data(), b"retired").is_err());
+        assert!(handler.get_key_raw(*keys[0].id().data()).await.is_none());
+        let saved: TonNodeConfig =
+            serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved.validator_keys.as_ref().unwrap().len(), 3);
+        assert!(saved.validator_keys.as_ref().unwrap().iter().all(|k| k.election_id != 1001));
+        assert!(!saved
+            .validator_key_ring
+            .as_ref()
+            .unwrap()
+            .contains_key(&base64_encode(keys[0].id().data())));
+        let reopened = secrets_vault::vault_builder::SecretVaultBuilder::from_url(
+            &std::env::var("VAULT_URL").unwrap(),
+            BlockCryptoFactory {}.new_crypto().unwrap(),
+        )
+        .await
+        .unwrap();
+        for namespace in
+            [SecretsVaultConfig::SID_PRIVATE_KEYS, SecretsVaultConfig::SID_VALIDATOR_KEYS]
+        {
+            assert!(!reopened
+                .exists(&make_secret_id!(namespace, base64_encode(keys[0].id().data())))
+                .await
+                .unwrap());
+            assert!(reopened
+                .exists(&make_secret_id!(namespace, base64_encode(keys[1].id().data())))
+                .await
+                .unwrap());
+        }
+    }
+    handler.stop_and_wait().await.unwrap();
+    // No unrelated store/flush may mask NOT_FOUND compensation on retry.
+    let id = base64_encode(keys[0].id().data());
+    let record = make_secret_id!(&namespace, &id);
+    if namespace == SecretsVaultConfig::SID_PRIVATE_KEYS {
+        let (json, _) = get_key_option_factory().from_private_key_with_json(&[191; 32]).unwrap();
+        SecretsVaultConfig::save_private_key(&id, &json, &keys[0]).await.unwrap();
+    } else {
+        SecretsVaultConfig::save_validator_key(&ValidatorKeysJson {
+            expire_at: i32::MAX,
+            election_id: 1001,
+            validator_key_id: id.clone(),
+            validator_adnl_key_id: None,
+        })
+        .await
+        .unwrap();
+    }
+    std::env::set_var("RTOS_RETIREMENT_FAIL_NAMESPACE", &namespace);
+    let delete = || async {
+        if namespace == SecretsVaultConfig::SID_PRIVATE_KEYS {
+            SecretsVaultConfig::on_drop(&id).await
+        } else {
+            SecretsVaultConfig::drop_validator_metadata(&id).await
+        }
+    };
+    assert!(delete().await.is_err());
+    assert!(
+        !vault.exists(&record).await.unwrap(),
+        "file backend already removed the memory record"
+    );
+    let reopen = || async {
+        secrets_vault::vault_builder::SecretVaultBuilder::from_url(
+            &std::env::var("VAULT_URL").unwrap(),
+            BlockCryptoFactory {}.new_crypto().unwrap(),
+        )
+        .await
+        .unwrap()
+    };
+    assert!(reopen().await.exists(&record).await.unwrap(), "failed write still exists on disk");
+    std::env::remove_var("RTOS_RETIREMENT_FAIL_NAMESPACE");
+    std::fs::remove_dir(std::env::var_os("RTOS_RETIREMENT_BLOCK_PATH").unwrap()).unwrap();
+    delete().await.unwrap();
+    assert!(
+        !reopen().await.exists(&record).await.unwrap(),
+        "NOT_FOUND retry must persist deletion"
+    );
+    // Retirement prevents new acquisition, not use of an Arc returned earlier.
+    assert!(keys[0].sign(b"previously acquired capability").is_ok());
+    drop(vault);
+}
