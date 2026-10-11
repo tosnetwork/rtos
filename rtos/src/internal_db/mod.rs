@@ -672,7 +672,7 @@ impl InternalDb {
         }
         // Applied masterchain blocks have exactly one predecessor and next1.
         // Shard receipts are preapplied and cannot invent inclusion/next links.
-        if handle.is_applied() && handle.id().is_masterchain() {
+        if handle.is_applied() && handle.id().shard().is_masterchain() {
             let parent = self
                 .load_block_handle(&previous[0])?
                 .ok_or_else(|| error!("Applied publication predecessor handle missing"))?;
