@@ -549,13 +549,53 @@ async fn publication_recovery_replays_prepared_and_ready_acceptance() {
                     &pair.shard_state_root
                 );
             }
+            // Exercise the actual Engine admission and owned worker. Publication
+            // stays disabled so every selected target must survive shutdown.
+            let mut record = entry.record;
+            record.created_at_unix_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            record.expires_at_unix_secs =
+                record.created_at_unix_secs + Limits::default().max_retention_secs;
+            record.effects = vec![PublicationEffect {
+                kind: if final_role {
+                    PublicationKind::Finality
+                } else {
+                    PublicationKind::Candidate
+                },
+                target: PublicationTarget::Public,
+            }];
+            let accepted = pair.provider.clone().submit_publication(record.clone()).await.unwrap();
+            assert_eq!(accepted.block(), &pair.shard);
+            assert_eq!(accepted.is_final(), final_role);
+            assert_eq!(accepted.phase(), AcceptancePhase::Preapplied);
+            record
         })
         .catch_unwind()
         .await;
         pair.receiver.clone().wait_stop().await.unwrap();
         pair.provider.clone().wait_stop().await.unwrap();
-        if let Err(panic) = result {
-            std::panic::resume_unwind(panic);
-        }
+        let record = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        let dir = pair._dir.path().join("provider");
+        let Pair { _dir: keep_dir, receiver, provider, .. } = pair;
+        drop(receiver);
+        drop(provider);
+        let reopened = open_engine(&dir).await;
+        let outbox = crate::propagation_outbox::PropagationOutbox::open(
+            reopened.db().clone(),
+            record.domain.clone(),
+            Limits::default(),
+        )
+        .unwrap();
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].stage, PublicationStage::Ready);
+        assert_eq!(pending[0].record, record);
+        assert_eq!(pending[0].pending, record.effects);
+        drop(outbox);
+        reopened.clone().wait_stop().await.unwrap();
+        drop(reopened);
+        drop(keep_dir);
     }
 }
