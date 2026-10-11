@@ -79,6 +79,46 @@ impl RuntimeManifest {
         }
         Ok(Self { _locked: file })
     }
+    /// Locks an existing namespace for retirement preparation without ever
+    /// provisioning: a missing or symlinked manifest or database is refused.
+    /// Returns the digest of the exact manifest bytes that were verified.
+    pub(crate) fn open_existing(
+        runtime: &AuthenticatedSessionRuntime,
+        directory: &Path,
+    ) -> crate::finality_delivery::source_retirement::Refusal<(Self, rtos_block::UInt256)> {
+        use crate::finality_delivery::source_retirement::{failed, RetirementRefusal};
+        let expected = Self::bytes(runtime).map_err(failed)?;
+        let path = directory.join("session-runtime.json");
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_file() => {}
+            Ok(_) => return Err(RetirementRefusal::UnknownArtifact(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(RetirementRefusal::Missing(path))
+            }
+            Err(e) => return Err(failed(e)),
+        }
+        let mut file = File::open(&path).map_err(failed)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(RetirementRefusal::Busy),
+            Err(e) => return Err(failed(e)),
+        }
+        let current = directory.join(runtime.session_id().to_hex_string()).join("CURRENT");
+        match std::fs::symlink_metadata(&current) {
+            Ok(m) if m.file_type().is_file() => {}
+            Ok(_) => return Err(RetirementRefusal::UnknownArtifact(current)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(RetirementRefusal::Missing(current))
+            }
+            Err(e) => return Err(failed(e)),
+        }
+        let mut bytes = Vec::new();
+        (&mut file).take((1 << 20) + 1).read_to_end(&mut bytes).map_err(failed)?;
+        if bytes != expected {
+            return Err(RetirementRefusal::Manifest("runtime binding mismatch".into()));
+        }
+        Ok((Self { _locked: file }, rtos_block::UInt256::calc_file_hash(&bytes)))
+    }
     #[cfg(any(test, feature = "integration-test-support"))]
     pub(crate) fn provision_test_validator(
         runtime: &AuthenticatedSessionRuntime,

@@ -319,6 +319,8 @@ pub struct RocksDbAsyncKeyValueStorage {
     /// Callback thread handle (for join on drop, None if no callback thread)
     /// No Mutex needed - only accessed in Drop which has &mut self
     callback_thread_handle: Option<JoinHandle<()>>,
+    /// Final teardown outcome, recorded once by `Drop`.
+    teardown: Arc<std::sync::OnceLock<std::result::Result<(), String>>>,
     /// Metrics receiver
     _metrics_receiver: MetricsHandle,
     /// Activity node for DB thread
@@ -490,6 +492,7 @@ impl RocksDbAsyncKeyValueStorage {
             mark_for_destroy,
             db_thread_handle: Some(db_thread),
             callback_thread_handle: callback_thread_handle,
+            teardown: Arc::new(std::sync::OnceLock::new()),
             _metrics_receiver: metrics_receiver,
             _db_activity_node: db_activity_node,
             _callback_activity_node: callback_activity_node,
@@ -1279,6 +1282,10 @@ impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
     fn get_storage_id(&self) -> &str {
         &self.storage_id
     }
+
+    fn teardown_receipt(&self) -> Option<crate::StorageTeardownReceipt> {
+        Some(crate::StorageTeardownReceipt::new(self.teardown.clone(), &self.storage_id))
+    }
 }
 
 impl Drop for RocksDbAsyncKeyValueStorage {
@@ -1320,6 +1327,7 @@ impl Drop for RocksDbAsyncKeyValueStorage {
                 self.storage_id
             );
         }
+        let mut failures = Vec::new();
         if let Err(e) = self.sync_internal(Some(STOP_WAIT_TIMEOUT)) {
             log::error!(
                 target: LOG_TARGET,
@@ -1327,6 +1335,7 @@ impl Drop for RocksDbAsyncKeyValueStorage {
                 self.storage_id,
                 e
             );
+            failures.push(format!("final drain failed: {e}"));
         }
 
         // Stop threads
@@ -1337,12 +1346,17 @@ impl Drop for RocksDbAsyncKeyValueStorage {
             // bounded-shutdown guarantee would be violated by a blocking join
             // on a wedged thread handle.
             if let Some(handle) = self.db_thread_handle.take() {
-                let _ = handle.join();
+                if handle.join().is_err() {
+                    failures.push("DB thread panicked".to_string());
+                }
             }
             if let Some(handle) = self.callback_thread_handle.take() {
-                let _ = handle.join();
+                if handle.join().is_err() {
+                    failures.push("callback thread panicked".to_string());
+                }
             }
         } else {
+            failures.push("worker threads detached after stop timeout".to_string());
             log::error!(
                 target: LOG_TARGET,
                 "AsyncKeyValueStorage {}: skip join after stop timeout (bounded shutdown mode)",
@@ -1351,6 +1365,8 @@ impl Drop for RocksDbAsyncKeyValueStorage {
             let _ = self.db_thread_handle.take();
             let _ = self.callback_thread_handle.take();
         }
+
+        let _ = self.teardown.set(if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) });
 
         log::info!(
             target: LOG_TARGET,

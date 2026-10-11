@@ -21,6 +21,8 @@ use std::{
 
 #[path = "finality_delivered.rs"]
 mod delivered;
+#[path = "source_retirement.rs"]
+pub mod source_retirement;
 pub use delivered::{
     close_source_id, scan_finality_closures, scan_finality_closures_namespace,
     scan_finality_closures_namespace_batch, scan_finality_closures_namespace_report,
@@ -548,15 +550,43 @@ impl PendingFinalityStore {
         Self::lock(directory)?.ok_or_else(|| error!("Source finality store already owned"))
     }
     pub(crate) fn lock(directory: PathBuf) -> Result<Option<Arc<Self>>> {
-        let intents = Arc::new(crate::finality_recovery::FinalityIntentStore::new(
-            directory.parent().ok_or_else(|| error!("Missing source namespace"))?,
-        ));
+        directory.parent().ok_or_else(|| error!("Missing source namespace"))?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(directory.join(".lock"))?;
+        Self::with_lock_file(directory, lock)
+    }
+    /// Locks an existing store without provisioning anything: a missing or
+    /// symlinked directory or lock file is refused, never created.
+    pub(crate) fn lock_existing(
+        directory: PathBuf,
+    ) -> source_retirement::Refusal<Arc<Self>> {
+        source_retirement::existing_directory(&directory)?;
+        let path = directory.join(".lock");
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_file() => {}
+            Ok(_) => return Err(source_retirement::RetirementRefusal::UnknownArtifact(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(source_retirement::RetirementRefusal::Missing(path))
+            }
+            Err(e) => return Err(source_retirement::failed(e)),
+        }
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(source_retirement::failed)?;
+        Self::with_lock_file(directory, lock)
+            .map_err(source_retirement::failed)?
+            .ok_or(source_retirement::RetirementRefusal::Busy)
+    }
+    fn with_lock_file(directory: PathBuf, lock: File) -> Result<Option<Arc<Self>>> {
+        let intents = Arc::new(crate::finality_recovery::FinalityIntentStore::new(
+            directory.parent().ok_or_else(|| error!("Missing source namespace"))?,
+        ));
         match lock.try_lock() {
             Ok(()) => Ok(Some(Arc::new(Self {
                 directory,

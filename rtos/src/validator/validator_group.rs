@@ -1014,6 +1014,30 @@ impl ValidatorGroupImpl {
     }
 }
 
+/// Fixed by the first stop request; a later request with another policy fails.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopPolicy {
+    Preserve,
+    Destroy,
+    /// Preserve the database, keep the namespace lease after teardown and
+    /// prepare the drained namespace for retirement.
+    PrepareRetirement,
+}
+
+/// Retirement preparation relies on the scan's own hard item and byte caps.
+struct RetirementBudget;
+impl simplex::finality_recovery::SourceHistoryDebtBudget for RetirementBudget {
+    fn step(&self) -> Result<()> {
+        Ok(())
+    }
+    fn workspace(&self, _: usize) -> Result<()> {
+        Ok(())
+    }
+    fn read_bytes(&self, _: usize) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct NormalNamespaceAdmission {
     reservation: Option<super::finality_recovery_owner::RecoveryReservation>,
@@ -1054,8 +1078,12 @@ pub struct ValidatorGroup {
     #[cfg(test)]
     session_exit_observed: CancellationToken,
     stop_completion: Mutex<
-        Option<(bool, tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>)>,
+        Option<(
+            StopPolicy,
+            tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>,
+        )>,
     >,
+    retirement_outcome: Mutex<Option<super::retirement_preparation::RetirementOutcome>>,
     /// Validator-side cache/resolver for speculative shard states.
     ///
     /// Simplex delivers candidate observations through `SessionListener`.
@@ -1279,6 +1307,7 @@ impl ValidatorGroup {
             #[cfg(test)]
             session_exit_observed: CancellationToken::new(),
             stop_completion: Mutex::new(None),
+            retirement_outcome: Mutex::new(None),
             state_resolver_cache: Arc::new(tokio::sync::Mutex::new(StateResolverCache::new())),
             action_queue,
             callback: Arc::new(listener),
@@ -1583,33 +1612,67 @@ impl ValidatorGroup {
     }
 
     /// Completion is shared by all callers and survives cancellation of one waiter.
-    /// The first request fixes preserve/destroy policy; later callers cannot turn
+    /// The first request fixes the teardown policy; later callers cannot turn
     /// a preserving shutdown into deletion of a recovery journal.
     pub async fn stop(
         self: Arc<Self>,
         rt: tokio::runtime::Handle,
         destroy_database: bool,
     ) -> Result<()> {
+        let policy = if destroy_database { StopPolicy::Destroy } else { StopPolicy::Preserve };
+        self.stop_with_policy(rt, policy).await
+    }
+
+    /// Preserving stop that keeps the namespace lease and prepares the drained
+    /// namespace for retirement. The outcome, including any refusal, is taken
+    /// with `take_retirement_outcome`; this result reports teardown only. It
+    /// conflicts with an ordinary stop already requested, in either order.
+    pub async fn stop_for_retirement_preparation(
+        self: Arc<Self>,
+        rt: tokio::runtime::Handle,
+    ) -> Result<()> {
+        self.stop_with_policy(rt, StopPolicy::PrepareRetirement).await
+    }
+
+    /// The prepared or refused retirement outcome, once teardown completed.
+    pub fn take_retirement_outcome(
+        &self,
+    ) -> Result<Option<super::retirement_preparation::RetirementOutcome>> {
+        Ok(self
+            .retirement_outcome
+            .lock()
+            .map_err(|_| error!("retirement outcome poisoned"))?
+            .take())
+    }
+
+    async fn stop_with_policy(
+        self: Arc<Self>,
+        rt: tokio::runtime::Handle,
+        policy: StopPolicy,
+    ) -> Result<()> {
         let mut completion = {
             let mut slot = self.stop_completion.lock().expect("stop completion poisoned");
-            if slot.as_ref().is_some_and(|(destroy, _)| *destroy != destroy_database) {
-                fail!("conflicting validator teardown preserve/destroy policy");
+            if slot.as_ref().is_some_and(|(existing, _)| *existing != policy) {
+                fail!("conflicting validator teardown preserve/destroy/retirement policy");
             }
             slot.get_or_insert_with(|| {
                 let (tx, rx) = tokio::sync::watch::channel(None);
                 let group = self.clone();
                 rt.clone().spawn(async move {
                     let result =
-                        match std::panic::AssertUnwindSafe(group.stop_inner(rt, destroy_database))
+                        match std::panic::AssertUnwindSafe(group.clone().stop_inner(rt, policy))
                             .catch_unwind()
                             .await
                         {
                             Ok(result) => result.map_err(|e| e.to_string()),
                             Err(_) => Err("validator group teardown panicked".to_owned()),
                         };
+                    if policy == StopPolicy::PrepareRetirement {
+                        group.finish_retirement_outcome(&result);
+                    }
                     tx.send_replace(Some(result));
                 });
-                (destroy_database, rx)
+                (policy, rx)
             })
             .1
             .clone()
@@ -1622,15 +1685,108 @@ impl ValidatorGroup {
         }
     }
 
+    /// Records a refusal when teardown ended before it produced an outcome
+    /// (an early error or a panic). A lease still in admission stays there.
+    fn finish_retirement_outcome(&self, result: &std::result::Result<(), String>) {
+        let mut slot = match self.retirement_outcome.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if slot.is_none() {
+            let reason = match result {
+                Ok(()) => "teardown produced no retirement outcome".to_owned(),
+                Err(error) => format!("teardown failed: {error}"),
+            };
+            *slot = Some(super::retirement_preparation::RetirementOutcome::refused(
+                simplex::finality_delivery::source_retirement::RetirementRefusal::Failed(reason),
+                None,
+            ));
+        }
+    }
+
+    /// Scans and reconciles the drained namespace in a blocking job. The job
+    /// runs inside the shared teardown task, so cancelling a waiter never
+    /// abandons it; the lease moves into the returned outcome either way.
+    async fn prepare_retirement(
+        &self,
+        rt: &tokio::runtime::Handle,
+        teardown: Option<consensus_common::StorageTeardownReceipt>,
+        reservation: Option<super::finality_recovery_owner::RecoveryReservation>,
+    ) -> super::retirement_preparation::RetirementOutcome {
+        use super::retirement_preparation::RetirementOutcome;
+        use simplex::finality_delivery::source_retirement::{
+            scan_source_retirement, RetirementRefusal,
+        };
+        const BUSY_RETRIES: u32 = 100;
+        let Some(reservation) = reservation else {
+            return RetirementOutcome::refused(
+                RetirementRefusal::Unsupported("group held no namespace reservation"),
+                None,
+            );
+        };
+        let Some(runtime) = self.authenticated_runtime.clone() else {
+            return RetirementOutcome::refused(
+                RetirementRefusal::Unsupported("session without authenticated runtime"),
+                Some(reservation),
+            );
+        };
+        let Some(teardown) = teardown else {
+            return RetirementOutcome::refused(
+                RetirementRefusal::DatabaseTeardown("session opened no certifiable storage".into()),
+                Some(reservation),
+            );
+        };
+        let Some(sink) = self.durable_finality_sink.get().cloned() else {
+            return RetirementOutcome::refused(
+                RetirementRefusal::Unsupported("session without durable finality sink"),
+                Some(reservation),
+            );
+        };
+        let namespace = match self
+            .engine
+            .db_root_dir()
+            .and_then(|root| runtime.runtime_directory(&format!("{root}/catchains")))
+        {
+            Ok(namespace) => std::path::PathBuf::from(namespace),
+            Err(error) => {
+                return RetirementOutcome::refused(
+                    RetirementRefusal::Failed(format!("namespace path: {error:#}")),
+                    Some(reservation),
+                )
+            }
+        };
+        let mut attempt = 0u32;
+        loop {
+            let (runtime, namespace, teardown, sink) =
+                (runtime.clone(), namespace.clone(), teardown.clone(), sink.clone());
+            let job = rt.spawn_blocking(move || {
+                let scan = scan_source_retirement(runtime, &namespace, &teardown, &RetirementBudget)?;
+                scan.reconcile(sink.as_ref()).map_err(|failure| failure.refusal)
+            });
+            match job.await {
+                Ok(Ok(preparation)) => return RetirementOutcome::prepared(preparation, reservation),
+                // Closure scanners hold the store lock only briefly.
+                Ok(Err(RetirementRefusal::Busy)) if attempt < BUSY_RETRIES => {
+                    attempt = attempt.saturating_add(1);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok(Err(refusal)) => return RetirementOutcome::refused(refusal, Some(reservation)),
+                Err(error) => {
+                    return RetirementOutcome::refused(
+                        RetirementRefusal::Failed(format!("preparation job failed: {error}")),
+                        Some(reservation),
+                    )
+                }
+            }
+        }
+    }
+
     pub(super) fn teardown_drained(&self) -> bool {
         self.teardown_drained.load(Ordering::Acquire)
     }
 
-    async fn stop_inner(
-        self: Arc<Self>,
-        rt: tokio::runtime::Handle,
-        destroy_database: bool,
-    ) -> Result<()> {
+    async fn stop_inner(self: Arc<Self>, rt: tokio::runtime::Handle, policy: StopPolicy) -> Result<()> {
+        let destroy_database = policy == StopPolicy::Destroy;
         self.set_status(ValidatorGroupStatus::Stopping).await?;
         *self.task_admission_closed.lock().expect("task admission poisoned") = true;
         self.stop_requested.cancel();
@@ -1665,6 +1821,9 @@ impl ValidatorGroup {
         // consensus workers exited. Only its returned result certifies the join.
         let (drained, result) =
             session_result.map_err(|e| error!("consensus session teardown failed: {e}"))?;
+        // Read after the checked join: startup can no longer open storage.
+        let storage_teardown =
+            namespace_session.as_ref().and_then(|session| session.storage_teardown_receipt());
         if drained {
             if let Some(session) = namespace_session {
                 // Node WAL tasks may need the blocking pool themselves. Wait
@@ -1690,9 +1849,32 @@ impl ValidatorGroup {
         let database_result = if drained && destroy_database {
             self.destroy_db().await
         } else { Ok(()) };
+        let mut retained_reservation = None;
         if drained && database_result.is_ok() {
             let mut admission = self.namespace_admission.lock().unwrap();
-            if let Some(token) = admission.reservation.take() { token.release(); }
+            if let Some(token) = admission.reservation.take() {
+                if policy == StopPolicy::PrepareRetirement {
+                    retained_reservation = Some(token);
+                } else {
+                    token.release();
+                }
+            }
+        }
+        if policy == StopPolicy::PrepareRetirement {
+            // From here the lease is owned by the outcome slot, so every exit
+            // below, including a teardown error, keeps the namespace closed.
+            let outcome = if !drained || database_result.is_err() || result.is_err() {
+                super::retirement_preparation::RetirementOutcome::refused(
+                    simplex::finality_delivery::source_retirement::RetirementRefusal::Failed(
+                        "session teardown did not complete".into(),
+                    ),
+                    retained_reservation,
+                )
+            } else {
+                self.prepare_retirement(&rt, storage_teardown, retained_reservation).await
+            };
+            *self.retirement_outcome.lock().map_err(|_| error!("retirement outcome poisoned"))? =
+                Some(outcome);
         }
         self.teardown_drained.store(drained && database_result.is_ok(), Ordering::Release);
         database_result?;

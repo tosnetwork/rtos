@@ -1858,6 +1858,11 @@ impl SimplexDb {
         self.storage.is_closed()
     }
 
+    /// Observer of the underlying storage instance's final teardown.
+    pub fn teardown_receipt(&self) -> Option<consensus_common::StorageTeardownReceipt> {
+        self.storage.teardown_receipt()
+    }
+
     /// Returns the on-disk path of the underlying storage.
     ///
     /// Used by tests + shutdown logging to correlate a SimplexDb with its

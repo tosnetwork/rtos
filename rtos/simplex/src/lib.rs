@@ -768,6 +768,12 @@ pub trait SimplexSession: ConsensusSession {
     fn finality_recovery_pending(&self) -> Option<usize> {
         None
     }
+    /// Observer of the teardown of the storage instance this session opened.
+    /// None means no storage was opened or teardown cannot be certified, which
+    /// retirement preparation treats as a refusal.
+    fn storage_teardown_receipt(&self) -> Option<consensus_common::StorageTeardownReceipt> {
+        None
+    }
 
     /// Notify session about the current applied top for its shard
     ///

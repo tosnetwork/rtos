@@ -100,6 +100,21 @@ impl RecoveryRegistry {
         self.changed.send_modify(|generation| *generation = generation.wrapping_add(1));
         Ok(Some(RecoveryReservation { registry: self.clone(), key, lease }))
     }
+    #[cfg(test)]
+    pub(crate) fn reserve_validator_for_test(
+        self: &Arc<Self>,
+        session: UInt256,
+    ) -> Result<Option<RecoveryReservation>> {
+        self.reserve_kind((session, RecoveryRole::Validator), AdmissionKind::Normal)
+    }
+    #[cfg(test)]
+    pub(crate) fn validator_reserved_for_test(&self, session: &UInt256) -> bool {
+        self.reservations
+            .lock()
+            .unwrap()
+            .occupied
+            .contains_key(&(session.clone(), RecoveryRole::Validator))
+    }
     pub(crate) fn stop(&self) {
         self.reservations.lock().unwrap().stopping = true;
         self.changed.send_modify(|generation| *generation = generation.wrapping_add(1));

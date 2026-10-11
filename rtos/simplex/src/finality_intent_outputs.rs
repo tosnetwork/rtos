@@ -38,7 +38,10 @@ impl OutputSet {
         if data.len() as u64 > MAX_OUTPUT_BYTES {
             fail!("Source output map grew");
         }
-        let result: Self = serde_json::from_slice(&data)?;
+        Self::parse(&data)
+    }
+    fn parse(data: &[u8]) -> Result<Self> {
+        let result: Self = serde_json::from_slice(data)?;
         if result.schema != 1
             || !result.metadata.certificate.is_empty()
             || result.outputs.is_empty()
@@ -322,6 +325,162 @@ impl FinalityIntentStore {
         }
         Ok(())
     }
+}
+
+/// Most released output sets retirement preparation will inventory.
+pub(crate) const MAX_RETIREMENT_SETS: usize = MAX_COMPLETED;
+/// Most output-set bytes retirement preparation will read.
+pub(crate) const MAX_RETIREMENT_SET_BYTES: u64 = MAX_OUTPUT_TOTAL;
+
+/// Compares the runtime-derivable fields of sealed metadata with the
+/// authenticated runtime. Session parents and start are not in the runtime;
+/// the caller checks that every set agrees on them.
+fn metadata_matches_runtime(m: &DiskIntent, runtime: &AuthenticatedSessionRuntime) -> bool {
+    let Some(binding) = runtime.recovery_binding() else {
+        return false;
+    };
+    let c = &binding.coordinates;
+    let index = match runtime.local_role() {
+        LocalRole::Validator(i) => Some(i),
+        LocalRole::Observer => None,
+    };
+    m.schema == 1
+        && m.certificate.is_empty()
+        && m.global_id == runtime.pin().global_id
+        && m.zerostate == runtime.pin().zerostate.to_string()
+        && m.governing_masterchain == binding.governing_masterchain.to_string()
+        && m.workchain == c.shard.workchain_id()
+        && m.shard_prefix == c.shard.shard_prefix_with_tag()
+        && m.catchain_seqno == c.catchain_seqno
+        && m.vertical_seqno == c.vertical_seqno
+        && m.last_key_block_seqno == c.last_key_block_seqno
+        && m.new_catchain_ids == c.new_catchain_ids
+        && m.protocol == runtime.protocol().version()
+        && m.carrier_version == runtime.carrier_version()
+        && m.wire_profile == runtime.wire_profile() as u8
+        && m.profile == runtime.profile().to_hex_string()
+        && m.session_id == runtime.session_id().to_hex_string()
+        && m.local_adnl == UInt256::from(*runtime.local_adnl().data()).to_hex_string()
+        && m.local_validator_index == index
+}
+
+/// Read-only inventory of the intent directory for retirement preparation;
+/// the caller holds the namespace locks. Every certificate must already be
+/// collected into a released output set: a pending, resolved or completed
+/// certificate, a temporary or any unknown entry refuses.
+pub(crate) fn retirement_sealed_sets(
+    namespace: &std::path::Path,
+    runtime: &AuthenticatedSessionRuntime,
+    charge: &mut crate::finality_delivery::source_retirement::Charge,
+) -> crate::finality_delivery::source_retirement::Refusal<
+    Vec<crate::finality_delivery::source_retirement::RetirementSealedSet>,
+> {
+    use crate::finality_delivery::source_retirement::{
+        existing_directory, failed, read_bounded, RetirementRefusal, RetirementSealedSet,
+    };
+    let directory = namespace.join(DIRECTORY);
+    existing_directory(&directory)?;
+    let mut outputs_directory = None;
+    for entry in std::fs::read_dir(&directory).map_err(failed)? {
+        charge.step()?;
+        let entry = entry.map_err(failed)?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(failed)?;
+        if entry.file_name() == OUTPUT_DIRECTORY && file_type.is_dir() {
+            outputs_directory = Some(path);
+            continue;
+        }
+        if entry.file_name() == COMPLETED_DIRECTORY && file_type.is_dir() {
+            // Any entry here is a certificate not yet collected: the first refuses.
+            if let Some(entry) = std::fs::read_dir(&path).map_err(failed)?.next() {
+                charge.step()?;
+                let entry = entry.map_err(failed)?;
+                let path = entry.path();
+                let file_type = entry.file_type().map_err(failed)?;
+                return Err(match path.extension().and_then(|s| s.to_str()) {
+                    Some("complete") if file_type.is_file() => {
+                        RetirementRefusal::UnreleasedOutputSet(path)
+                    }
+                    Some("tmp") => RetirementRefusal::UncertainTemporary(path),
+                    _ => RetirementRefusal::UnknownArtifact(path),
+                });
+            }
+            continue;
+        }
+        return Err(match path.extension().and_then(|s| s.to_str()) {
+            Some("json" | "resolved") if file_type.is_file() => {
+                RetirementRefusal::UnsealedIntent(path)
+            }
+            Some("tmp") => RetirementRefusal::UncertainTemporary(path),
+            _ => RetirementRefusal::UnknownArtifact(path),
+        });
+    }
+    let Some(outputs_directory) = outputs_directory else {
+        return Ok(Vec::new());
+    };
+    existing_directory(&outputs_directory)?;
+    let mut sets = Vec::new();
+    let mut session_start: Option<(Vec<String>, String)> = None;
+    for entry in std::fs::read_dir(&outputs_directory).map_err(failed)? {
+        charge.step()?;
+        let entry = entry.map_err(failed)?;
+        let path = entry.path();
+        if !entry.file_type().map_err(failed)?.is_file() {
+            return Err(RetirementRefusal::UnknownArtifact(path));
+        }
+        match path.extension().and_then(|s| s.to_str()) {
+            Some("outputs") => {}
+            Some("tmp") => return Err(RetirementRefusal::UncertainTemporary(path)),
+            _ => return Err(RetirementRefusal::UnknownArtifact(path)),
+        }
+        if sets.len() >= MAX_RETIREMENT_SETS {
+            return Err(RetirementRefusal::BudgetExhausted("output set cap".into()));
+        }
+        let bytes = read_bounded(&path, MAX_OUTPUT_BYTES, charge)?;
+        let set = OutputSet::parse(&bytes)
+            .map_err(|e| RetirementRefusal::LegacyFormat(path.clone(), format!("{e:#}")))?;
+        if !set.released {
+            return Err(RetirementRefusal::UnreleasedOutputSet(path));
+        }
+        let hash: UInt256 = set.metadata.candidate_hash.parse().map_err(|e| {
+            RetirementRefusal::DigestMismatch(path.clone(), format!("candidate hash: {e:#}"))
+        })?;
+        if path.file_stem().and_then(|s| s.to_str())
+            != Some(&format!("{}-{}", set.metadata.slot, hash.to_hex_string()))
+        {
+            return Err(RetirementRefusal::DigestMismatch(
+                path,
+                "file name differs from sealed slot/candidate".into(),
+            ));
+        }
+        if !metadata_matches_runtime(&set.metadata, runtime) {
+            return Err(RetirementRefusal::DomainMismatch(
+                path,
+                "sealed metadata differs from authenticated runtime".into(),
+            ));
+        }
+        let start = (set.metadata.prev_blocks.clone(), set.metadata.start_masterchain.clone());
+        match &session_start {
+            Some(existing) if existing != &start => {
+                return Err(RetirementRefusal::DomainMismatch(
+                    path,
+                    "sealed sets disagree on session start".into(),
+                ))
+            }
+            Some(_) => {}
+            None => session_start = Some(start),
+        }
+        sets.push(RetirementSealedSet {
+            file_hash: UInt256::calc_file_hash(&bytes),
+            outputs: set
+                .outputs
+                .iter()
+                .map(|o| (o.block_id.clone(), o.is_final, o.source_validator.clone()))
+                .collect(),
+            path,
+        });
+    }
+    Ok(sets)
 }
 
 #[cfg(test)]

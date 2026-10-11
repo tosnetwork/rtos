@@ -86,7 +86,10 @@ impl DeliveredDisk {
         if bytes.len() as u64 > MAX_REFERENCE_BYTES {
             fail!("Delivered record grew");
         }
-        let value: Self = serde_json::from_slice(&bytes)?;
+        Self::parse(path, &bytes)
+    }
+    fn parse(path: &Path, bytes: &[u8]) -> Result<Self> {
+        let value: Self = serde_json::from_slice(bytes)?;
         value.offer()?;
         if path.file_stem().and_then(|s| s.to_str())
             != Some(&value.reference.metadata_record()?.id()?.to_hex_string())
@@ -798,6 +801,106 @@ pub fn close_source_id(request: &CloseFinalityRequest) -> Result<UInt256> {
         created_at_unix_secs: request.created_at_unix_secs,
     }
     .id()
+}
+
+impl PendingFinalityStore {
+    /// Read-only inventory of the pending directory for retirement
+    /// preparation; the caller holds this store's lock. Anything other than
+    /// node-confirmed Delivered records refuses. Each record is re-synced so a
+    /// confirmation whose rename sync was uncertain before reopen is durable.
+    pub(super) fn retirement_delivered(
+        &self,
+        runtime: &AuthenticatedSessionRuntime,
+        charge: &mut super::source_retirement::Charge,
+    ) -> super::source_retirement::Refusal<Vec<super::source_retirement::RetirementDelivered>>
+    {
+        use super::source_retirement::{
+            existing_directory, failed, read_bounded, RetirementDelivered, RetirementRefusal,
+        };
+        let _guard = self.mutation.lock().map_err(|_| failed("source mutation lock poisoned"))?;
+        let mut references = None;
+        for entry in std::fs::read_dir(&self.directory).map_err(failed)? {
+            charge.step()?;
+            let entry = entry.map_err(failed)?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let file_type = entry.file_type().map_err(failed)?;
+            if name == ".lock" && file_type.is_file() {
+                continue;
+            }
+            if name == REFERENCE_DIRECTORY && file_type.is_dir() {
+                references = Some(path);
+                continue;
+            }
+            match path.extension().and_then(|s| s.to_str()) {
+                Some("tmp") => return Err(RetirementRefusal::UncertainTemporary(path)),
+                Some("json" | "acked") if file_type.is_file() => {
+                    return Err(RetirementRefusal::PendingRecord(path))
+                }
+                _ => return Err(RetirementRefusal::UnknownArtifact(path)),
+            }
+        }
+        let Some(references) = references else {
+            return Ok(Vec::new());
+        };
+        existing_directory(&references)?;
+        let mut delivered = Vec::new();
+        for entry in std::fs::read_dir(&references).map_err(failed)? {
+            charge.step()?;
+            let entry = entry.map_err(failed)?;
+            let path = entry.path();
+            if !entry.file_type().map_err(failed)?.is_file() {
+                return Err(RetirementRefusal::UnknownArtifact(path));
+            }
+            match path.extension().and_then(|s| s.to_str()) {
+                Some("delivered") => {}
+                Some("tmp") => return Err(RetirementRefusal::UncertainTemporary(path)),
+                Some("reference") => return Err(RetirementRefusal::PendingRecord(path)),
+                _ => return Err(RetirementRefusal::UnknownArtifact(path)),
+            }
+            if delivered.len() >= MAX_REFERENCES {
+                return Err(RetirementRefusal::BudgetExhausted("Delivered record cap".into()));
+            }
+            let bytes = read_bounded(&path, MAX_REFERENCE_BYTES, charge)?;
+            let disk = DeliveredDisk::parse(&path, &bytes)
+                .map_err(|e| RetirementRefusal::LegacyFormat(path.clone(), format!("{e:#}")))?;
+            check_binding(runtime, &disk.reference)
+                .map_err(|e| RetirementRefusal::DomainMismatch(path.clone(), format!("{e:#}")))?;
+            if !disk.node_confirmed {
+                return Err(RetirementRefusal::NotNodeConfirmed(path));
+            }
+            let record = disk.reference.metadata_record().map_err(failed)?;
+            let offer = disk.offer().map_err(failed)?;
+            File::open(&path).and_then(|f| f.sync_all()).map_err(failed)?;
+            delivered.push(RetirementDelivered {
+                file_hash: UInt256::calc_file_hash(&bytes),
+                block_id: record.block_id.to_string(),
+                is_final: record.is_final,
+                source_validator: record.source_validator.to_hex_string(),
+                source_id: record.id().map_err(failed)?,
+                offer,
+                path,
+            });
+        }
+        File::open(&references).and_then(|f| f.sync_all()).map_err(failed)?;
+        Ok(delivered)
+    }
+}
+
+#[cfg(test)]
+impl PendingFinalityStore {
+    /// Drives one acknowledged record through real Delivered and node confirmation.
+    pub(super) fn confirm_delivered_for_test(
+        self: &Arc<Self>,
+        runtime: &AuthenticatedSessionRuntime,
+        id: &UInt256,
+        offer: &CloseOffer,
+    ) -> Result<()> {
+        let reference =
+            self.close_locator(id)?.ok_or_else(|| error!("no source locator"))?.reference;
+        drop(self.commit_delivered(runtime, &reference, offer)?);
+        self.mark_node_confirmed(id, offer)
+    }
 }
 
 #[cfg(test)]

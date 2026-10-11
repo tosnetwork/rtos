@@ -117,6 +117,11 @@ async fn test_group_stop_waits_for_session_exit() {
 }
 
 impl super::consensus::SimplexSession for MockSimplexSession {
+    // The mock owns no source store, so its namespace drains with its threads.
+    fn namespace_drained(&self) -> bool {
+        self.drained.load(Ordering::Acquire)
+    }
+
     fn notify_mc_finalized(&self, _applied_top: BlockIdExt) {}
 
     fn ensure_candidate_available(
@@ -1391,4 +1396,115 @@ async fn test_group_stop_blocking_join_panic_does_not_certify_worker_exit() {
     let error = group.clone().stop(tokio::runtime::Handle::current(), false).await.unwrap_err();
     assert!(error.to_string().contains("session teardown failed"));
     assert!(!group.teardown_drained(), "a failed join must not certify consensus exit");
+}
+
+fn refused_outcome(
+    group: &ValidatorGroup,
+) -> super::retirement_preparation::RetirementRefusalOwner {
+    match group.take_retirement_outcome().unwrap() {
+        Some(super::retirement_preparation::RetirementOutcome::Refused(refused)) => refused,
+        Some(super::retirement_preparation::RetirementOutcome::Prepared(_)) => {
+            panic!("an unauthenticated mock namespace must not be prepared")
+        }
+        None => panic!("retirement stop produced no outcome"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_group_retirement_policy_conflicts_with_ordinary_stop_in_both_orders() {
+    for retirement_first in [false, true] {
+        let (group, entered, release) = gated_lifecycle_group().await;
+        let rt = tokio::runtime::Handle::current();
+        let start = |group: Arc<ValidatorGroup>, retirement: bool| {
+            let rt = rt.clone();
+            tokio::spawn(async move {
+                if retirement {
+                    group.stop_for_retirement_preparation(rt).await
+                } else {
+                    group.stop(rt, false).await
+                }
+            })
+        };
+        let first = start(group.clone(), retirement_first);
+        tokio::time::timeout(Duration::from_secs(5), entered).await.unwrap().unwrap();
+        let conflict = start(group.clone(), !retirement_first).await.unwrap().unwrap_err();
+        assert!(conflict.to_string().contains("retirement policy"), "{conflict}");
+        let repeated = start(group.clone(), retirement_first);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), first).await.unwrap().unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), repeated).await.unwrap().unwrap().unwrap();
+        if retirement_first {
+            let refused = refused_outcome(&group);
+            assert!(!refused.holds_reservation(), "the mock group never held a lease");
+            refused.abandon();
+        }
+        assert!(group.take_retirement_outcome().unwrap().is_none(), "outcome is taken once");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_group_retirement_keeps_lease_until_abandon_and_ordinary_stop_releases() {
+    let registry = Arc::new(super::finality_recovery_owner::RecoveryRegistry::default());
+    for retirement in [true, false] {
+        let group = make_simplex_group_for_resolver_tests();
+        let session = Arc::new(MockSimplexSession::default());
+        let holder = Arc::new(super::consensus::SessionHolder::simplex(session));
+        group.group_impl.execute_sync(|inner| inner.session = Some(holder)).await;
+        let key = group.session_id.clone();
+        let lease = registry.reserve_validator_for_test(key.clone()).unwrap().unwrap();
+        group.namespace_admission.lock().unwrap().reservation = Some(lease);
+        let rt = tokio::runtime::Handle::current();
+        if retirement {
+            group.clone().stop_for_retirement_preparation(rt).await.unwrap();
+            let refused = refused_outcome(&group);
+            assert!(
+                matches!(refused.refusal(), simplex::finality_delivery::source_retirement::RetirementRefusal::Unsupported(_)),
+                "{}",
+                refused.refusal()
+            );
+            assert!(refused.holds_reservation(), "the lease moved into the outcome");
+            assert!(registry.validator_reserved_for_test(&key), "the namespace stays closed");
+            assert!(registry.reserve_validator_for_test(key.clone()).unwrap().is_none());
+            drop(group);
+            assert!(registry.validator_reserved_for_test(&key), "dropping the group keeps it");
+            refused.abandon();
+        } else {
+            group.clone().stop(rt, false).await.unwrap();
+            assert!(group.take_retirement_outcome().unwrap().is_none());
+        }
+        assert!(!registry.validator_reserved_for_test(&key), "lease released");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_group_retirement_outcome_survives_cancelled_waiter() {
+    let (group, entered, release) = gated_lifecycle_group().await;
+    let rt = tokio::runtime::Handle::current();
+    let first = tokio::spawn(group.clone().stop_for_retirement_preparation(rt.clone()));
+    tokio::time::timeout(Duration::from_secs(5), entered).await.unwrap().unwrap();
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), group.clone().stop_for_retirement_preparation(rt))
+        .await
+        .unwrap()
+        .unwrap();
+    refused_outcome(&group).abandon();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_group_retirement_teardown_panic_records_refusal() {
+    let group = make_simplex_group_for_resolver_tests();
+    let session = Arc::new(MockSimplexSession::default());
+    session.panic_on_stop.store(true, Ordering::Relaxed);
+    let holder = Arc::new(super::consensus::SessionHolder::simplex(session));
+    group.group_impl.execute_sync(|inner| inner.session = Some(holder)).await;
+    let error = group
+        .clone()
+        .stop_for_retirement_preparation(tokio::runtime::Handle::current())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("session teardown failed"));
+    let refused = refused_outcome(&group);
+    assert!(refused.refusal().to_string().contains("teardown failed"), "{}", refused.refusal());
 }

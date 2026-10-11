@@ -590,6 +590,50 @@ pub trait AsyncKeyValueStorage: Send + Sync {
 
     /// Returns the storage identifier.
     fn get_storage_id(&self) -> &str;
+
+    /// Returns an observer of this exact instance's final teardown. `None`
+    /// means the implementation cannot certify teardown, which callers must
+    /// treat as a refusal.
+    fn teardown_receipt(&self) -> Option<StorageTeardownReceipt> {
+        None
+    }
+}
+
+/// Outcome of one storage instance's final teardown, recorded by its `Drop`.
+///
+/// It certifies teardown only after every strong reference is gone, the final
+/// drain succeeded, and both worker threads stopped and were joined without
+/// panicking. While the instance is alive no outcome exists, so a receipt
+/// cannot be satisfied by a copy of the storage that someone still holds.
+#[derive(Clone)]
+pub struct StorageTeardownReceipt {
+    outcome: Arc<std::sync::OnceLock<std::result::Result<(), String>>>,
+    storage_id: String,
+}
+
+impl StorageTeardownReceipt {
+    pub(crate) fn new(
+        outcome: Arc<std::sync::OnceLock<std::result::Result<(), String>>>,
+        storage_id: &str,
+    ) -> Self {
+        Self { outcome, storage_id: storage_id.to_string() }
+    }
+
+    /// Fails while the instance is alive, or when its teardown was not clean.
+    pub fn check(&self) -> Result<()> {
+        match self.outcome.get() {
+            None => rtos_block::fail!("Storage {} has not been torn down", self.storage_id),
+            Some(Err(error)) => {
+                rtos_block::fail!("Storage {} teardown was not clean: {}", self.storage_id, error)
+            }
+            Some(Ok(())) => Ok(()),
+        }
+    }
+
+    /// True when both receipts observe the same storage instance.
+    pub fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.outcome, &other.outcome)
+    }
 }
 
 // ============================================================================

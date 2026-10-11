@@ -311,6 +311,8 @@ pub(crate) struct SessionImpl {
     _callbacks: Arc<SessionCallbacks>,
     recovery_complete: Arc<AtomicBool>,
     recovery_pending: Arc<std::sync::atomic::AtomicUsize>,
+    /// Teardown observer of the storage instance opened by `main_loop`.
+    storage_teardown: Arc<Mutex<Option<consensus_common::StorageTeardownReceipt>>>,
     /// Session identifier
     session_id: SessionId,
     /// Activity node for session lifetime tracking
@@ -396,6 +398,9 @@ impl SimplexSession for SessionImpl {
 
     fn finality_recovery_complete(&self) -> bool {
         self.recovery_complete.load(Ordering::Acquire)
+    }
+    fn storage_teardown_receipt(&self) -> Option<consensus_common::StorageTeardownReceipt> {
+        self.storage_teardown.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
     fn finality_recovery_pending(&self) -> Option<usize> {
         let count = self.recovery_pending.load(Ordering::Acquire);
@@ -532,6 +537,7 @@ impl SessionImpl {
         recovery_only: bool,
         recovery_complete: Arc<AtomicBool>,
         recovery_pending: Arc<std::sync::atomic::AtomicUsize>,
+        storage_teardown: Arc<Mutex<Option<consensus_common::StorageTeardownReceipt>>>,
         #[cfg(test)] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
     ) {
         log::info!(
@@ -634,6 +640,7 @@ impl SessionImpl {
                 return;
             }
         };
+        *storage_teardown.lock().unwrap_or_else(|e| e.into_inner()) = db.teardown_receipt();
 
         #[cfg(test)]
         let test_coordinator = match test_signer {
@@ -1617,6 +1624,7 @@ impl SessionImpl {
         // Create thread synchronization flags
         let recovery_complete = Arc::new(AtomicBool::new(false));
         let recovery_pending = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let storage_teardown = Arc::new(Mutex::new(None));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let destroy_db_flag = Arc::new(AtomicBool::new(false));
         let start_flag = Arc::new(AtomicBool::new(false));
@@ -1679,6 +1687,7 @@ impl SessionImpl {
             _callbacks: callbacks.clone(),
             recovery_complete: recovery_complete.clone(),
             recovery_pending: recovery_pending.clone(),
+            storage_teardown: storage_teardown.clone(),
             session_id: session_id.clone(),
             _activity_node: session_activity_node.clone(),
             _receiver_listener: receiver_listener,
@@ -1743,6 +1752,7 @@ impl SessionImpl {
                         recovery_only,
                         recovery_complete,
                         recovery_pending,
+                        storage_teardown,
                         #[cfg(test)]
                         test_signer,
                     );

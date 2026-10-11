@@ -1272,3 +1272,71 @@ fn test_close_no_callback_thread_variant() {
 
     storage.mark_for_destroy();
 }
+
+#[test]
+fn test_teardown_receipt_requires_last_reference_and_clean_join() {
+    let path = create_test_db_path("teardown_receipt_clean");
+    let storage = ConsensusCommonFactory::create_async_key_value_storage(
+        &path,
+        "teardown_clean",
+        create_test_options(),
+    )
+    .unwrap();
+    let receipt = storage.teardown_receipt().expect("RocksDB storage certifies teardown");
+    assert!(receipt.same_instance(&storage.teardown_receipt().unwrap()));
+    assert!(receipt.check().is_err(), "a live instance has no teardown outcome");
+    let held = storage.clone();
+    storage.close(Some(Duration::from_secs(5))).unwrap();
+    assert!(receipt.check().is_err(), "a successful close is not a teardown");
+    storage.mark_for_destroy();
+    drop(storage);
+    assert!(
+        receipt.check().unwrap_err().to_string().contains("has not been torn down"),
+        "another strong reference keeps the instance alive"
+    );
+    drop(held);
+    receipt.check().unwrap();
+
+    let other_path = create_test_db_path("teardown_receipt_other");
+    let other = ConsensusCommonFactory::create_async_key_value_storage(
+        &other_path,
+        "teardown_other",
+        create_test_options(),
+    )
+    .unwrap();
+    assert!(!receipt.same_instance(&other.teardown_receipt().unwrap()));
+    other.mark_for_destroy();
+}
+
+#[test]
+fn test_teardown_receipt_rejects_detached_worker_thread() {
+    let path = create_test_db_path("teardown_receipt_wedged");
+    let storage = ConsensusCommonFactory::create_async_key_value_storage(
+        &path,
+        "teardown_wedged",
+        create_test_options(),
+    )
+    .unwrap();
+    let receipt = storage.teardown_receipt().unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    storage
+        .set(
+            b"key".to_vec(),
+            b"value".to_vec(),
+            Some(Box::new(move |result| {
+                result.unwrap();
+                entered_tx.send(()).unwrap();
+                // Hold the callback thread past the bounded stop wait.
+                let _ = release_rx.recv_timeout(Duration::from_secs(120));
+            })),
+        )
+        .wait()
+        .unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    storage.mark_for_destroy();
+    drop(storage);
+    let error = receipt.check().unwrap_err().to_string();
+    assert!(error.contains("detached after stop timeout"), "{error}");
+    release_tx.send(()).unwrap();
+}
