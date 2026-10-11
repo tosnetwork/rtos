@@ -83,7 +83,41 @@ async fn stop_fixture_engines(engines: Vec<Arc<Engine>>) {
     for result in results { result.unwrap(); }
 }
 
+// These isolated fixtures have no external DHT to refresh authenticated public
+// advertisements. Use the actual signing and verification path, including the
+// normal 600-second freshness policy, for every directed Engine pair.
+async fn refresh_fixture_public_advertisements(
+    engines: &[&Arc<Engine>],
+    shards: &[&rtos_block::ShardIdent],
+) {
+    for &local in engines {
+        for &remote in engines {
+            if Arc::ptr_eq(local, remote) {
+                continue;
+            }
+            for &shard in shards {
+                let client = local.overlay_client(shard).await.unwrap();
+                let id = adnl::OverlayShortId::from_data(*client.overlay_client().id().data());
+                let advertised = remote.network().context().stack.overlay
+                    .get_signed_node(&id, false).unwrap();
+                local.network().context().stack.overlay.add_public_peer(
+                    remote.network().context().stack.adnl.ip_address_adnl(),
+                    &advertised,
+                    &id,
+                ).unwrap().unwrap();
+            }
+        }
+    }
+}
+
 impl Pair {
+    async fn refresh_public_advertisements(&self) {
+        let mut engines = vec![&self.provider, &self.receiver];
+        engines.extend(self.observer.iter());
+        refresh_fixture_public_advertisements(
+            &engines, &[self.shard.id().shard(), self.anchor.shard()],
+        ).await;
+    }
     async fn stop_all(&self) {
         let mut engines = vec![self.provider.clone(), self.receiver.clone()];
         engines.extend(self.observer.iter().cloned());
@@ -327,24 +361,9 @@ impl Pair {
                 for shard_id in [shard.id().shard(), anchor.shard()] {
                     let client = local.overlay_client(shard_id).await.unwrap();
                     client.overlay_client().neighbours().add(peer.clone()).unwrap();
-                    let id = adnl::OverlayShortId::from_data(*client.overlay_client().id().data());
-                    let advertised = remote
-                        .network()
-                        .context()
-                        .stack
-                        .overlay
-                        .get_signed_node(&id, false)
-                        .unwrap();
-                    local
-                        .network()
-                        .context()
-                        .stack
-                        .overlay
-                        .add_public_peer(remote_adnl.ip_address_adnl(), &advertised, &id)
-                        .unwrap()
-                        .unwrap();
                 }
             }
+            refresh_fixture_public_advertisements(&engines, &[shard.id().shard(), anchor.shard()]).await;
         })
         .catch_unwind()
         .await;
