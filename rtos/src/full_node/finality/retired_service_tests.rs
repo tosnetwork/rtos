@@ -198,11 +198,10 @@ async fn retired_service_historical_sink_accepts_without_key_and_reauthenticates
 
 use consensus_common::{
     AsyncCollationRequestPtr, BlockHash, BlockPayloadPtr, CandidateObservedFlags,
-    CollationParentHint, ConsensusOverlay, ConsensusOverlayListener,
-    ConsensusOverlayLogReplayListener, ConsensusOverlayManager, ConsensusOverlayManagerPtr,
-    ConsensusOverlayPtr, OverlayTransportType, PrivateKey, PublicKey, PublicKeyHash,
-    QueryResponseCallback, SessionListener, SessionStats, ValidatorBlockCandidateCallback,
-    ValidatorBlockCandidateDecisionCallback,
+    CollationParentHint, ConsensusOverlayListener, ConsensusOverlayLogReplayListener,
+    ConsensusOverlayManagerPtr, ConsensusOverlayPtr, OverlayTransportType, PrivateKey, PublicKey,
+    PublicKeyHash, QueryResponseCallback, SessionListener, SessionStats,
+    ValidatorBlockCandidateCallback, ValidatorBlockCandidateDecisionCallback,
 };
 use rtos_api::IntoBoxed;
 
@@ -367,8 +366,8 @@ struct RawSocket {
 impl RawSocket {
     fn start(f: &SpoolFixture) -> Self {
         let listener = Arc::new(SocketListener::default());
-        let events: Arc<dyn ConsensusOverlayListener> = listener.clone();
-        let replay: Arc<dyn ConsensusOverlayLogReplayListener> = listener.clone();
+        let events: Arc<dyn ConsensusOverlayListener + Send + Sync> = listener.clone();
+        let replay: Arc<dyn ConsensusOverlayLogReplayListener + Send + Sync> = listener.clone();
         let manager = socket_manager(f);
         let id = f.runtime.overlay_short_id().unwrap();
         let overlay = manager
