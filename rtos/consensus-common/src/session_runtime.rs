@@ -119,6 +119,26 @@ impl AuthenticatedSessionRuntime {
             pq_context,
         })
     }
+    /// Whether a live group may retain its immutable admission snapshot.
+    /// The session hash alone does not encode a change to transport members.
+    pub fn same_admission(&self, other: &Self) -> bool {
+        self.pin == other.pin
+            && self.profile == other.profile
+            && self.session == other.session
+            && self.shard == other.shard
+            && self.catchain_seqno == other.catchain_seqno
+            && self.protocol == other.protocol
+            && self.carrier_version == other.carrier_version
+            && self.slots_per_leader_window == other.slots_per_leader_window
+            && self.max_candidate_size == other.max_candidate_size
+            && self.wire_profile == other.wire_profile
+            && self.committee == other.committee
+            && self.members == other.members
+            && self.current_total_set == other.current_total_set
+            && self.local_role == other.local_role
+            && self.local_adnl == other.local_adnl
+    }
+
     pub fn runtime_directory(&self, root: &str) -> Result<String> {
         if self.protocol != SimplexProtocol::PrivateObserversPlumtree {
             return crate::simplex_protocol::SimplexNamespace {

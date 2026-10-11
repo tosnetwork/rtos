@@ -949,3 +949,7 @@ pub(crate) mod pq_fixture;
 
 mod runtime_manifest;
 mod signing_coordinator;
+
+#[cfg(test)]
+#[path = "tests/authenticated_fixture.rs"]
+pub(crate) mod authenticated_fixture;

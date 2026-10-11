@@ -575,6 +575,10 @@ impl SessionImpl {
             is_stopped_flag.store(true, Ordering::Release);
         };
 
+        // Authenticated validator journals survive group retirement. Deletion must
+        // never erase the only durable record of already signed decisions.
+        let may_destroy_database = !authenticated_runtime.as_ref().is_some_and(|runtime|
+            matches!(runtime.local_role(), consensus_common::session_runtime::LocalRole::Validator(_)));
         let _runtime_manifest = match authenticated_runtime.as_ref().filter(|runtime| {
             runtime.protocol()
                 == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
@@ -609,7 +613,7 @@ impl SessionImpl {
                 let _ =
                     init_result_sender.send(Err(error!("Session stopped before bootstrap load")));
             }
-            if destroy_db_flag.load(Ordering::Acquire) {
+            if may_destroy_database && destroy_db_flag.load(Ordering::Acquire) {
                 db.mark_for_destroy();
             }
             is_stopped_flag.store(true, Ordering::Release);
@@ -762,7 +766,7 @@ impl SessionImpl {
                         "SimplexSession {} stopped while waiting for start()",
                         session_id.to_hex_string()
                     );
-                    if destroy_db_flag.load(Ordering::Acquire) {
+                    if may_destroy_database && destroy_db_flag.load(Ordering::Acquire) {
                         db.mark_for_destroy();
                     }
                     is_stopped_flag.store(true, Ordering::Release);
@@ -907,7 +911,7 @@ impl SessionImpl {
 
                 // Check if the main loop should be stopped
                 if should_stop_flag.load(Ordering::Relaxed) {
-                    processor.stop(destroy_db_flag.load(Ordering::Relaxed));
+                    processor.stop(may_destroy_database && destroy_db_flag.load(Ordering::Relaxed));
                     break;
                 }
 

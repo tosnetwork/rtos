@@ -458,6 +458,7 @@ pub(crate) struct ReceiverImpl {
     /// Local source index
     local_idx: Option<u32>,
     membership: consensus_common::simplex_protocol::SimplexMembership,
+    protocol: consensus_common::simplex_protocol::SimplexProtocol,
     /// Receiver listener (weak reference to SessionProcessor)
     listener: ReceiverListenerPtr,
     /// Per-source statistics
@@ -1401,8 +1402,7 @@ impl ReceiverImpl {
     fn send_serialized_certificate_to_all(&mut self, bytes: Vec<u8>) {
         let payload = ConsensusCommonFactory::create_block_payload(bytes.into());
         // v0/v1 retain their historical broadcast-to-committee replay behavior.
-        let random = self.membership.members().any(|member|
-            self.membership.validator_index(member).is_err());
+        let random = self.protocol == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree;
         self.send_certificate_payload_to_members(&payload, random);
     }
 
@@ -4928,6 +4928,7 @@ impl ReceiverWrapper {
                     local_adnl_id: local_adnl_id.clone(),
                     local_idx,
                     membership,
+                    protocol,
                     listener: listener_clone,
                     sources,
                     adnl_to_idx,

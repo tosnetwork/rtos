@@ -172,3 +172,79 @@ impl Drop for TestDirectory {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+/// Real worker -> Receiver -> common manager -> ADNL private overlay creation and drain.
+/// This does not stand in for root's NodeNetwork wrapper test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authenticated_observer_real_adnl_session_reopens_after_checked_drain() {
+    use adnl::{
+        node::{AdnlNode, AdnlNodeConfig},
+        DhtNode, NetworkStack, OverlayNode, RldpNode,
+    };
+    let (runtime, key, options) = crate::authenticated_fixture::runtime(false);
+    let (_, config) =
+        AdnlNodeConfig::from_ip_address_and_private_keys("127.0.0.1:0", vec![([0x71; 32], 0)])
+            .unwrap();
+    let adnl = AdnlNode::with_config(config).await.unwrap();
+    let dht = DhtNode::with_adnl_node(adnl.clone(), 0).unwrap();
+    let overlay =
+        OverlayNode::with_params_and_profile(adnl.clone(), &[22; 32], 0, rtos_api::WireProfile::T0)
+            .unwrap();
+    let rldp = RldpNode::with_params(adnl.clone(), vec![overlay.clone()], None).unwrap();
+    overlay.set_rldp(rldp.clone()).unwrap();
+    let stack = Arc::new(NetworkStack { adnl: adnl.clone(), dht, overlay, rldp, quic: None });
+    adnl.start_over_udp(vec![stack.overlay.clone(), stack.dht.clone(), stack.rldp.clone()])
+        .await
+        .unwrap();
+    let directory = TestDirectory::new();
+    let path = directory.path().join("observer");
+    let manager = ConsensusCommonFactory::create_adnl_overlay_manager(
+        tokio::runtime::Handle::current(),
+        stack,
+        None,
+        false,
+    )
+    .unwrap();
+    let listener: Arc<dyn SessionListener + Send + Sync> = Arc::new(Listener::default());
+    let result = (|| -> Result<()> {
+        for _ in 0..2 {
+            let session = crate::SessionFactory::create_authenticated_session(
+                &options,
+                runtime.clone(),
+                &key,
+                path.to_str().unwrap().to_owned(),
+                manager.clone(),
+                Arc::downgrade(&listener),
+                None,
+            )?;
+            let stopped = session.stop_checked();
+            let drained = session.threads_drained();
+            stopped?;
+            anyhow::ensure!(drained, "Actual session worker/overlay did not join");
+            anyhow::ensure!(
+                path.join(runtime.session_id().to_hex_string()).exists(),
+                "DB was lost on stop"
+            );
+        }
+        // A mismatched durable domain is rejected before the overlay can be recreated.
+        std::fs::write(path.join("session-runtime.json"), b"{}")?;
+        let rejected = crate::SessionFactory::create_authenticated_session(
+            &options,
+            runtime.clone(),
+            &key,
+            path.to_str().unwrap().to_owned(),
+            manager.clone(),
+            Arc::downgrade(&listener),
+            None,
+        );
+        if let Ok(session) = rejected {
+            session.stop_checked()?;
+            anyhow::bail!("Mismatched durable runtime was accepted");
+        }
+        Ok(())
+    })();
+    drop(manager);
+    let drained = adnl.stop_checked().await;
+    drained.unwrap();
+    result.unwrap();
+}

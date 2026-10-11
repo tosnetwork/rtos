@@ -66,6 +66,11 @@ impl RuntimeManifest {
                 File::open(parent)?.sync_all()?;
             }
         } else {
+            // A surviving manifest must not silently recreate a deleted/partial DB.
+            // Even an interrupted first creation fails closed and requires explicit repair.
+            if !directory.join(runtime.session_id().to_hex_string()).join("CURRENT").is_file() {
+                fail!("Durable runtime database is missing; implicit empty recovery is forbidden");
+            }
             let mut bytes = Vec::new();
             (&mut file).take((1 << 20) + 1).read_to_end(&mut bytes)?;
             if bytes != expected {
@@ -83,6 +88,9 @@ impl RuntimeManifest {
             fail!("Test provisioning requires validator role");
         }
         std::fs::create_dir_all(directory)?;
+        let database = crate::database::SimplexDb::open(directory, &runtime.session_id().to_hex_string())?;
+        database.close(None)?;
+        drop(database);
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -92,4 +100,71 @@ impl RuntimeManifest {
         File::open(directory)?.sync_all()?;
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authenticated_fixture::runtime;
+
+    #[test]
+    fn authenticated_manifest_reopen_lock_and_domain_rejection() {
+        let temp = crate::authenticated_fixture::TestDirectory::new();
+        let directory = temp.path().join("observer");
+        let (observer, _, _) = runtime(false);
+        let first = RuntimeManifest::open(&observer, &directory).unwrap();
+        assert!(RuntimeManifest::open(&observer, &directory).is_err());
+        let database = crate::database::SimplexDb::open(&directory, &observer.session_id().to_hex_string()).unwrap();
+        database.close(None).unwrap();
+        drop(database);
+        drop(first);
+        let reopened = RuntimeManifest::open(&observer, &directory).unwrap();
+        drop(reopened);
+        let (validator, _, _) = runtime(true);
+        let before = std::fs::read(directory.join("session-runtime.json")).unwrap();
+        assert!(RuntimeManifest::open(&validator, &directory).is_err());
+        assert_eq!(std::fs::read(directory.join("session-runtime.json")).unwrap(), before);
+        let mut corrupt: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        for field in
+            ["schema", "global_id", "simplex_protocol", "carrier_version", "slots_per_window"]
+        {
+            let original = corrupt[field].clone();
+            corrupt[field] = serde_json::json!(991);
+            let bytes = serde_json::to_vec(&corrupt).unwrap();
+            std::fs::write(directory.join("session-runtime.json"), &bytes).unwrap();
+            assert!(RuntimeManifest::open(&observer, &directory).is_err(), "{field}");
+            assert_eq!(std::fs::read(directory.join("session-runtime.json")).unwrap(), bytes);
+            corrupt[field] = original;
+        }
+        std::fs::remove_file(directory.join("session-runtime.json")).unwrap();
+        assert!(RuntimeManifest::open(&observer, &directory).is_err());
+    }
+
+    #[test]
+    fn authenticated_manifest_validator_never_implicitly_provisions() {
+        let temp = crate::authenticated_fixture::TestDirectory::new();
+        let directory = temp.path().join("validator");
+        let (validator, _, _) = runtime(true);
+        assert!(RuntimeManifest::open(&validator, &directory).is_err());
+        assert!(!directory.exists());
+        RuntimeManifest::provision_test_validator(&validator, &directory).unwrap();
+        drop(RuntimeManifest::open(&validator, &directory).unwrap());
+        let (observer, _, _) = runtime(false);
+        assert!(RuntimeManifest::open(&observer, &directory).is_err());
+        assert_ne!(
+            validator.runtime_directory("root").unwrap(),
+            observer.runtime_directory("root").unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn authenticated_manifest_missing_database_never_becomes_empty_recovery() {
+    let temp = crate::authenticated_fixture::TestDirectory::new();
+    let directory = temp.path().join("observer");
+    let (runtime, _, _) = crate::authenticated_fixture::runtime(false);
+    drop(RuntimeManifest::open(&runtime, &directory).unwrap());
+    assert!(RuntimeManifest::open(&runtime, &directory).is_err());
+    assert!(!directory.join(runtime.session_id().to_hex_string()).exists());
 }
