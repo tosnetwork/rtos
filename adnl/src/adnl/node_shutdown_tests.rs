@@ -98,17 +98,22 @@ async fn adnl_owned_udp_stop_waiter_cancel_and_concurrent_drain() {
     assert!(weak.upgrade().is_none());
 }
 
-struct PanicPoll;
+struct PanicPoll {
+    release: Notify,
+}
 #[async_trait::async_trait]
 impl Subscriber for PanicPoll {
     async fn poll(&self, _: &Arc<Instant>) {
+        self.release.notified().await;
         panic!("injected ADNL subscriber panic");
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_async_panic_closes_transport_and_is_sticky() {
     let (node, port) = node(43).await;
-    node.start_over_udp(vec![Arc::new(PanicPoll)]).await.unwrap();
+    let poll = Arc::new(PanicPoll { release: Notify::new() });
+    node.start_over_udp(vec![poll.clone()]).await.unwrap();
+    poll.release.notify_one();
     bounded(node.tasks.cancelled()).await;
     let error = bounded(node.stop_checked()).await.unwrap_err().to_string();
     assert!(error.contains("subscriber poll"));
@@ -165,6 +170,7 @@ async fn adnl_owned_tcp_accept_and_udp_are_joined() {
 }
 
 struct PendingSubscriber {
+    claimed: AtomicBool,
     entered: Notify,
     return_pending: Notify,
     pending_started: Arc<Notify>,
@@ -174,6 +180,9 @@ struct PendingSubscriber {
 #[async_trait::async_trait]
 impl Subscriber for PendingSubscriber {
     async fn try_consume_raw_query(&self, _: &[u8], _: &AdnlPeers) -> Result<Option<QueryAnswer>> {
+        if self.claimed.swap(true, Ordering::AcqRel) {
+            return Ok(Some(QueryAnswer::Ready(None)));
+        }
         self.entered.notify_one();
         self.return_pending.notified().await;
         let release = self.release.clone();
@@ -196,6 +205,7 @@ async fn adnl_owned_real_udp_pending_child_after_close_drains() {
     let (server, port) = node(46).await;
     let (client, _) = node(47).await;
     let pending = Arc::new(PendingSubscriber {
+        claimed: AtomicBool::new(false),
         entered: Notify::new(),
         return_pending: Notify::new(),
         pending_started: Arc::new(Notify::new()),
@@ -263,6 +273,12 @@ async fn adnl_owned_thread_join_survives_all_waiters_cancelled() {
     assert!(owner.enter().is_err());
     assert!(!cleaned.load(Ordering::Acquire));
     release.send(()).unwrap();
+    bounded(async {
+        while !cleaned.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
     bounded(owner.wait()).await.unwrap();
     assert!(cleaned.load(Ordering::Acquire));
     let weak = Arc::downgrade(&owner);
