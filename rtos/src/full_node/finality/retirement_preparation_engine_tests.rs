@@ -16,28 +16,34 @@ use consensus_common::finality_delivery::{
 
 type LookupResult = rtos_block::Result<FinalityTerminalLookup>;
 
-/// The first held lookup: the node's answer once it arrives, and the caller's
-/// completion that the test releases.
-#[derive(Default)]
+/// Holding state, changed only under one lock so draining can never miss a
+/// lookup admitted or answered concurrently.
 struct Held {
+    /// The next lookup is held; cleared once one is held or on drain.
+    armed: bool,
+    /// Draining: every answer goes straight to its real completion.
+    forward: bool,
     answer: Option<LookupResult>,
     completion: Option<FinalityTerminalCompletion>,
 }
 
 /// Forwards every call to the real engine sink. The first `lookup_terminal`
 /// is answered by the real node, but its delivery to the caller is held until
-/// the test releases it.
+/// the test releases or drains it. No completion is ever fabricated.
 struct HoldingSink {
     inner: DurableFinalitySinkPtr,
     held: Arc<std::sync::Mutex<Held>>,
-    armed: std::sync::atomic::AtomicBool,
 }
 impl HoldingSink {
     fn new(inner: DurableFinalitySinkPtr) -> Arc<Self> {
         Arc::new(Self {
             inner,
-            held: Arc::new(std::sync::Mutex::new(Held::default())),
-            armed: std::sync::atomic::AtomicBool::new(true),
+            held: Arc::new(std::sync::Mutex::new(Held {
+                armed: true,
+                forward: false,
+                answer: None,
+                completion: None,
+            })),
         })
     }
     /// True once a caller's lookup is admitted and the node has answered it.
@@ -45,6 +51,7 @@ impl HoldingSink {
         let held = self.held.lock().unwrap();
         held.completion.is_some() && held.answer.is_some()
     }
+    /// Delivers the held answer to the caller.
     fn release(&self) {
         let (answer, completion) = {
             let mut held = self.held.lock().unwrap();
@@ -52,26 +59,21 @@ impl HoldingSink {
         };
         completion.expect("a held lookup")(answer.expect("the node answered the held lookup"));
     }
-    /// Cleanup on every path: deliver whatever is still held, waiting a
-    /// bounded time for the node's answer.
-    async fn release_if_held(&self) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let ready = {
-                let held = self.held.lock().unwrap();
-                held.completion.is_none() || held.answer.is_some()
-            };
-            if ready || tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let (answer, completion) = {
+    /// Cleanup on every path: stop holding, deliver an answer already
+    /// received, and let any answer still in flight reach its completion.
+    fn drain(&self) {
+        let delivery = {
             let mut held = self.held.lock().unwrap();
-            (held.answer.take(), held.completion.take())
+            held.armed = false;
+            held.forward = true;
+            if held.answer.is_some() {
+                held.answer.take().zip(held.completion.take())
+            } else {
+                None
+            }
         };
-        if let Some(completion) = completion {
-            completion(answer.unwrap_or_else(|| Err(rtos_block::error!("test cleanup"))));
+        if let Some((answer, completion)) = delivery {
+            completion(answer);
         }
     }
     async fn wait_holding(&self) {
@@ -111,20 +113,85 @@ impl DurableFinalitySink for HoldingSink {
         request: CloseFinalityRequest,
         completion: FinalityTerminalCompletion,
     ) -> Result<()> {
-        if !self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
-            return self.inner.lookup_terminal(request, completion);
+        {
+            let mut held = self.held.lock().unwrap();
+            if !held.armed {
+                drop(held);
+                return self.inner.lookup_terminal(request, completion);
+            }
+            held.armed = false;
+            held.completion = Some(completion);
         }
-        self.held.lock().unwrap().completion = Some(completion);
         let held = self.held.clone();
         let admitted = self.inner.lookup_terminal(
             request,
-            Box::new(move |answer| held.lock().unwrap().answer = Some(answer)),
+            Box::new(move |answer| {
+                let delivery = {
+                    let mut state = held.lock().unwrap();
+                    if state.forward {
+                        state.completion.take().map(|completion| (completion, answer))
+                    } else {
+                        state.answer = Some(answer);
+                        None
+                    }
+                };
+                if let Some((completion, answer)) = delivery {
+                    completion(answer);
+                }
+            }),
         );
         if admitted.is_err() {
-            // Not admitted: the caller's completion must not run, so drop it.
+            // Not admitted: the caller's completion must never run.
             self.held.lock().unwrap().completion = None;
         }
         admitted
+    }
+}
+
+/// A taken retirement outcome that is abandoned on every exit path, including
+/// an assertion failure, so its lease and locks never outlive the test.
+struct Taken(Option<RetirementOutcome>);
+impl Taken {
+    fn from(group: &ValidatorGroup) -> Self {
+        Self(group.take_retirement_outcome().unwrap())
+    }
+    fn prepared(&self) -> &crate::validator::retirement_preparation::RetirementPreparationOwner {
+        match &self.0 {
+            Some(RetirementOutcome::Prepared(owner)) => owner,
+            Some(RetirementOutcome::Refused(refused)) => {
+                panic!("expected a preparation, refused: {}", refused.refusal())
+            }
+            None => panic!("retirement stop produced no outcome"),
+        }
+    }
+    fn refused(&self) -> &crate::validator::retirement_preparation::RetirementRefusalOwner {
+        match &self.0 {
+            Some(RetirementOutcome::Refused(refused)) => refused,
+            Some(RetirementOutcome::Prepared(_)) => panic!("expected a refusal, got a preparation"),
+            None => panic!("retirement stop produced no outcome"),
+        }
+    }
+    fn is_prepared(&self) -> bool {
+        matches!(self.0, Some(RetirementOutcome::Prepared(_)))
+    }
+    /// Explicit abandon; true when the lease was released.
+    fn abandon(mut self) -> bool {
+        Self::release(self.0.take())
+    }
+    fn release(outcome: Option<RetirementOutcome>) -> bool {
+        match outcome {
+            Some(RetirementOutcome::Prepared(owner)) => {
+                owner.abandon();
+                true
+            }
+            Some(RetirementOutcome::Refused(refused)) => refused.abandon().is_ok(),
+            None => false,
+        }
+    }
+}
+impl Drop for Taken {
+    fn drop(&mut self) {
+        Self::release(self.0.take());
     }
 }
 
@@ -345,20 +412,15 @@ async fn retirement_preparation_real_group_handoff_and_refusals() {
             .await
             .expect("stop finished after the callback drained")
             .unwrap();
-        match group.take_retirement_outcome().unwrap() {
-            Some(RetirementOutcome::Refused(refused)) => {
-                assert!(refused.drained(), "the callback drained before the proof: {}", refused.refusal());
-                assert!(refused.holds_reservation());
-                assert!(lease_held());
-                drop(group);
-                assert!(refused.abandon().is_ok());
-            }
-            Some(RetirementOutcome::Prepared(owner)) => {
-                drop(group);
-                owner.abandon();
-            }
-            None => panic!("retirement stop produced no outcome"),
+        let outcome = Taken::from(&group);
+        if !outcome.is_prepared() {
+            let refused = outcome.refused();
+            assert!(refused.drained(), "the callback drained before the proof: {}", refused.refusal());
+            assert!(refused.holds_reservation());
         }
+        assert!(lease_held());
+        drop(group);
+        assert!(outcome.abandon(), "a drained outcome releases its lease");
         assert!(!lease_held(), "abandon released the lease");
 
         // Finish the event to node Released through the real source.
@@ -391,20 +453,14 @@ async fn retirement_preparation_real_group_handoff_and_refusals() {
         assert!(lease_held());
         sink.release();
         stop(group.clone()).await;
-        let owner = match group.take_retirement_outcome().unwrap() {
-            Some(RetirementOutcome::Prepared(owner)) => owner,
-            Some(RetirementOutcome::Refused(refused)) => {
-                panic!("real released namespace refused: {}", refused.refusal())
-            }
-            None => panic!("retirement stop produced no outcome"),
-        };
-        let preparation = owner.preparation().unwrap();
+        let outcome = Taken::from(&group);
+        let preparation = outcome.prepared().preparation().unwrap();
         assert_eq!(preparation.inventory().len(), 1);
         assert_eq!(preparation.inventory()[0].offer, offer);
         assert!(lease_held(), "a prepared namespace stays closed to new sessions");
         assert!(source_locked().await, "the preparation holds the source store lock");
         drop(group);
-        owner.abandon();
+        assert!(outcome.abandon());
         assert!(!source_locked().await, "abandon released the source store lock");
         assert!(!lease_held());
 
@@ -414,17 +470,14 @@ async fn retirement_preparation_real_group_handoff_and_refusals() {
         group.clone().pre_create_engine().await.unwrap();
         group.inject_retirement_panic_for_test();
         stop(group.clone()).await;
-        let refused = match group.take_retirement_outcome().unwrap() {
-            Some(RetirementOutcome::Refused(refused)) => refused,
-            Some(RetirementOutcome::Prepared(_)) => panic!("an injected panic issued a preparation"),
-            None => panic!("retirement stop produced no outcome"),
-        };
+        let outcome = Taken::from(&group);
+        let refused = outcome.refused();
         assert!(refused.refusal().to_string().contains("panicked"), "{}", refused.refusal());
         assert!(refused.drained(), "the drain was verified before the panic");
         assert!(refused.holds_reservation(), "the stable owner kept the lease through the panic");
         assert!(lease_held());
         drop(group);
-        assert!(refused.abandon().is_ok());
+        assert!(outcome.abandon());
         assert!(!lease_held());
 
         // (c) Corrupt node custody: every lookup reopens custody and rereads
@@ -469,11 +522,8 @@ async fn retirement_preparation_real_group_handoff_and_refusals() {
         // Restore the exact evidence before any assertion.
         std::fs::write(&proof_path, &original).unwrap();
         stopped.expect("retirement stop did not finish").unwrap();
-        let refused = match group.take_retirement_outcome().unwrap() {
-            Some(RetirementOutcome::Refused(refused)) => refused,
-            Some(RetirementOutcome::Prepared(_)) => panic!("corrupt custody issued a preparation"),
-            None => panic!("retirement stop produced no outcome"),
-        };
+        let outcome = Taken::from(&group);
+        let refused = outcome.refused();
         assert!(
             matches!(
                 refused.refusal(),
@@ -487,7 +537,7 @@ async fn retirement_preparation_real_group_handoff_and_refusals() {
         assert!(source_locked().await, "with its source store lock");
         assert!(lease_held());
         drop(group);
-        assert!(refused.abandon().is_ok());
+        assert!(outcome.abandon());
         assert!(!source_locked().await);
         assert!(!lease_held());
     })
@@ -495,21 +545,15 @@ async fn retirement_preparation_real_group_handoff_and_refusals() {
     .await;
     let (sinks, groups) = std::mem::take(&mut *pending.lock().unwrap());
     for sink in sinks {
-        sink.release_if_held().await;
+        sink.drain();
     }
-    // Joining a started stop means awaiting its shared teardown completion.
+    // Joining a started stop means awaiting its shared teardown to its
+    // terminal result; outcomes not taken by the body are abandoned here.
     for group in groups {
         let rt = tokio::runtime::Handle::current();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(60),
-            group.clone().stop_for_retirement_preparation(rt),
-        )
-        .await;
-        match group.take_retirement_outcome() {
-            Ok(Some(RetirementOutcome::Prepared(owner))) => owner.abandon(),
-            Ok(Some(RetirementOutcome::Refused(refused))) => drop(refused.abandon()),
-            _ => {}
-        }
+        let terminal = group.clone().stop_for_retirement_preparation(rt).await;
+        log::info!("retirement cleanup teardown result: {terminal:?}");
+        drop(Taken::from(&group));
     }
     pair.stop_all().await;
     run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
