@@ -1087,7 +1087,7 @@ impl FullNodeOverlaysRouter {
                 let authorized = validators.list().iter().any(|member| {
                     matches!(member.key, rtos_block::ValidatorKey::Pq(_))
                         && member.validator_id().ok().as_ref() == Some(&binding.validator_id)
-                        && member.adnl_addr().as_ref() == Some(&binding.adnl_key_id)
+                        && member.adnl_addr().ok().as_ref() == Some(&binding.adnl_key_id)
                 });
                 if !authorized {
                     continue;
