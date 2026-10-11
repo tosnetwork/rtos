@@ -83,3 +83,151 @@ pub(super) fn verify_candidate_for_relay(
     }
     Ok(block)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use consensus_common::{session_runtime::SessionNetworkPin, ConsensusCommonFactory};
+    use rtos_api::session_identity::SessionCoordinates;
+    use rtos_block::{BlockIdExt, ConfigParams, Deserializable, KeyId, ShardIdent};
+
+    fn fixture() -> (AuthenticatedSessionRuntime, CandidateAuthenticationEvidence) {
+        let json: serde_json::Value = serde_json::from_str(include_str!(
+            "../full_node/finality/testdata/v2-propagation-recovery.json"
+        ))
+        .unwrap();
+        let bytes = |value: &serde_json::Value| hex::decode(value.as_str().unwrap()).unwrap();
+        let row = &json["rows"][0];
+        let config = ConfigParams::construct_from_bytes(&bytes(&json["config_boc"])).unwrap();
+        let candidate = bytes(&row["candidate"]);
+        let parsed: CandidateHashData =
+            rtos_api::WireProfile::T0.deserialize_typed(&candidate).unwrap();
+        let block_id = parsed.block().clone();
+        let (committee, _) = config
+            .validator_set()
+            .unwrap()
+            .calc_subset(
+                &config.catchain_config().unwrap(),
+                block_id.shard().shard_prefix_with_tag(),
+                0,
+                7,
+            )
+            .unwrap();
+        // This is an explicitly trusted isolated test configuration, not a test
+        // of governing-chain authentication or network peer admission.
+        let runtime = AuthenticatedSessionRuntime::from_authenticated_config(
+            SessionNetworkPin {
+                global_id: -239,
+                zerostate: BlockIdExt::with_params(
+                    ShardIdent::masterchain(),
+                    0,
+                    UInt256::from([21; 32]),
+                    UInt256::from([22; 32]),
+                ),
+            },
+            &config,
+            SessionCoordinates {
+                shard: block_id.shard(),
+                catchain_seqno: 7,
+                vertical_seqno: 0,
+                last_key_block_seqno: 0,
+                new_catchain_ids: false,
+            },
+            committee.clone(),
+            committee[0].adnl_addr().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(hex::encode(runtime.session_id().as_slice()), row["session"].as_str().unwrap());
+        let leader = (99 / runtime.slots_per_leader_window()) as usize % committee.len();
+        let identity = committee[leader].validator_id().unwrap();
+        let signer_index = u32::from_le_bytes(identity.as_slice()[..4].try_into().unwrap()) - 1;
+        let signature = row["candidate_signatures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["index"].as_u64() == Some(signer_index as u64))
+            .unwrap();
+        let evidence = CandidateAuthenticationEvidence {
+            session_id: runtime.session_id().clone(),
+            slot: 99,
+            creator_index: leader as u32,
+            creator_adnl: committee[leader].adnl_addr().unwrap(),
+            candidate_hash_data: candidate,
+            signature: bytes(&signature["signature"]),
+            block_id,
+            data: ConsensusCommonFactory::create_block_payload(bytes(&row["block_boc"])),
+            collated_data: ConsensusCommonFactory::create_block_payload(vec![]),
+        };
+        (runtime, evidence)
+    }
+
+    #[test]
+    fn candidate_relay_authentication_accepts_real_pq_author_and_binds_bodies() {
+        let (runtime, evidence) = fixture();
+        let size = evidence.data.data().len();
+        let block = verify_candidate_for_relay(&runtime, &evidence, size, 0).unwrap();
+        assert_eq!(block.id(), &evidence.block_id);
+        let mut changed = evidence.clone();
+        let mut body = changed.data.data().to_vec();
+        body[0] ^= 1;
+        changed.data = ConsensusCommonFactory::create_block_payload(body);
+        assert!(verify_candidate_for_relay(&runtime, &changed, size, 0).is_err());
+        changed = evidence.clone();
+        changed.collated_data = ConsensusCommonFactory::create_block_payload(vec![1]);
+        assert!(verify_candidate_for_relay(&runtime, &changed, size, 1).is_err());
+        assert!(verify_candidate_for_relay(&runtime, &evidence, size - 1, 0).is_err());
+    }
+
+    #[test]
+    fn candidate_relay_authentication_rejects_wrong_author_session_and_signature() {
+        let (runtime, evidence) = fixture();
+        let size = evidence.data.data().len();
+        verify_candidate_for_relay(&runtime, &evidence, size, 0).unwrap();
+        let mut changed = evidence.clone();
+        changed.creator_index = (changed.creator_index + 1) % runtime.committee().len() as u32;
+        assert!(verify_candidate_for_relay(&runtime, &changed, size, 0).is_err());
+        changed = evidence.clone();
+        changed.creator_adnl = KeyId::from_data([0xff; 32]);
+        assert!(verify_candidate_for_relay(&runtime, &changed, size, 0).is_err());
+        changed = evidence.clone();
+        changed.session_id = UInt256::from([0xff; 32]);
+        assert!(verify_candidate_for_relay(&runtime, &changed, size, 0).is_err());
+        changed = evidence.clone();
+        changed.signature[0] ^= 1;
+        assert!(verify_candidate_for_relay(&runtime, &changed, size, 0).is_err());
+        changed = evidence.clone();
+        changed.slot = i32::MAX as u32 + 1;
+        assert!(verify_candidate_for_relay(&runtime, &changed, size, 0).is_err());
+    }
+
+    #[test]
+    fn candidate_relay_authentication_rejects_noncanonical_and_inverted_parent() {
+        let (runtime, evidence) = fixture();
+        let size = evidence.data.data().len();
+        let mut changed = evidence.clone();
+        changed.candidate_hash_data.push(0);
+        assert!(verify_candidate_for_relay(&runtime, &changed, size, 0).is_err());
+        changed.candidate_hash_data.resize(257, 0);
+        assert!(verify_candidate_for_relay(&runtime, &changed, size, 0).is_err());
+        let mut parsed: CandidateHashData =
+            rtos_api::WireProfile::T0.deserialize_typed(&evidence.candidate_hash_data).unwrap();
+        let CandidateHashData::Consensus_CandidateHashDataOrdinary(ref mut ordinary) = parsed
+        else {
+            unreachable!()
+        };
+        ordinary.parent = rtos_api::ton::consensus::candidateparent::CandidateParent {
+            id: rtos_api::ton::consensus::candidateid::CandidateId {
+                slot: 99,
+                hash: UInt256::from([98; 32]),
+            }
+            .into_boxed(),
+        }
+        .into_boxed();
+        changed = evidence.clone();
+        changed.candidate_hash_data = rtos_api::serialize_boxed(&parsed).unwrap();
+        assert!(verify_candidate_for_relay(&runtime, &changed, size, 0)
+            .err().expect("inverted parent must fail")
+            .to_string()
+            .contains("parent slot"));
+    }
+}
