@@ -155,6 +155,10 @@ struct QuicOutboundConnection {
 /// one sender task runs per outbound peer. Also tracks connect attempts
 /// and timestamps for diagnostics.
 struct SenderState {
+    /// Queries and queued messages share one handshake per local identity/peer.
+    handshake: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    handshake_attempts: AtomicUsize,
     active: AtomicBool,
     /// Number of consecutive connect attempts (reset on success).
     connect_attempts: AtomicU64,
@@ -168,6 +172,9 @@ struct SenderState {
 impl SenderState {
     fn new() -> Arc<Self> {
         Arc::new(Self {
+            handshake: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            handshake_attempts: AtomicUsize::new(0),
             active: AtomicBool::new(false),
             connect_attempts: AtomicU64::new(0),
             last_connect: Mutex::new(None),
@@ -1196,6 +1203,12 @@ impl QuicNode {
     async fn connect(&self, peers: &AdnlPeers, addr: SocketAddr) -> Result<()> {
         let dst = peers.other();
         let state = self.local_key_state(peers.local())?;
+        let outbound = Self::get_or_create_outbound_connection(&state.outbound, addr)?;
+        // FEC repair can issue many simultaneous queries to a cold peer. Hold
+        // one cancellation-safe handshake lease, then recheck the shared live
+        // connection. Dropping a cancelled attempt releases the lease so a
+        // queued query can connect; no in-progress flag can remain stranded.
+        let _handshake = outbound.sender_state.handshake.lock().await;
 
         // Check if a live connection already exists — avoid creating a duplicate
         // that would be immediately closed and disrupt the peer's accept loop.
@@ -1222,6 +1235,8 @@ impl QuicNode {
         // port routes the handshake to the identity we actually want to reach
         // (matches the C++ node). Peers hosting a single identity ignore it.
         let server_name = compute_sni_name(dst);
+        #[cfg(test)]
+        outbound.sender_state.handshake_attempts.fetch_add(1, Ordering::Relaxed);
         let conn = endpoint
             .connect_with(state.client_config.clone(), addr, &server_name)
             .map_err(|e| error!("QUIC connect to {addr}: {e}"))?
@@ -2755,4 +2770,93 @@ fn rate_limit(
     }
 
     Some(incoming)
+}
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+    use rtos_block::{Ed25519KeyOption, ZeroizingBytes};
+    use tokio_util::sync::CancellationToken;
+
+    fn node(seed: u8, bind: SocketAddr) -> (Arc<QuicNode>, Arc<KeyId>, SocketAddr) {
+        let key = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[seed; 32]).unwrap();
+        let node = QuicNode::new(
+            Vec::new(),
+            CancellationToken::new(),
+            tokio::runtime::Handle::current(),
+            None,
+        );
+        node.add_key(&[seed; 32], key.id(), bind).unwrap();
+        let address =
+            node.endpoints.lock().unwrap().values().next().unwrap().endpoint.local_addr().unwrap();
+        (node, key.id().clone(), address)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quic_cold_peer_queries_share_one_real_handshake() {
+        let (client, client_id, _) = node(181, "127.0.0.1:0".parse().unwrap());
+        let (server, server_id, address) = node(182, "127.0.0.1:0".parse().unwrap());
+        client.add_peer_key(server_id.clone(), address).unwrap();
+        let peers = AdnlPeers::with_keys(client_id.clone(), server_id);
+        let outcome = async {
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..64 {
+                let client = client.clone();
+                let peers = AdnlPeers::with_keys(peers.local().clone(), peers.other().clone());
+                tasks.spawn(async move {
+                    client
+                        .ensure_outbound_connection(&peers)
+                        .await
+                        .map(|value| value.conn.unwrap().stable_id())
+                });
+            }
+            let mut ids = HashSet::new();
+            while let Some(result) = tasks.join_next().await {
+                ids.insert(result??);
+            }
+            let state = client.local_key_state(&client_id)?;
+            let connection = QuicNode::get_or_create_outbound_connection(&state.outbound, address)?;
+            Ok::<_, anyhow::Error>((
+                connection.sender_state.handshake_attempts.load(Ordering::Relaxed),
+                ids.len(),
+            ))
+        };
+        let result = tokio::time::timeout(Duration::from_secs(10), outcome).await;
+        client.shutdown_and_wait().await.unwrap();
+        server.shutdown_and_wait().await.unwrap();
+        assert_eq!(result.unwrap().unwrap(), (1, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quic_cancelled_handshake_releases_peer_for_real_retry() {
+        let (client, client_id, _) = node(183, "127.0.0.1:0".parse().unwrap());
+        // Hold a real UDP address without replying to the initial QUIC handshake.
+        let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = silent.local_addr().unwrap();
+        let server_key = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[184; 32]).unwrap();
+        client.add_peer_key(server_key.id().clone(), address).unwrap();
+        let peers = AdnlPeers::with_keys(client_id.clone(), server_key.id().clone());
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.ensure_outbound_connection(&peers),
+        )
+        .await
+        .is_err();
+        drop(silent);
+        let (server, _, _) = node(184, address);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.ensure_outbound_connection(&peers),
+        )
+        .await;
+        let state = client.local_key_state(&client_id).unwrap();
+        let connection =
+            QuicNode::get_or_create_outbound_connection(&state.outbound, address).unwrap();
+        let attempts = connection.sender_state.handshake_attempts.load(Ordering::Relaxed);
+        client.shutdown_and_wait().await.unwrap();
+        server.shutdown_and_wait().await.unwrap();
+        assert!(cancelled);
+        assert!(result.unwrap().unwrap().conn.is_some());
+        assert_eq!(attempts, 2);
+    }
 }
