@@ -846,6 +846,17 @@ impl crate::engine_traits::EngineOperations for RecoveryProofEngine {
             .map(|(_, p)| p.clone())
             .ok_or_else(|| rtos_block::error!("missing recovery proof"))
     }
+    async fn load_block_proof_bounded(
+        &self, handle: &std::sync::Arc<storage::block_handle_db::BlockHandle>, _: bool,
+        budget: std::sync::Arc<crate::history_read_budget::HistoryReadBudget>,
+    ) -> rtos_block::Result<BlockProofStuff> {
+        self.proof_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let proof = &self.entries.iter().find(|(h, _)| h.id() == handle.id())
+            .ok_or_else(|| rtos_block::error!("missing recovery proof"))?.1;
+        // Fixture objects are already parsed; account actual objects before clone.
+        budget.proof(proof)?;
+        Ok(proof.clone())
+    }
     async fn download_block_proof(
         &self,
         id: &rtos_block::BlockIdExt,
@@ -1041,6 +1052,21 @@ async fn test_live_proof_history_cache_never_caches_incoming_certificates() {
         proof_reads: AtomicUsize::new(0),
         verifier: Default::default(),
     };
+    {
+        use crate::history_read_budget::{HistoryReadBudget, HistoryReadLimits, HistoryBudgetExceeded};
+        let bytes = engine.entries.iter().map(|(_, p)| p.data().len()).sum();
+        let exact = HistoryReadLimits { proof_count: 4, proof_bytes: bytes, ..Default::default() };
+        let verifier = super::MasterchainProofVerifier::default();
+        verifier.verify_bounded(&engine, &target, HistoryReadBudget::new(exact.clone())).await.unwrap();
+        // A warm authority cache must still charge its actual retained proof.
+        let error = verifier.verify_bounded(&engine, &target, HistoryReadBudget::new(
+            HistoryReadLimits { proof_count: 0, ..exact.clone() })).await.err().expect("budget exceeded");
+        assert!(error.downcast_ref::<HistoryBudgetExceeded>().is_some());
+        let error = super::MasterchainProofVerifier::default().verify_bounded(&engine, &target,
+            HistoryReadBudget::new(HistoryReadLimits { proof_bytes: bytes - 1, ..exact })).await.err().expect("budget exceeded");
+        assert!(error.downcast_ref::<HistoryBudgetExceeded>().is_some());
+        engine.proof_reads.store(0, Ordering::SeqCst);
+    }
     let block = BlockStuff::deserialize_block_checked(
         target.id().clone(),
         Arc::new(hex::decode(row["block_boc"].as_str().unwrap()).unwrap()),

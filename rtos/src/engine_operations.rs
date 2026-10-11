@@ -96,6 +96,66 @@ impl EngineOperations for Engine {
             .unwrap_or_else(|_| rtos_block::UnixTime::now() as u32)
     }
 
+    async fn check_masterchain_proof_bounded(
+        &self, proof: &BlockProofStuff,
+        budget: Arc<crate::history_read_budget::HistoryReadBudget>,
+    ) -> Result<()> {
+        self.masterchain_proof_verifier.verify_bounded(self, proof, budget).await.map(|_| ())
+    }
+    async fn historical_pq_publication_context_bounded(
+        &self, id: &BlockIdExt, block: &rtos_block::Block,
+        budget: Arc<crate::history_read_budget::HistoryReadBudget>,
+    ) -> Result<crate::block_proof::PqPublicationContext> {
+        self.masterchain_proof_verifier.pq_publication_context_bounded(self, id, block, budget).await
+    }
+    async fn load_block_proof_bounded(
+        &self, handle: &Arc<BlockHandle>, is_link: bool,
+        budget: Arc<crate::history_read_budget::HistoryReadBudget>,
+    ) -> Result<BlockProofStuff> {
+        let db = self.db().clone();
+        let handle = handle.clone();
+        crate::types::service_tasks::spawn_owned(self, "bounded history proof read", async move {
+            let reservation = budget.reserve(crate::history_read_budget::ReadKind::Proof, budget.limits().single_proof_bytes)?;
+            let limits = storage::archives::bounded_read::ArchiveReadLimits {
+                data_bytes: reservation.allowance(), filename_bytes: 1024,
+            };
+            let bytes = match db.load_block_proof_raw_bounded(&handle, is_link, limits).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    if let Some(evidence) = error.downcast_ref::<storage::archives::bounded_read::ArchiveReadNotStarted>() {
+                        reservation.refund_not_started(evidence)?;
+                    }
+                    return Err(error);
+                }
+            };
+            reservation.finish(&bytes)?;
+            let proof = BlockProofStuff::deserialize_bounded(handle.id(), bytes, is_link, &budget)?;
+            budget.proof(&proof)?;
+            Ok::<_, anyhow::Error>(proof)
+        })?.await.map_err(|e| error!("Owned bounded history read failed: {e}"))?
+    }
+    async fn download_block_proof_bounded(
+        &self, id: &BlockIdExt, is_link: bool, key_block: bool,
+        budget: Arc<crate::history_read_budget::HistoryReadBudget>,
+    ) -> Result<BlockProofStuff> {
+        let client = self.overlay_client(id.shard()).await?;
+        let id = id.clone();
+        crate::types::service_tasks::spawn_owned(self, "bounded history proof download", async move {
+            let reservation = budget.reserve(crate::history_read_budget::ReadKind::Proof, budget.limits().single_proof_bytes)?;
+            let graph = budget.reserve_network_graph()?;
+            let limits = crate::network::full_node_overlay_client::NetworkDownloadLimits::proof(
+                reservation.allowance().min(graph.bytes), graph.cells, budget.limits().depth);
+            let proof = client.download_block_proof_bounded(&id, is_link, key_block, limits).await
+                .map_err(|e| if e.downcast_ref::<adnl::ResponseLimitExceeded>().is_some() {
+                    anyhow::Error::from(crate::history_read_budget::HistoryBudgetExceeded("network proof response"))
+                } else { e })?;
+            reservation.finish(proof.data())?;
+            graph.finish(proof.root_cell())?;
+            budget.proof(&proof)?;
+            Ok::<_, anyhow::Error>(proof)
+        })?.await.map_err(|e| error!("Owned bounded history download failed: {e}"))?
+    }
+
     async fn check_masterchain_proof(&self, proof: &BlockProofStuff) -> Result<()> {
         self.masterchain_proof_verifier.verify(self, proof).await.map(|_| ())
     }

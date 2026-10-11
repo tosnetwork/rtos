@@ -711,8 +711,20 @@ pub(crate) async fn authenticate_recovered_state_evidence<E: EngineOperations + 
     block_id: &BlockIdExt,
     state: Arc<crate::shard_state::ShardStateStuff>,
     evidence: Option<&[BlockProofStuff]>,
-    mut captured: Option<&mut Vec<BlockProofStuff>>,
+    captured: Option<&mut Vec<BlockProofStuff>>,
 ) -> Result<VerifiedMasterchainState> {
+    authenticate_recovered_state_evidence_with_budget(engine, block_id, state, evidence, captured, None).await
+}
+
+pub(crate) async fn authenticate_recovered_state_evidence_with_budget<E: EngineOperations + ?Sized>(
+    engine: &E,
+    block_id: &BlockIdExt,
+    state: Arc<crate::shard_state::ShardStateStuff>,
+    evidence: Option<&[BlockProofStuff]>,
+    mut captured: Option<&mut Vec<BlockProofStuff>>,
+    budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+) -> Result<VerifiedMasterchainState> {
+    if let Some(budget) = budget { budget.step()?; budget.graph(state.root_cell())?; }
     let pin = engine.init_mc_block_id();
     if !block_id.shard().is_masterchain_ext() || block_id.seq_no < pin.seq_no {
         fail!("Recovery position is outside the pinned masterchain history");
@@ -724,10 +736,12 @@ pub(crate) async fn authenticate_recovered_state_evidence<E: EngineOperations + 
         if pin != engine.zerostate_id()? {
             fail!("Recovery pin differs from network zerostate");
         }
-        BootstrapAuthority::from_zerostate(pin, engine.load_mc_zero_state().await?)?
+        let zero = engine.load_mc_zero_state().await?;
+        if let Some(budget) = budget { budget.graph(zero.root_cell())?; }
+        BootstrapAuthority::from_zerostate(pin, zero)?
     } else {
         let proof =
-            recovery_evidence_proof(engine, pin, true, true, evidence, &mut captured).await?;
+            recovery_evidence_proof(engine, pin, true, true, evidence, &mut captured, budget).await?;
         BootstrapAuthority::from_checkpoint(pin, proof)?
     };
     if block_id == pin {
@@ -753,11 +767,11 @@ pub(crate) async fn authenticate_recovered_state_evidence<E: EngineOperations + 
             fail!("Recovery history index has an invalid key-block position");
         }
         let proof =
-            recovery_evidence_proof(engine, &next, false, true, evidence, &mut captured).await?;
+            recovery_evidence_proof(engine, &next, false, true, evidence, &mut captured, budget).await?;
         history = history.advance_key_block(&next, proof)?;
     }
     let proof =
-        recovery_evidence_proof(engine, block_id, false, false, evidence, &mut captured).await?;
+        recovery_evidence_proof(engine, block_id, false, false, evidence, &mut captured, budget).await?;
     let verified = history.authenticate_block(block_id, proof)?.authenticate_state(state)?;
     if !verified.state().has_prev_block(pin)? {
         fail!("Authenticated recovered state does not contain the local pin");
@@ -772,7 +786,9 @@ async fn recovery_evidence_proof<E: EngineOperations + ?Sized>(
     key_block: bool,
     evidence: Option<&[BlockProofStuff]>,
     captured: &mut Option<&mut Vec<BlockProofStuff>>,
+    budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
 ) -> Result<BlockProofStuff> {
+    if let Some(budget) = budget { budget.step()?; }
     // Bound chain traversal before downloads or untrusted proof accumulation.
     if captured.as_ref().is_some_and(|proofs| proofs.len() >= 4096) {
         fail!("Recovery history proof chain exceeds bound");
@@ -783,8 +799,9 @@ async fn recovery_evidence_proof<E: EngineOperations + ?Sized>(
             .find(|p| p.id() == id)
             .cloned()
             .ok_or_else(|| error!("Retained history proof missing for {id}"))?,
-        None => load_history_proof(engine, id, checkpoint, key_block).await?,
+        None => load_history_proof_with_budget(engine, id, checkpoint, key_block, budget).await?,
     };
+    if let Some(budget) = budget { budget.proof(&proof)?; }
     if let Some(captured) = captured.as_mut() {
         if proof.data().len() > 8 << 20 {
             fail!("Recovery history proof exceeds bound");
@@ -805,6 +822,35 @@ pub(crate) async fn load_history_proof<E: EngineOperations + ?Sized>(
     checkpoint: bool,
     key_block: bool,
 ) -> Result<BlockProofStuff> {
+    load_history_proof_with_budget(engine, id, checkpoint, key_block, None).await
+}
+
+pub(crate) async fn load_history_proof_with_budget<E: EngineOperations + ?Sized>(
+    engine: &E,
+    id: &BlockIdExt,
+    checkpoint: bool,
+    key_block: bool,
+    budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+) -> Result<BlockProofStuff> {
+    if let Some(budget) = budget {
+        budget.step()?;
+        if let Some(handle) = engine.load_block_handle(id)? {
+            if handle.id() != id { fail!("Bounded history handle identity mismatch"); }
+            for link in [false, true] {
+                if link && !checkpoint { break; }
+                match engine.load_block_proof_bounded(&handle, link, budget.clone()).await {
+                    Ok(proof) => return Ok(proof),
+                    Err(error) if crate::history_read_budget::stops_fallback(&error) => return Err(error),
+                    Err(_) => {},
+                }
+            }
+        }
+        if let Some(proof) = crate::retired_history::load_proof_with_budget(engine, id, checkpoint, Some(budget)).await? {
+            return Ok(proof);
+        }
+        return engine.download_block_proof_bounded(id, checkpoint, key_block, budget.clone()).await;
+    }
+
     if let Some(handle) = engine.load_block_handle(id)? {
         if handle.id() != id {
             fail!("Recovery proof handle identity mismatch");

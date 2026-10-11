@@ -52,3 +52,5 @@ include!("../../common/src/info.rs");
 #[cfg(test)]
 #[path = "tests/test_helper.rs"]
 pub mod test_helper;
+
+pub(crate) mod history_read_budget;

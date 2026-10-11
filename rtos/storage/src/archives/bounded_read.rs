@@ -25,6 +25,18 @@ impl std::fmt::Display for ArchiveReadLimitExceeded {
 }
 impl std::error::Error for ArchiveReadLimitExceeded {}
 
+/// Issued only by an open operation before any archive payload read.
+#[derive(Debug)]
+pub struct ArchiveReadNotStarted(std::io::Error);
+impl ArchiveReadNotStarted {
+    pub(super) fn from_open(error: std::io::Error) -> Self { Self(error) }
+    pub fn is_not_found(&self) -> bool { self.0.kind() == std::io::ErrorKind::NotFound }
+}
+impl std::fmt::Display for ArchiveReadNotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.0.fmt(f) }
+}
+impl std::error::Error for ArchiveReadNotStarted {}
+
 pub fn check_length(resource: &'static str, requested: u64, limit: usize) -> Result<usize> {
     if requested > limit as u64 {
         return Err(ArchiveReadLimitExceeded { resource, requested, limit }.into());
@@ -36,7 +48,7 @@ pub(super) async fn read_loose(
     path: &std::path::Path,
     limits: ArchiveReadLimits,
 ) -> Result<Vec<u8>> {
-    let mut file = tokio::fs::File::open(path).await?;
+    let mut file = tokio::fs::File::open(path).await.map_err(ArchiveReadNotStarted::from_open)?;
     let metadata = file.metadata().await?;
     if !metadata.is_file() {
         fail!("Archive entry is not a regular file");
