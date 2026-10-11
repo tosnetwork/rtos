@@ -1061,6 +1061,13 @@ impl ResolverBackend for ValidatorGroup {
 }
 
 impl ValidatorGroup {
+    /// Frozen membership and role used to decide whether a live group can be reused.
+    pub fn authenticated_runtime(
+        &self,
+    ) -> Option<&Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>> {
+        self.authenticated_runtime.as_ref()
+    }
+
     /// Attach the manager's frozen governing snapshot before publishing the group.
     /// Authentication of the governing state belongs to the caller; this boundary
     /// rejects mismatched options, committee, session and local transport identity.
