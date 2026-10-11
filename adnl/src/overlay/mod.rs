@@ -3178,7 +3178,7 @@ impl OverlayNode {
         &self,
         overlay_id: &Arc<OverlayShortId>,
         config: PlumtreeConfig,
-        runtime: &tokio::runtime::Handle,
+        _runtime: &tokio::runtime::Handle,
     ) -> Result<()> {
         let overlay = self.get_overlay(overlay_id, "Configuring Plumtree on unknown overlay")?;
         if overlay.flags & Overlay::FLAG_OVERLAY_OTHER_WORKCHAIN != 0 {
