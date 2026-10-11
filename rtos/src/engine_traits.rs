@@ -926,7 +926,7 @@ pub trait EngineOperations: Sync + Send {
         id: &BlockIdExt,
         plan: &crate::validator::propagation::PropagationPlan,
     ) -> Result<Vec<crate::validator::propagation::PropagationDestination>> {
-        fail!("Propagation destination resolution is unavailable")
+        rtos_block::fail!("Propagation destination resolution is unavailable")
     }
 
     /// Propagation reports never undo or obscure an already durable acceptance.
