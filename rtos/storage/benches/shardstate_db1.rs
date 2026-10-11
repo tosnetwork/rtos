@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
 
         first_put_time.push(first_put.elapsed().as_millis());
     }
-    ss_db.stop().await;
+    ss_db.stop().await?;
     drop(ss_db);
     drop(db);
 
@@ -130,7 +130,7 @@ async fn main() -> Result<()> {
     let update_total = before_updates.elapsed().as_millis();
     println!("updates total time {}, per update {}", update_total, update_total / updates as u128);
 
-    ss_db.stop().await;
+    ss_db.stop().await?;
 
     Ok(())
 }

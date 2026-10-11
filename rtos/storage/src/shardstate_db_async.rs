@@ -181,6 +181,20 @@ struct TestGcBatchProgress {
     watched_epoch: Option<u64>,
 }
 
+type StateTaskJoin = futures::future::Shared<futures::future::BoxFuture<'static,
+    std::result::Result<(), Arc<str>>>>;
+#[derive(Default)]
+struct StateTaskOwners {
+    closed: bool,
+    worker: Option<StateTaskJoin>,
+    gc: Option<StateTaskJoin>,
+}
+fn state_task_join(task: tokio::task::JoinHandle<()>) -> StateTaskJoin {
+    use futures::FutureExt;
+    task.map(|result| result.map_err(|error| Arc::<str>::from(error.to_string())))
+        .boxed().shared()
+}
+
 pub struct ShardStateDb {
     shardstate_db: Arc<RocksDbTable<BlockIdExt>>,
     dynamic_boc_db: Arc<DynamicBocDb>,
@@ -189,6 +203,7 @@ pub struct ShardStateDb {
     bounded_read_gate: std::sync::RwLock<()>,
     in_queue: AtomicU32,
     stop: Arc<AtomicU8>,
+    task_owners: std::sync::Mutex<StateTaskOwners>,
     config: CellsDbConfig,
     gc_resolver: tokio::sync::OnceCell<Arc<dyn AllowStateGcResolver>>,
     #[cfg(any(test, feature = "integration-test-support"))]
@@ -234,6 +249,7 @@ impl ShardStateDb {
             write_failure: tokio::sync::watch::channel(None).0,
             in_queue: AtomicU32::new(0),
             stop: Arc::new(AtomicU8::new(0)),
+            task_owners: Default::default(),
             config,
             gc_resolver: tokio::sync::OnceCell::new(),
             #[cfg(any(test, feature = "integration-test-support"))]
@@ -242,13 +258,14 @@ impl ShardStateDb {
             telemetry,
         });
 
-        tokio::spawn({
+        let worker = tokio::spawn({
             let ss_db = ss_db.clone();
             async move {
                 ss_db.worker(receiver).await;
             }
         });
 
+        ss_db.task_owners.lock().unwrap().worker = Some(state_task_join(worker));
         Ok(ss_db)
     }
 
@@ -257,11 +274,17 @@ impl ShardStateDb {
         gc_resolver: Arc<dyn AllowStateGcResolver>,
         run_interval_adjustable_sec: Arc<AtomicU32>,
     ) {
+        // Register the actual owner under the same lock that closes admission.
+        // A stop concurrent with start_gc either joins it or prevents its spawn.
+        let owner = self.clone();
+        let mut tasks = owner.task_owners.lock().unwrap();
+        if tasks.closed { return; }
         if self.gc_resolver.set(gc_resolver.clone()).is_err() {
             log::error!(target: TARGET, "INTERNAL ERROR: Attempt to set GC resolver twice");
+            return;
         }
         self.stop.fetch_or(Self::MASK_GC, Ordering::Relaxed);
-        tokio::spawn(async move {
+        let gc = tokio::spawn(async move {
             fn check_and_stop(stop: &AtomicU8) -> bool {
                 if (stop.load(Ordering::Relaxed) & ShardStateDb::MASK_STOPPED) != 0 {
                     stop.fetch_and(!ShardStateDb::MASK_GC, Ordering::Relaxed);
@@ -449,25 +472,36 @@ impl ShardStateDb {
                 to_delete.sort_by_key(|b| std::cmp::Reverse(b.seq_no()));
             }
         });
+        tasks.gc = Some(state_task_join(gc));
     }
 
-    pub async fn stop(&self) {
-        self.stop.fetch_or(Self::MASK_STOPPED, Ordering::Relaxed);
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if !self.is_run() {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                break;
-            }
+    pub async fn stop(&self) -> Result<()> {
+        let (worker, gc) = {
+            let mut tasks = self.task_owners.lock().unwrap();
+            tasks.closed = true;
+            self.stop.fetch_or(Self::MASK_STOPPED, Ordering::Relaxed);
+            (tasks.worker.clone(), tasks.gc.clone())
+        };
+        // Shared joins survive cancellation of any individual stop waiter and
+        // retain failures for subsequent callers. Join completion proves the
+        // task's captured DB ownership has actually been released.
+        let mut failures = Vec::new();
+        for task in [worker, gc].into_iter().flatten() {
+            if let Err(error) = task.await { failures.push(error.to_string()); }
         }
+        self.stop.store(Self::MASK_STOPPED, Ordering::Relaxed);
+        if failures.is_empty() { Ok(()) }
+        else { Err(error!("State storage tasks failed: {}", failures.join("; "))) }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_worker_completion(&self) -> std::result::Result<(), Arc<str>> {
+        let worker = self.task_owners.lock().unwrap().worker.clone().unwrap();
+        worker.await
     }
 
     pub fn is_gc_run(&self) -> bool {
         self.stop.load(Ordering::Relaxed) & Self::MASK_GC != 0
-    }
-
-    fn is_run(&self) -> bool {
-        (self.stop.load(Ordering::Relaxed) & !Self::MASK_STOPPED) != 0
     }
 
     pub fn shardstate_db(&self) -> Arc<RocksDbTable<BlockIdExt>> {
@@ -1079,7 +1113,7 @@ mod bounded_read_tests {
             .put(&id, &DbEntry::with_params(other, root.repr_hash().clone(), 0).serialize())?;
         let error = states.get_detached(&id, &Budget, |_| Ok(())).err().unwrap();
         assert!(error.downcast_ref::<crate::bounded_cell::InvalidBoundedState>().is_some());
-        states.stop().await;
+        states.stop().await.unwrap();
         Ok(())
     }
 }

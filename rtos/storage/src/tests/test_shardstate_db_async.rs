@@ -104,7 +104,7 @@ async fn test_shardstate_db_async() -> Result<()> {
         }
     }
 
-    ss_db.stop().await;
+    ss_db.stop().await.unwrap();
 
     drop(ss_db);
     drop(db);
@@ -149,7 +149,7 @@ async fn publication_durability_state_barrier_waits_for_actual_completion() -> R
     pause.release.notify_one();
     barrier.await.unwrap()?;
     assert_eq!(store.get(&id)?.repr_hash(), Cell::default().repr_hash());
-    store.stop().await;
+    store.stop().await.unwrap();
     drop(store);
     drop(db);
     destroy_rocks_db(path.to_str().expect("UTF-8 temporary test path"), "db").await?;
@@ -174,9 +174,116 @@ async fn publication_durability_state_failure_cannot_ack_a_barrier() -> Result<(
     store.put(&BlockIdExt::default(), Cell::default(), None).await?;
     assert!(tokio::time::timeout(Duration::from_secs(5), store.sync_pending()).await?.is_err());
     assert!(store.sync_pending().await.is_err());
-    store.stop().await;
+    store.stop().await.unwrap();
     drop(store);
     drop(db);
     destroy_rocks_db(path.to_str().expect("UTF-8 temporary test path"), "db").await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn state_owner_immediate_stop_joins_unpolled_worker_and_reopens_db() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite)?;
+    let states = ShardStateDb::new(db.clone(), "states", "cells", "counters",
+        CellsDbConfig::default(),
+        #[cfg(feature = "telemetry")]
+        Arc::new(StorageTelemetry::default()), Arc::new(StorageAlloc::default()))?;
+    // No yield since spawn: current-thread worker has not set MASK_WORKER yet.
+    states.stop().await?;
+    states.clone().start_gc(Arc::new(MockedResolver), Arc::new(AtomicU32::new(0)));
+    assert!(!states.is_gc_run(), "closed storage cannot admit a new GC owner");
+    drop(states);
+    drop(db);
+    let reopened = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite)?;
+    drop(reopened);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn state_owner_cancelled_stop_retains_join_until_callback_finishes() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite)?;
+    let states = ShardStateDb::new(db.clone(), "states", "cells", "counters",
+        CellsDbConfig::default(),
+        #[cfg(feature = "telemetry")]
+        Arc::new(StorageTelemetry::default()), Arc::new(StorageAlloc::default()))?;
+    let pause = Arc::new(StateDurabilityPause { entered: Default::default(), release: Default::default() });
+    states.put(&BlockIdExt::default(), Cell::default(), Some(pause.clone())).await?;
+    pause.entered.notified().await;
+    let owner = states.clone();
+    let mut stop = tokio::spawn(async move { owner.stop().await });
+    let (waiting, cancelled) = match tokio::time::timeout(Duration::from_millis(20), &mut stop).await {
+        Ok(result) => (false, result),
+        Err(_) => { stop.abort(); (true, stop.await) },
+    };
+    pause.release.notify_one();
+    let drained = states.stop().await;
+    let weak = Arc::downgrade(&db);
+    drop(states);
+    drop(db);
+    assert!(waiting, "stop must wait for actual callback completion");
+    assert!(cancelled.unwrap_err().is_cancelled());
+    drained?;
+    assert!(weak.upgrade().is_none(), "joined task must drop its actual DB ownership");
+    Ok(())
+}
+
+struct PanickingStateCallback;
+#[async_trait::async_trait]
+impl crate::shardstate_db_async::Callback for PanickingStateCallback {
+    async fn invoke(&self, _: crate::shardstate_db_async::Job) {
+        panic!("injected actual state worker panic");
+    }
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn state_owner_worker_panic_is_retained_by_every_stop_waiter() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite)?;
+    let states = ShardStateDb::new(db.clone(), "states", "cells", "counters",
+        CellsDbConfig::default(),
+        #[cfg(feature = "telemetry")]
+        Arc::new(StorageTelemetry::default()), Arc::new(StorageAlloc::default()))?;
+    states.put(&BlockIdExt::default(), Cell::default(), Some(Arc::new(PanickingStateCallback))).await?;
+    // Observe actual task termination before setting the stop flag; otherwise
+    // normal stop could reject queued work before this callback runs.
+    let worker = states.test_worker_completion().await;
+    let first = states.stop().await;
+    let second = states.stop().await;
+    let weak = Arc::downgrade(&db);
+    drop(states);
+    drop(db);
+    assert!(worker.is_err());
+    assert!(first.unwrap_err().to_string().contains("injected actual state worker panic"));
+    assert!(second.is_err());
+    assert!(weak.upgrade().is_none());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn state_owner_gc_admission_racing_stop_has_no_unjoined_db_owner() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite)?;
+    let states = ShardStateDb::new(db.clone(), "states", "cells", "counters",
+        CellsDbConfig::default(),
+        #[cfg(feature = "telemetry")]
+        Arc::new(StorageTelemetry::default()), Arc::new(StorageAlloc::default()))?;
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let admission_owner = states.clone();
+    let start = barrier.clone();
+    let admission = tokio::spawn(async move {
+        start.wait().await;
+        admission_owner.start_gc(Arc::new(MockedResolver), Arc::new(AtomicU32::new(0)));
+    });
+    barrier.wait().await;
+    let stopped = states.stop().await;
+    let admitted = admission.await;
+    drop(states);
+    drop(db);
+    admitted.unwrap();
+    stopped?;
+    // Either admission won and was joined, or shutdown closed it before spawn.
+    let reopened = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite)?;
+    drop(reopened);
     Ok(())
 }
