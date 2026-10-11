@@ -10,8 +10,6 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::tasks::AdnlTasks;
-#[cfg(feature = "dump")]
-use crate::dump;
 #[cfg(feature = "telemetry")]
 use crate::telemetry::{TelemetryItem, TelemetryPrinter};
 use crate::{
@@ -3944,7 +3942,7 @@ impl AdnlNode {
                 _ => true,
             }
         } else if let Some(msgs) = pkt.messages.as_ref() {
-            for msg in msgs.0.iter() {
+            for msg in msgs.iter() {
                 match msg {
                     AdnlMessage::Adnl_Message_Custom(_) => (),
                     AdnlMessage::Adnl_Message_Nop => (),
@@ -4277,7 +4275,7 @@ impl AdnlNode {
                     "{} Recv packet, method {method}\n{:?}\nDump\n{}",
                     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                     pkt,
-                    dump!(&packet.buf[..])
+                    rtos_api::hex_dump!(&packet.buf[..])
                 );
                 dump.sender.send(DumpRecord { alive: true, key_id: other_key.clone(), msg })?;
             }
@@ -4649,7 +4647,7 @@ impl AdnlNode {
         }
         #[cfg(feature = "dump")]
         let msg = if Self::need_dump(&pkt) && self.dump.is_some() {
-            Some(format!("Send packet, priority {}\n{:?}", priority, pkt))
+            Some(format!("Send packet, method {method}\n{pkt:?}"))
         } else {
             None
         };
@@ -4661,7 +4659,7 @@ impl AdnlNode {
                     "{} {}\nDump\n{}",
                     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                     msg,
-                    dump!(&data[..])
+                    rtos_api::hex_dump!(&data[..])
                 );
                 dump.sender.send(DumpRecord {
                     alive: channel.is_some(),
