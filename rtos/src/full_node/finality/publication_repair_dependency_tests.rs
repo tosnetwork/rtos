@@ -427,7 +427,7 @@ async fn bounded_state_actual_engine_cold_warm_and_budget_rejection() {
             tokio::spawn(async move { reader_engine.load_state_bounded(&id, budget).await });
         entered.await.unwrap();
         reader.abort();
-        assert!(reader.await.unwrap_err().is_cancelled());
+        assert!(reader.await.err().expect("cancelled observer").is_cancelled());
         let stopper_engine = engine.clone();
         let mut stopped = tokio::spawn(async move { stopper_engine.wait_stop().await });
         assert!(

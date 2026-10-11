@@ -688,10 +688,7 @@ async fn authenticate_ordinary_with_budget<E: EngineOperations + ?Sized>(
     if !id.shard().is_masterchain_ext() || id.seq_no < engine.init_mc_block_id().seq_no {
         fail!("Bounded recovery outside pinned history");
     }
-    let state = match budget {
-        Some(budget) => engine.load_state_bounded(id, budget.clone()).await?,
-        None => engine.load_state(id).await?,
-    };
+    let state = engine.load_state_bounded(id, budget.clone()).await?;
     crate::boot::authenticate_recovered_state_evidence_with_budget(
         engine,
         id,
