@@ -15,6 +15,18 @@ const MAX_RECORD_BYTES: u64 = 64 << 20;
 const MAX_TOTAL_BYTES: u64 = 128 << 20;
 const MAX_RECORDS: usize = 1024;
 const DIRECTORY: &str = "finality-pending";
+// A single ACK transition may temporarily duplicate the largest admitted record.
+// Reserve both its physical file and its bytes at admission, not at completion.
+const ACK_ENVELOPE_RESERVE: u64 = 1024;
+fn check_retention_capacity(count: usize, total: u64, incoming: u64) -> Result<()> {
+    if incoming > MAX_RECORD_BYTES - ACK_ENVELOPE_RESERVE
+        || count >= MAX_RECORDS - 1
+        || total.checked_add(incoming).and_then(|n| n.checked_add(MAX_RECORD_BYTES))
+            .is_none_or(|n| n > MAX_TOTAL_BYTES) {
+        fail!("Source finality backpressure (ACK transition capacity reserved)");
+    }
+    Ok(())
+}
 
 /// Untrusted retained evidence. Recovery must authenticate historical configuration
 /// through Engine before obtaining node durability; this is not a runtime capability.
@@ -217,7 +229,7 @@ impl PendingFinalityStore {
             }
         }
         let total = paths.iter().try_fold(0u64, |total, path| Ok::<_, anyhow::Error>(total + std::fs::metadata(path)?.len()))?;
-        if paths.len() >= MAX_RECORDS || total + bytes.len() as u64 > MAX_TOTAL_BYTES { fail!("Source finality backpressure"); }
+        check_retention_capacity(paths.len(), total, bytes.len() as u64)?;
         let temporary = path.with_extension("tmp");
         let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&temporary)?;
         file.write_all(&bytes)?; file.sync_all()?; drop(file);
@@ -239,6 +251,7 @@ impl PendingFinalityStore {
         if !acknowledged.exists() {
             let bytes = serde_json::to_vec(&AcknowledgedRecord { schema: 1,
                 node_receipt: node_receipt.to_hex_string(), record: serde_json::from_slice(&record.encode()?)? })?;
+            if bytes.len() as u64 > MAX_RECORD_BYTES { fail!("Acknowledged source record exceeds readable bound"); }
             // Account the temporary duplicate too: no unbounded receipt history.
             let paths = self.paths()?;
             let total = paths.iter().try_fold(0u64, |n, p| Ok::<_, anyhow::Error>(n + std::fs::metadata(p)?.len()))?;
@@ -602,6 +615,34 @@ pub(crate) mod tests {
             complete(Ok(UInt256::from([4; 32])));
             assert!(source.poll(original).unwrap().is_some());
         }
+    }
+
+    #[test]
+    fn source_finality_admission_reserves_ack_file_and_byte_headroom() {
+        let temp = crate::authenticated_fixture::TestDirectory::new();
+        let (runtime, draft) = fixture();
+        let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+        let store = PendingFinalityStore::open(&namespace).unwrap();
+        let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
+        store.retain(&record).unwrap();
+        // Fill the advertised logical capacity using valid on-disk records.
+        for index in 1..MAX_RECORDS - 1 {
+            let mut next = record.clone();
+            let mut adnl = [0u8; 32]; adnl[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            next.local_adnl = UInt256::from(adnl);
+            std::fs::write(store.directory.join(format!("{}.json", next.id().unwrap().to_hex_string())), next.encode().unwrap()).unwrap();
+        }
+        let mut overflow = record.clone(); overflow.local_adnl = UInt256::from([0xff; 32]);
+        assert!(store.retain(&overflow).unwrap_err().to_string().contains("backpressure"));
+        // All source capacity may be occupied; already admitted work can still ACK.
+        store.acknowledge(&record.id().unwrap(), UInt256::from([1; 32])).unwrap();
+        assert_eq!(store.paths().unwrap().len(), MAX_RECORDS - 1);
+        assert!(store.directory.join(format!("{}.acked", record.id().unwrap().to_hex_string())).exists());
+        let readable = MAX_RECORD_BYTES - ACK_ENVELOPE_RESERVE;
+        assert!(check_retention_capacity(0, 0, readable).is_ok());
+        assert!(check_retention_capacity(0, 0, readable + 1).is_err());
+        assert!(check_retention_capacity(1, MAX_TOTAL_BYTES - MAX_RECORD_BYTES - 1, 1).is_ok());
+        assert!(check_retention_capacity(1, MAX_TOTAL_BYTES - MAX_RECORD_BYTES, 1).is_err());
     }
 
 }
