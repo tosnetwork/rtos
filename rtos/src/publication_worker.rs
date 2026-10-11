@@ -21,8 +21,9 @@ use crate::{
 };
 use consensus_common::{
     finality_delivery::{
-        DurableFinalitySink, DurableFinalitySinkPtr, FinalizedDeliveryCompletion,
-        FinalizedDeliveryDraft,
+        CanonicalFinalityCompletion, CanonicalFinalityRecord, CanonicalFinalityRequest,
+        DurableFinalitySink, DurableFinalitySinkPtr, FinalityDeliveryRole,
+        FinalizedDeliveryCompletion, FinalizedDeliveryDraft,
     },
     session_runtime::{AuthenticatedSessionRuntime, LocalRole},
     SessionFinality,
@@ -66,7 +67,29 @@ impl Drop for Completion {
         }
     }
 }
+struct CanonicalCompletion(Option<CanonicalFinalityCompletion>);
+impl CanonicalCompletion {
+    fn finish(mut self, result: Result<CanonicalFinalityRecord>) {
+        if let Some(callback) = self.0.take() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(result)));
+        }
+    }
+}
+impl Drop for CanonicalCompletion {
+    fn drop(&mut self) {
+        if let Some(callback) = self.0.take() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                callback(Err(error!("Publication owner stopped before canonical retention")))
+            }));
+        }
+    }
+}
 enum Submission {
+    Canonical {
+        request: CanonicalFinalityRequest,
+        runtime: Arc<AuthenticatedSessionRuntime>,
+        completion: CanonicalCompletion,
+    },
     Legacy(LegacySubmission),
     Draft {
         record: PublicationRecord,
@@ -84,6 +107,9 @@ enum Submission {
 impl Submission {
     fn reject(self) {
         match self {
+            Self::Canonical { completion, .. } => {
+                completion.finish(Err(error!("Publication retention shutdown")))
+            }
             Self::Legacy(request) => {
                 let _ = request
                     .response
@@ -104,6 +130,17 @@ struct SessionSink {
     historical: bool,
 }
 impl DurableFinalitySink for SessionSink {
+    fn retain_canonical(
+        &self,
+        request: CanonicalFinalityRequest,
+        completion: CanonicalFinalityCompletion,
+    ) -> Result<()> {
+        self.worker.admit_draft(Submission::Canonical {
+            request,
+            runtime: self.runtime.clone(),
+            completion: CanonicalCompletion(Some(completion)),
+        })
+    }
     fn stage(
         &self,
         draft: FinalizedDeliveryDraft,
@@ -280,8 +317,14 @@ impl PublicationWorker {
             },
             Err(_) => request,
         };
-        if let Submission::Draft { mut completion, .. } = rejected {
-            completion.0.take();
+        match rejected {
+            Submission::Draft { mut completion, .. } => {
+                completion.0.take();
+            }
+            Submission::Canonical { mut completion, .. } => {
+                completion.0.take();
+            }
+            _ => {}
         }
         fail!("Publication draft queue full or closed; retain source evidence")
     }
@@ -435,6 +478,24 @@ impl State {
     }
     async fn submit_one(&self, store: &Arc<PropagationOutbox>, command: Submission) {
         match command {
+            Submission::Canonical { request, runtime, completion } => {
+                let result = async {
+                    if self.stop.is_cancelled() {
+                        fail!("Publication shutdown before canonical retention");
+                    }
+                    let id = request.node_receipt.clone();
+                    let (delivery, entry) = self
+                        .write(store, move |store| store.delivery(&id))
+                        .await?
+                        .ok_or_else(|| error!("Unknown canonical delivery"))?;
+                    let canonical =
+                        canonical_record(&runtime, &request, &delivery, &entry, &self.limits)?;
+                    self.write(store, move |store| store.retain_delivery(&delivery)).await?;
+                    Ok(canonical)
+                }
+                .await;
+                completion.finish(result);
+            }
             Submission::Legacy(command) => self.submit_legacy(store, command).await,
             Submission::Draft {
                 mut record,
@@ -1047,6 +1108,96 @@ fn effect_from_destination(destination: PropagationDestination) -> Result<Public
         },
     })
 }
+/// Reconstruct only the original evidence under this sink's authenticated
+/// runtime. A delivery ID and disk fields alone never grant authority.
+fn canonical_record(
+    runtime: &AuthenticatedSessionRuntime,
+    request: &CanonicalFinalityRequest,
+    delivery: &crate::propagation_outbox::Delivery,
+    entry: &UnverifiedRecord,
+    limits: &Limits,
+) -> Result<CanonicalFinalityRecord> {
+    crate::propagation_outbox::validate_recovery_record(entry, limits)?;
+    let record = &entry.record;
+    let expected_index = match runtime.local_role() {
+        LocalRole::Validator(index) => Some(index),
+        LocalRole::Observer => None,
+    };
+    let origin =
+        delivery.origin.as_ref().ok_or_else(|| error!("Missing canonical source origin"))?;
+    if request.node_receipt != delivery.delivery_id
+        || delivery.record_id != entry.id
+        || request.node_receipt != crate::propagation_outbox::delivery_id(record)?
+        || request.block_id != record.block_id
+        || (request.role == FinalityDeliveryRole::Final) != record.carrier.is_final()
+        || request.local_adnl != UInt256::from(*runtime.local_adnl().data())
+        || request.local_validator_index != expected_index
+        || request.local_adnl != origin.local_adnl
+        || request.local_validator_index != origin.local_validator_index
+        || request.source_validator != origin.source_validator
+        || origin.carrier_version != runtime.carrier_version()
+        || record.domain.zerostate != runtime.pin().zerostate
+        || record.domain.global_id != runtime.pin().global_id
+        || record.domain.wire_profile != runtime.wire_profile()
+        || record.protocol != runtime.protocol()
+        || &record.profile != runtime.profile()
+        || &record.session_id != runtime.session_id()
+    {
+        fail!("Canonical delivery differs from authenticated source binding");
+    }
+    let block = crate::block::BlockStuff::deserialize_block_checked(
+        record.block_id.clone(),
+        Arc::new(record.block_data.clone()),
+    )?;
+    block.verify_expected_id(&record.block_id)?;
+    let creator = block.block()?.read_extra()?.created_by().clone();
+    if creator != request.source_validator
+        || !runtime
+            .committee()
+            .iter()
+            .any(|member| member.validator_id().ok().as_ref() == Some(&creator))
+        || block.block()?.global_id() != runtime.pin().global_id
+    {
+        fail!("Canonical body creator differs from authenticated source");
+    }
+    let (_, previous) =
+        crate::block::construct_and_check_prev_stuff(block.root_cell(), block.id(), false)?;
+    if previous.prev != record.prev {
+        fail!("Canonical body ancestry differs from retained record");
+    }
+    let wire: rtos_api::ton::ton_node::SignatureSet =
+        runtime.wire_profile().deserialize_typed(record.carrier.bytes())?;
+    if runtime.wire_profile().serialize(&wire)? != record.carrier.bytes() {
+        fail!("Noncanonical retained signature carrier");
+    }
+    let rtos_api::ton::ton_node::SignatureSet::TonNode_SignatureSet_SimplexPq(fields) = wire else {
+        fail!("Canonical retention requires a PQ carrier");
+    };
+    let verifier = runtime
+        .pq_context()
+        .ok_or_else(|| error!("Canonical retention needs PQ runtime"))?
+        .for_block(record.block_id.clone())?;
+    let verified = verifier.verify_network(&PqNetworkSignatureSet::from_node(fields)?)?;
+    if verified.is_final() != record.carrier.is_final() {
+        fail!("Canonical carrier role mismatch");
+    }
+    let finality = if verified.is_final() {
+        SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(verified.into_final()?.0))
+    } else {
+        SessionFinality::PqApproval(verified.into_approval()?.0)
+    };
+    Ok(CanonicalFinalityRecord {
+        request: request.clone(),
+        data: consensus_common::ConsensusCommonFactory::create_block_payload(
+            record.block_data.clone().into(),
+        ),
+        finality,
+        last_mc_finalized_seqno: delivery.last_mc,
+        candidate_already_sent: delivery.candidate_already_sent,
+        created_at_unix_secs: record.created_at_unix_secs,
+    })
+}
+
 fn live_record(
     runtime: &AuthenticatedSessionRuntime,
     draft: &FinalizedDeliveryDraft,

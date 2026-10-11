@@ -428,6 +428,22 @@ impl PropagationOutbox {
         }))
     }
 
+    /// A delivery mapping is a permanent source reference, including after
+    /// Completed. No delivery or canonical evidence may be reclaimed without a
+    /// separate source retirement protocol. Re-sync before a source compacts
+    /// its full ACK; an uncertain write poisons this owner just like admission.
+    pub(crate) fn retain_delivery(&self, expected: &Delivery) -> Result<()> {
+        let mut state = self.lock()?;
+        if !state.snapshot.deliveries.iter().any(|delivery| delivery == expected) {
+            fail!("Canonical source reference differs from durable delivery");
+        }
+        if expected.origin.is_none() {
+            fail!("Canonical source reference requires a retained origin");
+        }
+        let next = state.snapshot.clone();
+        self.commit(&mut state, next)
+    }
+
     pub fn delivery_for_record(&self, id: RecordId) -> Result<Option<Delivery>> {
         Ok(self.lock()?.snapshot.deliveries.iter().find(|d| d.record_id == id).cloned())
     }
@@ -1462,6 +1478,43 @@ mod tests {
         assert_eq!(pending.len(), 8);
         assert!(pending.iter().all(|p| p.pending
             == vec![effect(PublicationKind::Candidate), effect(PublicationKind::Finality)]));
+        Ok(())
+    }
+
+    #[test]
+    fn outbox_canonical_reference_reopen_and_uncertain_sync() -> Result<()> {
+        for failure in [0, 1, 2] {
+            let disk = Arc::new(MemoryStore::default());
+            let store = memory(disk.clone(), Limits::default());
+            let origin = RecoveryOrigin {
+                carrier_version: 14,
+                local_adnl: UInt256::from([1; 32]),
+                source_validator: UInt256::from([2; 32]),
+                local_validator_index: Some(0),
+            };
+            let id = store.stage_draft(record(1), 7, true, Some(origin))?;
+            let (delivery, original) = store.delivery(&id)?.unwrap();
+            store.mark_accepted(delivery.record_id)?;
+            store.resolve_draft(delivery.record_id, Vec::new())?;
+            assert_eq!(store.delivery(&id)?.unwrap().1.stage, PublicationStage::Completed);
+            let mut other = delivery.clone();
+            other.origin.as_mut().unwrap().local_adnl = UInt256::from([9; 32]);
+            assert!(store.retain_delivery(&other).is_err());
+            disk.failure.store(failure, Ordering::Release);
+            assert_eq!(store.retain_delivery(&delivery).is_ok(), failure == 0);
+            if failure != 0 {
+                assert!(store.delivery(&id).is_err(), "uncertain owner must fail closed");
+            }
+            drop(store);
+            disk.failure.store(0, Ordering::Release);
+            let reopened = memory(disk, Limits::default());
+            let (restored, entry) = reopened.delivery(&id)?.unwrap();
+            assert_eq!(restored, delivery);
+            assert_eq!(entry.record.block_data, original.record.block_data);
+            assert_eq!(entry.record.carrier, original.record.carrier);
+            assert_eq!(entry.record.created_at_unix_secs, original.record.created_at_unix_secs);
+            reopened.retain_delivery(&restored)?;
+        }
         Ok(())
     }
 
