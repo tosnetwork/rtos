@@ -94,50 +94,82 @@ pub(crate) fn failed(error: impl std::fmt::Display) -> RetirementRefusal {
     RetirementRefusal::Failed(format!("{error:#}"))
 }
 
-/// Charges the caller's budget, mapping exhaustion to a typed refusal.
+/// Which hard byte cap a file read counts against.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Bucket {
+    /// The runtime manifest; its reader bounds it separately.
+    Manifest,
+    Delivered,
+    Sets,
+}
+
+/// Workspace charged per inventoried file for the index, file list and digest.
+const WORKSPACE_PER_FILE: usize = 1024;
+
+fn exhausted(error: impl std::fmt::Display) -> RetirementRefusal {
+    RetirementRefusal::BudgetExhausted(format!("{error:#}"))
+}
+
+/// Charges the caller's budget before work and allocation, under hard caps
+/// the caller cannot raise: never more entries or bytes per directory than the
+/// source store itself may legally hold.
 pub(crate) struct Charge<'a> {
     budget: &'a dyn SourceHistoryDebtBudget,
-    items: usize,
-    bytes: u64,
+    entries: usize,
+    delivered_bytes: u64,
+    set_bytes: u64,
 }
 impl<'a> Charge<'a> {
-    // Independent of the caller's budget: never more items or bytes than the
-    // source directories may legally hold.
-    const MAX_ITEMS: usize = 2 * (MAX_REFERENCES + crate::finality_recovery::MAX_RETIREMENT_SETS);
-    const MAX_BYTES: u64 = MAX_REFERENCE_TOTAL
-        + MAX_REFERENCE_BYTES
-        + crate::finality_recovery::MAX_RETIREMENT_SET_BYTES;
+    // Directory entries of both stores, plus their fixed subdirectories and lock.
+    const MAX_ENTRIES: usize = MAX_REFERENCES + crate::finality_recovery::MAX_RETIREMENT_SETS + 8;
+    const MAX_DELIVERED_BYTES: u64 = MAX_REFERENCE_TOTAL;
+    const MAX_SET_BYTES: u64 = crate::finality_recovery::MAX_RETIREMENT_SET_BYTES;
     pub(crate) fn new(budget: &'a dyn SourceHistoryDebtBudget) -> Self {
-        Self { budget, items: 0, bytes: 0 }
+        Self { budget, entries: 0, delivered_bytes: 0, set_bytes: 0 }
     }
+    /// One directory entry examined.
     pub(crate) fn step(&mut self) -> Refusal<()> {
-        self.items = self
-            .items
-            .checked_add(1)
-            .ok_or_else(|| RetirementRefusal::BudgetExhausted("item count overflow".into()))?;
-        if self.items > Self::MAX_ITEMS {
-            return Err(RetirementRefusal::BudgetExhausted("item hard cap".into()));
+        self.entries =
+            self.entries.checked_add(1).ok_or_else(|| exhausted("entry count overflow"))?;
+        if self.entries > Self::MAX_ENTRIES {
+            return Err(exhausted("directory entry hard cap"));
         }
-        self.budget.step().map_err(|e| RetirementRefusal::BudgetExhausted(format!("{e:#}")))
+        self.budget.step().map_err(exhausted)
     }
-    pub(crate) fn read(&mut self, bytes: usize) -> Refusal<()> {
+    /// Bytes about to be read from one file, and the buffer that holds them.
+    pub(crate) fn read(&mut self, bucket: Bucket, bytes: usize) -> Refusal<()> {
         let bytes64 = u64::try_from(bytes).map_err(failed)?;
-        self.bytes = self
-            .bytes
-            .checked_add(bytes64)
-            .ok_or_else(|| RetirementRefusal::BudgetExhausted("byte count overflow".into()))?;
-        if self.bytes > Self::MAX_BYTES {
-            return Err(RetirementRefusal::BudgetExhausted("byte hard cap".into()));
+        let (total, cap) = match bucket {
+            Bucket::Manifest => (None, 0),
+            Bucket::Delivered => (Some(&mut self.delivered_bytes), Self::MAX_DELIVERED_BYTES),
+            Bucket::Sets => (Some(&mut self.set_bytes), Self::MAX_SET_BYTES),
+        };
+        if let Some(total) = total {
+            *total = total.checked_add(bytes64).ok_or_else(|| exhausted("byte count overflow"))?;
+            if *total > cap {
+                return Err(exhausted(format!("{bucket:?} byte hard cap")));
+            }
         }
-        self.budget
-            .read_bytes(bytes)
-            .and_then(|_| self.budget.workspace(bytes))
-            .map_err(|e| RetirementRefusal::BudgetExhausted(format!("{e:#}")))
+        self.budget.read_bytes(bytes).map_err(exhausted)?;
+        self.budget.workspace(bytes).map_err(exhausted)
+    }
+    /// Memory about to be allocated for derived structures.
+    pub(crate) fn workspace(&mut self, bytes: usize) -> Refusal<()> {
+        self.budget.workspace(bytes).map_err(exhausted)
+    }
+    /// One node lookup about to be admitted.
+    pub(crate) fn lookup(&mut self) -> Refusal<()> {
+        self.budget.step().map_err(exhausted)
     }
 }
 
 /// Reads one regular file with a size bound, refusing symlinks and growth.
-pub(crate) fn read_bounded(path: &Path, limit: u64, charge: &mut Charge) -> Refusal<Vec<u8>> {
+pub(crate) fn read_bounded(
+    path: &Path,
+    limit: u64,
+    bucket: Bucket,
+    charge: &mut Charge,
+) -> Refusal<Vec<u8>> {
     let metadata = std::fs::symlink_metadata(path).map_err(failed)?;
     if !metadata.file_type().is_file() {
         return Err(RetirementRefusal::UnknownArtifact(path.to_owned()));
@@ -146,7 +178,7 @@ pub(crate) fn read_bounded(path: &Path, limit: u64, charge: &mut Charge) -> Refu
         return Err(RetirementRefusal::LegacyFormat(path.to_owned(), "oversized".into()));
     }
     let length = usize::try_from(metadata.len()).map_err(failed)?;
-    charge.read(length)?;
+    charge.read(bucket, length)?;
     let file = File::open(path).map_err(failed)?;
     let mut bytes = Vec::with_capacity(length);
     file.take(limit.saturating_add(1)).read_to_end(&mut bytes).map_err(failed)?;
@@ -231,15 +263,22 @@ impl PendingRetirementScan {
         &self.manifest_digest
     }
     /// Asks the node, one item at a time, whether it released exactly the
-    /// offer this source recorded. An admitted lookup is never timed out: its
-    /// completion is owned by the node and runs exactly once. Call from a
-    /// blocking job. On refusal the still-locked scan is handed back.
-    pub fn reconcile(
+    /// offer this source recorded. Each lookup is charged before admission and
+    /// awaited asynchronously, so no thread blocks while the node's own
+    /// workers complete it. An admitted lookup is never timed out: its
+    /// completion is owned by the node and runs exactly once. On refusal the
+    /// still-locked scan is handed back.
+    pub async fn reconcile(
         self,
         sink: &dyn DurableFinalitySink,
+        budget: &dyn SourceHistoryDebtBudget,
     ) -> std::result::Result<SourceRetirementPreparation, Box<ReconcileFailure>> {
-        for item in &self.items {
-            if let Err(refusal) = lookup_released(sink, item) {
+        for index in 0..self.items.len() {
+            let result = match self.items.get(index) {
+                Some(item) => lookup_released(sink, budget, item).await,
+                None => Err(failed("inventory changed during reconciliation")),
+            };
+            if let Err(refusal) = result {
                 return Err(Box::new(ReconcileFailure { scan: self, refusal }));
             }
         }
@@ -247,8 +286,13 @@ impl PendingRetirementScan {
     }
 }
 
-fn lookup_released(sink: &dyn DurableFinalitySink, item: &RetirementItem) -> Refusal<()> {
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+async fn lookup_released(
+    sink: &dyn DurableFinalitySink,
+    budget: &dyn SourceHistoryDebtBudget,
+    item: &RetirementItem,
+) -> Refusal<()> {
+    Charge::new(budget).lookup()?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
     sink.lookup_terminal(
         item.offer.request.clone(),
         Box::new(move |result| {
@@ -259,7 +303,7 @@ fn lookup_released(sink: &dyn DurableFinalitySink, item: &RetirementItem) -> Ref
         source_id: item.source_id.clone(),
         error: format!("lookup not admitted: {e:#}"),
     })?;
-    let result = rx.recv().map_err(|_| RetirementRefusal::CustodyUnverified {
+    let result = rx.await.map_err(|_| RetirementRefusal::CustodyUnverified {
         source_id: item.source_id.clone(),
         error: "lookup completion dropped".into(),
     })?;
@@ -327,17 +371,35 @@ pub fn scan_source_retirement(
     if !runtime.shard().is_masterchain() {
         return Err(RetirementRefusal::Unsupported("only masterchain Final reaches Released"));
     }
+    // The receipt must observe this session's own storage at this namespace.
+    // RocksDB admits one instance per directory, and an outcome exists only
+    // after that instance's last reference is gone.
+    if teardown.storage_id() != runtime.session_id().to_hex_string() || teardown.path() != namespace
+    {
+        return Err(RetirementRefusal::DatabaseTeardown(
+            "receipt observes another storage instance".into(),
+        ));
+    }
     teardown.check().map_err(|e| RetirementRefusal::DatabaseTeardown(format!("{e:#}")))?;
     existing_directory(namespace)?;
-    let (manifest, manifest_digest) =
-        crate::runtime_manifest::RuntimeManifest::open_existing(&runtime, namespace)?;
-    let store = PendingFinalityStore::lock_existing(namespace.join(DIRECTORY))?;
     let mut charge = Charge::new(budget);
+    let (manifest, manifest_digest) =
+        crate::runtime_manifest::RuntimeManifest::open_existing(&runtime, namespace, &mut charge)?;
+    let store = PendingFinalityStore::lock_existing(namespace.join(DIRECTORY))?;
     let delivered = store.retirement_delivered(&runtime, &mut charge)?;
     let sets = crate::finality_recovery::retirement_sealed_sets(namespace, &runtime, &mut charge)?;
     if sets.is_empty() && delivered.is_empty() {
         return Err(RetirementRefusal::EmptyInventory);
     }
+    let files_count = sets
+        .len()
+        .checked_add(delivered.len())
+        .ok_or_else(|| exhausted("inventory count overflow"))?;
+    charge.workspace(
+        files_count
+            .checked_mul(WORKSPACE_PER_FILE)
+            .ok_or_else(|| exhausted("inventory workspace overflow"))?,
+    )?;
     let mut index = std::collections::HashMap::new();
     for (position, record) in delivered.iter().enumerate() {
         let key = (record.block_id.clone(), record.is_final, record.source_validator.clone());
@@ -379,7 +441,7 @@ pub fn scan_source_retirement(
             .map(str::to_owned)
             .ok_or_else(|| RetirementRefusal::UnknownArtifact(path.to_owned()))
     };
-    let mut files = Vec::with_capacity(sets.len().saturating_add(delivered.len()));
+    let mut files = Vec::with_capacity(files_count);
     for set in &sets {
         files.push((relative(&set.path)?, set.file_hash.to_hex_string()));
     }

@@ -21,6 +21,10 @@ impl SourceHistoryDebtBudget for Budget {
     }
 }
 
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(future)
+}
+
 struct Released {
     _dir: crate::authenticated_fixture::TestDirectory,
     runtime: Arc<AuthenticatedSessionRuntime>,
@@ -162,21 +166,24 @@ fn source_retirement_released_namespace_issues_locked_preparation() {
     assert!(matches!(
         crate::runtime_manifest::RuntimeManifest::open_existing(
             &fixture.runtime,
-            &fixture.namespace
+            &fixture.namespace,
+            &mut Charge::new(&Budget),
         ),
         Err(RetirementRefusal::Busy)
     ));
     let digest = scan.inventory_digest().clone();
     let lookups = AtomicUsize::new(0);
     let offer = fixture.offer.clone();
-    let preparation = scan
-        .reconcile(&Terminal(|request: CloseFinalityRequest| {
+    let preparation = block_on(scan.reconcile(
+        &Terminal(|request: CloseFinalityRequest| {
             lookups.fetch_add(1, Ordering::SeqCst);
             assert_eq!(request, offer.request);
             Ok(FinalityTerminalLookup::Released(offer.clone()))
-        }))
-        .map_err(|failure| failure.refusal)
-        .unwrap();
+        }),
+        &Budget,
+    ))
+    .map_err(|failure| failure.refusal)
+    .unwrap();
     assert_eq!(lookups.load(Ordering::SeqCst), 1);
     assert_eq!(preparation.inventory_digest(), &digest);
     assert!(fixture.store_locked(), "preparation keeps the store lock");
@@ -454,15 +461,224 @@ fn source_retirement_budget_is_charged_and_hard_capped() {
     );
     assert_eq!(fixture.snapshot(), before);
 
-    // The caller's budget cannot raise the module's own item cap.
+    // The caller's budget cannot raise the module's own caps, and each
+    // directory keeps its own byte cap: small output history cannot lend
+    // its share to Delivered records.
     let mut charge = Charge::new(&Budget);
-    for _ in 0..Charge::MAX_ITEMS {
+    for _ in 0..Charge::MAX_ENTRIES {
         charge.step().unwrap();
     }
     assert!(matches!(charge.step(), Err(RetirementRefusal::BudgetExhausted(_))));
+    for (bucket, cap) in
+        [(Bucket::Delivered, Charge::MAX_DELIVERED_BYTES), (Bucket::Sets, Charge::MAX_SET_BYTES)]
+    {
+        let mut charge = Charge::new(&Budget);
+        charge.read(bucket, usize::try_from(cap).unwrap()).unwrap();
+        assert!(matches!(charge.read(bucket, 1), Err(RetirementRefusal::BudgetExhausted(_))));
+    }
     let mut charge = Charge::new(&Budget);
-    charge.read(usize::try_from(Charge::MAX_BYTES).unwrap()).unwrap();
-    assert!(matches!(charge.read(1), Err(RetirementRefusal::BudgetExhausted(_))));
+    charge.read(Bucket::Sets, usize::try_from(Charge::MAX_SET_BYTES).unwrap()).unwrap();
+    assert!(
+        matches!(
+            charge.read(Bucket::Delivered, usize::try_from(Charge::MAX_SET_BYTES).unwrap() + 1),
+            Err(RetirementRefusal::BudgetExhausted(_))
+        ),
+        "Delivered bytes are capped on their own"
+    );
+}
+
+/// Counts or limits each budget dimension; `None` means unlimited.
+struct Meter {
+    steps: AtomicUsize,
+    read: AtomicUsize,
+    workspace: AtomicUsize,
+    limits: (Option<usize>, Option<usize>, Option<usize>),
+}
+impl Meter {
+    fn new(limits: (Option<usize>, Option<usize>, Option<usize>)) -> Self {
+        Self {
+            steps: AtomicUsize::new(0),
+            read: AtomicUsize::new(0),
+            workspace: AtomicUsize::new(0),
+            limits,
+        }
+    }
+    fn charge(counter: &AtomicUsize, amount: usize, limit: Option<usize>) -> Result<()> {
+        let total = counter.fetch_add(amount, Ordering::SeqCst) + amount;
+        if limit.is_some_and(|limit| total > limit) {
+            fail!("injected budget limit");
+        }
+        Ok(())
+    }
+}
+impl SourceHistoryDebtBudget for Meter {
+    fn step(&self) -> Result<()> {
+        Self::charge(&self.steps, 1, self.limits.0)
+    }
+    fn read_bytes(&self, bytes: usize) -> Result<()> {
+        Self::charge(&self.read, bytes, self.limits.1)
+    }
+    fn workspace(&self, bytes: usize) -> Result<()> {
+        Self::charge(&self.workspace, bytes, self.limits.2)
+    }
+}
+
+#[test]
+fn source_retirement_scan_read_and_workspace_boundaries() {
+    let fixture = released();
+    let before = fixture.snapshot();
+    let meter = Meter::new((None, None, None));
+    drop(
+        scan_source_retirement(
+            fixture.runtime.clone(),
+            &fixture.namespace,
+            &fixture.teardown,
+            &meter,
+        )
+        .unwrap(),
+    );
+    let read = meter.read.load(Ordering::SeqCst);
+    let workspace = meter.workspace.load(Ordering::SeqCst);
+    let manifest = std::fs::metadata(fixture.namespace.join("session-runtime.json")).unwrap().len();
+    assert!(read as u64 > manifest, "manifest and inventory reads are charged");
+    assert!(workspace > read, "derived inventory workspace is charged too");
+    for limits in [(None, Some(read - 1), None), (None, None, Some(workspace - 1))] {
+        let refusal = scan_source_retirement(
+            fixture.runtime.clone(),
+            &fixture.namespace,
+            &fixture.teardown,
+            &Meter::new(limits),
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(refusal, RetirementRefusal::BudgetExhausted(_)), "{refusal}");
+        assert!(!fixture.store_locked(), "a budget refusal releases the locks");
+    }
+    drop(
+        scan_source_retirement(
+            fixture.runtime.clone(),
+            &fixture.namespace,
+            &fixture.teardown,
+            &Meter::new((None, Some(read), Some(workspace))),
+        )
+        .unwrap(),
+    );
+
+    // Each node lookup is charged before admission.
+    let lookups = AtomicUsize::new(0);
+    let offer = fixture.offer.clone();
+    let sink = Terminal(|_: CloseFinalityRequest| {
+        lookups.fetch_add(1, Ordering::SeqCst);
+        Ok(FinalityTerminalLookup::Released(offer.clone()))
+    });
+    let failure = match block_on(
+        fixture.scan().unwrap().reconcile(&sink, &Meter::new((Some(0), None, None))),
+    ) {
+        Ok(_) => panic!("a lookup beyond the budget issued a preparation"),
+        Err(failure) => failure,
+    };
+    assert!(
+        matches!(failure.refusal, RetirementRefusal::BudgetExhausted(_)),
+        "{}",
+        failure.refusal
+    );
+    assert_eq!(lookups.load(Ordering::SeqCst), 0, "the refused lookup was never admitted");
+    drop(failure);
+    drop(
+        block_on(fixture.scan().unwrap().reconcile(&sink, &Meter::new((Some(1), None, None))))
+            .map_err(|f| f.refusal)
+            .unwrap(),
+    );
+    assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.snapshot(), before);
+}
+
+#[test]
+fn source_retirement_rejects_foreign_teardown_and_symlinked_database() {
+    let fixture = released();
+    let before = fixture.snapshot();
+    // A clean receipt from another storage instance proves nothing here.
+    let elsewhere = crate::authenticated_fixture::TestDirectory::new();
+    let foreign = crate::database::SimplexDb::open(
+        elsewhere.path(),
+        &fixture.runtime.session_id().to_hex_string(),
+    )
+    .unwrap();
+    let receipt = foreign.teardown_receipt().unwrap();
+    foreign.close(None).unwrap();
+    drop(foreign);
+    receipt.check().unwrap();
+    let refusal =
+        scan_source_retirement(fixture.runtime.clone(), &fixture.namespace, &receipt, &Budget)
+            .err()
+            .unwrap();
+    assert!(matches!(refusal, RetirementRefusal::DatabaseTeardown(_)), "{refusal}");
+    assert_eq!(fixture.snapshot(), before);
+
+    let database = fixture.namespace.join(fixture.runtime.session_id().to_hex_string());
+    let moved = fixture.namespace.join("moved-database");
+    std::fs::rename(&database, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &database).unwrap();
+    let before = fixture.snapshot();
+    let refusal = fixture.scan().err().unwrap();
+    assert!(matches!(refusal, RetirementRefusal::UnknownArtifact(_)), "{refusal}");
+    assert_eq!(fixture.snapshot(), before, "refusal preserved every byte");
+}
+
+#[test]
+fn source_retirement_reconcile_needs_no_blocking_thread() {
+    // The node completes custody lookups on its blocking pool. With a single
+    // blocking thread, a reconcile that blocked a pool thread would deadlock.
+    struct BlockingCompletion {
+        handle: tokio::runtime::Handle,
+        offer: CloseOffer,
+    }
+    impl DurableFinalitySink for BlockingCompletion {
+        fn stage(&self, _: FinalizedDeliveryDraft, _: FinalizedDeliveryCompletion) -> Result<()> {
+            fail!("unused")
+        }
+        fn lookup_terminal(
+            &self,
+            _: CloseFinalityRequest,
+            completion: FinalityTerminalCompletion,
+        ) -> Result<()> {
+            let offer = self.offer.clone();
+            drop(
+                self.handle.spawn_blocking(move || {
+                    completion(Ok(FinalityTerminalLookup::Released(offer)))
+                }),
+            );
+            Ok(())
+        }
+    }
+    let fixture = released();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    let sink =
+        BlockingCompletion { handle: runtime.handle().clone(), offer: fixture.offer.clone() };
+    let (rt_runtime, namespace, teardown) =
+        (fixture.runtime.clone(), fixture.namespace.clone(), fixture.teardown.clone());
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = runtime.block_on(async move {
+            let scan = tokio::task::spawn_blocking(move || {
+                scan_source_retirement(rt_runtime, &namespace, &teardown, &Budget)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            scan.reconcile(&sink, &Budget).await.map(|p| p.inventory().len()).map_err(|f| f.refusal)
+        });
+        let _ = done_tx.send(result);
+    });
+    let result = done_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("reconcile deadlocked on the blocking pool");
+    worker.join().unwrap();
+    assert_eq!(result.unwrap(), 1);
 }
 
 #[test]
@@ -484,20 +700,22 @@ fn source_retirement_reconcile_refusals_return_the_locked_scan() {
     ];
     for (name, answer, expected) in cases {
         let scan = fixture.scan().unwrap();
-        let (scan, refusal) =
-            match scan.reconcile(&Terminal(move |_: CloseFinalityRequest| Ok(answer.clone()))) {
-                Ok(_) => panic!("{name}: issued"),
-                Err(failure) => (failure.scan, failure.refusal),
-            };
+        let (scan, refusal) = match block_on(
+            scan.reconcile(&Terminal(move |_: CloseFinalityRequest| Ok(answer.clone())), &Budget),
+        ) {
+            Ok(_) => panic!("{name}: issued"),
+            Err(failure) => (failure.scan, failure.refusal),
+        };
         assert!(expected(&refusal), "{name}: {refusal}");
         assert!(fixture.store_locked(), "{name}: refused scan still owns the lock");
         drop(scan);
         assert!(!fixture.store_locked());
     }
     let scan = fixture.scan().unwrap();
-    let Err(failure) =
-        scan.reconcile(&Terminal(|_: CloseFinalityRequest| Err(error!("custody reopen failed"))))
-    else {
+    let Err(failure) = block_on(scan.reconcile(
+        &Terminal(|_: CloseFinalityRequest| Err(error!("custody reopen failed"))),
+        &Budget,
+    )) else {
         panic!("custody error issued a preparation");
     };
     let ReconcileFailure { scan, refusal } = *failure;
@@ -509,7 +727,7 @@ fn source_retirement_reconcile_refusals_return_the_locked_scan() {
             fail!("unused")
         }
     }
-    let Err(failure) = fixture.scan().unwrap().reconcile(&Refuse) else {
+    let Err(failure) = block_on(fixture.scan().unwrap().reconcile(&Refuse, &Budget)) else {
         panic!("unsupported lookup issued a preparation");
     };
     let ReconcileFailure { scan, refusal } = *failure;
@@ -540,7 +758,7 @@ fn source_retirement_admitted_lookup_is_never_timed_out() {
     let scan = fixture.scan().unwrap();
     let worker_sink = sink.clone();
     let worker = std::thread::spawn(move || {
-        scan.reconcile(worker_sink.as_ref()).map_err(|failure| failure.refusal)
+        block_on(scan.reconcile(worker_sink.as_ref(), &Budget)).map_err(|failure| failure.refusal)
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while sink.0.lock().unwrap().is_none() {

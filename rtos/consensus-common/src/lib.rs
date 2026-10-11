@@ -609,14 +609,26 @@ pub trait AsyncKeyValueStorage: Send + Sync {
 pub struct StorageTeardownReceipt {
     outcome: Arc<std::sync::OnceLock<std::result::Result<(), String>>>,
     storage_id: String,
+    path: std::path::PathBuf,
 }
 
 impl StorageTeardownReceipt {
     pub(crate) fn new(
         outcome: Arc<std::sync::OnceLock<std::result::Result<(), String>>>,
         storage_id: &str,
+        path: &std::path::Path,
     ) -> Self {
-        Self { outcome, storage_id: storage_id.to_string() }
+        Self { outcome, storage_id: storage_id.to_string(), path: path.to_owned() }
+    }
+
+    /// Identifier the observed instance was opened with.
+    pub fn storage_id(&self) -> &str {
+        &self.storage_id
+    }
+
+    /// Path the observed instance was opened at.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 
     /// Fails while the instance is alive, or when its teardown was not clean.

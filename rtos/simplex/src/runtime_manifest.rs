@@ -85,8 +85,12 @@ impl RuntimeManifest {
     pub(crate) fn open_existing(
         runtime: &AuthenticatedSessionRuntime,
         directory: &Path,
+        charge: &mut crate::finality_delivery::source_retirement::Charge,
     ) -> crate::finality_delivery::source_retirement::Refusal<(Self, rtos_block::UInt256)> {
-        use crate::finality_delivery::source_retirement::{failed, RetirementRefusal};
+        use crate::finality_delivery::source_retirement::{
+            existing_directory, failed, Bucket, RetirementRefusal,
+        };
+        const MAX_MANIFEST_BYTES: u64 = 1 << 20;
         let expected = Self::bytes(runtime).map_err(failed)?;
         let path = directory.join("session-runtime.json");
         match std::fs::symlink_metadata(&path) {
@@ -103,7 +107,9 @@ impl RuntimeManifest {
             Err(std::fs::TryLockError::WouldBlock) => return Err(RetirementRefusal::Busy),
             Err(e) => return Err(failed(e)),
         }
-        let current = directory.join(runtime.session_id().to_hex_string()).join("CURRENT");
+        let database = directory.join(runtime.session_id().to_hex_string());
+        existing_directory(&database)?;
+        let current = database.join("CURRENT");
         match std::fs::symlink_metadata(&current) {
             Ok(m) if m.file_type().is_file() => {}
             Ok(_) => return Err(RetirementRefusal::UnknownArtifact(current)),
@@ -112,8 +118,13 @@ impl RuntimeManifest {
             }
             Err(e) => return Err(failed(e)),
         }
+        let length = file.metadata().map_err(failed)?.len();
+        if length > MAX_MANIFEST_BYTES {
+            return Err(RetirementRefusal::Manifest("manifest oversized".into()));
+        }
+        charge.read(Bucket::Manifest, usize::try_from(length).map_err(failed)?)?;
         let mut bytes = Vec::new();
-        (&mut file).take((1 << 20) + 1).read_to_end(&mut bytes).map_err(failed)?;
+        (&mut file).take(MAX_MANIFEST_BYTES + 1).read_to_end(&mut bytes).map_err(failed)?;
         if bytes != expected {
             return Err(RetirementRefusal::Manifest("runtime binding mismatch".into()));
         }

@@ -1284,7 +1284,11 @@ impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
     }
 
     fn teardown_receipt(&self) -> Option<crate::StorageTeardownReceipt> {
-        Some(crate::StorageTeardownReceipt::new(self.teardown.clone(), &self.storage_id))
+        Some(crate::StorageTeardownReceipt::new(
+            self.teardown.clone(),
+            &self.storage_id,
+            &self.path,
+        ))
     }
 }
 

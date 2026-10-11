@@ -4,7 +4,7 @@
 //! session can be admitted between the stop and a later retirement step.
 use super::finality_recovery_owner::RecoveryReservation;
 use simplex::finality_delivery::source_retirement::{
-    RetirementRefusal, SourceRetirementPreparation,
+    PendingRetirementScan, RetirementRefusal, SourceRetirementPreparation,
 };
 
 /// Result of preparing a stopped group's namespace for retirement. Dropping
@@ -15,16 +15,21 @@ pub enum RetirementOutcome {
     Refused(RetirementRefusalOwner),
 }
 
-/// A preparation together with the lease that protects its namespace.
+/// A preparation together with the lease that protects its namespace. It
+/// exists only after a drained teardown, so abandoning it may release.
 pub struct RetirementPreparationOwner {
     source: Option<SourceRetirementPreparation>,
     reservation: Option<RecoveryReservation>,
 }
 
-/// A refusal that still owns the namespace lease; the namespace is unchanged.
+/// A refusal that still owns whatever it was given: the lease and, when the
+/// node refused reconciliation, the scan with its namespace locks. The
+/// namespace itself is unchanged.
 pub struct RetirementRefusalOwner {
     refusal: RetirementRefusal,
+    scan: Option<PendingRetirementScan>,
     reservation: Option<RecoveryReservation>,
+    drained: bool,
 }
 
 impl RetirementOutcome {
@@ -37,11 +42,15 @@ impl RetirementOutcome {
             reservation: Some(reservation),
         })
     }
+    /// `drained` certifies that the session's workers and storage are gone;
+    /// without it the lease can never be released through this outcome.
     pub(crate) fn refused(
         refusal: RetirementRefusal,
+        scan: Option<PendingRetirementScan>,
         reservation: Option<RecoveryReservation>,
+        drained: bool,
     ) -> Self {
-        Self::Refused(RetirementRefusalOwner { refusal, reservation })
+        Self::Refused(RetirementRefusalOwner { refusal, scan, reservation, drained })
     }
 }
 
@@ -66,10 +75,25 @@ impl RetirementRefusalOwner {
     pub fn holds_reservation(&self) -> bool {
         self.reservation.is_some()
     }
-    /// Releases the lease; the refused namespace becomes admissible again.
-    pub fn abandon(mut self) {
+    /// True when the refused scan, and with it the namespace locks, is held.
+    pub fn holds_scan(&self) -> bool {
+        self.scan.is_some()
+    }
+    /// True when teardown proved the session's workers and storage are gone.
+    pub fn drained(&self) -> bool {
+        self.drained
+    }
+    /// Releases the scan, then the lease, making the namespace admissible
+    /// again. An undrained namespace is never released here: the refusal is
+    /// handed back unchanged and keeps the namespace closed.
+    pub fn abandon(mut self) -> std::result::Result<(), Box<Self>> {
+        if !self.drained {
+            return Err(Box::new(self));
+        }
+        drop(self.scan.take());
         if let Some(reservation) = self.reservation.take() {
             reservation.release();
         }
+        Ok(())
     }
 }

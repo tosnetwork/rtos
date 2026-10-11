@@ -1283,6 +1283,8 @@ fn test_teardown_receipt_requires_last_reference_and_clean_join() {
     )
     .unwrap();
     let receipt = storage.teardown_receipt().expect("RocksDB storage certifies teardown");
+    assert_eq!(receipt.path(), path.as_path());
+    assert_eq!(receipt.storage_id(), "teardown_clean");
     assert!(receipt.same_instance(&storage.teardown_receipt().unwrap()));
     assert!(receipt.check().is_err(), "a live instance has no teardown outcome");
     let held = storage.clone();

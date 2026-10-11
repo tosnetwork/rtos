@@ -1436,7 +1436,8 @@ async fn test_group_retirement_policy_conflicts_with_ordinary_stop_in_both_order
         if retirement_first {
             let refused = refused_outcome(&group);
             assert!(!refused.holds_reservation(), "the mock group never held a lease");
-            refused.abandon();
+            assert!(refused.drained());
+            assert!(refused.abandon().is_ok(), "a drained refusal releases");
         }
         assert!(group.take_retirement_outcome().unwrap().is_none(), "outcome is taken once");
     }
@@ -1467,7 +1468,8 @@ async fn test_group_retirement_keeps_lease_until_abandon_and_ordinary_stop_relea
             assert!(registry.reserve_validator_for_test(key.clone()).unwrap().is_none());
             drop(group);
             assert!(registry.validator_reserved_for_test(&key), "dropping the group keeps it");
-            refused.abandon();
+            assert!(refused.drained());
+            assert!(refused.abandon().is_ok(), "a drained refusal releases");
         } else {
             group.clone().stop(rt, false).await.unwrap();
             assert!(group.take_retirement_outcome().unwrap().is_none());
@@ -1489,7 +1491,7 @@ async fn test_group_retirement_outcome_survives_cancelled_waiter() {
         .await
         .unwrap()
         .unwrap();
-    refused_outcome(&group).abandon();
+    assert!(refused_outcome(&group).abandon().is_ok());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1507,4 +1509,35 @@ async fn test_group_retirement_teardown_panic_records_refusal() {
     assert!(error.to_string().contains("session teardown failed"));
     let refused = refused_outcome(&group);
     assert!(refused.refusal().to_string().contains("teardown failed"), "{}", refused.refusal());
+    assert!(!refused.drained(), "a failed join never certifies drain");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_group_retirement_undrained_refusal_never_releases_its_lease() {
+    let registry = Arc::new(super::finality_recovery_owner::RecoveryRegistry::default());
+    let group = make_simplex_group_for_resolver_tests();
+    let session = Arc::new(MockSimplexSession::default());
+    session.panic_on_stop.store(true, Ordering::Relaxed);
+    let holder = Arc::new(super::consensus::SessionHolder::simplex(session));
+    group.group_impl.execute_sync(|inner| inner.session = Some(holder)).await;
+    let key = group.session_id.clone();
+    let lease = registry.reserve_validator_for_test(key.clone()).unwrap().unwrap();
+    group.namespace_admission.lock().unwrap().reservation = Some(lease);
+    assert!(group
+        .clone()
+        .stop_for_retirement_preparation(tokio::runtime::Handle::current())
+        .await
+        .is_err());
+    assert!(group.namespace_admission.lock().unwrap().reservation.is_none());
+    let refused = refused_outcome(&group);
+    assert!(refused.holds_reservation(), "the early-error outcome states it owns the lease");
+    assert!(!refused.drained());
+    let refused = match refused.abandon() {
+        Ok(()) => panic!("an undrained namespace was released"),
+        Err(refused) => refused,
+    };
+    assert!(registry.validator_reserved_for_test(&key));
+    assert!(registry.reserve_validator_for_test(key.clone()).unwrap().is_none());
+    drop(refused);
+    assert!(registry.validator_reserved_for_test(&key), "dropping never releases either");
 }

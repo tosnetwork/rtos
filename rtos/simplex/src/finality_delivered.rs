@@ -815,7 +815,8 @@ impl PendingFinalityStore {
     ) -> super::source_retirement::Refusal<Vec<super::source_retirement::RetirementDelivered>>
     {
         use super::source_retirement::{
-            existing_directory, failed, read_bounded, RetirementDelivered, RetirementRefusal,
+            existing_directory, failed, read_bounded, Bucket, RetirementDelivered,
+            RetirementRefusal,
         };
         let _guard = self.mutation.lock().map_err(|_| failed("source mutation lock poisoned"))?;
         let mut references = None;
@@ -861,7 +862,7 @@ impl PendingFinalityStore {
             if delivered.len() >= MAX_REFERENCES {
                 return Err(RetirementRefusal::BudgetExhausted("Delivered record cap".into()));
             }
-            let bytes = read_bounded(&path, MAX_REFERENCE_BYTES, charge)?;
+            let bytes = read_bounded(&path, MAX_REFERENCE_BYTES, Bucket::Delivered, charge)?;
             let disk = DeliveredDisk::parse(&path, &bytes)
                 .map_err(|e| RetirementRefusal::LegacyFormat(path.clone(), format!("{e:#}")))?;
             check_binding(runtime, &disk.reference)

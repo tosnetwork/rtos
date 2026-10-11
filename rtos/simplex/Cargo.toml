@@ -17,7 +17,7 @@ rand = '0.8'
 crossbeam = '0.8'
 metrics = '0.24'
 spin = '0.7'
-tokio = { features = [ 'rt-multi-thread' ], version = '1.40' }
+tokio = { features = [ 'rt-multi-thread', 'sync' ], version = '1.40' }
 
 adnl = { features = [ 'node' ], path = '../../adnl' }
 consensus-common = { path = '../consensus-common' }

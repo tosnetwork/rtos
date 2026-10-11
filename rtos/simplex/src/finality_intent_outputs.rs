@@ -376,7 +376,7 @@ pub(crate) fn retirement_sealed_sets(
     Vec<crate::finality_delivery::source_retirement::RetirementSealedSet>,
 > {
     use crate::finality_delivery::source_retirement::{
-        existing_directory, failed, read_bounded, RetirementRefusal, RetirementSealedSet,
+        existing_directory, failed, read_bounded, Bucket, RetirementRefusal, RetirementSealedSet,
     };
     let directory = namespace.join(DIRECTORY);
     existing_directory(&directory)?;
@@ -436,7 +436,7 @@ pub(crate) fn retirement_sealed_sets(
         if sets.len() >= MAX_RETIREMENT_SETS {
             return Err(RetirementRefusal::BudgetExhausted("output set cap".into()));
         }
-        let bytes = read_bounded(&path, MAX_OUTPUT_BYTES, charge)?;
+        let bytes = read_bounded(&path, MAX_OUTPUT_BYTES, Bucket::Sets, charge)?;
         let set = OutputSet::parse(&bytes)
             .map_err(|e| RetirementRefusal::LegacyFormat(path.clone(), format!("{e:#}")))?;
         if !set.released {

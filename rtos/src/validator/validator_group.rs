@@ -1686,7 +1686,8 @@ impl ValidatorGroup {
     }
 
     /// Records a refusal when teardown ended before it produced an outcome
-    /// (an early error or a panic). A lease still in admission stays there.
+    /// (an early error or a panic). The lease moves from admission into the
+    /// refusal, which is marked undrained and so can never release it.
     fn finish_retirement_outcome(&self, result: &std::result::Result<(), String>) {
         let mut slot = match self.retirement_outcome.lock() {
             Ok(slot) => slot,
@@ -1697,16 +1698,23 @@ impl ValidatorGroup {
                 Ok(()) => "teardown produced no retirement outcome".to_owned(),
                 Err(error) => format!("teardown failed: {error}"),
             };
+            let reservation = match self.namespace_admission.lock() {
+                Ok(mut admission) => admission.reservation.take(),
+                Err(poisoned) => poisoned.into_inner().reservation.take(),
+            };
             *slot = Some(super::retirement_preparation::RetirementOutcome::refused(
                 simplex::finality_delivery::source_retirement::RetirementRefusal::Failed(reason),
                 None,
+                reservation,
+                false,
             ));
         }
     }
 
-    /// Scans and reconciles the drained namespace in a blocking job. The job
-    /// runs inside the shared teardown task, so cancelling a waiter never
-    /// abandons it; the lease moves into the returned outcome either way.
+    /// Scans the drained namespace in a blocking job, then reconciles it with
+    /// the node asynchronously. Both run inside the shared teardown task, so
+    /// cancelling a waiter never abandons them; the lease moves into the
+    /// returned outcome either way, and a node refusal keeps the scan.
     async fn prepare_retirement(
         &self,
         rt: &tokio::runtime::Handle,
@@ -1722,24 +1730,32 @@ impl ValidatorGroup {
             return RetirementOutcome::refused(
                 RetirementRefusal::Unsupported("group held no namespace reservation"),
                 None,
+                None,
+                true,
             );
         };
         let Some(runtime) = self.authenticated_runtime.clone() else {
             return RetirementOutcome::refused(
                 RetirementRefusal::Unsupported("session without authenticated runtime"),
+                None,
                 Some(reservation),
+                true,
             );
         };
         let Some(teardown) = teardown else {
             return RetirementOutcome::refused(
                 RetirementRefusal::DatabaseTeardown("session opened no certifiable storage".into()),
+                None,
                 Some(reservation),
+                false,
             );
         };
         let Some(sink) = self.durable_finality_sink.get().cloned() else {
             return RetirementOutcome::refused(
                 RetirementRefusal::Unsupported("session without durable finality sink"),
+                None,
                 Some(reservation),
+                true,
             );
         };
         let namespace = match self
@@ -1751,32 +1767,51 @@ impl ValidatorGroup {
             Err(error) => {
                 return RetirementOutcome::refused(
                     RetirementRefusal::Failed(format!("namespace path: {error:#}")),
+                    None,
                     Some(reservation),
+                    true,
                 )
             }
         };
         let mut attempt = 0u32;
-        loop {
-            let (runtime, namespace, teardown, sink) =
-                (runtime.clone(), namespace.clone(), teardown.clone(), sink.clone());
+        let scan = loop {
+            let (runtime, namespace, teardown) =
+                (runtime.clone(), namespace.clone(), teardown.clone());
             let job = rt.spawn_blocking(move || {
-                let scan = scan_source_retirement(runtime, &namespace, &teardown, &RetirementBudget)?;
-                scan.reconcile(sink.as_ref()).map_err(|failure| failure.refusal)
+                scan_source_retirement(runtime, &namespace, &teardown, &RetirementBudget)
             });
             match job.await {
-                Ok(Ok(preparation)) => return RetirementOutcome::prepared(preparation, reservation),
+                Ok(Ok(scan)) => break scan,
                 // Closure scanners hold the store lock only briefly.
                 Ok(Err(RetirementRefusal::Busy)) if attempt < BUSY_RETRIES => {
                     attempt = attempt.saturating_add(1);
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                Ok(Err(refusal)) => return RetirementOutcome::refused(refusal, Some(reservation)),
+                Ok(Err(refusal)) => {
+                    // Only a refused teardown receipt leaves the drain unproven.
+                    let drained = !matches!(refusal, RetirementRefusal::DatabaseTeardown(_));
+                    return RetirementOutcome::refused(refusal, None, Some(reservation), drained);
+                }
                 Err(error) => {
                     return RetirementOutcome::refused(
                         RetirementRefusal::Failed(format!("preparation job failed: {error}")),
+                        None,
                         Some(reservation),
+                        true,
                     )
                 }
+            }
+        };
+        match scan.reconcile(sink.as_ref(), &RetirementBudget).await {
+            Ok(preparation) => RetirementOutcome::prepared(preparation, reservation),
+            Err(failure) => {
+                let failure = *failure;
+                RetirementOutcome::refused(
+                    failure.refusal,
+                    Some(failure.scan),
+                    Some(reservation),
+                    true,
+                )
             }
         }
     }
@@ -1849,32 +1884,12 @@ impl ValidatorGroup {
         let database_result = if drained && destroy_database {
             self.destroy_db().await
         } else { Ok(()) };
-        let mut retained_reservation = None;
-        if drained && database_result.is_ok() {
+        // A retirement stop keeps the lease in admission here. Every early
+        // return below hands it to an undrained refusal; only a fully checked
+        // teardown passes it to preparation.
+        if drained && database_result.is_ok() && policy != StopPolicy::PrepareRetirement {
             let mut admission = self.namespace_admission.lock().unwrap();
-            if let Some(token) = admission.reservation.take() {
-                if policy == StopPolicy::PrepareRetirement {
-                    retained_reservation = Some(token);
-                } else {
-                    token.release();
-                }
-            }
-        }
-        if policy == StopPolicy::PrepareRetirement {
-            // From here the lease is owned by the outcome slot, so every exit
-            // below, including a teardown error, keeps the namespace closed.
-            let outcome = if !drained || database_result.is_err() || result.is_err() {
-                super::retirement_preparation::RetirementOutcome::refused(
-                    simplex::finality_delivery::source_retirement::RetirementRefusal::Failed(
-                        "session teardown did not complete".into(),
-                    ),
-                    retained_reservation,
-                )
-            } else {
-                self.prepare_retirement(&rt, storage_teardown, retained_reservation).await
-            };
-            *self.retirement_outcome.lock().map_err(|_| error!("retirement outcome poisoned"))? =
-                Some(outcome);
+            if let Some(token) = admission.reservation.take() { token.release(); }
         }
         self.teardown_drained.store(drained && database_result.is_ok(), Ordering::Release);
         database_result?;
@@ -1884,6 +1899,17 @@ impl ValidatorGroup {
         }
         if self.task_panicked.load(Ordering::Acquire) {
             fail!("validator group task panicked during its lifetime");
+        }
+        if policy == StopPolicy::PrepareRetirement {
+            let reservation = self
+                .namespace_admission
+                .lock()
+                .map_err(|_| error!("namespace admission poisoned"))?
+                .reservation
+                .take();
+            let outcome = self.prepare_retirement(&rt, storage_teardown, reservation).await;
+            *self.retirement_outcome.lock().map_err(|_| error!("retirement outcome poisoned"))? =
+                Some(outcome);
         }
         self.group_impl
             .execute_sync(|gi| {
