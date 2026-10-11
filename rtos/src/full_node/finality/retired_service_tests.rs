@@ -552,6 +552,7 @@ async fn query_cached_native(
             }),
         );
         if let Ok(Ok(Ok(reply))) = tokio::time::timeout(Duration::from_secs(3), received).await {
+            log::debug!("Socket provider reply bytes={} row={}", reply.data().len(), row["slot"]);
             if let Ok(answer) = rtos_api::WireProfile::T0
                 .deserialize_typed::<rtos_api::ton::consensus::simplex::CandidateAndCert>(
                 reply.data(),
@@ -572,6 +573,7 @@ async fn query_cached_native(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn retired_service_socket_missing_body_reaches_node_wal_and_checked_join() {
+    let _ = env_logger::builder().is_test(true).try_init();
     for final_row in 0..2 {
         let input: serde_json::Value =
             serde_json::from_str(include_str!("testdata/v2-retired-socket.json")).unwrap();
