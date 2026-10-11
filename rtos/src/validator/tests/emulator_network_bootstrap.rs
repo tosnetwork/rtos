@@ -1430,7 +1430,7 @@ async fn test_manager_rejects_unadmitted_simplex_configurations() -> Result<()> 
             &bootstrap.validator_set,
         )
     };
-    // Valid codec input, but no runtime may silently reinterpret these versions.
+    // Typed v2 is supported only with PQ membership; future versions remain unsupported.
     for version in [2, 3] {
         let mut config = bootstrap.config_params.clone();
         config.set_config(ConfigParamEnum::ConfigParam30(NewConsensusConfigAll {
@@ -1457,7 +1457,11 @@ async fn test_manager_rejects_unadmitted_simplex_configurations() -> Result<()> 
             &engine.allocated,
         )?;
         let error = select(&state).err().expect("manager must refuse the version").to_string();
-        assert!(error.contains(&format!("protocol version {version}")), "{error}");
+        if version == 2 {
+            assert!(error.contains("PQ consensus keys for every member"), "{error}");
+        } else {
+            assert!(error.contains(&format!("protocol version {version}")), "{error}");
+        }
     }
     // No configured Simplex is not permission to enter classical consensus.
     bootstrap
