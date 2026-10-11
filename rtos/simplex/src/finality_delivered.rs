@@ -995,7 +995,7 @@ mod tests {
 mod boundary_tests {
     use super::*;
     #[test]
-    fn source_delivered_quota_and_non_mc_roles_preserve_original() {
+    fn source_delivered_non_mc_roles_preserve_original() {
         for (is_final, shard) in [
             (false, rtos_block::ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap()),
             (true, rtos_block::ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap()),
@@ -1018,22 +1018,6 @@ mod boundary_tests {
                 .join(format!("{}.acked", record.id().unwrap().to_hex_string()))
                 .exists());
         }
-        let (_dir, runtime, store, record, offer) = super::tests::setup();
-        let reference = store.close_locator(&record.id().unwrap()).unwrap().unwrap().reference;
-        let parent = store.directory.join(REFERENCE_DIRECTORY);
-        std::fs::create_dir_all(&parent).unwrap();
-        // Sparse real files consume the declared compact-byte quota; no fake
-        // in-memory counter or giant allocation is needed to exercise admission.
-        for index in 0..(MAX_REFERENCE_TOTAL / MAX_REFERENCE_BYTES) {
-            let path = parent.join(format!("{index:064x}.reference"));
-            File::create(path).unwrap().set_len(MAX_REFERENCE_BYTES).unwrap();
-        }
-        assert!(store.commit_delivered(&runtime, &reference, &offer).is_err());
-        assert!(!store.delivered_path(&record.id().unwrap()).exists());
-        assert!(store
-            .directory
-            .join(format!("{}.acked", record.id().unwrap().to_hex_string()))
-            .exists());
     }
     #[test]
     fn source_delivered_report_advances_past_malformed_and_confirmed_items() {
@@ -1077,3 +1061,7 @@ mod boundary_tests {
         assert!(batch.items[0].1.is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "finality_delivered_capacity_tests.rs"]
+mod capacity_tests;

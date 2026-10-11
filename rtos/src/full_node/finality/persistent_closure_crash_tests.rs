@@ -12,6 +12,16 @@ use std::io::Write;
 const MODE: &str = "RTOS_SOURCE_CLOSE_CRASH_WINDOW";
 const NOTE: &str = "RTOS_SOURCE_CLOSE_CRASH_NOTE";
 
+/// Abrupt process loss at an already synchronized cut point. Unlike exit, this
+/// skips C atexit handlers as well as Rust drops while native workers are live.
+/// This defines the crash simulation; it does not diagnose prior SIGSEGVs.
+fn abrupt_exit(status: std::ffi::c_int) -> ! {
+    unsafe extern "C" {
+        fn _exit(status: std::ffi::c_int) -> !;
+    }
+    unsafe { _exit(status) }
+}
+
 struct ExitAfterOffer {
     real: DurableFinalitySinkPtr,
     window: i32,
@@ -48,7 +58,7 @@ impl DurableFinalitySink for ExitAfterOffer {
             request,
             Box::new(move |result| {
                 if window == 72 && result.is_ok() {
-                    std::process::exit(72);
+                    abrupt_exit(72);
                 }
                 done(result);
             }),
@@ -118,7 +128,7 @@ async fn persistent_closure_crash_child() {
                 // Receipt cannot be constructed here: source file+directory sync
                 // and original-copy validation have already completed.
                 if window == 73 {
-                    std::process::exit(73);
+                    abrupt_exit(73);
                 }
                 real_confirm(
                     receipt,
@@ -126,7 +136,7 @@ async fn persistent_closure_crash_child() {
                         // Actual node Released WAL ended, but source has not received
                         // the acknowledgement that would sync node_confirmed=true.
                         if window == 74 && result.is_ok() {
-                            std::process::exit(74);
+                            abrupt_exit(74);
                         }
                         done(result);
                     }),
@@ -209,6 +219,10 @@ impl Drop for ChildOwner {
     }
 }
 async fn cold_window(window: i32) {
+    cold_window_mode(window, false).await;
+}
+
+async fn cold_window_mode(window: i32, canonical_only: bool) {
     let _ = env_logger::builder().is_test(true).try_init();
     let signer =
         std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER").expect("public fixture signer required");
@@ -267,6 +281,11 @@ async fn cold_window(window: i32) {
         wire_profile: WireProfile::T0,
     };
     let expected_id: BlockIdExt = note["block"].as_str().unwrap().parse().unwrap();
+    if canonical_only {
+        assert_eq!(window, 72);
+        canonical_after_offer(&provider, &namespace, &domain, &expected_id, &note).await;
+        return;
+    }
     // No network peer or source signer is restarted. Closing identity recovery
     // must not depend on the historical transport secret still being configured.
     let config_path = provider.join("config.json");
@@ -442,4 +461,87 @@ async fn persistent_closure_cold_service_after_delivered_exit73() {
 #[ignore = "real child process crash, PQ public fixture signer and network/WAL required"]
 async fn persistent_closure_cold_service_after_released_exit74() {
     cold_window(74).await;
+}
+
+/// A separate cold-read contract: this intentionally supplies an independently
+/// authenticated runtime only to the real canonical lookup. The background
+/// service tests above continue to recover without such external input.
+async fn canonical_after_offer(
+    provider: &Path,
+    namespace: &Path,
+    domain: &OutboxDomain,
+    expected_id: &BlockIdExt,
+    note: &serde_json::Value,
+) {
+    let (reference_path, original_reference) =
+        reference_backup(namespace).expect("exit72 must retain the original source reference");
+    for _ in 0..2 {
+        let engine = open_engine(provider).await;
+        let run = std::panic::AssertUnwindSafe(async {
+            let (_, closed) = inspect_closure_progress(engine.db(), domain).unwrap();
+            assert_eq!(closed.len(), 1);
+            let original = closed[0].clone();
+            let request = original.offer().request;
+            let runtime = crate::validator::retired_session_auth::authenticate_closing_runtime(
+                engine.as_ref(),
+                &request,
+                namespace,
+            )
+            .await
+            .unwrap();
+            let worker = engine.ensure_publication_worker().await.unwrap();
+            let sink = worker.sink(runtime.clone());
+            let (send, receive) = tokio::sync::oneshot::channel();
+            sink.retain_canonical(
+                request.canonical.clone(),
+                Box::new(move |result| {
+                    let _ = send.send(result);
+                }),
+            )
+            .unwrap();
+            let canonical = tokio::time::timeout(Duration::from_secs(30), receive)
+                .await
+                .expect("real canonical owner must complete")
+                .expect("real canonical callback must run")
+                .expect("offer-before-source-sync must retain replayable canonical evidence");
+            // Check the actual owned lookup before any Offered/active marker.
+            // Moving deletion into offer must fail above with Unknown canonical
+            // delivery, rather than being caught only by a stage assertion.
+            assert_eq!(canonical.request, request.canonical);
+            assert_eq!(&canonical.request.block_id, expected_id);
+            assert_eq!(canonical.created_at_unix_secs, note["created"].as_u64().unwrap());
+            assert_eq!(canonical.created_at_unix_secs, request.created_at_unix_secs);
+            assert_eq!(runtime.session_id().to_hex_string(), note["session"].as_str().unwrap());
+            let (source_id, digest) =
+                simplex::finality_delivery::canonical_source_identity(&runtime, &canonical)
+                    .unwrap();
+            assert_eq!(source_id, simplex::finality_delivery::close_source_id(&request).unwrap());
+            // The original schema digest covers the full body, exact carrier,
+            // role/origin/domain, timestamp, last MC and candidate-sent flag.
+            assert_eq!(digest, request.source_digest);
+            assert!(!canonical.data.data().is_empty());
+            let (active, after) = inspect_closure_progress(engine.db(), domain).unwrap();
+            assert_eq!(after, closed);
+            assert!(!original.released);
+            assert_eq!(active.len(), 1);
+            assert_eq!(std::fs::read(&reference_path).unwrap(), original_reference);
+            assert!(std::fs::read_dir(source_directory(namespace).join("references-v1"))
+                .unwrap()
+                .all(|entry| entry.unwrap().path().extension().and_then(|s| s.to_str())
+                    != Some("delivered")));
+        })
+        .catch_unwind()
+        .await;
+        // Even failed lookups/assertions drain the actual worker and Engine.
+        let stopped = engine.clone().wait_stop().await;
+        drop(engine);
+        run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        stopped.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real exit72 child, historical authentication and canonical WAL lookup"]
+async fn persistent_closure_cold_canonical_replay_before_source_sync() {
+    cold_window_mode(72, true).await;
 }

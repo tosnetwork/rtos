@@ -1304,6 +1304,13 @@ pub(crate) mod tests {
         is_final: bool,
         shard: ShardIdent,
     ) -> (Arc<AuthenticatedSessionRuntime>, FinalizedDeliveryDraft) {
+        fixture_seqno(is_final, shard, 1)
+    }
+    pub(crate) fn fixture_seqno(
+        is_final: bool,
+        shard: ShardIdent,
+        seqno: u32,
+    ) -> (Arc<AuthenticatedSessionRuntime>, FinalizedDeliveryDraft) {
         let stores: Vec<_> = [0xa9, 0xaa]
             .iter()
             .map(|seed| rtos_pq_consensus::ConsensusKeyStore::from_seed(&[*seed; 32], 0).unwrap())
@@ -1327,14 +1334,14 @@ pub(crate) mod tests {
         let mut block = Block::default();
         block.set_global_id(runtime.pin().global_id);
         let mut info = BlockInfo::default();
-        info.set_seq_no(1).unwrap();
+        info.set_seq_no(seqno).unwrap();
         info.set_shard(runtime.shard().clone());
         block.write_info(&info).unwrap();
         let cell = block.serialize().unwrap();
         let data = write_boc(&cell).unwrap();
         let block_id = BlockIdExt::with_params(
             runtime.shard().clone(),
-            1,
+            seqno,
             cell.repr_hash().clone(),
             UInt256::calc_file_hash(&data),
         );
