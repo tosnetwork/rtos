@@ -313,6 +313,16 @@ impl ShardStatesKeeper {
         PinnedShardStateGuard::new(state, self.gc_resolver.clone())
     }
 
+    /// Pin an existing physical state without cache fallback or catch-up writes.
+    /// Repair callers must not turn a missing dependency into recursive recovery.
+    pub(crate) fn load_and_pin_existing_state(
+        &self,
+        block_id: &BlockIdExt,
+    ) -> Result<PinnedShardStateGuard> {
+        let state = self.db.load_shard_state_dynamic(block_id)?;
+        PinnedShardStateGuard::new(state, self.gc_resolver.clone())
+    }
+
     pub async fn store_state(
         self: &Arc<Self>,
         handle: &Arc<BlockHandle>,

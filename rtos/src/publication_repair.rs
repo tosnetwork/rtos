@@ -19,6 +19,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
+use storage::archives::bounded_read::{ArchiveReadLimitExceeded, ArchiveReadLimits};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MAX_LIVE_REPAIRS: usize = 4;
@@ -156,11 +157,16 @@ async fn check_cells_with_limit(root: &Cell, max_cells: usize) -> Result<()> {
 async fn read_pair(engine: &Engine, id: &BlockIdExt) -> Result<(BlockStuff, BlockProofStuff)> {
     let handle =
         engine.load_block_handle(id)?.ok_or_else(|| error!("MC repair handle disappeared"))?;
-    let raw = engine.load_block_raw(&handle).await?;
-    let proof = engine.load_block_proof_raw(&handle, false).await?;
-    if raw.len() > MAX_ARTIFACT_BYTES || proof.len() > MAX_ARTIFACT_BYTES {
-        fail!("MC repair artifact exceeds byte budget");
-    }
+    let data_bytes = MAX_ARTIFACT_BYTES;
+    #[cfg(test)]
+    let data_bytes = artifact_test_limits()
+        .lock()
+        .unwrap()
+        .remove(&(engine as *const Engine as usize))
+        .unwrap_or(data_bytes);
+    let limits = ArchiveReadLimits { data_bytes, filename_bytes: 512 };
+    let raw = engine.db().load_block_data_raw_bounded(&handle, limits).await?;
+    let proof = engine.db().load_block_proof_raw_bounded(&handle, false, limits).await?;
     Ok((
         BlockStuff::deserialize_block_checked(id.clone(), Arc::new(raw))?,
         BlockProofStuff::deserialize(id, proof, false)?,
@@ -172,9 +178,19 @@ async fn repair_owned(
     request: McFinalRepairRequest,
     admission: Admission,
 ) -> Result<McFinalRepairCustody> {
+    check_domain(engine.as_ref(), &request)?;
+    // The Engine-owned worker awaits local file IO to completion. Do not put
+    // this under the timeout below: tokio file IO can own a blocking operation
+    // which would otherwise outlive its observer and admission permit.
+    let mut local = match read_pair(engine.as_ref(), &request.block_id).await {
+        Ok(pair) => Some(pair),
+        Err(error) if error.downcast_ref::<ArchiveReadLimitExceeded>().is_some() => {
+            return Err(error);
+        }
+        Err(_) => None,
+    };
     let (accepted, parent) = tokio::time::timeout(READ_TIMEOUT, async {
         check_domain(engine.as_ref(), &request)?;
-        let mut local = read_pair(engine.as_ref(), &request.block_id).await.ok();
         let accepted = loop {
             let from_local = local.is_some();
             let (block, proof) = match local.take() {
@@ -217,7 +233,7 @@ async fn repair_owned(
         if second.is_some() || !parent_id.shard().is_masterchain() {
             fail!("MC repair requires one MC parent");
         }
-        let parent = engine.load_and_pin_state(&parent_id).await?;
+        let parent = engine.shard_states_keeper().load_and_pin_existing_state(&parent_id)?;
         check_cells(parent.state().root_cell()).await?;
         if parent.state().root_cell().repr_hash() != &block.block()?.read_state_update()?.old_hash {
             fail!("MC repair parent state does not match update");
@@ -257,7 +273,7 @@ async fn repair_owned(
         gate.release.acquire().await.unwrap().forget();
     }
     engine.clone().ensure_publication_acceptance_durable(&accepted).await?;
-    let target = engine.load_and_pin_state(&request.block_id).await?;
+    let target = engine.shard_states_keeper().load_and_pin_existing_state(&request.block_id)?;
     check_cells(target.state().root_cell()).await?;
     if target.state().root_cell().repr_hash()
         != &accepted.block().block()?.read_state_update()?.new_hash
@@ -308,4 +324,15 @@ fn candidate_test_limits() -> &'static Mutex<std::collections::HashMap<usize, us
 #[cfg(test)]
 pub(crate) fn limit_next_candidate_for_test(engine: &Arc<Engine>, cells: usize) {
     candidate_test_limits().lock().unwrap().insert(Arc::as_ptr(engine) as usize, cells);
+}
+
+#[cfg(test)]
+fn artifact_test_limits() -> &'static Mutex<std::collections::HashMap<usize, usize>> {
+    static LIMITS: OnceLock<Mutex<std::collections::HashMap<usize, usize>>> = OnceLock::new();
+    LIMITS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn limit_next_artifact_for_test(engine: &Arc<Engine>, bytes: usize) {
+    artifact_test_limits().lock().unwrap().insert(Arc::as_ptr(engine) as usize, bytes);
 }
