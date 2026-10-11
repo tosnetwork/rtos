@@ -34,7 +34,6 @@ async fn check_imported_block(db: &InternalDb, id: &BlockIdExt) -> Result<Option
 }
 
 struct Gate {
-    fail: bool,
     stored: bool,
     entered: Notify,
     release: Semaphore,
@@ -51,9 +50,6 @@ pub(super) async fn hold(engine: &Arc<dyn EngineOperations>, stored: bool) -> Re
     if let Some(gate) = gate.filter(|gate| gate.stored == stored) {
         gate.entered.notify_one();
         gate.release.acquire().await.unwrap().forget();
-        if gate.fail {
-            fail!("injected failure after accepted archive storage");
-        }
     }
     Ok(())
 }
@@ -203,12 +199,7 @@ async fn archive_drain_cancel_before_admission_has_no_block_writes() {
     let fixture = Fixture::new();
     let engine = prepare(dir.path(), &fixture, false).await;
     let ops: Arc<dyn EngineOperations> = engine.clone();
-    let gate = Arc::new(Gate {
-        fail: false,
-        stored: false,
-        entered: Notify::new(),
-        release: Semaphore::new(0),
-    });
+    let gate = Arc::new(Gate { stored: false, entered: Notify::new(), release: Semaphore::new(0) });
     gates().lock().unwrap().insert(key(&ops), gate.clone());
     let maps = maps(dir.path()).await;
     let id = fixture.id(1, false);
@@ -236,12 +227,7 @@ async fn archive_drain_cancel_after_store_waits_for_real_apply_and_reopen() {
     let fixture = Fixture::new();
     let engine = prepare(dir.path(), &fixture, false).await;
     let ops: Arc<dyn EngineOperations> = engine.clone();
-    let gate = Arc::new(Gate {
-        fail: false,
-        stored: true,
-        entered: Notify::new(),
-        release: Semaphore::new(0),
-    });
+    let gate = Arc::new(Gate { stored: true, entered: Notify::new(), release: Semaphore::new(0) });
     gates().lock().unwrap().insert(key(&ops), gate.clone());
     let maps = maps(dir.path()).await;
     let id = fixture.id(1, false);
@@ -310,12 +296,7 @@ async fn archive_drain_shutdown_rejects_authenticated_but_unaccepted_block() {
     let fixture = Fixture::new();
     let engine = prepare(dir.path(), &fixture, false).await;
     let ops: Arc<dyn EngineOperations> = engine.clone();
-    let gate = Arc::new(Gate {
-        fail: false,
-        stored: false,
-        entered: Notify::new(),
-        release: Semaphore::new(0),
-    });
+    let gate = Arc::new(Gate { stored: false, entered: Notify::new(), release: Semaphore::new(0) });
     gates().lock().unwrap().insert(key(&ops), gate.clone());
     let maps = maps(dir.path()).await;
     let previous = fixture.id(0, false);
@@ -360,12 +341,7 @@ async fn archive_drain_unobserved_accepted_failure_is_sticky_and_retryable_after
     let fixture = Fixture::new();
     let engine = prepare(dir.path(), &fixture, false).await;
     let ops: Arc<dyn EngineOperations> = engine.clone();
-    let gate = Arc::new(Gate {
-        fail: true,
-        stored: true,
-        entered: Notify::new(),
-        release: Semaphore::new(0),
-    });
+    let gate = Arc::new(Gate { stored: true, entered: Notify::new(), release: Semaphore::new(0) });
     gates().lock().unwrap().insert(key(&ops), gate.clone());
     let package_maps = maps(dir.path()).await;
     let previous = fixture.id(0, false);
@@ -374,6 +350,12 @@ async fn archive_drain_unobserved_accepted_failure_is_sticky_and_retryable_after
         async move { import_first(ops, package_maps, previous).await }
     });
     tokio::time::timeout(Duration::from_secs(30), gate.entered.notified()).await.unwrap();
+    use storage::archives::package_entry_id::{GetFileName, PackageEntryId};
+    let obstruction = dir
+        .path()
+        .join("db/archive/unapplied")
+        .join(PackageEntryId::Proof(fixture.id(1, false)).filename_short());
+    std::fs::create_dir(&obstruction).unwrap();
     worker.abort();
     assert!(worker.await.unwrap_err().is_cancelled());
     gate.release.add_permits(1);
@@ -382,6 +364,10 @@ async fn archive_drain_unobserved_accepted_failure_is_sticky_and_retryable_after
         .unwrap()
         .unwrap_err();
     assert!(error.to_string().contains("Unobserved archive import failure"), "{error:#}");
+    assert!(
+        error.to_string().contains("Is a directory"),
+        "expected actual proof file I/O failure: {error:#}"
+    );
     assert_eq!(
         engine.load_last_applied_mc_block_id().unwrap().unwrap().as_ref(),
         &fixture.id(0, false)
@@ -390,6 +376,7 @@ async fn archive_drain_unobserved_accepted_failure_is_sticky_and_retryable_after
     gates().lock().unwrap().remove(&key(&ops));
     drop(ops);
     drop(engine);
+    std::fs::remove_dir(&obstruction).unwrap();
     let reopened = open(dir.path()).await;
     import_first(reopened.clone(), maps(dir.path()).await, fixture.id(0, false)).await.unwrap();
     assert_applied(&reopened, &fixture).await;

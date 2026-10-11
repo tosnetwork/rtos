@@ -762,7 +762,7 @@ impl crate::engine_traits::EngineOperations for RecoveryProofEngine {
         _name: &'static str,
         _mask: u32,
         start: Box<dyn FnOnce() -> tokio::task::JoinHandle<()> + Send>,
-    ) -> Result<tokio::task::JoinHandle<()>> {
+    ) -> rtos_block::Result<tokio::task::JoinHandle<()>> {
         // This proof-only double has no shutdown lifecycle. Archive drain tests
         // use a real Engine and its retained service owner instead.
         Ok(start())
