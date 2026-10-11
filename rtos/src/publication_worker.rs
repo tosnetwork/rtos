@@ -1464,6 +1464,31 @@ mod tests {
     }
 
     #[test]
+    fn publication_worker_closing_completion_drains_on_unwind_and_callback_panic() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _completion = ClosingCompletion::<()>(Some(Box::new(move |result| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                assert!(result.is_err());
+                panic!("source callback panicked during actor unwind");
+            })));
+            panic!("actor failed with accepted closing request");
+        });
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let counter = calls.clone();
+        ClosingCompletion(Some(Box::new(move |result: Result<()>| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            assert!(result.is_ok());
+            panic!("source callback panicked after successful close");
+        })))
+        .finish(Ok(()));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn publication_worker_rejected_draft_does_not_complete() {
         use std::sync::atomic::AtomicUsize;
         let calls = Arc::new(AtomicUsize::new(0));
