@@ -708,6 +708,7 @@ impl ShardStateDb {
                     StateCommand::BoundedPut { id, root, limits, budget, reply, observer } => {
                         self.in_queue.fetch_sub(1, Ordering::Relaxed);
                         let result = tokio::task::block_in_place(|| {
+                            rtos_block::merkle_apply_budget::require_materialized(&root)?;
                             if let Some(prior) = self.write_failure.borrow().as_ref() {
                                 fail!("Earlier state write failed: {prior}");
                             }
