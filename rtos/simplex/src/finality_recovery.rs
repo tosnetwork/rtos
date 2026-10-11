@@ -266,6 +266,59 @@ pub fn scan_finality_recovery(root: &std::path::Path) -> Result<Vec<SessionRecov
 mod tests {
     use super::*;
     #[test]
+    fn source_finality_cert_intent_process_child() {
+        let Some(root) = std::env::var_os("RTOS_CERT_INTENT_CRASH_ROOT") else { return; };
+        let root = PathBuf::from(root);
+        let (runtime, draft) = crate::finality_delivery::tests::fixture();
+        let namespace = PathBuf::from(runtime.runtime_directory(root.to_str().unwrap()).unwrap());
+        std::fs::create_dir_all(&namespace).unwrap();
+        let consensus_common::SessionFinality::Carrier(rtos_block::BlockSignaturesVariant::SimplexPq(proof)) = draft.finality else { unreachable!() };
+        let candidate = rtos_api::pq_finality::PqNetworkSignatureSet::from_final_fields(&proof).unwrap().to_node().candidate;
+        let hash = UInt256::calc_file_hash(&rtos_api::serialize_boxed(&candidate).unwrap());
+        let event = crate::simplex_state::BlockFinalizedEvent {
+            slot: crate::block::SlotIndex::new(proof.slot), block_hash: hash.clone(), block_id: None,
+            certificate: std::sync::Arc::new(crate::certificate::Certificate {
+                vote: crate::simplex_state::FinalizeVote { slot: crate::block::SlotIndex::new(proof.slot), block_hash: hash },
+                signatures: proof.signatures.iter().enumerate().map(|(index, signature)| crate::certificate::VoteSignature {
+                    validator_idx: crate::block::ValidatorIndex::new(index as u32), signature: signature.signature.clone(),
+                }).collect(),
+            }),
+        };
+        let source = crate::finality_delivery::SourceFinalityDelivery::open(runtime.clone(), &namespace,
+            std::sync::Arc::new(crate::finality_delivery::tests::HeldSink::default())).unwrap();
+        source.bind_start(runtime.pin().zerostate.clone()).unwrap();
+        source.retain_intent(vec![runtime.pin().zerostate.clone()], &event).unwrap();
+        // Exit without Drop, candidate body, source Draft, node stage or receipt.
+        std::process::exit(77);
+    }
+    #[test]
+    fn source_finality_cert_only_process_exit_retains_authentic_recovery_debt() {
+        let directory = crate::authenticated_fixture::TestDirectory::new();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "finality_recovery::tests::source_finality_cert_intent_process_child", "--nocapture"])
+            .env("RTOS_CERT_INTENT_CRASH_ROOT", directory.path()).output().unwrap();
+        assert_eq!(result.status.code(), Some(77), "{}", String::from_utf8_lossy(&result.stderr));
+        let records = scan_finality_recovery(directory.path()).unwrap();
+        assert_eq!(records.len(), 1, "source-only certificate vanished before candidate materialization");
+        let (runtime, _) = crate::finality_delivery::tests::fixture();
+        records[0].validate_runtime(&runtime).unwrap();
+        let owner = crate::finality_delivery::PendingFinalityStore::open(&records[0].namespace).unwrap();
+        let intents = FinalityIntentStore::new(&records[0].namespace).pending().unwrap();
+        assert_eq!(intents.len(), 1);
+        let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor).collect::<Result<Vec<_>>>().unwrap();
+        let transport = rtos_block::Ed25519KeyOption::<rtos_block::ZeroizingBytes>::from_private_key(&[0x71; 32]).unwrap();
+        let options = crate::SessionOptions { protocol: runtime.protocol(), proto_version: runtime.carrier_version(),
+            wire_profile: runtime.wire_profile(), slots_per_leader_window: runtime.slots_per_leader_window(), ..Default::default() };
+        let description = crate::session_description::SessionDescription::new_with_runtime(&options, runtime.session_id().clone(),
+            1, &nodes, transport, runtime.shard(), std::time::SystemTime::now(), None, Some(&runtime)).unwrap()
+            .bind_pq_session(runtime.catchain_seqno()).unwrap();
+        let certificate = runtime.wire_profile().deserialize_typed(&intents[0]).unwrap();
+        crate::certificate::Certificate::<crate::simplex_state::Vote>::from_tl(&certificate, &description, runtime.session_id()).unwrap();
+        assert!(std::fs::read_dir(records[0].namespace.join("finality-pending")).unwrap().all(|entry| entry.unwrap().file_name() == ".lock"),
+            "this window must precede any full Draft or node custody");
+        drop(owner);
+    }
+    #[test]
     fn source_finality_legacy_namespace_is_not_silently_empty_or_upgraded() {
         let directory = crate::authenticated_fixture::TestDirectory::new();
         let (runtime, _) = crate::finality_delivery::tests::fixture();
