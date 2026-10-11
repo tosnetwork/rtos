@@ -166,3 +166,102 @@ async fn persistent_repair_ledger_durable_sync_failure_and_wrong_domain() -> Res
     assert!(leases.protection.authentication().await.is_err());
     Ok(())
 }
+
+// These are storage admission fixtures, not authenticated custody capabilities.
+fn capacity_binding(n: u64) -> RepairLeaseBinding {
+    let mut value = binding();
+    value.record_id = n;
+    value.close_generation = n;
+    value
+}
+fn capacity_record(n: u64, deps: &[Dependency]) -> Result<LeaseRecord> {
+    let record = LeaseRecord {
+        schema: 1,
+        generation: n,
+        binding: capacity_binding(n).encode()?,
+        dependency_digest: format!("{:x}", dependency_digest(deps)?),
+        dependencies: deps.to_vec(),
+        state: LeaseState::Protecting,
+    };
+    record.validate()?;
+    Ok(record)
+}
+fn physical_ledger(leases: &DependencyLeases) -> Result<BTreeMap<Vec<u8>, (usize, UInt256)>> {
+    let mut result = BTreeMap::new();
+    leases.table.for_each(&mut |key, bytes| {
+        result.insert(key.to_vec(), (bytes.len(), UInt256::calc_file_hash(bytes)));
+        Ok(true)
+    })?;
+    Ok(result)
+}
+async fn ledger_real_capacity(dependency_count: usize) -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (db, leases) = open(dir.path())?;
+    let mut deps = Vec::new();
+    for n in 1..=dependency_count as u32 {
+        let mut dep = dependencies().remove(0);
+        // Unlike block(), this accepts sequence numbers beyond one byte.
+        dep.id = BlockIdExt::with_params(ShardIdent::masterchain(), n,
+            UInt256::from([1; 32]), UInt256::from([2; 32])).to_string();
+        deps.push(dep);
+    }
+    deps.sort();
+    let mut total = 0usize;
+    let mut rows = Vec::new();
+    for n in 1..=MAX_LEASES as u64 + 1 {
+        let bytes = serde_json::to_vec(&capacity_record(n, &deps)?)?;
+        assert!(bytes.len() <= MAX_RECORD_BYTES);
+        if rows.len() == MAX_LEASES || total + bytes.len() > MAX_TOTAL_BYTES { break; }
+        total += bytes.len();
+        rows.push(bytes);
+    }
+    let count = rows.len();
+    assert!(count > 1);
+    let last = rows.pop().unwrap();
+    let mut batch = leases.table.begin_transaction()?;
+    for (index, bytes) in rows.iter().enumerate() {
+        batch.put_raw(format!("lease/{:020}", index + 1).as_bytes(), bytes)?;
+    }
+    batch.put_raw(b"next", &((count - 1) as u64).to_le_bytes())?;
+    batch.commit()?;
+    leases.table.sync_wal()?;
+    drop(rows);
+    drop(leases);
+    drop(db);
+    let (db, leases) = open(dir.path())?;
+    let guard = leases.protection.authentication().await?;
+    assert_eq!(leases.begin(&capacity_binding(count as u64), deps.clone(),
+        &HistoryReadBudget::new(Default::default()))?, count as u64);
+    assert_eq!(leases.memory.lock().unwrap().bytes, total);
+    let before = physical_ledger(&leases)?;
+    assert_eq!(before.get(format!("lease/{:020}", count).as_bytes()),
+        Some(&(last.len(), UInt256::calc_file_hash(&last))));
+    let error = leases.begin(&capacity_binding(count as u64 + 1), deps.clone(),
+        &HistoryReadBudget::new(Default::default())).unwrap_err().to_string();
+    if count == MAX_LEASES {
+        assert!(error.contains("history capacity exhausted"), "{error}");
+    } else {
+        assert!(error.contains("lease capacity exhausted"), "{error}");
+        assert!(total + serde_json::to_vec(&capacity_record(count as u64 + 1, &deps)?)?.len()
+            > MAX_TOTAL_BYTES);
+    }
+    eprintln!("ledger capacity: dependencies={dependency_count}, records={count}, bytes={total}, rejection={error}");
+    assert_eq!(physical_ledger(&leases)?, before);
+    assert!(!leases.memory.lock().unwrap().poisoned);
+    drop(guard);
+    drop(leases);
+    drop(db);
+    let (_db, leases) = open(dir.path())?;
+    assert_eq!(physical_ledger(&leases)?, before);
+    assert_eq!(leases.memory.lock().unwrap().records.len(), count);
+    assert_eq!(leases.memory.lock().unwrap().bytes, total);
+    Ok(())
+}
+#[tokio::test]
+async fn persistent_repair_ledger_real_small_record_capacity_preserves_cold_records() -> Result<()> {
+    ledger_real_capacity(1).await
+}
+#[tokio::test]
+async fn persistent_repair_ledger_real_large_record_byte_capacity_preserves_cold_records() -> Result<()> {
+    ledger_real_capacity(MAX_DEPENDENCIES).await
+}
