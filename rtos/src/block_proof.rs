@@ -19,7 +19,7 @@ use crate::{
 };
 use rtos_block::{
     error, fail, write_boc, Block, BlockIdExt, BlockInfo, BlockProof, BlockSignaturesVariant,
-    BocReader, Cell, ConfigParams, Deserializable, HashmapType, MerkleProof, Result, Serializable,
+    BocReader, Cell, ConfigParams, Deserializable, HashmapType, MerkleProof, Result, Serializable, UInt256,
 };
 use std::sync::Arc;
 

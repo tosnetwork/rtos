@@ -347,7 +347,7 @@ fn validate_limits(limits: &Limits) -> Result<()> {
     Ok(())
 }
 fn validate_domain(domain: &OutboxDomain) -> Result<()> {
-    if !domain.zerostate.is_masterchain()
+    if !domain.zerostate.shard().is_masterchain()
         || domain.zerostate.seq_no() != 0
         || domain.zerostate.root_hash().is_zero()
         || domain.zerostate.file_hash().is_zero()
