@@ -21,12 +21,19 @@ async fn fixture(key_parent: bool) -> Fixture {
 }
 
 async fn fixture_backend(key_parent: bool, archive: bool) -> Fixture {
+    fixture_backend_in(key_parent, archive, None).await
+}
+
+async fn fixture_backend_in(key_parent: bool, archive: bool, parent_dir: Option<&Path>) -> Fixture {
     let input: serde_json::Value =
         serde_json::from_str(include_str!("testdata/mc-repair-dependencies.json")).unwrap();
     let row = &input["rows"][usize::from(key_parent)];
     let zero: BlockIdExt = input["zero"].as_str().unwrap().parse().unwrap();
     let zero_bytes = decode(&input["state_boc"]);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = match parent_dir {
+        Some(path) => tempfile::tempdir_in(path).unwrap(),
+        None => tempfile::tempdir().unwrap(),
+    };
     write_recovery_config(dir.path(), &zero, true);
     let config_path = dir.path().join("config.json");
     let mut config: serde_json::Value =
