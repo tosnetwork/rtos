@@ -55,6 +55,7 @@ async fn circulation(events: usize) {
     let pair = Pair::with_source_transport("included").await;
     let run = std::panic::AssertUnwindSafe(async {
         let engine = &pair.provider;
+        let observer = pair.observer.as_ref().expect("source fixture includes a public observer");
         // Bootstrap MC1 uses the real existing proof and application path;
         // every subsequent event is first admitted by the actual source driver.
         engine.clone().download_and_apply_block(pair.master.id(), 1, false).await.unwrap();
@@ -111,6 +112,7 @@ async fn circulation(events: usize) {
             engine.ensure_publication_worker().await.unwrap().delivered_sink(runtime.clone());
         let driver =
             FinalityDeliveryTestDriver::open(runtime.clone(), &namespace, sink, confirm).unwrap();
+        driver.prepare_intents(false).unwrap();
         engine.enable_publication_worker().await.unwrap();
         let mut parent = pair.master.id().clone();
         let mut root = engine.load_state(&parent).await.unwrap().root_cell().clone();
@@ -150,6 +152,7 @@ async fn circulation(events: usize) {
             };
             engine.set_test_chain_time(Some(1002 + id.seq_no()));
             pair.receiver.set_test_chain_time(Some(1002 + id.seq_no()));
+            observer.set_test_chain_time(Some(1002 + id.seq_no()));
             // Wait for the real source WAL ACK/reference first. Do not maintain
             // closing until the first pre-Delivered backup has been captured.
             tokio::time::timeout(Duration::from_secs(60), async {
@@ -168,6 +171,26 @@ async fn circulation(events: usize) {
                 assert!(backup.is_some(), "save an actual pre-Delivered reference");
                 first = Some(draft.clone());
             }
+            // Inspect the actual worker's completed checkpoint before allowing
+            // source closure. Both FastSync effects must really remain in the
+            // fixed plan and have no outstanding receipt debt.
+            tokio::time::timeout(Duration::from_secs(90), async {
+                loop {
+                    let (active, _) = inspect_closure_progress(engine.db(), &domain).unwrap();
+                    if let Some(entry) = active.iter().find(|e|
+                        e.record.block_id == id && e.stage == crate::propagation_outbox::PublicationStage::Completed) {
+                        use crate::propagation_outbox::{PublicationKind, PublicationTarget};
+                        assert!(entry.pending.is_empty());
+                        for kind in [PublicationKind::Candidate, PublicationKind::Finality] {
+                            assert!(entry.record.effects.iter().any(|effect|
+                                effect.kind == kind && effect.target == PublicationTarget::FastSync),
+                                "real FastSync effect was removed from the completed plan");
+                        }
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.expect("real worker FastSync/Public effects did not complete");
             let closed = tokio::time::timeout(Duration::from_secs(90), async {
                 loop {
                     driver.maintain().unwrap();
@@ -185,24 +208,21 @@ async fn circulation(events: usize) {
             })
             .await
             .expect("real network effects/custody/Delivered/Released did not finish");
-            // Real private FastSync receive processing, in addition to the
-            // publisher's actual transport receipts. Public-overlay reception
-            // cannot satisfy this observation.
+            // Committee members intentionally do not consume Plumtree data.
+            // Keep the second root for real FastSync outbound effects, while
+            // this public observer must process this exact candidate/finality.
             tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
-                    if pair.receiver.overlays_router().unwrap().test_fast_sync_received(&id) {
-                        assert!(pair.receiver.try_get_cached_block_candidate(&id).is_some());
+                    if observer.test_finality_received_ids.lock().unwrap().contains(&id)
+                        && observer.try_get_cached_block_candidate(&id).is_some() {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-            }).await.expect("receiver did not process both real FastSync candidate and finality");
-            // Keep the receiving Engine's real applied frontier current so
-            // its production sync gate remains open throughout the long run.
-            // This happens only AFTER both network receive observations.
-            pair.receiver.clone().download_and_apply_block(&id, id.seq_no(), false)
-                .await.unwrap();
-            assert_eq!(pair.receiver.load_state(&id).await.unwrap().root_cell().repr_hash(),
+            }).await.expect("public observer did not process the exact candidate and finality");
+            // Keep the real receiving frontier current AFTER ingress checks.
+            observer.clone().download_and_apply_block(&id, id.seq_no(), false).await.unwrap();
+            assert_eq!(observer.load_state(&id).await.unwrap().root_cell().repr_hash(),
                 expected.repr_hash());
             let entry = closed.iter().find(|x| x.binding.canonical.block_id == id).unwrap();
             assert_eq!(&entry.binding.domain.session_id, runtime.session_id());
@@ -227,12 +247,7 @@ async fn circulation(events: usize) {
     })
     .catch_unwind()
     .await;
-    let (provider_stop, receiver_stop) = tokio::join!(
-        pair.provider.clone().wait_stop(),
-        pair.receiver.clone().wait_stop(),
-    );
-    provider_stop.unwrap();
-    receiver_stop.unwrap();
+    pair.stop_all().await;
     let (runtime, namespace, domain, first, (old_path, old_bytes)) =
         run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     let Pair { _dir: dir, provider, receiver, .. } = pair;
