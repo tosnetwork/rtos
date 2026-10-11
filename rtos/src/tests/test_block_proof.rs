@@ -709,6 +709,7 @@ async fn test_warm_recovery_authenticates_history_before_saving_cursor() {
             entries.remove(1);
         }
         let engine = RecoveryProofEngine {
+            workers: Default::default(),
             pin,
             state,
             entries,
@@ -744,6 +745,7 @@ async fn test_warm_recovery_authenticates_history_before_saving_cursor() {
 }
 
 struct RecoveryProofEngine {
+    workers: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     pin: rtos_block::BlockIdExt,
     state: std::sync::Arc<crate::shard_state::ShardStateStuff>,
     entries: Vec<(std::sync::Arc<storage::block_handle_db::BlockHandle>, BlockProofStuff)>,
@@ -763,9 +765,18 @@ impl crate::engine_traits::EngineOperations for RecoveryProofEngine {
         _mask: u32,
         start: Box<dyn FnOnce() -> tokio::task::JoinHandle<()> + Send>,
     ) -> rtos_block::Result<tokio::task::JoinHandle<()>> {
-        // This proof-only double has no shutdown lifecycle. Archive drain tests
-        // use a real Engine and its retained service owner instead.
-        Ok(start())
+        // Retain the real worker independently of its observing handle. The
+        // proof-only fixture joins these workers before recovering its mock Arc.
+        // Shutdown behavior itself is covered by the real Engine archive tests.
+        let worker = start();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        self.workers.lock().unwrap().push(tokio::spawn(async move {
+            let result = worker.await;
+            let succeeded = result.is_ok();
+            let _ = sent.send(result);
+            assert!(succeeded, "proof fixture service worker failed");
+        }));
+        Ok(tokio::spawn(async move { received.await.unwrap().unwrap() }))
     }
 
     async fn store_block(
@@ -948,6 +959,7 @@ async fn test_warm_recovery_accepts_pinned_states_only_with_matching_roots() {
                 .unwrap();
             handle.set_block_applied();
             let engine = RecoveryProofEngine {
+            workers: Default::default(),
                 pin: pin.clone(),
                 state,
                 entries: vec![(handle, proof)],
@@ -1018,6 +1030,7 @@ async fn test_live_proof_history_cache_never_caches_incoming_certificates() {
         })
         .collect();
     let engine = RecoveryProofEngine {
+            workers: Default::default(),
         pin,
         state,
         entries,
@@ -1072,6 +1085,10 @@ async fn test_live_proof_history_cache_never_caches_incoming_certificates() {
         assert_eq!(engine_arc.stores.load(Ordering::SeqCst), 0, "archive stored unverified input");
     }
     drop(consumer_engine);
+    let workers = std::mem::take(&mut *engine_arc.workers.lock().unwrap());
+    for worker in workers {
+        worker.await.unwrap();
+    }
     let mut engine =
         Arc::try_unwrap(engine_arc).unwrap_or_else(|_| panic!("archive consumer retained engine"));
     let corrupt = bootstrap_fixture_proof(&row, true, true);
@@ -1421,6 +1438,7 @@ async fn historical_broadcast_context_authenticates_old_epoch_after_rotation() {
         })
         .collect();
     let mut engine = RecoveryProofEngine {
+        workers: Default::default(),
         pin: anchor.id().clone(),
         state,
         entries,
