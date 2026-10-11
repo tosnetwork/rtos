@@ -2,6 +2,7 @@
 //! Manager/group fixtures use generated governing states and real ADNL ownership.
 //! The Engine adapter supplies deterministic state; it is not a full Engine test.
 use super::*;
+use rtos_block::HashmapAugType;
 use consensus_common::session_runtime::{AuthenticatedSessionRuntime, LocalRole, SessionNetworkPin};
 
 fn configure(bootstrap: &mut EmulatorNetworkBootstrap, observer: &PrivateKey) -> Result<()> {
