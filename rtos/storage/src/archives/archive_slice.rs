@@ -51,6 +51,9 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 const DEFAULT_PKG_VERSION: u32 = 1;
 
+#[derive(Clone, Copy)]
+enum PackageOpenMode { RecoverOrCreate, PreserveExisting }
+
 enum ChosenPackage {
     Info(Arc<PackageInfo>),
     Slot(PackageEntryInfo),
@@ -223,6 +226,14 @@ impl ArchiveSlice {
             self.add_package(entry, file_size).await?;
         }
 
+        if !self.sliced_mode {
+            let pi = self.get_package_by_entry(&self.get_base_entry_info()).await
+                .ok_or_else(|| error!("Imported non-sliced package is missing"))?;
+            self.entry_db.put_value(&u32::MAX.into(),
+                &PackageEntryMeta::with_data(file_size, pi.version(), None))?;
+            self.package_status_db.put_value(&PackageStatusKey::NonSlicedSize, &file_size)?;
+        }
+
         for import_entry in entries {
             let offset_key = (&import_entry.entry_id).into();
             self.offsets_db.put_value(&offset_key, &import_entry.offset)?;
@@ -251,6 +262,7 @@ impl ArchiveSlice {
 
     #[allow(clippy::too_many_arguments)]
     pub async fn with_data(
+        protection: Arc<crate::repair_protection::RepairProtection>,
         db: Arc<RocksDb>,
         db_root_path: Arc<PathBuf>,
         archive_id: u32,
@@ -260,6 +272,12 @@ impl ArchiveSlice {
         #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
         allocated: Arc<StorageAlloc>,
     ) -> Result<Self> {
+        let _startup = protection.deletion().await;
+        let mode = if protection.archive_range(archive_id, None) {
+            PackageOpenMode::PreserveExisting
+        } else {
+            PackageOpenMode::RecoverOrCreate
+        };
         let mut ret = Self::create(
             db,
             db_root_path,
@@ -311,10 +329,10 @@ impl ArchiveSlice {
                 } else {
                     fail!("No entry info for slice #{i}")
                 };
-                match ret.new_package(entry, None, meta.entry_size(), meta.version()).await {
+                match ret.open_package(entry, None, meta.entry_size(), meta.version(), mode).await {
                     Ok(_) => (),
                     Err(e) => {
-                        if cleanup_if_broken {
+                        if cleanup_if_broken && matches!(mode, PackageOpenMode::RecoverOrCreate) {
                             match ret.destroy_broken().await {
                                 Ok(_) => (),
                                 Err(e) => log::error!(
@@ -329,8 +347,27 @@ impl ArchiveSlice {
             }
         } else {
             let size = ret.package_status_db.get_value::<u64>(&PackageStatusKey::NonSlicedSize)?;
+            // Live append persists the end under the non-sliced sentinel; imports
+            // historically used index zero. Never infer a committed end from the file.
+            let (size, version) = if matches!(mode, PackageOpenMode::PreserveExisting) {
+                let meta = match ret.entry_db.try_get_value(&u32::MAX.into())? {
+                    Some(meta) => Some(meta),
+                    None => ret.entry_db.try_get_value(&0.into())?,
+                };
+                match meta {
+                    Some(meta) => {
+                        // A legacy explicit truncation left only this status updated.
+                        // Without an ordering marker, disagreement is not repairable here.
+                        if size != 0 && size != meta.entry_size() {
+                            fail!("Protected non-sliced package has ambiguous durable length metadata")
+                        }
+                        (meta.entry_size(), meta.version())
+                    },
+                    None => (size, 0),
+                }
+            } else { (size, 0) };
             let entry = ret.get_base_entry_info();
-            ret.new_package(entry, None, size, 0).await?;
+            ret.open_package(entry, None, size, version, mode).await?;
         }
         Ok(ret)
     }
@@ -529,6 +566,9 @@ impl ArchiveSlice {
                     index.map(|index| format!(" for slice #{index}")).unwrap_or("".to_string())
                 );
                 self.entry_db.put_value(&index.unwrap_or(u32::MAX).into(), &meta)?;
+                if !self.sliced_mode {
+                    self.package_status_db.put_value(&PackageStatusKey::NonSlicedSize, &size)?;
+                }
                 self.offsets_db.put_value(&offset_key, &offset)?;
                 if let PackageEntryId::Block(_) = entry_id {
                     self.block_index_db.put(block_handle, offset as u32)?;
@@ -893,6 +933,8 @@ impl ArchiveSlice {
                 .withdraw_package(0)
                 .map_err(|e| error!("Slice is corrupted: {e}, cannot truncate, non-sliced mode"))?;
             package_info.package().truncate(offset).await?;
+            self.entry_db.put_value(&u32::MAX.into(),
+                &PackageEntryMeta::with_data(offset, package_info.version(), None))?;
             self.package_status_db.put_value(&PackageStatusKey::NonSlicedSize, &offset)?;
             let entry = package_info.entry().clone();
             self.package_store.insert(entry.clone(), OnceLock::from(Arc::new(package_info)));
@@ -1135,6 +1177,13 @@ impl ArchiveSlice {
         size: u64,
         version: u32,
     ) -> Result<bool> {
+        self.open_package(entry, index, size, version, PackageOpenMode::RecoverOrCreate).await
+    }
+
+    async fn open_package(
+        &self, entry: PackageEntryInfo, index: Option<u32>, size: u64,
+        version: u32, mode: PackageOpenMode,
+    ) -> Result<bool> {
         let package_str = format!("{} {}", entry.seqno, entry.shard);
         log::debug!(
             target: TARGET,
@@ -1145,10 +1194,15 @@ impl ArchiveSlice {
         let Some(parent) = path.parent() else {
             fail!("Cannot create parent directory for {}", path.display())
         };
-        create_dir_all(parent)
-            .map_err(|e| error!("Cannot create directory {} : {e}", parent.display()))?;
+        if matches!(mode, PackageOpenMode::RecoverOrCreate) {
+            create_dir_all(parent)
+                .map_err(|e| error!("Cannot create directory {} : {e}", parent.display()))?;
+        }
         if add_unbound_object_to_map(&self.package_store, entry.clone(), || Ok(OnceLock::new()))? {
             let create_package = async || {
+                if matches!(mode, PackageOpenMode::PreserveExisting) {
+                    return Package::open_existing_exact(path.clone(), self.finalized, size).await;
+                }
                 let package = match Package::open(path.clone(), self.finalized, true).await {
                     Ok(p) => p,
                     Err(e) => match tokio::fs::remove_file(path.as_path()).await {
