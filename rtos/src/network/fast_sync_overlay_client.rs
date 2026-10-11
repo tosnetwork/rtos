@@ -291,7 +291,10 @@ impl FastSyncOverlayClient {
                     broadcast, src.clone(), received_bytes,
                 ).await?;
                 #[cfg(test)]
-                self.received_for_test.lock().unwrap().1.insert(received_id);
+                {
+                    log::debug!("Processed FastSync finality {received_id} on local {}", self.client.network_context().stack.adnl.key_by_tag(super::node_network::NodeNetwork::TAG_OVERLAY_KEY)?.id());
+                    self.received_for_test.lock().unwrap().1.insert(received_id);
+                }
             }
             Broadcast::TonNode_BlockBroadcast(broadcast) => {
                 self.engine.clone().process_block_broadcast(broadcast, src.clone())
