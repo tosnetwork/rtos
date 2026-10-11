@@ -1,7 +1,7 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Source retention before node WAL acknowledgement. Records are untrusted on recovery.
 use consensus_common::{
-    finality_delivery::FinalizedDeliveryDraft,
+    finality_delivery::{FinalizedDeliveryDraft, CanonicalFinalityRequest, CanonicalFinalityRecord, FinalityDeliveryRole},
     session_runtime::{AuthenticatedSessionRuntime, SessionNetworkPin},
     simplex_protocol::SimplexProtocol,
     SessionFinality,
@@ -15,6 +15,10 @@ const MAX_RECORD_BYTES: u64 = 64 << 20;
 const MAX_TOTAL_BYTES: u64 = 128 << 20;
 const MAX_RECORDS: usize = 1024;
 const DIRECTORY: &str = "finality-pending";
+const REFERENCE_DIRECTORY: &str = "references-v1";
+const MAX_REFERENCES: usize = 16_384;
+const MAX_REFERENCE_BYTES: u64 = 16 << 10;
+const MAX_REFERENCE_TOTAL: u64 = 32 << 20;
 // A single ACK transition may temporarily duplicate the largest admitted record.
 // Reserve both its physical file and its bytes at admission, not at completion.
 const ACK_ENVELOPE_RESERVE: u64 = 1024;
@@ -51,7 +55,7 @@ pub struct PendingFinalityRecord {
     pub candidate_already_sent: bool,
     pub created_at_unix_secs: u64,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DiskRecord {
     schema: u32, global_id: i32, zerostate: String, protocol: u32, carrier_version: u32,
@@ -66,6 +70,53 @@ struct AcknowledgedRecord {
     schema: u32,
     node_receipt: String,
     record: DiskRecord,
+}
+/// Contains no payload. The node reference must already be durable before this
+/// marker replaces a full ACK. Its digest commits every original source field.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalReference {
+    schema: u32,
+    node_receipt: String,
+    digest: String,
+    metadata: DiskRecord,
+}
+impl CanonicalReference {
+    fn read(path: &Path) -> Result<Self> {
+        let file = File::open(path)?;
+        if file.metadata()?.len() > MAX_REFERENCE_BYTES { fail!("Canonical source reference oversized"); }
+        let mut bytes = Vec::new(); file.take(MAX_REFERENCE_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_REFERENCE_BYTES { fail!("Canonical source reference grew"); }
+        let value: Self = serde_json::from_slice(&bytes)?;
+        let record = value.metadata_record()?;
+        let _: UInt256 = value.digest.parse()?;
+        let _: UInt256 = value.node_receipt.parse()?;
+        if path.file_stem().and_then(|s| s.to_str()) != Some(&record.id()?.to_hex_string()) { fail!("Canonical reference identity mismatch"); }
+        Ok(value)
+    }
+    fn metadata_record(&self) -> Result<PendingFinalityRecord> {
+        if self.schema != 1 || !self.metadata.data.is_empty() || !self.metadata.signature_set.is_empty() {
+            fail!("Unknown/noncompact canonical source reference");
+        }
+        let record = PendingFinalityRecord::from_disk(self.metadata.clone())?;
+        if record.protocol != SimplexProtocol::PrivateObserversPlumtree || record.wire_profile != WireProfile::T0
+            || !record.pin.zerostate.shard().is_masterchain() || record.pin.zerostate.seq_no() != 0
+            || record.pin.zerostate.root_hash().is_zero() || record.pin.zerostate.file_hash().is_zero() {
+            fail!("Invalid canonical reference domain");
+        }
+        Ok(record)
+    }
+    fn request(&self) -> Result<CanonicalFinalityRequest> {
+        let record = self.metadata_record()?;
+        Ok(record.request(self.node_receipt.parse()?))
+    }
+    fn matches(&self, record: &PendingFinalityRecord) -> Result<()> {
+        if UInt256::calc_file_hash(&record.encode()?) != self.digest.parse()? { fail!("Canonical node reply differs from original source evidence"); }
+        let mut metadata: DiskRecord = serde_json::from_slice(&record.encode()?)?;
+        metadata.data.clear(); metadata.signature_set.clear();
+        if serde_json::to_vec(&metadata)? != serde_json::to_vec(&self.metadata)? { fail!("Canonical source metadata mismatch"); }
+        Ok(())
+    }
 }
 impl PendingFinalityRecord {
     pub fn id(&self) -> Result<UInt256> {
@@ -152,8 +203,14 @@ impl PendingFinalityRecord {
             let _: UInt256 = ack.node_receipt.parse()?;
             ack.record
         } else { serde_json::from_slice(&bytes)? };
+        let record = Self::from_disk(disk)?;
+        record.validate()?;
+        if path.file_stem().and_then(|s| s.to_str()) != Some(&record.id()?.to_hex_string()) { fail!("Source finality filename/domain mismatch"); }
+        Ok(record)
+    }
+    fn from_disk(disk: DiskRecord) -> Result<Self> {
         if disk.schema != 1 { fail!("Unknown source finality schema {}", disk.schema); }
-        let record = Self {
+        Ok(Self {
             pin: SessionNetworkPin { global_id: disk.global_id, zerostate: disk.zerostate.parse()? },
             protocol: disk.protocol.try_into()?, carrier_version: disk.carrier_version,
             wire_profile: match disk.wire_profile { 0 => WireProfile::Legacy, 1 => WireProfile::T0, _ => fail!("Unknown source wire profile") },
@@ -163,10 +220,13 @@ impl PendingFinalityRecord {
             data: hex::decode(disk.data)?, signature_set: hex::decode(disk.signature_set)?, is_final: disk.is_final,
             last_mc_finalized_seqno: disk.last_mc_finalized_seqno, candidate_already_sent: disk.candidate_already_sent,
             created_at_unix_secs: disk.created_at_unix_secs,
-        };
-        record.validate()?;
-        if path.file_stem().and_then(|s| s.to_str()) != Some(&record.id()?.to_hex_string()) { fail!("Source finality filename/domain mismatch"); }
-        Ok(record)
+        })
+    }
+    fn request(&self, node_receipt: UInt256) -> CanonicalFinalityRequest {
+        CanonicalFinalityRequest { node_receipt, block_id: self.block_id.clone(),
+            role: if self.is_final { FinalityDeliveryRole::Final } else { FinalityDeliveryRole::Approval },
+            local_adnl: self.local_adnl.clone(), local_validator_index: self.local_validator_index,
+            source_validator: self.source_validator.clone() }
     }
 }
 
@@ -174,6 +234,8 @@ pub(crate) struct PendingFinalityStore {
     directory: PathBuf,
     _lock: File,
     mutation: Mutex<()>,
+    #[cfg(test)]
+    fail_compact_once: std::sync::atomic::AtomicBool,
 }
 impl PendingFinalityStore {
     pub(crate) fn open(namespace: &Path) -> Result<Arc<Self>> {
@@ -185,28 +247,122 @@ impl PendingFinalityStore {
     pub(crate) fn lock(directory: PathBuf) -> Result<Option<Arc<Self>>> {
         let lock = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(directory.join(".lock"))?;
         match lock.try_lock() {
-            Ok(()) => Ok(Some(Arc::new(Self { directory, _lock: lock, mutation: Mutex::new(()) }))),
+            Ok(()) => Ok(Some(Arc::new(Self { directory, _lock: lock, mutation: Mutex::new(()),
+                #[cfg(test)] fail_compact_once: std::sync::atomic::AtomicBool::new(false) }))),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(error) => Err(error!("Source finality ownership: {error}")),
         }
     }
     fn paths(&self) -> Result<Vec<PathBuf>> {
-        let mut total = 0u64; let mut paths = Vec::new();
+        let mut total = 0u64; let mut full_count = 0usize;
+        let mut reference_total = 0u64; let mut reference_count = 0usize;
+        let mut full_temps = 0usize; let mut reference_temps = 0usize;
+        let mut full_temp_bytes = 0u64; let mut reference_temp_bytes = 0u64;
+        let mut paths = Vec::new();
         for entry in std::fs::read_dir(&self.directory)? {
             let entry = entry?; let path = entry.path();
             let name = entry.file_name(); let name = name.to_string_lossy();
-            if name == ".lock" || name.ends_with(".tmp") { continue; }
+            if name == ".lock" { continue; }
+            if name.ends_with(".tmp") {
+                if !entry.file_type()?.is_file() { fail!("Invalid source temporary"); }
+                let size = entry.metadata()?.len(); full_temps += 1; full_temp_bytes += size;
+                if size > MAX_RECORD_BYTES || full_temps > 1 || full_count + full_temps > MAX_RECORDS || total + full_temp_bytes > MAX_TOTAL_BYTES { fail!("Source temporary physical quota exceeded"); }
+                continue;
+            }
+            if name == REFERENCE_DIRECTORY {
+                if !entry.file_type()?.is_dir() { fail!("Canonical reference index is not directory"); }
+                for entry in std::fs::read_dir(path)? {
+                    let entry = entry?; let path = entry.path();
+                    if path.extension().and_then(|s| s.to_str()) == Some("tmp") {
+                        if !entry.file_type()?.is_file() { fail!("Invalid reference temporary"); }
+                        let size = entry.metadata()?.len(); reference_temps += 1; reference_temp_bytes += size;
+                        if size > MAX_REFERENCE_BYTES || reference_temps > 1 || reference_total + reference_temp_bytes > MAX_REFERENCE_TOTAL + MAX_REFERENCE_BYTES { fail!("Reference temporary physical quota exceeded"); }
+                        continue;
+                    }
+                    if !entry.file_type()?.is_file() || path.extension().and_then(|s| s.to_str()) != Some("reference") { fail!("Unexpected canonical reference artifact"); }
+                    let size = entry.metadata()?.len();
+                    if size > MAX_REFERENCE_BYTES { fail!("Canonical reference exceeds readable bound"); }
+                    reference_total += size; reference_count += 1;
+                    if reference_total > MAX_REFERENCE_TOTAL || reference_count > MAX_REFERENCES
+                        || reference_total + reference_temp_bytes > MAX_REFERENCE_TOTAL + MAX_REFERENCE_BYTES { fail!("Canonical reference quota exceeded"); }
+                    paths.push(path);
+                }
+                continue;
+            }
             if !entry.file_type()?.is_file() || !matches!(path.extension().and_then(|s| s.to_str()), Some("json" | "acked")) { fail!("Unexpected source finality entry"); }
             total = total.checked_add(entry.metadata()?.len()).ok_or_else(|| error!("Source quota overflow"))?;
+            full_count += 1;
+            if full_count + full_temps > MAX_RECORDS || total + full_temp_bytes > MAX_TOTAL_BYTES { fail!("Source physical quota exceeded"); }
             paths.push(path);
-            if total > MAX_TOTAL_BYTES || paths.len() > MAX_RECORDS { fail!("Source finality quota exceeded"); }
         }
+        if total > MAX_TOTAL_BYTES || full_count > MAX_RECORDS || reference_total > MAX_REFERENCE_TOTAL || reference_count > MAX_REFERENCES { fail!("Source finality quota exceeded"); }
         paths.sort(); Ok(paths)
+    }
+    fn prepare_temporary(path: &Path) -> Result<()> {
+        for entry in std::fs::read_dir(path.parent().unwrap())? {
+            let other = entry?.path();
+            if other.extension().and_then(|s| s.to_str()) == Some("tmp") && other != path {
+                fail!("Another uncertain source temporary requires retry/repair");
+            }
+        }
+        Ok(())
+    }
+    fn reference_path(&self, id: &UInt256) -> PathBuf {
+        self.directory.join(REFERENCE_DIRECTORY).join(format!("{}.reference", id.to_hex_string()))
+    }
+    fn reference(&self, id: &UInt256) -> Result<Option<CanonicalReference>> {
+        let _guard = self.mutation.lock().unwrap();
+        let path = self.reference_path(id);
+        if !path.exists() { return Ok(None); }
+        let reference = CanonicalReference::read(&path)?;
+        for extension in ["json", "acked"] {
+            let full = self.directory.join(format!("{}.{extension}", id.to_hex_string()));
+            if full.exists() { reference.matches(&PendingFinalityRecord::read(&full)?)?; }
+        }
+        Ok(Some(reference))
+    }
+    fn compact(&self, record: &PendingFinalityRecord, receipt: UInt256) -> Result<()> {
+        let _guard = self.mutation.lock().unwrap();
+        let id = record.id()?;
+        let path = self.reference_path(&id);
+        let parent = path.parent().unwrap();
+        std::fs::create_dir_all(parent)?; File::open(&self.directory)?.sync_all()?;
+        let ack = self.directory.join(format!("{}.acked", id.to_hex_string()));
+        let pending = ack.with_extension("json");
+        if !path.exists() {
+            let original = PendingFinalityRecord::read(&ack)?;
+            if original.encode()? != record.encode()? { fail!("Canonical lookup changed original source record"); }
+            let mut metadata: DiskRecord = serde_json::from_slice(&original.encode()?)?;
+            metadata.data.clear(); metadata.signature_set.clear();
+            let reference = CanonicalReference { schema: 1, node_receipt: receipt.to_hex_string(),
+                digest: UInt256::calc_file_hash(&original.encode()?).to_hex_string(), metadata };
+            let bytes = serde_json::to_vec(&reference)?;
+            let references: Vec<_> = self.paths()?.into_iter().filter(|p| p.extension().and_then(|s| s.to_str()) == Some("reference")).collect();
+            let total = references.iter().try_fold(0u64, |n, p| Ok::<_, anyhow::Error>(n + std::fs::metadata(p)?.len()))?;
+            if bytes.len() as u64 > MAX_REFERENCE_BYTES || references.len() >= MAX_REFERENCES || total + bytes.len() as u64 > MAX_REFERENCE_TOTAL { fail!("Canonical source reference backpressure"); }
+            let temporary = path.with_extension("tmp");
+            Self::prepare_temporary(&temporary)?;
+            let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&temporary)?;
+            file.write_all(&bytes)?; file.sync_all()?; drop(file); std::fs::rename(temporary, &path)?;
+        }
+        #[cfg(test)]
+        if self.fail_compact_once.swap(false, std::sync::atomic::Ordering::AcqRel) { fail!("Injected canonical reference sync failure"); }
+        let reference = CanonicalReference::read(&path)?;
+        if reference.node_receipt != receipt.to_hex_string() { fail!("Canonical receipt changed"); }
+        reference.matches(record)?;
+        for full in [&ack, &pending] { if full.exists() { reference.matches(&PendingFinalityRecord::read(full)?)?; } }
+        File::open(&path)?.sync_all()?; File::open(parent)?.sync_all()?;
+        for full in [&ack, &pending] {
+            match std::fs::remove_file(full) { Ok(()) => {}, Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}, Err(e) => return Err(e.into()) }
+        }
+        File::open(&self.directory)?.sync_all()?;
+        Ok(())
     }
     pub(crate) fn retain(&self, record: &PendingFinalityRecord) -> Result<PendingFinalityRecord> {
         let _guard = self.mutation.lock().unwrap();
         let path = self.directory.join(format!("{}.json", record.id()?.to_hex_string()));
         let acknowledged = path.with_extension("acked");
+        if self.reference_path(&record.id()?).exists() { fail!("Canonical node lookup required; cannot replace retained reference"); }
         if path.exists() || acknowledged.exists() {
             let retained_path = if acknowledged.exists() { &acknowledged } else { &path };
             let old = PendingFinalityRecord::read(retained_path)?;
@@ -223,14 +379,18 @@ impl PendingFinalityStore {
         let bytes = record.encode()?;
         let paths = self.paths()?;
         for existing in &paths {
-            let old = PendingFinalityRecord::read(existing)?;
+            let old = if existing.extension().and_then(|s| s.to_str()) == Some("reference") {
+                CanonicalReference::read(existing)?.metadata_record()?
+            } else { PendingFinalityRecord::read(existing)? };
             if old.block_id.seq_no() == record.block_id.seq_no() && old.block_id != record.block_id {
                 fail!("Conflicting source finality blocks at one seqno");
             }
         }
+        let paths: Vec<_> = paths.into_iter().filter(|p| p.extension().and_then(|s| s.to_str()) != Some("reference")).collect();
         let total = paths.iter().try_fold(0u64, |total, path| Ok::<_, anyhow::Error>(total + std::fs::metadata(path)?.len()))?;
         check_retention_capacity(paths.len(), total, bytes.len() as u64)?;
         let temporary = path.with_extension("tmp");
+        Self::prepare_temporary(&temporary)?;
         let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&temporary)?;
         file.write_all(&bytes)?; file.sync_all()?; drop(file);
         std::fs::rename(&temporary, &path)?; File::open(&self.directory)?.sync_all()?;
@@ -238,6 +398,18 @@ impl PendingFinalityStore {
     }
     pub(crate) fn acknowledge(&self, id: &UInt256, node_receipt: UInt256) -> Result<()> {
         let _guard = self.mutation.lock().unwrap();
+        let reference = self.reference_path(id);
+        if reference.exists() {
+            let reference_record = CanonicalReference::read(&reference)?;
+            if reference_record.node_receipt != node_receipt.to_hex_string() { fail!("Canonical ACK receipt mismatch"); }
+            for extension in ["json", "acked"] {
+                let full = self.directory.join(format!("{}.{extension}", id.to_hex_string()));
+                if full.exists() { reference_record.matches(&PendingFinalityRecord::read(&full)?)?; }
+            }
+            File::open(&reference)?.sync_all()?;
+            File::open(reference.parent().unwrap())?.sync_all()?;
+            return Ok(());
+        }
         let path = self.directory.join(format!("{}.json", id.to_hex_string()));
         let acknowledged = path.with_extension("acked");
         // The complete canonical proof remains available after node takeover,
@@ -253,12 +425,13 @@ impl PendingFinalityStore {
                 node_receipt: node_receipt.to_hex_string(), record: serde_json::from_slice(&record.encode()?)? })?;
             if bytes.len() as u64 > MAX_RECORD_BYTES { fail!("Acknowledged source record exceeds readable bound"); }
             // Account the temporary duplicate too: no unbounded receipt history.
-            let paths = self.paths()?;
+            let paths: Vec<_> = self.paths()?.into_iter().filter(|p| p.extension().and_then(|s| s.to_str()) != Some("reference")).collect();
             let total = paths.iter().try_fold(0u64, |n, p| Ok::<_, anyhow::Error>(n + std::fs::metadata(p)?.len()))?;
             if paths.len() >= MAX_RECORDS || total + bytes.len() as u64 > MAX_TOTAL_BYTES {
                 fail!("Source acknowledged retention backpressure");
             }
             let temporary = path.with_extension("ack.tmp");
+            Self::prepare_temporary(&temporary)?;
             let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&temporary)?;
             file.write_all(&bytes)?; file.sync_all()?; drop(file);
             std::fs::rename(temporary, &acknowledged)?;
@@ -313,6 +486,11 @@ pub fn scan_pending_finality(root: &Path) -> Result<Vec<PendingFinalityRecovery>
         if !path.exists() { continue; }
         let Some(store) = PendingFinalityStore::lock(path)? else { continue; };
         for path in store.paths()? {
+            if path.extension().and_then(|s| s.to_str()) == Some("reference") {
+                let reference = CanonicalReference::read(&path)?;
+                store.reference(&reference.metadata_record()?.id()?)?;
+                continue;
+            }
             let record = PendingFinalityRecord::read(&path)?;
             if path.extension().and_then(|s| s.to_str()) == Some("acked") {
                 let pending = path.with_extension("json");
@@ -392,6 +570,8 @@ impl SourceFinalityDelivery {
                     self.store.acknowledge(&id, receipt.clone())?;
                     let result = (receipt.clone(), draft.clone());
                     stages.remove(&id);
+                    drop(stages);
+                    self.request_compaction(result.0.clone(), result.1.clone());
                     return Ok(Some(result));
                 }
                 Some(SourceStage::Durable(_, _)) => {
@@ -402,25 +582,19 @@ impl SourceFinalityDelivery {
             }
             stages.insert(id.clone(), SourceStage::Running);
         }
+        match self.store.reference(&id) {
+            Ok(Some(reference)) => {
+                if let Err(error) = self.lookup_reference(id.clone(), reference, draft.source_info) {
+                    self.retry(&id); return Err(error);
+                }
+                return Ok(None);
+            }
+            Ok(None) => {},
+            Err(error) => { self.retry(&id); return Err(error); }
+        }
         let prepare = || -> Result<FinalizedDeliveryDraft> {
             let retained = self.store.retain(&record)?;
-            let wire: rtos_api::ton::ton_node::SignatureSet = retained.wire_profile.deserialize_typed(&retained.signature_set)?;
-            let rtos_api::ton::ton_node::SignatureSet::TonNode_SignatureSet_SimplexPq(value) = wire else { fail!("Retained signature set is not PQ"); };
-            let signatures = PqNetworkSignatureSet::from_node(value)?;
-            let verifier = self.runtime.pq_context().ok_or_else(|| error!("Missing PQ context"))?.for_block(retained.block_id.clone())?;
-            let verified = verifier.verify_network(&signatures)?;
-            let finality = if retained.is_final {
-                SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(verified.into_final()?.0))
-            } else { SessionFinality::PqApproval(verified.into_approval()?.0) };
-            Ok(FinalizedDeliveryDraft {
-                block_id: retained.block_id,
-                source_info: draft.source_info,
-                data: consensus_common::ConsensusCommonFactory::create_block_payload(retained.data),
-                finality,
-                last_mc_finalized_seqno: retained.last_mc_finalized_seqno,
-                candidate_already_sent: retained.candidate_already_sent,
-                created_at_unix_secs: retained.created_at_unix_secs,
-            })
+            self.restore_draft(retained, draft.source_info.clone())
         };
         let draft = match prepare() {
             Ok(draft) => draft,
@@ -439,7 +613,11 @@ impl SourceFinalityDelivery {
                             SourceStage::Acknowledging(receipt, completion_draft)
                         }
                     };
+                    let compact = matches!(&state, SourceStage::Durable(_, _));
+                    let compact_draft = match &state { SourceStage::Durable(_, draft) => Some(draft.clone()), _ => None };
+                    let compact_receipt = match &state { SourceStage::Durable(receipt, _) => Some(receipt.clone()), _ => None };
                     owner.stages.lock().unwrap().insert(completion_id, state);
+                    if compact { owner.request_compaction(compact_receipt.unwrap(), compact_draft.unwrap()); }
                 },
                 Err(error) => {
                     log::error!("Durable finality stage failed; retained for recovery: {error}");
@@ -451,6 +629,72 @@ impl SourceFinalityDelivery {
             return Err(error);
         }
         Ok(None)
+    }
+    fn restore_draft(&self, retained: PendingFinalityRecord, source_info: consensus_common::BlockSourceInfo) -> Result<FinalizedDeliveryDraft> {
+        let wire: rtos_api::ton::ton_node::SignatureSet = retained.wire_profile.deserialize_typed(&retained.signature_set)?;
+        let rtos_api::ton::ton_node::SignatureSet::TonNode_SignatureSet_SimplexPq(value) = wire else { fail!("Retained signature set is not PQ"); };
+        let signatures = PqNetworkSignatureSet::from_node(value)?;
+        let verifier = self.runtime.pq_context().ok_or_else(|| error!("Missing PQ context"))?.for_block(retained.block_id.clone())?;
+        let verified = verifier.verify_network(&signatures)?;
+        let finality = if retained.is_final {
+            SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(verified.into_final()?.0))
+        } else { SessionFinality::PqApproval(verified.into_approval()?.0) };
+        Ok(FinalizedDeliveryDraft { block_id: retained.block_id, source_info,
+            data: consensus_common::ConsensusCommonFactory::create_block_payload(retained.data), finality,
+            last_mc_finalized_seqno: retained.last_mc_finalized_seqno,
+            candidate_already_sent: retained.candidate_already_sent,
+            created_at_unix_secs: retained.created_at_unix_secs })
+    }
+    fn canonical_reply(&self, reply: CanonicalFinalityRecord, source_info: consensus_common::BlockSourceInfo)
+        -> Result<(PendingFinalityRecord, FinalizedDeliveryDraft)> {
+        let draft = FinalizedDeliveryDraft { block_id: reply.request.block_id.clone(), source_info,
+            data: reply.data, finality: reply.finality, last_mc_finalized_seqno: reply.last_mc_finalized_seqno,
+            candidate_already_sent: reply.candidate_already_sent, created_at_unix_secs: reply.created_at_unix_secs };
+        let record = PendingFinalityRecord::from_draft(&self.runtime, &draft)?;
+        if record.request(reply.request.node_receipt.clone()) != reply.request { fail!("Canonical reply changed source binding or role"); }
+        let verified = self.restore_draft(record.clone(), draft.source_info)?;
+        Ok((record, verified))
+    }
+    fn lookup_reference(self: &Arc<Self>, id: UInt256, reference: CanonicalReference,
+        source_info: consensus_common::BlockSourceInfo) -> Result<()> {
+        let request = reference.request()?;
+        let expected = request.clone();
+        let owner = self.clone();
+        self.sink.retain_canonical(request, Box::new(move |reply| {
+            let result = (|| -> Result<(UInt256, FinalizedDeliveryDraft)> {
+                let reply = reply?;
+                if reply.request != expected { fail!("Canonical lookup returned a different event"); }
+                let (record, draft) = owner.canonical_reply(reply, source_info)?;
+                reference.matches(&record)?;
+                owner.store.compact(&record, expected.node_receipt.clone())?;
+                Ok((expected.node_receipt.clone(), draft))
+            })();
+            match result {
+                Ok((receipt, draft)) => { owner.stages.lock().unwrap().insert(id, SourceStage::Durable(receipt, draft)); },
+                Err(error) => { log::error!("Canonical source lookup retained for retry: {error}"); owner.retry(&id); }
+            }
+        }))
+    }
+    fn request_compaction(self: &Arc<Self>, receipt: UInt256, draft: FinalizedDeliveryDraft) {
+        let original = match PendingFinalityRecord::from_draft(&self.runtime, &draft) {
+            Ok(record) => record,
+            Err(error) => { log::error!("Full source ACK retained: {error}"); return; }
+        };
+        let request = original.request(receipt.clone());
+        let expected = request.clone();
+        let owner = self.clone();
+        // Accepted completion retains this owner, including the actual store lock.
+        // Unsupported or failed retention never removes the original full ACK.
+        if let Err(error) = self.sink.retain_canonical(request, Box::new(move |reply| {
+            let compact = || -> Result<()> {
+                let reply = reply?;
+                if reply.request != expected { fail!("Canonical retention returned different coordinates"); }
+                let (record, _) = owner.canonical_reply(reply, draft.source_info)?;
+                if original.encode()? != record.encode()? { fail!("Canonical retention changed original evidence"); }
+                owner.store.compact(&record, receipt)
+            };
+            if let Err(error) = compact() { log::debug!("Full source ACK or reference retained after compaction failure: {error}"); }
+        })) { log::debug!("Full source ACK retained without canonical lookup: {error}"); }
     }
     fn retry(&self, id: &UInt256) {
         self.stages.lock().unwrap().insert(id.clone(),
@@ -676,6 +920,94 @@ pub(crate) mod tests {
         assert!(check_retention_capacity(0, 0, readable + 1).is_err());
         assert!(check_retention_capacity(1, MAX_TOTAL_BYTES - MAX_RECORD_BYTES - 1, 1).is_ok());
         assert!(check_retention_capacity(1, MAX_TOTAL_BYTES - MAX_RECORD_BYTES, 1).is_err());
+    }
+
+    #[derive(Default)]
+    struct CanonicalSink {
+        stages: Mutex<Vec<(FinalizedDeliveryDraft, FinalizedDeliveryCompletion)>>,
+        lookups: Mutex<Vec<(CanonicalFinalityRequest, consensus_common::finality_delivery::CanonicalFinalityCompletion)>>,
+    }
+    impl consensus_common::finality_delivery::DurableFinalitySink for CanonicalSink {
+        fn stage(&self, draft: FinalizedDeliveryDraft, completion: FinalizedDeliveryCompletion) -> Result<()> {
+            self.stages.lock().unwrap().push((draft, completion)); Ok(())
+        }
+        fn retain_canonical(&self, request: CanonicalFinalityRequest,
+            completion: consensus_common::finality_delivery::CanonicalFinalityCompletion) -> Result<()> {
+            self.lookups.lock().unwrap().push((request, completion)); Ok(())
+        }
+    }
+    fn canonical_response(request: CanonicalFinalityRequest, draft: &FinalizedDeliveryDraft) -> CanonicalFinalityRecord {
+        CanonicalFinalityRecord { request, data: draft.data.clone(), finality: draft.finality.clone(),
+            last_mc_finalized_seqno: draft.last_mc_finalized_seqno,
+            candidate_already_sent: draft.candidate_already_sent, created_at_unix_secs: draft.created_at_unix_secs }
+    }
+    #[test]
+    fn source_finality_canonical_reference_holds_owner_and_replays_original_after_reopen() {
+        let directory = crate::authenticated_fixture::TestDirectory::new();
+        let (runtime, draft) = fixture();
+        let namespace = PathBuf::from(runtime.runtime_directory(directory.path().to_str().unwrap()).unwrap());
+        std::fs::create_dir_all(&namespace).unwrap();
+        let sink = Arc::new(CanonicalSink::default());
+        let source = SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
+        let released = source.namespace_release_receipt();
+        assert!(source.poll(draft.clone()).unwrap().is_none());
+        let (canonical, completion) = sink.stages.lock().unwrap().pop().unwrap();
+        let receipt = UInt256::calc_file_hash(b"canonical-node-receipt");
+        completion(Ok(receipt.clone()));
+        assert!(source.poll(draft.clone()).unwrap().is_some());
+        assert_eq!(source.store.paths().unwrap()[0].extension().unwrap(), "acked");
+        drop(source);
+        assert!(!released.load(std::sync::atomic::Ordering::Acquire));
+        assert!(PendingFinalityStore::open(&namespace).is_err(), "held canonical completion retains real source lock");
+        let (request, completion) = sink.lookups.lock().unwrap().pop().unwrap();
+        completion(Ok(canonical_response(request, &canonical)));
+        assert!(released.load(std::sync::atomic::Ordering::Acquire));
+        let source = SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
+        let paths = source.store.paths().unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].extension().unwrap(), "reference");
+        let mut reconstructed = draft.clone(); reconstructed.created_at_unix_secs += 100;
+        reconstructed.candidate_already_sent = !draft.candidate_already_sent;
+        assert!(source.poll(reconstructed.clone()).unwrap().is_none());
+        assert!(sink.stages.lock().unwrap().is_empty(), "reference replay cannot rebuild a fresh node draft");
+        let (request, completion) = sink.lookups.lock().unwrap().pop().unwrap();
+        completion(Ok(canonical_response(request, &canonical)));
+        let (_, restored) = source.poll(reconstructed).unwrap().unwrap();
+        assert_eq!(PendingFinalityRecord::from_draft(&runtime, &restored).unwrap().encode().unwrap(),
+            PendingFinalityRecord::from_draft(&runtime, &canonical).unwrap().encode().unwrap());
+    }
+    #[test]
+    fn source_finality_canonical_mismatch_keeps_full_ack_and_uncertain_compaction_is_recoverable() {
+        let directory = crate::authenticated_fixture::TestDirectory::new();
+        let (runtime, draft) = fixture();
+        let namespace = PathBuf::from(runtime.runtime_directory(directory.path().to_str().unwrap()).unwrap());
+        std::fs::create_dir_all(&namespace).unwrap();
+        let sink = Arc::new(CanonicalSink::default());
+        let source = SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
+        source.poll(draft.clone()).unwrap();
+        let (canonical, completion) = sink.stages.lock().unwrap().pop().unwrap();
+        let receipt = UInt256::calc_file_hash(b"canonical-node-receipt"); completion(Ok(receipt.clone()));
+        let (request, completion) = sink.lookups.lock().unwrap().pop().unwrap();
+        let mut wrong = canonical_response(request, &canonical); wrong.created_at_unix_secs += 1;
+        completion(Ok(wrong));
+        assert_eq!(source.store.paths().unwrap()[0].extension().unwrap(), "acked");
+        let record = PendingFinalityRecord::from_draft(&runtime, &canonical).unwrap();
+        let mut wrong_role = record.request(receipt.clone()); wrong_role.role = FinalityDeliveryRole::Approval;
+        assert!(source.canonical_reply(canonical_response(wrong_role, &canonical), canonical.source_info.clone()).is_err());
+        source.store.fail_compact_once.store(true, std::sync::atomic::Ordering::Release);
+        assert!(source.store.compact(&record, receipt.clone()).is_err());
+        assert_eq!(source.store.paths().unwrap().len(), 2, "uncertain rename retains original ACK");
+        drop(source);
+        let store = PendingFinalityStore::open(&namespace).unwrap();
+        let reference = store.reference(&record.id().unwrap()).unwrap().unwrap();
+        reference.matches(&record).unwrap();
+        store.compact(&record, receipt).unwrap();
+        assert_eq!(store.paths().unwrap().len(), 1);
+        assert!(store.retain(&record).is_err(), "compact reference cannot be overwritten by reconstructed evidence");
+        let path = store.paths().unwrap().pop().unwrap();
+        std::fs::write(&path, b"{broken").unwrap();
+        drop(store);
+        assert!(scan_pending_finality(directory.path()).is_err(), "bad compact index is not an empty source");
     }
 
 }

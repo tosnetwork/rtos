@@ -34,6 +34,18 @@ const DIRECTORY: &str = "finality-intents";
 const MAX_INTENT_BYTES: u64 = 16 << 20;
 const MAX_INTENT_TOTAL: u64 = 64 << 20;
 const MAX_INTENTS: usize = 1024;
+// Completed evidence has its own finite budget. This is not retirement GC:
+// reaching either completed limit deliberately backpressures further resolution.
+const COMPLETED_DIRECTORY: &str = "completed-v1";
+const MAX_COMPLETED: usize = 16_384;
+const MAX_COMPLETED_TOTAL: u64 = 256 << 20;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletedIntent {
+    schema: u32,
+    record: DiskIntent,
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,7 +101,11 @@ fn read_intent(path: &std::path::Path, namespace: &std::path::Path) -> Result<(S
     if file.metadata()?.len() > MAX_INTENT_BYTES { fail!("Source recovery intent oversized"); }
     let mut bytes = Vec::new(); file.take(MAX_INTENT_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_INTENT_BYTES { fail!("Source recovery intent grew beyond bound"); }
-    let disk: DiskIntent = serde_json::from_slice(&bytes)?;
+    let disk: DiskIntent = if path.extension().and_then(|s| s.to_str()) == Some("complete") {
+        let completed: CompletedIntent = serde_json::from_slice(&bytes)?;
+        if completed.schema != 1 { fail!("Unknown completed source intent schema"); }
+        completed.record
+    } else { serde_json::from_slice(&bytes)? };
     if disk.schema != 1 || disk.protocol != 2 || disk.wire_profile != 1 { fail!("Unknown source recovery domain/schema"); }
     let certificate = hex::decode(disk.certificate)?;
     let wire: rtos_api::ton::consensus::simplex::Certificate = WireProfile::T0.deserialize_typed(&certificate)?;
@@ -142,21 +158,115 @@ impl FinalityIntentStore {
             std::fs::create_dir(&directory)?;
             File::open(&self.namespace)?.sync_all()?;
         }
-        self.paths()?;
+        for path in self.paths()? {
+            if path.extension().and_then(|s| s.to_str()) == Some("resolved") { self.complete_path(&path)?; }
+        }
         Ok(())
     }
     fn paths(&self) -> Result<Vec<PathBuf>> {
         let directory = self.namespace.join(DIRECTORY);
         if !directory.exists() { return Ok(Vec::new()); }
-        let mut total = 0u64; let mut paths = Vec::new();
-        for entry in std::fs::read_dir(directory)? {
-            let entry = entry?; let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("tmp") { continue; }
-            if !entry.file_type()?.is_file() || !matches!(path.extension().and_then(|s| s.to_str()), Some("json" | "resolved")) { fail!("Unexpected source recovery artifact"); }
-            total += entry.metadata()?.len(); paths.push(path);
-            if total > MAX_INTENT_TOTAL || paths.len() > MAX_INTENTS { fail!("Source recovery intent quota exceeded"); }
+        let mut pending_total = 0u64; let mut pending_count = 0usize;
+        let mut completed_total = 0u64; let mut completed_count = 0usize;
+        let mut pending_physical = 0u64; let mut completed_physical = 0u64;
+        let mut pending_temps = 0usize; let mut completed_temps = 0usize;
+        let mut completed_keys = std::collections::HashMap::<String, (PathBuf, u64)>::new();
+        let mut paths = Vec::new();
+        // Flatten only the one known completed directory, with no recursive walk.
+        let mut entries = std::collections::VecDeque::from([std::fs::read_dir(&directory)?]);
+        while let Some(mut entries_in_directory) = entries.pop_front() {
+            for entry in &mut entries_in_directory {
+                let entry = entry?; let path = entry.path();
+                if path == directory.join(COMPLETED_DIRECTORY) {
+                    if !entry.file_type()?.is_dir() { fail!("Completed intent index is not a directory"); }
+                    entries.push_back(std::fs::read_dir(&path)?); continue;
+                }
+                if !entry.file_type()?.is_file() { fail!("Unexpected source recovery artifact"); }
+                let extension = path.extension().and_then(|s| s.to_str());
+                let in_completed = path.parent() == Some(directory.join(COMPLETED_DIRECTORY).as_path());
+                let size = entry.metadata()?.len();
+                if size > MAX_INTENT_BYTES { fail!("Source recovery artifact oversized"); }
+                let completed = in_completed || extension == Some("resolved");
+                if completed { completed_physical += size; } else { pending_physical += size; }
+                if completed_physical > MAX_COMPLETED_TOTAL + MAX_INTENT_BYTES
+                    || pending_physical > MAX_INTENT_TOTAL + MAX_INTENT_BYTES { fail!("Source recovery physical quota exceeded"); }
+                if extension == Some("tmp") {
+                    if completed { completed_temps += 1; } else { pending_temps += 1; }
+                    if completed_temps > 1 || pending_temps > 1 { fail!("Source recovery temporary quota exceeded"); }
+                    continue;
+                }
+                if (in_completed && extension != Some("complete")) || (!in_completed && !matches!(extension, Some("json" | "resolved"))) { fail!("Unexpected source recovery artifact"); }
+                if completed {
+                    let key = path.file_stem().unwrap().to_string_lossy().into_owned();
+                    if let Some((old, old_size)) = completed_keys.get_mut(&key) {
+                        let canonical = |path: &std::path::Path| -> Result<Vec<u8>> {
+                            let bytes = std::fs::read(path)?;
+                            let record = if path.extension().and_then(|s| s.to_str()) == Some("complete") {
+                                let value: CompletedIntent = serde_json::from_slice(&bytes)?;
+                                if value.schema != 1 { fail!("Unknown completed intent schema"); } value.record
+                            } else { serde_json::from_slice(&bytes)? };
+                            Ok(serde_json::to_vec(&record)?)
+                        };
+                        if canonical(old)? != canonical(&path)? { fail!("Conflicting legacy/completed source intent"); }
+                        if size > *old_size { completed_total += size - *old_size; *old_size = size; }
+                    } else { completed_keys.insert(key, (path.clone(), size)); completed_total += size; completed_count += 1; }
+                } else { pending_total += size; pending_count += 1; }
+                if pending_total > MAX_INTENT_TOTAL || pending_count > MAX_INTENTS
+                    || completed_total > MAX_COMPLETED_TOTAL || completed_count > MAX_COMPLETED { fail!("Source recovery intent quota exceeded"); }
+                paths.push(path);
+            }
         }
         paths.sort(); Ok(paths)
+    }
+    fn prepare_temporary(path: &std::path::Path) -> Result<()> {
+        for entry in std::fs::read_dir(path.parent().unwrap())? {
+            let entry = entry?; let other = entry.path();
+            if other.extension().and_then(|s| s.to_str()) == Some("tmp") && other != path {
+                fail!("Another uncertain source intent temporary requires retry/repair");
+            }
+        }
+        Ok(())
+    }
+    fn completed_path(&self, path: &std::path::Path) -> PathBuf {
+        self.namespace.join(DIRECTORY).join(COMPLETED_DIRECTORY)
+            .join(path.file_name().unwrap()).with_extension("complete")
+    }
+    // Persist the exact original proof before removing its old representation.
+    // Both copies may survive a crash; they must agree byte-for-byte semantically.
+    fn complete_path(&self, path: &std::path::Path) -> Result<()> {
+        let completed = self.completed_path(path);
+        let directory = completed.parent().unwrap();
+        let parent = directory.parent().unwrap();
+        std::fs::create_dir_all(directory)?; File::open(parent)?.sync_all()?;
+        if path.exists() {
+            read_intent(path, &self.namespace)?;
+            let record: DiskIntent = serde_json::from_slice(&std::fs::read(path)?)?;
+            let bytes = serde_json::to_vec(&CompletedIntent { schema: 1, record })?;
+            if bytes.len() as u64 > MAX_INTENT_BYTES { fail!("Completed intent exceeds readable bound"); }
+            if completed.exists() {
+                read_intent(&completed, &self.namespace)?;
+                if std::fs::read(&completed)? != bytes { fail!("Conflicting completed source intent"); }
+            } else {
+                let paths = self.paths()?;
+                let completed_paths: Vec<_> = paths.iter().filter(|p| p.as_path() != path && matches!(p.extension().and_then(|s| s.to_str()), Some("complete" | "resolved"))).collect();
+                let total = completed_paths.iter().try_fold(0u64, |n, p| Ok::<_, anyhow::Error>(n + std::fs::metadata(p)?.len()))?;
+                if completed_paths.len() >= MAX_COMPLETED || total + bytes.len() as u64 > MAX_COMPLETED_TOTAL { fail!("Completed source intent backpressure"); }
+                let temporary = completed.with_extension("tmp");
+                Self::prepare_temporary(&temporary)?;
+                let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&temporary)?;
+                file.write_all(&bytes)?; file.sync_all()?; drop(file);
+                std::fs::rename(temporary, &completed)?;
+            }
+        }
+        #[cfg(test)]
+        if self.fail_resolve_once.swap(false, std::sync::atomic::Ordering::AcqRel) { fail!("Injected source resolve sync failure after rename"); }
+        read_intent(&completed, &self.namespace)?;
+        File::open(&completed)?.sync_all()?; File::open(directory)?.sync_all()?;
+        match std::fs::remove_file(path) {
+            Ok(()) => {}, Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}, Err(e) => return Err(e.into()),
+        }
+        File::open(parent)?.sync_all()?;
+        Ok(())
     }
     pub(crate) fn retain(&self, runtime: &AuthenticatedSessionRuntime, prevs: Vec<BlockIdExt>, start_masterchain: BlockIdExt, event: &crate::simplex_state::BlockFinalizedEvent) -> Result<()> {
         let _guard = self.mutation.lock().unwrap();
@@ -165,17 +275,20 @@ impl FinalityIntentStore {
         File::open(&self.namespace)?.sync_all()?;
         let path = directory.join(format!("{}-{}.json", event.slot.value(), event.block_hash.to_hex_string()));
         let resolved = path.with_extension("resolved");
-        let old = if resolved.exists() { &resolved } else { &path };
+        let completed = self.completed_path(&path);
+        let old = if completed.exists() { &completed } else if resolved.exists() { &resolved } else { &path };
         if old.exists() {
             read_intent(old, &self.namespace)?.0.validate_runtime(runtime)?;
-            File::open(old)?.sync_all()?; File::open(&directory)?.sync_all()?; return Ok(());
+            File::open(old)?.sync_all()?; File::open(old.parent().unwrap())?.sync_all()?;
+            File::open(&directory)?.sync_all()?; return Ok(());
         }
-        if let Some(pending) = self.unresolved.lock().unwrap().as_mut() { pending.insert(path.clone()); }
         let bytes = serde_json::to_vec(&record.disk(event)?)?;
-        let paths = self.paths()?;
+        let paths: Vec<_> = self.paths()?.into_iter().filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json")).collect();
         let total = paths.iter().try_fold(0u64, |n, p| Ok::<_, anyhow::Error>(n + std::fs::metadata(p)?.len()))?;
-        if bytes.len() as u64 > MAX_INTENT_BYTES || paths.len() >= MAX_INTENTS || total + bytes.len() as u64 > MAX_INTENT_TOTAL { fail!("Source recovery intent backpressure"); }
+        if bytes.len() as u64 > MAX_INTENT_BYTES - 1024 || paths.len() >= MAX_INTENTS || total + bytes.len() as u64 > MAX_INTENT_TOTAL { fail!("Source recovery intent backpressure"); }
         let temporary = path.with_extension("tmp");
+        Self::prepare_temporary(&temporary)?;
+        if let Some(pending) = self.unresolved.lock().unwrap().as_mut() { pending.insert(path.clone()); }
         let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&temporary)?;
         file.write_all(&bytes)?; file.sync_all()?; drop(file); std::fs::rename(temporary, path)?;
         File::open(&directory)?.sync_all()?;
@@ -186,12 +299,9 @@ impl FinalityIntentStore {
         let directory = self.namespace.join(DIRECTORY);
         let path = directory.join(format!("{}-{}.json", id.slot.value(), id.hash.to_hex_string()));
         let resolved = path.with_extension("resolved");
-        let was_pending = path.exists();
-        if was_pending { std::fs::rename(&path, &resolved)?; }
-        #[cfg(test)]
-        if self.fail_resolve_once.swap(false, std::sync::atomic::Ordering::AcqRel) { fail!("Injected source resolve sync failure after rename"); }
-        read_intent(&resolved, &self.namespace)?;
-        File::open(&resolved)?.sync_all()?; File::open(directory)?.sync_all()?;
+        if path.exists() { self.complete_path(&path)?; }
+        else if resolved.exists() { self.complete_path(&resolved)?; }
+        else { self.complete_path(&path)?; }
         if let Some(pending) = self.unresolved.lock().unwrap().as_mut() { pending.remove(&path); }
         Ok(())
     }
@@ -200,6 +310,13 @@ impl FinalityIntentStore {
         let mut pending = Vec::new();
         for path in self.paths()? {
             let (_, certificate) = read_intent(&path, &self.namespace)?;
+            if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                let completed = self.completed_path(&path);
+                if completed.exists() {
+                    let original: DiskIntent = serde_json::from_slice(&std::fs::read(&path)?)?;
+                    if std::fs::read(&completed)? != serde_json::to_vec(&CompletedIntent { schema: 1, record: original })? { fail!("Conflicting pending/completed intent"); }
+                }
+            }
             if path.extension().and_then(|s| s.to_str()) == Some("json") { pending.push(certificate); }
         }
         // Initialize once: after a failed rename/fsync transition the in-process
@@ -380,6 +497,8 @@ mod tests {
         reopened.fail_resolve_once.store(true, std::sync::atomic::Ordering::Release);
         assert!(reopened.resolve(&id).is_err());
         assert_eq!(reopened.pending_count().unwrap(), 1, "rename alone cannot certify durable completion");
+        let uncertain_reopen = FinalityIntentStore::new(&namespace);
+        assert_eq!(uncertain_reopen.pending_count().unwrap(), 1, "index copy alone cannot skip pending debt after reopen");
         reopened.resolve(&id).unwrap();
         assert_eq!(reopened.pending_count().unwrap(), 0);
         assert!(scan_finality_recovery(directory.path()).unwrap().is_empty());
@@ -387,4 +506,56 @@ mod tests {
         std::fs::write(&reopened.paths().unwrap()[0], b"{broken").unwrap();
         assert!(scan_finality_recovery(directory.path()).is_err(), "bad resolved records cannot become an empty scan");
     }
+    #[test]
+    fn source_finality_completed_index_does_not_consume_pending_quota_or_skip_holes() {
+        let directory = crate::authenticated_fixture::TestDirectory::new();
+        let (runtime, _) = crate::finality_delivery::tests::fixture();
+        let namespace = PathBuf::from(runtime.runtime_directory(directory.path().to_str().unwrap()).unwrap());
+        std::fs::create_dir_all(&namespace).unwrap();
+        let store = FinalityIntentStore::new(&namespace);
+        store.prepare(false).unwrap();
+        // Storage accepts untrusted evidence. These structural certificates test
+        // storage admission, not cryptographic authentication or finality.
+        let event = |slot: u32| {
+            let hash = UInt256::calc_file_hash(&slot.to_le_bytes());
+            crate::simplex_state::BlockFinalizedEvent {
+                slot: crate::block::SlotIndex::new(slot), block_hash: hash.clone(), block_id: None,
+                certificate: std::sync::Arc::new(crate::certificate::Certificate {
+                    vote: crate::simplex_state::FinalizeVote { slot: crate::block::SlotIndex::new(slot), block_hash: hash },
+                    signatures: Vec::new(),
+                }),
+            }
+        };
+        let retain = |event: &crate::simplex_state::BlockFinalizedEvent| store.retain(&runtime,
+            vec![runtime.pin().zerostate.clone()], runtime.pin().zerostate.clone(), event).unwrap();
+        let hole = event(1u32); retain(&hole);
+        for slot in 2u32..1104 {
+            let next = event(slot); retain(&next);
+            store.resolve(&crate::block::RawCandidateId { slot: next.slot, hash: next.block_hash }).unwrap();
+        }
+        assert_eq!(store.pending_count().unwrap(), 1, "high completed slots cannot consume the hole");
+        assert_eq!(store.pending().unwrap().len(), 1);
+        assert_eq!(store.paths().unwrap().len(), 1103);
+        drop(store);
+        let reopened = FinalityIntentStore::new(&namespace);
+        reopened.prepare(true).unwrap();
+        assert_eq!(reopened.pending_count().unwrap(), 1);
+        let already = event(1103);
+        reopened.retain(&runtime, vec![runtime.pin().zerostate.clone()], runtime.pin().zerostate.clone(), &already).unwrap();
+        assert_eq!(reopened.pending_count().unwrap(), 1, "exact completed replay is idempotent");
+        let next = event(1104);
+        reopened.retain(&runtime, vec![runtime.pin().zerostate.clone()], runtime.pin().zerostate.clone(), &next).unwrap();
+        assert_eq!(reopened.pending_count().unwrap(), 2, "independent pending quota remains available");
+        let completed = reopened.paths().unwrap().into_iter().find(|p| p.extension().and_then(|s| s.to_str()) == Some("complete")).unwrap();
+        let decoded: CompletedIntent = serde_json::from_slice(&std::fs::read(&completed).unwrap()).unwrap();
+        let legacy = namespace.join(DIRECTORY).join(completed.file_name().unwrap()).with_extension("resolved");
+        std::fs::write(&legacy, serde_json::to_vec(&decoded.record).unwrap()).unwrap();
+        std::fs::remove_file(&completed).unwrap();
+        reopened.prepare(true).unwrap();
+        assert!(!legacy.exists()); assert!(completed.exists(), "legacy exact proof migrated durably");
+        let temporary = namespace.join(DIRECTORY).join("oversized.tmp");
+        File::create(&temporary).unwrap().set_len(MAX_INTENT_BYTES + 1).unwrap();
+        assert!(reopened.paths().is_err(), "temporary bytes cannot bypass physical quota");
+    }
+
 }
