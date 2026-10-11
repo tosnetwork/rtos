@@ -152,7 +152,7 @@ pub struct Engine {
     shard_states_awaiters: AwaitersPool<BlockIdExt, Arc<ShardStateStuff>>,
     block_applying_awaiters: AwaitersPool<BlockIdExt, ()>,
     next_block_applying_awaiters: AwaitersPool<BlockIdExt, BlockIdExt>,
-    download_block_awaiters: AwaitersPool<BlockIdExt, (BlockStuff, BlockProofStuff)>,
+    download_block_awaiters: AwaitersPool<BlockDownloadKey, (BlockStuff, BlockProofStuff)>,
     external_messages: Arc<MessagesPool>,
     confirmed_block_events: ConfirmedBlockEvents,
 
@@ -216,6 +216,32 @@ pub struct Engine {
     trace_collector: Option<simplex::TraceCollector>,
     // Drop after the engine-owned database/network fields.
     _network_binding: crate::network_db::DbNetworkBinding,
+}
+
+/// Only requests with identical retry policy may share a network operation.
+/// A one-attempt finality lookup must not determine an ordinary apply's result.
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub(crate) struct BlockDownloadKey {
+    id: BlockIdExt,
+    attempts: Option<u32>,
+    timeout: Option<(u64, u64, u64)>,
+}
+
+impl std::fmt::Display for BlockDownloadKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} attempts={:?} timeout={:?}", self.id, self.attempts, self.timeout)
+    }
+}
+
+async fn download_with_policy<R: Clone>(
+    pool: &AwaitersPool<BlockDownloadKey, R>,
+    id: &BlockIdExt,
+    attempts: Option<u32>,
+    timeout: Option<(u64, u64, u64)>,
+    worker: impl std::future::Future<Output = Result<R>>,
+) -> Result<Option<R>> {
+    let key = BlockDownloadKey { id: id.clone(), attempts, timeout };
+    pool.do_or_wait(&key, None, worker).await
 }
 
 struct DownloadContext<'a, T> {
@@ -1473,10 +1499,26 @@ impl Engine {
         &self.next_block_applying_awaiters
     }
 
-    pub fn download_block_awaiters(
+    pub(crate) fn download_block_awaiters(
         &self,
-    ) -> &AwaitersPool<BlockIdExt, (BlockStuff, BlockProofStuff)> {
+    ) -> &AwaitersPool<BlockDownloadKey, (BlockStuff, BlockProofStuff)> {
         &self.download_block_awaiters
+    }
+
+    pub(crate) async fn download_block_with_policy(
+        &self,
+        id: &BlockIdExt,
+        attempts: Option<u32>,
+        timeout: Option<(u64, u64, u64)>,
+    ) -> Result<Option<(BlockStuff, BlockProofStuff)>> {
+        download_with_policy(
+            self.download_block_awaiters(),
+            id,
+            attempts,
+            timeout,
+            self.download_block_worker(id, attempts, timeout),
+        )
+        .await
     }
 
     pub fn external_messages(&self) -> &Arc<MessagesPool> {
@@ -1506,7 +1548,7 @@ impl Engine {
             log::trace!("Cached block candidate {}", id);
         }
 
-        self.download_block_awaiters().shunt(id, || {
+        self.download_block_awaiters().shunt_matching(|key| &key.id == id, || {
             let block = BlockStuff::deserialize_block(id.clone(), block_data.clone())?;
             let proof = create_new_proof_link(&block)?;
             Ok((block, proof))
@@ -1778,8 +1820,7 @@ impl Engine {
                     if pre_apply { (Some(10), Some((50, 15, 500))) } else { (None, None) };
 
                 break self
-                    .download_block_awaiters()
-                    .do_or_wait(id, None, self.download_block_worker(id, attempts, timeout))
+                    .download_block_with_policy(id, attempts, timeout)
                     .await?;
             };
 
@@ -3796,3 +3837,7 @@ mod stopper_tests;
 #[cfg(test)]
 #[path = "tests/test_engine_owned_drain.rs"]
 mod owned_drain_tests;
+
+#[cfg(test)]
+#[path = "tests/engine_download_tests.rs"]
+mod download_policy_tests;
