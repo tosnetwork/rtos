@@ -203,6 +203,18 @@ impl SessionCallbacks {
         });
     }
 
+    pub(crate) fn notify_authenticated_candidate(
+        &self,
+        evidence: consensus_common::CandidateAuthenticationEvidence,
+    ) {
+        let listener = self.listener.clone();
+        self.invoke(move || {
+            if let Some(listener) = listener.upgrade() {
+                listener.on_authenticated_candidate(evidence);
+            }
+        });
+    }
+
     /// Notify listener that a candidate has been observed (with
     /// parent/body/local flags) so the validator-side state resolver
     /// cache can race against `engine.wait_state()`.

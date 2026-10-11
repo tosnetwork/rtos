@@ -1474,6 +1474,22 @@ pub enum ResolverPurpose {
     CatchainLocalCollation,
 }
 
+/// Evidence emitted only after a non-empty candidate passed leader signature verification.
+/// This is not a capability: consumers must bind and verify it against their authenticated
+/// runtime before authorizing public relay. It does not certify block execution validity.
+#[derive(Clone)]
+pub struct CandidateAuthenticationEvidence {
+    pub session_id: SessionId,
+    pub slot: u32,
+    pub creator_index: u32,
+    pub creator_adnl: PublicKeyHash,
+    pub candidate_hash_data: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub block_id: BlockIdExt,
+    pub data: BlockPayloadPtr,
+    pub collated_data: BlockPayloadPtr,
+}
+
 /// Store-only candidate observation flags sent from consensus to validator.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CandidateObservedFlags {
@@ -1578,6 +1594,9 @@ pub trait SessionListener: Send + Sync {
         flags: CandidateObservedFlags,
     ) {
     }
+
+    /// Independent PQ candidate authentication evidence; never inferred from observation flags.
+    fn on_authenticated_candidate(&self, _evidence: CandidateAuthenticationEvidence) {}
 
     /// A block is ready for validator-side acceptance (Simplex only).
     /// `SessionFinality` distinguishes a final certificate from a temporary
