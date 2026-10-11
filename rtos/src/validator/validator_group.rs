@@ -1069,6 +1069,12 @@ impl ValidatorGroup {
         runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
     ) -> Result<Self> {
         use consensus_common::session_runtime::LocalRole;
+        if self.authenticated_runtime.is_some() {
+            fail!("A published runtime binding cannot be replaced");
+        }
+        if &runtime.pin().zerostate != self.engine.zerostate_id()? {
+            fail!("Authenticated runtime differs from the engine network anchor");
+        }
         let ConsensusOptions::Simplex(options) = &self.consensus_options else {
             fail!("Authenticated Simplex runtime requires Simplex options");
         };
