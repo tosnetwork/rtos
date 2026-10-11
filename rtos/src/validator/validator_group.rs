@@ -1004,6 +1004,7 @@ pub struct ValidatorGroup {
     /// Simplex delivers candidate observations through `SessionListener`.
     /// We persist those observations here and resolve parent states before
     /// falling back to `engine.wait_state()`.
+    candidate_relays: Mutex<super::propagation::CandidateRelayDeduplicator>,
     state_resolver_cache: Arc<tokio::sync::Mutex<StateResolverCache>>,
     action_queue: tokio::sync::mpsc::UnboundedSender<ValidationAction>,
     callback: Arc<dyn SessionListener + Send + Sync>,
@@ -1204,6 +1205,7 @@ impl ValidatorGroup {
             validator_set,
             pq_session,
             authenticated_runtime: None,
+            candidate_relays: Mutex::new(Default::default()),
             consensus_options,
             is_accelerated_consensus_enabled: is_accelerated,
             engine,
@@ -1625,6 +1627,69 @@ impl ValidatorGroup {
 
     pub async fn info(&self) -> String {
         self.group_impl.execute_sync(|group_impl| group_impl.info()).await
+    }
+
+    /// Only this independently verified callback authorizes v2 candidate relay.
+    /// Store-only observations never acquire that authority.
+    pub async fn on_authenticated_candidate(
+        &self,
+        evidence: consensus_common::CandidateAuthenticationEvidence,
+    ) -> Result<()> {
+        use super::propagation::{PropagationEvent, PropagationPlan, ValidatedCandidateRelay};
+        let Some(runtime) = &self.authenticated_runtime else {
+            return Ok(()); // Legacy sessions retain their existing propagation path.
+        };
+        if self.stop_requested.is_cancelled() {
+            fail!("Candidate relay rejected after group stop");
+        }
+        let ConsensusOptions::Simplex(options) = &self.consensus_options else {
+            fail!("Authenticated candidate requires a Simplex group");
+        };
+        let block = super::candidate_authentication::verify_candidate_for_relay(
+            runtime,
+            &evidence,
+            options.max_block_size,
+            options.max_collated_data_size,
+        )?;
+        if self.candidate_relays.lock().unwrap().contains(block.id()) {
+            return Ok(());
+        }
+        let cc_seqno = runtime.catchain_seqno();
+        let subset_hash = ValidatorSet::calc_subset_hash_short(runtime.committee(), cc_seqno)?;
+        let last_mc =
+            self.group_impl.execute_sync(|group| group.last_accepted_mc_seqno.unwrap_or(0)).await;
+        let is_creator = matches!(
+            runtime.local_role(),
+            consensus_common::session_runtime::LocalRole::Validator(index)
+                if index == evidence.creator_index
+        );
+        let plan = PropagationPlan::for_event(
+            runtime.protocol(),
+            PropagationEvent::CandidateReceived,
+            block.id(),
+            true,
+            is_creator,
+            false,
+            last_mc,
+            false,
+        );
+        let id = block.id().clone();
+        let candidate = ValidatedCandidateRelay::from_validated_group_candidate(
+            block,
+            cc_seqno,
+            subset_hash,
+            runtime.session_id().clone(),
+        );
+        // No group/cache lock is held over network operations. Queue ownership
+        // keeps this callback in the group's shutdown barrier.
+        let outcome = self.engine.relay_validated_candidate(&candidate, &plan).await;
+        if outcome.attempted() && !outcome.needs_retry() {
+            self.candidate_relays.lock().unwrap().record_sent(id);
+        }
+        if outcome.needs_retry() {
+            fail!("Candidate relay deferred or failed; candidate remains eligible for retry");
+        }
+        Ok(())
     }
 
     pub async fn on_candidate_observed(

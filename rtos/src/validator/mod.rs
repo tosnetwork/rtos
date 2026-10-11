@@ -11,6 +11,7 @@
  */
 pub mod accept_block;
 pub mod block_sync_observer;
+mod candidate_authentication;
 pub mod candidate_db;
 pub mod collator;
 pub mod consensus;

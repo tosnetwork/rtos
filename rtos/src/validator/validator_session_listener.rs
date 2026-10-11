@@ -60,6 +60,7 @@ pub enum ValidationAction {
         collated_data: BlockPayloadPtr,
         callback: ValidatorBlockCandidateDecisionCallback,
     },
+    OnAuthenticatedCandidate(consensus_common::CandidateAuthenticationEvidence),
     OnCandidateObserved {
         block_id: BlockIdExt,
         data: BlockPayloadPtr,
@@ -105,6 +106,9 @@ impl fmt::Display for ValidationAction {
                 write!(f, "OnCandidate round: {}", source_info.priority.round)
             }
 
+            ValidationAction::OnAuthenticatedCandidate(ref evidence) => {
+                write!(f, "OnAuthenticatedCandidate block_id={}", evidence.block_id)
+            }
             ValidationAction::OnCandidateObserved { ref block_id, ref flags, .. } => {
                 write!(
                     f,
@@ -183,6 +187,13 @@ impl SessionListener for ValidatorSessionListener {
             Some(round),
             ValidationAction::OnCandidate { source_info, root_hash, data, collated_data, callback },
         );
+    }
+
+    fn on_authenticated_candidate(
+        &self,
+        evidence: consensus_common::CandidateAuthenticationEvidence,
+    ) {
+        self.do_send_general(None, ValidationAction::OnAuthenticatedCandidate(evidence));
     }
 
     fn on_candidate_observed(
@@ -393,6 +404,11 @@ async fn process_validation_action(action: ValidationAction, g: Arc<ValidatorGro
             g.on_candidate(source_info, root_hash, data, collated_data, callback).await
         }
 
+        ValidationAction::OnAuthenticatedCandidate(evidence) => {
+            if let Err(error) = g.on_authenticated_candidate(evidence).await {
+                log::warn!(target: "validator", "Candidate relay rejected: {error}");
+            }
+        }
         ValidationAction::OnCandidateObserved { block_id, data, collated_data, flags } => {
             log::trace!(
                 target: "simplex_resolver",
