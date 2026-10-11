@@ -846,12 +846,13 @@ mod tests {
             Some(SourceIoGate { entered: writer_entered_tx, release: writer_release_rx });
         let (scan_entered_tx, scan_entered) = mpsc::channel();
         let (scan_release, scan_release_rx) = mpsc::channel();
-        if unlocked_control {
-            *store.scan_metadata_gate.lock().unwrap() =
-                Some(SourceIoGate { entered: scan_entered_tx.clone(), release: scan_release_rx });
-        } else {
-            *store.scan_started.lock().unwrap() = Some(scan_entered_tx.clone());
+        *store.scan_metadata_gate.lock().unwrap() =
+            Some(SourceIoGate { entered: scan_entered_tx, release: scan_release_rx });
+        let (scan_started_tx, scan_started) = mpsc::channel();
+        if !unlocked_control {
+            *store.scan_started.lock().unwrap() = Some(scan_started_tx);
         }
+        let (scan_finished_tx, scan_finished) = mpsc::channel();
         let owner = store.clone();
         let writer_id = id.clone();
         let writer_offer = offer.clone();
@@ -869,13 +870,32 @@ mod tests {
             reader = Some(std::thread::spawn(move || {
                 // The negative control invokes exactly the former unsynchronized
                 // enumeration, not a copied algorithm or swallowed IO error.
-                if unlocked_control {
+                let result = if unlocked_control {
                     scan_store.paths_under_mutation()
                 } else {
                     scan_store.paths()
-                }
+                };
+                let _ = scan_finished_tx.send(());
+                result
             }));
-            scan_entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            if unlocked_control {
+                scan_entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            } else {
+                scan_started.recv_timeout(Duration::from_secs(5)).unwrap();
+                // The writer still owns mutation and its real temporary file.
+                // Removing only the production scan lock lets the reader reach
+                // this exact metadata gate, failing before writer release.
+                assert_eq!(
+                    scan_entered.recv_timeout(Duration::from_millis(500)),
+                    Err(mpsc::RecvTimeoutError::Timeout),
+                    "scan reached temporary metadata while confirmed writer held mutation"
+                );
+                assert_eq!(
+                    scan_finished.try_recv(),
+                    Err(mpsc::TryRecvError::Empty),
+                    "scan completed while confirmed writer held mutation"
+                );
+            }
             writer_release.send(()).unwrap();
             writer.take().unwrap().join().unwrap().unwrap();
             let _ = scan_release.send(());
