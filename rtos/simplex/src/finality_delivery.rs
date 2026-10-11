@@ -445,17 +445,23 @@ pub fn canonical_source_identity_bounded(
     if data.len() > (16 << 20) || signature_set.len() > (16 << 20) {
         fail!("Source finality body/carrier exceeds bound");
     }
-    let raw_len = data.len().checked_add(signature_set.len())
+    let raw_len = data
+        .len()
+        .checked_add(signature_set.len())
         .ok_or_else(|| error!("Source identity length overflow"))?;
     // Exact payload copies and hex allocations, plus bounded fixed-size identity
     // strings/id serialization. JSON itself is counted before allocating below.
     budget.workspace(raw_len)?;
-    budget.workspace(raw_len.checked_mul(2).ok_or_else(|| error!("Source hex length overflow"))?)?;
+    budget
+        .workspace(raw_len.checked_mul(2).ok_or_else(|| error!("Source hex length overflow"))?)?;
     budget.workspace(4096)?;
     let record = PendingFinalityRecord {
-        pin: runtime.pin().clone(), protocol: runtime.protocol(),
-        carrier_version: runtime.carrier_version(), wire_profile: runtime.wire_profile(),
-        profile: runtime.profile().clone(), session_id: runtime.session_id().clone(),
+        pin: runtime.pin().clone(),
+        protocol: runtime.protocol(),
+        carrier_version: runtime.carrier_version(),
+        wire_profile: runtime.wire_profile(),
+        profile: runtime.profile().clone(),
+        session_id: runtime.session_id().clone(),
         block_id: reply.request.block_id.clone(),
         local_adnl: UInt256::from(*runtime.local_adnl().data()),
         local_validator_index: match runtime.local_role() {
@@ -463,7 +469,8 @@ pub fn canonical_source_identity_bounded(
             consensus_common::session_runtime::LocalRole::Observer => None,
         },
         source_validator: reply.request.source_validator.clone(),
-        data: data.to_vec(), signature_set: signature_set.to_vec(),
+        data: data.to_vec(),
+        signature_set: signature_set.to_vec(),
         is_final: reply.request.role == FinalityDeliveryRole::Final,
         last_mc_finalized_seqno: reply.last_mc_finalized_seqno,
         candidate_already_sent: reply.candidate_already_sent,
@@ -476,14 +483,18 @@ pub fn canonical_source_identity_bounded(
     struct Count(usize);
     impl Write for Count {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.checked_add(bytes.len())
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
                 .ok_or_else(|| std::io::Error::other("Source JSON length overflow"))?;
             if self.0 as u64 > MAX_RECORD_BYTES {
                 return Err(std::io::Error::other("Source finality record exceeds bound"));
             }
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
     let mut count = Count(0);
     serde_json::to_writer(&mut count, &disk)?;
@@ -493,10 +504,28 @@ pub fn canonical_source_identity_bounded(
     Ok((record.id()?, UInt256::calc_file_hash(&bytes)))
 }
 
+#[cfg(test)]
+struct SourceIoGate {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+#[cfg(test)]
+impl SourceIoGate {
+    fn wait(self) {
+        let _ = self.entered.send(());
+        let _ = self.release.recv(); // disconnected test owner must never strand a writer
+    }
+}
 pub(crate) struct PendingFinalityStore {
     directory: PathBuf,
     _lock: File,
     mutation: Mutex<()>,
+    #[cfg(test)]
+    scan_metadata_gate: Mutex<Option<SourceIoGate>>,
+    #[cfg(test)]
+    scan_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
+    confirmed_rename_gate: Mutex<Option<SourceIoGate>>,
     delivered_uncertain: std::sync::atomic::AtomicBool,
     runtime_binding: Mutex<Option<delivered::DiskRecoveryBinding>>,
     intents: Arc<crate::finality_recovery::FinalityIntentStore>,
@@ -533,6 +562,12 @@ impl PendingFinalityStore {
                 directory,
                 _lock: lock,
                 mutation: Mutex::new(()),
+                #[cfg(test)]
+                scan_metadata_gate: Mutex::new(None),
+                #[cfg(test)]
+                scan_started: Mutex::new(None),
+                #[cfg(test)]
+                confirmed_rename_gate: Mutex::new(None),
                 delivered_uncertain: std::sync::atomic::AtomicBool::new(false),
                 runtime_binding: Mutex::new(None),
                 intents,
@@ -552,6 +587,17 @@ impl PendingFinalityStore {
         }
     }
     fn paths(&self) -> Result<Vec<PathBuf>> {
+        #[cfg(test)]
+        if let Some(started) = self.scan_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let _guard = self.mutation.lock().unwrap();
+        self.paths_under_mutation()
+    }
+    // Caller holds mutation throughout enumeration and all physical metadata
+    // reads. Writers use this entry to avoid recursively locking the mutex.
+    fn paths_under_mutation(&self) -> Result<Vec<PathBuf>> {
+        use anyhow::Context;
         let mut total = 0u64;
         let mut full_count = 0usize;
         let mut reference_total = 0u64;
@@ -561,8 +607,12 @@ impl PendingFinalityStore {
         let mut full_temp_bytes = 0u64;
         let mut reference_temp_bytes = 0u64;
         let mut paths = Vec::new();
-        for entry in std::fs::read_dir(&self.directory)? {
-            let entry = entry?;
+        for entry in std::fs::read_dir(&self.directory)
+            .with_context(|| format!("scan source directory {}", self.directory.display()))?
+        {
+            let entry = entry.with_context(|| {
+                format!("enumerate source directory {}", self.directory.display())
+            })?;
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -570,10 +620,21 @@ impl PendingFinalityStore {
                 continue;
             }
             if name.ends_with(".tmp") {
-                if !entry.file_type()?.is_file() {
+                #[cfg(test)]
+                if let Some(gate) = self.scan_metadata_gate.lock().unwrap().take() {
+                    gate.wait();
+                }
+                if !entry
+                    .file_type()
+                    .with_context(|| format!("source file type {}", path.display()))?
+                    .is_file()
+                {
                     fail!("Invalid source temporary");
                 }
-                let size = entry.metadata()?.len();
+                let size = entry
+                    .metadata()
+                    .with_context(|| format!("source metadata {}", path.display()))?
+                    .len();
                 full_temps += 1;
                 full_temp_bytes += size;
                 if size > MAX_RECORD_BYTES
@@ -586,17 +647,36 @@ impl PendingFinalityStore {
                 continue;
             }
             if name == REFERENCE_DIRECTORY {
-                if !entry.file_type()?.is_dir() {
+                if !entry
+                    .file_type()
+                    .with_context(|| format!("source file type {}", path.display()))?
+                    .is_dir()
+                {
                     fail!("Canonical reference index is not directory");
                 }
-                for entry in std::fs::read_dir(path)? {
-                    let entry = entry?;
+                for entry in std::fs::read_dir(&path)
+                    .with_context(|| format!("scan reference directory {}", path.display()))?
+                {
+                    let entry = entry.with_context(|| {
+                        format!("enumerate source directory {}", self.directory.display())
+                    })?;
                     let path = entry.path();
                     if path.extension().and_then(|s| s.to_str()) == Some("tmp") {
-                        if !entry.file_type()?.is_file() {
+                        #[cfg(test)]
+                        if let Some(gate) = self.scan_metadata_gate.lock().unwrap().take() {
+                            gate.wait();
+                        }
+                        if !entry
+                            .file_type()
+                            .with_context(|| format!("source file type {}", path.display()))?
+                            .is_file()
+                        {
                             fail!("Invalid reference temporary");
                         }
-                        let size = entry.metadata()?.len();
+                        let size = entry
+                            .metadata()
+                            .with_context(|| format!("source metadata {}", path.display()))?
+                            .len();
                         reference_temps += 1;
                         reference_temp_bytes += size;
                         if size > MAX_REFERENCE_BYTES
@@ -608,7 +688,10 @@ impl PendingFinalityStore {
                         }
                         continue;
                     }
-                    if !entry.file_type()?.is_file()
+                    if !entry
+                        .file_type()
+                        .with_context(|| format!("source file type {}", path.display()))?
+                        .is_file()
                         || !matches!(
                             path.extension().and_then(|s| s.to_str()),
                             Some("reference" | "delivered")
@@ -616,7 +699,10 @@ impl PendingFinalityStore {
                     {
                         fail!("Unexpected canonical reference artifact");
                     }
-                    let size = entry.metadata()?.len();
+                    let size = entry
+                        .metadata()
+                        .with_context(|| format!("source metadata {}", path.display()))?
+                        .len();
                     if size > MAX_REFERENCE_BYTES {
                         fail!("Canonical reference exceeds readable bound");
                     }
@@ -633,13 +719,21 @@ impl PendingFinalityStore {
                 }
                 continue;
             }
-            if !entry.file_type()?.is_file()
+            if !entry
+                .file_type()
+                .with_context(|| format!("source file type {}", path.display()))?
+                .is_file()
                 || !matches!(path.extension().and_then(|s| s.to_str()), Some("json" | "acked"))
             {
                 fail!("Unexpected source finality entry");
             }
             total = total
-                .checked_add(entry.metadata()?.len())
+                .checked_add(
+                    entry
+                        .metadata()
+                        .with_context(|| format!("source metadata {}", path.display()))?
+                        .len(),
+                )
                 .ok_or_else(|| error!("Source quota overflow"))?;
             full_count += 1;
             if full_count + full_temps > MAX_RECORDS || total + full_temp_bytes > MAX_TOTAL_BYTES {
@@ -715,7 +809,7 @@ impl PendingFinalityStore {
             };
             let bytes = serde_json::to_vec(&reference)?;
             let references: Vec<_> = self
-                .paths()?
+                .paths_under_mutation()?
                 .into_iter()
                 .filter(|p| {
                     matches!(
@@ -797,13 +891,16 @@ impl PendingFinalityStore {
             return Ok(old);
         }
         let bytes = record.encode()?;
-        let paths = self.paths()?;
+        let paths = self.paths_under_mutation()?;
         for existing in &paths {
             let old = match existing.extension().and_then(|s| s.to_str()) {
                 Some("reference") => CanonicalReference::read(existing)?.metadata_record()?,
                 Some("delivered") => {
-                    let id: UInt256 = existing.file_stem().and_then(|s| s.to_str())
-                        .ok_or_else(|| error!("Invalid source Delivered filename"))?.parse()?;
+                    let id: UInt256 = existing
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .ok_or_else(|| error!("Invalid source Delivered filename"))?
+                        .parse()?;
                     self.delivered_reference(&id)?
                         .ok_or_else(|| error!("Source Delivered disappeared during retention"))?
                         .metadata_record()?
@@ -878,7 +975,7 @@ impl PendingFinalityStore {
             }
             // Account the temporary duplicate too: no unbounded receipt history.
             let paths: Vec<_> = self
-                .paths()?
+                .paths_under_mutation()?
                 .into_iter()
                 .filter(|p| {
                     !matches!(
@@ -1914,12 +2011,16 @@ impl FinalityDeliveryTestDriver {
         draft: &FinalizedDeliveryDraft,
         prev_blocks: &[BlockIdExt],
     ) -> Result<()> {
-        let SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(proof)) = &draft.finality else {
+        let SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(proof)) = &draft.finality
+        else {
             fail!("Source certificate fixture requires a PQ Final carrier");
         };
         let runtime = &self.0.runtime;
-        runtime.pq_context().ok_or_else(|| error!("Source certificate fixture requires PQ runtime"))?
-            .for_block(draft.block_id.clone())?.verify_final(proof)?;
+        runtime
+            .pq_context()
+            .ok_or_else(|| error!("Source certificate fixture requires PQ runtime"))?
+            .for_block(draft.block_id.clone())?
+            .verify_final(proof)?;
         let candidate = PqNetworkSignatureSet::from_final_fields(proof)?.to_node().candidate;
         let hash = UInt256::calc_file_hash(&runtime.wire_profile().serialize(&candidate)?);
         let mut signatures = Vec::with_capacity(proof.signatures.len());
@@ -1932,24 +2033,34 @@ impl FinalityDeliveryTestDriver {
                 }
             }
             signatures.push(crate::certificate::VoteSignature {
-                validator_idx: crate::block::ValidatorIndex::new(index.ok_or_else(|| error!("Unknown source certificate signer"))?),
+                validator_idx: crate::block::ValidatorIndex::new(
+                    index.ok_or_else(|| error!("Unknown source certificate signer"))?,
+                ),
                 signature: signature.signature.clone(),
             });
         }
         let certificate = crate::certificate::Certificate {
             vote: crate::simplex_state::FinalizeVote {
-                slot: crate::block::SlotIndex::new(proof.slot), block_hash: hash.clone(),
+                slot: crate::block::SlotIndex::new(proof.slot),
+                block_hash: hash.clone(),
             },
             signatures,
         };
         // Reuse the exact factory verifier for the converted raw certificate too.
         crate::certificate::Certificate::<crate::simplex_state::Vote>::from_authenticated_runtime(
-            &certificate.to_tl()?, runtime, &|| Ok(()),
+            &certificate.to_tl()?,
+            runtime,
+            &|| Ok(()),
         )?;
-        self.0.retain_intent(prev_blocks.to_vec(), &crate::simplex_state::BlockFinalizedEvent {
-            slot: crate::block::SlotIndex::new(proof.slot), block_hash: hash,
-            block_id: None, certificate: Arc::new(certificate),
-        })
+        self.0.retain_intent(
+            prev_blocks.to_vec(),
+            &crate::simplex_state::BlockFinalizedEvent {
+                slot: crate::block::SlotIndex::new(proof.slot),
+                block_hash: hash,
+                block_id: None,
+                certificate: Arc::new(certificate),
+            },
+        )
     }
     pub fn maintain(&self) -> Result<()> {
         self.0.maintain_closing()
