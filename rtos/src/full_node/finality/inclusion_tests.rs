@@ -76,11 +76,23 @@ struct Pair {
 
 impl Pair {
     async fn new(variant: &str, corrupt_signature: bool) -> Self {
+        Self::with_propagation_profile(variant, corrupt_signature, false).await
+    }
+
+    async fn with_propagation_profile(variant: &str, corrupt_signature: bool, v2: bool) -> Self {
         let _ = env_logger::builder().is_test(true).try_init();
-        let recovery: serde_json::Value =
-            serde_json::from_str(include_str!("testdata/recovery.json")).unwrap();
-        let inclusion: serde_json::Value =
-            serde_json::from_str(include_str!("testdata/inclusion.json")).unwrap();
+        let recovery: serde_json::Value = serde_json::from_str(if v2 {
+            include_str!("testdata/v2-propagation-recovery.json")
+        } else {
+            include_str!("testdata/recovery.json")
+        })
+        .unwrap();
+        let inclusion: serde_json::Value = serde_json::from_str(if v2 {
+            include_str!("testdata/v2-propagation-inclusion.json")
+        } else {
+            include_str!("testdata/inclusion.json")
+        })
+        .unwrap();
         let row =
             inclusion["rows"].as_array().unwrap().iter().find(|r| r["name"] == variant).unwrap();
         let master = fixture_block(row);
@@ -103,6 +115,26 @@ impl Pair {
         let provider_dir = dir.path().join("provider");
         write_recovery_config(&receiver_dir, &anchor, true);
         write_recovery_config(&provider_dir, &anchor, true);
+        if v2 {
+            // The fixture's governing set authenticates these public test transport
+            // IDs. Normal router configuration selects the actual primary key.
+            // No test manually activates Plumtree or bypasses an authority check.
+            for (dir, seed) in [(&provider_dir, 0x60), (&receiver_dir, 0x61)] {
+                let file = dir.join("config.json");
+                let mut config: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+                let (key, _) =
+                    Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[seed; 32])
+                        .unwrap();
+                for entry in config["adnl_node"]["keys"].as_array_mut().unwrap() {
+                    if entry["tag"] == NodeNetwork::TAG_OVERLAY_KEY {
+                        entry["data"] = serde_json::to_value(&key).unwrap();
+                    }
+                }
+                config["ip_address_quic"] = "127.0.0.1:0".into();
+                std::fs::write(file, serde_json::to_vec(&config).unwrap()).unwrap();
+            }
+        }
         let receiver = open_engine(&receiver_dir).await;
         let provider = open_engine(&provider_dir).await;
         for engine in [&receiver, &provider] {
@@ -135,6 +167,14 @@ impl Pair {
             engine.set_test_chain_time(Some(1002));
             assert!(crate::network::check_sync_for_listen_bcasts(engine.as_ref()));
             engine.initialize_test_full_node_overlays().await.unwrap();
+            if v2 {
+                engine
+                    .overlays_router()
+                    .unwrap()
+                    .refresh_fast_sync_from_applied_state()
+                    .await
+                    .unwrap();
+            }
         }
         let handle = provider.store_block(&shard).await.unwrap().to_any();
         let link = crate::validator::accept_block::create_new_proof_link(&shard).unwrap();
@@ -842,3 +882,6 @@ async fn real_multinode_plumtree_repairs_lost_ihave_and_first_repair_response() 
     relays.receiver.clone().wait_stop().await.unwrap();
     relays.provider.clone().wait_stop().await.unwrap();
 }
+
+#[path = "propagation_tests.rs"]
+mod propagation_tests;
