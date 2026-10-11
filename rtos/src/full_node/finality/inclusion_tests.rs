@@ -1038,6 +1038,8 @@ impl SpoolFixture {
                 committee,
                 key.id().clone(),
             )
+            .unwrap()
+            .bind_recovery_anchor(anchor.clone())
             .unwrap();
             assert_eq!(
                 runtime.local_role(),

@@ -801,12 +801,12 @@ async fn publication_durable_sink_wal_receipt_reopens_and_accepts_creator_bound_
                         .unwrap();
                 let (_, stored) = ledger.delivery(&id).unwrap().unwrap();
                 assert_eq!(ledger.pending().unwrap().len(), 1);
-                assert_eq!(stored.stage, PublicationStage::Ready);
+                assert_eq!(stored.stage, PublicationStage::AcceptedDraft);
+                assert!(stored.pending.is_empty(), "disabled publication cannot resolve targets");
                 assert!(
-                    !stored.pending.is_empty(),
-                    "publication remained disabled; no target was sent"
+                    stored.record.effects.is_empty(),
+                    "empty unresolved intent is not Completed"
                 );
-                assert_eq!(stored.pending, stored.record.effects);
                 assert_eq!(
                     reopened.load_state(block.id()).await.unwrap().root_cell().repr_hash(),
                     &state_root
@@ -824,4 +824,459 @@ async fn publication_durable_sink_wal_receipt_reopens_and_accepts_creator_bound_
     assert_ne!(stable_ids[0], stable_ids[1], "Approval and Final must have different IDs");
     assert_eq!(stable_ids[0], stable_ids[2], "empty trigger must refer to the same body/role ID");
     assert_eq!(stable_ids[1], stable_ids[3]);
+}
+
+fn remove_spool_transport(dir: &std::path::Path) -> serde_json::Value {
+    let path = dir.join("config.json");
+    let original: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut retired = original.clone();
+    retired["consensus_transport_bindings"] = serde_json::json!([]);
+    retired["validator_key_ring"] = serde_json::json!({});
+    std::fs::write(path, serde_json::to_vec(&retired).unwrap()).unwrap();
+    original
+}
+fn restore_spool_transport(dir: &std::path::Path, original: &serde_json::Value) {
+    let path = dir.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["consensus_transport_bindings"] = original["consensus_transport_bindings"].clone();
+    config["validator_key_ring"] = original["validator_key_ring"].clone();
+    std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+}
+fn spool_domain(
+    runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+) -> crate::propagation_outbox::OutboxDomain {
+    crate::propagation_outbox::OutboxDomain {
+        zerostate: runtime.pin().zerostate.clone(),
+        global_id: runtime.pin().global_id,
+        wire_profile: runtime.wire_profile(),
+    }
+}
+fn inspect_spool(
+    engine: &Arc<Engine>,
+    domain: &crate::propagation_outbox::OutboxDomain,
+    id: &UInt256,
+) -> crate::propagation_outbox::UnverifiedRecord {
+    crate::propagation_outbox::inspect_delivery(
+        engine.db(),
+        domain,
+        &crate::propagation_outbox::Limits::default(),
+        id,
+    )
+    .unwrap()
+    .expect("persisted delivery disappeared")
+    .1
+}
+async fn initialize_spool_router(engine: &Arc<Engine>) {
+    engine.set_test_chain_time(Some(1002));
+    engine.initialize_test_full_node_overlays().await.unwrap();
+    engine.overlays_router().unwrap().refresh_fast_sync_from_applied_state().await.unwrap();
+}
+async fn assert_spool_acceptance(
+    engine: &Arc<Engine>,
+    id: &UInt256,
+    block: &BlockStuff,
+    state_root: &UInt256,
+    final_role: bool,
+) {
+    let accepted =
+        tokio::time::timeout(Duration::from_secs(20), engine.clone().await_publication(id.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(accepted.block(), block);
+    assert_eq!(accepted.is_final(), final_role);
+    assert_eq!(accepted.phase(), AcceptancePhase::Preapplied);
+    assert_eq!(engine.load_state(block.id()).await.unwrap().root_cell().repr_hash(), state_root);
+    assert!(!engine.load_block_handle(block.id()).unwrap().unwrap().is_applied());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publication_retired_transport_accepts_and_restored_authority_resumes_frozen_routes() {
+    use crate::propagation_outbox::PublicationStage;
+    for row_index in 0..2 {
+        for final_role in [false, true] {
+            let SpoolFixture { dir, engine, runtime, block, row, state_root } =
+                SpoolFixture::new(row_index).await;
+            let domain = spool_domain(&runtime);
+            let result = std::panic::AssertUnwindSafe(async {
+                let sink = engine.clone().durable_finality_sink(runtime.clone()).await.unwrap();
+                stage_spool(&sink, spool_draft(&runtime, &block, &row, final_role)).await.unwrap()
+            })
+            .catch_unwind()
+            .await;
+            engine.clone().wait_stop().await.unwrap();
+            drop(engine);
+            let id = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let original = remove_spool_transport(dir.path());
+            let retired = open_engine(dir.path()).await;
+            let result = std::panic::AssertUnwindSafe(async {
+                assert!(retired.adnl_key_by_id(runtime.local_adnl()).is_none());
+                assert!(retired.consensus_transport_bindings().unwrap().is_empty());
+                initialize_spool_router(&retired).await;
+                assert_spool_acceptance(&retired, &id, &block, &state_root, final_role).await;
+                let accepted = inspect_spool(&retired, &domain, &id);
+                assert_eq!(accepted.stage, PublicationStage::AcceptedDraft);
+                assert!(accepted.pending.is_empty() && accepted.record.effects.is_empty());
+                retired.enable_publication_worker().await.unwrap();
+                // Observe more than one retry interval: absent authority must
+                // not reinterpret this original validator intent as an observer.
+                let until = tokio::time::Instant::now() + Duration::from_millis(1200);
+                while tokio::time::Instant::now() < until {
+                    assert_eq!(inspect_spool(&retired, &domain, &id), accepted);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                accepted
+            })
+            .catch_unwind()
+            .await;
+            retired.clone().wait_stop().await.unwrap();
+            drop(retired);
+            let blocked = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+
+            restore_spool_transport(dir.path(), &original);
+            let restored = open_engine(dir.path()).await;
+            let result = std::panic::AssertUnwindSafe(async {
+                assert!(restored.adnl_key_by_id(runtime.local_adnl()).is_some());
+                assert_eq!(
+                    inspect_spool(&restored, &domain, &id),
+                    blocked,
+                    "blocked intent changed across actual DB reopen"
+                );
+                initialize_spool_router(&restored).await;
+                restored.enable_publication_worker().await.unwrap();
+                let ready = tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        let entry = inspect_spool(&restored, &domain, &id);
+                        if entry.stage == PublicationStage::Ready {
+                            break entry;
+                        }
+                        assert_ne!(
+                            entry.stage,
+                            PublicationStage::Completed,
+                            "unresolved/failed transport cannot complete"
+                        );
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("restored real authority did not resolve original routing intent");
+                assert!(!ready.record.effects.is_empty());
+                assert!(
+                    !ready.pending.is_empty(),
+                    "isolated fast/public Plumtree has no outbound neighbours"
+                );
+                assert_eq!(ready.record.created_at_unix_secs, blocked.record.created_at_unix_secs);
+                assert_eq!(ready.record.block_data, blocked.record.block_data);
+                assert_eq!(ready.record.carrier, blocked.record.carrier);
+                assert_spool_acceptance(&restored, &id, &block, &state_root, final_role).await;
+            })
+            .catch_unwind()
+            .await;
+            restored.clone().wait_stop().await.unwrap();
+            drop(restored);
+            result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+
+            // Revoke authority again after destinations have been frozen. The
+            // next normal router has no fast identity, but cannot rewrite them.
+            remove_spool_transport(dir.path());
+            let retired = open_engine(dir.path()).await;
+            let result = std::panic::AssertUnwindSafe(async {
+                assert!(retired.adnl_key_by_id(runtime.local_adnl()).is_none());
+                let frozen = inspect_spool(&retired, &domain, &id);
+                assert_eq!(frozen.stage, PublicationStage::Ready);
+                assert!(!frozen.pending.is_empty());
+                initialize_spool_router(&retired).await;
+                retired.enable_publication_worker().await.unwrap();
+                assert_spool_acceptance(&retired, &id, &block, &state_root, final_role).await;
+                let until = tokio::time::Instant::now() + Duration::from_millis(1200);
+                while tokio::time::Instant::now() < until {
+                    assert_eq!(
+                        inspect_spool(&retired, &domain, &id),
+                        frozen,
+                        "authority loss rewrote frozen targets or acknowledged a send"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .catch_unwind()
+            .await;
+            retired.clone().wait_stop().await.unwrap();
+            drop(retired);
+            result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        }
+    }
+}
+
+fn spool_pending_record(
+    runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+    draft: &consensus_common::finality_delivery::FinalizedDeliveryDraft,
+) -> simplex::finality_delivery::PendingFinalityRecord {
+    let signatures = match &draft.finality {
+        SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(value)) => {
+            rtos_api::pq_finality::PqNetworkSignatureSet::from_final_fields(value).unwrap()
+        }
+        SessionFinality::PqApproval(value) => {
+            rtos_api::pq_finality::PqNetworkSignatureSet::from_approval(value).unwrap()
+        }
+        _ => unreachable!(),
+    };
+    simplex::finality_delivery::PendingFinalityRecord {
+        pin: runtime.pin().clone(),
+        protocol: runtime.protocol(),
+        carrier_version: runtime.carrier_version(),
+        wire_profile: runtime.wire_profile(),
+        profile: runtime.profile().clone(),
+        session_id: runtime.session_id().clone(),
+        block_id: draft.block_id.clone(),
+        local_adnl: UInt256::from(*runtime.local_adnl().data()),
+        local_validator_index: Some(0),
+        source_validator: UInt256::from(*draft.source_info.source.id().data()),
+        data: draft.data.data().to_vec(),
+        signature_set: runtime
+            .wire_profile()
+            .serialize(&signatures.to_node().into_boxed())
+            .unwrap(),
+        is_final: signatures.is_final(),
+        last_mc_finalized_seqno: draft.last_mc_finalized_seqno,
+        candidate_already_sent: draft.candidate_already_sent,
+        created_at_unix_secs: draft.created_at_unix_secs,
+    }
+}
+fn spool_recovery_record(
+    source: &simplex::finality_delivery::PendingFinalityRecord,
+) -> crate::propagation_outbox::PublicationRecord {
+    use crate::propagation_outbox::{Limits, OutboxDomain, PublicationRecord, StoredCarrier};
+    let block = BlockStuff::deserialize_block_checked(
+        source.block_id.clone(),
+        Arc::new(source.data.clone()),
+    )
+    .unwrap();
+    PublicationRecord {
+        domain: OutboxDomain {
+            zerostate: source.pin.zerostate.clone(),
+            global_id: source.pin.global_id,
+            wire_profile: source.wire_profile,
+        },
+        protocol: source.protocol,
+        profile: source.profile.clone(),
+        session_id: source.session_id.clone(),
+        block_id: source.block_id.clone(),
+        block_data: source.data.clone(),
+        proof_data: None,
+        prev: vec![block.construct_prev_id().unwrap().0],
+        carrier: if source.is_final {
+            StoredCarrier::Final(source.signature_set.clone())
+        } else {
+            StoredCarrier::Approval(source.signature_set.clone())
+        },
+        locally_generated: true,
+        created_at_unix_secs: source.created_at_unix_secs,
+        expires_at_unix_secs: source.created_at_unix_secs + Limits::default().max_retention_secs,
+        effects: Vec::new(),
+    }
+}
+fn spool_origin(
+    source: &simplex::finality_delivery::PendingFinalityRecord,
+) -> crate::propagation_outbox::RecoveryOrigin {
+    crate::propagation_outbox::RecoveryOrigin {
+        carrier_version: source.carrier_version,
+        local_adnl: source.local_adnl.clone(),
+        source_validator: source.source_validator.clone(),
+        local_validator_index: source.local_validator_index,
+    }
+}
+
+#[test]
+fn publication_source_only_crash_child() {
+    let Ok(root) = std::env::var("RTOS_SPOOL_CRASH_ROOT") else { return };
+    let row_index: usize = std::env::var("RTOS_SPOOL_CRASH_ROW").unwrap().parse().unwrap();
+    let final_role = std::env::var("RTOS_SPOOL_CRASH_FINAL").unwrap() == "1";
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("testdata/v2-publication-spool.json")).unwrap();
+    let row = &fixture["rows"][row_index];
+    let block = fixture_block(row);
+    let bytes = decode(&fixture["state_boc"]);
+    let cell = read_single_root_boc(&bytes).unwrap();
+    let anchor = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        0,
+        cell.repr_hash().clone(),
+        UInt256::calc_file_hash(&bytes),
+    );
+    let config = ConfigParams::construct_from_cell(
+        read_single_root_boc(&decode(&fixture["config_boc"])).unwrap(),
+    )
+    .unwrap();
+    let (committee, _) = config
+        .validator_set()
+        .unwrap()
+        .calc_subset(&config.catchain_config().unwrap(), SHARD_FULL, 0, 7)
+        .unwrap();
+    let transport = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x61; 32]).unwrap();
+    let runtime =
+        consensus_common::session_runtime::AuthenticatedSessionRuntime::from_authenticated_config(
+            consensus_common::session_runtime::SessionNetworkPin {
+                global_id: -239,
+                zerostate: anchor,
+            },
+            &config,
+            rtos_api::session_identity::SessionCoordinates {
+                shard: block.id().shard(),
+                catchain_seqno: 7,
+                vertical_seqno: 0,
+                last_key_block_seqno: 0,
+                new_catchain_ids: false,
+            },
+            committee,
+            transport.id().clone(),
+        )
+        .unwrap();
+    let record = spool_pending_record(&runtime, &spool_draft(&runtime, &block, row, final_role));
+    let namespace = std::path::PathBuf::from(runtime.runtime_directory(&root).unwrap());
+    std::fs::create_dir_all(&namespace).unwrap();
+    simplex::finality_delivery::retain_pending_finality(&namespace, &record).unwrap();
+    // Abrupt process exit: no node sink/ledger ever received this source record.
+    std::process::exit(73);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publication_source_only_crash_recovers_without_retired_key_and_rejects_bad_history() {
+    use crate::propagation_outbox::{Limits, PublicationStage, StoredCarrier};
+    for row_index in 0..2 {
+        for final_role in [false, true] {
+            let SpoolFixture { dir, engine, runtime, block, state_root, .. } =
+                SpoolFixture::new(row_index).await;
+            let source_root =
+                std::path::PathBuf::from(engine.db_root_dir().unwrap()).join("catchains");
+            engine.clone().wait_stop().await.unwrap();
+            drop(engine);
+            let original = remove_spool_transport(dir.path());
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","full_node::finality::persistence_tests::inclusion_tests::propagation_tests::publication_source_only_crash_child","--nocapture"])
+                .env("RTOS_SPOOL_CRASH_ROOT",&source_root)
+                .env("RTOS_SPOOL_CRASH_ROW",row_index.to_string())
+                .env("RTOS_SPOOL_CRASH_FINAL",if final_role {"1"} else {"0"}).output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "child failed before durable source retention: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let source = {
+                let pending =
+                    simplex::finality_delivery::scan_pending_finality(&source_root).unwrap();
+                assert_eq!(pending.len(), 1);
+                pending[0].record().clone()
+            }; // Release source-store lock before the production scanner opens it.
+            let record = spool_recovery_record(&source);
+            let domain = record.domain.clone();
+            let id = crate::propagation_outbox::delivery_id(&record).unwrap();
+            let retired = open_engine(dir.path()).await;
+            let result = std::panic::AssertUnwindSafe(async {
+                assert!(retired.adnl_key_by_id(runtime.local_adnl()).is_none());
+                assert!(retired.consensus_transport_bindings().unwrap().is_empty());
+                assert!(
+                    crate::propagation_outbox::inspect_delivery(
+                        retired.db(),
+                        &domain,
+                        &Limits::default(),
+                        &id
+                    )
+                    .unwrap()
+                    .is_none(),
+                    "child must not create node WAL"
+                );
+                crate::validator::recover_retained_finality(retired.clone()).await.unwrap();
+                assert!(
+                    simplex::finality_delivery::scan_pending_finality(&source_root)
+                        .unwrap()
+                        .is_empty(),
+                    "source must ACK only after node WAL"
+                );
+                let durable = inspect_spool(&retired, &domain, &id);
+                assert_eq!(durable.record.block_data, record.block_data);
+                assert_eq!(durable.record.carrier, record.carrier);
+                assert_eq!(durable.record.created_at_unix_secs, source.created_at_unix_secs);
+                assert_spool_acceptance(&retired, &id, &block, &state_root, final_role).await;
+                let accepted = inspect_spool(&retired, &domain, &id);
+                assert_eq!(accepted.stage, PublicationStage::AcceptedDraft);
+                assert!(accepted.pending.is_empty() && accepted.record.effects.is_empty());
+                if row_index == 1 && final_role {
+                    // All records remain canonical/bounded; historical evidence,
+                    // not absence of a current key, must reject these mutations.
+                    let origin = spool_origin(&source);
+                    let mut negatives = Vec::new();
+                    let mut bad = origin.clone();
+                    bad.source_validator = runtime.committee()[1].validator_id().unwrap();
+                    negatives.push((record.clone(), bad));
+                    let mut bad = origin.clone();
+                    bad.local_validator_index = Some(1);
+                    negatives.push((record.clone(), bad));
+                    let mut bad = origin.clone();
+                    bad.carrier_version += 1;
+                    negatives.push((record.clone(), bad));
+                    let mut bad = record.clone();
+                    bad.domain.zerostate.file_hash = UInt256::from([91; 32]);
+                    negatives.push((bad, origin.clone()));
+                    let mut bad = record.clone();
+                    bad.profile = UInt256::from([92; 32]);
+                    negatives.push((bad, origin.clone()));
+                    let mut bad = record.clone();
+                    bad.session_id = UInt256::from([93; 32]);
+                    negatives.push((bad, origin.clone()));
+                    let mut bad = record.clone();
+                    bad.carrier = StoredCarrier::Approval(source.signature_set.clone());
+                    negatives.push((bad, origin.clone()));
+                    let mut bad = record.clone();
+                    bad.block_data[0] ^= 1;
+                    negatives.push((bad, origin.clone()));
+                    for (bad, origin) in &negatives {
+                        assert!(retired
+                            .clone()
+                            .recover_finality_delivery(bad.clone(), 0, false, origin.clone())
+                            .await
+                            .is_err());
+                    }
+                    assert_eq!(inspect_spool(&retired, &domain, &id), accepted);
+                    negatives
+                } else {
+                    Vec::new()
+                }
+            })
+            .catch_unwind()
+            .await;
+            retired.clone().wait_stop().await.unwrap();
+            drop(retired);
+            let negatives = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            // An additional real DB reopen preserves the accepted but unresolved
+            // evidence. Key restoration cannot turn corrupt history into valid input.
+            if !negatives.is_empty() {
+                restore_spool_transport(dir.path(), &original);
+            }
+            let reopened = open_engine(dir.path()).await;
+            let result = std::panic::AssertUnwindSafe(async {
+                let retained = inspect_spool(&reopened, &domain, &id);
+                assert_eq!(retained.stage, PublicationStage::AcceptedDraft);
+                assert_eq!(retained.record.block_data, record.block_data);
+                assert_eq!(retained.record.carrier, record.carrier);
+                assert_eq!(retained.record.created_at_unix_secs, source.created_at_unix_secs);
+                assert!(retained.pending.is_empty() && retained.record.effects.is_empty());
+                for (bad, origin) in negatives {
+                    assert!(reopened
+                        .clone()
+                        .recover_finality_delivery(bad, 0, false, origin)
+                        .await
+                        .is_err());
+                }
+                assert_spool_acceptance(&reopened, &id, &block, &state_root, final_role).await;
+            })
+            .catch_unwind()
+            .await;
+            reopened.clone().wait_stop().await.unwrap();
+            drop(reopened);
+            result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        }
+    }
 }
