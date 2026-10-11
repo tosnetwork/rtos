@@ -1209,6 +1209,40 @@ impl PrivateOverlayOperations for NodeNetwork {
         Ok(client as Arc<dyn CatchainOverlay + Send>)
     }
 
+    fn create_authenticated_consensus_client(
+        &self,
+        _validator_list_id: UInt256,
+        local_transport_key: &PrivateKey,
+        overlay_short_id: &Arc<PrivateOverlayShortId>,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        listener: CatchainOverlayListenerPtr,
+        replay_listener: CatchainOverlayLogReplayListenerPtr,
+        _broadcast_hops: Option<u8>,
+        transport_type: consensus_common::OverlayTransportType,
+    ) -> Result<consensus_common::ConsensusOverlayPtr> {
+        if runtime.wire_profile() != self.network_context.stack.overlay.wire_profile() {
+            fail!("Authenticated consensus runtime/transport wire profile mismatch");
+        }
+        if local_transport_key.id() != runtime.local_adnl() {
+            fail!("Authenticated consensus runtime/local transport identity mismatch");
+        }
+        // Resolve real loaded custody; runtime roles never supply a signing key.
+        // No lookup in a classical consensus-key validator list is required for
+        // a noncommittee observer's independently configured ADNL identity.
+        let transport_key = self.network_context.stack.adnl.key_by_id(runtime.local_adnl())?;
+        let _lifecycle = self.validator_context.overlay_lifecycle.lock().unwrap();
+        let overlay = self.network_context.catchain_overlay_manager.start_authenticated_overlay(
+            &transport_key,
+            overlay_short_id,
+            runtime,
+            listener,
+            replay_listener,
+            transport_type,
+        )?;
+        self.validator_context.catchain_overlays.insert(overlay_short_id.clone(), overlay.clone());
+        Ok(overlay)
+    }
+
     fn stop_catchain_client_checked(
         &self,
         id: &Arc<PrivateOverlayShortId>,

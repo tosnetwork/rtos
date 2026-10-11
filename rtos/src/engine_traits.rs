@@ -158,6 +158,22 @@ pub trait PrivateOverlayOperations: Sync + Send {
         block_sync_params: Option<BlockSyncOverlayParams>,
     ) -> Result<Arc<dyn CatchainOverlay + Send>>;
 
+    /// The governing-state caller supplies an immutable authenticated runtime.
+    /// Unlike classical creation, observer transport needs no consensus key match.
+    fn create_authenticated_consensus_client(
+        &self,
+        _validator_list_id: UInt256,
+        _local_transport_key: &PrivateKey,
+        _overlay_short_id: &Arc<PrivateOverlayShortId>,
+        _runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        _listener: CatchainOverlayListenerPtr,
+        _replay_listener: CatchainOverlayLogReplayListenerPtr,
+        _broadcast_hops: Option<u8>,
+        _transport_type: OverlayTransportType,
+    ) -> Result<consensus_common::ConsensusOverlayPtr> {
+        rtos_block::fail!("Authenticated consensus overlay creation is unavailable")
+    }
+
     /// Stop the exact registered generation; unsupported implementations must not
     /// claim success or allow session database ownership to be released.
     fn stop_catchain_client_checked(
