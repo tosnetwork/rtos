@@ -394,7 +394,9 @@ impl SimplexSession for SessionImpl {
         self.threads_drained() && self._callbacks.source_namespace_drained()
     }
 
-    fn finality_recovery_complete(&self) -> bool { self.recovery_complete.load(Ordering::Acquire) }
+    fn finality_recovery_complete(&self) -> bool {
+        self.recovery_complete.load(Ordering::Acquire)
+    }
     fn finality_recovery_pending(&self) -> Option<usize> {
         let count = self.recovery_pending.load(Ordering::Acquire);
         (count != usize::MAX).then_some(count)
@@ -592,8 +594,10 @@ impl SessionImpl {
 
         // Authenticated validator journals survive group retirement. Deletion must
         // never erase the only durable record of already signed decisions.
-        let may_destroy_database = !authenticated_runtime.as_ref().is_some_and(|runtime|
-            runtime.protocol() == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree);
+        let may_destroy_database = !authenticated_runtime.as_ref().is_some_and(|runtime| {
+            runtime.protocol()
+                == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
+        });
         let _runtime_manifest = match authenticated_runtime.as_ref().filter(|runtime| {
             runtime.protocol()
                 == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
@@ -613,7 +617,9 @@ impl SessionImpl {
 
         let _source_delivery_lifetime = callbacks.delivery_lifetime();
         if let Some(runtime) = authenticated_runtime.as_ref() {
-            if let Err(error) = callbacks.initialize_delivery(runtime.clone(), std::path::Path::new(&db_path)) {
+            if let Err(error) =
+                callbacks.initialize_delivery(runtime.clone(), std::path::Path::new(&db_path))
+            {
                 fail_startup(error, "durable finality source admission failed");
                 return;
             }
@@ -631,11 +637,16 @@ impl SessionImpl {
 
         #[cfg(test)]
         let test_coordinator = match test_signer {
-            Some(profile) => match authenticated_runtime.as_deref()
+            Some(profile) => match authenticated_runtime
+                .as_deref()
                 .ok_or_else(|| error!("Isolated signer requires authenticated runtime"))
-                .and_then(|runtime| profile.open(runtime, db.clone())) {
+                .and_then(|runtime| profile.open(runtime, db.clone()))
+            {
                 Ok(coordinator) => Some(coordinator),
-                Err(error) => { fail_startup(error, "isolated signer admission failed"); return; }
+                Err(error) => {
+                    fail_startup(error, "isolated signer admission failed");
+                    return;
+                }
             },
             None => None,
         };
@@ -718,8 +729,11 @@ impl SessionImpl {
         };
 
         if authenticated_runtime.is_some() {
-            if let Err(error) = callbacks.prepare_finality_intents(!bootstrap.final_certs.is_empty()) {
-                fail_startup(error, "Source finality provenance unavailable"); return;
+            if let Err(error) =
+                callbacks.prepare_finality_intents(!bootstrap.final_certs.is_empty())
+            {
+                fail_startup(error, "Source finality provenance unavailable");
+                return;
             }
         }
         if pq_session {
@@ -747,8 +761,12 @@ impl SessionImpl {
                 if authenticated_runtime.is_some() {
                     for bytes in callbacks.pending_finality_intents()? {
                         let wire = options.wire_profile.deserialize_typed(&bytes)?;
-                        let verified = crate::certificate::Certificate::<crate::simplex_state::Vote>::from_tl(
-                            &wire, &description, description.get_session_id())?;
+                        let verified =
+                            crate::certificate::Certificate::<crate::simplex_state::Vote>::from_tl(
+                                &wire,
+                                &description,
+                                description.get_session_id(),
+                            )?;
                         if !matches!(verified.vote, crate::simplex_state::Vote::Finalize(_)) {
                             rtos_block::fail!("Durable source intent is not a FinalCert");
                         }
@@ -839,7 +857,8 @@ impl SessionImpl {
             .expect("SimplexSession start flag set without explicit prev blocks");
         if authenticated_runtime.is_some() {
             if let Err(error) = callbacks.bind_delivery_start(min_masterchain_block_id.clone()) {
-                fail_startup(error, "Cannot bind source session start anchor"); return;
+                fail_startup(error, "Cannot bind source session start anchor");
+                return;
             }
         }
         let initial_block_seqno =
@@ -877,8 +896,7 @@ impl SessionImpl {
                 description.install_test_coordinator(coordinator.clone())?;
             }
             Ok(description)
-        })
-        {
+        }) {
             Ok(d) => Arc::new(d),
             Err(err) => {
                 fail_startup(err, "failed to create SessionDescription");
@@ -994,7 +1012,7 @@ impl SessionImpl {
                     Ok(pending) => {
                         recovery_pending.store(pending, Ordering::Release);
                         recovery_complete.store(pending == 0, Ordering::Release);
-                    },
+                    }
                     Err(error) => {
                         processor.stop(false);
                         fail_startup(error, "Source recovery progress cannot be established");
@@ -1394,9 +1412,23 @@ impl SessionImpl {
         >,
         delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
     ) -> Result<SessionPtr> {
-        Self::create_with_profile(options, session_id, shard, ids, local_key, db_path,
-            overlay_manager, listener, trace_collector, catchain_seqno, authenticated_runtime, delivery_sink, false,
-            #[cfg(test)] None)
+        Self::create_with_profile(
+            options,
+            session_id,
+            shard,
+            ids,
+            local_key,
+            db_path,
+            overlay_manager,
+            listener,
+            trace_collector,
+            catchain_seqno,
+            authenticated_runtime,
+            delivery_sink,
+            false,
+            #[cfg(test)]
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1418,7 +1450,24 @@ impl SessionImpl {
         recovery_only: bool,
         #[cfg(test)] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
     ) -> Result<SessionPtr> {
-        Self::create_with_profile_checked(options, session_id, shard, ids, local_key, db_path, overlay_manager, listener, trace_collector, catchain_seqno, authenticated_runtime, delivery_sink, recovery_only, #[cfg(test)] test_signer).map_err(crate::SessionCreationFailure::into_error)
+        Self::create_with_profile_checked(
+            options,
+            session_id,
+            shard,
+            ids,
+            local_key,
+            db_path,
+            overlay_manager,
+            listener,
+            trace_collector,
+            catchain_seqno,
+            authenticated_runtime,
+            delivery_sink,
+            recovery_only,
+            #[cfg(test)]
+            test_signer,
+        )
+        .map_err(crate::SessionCreationFailure::into_error)
     }
 
     pub(crate) fn create_with_profile_checked(
@@ -1439,12 +1488,74 @@ impl SessionImpl {
         recovery_only: bool,
         #[cfg(test)] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
     ) -> std::result::Result<SessionPtr, crate::SessionCreationFailure> {
+        Self::create_with_profile_delivered_checked(
+            options,
+            session_id,
+            shard,
+            ids,
+            local_key,
+            db_path,
+            overlay_manager,
+            listener,
+            trace_collector,
+            catchain_seqno,
+            authenticated_runtime,
+            delivery_sink,
+            None,
+            recovery_only,
+            #[cfg(test)]
+            test_signer,
+        )
+    }
+
+    pub(crate) fn create_with_profile_delivered_checked(
+        options: &SessionOptions,
+        session_id: &SessionId,
+        shard: &ShardIdent,
+        ids: Vec<crate::SimplexSessionNode>,
+        local_key: &PrivateKey,
+        db_path: String,
+        overlay_manager: ConsensusOverlayManagerPtr,
+        listener: SessionListenerPtr,
+        trace_collector: Option<TraceCollector>,
+        catchain_seqno: u32,
+        authenticated_runtime: Option<
+            Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        >,
+        delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
+        delivered_completion: Option<crate::finality_delivery::DeliveredCompletionSink>,
+        recovery_only: bool,
+        #[cfg(test)] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
+    ) -> std::result::Result<SessionPtr, crate::SessionCreationFailure> {
         let mut owner: Option<SessionPtr> = None;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Self::create_with_profile_inner(options, session_id, shard, ids, local_key, db_path, overlay_manager, listener, trace_collector, catchain_seqno, authenticated_runtime, delivery_sink, recovery_only, #[cfg(test)] test_signer, &mut owner)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::create_with_profile_inner(
+                options,
+                session_id,
+                shard,
+                ids,
+                local_key,
+                db_path,
+                overlay_manager,
+                listener,
+                trace_collector,
+                catchain_seqno,
+                authenticated_runtime,
+                delivery_sink,
+                delivered_completion,
+                recovery_only,
+                #[cfg(test)]
+                test_signer,
+                &mut owner,
+            )
+        }));
         match result {
             Ok(Ok(session)) => Ok(session),
             Ok(Err(error)) => Err(crate::SessionCreationFailure::after_attempt(error, owner)),
-            Err(_) => Err(crate::SessionCreationFailure::after_attempt(error!("Session construction panicked"), owner)),
+            Err(_) => Err(crate::SessionCreationFailure::after_attempt(
+                error!("Session construction panicked"),
+                owner,
+            )),
         }
     }
 
@@ -1463,6 +1574,7 @@ impl SessionImpl {
             Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
         >,
         delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
+        delivered_completion: Option<crate::finality_delivery::DeliveredCompletionSink>,
         recovery_only: bool,
         #[cfg(test)] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
         failure_owner: &mut Option<SessionPtr>,
@@ -1478,8 +1590,10 @@ impl SessionImpl {
         match &authenticated_runtime {
             Some(runtime) => {
                 options.validate_authenticated(runtime)?;
-                if delivery_sink.is_none() { rtos_block::fail!("Authenticated v2 session requires durable finality sink"); }
-            },
+                if delivery_sink.is_none() {
+                    rtos_block::fail!("Authenticated v2 session requires durable finality sink");
+                }
+            }
             None => options.validate()?,
         }
 
@@ -1517,13 +1631,17 @@ impl SessionImpl {
         // routing flag; the worker thread is spawned below when the flag is
         // set. Kept here as an Arc so SessionProcessor can dispatch
         // notifications without going through the SessionImpl borrow.
-        let callbacks = Arc::new(SessionCallbacks::new(
-            session_id.clone(),
-            stop_flag.clone(),
-            options.use_callback_thread,
-            callbacks_task_queue.clone(),
-            listener,
-        ).with_delivery_sink(delivery_sink));
+        let callbacks = Arc::new(
+            SessionCallbacks::new(
+                session_id.clone(),
+                stop_flag.clone(),
+                options.use_callback_thread,
+                callbacks_task_queue.clone(),
+                listener,
+            )
+            .with_delivery_sink(delivery_sink)
+            .with_delivered_completion(delivered_completion),
+        );
 
         // Create receiver-callback adapter (posts SXRCV events onto SXMAIN).
         // Symmetric counterpart of SessionCallbacks (SXMAIN -> SXCB listener).
@@ -1625,7 +1743,8 @@ impl SessionImpl {
                         recovery_only,
                         recovery_complete,
                         recovery_pending,
-                        #[cfg(test)] test_signer,
+                        #[cfg(test)]
+                        test_signer,
                     );
                 }));
 

@@ -661,7 +661,10 @@ impl SessionProcessor {
             SlotIndex::new(0) // Don't clean up if we haven't reached MAX_HISTORY_SLOTS yet
         };
 
-        let up_to_slot = self.consensus.durable_pending_floor().map_or(up_to_slot, |floor| up_to_slot.min(floor));
+        let up_to_slot = self
+            .consensus
+            .durable_pending_floor()
+            .map_or(up_to_slot, |floor| up_to_slot.min(floor));
 
         if up_to_slot.value() == 0 {
             log::trace!(
@@ -933,6 +936,7 @@ impl SessionProcessor {
     ///
     /// Reference: validator-session/src/session_processor.rs check_all
     pub(crate) fn check_all(&mut self) {
+        self.callbacks.maintain_finality_closing();
         check_execution_time!(10_000);
 
         // Increment metrics counter
@@ -944,6 +948,8 @@ impl SessionProcessor {
 
         // Reset awake time to far future, will be updated by various checks
         self.reset_next_awake_time();
+        // Closing work must remain reachable even when consensus has no pending slot.
+        self.runtime.set_next_awake_time(now + Duration::from_secs(1));
 
         // Stalled consensus detection
         // Debug dump if no finalizations for ROUND_DEBUG_PERIOD (stalled consensus)
@@ -976,7 +982,9 @@ impl SessionProcessor {
         self.process_simplex_events();
 
         if self.consensus.durable_pending_floor().is_some() {
-            self.with_consensus_backend(|consensus, backend| consensus.retry_pending_recursive_finalization(backend));
+            self.with_consensus_backend(|consensus, backend| {
+                consensus.retry_pending_recursive_finalization(backend)
+            });
             self.runtime.set_next_awake_time(now + Duration::from_millis(250));
         }
 
@@ -2690,13 +2698,29 @@ impl SessionProcessor {
     /// optimization, then drive only the finality delivery walk.
     pub(crate) fn replay_finality_intent(&mut self, wire: Certificate) -> Result<()> {
         let description = self.get_description();
-        if description.authenticated_runtime().is_none() { rtos_block::fail!("Source intent requires authenticated runtime"); }
+        if description.authenticated_runtime().is_none() {
+            rtos_block::fail!("Source intent requires authenticated runtime");
+        }
         let certificate = crate::certificate::Certificate::<crate::simplex_state::Vote>::from_tl(
-            &wire, &description, description.get_session_id())?;
-        let crate::simplex_state::Vote::Finalize(vote) = certificate.vote else { rtos_block::fail!("Source recovery requires FinalCert"); };
-        let event = crate::simplex_state::BlockFinalizedEvent { slot: vote.slot, block_hash: vote.block_hash.clone(), block_id: None,
-            certificate: Arc::new(crate::certificate::Certificate { vote, signatures: certificate.signatures }) };
-        self.with_consensus_backend(|controller, backend| controller.handle_block_finalized(backend, event));
+            &wire,
+            &description,
+            description.get_session_id(),
+        )?;
+        let crate::simplex_state::Vote::Finalize(vote) = certificate.vote else {
+            rtos_block::fail!("Source recovery requires FinalCert");
+        };
+        let event = crate::simplex_state::BlockFinalizedEvent {
+            slot: vote.slot,
+            block_hash: vote.block_hash.clone(),
+            block_id: None,
+            certificate: Arc::new(crate::certificate::Certificate {
+                vote,
+                signatures: certificate.signatures,
+            }),
+        };
+        self.with_consensus_backend(|controller, backend| {
+            controller.handle_block_finalized(backend, event)
+        });
         self.check_all();
         Ok(())
     }

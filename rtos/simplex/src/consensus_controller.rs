@@ -556,7 +556,8 @@ impl ConsensusController {
         slot: SlotIndex,
         block_id: BlockIdExt,
     ) {
-        self.finalized_delivery_sent_seqno.insert(seqno, FinalizedSeqnoRecord { is_final: true, slot, block_id });
+        self.finalized_delivery_sent_seqno
+            .insert(seqno, FinalizedSeqnoRecord { is_final: true, slot, block_id });
     }
 
     /* History pruning */
@@ -1658,13 +1659,17 @@ impl ConsensusController {
         event: &BlockFinalizedEvent,
     ) -> bool {
         if self.description.authenticated_runtime().is_some() {
-            if let Err(error) = self.callbacks.retain_finality_intent(backend.runtime().session_start_prev_blocks().to_vec(), event) {
+            if let Err(error) = self.callbacks.retain_finality_intent(
+                backend.runtime().session_start_prev_blocks().to_vec(),
+                event,
+            ) {
                 log::error!("Cannot durably retain finality intent: {error}");
                 return false;
             }
         }
         let applied_floor = self.last_mc_finalized_seqno.unwrap_or(0);
         let mut complete = true;
+        let mut expected_outputs = Vec::new();
         let mut visited = HashSet::new();
         let mut depth = 0u32;
         let mut depth_warned = false;
@@ -1753,6 +1758,14 @@ impl ConsensusController {
                 break;
             }
 
+            if !received.is_empty && self.description.authenticated_runtime().is_some() {
+                let source = self.build_source_info_for_received(&received);
+                expected_outputs.push(crate::finality_recovery::ExpectedFinalityOutput::new(
+                    &received.block_id,
+                    has_final_cert,
+                    &UInt256::from(*source.source.id().data()),
+                ));
+            }
             // Step 2: evaluate local readiness + floor constraints for this block only.
             // C++ parity: cert-carrying walks bypass the floor check because the
             // recursive finalization in C++ has no applied-floor guard.
@@ -1763,7 +1776,9 @@ impl ConsensusController {
             if body_available {
                 // Step 3: persist/apply local finalized state before listener callback emission.
                 let durable = self.description.authenticated_runtime().is_some();
-                if !durable && !self.maybe_apply_finalized_state(backend, &current_id, has_final_cert) {
+                if !durable
+                    && !self.maybe_apply_finalized_state(backend, &current_id, has_final_cert)
+                {
                     complete = false;
                     break;
                 }
@@ -1780,7 +1795,9 @@ impl ConsensusController {
                     &mut complete,
                 );
                 if durable {
-                    if !complete || !self.maybe_apply_finalized_state(backend, &current_id, has_final_cert) {
+                    if !complete
+                        || !self.maybe_apply_finalized_state(backend, &current_id, has_final_cert)
+                    {
                         complete = false;
                         break;
                     }
@@ -1828,13 +1845,21 @@ impl ConsensusController {
             }
 
             let Some(parent_id) = received.parent_id else {
-                if has_final_cert && self.description.authenticated_runtime().is_some() { complete = false; }
+                if has_final_cert && self.description.authenticated_runtime().is_some() {
+                    complete = false;
+                }
                 break;
             };
 
             current_id = parent_id;
         }
 
+        if complete && self.description.authenticated_runtime().is_some() {
+            if let Err(error) = self.callbacks.seal_finality_outputs(trigger_id, expected_outputs) {
+                log::error!("Cannot seal complete finality output set: {error}");
+                return false;
+            }
+        }
         complete
     }
 
@@ -1874,7 +1899,9 @@ impl ConsensusController {
         // protocol breach.
         let seqno = received.block_id.seq_no();
         if let Some(existing) = self.finalized_delivery_sent_seqno.get(&seqno) {
-            if existing.block_id == received.block_id && !(durable && has_final_cert && !existing.is_final) {
+            if existing.block_id == received.block_id
+                && !(durable && has_final_cert && !existing.is_final)
+            {
                 log::debug!(
                     "Session {} recursive finalization: idempotent re-entry for \
                      block_id={} seqno={} previous_slot={} current_slot={} (slot dedup pruned)",
@@ -1886,7 +1913,9 @@ impl ConsensusController {
                 );
                 // Re-insert the candidate_id so subsequent walks short-circuit at
                 // the cheaper dedup before reaching here.
-                if !durable || existing.is_final { self.finalized_delivery_sent.insert(candidate_id.clone()); }
+                if !durable || existing.is_final {
+                    self.finalized_delivery_sent.insert(candidate_id.clone());
+                }
                 return;
             }
             assert!(
@@ -2007,7 +2036,9 @@ impl ConsensusController {
                 &self.description,
                 now,
             );
-            if !durable || has_final_cert { self.finalized_delivery_sent.insert(candidate_id.clone()); }
+            if !durable || has_final_cert {
+                self.finalized_delivery_sent.insert(candidate_id.clone());
+            }
             let previous = self.finalized_delivery_sent_seqno.insert(
                 seqno,
                 FinalizedSeqnoRecord {
@@ -2017,7 +2048,10 @@ impl ConsensusController {
                 },
             );
             assert!(
-                previous.as_ref().is_none_or(|old| durable && old.block_id == received.block_id && !old.is_final && has_final_cert),
+                previous.as_ref().is_none_or(|old| durable
+                    && old.block_id == received.block_id
+                    && !old.is_final
+                    && has_final_cert),
                 "Session {} protocol breach: duplicate finalized callback seqno={} \
                  previous_block_id={} new_block_id={}",
                 &self.session_id().to_hex_string()[..8],
@@ -2032,7 +2066,9 @@ impl ConsensusController {
 
     /// Pending source work must retain its ancestry until node WAL takeover.
     pub(crate) fn durable_pending_floor(&self) -> Option<SlotIndex> {
-        if self.description.authenticated_runtime().is_none() { return None; }
+        if self.description.authenticated_runtime().is_none() {
+            return None;
+        }
         // A pending trigger may still depend on an older ancestor whose body
         // has not arrived. Keep the whole session history until this closes.
         (!self.finalized_pending_body.is_empty()).then_some(SlotIndex::new(0))
@@ -2057,7 +2093,10 @@ impl ConsensusController {
         is_final: bool,
     ) -> bool {
         if self.finalized_blocks.contains(finalized_id)
-            && (!self.description.authenticated_runtime().is_some() || !is_final || self.finalized_final_proofs.contains(finalized_id)) {
+            && (!self.description.authenticated_runtime().is_some()
+                || !is_final
+                || self.finalized_final_proofs.contains(finalized_id))
+        {
             return true;
         }
 
@@ -2148,7 +2187,9 @@ impl ConsensusController {
         }
 
         self.finalized_blocks.insert(finalized_id.clone());
-        if is_final { self.finalized_final_proofs.insert(finalized_id.clone()); }
+        if is_final {
+            self.finalized_final_proofs.insert(finalized_id.clone());
+        }
 
         // Trace: a FinalCert was observed and this block is now accepted/materialized.
         if let Some(tc) = &self.trace_collector {
@@ -2193,7 +2234,9 @@ impl ConsensusController {
         has_final_cert: bool,
         applied_floor: u32,
     ) -> bool {
-        if self.description.authenticated_runtime().is_some() && has_final_cert { return true; }
+        if self.description.authenticated_runtime().is_some() && has_final_cert {
+            return true;
+        }
         if self.description.get_shard().is_masterchain() {
             return has_final_cert;
         }
@@ -2237,17 +2280,25 @@ impl ConsensusController {
 
         if self.description.authenticated_runtime().is_some() {
             let draft = consensus_common::finality_delivery::FinalizedDeliveryDraft {
-                block_id, source_info, data, finality: signatures_variant,
+                block_id,
+                source_info,
+                data,
+                finality: signatures_variant,
                 last_mc_finalized_seqno: self.last_mc_finalized_seqno.unwrap_or(0),
                 // The node ledger owns candidate publication deduplication.
                 candidate_already_sent: false,
-                created_at_unix_secs: SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                    .map(|duration| duration.as_secs()).unwrap_or(0),
+                created_at_unix_secs: SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or(0),
             };
             return match self.callbacks.poll_durable_finality(draft) {
                 Ok(durable) => durable,
                 Err(error) => {
-                    log::error!("Session {} finality retained/retry required: {error}", self.session_id());
+                    log::error!(
+                        "Session {} finality retained/retry required: {error}",
+                        self.session_id()
+                    );
                     false
                 }
             };
