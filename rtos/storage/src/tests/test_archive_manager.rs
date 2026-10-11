@@ -997,7 +997,7 @@ async fn archive_unleased_startup_still_recovers_uncommitted_tail_and_appends() 
     handle.set_proof();
     manager.move_to_archive(&handle, || { handle.set_archived(); Ok(()) }).await?;
     let root = Arc::new(dir.path().join("tail-control"));
-    let path = PackageId::for_block(0).full_path(&root, id.shard())?;
+    let path = PackageId::for_block(0).full_path(root.as_path(), id.shard())?;
     let original = std::fs::read(&path)?;
     drop(manager);
     let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
