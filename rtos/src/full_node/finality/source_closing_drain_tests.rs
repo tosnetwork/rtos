@@ -9,6 +9,13 @@ use consensus_common::{
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn source_closing_service_panic_drains_held_actual_source_completion() {
+    actual_source_completion_case(false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_closing_service_release_before_actual_lookup_never_strands_source() {
+    actual_source_completion_case(true).await;
+}
+async fn actual_source_completion_case(release_before_register: bool) {
     let fixture = fixture(false).await;
     let engine = fixture.engine.clone();
     let run = std::panic::AssertUnwindSafe(async {
@@ -115,6 +122,7 @@ async fn source_closing_service_panic_drains_held_actual_source_completion() {
             engine.clone(),
             namespace,
             runtime,
+            release_before_register,
         )
         .await;
     })

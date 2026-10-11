@@ -242,15 +242,40 @@ async fn replay_namespace(
 #[cfg(test)]
 #[derive(Default)]
 struct ClosureAdmissionGate {
-    held: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    state: Mutex<ClosureGateState>,
     entered: tokio::sync::Notify,
     panicking: std::sync::atomic::AtomicBool,
     lookup_ok: std::sync::atomic::AtomicBool,
 }
 #[cfg(test)]
+#[derive(Default)]
+struct ClosureGateState {
+    opened: bool,
+    held: Option<Box<dyn FnOnce() + Send>>,
+}
+#[cfg(test)]
 impl ClosureAdmissionGate {
+    fn register(&self, callback: Box<dyn FnOnce() + Send>) {
+        let ready = {
+            let mut state = self.state.lock().unwrap();
+            if state.opened {
+                Some(callback)
+            } else {
+                assert!(state.held.is_none(), "only the first admission uses this gate");
+                state.held = Some(callback);
+                None
+            }
+        };
+        if let Some(callback) = ready {
+            callback();
+        }
+    }
     fn release(&self) {
-        let callback = self.held.lock().unwrap().take();
+        let callback = {
+            let mut state = self.state.lock().unwrap();
+            state.opened = true;
+            state.held.take()
+        };
         if let Some(callback) = callback {
             callback();
         }
@@ -280,7 +305,7 @@ impl consensus_common::finality_delivery::DurableFinalitySink for HeldTerminalSi
             request,
             Box::new(move |result| {
                 gate.lookup_ok.store(result.is_ok(), std::sync::atomic::Ordering::Release);
-                *gate.held.lock().unwrap() = Some(Box::new(move || completion(result)));
+                gate.register(Box::new(move || completion(result)));
                 gate.entered.notify_one();
             }),
         )
@@ -301,6 +326,7 @@ pub(crate) async fn test_admission_panic_drains_real_source(
     engine: Arc<Engine>,
     namespace: PathBuf,
     runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+    release_before_register: bool,
 ) {
     use std::sync::atomic::Ordering;
     let service = RetiredSessionService {
@@ -309,6 +335,9 @@ pub(crate) async fn test_admission_panic_drains_real_source(
         close_cursors: Arc::new(Mutex::new(Default::default())),
     };
     let gate = Arc::new(ClosureAdmissionGate::default());
+    if release_before_register {
+        gate.release();
+    }
     struct Release(Arc<ClosureAdmissionGate>);
     impl Drop for Release {
         fn drop(&mut self) {
@@ -335,17 +364,23 @@ pub(crate) async fn test_admission_panic_drains_real_source(
         .await
         .expect("second admission must panic after actual first lookup");
         assert!(gate.lookup_ok.load(Ordering::Acquire), "real Engine lookup must succeed");
-        service.poll_closures(&engine, &mut active);
-        assert_eq!(active.len(), 1, "held source completion must retain actual job");
-        assert_eq!(service.snapshot().deferred, 0, "job must not report terminal before drain");
-        assert!(engine.finality_recovery_registry().owns(&runtime));
-        assert!(engine.finality_recovery_registry().reserve_normal(&runtime).unwrap().is_none());
-        assert!(
-            simplex::finality_delivery::scan_finality_closures_namespace(&namespace)
+        if !release_before_register {
+            service.poll_closures(&engine, &mut active);
+            assert_eq!(active.len(), 1, "held source completion must retain actual job");
+            assert_eq!(service.snapshot().deferred, 0, "job must not report terminal before drain");
+            assert!(engine.finality_recovery_registry().owns(&runtime));
+            assert!(engine
+                .finality_recovery_registry()
+                .reserve_normal(&runtime)
                 .unwrap()
-                .is_empty(),
-            "real source file lock must still be held"
-        );
+                .is_none());
+            assert!(
+                simplex::finality_delivery::scan_finality_closures_namespace(&namespace)
+                    .unwrap()
+                    .is_empty(),
+                "real source file lock must still be held"
+            );
+        }
         gate.release();
     })
     .catch_unwind()
@@ -370,4 +405,23 @@ pub(crate) async fn test_admission_panic_drains_real_source(
         simplex::finality_delivery::scan_finality_closures_namespace(&namespace).unwrap();
     assert!(!locators.is_empty(), "terminal job must have dropped every source store lock owner");
     drop(locators);
+}
+
+#[cfg(test)]
+#[test]
+fn source_closing_gate_release_before_registration_is_permanent_and_lock_free() {
+    let gate = Arc::new(ClosureAdmissionGate::default());
+    gate.release();
+    let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for _ in 0..2 {
+        let owner = gate.clone();
+        let completed = completed.clone();
+        gate.register(Box::new(move || {
+            // Reentrant release proves the continuation is called outside the mutex.
+            owner.release();
+            completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+    }
+    assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(gate.state.lock().unwrap().held.is_none());
 }
