@@ -82,6 +82,7 @@ pub(crate) struct SessionCallbacks {
     /// re-checks `upgrade()` and silently drops when the listener is gone.
     listener: SessionListenerPtr,
     delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
+    source_delivery: std::sync::OnceLock<Arc<crate::finality_delivery::SourceFinalityDelivery>>,
 }
 
 // ======================================================================
@@ -103,12 +104,27 @@ impl SessionCallbacks {
         task_queue: CallbackTaskQueuePtr,
         listener: SessionListenerPtr,
     ) -> Self {
-        Self { session_id, stop_flag, use_callback_thread, task_queue, listener, delivery_sink: None }
+        Self { session_id, stop_flag, use_callback_thread, task_queue, listener, delivery_sink: None, source_delivery: std::sync::OnceLock::new() }
     }
 
     pub(crate) fn with_delivery_sink(mut self, sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>) -> Self {
         self.delivery_sink = sink;
         self
+    }
+
+    pub(crate) fn initialize_delivery(&self, runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>, namespace: &std::path::Path) -> rtos_block::Result<()> {
+        let sink = self.delivery_sink.clone().ok_or_else(|| rtos_block::error!("Missing durable sink"))?;
+        let source = crate::finality_delivery::SourceFinalityDelivery::open(runtime, namespace, sink)?;
+        self.source_delivery.set(source).map_err(|_| rtos_block::error!("Source delivery already initialized"))
+    }
+
+    pub(crate) fn poll_durable_finality(&self, draft: consensus_common::finality_delivery::FinalizedDeliveryDraft) -> rtos_block::Result<bool> {
+        let source = self.source_delivery.get().ok_or_else(|| rtos_block::error!("Source delivery not initialized"))?;
+        if let Some((id, draft)) = source.poll(draft)? {
+            let listener = self.listener.clone();
+            self.invoke(move || { if let Some(listener) = listener.upgrade() { listener.on_durable_block_finalized(id, draft); } });
+            Ok(true)
+        } else { Ok(false) }
     }
 
     /// Clone this callbacks aspect with a different session listener.
@@ -127,6 +143,7 @@ impl SessionCallbacks {
             task_queue: self.task_queue.clone(),
             listener,
             delivery_sink: self.delivery_sink.clone(),
+            source_delivery: self.source_delivery.clone(),
         }
     }
 

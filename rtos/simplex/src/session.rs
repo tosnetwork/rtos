@@ -597,6 +597,13 @@ impl SessionImpl {
             None => None,
         };
 
+        if let Some(runtime) = authenticated_runtime.as_ref() {
+            if let Err(error) = callbacks.initialize_delivery(runtime.clone(), std::path::Path::new(&db_path)) {
+                fail_startup(error, "durable finality source admission failed");
+                return;
+            }
+        }
+
         // Phase 4: Open database (cancellable via stop_flag)
         let storage_id = session_id.to_hex_string();
         let db = match crate::database::SimplexDb::open(&db_path, &storage_id) {
