@@ -761,9 +761,16 @@ impl InternalDb {
                 }
                 Ok(stored)
             });
-        let proof_ok = old_proof.is_ok();
+        // A structurally valid stored full proof can still contain corrupted
+        // signatures. For a fully authenticated Final input, persist that exact
+        // proof instead of preserving different, merely parsed disk evidence.
+        // Approval inputs still cannot replace an existing Final proof.
+        let proof_ok = old_proof
+            .as_ref()
+            .is_ok_and(|stored| proof.is_link() || stored.data() == proof.data());
         let selected = match old_proof {
-            Ok(stored) => stored,
+            Ok(stored) if proof.is_link() || stored.data() == proof.data() => stored,
+            Ok(_) => proof.clone(),
             Err(error) if preserve_final => {
                 fail!("Cannot reconstruct missing Final proof from Approval: {error}");
             }
