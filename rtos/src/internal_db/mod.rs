@@ -573,6 +573,22 @@ impl InternalDb {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_watch_state_gc_batch(&self, id: &BlockIdExt) {
+        match &self.state_db {
+            StateDb::Dynamic(db) => db.test_watch_gc_batch(id),
+            _ => panic!("Dynamic state fixture required"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_watched_state_gc_batch_completed(&self) -> bool {
+        match &self.state_db {
+            StateDb::Dynamic(db) => db.test_watched_gc_batch_completed(),
+            _ => panic!("Dynamic state fixture required"),
+        }
+    }
+
     pub fn start_states_gc(&self, resolver: Arc<dyn AllowStateGcResolver>) {
         if let StateDb::Dynamic(db) = &self.state_db {
             db.clone().start_gc(resolver, self.cells_gc_interval.clone())

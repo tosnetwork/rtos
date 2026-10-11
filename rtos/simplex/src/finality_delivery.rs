@@ -695,8 +695,10 @@ impl PendingFinalityStore {
         self.check_delivered_health()?;
         let path = self.directory.join(format!("{}.json", record.id()?.to_hex_string()));
         let acknowledged = path.with_extension("acked");
-        if self.reference_path(&record.id()?).exists() {
-            fail!("Canonical node lookup required; cannot replace retained reference");
+        if self.reference_path(&record.id()?).exists()
+            || self.delivered_path(&record.id()?).exists()
+        {
+            fail!("Canonical node lookup required; cannot replace retained reference or Delivered");
         }
         if path.exists() || acknowledged.exists() {
             let retained_path = if acknowledged.exists() { &acknowledged } else { &path };
@@ -719,10 +721,16 @@ impl PendingFinalityStore {
         let bytes = record.encode()?;
         let paths = self.paths()?;
         for existing in &paths {
-            let old = if existing.extension().and_then(|s| s.to_str()) == Some("reference") {
-                CanonicalReference::read(existing)?.metadata_record()?
-            } else {
-                PendingFinalityRecord::read(existing)?
+            let old = match existing.extension().and_then(|s| s.to_str()) {
+                Some("reference") => CanonicalReference::read(existing)?.metadata_record()?,
+                Some("delivered") => {
+                    let id: UInt256 = existing.file_stem().and_then(|s| s.to_str())
+                        .ok_or_else(|| error!("Invalid source Delivered filename"))?.parse()?;
+                    self.delivered_reference(&id)?
+                        .ok_or_else(|| error!("Source Delivered disappeared during retention"))?
+                        .metadata_record()?
+                }
+                _ => PendingFinalityRecord::read(existing)?,
             };
             if old.block_id.seq_no() == record.block_id.seq_no() && old.block_id != record.block_id
             {
