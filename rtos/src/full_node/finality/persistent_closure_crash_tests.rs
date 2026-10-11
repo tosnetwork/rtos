@@ -209,6 +209,7 @@ impl Drop for ChildOwner {
     }
 }
 async fn cold_window(window: i32) {
+    let _ = env_logger::builder().is_test(true).try_init();
     let signer =
         std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER").expect("public fixture signer required");
     assert!(Path::new(&signer).is_file());
@@ -351,7 +352,34 @@ async fn cold_window(window: i32) {
                 }
             })
             .await
-            .expect("background compact-only closing recovery must finish");
+            .unwrap_or_else(|timeout| {
+                let ledger =
+                    inspect_closure_progress(engine.db(), &domain).map(|(active, closed)| {
+                        (
+                            active.len(),
+                            closed.len(),
+                            closed.iter().filter(|record| record.released).count(),
+                        )
+                    });
+                let scanner = simplex::finality_delivery::scan_finality_closures_namespace_report(
+                    &namespace, None, 16,
+                )
+                .map(|batch| {
+                    let errors: Vec<_> = batch
+                        .items
+                        .iter()
+                        .filter_map(|(_, item)| item.as_ref().err().map(ToString::to_string))
+                        .collect();
+                    (batch.next_cursor.is_some(), batch.items.len(), errors)
+                });
+                panic!(
+                    "background compact-only closing recovery timed out: {timeout}; \
+                    window={window} reopen={reopen} service={:?} \
+                    ledger(active,closed,released)={ledger:?} \
+                    scanner(cursor,items,errors)={scanner:?}",
+                    service.snapshot()
+                );
+            });
             assert_eq!(final_record.binding, original.binding);
             assert_eq!(final_record.lease_generation, original.lease_generation);
             assert_eq!(final_record.dependency_digest, original.dependency_digest);
