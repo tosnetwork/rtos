@@ -175,6 +175,10 @@ fn read_intent(
     if bytes.len() as u64 > MAX_INTENT_BYTES {
         fail!("Source recovery intent grew beyond bound");
     }
+    decode_intent(path, namespace, &bytes)
+}
+fn decode_intent(path: &std::path::Path, namespace: &std::path::Path, bytes: &[u8])
+    -> Result<(SessionRecoveryRecord, Vec<u8>)> {
     let disk: DiskIntent = if path.extension().and_then(|s| s.to_str()) == Some("complete") {
         let completed: CompletedIntent = serde_json::from_slice(&bytes)?;
         if completed.schema != 1 {
@@ -711,6 +715,10 @@ pub fn scan_finality_recovery_namespace(
     }
     Ok(found)
 }
+
+#[path = "source_history_debt.rs"]
+mod history_debt;
+pub use history_debt::{authenticate_source_history_debt, SourceHistoryDebt, SourceHistoryDebtBudget, SourceHistoryDebtBusy};
 
 #[cfg(test)]
 mod tests {
