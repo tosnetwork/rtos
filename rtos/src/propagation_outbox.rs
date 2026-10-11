@@ -513,19 +513,36 @@ impl PropagationOutbox {
 /// Domain-, session-, block- and role-bound identity. Effects and wall clock are
 /// deliberately excluded: the first durable handoff freezes their meaning.
 pub(crate) fn delivery_id(record: &PublicationRecord) -> Result<UInt256> {
+    delivery_coordinates(
+        &record.domain,
+        record.protocol,
+        &record.profile,
+        &record.session_id,
+        &record.block_id,
+        record.carrier.is_final(),
+    )
+}
+fn delivery_coordinates(
+    domain: &OutboxDomain,
+    protocol: SimplexProtocol,
+    profile: &UInt256,
+    session_id: &UInt256,
+    block_id: &BlockIdExt,
+    is_final: bool,
+) -> Result<UInt256> {
     let mut out = Encoder { bytes: Vec::new(), maximum: 512 };
     out.append(b"RTOS-finality-delivery-v1")?;
-    out.id(&record.domain.zerostate)?;
-    out.append(&record.domain.global_id.to_le_bytes())?;
-    out.byte(match record.domain.wire_profile {
+    out.id(&domain.zerostate)?;
+    out.append(&domain.global_id.to_le_bytes())?;
+    out.byte(match domain.wire_profile {
         WireProfile::Legacy => 0,
         WireProfile::T0 => 1,
     })?;
-    out.byte(u8::try_from(record.protocol.version())?)?;
-    out.hash(&record.profile)?;
-    out.hash(&record.session_id)?;
-    out.id(&record.block_id)?;
-    out.byte(u8::from(record.carrier.is_final()))?;
+    out.byte(u8::try_from(protocol.version())?)?;
+    out.hash(profile)?;
+    out.hash(session_id)?;
+    out.id(block_id)?;
+    out.byte(u8::from(is_final))?;
     Ok(UInt256::calc_file_hash(&out.bytes))
 }
 

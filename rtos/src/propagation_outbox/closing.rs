@@ -307,6 +307,15 @@ fn validate_history(snapshot: &Snapshot, domain: &OutboxDomain) -> Result<()> {
             || c.binding.domain.zerostate != domain.zerostate
             || c.binding.domain.global_id != domain.global_id
             || c.binding.domain.wire_profile != domain.wire_profile
+            || c.binding.delivery_id
+                != delivery_coordinates(
+                    domain,
+                    c.binding.domain.protocol,
+                    &c.binding.domain.profile,
+                    &c.binding.domain.session_id,
+                    &c.binding.canonical.block_id,
+                    true,
+                )?
             || !ids.insert(c.binding.delivery_id.clone())
             || !generations.insert(c.binding.close_generation)
             || !records.insert(c.binding.record_id)
@@ -662,6 +671,47 @@ mod tests {
         changed.last_mc += 1;
         assert!(store.reserve_close(&changed, &e).is_err());
         assert_eq!(c.binding.close_generation, 1);
+        Ok(())
+    }
+    #[test]
+    fn close_compact_codec_quota_is_independent_of_active_payload_count() -> Result<()> {
+        // Codec-only capacity evidence; actual Engine circulation is separately tested.
+        let disk = Arc::new(Disk::default());
+        let store = open(disk.clone());
+        let (d, e, c) = setup(&store, 1)?;
+        store.begin_close_offer_inner(c.clone(), &d, &e)?;
+        store.confirm_close_inner(c)?;
+        let mut snapshot = store.lock()?.snapshot.clone();
+        let base = snapshot.closing[0].clone();
+        for n in 2..=1025u32 {
+            let mut row = base.clone();
+            row.binding.record_id = u64::from(n);
+            row.binding.close_generation = u64::from(n);
+            row.binding.canonical.block_id = id(n);
+            row.binding.delivery_id = delivery_coordinates(
+                &domain(),
+                row.binding.domain.protocol,
+                &row.binding.domain.profile,
+                &row.binding.domain.session_id,
+                &row.binding.canonical.block_id,
+                true,
+            )?;
+            row.binding.canonical.node_receipt = row.binding.delivery_id.clone();
+            snapshot.closing.push(row);
+        }
+        snapshot.next_id = 1026;
+        snapshot.next_close_generation = 1026;
+        let limits = Limits { max_records: 1, ..Limits::default() };
+        let encoded = encode_snapshot(&snapshot, &domain(), &limits)?;
+        let decoded = decode_snapshot(&encoded, &domain(), &limits)?;
+        assert_eq!(decoded.closing.len(), 1025);
+        assert!(decoded.entries.is_empty());
+        let mut bad = decoded.clone();
+        bad.closing[0].binding.canonical.block_id = id(2000);
+        assert!(encode_snapshot(&bad, &domain(), &limits).is_err());
+        let mut bad = decoded;
+        bad.closing.resize(MAX_CLOSE_RECORDS + 1, base);
+        assert!(encode_snapshot(&bad, &domain(), &limits).is_err());
         Ok(())
     }
 }
