@@ -188,7 +188,6 @@ async fn publication_durability_handle_barrier_waits_for_queued_work() {
     drop(storage);
     drop(db);
     destroy_rocks_db(path.to_str().expect("UTF-8 temporary test path"), "db").await.unwrap();
-    std::fs::remove_dir_all(path).unwrap();
 }
 
 #[tokio::test]
@@ -208,5 +207,4 @@ async fn publication_durability_handle_write_failure_is_sticky() {
     drop(storage);
     drop(db);
     destroy_rocks_db(path.to_str().expect("UTF-8 temporary test path"), "db").await.unwrap();
-    std::fs::remove_dir_all(path).unwrap();
 }
