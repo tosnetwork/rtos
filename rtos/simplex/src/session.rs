@@ -333,12 +333,12 @@ impl ConsensusSession for SessionImpl {
     fn stop_checked(&self) -> Result<()> {
         if IN_SESSION_WORKER.with(Cell::get) {
             self.stop_async();
-            fail!("Cannot join session from its own worker");
+            rtos_block::fail!("Cannot join session from its own worker");
         }
         self.stop_impl(false);
         let overlay = self.overlay_owner.stop_checked();
         if self.panicked_flag.load(Ordering::Acquire) {
-            fail!("Simplex consensus worker panicked; overlay result: {overlay:?}");
+            rtos_block::fail!("Simplex consensus worker panicked; overlay result: {overlay:?}");
         }
         overlay
     }
