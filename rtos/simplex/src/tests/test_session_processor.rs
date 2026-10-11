@@ -11537,9 +11537,16 @@ fn authenticated_observer_nonempty_query_emits_leader_evidence_after_pq_verifica
 
 #[test]
 fn source_finality_controller_waits_for_wal_before_persist_sent_and_gc() {
-    use crate::finality_delivery::tests::{fixture, HeldSink};
+    source_finality_controller_case(false);
+}
+#[test]
+fn source_finality_controller_approval_upgrades_to_final_after_separate_wal_ack() {
+    source_finality_controller_case(true);
+}
+fn source_finality_controller_case(upgrade: bool) {
+    use crate::finality_delivery::tests::{fixture, fixture_role, HeldSink};
     let temp = crate::authenticated_fixture::TestDirectory::new();
-    let (runtime, draft) = fixture();
+    let (runtime, draft) = if upgrade { fixture_role(true, ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap()) } else { fixture() };
     let namespace = runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap();
     let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor)
         .collect::<rtos_block::Result<Vec<_>>>().unwrap();
@@ -11551,7 +11558,7 @@ fn source_finality_controller_waits_for_wal_before_persist_sent_and_gc() {
         1, &nodes, key, runtime.shard(), SystemTime::now(), None, Some(&runtime)).unwrap()
         .bind_pq_session(runtime.catchain_seqno()).unwrap());
     let db = crate::database::SimplexDb::open(&namespace, "source-ack").unwrap();
-    let mut processor = make_pq_processor_with_description_for_test(db.clone(), description);
+    let mut processor = make_pq_processor_with_description_for_test(db.clone(), description.clone());
     let listener = RecordingListener::new();
     let listener_dyn: Arc<dyn consensus_common::SessionListener + Send + Sync> = listener.clone();
     let sink = Arc::new(HeldSink::default());
@@ -11578,13 +11585,42 @@ fn source_finality_controller_waits_for_wal_before_persist_sent_and_gc() {
             validator_idx: ValidatorIndex::new(index as u32), signature: signature.signature.clone(),
         }).collect(),
     });
-    processor.handle_block_finalized(BlockFinalizedEvent { slot: candidate_id.slot, block_hash: candidate_id.hash.clone(),
-        block_id: Some(draft.block_id.clone()), certificate });
+    let event = BlockFinalizedEvent { slot: candidate_id.slot, block_hash: candidate_id.hash.clone(),
+        block_id: Some(draft.block_id.clone()), certificate };
+    if upgrade {
+        let (_, approval) = fixture_role(false, runtime.shard().clone());
+        let consensus_common::SessionFinality::PqApproval(proof) = approval.finality else { unreachable!() };
+        let wire = rtos_api::pq_finality::PqNetworkSignatureSet::from_approval(&proof).unwrap().to_node();
+        let cert = Arc::new(crate::certificate::Certificate {
+            vote: crate::simplex_state::NotarizeVote { slot: candidate_id.slot, block_hash: candidate_id.hash.clone() },
+            signatures: wire.signatures.iter().enumerate().map(|(index, signature)| crate::certificate::VoteSignature {
+                validator_idx: ValidatorIndex::new(index as u32), signature: signature.signature.clone(),
+            }).collect(),
+        });
+        processor.simplex_state.set_notarize_certificate(&description, candidate_id.slot, &candidate_id.hash, cert).unwrap();
+        let received = processor.candidate_book().received(&candidate_id).unwrap().clone();
+        let mut complete = true;
+        processor.try_emit_recursive_finalized_callback(&candidate_id, &received, &event, false,
+            candidate_id.slot, &received.candidate_hash_data_bytes, &mut complete);
+        assert!(!complete);
+        let (staged, complete_stage) = sink.0.lock().unwrap().pop().unwrap();
+        assert!(matches!(staged.finality, consensus_common::SessionFinality::PqApproval(_)));
+        complete_stage(Ok(UInt256::from([6; 32])));
+        complete = true;
+        processor.try_emit_recursive_finalized_callback(&candidate_id, &received, &event, false,
+            candidate_id.slot, &received.candidate_hash_data_bytes, &mut complete);
+        assert!(complete);
+        assert!(!processor.consensus.finalized_delivery_sent_contains(&candidate_id), "Approval cannot suppress Final");
+        processor.with_consensus_backend(|controller, backend| assert!(controller.maybe_apply_finalized_state(backend, &candidate_id, false)));
+        db.sync(Some(Duration::from_secs(5))).unwrap();
+        assert!(!db.load_finalized_blocks().unwrap()[0].is_final);
+    }
+    processor.handle_block_finalized(event);
     assert_eq!(sink.0.lock().unwrap().len(), 1);
-    assert!(!processor.consensus.is_finalized_block(&candidate_id));
+    assert_eq!(processor.consensus.is_finalized_block(&candidate_id), upgrade);
     assert!(!processor.consensus.finalized_delivery_sent_contains(&candidate_id));
     db.sync(Some(Duration::from_secs(5))).unwrap();
-    assert!(db.load_finalized_blocks().unwrap().is_empty(), "source finalized DB must wait for node WAL");
+    assert!(db.load_finalized_blocks().unwrap().iter().all(|record| !record.is_final), "source Final must wait for its own node WAL");
     processor.cleanup_old_slots(SlotIndex::new(1000));
     assert!(processor.candidate_book().received(&candidate_id).is_some(), "held finality must retain body ancestry");
     let (_, complete) = sink.0.lock().unwrap().pop().unwrap();
@@ -11593,7 +11629,9 @@ fn source_finality_controller_waits_for_wal_before_persist_sent_and_gc() {
     assert!(processor.consensus.is_finalized_block(&candidate_id));
     assert!(processor.consensus.finalized_delivery_sent_contains(&candidate_id));
     db.sync(Some(Duration::from_secs(5))).unwrap(); processor.process_pending_async_db_results();
-    assert_eq!(db.load_finalized_blocks().unwrap().len(), 1);
+    let finalized = db.load_finalized_blocks().unwrap();
+    assert_eq!(finalized.len(), 1);
+    assert!(finalized[0].is_final, "Final must upgrade earlier Approval persistence");
     processor.with_consensus_backend(|controller, backend| controller.retry_pending_recursive_finalization(backend));
     assert!(sink.0.lock().unwrap().is_empty(), "duplicate retry must not stage again");
     drop(processor); db.close(None).unwrap();
