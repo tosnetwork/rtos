@@ -275,9 +275,18 @@ impl MessagesPool {
     pub fn start_applied_blocks_worker(
         self: Arc<Self>,
         mut rx: mpsc::UnboundedReceiver<Arc<BlockStuff>>,
-    ) {
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            while let Some(block) = rx.recv().await {
+            loop {
+                let block = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled(), if !rx.is_closed() => {
+                        rx.close();
+                        continue;
+                    }
+                    block = rx.recv() => match block { Some(block) => block, None => break },
+                };
                 if let Err(e) = self.process_applied_block(&block) {
                     log::error!(
                         target: EXT_MESSAGES_TRACE_TARGET,
@@ -287,7 +296,7 @@ impl MessagesPool {
                 }
             }
             log::info!(target: EXT_MESSAGES_TRACE_TARGET, "Applied blocks cleanup worker stopped");
-        });
+        })
     }
 
     fn process_applied_block(&self, block: &BlockStuff) -> Result<()> {

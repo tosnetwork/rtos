@@ -86,6 +86,8 @@ struct RecoveryEngine {
     downloads: AtomicUsize,
     gate: Option<DownloadGate>,
     stores: AtomicUsize,
+    store_gate: Option<DownloadGate>,
+    stores_completed: AtomicUsize,
     observed: tokio::sync::Notify,
     #[cfg(feature = "telemetry")]
     telemetry: crate::full_node::telemetry::FullNodeTelemetry,
@@ -121,7 +123,12 @@ impl EngineOperations for RecoveryEngine {
     async fn store_block(&self, block: &BlockStuff) -> Result<BlockResult> {
         assert_eq!(block.id(), self.block.id());
         assert_eq!(block.data(), self.block.data());
-        self.stores.fetch_add(1, Ordering::SeqCst);
+        let attempt = self.stores.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(gate) = &self.store_gate {
+            gate.entered.send(attempt).unwrap();
+            gate.release.acquire().await.unwrap().forget();
+        }
+        self.stores_completed.fetch_add(1, Ordering::SeqCst);
         self.observed.notify_one();
         fail!("authenticated storage boundary")
     }
@@ -140,6 +147,8 @@ fn engine() -> (Arc<RecoveryEngine>, BlockSignaturesSimplexPq) {
             downloads: AtomicUsize::new(0),
             gate: None,
             stores: AtomicUsize::new(0),
+            store_gate: None,
+            stores_completed: AtomicUsize::new(0),
             observed: tokio::sync::Notify::new(),
             #[cfg(feature = "telemetry")]
             telemetry: Default::default(),
@@ -279,6 +288,8 @@ async fn authenticated_max_parented_finality_download_and_admission() {
         downloads: AtomicUsize::new(0),
         gate: None,
         stores: AtomicUsize::new(0),
+        store_gate: None,
+        stores_completed: AtomicUsize::new(0),
         observed: tokio::sync::Notify::new(),
         #[cfg(feature = "telemetry")]
         telemetry: Default::default(),
@@ -448,13 +459,9 @@ async fn wait_attempt(rx: &mut tokio::sync::mpsc::UnboundedReceiver<usize>, expe
 
 async fn stop_workers(engine: &Arc<RecoveryEngine>, pending: &SharedPendingFinality) {
     engine.stopped.store(true, Ordering::SeqCst);
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while pending.lock().workers != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    let tasks = pending.lock().tasks.clone();
+    tokio::time::timeout(Duration::from_secs(3), tasks.wait()).await.unwrap().unwrap();
+    assert_eq!(pending.lock().workers, 0);
     assert!(pending.lock().entries.is_empty());
     assert!(pending.lock().active.is_empty());
 }
@@ -656,4 +663,51 @@ async fn invalid_final_upgrade_preserves_authenticated_approval() {
     }
     assert_eq!(engine.stores.load(Ordering::SeqCst), 1, "invalid final must not reach storage");
     stop_workers(&engine, &pending).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn finality_owned_drain_finishes_actual_store_after_stop_and_ttl() {
+    let (mut engine, carrier) = engine();
+    let (entered, mut attempts) = tokio::sync::mpsc::unbounded_channel();
+    Arc::get_mut(&mut engine).unwrap().store_gate =
+        Some(DownloadGate { entered, release: tokio::sync::Semaphore::new(0) });
+    let pending: SharedPendingFinality = Default::default();
+    deliver(&engine, &pending, &evidence(&carrier)).await.unwrap();
+    wait_attempt(&mut attempts, 1).await;
+    assert_eq!(engine.stores_completed.load(Ordering::SeqCst), 0);
+    assert!(pending.lock().entries[engine.block.id()][0].verified);
+    let tasks = pending.lock().tasks.clone();
+    engine.stopped.store(true, Ordering::SeqCst);
+    tasks.stop();
+    tokio::time::advance(RETENTION + Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), tasks.wait()).await.is_err(),
+        "stop/TTL discarded an already admitted store operation"
+    );
+    assert!(deliver(&engine, &pending, &evidence(&carrier)).await.is_err());
+    engine.store_gate.as_ref().unwrap().release.add_permits(1);
+    tasks.wait().await.unwrap();
+    assert_eq!(engine.stores_completed.load(Ordering::SeqCst), 1);
+    assert_eq!(pending.lock().workers, 0);
+    assert!(pending.lock().active.is_empty());
+    assert!(pending.lock().entries.is_empty());
+}
+
+#[tokio::test]
+async fn finality_owned_drain_cancels_actual_download_without_storage() {
+    let (mut engine, carrier) = engine();
+    let (entered, mut attempts) = tokio::sync::mpsc::unbounded_channel();
+    Arc::get_mut(&mut engine).unwrap().gate =
+        Some(DownloadGate { entered, release: tokio::sync::Semaphore::new(0) });
+    let pending: SharedPendingFinality = Default::default();
+    deliver(&engine, &pending, &evidence(&carrier)).await.unwrap();
+    wait_attempt(&mut attempts, 1).await;
+    let tasks = pending.lock().tasks.clone();
+    tasks.stop();
+    tokio::time::timeout(Duration::from_secs(2), tasks.wait()).await.unwrap().unwrap();
+    assert_eq!(engine.stores.load(Ordering::SeqCst), 0);
+    assert_eq!(pending.lock().workers, 0);
+    assert!(pending.lock().entries.is_empty());
+    assert!(deliver(&engine, &pending, &evidence(&carrier)).await.is_err());
 }

@@ -17,7 +17,10 @@ use crate::{
 #[cfg(feature = "telemetry")]
 use crate::{engine_traits::EngineTelemetry, network::telemetry::FullNodeNetworkTelemetry};
 use adnl::{
-    common::{add_counted_object_to_map, spawn_cancelable, CountedObject, Counter},
+    common::{
+        add_counted_object_to_map, spawn_cancelable, AdnlPeers, CountedObject, Counter,
+        QueryAnswer, QueryResult, Subscriber,
+    },
     declare_counted,
     node::AdnlNode,
     AddressSearchContext, DhtNode, DhtSearchPolicy, NetworkStack, OverlayNode, OverlayShortId,
@@ -53,7 +56,67 @@ pub struct NetworkContext {
     pub engine_allocated: Arc<EngineAlloc>,
 }
 
+// Transports dispatch through the node-owned overlay without retaining a
+// reverse strong edge. Each accepted callback keeps its target alive until done.
+struct WeakOverlaySubscriber(std::sync::Weak<OverlayNode>);
+
+#[async_trait::async_trait]
+impl Subscriber for WeakOverlaySubscriber {
+    async fn poll(&self, start: &Arc<std::time::Instant>) {
+        if let Some(overlay) = self.0.upgrade() {
+            overlay.poll(start).await;
+        }
+    }
+    async fn try_consume_custom(&self, data: &[u8], peers: &AdnlPeers) -> Result<bool> {
+        match self.0.upgrade() {
+            Some(overlay) => overlay.try_consume_custom(data, peers).await,
+            None => Ok(false),
+        }
+    }
+    async fn try_consume_object(
+        &self,
+        object: rtos_api::TLObject,
+        peers: &AdnlPeers,
+    ) -> Result<bool> {
+        match self.0.upgrade() {
+            Some(overlay) => overlay.try_consume_object(object, peers).await,
+            None => Ok(false),
+        }
+    }
+    async fn try_consume_raw_query(
+        &self,
+        bytes: &[u8],
+        peers: &AdnlPeers,
+    ) -> Result<Option<QueryAnswer>> {
+        match self.0.upgrade() {
+            Some(overlay) => overlay.try_consume_raw_query(bytes, peers).await,
+            None => Ok(None),
+        }
+    }
+    async fn try_consume_query(
+        &self,
+        object: rtos_api::TLObject,
+        peers: &AdnlPeers,
+    ) -> Result<QueryResult> {
+        match self.0.upgrade() {
+            Some(overlay) => overlay.try_consume_query(object, peers).await,
+            None => Ok(QueryResult::Rejected(object)),
+        }
+    }
+    async fn try_consume_query_bundle(
+        &self,
+        objects: Vec<rtos_api::TLObject>,
+        peers: &AdnlPeers,
+    ) -> Result<QueryResult> {
+        match self.0.upgrade() {
+            Some(overlay) => overlay.try_consume_query_bundle(objects, peers).await,
+            None => Ok(QueryResult::RejectedBundle(objects)),
+        }
+    }
+}
+
 pub struct NodeNetwork {
+    tasks: crate::types::owned_tasks::OwnedTasks,
     #[cfg(test)]
     pub(crate) test_broadcast_faults: Arc<super::test_broadcast_faults::BroadcastFaults>,
     network_context: Arc<NetworkContext>,
@@ -170,7 +233,9 @@ impl NodeNetwork {
         if config.extensions().disable_broadcast_retransmit {
             overlay.set_broadcast_retransmit(false)
         }
-        let rldp = RldpNode::with_params(adnl.clone(), vec![overlay.clone()], None)?;
+        let overlay_subscriber: Arc<dyn Subscriber> =
+            Arc::new(WeakOverlaySubscriber(Arc::downgrade(&overlay)));
+        let rldp = RldpNode::with_params(adnl.clone(), vec![overlay_subscriber.clone()], None)?;
         overlay.set_rldp(rldp.clone())?;
 
         // Initialize QUIC transport (lazy: no endpoint bound until add_key() is called).
@@ -182,11 +247,11 @@ impl NodeNetwork {
             #[cfg(test)]
             let subscriber: Arc<dyn adnl::common::Subscriber> =
                 Arc::new(super::test_broadcast_faults::ObservedOverlay {
-                    overlay: overlay.clone(),
+                    overlay: overlay_subscriber.clone(),
                     faults: test_broadcast_faults.clone(),
                 });
             #[cfg(not(test))]
-            let subscriber: Arc<dyn adnl::common::Subscriber> = overlay.clone();
+            let subscriber: Arc<dyn adnl::common::Subscriber> = overlay_subscriber;
             let quic = adnl::QuicNode::new(
                 vec![subscriber],
                 cancellation_token.clone(),
@@ -210,33 +275,8 @@ impl NodeNetwork {
         }
 
         let dht_key = adnl.key_by_tag(Self::TAG_DHT_KEY)?;
-        NodeNetwork::periodic_store_ip_addr(dht.clone(), dht_key, None, cancellation_token.clone());
 
         let overlay_key = adnl.key_by_tag(Self::TAG_OVERLAY_KEY)?;
-        // Bind QUIC immediately on the default overlay ADNL key, validator key will be added later
-        if let Some(quic) = &quic {
-            let adnl_ip = adnl.ip_address_adnl();
-            match Self::compute_quic_bind_addr(adnl_ip, quic_address) {
-                Ok((_quic_addr, bind_addr)) => {
-                    if let Err(e) = Self::bind_quic_key(quic, &overlay_key, bind_addr) {
-                        log::warn!(
-                            "Cannot register default ADNL key {} on QUIC: {e}",
-                            overlay_key.id()
-                        );
-                    }
-                }
-                Err(e) => log::warn!("Skipping default QUIC identity: {e}"),
-            }
-        }
-
-        NodeNetwork::periodic_store_ip_addr(
-            dht.clone(),
-            overlay_key,
-            None,
-            cancellation_token.clone(),
-        );
-        NodeNetwork::find_dht_nodes(dht.clone(), cancellation_token.clone());
-
         let (config_handler, config_handler_context) =
             NodeConfigHandler::create(config, tokio::runtime::Handle::current())?;
 
@@ -274,6 +314,7 @@ impl NodeNetwork {
         let network_context = Arc::new(network_context);
 
         let node_network = NodeNetwork {
+            tasks: crate::types::owned_tasks::OwnedTasks::new(cancellation_token.child_token()),
             #[cfg(test)]
             test_broadcast_faults,
             network_context: network_context.clone(),
@@ -285,11 +326,47 @@ impl NodeNetwork {
         };
         let node_network = Arc::new(node_network);
 
-        if let Err(error) = NodeConfigHandler::start_sheduler(
-            node_network.config_handler.clone(),
-            config_handler_context,
-            vec![node_network.clone()],
-        ) {
+        let initialized = (|| -> Result<()> {
+            // Bind QUIC immediately on the default overlay ADNL key, validator key will be added later
+            if let Some(quic) = &node_network.network_context.stack.quic {
+                let adnl_ip = node_network.network_context.stack.adnl.ip_address_adnl();
+                match Self::compute_quic_bind_addr(adnl_ip, quic_address) {
+                    Ok((_quic_addr, bind_addr)) => {
+                        if let Err(e) = Self::bind_quic_key(quic, &overlay_key, bind_addr) {
+                            log::warn!(
+                                "Cannot register default ADNL key {} on QUIC: {e}",
+                                overlay_key.id()
+                            );
+                        }
+                    }
+                    Err(e) => log::warn!("Skipping default QUIC identity: {e}"),
+                }
+            }
+
+            NodeConfigHandler::start_sheduler(
+                node_network.config_handler.clone(),
+                config_handler_context,
+                vec![node_network.clone()],
+            )?;
+            for key in [dht_key, overlay_key] {
+                node_network.tasks.spawn_handle("network DHT announcement", || {
+                    Self::periodic_store_ip_addr(
+                        node_network.network_context.stack.dht.clone(),
+                        key,
+                        None,
+                        node_network.cancellation_token.clone(),
+                    )
+                })?;
+            }
+            node_network.tasks.spawn_handle("network DHT discovery", || {
+                Self::find_dht_nodes(
+                    node_network.network_context.stack.dht.clone(),
+                    node_network.cancellation_token.clone(),
+                )
+            })?;
+            Ok(())
+        })();
+        if let Err(error) = initialized {
             // Keep cleanup owned if the failed constructor's caller is cancelled.
             let cleanup = node_network.clone();
             let drain = tokio::spawn(async move { cleanup.stop_adnl().await });
@@ -356,14 +433,25 @@ impl NodeNetwork {
         // A queued subscriber must finish before transport shutdown, otherwise
         // it can register a new endpoint after the old endpoints were stopped.
         let config_result = self.config_handler.stop_and_wait().await;
-        if let Some(quic) = &self.network_context.stack.quic {
+        let workers_result = self.tasks.wait().await;
+        let quic_result = if let Some(quic) = &self.network_context.stack.quic {
             log::info!("Stopping QUIC...");
-            quic.shutdown();
-        }
+            quic.shutdown_and_wait().await
+        } else {
+            Ok(())
+        };
         log::info!("Node network loops stopped. Stopping adnl...");
         self.network_context.stack.adnl.stop().await;
         log::info!("Stopped adnl");
-        config_result
+        match (config_result, workers_result, quic_result) {
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
+            (config, workers, quic) => Err(error!(
+                "Network shutdown: config={:?}; workers={:?}; QUIC={:?}",
+                config.err(),
+                workers.err(),
+                quic.err()
+            )),
+        }
     }
 
     fn try_add_counted_object<K: Hash + Ord + Clone, T: CountedObject>(
@@ -385,8 +473,8 @@ impl NodeNetwork {
         dht: Arc<DhtNode>,
         node_key: Arc<dyn KeyOption>,
         cancellation_token: tokio_util::sync::CancellationToken,
-    ) {
-        Self::periodic_store_ip_addr(dht, node_key, None, cancellation_token);
+    ) -> tokio::task::JoinHandle<()> {
+        Self::periodic_store_ip_addr(dht, node_key, None, cancellation_token)
     }
 
     fn bind_quic_key(
@@ -423,7 +511,10 @@ impl NodeNetwork {
         Ok((quic_addr, bind_addr))
     }
 
-    fn find_dht_nodes(dht: Arc<DhtNode>, cancellation_token: tokio_util::sync::CancellationToken) {
+    fn find_dht_nodes(
+        dht: Arc<DhtNode>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
         spawn_cancelable(cancellation_token, async move {
             loop {
                 let mut iter = None;
@@ -434,7 +525,7 @@ impl NodeNetwork {
                 }
                 tokio::time::sleep(Self::TIMEOUT_FIND_DHT_NODES).await;
             }
-        });
+        })
     }
 
     fn periodic_store_ip_addr(
@@ -442,7 +533,7 @@ impl NodeNetwork {
         node_key: Arc<dyn KeyOption>,
         validator_info: Option<(Arc<ValidatorAdnlKeyIds>, i32)>,
         cancellation_token: tokio_util::sync::CancellationToken,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         spawn_cancelable(cancellation_token, async move {
             let key_id = node_key.id();
             loop {
@@ -460,7 +551,7 @@ impl NodeNetwork {
                     }
                 }
             }
-        });
+        })
     }
 
     fn search_validator_keys_for_validator(
@@ -469,12 +560,12 @@ impl NodeNetwork {
         validators_contexts: Arc<lockfree::map::Map<UInt256, Arc<ValidatorSetContext>>>,
         validator_list_id: UInt256,
         validators: Vec<CatchainNode>,
-    ) {
+    ) -> Result<()> {
         let dht = self.network_context.stack.dht.clone();
         let adnl = self.network_context.stack.adnl.clone();
         let overlay = self.network_context.stack.overlay.clone();
 
-        spawn_cancelable(self.cancellation_token.clone(), async move {
+        self.tasks.spawn_cancelable("validator key discovery", async move {
             let mut current_validators = validators;
             loop {
                 match Self::search_validator_keys_round(
@@ -509,7 +600,8 @@ impl NodeNetwork {
                     break;
                 }
             }
-        });
+        })?;
+        Ok(())
     }
 
     /// Spawn a background task that DHT-resolves ADNL addresses for a list of
@@ -527,10 +619,7 @@ impl NodeNetwork {
         overlay: Arc<OverlayNode>,
         cancellation_token: tokio_util::sync::CancellationToken,
         label: String,
-    ) {
-        if peers.is_empty() {
-            return;
-        }
+    ) -> tokio::task::JoinHandle<()> {
         spawn_cancelable(cancellation_token, async move {
             let mut peers = peers;
             loop {
@@ -550,7 +639,7 @@ impl NodeNetwork {
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
-        });
+        })
     }
 
     async fn resolve_overlay_peers_round(
@@ -701,12 +790,15 @@ impl NodeNetwork {
                 log::warn!("Cannot add validator ADNL key {key_id} to QUIC: {e}");
             }
         }
-        NodeNetwork::periodic_store_ip_addr(
-            self.network_context.stack.dht.clone(),
-            self.network_context.stack.adnl.key_by_id(&key_id)?,
-            Some((self.validator_context.adnl_key_ids.clone(), election_id)),
-            self.cancellation_token.clone(),
-        );
+        let stored_key = self.network_context.stack.adnl.key_by_id(&key_id)?;
+        self.tasks.spawn_handle("validator DHT announcement", || {
+            NodeNetwork::periodic_store_ip_addr(
+                self.network_context.stack.dht.clone(),
+                stored_key,
+                Some((self.validator_context.adnl_key_ids.clone(), election_id)),
+                self.cancellation_token.clone(),
+            )
+        })?;
         log::info!(
             "load_and_store_validator_adnl_key: \
             id {key_id} added for elections {election_id}"
@@ -931,7 +1023,7 @@ impl PrivateOverlayOperations for NodeNetwork {
                 self.validator_context.sets_contexts.clone(),
                 validator_list_id.clone(),
                 lost_validators,
-            );
+            )?;
         }
 
         for peer in context.validator_peers.iter() {

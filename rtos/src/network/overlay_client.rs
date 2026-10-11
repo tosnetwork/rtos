@@ -9,12 +9,15 @@
  */
 #[cfg(feature = "telemetry")]
 use crate::network::telemetry::FullNodeNetworkTelemetry;
-use crate::network::{
-    neighbours::{
-        Neighbour, Neighbours, MAX_NEIGHBOURS, UPDATE_FLAG_IS_REGISTER,
-        UPDATE_FLAG_IS_REG_IN_COMMON_STAT, UPDATE_FLAG_IS_RLDP,
+use crate::{
+    network::{
+        neighbours::{
+            Neighbour, Neighbours, MAX_NEIGHBOURS, UPDATE_FLAG_IS_REGISTER,
+            UPDATE_FLAG_IS_REG_IN_COMMON_STAT, UPDATE_FLAG_IS_RLDP,
+        },
+        node_network::NetworkContext,
     },
-    node_network::NetworkContext,
+    types::owned_tasks::OwnedTasks,
 };
 use adnl::{
     common::{spawn_cancelable, Subscriber, TaggedByteSlice, TaggedObject, TaggedTlObject},
@@ -84,23 +87,83 @@ impl OverlayClientContext {
     }
 }
 
+// Covers the protocol registration before the first constructor await. No
+// detached async cleanup is needed: workers are already owned by the router.
+struct OverlayRegistration {
+    network: Arc<NetworkContext>,
+    id: Arc<OverlayShortId>,
+    cancellation: tokio_util::sync::CancellationToken,
+    committed: bool,
+    deletion: Arc<std::sync::Mutex<bool>>,
+    owner: Arc<OwnedTasks>,
+}
+impl OverlayRegistration {
+    fn new(
+        network: Arc<NetworkContext>,
+        id: Arc<OverlayShortId>,
+        cancellation: tokio_util::sync::CancellationToken,
+        owner: Arc<OwnedTasks>,
+    ) -> Self {
+        Self {
+            network,
+            id,
+            cancellation,
+            committed: false,
+            deletion: Arc::new(std::sync::Mutex::new(false)),
+            owner,
+        }
+    }
+}
+impl Drop for OverlayRegistration {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.cancellation.cancel();
+            let mut deleted = self.deletion.lock().unwrap();
+            if *deleted {
+                return;
+            }
+            *deleted = true;
+            if let Err(error) = self.network.stack.overlay.delete_public_overlay(&self.id) {
+                self.owner.record_error(format!("Partial overlay {} cleanup: {error}", self.id));
+            }
+        }
+    }
+}
+
 pub struct OverlayClient {
+    deletion: Arc<std::sync::Mutex<bool>>,
     ctx: Arc<OverlayClientContext>,
-    neighbours_rotation_handle: tokio::task::JoinHandle<()>,
-    ping_handle: Option<tokio::task::JoinHandle<()>>,
-    resolve_incoming_query_peers_handle: tokio::task::JoinHandle<()>,
-    saving_to_dht_handle: Option<tokio::task::JoinHandle<()>>,
+    tasks: Arc<OwnedTasks>,
+    neighbours_rotation_handle: tokio::task::AbortHandle,
+    ping_handle: Option<tokio::task::AbortHandle>,
+    resolve_incoming_query_peers_handle: tokio::task::AbortHandle,
+    saving_to_dht_handle: Option<tokio::task::AbortHandle>,
+}
+
+#[cfg(test)]
+pub(crate) struct OverlayInitGate {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Semaphore,
+    pub fail: bool,
 }
 
 impl OverlayClient {
-    pub async fn new_public(
+    #[cfg(test)]
+    pub(crate) fn cancellation_token(&self) -> &tokio_util::sync::CancellationToken {
+        &self.ctx.cancellation_token
+    }
+
+    pub(crate) async fn new_public(
         id: Arc<OverlayShortId>,
         id_full: OverlayId,
         network_context: Arc<NetworkContext>,
         cancellation_token: tokio_util::sync::CancellationToken,
         policy: DhtSearchPolicy,
         default_rldp_roundtrip: Option<u32>,
+        owner: Arc<OwnedTasks>,
+        #[cfg(test)] gate: Option<Arc<OverlayInitGate>>,
     ) -> Result<Arc<Self>> {
+        let _admission = owner.enter()?;
         // Add a new overlay to the protocol
         let params = OverlayParams {
             flags: 0,
@@ -109,6 +172,24 @@ impl OverlayClient {
             runtime: None,
         };
         network_context.stack.overlay.add_local_workchain_overlay(params)?;
+        let mut registration = OverlayRegistration::new(
+            network_context.clone(),
+            id.clone(),
+            cancellation_token.clone(),
+            owner.clone(),
+        );
+        #[cfg(test)]
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => fail!("Overlay constructor stopped"),
+                permit = gate.release.acquire() => { permit.unwrap().forget(); },
+            }
+            if gate.fail {
+                fail!("Injected failure after protocol registration");
+            }
+        }
 
         // Find initial neighbors in the DHT and add them to the overlay protocol
         let mut search_ctx = OverlayNodesSearchContext::with_params(&id, policy.clone())?;
@@ -123,7 +204,7 @@ impl OverlayClient {
 
         log::trace!("{}: found {} initial peers from DHT", id, initial_peers.len());
 
-        OverlayClient::init(
+        let client = OverlayClient::init(
             id,
             id_full,
             network_context,
@@ -133,11 +214,14 @@ impl OverlayClient {
             false,
             initial_peers,
             Some(search_ctx),
-        )
-        .await
+            owner,
+            registration.deletion.clone(),
+        )?;
+        registration.committed = true;
+        Ok(client)
     }
 
-    pub async fn new_semiprivate(
+    pub(crate) async fn new_semiprivate(
         id: Arc<OverlayShortId>,
         id_full: OverlayId,
         root_adnl_ids: Vec<Arc<KeyId>>,
@@ -150,7 +234,9 @@ impl OverlayClient {
         default_rldp_roundtrip: Option<u32>,
         max_clients: usize,
         use_quic: bool,
+        owner: Arc<OwnedTasks>,
     ) -> Result<Arc<Self>> {
+        let _admission = owner.enter()?;
         // Add a new overlay to the protocol
         let params = OverlayParams::with_id_only(&id);
         network_context.stack.overlay.add_semiprivate_overlay(
@@ -162,8 +248,14 @@ impl OverlayClient {
             max_clients,
             use_quic,
         )?;
+        let mut registration = OverlayRegistration::new(
+            network_context.clone(),
+            id.clone(),
+            cancellation_token.clone(),
+            owner.clone(),
+        );
 
-        OverlayClient::init(
+        let client = OverlayClient::init(
             id,
             id_full,
             network_context,
@@ -173,11 +265,14 @@ impl OverlayClient {
             true,
             root_adnl_ids,
             None,
-        )
-        .await
+            owner,
+            registration.deletion.clone(),
+        )?;
+        registration.committed = true;
+        Ok(client)
     }
 
-    async fn init(
+    fn init(
         id: Arc<OverlayShortId>,
         id_full: OverlayId,
         network_context: Arc<NetworkContext>,
@@ -187,7 +282,10 @@ impl OverlayClient {
         is_semiprivate: bool,
         initial_peers: Vec<Arc<KeyId>>,
         search_ctx: Option<OverlayNodesSearchContext>,
+        owner: Arc<OwnedTasks>,
+        deletion: Arc<std::sync::Mutex<bool>>,
     ) -> Result<Arc<Self>> {
+        let tasks = Arc::new(OwnedTasks::child(owner, cancellation_token.clone()));
         // Create a neighbors manager
         let neighbours_manager = Arc::new(Neighbours::new(
             &initial_peers,
@@ -195,6 +293,7 @@ impl OverlayClient {
             id.clone(),
             &default_rldp_roundtrip,
             cancellation_token.clone(),
+            tasks.clone(),
         )?);
 
         let ctx = Arc::new(OverlayClientContext {
@@ -207,22 +306,34 @@ impl OverlayClient {
             is_semiprivate,
         });
 
-        let saving_to_dht_handle =
-            if !is_semiprivate { Some(start_saving_to_dht_worker(ctx.clone())?) } else { None };
+        let saving_to_dht_handle = if !is_semiprivate {
+            Some(tasks.spawn_result("overlay DHT announcements", || {
+                start_saving_to_dht_worker(ctx.clone())
+            })?)
+        } else {
+            None
+        };
 
         // Start a worker that pings active neighbors
         let ping_handle = if !is_semiprivate {
-            Some(ctx.neighbours_manager.clone().start_ping_worker())
+            Some(tasks.spawn_handle("overlay neighbour ping loop", || {
+                ctx.neighbours_manager.clone().start_ping_worker()
+            })?)
         } else {
             None
         };
 
         // Get the neighbors list from the overlay protocol and replace bad active neighbors
-        let neighbours_rotation_handle = ctx.neighbours_manager.clone().start_rotation_worker();
+        let neighbours_rotation_handle = tasks
+            .spawn_handle("overlay neighbour rotation", || {
+                ctx.neighbours_manager.clone().start_rotation_worker()
+            })?;
 
         if let Some(search_ctx) = search_ctx {
             // The next worker calls add_neighbors_from_dht until found MAX_NEIGHBOURS
-            let _ = start_find_neighbors_in_dht_worker(ctx.clone(), search_ctx);
+            tasks.spawn_handle("overlay initial DHT neighbours", || {
+                start_find_neighbors_in_dht_worker(ctx.clone(), search_ctx)
+            })?;
         }
 
         // The next worker:
@@ -230,11 +341,15 @@ impl OverlayClient {
         // - Resolves them via DHT
         // - Adds resolved peers back to the overlay protocol
         // - Adds peers to the all-neighbors list
-        let resolve_incoming_query_peers_handle =
-            start_resolve_incoming_query_peers_worker(ctx.clone(), policy);
+        let resolve_incoming_query_peers_handle = tasks
+            .spawn_handle("overlay incoming peer resolution", || {
+                start_resolve_incoming_query_peers_worker(ctx.clone(), policy)
+            })?;
 
         Ok(Arc::new(Self {
+            deletion,
             ctx,
+            tasks,
             neighbours_rotation_handle,
             ping_handle,
             resolve_incoming_query_peers_handle,
@@ -267,7 +382,7 @@ impl OverlayClient {
     pub fn deactivate(&self) {
         if !self.is_died() && self.ctx.is_active.swap(false, Ordering::Relaxed) {
             let ctx = self.ctx.clone();
-            tokio::spawn(async move {
+            let _ = self.tasks.spawn_cancelable("overlay delayed deactivation", async move {
                 // Wait while dht announce expires
                 tokio::time::sleep(TIMEOUT_STORE_OVERLAY_NODE_SEC + Duration::from_secs(60)).await;
                 if !ctx.is_active.load(Ordering::Relaxed) {
@@ -277,14 +392,30 @@ impl OverlayClient {
         }
     }
 
-    pub(crate) fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
-        self.ctx.cancellation_token.clone()
+    pub fn delete(&self) -> Result<bool> {
+        self.tasks.stop();
+        self.ctx.is_active.store(false, Ordering::Relaxed);
+        let mut deleted = self.deletion.lock().unwrap();
+        if *deleted {
+            return Ok(false);
+        }
+        // Shared with the constructor guard; hold through protocol deletion so
+        // a concurrent repeat cannot certify retirement before deletion finishes.
+        *deleted = true;
+        let result = self.ctx.overlay_node().delete_public_overlay(&self.ctx.id);
+        if let Err(error) = &result {
+            self.tasks.record_error(format!("Overlay {} deletion: {error}", self.id()));
+        }
+        result
     }
 
-    pub fn delete(&self) -> Result<bool> {
-        self.ctx.cancellation_token.cancel();
-        self.ctx.is_active.store(false, Ordering::Relaxed);
-        self.ctx.overlay_node().delete_public_overlay(&self.ctx.id)
+    pub async fn stop_and_wait(&self) -> Result<()> {
+        let deletion = self.delete();
+        let workers = self.tasks.wait().await;
+        match (deletion, workers) {
+            (Ok(_), Ok(())) => Ok(()),
+            (a, b) => fail!("Overlay {} shutdown: deletion={a:?}; workers={b:?}", self.id()),
+        }
     }
 
     pub fn is_active(&self) -> bool {

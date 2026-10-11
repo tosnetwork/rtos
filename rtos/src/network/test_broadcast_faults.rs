@@ -1,9 +1,6 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Instance-local faults after real QUIC authentication, before overlay dispatch.
-use adnl::{
-    common::{AdnlPeers, QueryAnswer, QueryResult, Subscriber},
-    OverlayNode,
-};
+use adnl::common::{AdnlPeers, QueryAnswer, QueryResult, Subscriber};
 use rtos_api::TLObject;
 use rtos_block::Result;
 use std::sync::{Arc, Mutex};
@@ -131,7 +128,7 @@ impl BroadcastFaults {
 }
 
 pub(crate) struct ObservedOverlay {
-    pub overlay: Arc<OverlayNode>,
+    pub overlay: Arc<dyn Subscriber>,
     pub faults: Arc<BroadcastFaults>,
 }
 

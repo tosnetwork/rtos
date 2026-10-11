@@ -73,7 +73,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
-        Arc, OnceLock,
+        Arc,
     },
     time::Duration,
 };
@@ -91,7 +91,41 @@ struct StorageDictInfo {
 }
 
 pub type SplitQueues = Option<(OutMsgQueue, OutMsgQueue, ahash::AHashSet<UInt256>)>;
+// Cancellation of startup starts retained cleanup instead of dropping resources.
+struct EngineShutdownGuard(Option<Arc<Engine>>);
+impl Drop for EngineShutdownGuard {
+    fn drop(&mut self) {
+        if let Some(engine) = self.0.take() {
+            if let Err(error) = engine.start_shutdown() {
+                engine.stopper.report_service_failure(0, format!("start shutdown: {error}"));
+            }
+        }
+    }
+}
+
+struct StopOnDrop(Option<Arc<Stopper>>);
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        if let Some(stopper) = self.0.take() {
+            stopper.set_stop();
+        }
+    }
+}
+
+#[derive(Default)]
+struct EngineOwners {
+    stopping: bool,
+    router_ready: bool,
+    router: Option<Arc<FullNodeOverlaysRouter>>,
+    queue: Option<Arc<OutMsgQueueManager>>,
+}
+
 pub struct Engine {
+    #[cfg(test)]
+    state_db_stop_started: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) overlay_init_test_gate:
+        std::sync::Mutex<Option<Arc<crate::network::overlay_client::OverlayInitGate>>>,
     #[cfg(test)]
     pub(crate) test_chain_time: AtomicU64,
     #[cfg(test)]
@@ -101,7 +135,14 @@ pub struct Engine {
     db: Arc<InternalDb>,
     candidate_db: CandidateDbPool,
     network: Arc<NodeNetwork>,
-    overlays_router: OnceLock<Arc<FullNodeOverlaysRouter>>,
+    owned_services: std::sync::Mutex<EngineOwners>,
+    service_tasks: crate::types::service_tasks::ServiceTasks,
+    server_constructors: crate::types::owned_tasks::OwnedTasks,
+    shutdown_started: std::sync::Mutex<bool>,
+    shutdown_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
+    background_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
+    ingress_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
+    persistence_tasks: crate::types::owned_tasks::OwnedTasks,
 
     shard_states_awaiters: AwaitersPool<BlockIdExt, Arc<ShardStateStuff>>,
     block_applying_awaiters: AwaitersPool<BlockIdExt, ()>,
@@ -140,7 +181,6 @@ pub struct Engine {
     collator_config_mc: CollatorConfig,
 
     shard_states_keeper: Arc<ShardStatesKeeper>,
-    out_msg_queue_manager: OnceLock<Arc<OutMsgQueueManager>>,
 
     // None - queue calculating is in progress
     split_queues_cache: lockfree::map::Map<BlockIdExt, SplitQueues>,
@@ -386,6 +426,12 @@ impl Downloader for ZeroStateDownloader {
 
 #[derive(Default)]
 pub struct Stopper {
+    #[cfg(test)]
+    construction_network: std::sync::Mutex<Option<std::sync::Weak<NodeNetwork>>>,
+    #[cfg(test)]
+    construction_gate: std::sync::Mutex<
+        Option<(&'static str, Arc<crate::network::overlay_client::OverlayInitGate>)>,
+    >,
     stop: Arc<AtomicU32>,
     token: tokio_util::sync::CancellationToken,
     // A failed owner keeps its service bit. Failure is not a successful release.
@@ -398,7 +444,30 @@ impl Stopper {
             stop: Arc::new(AtomicU32::new(0)),
             token: tokio_util::sync::CancellationToken::new(),
             failures: Default::default(),
+            #[cfg(test)]
+            construction_gate: Default::default(),
+            #[cfg(test)]
+            construction_network: Default::default(),
         }
+    }
+
+    #[cfg(test)]
+    async fn wait_construction_gate(&self, stage: &'static str) -> Result<()> {
+        let gate = self
+            .construction_gate
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(at, _)| *at == stage)
+            .map(|(_, gate)| gate.clone());
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.acquire().await.unwrap().forget();
+            if gate.fail {
+                fail!("controlled {stage} construction failure");
+            }
+        }
+        Ok(())
     }
 
     pub fn set_stop(&self) {
@@ -420,6 +489,10 @@ impl Stopper {
     }
 
     pub async fn wait_stop(self: Arc<Self>) -> Result<()> {
+        self.wait_stop_except(0).await
+    }
+
+    async fn wait_stop_except(self: Arc<Self>, except: u32) -> Result<()> {
         loop {
             {
                 let failures = self.failures.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -428,7 +501,7 @@ impl Stopper {
                 Self::log_stop_status(stop);
                 // Terminal failed owners cannot release successfully, but every
                 // other service must finish before shutdown returns its error.
-                if stop & !failed == 0 {
+                if stop & !failed & !except == 0 {
                     if failures.is_empty() {
                         return Ok(());
                     }
@@ -496,7 +569,9 @@ impl Stopper {
     }
 
     pub fn release_stop(&self, mask: u32) {
-        self.stop.fetch_and(!mask, Ordering::Relaxed);
+        let failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        let failed = failures.keys().fold(0, |all, mask| all | mask);
+        self.stop.fetch_and(!(mask & !failed), Ordering::Relaxed);
     }
 
     pub fn _token(&self) -> tokio_util::sync::CancellationToken {
@@ -648,14 +723,6 @@ impl Engine {
         )?;
         let test_bundles_config = general_config.test_bundles_config().clone();
         let session_logs_file = general_config.session_logs_file();
-        // Spawn the trace collector worker only when an on-disk session-stats
-        // file is configured. Otherwise leave it as `None` so we don't run an
-        // idle background thread
-        let trace_collector = if session_logs_file.is_some() {
-            Some(simplex::TraceCollector::new(session_logs_file))
-        } else {
-            None
-        };
         let external_messages_maximum_queue_length =
             collator_config.external_messages_maximum_queue_length;
 
@@ -667,204 +734,327 @@ impl Engine {
             engine_allocated.clone(),
         )
         .await?;
-        network.start().await?;
-
-        let (status_reporter, status_server) = if let Some(control_config) = control_config {
-            log::info!("Invoking DB status control server");
-            let status_reporter = Arc::new(DbStatusReporter { is_broken: AtomicBool::new(false) });
-            let status_server = ControlServer::with_params(
-                control_config,
-                DataSource::Status(status_reporter.clone()),
-                network.config_handler(),
-                network.config_handler(),
-                Some(&network),
-            )
-            .await?;
-            (Some(status_reporter), Some(status_server))
-        } else {
-            (None, None)
-        };
-
-        stopper.acquire_stop(Self::MASK_SERVICE_DB_RESTORE);
-        let monitor_min_split = Arc::new(AtomicU8::new(0));
-        let db = open_db(
-            db_config,
-            restore_db,
-            flags.force_check_db,
-            if let Some(status_reporter) = status_reporter.as_ref() {
-                Some(&status_reporter.is_broken)
-            } else {
-                None
-            },
-            &stopper,
-            monitor_min_split.clone(),
-            flags.truncate_db,
-            #[cfg(feature = "telemetry")]
-            engine_telemetry.clone(),
-            engine_allocated.clone(),
-        )
-        .await;
-        if let Some(status_server) = status_server {
-            log::info!("Stopping DB status control server...");
-            status_server.shutdown().await;
-            log::info!("Stopped DB status control server");
+        #[cfg(test)]
+        {
+            *stopper.construction_network.lock().unwrap() = Some(Arc::downgrade(&network));
         }
-        stopper.release_stop(Self::MASK_SERVICE_DB_RESTORE);
-        let db = db?;
+        // Once the network exists, construction owns writes and services until
+        // their actual completion. Dropping this caller only requests stop.
+        let mut caller = StopOnDrop(Some(stopper.clone()));
+        let owner = Arc::new(crate::types::owned_tasks::OwnedTasks::default());
+        let (sent, received) = tokio::sync::oneshot::channel();
+        owner.spawn("Engine construction", async move {
+            use futures::FutureExt;
+            let rollback_network = network.clone();
+            let rollback_stopper = stopper.clone();
+            let mut opened_db: Option<Arc<InternalDb>> = None;
+            let mut status_server: Option<ControlServer> = None;
+            let mut network_binding = Some(network_binding);
+            let mut trace_collector = None;
+            let mut transferred = false;
+            let mut transferred_engine: Option<Arc<Engine>> = None;
+            let result = std::panic::AssertUnwindSafe(async {
+                if session_logs_file.is_some() {
+                    trace_collector = Some(simplex::TraceCollector::new(session_logs_file));
+                }
+                network.start().await?;
+                #[cfg(test)]
+                stopper.wait_construction_gate("network").await?;
 
-        let mut hardforks = global_config.hardforks()?;
-        hardforks.sort_by(|a, b| a.seq_no.cmp(&b.seq_no));
-        if !boot_from_zerostate {
-            if let Some(block_id) = hardforks.last() {
-                if block_id.seq_no > init_mc_block_id.seq_no {
-                    fail!(
+                let status_reporter = if let Some(control_config) = control_config {
+                    log::info!("Invoking DB status control server");
+                    let status_reporter =
+                        Arc::new(DbStatusReporter { is_broken: AtomicBool::new(false) });
+                    let server = ControlServer::with_params(
+                        control_config,
+                        DataSource::Status(status_reporter.clone()),
+                        network.config_handler(),
+                        network.config_handler(),
+                        Some(&network),
+                    )
+                    .await?;
+                    status_server = Some(server);
+                    #[cfg(test)]
+                    stopper.wait_construction_gate("control").await?;
+                    Some(status_reporter)
+                } else {
+                    None
+                };
+
+                stopper.acquire_stop(Self::MASK_SERVICE_DB_RESTORE);
+                let monitor_min_split = Arc::new(AtomicU8::new(0));
+                let db = open_db(
+                    db_config,
+                    restore_db,
+                    flags.force_check_db,
+                    if let Some(status_reporter) = status_reporter.as_ref() {
+                        Some(&status_reporter.is_broken)
+                    } else {
+                        None
+                    },
+                    &stopper,
+                    monitor_min_split.clone(),
+                    flags.truncate_db,
+                    #[cfg(feature = "telemetry")]
+                    engine_telemetry.clone(),
+                    engine_allocated.clone(),
+                )
+                .await;
+                if let Ok(db) = &db {
+                    opened_db = Some(db.clone());
+                }
+                #[cfg(test)]
+                stopper.wait_construction_gate("database").await?;
+                if let Some(status_server) = status_server.take() {
+                    log::info!("Stopping DB status control server...");
+                    status_server.shutdown().await;
+                    log::info!("Stopped DB status control server");
+                }
+                stopper.release_stop(Self::MASK_SERVICE_DB_RESTORE);
+                let db = db?;
+
+                let mut hardforks = global_config.hardforks()?;
+                hardforks.sort_by(|a, b| a.seq_no.cmp(&b.seq_no));
+                if !boot_from_zerostate {
+                    if let Some(block_id) = hardforks.last() {
+                        if block_id.seq_no > init_mc_block_id.seq_no {
+                            fail!(
                         "global config contains init_block and hardforks sections so int_block {} \
                         must be after last hard_fork {}",
                         init_mc_block_id.seq_no,
                         block_id.seq_no
                     )
+                        }
+                    }
+                    // A persisted resume cursor cannot replace an explicitly configured
+                    // trust anchor. Cold boot reauthenticates forward from that anchor.
+                }
+
+                log::info!("load_all_top_shard_blocks");
+                let shard_blocks = match db.load_all_top_shard_blocks() {
+                    Ok(tsbs) => tsbs,
+                    Err(e) => {
+                        log::error!(
+                            "Can't load top shard blocks from db (continue without ones): {:?}",
+                            e
+                        );
+                        HashMap::default()
+                    }
+                };
+                log::info!("load_node_state");
+                let last_mc_seqno =
+                    db.load_full_node_state(LAST_APPLIED_MC_BLOCK)?.map_or(0, |id| id.seq_no);
+                let (shard_blocks_pool, shard_blocks_receiver) = ShardBlocksPool::new(
+                    shard_blocks,
+                    last_mc_seqno,
+                    false,
+                    #[cfg(feature = "telemetry")]
+                    &engine_telemetry,
+                    &engine_allocated,
+                )?;
+
+                let shard_states_keeper = ShardStatesKeeper::new(
+                    db.clone(),
+                    enable_shard_state_persistent_gc,
+                    skip_saving_persistent_states,
+                    pss_cells_cache_max_count,
+                    pss_prev_part_max_size,
+                    states_cache_mode,
+                    cells_lifetime_sec,
+                    stopper.clone(),
+                    cells_db_config.states_db_queue_len + 10,
+                    #[cfg(feature = "telemetry")]
+                    engine_telemetry.clone(),
+                    engine_allocated.clone(),
+                )?;
+
+                log::info!("Engine is created.");
+
+                let now = UnixTime::now() as u32;
+                let (ext_messages_pool, applied_blocks_rx) =
+                    MessagesPool::new(now, external_messages_maximum_queue_length);
+                let candidate_db = CandidateDbPool::with_path(db.db_root_dir()?);
+                let engine = Arc::new(Engine {
+                    #[cfg(test)]
+                    parent_apply_test_gate: std::sync::Mutex::new(None),
+                    #[cfg(test)]
+                    overlay_init_test_gate: std::sync::Mutex::new(None),
+                    db,
+                    candidate_db,
+                    shard_states_awaiters: AwaitersPool::new(
+                        "shard_states_awaiters",
+                        #[cfg(feature = "telemetry")]
+                        engine_telemetry.clone(),
+                        engine_allocated.clone(),
+                    ),
+                    block_applying_awaiters: AwaitersPool::new(
+                        "block_applying_awaiters",
+                        #[cfg(feature = "telemetry")]
+                        engine_telemetry.clone(),
+                        engine_allocated.clone(),
+                    ),
+                    next_block_applying_awaiters: AwaitersPool::new(
+                        "next_block_applying_awaiters",
+                        #[cfg(feature = "telemetry")]
+                        engine_telemetry.clone(),
+                        engine_allocated.clone(),
+                    ),
+                    download_block_awaiters: AwaitersPool::new(
+                        "download_block_awaiters",
+                        #[cfg(feature = "telemetry")]
+                        engine_telemetry.clone(),
+                        engine_allocated.clone(),
+                    ),
+                    external_messages: Arc::new(ext_messages_pool),
+                    confirmed_block_events: ConfirmedBlockEvents::new(),
+
+                    #[cfg(test)]
+                    state_db_stop_started: std::sync::atomic::AtomicBool::new(false),
+                    servers: lockfree::queue::Queue::new(),
+                    stopper: stopper.clone(),
+                    _network_binding: network_binding.take().unwrap(),
+                    zerostate_id: zero_state_id,
+                    init_mc_block_id,
+                    masterchain_proof_verifier: Default::default(),
+                    hardforks,
+                    flags,
+                    archives_life_time_hours,
+                    network,
+                    owned_services: std::sync::Mutex::new(EngineOwners::default()),
+                    service_tasks: crate::types::service_tasks::ServiceTasks::new(stopper.clone()),
+                    server_constructors: Default::default(),
+                    shutdown_started: std::sync::Mutex::new(false),
+                    shutdown_tasks: Arc::new(crate::types::owned_tasks::OwnedTasks::default()),
+                    background_tasks: Arc::new(Default::default()),
+                    ingress_tasks: Arc::new(crate::types::owned_tasks::OwnedTasks::new(
+                        tokio_util::sync::CancellationToken::new(),
+                    )),
+                    persistence_tasks: crate::types::owned_tasks::OwnedTasks::new(
+                        tokio_util::sync::CancellationToken::new(),
+                    ),
+                    shard_blocks: shard_blocks_pool,
+                    pending_finality: Default::default(),
+                    candidates_cache: parking_lot::Mutex::new(lru::LruCache::new(
+                        Self::CANDIDATES_CACHE_SIZE.try_into()?,
+                    )),
+                    last_applied_mc_block_seqno: AtomicU32::new(0),
+                    #[cfg(test)]
+                    test_chain_time: AtomicU64::new(u64::MAX),
+                    #[cfg(test)]
+                    test_finality_notifications: AtomicU64::new(0),
+                    last_applied_mc_block_utime: AtomicU32::new(0),
+                    last_known_mc_block_seqno: AtomicU32::new(0),
+                    last_known_keyblock_seqno: AtomicU32::new(0),
+                    will_validate: AtomicBool::new(false),
+                    sync_status: AtomicU32::new(0),
+                    monitor_min_split,
+                    monitored_shards: AtomicU64::new(u64::MAX), // all shards are monitored by default
+                    test_bundles_config,
+                    collator_config,
+                    collator_config_mc,
+                    shard_states_keeper: shard_states_keeper.clone(),
+                    split_queues_cache: lockfree::map::Map::new(),
+                    validation_status: AtomicU8::new(0),
+                    last_validation_time: lockfree::map::Map::new(),
+                    last_collation_time: lockfree::map::Map::new(),
+                    #[cfg(feature = "telemetry")]
+                    full_node_telemetry: FullNodeTelemetry::default(),
+                    #[cfg(feature = "telemetry")]
+                    collator_telemetry: CollatorValidatorTelemetry::default(),
+                    #[cfg(feature = "telemetry")]
+                    validator_telemetry: CollatorValidatorTelemetry::default(),
+                    #[cfg(feature = "telemetry")]
+                    full_node_service_telemetry: FullNodeNetworkTelemetry::new_service(),
+                    #[cfg(feature = "telemetry")]
+                    engine_telemetry,
+                    engine_allocated,
+                    #[cfg(feature = "telemetry")]
+                    telemetry_printer: TelemetryPrinter::with_params(
+                        "RTOS node",
+                        Self::TIMEOUT_TELEMETRY_SEC,
+                        metrics,
+                    ),
+                    tps_counter: TpsCounter::default(),
+                    trace_collector: trace_collector.take(),
+                    storage_dicts_cache: parking_lot::Mutex::new((0, lru::LruCache::unbounded())),
+                });
+
+                transferred = true;
+                transferred_engine = Some(engine.clone());
+                opened_db.take();
+                let guard = EngineShutdownGuard(Some(engine.clone()));
+                engine.acquire_stop(Self::MASK_SERVICE_SHARDSTATE_GC);
+                engine.persistence_tasks.spawn_handle("top shard persistence", || {
+                    save_top_shard_blocks_worker(
+                        engine.clone(),
+                        shard_blocks_receiver,
+                        engine.persistence_tasks.cancellation().clone(),
+                    )
+                })?;
+                engine.persistence_tasks.spawn_handle("applied message cleanup", || {
+                    engine.external_messages().clone().start_applied_blocks_worker(
+                        applied_blocks_rx,
+                        engine.persistence_tasks.cancellation().clone(),
+                    )
+                })?;
+                #[cfg(test)]
+                stopper.wait_construction_gate("complete").await?;
+                Ok::<_, anyhow::Error>(guard)
+            })
+            .catch_unwind()
+            .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => {
+                    rollback_stopper
+                        .report_service_failure(0, "Engine construction panicked".into());
+                    Err(error!("Engine construction panicked"))
+                }
+            };
+            if result.is_err() {
+                if let Some(engine) = transferred_engine.take() {
+                    if let Err(error) = engine.wait_stop().await {
+                        rollback_stopper.report_service_failure(
+                            0,
+                            format!("constructed Engine rollback: {error}"),
+                        );
+                    }
                 }
             }
-            // A persisted resume cursor cannot replace an explicitly configured
-            // trust anchor. Cold boot reauthenticates forward from that anchor.
-        }
-
-        log::info!("load_all_top_shard_blocks");
-        let shard_blocks = match db.load_all_top_shard_blocks() {
-            Ok(tsbs) => tsbs,
-            Err(e) => {
-                log::error!("Can't load top shard blocks from db (continue without ones): {:?}", e);
-                HashMap::default()
+            if !transferred {
+                if let Some(server) = status_server.take() {
+                    if std::panic::AssertUnwindSafe(server.shutdown()).catch_unwind().await.is_err()
+                    {
+                        rollback_stopper
+                            .report_service_failure(0, "DB status server shutdown panicked".into());
+                    }
+                }
+                if let Some(db) = opened_db.take() {
+                    db.stop_states_db().await;
+                }
+                if let Err(error) = rollback_network.stop_adnl().await {
+                    rollback_stopper.report_service_failure(
+                        0,
+                        format!("partial Engine network shutdown: {error}"),
+                    );
+                }
+                if let Some(trace) = trace_collector.take() {
+                    trace.stop();
+                }
+                rollback_stopper.release_stop(Self::MASK_SERVICE_DB_RESTORE);
             }
-        };
-        log::info!("load_node_state");
-        let last_mc_seqno =
-            db.load_full_node_state(LAST_APPLIED_MC_BLOCK)?.map_or(0, |id| id.seq_no);
-        let (shard_blocks_pool, shard_blocks_receiver) = ShardBlocksPool::new(
-            shard_blocks,
-            last_mc_seqno,
-            false,
-            #[cfg(feature = "telemetry")]
-            &engine_telemetry,
-            &engine_allocated,
-        )?;
-
-        let shard_states_keeper = ShardStatesKeeper::new(
-            db.clone(),
-            enable_shard_state_persistent_gc,
-            skip_saving_persistent_states,
-            pss_cells_cache_max_count,
-            pss_prev_part_max_size,
-            states_cache_mode,
-            cells_lifetime_sec,
-            stopper.clone(),
-            cells_db_config.states_db_queue_len + 10,
-            #[cfg(feature = "telemetry")]
-            engine_telemetry.clone(),
-            engine_allocated.clone(),
-        )?;
-
-        log::info!("Engine is created.");
-
-        let now = UnixTime::now() as u32;
-        let (ext_messages_pool, applied_blocks_rx) =
-            MessagesPool::new(now, external_messages_maximum_queue_length);
-        let candidate_db = CandidateDbPool::with_path(db.db_root_dir()?);
-        let engine = Arc::new(Engine {
-            #[cfg(test)]
-            parent_apply_test_gate: std::sync::Mutex::new(None),
-            db,
-            candidate_db,
-            shard_states_awaiters: AwaitersPool::new(
-                "shard_states_awaiters",
-                #[cfg(feature = "telemetry")]
-                engine_telemetry.clone(),
-                engine_allocated.clone(),
-            ),
-            block_applying_awaiters: AwaitersPool::new(
-                "block_applying_awaiters",
-                #[cfg(feature = "telemetry")]
-                engine_telemetry.clone(),
-                engine_allocated.clone(),
-            ),
-            next_block_applying_awaiters: AwaitersPool::new(
-                "next_block_applying_awaiters",
-                #[cfg(feature = "telemetry")]
-                engine_telemetry.clone(),
-                engine_allocated.clone(),
-            ),
-            download_block_awaiters: AwaitersPool::new(
-                "download_block_awaiters",
-                #[cfg(feature = "telemetry")]
-                engine_telemetry.clone(),
-                engine_allocated.clone(),
-            ),
-            external_messages: Arc::new(ext_messages_pool),
-            confirmed_block_events: ConfirmedBlockEvents::new(),
-
-            servers: lockfree::queue::Queue::new(),
-            stopper,
-            _network_binding: network_binding,
-            zerostate_id: zero_state_id,
-            init_mc_block_id,
-            masterchain_proof_verifier: Default::default(),
-            hardforks,
-            flags,
-            archives_life_time_hours,
-            network,
-            overlays_router: OnceLock::new(),
-            shard_blocks: shard_blocks_pool,
-            pending_finality: Default::default(),
-            candidates_cache: parking_lot::Mutex::new(lru::LruCache::new(
-                Self::CANDIDATES_CACHE_SIZE.try_into()?,
-            )),
-            last_applied_mc_block_seqno: AtomicU32::new(0),
-            #[cfg(test)]
-            test_chain_time: AtomicU64::new(u64::MAX),
-            #[cfg(test)]
-            test_finality_notifications: AtomicU64::new(0),
-            last_applied_mc_block_utime: AtomicU32::new(0),
-            last_known_mc_block_seqno: AtomicU32::new(0),
-            last_known_keyblock_seqno: AtomicU32::new(0),
-            will_validate: AtomicBool::new(false),
-            sync_status: AtomicU32::new(0),
-            monitor_min_split,
-            monitored_shards: AtomicU64::new(u64::MAX), // all shards are monitored by default
-            test_bundles_config,
-            collator_config,
-            collator_config_mc,
-            shard_states_keeper: shard_states_keeper.clone(),
-            out_msg_queue_manager: OnceLock::new(),
-            split_queues_cache: lockfree::map::Map::new(),
-            validation_status: AtomicU8::new(0),
-            last_validation_time: lockfree::map::Map::new(),
-            last_collation_time: lockfree::map::Map::new(),
-            #[cfg(feature = "telemetry")]
-            full_node_telemetry: FullNodeTelemetry::default(),
-            #[cfg(feature = "telemetry")]
-            collator_telemetry: CollatorValidatorTelemetry::default(),
-            #[cfg(feature = "telemetry")]
-            validator_telemetry: CollatorValidatorTelemetry::default(),
-            #[cfg(feature = "telemetry")]
-            full_node_service_telemetry: FullNodeNetworkTelemetry::new_service(),
-            #[cfg(feature = "telemetry")]
-            engine_telemetry,
-            engine_allocated,
-            #[cfg(feature = "telemetry")]
-            telemetry_printer: TelemetryPrinter::with_params(
-                "RTOS node",
-                Self::TIMEOUT_TELEMETRY_SEC,
-                metrics,
-            ),
-            tps_counter: TpsCounter::default(),
-            trace_collector,
-            storage_dicts_cache: parking_lot::Mutex::new((0, lru::LruCache::unbounded())),
-        });
-
-        engine.acquire_stop(Self::MASK_SERVICE_SHARDSTATE_GC);
-        save_top_shard_blocks_worker(engine.clone(), shard_blocks_receiver);
-        engine.external_messages().clone().start_applied_blocks_worker(applied_blocks_rx);
-        Ok(engine)
+            // The payload also owns shutdown: cancellation after a successful
+            // send but before receive cannot abandon a complete Engine.
+            let _ = sent.send(result);
+        })?;
+        let result = received.await;
+        owner.wait().await?;
+        let mut result = result.map_err(|_| error!("Engine construction completion lost"))??;
+        if caller.0.as_ref().unwrap().check_stop() {
+            fail!("Engine construction stopped");
+        }
+        caller.0.take();
+        Ok(result.0.take().unwrap())
     }
 
     pub fn set_last_applied_mc_seqno(&self, seqno: u32) {
@@ -898,36 +1088,171 @@ impl Engine {
         self.monitor_min_split.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn register_owned_service(
+        &self,
+        name: &'static str,
+        mask: u32,
+        start: Box<dyn FnOnce() -> tokio::task::JoinHandle<()> + Send>,
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        self.service_tasks.register(name, mask, start)
+    }
+
+    fn start_shutdown(self: &Arc<Self>) -> Result<Arc<crate::types::owned_tasks::OwnedTasks>> {
+        let tasks = self.shutdown_tasks.clone();
+        {
+            let mut started = self.shutdown_started.lock().unwrap();
+            if !*started {
+                self.stopper.set_stop();
+                self.server_constructors.stop();
+                self.service_tasks.stop();
+                let engine = self.clone();
+                let result_owner = tasks.clone();
+                tasks.spawn("Engine shutdown", async move {
+                    if let Err(error) = engine.wait_stop_inner().await {
+                        result_owner.record_error(format!("Engine shutdown: {error}"));
+                    }
+                })?;
+                *started = true;
+            }
+        }
+        Ok(tasks)
+    }
+
     pub async fn wait_stop(self: Arc<Self>) -> Result<()> {
+        self.start_shutdown()?.wait().await
+    }
+
+    async fn start_owned_server(
+        self: &Arc<Self>,
+        name: &'static str,
+        constructor: impl std::future::Future<Output = Result<Box<dyn Stoppable>>> + Send + 'static,
+    ) -> Result<()> {
+        let mut guard = EngineShutdownGuard(Some(self.clone()));
+        let engine = self.clone();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        self.server_constructors.spawn(name, async move {
+            let result = match constructor.await {
+                Ok(server) => {
+                    engine.servers.push(server);
+                    Ok(())
+                }
+                Err(error) => {
+                    let message = format!("{name} construction: {error}");
+                    engine.stopper.report_service_failure(0, message.clone());
+                    Err(message)
+                }
+            };
+            let _ = sent.send(result);
+        })?;
+        received
+            .await
+            .map_err(|error| error!("{name} constructor completion: {error}"))?
+            .map_err(|error| error!("{error}"))?;
+        if self.stopper.check_stop() {
+            fail!("Engine stopped during {name} construction");
+        }
+        guard.0.take();
+        Ok(())
+    }
+
+    async fn wait_stop_inner(self: Arc<Self>) -> Result<()> {
         // set stop flag
         self.stopper.set_stop();
-        if let Ok(or) = self.overlays_router() {
-            or.delete_overlays();
+        self.background_tasks.stop();
+        self.ingress_tasks.stop();
+        let finality_tasks = self.pending_finality.lock().tasks.clone();
+        finality_tasks.stop();
+        let (router, queue) = {
+            let mut owners = self.owned_services.lock().unwrap();
+            owners.stopping = true;
+            owners.router_ready = false;
+            (owners.router.clone(), owners.queue.clone())
+        };
+        if let Some(router) = &router {
+            router.stop();
+        }
+        if let Some(queue) = &queue {
+            queue.stop();
         }
 
+        // Constructors admitted before close finish and register their server
+        // even when the original startup waiter was cancelled. None can register
+        // after this join, so taking the shutdown owners is race-free.
+        if let Err(error) = self.server_constructors.wait().await {
+            self.stopper.report_service_failure(0, format!("server constructors: {error}"));
+        }
         // stop servers
         let mut tasks = Vec::new();
         while let Some(server) = self.servers.pop() {
+            let stopper = self.stopper.clone();
             tasks.push(async move {
+                use futures::FutureExt;
                 let name = server.name();
                 log::info!("Stopping {name} server...");
-                server.shutdown().await;
+                if std::panic::AssertUnwindSafe(server.shutdown()).catch_unwind().await.is_err() {
+                    stopper.report_service_failure(0, format!("{name} shutdown panicked"));
+                }
                 log::info!("Stopped {name} server");
             });
         }
         futures::future::join_all(tasks).await;
 
-        // stop states GC
-        let engine = self.clone();
-        tokio::spawn(async move {
-            engine.db.stop_states_db().await;
-            engine.stopper.release_stop(Self::MASK_SERVICE_SHARDSTATE_GC);
-        });
+        let (router_result, queue_result) = tokio::join!(
+            async {
+                if let Some(router) = &router {
+                    router.stop_and_wait().await
+                } else {
+                    Ok(())
+                }
+            },
+            async {
+                if let Some(queue) = &queue {
+                    queue.stop_and_wait().await
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        for (name, result) in
+            [("full-node overlays", router_result), ("out-message queue", queue_result)]
+        {
+            if let Err(error) = result {
+                self.stopper.report_service_failure(0, format!("{name}: {error}"));
+            }
+        }
+        {
+            let mut owners = self.owned_services.lock().unwrap();
+            owners.router.take();
+            owners.queue.take();
+        }
+        drop(router);
+        drop(queue);
 
-        // wait while all node's services will stop
-        // Failure sources are sticky. Still finish transport cleanup before
-        // returning the final result, including failures reported during it.
-        let _ = self.stopper.clone().wait_stop().await;
+        if let Err(error) = self.background_tasks.wait().await {
+            self.stopper.report_service_failure(0, format!("background sampling: {error}"));
+        }
+        if let Err(error) = self.ingress_tasks.wait().await {
+            self.stopper.report_service_failure(0, format!("broadcast ingress: {error}"));
+        }
+
+        if let Err(error) = finality_tasks.wait().await {
+            self.stopper.report_service_failure(0, format!("finality recovery: {error}"));
+        }
+
+        if let Err(error) = self.service_tasks.wait().await {
+            self.stopper.report_service_failure(0, format!("service ownership: {error}"));
+        }
+        // An unknown validator teardown retains its bit and blocks DB shutdown.
+        let _ = self.stopper.clone().wait_stop_except(Self::MASK_SERVICE_SHARDSTATE_GC).await;
+        #[cfg(test)]
+        self.state_db_stop_started.store(true, Ordering::Release);
+        self.db.stop_states_db().await;
+        self.stopper.release_stop(Self::MASK_SERVICE_SHARDSTATE_GC);
+        // Producers have stopped. Close the queue and flush accepted metadata
+        // writes before releasing the Engine/database owner.
+        if let Err(error) = self.persistence_tasks.wait().await {
+            self.stopper.report_service_failure(0, format!("top shard persistence: {error}"));
+        }
         if let Err(error) = self.network.stop_adnl().await {
             self.stopper.report_service_failure(0, format!("node network shutdown: {error}"));
         }
@@ -935,6 +1260,10 @@ impl Engine {
             tc.stop();
         }
         self.stopper.clone().wait_stop().await
+    }
+
+    pub(crate) fn ingress_tasks(&self) -> &Arc<crate::types::owned_tasks::OwnedTasks> {
+        &self.ingress_tasks
     }
 
     pub fn stopper(&self) -> &Stopper {
@@ -979,22 +1308,61 @@ impl Engine {
 
     #[cfg(test)]
     pub(crate) async fn initialize_test_full_node_overlays(self: &Arc<Self>) -> Result<()> {
-        // Isolated Engine fixtures have authenticated their own bootstrap state
-        // but do not run the top-level service/boot loop. Use the production
-        // router constructor, including ordinary query service registration.
-        let router = FullNodeOverlaysRouter::new(
-            self.clone(),
-            self.network.clone(),
-            DhtSearchPolicy::default(),
-        )
-        .await?;
-        self.overlays_router.set(router).map_err(|_| error!("Overlays router already set"))
+        self.initialize_full_node_overlays(DhtSearchPolicy::default()).await?;
+        Ok(())
     }
 
-    pub fn overlays_router(&self) -> Result<&Arc<FullNodeOverlaysRouter>> {
-        self.overlays_router
-            .get()
-            .ok_or_else(|| error!("INTERNAL ERROR: overlays router is not initialized"))
+    pub fn overlays_router(&self) -> Result<Arc<FullNodeOverlaysRouter>> {
+        let owners = self.owned_services.lock().unwrap();
+        if owners.stopping || !owners.router_ready {
+            fail!("Overlays router is not ready or is stopping");
+        }
+        owners.router.clone().ok_or_else(|| error!("Overlays router is absent"))
+    }
+
+    pub(crate) async fn initialize_full_node_overlays(
+        self: &Arc<Self>,
+        policy: DhtSearchPolicy,
+    ) -> Result<Arc<FullNodeOverlaysRouter>> {
+        let router = FullNodeOverlaysRouter::create(self.clone(), self.network.clone(), policy)?;
+        #[cfg(test)]
+        {
+            *router.init_gate.lock().unwrap() = self.overlay_init_test_gate.lock().unwrap().clone();
+        }
+        {
+            let mut owners = self.owned_services.lock().unwrap();
+            if owners.stopping || self.stopper.check_stop() {
+                fail!("Engine is stopping");
+            }
+            if owners.router.is_some() {
+                fail!("Overlays router already registered");
+            }
+            owners.router = Some(router.clone());
+        }
+        router.initialize().await?;
+        {
+            let mut owners = self.owned_services.lock().unwrap();
+            if owners.stopping || self.stopper.check_stop() {
+                fail!("Engine stopped during overlay initialization");
+            }
+            owners.router_ready = true;
+        }
+        Ok(router)
+    }
+
+    async fn initialize_queue_manager(self: &Arc<Self>) -> Result<()> {
+        let manager = OutMsgQueueManager::create(self.clone());
+        {
+            let mut owners = self.owned_services.lock().unwrap();
+            if owners.stopping || self.stopper.check_stop() {
+                fail!("Engine is stopping");
+            }
+            if owners.queue.is_some() {
+                fail!("Queue manager already registered");
+            }
+            owners.queue = Some(manager.clone());
+        }
+        manager.initialize().await
     }
 
     pub fn shard_states_awaiters(&self) -> &AwaitersPool<BlockIdExt, Arc<ShardStateStuff>> {
@@ -1829,7 +2197,7 @@ impl Engine {
             return Ok(id);
         }
 
-        tokio::spawn({
+        self.ingress_tasks.clone().spawn("top shard state/apply", {
             let id = id.clone();
             async move {
                 // just passively waiting for 1s...
@@ -1861,7 +2229,7 @@ impl Engine {
                     }
                 }
             }
-        });
+        })?;
 
         Ok(id)
     }
@@ -2025,14 +2393,20 @@ impl Engine {
         archives_gc_block: BlockIdExt,
     ) -> Result<tokio::task::JoinHandle<()>> {
         log::info!("start_archives_gc");
-        let join_handle = tokio::spawn(async move {
-            engine.acquire_stop(Engine::MASK_SERVICE_ARCHIVES_GC);
-            if let Err(e) = Self::archives_gc_worker(&engine, archives_gc_block).await {
-                log::error!("CRITICAL!!! Unexpected error in archives gc: {:?}", e);
-            }
-            engine.release_stop(Engine::MASK_SERVICE_ARCHIVES_GC);
-        });
-        Ok(join_handle)
+        engine.clone().register_service_task(
+            "archive GC",
+            Engine::MASK_SERVICE_ARCHIVES_GC,
+            Box::new(move || {
+                tokio::spawn(async move {
+                    if let Err(e) = Self::archives_gc_worker(&engine, archives_gc_block).await {
+                        engine.report_service_failure(
+                            Engine::MASK_SERVICE_ARCHIVES_GC,
+                            format!("archives GC: {e}"),
+                        );
+                    }
+                })
+            }),
+        )
     }
 
     pub async fn archives_gc_worker(
@@ -2189,17 +2563,18 @@ impl Engine {
         }
     }
 
-    fn check_finish_sync(self: Arc<Self>) {
-        tokio::spawn(async move {
+    fn check_finish_sync(self: Arc<Self>) -> Result<tokio::task::AbortHandle> {
+        let tasks = self.background_tasks.clone();
+        tasks.spawn_cancelable("sync status sampler", async move {
             const SLEEP_TIME: u64 = 30;
             loop {
                 if let Ok(true) = self.check_sync().await {
                     self.set_sync_status(Engine::SYNC_STATUS_FINISH_SYNC);
                     return;
-                };
+                }
                 tokio::time::sleep(Duration::from_secs(SLEEP_TIME)).await;
             }
-        });
+        })
     }
 
     #[allow(dead_code)]
@@ -2459,135 +2834,146 @@ pub async fn run(
     // Create engine
     let truncate_db = flags.truncate_db;
     let engine = Engine::new(node_config, flags, stopper.clone()).await?;
-    if let Some(mc_seq_no) = truncate_db {
-        engine.truncate_database(mc_seq_no).await?;
-    }
+    let mut startup_guard = EngineShutdownGuard(Some(engine.clone()));
     let engine_ret = engine.clone();
-    let result = async move {
-        #[cfg(feature = "telemetry")]
-        telemetry_logger(engine.clone());
-        #[cfg(all(target_os = "linux", feature = "telemetry"))]
-        proc_status_logger();
-
-        // control server
-        if let Some(config) = control_server_config {
-            let server = ControlServer::with_params(
-                config,
-                DataSource::Engine(engine.clone()),
-                engine.network().config_handler(),
-                engine.network().config_handler(),
-                Some(engine.network()),
-            )
-            .await?;
-            engine.servers.push(Box::new(server));
-        }
-
-        // liteserver
-        if let Some(config) = lite_server_config {
-            let server =
-                LiteServer::with_params(config, liteserver_runtime, engine.clone()).await?;
-            engine.servers.push(Box::new(server));
-        }
-
-        // jsonrpc server
-        if let Some(config) = json_rpc_server_config {
-            let server = RpcServer::start(config, engine.clone()).await?;
-            engine.servers.push(Box::new(server));
-        }
-
-        // metrics server (Prometheus + health probes)
-        if let Some((address, handle)) = metrics {
-            let server = start_metrics_server(engine.clone(), address, handle).await;
-            engine.servers.push(Box::new(server));
-        }
-
-        // Overlays
-        let overlays_router = FullNodeOverlaysRouter::new(
-            engine.clone(),
-            engine.network.clone(),
-            DhtSearchPolicy::default(),
-        )
-        .await?;
-        overlays_router.update_custom_overlays(Some(&custom_overlays_config)).await?;
-        engine
-            .overlays_router
-            .set(overlays_router.clone())
-            .map_err(|_| error!("Overlays router already set"))?;
-
-        // Boot
-        let mut boot_info =
-            boot(&engine, zerostate_path, configs_dir, pss_downloading_threads).await?;
-
-        let out_msg_queue_manager = OutMsgQueueManager::new(engine.clone()).await?;
-        engine
-            .out_msg_queue_manager
-            .set(out_msg_queue_manager.clone())
-            .map_err(|_| error!("OutMsgQueueManager already set"))?;
-
-        Engine::start_archives_gc(engine.clone(), boot_info.archives_gc_block)?;
-
-        engine
-            .shard_states_keeper
-            .clone()
-            .start(
-                engine.clone(),
-                boot_info.last_applied_mc_block.clone(),
-                boot_info.shard_client_mc_block.clone(),
-                boot_info.ss_keeper_mc_block,
-            )
-            .await?;
-
-        // Start validator manager, which will start validator sessions when necessary
-        start_validator_manager(
-            Arc::clone(&engine) as Arc<dyn EngineOperations>,
-            validator_runtime,
-            vm_config,
-        );
-
-        // Sync by archives
-        if sync_by_archives && !engine.check_sync().await? {
-            engine.set_sync_status(Engine::SYNC_STATUS_SYNC_ARCHIVES);
-            struct Checker;
-            #[async_trait::async_trait]
-            impl crate::sync::StopSyncChecker for Checker {
-                async fn check(&self, engine: &Arc<dyn EngineOperations>) -> bool {
-                    engine.check_sync().await.unwrap_or(false)
-                }
+    let zerostate_path = zerostate_path.map(str::to_owned);
+    let result = crate::types::service_tasks::spawn_owned(
+        engine_ret.as_ref(),
+        "Engine startup",
+        async move {
+            if let Some(mc_seq_no) = truncate_db {
+                engine.truncate_database(mc_seq_no).await?;
             }
-            crate::sync::start_sync(
+            #[cfg(feature = "telemetry")]
+            telemetry_logger(engine.clone())?;
+            #[cfg(all(target_os = "linux", feature = "telemetry"))]
+            proc_status_logger(engine.clone())?;
+
+            // Each constructor is owned before its first poll. A cancelled startup
+            // can neither abandon a live server nor race late registration with stop.
+            if let Some(config) = control_server_config {
+                let owner = engine.clone();
+                engine
+                    .start_owned_server("control", async move {
+                        let server = ControlServer::with_params(
+                            config,
+                            DataSource::Engine(owner.clone()),
+                            owner.network().config_handler(),
+                            owner.network().config_handler(),
+                            Some(owner.network()),
+                        )
+                        .await?;
+                        Ok(Box::new(server) as Box<dyn Stoppable>)
+                    })
+                    .await?;
+            }
+            if let Some(config) = lite_server_config {
+                let owner = engine.clone();
+                engine
+                    .start_owned_server("lite", async move {
+                        let server =
+                            LiteServer::with_params(config, liteserver_runtime, owner).await?;
+                        Ok(Box::new(server) as Box<dyn Stoppable>)
+                    })
+                    .await?;
+            }
+            if let Some(config) = json_rpc_server_config {
+                let owner = engine.clone();
+                engine
+                    .start_owned_server("JSON RPC", async move {
+                        let server = RpcServer::start(config, owner).await?;
+                        Ok(Box::new(server) as Box<dyn Stoppable>)
+                    })
+                    .await?;
+            }
+            if let Some((address, handle)) = metrics {
+                let owner = engine.clone();
+                engine
+                    .start_owned_server("metrics", async move {
+                        Ok(Box::new(start_metrics_server(owner, address, handle).await)
+                            as Box<dyn Stoppable>)
+                    })
+                    .await?;
+            }
+
+            // Overlays
+            let overlays_router =
+                engine.initialize_full_node_overlays(DhtSearchPolicy::default()).await?;
+            overlays_router.update_custom_overlays(Some(&custom_overlays_config)).await?;
+
+            // Boot
+            let mut boot_info =
+                boot(&engine, zerostate_path.as_deref(), configs_dir, pss_downloading_threads)
+                    .await?;
+
+            engine.initialize_queue_manager().await?;
+
+            Engine::start_archives_gc(engine.clone(), boot_info.archives_gc_block)?;
+
+            engine
+                .shard_states_keeper
+                .clone()
+                .start(
+                    engine.clone(),
+                    boot_info.last_applied_mc_block.clone(),
+                    boot_info.shard_client_mc_block.clone(),
+                    boot_info.ss_keeper_mc_block,
+                )
+                .await?;
+
+            // Start validator manager, which will start validator sessions when necessary
+            start_validator_manager(
                 Arc::clone(&engine) as Arc<dyn EngineOperations>,
-                Some(&Checker),
-                None,
-            )
-            .await?;
-            boot_info.last_applied_mc_block = engine
-                .load_last_applied_mc_block_id()?
-                .ok_or_else(|| error!("INTERNAL ERROR: No last applied MC block after sync"))?
-                .deref()
-                .clone();
-            boot_info.shard_client_mc_block = engine
-                .load_shard_client_mc_block_id()?
-                .ok_or_else(|| error!("INTERNAL ERROR: No shard client MC block after sync"))?
-                .deref()
-                .clone();
-        }
+                validator_runtime,
+                vm_config,
+            )?;
 
-        // top shard blocks
-        resend_top_shard_blocks_worker(engine.clone());
+            // Sync by archives
+            if sync_by_archives && !engine.check_sync().await? {
+                engine.set_sync_status(Engine::SYNC_STATUS_SYNC_ARCHIVES);
+                struct Checker;
+                #[async_trait::async_trait]
+                impl crate::sync::StopSyncChecker for Checker {
+                    async fn check(&self, engine: &Arc<dyn EngineOperations>) -> bool {
+                        engine.check_sync().await.unwrap_or(false)
+                    }
+                }
+                crate::sync::start_sync(
+                    Arc::clone(&engine) as Arc<dyn EngineOperations>,
+                    Some(&Checker),
+                    None,
+                )
+                .await?;
+                boot_info.last_applied_mc_block = engine
+                    .load_last_applied_mc_block_id()?
+                    .ok_or_else(|| error!("INTERNAL ERROR: No last applied MC block after sync"))?
+                    .deref()
+                    .clone();
+                boot_info.shard_client_mc_block = engine
+                    .load_shard_client_mc_block_id()?
+                    .ok_or_else(|| error!("INTERNAL ERROR: No shard client MC block after sync"))?
+                    .deref()
+                    .clone();
+            }
 
-        overlays_router.special_update_fastsync_overlays().await?;
+            // top shard blocks
+            resend_top_shard_blocks_worker(engine.clone())?;
 
-        // blocks download clients
-        engine.set_sync_status(Engine::SYNC_STATUS_SYNC_BLOCKS);
-        Engine::check_finish_sync(Arc::clone(&engine));
-        let join_shards = start_shards_client(engine.clone(), boot_info.shard_client_mc_block)?;
-        let join_master =
-            start_masterchain_client(engine.clone(), boot_info.last_applied_mc_block)?;
-        Ok((join_shards, join_master))
-    }
-    .await;
+            overlays_router.special_update_fastsync_overlays().await?;
 
-    match result {
+            // blocks download clients
+            engine.set_sync_status(Engine::SYNC_STATUS_SYNC_BLOCKS);
+            Engine::check_finish_sync(Arc::clone(&engine))?;
+            let join_shards = start_shards_client(engine.clone(), boot_info.shard_client_mc_block)?;
+            let join_master =
+                start_masterchain_client(engine.clone(), boot_info.last_applied_mc_block)?;
+            Ok((join_shards, join_master))
+        },
+    )?
+    .await
+    .map_err(|error| error!("Engine startup join: {error}"))?;
+
+    let result = match result {
         Err(e) => {
             // Always wait for engine stop
             match engine_ret.wait_stop().await {
@@ -2618,12 +3004,14 @@ pub async fn run(
             });
             Ok((engine_ret, join_engine))
         }
-    }
+    };
+    startup_guard.0.take();
+    result
 }
 
 #[cfg(target_os = "linux")]
-fn proc_status_logger() {
-    tokio::spawn(async move {
+fn proc_status_logger(engine: Arc<Engine>) -> Result<tokio::task::AbortHandle> {
+    engine.background_tasks.spawn_cancelable("process status sampler", async move {
         let parse_kb = |line: &str| -> u64 {
             line.split_whitespace().nth(1).and_then(|n| n.parse().ok()).unwrap_or(0)
         };
@@ -2653,12 +3041,13 @@ fn proc_status_logger() {
                 vm_size / 1024,
             );
         }
-    });
+    })
 }
 
 #[cfg(feature = "telemetry")]
-fn telemetry_logger(engine: Arc<Engine>) {
-    tokio::spawn(async move {
+fn telemetry_logger(engine: Arc<Engine>) -> Result<tokio::task::AbortHandle> {
+    let tasks = engine.background_tasks.clone();
+    tasks.spawn_cancelable("telemetry sampler", async move {
         #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
         {
             let dirty: isize =
@@ -2840,7 +3229,7 @@ fn telemetry_logger(engine: Arc<Engine>) {
             }
             engine.telemetry_printer.try_print();
         }
-    });
+    })
 }
 
 pub fn init_prometheus_recorder(
@@ -3300,3 +3689,7 @@ pub(crate) mod parent_apply_tests;
 #[cfg(test)]
 #[path = "tests/test_stopper.rs"]
 mod stopper_tests;
+
+#[cfg(test)]
+#[path = "tests/test_engine_owned_drain.rs"]
+mod owned_drain_tests;

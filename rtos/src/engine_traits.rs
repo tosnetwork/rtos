@@ -1003,6 +1003,16 @@ pub trait EngineOperations: Sync + Send {
 
     // Engine stopping
 
+    /// Atomically register a service before starting its actual worker.
+    fn register_service_task(
+        &self,
+        name: &'static str,
+        mask: u32,
+        start: Box<dyn FnOnce() -> tokio::task::JoinHandle<()> + Send>,
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        rtos_block::fail!("Engine does not provide owned service registration: {name}");
+    }
+
     fn acquire_stop(&self, mask: u32) {
         unimplemented!();
     }

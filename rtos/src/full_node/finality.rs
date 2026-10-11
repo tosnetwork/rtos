@@ -63,6 +63,7 @@ struct Entry {
 /// Owned by one engine generation. Nothing here is persisted as verified proof.
 #[derive(Default)]
 pub(crate) struct PendingFinality {
+    pub(crate) tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
     entries: HashMap<BlockIdExt, VecDeque<Entry>>,
     // Recovery ownership outlives evidence replacement and expiry.
     active: HashMap<BlockIdExt, u64>,
@@ -360,6 +361,8 @@ pub(crate) async fn receive(
     peer: Arc<KeyId>,
     received_bytes: usize,
 ) -> Result<()> {
+    let tasks = store.lock().tasks.clone();
+    let _admission = tasks.enter()?;
     if engine.check_stop() || !engine.need_monitor(broadcast.id.shard())? {
         return Ok(());
     }
@@ -394,9 +397,10 @@ pub(crate) async fn receive(
     };
     if start_worker {
         let mut lease = WorkerLease { store: store.clone(), active: None, counted: true };
-        tokio::spawn(async move {
+        let cancellation = tasks.cancellation().clone();
+        tasks.spawn("finality recovery", async move {
             loop {
-                if engine.check_stop() {
+                if engine.check_stop() || cancellation.is_cancelled() {
                     let mut pending = store.lock();
                     pending.entries.clear();
                     break;
@@ -404,19 +408,38 @@ pub(crate) async fn receive(
                 let work = lease.work(Instant::now());
                 match work {
                     Work::Stop => break,
-                    Work::Sleep(delay) => tokio::time::sleep(delay).await,
+                    Work::Sleep(delay) => tokio::select! {
+                        // Re-enter the stop branch to clear retained retries,
+                        // including verified entries that have no active lease.
+                        _ = cancellation.cancelled() => continue,
+                        _ = tokio::time::sleep(delay) => {},
+                    },
                     Work::Run(id, entry) => {
                         lease.active = Some((id.clone(), entry.generation));
                         let remaining = entry.expires.saturating_duration_since(Instant::now());
                         let result = tokio::select! {
-                            value = tokio::time::timeout(remaining, recover_authenticated(&engine, &id, &entry.signatures, || {
-                                store.lock().mark_verified(&id, entry.generation);
-                            })) => value,
-                            _ = wait_stopped(&engine) => {
+                            value = tokio::time::timeout(remaining, prepare_authenticated(&engine, &id, &entry.signatures)) => value,
+                            _ = async {
+                                tokio::select! {
+                                    _ = cancellation.cancelled() => {},
+                                    _ = wait_stopped(&engine) => {},
+                                }
+                            } => {
                                 store.lock().remove(&id, entry.generation);
                                 lease.active = None;
                                 continue;
                             }
+                        };
+                        // After authentication, store/apply is never selected
+                        // against stop or TTL. Shutdown joins this entire phase.
+                        let result = match result {
+                            Ok(Ok(Some(broadcast))) => {
+                                store.lock().mark_verified(&id, entry.generation);
+                                Ok(commit_authenticated(&engine, &id, broadcast).await)
+                            }
+                            Ok(Ok(None)) => Ok(Ok(false)),
+                            Ok(Err(error)) => Ok(Err(error)),
+                            Err(elapsed) => Err(elapsed),
                         };
                         match result {
                             Ok(Ok(accepted)) => {
@@ -432,7 +455,7 @@ pub(crate) async fn receive(
                     }
                 }
             }
-        });
+        })?;
     }
     Ok(())
 }
@@ -449,15 +472,17 @@ async fn recover(
     id: &BlockIdExt,
     signatures: &NetworkSignatureSet,
 ) -> Result<()> {
-    recover_authenticated(engine, id, signatures, || {}).await.map(|_| ())
+    if let Some(broadcast) = prepare_authenticated(engine, id, signatures).await? {
+        commit_authenticated(engine, id, broadcast).await?;
+    }
+    Ok(())
 }
 
-async fn recover_authenticated(
+async fn prepare_authenticated(
     engine: &Arc<dyn EngineOperations>,
     id: &BlockIdExt,
     signatures: &NetworkSignatureSet,
-    authenticated: impl FnOnce(),
-) -> Result<bool> {
+) -> Result<Option<BlockBroadcastV2>> {
     // This is ordinary authenticated block download, independent of whether a
     // Plumtree notification was dropped, duplicated or never subscribed to.
     let (block, proof) = engine.download_block(id, Some(1)).await?;
@@ -481,26 +506,29 @@ async fn recover_authenticated(
             .await?;
             if let Err(error) = context.verify_network(pq) {
                 log::debug!("Discarding invalid pending finality for {id}: {error}");
-                return Ok(false);
+                return Ok(None);
             }
         }
         NetworkSignatureSet::Classical(classical) => {
             super::shard_client::validate_brodcast_v2(classical, &state, id)?;
         }
     }
-    authenticated();
-    // V2 repeats signature/proof authentication before the first store/apply.
-    // A notarization remains a shard pre-apply input, never a final proof.
-    super::shard_client::process_recovered_block_broadcast_v2(
-        engine,
-        BlockBroadcastV2 {
-            id: id.clone(),
-            signatures: signatures.clone(),
-            proof: proof.data().to_vec(),
-            data: block.data().to_vec(),
-        },
-    )
-    .await?;
+    Ok(Some(BlockBroadcastV2 {
+        id: id.clone(),
+        signatures: signatures.clone(),
+        proof: proof.data().to_vec(),
+        data: block.data().to_vec(),
+    }))
+}
+
+async fn commit_authenticated(
+    engine: &Arc<dyn EngineOperations>,
+    id: &BlockIdExt,
+    broadcast: BlockBroadcastV2,
+) -> Result<bool> {
+    // Re-authentication and all persistence/application finish without an
+    // external cancellation boundary once the authenticated phase is admitted.
+    super::shard_client::process_recovered_block_broadcast_v2(engine, broadcast).await?;
     let handle = engine
         .load_block_handle(id)?
         .ok_or_else(|| rtos_block::error!("Recovered finality block has no stored handle"))?;

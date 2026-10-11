@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 #[derive(Default)]
 struct LifecycleEngine {
+    services: std::sync::OnceLock<crate::types::service_tasks::ServiceTasks>,
     status: AtomicU8,
     persisted: std::sync::Mutex<HashSet<UInt256>>,
     acquired: std::sync::atomic::AtomicBool,
@@ -27,6 +28,17 @@ struct StateGate {
 
 #[async_trait::async_trait]
 impl EngineOperations for LifecycleEngine {
+    fn register_service_task(
+        &self,
+        name: &'static str,
+        mask: u32,
+        start: Box<dyn FnOnce() -> tokio::task::JoinHandle<()> + Send>,
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        self.services
+            .get_or_init(|| crate::types::service_tasks::ServiceTasks::new(self.stopper.clone()))
+            .register(name, mask, start)
+    }
+
     fn remove_last_validation_time(&self, _: &ShardIdent) {}
     fn remove_last_collation_time(&self, _: &ShardIdent) {}
     fn destroy_block_candidates(&self, _: &UInt256) -> Result<bool> {
@@ -102,7 +114,8 @@ async fn test_manager_lifecycle_service_mask_and_restart_refused_after_teardown_
             engine.clone(),
             tokio::runtime::Handle::current(),
             ValidatorManagerConfig::default(),
-        );
+        )
+        .unwrap();
         tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
         assert!(engine.acquired.load(Ordering::Acquire));
         assert_eq!(engine.released.load(Ordering::Acquire), !failing);
@@ -378,7 +391,8 @@ async fn test_manager_lifecycle_invocation_panic_drains_before_terminal_failure(
         engine.clone(),
         tokio::runtime::Handle::current(),
         ValidatorManagerConfig::default(),
-    );
+    )
+    .unwrap();
     tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
     assert_eq!(engine.invocations.load(Ordering::Relaxed), 1);
     assert!(!engine.released.load(Ordering::Acquire));

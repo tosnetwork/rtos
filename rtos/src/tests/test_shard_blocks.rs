@@ -119,7 +119,11 @@ async fn test_shard_blocks_pool() {
         &engine.engine_allocated,
     )
     .unwrap();
-    save_top_shard_blocks_worker(engine.clone(), receiver);
+    save_top_shard_blocks_worker(
+        engine.clone(),
+        receiver,
+        tokio_util::sync::CancellationToken::new(),
+    );
 
     // TODO: prepare proper masterchain state
     let mc_ss = make_shard_state();
@@ -204,7 +208,11 @@ async fn test_shard_blocks_pool_threads() {
         &engine.engine_allocated,
     )
     .unwrap();
-    save_top_shard_blocks_worker(engine.clone(), receiver);
+    save_top_shard_blocks_worker(
+        engine.clone(),
+        receiver,
+        tokio_util::sync::CancellationToken::new(),
+    );
     let pool = Arc::new(pool);
 
     let threads = 500;

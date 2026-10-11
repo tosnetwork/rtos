@@ -7,6 +7,20 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+/// The router encapsulates work with full node overlays at the logical level. It abstracts creation,
+/// deletion, and getting of specific overlay clients from higher-level classes. For lower-level
+/// classes, overlays are physical entities not tied to shards or other blockchain entities.
+///
+/// ValidatorManager  Collator  ValidatorQuery  etc.   <- high level node commponents
+///       v              v             v
+///                 Engine
+///                  v ^
+///         **FullNodeOverlaysRouter** contains list of FullNodeOverlayClient
+///                    v
+///               NodeNetwork                   <- low level node components
+///                    v
+///            network protocols
+use crate::types::owned_tasks::OwnedTasks;
 use crate::{
     block::BlockStuff,
     block_proof::{BlockProofStuff, BootstrapAuthority},
@@ -28,7 +42,7 @@ use crate::{
 #[cfg(feature = "xp25")]
 use adnl::OverlayNode;
 use adnl::{
-    common::{add_unbound_object_to_map_with_update, spawn_cancelable, TaggedByteSlice},
+    common::{add_unbound_object_to_map_with_update, TaggedByteSlice},
     node::AdnlSendMethod,
     DhtSearchPolicy, OverlayUtils,
 };
@@ -106,15 +120,22 @@ struct FastSyncSnapshot {
 
 pub struct FullNodeOverlaysRouter {
     engine: Arc<dyn EngineOperations>,
+    tasks: Arc<OwnedTasks>,
+    #[cfg(test)]
+    pub(crate) init_gate:
+        std::sync::Mutex<Option<Arc<crate::network::overlay_client::OverlayInitGate>>>,
     network: Arc<NodeNetwork>,
     service: Arc<FullNodeOverlayService>,
     policy: DhtSearchPolicy,
+    public_generations:
+        std::sync::Mutex<std::collections::HashMap<ShardIdent, Arc<tokio::sync::Mutex<()>>>>,
     public_overlays: lockfree::map::Map<ShardIdent, Arc<FullNodeOverlayClient>>,
     fast_sync_overlays: lockfree::map::Map<ShardIdent, Arc<FastSyncOverlayClient>>,
     custom_overlays: lockfree::map::Map<String, Arc<CustomOverlayClient>>,
     public_overlays_awaiters: AwaitersPool<ShardIdent, Arc<FullNodeOverlayClient>>,
     fast_sync_snapshot: tokio::sync::Mutex<Option<FastSyncSnapshot>>,
     fast_sync_refresh: tokio::sync::Mutex<()>,
+    fast_sync_retiring: Arc<std::sync::Mutex<Vec<Arc<FastSyncOverlayClient>>>>,
     #[cfg(test)]
     fast_sync_refresh_gate: std::sync::Mutex<
         Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
@@ -129,6 +150,7 @@ pub struct FullNodeOverlaysRouter {
 // Keeps a partially constructed generation unreachable through the router and
 // revokes all completed registrations if construction fails or is cancelled.
 struct PendingFastSync {
+    retiring: Arc<std::sync::Mutex<Vec<Arc<FastSyncOverlayClient>>>>,
     overlays: Vec<(ShardIdent, Arc<FastSyncOverlayClient>)>,
     cancellation: tokio_util::sync::CancellationToken,
     committed: bool,
@@ -138,7 +160,9 @@ impl Drop for PendingFastSync {
     fn drop(&mut self) {
         if !self.committed {
             self.cancellation.cancel();
-            for (_, overlay) in &self.overlays {
+            let mut retiring = self.retiring.lock().unwrap();
+            for (_, overlay) in self.overlays.drain(..) {
+                retiring.push(overlay.clone());
                 overlay.stop();
             }
         }
@@ -146,12 +170,13 @@ impl Drop for PendingFastSync {
 }
 
 impl FullNodeOverlaysRouter {
-    pub async fn new(
+    pub fn create(
         engine: Arc<dyn EngineOperations>,
         network: Arc<NodeNetwork>,
         policy: DhtSearchPolicy,
     ) -> Result<Arc<Self>> {
-        let service = Arc::new(FullNodeOverlayService::new(engine.clone(), false)); // compression = false
+        let tasks = Arc::new(OwnedTasks::new(network.cancellation_token().child_token()));
+        let service = Arc::new(FullNodeOverlayService::new(engine.clone(), false, tasks.clone())); // compression = false
         let public_overlays_awaiters = AwaitersPool::new(
             "public_overlays_awaiters",
             #[cfg(feature = "telemetry")]
@@ -159,17 +184,22 @@ impl FullNodeOverlaysRouter {
             engine.engine_allocated().clone(),
         );
         let actual_monitor_min_split = AtomicU8::new(engine.get_monitor_min_split());
-        let overlays_router = Arc::new(Self {
+        Ok(Arc::new(Self {
+            tasks,
+            #[cfg(test)]
+            init_gate: std::sync::Mutex::new(None),
             engine,
             network,
             service,
             policy,
+            public_generations: Default::default(),
             public_overlays: lockfree::map::Map::new(),
             fast_sync_overlays: lockfree::map::Map::new(),
             custom_overlays: lockfree::map::Map::new(),
             public_overlays_awaiters,
             fast_sync_snapshot: tokio::sync::Mutex::new(None),
             fast_sync_refresh: tokio::sync::Mutex::new(()),
+            fast_sync_retiring: Default::default(),
             #[cfg(test)]
             fast_sync_refresh_gate: std::sync::Mutex::new(None),
             monitor_min_split_for_fast_sync: AtomicU8::new(0),
@@ -177,12 +207,79 @@ impl FullNodeOverlaysRouter {
             actual_monitor_min_split,
             monitor_min_split_worker_started: AtomicBool::new(false),
             fast_sync_peer_resolver: tokio::sync::Mutex::new(None),
-        });
+        }))
+    }
+
+    pub async fn initialize(self: &Arc<Self>) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         futures::try_join!(
-            overlays_router.overlay_client(&ShardIdent::MASTERCHAIN),
-            overlays_router.overlay_client(&ShardIdent::BASE_WORKCHAIN)
+            self.overlay_client(&ShardIdent::MASTERCHAIN),
+            self.overlay_client(&ShardIdent::BASE_WORKCHAIN)
         )?;
-        Ok(overlays_router)
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_test_auxiliary_listeners(
+        self: &Arc<Self>,
+    ) -> Result<Vec<tokio::sync::oneshot::Sender<()>>> {
+        use rtos_api::ton::engine::validator::customoverlaynode::CustomOverlayNode;
+        use rtos_block::{Ed25519KeyOption, SigPubKey, UInt256, ZeroizingBytes};
+        let local = self.network.context().stack.adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)?;
+        let peer = Ed25519KeyOption::<ZeroizingBytes>::generate()?;
+        let validators = ValidatorSet::new(
+            0,
+            u32::MAX,
+            2,
+            vec![
+                ValidatorDescr::with_params(
+                    SigPubKey::from_bytes(local.pub_key()?)?,
+                    1,
+                    Some(UInt256::from_slice(local.id().data())),
+                ),
+                ValidatorDescr::with_params(
+                    SigPubKey::from_bytes(peer.pub_key()?)?,
+                    1,
+                    Some(UInt256::from_slice(peer.id().data())),
+                ),
+            ],
+        )?;
+        self.update_fast_sync_overlays(
+            &ValidatorSet::default(),
+            &validators,
+            &ValidatorSet::default(),
+            0,
+            Some(&local),
+            false,
+            false,
+        )
+        .await?;
+        let config = CustomOverlay {
+            name: "owned-drain-test".into(),
+            nodes: vec![local.id(), peer.id()]
+                .into_iter()
+                .map(|id| CustomOverlayNode {
+                    adnl_id: UInt256::from_slice(id.data()),
+                    msg_sender: true.into(),
+                    msg_sender_priority: 0,
+                    block_sender: true.into(),
+                })
+                .collect(),
+            sender_shards: vec![(&ShardIdent::MASTERCHAIN).into()],
+            skip_public_msg_send: false.into(),
+            use_quic: false.into(),
+        };
+        self.update_custom_overlays(Some(&[config])).await?;
+        self.update_public_overlays(self.engine.zerostate_id()?, 0).await?;
+        let mut gates = Vec::new();
+        for entry in self.fast_sync_overlays.iter() {
+            gates.push(entry.val().hold_listener_exit());
+        }
+        for entry in self.custom_overlays.iter() {
+            gates.push(entry.val().hold_listener_exit());
+        }
+        assert_eq!(gates.len(), 3, "two fast-sync and one active custom listener");
+        Ok(gates)
     }
 
     #[cfg(test)]
@@ -204,6 +301,10 @@ impl FullNodeOverlaysRouter {
         self: &Arc<Self>,
         shard: ShardIdent,
     ) -> Result<Arc<FullNodeOverlayClient>> {
+        let _admission = self.tasks.enter()?;
+        let generation =
+            self.public_generations.lock().unwrap().entry(shard.clone()).or_default().clone();
+        let _generation = generation.lock().await;
         loop {
             match self.public_overlays.get(&shard) {
                 Some(guard) => {
@@ -212,7 +313,14 @@ impl FullNodeOverlaysRouter {
                         return Ok(client.clone());
                     } else if client.overlay_client().is_died() {
                         log::debug!("Overlay client {} is dead - will be recreated", shard);
-                        self.public_overlays.remove(&shard);
+                        client.stop_and_wait().await?;
+                        if self
+                            .public_overlays
+                            .get(&shard)
+                            .is_some_and(|current| Arc::ptr_eq(current.val(), client))
+                        {
+                            self.public_overlays.remove(&shard);
+                        }
                     } else {
                         log::debug!(
                             "Overlay client {} was not died yet - will be activated",
@@ -246,20 +354,33 @@ impl FullNodeOverlaysRouter {
                                 id,
                                 base64_encode(id_full)
                             );
+                            #[cfg(test)]
+                            let gate = if shard == ShardIdent::BASE_WORKCHAIN {
+                                self.init_gate.lock().unwrap().clone()
+                            } else {
+                                None
+                            };
                             let client = OverlayClient::new_public(
                                 id,
                                 id_full,
                                 self.network.context().clone(),
-                                self.network.cancellation_token().child_token(),
+                                self.tasks.cancellation().child_token(),
                                 self.policy.clone(),
                                 self.network.default_rldp_roundtrip(),
+                                self.tasks.clone(),
+                                #[cfg(test)]
+                                gate,
                             )
                             .await?;
-                            client.add_consumer(self.service.clone())?;
+                            if let Err(error) = client.add_consumer(self.service.clone()) {
+                                let _ = client.delete();
+                                return Err(error);
+                            }
                             let fullnode_client = FullNodeOverlayClient::new(
                                 self.engine.clone(),
                                 client,
                                 shard.clone(),
+                                self.tasks.clone(),
                             )?;
                             self.public_overlays.insert(shard.clone(), fullnode_client.clone());
 
@@ -300,7 +421,8 @@ impl FullNodeOverlaysRouter {
             result
         }
 
-        spawn_cancelable(self.network.cancellation_token().child_token(), async move {
+        let tasks = self.tasks.clone();
+        let _ = tasks.spawn_cancelable("monitor min split", async move {
             log::info!(
                 "Starting monitor min split worker: last observed keyblock {}, monitor min split {}",
                 last_known_keyblock_id, last_known_monitor_min_split
@@ -331,6 +453,7 @@ impl FullNodeOverlaysRouter {
         keyblock_id: &BlockIdExt,
         new_mms: u8,
     ) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         check_monitor_min_split(new_mms)?;
         // Serialize updates and commit the cursor only after overlay work
         // succeeds, so a failed creation can be retried at the same key block.
@@ -389,6 +512,7 @@ impl FullNodeOverlaysRouter {
     }
 
     pub(crate) async fn special_update_fastsync_overlays(self: &Arc<Self>) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         if self.network.context().stack.overlay.wire_profile() == rtos_api::WireProfile::T0 {
             return self.refresh_fast_sync_from_applied_state().await;
         }
@@ -529,11 +653,13 @@ impl FullNodeOverlaysRouter {
         };
 
         // 4) Start periodic_store_ip_addr to DHT
-        NodeNetwork::start_periodic_store_ip_addr(
-            self.network.context().stack.dht.clone(),
-            adnl_key.clone(),
-            self.network.cancellation_token().child_token(),
-        );
+        self.tasks.spawn_handle("fast-sync DHT address announcements", || {
+            NodeNetwork::start_periodic_store_ip_addr(
+                self.network.context().stack.dht.clone(),
+                adnl_key.clone(),
+                self.tasks.cancellation().child_token(),
+            )
+        })?;
 
         // In update_fast_sync_overlays:
         // 5) Resolve peers and 6) create fast sync overlays
@@ -567,6 +693,7 @@ impl FullNodeOverlaysRouter {
         config: &ConfigParams,
         applied_id: Option<BlockIdExt>,
     ) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         let mut binding = FastSyncRefreshBinding {
             transport_revision: self.network.config_handler().validator_transport_revision()?,
             applied_id,
@@ -583,9 +710,10 @@ impl FullNodeOverlaysRouter {
                         selected.key
                     }),
                     Err(error) => {
+                        let _admission = self.tasks.enter()?;
                         let mut installed = self.fast_sync_snapshot.lock().await;
                         *installed = None;
-                        self.clear_fast_sync_overlays();
+                        self.clear_fast_sync_overlays().await?;
                         if let Some(resolver) = self.fast_sync_peer_resolver.lock().await.take() {
                             resolver.cancel();
                         }
@@ -624,6 +752,7 @@ impl FullNodeOverlaysRouter {
     }
 
     pub async fn update_custom_overlays(&self, configs: Option<&[CustomOverlay]>) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         if let Some(configs) = configs {
             for config in configs {
                 add_unbound_object_to_map_with_update(
@@ -640,9 +769,10 @@ impl FullNodeOverlaysRouter {
                             log::info!("Creating custom overlay \"{}\"", config.name);
                             Ok(Some(CustomOverlayClient::new(
                                 config,
-                                self.network.cancellation_token().child_token(),
+                                self.tasks.cancellation().child_token(),
                                 self.network.context().stack.clone(),
                                 self.engine.clone(),
+                                self.tasks.clone(),
                             )?))
                         }
                     },
@@ -656,7 +786,7 @@ impl FullNodeOverlaysRouter {
             if let Some(configs) = configs {
                 if !configs.iter().any(|c| &c.name == name) {
                     log::info!("Deleting custom overlay \"{}\"", name);
-                    guard.val().stop();
+                    guard.val().stop_and_wait().await?;
                     to_remove.push(name.clone());
                     continue;
                 }
@@ -706,6 +836,7 @@ impl FullNodeOverlaysRouter {
         shard_use_quic: bool,
         binding: Option<&FastSyncRefreshBinding>,
     ) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         let mut installed = self.fast_sync_snapshot.lock().await;
         self.publish_fast_sync(binding, || Ok(()))?;
         let desired = FastSyncSnapshot {
@@ -723,7 +854,7 @@ impl FullNodeOverlaysRouter {
         // Revoke the old generation before installing any new authority. On
         // failure the snapshot stays unset, so the same input is retried.
         *installed = None;
-        self.clear_fast_sync_overlays();
+        self.clear_fast_sync_overlays().await?;
         if let Some(previous) = self.fast_sync_peer_resolver.lock().await.take() {
             previous.cancel();
         }
@@ -735,8 +866,9 @@ impl FullNodeOverlaysRouter {
             });
         };
         let mut pending = PendingFastSync {
+            retiring: self.fast_sync_retiring.clone(),
             overlays: Vec::new(),
-            cancellation: self.network.cancellation_token().child_token(),
+            cancellation: self.tasks.cancellation().child_token(),
             committed: false,
         };
         let result: Result<()> = async {
@@ -766,6 +898,7 @@ impl FullNodeOverlaysRouter {
                     self.policy.clone(),
                     self.network.default_rldp_roundtrip(),
                     use_quic,
+                    self.tasks.clone(),
                 )
             };
 
@@ -803,14 +936,16 @@ impl FullNodeOverlaysRouter {
                         to_resolve.len()
                     );
                     let token = pending.cancellation.child_token();
-                    NodeNetwork::spawn_overlay_peer_resolver(
-                        local_key_id.clone(),
-                        to_resolve,
-                        self.network.context().stack.dht.clone(),
-                        self.network.context().stack.overlay.clone(),
-                        token.clone(),
-                        "fastsync".to_string(),
-                    );
+                    self.tasks.spawn_handle("fast-sync peer resolver", || {
+                        NodeNetwork::spawn_overlay_peer_resolver(
+                            local_key_id.clone(),
+                            to_resolve,
+                            self.network.context().stack.dht.clone(),
+                            self.network.context().stack.overlay.clone(),
+                            token.clone(),
+                            "fastsync".to_string(),
+                        )
+                    })?;
                     *slot = Some(token);
                 }
             }
@@ -838,7 +973,7 @@ impl FullNodeOverlaysRouter {
         }
         .await;
         if let Err(error) = result {
-            self.clear_fast_sync_overlays();
+            self.clear_fast_sync_overlays().await?;
             if let Some(resolver) = self.fast_sync_peer_resolver.lock().await.take() {
                 resolver.cancel();
             }
@@ -881,14 +1016,23 @@ impl FullNodeOverlaysRouter {
             .ok_or_else(|| error!(RetryFastSyncRefresh))?
     }
 
-    fn clear_fast_sync_overlays(&self) {
+    async fn clear_fast_sync_overlays(&self) -> Result<()> {
         let shards: Vec<_> =
             self.fast_sync_overlays.iter().map(|entry| entry.key().clone()).collect();
         for shard in shards {
             if let Some(old) = self.fast_sync_overlays.remove(&shard) {
+                // Register before stopping or awaiting: cancelled refreshes must
+                // drain this generation before creating its replacement.
+                self.fast_sync_retiring.lock().unwrap().push(old.val().clone());
                 old.val().stop();
             }
         }
+        let retiring = self.fast_sync_retiring.lock().unwrap().clone();
+        for old in retiring {
+            old.stop_and_wait().await?;
+            self.fast_sync_retiring.lock().unwrap().retain(|entry| !Arc::ptr_eq(entry, &old));
+        }
+        Ok(())
     }
 
     // The full-node ADNL identity and unexpired classical validator transport
@@ -1024,6 +1168,7 @@ impl FullNodeOverlaysRouter {
         proof: &BlockProofStuff,
         signatures: &BlockSignaturesVariant,
     ) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         log::debug!("Sending block broadcast {}...", block.id());
 
         let mut custom_overlays = vec![];
@@ -1130,6 +1275,7 @@ impl FullNodeOverlaysRouter {
         self: &Arc<Self>,
         tbd: Arc<TopBlockDescrStuff>,
     ) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         log::debug!("Sending top shard blocks broadcast {}...", tbd.proof_for());
 
         let broadcast = TaggedByteSlice {
@@ -1158,6 +1304,7 @@ impl FullNodeOverlaysRouter {
         to: &AccountIdPrefixFull,
         data: &[u8],
     ) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         let broadcast = TaggedByteSlice {
             object: &self.network.context().stack.overlay.wire_profile().serialize(
                 &ExternalMessageBroadcast { message: ExternalMessage { data: data.to_vec() } }
@@ -1193,6 +1340,7 @@ impl FullNodeOverlaysRouter {
         validator_set_hash: u32,
         block_root: &Cell,
     ) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         let mut custom_overlays = vec![];
         for guard in self.custom_overlays.iter() {
             let overlay = guard.val();
@@ -1247,6 +1395,7 @@ impl FullNodeOverlaysRouter {
         msg_count: u32,
         limits: ImportedMsgQueueLimits,
     ) -> Result<()> {
+        let _admission = self.tasks.enter()?;
         if let Some(client) = self.fast_sync_overlay(&dst_shard) {
             log::debug!("Sending out msg queue proof broadcast {} for shard {}...", id, dst_shard);
             let broadcast = OutMsgQueueProofBroadcast {
@@ -1281,8 +1430,32 @@ impl FullNodeOverlaysRouter {
         Ok(())
     }
 
-    pub fn delete_overlays(&self) {
+    pub fn stop(&self) {
+        self.tasks.stop();
+        self.delete_overlays();
+    }
+
+    pub async fn stop_and_wait(&self) -> Result<()> {
+        self.stop();
+        // Includes admitted constructors and all real worker joins, even for
+        // clients already retired or whose constructor was cancelled.
+        let _ = self.tasks.wait().await;
+        self.delete_overlays();
+        for key in self.public_overlays.iter().map(|g| g.key().clone()).collect::<Vec<_>>() {
+            self.public_overlays.remove(&key);
+        }
+        for key in self.fast_sync_overlays.iter().map(|g| g.key().clone()).collect::<Vec<_>>() {
+            self.fast_sync_overlays.remove(&key);
+        }
+        for key in self.custom_overlays.iter().map(|g| g.key().clone()).collect::<Vec<_>>() {
+            self.custom_overlays.remove(&key);
+        }
+        self.tasks.wait().await
+    }
+
+    fn delete_overlays(&self) {
         for guard in self.public_overlays.iter() {
+            guard.val().stop();
             let id = guard.val().overlay_client().id();
             log::info!("Deleting public overlay {}", id);
             match guard.val().overlay_client().delete() {
@@ -1293,6 +1466,9 @@ impl FullNodeOverlaysRouter {
         for guard in self.fast_sync_overlays.iter() {
             let id = guard.val().id();
             log::info!("Deleting fast sync overlay {} {}", guard.key(), id);
+            guard.val().stop();
+        }
+        for guard in self.custom_overlays.iter() {
             guard.val().stop();
         }
     }

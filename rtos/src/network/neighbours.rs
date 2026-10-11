@@ -1,3 +1,4 @@
+use crate::types::owned_tasks::OwnedTasks;
 /*
  * RTOS project modifications (2026-10-10): project and crate naming.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
@@ -56,6 +57,7 @@ pub struct Neighbours {
     all_attempts: AtomicU64,
     start: Instant,
     cancellation_token: tokio_util::sync::CancellationToken,
+    tasks: Arc<OwnedTasks>,
 }
 
 pub const PROTOCOL_VERSION_MAJOR: i32 = 2;
@@ -87,7 +89,7 @@ impl Display for Neighbour {
 }
 
 impl Neighbour {
-    pub fn new(id: Arc<KeyId>, default_rldp_roundtrip: u32) -> Self {
+    pub(crate) fn new(id: Arc<KeyId>, default_rldp_roundtrip: u32) -> Self {
         Self {
             id,
             last_ping: AtomicU64::new(0),
@@ -243,12 +245,13 @@ impl Neighbours {
     const TIMEOUT_PING_MAX: Duration = Duration::from_millis(Self::TIMEOUT_PING_MAX_MS);
     const TIMEOUT_PING_MIN: Duration = Duration::from_millis(10);
 
-    pub fn new(
+    pub(crate) fn new(
         start_peers: &[Arc<KeyId>],
         overlay: &Arc<OverlayNode>,
         overlay_id: Arc<OverlayShortId>,
         default_rldp_roundtrip: &Option<u32>,
         cancellation_token: tokio_util::sync::CancellationToken,
+        tasks: Arc<OwnedTasks>,
     ) -> Result<Self> {
         let default_rldp_roundtrip =
             default_rldp_roundtrip.unwrap_or(Self::DEFAULT_RLDP_ROUNDTRIP_MS);
@@ -262,6 +265,7 @@ impl Neighbours {
             all_attempts: AtomicU64::new(0),
             start: Instant::now(),
             cancellation_token,
+            tasks,
         };
         Ok(ret)
     }
@@ -574,12 +578,18 @@ impl Neighbours {
             let wait_cloned = wait.clone();
             let mut count = wait.request();
             peer.set_last_ping(self.start.elapsed().as_millis() as u64);
-            tokio::spawn(async move {
-                if let Err(e) = self_cloned.update_capabilities(peer, ping_reserve).await {
-                    log::debug!("{}; ping_idx #{}", e, ping_idx)
-                }
-                wait_cloned.respond(Some(()));
-            });
+            if self
+                .tasks
+                .spawn_cancelable("neighbour capability ping", async move {
+                    if let Err(e) = self_cloned.update_capabilities(peer, ping_reserve).await {
+                        log::debug!("{}; ping_idx #{}", e, ping_idx)
+                    }
+                    wait_cloned.respond(Some(()));
+                })
+                .is_err()
+            {
+                return;
+            }
             while count >= max_count {
                 wait.wait(&mut queue_reader, false).await;
                 count -= 1;
@@ -881,7 +891,7 @@ struct ReserveNeighbours {
 }
 
 impl ReserveNeighbours {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         ReserveNeighbours { last_ping: AtomicU64::new(0), reserve: lockfree::map::Map::new() }
     }
 

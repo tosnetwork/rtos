@@ -8,8 +8,10 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    engine_traits::EngineOperations, internal_db::state_gc_resolver::AllowStateGcSmartResolver,
-    types::awaiters_pool::AwaitersPool, validator::out_msg_queue::build_proofs,
+    engine_traits::EngineOperations,
+    internal_db::state_gc_resolver::AllowStateGcSmartResolver,
+    types::{awaiters_pool::AwaitersPool, owned_tasks::OwnedTasks},
+    validator::out_msg_queue::build_proofs,
 };
 use rtos_api::ton::ton_node::OutMsgQueueProof;
 use rtos_block::{
@@ -58,6 +60,7 @@ impl ShardNeighbours {
 
 pub struct OutMsgQueueManager {
     engine: Arc<dyn EngineOperations>,
+    tasks: OwnedTasks,
     queue_awaiters: AwaitersPool<ShardNeighbours, HashMap<BlockIdExt, OutMsgQueueInfo>>,
     request_id: AtomicU64,
     max_bytes_limit: AtomicU32,
@@ -73,8 +76,9 @@ pub struct OutMsgQueueManager {
 }
 
 impl OutMsgQueueManager {
-    pub async fn new(engine: Arc<dyn EngineOperations>) -> Result<Arc<Self>> {
-        let manager = Arc::new(Self {
+    pub fn create(engine: Arc<dyn EngineOperations>) -> Arc<Self> {
+        Arc::new(Self {
+            tasks: OwnedTasks::new(tokio_util::sync::CancellationToken::new()),
             queues_cache: lockfree::map::Map::new(),
             requests_cache: lockfree::map::Map::new(),
             queue_awaiters: AwaitersPool::new(
@@ -88,21 +92,42 @@ impl OutMsgQueueManager {
             max_bytes_limit: AtomicU32::new(0),
             max_messages_limit: AtomicU32::new(0),
             cache_resolver: Arc::new(AllowStateGcSmartResolver::new(0)),
-        });
-        let last_mc_state = manager.engine.load_last_applied_mc_state().await?;
-        manager.apply_config(last_mc_state.config_params()?)?;
-        let manager_clone = manager.clone();
-        tokio::spawn(async move {
+        })
+    }
+
+    pub async fn initialize(self: &Arc<Self>) -> Result<()> {
+        let _admission = self.tasks.enter()?;
+        let last_mc_state = tokio::select! {
+            biased;
+            _ = self.tasks.cancellation().cancelled() => fail!("Queue manager initialization stopped"),
+            result = self.engine.load_last_applied_mc_state() => result?,
+        };
+        self.apply_config(last_mc_state.config_params()?)?;
+        let manager = self.clone();
+        // This worker only reads storage and changes its own caches. Cancelling
+        // a pending read or retry is safe; the join supervisor is never cancelled.
+        self.tasks.spawn_cancelable("out-message queue cache cleaner", async move {
             loop {
-                if let Err(e) = manager_clone.clean_cache_worker().await {
+                if manager.engine.check_stop() {
+                    break;
+                }
+                if let Err(e) = manager.clean_cache_worker().await {
                     log::error!("OutMsgQueueManager unexpected error in clean_cache_worker: {}", e);
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 } else {
                     break;
                 }
             }
-        });
-        Ok(manager)
+        })?;
+        Ok(())
+    }
+
+    pub fn stop(&self) {
+        self.tasks.stop();
+    }
+
+    pub async fn stop_and_wait(&self) -> Result<()> {
+        self.tasks.wait().await
     }
 
     #[allow(dead_code)]
@@ -482,3 +507,7 @@ impl OutMsgQueueManager {
         Ok(queues)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_out_msg_queue_lifecycle.rs"]
+mod lifecycle_tests;

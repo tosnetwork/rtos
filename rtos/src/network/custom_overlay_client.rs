@@ -14,9 +14,10 @@ use crate::{
         decompress_and_check_candidate_data_v2, decompress_block_broadcast,
         decompress_block_broadcast_v2, node_network::NodeNetwork,
     },
+    types::owned_tasks::OwnedTasks,
 };
 use adnl::{
-    common::{hash, spawn_cancelable, TaggedByteSlice},
+    common::{hash, TaggedByteSlice},
     BroadcastRecvInfo, NetworkStack, OverlayNode, OverlayParams, OverlayShortId,
 };
 use rtos_api::{
@@ -54,14 +55,20 @@ pub struct CustomOverlayClient {
     is_active: AtomicBool,
     is_msg_sender: AtomicBool,
     is_block_sender: AtomicBool,
+    tasks: Arc<OwnedTasks>,
+    #[cfg(test)]
+    exit_gate: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    activation: std::sync::Mutex<()>,
+    deleted: AtomicBool,
 }
 
 impl CustomOverlayClient {
-    pub fn new(
+    pub(crate) fn new(
         config: &CustomOverlay,
         cancellation_token: tokio_util::sync::CancellationToken,
         stack: Arc<NetworkStack>,
         engine: Arc<dyn EngineOperations>,
+        owner: Arc<OwnedTasks>,
     ) -> Result<Arc<Self>> {
         let quic_available = stack.quic.is_some();
         let mut nodes = HashMap::new();
@@ -97,13 +104,25 @@ impl CustomOverlayClient {
             use_quic,
             stack,
             engine,
+            tasks: Arc::new(OwnedTasks::child(owner, cancellation_token.clone())),
+            activation: std::sync::Mutex::new(()),
+            deleted: AtomicBool::new(false),
+            #[cfg(test)]
+            exit_gate: std::sync::Mutex::new(None),
             cancellation_token,
             is_active: AtomicBool::new(false),
             is_msg_sender: AtomicBool::new(false),
             is_block_sender: AtomicBool::new(false),
         });
 
-        if result.clone().try_activate()? {
+        let activated = match result.clone().try_activate() {
+            Ok(active) => active,
+            Err(error) => {
+                result.stop();
+                return Err(error);
+            }
+        };
+        if activated {
             log::info!("Custom overlay \"{}\" with id {} created", config.name, result.id);
         } else {
             log::info!(
@@ -116,6 +135,8 @@ impl CustomOverlayClient {
     }
 
     pub fn try_activate(self: Arc<Self>) -> Result<bool> {
+        let _activation = self.activation.lock().unwrap();
+        let _admission = self.tasks.enter()?;
         let mut attempt = 0;
         loop {
             if self.is_active.load(Ordering::Relaxed) {
@@ -150,15 +171,17 @@ impl CustomOverlayClient {
             }
             let subscription = self.stack.overlay.subscribe_broadcast(&self.id)?;
             self.is_active.store(true, Ordering::Relaxed);
-            self.clone().listen_broadcasts(subscription);
-            NodeNetwork::spawn_overlay_peer_resolver(
-                key.id().clone(),
-                self.nodes.keys().cloned().collect(),
-                self.stack.dht.clone(),
-                self.stack.overlay.clone(),
-                self.cancellation_token.child_token(),
-                format!("custom overlay {}", self.id),
-            );
+            self.clone().listen_broadcasts(subscription)?;
+            self.tasks.spawn_handle("custom overlay peer resolver", || {
+                NodeNetwork::spawn_overlay_peer_resolver(
+                    key.id().clone(),
+                    self.nodes.keys().cloned().collect(),
+                    self.stack.dht.clone(),
+                    self.stack.overlay.clone(),
+                    self.cancellation_token.child_token(),
+                    format!("custom overlay {}", self.id),
+                )
+            })?;
             log::info!("Custom overlay \"{}\" with id {} activated", self.config.name, self.id);
             return Ok(true);
         }
@@ -169,12 +192,30 @@ impl CustomOverlayClient {
         &self.id
     }
 
+    #[cfg(test)]
+    pub(crate) fn hold_listener_exit(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (release, gate) = tokio::sync::oneshot::channel();
+        *self.exit_gate.lock().unwrap() = Some(gate);
+        release
+    }
+
     pub fn stop(&self) {
+        let _activation = self.activation.lock().unwrap();
+        self.tasks.stop();
         log::debug!("Stopping custom overlay \"{}\"", self.config.name);
         self.cancellation_token.cancel();
+        if self.deleted.swap(true, Ordering::AcqRel) {
+            return;
+        }
         if let Err(e) = self.stack.overlay.delete_private_overlay(&self.id) {
+            self.tasks.record_error(format!("Custom overlay {} deletion: {e}", self.id));
             log::error!("Error while deleting custom overlay \"{}\": {}", self.config.name, e);
         }
+    }
+
+    pub async fn stop_and_wait(&self) -> Result<()> {
+        self.stop();
+        self.tasks.wait().await
     }
 
     pub fn skip_public_msg_send(&self) -> bool {
@@ -203,18 +244,23 @@ impl CustomOverlayClient {
         false
     }
 
-    fn listen_broadcasts(self: Arc<Self>, mut subscription: adnl::BroadcastSubscription) {
-        spawn_cancelable(self.cancellation_token.clone(), async move {
+    fn listen_broadcasts(
+        self: Arc<Self>,
+        mut subscription: adnl::BroadcastSubscription,
+    ) -> Result<()> {
+        let tasks = self.tasks.clone();
+        tasks.spawn("custom overlay broadcast listener", async move {
             log::debug!(
                 "Started listening broadcasts in custom overlay \"{}\" {}",
                 self.config.name,
                 self.id
             );
             loop {
-                if self.engine.check_stop() {
+                if self.engine.check_stop() || self.cancellation_token.is_cancelled() {
                     break;
                 }
-                match subscription.recv().await {
+                let broadcast = tokio::select! { biased; _ = self.cancellation_token.cancelled() => break, result = subscription.recv() => result };
+                match broadcast {
                     Err(e) => log::error!(
                         "Error while wait_broadcast in custom overlay \"{}\" {}: {}",
                         self.config.name,
@@ -248,7 +294,13 @@ impl CustomOverlayClient {
                     }
                 }
             }
-        });
+            #[cfg(test)]
+            {
+                let gate = self.exit_gate.lock().unwrap().take();
+                if let Some(gate) = gate { let _ = gate.await; }
+            }
+        })?;
+        Ok(())
     }
 
     async fn process_broadcast(&self, info: &BroadcastRecvInfo) -> Result<()> {

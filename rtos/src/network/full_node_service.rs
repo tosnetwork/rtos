@@ -52,18 +52,26 @@ use storage::types::PersistentStatePartId;
 // max part size for partially transmitted data like archives and states
 const PART_MAX_SIZE: usize = 1 << 21;
 
+use crate::types::owned_tasks::OwnedTasks;
+
 pub struct FullNodeOverlayService {
     engine: Arc<dyn EngineOperations>,
     compression: bool,
+    tasks: Arc<OwnedTasks>,
     #[cfg(test)]
     block_download_queries: std::sync::atomic::AtomicUsize,
 }
 
 impl FullNodeOverlayService {
-    pub fn new(engine: Arc<dyn EngineOperations>, compression: bool) -> Self {
+    pub(crate) fn new(
+        engine: Arc<dyn EngineOperations>,
+        compression: bool,
+        tasks: Arc<OwnedTasks>,
+    ) -> Self {
         Self {
             engine,
             compression,
+            tasks,
             #[cfg(test)]
             block_download_queries: Default::default(),
         }
@@ -713,6 +721,7 @@ impl Subscriber for FullNodeOverlayService {
         query: TLObject,
         adnl_peers: &AdnlPeers,
     ) -> Result<QueryResult> {
+        let _admission = self.tasks.enter()?;
         log::debug!("try_consume_query {:?} from {}", query, adnl_peers.other());
 
         let query = match self

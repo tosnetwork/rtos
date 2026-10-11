@@ -425,27 +425,35 @@ impl ShardBlocksPool {
     }
 }
 
-pub fn resend_top_shard_blocks_worker(engine: Arc<dyn EngineOperations>) {
-    tokio::spawn(async move {
-        engine.acquire_stop(Engine::MASK_SERVICE_TOP_SHARDBLOCKS_SENDER);
-        loop {
-            if engine.check_stop() {
-                break;
-            }
-            // 2..3 seconds
-            let delay = rand::thread_rng().gen_range(2000..3000);
-            futures_timer::Delay::new(Duration::from_millis(delay)).await;
-            match resend_top_shard_blocks(engine.deref()).await {
-                Ok(_) => log::trace!("resend_top_shard_blocks: ok"),
-                Err(e) => log::error!("resend_top_shard_blocks: {:?}", e),
-            }
-        }
-        engine.release_stop(Engine::MASK_SERVICE_TOP_SHARDBLOCKS_SENDER);
-    });
+pub fn resend_top_shard_blocks_worker(engine: Arc<dyn EngineOperations>) -> Result<()> {
+    engine.clone().register_service_task(
+        "top shard sender",
+        Engine::MASK_SERVICE_TOP_SHARDBLOCKS_SENDER,
+        Box::new(move || {
+            tokio::spawn(async move {
+                loop {
+                    if engine.check_stop() {
+                        break;
+                    }
+                    // 2..3 seconds
+                    let delay = rand::thread_rng().gen_range(2000..3000);
+                    futures_timer::Delay::new(Duration::from_millis(delay)).await;
+                    match resend_top_shard_blocks(engine.deref()).await {
+                        Ok(_) => log::trace!("resend_top_shard_blocks: ok"),
+                        Err(e) => log::error!("resend_top_shard_blocks: {:?}", e),
+                    }
+                }
+            })
+        }),
+    )?;
+    Ok(())
 }
 
 async fn resend_top_shard_blocks(engine: &dyn EngineOperations) -> Result<()> {
     loop {
+        if engine.check_stop() {
+            return Ok(());
+        }
         let mc_state = engine.load_last_applied_mc_state().await?;
         let mut actual_last_mc_seqno = mc_state.block_id().seq_no;
         match engine.get_own_shard_blocks(&mc_state, Some(&mut actual_last_mc_seqno)).await {
@@ -469,21 +477,41 @@ async fn resend_top_shard_blocks(engine: &dyn EngineOperations) -> Result<()> {
 pub fn save_top_shard_blocks_worker(
     engine: Arc<dyn EngineOperations>,
     mut receiver: tokio::sync::mpsc::UnboundedReceiver<StoreAction>,
-) {
+    cancellation: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(action) = receiver.recv().await {
-            match action {
-                StoreAction::Save(id, tsb) => match engine.save_top_shard_block(&id, &tsb) {
-                    Ok(_) => log::trace!("save_top_shard_block {}: OK", id),
-                    Err(e) => log::error!("save_top_shard_block {}: {:?}", id, e),
-                },
-                StoreAction::Remove(id) => match engine.remove_top_shard_block(&id) {
-                    Ok(_) => log::trace!("remove_top_shard_block {}: OK", id),
-                    Err(e) => log::error!("remove_top_shard_block {}: {:?}", id, e),
-                },
+        let mut closing = false;
+        loop {
+            let action = if closing {
+                receiver.recv().await
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        // Reject later sends, but flush every accepted action.
+                        receiver.close();
+                        closing = true;
+                        continue;
+                    }
+                    action = receiver.recv() => action,
+                }
+            };
+            let Some(action) = action else {
+                break;
+            };
+            let (label, result) = match action {
+                StoreAction::Save(id, tsb) => {
+                    (format!("save top shard {id}"), engine.save_top_shard_block(&id, &tsb))
+                }
+                StoreAction::Remove(id) => {
+                    (format!("remove top shard {id}"), engine.remove_top_shard_block(&id))
+                }
+            };
+            if let Err(error) = result {
+                engine.report_service_failure(0, format!("{label}: {error}"));
             }
         }
-    });
+    })
 }
 
 fn prepare_resolver_ctx(

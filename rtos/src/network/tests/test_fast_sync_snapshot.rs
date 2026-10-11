@@ -73,10 +73,15 @@ impl Fixture {
             fail_after: AtomicUsize::new(usize::MAX),
             applied: std::sync::RwLock::new(None),
         });
+        let tasks = Arc::new(OwnedTasks::new(network.cancellation_token().child_token()));
         let router = Arc::new(FullNodeOverlaysRouter {
+            tasks: tasks.clone(),
+            init_gate: Default::default(),
+            public_generations: Default::default(),
+            fast_sync_retiring: Default::default(),
             engine: engine.clone(),
             network,
-            service: Arc::new(FullNodeOverlayService::new(engine.clone(), false)),
+            service: Arc::new(FullNodeOverlayService::new(engine.clone(), false, tasks)),
             policy: DhtSearchPolicy::default(),
             public_overlays: lockfree::map::Map::new(),
             fast_sync_overlays: lockfree::map::Map::new(),
@@ -141,8 +146,14 @@ impl Fixture {
     }
 
     async fn stop(&self) {
-        self.router.clear_fast_sync_overlays();
-        self.router.network.stop_adnl().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), self.router.stop_and_wait())
+            .await
+            .expect("router workers retained after router cancellation")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), self.router.network.stop_adnl())
+            .await
+            .expect("network shutdown watchdog")
+            .unwrap();
     }
 }
 fn set(members: Vec<ValidatorDescr>) -> ValidatorSet {
@@ -373,7 +384,7 @@ async fn fast_sync_snapshot_real_engine_pq_transport_startup_and_keyring_notific
     .await?;
     let result: Result<()> = async {
         let router = engine.overlays_router()?;
-        let first = overlay(router, &ShardIdent::MASTERCHAIN);
+        let first = overlay(&router, &ShardIdent::MASTERCHAIN);
         assert_eq!(
             router.fast_sync_snapshot.lock().await.as_ref().unwrap().local_key.as_ref(),
             Some(bootstrap.validators[0].adnl_key.id())
@@ -600,6 +611,8 @@ async fn fast_sync_snapshot_registration_expiring_during_lookup_cannot_publish()
     handler
         .add_validator_adnl_key(local.validator_key.id().data(), local.adnl_key.id().data())
         .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), handler.wait_test_subscribers())
+        .await??;
     let mut config = f.bootstrap.config_params().clone();
     config.set_config(ConfigParamEnum::ConfigParam34(ConfigParam34::with_validator_set(set(
         vec![f.member(0)],

@@ -352,9 +352,21 @@ async fn run_engine_recovery(network_repair: bool) {
     drop(partial);
     drop(handle);
     engine.clone().wait_stop().await.unwrap();
+    let receiver_weak = Arc::downgrade(&engine);
+    drop(engine);
+    assert!(receiver_weak.upgrade().is_none(), "recovery retained receiver Engine");
     if let Some(provider) = provider {
         provider.clone().wait_stop().await.unwrap();
+        let provider_weak = Arc::downgrade(&provider);
+        drop(provider);
+        assert!(provider_weak.upgrade().is_none(), "network query retained provider Engine");
+        let reopened_provider = open_engine(&dir.join("provider")).await;
+        reopened_provider.wait_stop().await.unwrap();
     }
+    // Reopen the exact database in this process/runtime after real network
+    // ingress, recovery workers, storage/apply and all owned tasks have joined.
+    let reopened_receiver = open_engine(dir).await;
+    reopened_receiver.wait_stop().await.unwrap();
 }
 
 fn write_recovery_config(dir: &std::path::Path, mc_id: &BlockIdExt, network: bool) {
