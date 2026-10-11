@@ -104,8 +104,8 @@ impl Request {
         if !id.shard().is_masterchain_ext() || id.seq_no < self.engine.init_mc_block_id().seq_no {
             fail!("Historical recovery outside exact pinned masterchain");
         }
-        let (verified, proofs, detached) = if let Some(verified) =
-            crate::retired_history::authenticate_capsule_with_budget(
+        let (verified, proofs, detached) = if let Some((verified, receipt)) =
+            crate::retired_history::authenticate_capsule_for_request(
                 self.engine.as_ref(),
                 id,
                 Some(&self.budget),
@@ -120,6 +120,7 @@ impl Request {
                 crate::retired_history::sync_recovered_capsule(
                     engine.as_ref(),
                     check.as_ref(),
+                    &receipt,
                     &budget,
                 )?;
                 #[cfg(test)]

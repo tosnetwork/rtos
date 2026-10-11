@@ -108,9 +108,16 @@ struct Manifest {
     proofs: Vec<ProofRef>,
 }
 struct Evidence {
+    manifest_hash: UInt256,
     manifest: Manifest,
     state: Vec<u8>,
     proofs: Vec<BlockProofStuff>,
+}
+// Only successful pinned authentication creates this capability. It binds the
+// exact bytes and complete file set that a later durability barrier must reread.
+pub(crate) struct CapsuleDurabilityReceipt {
+    manifest_hash: UInt256,
+    manifest: Manifest,
 }
 struct Store {
     root: PathBuf,
@@ -120,6 +127,22 @@ struct Store {
     fail_manifest: bool,
 }
 
+fn charge_digest_work(length: usize, budget: &crate::history_read_budget::HistoryReadBudget) -> Result<()> {
+    // SHA-256 input blocks plus padding; work is cumulative even on rejection.
+    for _ in 0..length / 64 + 2 {
+        budget.step()?;
+    }
+    Ok(())
+}
+fn bounded_digest(
+    bytes: &[u8],
+    budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+) -> Result<UInt256> {
+    if let Some(budget) = budget {
+        charge_digest_work(bytes.len(), budget)?;
+    }
+    Ok(UInt256::calc_file_hash(bytes))
+}
 fn digest(bytes: &[u8]) -> String {
     UInt256::calc_file_hash(bytes).to_hex_string()
 }
@@ -202,6 +225,53 @@ impl Store {
         }
         Ok((bytes, anchors))
     }
+    fn sync_authenticated_capsule(
+        &self,
+        domain: &Domain,
+        id: &BlockIdExt,
+        receipt: &CapsuleDurabilityReceipt,
+        budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
+    ) -> Result<()> {
+        if receipt.manifest.domain != *domain || receipt.manifest.id != id.to_string() {
+            fail!("Authenticated capsule receipt domain/identity mismatch");
+        }
+        self.usage_budget(Some(budget))?;
+        let path = self.root.join(format!("{}.json", anchor_name(domain, id)));
+        let (manifest_bytes, manifest_file) = self.budget_file_open(
+            &path, 2 << 20, crate::history_read_budget::ReadKind::Metadata, budget,
+        )?;
+        if bounded_digest(&manifest_bytes, Some(budget))? != receipt.manifest_hash {
+            fail!("Authenticated capsule manifest changed before durability barrier");
+        }
+        let mut total = 0usize;
+        for (index, hash) in std::iter::once(&receipt.manifest.state)
+            .chain(receipt.manifest.proofs.iter().map(|proof| &proof.blob)).enumerate()
+        {
+            let (bound, kind) = if index == 0 {
+                (self.limits.state_bytes, crate::history_read_budget::ReadKind::State)
+            } else {
+                (self.limits.proof_bytes, crate::history_read_budget::ReadKind::Proof)
+            };
+            let (bytes, file) = self.budget_file_open(
+                &self.root.join(format!("{hash}.blob")), bound, kind, budget,
+            )?;
+            total = total.checked_add(bytes.len()).ok_or_else(|| error!("Capsule size overflow"))?;
+            if total as u64 > self.limits.total_bytes {
+                fail!("Retained history evidence exceeds memory bound");
+            }
+            if bounded_digest(&bytes, Some(budget))?.to_hex_string() != *hash {
+                fail!("Authenticated capsule blob changed before durability barrier");
+            }
+            budget.step()?;
+            // Sync the descriptor whose bytes were checked, not a reopened path.
+            file.sync_all()?;
+        }
+        budget.step()?;
+        manifest_file.sync_all()?;
+        budget.step()?;
+        File::open(&self.root)?.sync_all()?;
+        Ok(())
+    }
     fn blob(&self, hash: &str, bound: usize) -> Result<Vec<u8>> {
         if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
             fail!("Invalid history blob reference");
@@ -219,7 +289,17 @@ impl Store {
         kind: crate::history_read_budget::ReadKind,
         budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
     ) -> Result<Vec<u8>> {
+        self.budget_file_open(path, bound, kind, budget).map(|(bytes, _)| bytes)
+    }
+    fn budget_file_open(
+        &self,
+        path: &Path,
+        bound: usize,
+        kind: crate::history_read_budget::ReadKind,
+        budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
+    ) -> Result<(Vec<u8>, File)> {
         use std::io::Read;
+        budget.step()?;
         let file = File::open(path)?;
         let length = usize::try_from(file.metadata()?.len())?;
         if length > bound {
@@ -260,8 +340,12 @@ impl Store {
         if bytes.len() != length {
             fail!("Capsule file changed during read");
         }
+        if matches!(kind, crate::history_read_budget::ReadKind::Proof) {
+            // finish() hashes proof bytes for cumulative deduplication.
+            charge_digest_work(bytes.len(), budget)?;
+        }
         reservation.finish(&bytes)?;
-        Ok(bytes)
+        Ok((bytes, file))
     }
     fn blob_budget(
         &self,
@@ -278,7 +362,7 @@ impl Store {
         }
         let bytes =
             self.budget_file(&self.root.join(format!("{hash}.blob")), bound, kind, budget)?;
-        if digest(&bytes) != hash {
+        if bounded_digest(&bytes, Some(budget))?.to_hex_string() != hash {
             fail!("History blob checksum mismatch");
         }
         Ok(bytes)
@@ -303,6 +387,7 @@ impl Store {
             }
             None => bounded_read(&path, 2 << 20)?,
         };
+        let manifest_hash = bounded_digest(&bytes, budget)?;
         let manifest = Self::decode_manifest(&bytes, budget)?;
         if manifest.schema != SCHEMA
             || &manifest.domain != domain
@@ -353,7 +438,7 @@ impl Store {
                 None => BlockProofStuff::deserialize(&id, bytes, proof.link)?,
             });
         }
-        Ok(Some(Evidence { manifest, state, proofs }))
+        Ok(Some(Evidence { manifest_hash, manifest, state, proofs }))
     }
     /// Metadata lookup is bounded independently of proof/state authentication.
     /// Conflicting full identities at one height are never resolved by order.
@@ -706,6 +791,14 @@ pub(crate) async fn authenticate_capsule_with_budget<E: EngineOperations + ?Size
     id: &BlockIdExt,
     budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
 ) -> Result<Option<VerifiedMasterchainState>> {
+    Ok(authenticate_capsule_for_request(engine, id, budget).await?.map(|(state, _)| state))
+}
+
+pub(crate) async fn authenticate_capsule_for_request<E: EngineOperations + ?Sized>(
+    engine: &E,
+    id: &BlockIdExt,
+    budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+) -> Result<Option<(VerifiedMasterchainState, CapsuleDurabilityReceipt)>> {
     let path = root(engine)?;
     if !path.try_exists()? {
         return Ok(None);
@@ -750,7 +843,10 @@ pub(crate) async fn authenticate_capsule_with_budget<E: EngineOperations + ?Size
     if verified.state().state()?.global_id() != evidence.manifest.global_id {
         fail!("History global ID mismatch");
     }
-    Ok(Some(verified))
+    Ok(Some((verified, CapsuleDurabilityReceipt {
+        manifest_hash: evidence.manifest_hash,
+        manifest: evidence.manifest,
+    })))
 }
 
 /// Raw evidence only: callers must verify through BootstrapAuthority.
@@ -1322,25 +1418,15 @@ pub(crate) fn commit_recovered_capsule(
 pub(crate) fn sync_recovered_capsule(
     engine: &dyn EngineOperations,
     state: &VerifiedMasterchainState,
+    receipt: &CapsuleDurabilityReceipt,
     budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
 ) -> Result<()> {
-    use storage::bounded_cell::CellReadBudget;
     let store = Store::open(root(engine)?, Limits::default())?;
-    let domain = Domain::from_engine(engine)?;
-    let id = state.state().block_id();
-    let evidence = store
-        .read_budget(&domain, id, Some(budget))?
-        .ok_or_else(|| error!("Recovered capsule disappeared before durability barrier"))?;
-    if budget.parse_boc(&evidence.state)?.repr_hash() != state.state().root_cell().repr_hash() {
-        fail!("Recovered capsule changed before durability barrier");
-    }
-    for hash in std::iter::once(&evidence.manifest.state)
-        .chain(evidence.manifest.proofs.iter().map(|p| &p.blob))
-    {
-        budget.step()?;
-        File::open(store.root.join(format!("{hash}.blob")))?.sync_all()?;
-    }
-    File::open(store.root.join(format!("{}.json", anchor_name(&domain, id))))?.sync_all()?;
-    File::open(&store.root)?.sync_all()?;
-    Ok(())
+    store.sync_authenticated_capsule(
+        &Domain::from_engine(engine)?, state.state().block_id(), receipt, budget,
+    )
 }
+
+#[cfg(test)]
+#[path = "retired_history_capsule_barrier_tests.rs"]
+mod capsule_barrier_tests;
