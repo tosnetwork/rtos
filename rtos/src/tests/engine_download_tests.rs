@@ -102,3 +102,40 @@ async fn download_policy_candidate_shunt_constructs_once_for_all_policies() {
     assert_eq!(unlimited.await.unwrap(), Some(17));
     assert_eq!(download_with_policy(&pool, &id, Some(1), None, async { Ok(18) }).await.unwrap(), Some(18));
 }
+
+#[tokio::test]
+async fn download_policy_masterchain_candidate_does_not_end_full_proof_download() {
+    let pool = pool();
+    let mc = BlockIdExt::with_params(ShardIdent::masterchain(), 12, UInt256::from([1; 32]),
+        UInt256::from([2; 32]));
+    let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+    let mut full = Box::pin(download_with_policy(&pool, &mc, None, None, async {
+        finished.await.unwrap();
+        Ok(5)
+    }));
+    let mut finality = Box::pin(download_with_policy(&pool, &mc, Some(1), None,
+        std::future::pending::<Result<u32>>()));
+    assert!(futures::poll!(&mut full).is_pending());
+    assert!(futures::poll!(&mut finality).is_pending());
+    let mut builds = 0;
+    assert!(!shunt_candidate_downloads(&pool, &mc, || { builds += 1; Ok(99) }).unwrap());
+    assert_eq!(builds, 0, "a masterchain candidate must not build a proof link");
+    assert!(futures::poll!(&mut full).is_pending());
+    assert!(futures::poll!(&mut finality).is_pending());
+    finish.send(()).unwrap();
+    assert_eq!(full.await.unwrap(), Some(5));
+    drop(finality);
+
+    let shard = BlockIdExt::with_params(ShardIdent::full(0), 12, UInt256::from([1; 32]),
+        UInt256::from([2; 32]));
+    let mut ordinary = Box::pin(download_with_policy(&pool, &shard, None, None,
+        std::future::pending::<Result<u32>>()));
+    let mut limited = Box::pin(download_with_policy(&pool, &shard, Some(1), None,
+        std::future::pending::<Result<u32>>()));
+    assert!(futures::poll!(&mut ordinary).is_pending());
+    assert!(futures::poll!(&mut limited).is_pending());
+    assert!(shunt_candidate_downloads(&pool, &shard, || { builds += 1; Ok(11) }).unwrap());
+    assert_eq!(builds, 1);
+    assert_eq!(ordinary.await.unwrap(), Some(11));
+    assert_eq!(limited.await.unwrap(), Some(11));
+}

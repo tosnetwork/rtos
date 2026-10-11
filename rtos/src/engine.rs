@@ -244,6 +244,24 @@ async fn download_with_policy<R: Clone>(
     pool.do_or_wait(&key, None, worker).await
 }
 
+/// Completes pending downloads of `id` from a cached candidate.
+///
+/// A candidate only yields a proof link built from its own bytes. Masterchain
+/// downloads need a signed full proof, so a masterchain candidate stays cached
+/// but never completes a download; otherwise its link would end a legitimate
+/// download that apply must then reject. Returns whether a shunt was attempted.
+fn shunt_candidate_downloads<R: Clone>(
+    pool: &AwaitersPool<BlockDownloadKey, R>,
+    id: &BlockIdExt,
+    build: impl FnOnce() -> Result<R>,
+) -> Result<bool> {
+    if id.shard().is_masterchain() {
+        return Ok(false);
+    }
+    pool.shunt_matching(|key| &key.id == id, build)?;
+    Ok(true)
+}
+
 struct DownloadContext<'a, T> {
     engine: &'a Engine,
     client: Arc<FullNodeOverlayClient>,
@@ -1548,7 +1566,7 @@ impl Engine {
             log::trace!("Cached block candidate {}", id);
         }
 
-        self.download_block_awaiters().shunt_matching(|key| &key.id == id, || {
+        shunt_candidate_downloads(self.download_block_awaiters(), id, || {
             let block = BlockStuff::deserialize_block(id.clone(), block_data.clone())?;
             let proof = create_new_proof_link(&block)?;
             Ok((block, proof))
