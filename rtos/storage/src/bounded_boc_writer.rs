@@ -113,7 +113,7 @@ impl DynamicBocDb {
                 budget.step()?;
                 let child_hash = cell.reference_repr_hash(i)?;
                 let child = entries
-                    .get_mut(child_hash, budget)?
+                    .get_mut(&child_hash, budget)?
                     .ok_or_else(|| error!("Missing bounded writer child"))?;
                 if existing && !child.existing {
                     fail!("Existing bounded parent has missing descendant");
