@@ -356,6 +356,7 @@ impl SourceFinalityDelivery {
             start_masterchain: Mutex::new(None),
             stages: Mutex::new(std::collections::HashMap::new()) }))
     }
+    pub(crate) fn prepare_intents(&self, has_existing_certificates: bool) -> Result<()> { self.intents.prepare(has_existing_certificates) }
     pub(crate) fn bind_start(&self, anchor: BlockIdExt) -> Result<()> {
         let mut slot = self.start_masterchain.lock().unwrap();
         if slot.is_some() { fail!("Source start anchor already bound"); }

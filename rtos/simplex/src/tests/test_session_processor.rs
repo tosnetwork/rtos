@@ -11625,7 +11625,12 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool) {
         later.seq_no += 100;
         processor.set_mc_finalized_block(later);
     }
-    processor.handle_block_finalized(event);
+    if high_floor {
+        processor.simplex_state.set_first_non_finalized_slot(SlotIndex::new(candidate_id.slot.value() + 100));
+        processor.replay_finality_intent(event.certificate.to_tl().unwrap()).unwrap();
+    } else {
+        processor.handle_block_finalized(event);
+    }
     assert_eq!(sink.0.lock().unwrap().len(), 1);
     assert_eq!(processor.consensus.is_finalized_block(&candidate_id), upgrade);
     assert!(!processor.consensus.finalized_delivery_sent_contains(&candidate_id));

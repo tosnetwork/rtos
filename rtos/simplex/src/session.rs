@@ -707,6 +707,11 @@ impl SessionImpl {
             }
         };
 
+        if authenticated_runtime.is_some() {
+            if let Err(error) = callbacks.prepare_finality_intents(!bootstrap.final_certs.is_empty()) {
+                fail_startup(error, "Source finality provenance unavailable"); return;
+            }
+        }
         if pq_session {
             let authentication = SessionDescription::new_with_runtime(
                 &options,
@@ -952,7 +957,7 @@ impl SessionImpl {
             let replay = callbacks.pending_finality_intents().and_then(|certificates| {
                 for bytes in certificates {
                     let wire = options.wire_profile.deserialize_typed(&bytes)?;
-                    processor.on_certificate(None::<u32>, wire);
+                    processor.replay_finality_intent(wire)?;
                 }
                 Ok(())
             });

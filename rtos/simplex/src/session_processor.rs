@@ -2685,6 +2685,22 @@ impl SessionProcessor {
     /// # Arguments
     /// * `source_idx` - Validator index of the sender
     /// * `tl_certificate` - Deserialized TL certificate object
+    /// Durable source debt must be replayed even when peer/FSM caches already
+    /// advanced beyond this slot. Authenticate it without the network stale-slot
+    /// optimization, then drive only the finality delivery walk.
+    pub(crate) fn replay_finality_intent(&mut self, wire: Certificate) -> Result<()> {
+        let description = self.get_description();
+        if description.authenticated_runtime().is_none() { rtos_block::fail!("Source intent requires authenticated runtime"); }
+        let certificate = crate::certificate::Certificate::<crate::simplex_state::Vote>::from_tl(
+            &wire, &description, description.get_session_id())?;
+        let crate::simplex_state::Vote::Finalize(vote) = certificate.vote else { rtos_block::fail!("Source recovery requires FinalCert"); };
+        let event = BlockFinalizedEvent { slot: vote.slot, block_hash: vote.block_hash.clone(), block_id: None,
+            certificate: Arc::new(crate::certificate::Certificate { vote, signatures: certificate.signatures }) };
+        self.with_consensus_backend(|controller, backend| controller.handle_block_finalized(backend, event));
+        self.check_all();
+        Ok(())
+    }
+
     pub(crate) fn on_certificate(
         &mut self,
         source_idx: impl Into<Option<u32>>,
