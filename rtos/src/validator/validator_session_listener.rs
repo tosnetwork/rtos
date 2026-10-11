@@ -79,6 +79,10 @@ pub enum ValidationAction {
         callback: ValidatorBlockCandidateCallback,
     },
     OnBlockFinalized(OnBlockFinalized),
+    OnDurableBlockFinalized {
+        delivery_id: rtos_block::UInt256,
+        draft: consensus_common::finality_delivery::FinalizedDeliveryDraft,
+    },
 }
 
 impl fmt::Display for OnBlockCommitted {
@@ -127,6 +131,9 @@ impl fmt::Display for ValidationAction {
 
             ValidationAction::OnGetApprovedCandidate { .. } => write!(f, "OnGetApprovedCandidate"),
 
+            ValidationAction::OnDurableBlockFinalized { ref delivery_id, ref draft } => {
+                write!(f, "OnDurableBlockFinalized id={delivery_id:x} block_id={}", draft.block_id)
+            }
             ValidationAction::OnBlockFinalized(ref finalized) => {
                 write!(
                     f,
@@ -296,6 +303,17 @@ impl SessionListener for ValidatorSessionListener {
                 collated_data_hash,
                 callback,
             },
+        );
+    }
+
+    fn on_durable_block_finalized(
+        &self,
+        delivery_id: rtos_block::UInt256,
+        draft: consensus_common::finality_delivery::FinalizedDeliveryDraft,
+    ) {
+        self.do_send_general(
+            Some(draft.source_info.priority.round),
+            ValidationAction::OnDurableBlockFinalized { delivery_id, draft },
         );
     }
 
@@ -474,6 +492,9 @@ async fn process_validation_action(action: ValidationAction, g: Arc<ValidatorGro
                 .await
         }
 
+        ValidationAction::OnDurableBlockFinalized { delivery_id, draft } => {
+            g.on_durable_block_finalized(delivery_id, draft).await;
+        }
         ValidationAction::OnBlockFinalized(OnBlockFinalized {
             block_id,
             source_info,

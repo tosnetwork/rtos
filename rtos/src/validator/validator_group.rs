@@ -767,6 +767,7 @@ impl ValidatorGroupImpl {
                         overlay_manager,
                         listener,
                         g.engine.trace_collector(),
+                        g.durable_finality_sink.get().cloned(),
                     );
                 }
                 let nodes = g
@@ -1002,6 +1003,8 @@ pub struct ValidatorGroup {
     pq_session: std::result::Result<Option<rtos_api::pq_finality::PqSessionContext>, String>,
     authenticated_runtime:
         Option<Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>>,
+    durable_finality_sink:
+        tokio::sync::OnceCell<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
     #[allow(dead_code)]
     allow_unsafe_self_blocks_resync: bool,
 
@@ -1222,6 +1225,7 @@ impl ValidatorGroup {
             validator_set,
             pq_session,
             authenticated_runtime: None,
+            durable_finality_sink: tokio::sync::OnceCell::new(),
             candidate_relays: Mutex::new(Default::default()),
             consensus_options,
             is_accelerated_consensus_enabled: is_accelerated,
@@ -1364,9 +1368,26 @@ impl ValidatorGroup {
         Arc::downgrade(&self.callback)
     }
 
+    async fn prepare_durable_finality_sink(&self) -> Result<()> {
+        let Some(runtime) = self.authenticated_runtime.as_ref().filter(|runtime| {
+            runtime.protocol()
+                == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
+        }) else {
+            return Ok(());
+        };
+        if self.stop_requested.is_cancelled() {
+            fail!("Durable finality sink rejected after group stop");
+        }
+        self.durable_finality_sink
+            .get_or_try_init(|| self.engine.clone().durable_finality_sink(runtime.clone()))
+            .await?;
+        Ok(())
+    }
+
     /// Pre-create the consensus engine without starting the validation queue.
     /// Called for future-validator groups to warm up the session ahead of time.
     pub async fn pre_create_engine(self: Arc<ValidatorGroup>) -> Result<()> {
+        self.prepare_durable_finality_sink().await?;
         let callback = self.make_validator_session_callback();
         self.group_impl
             .execute_sync(|group_impl| {
@@ -1389,6 +1410,7 @@ impl ValidatorGroup {
         min_ts: SystemTime,
         rt: tokio::runtime::Handle,
     ) -> Result<()> {
+        self.prepare_durable_finality_sink().await?;
         self.clone().spawn_root_task(&rt.clone(), async move {
             let callback = self.make_validator_session_callback();
             self.group_impl
@@ -2793,6 +2815,61 @@ impl ValidatorGroup {
     /// The engine's `apply_block` is dependency-driven and will recursively
     /// fetch predecessors, so out-of-order acceptance is safe at that layer.
     #[allow(clippy::too_many_arguments)]
+    /// Observe a node-owned durable handoff. The public ID is only a lookup key;
+    /// acceptance and session identity come from the node's authenticated result.
+    pub async fn on_durable_block_finalized(
+        &self,
+        delivery_id: UInt256,
+        draft: consensus_common::finality_delivery::FinalizedDeliveryDraft,
+    ) {
+        let Some(runtime) = self.authenticated_runtime.clone() else {
+            log::error!("Durable finality notification without authenticated group runtime");
+            return;
+        };
+        let engine = self.engine.clone();
+        let stop = self.stop_requested.clone();
+        let cache = self.state_resolver_cache.clone();
+        let group = self.group_impl.clone();
+        let seqno_tx = self.accepted_mc_seqno_tx.clone();
+        let block_tx = self.accepted_mc_block_tx.clone();
+        self.spawn_task(&tokio::runtime::Handle::current(), async move {
+            let accepted = tokio::select! {
+                _ = stop.cancelled() => return,
+                result = engine.await_publication(delivery_id) => match result {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        log::error!("Durable finality observation failed: {error}");
+                        return;
+                    }
+                },
+            };
+            let expected_final =
+                matches!(draft.finality, consensus_common::SessionFinality::Carrier(_));
+            let same_session = accepted
+                .candidate_relay()
+                .is_ok_and(|relay| relay.session_id() == runtime.session_id());
+            if accepted.block().id() != &draft.block_id
+                || accepted.is_final() != expected_final
+                || !same_session
+            {
+                log::error!("Durable finality receipt differs from the receiving group");
+                return;
+            }
+            if !accepted.is_final() {
+                return;
+            }
+            cache.lock().await.prune_finalized(&draft.block_id);
+            let (seqno, block) = group
+                .execute_sync(|group| {
+                    sync_last_accepted_mc_head_from_block(group, &draft.block_id);
+                    (group.last_accepted_mc_seqno, group.last_accepted_mc_block_id.clone())
+                })
+                .await;
+            seqno_tx.send_replace(seqno);
+            block_tx.send_replace(block);
+        });
+    }
+
     pub async fn on_block_finalized(
         &self,
         block_id: BlockIdExt,
@@ -2804,6 +2881,13 @@ impl ValidatorGroup {
         signatures: consensus_common::SessionFinality,
         _approve_sig_set: Vec<(PublicKeyHash, BlockPayloadPtr)>,
     ) {
+        if self.authenticated_runtime.as_ref().is_some_and(|runtime| {
+            runtime.protocol()
+                == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
+        }) {
+            log::error!("Private finality callback requires a durable handoff ID");
+            return;
+        }
         let is_simplex_group = self
             .group_impl
             .execute_sync(|group_impl| group_impl.consensus_type == ConsensusType::Simplex)
@@ -2932,13 +3016,6 @@ impl ValidatorGroup {
             block_id={block_id} source={source_id} round={round}"
         );
 
-        let publication_runtime = self.authenticated_runtime.clone().filter(|runtime| {
-            runtime.protocol()
-                == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
-        });
-        let candidate_already_sent = self.candidate_relays.lock().unwrap().contains(&block_id);
-        let last_accepted_mc =
-            self.group_impl.execute_sync(|group| group.last_accepted_mc_seqno.unwrap_or(0)).await;
         self.spawn_task(&tokio::runtime::Handle::current(), async move {
             let (accept_data, prevs) =
                 match Self::resolve_prev_for_finalized_block(engine.clone(), &block_id, data_opt)
@@ -2955,54 +3032,17 @@ impl ValidatorGroup {
                     }
                 };
 
-            let result = if let Some(runtime) = publication_runtime {
-                async {
-                    let bytes = accept_data
-                        .ok_or_else(|| error!("Resolved publication block has no bytes"))?;
-                    let intent = super::session_publication::prepare_publication(
-                        &runtime,
-                        block_id.clone(),
-                        &bytes,
-                        &prevs,
-                        &signatures,
-                        &engine,
-                        we_generated,
-                        last_accepted_mc,
-                        candidate_already_sent,
-                    )
-                    .await?;
-                    if let Some(intent) = intent {
-                        // The Engine owns admitted work after this waiter is cancelled.
-                        // Success means acceptance and the Ready WAL checkpoint, not
-                        // successful delivery to every network destination.
-                        engine.clone().submit_publication(intent).await?;
-                    } else {
-                        super::accept_block::accept_pq_session_block(
-                            block_id.clone(),
-                            Some(bytes),
-                            prevs,
-                            signatures,
-                            pq_context.ok_or_else(|| error!("Missing PQ publication context"))?,
-                            engine.clone(),
-                        )
-                        .await?;
-                    }
-                    Ok(())
-                }
-                .await
-            } else {
-                super::accept_block::accept_session_block(
-                    block_id.clone(),
-                    accept_data,
-                    prevs,
-                    validator_set,
-                    signatures,
-                    pq_context,
-                    send_block_broadcast,
-                    engine,
-                )
-                .await
-            };
+            let result = super::accept_block::accept_session_block(
+                block_id.clone(),
+                accept_data,
+                prevs,
+                validator_set,
+                signatures,
+                pq_context,
+                send_block_broadcast,
+                engine,
+            )
+            .await;
 
             match result {
                 Ok(()) => {
