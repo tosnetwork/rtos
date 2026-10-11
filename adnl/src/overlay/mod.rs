@@ -9,6 +9,7 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+use crate::adnl::tasks::AdnlTasks;
 #[cfg(feature = "telemetry")]
 use crate::{common::add_unbound_object_to_map, telemetry::Metric};
 use crate::{
@@ -544,6 +545,9 @@ declare_counted!(
 
 declare_counted!(
     struct Overlay {
+        consumer: OnceLock<Arc<dyn Subscriber>>,
+        tasks: Arc<AdnlTasks>,
+        inbound_caps: Arc<std::sync::Mutex<Vec<Arc<KeyId>>>>,
         adnl: Arc<AdnlNode>,
         quic: Option<Arc<QuicNode>>,
         rldp: Option<Arc<RldpNode>>,
@@ -1435,8 +1439,27 @@ impl<'a> OverlayParams<'a> {
     }
 }
 
+/// Owned completion receipt for one concrete overlay generation.
+#[derive(Clone)]
+pub struct OverlayShutdown {
+    id: Arc<OverlayShortId>,
+    tasks: Arc<AdnlTasks>,
+}
+impl OverlayShutdown {
+    pub fn drained(&self) -> bool {
+        self.tasks.drained()
+    }
+}
+
 /// Overlay Node
 pub struct OverlayNode {
+    #[cfg(test)]
+    send_admission_gate: std::sync::Mutex<Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>>,
+    #[cfg(test)]
+    receive_admission_gate:
+        std::sync::Mutex<Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>>,
+    generations: std::sync::Mutex<()>,
+    retired: std::sync::Mutex<HashMap<Arc<OverlayShortId>, std::sync::Weak<AdnlTasks>>>,
     wire_profile: rtos_api::WireProfile,
     adnl: Arc<AdnlNode>,
     consumers: lockfree::map::Map<Arc<OverlayShortId>, ConsumerObject>,
@@ -1449,6 +1472,14 @@ pub struct OverlayNode {
     #[cfg(feature = "telemetry")]
     telemetry: Arc<OverlayTelemetry>,
     allocated: Arc<OverlayAlloc>,
+}
+
+impl Drop for OverlayNode {
+    fn drop(&mut self) {
+        for item in self.overlays.iter() {
+            item.val().tasks.close();
+        }
+    }
 }
 
 impl OverlayNode {
@@ -1513,11 +1544,17 @@ impl OverlayNode {
             stats_transfer: Arc::new(AtomicU64::new(0)),
         };
         let ret = Self {
+            #[cfg(test)]
+            send_admission_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            receive_admission_gate: std::sync::Mutex::new(None),
             wire_profile,
             adnl,
             consumers: lockfree::map::Map::new(),
             node_key,
             options: Arc::new(AtomicU32::new(0)),
+            generations: std::sync::Mutex::new(()),
+            retired: std::sync::Mutex::new(HashMap::new()),
             overlays: lockfree::map::Map::new(),
             quic: OnceLock::new(),
             rldp: OnceLock::new(),
@@ -1529,6 +1566,22 @@ impl OverlayNode {
         Ok(Arc::new(ret))
     }
 
+    #[cfg(test)]
+    async fn pause_after_send_admission(&self) {
+        let gate = self.send_admission_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.0.notify_one();
+            gate.1.notified().await;
+        }
+    }
+    #[cfg(test)]
+    async fn pause_after_receive_admission(&self) {
+        let gate = self.receive_admission_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.0.notify_one();
+            gate.1.notified().await;
+        }
+    }
     pub fn wire_profile(&self) -> rtos_api::WireProfile {
         self.wire_profile
     }
@@ -1539,16 +1592,42 @@ impl OverlayNode {
         overlay_id: &Arc<OverlayShortId>,
         consumer: Arc<dyn Subscriber>,
     ) -> Result<bool> {
-        log::debug!(target: TARGET, "Add consumer {} to overlay", overlay_id);
-        add_counted_object_to_map(&self.consumers, overlay_id.clone(), || {
-            let ret = ConsumerObject {
+        let _generation = self.generations.lock().unwrap();
+        let overlay = self.get_overlay(overlay_id, "Consumer registration for unknown overlay")?;
+        self.add_consumer_locked(&overlay, consumer)
+    }
+    pub fn add_consumer_for_generation(
+        &self,
+        generation: &OverlayShutdown,
+        consumer: Arc<dyn Subscriber>,
+    ) -> Result<bool> {
+        let _generation = self.generations.lock().unwrap();
+        let overlay =
+            self.get_overlay(&generation.id, "Consumer registration for unknown generation")?;
+        if !Arc::ptr_eq(&overlay.tasks, &generation.tasks) {
+            fail!("Consumer generation was replaced");
+        }
+        self.add_consumer_locked(&overlay, consumer)
+    }
+    fn add_consumer_locked(
+        &self,
+        overlay: &Arc<Overlay>,
+        consumer: Arc<dyn Subscriber>,
+    ) -> Result<bool> {
+        let _lease = overlay.tasks.enter()?;
+        let added = add_counted_object_to_map(&self.consumers, overlay.overlay_id.clone(), || {
+            Ok(ConsumerObject {
                 object: consumer.clone(),
                 counter: self.allocated.consumers.clone().into(),
-            };
-            #[cfg(feature = "telemetry")]
-            self.telemetry.consumers.update(self.allocated.consumers.load(Ordering::Relaxed));
-            Ok(ret)
-        })
+            })
+        })?;
+        if added {
+            overlay
+                .consumer
+                .set(consumer)
+                .map_err(|_| error!("Overlay consumer is already bound"))?;
+        }
+        Ok(added)
     }
 
     /// Add overlay for local workchain
@@ -1714,6 +1793,7 @@ impl OverlayNode {
     ) -> Result<BroadcastSendInfo> {
         log::trace!(target: TARGET, "Broadcast {} bytes", data.object.len());
         let overlay = self.get_overlay(overlay_id, "Trying broadcast to unknown overlay")?;
+        let _lease = overlay.tasks.enter()?;
         let mut ctx = BroadcastSendContext {
             data,
             flags,
@@ -1750,6 +1830,7 @@ impl OverlayNode {
         log::trace!(target: TARGET, "Two-step broadcast {} bytes", data.object.len());
         let overlay =
             self.get_overlay(overlay_id, "Trying two-step broadcast to unknown overlay")?;
+        let _lease = overlay.tasks.enter()?;
         let ctx = BroadcastSendContext {
             data,
             flags,
@@ -1794,6 +1875,48 @@ impl OverlayNode {
     /// Delete private_overlay
     pub fn delete_private_overlay(&self, overlay_id: &Arc<OverlayShortId>) -> Result<bool> {
         self.delete_overlay(overlay_id, true)
+    }
+
+    /// Capture a generation before starting teardown. Keep this receipt for
+    /// repeated waiters; an old receipt can never remove a replacement overlay.
+    pub fn overlay_generation(&self, id: &Arc<OverlayShortId>) -> Result<OverlayShutdown> {
+        let overlay = self.get_overlay(id, "Capturing unknown overlay generation")?;
+        Ok(OverlayShutdown { id: id.clone(), tasks: overlay.tasks.clone() })
+    }
+
+    pub async fn delete_private_overlay_checked(
+        &self,
+        generation: &OverlayShutdown,
+    ) -> Result<bool> {
+        self.delete_overlay_checked(generation, true).await
+    }
+    pub async fn delete_public_overlay_checked(
+        &self,
+        generation: &OverlayShutdown,
+    ) -> Result<bool> {
+        self.delete_overlay_checked(generation, false).await
+    }
+    async fn delete_overlay_checked(
+        &self,
+        generation: &OverlayShutdown,
+        private: bool,
+    ) -> Result<bool> {
+        let removed = {
+            let _generation = self.generations.lock().unwrap();
+            let same = self
+                .overlays
+                .get(&generation.id)
+                .is_some_and(|current| Arc::ptr_eq(&current.val().tasks, &generation.tasks));
+            if same {
+                self.delete_overlay_locked(&generation.id, private)?
+            } else if generation.tasks.is_closed() {
+                false
+            } else {
+                fail!("Overlay generation belongs to a different owner");
+            }
+        };
+        generation.tasks.wait().await?;
+        Ok(removed)
     }
 
     /// Delete public_overlay
@@ -1892,15 +2015,14 @@ impl OverlayNode {
         data: &TaggedByteSlice<'_>,
         overlay_id: &Arc<OverlayShortId>,
     ) -> Result<()> {
+        let overlay = self.get_overlay(overlay_id, "Overlay admission")?;
+        let _lease = overlay.tasks.enter()?;
+        #[cfg(test)]
+        self.pause_after_send_admission().await;
         #[cfg(feature = "telemetry")]
         let tag = data.tag;
         let (peers, data) = self
-            .prepare_to_send_message(
-                dst,
-                data,
-                overlay_id,
-                "Sending ADNL message to unknown overlay",
-            )
+            .prepare_to_send_message(dst, data, &overlay, "Sending ADNL message to unknown overlay")
             .await?;
         self.adnl
             .send_custom(
@@ -1921,16 +2043,15 @@ impl OverlayNode {
         data: &TaggedByteSlice<'_>,
         overlay_id: &Arc<OverlayShortId>,
     ) -> Result<()> {
+        let overlay = self.get_overlay(overlay_id, "Overlay admission")?;
+        let _lease = overlay.tasks.enter()?;
+        #[cfg(test)]
+        self.pause_after_send_admission().await;
         let Some(quic) = self.quic.get() else {
             fail!("QUIC sender is not set in overlay node");
         };
         let (peers, data) = self
-            .prepare_to_send_message(
-                dst,
-                data,
-                overlay_id,
-                "Sending QUIC message to unknown overlay",
-            )
+            .prepare_to_send_message(dst, data, &overlay, "Sending QUIC message to unknown overlay")
             .await?;
         quic.message(data, Some(&self.adnl), &peers).await?;
         Ok(())
@@ -1945,15 +2066,14 @@ impl OverlayNode {
         v2: bool,
         roundtrip: Option<u64>,
     ) -> Result<u64> {
+        let overlay = self.get_overlay(overlay_id, "Overlay admission")?;
+        let _lease = overlay.tasks.enter()?;
+        #[cfg(test)]
+        self.pause_after_send_admission().await;
         #[cfg(feature = "telemetry")]
         let tag = data.tag;
         let (peers, data) = self
-            .prepare_to_send_message(
-                dst,
-                data,
-                overlay_id,
-                "Sending RLDP message to unknown overlay",
-            )
+            .prepare_to_send_message(dst, data, &overlay, "Sending RLDP message to unknown overlay")
             .await?;
         let Some(rldp) = self.rldp.get() else {
             fail!("RLDP sender is not set in overlay node");
@@ -1979,10 +2099,14 @@ impl OverlayNode {
         overlay_id: &Arc<OverlayShortId>,
         timeout_ms: Option<u64>,
     ) -> Result<Option<TLObject>> {
+        let overlay = self.get_overlay(overlay_id, "Overlay admission")?;
+        let _lease = overlay.tasks.enter()?;
+        #[cfg(test)]
+        self.pause_after_send_admission().await;
         let (peers, overlay) = self
             .prepare_to_send(
                 dst,
-                overlay_id,
+                &overlay,
                 "Sending ADNL query to unknown overlay",
                 #[cfg(feature = "telemetry")]
                 query.tag,
@@ -2010,13 +2134,17 @@ impl OverlayNode {
         overlay_id: &Arc<OverlayShortId>,
         timeout_ms: Option<u64>,
     ) -> Result<Option<TLObject>> {
+        let overlay = self.get_overlay(overlay_id, "Overlay admission")?;
+        let _lease = overlay.tasks.enter()?;
+        #[cfg(test)]
+        self.pause_after_send_admission().await;
         let Some(quic) = self.quic.get() else {
             fail!("QUIC sender is not set in overlay node");
         };
         let (peers, overlay) = self
             .prepare_to_send(
                 dst,
-                overlay_id,
+                &overlay,
                 "Sending QUIC query to unknown overlay",
                 #[cfg(feature = "telemetry")]
                 query.tag,
@@ -2043,10 +2171,14 @@ impl OverlayNode {
         v2: bool,
         roundtrip: Option<u64>,
     ) -> Result<(Option<Vec<u8>>, u64)> {
+        let overlay = self.get_overlay(overlay_id, "Overlay admission")?;
+        let _lease = overlay.tasks.enter()?;
+        #[cfg(test)]
+        self.pause_after_send_admission().await;
         let (peers, _) = self
             .prepare_to_send(
                 dst,
-                overlay_id,
+                &overlay,
                 "Sending RLDP query to unknown overlay",
                 #[cfg(feature = "telemetry")]
                 data.tag,
@@ -2107,6 +2239,7 @@ impl OverlayNode {
         overlay_id: &Arc<OverlayShortId>,
     ) -> Result<Option<BroadcastRecvInfo>> {
         let overlay = self.get_overlay(overlay_id, "Waiting for broadcast in unknown overlay")?;
+        let _lease = overlay.tasks.enter()?;
         if (overlay.flags & Overlay::FLAG_OVERLAY_OTHER_WORKCHAIN) != 0 {
             fail!("Waiting for broadcast in overlay from other workchain")
         }
@@ -2118,7 +2251,9 @@ impl OverlayNode {
         &self,
         overlay_id: &Arc<OverlayShortId>,
     ) -> Result<Option<(CatchainBlockUpdate, CatchainData, Arc<KeyId>)>> {
-        self.get_overlay(overlay_id, "Waiting for catchain in unknown overlay")?
+        let overlay = self.get_overlay(overlay_id, "Waiting for catchain in unknown overlay")?;
+        let _lease = overlay.tasks.enter()?;
+        overlay
             .received_catchain
             .as_ref()
             .ok_or_else(|| error!("Waiting for catchain in public overlay {}", overlay_id))?
@@ -2131,13 +2266,20 @@ impl OverlayNode {
         &self,
         overlay_id: &Arc<OverlayShortId>,
     ) -> Result<Option<Vec<OverlayNodeInfo<NodeV1, NodeV2>>>> {
-        self.get_overlay(overlay_id, "Waiting for peers in unknown overlay")?
-            .received_peers
-            .pop()
-            .await
+        let overlay = self.get_overlay(overlay_id, "Waiting for peers in unknown overlay")?;
+        let _lease = overlay.tasks.enter()?;
+        overlay.received_peers.pop().await
     }
 
     fn add_overlay(&self, overlay_type: OverlayType, params: OverlayParams) -> Result<bool> {
+        let _generation = self.generations.lock().unwrap();
+        self.add_overlay_locked(overlay_type, params)
+    }
+    fn add_overlay_locked(&self, overlay_type: OverlayType, params: OverlayParams) -> Result<bool> {
+        {
+            let mut retired = self.retired.lock().unwrap();
+            retired.retain(|_, tasks| tasks.upgrade().is_some_and(|tasks| !tasks.drained()));
+        }
         log::debug!(target: TARGET, "Add overlay {} to node", params.overlay_id);
         if !overlay_type.is_public()
             && ((params.flags & Overlay::FLAG_OVERLAY_OTHER_WORKCHAIN) != 0)
@@ -2157,6 +2299,11 @@ impl OverlayNode {
         };
         let quic = if overlay_type.quic_requested() { self.quic.get().cloned() } else { None };
         let overlay = Overlay {
+            consumer: OnceLock::new(),
+            tasks: AdnlTasks::with_runtime(
+                params.runtime.clone().unwrap_or_else(tokio::runtime::Handle::current),
+            ),
+            inbound_caps: Arc::new(std::sync::Mutex::new(Vec::new())),
             adnl: self.adnl.clone(),
             rldp: self.rldp.get().cloned(),
             quic,
@@ -2213,8 +2360,21 @@ impl OverlayNode {
         if added {
             let default_key = self.node_key.clone();
             let overlay = self.get_overlay(params.overlay_id, "Cannot add overlay")?;
-            let handle = params.runtime.unwrap_or_else(tokio::runtime::Handle::current);
-            handle.spawn(async move {
+            let tasks = overlay.tasks.clone();
+            let caps = overlay.inbound_caps.clone();
+            let rldp = overlay.rldp.clone();
+            let weak_tasks = Arc::downgrade(&tasks);
+            tasks.on_stopped(move || {
+                if let Some(rldp) = rldp {
+                    let caps = std::mem::take(&mut *caps.lock().unwrap());
+                    if let Err(error) = rldp.change_inbound_cap_for_peers(&caps, -1) {
+                        if let Some(tasks) = weak_tasks.upgrade() {
+                            tasks.failed(format!("Overlay inbound cap cleanup: {error}"));
+                        }
+                    }
+                }
+            });
+            tasks.spawn_cancelable("overlay maintenance", async move {
                 let local_adnl_key = if overlay.overlay_type.is_private() {
                     Some(overlay.overlay_key().unwrap_or(&default_key).id())
                 } else {
@@ -2350,28 +2510,6 @@ impl OverlayNode {
                     timeout_pending_peers += tick_ms;
                     timeout_ping += tick_ms;
                 }
-                // Reduce inbound cap for pending peers of Private overlays
-                // additionally to known peers
-                if !matches!(overlay.overlay_type, OverlayType::Private { .. }) {
-                    return;
-                }
-                let Some(rldp) = &overlay.rldp else {
-                    return;
-                };
-                let mut remaining: Vec<Arc<KeyId>> = Vec::new();
-                while let Some(peer) = overlay.pending_peers.pop() {
-                    remaining.push(peer);
-                }
-                if remaining.is_empty() {
-                    return;
-                }
-                if let Err(e) = rldp.change_inbound_cap_for_peers(&remaining, -1) {
-                    log::warn!(
-                        target: TARGET,
-                        "Error reducing inbound cap for pending peers in overlay {}: {e}",
-                        overlay.overlay_id
-                    );
-                }
             });
         }
         Ok(added)
@@ -2411,16 +2549,29 @@ impl OverlayNode {
         params: OverlayParams,
         peers: &[Arc<KeyId>],
     ) -> Result<bool> {
-        let overlay_id = params.overlay_id;
-        if self.add_overlay(overlay_type, params)? {
-            self.add_peers_to_overlay(overlay_id, peers, "Cannot add the private overlay")?;
+        let _generation = self.generations.lock().unwrap();
+        let overlay_id = params.overlay_id.clone();
+        if !self.add_overlay_locked(overlay_type, params)? {
+            return Ok(false);
+        }
+        let initialization = (|| -> Result<()> {
+            let overlay = self.get_overlay(&overlay_id, "Private overlay initialization")?;
+            let _lease = overlay.tasks.enter()?;
+            self.add_peers_to_overlay(&overlay_id, peers, "Cannot add the private overlay")?;
             if let Some(rldp) = self.rldp.get() {
                 rldp.change_inbound_cap_for_peers(peers, 1)?;
+                let overlay = self.get_overlay(&overlay_id, "Private overlay initialization")?;
+                *overlay.inbound_caps.lock().unwrap() = peers.to_vec();
             }
-            Ok(true)
-        } else {
-            Ok(false)
+            Ok(())
+        })();
+        if let Err(error) = initialization {
+            let cleanup = self.delete_overlay_locked(&overlay_id, true);
+            return Err(error!(
+                "Private overlay initialization failed: {error}; rollback: {cleanup:?}"
+            ));
         }
+        Ok(true)
     }
 
     fn calc_src_key_for_broadcast<'a>(
@@ -2462,6 +2613,14 @@ impl OverlayNode {
     }
 
     fn delete_overlay(&self, overlay_id: &Arc<OverlayShortId>, is_private: bool) -> Result<bool> {
+        let _generation = self.generations.lock().unwrap();
+        self.delete_overlay_locked(overlay_id, is_private)
+    }
+    fn delete_overlay_locked(
+        &self,
+        overlay_id: &Arc<OverlayShortId>,
+        is_private: bool,
+    ) -> Result<bool> {
         let type_of = if is_private { "private" } else { "public" };
         log::info!(target: TARGET, "Delete {} overlay {}", type_of, overlay_id);
         if let Some(overlay) = self.overlays.get(overlay_id) {
@@ -2476,27 +2635,8 @@ impl OverlayNode {
             } else if overlay.overlay_type.is_private() {
                 fail!("Try to delete private overlay {} as public", overlay_id)
             }
-            if let Some(rldp) = self.rldp.get() {
-                let roots: Vec<Arc<KeyId>> = match &overlay.overlay_type {
-                    OverlayType::CertifiedMembers { root_adnl_ids, .. } => {
-                        root_adnl_ids.iter().cloned().collect()
-                    }
-                    OverlayType::Private { .. } => {
-                        let mut roots = Vec::new();
-                        let known = overlay.known_peers.all();
-                        let (mut iter, mut peer) = known.first();
-                        while let Some(p) = peer {
-                            roots.push(p);
-                            peer = known.next(&mut iter);
-                        }
-                        roots
-                    }
-                    OverlayType::Public => Vec::new(),
-                };
-                if !roots.is_empty() {
-                    rldp.change_inbound_cap_for_peers(&roots, -1)?;
-                }
-            }
+            overlay.tasks.close();
+            self.retired.lock().unwrap().insert(overlay_id.clone(), Arc::downgrade(&overlay.tasks));
             if let Some(transport) = overlay.plumtree.get() {
                 transport.stopped.store(true, Ordering::Release);
             }
@@ -2524,11 +2664,10 @@ impl OverlayNode {
     async fn prepare_to_send(
         &self,
         dst: &Arc<KeyId>,
-        overlay_id: &Arc<OverlayShortId>,
-        err_msg: &str,
+        overlay: &Arc<Overlay>,
+        _err_msg: &str,
         #[cfg(feature = "telemetry")] tag: u32,
     ) -> Result<(AdnlPeers, Arc<Overlay>)> {
-        let overlay = self.get_overlay(overlay_id, err_msg)?;
         let peers = overlay
             .prepare_to_send(
                 dst,
@@ -2537,21 +2676,21 @@ impl OverlayNode {
                 tag,
             )
             .await?;
-        Ok((peers, overlay))
+        Ok((peers, overlay.clone()))
     }
 
     async fn prepare_to_send_message(
         &self,
         dst: &Arc<KeyId>,
         data: &TaggedByteSlice<'_>,
-        overlay_id: &Arc<OverlayShortId>,
-        err_msg: &str,
+        overlay: &Arc<Overlay>,
+        _err_msg: &str,
     ) -> Result<(AdnlPeers, Vec<u8>)> {
         let (peers, overlay) = self
             .prepare_to_send(
                 dst,
-                overlay_id,
-                err_msg,
+                overlay,
+                _err_msg,
                 #[cfg(feature = "telemetry")]
                 data.tag,
             )
@@ -2627,6 +2766,9 @@ impl Subscriber for OverlayNode {
             return Ok(true);
         }
         let overlay = self.get_overlay(&overlay_id, "Message to unknown overlay")?;
+        let _lease = overlay.tasks.enter()?;
+        #[cfg(test)]
+        self.pause_after_receive_admission().await;
         if (overlay.flags & Overlay::FLAG_OVERLAY_OTHER_WORKCHAIN) != 0 {
             return Ok(true);
         }
@@ -2643,8 +2785,8 @@ impl Subscriber for OverlayNode {
         }
 
         let suffix = &data[suffix_offset..];
-        let consumer = if let Some(consumer) = self.consumers.get(&overlay_id) {
-            let consumer = consumer.val().object.clone();
+        let consumer = if let Some(consumer) = overlay.consumer.get() {
+            let consumer = consumer.clone();
             if overlay.overlay_type.is_private() {
                 match consumer.try_consume_custom(suffix, peers).await {
                     Err(e) => {
@@ -2837,6 +2979,9 @@ impl Subscriber for OverlayNode {
         } else {
             fail!("Query to unknown overlay {}", overlay_id)
         };
+        let _lease = overlay.tasks.enter()?;
+        #[cfg(test)]
+        self.pause_after_receive_admission().await;
         if !self.check_overlay_adnl_address(&overlay, peers.local()) {
             return Ok(QueryResult::Consumed(QueryAnswer::Ready(None)));
         }
@@ -2918,8 +3063,8 @@ impl Subscriber for OverlayNode {
         if other_workchain {
             return Ok(QueryResult::Consumed(QueryAnswer::Ready(None)));
         }
-        let consumer = if let Some(consumer) = self.consumers.get(&overlay_id) {
-            consumer.val().object.clone()
+        let consumer = if let Some(consumer) = overlay.consumer.get() {
+            consumer.clone()
         } else {
             fail!(
                 "No dedicated consumer for query {object:?} from {} in overlay {overlay_id}",
@@ -2928,7 +3073,25 @@ impl Subscriber for OverlayNode {
         };
         match consumer.try_consume_query(object, peers).await {
             Err(msg) => fail!("Unsupported query {msg} in overlay {overlay_id}"),
-            r => r,
+            Ok(QueryResult::Consumed(QueryAnswer::Pending(worker))) => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let response_tasks = overlay.tasks.clone();
+                let future = async move {
+                    let result = match worker.await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            response_tasks.failed(format!("Overlay response worker: {error}"));
+                            Err(error!("Overlay response worker: {error}"))
+                        }
+                    };
+                    let _ = tx.send(result);
+                };
+                overlay.tasks.spawn_admitted("overlay pending response", _lease, future);
+                Ok(QueryResult::Consumed(QueryAnswer::Pending(tokio::spawn(async move {
+                    rx.await.map_err(|_| error!("Overlay response owner failed"))?
+                }))))
+            }
+            result => result,
         }
     }
 }
@@ -3048,7 +3211,7 @@ impl Overlay {
                         }
                         let mut bytes = self.query_prefix.clone();
                         serialize_boxed_append(&mut bytes, &query)?;
-                        tokio::spawn(async move {
+                        self.tasks.spawn_cancelable("plumtree repair query", async move {
                             // The total budget also bounds the QUIC helper's reconnect/retry.
                             let response = tokio::time::timeout(
                                 Duration::from_secs(5),
@@ -3122,9 +3285,11 @@ impl OverlayNode {
         &self,
         overlay_id: &Arc<OverlayShortId>,
         config: PlumtreeConfig,
-        runtime: &tokio::runtime::Handle,
+        _runtime: &tokio::runtime::Handle,
     ) -> Result<()> {
+        let _generation = self.generations.lock().unwrap();
         let overlay = self.get_overlay(overlay_id, "Configuring Plumtree on unknown overlay")?;
+        let _lease = overlay.tasks.enter()?;
         if overlay.flags & Overlay::FLAG_OVERLAY_OTHER_WORKCHAIN != 0 {
             fail!("Plumtree cannot be enabled for an inactive workchain");
         }
@@ -3147,7 +3312,7 @@ impl OverlayNode {
         overlay.plumtree.set(PlumtreeTransport { quic, engine: std::sync::Mutex::new(engine), local, original_sender, stopped: std::sync::atomic::AtomicBool::new(false) })
             .map_err(|_| error!("Plumtree policy is already installed; recreate the overlay to change its authority"))?;
         let weak = Arc::downgrade(&overlay);
-        runtime.spawn(async move {
+        let admitted = overlay.tasks.spawn_cancelable("plumtree ticker", async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(50));
             loop {
                 ticker.tick().await;
@@ -3166,6 +3331,12 @@ impl OverlayNode {
                 }
             }
         });
+        if !admitted {
+            if let Some(transport) = overlay.plumtree.get() {
+                transport.stopped.store(true, Ordering::Release);
+            }
+            fail!("Plumtree activation raced overlay failure");
+        }
         Ok(())
     }
 
@@ -3181,6 +3352,7 @@ impl OverlayNode {
         data: &[u8],
     ) -> Result<()> {
         let overlay = self.get_overlay(overlay_id, "Plumtree broadcast to unknown overlay")?;
+        let _lease = overlay.tasks.enter()?;
         let neighbours = overlay.plumtree_neighbours();
         let actions = overlay.plumtree_engine()?.publish(
             signer,
@@ -3199,3 +3371,6 @@ impl OverlayNode {
 #[cfg(test)]
 #[path = "wire_profile_tests.rs"]
 mod wire_profile_tests;
+
+#[cfg(test)]
+mod owned_shutdown_tests;

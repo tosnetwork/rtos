@@ -14,6 +14,9 @@
 
 // Internal modules
 pub mod simplex_protocol;
+pub mod thread_owner;
+mod async_owner;
+pub mod overlay_owner;
 mod validator_identity;
 pub use validator_identity::{SimplexSignatureVerifier, ValidatorIdentity};
 mod activity_node;
@@ -1062,6 +1065,11 @@ pub trait ConsensusOverlayManager {
         block_sync_params: Option<BlockSyncOverlayParams>,
     ) -> Result<ConsensusOverlayPtr>;
 
+    fn stop_overlay_checked(&self, _id: &Arc<PrivateOverlayShortId>, _overlay: &ConsensusOverlayPtr) -> Result<()> {
+        Err(rtos_block::error!("Overlay does not implement checked drain"))
+    }
+    fn overlay_drained(&self, _overlay: &ConsensusOverlayPtr) -> bool { false }
+
     /// Stop existing overlay
     fn stop_overlay(
         &self,
@@ -1604,6 +1612,20 @@ pub trait Session: fmt::Display + Send + Sync {
     /// Stop the session (blocks until all threads have stopped)
     /// Database is preserved for potential restart/recovery.
     fn stop(&self);
+
+    /// Join workers and preserve terminal failures for subsequent callers.
+    fn threads_drained(&self) -> bool {
+        false
+    }
+
+    fn stop_checked(&self) -> Result<()> {
+        Err(rtos_block::error!("checked shutdown is not implemented"))
+    }
+
+    /// Destroy after joining, reporting any terminal worker failure.
+    fn destroy_checked(&self) -> Result<()> {
+        Err(rtos_block::error!("checked destruction is not implemented"))
+    }
 
     /// Request session stop without waiting (non-blocking)
     /// Database is preserved for potential restart/recovery.

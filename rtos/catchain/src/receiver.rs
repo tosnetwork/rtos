@@ -20,7 +20,7 @@ use crate::{
     ActivityNodePtr, BlockHash, BlockHeight, BlockPayloadPtr, CatchainFactory, CatchainNode,
     CatchainOverlayListener, CatchainOverlayLogReplayListener, CatchainOverlayManagerPtr,
     CatchainOverlayPtr, DatabasePtr, Options, PrivateKey, PrivateOverlayShortId, PublicKeyHash,
-    QueryResponseCallback, RawBuffer, ReceivedBlockPtr, Receiver, ReceiverListenerPtr, ReceiverPtr,
+    QueryResponseCallback, RawBuffer, ReceivedBlockPtr, Receiver, ReceiverListenerPtr,
     ReceiverSourcePtr, SessionId,
 };
 use adnl::OverlayUtils;
@@ -35,7 +35,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -134,125 +133,43 @@ impl ReceiverTaskQueues {
     ReceiverThreads
 */
 
-struct ReceiverThreadDesc {
-    thread_prefix: String,                 //thread prefix
-    stopped: Arc<AtomicBool>,              //stop flag
-    thread_handle: thread::JoinHandle<()>, //thread handle
-    _activity_node: ActivityNodePtr,       //activity node for tracking hanged threads
-}
-
 struct ReceiverThreads {
-    threads: Vec<ReceiverThreadDesc>, //receiver threads
-    stop_flag: Arc<AtomicBool>,       //stop flag for threads
-    session_id: SessionId,            //session ID
+    owner: consensus_common::thread_owner::ThreadOwner,
+    stop_flag: Arc<AtomicBool>,
+    session_id: SessionId,
 }
-
 impl ReceiverThreads {
     fn new(session_id: SessionId) -> Self {
-        Self { threads: Vec::new(), stop_flag: Arc::new(AtomicBool::new(false)), session_id }
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        Self {
+            owner: consensus_common::thread_owner::ThreadOwner::new(stop_flag.clone()),
+            stop_flag,
+            session_id,
+        }
     }
-
     fn start_thread(
         &mut self,
         thread_prefix: String,
         thread_fn: Box<dyn FnOnce(Arc<AtomicBool>, ActivityNodePtr) + Send>,
     ) -> Result<Arc<AtomicBool>> {
-        //create DB thread context
         let stop = self.stop_flag.clone();
         let stopped = Arc::new(AtomicBool::new(false));
-        let session_id = self.session_id.to_hex_string();
-        let activity_node = CatchainFactory::create_activity_node(
-            format!("{}_{}", thread_prefix, session_id).to_string(),
-        );
-        let thread_prefix_clone = thread_prefix.clone();
-        let stopped_clone = stopped.clone();
-        let activity_node_clone = activity_node.clone();
-
-        //start thread
-        let handle = std::thread::Builder::new()
-            .name(format!("{}:{}", thread_prefix, self.session_id.to_hex_string()))
-            .spawn(move || {
-                log::info!("{} thread started for session {}", thread_prefix, session_id);
-
-                thread_fn(stop, activity_node);
-
-                log::info!("{} thread exited for session {}", thread_prefix, session_id);
-
-                //signal that thread is stopped
-
-                stopped.store(true, Ordering::Relaxed);
-            })?;
-
-        //store thread handle for later joining
-
-        self.threads.push(ReceiverThreadDesc {
-            thread_prefix: thread_prefix_clone,
-            stopped: stopped_clone.clone(),
-            thread_handle: handle,
-            _activity_node: activity_node_clone,
-        });
-
-        Ok(stopped_clone)
+        let activity = CatchainFactory::create_activity_node(format!(
+            "{}_{}",
+            thread_prefix,
+            self.session_id.to_hex_string()
+        ));
+        let name = format!("{}:{}", thread_prefix, self.session_id.to_hex_string());
+        self.owner.spawn(
+            std::thread::Builder::new().name(name.clone()),
+            name,
+            stopped.clone(),
+            move || thread_fn(stop, activity),
+        )?;
+        Ok(stopped)
     }
-
-    fn stop_threads(&self) {
-        self.stop_flag.store(true, Ordering::Relaxed);
-
-        let all_stopped = self.threads.iter().all(|thread| thread.stopped.load(Ordering::Relaxed));
-
-        if all_stopped {
-            return;
-        }
-
-        let session_id = self.session_id.to_hex_string();
-
-        log::info!("Stopping receiver for session {}", session_id);
-
-        loop {
-            let all_stopped =
-                self.threads.iter().all(|thread| thread.stopped.load(Ordering::Relaxed));
-
-            if all_stopped {
-                break;
-            }
-
-            let threads_to_dump = self
-                .threads
-                .iter()
-                .filter(|thread| !thread.stopped.load(Ordering::Relaxed))
-                .map(|thread| thread.thread_prefix.clone())
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            log::info!(
-                "...waiting for Receiver threads for session {}: {:?}",
-                session_id,
-                threads_to_dump
-            );
-
-            const CHECKING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-
-            std::thread::sleep(CHECKING_INTERVAL);
-        }
-
-        log::info!("Stopped receiver for session {}", session_id);
-    }
-
-    fn remove_all_threads(&mut self) {
-        log::info!("Removing all threads for session {}", self.session_id.to_hex_string());
-
-        for thread in &mut self.threads.drain(..) {
-            if let Err(err) = thread.thread_handle.join() {
-                log::error!(
-                    "Error joining thread {} for session {}: {:?}",
-                    thread.thread_prefix,
-                    self.session_id.to_hex_string(),
-                    err
-                );
-            }
-        }
-
-        log::info!("Removed all threads for session {}", self.session_id.to_hex_string());
+    fn stop_threads(&self) -> Result<()> {
+        self.owner.join()
     }
 }
 
@@ -262,6 +179,7 @@ impl ReceiverThreads {
 
 /// Parameters which copied from ReceiverImpl to ReceiverWrapper
 struct ReceiverStartupResult {
+    overlay_short_id: PublicKeyHash,
     out_broadcasts_bytes: metrics::Counter, //outgoing broadcasts traffic
     out_bytes: metrics::Counter,            //outgoing traffic
     local_adnl_id: PublicKeyHash,           //local ADNL ID
@@ -277,7 +195,9 @@ pub(crate) struct ReceiverWrapper {
     out_bytes: metrics::Counter,          //outgoing traffic
     local_adnl_id: PublicKeyHash,         //local ADNL ID
     local_id: PublicKeyHash,              //this node's public key hash (computed from local_key)
-    overlay: CatchainOverlayPtr,          //overlay
+    overlay_manager: CatchainOverlayManagerPtr,
+    overlay_short_id: PublicKeyHash,
+    overlay: CatchainOverlayPtr, //overlay
 }
 
 impl Drop for ReceiverWrapper {
@@ -286,9 +206,6 @@ impl Drop for ReceiverWrapper {
 
         // Stop receiver
         self.stop();
-
-        // Remove all threads and join them
-        self.receiver_threads.remove_all_threads();
 
         log::info!("Dropped ReceiverWrapper for session {}", self.session_id.to_hex_string());
     }
@@ -356,7 +273,25 @@ impl Receiver for ReceiverWrapper {
 
     /// Stop receiver
     fn stop(&self) {
-        self.receiver_threads.stop_threads();
+        if let Err(error) = self.stop_checked() {
+            log::error!("Receiver shutdown: {error}");
+        }
+    }
+
+    fn threads_drained(&self) -> bool {
+        self.receiver_threads.owner.is_joined()
+            && self.overlay_manager.overlay_drained(&self.overlay)
+    }
+
+    fn stop_checked(&self) -> Result<()> {
+        let threads = self.receiver_threads.stop_threads();
+        let overlay =
+            self.overlay_manager.stop_overlay_checked(&self.overlay_short_id, &self.overlay);
+        match (threads, overlay) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(a), Err(b)) => Err(error!("{a}; {b}")),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
     }
 
     /// Destroy DB
@@ -689,6 +624,7 @@ impl ReceiverWrapper {
             let receiver = receiver.borrow();
 
             ReceiverStartupResult {
+                overlay_short_id: receiver.overlay_short_id.clone(),
                 out_broadcasts_bytes: receiver.out_broadcasts_bytes.clone(),
                 out_bytes: receiver.out_bytes.clone(),
                 local_adnl_id: receiver
@@ -812,7 +748,7 @@ impl ReceiverWrapper {
         db_suffix: String,
         allow_unsafe_self_blocks_resync: bool,
         overlay_manager: CatchainOverlayManagerPtr,
-    ) -> Result<ReceiverPtr> {
+    ) -> Result<Arc<Self>> {
         let metrics_receiver = MetricsHandle::new(Some(Duration::from_secs(30)));
         let task_queues = Arc::new(ReceiverTaskQueues::new(metrics_receiver.clone()));
         let mut receiver_threads = ReceiverThreads::new(session_id.clone());
@@ -829,6 +765,7 @@ impl ReceiverWrapper {
         let task_queues_clone = task_queues.clone();
         let metrics_receiver_clone = metrics_receiver.clone();
         let local_id = local_key.id().clone();
+        let overlay_manager_for_wrapper = overlay_manager.clone();
 
         let _processing_thread_stopped = Self::start_processing_thread(
             &mut receiver_threads,
@@ -884,7 +821,9 @@ impl ReceiverWrapper {
             out_bytes: startup_result.out_bytes,
             local_adnl_id: startup_result.local_adnl_id,
             local_id,
+            overlay_short_id: startup_result.overlay_short_id,
             overlay: startup_result.overlay,
+            overlay_manager: overlay_manager_for_wrapper,
         };
 
         Ok(Arc::new(wrapper))
@@ -3916,3 +3855,7 @@ impl Drop for OverlayListenerImpl {
         log::info!("Dropped OverlayListenerImpl for session {}", self.session_id.to_hex_string());
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_receiver_lifecycle.rs"]
+mod lifecycle_tests;

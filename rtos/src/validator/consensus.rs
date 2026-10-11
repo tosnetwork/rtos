@@ -146,6 +146,16 @@ impl Display for EmulatorSimplexSessionAdapter {
 
 #[cfg(test)]
 impl Session for EmulatorSimplexSessionAdapter {
+    fn threads_drained(&self) -> bool {
+        self.emulator.threads_drained()
+    }
+    fn stop_checked(&self) -> consensus_common::Result<()> {
+        self.emulator.stop_checked()
+    }
+    fn destroy_checked(&self) -> consensus_common::Result<()> {
+        self.emulator.destroy_checked()
+    }
+
     fn start(&self, prev_blocks: Vec<BlockIdExt>, min_masterchain_block_id: BlockIdExt) {
         self.emulator.start(prev_blocks, min_masterchain_block_id);
     }
@@ -411,6 +421,16 @@ impl SessionHolder {
 // Implement consensus_common::Session for SessionHolder
 // Delegates to the common Session interface of the inner session
 impl consensus_common::Session for SessionHolder {
+    fn threads_drained(&self) -> bool {
+        self.inner.as_common_session().threads_drained()
+    }
+    fn stop_checked(&self) -> consensus_common::Result<()> {
+        self.inner.as_common_session().stop_checked()
+    }
+    fn destroy_checked(&self) -> consensus_common::Result<()> {
+        self.inner.as_common_session().destroy_checked()
+    }
+
     fn start(&self, prev_blocks: Vec<BlockIdExt>, min_masterchain_block_id: BlockIdExt) {
         self.inner.as_common_session().start(prev_blocks, min_masterchain_block_id);
     }

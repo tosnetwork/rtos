@@ -378,6 +378,21 @@ struct LoopbackOverlayManager {
 }
 
 impl CatchainOverlayManager for LoopbackOverlayManager {
+    fn stop_overlay_checked(
+        &self,
+        _: &Arc<PrivateOverlayShortId>,
+        overlay: &CatchainOverlayPtr,
+    ) -> Result<()> {
+        if !self.overlay_drained(overlay) {
+            fail!("Unexpected loopback overlay implementation");
+        }
+        Ok(())
+    }
+    fn overlay_drained(&self, overlay: &CatchainOverlayPtr) -> bool {
+        // Delivery is synchronous on the already-owned consensus worker.
+        overlay.get_impl().is::<LoopbackOverlay>()
+    }
+
     /// Create new overlay
     fn start_overlay(
         &self,
@@ -425,10 +440,9 @@ impl LoopbackOverlayManager {
 */
 
 pub(crate) struct SessionImpl {
+    threads: consensus_common::thread_owner::ThreadOwner,
     stop_flag: Arc<AtomicBool>, //atomic flag to indicate that all processing threads should be stopped
     destroy_catchain_db_flag: Arc<AtomicBool>, //indicates catchain has to destroy DB
-    main_processing_thread_stopped: Arc<AtomicBool>, //atomic flag to indicate that processing thread has been stopped
-    session_callbacks_processing_thread_stopped: Arc<AtomicBool>, //atomic flag to indicate that processing thread has been stopped
     main_task_queue: TaskQueuePtr, //task queue for main thread tasks processing
     _session_callbacks_task_queue: CallbackTaskQueuePtr, //task queue for session callbacks processing
     catchain: CatchainPtr,                               //catchain session
@@ -448,6 +462,18 @@ impl consensus_common::Session for SessionImpl {
 
     fn stop(&self) {
         self.stop_impl(false); // Stop without destroying DB (preserve for recovery)
+    }
+
+    fn threads_drained(&self) -> bool {
+        self.threads.is_joined() && self.catchain.threads_drained()
+    }
+
+    fn stop_checked(&self) -> Result<()> {
+        self.stop_checked_impl(false)
+    }
+
+    fn destroy_checked(&self) -> Result<()> {
+        self.stop_checked_impl(true)
     }
 
     fn stop_async(&self) {
@@ -518,45 +544,32 @@ impl SessionImpl {
     }
 
     fn stop_impl(&self, destroy_catchain_db: bool) {
+        if let Err(error) = self.stop_checked_impl(destroy_catchain_db) {
+            log::error!("ValidatorSession shutdown: {error}");
+        }
+    }
+
+    fn stop_checked_impl(&self, destroy_catchain_db: bool) -> Result<()> {
         if destroy_catchain_db {
-            // Once true, cannot be unset
             self.destroy_catchain_db_flag.store(true, Ordering::SeqCst);
         }
-
         self.stop_flag.store(true, Ordering::Release);
-
-        loop {
-            if self.session_callbacks_processing_thread_stopped.load(Ordering::Relaxed)
-                && self.main_processing_thread_stopped.load(Ordering::Relaxed)
-            {
-                break;
-            }
-
-            log::info!(
-                "...waiting for ValidatorSession threads (session_id is {})",
-                self.session_id.to_hex_string()
-            );
-
-            const CHECKING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
-
-            std::thread::sleep(CHECKING_INTERVAL);
-        }
-
-        //order is important: catchain retains blocks and controls their GC without deep recursion during automatic destroying
-
-        log::debug!("...stopping Catchain (session_id is {})", self.session_id.to_hex_string());
-
-        // Choose which catchain method to call based on the destroy flag
-        if self.destroy_catchain_db_flag.load(Ordering::SeqCst) {
-            self.catchain.destroy();
+        let session = self.threads.join();
+        // Keep the block storage alive until session processors and callbacks
+        // have actually exited, including their destructors.
+        let catchain = if self.destroy_catchain_db_flag.load(Ordering::SeqCst) {
+            self.catchain.destroy_checked()
         } else {
-            self.catchain.stop();
+            self.catchain.stop_checked()
+        };
+        let errors: Vec<_> = [session, catchain]
+            .into_iter()
+            .filter_map(|r| r.err().map(|e| e.to_string()))
+            .collect();
+        if !errors.is_empty() {
+            return Err(rtos_block::error!("{}", errors.join("; ")));
         }
-
-        log::info!(
-            "ValidatorSession has been stopped (session_id is {})",
-            self.session_id.to_hex_string()
-        );
+        Ok(())
     }
 
     /*
@@ -1229,11 +1242,9 @@ impl SessionImpl {
             session_id.to_hex_string()
         ));
         let body: SessionImpl = SessionImpl {
+            threads: consensus_common::thread_owner::ThreadOwner::new(stop_flag.clone()),
             stop_flag: stop_flag.clone(),
             destroy_catchain_db_flag: destroy_catchain_db_flag.clone(),
-            main_processing_thread_stopped: main_processing_thread_stopped.clone(),
-            session_callbacks_processing_thread_stopped:
-                session_callbacks_processing_thread_stopped.clone(),
             main_task_queue: main_task_queue.clone(),
             _session_callbacks_task_queue: session_callbacks_task_queue.clone(),
             catchain: catchain.clone(),
@@ -1252,9 +1263,15 @@ impl SessionImpl {
         //create processing threads
 
         let metrics_receiver_clone = metrics_receiver.clone();
-        let _main_processing_thread = std::thread::Builder::new()
-            .name(format!("{}:{}", MAIN_LOOP_NAME, session_id.to_hex_string()))
-            .spawn(move || {
+        session.threads.spawn(
+            std::thread::Builder::new().name(format!(
+                "{}:{}",
+                MAIN_LOOP_NAME,
+                session_id.to_hex_string()
+            )),
+            format!("{}:{}", MAIN_LOOP_NAME, session_id.to_hex_string()),
+            main_processing_thread_stopped.clone(),
+            move || {
                 SessionImpl::main_loop(
                     stop_flag_for_main_loop,
                     main_processing_thread_stopped,
@@ -1271,7 +1288,8 @@ impl SessionImpl {
                     session_creation_time,
                     metrics_receiver,
                 );
-            });
+            },
+        )?;
 
         let session_id_clone = session_id.clone();
 
@@ -1282,9 +1300,15 @@ impl SessionImpl {
                 session_id.to_hex_string()
             );
 
-            let _session_callbacks_processing_thread = std::thread::Builder::new()
-                .name(format!("{}:{}", CALLBACKS_LOOP_NAME, session_id.to_hex_string()))
-                .spawn(move || {
+            session.threads.spawn(
+                std::thread::Builder::new().name(format!(
+                    "{}:{}",
+                    CALLBACKS_LOOP_NAME,
+                    session_id.to_hex_string()
+                )),
+                format!("{}:{}", CALLBACKS_LOOP_NAME, session_id.to_hex_string()),
+                session_callbacks_processing_thread_stopped.clone(),
+                move || {
                     SessionImpl::session_callbacks_loop(
                         stop_flag_for_callbacks_loop,
                         session_callbacks_processing_thread_stopped,
@@ -1292,7 +1316,8 @@ impl SessionImpl {
                         session_id_clone,
                         metrics_receiver_clone,
                     );
-                });
+                },
+            )?;
         } else {
             log::info!(
                 "ValidatorSession {}: Callback processing thread is disabled (use_callback_thread=false), callbacks will execute synchronously in main session thread",
@@ -1341,3 +1366,7 @@ impl SessionImpl {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_owned_shutdown.rs"]
+mod owned_shutdown_tests;

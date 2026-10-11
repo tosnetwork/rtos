@@ -576,7 +576,8 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
         let overlay = ctx.overlay.clone();
         let src_key = bcast.src_key()?;
         let src_key_id = src_key.id().clone();
-        tokio::spawn(async move {
+        let tasks = overlay.tasks.clone();
+        tasks.spawn_cancelable("overlay FEC transfer", async move {
             let mut received = false;
             let mut packets = 0;
             let mut extra: Option<Vec<u8>> = None;
@@ -686,7 +687,8 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
         #[cfg(feature = "xp25")]
         let flags = bcast.flags();
         let overlay = ctx.overlay.clone();
-        tokio::spawn(async move {
+        let tasks = overlay.tasks.clone();
+        tasks.spawn_cancelable("overlay FEC transfer", async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(timeout_sec * 100)).await;
                 if let Some(transfer) = overlay.owned_broadcasts.get(&bcast_id_wait) {
@@ -1211,7 +1213,8 @@ impl BroadcastProtocol<BroadcastFec> for BroadcastFecProtocol {
         let max_seqno = (data_size / transfer.encoder.params().symbol_size as u32 + 1) * 3 / 2;
         let overlay = ctx.overlay.clone();
         let (sender, mut reader) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move {
+        let tasks = overlay.tasks.clone();
+        tasks.spawn_cancelable("overlay FEC transfer", async move {
             while transfer.seqno <= max_seqno {
                 for _ in 0..Self::SIZE_WAVE {
                     let seqno = transfer.seqno;
@@ -1246,7 +1249,8 @@ impl BroadcastProtocol<BroadcastFec> for BroadcastFecProtocol {
         let overlay = ctx.overlay.clone();
         let send_method = self.send_method();
         let src_adnl_key_id = ctx.src_adnl_key_id.clone();
-        tokio::spawn(async move {
+        let tasks = overlay.tasks.clone();
+        tasks.spawn_cancelable("overlay FEC transfer", async move {
             while let Some((mut buf, seqno)) = reader.recv().await {
                 if let Some(hops) = &hops {
                     buf.push(*hops)
@@ -1863,7 +1867,8 @@ impl BroadcastProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
         let flags = ctx.flags;
         #[cfg(feature = "telemetry")]
         let tag = ctx.data.tag;
-        tokio::spawn(async move {
+        let tasks = overlay.tasks.clone();
+        tasks.spawn_cancelable("overlay FEC transfer", async move {
             for i in 0..neighbours.len() {
                 let bcast = match Self::prepare_part(&overlay, &mut transfer) {
                     Err(e) => {

@@ -273,6 +273,7 @@ where
 
 /// Simplex session implementation
 pub(crate) struct SessionImpl {
+    overlay_owner: Arc<consensus_common::overlay_owner::OverlayOwner>,
     /// Real worker ownership, including destruction of their stack-local DBs.
     /// Serialized joins make repeated external stop calls completion barriers.
     worker_threads: Mutex<Vec<thread::JoinHandle<()>>>,
@@ -324,6 +325,28 @@ pub(crate) struct SessionImpl {
 // the Simplex-specific MC-finalized notification, candidate-availability
 // repair, and stop / panic probes (`SimplexSession`).
 impl ConsensusSession for SessionImpl {
+    fn threads_drained(&self) -> bool {
+        self.stop_flag.load(Ordering::Acquire)
+            && self.worker_threads.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            && self.overlay_owner.drained()
+    }
+    fn stop_checked(&self) -> Result<()> {
+        if IN_SESSION_WORKER.with(Cell::get) {
+            self.stop_async();
+            rtos_block::fail!("Cannot join session from its own worker");
+        }
+        self.stop_impl(false);
+        let overlay = self.overlay_owner.stop_checked();
+        if self.panicked_flag.load(Ordering::Acquire) {
+            rtos_block::fail!("Simplex consensus worker panicked; overlay result: {overlay:?}");
+        }
+        overlay
+    }
+    fn destroy_checked(&self) -> Result<()> {
+        self.destroy_db_flag.store(true, Ordering::Release);
+        self.stop_checked()
+    }
+
     fn start(&self, prev_blocks: Vec<BlockIdExt>, min_masterchain_block_id: BlockIdExt) {
         assert!(
             !prev_blocks.is_empty() && prev_blocks.len() <= 2,
@@ -1281,7 +1304,10 @@ impl SessionImpl {
             None::<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
         ));
         // Create session (receiver is created in main_loop after bootstrap loading)
+        let overlay_owner = consensus_common::overlay_owner::OverlayOwner::new(overlay_manager);
+        let overlay_manager: ConsensusOverlayManagerPtr = overlay_owner.clone();
         let session = SessionImpl {
+            overlay_owner,
             worker_threads: Mutex::new(Vec::new()),
             #[cfg(test)]
             worker_exit_gate: worker_exit_gate.clone(),

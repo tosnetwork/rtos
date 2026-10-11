@@ -1240,6 +1240,11 @@ impl RldpNode {
         None
     }
 
+    #[cfg(test)]
+    pub(crate) fn inbound_cap_leases_for_test(&self, peer: &Arc<KeyId>) -> i32 {
+        self.extended_caps.get(peer).map_or(0, |cap| cap.val().load(Ordering::Acquire))
+    }
+
     fn peer_inbound_cap(&self, peer: &Arc<KeyId>) -> usize {
         if let Some(cap) = self.extended_caps.get(peer) {
             if cap.val().load(Ordering::Relaxed) > 0 {

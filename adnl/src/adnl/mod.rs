@@ -20,4 +20,4 @@ pub mod telemetry;
 pub mod transport;
 
 #[cfg(feature = "node")]
-mod tasks;
+pub(crate) mod tasks;

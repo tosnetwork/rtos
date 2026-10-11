@@ -107,6 +107,21 @@ impl ConsensusOverlay for DummyConsensusOverlay {
 pub(crate) struct DummyConsensusOverlayManager;
 
 impl ConsensusOverlayManager for DummyConsensusOverlayManager {
+    fn stop_overlay_checked(
+        &self,
+        _: &Arc<PrivateOverlayShortId>,
+        overlay: &ConsensusOverlayPtr,
+    ) -> Result<()> {
+        if !self.overlay_drained(overlay) {
+            return Err(rtos_block::error!("Unexpected dummy overlay implementation"));
+        }
+        Ok(())
+    }
+    fn overlay_drained(&self, overlay: &ConsensusOverlayPtr) -> bool {
+        // This concrete overlay owns no worker, transport, callback queue or DB.
+        overlay.get_impl().is::<DummyConsensusOverlay>()
+    }
+
     fn start_overlay(
         &self,
         _local_validator_key: &PrivateKey,

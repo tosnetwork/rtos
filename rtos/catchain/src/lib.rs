@@ -230,6 +230,15 @@ pub trait Receiver: Send + Sync {
     /// Stop receiver
     fn stop(&self);
 
+    /// Join receiver workers and report terminal failures.
+    fn threads_drained(&self) -> bool {
+        false
+    }
+
+    fn stop_checked(&self) -> Result<()> {
+        Err(rtos_block::error!("checked shutdown is not implemented"))
+    }
+
     /// Destroy DB
     fn destroy_db(&self);
 }
@@ -374,6 +383,20 @@ pub trait Catchain: Send + Sync {
     /// Stop the Catchain (blocks until complete, preserves DB)
     fn stop(&self);
 
+    /// Join workers and retain terminal errors.
+    fn threads_drained(&self) -> bool {
+        false
+    }
+
+    fn stop_checked(&self) -> Result<()> {
+        Err(rtos_block::error!("checked shutdown is not implemented"))
+    }
+
+    /// Destroy storage after joining workers.
+    fn destroy_checked(&self) -> Result<()> {
+        Err(rtos_block::error!("checked destruction is not implemented"))
+    }
+
     /// Async stop the Catchain (non-blocking, preserves DB)
     fn stop_async(&self);
 
@@ -449,7 +472,7 @@ impl CatchainFactory {
         allow_unsafe_self_blocks_resync: bool,
         overlay_manager: CatchainOverlayManagerPtr,
     ) -> Result<ReceiverPtr> {
-        receiver::ReceiverWrapper::create(
+        Ok(receiver::ReceiverWrapper::create(
             session_id,
             options,
             listener,
@@ -459,7 +482,7 @@ impl CatchainFactory {
             db_suffix,
             allow_unsafe_self_blocks_resync,
             overlay_manager,
-        )
+        )?)
     }
 
     /// Create dummy overlay manager
@@ -517,7 +540,7 @@ impl CatchainFactory {
         overlay_manager: CatchainOverlayManagerPtr,
         listener: CatchainListenerPtr,
     ) -> Result<CatchainPtr> {
-        catchain::CatchainImpl::create(
+        Ok(catchain::CatchainImpl::create(
             options,
             session_id,
             ids,
@@ -527,7 +550,7 @@ impl CatchainFactory {
             allow_unsafe_self_blocks_resync,
             overlay_manager,
             listener,
-        )
+        )?)
     }
 
     /// Create log replay object
@@ -567,3 +590,7 @@ impl CatchainFactory {
         ConsensusCommonFactory::create_activity_node(name)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/lifecycle_support.rs"]
+mod lifecycle_support;

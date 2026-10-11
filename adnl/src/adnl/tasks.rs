@@ -26,9 +26,12 @@ pub(crate) struct AdnlTasks {
 }
 impl AdnlTasks {
     pub fn new() -> Arc<Self> {
+        Self::with_runtime(tokio::runtime::Handle::current())
+    }
+    pub fn with_runtime(runtime: tokio::runtime::Handle) -> Arc<Self> {
         Arc::new(Self {
             open: Mutex::new(true),
-            runtime: tokio::runtime::Handle::current(),
+            runtime,
             workers: TaskTracker::new(),
             cancellation: CancellationToken::new(),
             stopped: CancellationToken::new(),
@@ -64,6 +67,17 @@ impl AdnlTasks {
             return Err(future);
         }
         let token = self.workers.token();
+        self.spawn_admitted(name, token, future);
+        Ok(())
+    }
+    /// Transfer a lease already admitted by this owner to a retained supervisor.
+    /// Closing admission cannot cancel this ownership handoff.
+    pub fn spawn_admitted(
+        self: &Arc<Self>,
+        name: &'static str,
+        token: TaskTrackerToken,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) {
         let worker = self.runtime.spawn(future);
         let owner = self.clone();
         self.runtime.spawn(async move {
@@ -72,7 +86,6 @@ impl AdnlTasks {
                 owner.failed(format!("{name}: {error}"));
             }
         });
-        Ok(())
     }
     pub fn spawn(
         self: &Arc<Self>,
@@ -113,7 +126,7 @@ impl AdnlTasks {
         });
         Ok(())
     }
-    pub(super) fn failed(self: &Arc<Self>, error: String) {
+    pub(crate) fn failed(self: &Arc<Self>, error: String) {
         self.errors.lock().unwrap().push(error);
         self.close();
     }
@@ -137,6 +150,9 @@ impl AdnlTasks {
                 owner.stopped.cancel();
             });
         }
+    }
+    pub fn drained(&self) -> bool {
+        self.stopped.is_cancelled()
     }
     pub fn is_closed(&self) -> bool {
         self.cancellation.is_cancelled()
