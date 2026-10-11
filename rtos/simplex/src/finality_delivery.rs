@@ -437,6 +437,10 @@ pub(crate) struct PendingFinalityStore {
     #[cfg(test)]
     fail_delivered_once: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    fail_delivered_cleanup_once: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_confirmed_once: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     fail_compact_once: std::sync::atomic::AtomicBool,
 }
 impl PendingFinalityStore {
@@ -466,6 +470,10 @@ impl PendingFinalityStore {
                 intents,
                 #[cfg(test)]
                 fail_delivered_once: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                fail_delivered_cleanup_once: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                fail_confirmed_once: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 fail_compact_once: std::sync::atomic::AtomicBool::new(false),
             }))),
