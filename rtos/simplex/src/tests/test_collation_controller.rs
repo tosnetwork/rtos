@@ -2254,3 +2254,66 @@ fn own_journal_real_full_and_empty_publish_barriers() {
         }
     }
 }
+
+#[test]
+fn custody_real_full_and_empty_publish_barriers() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    use crate::{pq_fixture as f, signing_coordinator::tests::Harness};
+    for full in [false, true] {
+        for stage in [
+            None,
+            Some("before_intent"),
+            Some("after_intent"),
+            Some("before_sign"),
+            Some("after_sign"),
+            Some("before_signed"),
+            Some("after_signed"),
+        ] {
+            let h = Harness::custody(rtos_api::WireProfile::T0);
+            h.description.install_test_coordinator(h.coordinator.clone()).unwrap();
+            *h.coordinator.fail_at.lock().unwrap() = stage;
+            let mut controller = mk_ctrl(h.description.clone());
+            let slot = SlotIndex::new(99);
+            let mut backend = FakeCollationBackend::new(slot, h.description.get_window_idx(slot));
+            let (result, parent) = if full {
+                let candidate = crate::ValidatorBlockCandidate {
+                    public_key: f::members().1[1].clone(),
+                    id: f::block_id("ordinary"),
+                    collated_file_hash: UInt256::calc_file_hash(&[]),
+                    data: ConsensusCommonFactory::create_block_payload(f::bytes(
+                        &f::data(),
+                        "block_boc",
+                    )),
+                    collated_data: ConsensusCommonFactory::create_block_payload(vec![]),
+                };
+                (CollationResult::Block(Arc::new(candidate)), None)
+            } else {
+                (
+                    CollationResult::Empty { parent_block_id: f::block_id("empty") },
+                    Some(CandidateParentInfo {
+                        slot: SlotIndex::new(98),
+                        hash: UInt256::from([5; 32]),
+                    }),
+                )
+            };
+            controller.publish_candidate(&mut backend, slot, parent.clone(), result.clone(), None);
+            assert_eq!(
+                backend.published.borrow().len(),
+                usize::from(stage.is_none()),
+                "full={full}, stage={stage:?}"
+            );
+            assert_eq!(*backend.published.borrow(), *backend.self_received.borrow());
+            assert_eq!(
+                controller.local_chain_head().is_some(),
+                stage.is_none(),
+                "cache must not precede durable bytes"
+            );
+            if stage.is_none() {
+                let first = backend.published.borrow()[0].clone();
+                controller.publish_candidate(&mut backend, slot, parent, result, None);
+                assert_eq!(backend.published.borrow()[1], first);
+                assert_eq!(h.signature_count(), 1);
+            }
+        }
+    }
+}

@@ -5187,6 +5187,7 @@ dependencies = [
  "rand 0.8.5",
  "rtos_api",
  "rtos_block",
+ "rtos_pq_consensus",
  "serde",
  "serde_json",
  "spin 0.7.1",
