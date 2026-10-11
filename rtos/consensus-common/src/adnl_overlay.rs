@@ -1298,27 +1298,31 @@ impl AdnlOverlay {
                     if let Err(error) = manager.stop_checked() {
                         errors_for_blocking.lock().unwrap().push(error.to_string());
                     }
-                    let (peers_drained, peer_result) = storage.remove_peers(peers);
-                    let mut removed = true;
+                    let (drained, peer_result) = storage.remove_peers(peers);
                     if let Err(error) = peer_result {
                         errors_for_blocking.lock().unwrap().push(error.to_string());
                     }
-                    if let Err(error) = overlay.delete_private_overlay(&id) {
-                        removed = false;
-                        errors_for_blocking.lock().unwrap().push(error.to_string());
-                    }
-                    if let Some(id) = block_sync {
-                        if let Err(error) = overlay.delete_private_overlay(&id) {
-                            removed = false;
-                            errors_for_blocking.lock().unwrap().push(error.to_string());
-                        }
-                    }
-                    cleanup_complete.store(peers_drained && removed, Ordering::Release);
+                    drained
                 })
                 .await;
-            if let Err(error) = result {
+            let peers_drained = match result {
+                Ok(drained) => drained,
+                Err(error) => {
+                    errors.lock().unwrap().push(error.to_string());
+                    false
+                }
+            };
+            if let Err(error) = overlay.delete_private_overlay_checked(&id).await {
                 errors.lock().unwrap().push(error.to_string());
             }
+            let mut network_drained = overlay.private_overlay_drained(&id);
+            if let Some(id) = block_sync {
+                if let Err(error) = overlay.delete_private_overlay_checked(&id).await {
+                    errors.lock().unwrap().push(error.to_string());
+                }
+                network_drained &= overlay.private_overlay_drained(&id);
+            }
+            cleanup_complete.store(peers_drained && network_drained, Ordering::Release);
         });
         self.shutdown.close();
     }
