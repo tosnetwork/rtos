@@ -66,6 +66,8 @@ pub struct FullNodeOverlayService {
     bounded_queries: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pss_reply: std::sync::Mutex<Option<(Arc<rtos_block::KeyId>, PersistentStateIdV2, Option<i64>, Vec<u8>)>>,
+    #[cfg(test)]
+    pss_observations: std::sync::Mutex<Vec<(BlockIdExt, Option<i64>, Option<usize>)>>,
 }
 
 impl FullNodeOverlayService {
@@ -86,6 +88,8 @@ impl FullNodeOverlayService {
             bounded_queries: Default::default(),
             #[cfg(test)]
             pss_reply: Default::default(),
+            #[cfg(test)]
+            pss_observations: Default::default(),
         }
     }
 
@@ -115,6 +119,11 @@ impl FullNodeOverlayService {
     pub(crate) fn test_clear_history_replies(&self) {
         self.pss_reply.lock().unwrap().take();
         self.bounded_reply.lock().unwrap().take();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pss_observations(&self) -> Vec<(BlockIdExt, Option<i64>, Option<usize>)> {
+        self.pss_observations.lock().unwrap().clone()
     }
 
     #[cfg(test)]
@@ -452,6 +461,8 @@ impl FullNodeOverlayService {
                         query.max_size as u64,
                     )
                     .await?;
+                #[cfg(test)]
+                self.pss_observations.lock().unwrap().push((query.state.block.clone(), Some(query.offset), Some(data.len())));
                 let answer = TaggedByteVec {
                     object: data,
                     #[cfg(feature = "telemetry")]
@@ -774,11 +785,13 @@ impl Subscriber for FullNodeOverlayService {
                 Some((query.clone().downcast::<GetPersistentStateSizeV2>().unwrap().state, None))
             } else { None };
             if let Some((state, offset)) = pss {
+                self.pss_observations.lock().unwrap().push((state.block.clone(), offset, None));
                 let mut reply = self.pss_reply.lock().unwrap();
                 if reply.as_ref().is_some_and(|(peer, expected, at, _)| {
                     peer == adnl_peers.other() && expected == &state && at == &offset
                 }) {
                     let (_, _, _, bytes) = reply.take().unwrap();
+                    self.pss_observations.lock().unwrap().push((state.block.clone(), offset, Some(bytes.len())));
                     return Ok(QueryResult::Consumed(QueryAnswer::Ready(Some(Answer::Raw(
                         TaggedByteVec { object: bytes, #[cfg(feature = "telemetry")] tag: 0 },
                     )))));

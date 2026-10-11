@@ -20,6 +20,9 @@ fn retained_source_bytes(namespace: &Path) -> std::collections::BTreeMap<PathBuf
 }
 
 fn pss_fault(pair: &Pair, id: &BlockIdExt, bytes: &[u8]) {
+    pss_fault_at(pair, id, 0, bytes);
+}
+fn pss_fault_at(pair: &Pair, id: &BlockIdExt, offset: i64, bytes: &[u8]) {
     let requester = pair
         .provider
         .network()
@@ -38,7 +41,7 @@ fn pss_fault(pair: &Pair, id: &BlockIdExt, bytes: &[u8]) {
                 masterchain_block: id.clone(),
                 effective_shard: 0,
             },
-            Some(0),
+            Some(offset),
             bytes.to_vec(),
         );
     }
@@ -49,7 +52,29 @@ fn clear_faults(pair: &Pair) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryScenario {
+    Existing(u8),
+    DirectTargetSnapshot,
+    MissingTailAfterFullPart,
+    AutonomousColdStartup,
+    QuotaSecondAnchor,
+    CorruptExistingCapsule,
+    WrongRemoteDomain,
+    WrongRemoteParent,
+}
+
 async fn recover_source(mode: u8) {
+    recover_scenario(RecoveryScenario::Existing(mode)).await;
+}
+
+async fn recover_scenario(scenario: RecoveryScenario) {
+    let mode = match scenario {
+        RecoveryScenario::Existing(mode) => mode,
+        RecoveryScenario::QuotaSecondAnchor => 6,
+        _ => 0,
+    };
+
     let signer = std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER").unwrap();
     let pair = Pair::with_source_options("included", false, true, true, true).await;
     let run = std::panic::AssertUnwindSafe(async {
@@ -60,7 +85,27 @@ async fn recover_source(mode: u8) {
         let cc = pair.master.block().unwrap().read_info().unwrap().gen_catchain_seqno();
         let creator = config.validator_set().unwrap().list()[0].validator_id().unwrap();
         let (mut target, mut target_root, row) =
-            chain::successor(&signer, pair.master.id(), first.root_cell(), false, 0, cc, &creator);
+            chain::successor_with_state_transform(&signer, pair.master.id(), first.root_cell(), false, 0, cc, &creator, |state| {
+                if scenario == RecoveryScenario::MissingTailAfterFullPart {
+                    // Real state data, not peer-advertised padding: every leaf is
+                    // unique, and the resulting block/state update is signed.
+                    let mut level: Vec<_> = (0u32..18_000).map(|index| {
+                        let mut bytes = vec![0x59; 127];
+                        bytes[..4].copy_from_slice(&index.to_be_bytes());
+                        rtos_block::BuilderData::with_raw(bytes, 1016).unwrap().into_cell().unwrap()
+                    }).collect();
+                    while level.len() > 1 {
+                        level = level.chunks(2).map(|children| {
+                            let mut cell = rtos_block::BuilderData::new();
+                            for child in children { cell.checked_append_reference(child.clone()).unwrap(); }
+                            cell.into_cell().unwrap()
+                        }).collect();
+                    }
+                    let mut extra = state.read_custom().unwrap().unwrap();
+                    extra.config.set_config(rtos_block::ConfigParamEnum::ConfigParamAny(1000, level.pop().unwrap())).unwrap();
+                    state.write_custom(Some(&extra)).unwrap();
+                }
+            });
         let block = fixture_block(&row);
         let proof =
             BlockProofStuff::deserialize(&target, decode(&row["proof_boc"]), false).unwrap();
@@ -84,14 +129,22 @@ async fn recover_source(mode: u8) {
             target_root = root;
             Some(middle)
         } else { None };
-        // Only MC1 has a persistent snapshot on the peer. MC2 must be replayed.
+        // Legacy scenarios require MC1 replay; the named direct/part scenarios
+        // publish the exact target snapshot instead.
+        let target_snapshot = matches!(scenario, RecoveryScenario::DirectTargetSnapshot | RecoveryScenario::MissingTailAfterFullPart);
+        let snapshot_id = if target_snapshot { &target } else { pair.master.id() };
+        let snapshot_root = if target_snapshot { &target_root } else { first.root_cell() };
+        let snapshot_bytes = rtos_block::write_boc(snapshot_root).unwrap();
+        if scenario == RecoveryScenario::MissingTailAfterFullPart {
+            assert!(snapshot_bytes.len() > 2 << 20);
+        }
         for peer in [&pair.receiver, pair.observer.as_ref().unwrap()] {
             peer.clone().download_and_apply_block(pair.master.id(), 1, false).await.unwrap();
-            let handle = peer.load_block_handle(pair.master.id()).unwrap().unwrap();
+            let handle = peer.load_block_handle(snapshot_id).unwrap().unwrap();
             peer.db()
                 .store_shard_state_persistent_raw(
                     &handle,
-                    &rtos_block::write_boc(first.root_cell()).unwrap(),
+                    &snapshot_bytes,
                     None,
                 )
                 .await
@@ -261,6 +314,74 @@ async fn recover_source(mode: u8) {
                 "{error:#}"
             );
         }
+        if scenario == RecoveryScenario::AutonomousColdStartup {
+            // Leave absent capsule/ordinary state and genuine source certificate
+            // on disk. The cold process receives no record or runtime argument.
+            return (record, target, target_root.repr_hash().clone(), closing, namespace);
+        }
+        if scenario == RecoveryScenario::QuotaSecondAnchor {
+            let before = retained_source_bytes(&namespace);
+            let guard = crate::retired_history::test_recovered_capsule_limits(
+                Path::new(engine.db_root_dir().unwrap()),
+                crate::retired_history::Limits { anchors: 1, ..Default::default() });
+            let error = engine.clone().authenticate_retired_source_with_history(record.clone()).await.err()
+                .expect("second authenticated anchor must hit actual Store quota branch");
+            assert!(format!("{error:#}").contains("Retained history anchor quota exhausted"), "{error:#}");
+            assert!(crate::retired_history::authenticate_capsule_with_budget(engine.as_ref(), pair.master.id(), None).await.unwrap().is_some());
+            assert!(crate::retired_history::authenticate_capsule_with_budget(engine.as_ref(), &target, None).await.unwrap().is_none());
+            assert_eq!(retained_source_bytes(&namespace), before);
+            drop(guard); // Restore production capacity; no data is removed to make space.
+            return (record, target, target_root.repr_hash().clone(), closing, namespace);
+        }
+        if matches!(scenario, RecoveryScenario::WrongRemoteDomain | RecoveryScenario::WrongRemoteParent) {
+            use rtos_api::IntoBoxed;
+            let before = retained_source_bytes(&namespace);
+            engine.db().test_remove_archived_artifacts(&target).await.unwrap();
+            let mut wrong_parent = pair.master.id().clone();
+            if scenario == RecoveryScenario::WrongRemoteParent {
+                wrong_parent.file_hash = UInt256::calc_file_hash(b"another exact parent");
+            }
+            let (wrong_id, _, wrong_row) = chain::successor_in_domain(
+                &signer, &wrong_parent, first.root_cell(), false, 0, cc, &creator,
+                if scenario == RecoveryScenario::WrongRemoteDomain { -238 } else { -239 }, |_| {});
+            assert_ne!(wrong_id, target);
+            let reply = WireProfile::T0.serialize(&rtos_api::ton::ton_node::datafull::DataFull {
+                id: wrong_id, block: decode(&wrong_row["block_boc"]), proof: decode(&wrong_row["proof_boc"]), is_link: false.into(),
+            }.into_boxed()).unwrap();
+            let requester = engine.network().context().stack.adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap().id().clone();
+            let count = || [&pair.receiver, pair.observer.as_ref().unwrap()].iter()
+                .map(|peer| peer.overlays_router().unwrap().test_bounded_queries()).sum::<usize>();
+            let before_count = count();
+            for peer in [&pair.receiver, pair.observer.as_ref().unwrap()] {
+                peer.overlays_router().unwrap().test_bounded_reply(requester.clone(), target.clone(), true, reply.clone());
+            }
+            let error = engine.clone().authenticate_retired_source_with_history(record.clone()).await.err()
+                .expect("valid signed foreign response must not replace the requested full block identity");
+            assert!(count() > before_count, "must consume a real foreign peer reply");
+            assert!(format!("{error:#}").contains("Block with another id was received"), "{error:#}");
+            assert_eq!(retained_source_bytes(&namespace), before);
+            assert_eq!(engine.load_last_applied_mc_block_id().unwrap(), head);
+            assert!(crate::retired_history::authenticate_capsule_with_budget(engine.as_ref(), &target, None).await.unwrap().is_none());
+            clear_faults(&pair);
+            // The subsequent normal recovery downloads the genuine target.
+        }
+        if scenario == RecoveryScenario::MissingTailAfterFullPart {
+            const PART: usize = 2 << 20;
+            let before = retained_source_bytes(&namespace);
+            pss_fault_at(&pair, &target, PART as i64, &[]);
+            let error = engine.clone().authenticate_retired_source_with_history(record.clone()).await.err()
+                .expect("missing second part must not authenticate a truncated snapshot");
+            assert!(format!("{error:#}").contains("Historical snapshot part is missing or short"), "{error:#}");
+            let observations: Vec<_> = [&pair.receiver, pair.observer.as_ref().unwrap()].iter()
+                .flat_map(|peer| peer.overlays_router().unwrap().test_pss_observations()).collect();
+            assert!(observations.iter().any(|(id, offset, size)| id == &target && *offset == Some(0) && *size == Some(PART)),
+                "first part must come from the real persistent-state file: {observations:?}");
+            assert!(observations.iter().any(|(id, offset, size)| id == &target && *offset == Some(PART as i64) && *size == Some(0)));
+            assert_eq!(retained_source_bytes(&namespace), before);
+            assert_eq!(engine.load_last_applied_mc_block_id().unwrap(), head);
+            assert!(crate::retired_history::authenticate_capsule_with_budget(engine.as_ref(), &target, None).await.unwrap().is_none());
+            clear_faults(&pair);
+        }
         if mode == 8 || mode == 9 {
             let before = retained_source_bytes(&namespace);
             let bytes = if mode == 8 {
@@ -411,7 +532,7 @@ async fn recover_source(mode: u8) {
                 assert_eq!(control.syncs(), 1);
                 assert_eq!(retained_source_bytes(&namespace), before);
             }
-            if mode == 5 || mode == 6 {
+            if (mode == 5 || mode == 6) && scenario != RecoveryScenario::QuotaSecondAnchor {
                 let before = retained_source_bytes(&namespace);
                 let control =
                     crate::historical_recovery::test_hooks::install(engine.as_ref(), false, mode == 5);
@@ -474,6 +595,39 @@ async fn recover_source(mode: u8) {
                 .unwrap();
             assert_eq!(authenticated.runtime().session_id(), runtime.session_id());
         }
+        if scenario == RecoveryScenario::CorruptExistingCapsule {
+            let before = retained_source_bytes(&namespace);
+            let root = Path::new(engine.db_root_dir().unwrap()).join("retired-history-v1");
+            let manifest = std::fs::read_dir(&root).unwrap().filter_map(|entry| {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|v| v.to_str()) != Some("json") { return None; }
+                let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                (value["id"].as_str() == Some(target.to_string().as_str())).then_some(value)
+            }).next().expect("actual authorized capsule manifest");
+            let blob = root.join(format!("{}.blob", manifest["state"].as_str().unwrap()));
+            let original = std::fs::read(&blob).unwrap();
+            let mut damaged = original.clone(); damaged[0] ^= 1;
+            std::fs::write(&blob, &damaged).unwrap();
+            let queries = || [&pair.receiver, pair.observer.as_ref().unwrap()].iter().map(|peer| {
+                let router = peer.overlays_router().unwrap();
+                (router.test_pss_observations().len(), router.test_bounded_queries())
+            }).collect::<Vec<_>>();
+            let before_queries = queries();
+            let error = engine.clone().authenticate_retired_source_with_history(record.clone()).await.err()
+                .expect("corrupt existing capsule must not fall back to available peer");
+            assert!(format!("{error:#}").contains("History blob checksum mismatch"), "{error:#}");
+            assert_eq!(queries(), before_queries, "corrupt established evidence must cause zero remote fetch");
+            assert_eq!(std::fs::read(&blob).unwrap(), damaged);
+            assert_eq!(retained_source_bytes(&namespace), before);
+            std::fs::write(&blob, original).unwrap();
+        }
+        if target_snapshot {
+            let observations: Vec<_> = [&pair.receiver, pair.observer.as_ref().unwrap()].iter()
+                .flat_map(|peer| peer.overlays_router().unwrap().test_pss_observations()).collect();
+            assert!(observations.iter().any(|(id, offset, size)| id == &target && *offset == Some(0) && size.is_some()));
+            assert!(observations.iter().all(|(id, _, _)| id == &target),
+                "direct snapshot must not silently fall back to an ancestor: {observations:?}");
+        }
         assert_eq!(engine.load_last_applied_mc_block_id().unwrap(), head);
         assert!(
             !engine.db().test_contains_dynamic_state_record(&target).unwrap(),
@@ -497,24 +651,55 @@ async fn recover_source(mode: u8) {
     })
     .catch_unwind()
     .await;
-    pair.stop_all().await;
+    if matches!(
+        scenario,
+        RecoveryScenario::AutonomousColdStartup | RecoveryScenario::QuotaSecondAnchor
+    ) && run.is_ok()
+    {
+        pair.provider.clone().wait_stop().await.unwrap();
+    } else {
+        pair.stop_all().await;
+    }
     let (record, target, expected, closing, namespace) =
         run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     let Pair { _dir: directory, receiver, provider, observer, .. } = pair;
-    drop(receiver);
     drop(provider);
-    drop(observer);
+    // Autonomous first cold boot still needs live peers; all other scenarios
+    // have already joined them and prove offline capsule reauthentication.
     // No peer is reopened: this must authenticate solely from durable capsule.
     let cold = open_engine(&directory.path().join("provider")).await;
     let result = std::panic::AssertUnwindSafe(async {
         assert!(!cold.db().test_contains_dynamic_state_record(&target).unwrap());
-        if let Some(request) = closing {
+        if scenario == RecoveryScenario::AutonomousColdStartup {
+            let service = cold.ensure_retired_session_recovery().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(90), async {
+                loop {
+                    match crate::retired_history::authenticate_capsule_with_budget(
+                        cold.as_ref(),
+                        &target,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(Some(_)) => break,
+                        Ok(None) => {}
+                        Err(error) if crate::retired_history::is_retryable(&error) => {}
+                        Err(error) => panic!("cold capsule authentication: {error:#}"),
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("autonomous capsule recovery timed out: {:?}", service.snapshot())
+            });
+        } else if let Some(request) = closing.clone() {
             cold.clone()
                 .authenticate_closing_source_with_history(request, namespace)
                 .await
                 .unwrap();
         } else {
-            cold.clone().authenticate_retired_source_with_history(record).await.unwrap();
+            cold.clone().authenticate_retired_source_with_history(record.clone()).await.unwrap();
         }
         assert_eq!(
             crate::retired_history::authenticate_state(cold.as_ref(), &target)
@@ -530,6 +715,33 @@ async fn recover_source(mode: u8) {
     .await;
     cold.clone().wait_stop().await.unwrap();
     drop(cold);
+    if matches!(
+        scenario,
+        RecoveryScenario::AutonomousColdStartup | RecoveryScenario::QuotaSecondAnchor
+    ) {
+        let (a, b) = tokio::join!(receiver.clone().wait_stop(), async {
+            if let Some(peer) = observer.as_ref() {
+                peer.clone().wait_stop().await
+            } else {
+                Ok(())
+            }
+        });
+        a.unwrap();
+        b.unwrap();
+    }
+    drop(receiver);
+    drop(observer);
+    if result.is_ok()
+        && matches!(
+            scenario,
+            RecoveryScenario::AutonomousColdStartup | RecoveryScenario::QuotaSecondAnchor
+        )
+    {
+        let offline = open_engine(&directory.path().join("provider")).await;
+        let check = offline.clone().authenticate_retired_source_with_history(record).await;
+        offline.clone().wait_stop().await.unwrap();
+        check.unwrap();
+    }
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -609,4 +821,46 @@ async fn historical_recovery_remote_depth_limit_stays_failed_on_same_request() {
 #[ignore = "real absent intermediate state/body and peer hole; RTOS_PUBLIC_FIXTURE_SIGNER required"]
 async fn historical_recovery_missing_intermediate_successor_refuses_replay() {
     recover_source(10).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real exact target snapshot; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_direct_target_snapshot_and_peer_off_cold() {
+    recover_scenario(RecoveryScenario::DirectTargetSnapshot).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real two-part PSS missing tail; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_missing_tail_after_real_first_part() {
+    recover_scenario(RecoveryScenario::MissingTailAfterFullPart).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real cold autonomous source scanner; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_autonomous_cold_startup_without_record_input() {
+    recover_scenario(RecoveryScenario::AutonomousColdStartup).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real Store quota branch with per-DB reduced limit; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_second_anchor_quota_preserves_first_and_source() {
+    recover_scenario(RecoveryScenario::QuotaSecondAnchor).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "actual corrupted capsule rejects without peer fallback; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_corrupt_existing_capsule_never_fetches_remote() {
+    recover_scenario(RecoveryScenario::CorruptExistingCapsule).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real signed foreign-domain peer block; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_foreign_domain_response_cannot_replace_exact_target() {
+    recover_scenario(RecoveryScenario::WrongRemoteDomain).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real signed different-parent peer block; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_foreign_parent_response_cannot_replace_exact_target() {
+    recover_scenario(RecoveryScenario::WrongRemoteParent).await;
 }

@@ -87,10 +87,38 @@ pub(super) fn successor(
     cc: u32,
     creator: &UInt256,
 ) -> (BlockIdExt, Cell, Value) {
+    successor_with_state_transform(signer, parent, old_cell, key, epoch, cc, creator, |_| {})
+}
+
+pub(super) fn successor_with_state_transform(
+    signer: &str,
+    parent: &BlockIdExt,
+    old_cell: &Cell,
+    key: bool,
+    epoch: u32,
+    cc: u32,
+    creator: &UInt256,
+    transform: impl FnOnce(&mut ShardStateUnsplit),
+) -> (BlockIdExt, Cell, Value) {
+    successor_in_domain(signer, parent, old_cell, key, epoch, cc, creator, -239, transform)
+}
+
+pub(super) fn successor_in_domain(
+    signer: &str,
+    parent: &BlockIdExt,
+    old_cell: &Cell,
+    key: bool,
+    epoch: u32,
+    cc: u32,
+    creator: &UInt256,
+    global_id: i32,
+    transform: impl FnOnce(&mut ShardStateUnsplit),
+) -> (BlockIdExt, Cell, Value) {
     let old_state = ShardStateUnsplit::construct_from_cell(old_cell.clone()).unwrap();
     let config = old_state.read_custom().unwrap().unwrap().config;
     let seq = parent.seq_no + 1;
     let mut state = old_state.clone();
+    state.set_global_id(global_id);
     state.set_seq_no(seq);
     state.set_gen_time(old_state.gen_time() + 1);
     state.set_gen_lt(old_state.gen_lt() + 5);
@@ -106,6 +134,7 @@ pub(super) fn successor(
         .unwrap();
     extra.after_key_block = key;
     state.write_custom(Some(&extra)).unwrap();
+    transform(&mut state);
     let state_cell = state.serialize().unwrap();
     let placeholder = BlockIdExt::with_params(
         ShardIdent::masterchain(),
@@ -114,7 +143,7 @@ pub(super) fn successor(
         UInt256::default(),
     );
     let context =
-        PqVerificationContext::from_governing_config(-239, &config, placeholder, 0, epoch, cc)
+        PqVerificationContext::from_governing_config(global_id, &config, placeholder, 0, epoch, cc)
             .unwrap();
     let mut info = BlockInfo::default();
     info.set_seq_no(seq).unwrap();
@@ -137,7 +166,7 @@ pub(super) fn successor(
     *block_extra.created_by_mut() = creator.clone();
     block_extra.write_custom(&custom).unwrap();
     let block = Block::with_params(
-        -239,
+        global_id,
         info,
         ValueFlow::default(),
         MerkleUpdate::create(old_cell, &state_cell).unwrap(),
@@ -146,7 +175,7 @@ pub(super) fn successor(
     .unwrap();
     let (id, bytes) = encode_block(&block);
     let context =
-        PqVerificationContext::from_governing_config(-239, &config, id.clone(), 0, epoch, cc)
+        PqVerificationContext::from_governing_config(global_id, &config, id.clone(), 0, epoch, cc)
             .unwrap();
     let (carrier, candidate) = sign(signer, &context, &id, cc, &config);
     let proof = BlockProof::with_params(
