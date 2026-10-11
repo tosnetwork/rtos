@@ -3,7 +3,7 @@
 use super::super::retired_session_auth::authenticate_closing_runtime;
 use super::*;
 use consensus_common::finality_delivery::FinalityDeliveryRole;
-use simplex::finality_delivery::{close_source_id, scan_finality_closures_namespace_batch};
+use simplex::finality_delivery::scan_finality_closures_namespace_report;
 
 const CLOSE_BATCH: usize = 16;
 
@@ -71,36 +71,46 @@ async fn replay_namespace(
         cursors.get(&namespace).cloned()
     };
     let path = namespace.clone();
-    let locators = tokio::task::spawn_blocking(move || {
-        scan_finality_closures_namespace_batch(&path, after.as_ref(), CLOSE_BATCH)
+    let batch = tokio::task::spawn_blocking(move || {
+        scan_finality_closures_namespace_report(&path, after.as_ref(), CLOSE_BATCH)
     })
     .await
     .map_err(|e| error!("Source closing scan join: {e}"))??;
-    if let Some(last) = locators.last() {
+    if let Some(last) = batch.next_cursor {
         cursors
             .lock()
             .map_err(|_| error!("Closing cursor poisoned"))?
-            .insert(namespace.clone(), close_source_id(&last.request()?)?);
+            .insert(namespace.clone(), last);
     }
     let mut candidates = Vec::new();
-    for locator in locators {
-        let request = locator.request()?;
+    let mut first_error = None;
+    for (id, locator) in batch.items {
+        let (locator, request) = match locator.and_then(|locator| {
+            let request = locator.request()?;
+            Ok((locator, request))
+        }) {
+            Ok(value) => value,
+            Err(error) => {
+                log::warn!(target: "validator", "Source closing {} item {id}: {error}", namespace.display());
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
         // Legacy references without an authenticated recovery binding still
         // need the full historical session recovery path.
         if request.domain.recovery_binding.is_some()
             && request.canonical.role == FinalityDeliveryRole::Final
             && request.canonical.block_id.shard().is_masterchain()
         {
-            candidates.push((close_source_id(&request)?, locator));
+            candidates.push((id, locator));
         }
     }
     if candidates.is_empty() || engine.check_stop() {
-        return Ok(0);
+        return first_error.map_or(Ok(0), Err);
     }
     let worker = engine.ensure_publication_worker().await?;
     let mut lease = None;
     let mut completions = Vec::new();
-    let mut first_error = None;
     let admission = std::panic::AssertUnwindSafe(async {
         for (_, locator) in candidates {
             if engine.check_stop() {
