@@ -33,7 +33,7 @@ async fn circulation(events: usize) {
     let signer = std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER")
         .expect("set RTOS_PUBLIC_FIXTURE_SIGNER to the archived public-only fixture signer");
     assert!(Path::new(&signer).is_file());
-    let pair = Pair::with_propagation_profile("included", false, true).await;
+    let pair = Pair::with_source_transport("included").await;
     let run = std::panic::AssertUnwindSafe(async {
         let engine = &pair.provider;
         // Bootstrap MC1 uses the real existing proof and application path;
