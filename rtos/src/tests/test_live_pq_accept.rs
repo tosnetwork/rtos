@@ -465,3 +465,23 @@ async fn pq_live_accept_notarized_state_promotes_only_with_authenticated_final()
     assert_eq!(engine.proofs.load(Ordering::Relaxed), 2);
     assert_eq!(engine.tops.load(Ordering::Relaxed), 1);
 }
+
+#[test]
+fn pq_accept_header_binds_file_hash_for_ordinary_blocks() {
+    let (block, _, _, _, _) = node_fixture("current", "finalize");
+    let prev = BlockIdExt::with_params(
+        block.id().shard().clone(),
+        41,
+        UInt256::from([41; 32]),
+        UInt256::from([42; 32]),
+    );
+    precheck_header(&block, &[prev.clone()], false, false).unwrap();
+    let mut wrong_id = block.id().clone();
+    wrong_id.file_hash = UInt256::from([0xA5; 32]);
+    // This constructor deliberately checks only the root; the acceptance
+    // boundary must bind the file hash even for a well-formed block body.
+    let unchecked =
+        BlockStuff::deserialize_block(wrong_id, Arc::new(block.data().to_vec())).unwrap();
+    let error = precheck_header(&unchecked, &[prev], false, false).unwrap_err();
+    assert!(error.to_string().contains("block file hash mismatch"), "{error}");
+}
