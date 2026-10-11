@@ -26,9 +26,7 @@ use rtos_block::{fail, Result, UInt256};
 use std::{
     cmp::min,
     collections::HashMap,
-    future::Future,
     ops::Range,
-    pin::Pin,
     sync::{
         atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering},
         Arc,
@@ -36,55 +34,6 @@ use std::{
 };
 #[cfg(feature = "debug")]
 use std::{sync::atomic::AtomicPtr, time::Instant};
-
-type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send>>;
-
-// Pool decoupling task count from in-flight transfers; workers spawn on first submit.
-pub(crate) struct SendWorkerPool {
-    queue: Arc<lockfree::queue::Queue<BoxedFut>>,
-    sem: Arc<tokio::sync::Semaphore>,
-    spawned: std::sync::OnceLock<()>,
-}
-
-impl SendWorkerPool {
-    pub(crate) fn new() -> Self {
-        Self {
-            queue: Arc::new(lockfree::queue::Queue::new()),
-            sem: Arc::new(tokio::sync::Semaphore::new(0)),
-            spawned: std::sync::OnceLock::new(),
-        }
-    }
-
-    pub(crate) fn submit<F>(&self, fut: F)
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        self.spawned.get_or_init(|| {
-            let n = num_cpus::get().min(8).max(1);
-            for _ in 0..n {
-                let queue = self.queue.clone();
-                let sem = self.sem.clone();
-                tokio::spawn(async move {
-                    while let Ok(permit) = sem.acquire().await {
-                        permit.forget();
-                        if let Some(fut) = queue.pop() {
-                            fut.await;
-                        }
-                    }
-                });
-            }
-        });
-        self.queue.push(Box::pin(fut));
-        self.sem.add_permits(1);
-    }
-}
-
-impl Drop for SendWorkerPool {
-    fn drop(&mut self) {
-        // Wakes workers with Err; they exit after current future.
-        self.sem.close();
-    }
-}
 
 /// RaptorQ encoder
 pub struct RaptorqEncoder {
@@ -174,6 +123,9 @@ impl RaptorqEncoder {
 }
 
 pub(crate) struct SendContext {
+    pub(super) control: Arc<super::SendControl>,
+    pub(super) permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    pub(super) registration: Arc<super::owned_send::SendRegistration>,
     pub(crate) adnl: Arc<AdnlNode>,
     pub(crate) peers: AdnlPeers,
     pub(crate) pong: tokio::sync::mpsc::UnboundedReceiver<()>,
@@ -335,6 +287,27 @@ pub(crate) struct SendPartV2 {
     total_ack_prev: u32,
     total_lost: u32,
     total_lost_prev: u32,
+}
+
+pub(super) struct OwnedSendPart {
+    pub part: SendPartV2,
+    pub peer: Arc<RldpPeer>,
+}
+impl std::ops::Deref for OwnedSendPart {
+    type Target = SendPartV2;
+    fn deref(&self) -> &SendPartV2 {
+        &self.part
+    }
+}
+impl std::ops::DerefMut for OwnedSendPart {
+    fn deref_mut(&mut self) -> &mut SendPartV2 {
+        &mut self.part
+    }
+}
+impl Drop for OwnedSendPart {
+    fn drop(&mut self) {
+        self.part.on_drop(&self.peer);
+    }
 }
 
 impl SendPartV2 {
