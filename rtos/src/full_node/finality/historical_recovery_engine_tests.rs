@@ -206,7 +206,7 @@ async fn recover_scenario(scenario: RecoveryScenario) {
                 },
             },
             data: ConsensusCommonFactory::create_block_payload(next_block.data().to_vec()),
-            finality: SessionFinality::Carrier(next_proof.drain_signatures().unwrap()),
+            finality: SessionFinality::Carrier(next_proof.clone().drain_signatures().unwrap()),
             last_mc_finalized_seqno: 0,
             candidate_already_sent: false,
             created_at_unix_secs: std::time::SystemTime::now()
