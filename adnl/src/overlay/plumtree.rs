@@ -301,6 +301,7 @@ struct Part {
 }
 struct BroadcastState {
     first_seen: Instant,
+    last_publication: Option<Instant>,
     source: Arc<KeyId>,
     flags: i32,
     full_hash: Option<[u8; 32]>,
@@ -768,6 +769,7 @@ impl Engine {
         };
         let state = self.states.entry(key.id).or_insert_with(|| BroadcastState {
             first_seen: mono,
+            last_publication: None,
             source,
             flags,
             full_hash,
@@ -823,6 +825,78 @@ impl Engine {
 }
 
 impl Engine {
+    /// Retry an explicitly requested local publication without changing the signed
+    /// carrier, local delivery, or retention lifetime. Network ingress never calls
+    /// this path. Each retry grants one bounded forwarding round, at most once per
+    /// second; transport failure must remain visible to the caller.
+    fn republish(
+        &mut self,
+        id: [u8; 32],
+        flags: i32,
+        simple: bool,
+        data: &[u8],
+        neighbours: &[[u8; 32]],
+        now: f64,
+        mono: Instant,
+    ) -> Result<Vec<Action>> {
+        let state = &self.states[&id];
+        let matches_payload = if simple {
+            state.full_hash.is_none()
+                && state.parts.get(&0).is_some_and(|part| match &part.wire {
+                    Broadcast::Overlay_BroadcastPlumtreeSimple(message) => {
+                        message.data.as_slice() == data
+                    }
+                    _ => false,
+                })
+        } else {
+            state.full_hash == Some(sha256_digest(data))
+        };
+        if state.flags != flags || state.full_size != data.len() || !matches_payload {
+            fail!("Plumtree publication commitment collision");
+        }
+        if !state.delivered || state.decode_failed || state.parts.is_empty() {
+            fail!("Plumtree publication is not fully retained");
+        }
+        if state.last_publication.is_some_and(|last| mono.duration_since(last).as_secs() < 1) {
+            fail!("Plumtree publication retry is rate limited");
+        }
+        let keys: Vec<_> = state
+            .parts
+            .keys()
+            .map(|part| PartKey { id, part: *part, tree: if simple { 0 } else { *part + 1 } })
+            .collect();
+        // Check every retained carrier before mutating any forwarding state. A
+        // received carrier may expire before our monotonic retention deadline.
+        for key in &keys {
+            state.parts[&key.part].auth.verify(
+                *key,
+                &self.policy,
+                &self.overlay,
+                state.full_size,
+                flags & 1 != 0,
+                now,
+            )?;
+        }
+        if neighbours.is_empty() {
+            fail!("Plumtree publication retry has no neighbours");
+        }
+        let state = self.states.get_mut(&id).unwrap();
+        state.last_publication = Some(mono);
+        for part in state.parts.values_mut() {
+            part.sent.clear();
+            part.advertised.clear();
+            part.full_sends = 0;
+        }
+        let mut actions = Vec::new();
+        for key in keys {
+            actions.extend(self.forward(key, None, neighbours, now, mono));
+        }
+        if actions.is_empty() {
+            fail!("Plumtree publication retry has no eligible neighbours");
+        }
+        Ok(actions)
+    }
+
     pub fn publish(
         &mut self,
         signer: &Arc<dyn KeyOption>,
@@ -860,7 +934,7 @@ impl Engine {
                 .as_array(),
         };
         if self.states.contains_key(&id) {
-            fail!("Plumtree broadcast identity is already retained");
+            return self.republish(id, flags, simple_id.is_some(), data, neighbours, now, mono);
         }
         if self.states.len() >= self.policy.max_broadcasts {
             fail!("Plumtree broadcast limit exceeded");
@@ -878,6 +952,7 @@ impl Engine {
         }
         let mut state = BroadcastState {
             first_seen: mono,
+            last_publication: Some(mono),
             source: signer.id().clone(),
             flags,
             full_hash: if simple_id.is_some() { None } else { Some(full_hash) },
@@ -983,7 +1058,7 @@ mod tests {
     use super::*;
     use rtos_api::deserialize_boxed;
     use rtos_block::{Ed25519KeyOption, ZeroizingBytes};
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, time::Duration};
 
     fn key(seed: u8) -> Arc<dyn KeyOption> {
         Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[seed; 32]).unwrap()
@@ -1000,6 +1075,176 @@ mod tests {
             max_broadcasts: 16,
         }
     }
+    #[test]
+    fn publication_retry_preserves_carrier_and_bounds() {
+        let signer = key(73);
+        let mono = Instant::now();
+        let now = 1700000000.0;
+        for simple_id in [Some([8; 32]), None] {
+            let mut engine = Engine::new(policy(&signer), [9; 32]).unwrap();
+            let data = vec![42; 4096];
+            engine
+                .publish(
+                    &signer,
+                    Certificate::Overlay_EmptyCertificate,
+                    0,
+                    simple_id,
+                    &data,
+                    &[[2; 32]],
+                    now,
+                    mono,
+                )
+                .unwrap();
+            let id = *engine.states.keys().next().unwrap();
+            let first_part = *engine.states[&id].parts.keys().next().unwrap();
+            let part_key = PartKey {
+                id,
+                part: first_part,
+                tree: if simple_id.is_some() { 0 } else { first_part + 1 },
+            };
+            // Simulate a repair response lost after the transport accepted it.
+            let first_response =
+                engine.repair_query([2; 32], part_key.query(now), now, mono).unwrap();
+            assert!(!matches!(first_response, Broadcast::Overlay_BroadcastNotFound));
+            assert!(engine.repair_query([2; 32], part_key.query(now), now, mono).is_err());
+            let retained = engine.retained;
+            let original: Vec<_> = engine.states[&id]
+                .parts
+                .values()
+                .map(|p| serialize_boxed(&p.wire).unwrap())
+                .collect();
+            assert!(engine
+                .publish(
+                    &signer,
+                    Certificate::Overlay_EmptyCertificate,
+                    0,
+                    simple_id,
+                    &data,
+                    &[[2; 32]],
+                    now,
+                    mono
+                )
+                .is_err());
+            let later = mono + Duration::from_secs(1);
+            let retry = engine
+                .publish(
+                    &signer,
+                    Certificate::Overlay_EmptyCertificate,
+                    0,
+                    simple_id,
+                    &data,
+                    &[[2; 32]],
+                    now + 1.0,
+                    later,
+                )
+                .unwrap();
+            assert!(!retry.is_empty());
+            assert!(retry.iter().all(|a| matches!(a, Action::Send { .. })));
+            let response =
+                engine.repair_query([2; 32], part_key.query(now + 1.0), now + 1.0, later).unwrap();
+            assert_eq!(
+                serialize_boxed(&response).unwrap(),
+                serialize_boxed(&first_response).unwrap()
+            );
+            assert_eq!(engine.retained, retained);
+            assert_eq!(engine.states[&id].first_seen, mono);
+            assert_eq!(
+                original,
+                engine.states[&id]
+                    .parts
+                    .values()
+                    .map(|p| serialize_boxed(&p.wire).unwrap())
+                    .collect::<Vec<_>>()
+            );
+            // A failed body match must not consume the next retry interval.
+            let mut wrong = data.clone();
+            wrong[0] ^= 1;
+            assert!(engine
+                .republish(
+                    id,
+                    0,
+                    simple_id.is_some(),
+                    &wrong,
+                    &[[2; 32]],
+                    now + 2.0,
+                    later + Duration::from_secs(1)
+                )
+                .is_err());
+            assert!(engine
+                .republish(
+                    id,
+                    0,
+                    simple_id.is_some(),
+                    &data,
+                    &[],
+                    now + 2.0,
+                    later + Duration::from_secs(1)
+                )
+                .is_err());
+            // Wall clock expiration must not be refreshed by local retries.
+            assert!(engine
+                .republish(
+                    id,
+                    0,
+                    simple_id.is_some(),
+                    &data,
+                    &[[2; 32]],
+                    now + LIFETIME + 1.0,
+                    later + Duration::from_secs(1)
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn received_publication_can_relay_without_redelivery_or_resigning() {
+        let signer = key(74);
+        let relay = key(75);
+        let mut cfg = policy(&signer);
+        cfg.authorized_keys.insert(*relay.id().data(), MAX_PLUMTREE_PAYLOAD);
+        let mut sender = Engine::new(cfg.clone(), [9; 32]).unwrap();
+        let mut receiver = Engine::new(cfg, [9; 32]).unwrap();
+        let now = 1700000000.0;
+        let mono = Instant::now();
+        let id = [7; 32];
+        let data = b"independent finality carrier";
+        sender
+            .publish(
+                &signer,
+                Certificate::Overlay_EmptyCertificate,
+                0,
+                Some(id),
+                data,
+                &[],
+                now,
+                mono,
+            )
+            .unwrap();
+        let wire = sender.states[&id].parts[&0].wire.clone();
+        receiver.promote(0, [1; 32], mono, true);
+        let actions = receiver.receive([1; 32], wire.clone(), None, &[], now, mono).unwrap();
+        assert_eq!(actions.iter().filter(|a| matches!(a, Action::Deliver { .. })).count(), 1);
+        let actions = receiver
+            .publish(
+                &relay,
+                Certificate::Overlay_EmptyCertificate,
+                0,
+                Some(id),
+                data,
+                &[[3; 32]],
+                now,
+                mono,
+            )
+            .unwrap();
+        assert!(!actions.is_empty());
+        assert!(actions.iter().all(|a| matches!(a, Action::Send { .. })));
+        assert_eq!(
+            serialize_boxed(&wire).unwrap(),
+            serialize_boxed(&receiver.states[&id].parts[&0].wire).unwrap()
+        );
+        assert_eq!(receiver.states[&id].source, signer.id().clone());
+    }
+
     #[test]
     fn repair_response_requires_single_exact_carrier() {
         let bytes = serialize_boxed(&Broadcast::Overlay_BroadcastNotFound).unwrap();
