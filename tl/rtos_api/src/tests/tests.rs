@@ -131,3 +131,30 @@ fn test_check_all_structs_with_vecs() {
     // }
     assert!(sizes.is_sorted_by(|a, b| a.1 <= b.1));
 }
+
+#[test]
+fn bounded_bytes_reject_declared_length_before_body_read() {
+    let mut input = &[254, 0x00, 0x10, 0x00][..];
+    let mut de = Deserializer::new(&mut input).with_bytes_budget(32);
+    let error = de.read_bare::<crate::ton::bytes>().unwrap_err();
+    let limit = error.downcast_ref::<crate::DecodeLimitExceeded>().unwrap();
+    assert_eq!((limit.actual, limit.limit), (4096, 32));
+    assert_eq!(de.pos, 4);
+}
+
+#[test]
+fn bounded_bytes_charge_all_fields_and_preserve_legacy_decoder() {
+    let encoded = [3, 1, 2, 3, 3, 4, 5, 6];
+    let mut input = encoded.as_slice();
+    let mut de = Deserializer::new(&mut input).with_bytes_budget(5);
+    assert_eq!(de.read_bare::<crate::ton::bytes>().unwrap(), vec![1, 2, 3]);
+    assert!(de
+        .read_bare::<crate::ton::bytes>()
+        .unwrap_err()
+        .downcast_ref::<crate::DecodeLimitExceeded>()
+        .is_some());
+    let mut input = encoded.as_slice();
+    let mut de = Deserializer::new(&mut input);
+    assert_eq!(de.read_bare::<crate::ton::bytes>().unwrap(), vec![1, 2, 3]);
+    assert_eq!(de.read_bare::<crate::ton::bytes>().unwrap(), vec![4, 5, 6]);
+}

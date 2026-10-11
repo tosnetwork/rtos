@@ -982,6 +982,18 @@ impl DataCompression {
         }
     }
 
+    /// Scoped expansion budget; the legacy heuristic and global cap remain intact.
+    pub fn decompress_raw_bounded(data: &[u8], limit: usize) -> Result<Option<Vec<u8>>> {
+        let len = data.len();
+        if len > 5 && data[len - 1] == Self::TAG_COMPRESSED {
+            let size = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+            if size <= Self::MAX_DECOMPRESSED_SIZE && size > limit {
+                return Err(rtos_api::DecodeLimitExceeded { limit, actual: size }.into());
+            }
+        }
+        Ok(Self::decompress_raw(data))
+    }
+
     pub fn decompress_raw(data: &[u8]) -> Option<Vec<u8>> {
         let len = data.len();
         if len <= 5 {

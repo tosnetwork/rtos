@@ -200,13 +200,50 @@ impl Store {
         }
         Ok(bytes)
     }
+    fn budget_file(&self, path: &Path, bound: usize,
+        kind: crate::history_read_budget::ReadKind,
+        budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
+    ) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let file = File::open(path)?;
+        let length = usize::try_from(file.metadata()?.len())?;
+        let reservation = budget.reserve(kind, length.max(1).min(bound))?;
+        let allowance = reservation.allowance();
+        if length > allowance { return Err(crate::history_read_budget::HistoryBudgetExceeded("capsule file bytes").into()); }
+        let mut bytes = Vec::with_capacity(length);
+        file.take(u64::try_from(allowance)?.checked_add(1).ok_or_else(|| error!("History read limit overflow"))?)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > allowance { return Err(crate::history_read_budget::HistoryBudgetExceeded("capsule file growth").into()); }
+        if bytes.len() != length { fail!("Capsule file changed during read"); }
+        reservation.finish(&bytes)?;
+        Ok(bytes)
+    }
+    fn blob_budget(&self, hash: &str, bound: usize,
+        kind: crate::history_read_budget::ReadKind,
+        budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+    ) -> Result<Vec<u8>> {
+        let Some(budget) = budget else { return self.blob(hash, bound); };
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) { fail!("Invalid history blob reference"); }
+        let bytes = self.budget_file(&self.root.join(format!("{hash}.blob")), bound, kind, budget)?;
+        if digest(&bytes) != hash { fail!("History blob checksum mismatch"); }
+        Ok(bytes)
+    }
     fn read(&self, domain: &Domain, id: &BlockIdExt) -> Result<Option<Evidence>> {
+        self.read_budget(domain, id, None)
+    }
+    fn read_budget(&self, domain: &Domain, id: &BlockIdExt,
+        budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+    ) -> Result<Option<Evidence>> {
         self.usage()?;
         let path = self.root.join(format!("{}.json", anchor_name(domain, id)));
         if !path.exists() {
             return Ok(None);
         }
-        let manifest: Manifest = serde_json::from_slice(&bounded_read(&path, 2 << 20)?)?;
+        let bytes = match budget {
+            Some(b) => self.budget_file(&path, 2 << 20, crate::history_read_budget::ReadKind::Metadata, b)?,
+            None => bounded_read(&path, 2 << 20)?,
+        };
+        let manifest: Manifest = serde_json::from_slice(&bytes)?;
         if manifest.schema != SCHEMA
             || &manifest.domain != domain
             || manifest.id != id.to_string()
@@ -214,11 +251,11 @@ impl Store {
         {
             fail!("Retained history manifest domain/schema mismatch");
         }
-        let state = self.blob(&manifest.state, self.limits.state_bytes)?;
+        let state = self.blob_budget(&manifest.state, self.limits.state_bytes, crate::history_read_budget::ReadKind::State, budget)?;
         let mut proofs = Vec::new();
         let mut total = state.len() as u64;
         for proof in &manifest.proofs {
-            let bytes = self.blob(&proof.blob, self.limits.proof_bytes)?;
+            let bytes = self.blob_budget(&proof.blob, self.limits.proof_bytes, crate::history_read_budget::ReadKind::Proof, budget)?;
             total += bytes.len() as u64;
             if total > self.limits.total_bytes {
                 fail!("Retained history evidence exceeds memory bound");
@@ -227,13 +264,21 @@ impl Store {
             if proofs.iter().any(|p: &BlockProofStuff| p.id() == &id) {
                 fail!("Duplicate retained proof identity");
             }
-            proofs.push(BlockProofStuff::deserialize(&id, bytes, proof.link)?);
+            proofs.push(match budget {
+                Some(b) => BlockProofStuff::deserialize_bounded(&id, bytes, proof.link, b)?,
+                None => BlockProofStuff::deserialize(&id, bytes, proof.link)?,
+            });
         }
         Ok(Some(Evidence { manifest, state, proofs }))
     }
     /// Metadata lookup is bounded independently of proof/state authentication.
     /// Conflicting full identities at one height are never resolved by order.
     fn manifests(&self, domain: &Domain) -> Result<Vec<Manifest>> {
+        self.manifests_budget(domain, None)
+    }
+    fn manifests_budget(&self, domain: &Domain,
+        budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+    ) -> Result<Vec<Manifest>> {
         self.usage()?;
         let mut result = Vec::new();
         let mut identities = std::collections::BTreeMap::new();
@@ -243,7 +288,10 @@ impl Store {
             if entry.path().extension().is_none_or(|e| e != "json") {
                 continue;
             }
-            let bytes = bounded_read(&entry.path(), 2 << 20)?;
+            let bytes = match budget {
+                Some(b) => { b.step()?; self.budget_file(&entry.path(), 2 << 20, crate::history_read_budget::ReadKind::Metadata, b)? },
+                None => bounded_read(&entry.path(), 2 << 20)?,
+            };
             read_bytes = read_bytes
                 .checked_add(bytes.len())
                 .ok_or_else(|| error!("History metadata budget overflow"))?;
@@ -287,7 +335,12 @@ impl Store {
         id: &BlockIdExt,
         allow_link: bool,
     ) -> Result<Option<BlockProofStuff>> {
-        let manifests = self.manifests(domain)?;
+        self.find_proof_budget(domain, id, allow_link, None)
+    }
+    fn find_proof_budget(&self, domain: &Domain, id: &BlockIdExt, allow_link: bool,
+        budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+    ) -> Result<Option<BlockProofStuff>> {
+        let manifests = self.manifests_budget(domain, budget)?;
         let mut found: Option<&ProofRef> = None;
         for proof in manifests.iter().flat_map(|m| &m.proofs) {
             if proof.id != id.to_string() || (proof.link && !allow_link) {
@@ -305,11 +358,11 @@ impl Store {
         }
         found
             .map(|p| {
-                BlockProofStuff::deserialize(
-                    id,
-                    self.blob(&p.blob, self.limits.proof_bytes)?,
-                    p.link,
-                )
+                let bytes = self.blob_budget(&p.blob, self.limits.proof_bytes, crate::history_read_budget::ReadKind::Proof, budget)?;
+                match budget {
+                    Some(b) => BlockProofStuff::deserialize_bounded(id, bytes, p.link, b),
+                    None => BlockProofStuff::deserialize(id, bytes, p.link),
+                }
             })
             .transpose()
     }
@@ -447,27 +500,35 @@ pub(crate) async fn authenticate_state<E: EngineOperations + ?Sized>(
     engine: &E,
     id: &BlockIdExt,
 ) -> Result<VerifiedMasterchainState> {
+    authenticate_state_with_budget(engine, id, None).await
+}
+pub(crate) async fn authenticate_state_with_budget<E: EngineOperations + ?Sized>(
+    engine: &E,
+    id: &BlockIdExt,
+    budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+) -> Result<VerifiedMasterchainState> {
     let path = root(engine)?;
     if !path.exists() {
-        return crate::boot::authenticate_recovered_state(engine, id).await;
+        return authenticate_ordinary_with_budget(engine, id, budget).await;
     }
     let domain = Domain::from_engine(engine)?;
     let expected = id.clone();
+    let read_budget = budget.cloned();
     let evidence =
-        owned_io(engine, move || Store::open(path, Limits::default())?.read(&domain, &expected))
+        owned_io(engine, move || Store::open(path, Limits::default())?.read_budget(&domain, &expected, read_budget.as_ref()))
             .await?;
     let Some(evidence) = evidence else {
-        return crate::boot::authenticate_recovered_state(engine, id).await;
+        return authenticate_ordinary_with_budget(engine, id, budget).await;
     };
     let state = ShardStateStuff::from_root_cell(
         id.clone(),
-        rtos_block::read_single_root_boc(&evidence.state)?,
+        match budget { Some(b) => b.parse_boc(&evidence.state)?, None => rtos_block::read_single_root_boc(&evidence.state)? },
         #[cfg(feature = "telemetry")]
         engine.engine_telemetry(),
         engine.engine_allocated(),
     )?;
     let verified =
-        authenticate_recovered_state_evidence(engine, id, state, Some(&evidence.proofs), None)
+        crate::boot::authenticate_recovered_state_evidence_with_budget(engine, id, state, Some(&evidence.proofs), None, budget)
             .await?;
     if verified.state().state()?.global_id() != evidence.manifest.global_id {
         fail!("History global ID mismatch");
@@ -481,14 +542,23 @@ pub(crate) async fn load_proof<E: EngineOperations + ?Sized>(
     id: &BlockIdExt,
     allow_link: bool,
 ) -> Result<Option<BlockProofStuff>> {
+    load_proof_with_budget(engine, id, allow_link, None).await
+}
+pub(crate) async fn load_proof_with_budget<E: EngineOperations + ?Sized>(
+    engine: &E,
+    id: &BlockIdExt,
+    allow_link: bool,
+    budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+) -> Result<Option<BlockProofStuff>> {
     let path = root(engine)?;
     if !path.exists() {
         return Ok(None);
     }
     let domain = Domain::from_engine(engine)?;
     let id = id.clone();
+    let read_budget = budget.cloned();
     owned_io(engine, move || {
-        Store::open(path, Limits::default())?.find_proof(&domain, &id, allow_link)
+        Store::open(path, Limits::default())?.find_proof_budget(&domain, &id, allow_link, read_budget.as_ref())
     })
     .await
 }
@@ -498,15 +568,23 @@ pub(crate) async fn lookup_hint<E: EngineOperations + ?Sized>(
     engine: &E,
     epoch: u32,
 ) -> Result<Option<Arc<ShardStateStuff>>> {
+    lookup_hint_with_budget(engine, epoch, None).await
+}
+pub(crate) async fn lookup_hint_with_budget<E: EngineOperations + ?Sized>(
+    engine: &E,
+    epoch: u32,
+    budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+) -> Result<Option<Arc<ShardStateStuff>>> {
     let path = root(engine)?;
     if !path.exists() {
         return Ok(None);
     }
     let domain = Domain::from_engine(engine)?;
+    let read_budget = budget.cloned();
     let selected = owned_io(engine, move || {
         let store = Store::open(path, Limits::default())?;
         let mut ids = store
-            .manifests(&domain)?
+            .manifests_budget(&domain, read_budget.as_ref())?
             .into_iter()
             .map(|m| m.id.parse::<BlockIdExt>())
             .collect::<Result<Vec<_>>>()?;
@@ -518,9 +596,21 @@ pub(crate) async fn lookup_hint<E: EngineOperations + ?Sized>(
     let Some(id) = selected else {
         return Ok(None);
     };
-    let verified = authenticate_state(engine, &id).await?;
+    let verified = authenticate_state_with_budget(engine, &id, budget).await?;
     verified.state().find_block_id(epoch)?;
     Ok(Some(verified.state().clone()))
+}
+
+async fn authenticate_ordinary_with_budget<E: EngineOperations + ?Sized>(
+    engine: &E, id: &BlockIdExt,
+    budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+) -> Result<VerifiedMasterchainState> {
+    let Some(budget) = budget else { return crate::boot::authenticate_recovered_state(engine, id).await; };
+    if !id.shard().is_masterchain_ext() || id.seq_no < engine.init_mc_block_id().seq_no {
+        fail!("Bounded recovery outside pinned history");
+    }
+    let state = engine.load_state(id).await?;
+    crate::boot::authenticate_recovered_state_evidence_with_budget(engine, id, state, None, None, Some(budget)).await
 }
 
 /// Live authenticated admission only. Two concurrent preparations bound working

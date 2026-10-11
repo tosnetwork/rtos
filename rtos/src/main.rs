@@ -631,3 +631,5 @@ mod shutdown_tests {
         assert!(!beacon.exists());
     }
 }
+
+pub(crate) mod history_read_budget;

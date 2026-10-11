@@ -93,11 +93,25 @@ impl Debug for InvalidConstructor {
     }
 }
 
+/// A caller-supplied decode/response budget was exceeded before allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeLimitExceeded {
+    pub limit: usize,
+    pub actual: usize,
+}
+impl std::fmt::Display for DecodeLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "decode size {} exceeds caller limit {}", self.actual, self.limit)
+    }
+}
+impl std::error::Error for DecodeLimitExceeded {}
+
 /// Struct for deserializing TL-scheme objects from any `io::Read`
 pub struct Deserializer<'r> {
     reader: &'r mut dyn Read,
     pos: usize,
     bytes_limit: usize,
+    bytes_budget: Option<usize>,
     profile: WireProfile,
 }
 
@@ -108,7 +122,21 @@ impl<'r> Deserializer<'r> {
     }
 
     pub fn with_profile(reader: &'r mut dyn Read, profile: WireProfile) -> Self {
-        Deserializer { reader, pos: 0, bytes_limit: ton_prelude::MAX_TL_BYTES_LEN, profile }
+        Deserializer {
+            reader,
+            pos: 0,
+            bytes_limit: ton_prelude::MAX_TL_BYTES_LEN,
+            bytes_budget: None,
+            profile,
+        }
+    }
+
+    /// Bound both a declared byte field and aggregate byte-field allocations.
+    /// Ordinary deserializers retain their existing limits.
+    pub fn with_bytes_budget(mut self, limit: usize) -> Self {
+        self.bytes_limit = self.bytes_limit.min(limit);
+        self.bytes_budget = Some(limit);
+        self
     }
 
     /// Read `ConstructorNumber` from reader
