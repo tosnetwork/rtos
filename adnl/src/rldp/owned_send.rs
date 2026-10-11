@@ -1,3 +1,10 @@
+/*
+ * Copyright (C) 2025-2026 RSquad Blockchain Lab.
+ * RTOS project modifications (2026-10-11): owned RLDP sender lifecycle.
+ * Licensed under the GNU General Public License v3.0.
+ * See the LICENSE file in the root of this repository.
+ * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
+ */
 //! RLDP sender owners. Cancellation requests drain; they never detach active work.
 use super::TARGET;
 use crate::adnl::tasks::AdnlTasks;
@@ -29,6 +36,15 @@ pub(super) struct SendControl {
     token: CancellationToken,
     reason: Mutex<Option<SendCancelled>>,
     parts: tokio_util::task::TaskTracker,
+    failure: Mutex<Option<Result<bool>>>,
+    #[cfg(test)]
+    pub test_after_start: Mutex<Option<Arc<dyn Fn(u32) -> Result<Option<bool>> + Send + Sync>>>,
+    #[cfg(test)]
+    pub test_after_fec: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    pub test_deadline: Mutex<Option<std::time::Duration>>,
+    #[cfg(test)]
+    pub test_bbr_error: std::sync::atomic::AtomicBool,
 }
 impl SendControl {
     pub fn new() -> Arc<Self> {
@@ -36,7 +52,23 @@ impl SendControl {
             token: CancellationToken::new(),
             reason: Mutex::new(None),
             parts: tokio_util::task::TaskTracker::new(),
+            failure: Mutex::new(None),
+            #[cfg(test)]
+            test_after_start: Mutex::new(None),
+            #[cfg(test)]
+            test_after_fec: Mutex::new(None),
+            #[cfg(test)]
+            test_deadline: Mutex::new(None),
+            #[cfg(test)]
+            test_bbr_error: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+    pub fn deadline(&self) -> std::time::Duration {
+        #[cfg(test)]
+        if let Some(deadline) = *self.test_deadline.lock().unwrap() {
+            return deadline;
+        }
+        std::time::Duration::from_millis(super::RldpNode::TIMEOUT_OUTBOUND_HARD_MS)
     }
     pub fn cancel(&self, reason: SendCancelled) {
         let mut previous = self.reason.lock().unwrap();
@@ -54,6 +86,23 @@ impl SendControl {
         }
         Ok(())
     }
+    pub(super) fn record_failure(&self, result: &mut Result<bool>) {
+        if matches!(result, Ok(true)) {
+            return;
+        }
+        let mut first = self.failure.lock().unwrap();
+        if first.is_none() {
+            *first = Some(match result {
+                Ok(false) => Ok(false),
+                _ => std::mem::replace(result, Err(SendCancelled::SiblingFailed.into())),
+            });
+        }
+        self.cancel(SendCancelled::SiblingFailed);
+    }
+    pub fn take_failure(&self) -> Option<Result<bool>> {
+        self.failure.lock().unwrap().take()
+    }
+
     pub async fn drain(&self) {
         self.parts.close();
         self.parts.wait().await;
@@ -85,6 +134,7 @@ pub(super) struct SendWorkerPool {
     owner: Arc<AdnlTasks>,
     admission: Arc<Mutex<bool>>,
     started: std::sync::OnceLock<()>,
+    pub(super) workers: usize,
 }
 impl SendWorkerPool {
     pub fn new(owner: Arc<AdnlTasks>) -> Self {
@@ -93,6 +143,7 @@ impl SendWorkerPool {
             owner,
             admission: Arc::new(Mutex::new(true)),
             started: std::sync::OnceLock::new(),
+            workers: num_cpus::get().clamp(1, 8),
         }
     }
     pub fn submit(
@@ -109,7 +160,7 @@ impl SendWorkerPool {
         // cannot observe a partially registered pool as drained.
         let startup = self.owner.enter()?;
         self.started.get_or_init(|| {
-            for _ in 0..num_cpus::get().clamp(1, 8) {
+            for _ in 0..self.workers {
                 let core = self.core.clone();
                 let owner = self.owner.clone();
                 let admission = self.admission.clone();
@@ -132,20 +183,22 @@ impl SendWorkerPool {
                         }
                         if let Some(job) = core.queue.pop() {
                             if owner.is_closed() { job.control.cancel(SendCancelled::OwnerClosed); }
-                            let result = match job.control.check() {
+                            let mut panicked = false;
+                            let mut result = match job.control.check() {
                                 Err(error) => Err(error),
                                 Ok(()) => match std::panic::AssertUnwindSafe(job.work).catch_unwind().await {
                                     Ok(result) => result,
                                     Err(_) => {
-                                        job.control.cancel(SendCancelled::SiblingFailed);
-                                        owner.failed("RLDP part panicked".into());
+                                        panicked = true;
                                         Err(error!("RLDP part panicked"))
                                     }
                                 },
                             };
                             if result.as_ref().err().is_some_and(|e| e.downcast_ref::<FecTaskFailed>().is_some()) {
-                                owner.failed("RLDP FEC task panicked".into());
+                                panicked = true;
                             }
+                            job.control.record_failure(&mut result);
+                            if panicked { owner.failed("RLDP sender worker panicked".into()); }
                             let _ = job.done.send(result);
                         }
                     }
@@ -180,16 +233,57 @@ impl std::fmt::Display for FecTaskFailed {
 }
 impl std::error::Error for FecTaskFailed {}
 
+pub(super) async fn supervise(
+    control: Arc<SendControl>,
+    owner: Arc<AdnlTasks>,
+    deadline: std::time::Duration,
+    work: impl Future<Output = Result<bool>>,
+) -> Result<bool> {
+    let work = std::panic::AssertUnwindSafe(work).catch_unwind();
+    tokio::pin!(work);
+    let result = tokio::select! {
+        result = &mut work => result,
+        _ = owner.cancelled() => { control.cancel(SendCancelled::OwnerClosed); work.await },
+        _ = tokio::time::sleep(deadline) => { control.cancel(SendCancelled::Deadline); work.await },
+    };
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            control.cancel(SendCancelled::SiblingFailed);
+            owner.failed("RLDP transfer panicked".into());
+            Err(error!("RLDP transfer panicked"))
+        }
+    }
+}
+
 // Called only by retained send owners. There is intentionally no timeout/select
 // around the real handle: running encoder work cannot be forcibly cancelled.
-pub(super) async fn fec<T, R, F>(mut state: T, work: F) -> Result<(T, R)>
+pub(super) async fn fec<T, R, F>(
+    mut state: T,
+    control: Arc<SendControl>,
+    owner: Arc<AdnlTasks>,
+    work: F,
+) -> Result<(T, R)>
 where
     T: Send + 'static,
     R: Send + 'static,
     F: FnOnce(&mut T) -> Result<R> + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
+        // Cancellation may arrive while Tokio's blocking queue is occupied.
+        // An admitted async part does not authorize starting queued FEC later.
+        if owner.is_closed() {
+            control.cancel(SendCancelled::OwnerClosed);
+        }
+        control.check()?;
         let result = work(&mut state)?;
+        #[cfg(test)]
+        {
+            let hook = control.test_after_fec.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         Ok((state, result))
     })
     .await
@@ -216,9 +310,9 @@ impl Drop for SendRegistration {
         let send = self.send;
         let receive = self.receive;
         let owner = self.owner.clone();
-        let permit = self.bounded_permit.clone();
+        // The query capacity lease ends with the real transfer, not with its
+        // small tombstone's expiry timer.
         let expiry = async move {
-            let _permit = permit;
             tokio::select! {
                 _ = owner.cancelled() => {},
                 _ = tokio::time::sleep(std::time::Duration::from_millis(super::RldpNode::TIMEOUT_MAX_MS * 2)) => {},
@@ -236,3 +330,7 @@ impl Drop for SendRegistration {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "owned_send_tests.rs"]
+mod tests;
