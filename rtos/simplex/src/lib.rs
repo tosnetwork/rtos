@@ -951,6 +951,7 @@ impl SessionFactory {
 pub(crate) mod pq_fixture;
 
 pub mod finality_delivery;
+pub mod finality_recovery;
 mod runtime_manifest;
 mod signing_coordinator;
 
