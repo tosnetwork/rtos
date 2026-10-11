@@ -964,9 +964,17 @@ impl SpoolFixture {
     }
 
     async fn new_for_transport(row_index: usize, transport_seed: u8) -> Self {
-        use consensus_common::session_runtime::{AuthenticatedSessionRuntime, SessionNetworkPin};
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("testdata/v2-publication-spool.json")).unwrap();
+        Self::from_transport_fixture(fixture, row_index, transport_seed).await
+    }
+
+    async fn from_transport_fixture(
+        fixture: serde_json::Value,
+        row_index: usize,
+        transport_seed: u8,
+    ) -> Self {
+        use consensus_common::session_runtime::{AuthenticatedSessionRuntime, SessionNetworkPin};
         let row = fixture["rows"][row_index].clone();
         let block = fixture_block(&row);
         let mc_data = decode(&fixture["state_boc"]);
