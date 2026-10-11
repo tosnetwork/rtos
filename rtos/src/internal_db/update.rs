@@ -14,13 +14,13 @@ use rtos_block::{fail, Result};
 use std::sync::atomic::AtomicBool;
 
 pub async fn update(
-    db: InternalDb,
+    db: &InternalDb,
     mut version: u32,
     _check_stop: &(dyn Fn() -> Result<()> + Sync),
     _is_broken: Option<&AtomicBool>,
     _force_check_db: bool,
     _restore_db_enabled: bool,
-) -> Result<InternalDb> {
+) -> Result<()> {
     if version == DB_VERSION_7 {
         // No updates needed, just update version
         version = DB_VERSION_8;
@@ -35,5 +35,5 @@ pub async fn update(
         fail!("Wrong database version {}, supported: {}", version, CURRENT_DB_VERSION);
     }
 
-    Ok(db)
+    Ok(())
 }

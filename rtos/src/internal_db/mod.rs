@@ -337,7 +337,7 @@ impl InternalDb {
         #[cfg(feature = "telemetry")] telemetry: Arc<EngineTelemetry>,
         allocated: Arc<EngineAlloc>,
     ) -> Result<Self> {
-        let mut db = Self::construct(
+        let db = Self::construct(
             config,
             allow_update,
             monitor_min_split,
@@ -347,38 +347,57 @@ impl InternalDb {
             allocated,
         )
         .await?;
-        let version = db.resolve_db_version()?;
-        if version != CURRENT_DB_VERSION {
-            if allow_update {
-                db = update::update(
-                    db,
-                    version,
-                    check_stop,
-                    is_broken,
-                    force_check_db,
-                    restore_db_enabled,
-                )
-                .await?
+        use futures::FutureExt;
+        let checked = std::panic::AssertUnwindSafe(async {
+            let version = db.resolve_db_version()?;
+            if version != CURRENT_DB_VERSION {
+                if allow_update {
+                    update::update(
+                        &db,
+                        version,
+                        check_stop,
+                        is_broken,
+                        force_check_db,
+                        restore_db_enabled,
+                    )
+                    .await?;
+                } else {
+                    fail!(
+                        "DB version {} does not correspond to current supported one {}.",
+                        version,
+                        CURRENT_DB_VERSION
+                    )
+                }
+            } else if let Some(mc_seqno) = truncate_db {
+                let (id, _) = db
+                    .lookup_block_by_seqno(&AccountIdPrefixFull::any_masterchain(), mc_seqno)
+                    .await?
+                    .ok_or_else(|| {
+                        error!("there is no block with seqno {} in masterchain", mc_seqno)
+                    })?;
+                log::info!("Truncating database at block {}", id);
+                db.truncate_database(&id).await?;
             } else {
-                fail!(
-                    "DB version {} does not correspond to current supported one {}.",
-                    version,
-                    CURRENT_DB_VERSION
-                )
+                log::info!("DB VERSION {}", version);
+                // TODO correct workchain id needed here, but it will be known later
+                check_db(&db, 0, restore_db_enabled, force_check_db, check_stop, is_broken).await?;
             }
-        } else if let Some(mc_seqno) = truncate_db {
-            let (id, _) = db
-                .lookup_block_by_seqno(&AccountIdPrefixFull::any_masterchain(), mc_seqno)
-                .await?
-                .ok_or_else(|| {
-                    error!("there is no block with seqno {} in masterchain", mc_seqno)
-                })?;
-            log::info!("Truncating database at block {}", id);
-            db.truncate_database(&id).await?;
-        } else {
-            log::info!("DB VERSION {}", version);
-            // TODO correct workchain id needed here, but it will be known later
-            db = check_db(db, 0, restore_db_enabled, force_check_db, check_stop, is_broken).await?;
+            Ok::<(), rtos_block::Error>(())
+        }).catch_unwind().await;
+        match checked {
+            Ok(Ok(())) => (),
+            Ok(Err(error)) => {
+                if let Err(cleanup) = db.stop_states_db().await {
+                    return Err(error!("DB startup failed: {error:#}; storage cleanup failed: {cleanup:#}"));
+                }
+                return Err(error);
+            }
+            Err(panic) => {
+                if let Err(cleanup) = db.stop_states_db().await {
+                    log::error!("DB startup panic cleanup failed: {cleanup:#}");
+                }
+                std::panic::resume_unwind(panic);
+            }
         }
         Ok(db)
     }
@@ -616,10 +635,15 @@ impl InternalDb {
         // shutdown of the state worker, nor disappear from the shutdown result.
         self.archive_admission.close();
         let archived = self.archive_tasks.wait().await;
-        if let StateDb::Dynamic(db) = &self.state_db {
-            db.stop().await;
+        let states = match &self.state_db {
+            StateDb::Dynamic(db) => db.stop().await,
+            StateDb::Archive(_) => Ok(()),
+        };
+        match (archived, states) {
+            (Err(a), Err(s)) => Err(error!("Archive shutdown failed: {a:#}; state shutdown failed: {s:#}")),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+            _ => Ok(()),
         }
-        archived
     }
 
     #[cfg(test)]
