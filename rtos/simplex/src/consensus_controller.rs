@@ -317,6 +317,7 @@ pub(crate) struct ConsensusController {
     /// Blocks whose finalized state has already been materialized locally
     /// (dedup of repeat finalization events + late body arrivals).
     finalized_blocks: HashSet<RawCandidateId>,
+    finalized_final_proofs: HashSet<RawCandidateId>,
     /// Finalized blocks (FinalCert observed) still waiting for candidate body
     /// arrival; materialization is deferred until the body arrives.
     finalized_pending_body: HashMap<RawCandidateId, FinalizedEntry>,
@@ -404,6 +405,7 @@ impl ConsensusController {
             before_split_by_block_id: HashMap::new(),
             last_consensus_finalized_seqno,
             finalized_blocks: HashSet::new(),
+            finalized_final_proofs: HashSet::new(),
             finalized_pending_body: HashMap::new(),
             finalized_delivery_sent: HashSet::new(),
             finalized_delivery_sent_seqno: HashMap::new(),
@@ -2041,7 +2043,8 @@ impl ConsensusController {
         finalized_id: &RawCandidateId,
         is_final: bool,
     ) -> bool {
-        if self.finalized_blocks.contains(finalized_id) {
+        if self.finalized_blocks.contains(finalized_id)
+            && (!self.description.authenticated_runtime().is_some() || !is_final || self.finalized_final_proofs.contains(finalized_id)) {
             return true;
         }
 
@@ -2132,6 +2135,7 @@ impl ConsensusController {
         }
 
         self.finalized_blocks.insert(finalized_id.clone());
+        if is_final { self.finalized_final_proofs.insert(finalized_id.clone()); }
 
         // Trace: a FinalCert was observed and this block is now accepted/materialized.
         if let Some(tc) = &self.trace_collector {

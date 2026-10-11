@@ -21,6 +21,12 @@ pub fn runtime(
 pub fn runtime_with_members(
     members: Vec<ValidatorDescr>, transport: crate::PrivateKey,
 ) -> (Arc<AuthenticatedSessionRuntime>, crate::PrivateKey, crate::SessionOptions) {
+    runtime_with_members_on_shard(members, transport, ShardIdent::masterchain())
+}
+
+pub fn runtime_with_members_on_shard(
+    members: Vec<ValidatorDescr>, transport: crate::PrivateKey, shard: ShardIdent,
+) -> (Arc<AuthenticatedSessionRuntime>, crate::PrivateKey, crate::SessionOptions) {
     let selected = SimplexConfig { protocol_version: 2, ..Default::default() };
     let selected_cell = selected.serialize().unwrap();
     let mut wrapper = BuilderData::new();
@@ -58,7 +64,7 @@ pub fn runtime_with_members(
             },
             &config,
             SessionCoordinates {
-                shard: &ShardIdent::masterchain(),
+                shard: &shard,
                 catchain_seqno: 7,
                 vertical_seqno: 0,
                 last_key_block_seqno: 0,
