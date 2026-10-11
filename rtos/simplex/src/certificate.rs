@@ -515,6 +515,37 @@ impl Certificate<Vote> {
         desc: &SessionDescription,
         session_id: &SessionId,
     ) -> Result<Self> {
+        Self::from_tl_authority(tl_cert, session_id, desc.get_total_nodes(),
+            desc.get_threshold_66(), |index| (desc.get_source_public_key(index), desc.get_node_weight(index)),
+            &|| Ok(()))
+    }
+
+    pub(crate) fn from_authenticated_runtime(
+        tl_cert: &CertificateBoxed,
+        runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+        step: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
+        if runtime.pq_context().is_none() {
+            fail!("Source history requires authenticated PQ runtime");
+        }
+        let nodes = runtime.committee().iter()
+            .map(crate::SimplexSessionNode::from_descriptor).collect::<Result<Vec<_>>>()?;
+        let total = rtos_block::checked_validator_weight_sum(nodes.iter().map(|n| n.weight))?;
+        Self::from_tl_authority(tl_cert, runtime.session_id(), nodes.len(),
+            crate::utils::threshold_66(total), |index| {
+                let node = &nodes[index.value() as usize];
+                (&node.identity, node.weight)
+            }, step)
+    }
+
+    fn from_tl_authority<'a>(
+        tl_cert: &CertificateBoxed,
+        session_id: &SessionId,
+        num_validators: usize,
+        threshold: u64,
+        authority: impl Fn(ValidatorIndex) -> (&'a consensus_common::ValidatorIdentity, u64),
+        step: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
         let unsigned_vote = tl_cert.vote();
 
         // Parse vote from TL
@@ -527,7 +558,6 @@ impl Certificate<Vote> {
 
         // Parse and verify signatures
         let votes_vec = tl_cert.signatures().votes();
-        let num_validators = desc.get_total_nodes();
         if votes_vec.len() > num_validators {
             fail!("more certificate signatures than validators");
         }
@@ -536,6 +566,7 @@ impl Certificate<Vote> {
         let mut voted_weight: u64 = 0;
 
         for tl_sig in votes_vec.iter() {
+            step()?;
             let sig = VoteSignature::from_tl(tl_sig);
             let validator_idx = sig.validator_idx;
 
@@ -550,7 +581,7 @@ impl Certificate<Vote> {
             }
 
             // Verify signature - REJECT the entire certificate if any signature is invalid
-            let validator_key = desc.get_source_public_key(validator_idx);
+            let (validator_key, weight) = authority(validator_idx);
             if validator_key.verify_simplex(&vote_bytes, &sig.signature).is_err() {
                 fail!("Invalid vote signature for validator {}", validator_idx)
             }
@@ -559,13 +590,12 @@ impl Certificate<Vote> {
             voted[validator_idx.value() as usize] = true;
             voted_weight = rtos_block::checked_add_validator_weight(
                 voted_weight,
-                desc.get_node_weight(validator_idx),
+                weight,
             )?;
             signatures.push(sig);
         }
 
         // Check weight threshold - REJECT if insufficient weight after processing
-        let threshold = desc.get_threshold_66();
         if voted_weight < threshold {
             // Match C++ behavior (`certificate.cpp`): reject with a generic message.
             fail!("Not enough signatures in certificate")
