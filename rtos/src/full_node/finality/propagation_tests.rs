@@ -196,8 +196,9 @@ async fn propagation_authenticated_normal_finality_applies_by_mc_and_reopens() {
         let applied = pair.receiver.load_block_handle(pair.shard.id()).unwrap().unwrap();
         assert!(applied.is_applied());
         assert_eq!(applied.masterchain_ref_seq_no(), 1);
-        // Real already-applied acceptance rebuilds a verified carrier and sends
-        // through the opposite node's normal router without rewriting its state.
+        // An applied observer can reconstruct authenticated acceptance, but its
+        // lack of an authorized origination signer must remain a publication
+        // failure; it cannot masquerade as a validator for reverse sends.
         let retry = accept_pq_session_block(
             pair.shard.id().clone(),
             None,
@@ -210,7 +211,13 @@ async fn propagation_authenticated_normal_finality_applies_by_mc_and_reopens() {
         .unwrap();
         assert!(retry.already_present());
         assert_eq!(retry.phase(), AcceptancePhase::Applied);
-        let retry_outcome = pair.receiver.propagate_accepted_session_block(&retry, &plan).await;
+        let observer_outcome = pair.receiver.propagate_accepted_session_block(&retry, &plan).await;
+        assert!(!sent(&observer_outcome, PropagationKind::Finality), "{observer_outcome:?}");
+        assert!(observer_outcome.needs_retry(), "{observer_outcome:?}");
+        // The authorized provider can retry the retained carrier. This is a
+        // same-direction idempotent resend, not bidirectional role interoperability.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let retry_outcome = pair.provider.propagate_accepted_session_block(&accepted, &plan).await;
         assert!(sent(&retry_outcome, PropagationKind::Finality), "{retry_outcome:?}");
         assert!(!retry_outcome.needs_retry(), "{retry_outcome:?}");
     })
@@ -325,7 +332,7 @@ async fn propagation_authenticated_approval_uses_block_fec_without_finality() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn propagation_authenticated_finalize_candidate_fallback_shares_receive_dedup() {
+async fn propagation_authenticated_finalize_candidate_fallback_keeps_partial_delivery_retryable() {
     let pair = Pair::with_propagation_profile("included", false, true).await;
     let result = std::panic::AssertUnwindSafe(async {
         let fixture: serde_json::Value =
@@ -361,7 +368,7 @@ async fn propagation_authenticated_finalize_candidate_fallback_shares_receive_de
         );
         let outcome = pair.provider.propagate_accepted_session_block(&accepted, &plan).await;
         assert!(sent(&outcome, PropagationKind::Candidate), "{outcome:?}");
-        assert!(!outcome.needs_retry(), "{outcome:?}");
+        assert!(outcome.needs_retry(), "the fast overlay has no observer peers: {outcome:?}");
         assert!(!sent(&outcome, PropagationKind::Block));
         assert!(!sent(&outcome, PropagationKind::Finality));
         tokio::time::timeout(Duration::from_secs(15), async {
@@ -385,12 +392,15 @@ async fn propagation_authenticated_finalize_candidate_fallback_shares_receive_de
             .provider
             .relay_validated_candidate(&accepted.candidate_relay().unwrap(), &receive_plan)
             .await;
-        assert!(!duplicate.attempted(), "{duplicate:?}");
-        assert!(duplicate
-            .receipts
-            .iter()
-            .any(|r| matches!(r.status, PropagationStatus::Skipped(_))));
-        assert!(!duplicate.needs_retry());
+        assert!(
+            duplicate.needs_retry(),
+            "unacknowledged fast destination must remain retryable: {duplicate:?}"
+        );
+        assert!(
+            !duplicate.receipts.iter().any(|r| matches!(&r.status,
+            PropagationStatus::Skipped(reason) if reason == "Candidate already relayed")),
+            "partial publication must not poison the shared receive/finalize cache: {duplicate:?}"
+        );
         assert!(!pair
             .receiver
             .load_block_handle(pair.shard.id())

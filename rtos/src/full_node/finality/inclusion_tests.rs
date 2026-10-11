@@ -117,10 +117,11 @@ impl Pair {
         write_recovery_config(&receiver_dir, &anchor, true);
         write_recovery_config(&provider_dir, &anchor, true);
         if v2 {
-            // The fixture's governing set authenticates these public test transport
-            // IDs. Normal router configuration selects the actual primary key.
+            // The provider is a governing validator transport. The receiver is
+            // a public observer outside that committee, so normal T0 policy
+            // receives rather than marking both nodes as original senders.
             // No test manually activates Plumtree or bypasses an authority check.
-            for (dir, seed) in [(&provider_dir, 0x60), (&receiver_dir, 0x61)] {
+            for (dir, seed) in [(&provider_dir, 0x60), (&receiver_dir, 0x70)] {
                 let file = dir.join("config.json");
                 let mut config: serde_json::Value =
                     serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();

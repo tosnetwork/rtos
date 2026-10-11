@@ -1081,7 +1081,25 @@ impl FullNodeOverlaysRouter {
             .collect::<Result<Vec<_>>>()?;
         let context = self.network.context();
         let primary = context.stack.adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)?;
+        let bindings = handler.consensus_transport_bindings()?;
         for validators in sets {
+            for binding in &bindings {
+                let authorized = validators.list().iter().any(|member| {
+                    matches!(member.key, rtos_block::ValidatorKey::Pq(_))
+                        && member.validator_id().ok().as_ref() == Some(&binding.validator_id)
+                        && member.adnl_addr().as_ref() == Some(&binding.adnl_key_id)
+                });
+                if !authorized {
+                    continue;
+                }
+                let key = handler.consensus_transport_key(&binding.adnl_key_id).await?;
+                if context.stack.adnl.key_by_id(&binding.adnl_key_id)?.id() != key.id() {
+                    rtos_block::fail!(
+                        "Configured consensus transport does not match loaded ADNL identity"
+                    );
+                }
+                return Ok(Some(LocalFastSyncTransport { key, valid_until: None }));
+            }
             let (members, _) =
                 fast_sync_transport_authority(validators.list(), rtos_api::WireProfile::T0)?;
             if members.contains(primary.id()) {

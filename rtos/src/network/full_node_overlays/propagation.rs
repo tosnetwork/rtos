@@ -688,7 +688,7 @@ mod configuration_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn propagation_normal_applied_configuration_installs_and_rotates_transport() -> Result<()>
     {
-        for protocol in [0, 1, 2] {
+        for (protocol, binding_mode) in [(0, 0), (1, 0), (2, 0), (2, 1), (2, 2)] {
             let bootstrap = EmulatorNetworkBootstrap::build_with_config(2, |config, keys| {
                 let corpus: serde_json::Value = serde_json::from_str(include_str!(
                     "../../../../tl/rtos_api/tests/data/live-pq.json"
@@ -734,6 +734,13 @@ mod configuration_tests {
                 registration["election_id"] =
                     (registration["election_id"].as_i64().unwrap() + 1000).into();
             }
+            if binding_mode != 0 {
+                local["validator_keys"] = serde_json::json!([]);
+                local["consensus_transport_bindings"] = serde_json::json!([{
+                    "validator_id": rtos_block::base64_encode(&[if binding_mode == 1 { 1 } else { 99 }; 32]),
+                    "adnl_key_id": rtos_block::base64_encode(bootstrap.validators[0].adnl_key.id().data()),
+                }]);
+            }
             std::fs::write(&bootstrap.config_path, serde_json::to_vec(&local)?)?;
             let engine = Engine::new(
                 bootstrap.load_node_config().await?,
@@ -764,6 +771,21 @@ mod configuration_tests {
                 let router = engine.overlays_router()?;
                 router.refresh_fast_sync_from_applied_state().await?;
                 let public = router.overlay_client(&ShardIdent::MASTERCHAIN).await?;
+                if binding_mode == 2 {
+                    assert!(
+                        router
+                            .propagation_config
+                            .read()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .signer
+                            .is_none(),
+                        "a loaded binding with the wrong stable member ID is not authority"
+                    );
+                    assert!(router.fast_sync_overlay(&ShardIdent::MASTERCHAIN).is_none());
+                    return Ok::<_, anyhow::Error>(());
+                }
                 let fast = router.fast_sync_overlay(&ShardIdent::MASTERCHAIN).unwrap();
                 let signer = router
                     .propagation_config
@@ -774,6 +796,14 @@ mod configuration_tests {
                     .signer
                     .clone()
                     .unwrap();
+                if binding_mode == 1 {
+                    assert!(!engine.network().config_handler().get_validator_status());
+                    assert_eq!(signer.id(), bootstrap.validators[0].adnl_key.id());
+                    assert_eq!(
+                        engine.network().context().stack.adnl.key_by_id(signer.id())?.id(),
+                        signer.id()
+                    );
+                }
                 // Exercise actual signed transport publication after normal config
                 // activation. This transport-only check is not block acceptance or
                 // mixed-network evidence; consensus/full-node consumers remain in place.
@@ -797,7 +827,7 @@ mod configuration_tests {
                         "typed protocol must select actual transport activation: {error}"
                     );
                 }
-                if protocol == 2 {
+                if protocol == 2 && binding_mode == 0 {
                     let other = bootstrap
                         .validators
                         .iter()
