@@ -15,10 +15,30 @@ use rtos_block::{error, fail, BlockIdExt, KeyId, Result, ShardDescr, ShardIdent}
 use simplex::finality_recovery::SessionRecoveryRecord;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
+/// Node-only authentication receipt. Its private fields can only be produced
+/// after pinned history, scheduled membership, options and start parents agree.
+#[derive(Debug)]
+pub(crate) struct AuthenticatedRetiredSession {
+    runtime: Arc<AuthenticatedSessionRuntime>,
+    options: simplex::SessionOptions,
+    record: SessionRecoveryRecord,
+}
+impl AuthenticatedRetiredSession {
+    pub(crate) fn runtime(&self) -> &Arc<AuthenticatedSessionRuntime> {
+        &self.runtime
+    }
+    pub(crate) fn options(&self) -> &simplex::SessionOptions {
+        &self.options
+    }
+    pub(crate) fn record(&self) -> &SessionRecoveryRecord {
+        &self.record
+    }
+}
+
 pub(crate) async fn authenticate_retired_session(
     engine: &dyn EngineOperations,
     record: &SessionRecoveryRecord,
-) -> Result<Arc<AuthenticatedSessionRuntime>> {
+) -> Result<AuthenticatedRetiredSession> {
     if &record.pin.zerostate != engine.zerostate_id()? {
         fail!("Retired session network pin mismatch");
     }
@@ -134,7 +154,10 @@ pub(crate) async fn authenticate_retired_session(
     if record.prev_blocks != parents {
         fail!("Retired session previous block floor mismatch");
     }
-    Ok(Arc::new(runtime))
+    let options =
+        super::validator_manager::build_historical_simplex_options(config, &coordinates.shard)?;
+    options.validate_authenticated(&runtime)?;
+    Ok(AuthenticatedRetiredSession { runtime: Arc::new(runtime), options, record: record.clone() })
 }
 
 /// Same effective-shard parent ordering used by manager::update_shards.
@@ -327,7 +350,8 @@ mod tests {
             for observer in [false, true] {
                 for cc in [7, 8] {
                     let record = locator(&engine, cc, cc == 8 && next_since == 1100, observer)?;
-                    let runtime = authenticate_retired_session(&engine, &record).await?;
+                    let authenticated = authenticate_retired_session(&engine, &record).await?;
+                    let runtime = authenticated.runtime();
                     assert_eq!(runtime.session_id(), &record.session_id);
                     assert_eq!(runtime.recovery_binding(), Some(&record.binding));
                     assert_eq!(runtime.local_role() == LocalRole::Observer, observer);
@@ -487,6 +511,47 @@ mod tests {
         let mut high = record.clone();
         high.prev_blocks[1].seq_no += 1;
         assert!(authenticate_retired_session(&merge, &high).await.is_err());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn retired_session_auth_receipt_freezes_historical_runtime_options() -> Result<()> {
+        let original = history(1100)?;
+        let mut state = original.state.state()?.clone();
+        let mut extra = state.read_custom()?.unwrap();
+        let mut consensus = extra.config.consensus_config()?;
+        consensus.max_block_bytes = 123456;
+        consensus.max_collated_bytes = 234567;
+        extra.config.set_config(rtos_block::ConfigParamEnum::ConfigParam29(consensus))?;
+        let mut selected = extra.config.selected_simplex_config(true)?.unwrap().config;
+        selected.slots_per_leader_window = 5;
+        selected.noncritical_params.target_rate_ms = 237;
+        selected.noncritical_params.candidate_resolve_timeout_ms = 731;
+        selected.noncritical_params.candidate_resolve_cooldown_ms = 619;
+        selected.noncritical_params.standstill_max_egress_bytes_per_s = 7654321;
+        selected.use_quic = false;
+        extra.config.set_config(rtos_block::ConfigParamEnum::ConfigParam30(
+            rtos_block::NewConsensusConfigAll { mc: Some(selected.clone()), shard: Some(selected) },
+        ))?;
+        state.write_custom(Some(&extra))?;
+        let engine = pinned(state)?;
+        let mut record = locator(&engine, 7, false, false)?;
+        let authenticated = authenticate_retired_session(&engine, &record).await?;
+        let options = authenticated.options();
+        assert_eq!(options.max_block_size, 123456);
+        assert_eq!(options.max_collated_data_size, 234567);
+        assert_eq!(options.slots_per_leader_window, 5);
+        assert_eq!(options.target_rate, std::time::Duration::from_millis(237));
+        assert_eq!(options.candidate_resolve_timeout, std::time::Duration::from_millis(731));
+        assert_eq!(options.candidate_resolve_cooldown, std::time::Duration::from_millis(619));
+        assert_eq!(options.standstill_max_egress_bytes_per_s, 7654321);
+        assert!(!options.use_quic);
+        assert!(options.empty_block_mc_lag_threshold.is_none());
+        options.validate_authenticated(authenticated.runtime())?;
+        record.prev_blocks.clear();
+        record.profile = UInt256::ZERO;
+        assert!(!authenticated.record().prev_blocks.is_empty());
+        assert_ne!(authenticated.record().profile, record.profile);
+        assert_eq!(authenticated.record().session_id, *authenticated.runtime().session_id());
         Ok(())
     }
 }

@@ -960,6 +960,10 @@ struct SpoolFixture {
 
 impl SpoolFixture {
     async fn new(row_index: usize) -> Self {
+        Self::new_for_transport(row_index, 0x61).await
+    }
+
+    async fn new_for_transport(row_index: usize, transport_seed: u8) -> Self {
         use consensus_common::session_runtime::{AuthenticatedSessionRuntime, SessionNetworkPin};
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("testdata/v2-publication-spool.json")).unwrap();
@@ -979,12 +983,26 @@ impl SpoolFixture {
         let mut config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         let (key_json, key) =
-            Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[0x61; 32]).unwrap();
+            Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[transport_seed; 32])
+                .unwrap();
+        let governing = ConfigParams::construct_from_cell(
+            read_single_root_boc(&decode(&fixture["config_boc"])).unwrap(),
+        )
+        .unwrap();
+        let validator = governing
+            .validator_set()
+            .unwrap()
+            .list()
+            .iter()
+            .find(|member| member.adnl_addr().is_ok_and(|id| id == *key.id()))
+            .expect("fixture transport must bind to its real governing identity")
+            .validator_id()
+            .unwrap();
         config["ip_address_quic"] = "127.0.0.1:0".into();
         config["validator_key_ring"][base64_encode(key.id().data())] =
             serde_json::to_value(key_json).unwrap();
         config["consensus_transport_bindings"] = serde_json::json!([{
-            "validator_id":base64_encode(decode(&row["creator_id"])),
+            "validator_id":base64_encode(validator.as_slice()),
             "adnl_key_id":base64_encode(key.id().data()),
         }]);
         std::fs::write(file, serde_json::to_vec(&config).unwrap()).unwrap();
@@ -1041,9 +1059,14 @@ impl SpoolFixture {
             .unwrap()
             .bind_recovery_anchor(anchor.clone())
             .unwrap();
+            let expected_index = runtime
+                .committee()
+                .iter()
+                .position(|member| member.adnl_addr().is_ok_and(|id| id == *key.id()))
+                .unwrap() as u32;
             assert_eq!(
                 runtime.local_role(),
-                consensus_common::session_runtime::LocalRole::Validator(0)
+                consensus_common::session_runtime::LocalRole::Validator(expected_index)
             );
             assert_eq!(runtime.session_id(), &UInt256::from_slice(&decode(&row["session"])));
             Arc::new(runtime)
