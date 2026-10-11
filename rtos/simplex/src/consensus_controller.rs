@@ -1616,6 +1616,12 @@ impl ConsensusController {
             };
 
             if self.try_finalize_recursive_chain(backend, trigger_id, &event) {
+                if self.description.authenticated_runtime().is_some() {
+                    if let Err(error) = self.callbacks.resolve_finality_intent(trigger_id) {
+                        log::error!("Cannot durably resolve source finality intent: {error}");
+                        continue;
+                    }
+                }
                 completed.push(trigger_id.clone());
             }
         }
@@ -1651,6 +1657,12 @@ impl ConsensusController {
         trigger_id: &RawCandidateId,
         event: &BlockFinalizedEvent,
     ) -> bool {
+        if self.description.authenticated_runtime().is_some() {
+            if let Err(error) = self.callbacks.retain_finality_intent(backend.runtime().session_start_prev_blocks().to_vec(), event) {
+                log::error!("Cannot durably retain finality intent: {error}");
+                return false;
+            }
+        }
         let applied_floor = self.last_mc_finalized_seqno.unwrap_or(0);
         let mut complete = true;
         let mut visited = HashSet::new();

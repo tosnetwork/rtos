@@ -447,7 +447,7 @@ impl SigningCoordinator {
             let mut previous = Vec::new();
             let mut sequences = std::collections::BTreeSet::new();
             for record in state.records.values() {
-                result.verify_record(&state.header.binding, record)?;
+                Self::verify_record(&result.identity, &state.header.binding, record)?;
                 if !sequences.insert(record.sequence) {
                     fail!("duplicate journal sequence");
                 }
@@ -563,7 +563,7 @@ impl SigningCoordinator {
             .ok_or_else(|| error!("signing journal write timeout"))??;
         Ok(())
     }
-    fn preimage(&self, b: &SigningBinding, decision: &Decision) -> Result<Vec<u8>> {
+    fn preimage(b: &SigningBinding, decision: &Decision) -> Result<Vec<u8>> {
         let unsigned = if decision.kind == 3 {
             utils::create_candidate_id_to_sign(
                 SlotIndex::new(decision.slot),
@@ -574,7 +574,7 @@ impl SigningCoordinator {
         };
         Ok(utils::create_data_to_sign(&UInt256::from(b.session), &unsigned))
     }
-    fn verify_record(&self, b: &SigningBinding, record: &Record) -> Result<()> {
+    fn verify_record(identity: &ValidatorIdentity, b: &SigningBinding, record: &Record) -> Result<()> {
         if record.binding != *UInt256::calc_file_hash(&encode(b)?).as_array() {
             fail!("decision binding mismatch");
         }
@@ -613,7 +613,7 @@ impl SigningCoordinator {
                 }
                 vote.signature
             };
-            self.identity.verify_simplex(&self.preimage(b, d)?, &signature)?;
+            identity.verify_simplex(&Self::preimage(b, d)?, &signature)?;
         }
         Ok(())
     }
@@ -647,14 +647,14 @@ impl SigningCoordinator {
                 decision,
                 signed: None,
             };
-            self.verify_record(&state.header.binding, &record)?;
+            Self::verify_record(&self.identity, &state.header.binding, &record)?;
             self.checkpoint("before_intent")?;
             self.put(k.clone(), encode(&record)?)?;
             state.records.insert(k.clone(), record.clone());
             self.checkpoint("after_intent")?;
             self.live(&mut state)?;
             self.checkpoint("before_sign")?;
-            let preimage = self.preimage(&state.header.binding, &record.decision)?;
+            let preimage = Self::preimage(&state.header.binding, &record.decision)?;
             let signature = self.signer.sign(&preimage)?;
             self.checkpoint("after_sign")?;
             self.live(&mut state)?;
@@ -766,6 +766,36 @@ impl SigningCoordinator {
         Ok(())
     }
 }
+/// Read-only recovery authenticates every existing record without acquiring a
+/// signer, advancing an unsigned intent, or changing the protected journal.
+pub(crate) fn verify_recovery_journal(
+    runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+    raw: &[(Vec<u8>, Vec<u8>)],
+) -> Result<()> {
+    if raw.is_empty() { return Ok(()); }
+    let headers = raw.iter().filter(|(key, _)| key == HEADER).collect::<Vec<_>>();
+    if headers.len() != 1 { fail!("Recovery journal requires exactly one header"); }
+    let header: Header = decode(&headers[0].1)?;
+    let expected = SigningBinding::from_authenticated_runtime(runtime, header.binding.generation, header.binding.expire_at)?;
+    if header.binding != expected || expected.generation == 0 { fail!("Recovery journal authenticated binding mismatch"); }
+    let identity = ValidatorIdentity::from_descriptor(&runtime.committee()[expected.local_index as usize])?;
+    let mut previous = Vec::new();
+    let mut sequences = std::collections::BTreeSet::new();
+    let mut keys = std::collections::BTreeSet::new();
+    for (key, value) in raw {
+        validate_record(key, value)?;
+        if !keys.insert(key) { fail!("Duplicate recovery journal key"); }
+        if key == HEADER { continue; }
+        let record: Record = decode(value)?;
+        SigningCoordinator::verify_record(&identity, &expected, &record)?;
+        if !sequences.insert(record.sequence) { fail!("Duplicate recovery journal sequence"); }
+        if previous.iter().any(|old| !compatible(old, &record.decision)) { fail!("Conflicting recovery signing intents"); }
+        previous.push(record.decision);
+    }
+    if sequences.iter().copied().ne(1..=sequences.len() as u64) { fail!("Recovery journal sequence gap"); }
+    Ok(())
+}
+
 fn vote_decision(vote: &Vote) -> Result<Decision> {
     let (kind, slot, hash) = match vote {
         Vote::Notarize(v) => (0, v.slot, Some(*v.block_hash.as_array())),

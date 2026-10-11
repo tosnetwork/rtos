@@ -182,7 +182,7 @@ impl PendingFinalityStore {
         File::open(namespace)?.sync_all()?;
         Self::lock(directory)?.ok_or_else(|| error!("Source finality store already owned"))
     }
-    fn lock(directory: PathBuf) -> Result<Option<Arc<Self>>> {
+    pub(crate) fn lock(directory: PathBuf) -> Result<Option<Arc<Self>>> {
         let lock = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(directory.join(".lock"))?;
         match lock.try_lock() {
             Ok(()) => Ok(Some(Arc::new(Self { directory, _lock: lock, mutation: Mutex::new(()) }))),
@@ -338,6 +338,8 @@ pub(crate) struct SourceFinalityDelivery {
     runtime: Arc<AuthenticatedSessionRuntime>,
     store: Arc<PendingFinalityStore>,
     sink: consensus_common::finality_delivery::DurableFinalitySinkPtr,
+    intents: crate::finality_recovery::FinalityIntentStore,
+    start_masterchain: Mutex<Option<BlockIdExt>>,
     stages: Mutex<std::collections::HashMap<UInt256, SourceStage>>,
 }
 enum SourceStage {
@@ -350,8 +352,21 @@ impl SourceFinalityDelivery {
     pub(crate) fn open(runtime: Arc<AuthenticatedSessionRuntime>, namespace: &Path,
         sink: consensus_common::finality_delivery::DurableFinalitySinkPtr) -> Result<Arc<Self>> {
         Ok(Arc::new(Self { runtime, store: PendingFinalityStore::open(namespace)?, sink,
+            intents: crate::finality_recovery::FinalityIntentStore::new(namespace),
+            start_masterchain: Mutex::new(None),
             stages: Mutex::new(std::collections::HashMap::new()) }))
     }
+    pub(crate) fn bind_start(&self, anchor: BlockIdExt) -> Result<()> {
+        let mut slot = self.start_masterchain.lock().unwrap();
+        if slot.is_some() { fail!("Source start anchor already bound"); }
+        *slot = Some(anchor); Ok(())
+    }
+    pub(crate) fn retain_intent(&self, prevs: Vec<BlockIdExt>, event: &crate::simplex_state::BlockFinalizedEvent) -> Result<()> {
+        self.intents.retain(&self.runtime, prevs, self.start_masterchain.lock().unwrap().clone().ok_or_else(|| error!("Source start anchor not bound"))?, event)
+    }
+    pub(crate) fn resolve_intent(&self, id: &crate::block::RawCandidateId) -> Result<()> { self.intents.resolve(id) }
+    pub(crate) fn pending_intents(&self) -> Result<Vec<Vec<u8>>> { self.intents.pending() }
+
     /// None means not yet durable. Retention precedes every first stage; later
     /// attempts use the exact retained certificate, metadata and creation time.
     pub(crate) fn poll(self: &Arc<Self>, draft: FinalizedDeliveryDraft)

@@ -11566,6 +11566,7 @@ fn source_finality_controller_case(upgrade: bool) {
         Arc::new(AtomicBool::new(false)), false, Arc::new(TestCallbackQueue), Arc::downgrade(&listener_dyn))
         .with_delivery_sink(Some(sink.clone())));
     callbacks.initialize_delivery(runtime.clone(), std::path::Path::new(&namespace)).unwrap();
+    callbacks.bind_delivery_start(runtime.pin().zerostate.clone()).unwrap();
     processor.consensus.set_callbacks_for_test(callbacks.clone());
     processor.callbacks = callbacks;
     let consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(proof)) = &draft.finality else { unreachable!() };
@@ -11651,6 +11652,7 @@ fn source_finality_main_worker_release_keeps_only_accepted_node_work_owned() {
         .with_delivery_sink(Some(sink.clone())));
     let main_worker = callbacks.delivery_lifetime();
     callbacks.initialize_delivery(runtime.clone(), std::path::Path::new(&namespace)).unwrap();
+    callbacks.bind_delivery_start(runtime.pin().zerostate.clone()).unwrap();
     let old_handle = Arc::new(callbacks.with_listener(Arc::downgrade(&listener_dyn)));
     assert!(!callbacks.poll_durable_finality(draft).unwrap());
     drop(main_worker);
