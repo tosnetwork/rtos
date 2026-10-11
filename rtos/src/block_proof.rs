@@ -218,6 +218,8 @@ pub struct PqPublicationContext {
     global_id: i32,
     protocol: consensus_common::simplex_protocol::SimplexProtocol,
     profile: UInt256,
+    committee: Vec<rtos_block::ValidatorDescr>,
+    slots_per_leader_window: u32,
     verifier: rtos_api::pq_finality::PqVerificationContext,
 }
 
@@ -237,6 +239,12 @@ impl PqPublicationContext {
     }
     pub fn profile(&self) -> &UInt256 {
         &self.profile
+    }
+    pub fn committee(&self) -> &[rtos_block::ValidatorDescr] {
+        &self.committee
+    }
+    pub fn slots_per_leader_window(&self) -> u32 {
+        self.slots_per_leader_window
     }
     pub fn verifier(&self) -> &rtos_api::pq_finality::PqVerificationContext {
         &self.verifier
@@ -381,6 +389,10 @@ impl MasterchainProofVerifier {
             id.shard().workchain_id(),
             info.gen_catchain_seqno(),
         )?;
+        let slots_per_leader_window = selected.config.slots_per_leader_window;
+        if committee.is_empty() || slots_per_leader_window == 0 {
+            fail!("Publication history has no valid leader schedule");
+        }
         let identity = rtos_api::session_identity::derive_session_from_config(
             authority.global_id,
             &config,
@@ -402,6 +414,8 @@ impl MasterchainProofVerifier {
             global_id: authority.global_id,
             protocol,
             profile: identity.config_hash,
+            committee,
+            slots_per_leader_window,
             verifier,
         })
     }
