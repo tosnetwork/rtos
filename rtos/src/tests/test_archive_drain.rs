@@ -65,6 +65,12 @@ impl Drop for GateRegistration {
         self.gate.release.add_permits(1);
     }
 }
+struct ReleaseOnDrop(Arc<Semaphore>);
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.add_permits(1);
+    }
+}
 fn install(engine: &Arc<dyn EngineOperations>, gate: &Arc<Gate>) -> GateRegistration {
     gates().lock().unwrap().insert(key(engine), gate.clone());
     GateRegistration { key: key(engine), gate: gate.clone() }
@@ -548,6 +554,7 @@ async fn archive_drain_shard_unobserved_file_failure_is_sticky_and_retryable() {
     let proof = std::fs::read(&obstruction).unwrap();
     std::fs::remove_file(&obstruction).unwrap();
     std::fs::create_dir(&obstruction).unwrap();
+    assert_eq!(std::fs::read(&obstruction).unwrap_err().kind(), std::io::ErrorKind::IsADirectory);
     worker.abort();
     assert!(worker.await.unwrap_err().is_cancelled());
     gate.release.add_permits(1);
@@ -559,7 +566,9 @@ async fn archive_drain_shard_unobserved_file_failure_is_sticky_and_retryable() {
         error.to_string().contains("Unobserved archive import failure (archive shard import)"),
         "{error:#}"
     );
-    assert!(error.to_string().contains("Is a directory"), "{error:#}");
+    // ArchiveManager wraps the underlying read error with entry identity.
+    assert!(error.to_string().contains("file was not read"), "{error:#}");
+    assert!(error.to_string().contains("prooflink_"), "{error:#}");
     assert!(!engine.load_block_handle(&fixture.id(1, true)).unwrap().unwrap().is_applied());
     assert_eq!(
         engine.load_shard_client_mc_block_id().unwrap().unwrap().as_ref(),
@@ -588,6 +597,7 @@ async fn archive_drain_aggregate_cancel_does_not_ack_buffered_error() {
     let ops: Arc<dyn EngineOperations> = engine.clone();
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Semaphore::new(0));
+    let _release = ReleaseOnDrop(release.clone());
     let path = dir.path().to_path_buf();
     let first = spawn_archive_task(&ops, "buffered archive error", async move {
         // A real filesystem error reaches the same retained result path.
