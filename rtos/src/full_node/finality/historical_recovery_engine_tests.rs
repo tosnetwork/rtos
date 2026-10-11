@@ -255,6 +255,12 @@ async fn recover_scenario(scenario: RecoveryScenario) {
         let sink = engine.clone().durable_finality_sink(runtime.clone()).await.unwrap();
         let confirm =
             engine.ensure_publication_worker().await.unwrap().delivered_sink(runtime.clone());
+        if scenario == RecoveryScenario::AutonomousColdStartup {
+            // Model a real preexisting validator session before retaining its
+            // source debt. Cold startup must only open these original files.
+            FinalityDeliveryTestDriver::provision_validator_namespace(&runtime, &namespace)
+                .unwrap();
+        }
         let driver =
             FinalityDeliveryTestDriver::open(runtime.clone(), &namespace, sink, confirm).unwrap();
         driver.prepare_intents(false).unwrap();

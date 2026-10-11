@@ -1970,6 +1970,15 @@ pub(crate) mod tests {
 pub struct FinalityDeliveryTestDriver(Arc<SourceFinalityDelivery>);
 #[cfg(feature = "integration-test-support")]
 impl FinalityDeliveryTestDriver {
+    /// Explicit warm-fixture provisioning of a fresh validator namespace.
+    /// Never call this during cold recovery; an existing namespace is rejected.
+    pub fn provision_validator_namespace(
+        runtime: &AuthenticatedSessionRuntime,
+        namespace: &Path,
+    ) -> Result<()> {
+        crate::runtime_manifest::RuntimeManifest::provision_test_validator(runtime, namespace)
+    }
+
     pub fn open(
         runtime: Arc<AuthenticatedSessionRuntime>,
         namespace: &Path,
