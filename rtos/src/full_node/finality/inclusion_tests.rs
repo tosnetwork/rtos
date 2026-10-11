@@ -81,6 +81,10 @@ impl Pair {
     }
 
     async fn with_propagation_profile(variant: &str, corrupt_signature: bool, v2: bool) -> Self {
+        Self::with_gc_options(variant, corrupt_signature, v2, false).await
+    }
+
+    async fn with_gc_options(variant: &str, corrupt_signature: bool, v2: bool, history_gc: bool) -> Self {
         let _ = env_logger::builder().is_test(true).try_init();
         let recovery: serde_json::Value = serde_json::from_str(if v2 {
             include_str!("testdata/v2-propagation-recovery.json")
@@ -136,6 +140,16 @@ impl Pair {
                 let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
                 config["ip_address_quic"] = socket.local_addr().unwrap().to_string().into();
                 drop(socket);
+                std::fs::write(file, serde_json::to_vec(&config).unwrap()).unwrap();
+            }
+        }
+        if history_gc {
+            for dir in [&receiver_dir, &provider_dir] {
+                let file = dir.join("config.json");
+                let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+                config["gc"] = serde_json::json!({"enable_for_archives": false,
+                    "enable_for_shard_state_persistent": false,
+                    "cells_gc_config": {"gc_interval_sec": 1, "cells_lifetime_sec": 0}});
                 std::fs::write(file, serde_json::to_vec(&config).unwrap()).unwrap();
             }
         }
@@ -1091,3 +1105,6 @@ mod propagation_tests;
 
 #[path = "retired_service_tests.rs"]
 mod retired_service_tests;
+
+#[path = "history_gc_tests.rs"]
+mod history_gc_tests;

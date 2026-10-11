@@ -12,6 +12,7 @@ pub mod archive_import;
 pub mod block;
 pub mod block_proof;
 pub mod boot;
+pub(crate) mod retired_history;
 pub mod collator_test_bundle;
 pub mod config;
 pub mod confirmed_blocks;

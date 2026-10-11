@@ -516,6 +516,11 @@ impl ShardStateDb {
         Ok(())
     }
 
+    /// Physical record presence, independent of logical GC eligibility.
+    pub fn contains_state_record(&self, id: &BlockIdExt) -> Result<bool> {
+        self.shardstate_db.contains(id)
+    }
+
     pub fn get(&self, id: &BlockIdExt) -> Result<Cell> {
         let data = match self.shardstate_db.get(id) {
             Ok(data) => data,

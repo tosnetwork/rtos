@@ -2,7 +2,7 @@
 //! Authenticate an untrusted retired-session locator before any source DB opens.
 //! This grants neither signing authority nor permission to skip source PQ checks.
 use crate::{
-    boot::authenticate_recovered_state, engine_traits::EngineOperations,
+    retired_history::authenticate_state as authenticate_recovered_state, engine_traits::EngineOperations,
     shard_state::ShardStateStuff,
     validator::validator_utils::try_calc_subset_for_workchain_standard,
 };

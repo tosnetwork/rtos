@@ -257,6 +257,13 @@ impl ShardStatesKeeper {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_retire_history_state(&self, id: &BlockIdExt) {
+        self.states.remove(id);
+        self.gc_resolver.test_advance_expired_mc_boundary(id.seq_no() + 1);
+        self.db.adjust_states_gc_interval(1);
+    }
+
     pub fn allow_state_gc(&self, block_id: &BlockIdExt) -> Result<bool> {
         self.gc_resolver.allow_state_gc(block_id, 0, u64::MAX)
     }

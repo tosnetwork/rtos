@@ -1028,6 +1028,29 @@ impl EngineOperations for BootstrapTestEngine {
         Ok(true)
     }
 
+    async fn load_block_proof(&self, handle: &Arc<BlockHandle>, is_link: bool) -> Result<crate::block_proof::BlockProofStuff> {
+        self.db.load_block_proof(handle, is_link).await
+    }
+
+    async fn download_block_proof(&self, id: &BlockIdExt, _: bool, _: bool) -> Result<crate::block_proof::BlockProofStuff> {
+        fail!("Bootstrap fixture lacks signed historical proof for {id}")
+    }
+
+    async fn prepare_retired_history(self: Arc<Self>, runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>, start: BlockIdExt) -> Result<()> {
+        crate::retired_history::prepare(self, runtime, start).await
+    }
+
+    async fn load_mc_zero_state(&self) -> Result<Arc<ShardStateStuff>> {
+        self.load_state(&self.init_mc_block_id).await
+    }
+
+    async fn load_and_pin_state(&self, id: &BlockIdExt) -> Result<crate::shard_states_keeper::PinnedShardStateGuard> {
+        // This in-memory fixture does not run GC; retain the same real guard API
+        // as production rather than bypassing the preparation contract.
+        crate::shard_states_keeper::PinnedShardStateGuard::new(self.load_state(id).await?,
+            Arc::new(crate::internal_db::state_gc_resolver::AllowStateGcSmartResolver::new(0)))
+    }
+
     async fn load_state(&self, block_id: &BlockIdExt) -> Result<Arc<ShardStateStuff>> {
         self.states
             .read()
@@ -1065,6 +1088,9 @@ impl EngineOperations for BootstrapTestEngine {
     fn produce_shard_hashes_enabled(&self) -> bool {
         true
     }
+
+    #[cfg(feature = "telemetry")]
+    fn engine_telemetry(&self) -> &Arc<crate::engine_traits::EngineTelemetry> { &self.telemetry }
 
     fn engine_allocated(&self) -> &Arc<crate::engine_traits::EngineAlloc> {
         &self.allocated

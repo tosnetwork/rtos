@@ -550,6 +550,14 @@ impl InternalDb {
         usage
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_contains_dynamic_state_record(&self, id: &BlockIdExt) -> Result<bool> {
+        match &self.state_db {
+            StateDb::Dynamic(db) => db.contains_state_record(id),
+            _ => fail!("Dynamic state fixture required"),
+        }
+    }
+
     pub fn start_states_gc(&self, resolver: Arc<dyn AllowStateGcResolver>) {
         if let StateDb::Dynamic(db) = &self.state_db {
             db.clone().start_gc(resolver, self.cells_gc_interval.clone())

@@ -12,6 +12,7 @@
 mod block;
 mod block_proof;
 mod boot;
+pub(crate) mod retired_history;
 mod collator_test_bundle;
 mod config;
 mod confirmed_blocks;

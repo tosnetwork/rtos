@@ -24,9 +24,17 @@ pub struct AllowStateGcSmartResolver {
     min_actual_ss: lockfree::map::Map<ShardIdent, AtomicU32>,
     life_time_sec: u64,
     pinned_roots: parking_lot::RwLock<HashMap<BlockIdExt, u32>>,
+    #[cfg(test)]
+    test_expired: std::sync::atomic::AtomicBool,
 }
 
 impl AllowStateGcSmartResolver {
+    #[cfg(test)]
+    pub(crate) fn test_advance_expired_mc_boundary(&self, min: u32) {
+        self.min_ref_mc_block.store(min, Ordering::Release);
+        self.test_expired.store(true, Ordering::Release);
+    }
+
     pub fn new(life_time_sec: u64) -> Self {
         Self {
             last_processed_block: AtomicU32::new(0),
@@ -34,6 +42,7 @@ impl AllowStateGcSmartResolver {
             min_actual_ss: lockfree::map::Map::new(),
             life_time_sec,
             pinned_roots: parking_lot::RwLock::new(HashMap::new()),
+            #[cfg(test)] test_expired: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -159,7 +168,10 @@ impl AllowStateGcSmartResolver {
     }
 
     fn allow_state_gc(&self, block_id: &BlockIdExt, saved_at: u64, gc_utime: u64) -> Result<bool> {
-        if gc_utime > saved_at && gc_utime - saved_at < self.life_time_sec {
+        let recent = gc_utime > saved_at && gc_utime - saved_at < self.life_time_sec;
+        #[cfg(test)]
+        let recent = recent && !self.test_expired.load(Ordering::Acquire);
+        if recent {
             return Ok(false);
         }
         if block_id.shard().is_masterchain() {
