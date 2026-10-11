@@ -947,5 +947,119 @@ async fn real_multinode_plumtree_repairs_lost_ihave_and_first_repair_response() 
     relays.provider.clone().wait_stop().await.unwrap();
 }
 
+// Separate from Pair: this fixture never installs the old network block or MC
+// successor, and exercises durable local acceptance with publication disabled.
+struct SpoolFixture {
+    dir: tempfile::TempDir,
+    engine: Arc<Engine>,
+    runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+    block: BlockStuff,
+    row: serde_json::Value,
+    state_root: UInt256,
+}
+
+impl SpoolFixture {
+    async fn new(row_index: usize) -> Self {
+        use consensus_common::session_runtime::{AuthenticatedSessionRuntime, SessionNetworkPin};
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/v2-publication-spool.json")).unwrap();
+        let row = fixture["rows"][row_index].clone();
+        let block = fixture_block(&row);
+        let mc_data = decode(&fixture["state_boc"]);
+        let mc_root = read_single_root_boc(&mc_data).unwrap();
+        let anchor = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            0,
+            mc_root.repr_hash().clone(),
+            UInt256::calc_file_hash(&mc_data),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        write_recovery_config(dir.path(), &anchor, true);
+        let file = dir.path().join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let (key_json, key) =
+            Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[0x61; 32]).unwrap();
+        config["ip_address_quic"] = "127.0.0.1:0".into();
+        config["validator_key_ring"][base64_encode(key.id().data())] =
+            serde_json::to_value(key_json).unwrap();
+        config["consensus_transport_bindings"] = serde_json::json!([{
+            "validator_id":base64_encode(decode(&row["creator_id"])),
+            "adnl_key_id":base64_encode(key.id().data()),
+        }]);
+        std::fs::write(file, serde_json::to_vec(&config).unwrap()).unwrap();
+        let engine = open_engine(dir.path()).await;
+        let setup = std::panic::AssertUnwindSafe(async {
+            assert!(engine.adnl_key_by_id(key.id()).is_some(), "normal explicit key loading");
+            assert!(!engine.network().config_handler().get_validator_status());
+            for bytes in [&mc_data, &decode(&fixture["prev_state_boc"])] {
+                let root = read_single_root_boc(bytes).unwrap();
+                let state = ShardStateUnsplit::construct_from_cell(root.clone()).unwrap();
+                let id = BlockIdExt::with_params(
+                    state.shard().clone(),
+                    state.seq_no(),
+                    root.repr_hash().clone(),
+                    UInt256::calc_file_hash(bytes),
+                );
+                let state = ShardStateStuff::from_root_cell(
+                    id,
+                    root,
+                    #[cfg(feature = "telemetry")]
+                    engine.engine_telemetry(),
+                    engine.engine_allocated(),
+                )
+                .unwrap();
+                let (_, handle) = engine.store_zerostate(state, bytes).await.unwrap();
+                assert_eq!(handle.id().seq_no(), 0);
+                engine.set_applied(&handle, 0).await.unwrap();
+            }
+            engine.save_last_applied_mc_block_id(&anchor).unwrap();
+            engine.save_shard_client_mc_block_id(&anchor).unwrap();
+            engine.set_test_chain_time(Some(1002));
+            engine.initialize_test_full_node_overlays().await.unwrap();
+            engine.overlays_router().unwrap().refresh_fast_sync_from_applied_state().await.unwrap();
+            let state = engine.load_state(&anchor).await.unwrap();
+            let config = state.config_params().unwrap();
+            let (committee, _) = config
+                .validator_set()
+                .unwrap()
+                .calc_subset(&config.catchain_config().unwrap(), SHARD_FULL, 0, 7)
+                .unwrap();
+            let runtime = AuthenticatedSessionRuntime::from_authenticated_config(
+                SessionNetworkPin { global_id: -239, zerostate: anchor.clone() },
+                config,
+                rtos_api::session_identity::SessionCoordinates {
+                    shard: block.id().shard(),
+                    catchain_seqno: 7,
+                    vertical_seqno: 0,
+                    last_key_block_seqno: 0,
+                    new_catchain_ids: false,
+                },
+                committee,
+                key.id().clone(),
+            )
+            .unwrap();
+            assert_eq!(
+                runtime.local_role(),
+                consensus_common::session_runtime::LocalRole::Validator(0)
+            );
+            assert_eq!(runtime.session_id(), &UInt256::from_slice(&decode(&row["session"])));
+            Arc::new(runtime)
+        })
+        .catch_unwind()
+        .await;
+        let runtime = match setup {
+            Ok(runtime) => runtime,
+            Err(panic) => {
+                engine.clone().wait_stop().await.unwrap();
+                std::panic::resume_unwind(panic)
+            }
+        };
+        let state_root =
+            read_single_root_boc(&decode(&fixture["next_state_boc"])).unwrap().repr_hash();
+        Self { dir, engine, runtime, block, row, state_root }
+    }
+}
+
 #[path = "propagation_tests.rs"]
 mod propagation_tests;

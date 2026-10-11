@@ -599,3 +599,229 @@ async fn publication_recovery_replays_prepared_and_ready_acceptance() {
         drop(keep_dir);
     }
 }
+
+fn spool_draft(
+    runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+    block: &BlockStuff,
+    row: &serde_json::Value,
+    final_role: bool,
+) -> consensus_common::finality_delivery::FinalizedDeliveryDraft {
+    use consensus_common::{
+        BlockCandidatePriority, BlockSourceInfo, ConsensusCommonFactory, ValidatorIdentity,
+    };
+    let mut row = row.clone();
+    if !final_role {
+        row["signatures"] = row["approval_signatures"].clone();
+    }
+    let mut carrier = fixture_carrier(&row);
+    carrier.slot = row["slot"].as_u64().unwrap() as u32;
+    let finality = if final_role {
+        SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(carrier))
+    } else {
+        SessionFinality::PqApproval(
+            rtos_api::pq_finality::PqApproval::from_notarization_fields(carrier).unwrap(),
+        )
+    };
+    consensus_common::finality_delivery::FinalizedDeliveryDraft {
+        block_id: block.id().clone(),
+        source_info: BlockSourceInfo {
+            source: ValidatorIdentity::from_descriptor(&runtime.committee()[0]).unwrap(),
+            priority: BlockCandidatePriority { round: 99, first_block_round: 0, priority: 0 },
+        },
+        data: ConsensusCommonFactory::create_block_payload(block.data().to_vec()),
+        finality,
+        last_mc_finalized_seqno: 0,
+        candidate_already_sent: false,
+        created_at_unix_secs: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    }
+}
+
+async fn stage_spool(
+    sink: &consensus_common::finality_delivery::DurableFinalitySinkPtr,
+    draft: consensus_common::finality_delivery::FinalizedDeliveryDraft,
+) -> Result<UInt256> {
+    let (sent, received) = tokio::sync::oneshot::channel();
+    sink.stage(
+        draft,
+        Box::new(move |result| {
+            let _ = sent.send(result);
+        }),
+    )?;
+    tokio::time::timeout(Duration::from_secs(15), received)
+        .await
+        .map_err(|_| rtos_block::error!("durable completion timeout"))?
+        .map_err(|error| rtos_block::error!("durable completion dropped: {error}"))?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publication_durable_sink_wal_receipt_reopens_and_accepts_creator_bound_drafts() {
+    use crate::propagation_outbox::{Limits, OutboxDomain, PropagationOutbox, PublicationStage};
+    use consensus_common::{ConsensusCommonFactory, ValidatorIdentity};
+    let all: serde_json::Value =
+        serde_json::from_str(include_str!("testdata/v2-publication-spool.json")).unwrap();
+    let mut stable_ids = Vec::new();
+    for row_index in 0..2 {
+        for final_role in [false, true] {
+            let SpoolFixture { dir, engine, runtime, block, row, state_root } =
+                SpoolFixture::new(row_index).await;
+            let domain = OutboxDomain {
+                zerostate: runtime.pin().zerostate.clone(),
+                global_id: runtime.pin().global_id,
+                wire_profile: runtime.wire_profile(),
+            };
+            let draft = spool_draft(&runtime, &block, &row, final_role);
+            let result = std::panic::AssertUnwindSafe(async {
+                let sink = engine.clone().durable_finality_sink(runtime.clone()).await.unwrap();
+                assert!(engine.load_block_handle(block.id()).unwrap().is_none());
+                let mut wrong_creator = draft.clone();
+                wrong_creator.source_info.source =
+                    ValidatorIdentity::from_descriptor(&runtime.committee()[1]).unwrap();
+                let mut wrong_body = draft.clone();
+                let mut data = block.data().to_vec();
+                let last = data.len() - 1;
+                data[last] ^= 1;
+                wrong_body.data = ConsensusCommonFactory::create_block_payload(data);
+                for rejected in [wrong_creator, wrong_body] {
+                    let (sent, received) = tokio::sync::oneshot::channel();
+                    assert!(sink
+                        .stage(
+                            rejected,
+                            Box::new(move |value| {
+                                let _ = sent.send(value);
+                            })
+                        )
+                        .is_err());
+                    assert!(
+                        received.await.is_err(),
+                        "rejected admission must not invoke WAL completion"
+                    );
+                }
+                assert!(
+                    engine.load_block_handle(block.id()).unwrap().is_none(),
+                    "rejected evidence touched block storage"
+                );
+                let id = stage_spool(&sink, draft.clone()).await.unwrap();
+                assert_eq!(
+                    stage_spool(&sink, draft.clone()).await.unwrap(),
+                    id,
+                    "exact retry changed durable identity"
+                );
+                // A different valid certificate for the same body/role has the
+                // same delivery identity, but must not replace its first evidence.
+                let alternative =
+                    spool_draft(&runtime, &block, &all["rows"][1 - row_index], final_role);
+                let collision = stage_spool(&sink, alternative).await.unwrap_err();
+                assert!(collision.to_string().contains("different evidence"), "{collision}");
+                id
+            })
+            .catch_unwind()
+            .await;
+            engine.clone().wait_stop().await.unwrap();
+            drop(engine);
+            let id = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            stable_ids.push(id.clone());
+
+            // Inspect only after closing the actual Engine: an independent
+            // live writer would violate the outbox's single-writer contract.
+            let reopened = open_engine(dir.path()).await;
+            let result = std::panic::AssertUnwindSafe(async {
+                {
+                    let ledger = PropagationOutbox::open(
+                        reopened.db().clone(),
+                        domain.clone(),
+                        Limits::default(),
+                    )
+                    .unwrap();
+                    let (delivery, stored) = ledger
+                        .delivery(&id)
+                        .unwrap()
+                        .expect("WAL receipt lost across real DB reopen");
+                    assert_eq!(
+                        ledger.pending().unwrap().len(),
+                        1,
+                        "rejected or duplicate draft created another record"
+                    );
+                    assert_eq!(
+                        delivery.origin.as_ref().unwrap().source_validator,
+                        block.block().unwrap().read_extra().unwrap().created_by().clone()
+                    );
+                    assert_eq!(delivery.origin.as_ref().unwrap().local_validator_index, Some(0));
+                    assert_eq!(stored.record.block_data, block.data().as_slice());
+                    assert_eq!(stored.record.carrier.is_final(), final_role);
+                    assert!(
+                        stored.record.locally_generated,
+                        "empty trigger leader replaced original creator"
+                    );
+                }
+                reopened.set_test_chain_time(Some(1002));
+                reopened.initialize_test_full_node_overlays().await.unwrap();
+                reopened
+                    .overlays_router()
+                    .unwrap()
+                    .refresh_fast_sync_from_applied_state()
+                    .await
+                    .unwrap();
+                let accepted = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    reopened.clone().await_publication(id.clone()),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(accepted.block(), &block);
+                assert_eq!(accepted.is_final(), final_role);
+                assert_eq!(accepted.phase(), AcceptancePhase::Preapplied);
+                let handle = reopened.load_block_handle(block.id()).unwrap().unwrap();
+                assert!(handle.has_state());
+                assert!(!handle.is_applied(), "durable acceptance cannot fake MC inclusion");
+                assert_eq!(
+                    reopened.load_state(block.id()).await.unwrap().root_cell().repr_hash(),
+                    state_root
+                );
+                let sink = reopened.clone().durable_finality_sink(runtime.clone()).await.unwrap();
+                assert_eq!(
+                    stage_spool(&sink, draft.clone()).await.unwrap(),
+                    id,
+                    "reopen retry changed ID"
+                );
+            })
+            .catch_unwind()
+            .await;
+            reopened.clone().wait_stop().await.unwrap();
+            drop(reopened);
+            result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+
+            let reopened = open_engine(dir.path()).await;
+            let result = std::panic::AssertUnwindSafe(async {
+                let ledger =
+                    PropagationOutbox::open(reopened.db().clone(), domain, Limits::default())
+                        .unwrap();
+                let (_, stored) = ledger.delivery(&id).unwrap().unwrap();
+                assert_eq!(ledger.pending().unwrap().len(), 1);
+                assert_eq!(stored.stage, PublicationStage::Ready);
+                assert!(
+                    !stored.pending.is_empty(),
+                    "publication remained disabled; no target was sent"
+                );
+                assert_eq!(stored.pending, stored.record.effects);
+                assert_eq!(
+                    reopened.load_state(block.id()).await.unwrap().root_cell().repr_hash(),
+                    state_root
+                );
+                assert!(!reopened.load_block_handle(block.id()).unwrap().unwrap().is_applied());
+            })
+            .catch_unwind()
+            .await;
+            reopened.clone().wait_stop().await.unwrap();
+            drop(reopened);
+            result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            drop(dir);
+        }
+    }
+    assert_ne!(stable_ids[0], stable_ids[1], "Approval and Final must have different IDs");
+    assert_eq!(stable_ids[0], stable_ids[2], "empty trigger must refer to the same body/role ID");
+    assert_eq!(stable_ids[1], stable_ids[3]);
+}
