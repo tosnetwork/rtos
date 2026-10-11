@@ -697,14 +697,7 @@ async fn import_mc_blocks(
         let Some(entry) = maps.blocks.get(last_mc_block_id) else {
             fail!("Inconsistent blocks map: block {} is missing", last_mc_block_id.seq_no());
         };
-        let (handle, block, _proof) =
-            save_block(&sync_context.engine, last_mc_block_id, entry).await?;
-        log::debug!(target: TARGET, "Applying masterchain block: {last_mc_block_id}...");
-        sync_context
-            .engine
-            .clone()
-            .apply_block(&handle, &block, last_mc_block_id.seq_no(), false)
-            .await?;
+        save_block_owned(&sync_context.engine, last_mc_block_id, entry, true).await?;
     }
 
     log::debug!(target: TARGET, "Last applied MC seq_no = {}", last_mc_block_id.seq_no());
@@ -942,6 +935,18 @@ async fn save_block(
     block_id: &BlockIdExt,
     entry: &BlocksEntry,
 ) -> Result<(Arc<BlockHandle>, Arc<BlockStuff>, Arc<BlockProofStuff>)> {
+    save_block_owned(engine, block_id, entry, false).await
+}
+
+// Authentication is cancellation-safe and performs no writes. Once admitted, the
+// Engine owns the complete block/proof write and (for MC) normal apply operation.
+// Cancelling its observer must not strand a partially stored authenticated block.
+async fn save_block_owned(
+    engine: &Arc<dyn EngineOperations>,
+    block_id: &BlockIdExt,
+    entry: &BlocksEntry,
+    apply_mc: bool,
+) -> Result<(Arc<BlockHandle>, Arc<BlockStuff>, Arc<BlockProofStuff>)> {
     log::trace!(target: TARGET, "save_block: id = {}", block_id);
     let block = if let Some(ref block) = entry.block {
         Arc::clone(block)
@@ -955,17 +960,71 @@ async fn save_block(
         fail!("Proof{} not found in archive: {}", link_str, block_id);
     };
     crate::block_proof::check_block_proof_pair(engine.as_ref(), block_id, &block, &proof).await?;
-    let handle = engine.store_block(&block).await?.to_non_created().ok_or_else(|| {
-        error!("INTERNAL ERROR: mismatch in block {} store result during sync", block_id)
-    })?;
-    let handle = engine
-        .store_block_proof(block_id, Some(handle), &proof)
-        .await?
-        .to_non_created()
-        .ok_or_else(|| {
-        error!("INTERNAL ERROR: mismatch in block {} proof store result during sync", block_id)
-    })?;
-    Ok((handle, block, proof))
+    #[cfg(test)]
+    archive_drain_tests::hold(engine, 0).await?;
+    let worker_engine = engine.clone();
+    let block_id = block_id.clone();
+    let (sent, received) = tokio::sync::oneshot::channel();
+    let (acknowledge, observed) = tokio::sync::oneshot::channel();
+    let completion = engine.register_service_task(
+        "authenticated archive block",
+        0,
+        Box::new(move || {
+            tokio::spawn(async move {
+                let result = async {
+                    let engine = worker_engine.clone();
+                    let handle =
+                        engine.store_block(&block).await?.to_non_created().ok_or_else(|| {
+                            error!(
+                                "INTERNAL ERROR: mismatch in block {} store result during sync",
+                                block_id
+                            )
+                        })?;
+                    #[cfg(test)]
+                    archive_drain_tests::hold(&engine, 1).await?;
+                    let handle = engine
+                        .store_block_proof(&block_id, Some(handle), &proof)
+                        .await?
+                        .to_non_created()
+                        .ok_or_else(|| {
+                            error!(
+                        "INTERNAL ERROR: mismatch in block {} proof store result during sync",
+                        block_id
+                    )
+                        })?;
+                    if apply_mc {
+                        engine
+                            .clone()
+                            .apply_block(&handle, &block, block_id.seq_no(), false)
+                            .await?;
+                    }
+                    Ok((handle, block, proof))
+                }
+                .await;
+                let failure = result.as_ref().err().map(|error| format!("{error:#}"));
+                let _ = sent.send(result);
+                // Sending is not consumption: the observer can be cancelled with
+                // a queued result. Its acknowledgement is emitted synchronously
+                // after receiving, and dropped on cancellation before receiving.
+                if observed.await.is_err() {
+                    if let Some(error) = failure {
+                        worker_engine.report_service_failure(
+                            0,
+                            format!("Unobserved archive import failure: {error}"),
+                        );
+                    }
+                }
+            })
+        }),
+    )?;
+    let result = received.await?;
+    #[cfg(test)]
+    archive_drain_tests::hold(engine, 2).await?;
+    // No suspension point is allowed between acknowledgement and returning the
+    // result to sync. The real worker remains owned by ServiceTasks.
+    let _ = acknowledge.send(());
+    drop(completion);
+    result
 }
 
 #[cfg(test)]
@@ -982,3 +1041,7 @@ pub(crate) async fn save_test_block(
 #[cfg(test)]
 #[path = "tests/test_sync.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/test_archive_drain.rs"]
+mod archive_drain_tests;
