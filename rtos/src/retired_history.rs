@@ -220,13 +220,18 @@ impl Store {
                 crate::history_read_budget::HistoryBudgetExceeded("capsule file bytes").into()
             );
         }
-        let mut bytes = Vec::with_capacity(length);
-        file.take(
-            u64::try_from(allowance)?
-                .checked_add(1)
-                .ok_or_else(|| error!("History read limit overflow"))?,
-        )
-        .read_to_end(&mut bytes)?;
+        // Exactly admitted buffer plus stack growth probe: read_to_end would
+        // implicitly grow the allocation if the same file changed during IO.
+        rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(budget.as_ref(), length)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length)?;
+        bytes.resize(length, 0);
+        let mut file = file;
+        file.read_exact(&mut bytes)?;
+        let mut extra = [0u8; 1];
+        if file.read(&mut extra)? != 0 {
+            return Err(crate::history_read_budget::HistoryBudgetExceeded("capsule file growth").into());
+        }
         if bytes.len() > allowance {
             return Err(
                 crate::history_read_budget::HistoryBudgetExceeded("capsule file growth").into()
@@ -267,7 +272,7 @@ impl Store {
         id: &BlockIdExt,
         budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
     ) -> Result<Option<Evidence>> {
-        self.usage()?;
+        self.usage_budget(budget)?;
         let path = self.root.join(format!("{}.json", anchor_name(domain, id)));
         if !path.exists() {
             return Ok(None);
@@ -278,7 +283,7 @@ impl Store {
             }
             None => bounded_read(&path, 2 << 20)?,
         };
-        let manifest: Manifest = serde_json::from_slice(&bytes)?;
+        let manifest = Self::decode_manifest(&bytes, budget)?;
         if manifest.schema != SCHEMA
             || &manifest.domain != domain
             || manifest.id != id.to_string()
@@ -293,6 +298,12 @@ impl Store {
             budget,
         )?;
         let mut proofs = Vec::new();
+        if let Some(budget) = budget {
+            let bytes = manifest.proofs.len().checked_mul(std::mem::size_of::<BlockProofStuff>())
+                .ok_or_else(|| error!("History proof vector overflow"))?;
+            rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(budget.as_ref(), bytes)?;
+            proofs.try_reserve_exact(manifest.proofs.len())?;
+        }
         let mut total = state.len() as u64;
         for proof in &manifest.proofs {
             let bytes = self.blob_budget(
@@ -318,6 +329,18 @@ impl Store {
     }
     /// Metadata lookup is bounded independently of proof/state authentication.
     /// Conflicting full identities at one height are never resolved by order.
+    fn decode_manifest(bytes: &[u8], budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>) -> Result<Manifest> {
+        if let Some(budget) = budget {
+            // Each JSON object requires at least two input bytes. Cover
+            // geometric vector growth and string buffers before serde allocates.
+            let workspace = bytes.len().checked_mul(2 * std::mem::size_of::<ProofRef>() + 8)
+                .and_then(|n| n.checked_add(4096))
+                .ok_or_else(|| error!("History manifest workspace overflow"))?;
+            rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(budget.as_ref(), workspace)?;
+        }
+        let manifest: Manifest = serde_json::from_slice(bytes)?;
+        Ok(manifest)
+    }
     fn manifests(&self, domain: &Domain) -> Result<Vec<Manifest>> {
         self.manifests_budget(domain, None)
     }
@@ -326,11 +349,13 @@ impl Store {
         domain: &Domain,
         budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
     ) -> Result<Vec<Manifest>> {
-        self.usage()?;
+        use storage::bounded_cell::CellReadBudget;
+        self.usage_budget(budget)?;
         let mut result = Vec::new();
         let mut identities = std::collections::BTreeMap::new();
         let mut read_bytes = 0usize;
         for entry in std::fs::read_dir(&self.root)? {
+            if let Some(budget) = budget { budget.step()?; budget.metadata(512)?; }
             let entry = entry?;
             if entry.path().extension().is_none_or(|e| e != "json") {
                 continue;
@@ -353,7 +378,7 @@ impl Store {
             if read_bytes > 16 << 20 {
                 fail!("History metadata lookup exceeds budget");
             }
-            let manifest: Manifest = serde_json::from_slice(&bytes)?;
+            let manifest = Self::decode_manifest(&bytes, budget)?;
             if &manifest.domain != domain {
                 continue;
             }
@@ -369,6 +394,10 @@ impl Store {
             for id in std::iter::once(Ok(id))
                 .chain(manifest.proofs.iter().map(|p| p.id.parse::<BlockIdExt>()))
             {
+                if let Some(budget) = budget {
+                    budget.step()?;
+                    rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(budget.as_ref(), 1024)?;
+                }
                 let id = id?;
                 if !id.shard().is_masterchain_ext() {
                     fail!("Non-masterchain retained history proof");
@@ -378,6 +407,10 @@ impl Store {
                         fail!("Conflicting retained history identities at height {}", id.seq_no);
                     }
                 }
+            }
+            if let Some(budget) = budget {
+                rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(budget.as_ref(), std::mem::size_of::<Manifest>())?;
+                result.try_reserve_exact(1)?;
             }
             result.push(manifest);
         }
@@ -912,6 +945,27 @@ mod tests {
         assert_eq!(reopened.read(&domain(), &identity(1)).unwrap().unwrap().state, vec![1, 2, 3]);
         let wrong = Domain { init: identity(7).to_string(), ..domain() };
         assert!(reopened.read(&wrong, &identity(1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn retired_history_capsule_reader_charges_directory_and_workspace_before_decode() {
+        use crate::history_read_budget::{HistoryReadBudget, HistoryReadLimits, HistoryBudgetExceeded};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().to_owned(), Limits::default()).unwrap();
+        store.commit(domain(), identity(1), -239, vec![7; 32], vec![]).unwrap();
+        let manifest_path = dir.path().join(format!("{}.json", anchor_name(&domain(), &identity(1))));
+        let before = std::fs::read(&manifest_path).unwrap();
+        for dimension in 0..3 {
+            let mut limits = HistoryReadLimits::default();
+            match dimension { 0 => limits.steps = 0, 1 => limits.metadata_bytes = 0, _ => limits.cell_bytes = 0 }
+            let budget = HistoryReadBudget::new(limits);
+            let error = store.read_budget(&domain(), &identity(1), Some(&budget)).err().unwrap();
+            assert!(error.downcast_ref::<HistoryBudgetExceeded>().is_some(), "{error:#}");
+            assert!(store.manifests_budget(&domain(), Some(&budget)).is_err());
+            assert_eq!(std::fs::read(&manifest_path).unwrap(), before);
+        }
+        let budget = HistoryReadBudget::new(HistoryReadLimits::default());
+        assert_eq!(store.read_budget(&domain(), &identity(1), Some(&budget)).unwrap().unwrap().state, vec![7; 32]);
     }
 
     #[test]

@@ -23,6 +23,12 @@ static REQUESTS: LazyLock<Arc<tokio::sync::Semaphore>> =
 const MAX_REPLAY: usize = 128;
 const PART: usize = 2 << 20;
 
+fn artifact_missing(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<storage::archives::bounded_read::ArchiveArtifactMissing>().is_some()
+        || error.downcast_ref::<storage::archives::bounded_read::ArchiveReadNotStarted>()
+            .is_some_and(|e| e.is_not_found())
+}
+
 struct Prepared {
     id: BlockIdExt,
     verified: Arc<VerifiedMasterchainState>,
@@ -203,12 +209,11 @@ impl Request {
         self.budget.step()?;
         if let Some(handle) = self.engine.load_block_handle(id)? {
             if handle.has_data() && handle.has_proof() {
-                return crate::publication_repair::read_pair(
-                    self.engine.as_ref(),
-                    id,
-                    &self.budget,
-                )
-                .await;
+                match crate::publication_repair::read_pair(self.engine.as_ref(), id, &self.budget).await {
+                    Ok(pair) => return Ok(pair),
+                    Err(error) if artifact_missing(&error) => {},
+                    Err(error) => return Err(error),
+                }
             }
         }
         let body = self.budget.reserve(ReadKind::State, 8 << 20)?;
