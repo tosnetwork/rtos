@@ -757,6 +757,17 @@ struct RecoveryProofEngine {
 
 #[async_trait::async_trait]
 impl crate::engine_traits::EngineOperations for RecoveryProofEngine {
+    fn register_service_task(
+        &self,
+        _name: &'static str,
+        _mask: u32,
+        start: Box<dyn FnOnce() -> tokio::task::JoinHandle<()> + Send>,
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        // This proof-only double has no shutdown lifecycle. Archive drain tests
+        // use a real Engine and its retained service owner instead.
+        Ok(start())
+    }
+
     async fn store_block(
         &self,
         block: &BlockStuff,
