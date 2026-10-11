@@ -151,6 +151,30 @@ enum RldpTransfer {
     Done,
 }
 
+// The expiry is an update, never a new registration. A delayed timer must not
+// resurrect an ID removed by the receive owner during shutdown or completion.
+async fn expire_inbound_transfer(
+    transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
+    transfer_id: TransferId,
+    owner: Arc<crate::adnl::tasks::AdnlTasks>,
+    timer: impl std::future::Future<Output = ()>,
+) {
+    tokio::select! {
+        biased;
+        _ = owner.cancelled() => return,
+        _ = timer => {},
+    }
+    transfers.insert_with(transfer_id, |_, _, found| {
+        if found.is_some() {
+            lockfree::map::Preview::New(RldpTransfer::Done)
+        } else {
+            // Also discard a prepared replacement if a concurrent remove won
+            // and insert_with invokes this callback again with no entry.
+            lockfree::map::Preview::Discard
+        }
+    });
+}
+
 #[cfg(feature = "telemetry")]
 #[derive(Default)]
 struct RldpStats {
@@ -916,11 +940,13 @@ impl RldpNode {
         let transfer_id = *transfer_id;
         let lifetime = owner.clone();
         owner.spawn("RLDP inbound expiry", async move {
-            tokio::select! {
-                _ = lifetime.cancelled() => {},
-                _ = tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS)) => {},
-            }
-            transfers.insert(transfer_id, RldpTransfer::Done);
+            expire_inbound_transfer(
+                transfers,
+                transfer_id,
+                lifetime,
+                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS)),
+            )
+            .await;
         });
         Ok(Some(queue_sender))
     }

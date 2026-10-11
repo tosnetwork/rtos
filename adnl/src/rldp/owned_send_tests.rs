@@ -567,3 +567,50 @@ async fn rldp_owned_async_part_panic_has_sticky_completion() {
     assert!(bounded(receipt).await.unwrap().is_err());
     assert!(bounded(owner.wait()).await.unwrap_err().to_string().contains("panicked"));
 }
+
+#[tokio::test]
+async fn rldp_owned_inbound_expiry_cannot_revive_removed_registration() {
+    for cancelled in [false, true] {
+        let owner = AdnlTasks::new();
+        let transfers = Arc::new(lockfree::map::Map::new());
+        let id = [91; 32];
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        transfers.insert(id, super::super::RldpTransfer::Recv(sender));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let map = transfers.clone();
+        let lifetime = owner.clone();
+        owner.spawn("test actual inbound expiry", async move {
+            super::super::expire_inbound_transfer(map, id, lifetime, async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+            })
+            .await;
+            let _ = done_tx.send(());
+        });
+        bounded(entered_rx).await.unwrap();
+        // The real receive owner removes the registration before the delayed
+        // expiry can finish. Both shutdown and the timer branch must preserve it.
+        transfers.remove(&id);
+        if cancelled {
+            owner.close();
+        }
+        let _ = release_tx.send(());
+        let completed = tokio::time::timeout(Duration::from_secs(5), done_rx).await;
+        owner.close();
+        bounded(owner.wait()).await.unwrap();
+        completed.unwrap().unwrap();
+        assert!(transfers.get(&id).is_none(), "late inbound expiry revived a removed ID");
+    }
+    // A live registration still transitions on a real timer completion.
+    let owner = AdnlTasks::new();
+    let transfers = Arc::new(lockfree::map::Map::new());
+    let id = [92; 32];
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    transfers.insert(id, super::super::RldpTransfer::Recv(sender));
+    super::super::expire_inbound_transfer(transfers.clone(), id, owner.clone(), async {}).await;
+    assert!(matches!(&*transfers.get(&id).unwrap().val(), super::super::RldpTransfer::Done));
+    owner.close();
+    bounded(owner.wait()).await.unwrap();
+}
