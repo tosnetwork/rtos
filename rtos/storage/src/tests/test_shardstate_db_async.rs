@@ -152,7 +152,7 @@ async fn publication_durability_state_barrier_waits_for_actual_completion() -> R
     store.stop().await;
     drop(store);
     drop(db);
-    destroy_rocks_db(&path, "db").await?;
+    destroy_rocks_db(path.to_str().expect("UTF-8 temporary test path"), "db").await?;
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
@@ -178,7 +178,7 @@ async fn publication_durability_state_failure_cannot_ack_a_barrier() -> Result<(
     store.stop().await;
     drop(store);
     drop(db);
-    destroy_rocks_db(&path, "db").await?;
+    destroy_rocks_db(path.to_str().expect("UTF-8 temporary test path"), "db").await?;
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
