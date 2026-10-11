@@ -45,7 +45,7 @@ use std::{
     collections::VecDeque,
     fmt::{Display, Formatter},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         *,
     },
     time::*,
@@ -1084,6 +1084,13 @@ pub struct ValidatorGroup {
         )>,
     >,
     retirement_outcome: Mutex<Option<super::retirement_preparation::RetirementOutcome>>,
+    /// Stable owner of the namespace lease while retirement is prepared, so an
+    /// unwinding preparation can never drop the token.
+    retirement_lease: Mutex<Option<super::finality_recovery_owner::RecoveryReservation>>,
+    #[cfg(test)]
+    retirement_scans_started: AtomicUsize,
+    #[cfg(test)]
+    panic_in_retirement_for_test: AtomicBool,
     /// Validator-side cache/resolver for speculative shard states.
     ///
     /// Simplex delivers candidate observations through `SessionListener`.
@@ -1308,6 +1315,11 @@ impl ValidatorGroup {
             session_exit_observed: CancellationToken::new(),
             stop_completion: Mutex::new(None),
             retirement_outcome: Mutex::new(None),
+            retirement_lease: Mutex::new(None),
+            #[cfg(test)]
+            retirement_scans_started: AtomicUsize::new(0),
+            #[cfg(test)]
+            panic_in_retirement_for_test: AtomicBool::new(false),
             state_resolver_cache: Arc::new(tokio::sync::Mutex::new(StateResolverCache::new())),
             action_queue,
             callback: Arc::new(listener),
@@ -1685,9 +1697,21 @@ impl ValidatorGroup {
         }
     }
 
+    /// Takes the lease from its stable retirement slot, else from admission.
+    fn take_retirement_lease(&self) -> Option<super::finality_recovery_owner::RecoveryReservation> {
+        let from_slot = match self.retirement_lease.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        from_slot.or_else(|| match self.namespace_admission.lock() {
+            Ok(mut admission) => admission.reservation.take(),
+            Err(poisoned) => poisoned.into_inner().reservation.take(),
+        })
+    }
+
     /// Records a refusal when teardown ended before it produced an outcome
-    /// (an early error or a panic). The lease moves from admission into the
-    /// refusal, which is marked undrained and so can never release it.
+    /// (an early error or a panic). The lease moves into the refusal, which is
+    /// marked undrained and so can never release it.
     fn finish_retirement_outcome(&self, result: &std::result::Result<(), String>) {
         let mut slot = match self.retirement_outcome.lock() {
             Ok(slot) => slot,
@@ -1698,83 +1722,87 @@ impl ValidatorGroup {
                 Ok(()) => "teardown produced no retirement outcome".to_owned(),
                 Err(error) => format!("teardown failed: {error}"),
             };
-            let reservation = match self.namespace_admission.lock() {
-                Ok(mut admission) => admission.reservation.take(),
-                Err(poisoned) => poisoned.into_inner().reservation.take(),
-            };
             *slot = Some(super::retirement_preparation::RetirementOutcome::refused(
                 simplex::finality_delivery::source_retirement::RetirementRefusal::Failed(reason),
                 None,
-                reservation,
+                self.take_retirement_lease(),
                 false,
             ));
         }
     }
 
+    /// The single drain proof: the stopped session's own storage receipt,
+    /// bound to this runtime's namespace and verified torn down. Nothing else
+    /// may certify that the namespace is drained.
+    fn retirement_drain_proof(
+        &self,
+        teardown: Option<consensus_common::StorageTeardownReceipt>,
+    ) -> std::result::Result<
+        (
+            Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+            std::path::PathBuf,
+            consensus_common::StorageTeardownReceipt,
+        ),
+        simplex::finality_delivery::source_retirement::RetirementRefusal,
+    > {
+        use simplex::finality_delivery::source_retirement::RetirementRefusal;
+        let runtime = self.authenticated_runtime.clone().ok_or(RetirementRefusal::Unsupported(
+            "session without authenticated runtime",
+        ))?;
+        let teardown = teardown.ok_or_else(|| {
+            RetirementRefusal::DatabaseTeardown("session opened no certifiable storage".into())
+        })?;
+        let namespace = self
+            .engine
+            .db_root_dir()
+            .and_then(|root| runtime.runtime_directory(&format!("{root}/catchains")))
+            .map(std::path::PathBuf::from)
+            .map_err(|error| RetirementRefusal::Failed(format!("namespace path: {error:#}")))?;
+        if teardown.storage_id() != runtime.session_id().to_hex_string()
+            || teardown.path() != namespace
+        {
+            return Err(RetirementRefusal::DatabaseTeardown(
+                "receipt observes another storage instance".into(),
+            ));
+        }
+        teardown
+            .check()
+            .map_err(|error| RetirementRefusal::DatabaseTeardown(format!("{error:#}")))?;
+        Ok((runtime, namespace, teardown))
+    }
+
     /// Scans the drained namespace in a blocking job, then reconciles it with
-    /// the node asynchronously. Both run inside the shared teardown task, so
-    /// cancelling a waiter never abandons them; the lease moves into the
-    /// returned outcome either way, and a node refusal keeps the scan.
+    /// the node asynchronously. It never owns the lease; a node refusal hands
+    /// back the scan with its locks.
     async fn prepare_retirement(
         &self,
         rt: &tokio::runtime::Handle,
-        teardown: Option<consensus_common::StorageTeardownReceipt>,
-        reservation: Option<super::finality_recovery_owner::RecoveryReservation>,
-    ) -> super::retirement_preparation::RetirementOutcome {
-        use super::retirement_preparation::RetirementOutcome;
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        namespace: std::path::PathBuf,
+        teardown: consensus_common::StorageTeardownReceipt,
+    ) -> std::result::Result<
+        simplex::finality_delivery::source_retirement::SourceRetirementPreparation,
+        (
+            simplex::finality_delivery::source_retirement::RetirementRefusal,
+            Option<simplex::finality_delivery::source_retirement::PendingRetirementScan>,
+        ),
+    > {
         use simplex::finality_delivery::source_retirement::{
             scan_source_retirement, RetirementRefusal,
         };
         const BUSY_RETRIES: u32 = 100;
-        let Some(reservation) = reservation else {
-            return RetirementOutcome::refused(
-                RetirementRefusal::Unsupported("group held no namespace reservation"),
-                None,
-                None,
-                true,
-            );
-        };
-        let Some(runtime) = self.authenticated_runtime.clone() else {
-            return RetirementOutcome::refused(
-                RetirementRefusal::Unsupported("session without authenticated runtime"),
-                None,
-                Some(reservation),
-                true,
-            );
-        };
-        let Some(teardown) = teardown else {
-            return RetirementOutcome::refused(
-                RetirementRefusal::DatabaseTeardown("session opened no certifiable storage".into()),
-                None,
-                Some(reservation),
-                false,
-            );
-        };
-        let Some(sink) = self.durable_finality_sink.get().cloned() else {
-            return RetirementOutcome::refused(
-                RetirementRefusal::Unsupported("session without durable finality sink"),
-                None,
-                Some(reservation),
-                true,
-            );
-        };
-        let namespace = match self
-            .engine
-            .db_root_dir()
-            .and_then(|root| runtime.runtime_directory(&format!("{root}/catchains")))
-        {
-            Ok(namespace) => std::path::PathBuf::from(namespace),
-            Err(error) => {
-                return RetirementOutcome::refused(
-                    RetirementRefusal::Failed(format!("namespace path: {error:#}")),
-                    None,
-                    Some(reservation),
-                    true,
-                )
-            }
-        };
+        let sink = self.durable_finality_sink.get().cloned().ok_or((
+            RetirementRefusal::Unsupported("session without durable finality sink"),
+            None,
+        ))?;
+        #[cfg(test)]
+        if self.panic_in_retirement_for_test.load(Ordering::Acquire) {
+            panic!("injected retirement preparation panic");
+        }
         let mut attempt = 0u32;
         let scan = loop {
+            #[cfg(test)]
+            self.retirement_scans_started.fetch_add(1, Ordering::AcqRel);
             let (runtime, namespace, teardown) =
                 (runtime.clone(), namespace.clone(), teardown.clone());
             let job = rt.spawn_blocking(move || {
@@ -1787,33 +1815,29 @@ impl ValidatorGroup {
                     attempt = attempt.saturating_add(1);
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                Ok(Err(refusal)) => {
-                    // Only a refused teardown receipt leaves the drain unproven.
-                    let drained = !matches!(refusal, RetirementRefusal::DatabaseTeardown(_));
-                    return RetirementOutcome::refused(refusal, None, Some(reservation), drained);
-                }
+                Ok(Err(refusal)) => return Err((refusal, None)),
                 Err(error) => {
-                    return RetirementOutcome::refused(
+                    return Err((
                         RetirementRefusal::Failed(format!("preparation job failed: {error}")),
                         None,
-                        Some(reservation),
-                        true,
-                    )
+                    ))
                 }
             }
         };
-        match scan.reconcile(sink.as_ref(), &RetirementBudget).await {
-            Ok(preparation) => RetirementOutcome::prepared(preparation, reservation),
-            Err(failure) => {
-                let failure = *failure;
-                RetirementOutcome::refused(
-                    failure.refusal,
-                    Some(failure.scan),
-                    Some(reservation),
-                    true,
-                )
-            }
-        }
+        scan.reconcile(sink.as_ref(), &RetirementBudget).await.map_err(|failure| {
+            let failure = *failure;
+            (failure.refusal, Some(failure.scan))
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_retirement_panic_for_test(&self) {
+        self.panic_in_retirement_for_test.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn has_session_for_test(&self) -> bool {
+        self.group_impl.execute_sync(|group| group.session.is_some()).await
     }
 
     pub(super) fn teardown_drained(&self) -> bool {
@@ -1901,13 +1925,50 @@ impl ValidatorGroup {
             fail!("validator group task panicked during its lifetime");
         }
         if policy == StopPolicy::PrepareRetirement {
+            use super::retirement_preparation::RetirementOutcome;
+            use simplex::finality_delivery::source_retirement::RetirementRefusal;
             let reservation = self
                 .namespace_admission
                 .lock()
                 .map_err(|_| error!("namespace admission poisoned"))?
                 .reservation
                 .take();
-            let outcome = self.prepare_retirement(&rt, storage_teardown, reservation).await;
+            *self.retirement_lease.lock().map_err(|_| error!("retirement lease poisoned"))? =
+                reservation;
+            let outcome = match self.retirement_drain_proof(storage_teardown) {
+                // Without the proof no scan starts and the lease is never releasable.
+                Err(refusal) => {
+                    RetirementOutcome::refused(refusal, None, self.take_retirement_lease(), false)
+                }
+                Ok((runtime, namespace, teardown)) => {
+                    let prepared = std::panic::AssertUnwindSafe(
+                        self.prepare_retirement(&rt, runtime, namespace, teardown),
+                    )
+                    .catch_unwind()
+                    .await;
+                    let lease = self.take_retirement_lease();
+                    match (prepared, lease) {
+                        (Ok(Ok(preparation)), Some(lease)) => {
+                            RetirementOutcome::prepared(preparation, lease)
+                        }
+                        (Ok(Ok(_)), None) => RetirementOutcome::refused(
+                            RetirementRefusal::Unsupported("group held no namespace reservation"),
+                            None,
+                            None,
+                            true,
+                        ),
+                        (Ok(Err((refusal, scan))), lease) => {
+                            RetirementOutcome::refused(refusal, scan, lease, true)
+                        }
+                        (Err(_), lease) => RetirementOutcome::refused(
+                            RetirementRefusal::Failed("retirement preparation panicked".into()),
+                            None,
+                            lease,
+                            true,
+                        ),
+                    }
+                }
+            };
             *self.retirement_outcome.lock().map_err(|_| error!("retirement outcome poisoned"))? =
                 Some(outcome);
         }

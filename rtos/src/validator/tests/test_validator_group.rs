@@ -1436,8 +1436,7 @@ async fn test_group_retirement_policy_conflicts_with_ordinary_stop_in_both_order
         if retirement_first {
             let refused = refused_outcome(&group);
             assert!(!refused.holds_reservation(), "the mock group never held a lease");
-            assert!(refused.drained());
-            assert!(refused.abandon().is_ok(), "a drained refusal releases");
+            assert!(!refused.drained(), "a mock session has no storage drain proof");
         }
         assert!(group.take_retirement_outcome().unwrap().is_none(), "outcome is taken once");
     }
@@ -1445,6 +1444,7 @@ async fn test_group_retirement_policy_conflicts_with_ordinary_stop_in_both_order
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_group_retirement_keeps_lease_until_abandon_and_ordinary_stop_releases() {
+    use simplex::finality_delivery::source_retirement::RetirementRefusal;
     let registry = Arc::new(super::finality_recovery_owner::RecoveryRegistry::default());
     for retirement in [true, false] {
         let group = make_simplex_group_for_resolver_tests();
@@ -1455,26 +1455,32 @@ async fn test_group_retirement_keeps_lease_until_abandon_and_ordinary_stop_relea
         let lease = registry.reserve_validator_for_test(key.clone()).unwrap().unwrap();
         group.namespace_admission.lock().unwrap().reservation = Some(lease);
         let rt = tokio::runtime::Handle::current();
-        if retirement {
-            group.clone().stop_for_retirement_preparation(rt).await.unwrap();
-            let refused = refused_outcome(&group);
-            assert!(
-                matches!(refused.refusal(), simplex::finality_delivery::source_retirement::RetirementRefusal::Unsupported(_)),
-                "{}",
-                refused.refusal()
-            );
-            assert!(refused.holds_reservation(), "the lease moved into the outcome");
-            assert!(registry.validator_reserved_for_test(&key), "the namespace stays closed");
-            assert!(registry.reserve_validator_for_test(key.clone()).unwrap().is_none());
-            drop(group);
-            assert!(registry.validator_reserved_for_test(&key), "dropping the group keeps it");
-            assert!(refused.drained());
-            assert!(refused.abandon().is_ok(), "a drained refusal releases");
-        } else {
+        if !retirement {
             group.clone().stop(rt, false).await.unwrap();
             assert!(group.take_retirement_outcome().unwrap().is_none());
+            assert!(!registry.validator_reserved_for_test(&key), "ordinary stop releases");
+            continue;
         }
-        assert!(!registry.validator_reserved_for_test(&key), "lease released");
+        group.clone().stop_for_retirement_preparation(rt).await.unwrap();
+        let refused = refused_outcome(&group);
+        assert!(matches!(refused.refusal(), RetirementRefusal::Unsupported(_)), "{}", refused.refusal());
+        assert!(refused.holds_reservation(), "the lease moved into the outcome");
+        assert!(!refused.drained(), "without a drain proof the lease is never releasable");
+        assert_eq!(
+            group.retirement_scans_started.load(Ordering::Acquire),
+            0,
+            "an unproven drain never starts a scan"
+        );
+        assert!(registry.reserve_validator_for_test(key.clone()).unwrap().is_none());
+        drop(group);
+        assert!(registry.validator_reserved_for_test(&key), "dropping the group keeps it");
+        let refused = match refused.abandon() {
+            Ok(()) => panic!("an unproven namespace was released"),
+            Err(refused) => refused,
+        };
+        assert!(registry.validator_reserved_for_test(&key), "a refused abandon keeps it");
+        drop(refused);
+        assert!(registry.validator_reserved_for_test(&key), "dropping never releases either");
     }
 }
 
@@ -1491,7 +1497,8 @@ async fn test_group_retirement_outcome_survives_cancelled_waiter() {
         .await
         .unwrap()
         .unwrap();
-    assert!(refused_outcome(&group).abandon().is_ok());
+    let refused = refused_outcome(&group);
+    assert!(!refused.drained(), "recorded once despite the cancelled waiter");
 }
 
 #[tokio::test(flavor = "current_thread")]

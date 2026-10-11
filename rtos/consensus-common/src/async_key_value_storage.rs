@@ -321,6 +321,9 @@ pub struct RocksDbAsyncKeyValueStorage {
     callback_thread_handle: Option<JoinHandle<()>>,
     /// Final teardown outcome, recorded once by `Drop`.
     teardown: Arc<std::sync::OnceLock<std::result::Result<(), String>>>,
+    /// Generation of this instance in its database directory's slot.
+    instance: crate::StorageGeneration,
+    generation: u64,
     /// Metrics receiver
     _metrics_receiver: MetricsHandle,
     /// Activity node for DB thread
@@ -432,6 +435,9 @@ impl RocksDbAsyncKeyValueStorage {
             let _ = db_thread.join();
             return Err(e);
         }
+        // Only a successful open registers an instance of this directory.
+        let (instance, generation) =
+            crate::register_storage_instance(&path.join(&storage_id_owned));
 
         // Create callback thread stopped flag (always present)
         // If no callback thread, set to true immediately
@@ -493,6 +499,8 @@ impl RocksDbAsyncKeyValueStorage {
             db_thread_handle: Some(db_thread),
             callback_thread_handle: callback_thread_handle,
             teardown: Arc::new(std::sync::OnceLock::new()),
+            instance,
+            generation,
             _metrics_receiver: metrics_receiver,
             _db_activity_node: db_activity_node,
             _callback_activity_node: callback_activity_node,
@@ -1288,6 +1296,8 @@ impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
             self.teardown.clone(),
             &self.storage_id,
             &self.path,
+            self.instance.clone(),
+            self.generation,
         ))
     }
 }
@@ -1370,6 +1380,15 @@ impl Drop for RocksDbAsyncKeyValueStorage {
             let _ = self.callback_thread_handle.take();
         }
 
+        {
+            let mut state = match self.instance.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if state.generation == self.generation {
+                state.live = false;
+            }
+        }
         let _ = self.teardown.set(if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) });
 
         log::info!(

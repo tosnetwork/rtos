@@ -775,3 +775,81 @@ fn source_retirement_admitted_lookup_is_never_timed_out() {
     drop(preparation);
     assert!(!fixture.store_locked());
 }
+
+#[test]
+fn source_retirement_largest_output_set_is_refused_before_parse_and_copy() {
+    // Records every workspace charge, refusing once the running total passes
+    // the limit, so a refusal names the stage that would have allocated.
+    struct Log(std::sync::Mutex<(Vec<usize>, usize)>, Option<usize>);
+    impl SourceHistoryDebtBudget for Log {
+        fn step(&self) -> Result<()> {
+            Ok(())
+        }
+        fn read_bytes(&self, _: usize) -> Result<()> {
+            Ok(())
+        }
+        fn workspace(&self, bytes: usize) -> Result<()> {
+            let mut state = self.0.lock().unwrap();
+            state.0.push(bytes);
+            state.1 += bytes;
+            if self.1.is_some_and(|limit| state.1 > limit) {
+                fail!("injected workspace limit");
+            }
+            Ok(())
+        }
+    }
+    let fixture = released();
+    // Grow the sealed set to the most outputs that still fit one record file.
+    let (file_cap, output_cap) = crate::finality_recovery::MAX_SEALED_SET_FILE;
+    let template: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&fixture.output_set).unwrap()).unwrap();
+    let mut outputs = Vec::new();
+    for index in 0..output_cap {
+        let mut output = template["outputs"][0].clone();
+        output["source_validator"] = serde_json::json!(format!("{index:064x}"));
+        outputs.push(output);
+        let mut candidate = template.clone();
+        candidate["outputs"] = serde_json::Value::Array(outputs.clone());
+        if serde_json::to_vec(&candidate).unwrap().len() as u64 > file_cap {
+            outputs.pop();
+            break;
+        }
+    }
+    assert!(outputs.len() > 100, "a large sealed set");
+    let mut largest = template.clone();
+    largest["outputs"] = serde_json::Value::Array(outputs);
+    let bytes = serde_json::to_vec(&largest).unwrap();
+    std::fs::write(&fixture.output_set, &bytes).unwrap();
+    let before = fixture.snapshot();
+
+    let scan = |limit| {
+        let log = Log(Default::default(), limit);
+        let result = scan_source_retirement(
+            fixture.runtime.clone(),
+            &fixture.namespace,
+            &fixture.teardown,
+            &log,
+        );
+        (result.err(), log.0.into_inner().unwrap().0)
+    };
+    // Unlimited, the scan reaches matching and refuses the unclaimed outputs.
+    let (refusal, charges) = scan(None);
+    assert!(matches!(refusal, Some(RetirementRefusal::MissingDelivered(_))), "{refusal:?}");
+    let parse = bytes.len() * PARSE_WORKSPACE_FACTOR;
+    let position = charges.iter().position(|charge| *charge == parse).expect("parse is charged");
+    let copy = charges.get(position + 1).copied().expect("output copy is charged");
+    let before_parse: usize = charges[..position].iter().sum();
+    for (limit, stage) in [
+        (before_parse + parse - 1, "output set parse"),
+        (before_parse + parse + copy - 1, "output set copy"),
+    ] {
+        match scan(Some(limit)).0 {
+            Some(RetirementRefusal::BudgetExhausted(message)) => {
+                assert!(message.contains(stage), "{stage}: {message}")
+            }
+            other => panic!("{stage}: expected a budget refusal, got {other:?}"),
+        }
+        assert!(!fixture.store_locked(), "{stage}: a refusal releases the locks");
+    }
+    assert_eq!(fixture.snapshot(), before);
+}

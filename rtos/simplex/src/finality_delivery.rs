@@ -2101,6 +2101,29 @@ impl FinalityDeliveryTestDriver {
             },
         )
     }
+    /// Seal and resolve the retained FinalCert's trigger as the session's
+    /// masterchain finalization walk does: one Final output for this block
+    /// from its source. Call after `retain_final_cert` for the same draft.
+    pub fn seal_final_output(&self, draft: &FinalizedDeliveryDraft) -> Result<()> {
+        let SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(proof)) = &draft.finality
+        else {
+            fail!("Source certificate fixture requires a PQ Final carrier");
+        };
+        let candidate = PqNetworkSignatureSet::from_final_fields(proof)?.to_node().candidate;
+        let id = crate::block::RawCandidateId {
+            slot: crate::block::SlotIndex::new(proof.slot),
+            hash: UInt256::calc_file_hash(&self.0.runtime.wire_profile().serialize(&candidate)?),
+        };
+        self.0.seal_outputs(
+            &id,
+            vec![crate::finality_recovery::ExpectedFinalityOutput::new(
+                &draft.block_id,
+                true,
+                &UInt256::from(*draft.source_info.source.id().data()),
+            )],
+        )?;
+        self.0.resolve_intent(&id)
+    }
     pub fn maintain(&self) -> Result<()> {
         self.0.maintain_closing()
     }

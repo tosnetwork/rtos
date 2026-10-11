@@ -331,6 +331,9 @@ impl FinalityIntentStore {
 pub(crate) const MAX_RETIREMENT_SETS: usize = MAX_COMPLETED;
 /// Most output-set bytes retirement preparation will read.
 pub(crate) const MAX_RETIREMENT_SET_BYTES: u64 = MAX_OUTPUT_TOTAL;
+/// Largest single output-set file and output count a source can seal.
+#[cfg(test)]
+pub(crate) const MAX_SEALED_SET_FILE: (u64, usize) = (MAX_OUTPUT_BYTES, MAX_OUTPUTS);
 
 /// Compares the runtime-derivable fields of sealed metadata with the
 /// authenticated runtime. Session parents and start are not in the runtime;
@@ -437,6 +440,7 @@ pub(crate) fn retirement_sealed_sets(
             return Err(RetirementRefusal::BudgetExhausted("output set cap".into()));
         }
         let bytes = read_bounded(&path, MAX_OUTPUT_BYTES, Bucket::Sets, charge)?;
+        charge.parse("output set parse", bytes.len())?;
         let set = OutputSet::parse(&bytes)
             .map_err(|e| RetirementRefusal::LegacyFormat(path.clone(), format!("{e:#}")))?;
         if !set.released {
@@ -470,6 +474,17 @@ pub(crate) fn retirement_sealed_sets(
             Some(_) => {}
             None => session_start = Some(start),
         }
+        let mut copies = 0usize;
+        for output in &set.outputs {
+            copies = output
+                .block_id
+                .len()
+                .checked_add(output.source_validator.len())
+                .and_then(|entry| entry.checked_add(std::mem::size_of::<(String, bool, String)>()))
+                .and_then(|entry| copies.checked_add(entry))
+                .ok_or_else(|| RetirementRefusal::BudgetExhausted("output copy overflow".into()))?;
+        }
+        charge.workspace("output set copy", copies)?;
         sets.push(RetirementSealedSet {
             file_hash: UInt256::calc_file_hash(&bytes),
             outputs: set

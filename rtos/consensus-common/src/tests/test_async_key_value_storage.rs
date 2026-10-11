@@ -1311,6 +1311,42 @@ fn test_teardown_receipt_requires_last_reference_and_clean_join() {
 }
 
 #[test]
+fn test_teardown_receipt_is_invalidated_by_a_reopened_instance() {
+    let path = create_test_db_path("teardown_receipt_reopen");
+    let open = || {
+        ConsensusCommonFactory::create_async_key_value_storage(
+            &path,
+            "teardown_reopen",
+            create_test_options(),
+        )
+        .unwrap()
+    };
+    let first = open();
+    let receipt = first.teardown_receipt().unwrap();
+    drop(first);
+    receipt.check().unwrap();
+    let second = open();
+    let error = receipt.check().unwrap_err().to_string();
+    assert!(error.contains("reopened by a newer instance"), "{error}");
+    let newer = second.teardown_receipt().unwrap();
+    assert!(!receipt.same_instance(&newer));
+    second.mark_for_destroy();
+    drop(second);
+    newer.check().unwrap();
+    assert!(receipt.check().is_err(), "an older receipt stays invalid after the newer drops");
+    // An aliased path to the same directory shares the generation.
+    let alias = path.join(".");
+    let third = ConsensusCommonFactory::create_async_key_value_storage(
+        &alias,
+        "teardown_reopen",
+        create_test_options(),
+    )
+    .unwrap();
+    assert!(newer.check().is_err(), "an alias reopen invalidates the receipt");
+    third.mark_for_destroy();
+}
+
+#[test]
 fn test_teardown_receipt_rejects_detached_worker_thread() {
     let path = create_test_db_path("teardown_receipt_wedged");
     let storage = ConsensusCommonFactory::create_async_key_value_storage(

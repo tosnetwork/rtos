@@ -863,6 +863,7 @@ impl PendingFinalityStore {
                 return Err(RetirementRefusal::BudgetExhausted("Delivered record cap".into()));
             }
             let bytes = read_bounded(&path, MAX_REFERENCE_BYTES, Bucket::Delivered, charge)?;
+            charge.parse("Delivered parse", bytes.len())?;
             let disk = DeliveredDisk::parse(&path, &bytes)
                 .map_err(|e| RetirementRefusal::LegacyFormat(path.clone(), format!("{e:#}")))?;
             check_binding(runtime, &disk.reference)

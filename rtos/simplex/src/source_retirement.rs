@@ -103,8 +103,13 @@ pub(crate) enum Bucket {
     Sets,
 }
 
-/// Workspace charged per inventoried file for the index, file list and digest.
-const WORKSPACE_PER_FILE: usize = 1024;
+/// Parsed JSON with its owned strings and containers stays within this many
+/// times the bytes it was parsed from.
+pub(crate) const PARSE_WORKSPACE_FACTOR: usize = 4;
+/// Upper bound for the runtime manifest the reader rebuilds for comparison.
+pub(crate) const MANIFEST_WORKSPACE: usize = 4096;
+/// Per-entry overhead of the index, file list and digest beyond its strings.
+const ENTRY_OVERHEAD: usize = 256;
 
 fn exhausted(error: impl std::fmt::Display) -> RetirementRefusal {
     RetirementRefusal::BudgetExhausted(format!("{error:#}"))
@@ -153,9 +158,16 @@ impl<'a> Charge<'a> {
         self.budget.read_bytes(bytes).map_err(exhausted)?;
         self.budget.workspace(bytes).map_err(exhausted)
     }
-    /// Memory about to be allocated for derived structures.
-    pub(crate) fn workspace(&mut self, bytes: usize) -> Refusal<()> {
-        self.budget.workspace(bytes).map_err(exhausted)
+    /// Memory about to be allocated for derived structures at `stage`.
+    pub(crate) fn workspace(&mut self, stage: &'static str, bytes: usize) -> Refusal<()> {
+        self.budget.workspace(bytes).map_err(|e| exhausted(format!("{stage}: {e:#}")))
+    }
+    /// Workspace for parsing `bytes` read from one file at `stage`.
+    pub(crate) fn parse(&mut self, stage: &'static str, bytes: usize) -> Refusal<()> {
+        let bound = bytes
+            .checked_mul(PARSE_WORKSPACE_FACTOR)
+            .ok_or_else(|| exhausted(format!("{stage}: workspace overflow")))?;
+        self.workspace(stage, bound)
     }
     /// One node lookup about to be admitted.
     pub(crate) fn lookup(&mut self) -> Refusal<()> {
@@ -395,11 +407,28 @@ pub fn scan_source_retirement(
         .len()
         .checked_add(delivered.len())
         .ok_or_else(|| exhausted("inventory count overflow"))?;
-    charge.workspace(
-        files_count
-            .checked_mul(WORKSPACE_PER_FILE)
-            .ok_or_else(|| exhausted("inventory workspace overflow"))?,
-    )?;
+    // Index keys, file list entries and digest input are bounded by the
+    // strings they copy plus a fixed per-entry overhead.
+    let mut inventory_bound = ENTRY_OVERHEAD;
+    for path in sets.iter().map(|s| &s.path).chain(delivered.iter().map(|d| &d.path)) {
+        inventory_bound = path
+            .as_os_str()
+            .len()
+            .checked_add(ENTRY_OVERHEAD)
+            .and_then(|entry| entry.checked_mul(2))
+            .and_then(|entry| inventory_bound.checked_add(entry))
+            .ok_or_else(|| exhausted("inventory workspace overflow"))?;
+    }
+    for record in &delivered {
+        inventory_bound = record
+            .block_id
+            .len()
+            .checked_add(record.source_validator.len())
+            .and_then(|entry| entry.checked_add(ENTRY_OVERHEAD))
+            .and_then(|entry| inventory_bound.checked_add(entry))
+            .ok_or_else(|| exhausted("inventory workspace overflow"))?;
+    }
+    charge.workspace("inventory index and digest", inventory_bound)?;
     let mut index = std::collections::HashMap::new();
     for (position, record) in delivered.iter().enumerate() {
         let key = (record.block_id.clone(), record.is_final, record.source_validator.clone());

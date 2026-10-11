@@ -41,6 +41,8 @@ mod outputs;
 pub(crate) use outputs::{
     retirement_sealed_sets, ExpectedFinalityOutput, MAX_RETIREMENT_SETS, MAX_RETIREMENT_SET_BYTES,
 };
+#[cfg(test)]
+pub(crate) use outputs::MAX_SEALED_SET_FILE;
 const DIRECTORY: &str = "finality-intents";
 const MAX_INTENT_BYTES: u64 = 16 << 20;
 const MAX_INTENT_TOTAL: u64 = 64 << 20;

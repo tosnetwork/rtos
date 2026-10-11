@@ -599,6 +599,46 @@ pub trait AsyncKeyValueStorage: Send + Sync {
     }
 }
 
+/// Open-instance generation of one database directory, shared by every
+/// instance opened there while any instance or receipt still refers to it.
+pub(crate) struct StorageGenerationSlot {
+    pub(crate) generation: u64,
+    pub(crate) live: bool,
+}
+pub(crate) type StorageGeneration = Arc<std::sync::Mutex<StorageGenerationSlot>>;
+
+/// Registers a newly opened instance of the database at `directory` and
+/// returns its slot and generation. The key is the canonical directory, so
+/// aliases share one slot; entries whose slot nobody holds are pruned, which
+/// bounds the map by live instances plus outstanding receipts.
+pub(crate) fn register_storage_instance(directory: &std::path::Path) -> (StorageGeneration, u64) {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Weak<std::sync::Mutex<StorageGenerationSlot>>>>,
+    > = std::sync::OnceLock::new();
+    let key = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_owned());
+    let registry = REGISTRY.get_or_init(Default::default);
+    let mut map = match registry.lock() {
+        Ok(map) => map,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    map.retain(|_, slot| slot.strong_count() > 0);
+    let slot = map.get(&key).and_then(std::sync::Weak::upgrade).unwrap_or_else(|| {
+        Arc::new(std::sync::Mutex::new(StorageGenerationSlot { generation: 0, live: false }))
+    });
+    map.insert(key, Arc::downgrade(&slot));
+    let generation = {
+        let mut state = match slot.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // u64 generations per directory cannot be exhausted in practice.
+        state.generation = state.generation.saturating_add(1);
+        state.live = true;
+        state.generation
+    };
+    (slot, generation)
+}
+
 /// Outcome of one storage instance's final teardown, recorded by its `Drop`.
 ///
 /// It certifies teardown only after every strong reference is gone, the final
@@ -610,6 +650,8 @@ pub struct StorageTeardownReceipt {
     outcome: Arc<std::sync::OnceLock<std::result::Result<(), String>>>,
     storage_id: String,
     path: std::path::PathBuf,
+    instance: StorageGeneration,
+    generation: u64,
 }
 
 impl StorageTeardownReceipt {
@@ -617,8 +659,10 @@ impl StorageTeardownReceipt {
         outcome: Arc<std::sync::OnceLock<std::result::Result<(), String>>>,
         storage_id: &str,
         path: &std::path::Path,
+        instance: StorageGeneration,
+        generation: u64,
     ) -> Self {
-        Self { outcome, storage_id: storage_id.to_string(), path: path.to_owned() }
+        Self { outcome, storage_id: storage_id.to_string(), path: path.to_owned(), instance, generation }
     }
 
     /// Identifier the observed instance was opened with.
@@ -631,8 +675,21 @@ impl StorageTeardownReceipt {
         &self.path
     }
 
-    /// Fails while the instance is alive, or when its teardown was not clean.
+    /// Fails while the instance is alive, when its teardown was not clean,
+    /// or when a newer instance was opened at the same database directory.
     pub fn check(&self) -> Result<()> {
+        {
+            let state = match self.instance.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if state.generation != self.generation {
+                rtos_block::fail!("Storage {} was reopened by a newer instance", self.storage_id);
+            }
+            if state.live {
+                rtos_block::fail!("Storage {} has not been torn down", self.storage_id);
+            }
+        }
         match self.outcome.get() {
             None => rtos_block::fail!("Storage {} has not been torn down", self.storage_id),
             Some(Err(error)) => {
