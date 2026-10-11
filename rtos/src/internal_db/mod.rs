@@ -269,6 +269,8 @@ pub struct InternalDb {
     propagation_outbox_writer: Arc<AtomicBool>,
     #[cfg(test)]
     publication_sync_observer: std::sync::Mutex<storage::durability::SyncObservation>,
+    #[cfg(test)]
+    bounded_repair_sync_observer: std::sync::Mutex<storage::durability::SyncObservation>,
     prev1_block_db: BlockInfoDb,
     prev2_block_db: BlockInfoDb,
     next1_block_db: BlockInfoDb,
@@ -463,6 +465,8 @@ impl InternalDb {
             propagation_outbox_writer: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             publication_sync_observer: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            bounded_repair_sync_observer: std::sync::Mutex::new(None),
             prev1_block_db: BlockInfoDb::with_db(db.clone(), PREV1_BLOCK_DB_NAME, can_create_db)?,
             prev2_block_db: BlockInfoDb::with_db(db.clone(), PREV2_BLOCK_DB_NAME, can_create_db)?,
             next1_block_db: BlockInfoDb::with_db(db.clone(), NEXT1_BLOCK_DB_NAME, can_create_db)?,
@@ -642,6 +646,15 @@ impl InternalDb {
     ) {
         *self.publication_sync_observer.lock().unwrap() = observer;
     }
+    /// Observe only the real bounded state writer, not artifact WAL on the same DB.
+    #[cfg(test)]
+    pub(crate) fn set_bounded_repair_sync_observer(
+        &self,
+        observer: storage::durability::SyncObservation,
+    ) {
+        *self.bounded_repair_sync_observer.lock().unwrap() = observer;
+    }
+
     fn publication_sync_observer(&self) -> storage::durability::SyncObservation {
         #[cfg(test)]
         {
@@ -896,26 +909,17 @@ impl InternalDb {
             max_entries: budget.limits().cells,
             max_depth: budget.limits().depth,
         };
+        let observer = self.publication_sync_observer();
+        #[cfg(test)]
+        let observer = self.bounded_repair_sync_observer.lock().unwrap().clone().or(observer);
         match &self.state_db {
             StateDb::Dynamic(db) => {
-                db.put_bounded_observed(
-                    id,
-                    candidate.root().clone(),
-                    limits,
-                    budget,
-                    self.publication_sync_observer(),
-                )
-                .await
+                db.put_bounded_observed(id, candidate.root().clone(), limits, budget, observer)
+                    .await
             }
             StateDb::Archive(db) => {
-                db.put_bounded_observed(
-                    id,
-                    candidate.root().clone(),
-                    limits,
-                    budget,
-                    self.publication_sync_observer(),
-                )
-                .await
+                db.put_bounded_observed(id, candidate.root().clone(), limits, budget, observer)
+                    .await
             }
         }
         .map_err(|error| {

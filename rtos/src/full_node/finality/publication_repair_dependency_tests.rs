@@ -485,7 +485,7 @@ async fn mc_live_repair_bounded_writer_pin_survives_gc_and_transfers_to_custody(
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         gate = Some(ReleaseGate(Some(release_tx)));
         let release_rx = std::sync::Mutex::new(release_rx);
-        engine.db().set_publication_sync_observer(Some(Arc::new(move |point, _| {
+        engine.db().set_bounded_repair_sync_observer(Some(Arc::new(move |point, _| {
             if point == storage::durability::SyncPoint::Wal {
                 if let Some(entered) = entered_tx.lock().unwrap().take() {
                     let _ = entered.send(());
@@ -506,7 +506,7 @@ async fn mc_live_repair_bounded_writer_pin_survives_gc_and_transfers_to_custody(
         assert!(engine.db().test_contains_dynamic_state_record(target.id()).unwrap());
         drop(gate.take());
         let custody = repair.take().unwrap().await.unwrap().unwrap();
-        engine.db().set_publication_sync_observer(None);
+        engine.db().set_bounded_repair_sync_observer(None);
         assert_eq!(
             custody.state_root(),
             &target.block().unwrap().read_state_update().unwrap().new_hash
@@ -529,7 +529,7 @@ async fn mc_live_repair_bounded_writer_pin_survives_gc_and_transfers_to_custody(
     // On assertion/timeout panic release the real writer before collecting its
     // task. A dropped observation future must not strand the DB shutdown.
     drop(gate.take());
-    engine.db().set_publication_sync_observer(None);
+    engine.db().set_bounded_repair_sync_observer(None);
     if let Some(task) = repair.take() {
         let _ = task.await;
     }
