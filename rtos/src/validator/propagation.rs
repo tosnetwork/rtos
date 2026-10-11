@@ -66,7 +66,9 @@ impl PropagationPlan {
             && ((v2
                 && (event == PropagationEvent::CandidateReceived
                     || (event == PropagationEvent::Finalized && candidate_recent)))
-                || (!v2 && event == PropagationEvent::CandidateGenerated && !id.is_masterchain()))
+                || (!v2
+                    && event == PropagationEvent::CandidateGenerated
+                    && !id.shard().is_masterchain()))
         {
             plan.candidate_targets = if v2 { TargetSet::ALL } else { TargetSet::AUXILIARY };
         }

@@ -359,7 +359,9 @@ impl Pair {
         }
         .into_boxed();
         let mut identity = WireProfile::T0.serialize(&identifier).unwrap();
-        identity.extend_from_slice(UInt256::calc_file_hash(&WireProfile::T0.serialize(&signature_set).unwrap()).as_slice());
+        identity.extend_from_slice(
+            UInt256::calc_file_hash(&WireProfile::T0.serialize(&signature_set).unwrap()).as_slice(),
+        );
         let hash = UInt256::calc_file_hash(&identity);
         (wire, *hash.as_array())
     }

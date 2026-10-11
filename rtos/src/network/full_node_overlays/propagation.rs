@@ -440,7 +440,7 @@ impl FullNodeOverlaysRouter {
         // Separate effects: a failed block/finality send must not silently omit
         // the legacy shard-description operation or erase its own result.
         if plan.send_shard_description {
-            if accepted.block().id().is_masterchain() || !accepted.is_final() {
+            if accepted.block().id().shard().is_masterchain() || !accepted.is_final() {
                 outcome.record(
                     PropagationKind::ShardDescription,
                     PropagationTarget::ShardDescription,
