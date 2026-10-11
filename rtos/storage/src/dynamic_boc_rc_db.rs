@@ -1102,7 +1102,7 @@ mod bounded_writer;
 /// A bounded write reached the physical commit/sync boundary and failed.
 /// The request must reopen rather than retry as an ordinary state write.
 #[derive(Debug)]
-pub struct BoundedStateWriteFailure(anyhow::Error);
+pub struct BoundedStateWriteFailure(pub(crate) anyhow::Error);
 impl std::fmt::Display for BoundedStateWriteFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Bounded state write durability failure: {}", self.0)

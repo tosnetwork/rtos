@@ -476,6 +476,25 @@ impl ShardStateDb {
         }
     }
 
+    /// Execute a reservation only while the physical state index is absent.
+    /// The same gate excludes actual deletion and both state writer paths.
+    pub fn with_absent_state<T>(
+        &self,
+        id: &BlockIdExt,
+        reserve: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let _gate =
+            self.bounded_read_gate.write().map_err(|_| error!("State write gate poisoned"))?;
+        if let Some(reason) = self.write_failure.borrow().as_ref() {
+            fail!("State writer failed: {reason}");
+        }
+        if self.shardstate_db.contains(id)? {
+            Ok(None)
+        } else {
+            reserve().map(Some)
+        }
+    }
+
     /// Admit and enqueue one bounded state save. The command owns its budget
     /// until the actual serialized writer and WAL sync finish, even if this
     /// observation future is dropped. Budget failures are never retried through
@@ -490,7 +509,7 @@ impl ShardStateDb {
         self.put_bounded_observed(id, root, limits, budget, None).await
     }
 
-    async fn put_bounded_observed(
+    pub async fn put_bounded_observed(
         &self,
         id: &BlockIdExt,
         root: Cell,
@@ -708,10 +727,15 @@ impl ShardStateDb {
                     StateCommand::BoundedPut { id, root, limits, budget, reply, observer } => {
                         self.in_queue.fetch_sub(1, Ordering::Relaxed);
                         let result = tokio::task::block_in_place(|| {
+                            let _gate = self
+                                .bounded_read_gate
+                                .write()
+                                .map_err(|_| error!("State write gate poisoned"))?;
                             rtos_block::merkle_apply_budget::require_materialized(&root)?;
                             if let Some(prior) = self.write_failure.borrow().as_ref() {
                                 fail!("Earlier state write failed: {prior}");
                             }
+                            budget.workspace(DbEntry::SIZE)?;
                             let existing_index = self.shardstate_db.try_get(&id)?;
                             if let Some(existing) = &existing_index {
                                 if existing.len() != DbEntry::SIZE {
@@ -730,7 +754,7 @@ impl ShardStateDb {
                                 root.repr_hash().clone(),
                                 UnixTime::now(),
                             );
-                            self.dynamic_boc_db.save_boc_bounded(
+                            let result = self.dynamic_boc_db.save_boc_bounded(
                                 &root,
                                 limits,
                                 budget.as_ref(),
@@ -743,17 +767,18 @@ impl ShardStateDb {
                                         &entry.serialize(),
                                     )
                                 },
-                            )
-                        });
-                        if let Err(error) = &result {
-                            if error
+                            );
+                            if let Err(error) = &result {
+                                if error
                                 .downcast_ref::<crate::dynamic_boc_rc_db::BoundedStateWriteFailure>(
                                 )
                                 .is_some()
                             {
                                 self.write_failure.send_replace(Some(error.to_string()));
                             }
-                        }
+                            }
+                            result
+                        });
                         // Per-request rejection is terminal for this command,
                         // not a permanent ordinary-writer retry loop.
                         let _ = reply.send(result);
@@ -823,6 +848,8 @@ impl ShardStateDb {
     }
 
     fn put_internal(self: Arc<Self>, id: &BlockIdExt, state_root: Cell) -> Result<Cell> {
+        let _gate =
+            self.bounded_read_gate.write().map_err(|_| error!("State write gate poisoned"))?;
         let cell_id = state_root.repr_hash().clone();
 
         log::trace!(

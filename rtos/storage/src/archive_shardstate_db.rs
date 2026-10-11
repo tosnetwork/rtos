@@ -17,12 +17,14 @@ use crate::{
     traits::Serializable,
     StorageAlloc, TARGET,
 };
+use rtos_block::merkle_apply_budget::{MerkleApplyBudget, MerkleApplyLimits};
 use rtos_block::{BlockIdExt, Cell, CellsFactory, CellsStorage, Result, UInt256, UnixTime};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub struct ArchiveShardStateDb {
     index: Arc<RocksDbTable<BlockIdExt>>,
     boc_db: Arc<DynamicBocArchiveDb>,
+    write_gate: Arc<Mutex<Option<String>>>,
 }
 
 impl ArchiveShardStateDb {
@@ -44,10 +46,96 @@ impl ArchiveShardStateDb {
             allocated,
         )?);
         let index = Arc::new(RocksDbTable::with_db(db, index_cf, true)?);
-        Ok(Self { index, boc_db })
+        Ok(Self { index, boc_db, write_gate: Arc::new(Mutex::new(None)) })
+    }
+
+    pub fn contains_state_record(&self, id: &BlockIdExt) -> Result<bool> {
+        self.index.contains(id)
+    }
+
+    /// The reservation is registered before any ordinary or bounded writer can
+    /// create this index. Archive states are append-only and have no GC.
+    pub fn with_absent_state<T>(
+        &self,
+        id: &BlockIdExt,
+        reserve: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let _gate = self
+            .write_gate
+            .lock()
+            .map_err(|_| rtos_block::error!("Archive write gate poisoned"))?;
+        if let Some(reason) = _gate.as_ref() {
+            rtos_block::fail!("Archive writer failed: {reason}");
+        }
+        if self.index.contains(id)? {
+            Ok(None)
+        } else {
+            reserve().map(Some)
+        }
+    }
+
+    pub async fn put_bounded(
+        &self,
+        id: &BlockIdExt,
+        root: Cell,
+        limits: MerkleApplyLimits,
+        budget: Arc<dyn MerkleApplyBudget>,
+    ) -> Result<()> {
+        self.put_bounded_observed(id, root, limits, budget, None).await
+    }
+
+    /// The blocking writer owns the budget through the actual WAL boundary,
+    /// even when the future observing its result is cancelled.
+    pub async fn put_bounded_observed(
+        &self,
+        id: &BlockIdExt,
+        root: Cell,
+        limits: MerkleApplyLimits,
+        budget: Arc<dyn MerkleApplyBudget>,
+        observer: crate::durability::SyncObservation,
+    ) -> Result<()> {
+        budget.workspace(1024)?;
+        let id = id.clone();
+        let index = self.index.clone();
+        let boc = self.boc_db.clone();
+        let gate = self.write_gate.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut failed =
+                gate.lock().map_err(|_| rtos_block::error!("Archive write gate poisoned"))?;
+            if let Some(reason) = failed.as_ref() {
+                rtos_block::fail!("Archive writer failed: {reason}");
+            }
+            let result = bounded_writer::write(
+                &index,
+                &boc,
+                &id,
+                root,
+                limits,
+                budget.as_ref(),
+                observer.as_deref(),
+            );
+            if let Err(error) = &result {
+                if error
+                    .downcast_ref::<crate::dynamic_boc_rc_db::BoundedStateWriteFailure>()
+                    .is_some()
+                {
+                    *failed = Some(error.to_string());
+                }
+            }
+            result
+        })
+        .await
+        .map_err(|e| rtos_block::error!("Archive bounded writer task: {e}"))?
     }
 
     pub fn put(&self, id: &BlockIdExt, state_root: Cell) -> Result<Cell> {
+        let gate = self
+            .write_gate
+            .lock()
+            .map_err(|_| rtos_block::error!("Archive write gate poisoned"))?;
+        if let Some(reason) = gate.as_ref() {
+            rtos_block::fail!("Archive writer failed: {reason}");
+        }
         let cell_id = state_root.repr_hash().clone();
         log::debug!(
             target: TARGET,
@@ -72,6 +160,13 @@ impl ArchiveShardStateDb {
     }
 
     pub fn put_update(&self, id: &BlockIdExt, state_root: Cell) -> Result<()> {
+        let gate = self
+            .write_gate
+            .lock()
+            .map_err(|_| rtos_block::error!("Archive write gate poisoned"))?;
+        if let Some(reason) = gate.as_ref() {
+            rtos_block::fail!("Archive writer failed: {reason}");
+        }
         let state_root = state_root.virtualize(1);
         let cell_id = state_root.repr_hash().clone();
         log::debug!(
@@ -102,7 +197,18 @@ impl ArchiveShardStateDb {
         &self,
         observer: Option<&crate::durability::SyncObserver>,
     ) -> Result<()> {
-        self.index.sync_wal_observed(observer)
+        let mut failed = self
+            .write_gate
+            .lock()
+            .map_err(|_| rtos_block::error!("Archive write gate poisoned"))?;
+        if let Some(reason) = failed.as_ref() {
+            rtos_block::fail!("Archive writer failed: {reason}");
+        }
+        let result = self.index.sync_wal_observed(observer);
+        if let Err(error) = &result {
+            *failed = Some(error.to_string());
+        }
+        result
     }
 
     pub fn get(&self, id: &BlockIdExt) -> Result<Cell> {
@@ -159,3 +265,10 @@ impl ArchiveShardStateDb {
         CellByHashStorageAdapter::new(self.boc_db.cell_db().clone(), root, max_inmemory_cells)
     }
 }
+
+#[path = "bounded_archive_writer.rs"]
+mod bounded_writer;
+
+#[cfg(test)]
+#[path = "tests/test_bounded_archive_writer.rs"]
+mod bounded_writer_tests;

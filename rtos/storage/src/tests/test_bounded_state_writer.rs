@@ -270,3 +270,40 @@ async fn bounded_state_writer_wal_failure_poison_and_reopen_idempotency() -> Res
     assert_eq!(count(&db, &child)?, Some(2));
     close(db, states).await
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_state_writer_absence_reservation_excludes_real_writer() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (db, states) = open(dir.path())?;
+    let (root, _, first, _) = fixture();
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let owner = states.clone();
+    let id = first.clone();
+    let reservation = std::thread::spawn(move || {
+        owner.with_absent_state(&id, || {
+            assert!(owner.bounded_read_gate.try_write().is_err());
+            let _ = entered.send(());
+            wait.recv()?;
+            assert!(!owner.contains_state_record(&id)?);
+            Ok(())
+        })
+    });
+    tokio::time::timeout(Duration::from_secs(10), observed).await??;
+    let owner = states.clone();
+    let id = first.clone();
+    let mut writer =
+        tokio::spawn(
+            async move { owner.put_bounded(&id, root, LIMITS, Budget::new(usize::MAX)).await },
+        );
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut writer).await.is_err());
+    release.send(())?;
+    assert_eq!(reservation.join().unwrap()?, Some(()));
+    writer.await??;
+    assert_eq!(
+        states
+            .with_absent_state(&first, || -> Result<()> { panic!("existing must not reserve") })?,
+        None
+    );
+    close(db, states).await
+}

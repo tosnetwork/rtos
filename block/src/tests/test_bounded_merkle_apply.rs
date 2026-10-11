@@ -153,7 +153,9 @@ fn bounded_merkle_apply_shared_cell_merkle_depth_traversal_order() -> Result<()>
     let proof =
         MerkleProof { hash: shared.hash(0).clone(), depth: shared.depth(0), proof: shared.clone() }
             .serialize()?;
-    for refs in [[shared.clone(), proof.clone()], [proof.clone(), shared.clone()]] {
+    for (positive, refs) in
+        [(true, [shared.clone(), proof.clone()]), (false, [proof.clone(), shared.clone()])]
+    {
         let old = cell(11, &refs);
         let new = cell(12, &refs);
         let update = MerkleUpdate {
@@ -164,8 +166,27 @@ fn bounded_merkle_apply_shared_cell_merkle_depth_traversal_order() -> Result<()>
             old: old.clone(),
             new: new.clone(),
         };
-        let ordinary = update.apply_for(&old)?;
-        let bounded = update.apply_for_bounded(&old, &LIMITS, &Budget::new([usize::MAX; 3]))?;
+        let ordinary = update.apply_for(&old);
+        let bounded = update.apply_for_bounded(&old, &LIMITS, &Budget::new([usize::MAX; 3]));
+        if !positive {
+            assert!(
+                ordinary.is_err(),
+                "ordinary implementation rejects proof-first shared-depth order"
+            );
+            assert!(bounded.is_err(), "bounded implementation must preserve this rejection");
+            continue;
+        }
+        let ordinary = ordinary.map_err(|e| error!("direct-first ordinary baseline: {e:#}"))?;
+        let bounded = bounded.map_err(|e| error!("direct-first bounded apply: {e:#}"))?;
+        assert!(
+            with_reversed_dfs_for_test(|| update.apply_for_bounded(
+                &old,
+                &LIMITS,
+                &Budget::new([usize::MAX; 3])
+            ))
+            .is_err(),
+            "positive fixture must detect the former LIFO order mutation"
+        );
         assert_eq!(write_boc(&ordinary.0)?, write_boc(&bounded.0)?);
         assert_eq!(ordinary.0.repr_depth(), bounded.0.repr_depth());
     }

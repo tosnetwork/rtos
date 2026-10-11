@@ -411,7 +411,11 @@ impl MerkleUpdate {
                 let md = merkle_depth
                     .checked_add(u8::from(cell.is_merkle()))
                     .ok_or(MerkleApplyLimitExceeded("merkle depth overflow"))?;
-                for index in (0..cell.references_count()).rev() {
+                for position in 0..cell.references_count() {
+                    let index = crate::merkle_apply_budget::dfs_push_index(
+                        cell.references_count(),
+                        position,
+                    );
                     budget.step()?;
                     stack.push((cell.reference(index)?, md, child_depth), budget)?;
                 }
@@ -434,7 +438,11 @@ impl MerkleUpdate {
                     continue;
                 }
                 seen.insert(cell.repr_hash().clone(), (), budget)?;
-                for i in (0..cell.references_count()).rev() {
+                for position in 0..cell.references_count() {
+                    let i = crate::merkle_apply_budget::dfs_push_index(
+                        cell.references_count(),
+                        position,
+                    );
                     budget.step()?;
                     stack.push(
                         (
@@ -472,7 +480,11 @@ impl MerkleUpdate {
                     .ok_or(MerkleApplyLimitExceeded("merkle depth overflow"))?;
                 let child_depth =
                     depth.checked_add(1).ok_or(MerkleApplyLimitExceeded("depth overflow"))?;
-                for i in (0..cell.references_count()).rev() {
+                for position in 0..cell.references_count() {
+                    let i = crate::merkle_apply_budget::dfs_push_index(
+                        cell.references_count(),
+                        position,
+                    );
                     budget.step()?;
                     stack.push((cell.reference(i)?, child_md, child_depth), budget)?;
                 }

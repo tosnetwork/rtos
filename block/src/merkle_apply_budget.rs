@@ -192,3 +192,26 @@ impl<T> BudgetStack<T> {
 #[cfg(test)]
 #[path = "tests/test_bounded_merkle_apply.rs"]
 mod tests;
+
+#[cfg(test)]
+thread_local! { static REVERSE_DFS_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+pub(crate) fn dfs_push_index(count: usize, position: usize) -> usize {
+    #[cfg(test)]
+    if REVERSE_DFS_TEST.with(std::cell::Cell::get) {
+        return position;
+    }
+    count - 1 - position
+}
+
+#[cfg(test)]
+pub(crate) fn with_reversed_dfs_for_test<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REVERSE_DFS_TEST.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(REVERSE_DFS_TEST.with(|flag| flag.replace(true)));
+    run()
+}
