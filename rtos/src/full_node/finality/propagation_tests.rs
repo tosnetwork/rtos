@@ -412,6 +412,25 @@ async fn publication_recovery_replays_prepared_and_ready_acceptance() {
         propagation_outbox_auth::authenticate_publication,
         validator::accept_block::accept_authenticated_publication,
     };
+    struct WrongCheckpoint {
+        zero: BlockIdExt,
+        init: BlockIdExt,
+    }
+    #[async_trait::async_trait]
+    impl EngineOperations for WrongCheckpoint {
+        fn zerostate_id(&self) -> Result<&BlockIdExt> {
+            Ok(&self.zero)
+        }
+        fn init_mc_block_id(&self) -> &BlockIdExt {
+            &self.init
+        }
+        fn load_block_handle(
+            &self,
+            _: &BlockIdExt,
+        ) -> Result<Option<Arc<storage::block_handle_db::BlockHandle>>> {
+            panic!("foreign checkpoint reached storage");
+        }
+    }
     for final_role in [false, true] {
         let pair = Pair::with_propagation_profile("included", false, true).await;
         let result = std::panic::AssertUnwindSafe(async {
@@ -472,6 +491,22 @@ async fn publication_recovery_replays_prepared_and_ready_acceptance() {
                 },
                 pending: vec![effect],
             };
+            let mut wrong_init = context.history_init().clone();
+            wrong_init.file_hash = UInt256::from([0xAB; 32]);
+            let foreign =
+                Arc::new(WrongCheckpoint { zero: context.zerostate().clone(), init: wrong_init });
+            let receipt = authenticate_publication(
+                &history,
+                pair.provider.as_ref(),
+                entry.clone(),
+                &Limits::default(),
+            )
+            .await
+            .unwrap();
+            let failure = accept_authenticated_publication(receipt, foreign).await;
+            assert!(
+                matches!(failure, Err(error) if error.to_string().contains("another Engine domain"))
+            );
             for stage in [PublicationStage::Prepared, PublicationStage::Ready] {
                 entry.stage = stage;
                 let receipt = authenticate_publication(

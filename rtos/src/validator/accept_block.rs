@@ -1231,6 +1231,7 @@ pub(crate) async fn accept_authenticated_publication(
     let (entry, block, context, verified) = publication.into_parts();
     // A valid receipt for one Engine must not authorize writes to another pin.
     if context.zerostate() != engine.zerostate_id()?
+        || context.history_init() != engine.init_mc_block_id()
         || entry.record.domain.wire_profile != engine.validator_network().wire_profile()
     {
         fail!("Authenticated publication belongs to another Engine domain");
