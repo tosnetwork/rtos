@@ -143,6 +143,13 @@ type ValidatorAdnlKeyIds = lockfree::map::Map<i32, ValidatorAdnlKeyId>;
 
 struct ValidatorContext {
     overlay_lifecycle: std::sync::Mutex<()>,
+    // Config callbacks and validator-list setup can load the same election in
+    // parallel. Only completed registrations may appear in adnl_key_ids.
+    adnl_registration: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    adnl_registration_gate: std::sync::Mutex<
+        Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
+    >,
     private_overlays: Arc<lockfree::map::Map<Arc<OverlayShortId>, Arc<CatchainClient>>>,
     catchain_overlays: Arc<lockfree::map::Map<Arc<PrivateOverlayShortId>, CatchainOverlayPtr>>,
     adnl_key_ids: Arc<ValidatorAdnlKeyIds>,
@@ -294,6 +301,9 @@ impl NodeNetwork {
 
         let validator_context = ValidatorContext {
             overlay_lifecycle: std::sync::Mutex::new(()),
+            adnl_registration: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            adnl_registration_gate: std::sync::Mutex::new(None),
             private_overlays: Arc::new(lockfree::map::Map::new()),
             catchain_overlays: Arc::new(lockfree::map::Map::new()),
             adnl_key_ids: Arc::new(lockfree::map::Map::new()),
@@ -746,33 +756,30 @@ impl NodeNetwork {
         election_id: i32,
     ) -> Result<bool> {
         log::info!("load_and_store_validator_adnl_key: id {key_id} elections {election_id}");
-        let added =
-            add_counted_object_to_map(&self.validator_context.adnl_key_ids, election_id, || {
-                Ok(ValidatorAdnlKeyId {
-                    key_id: key_id.clone(),
-                    counter: self
-                        .network_context
-                        .engine_allocated
-                        .validator_adnl_keys
-                        .clone()
-                        .into(),
-                })
-            })?;
+        let _admission = self.tasks.enter()?;
+        let _registration = self.validator_context.adnl_registration.lock().await;
         if let Some(key_id_stored) = self.validator_context.adnl_key_ids.get(&election_id) {
             let key_id_stored = &key_id_stored.val().key_id;
             if key_id_stored != &key_id {
                 fail!("ADNL key mismatch for election {election_id}: {key_id_stored} vs. {key_id}");
             }
-        } else {
-            fail!("Cannot get saved ADNL key for election {election_id}");
-        };
-        if !added {
-            log::info!(
-                "load_and_store_validator_adnl_key: \
-                id {key_id} already added for elections {election_id}"
-            );
-            return Ok(false);
+            // A recorded ID alone is not transport readiness. Repair a stale
+            // registration instead of permanently skipping its failed load.
+            if self.network_context.stack.adnl.key_by_id(&key_id).is_ok() {
+                return Ok(false);
+            }
+            self.validator_context.adnl_key_ids.remove(&election_id);
         }
+        #[cfg(test)]
+        {
+            let gate = self.validator_context.adnl_registration_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                release.await.map_err(|_| error!("ADNL registration test gate closed"))?;
+            }
+        }
+        // No reservation is published across this await. Cancellation or a key
+        // lookup error leaves the next caller free to retry (including fallback).
         let Some((adnl_key, _)) = self.config_handler.get_validator_key(&key_id).await else {
             fail!("Cannot find validator ADNL key {key_id} for election {election_id} in config");
         };
@@ -781,16 +788,13 @@ impl NodeNetwork {
         )?;
         if let Some(quic) = &self.network_context.stack.quic {
             let adnl_ip = self.network_context.stack.adnl.ip_address_adnl();
-            let (_quic_addr, bind_addr) =
-                match Self::compute_quic_bind_addr(adnl_ip, self.network_context.quic_address) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log::warn!("Skipping QUIC key {key_id}: {e}");
-                        return Ok(true);
+            match Self::compute_quic_bind_addr(adnl_ip, self.network_context.quic_address) {
+                Ok((_quic_addr, bind_addr)) => {
+                    if let Err(e) = Self::bind_quic_key(quic, &adnl_key, bind_addr) {
+                        log::warn!("Cannot add validator ADNL key {key_id} to QUIC: {e}");
                     }
-                };
-            if let Err(e) = Self::bind_quic_key(quic, &adnl_key, bind_addr) {
-                log::warn!("Cannot add validator ADNL key {key_id} to QUIC: {e}");
+                }
+                Err(e) => log::warn!("Skipping QUIC key {key_id}: {e}"),
             }
         }
         let stored_key = self.network_context.stack.adnl.key_by_id(&key_id)?;
@@ -801,6 +805,15 @@ impl NodeNetwork {
                 Some((self.validator_context.adnl_key_ids.clone(), election_id)),
                 self.cancellation_token.clone(),
             )
+        })?;
+        // Everything after the awaited lookup is synchronous under the same
+        // async mutex as removal. Failed transport/task setup never reserves an
+        // election ID; a retry can reuse an already-added transport key.
+        add_counted_object_to_map(&self.validator_context.adnl_key_ids, election_id, || {
+            Ok(ValidatorAdnlKeyId {
+                key_id: key_id.clone(),
+                counter: self.network_context.engine_allocated.validator_adnl_keys.clone().into(),
+            })
         })?;
         log::info!(
             "load_and_store_validator_adnl_key: \
@@ -817,6 +830,7 @@ impl NodeNetwork {
     ) -> Option<Arc<dyn KeyOption>> {
         let candidate_ids = local_validator_adnl_candidates(local_validator);
 
+        let registration = self.validator_context.adnl_registration.lock().await;
         for candidate_id in &candidate_ids {
             if let Ok(adnl_key) = self.network_context.stack.adnl.key_by_id(candidate_id) {
                 if candidate_id.as_ref() != local_validator.adnl_id.as_ref() {
@@ -832,6 +846,7 @@ impl NodeNetwork {
                 return Some(adnl_key);
             }
         }
+        drop(registration);
 
         for candidate_id in &candidate_ids {
             if let Err(e) =
@@ -1282,6 +1297,7 @@ impl NodeConfigSubscriber for NodeNetwork {
                 self.load_and_store_validator_adnl_key(validator_adnl_key_id, election_id).await
             }
             ConfigEvent::RemoveValidatorAdnlKey(validator_adnl_key_id, election_id) => {
+                let _registration = self.validator_context.adnl_registration.lock().await;
                 log::info!(
                     "config event (RemoveValidatorAdnlKey) id: {} election: {}",
                     &validator_adnl_key_id,
