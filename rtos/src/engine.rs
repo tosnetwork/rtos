@@ -144,6 +144,7 @@ pub struct Engine {
     ingress_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
     persistence_tasks: crate::types::owned_tasks::OwnedTasks,
     publication_worker: std::sync::Mutex<Option<Arc<crate::publication_worker::PublicationWorker>>>,
+    finality_recovery: Arc<crate::validator::finality_recovery_owner::RecoveryRegistry>,
 
     shard_states_awaiters: AwaitersPool<BlockIdExt, Arc<ShardStateStuff>>,
     block_applying_awaiters: AwaitersPool<BlockIdExt, ()>,
@@ -936,6 +937,7 @@ impl Engine {
                     shutdown_tasks: Arc::new(crate::types::owned_tasks::OwnedTasks::default()),
                     background_tasks: Arc::new(Default::default()),
                     publication_worker: std::sync::Mutex::new(None),
+                    finality_recovery: Arc::new(Default::default()),
                     ingress_tasks: Arc::new(crate::types::owned_tasks::OwnedTasks::new(
                         tokio_util::sync::CancellationToken::new(),
                     )),
@@ -1165,6 +1167,10 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) fn finality_recovery_registry(&self) -> &Arc<crate::validator::finality_recovery_owner::RecoveryRegistry> {
+        &self.finality_recovery
+    }
+
     pub(crate) async fn ensure_publication_worker(
         self: &Arc<Self>,
     ) -> Result<Arc<crate::publication_worker::PublicationWorker>> {
@@ -1206,6 +1212,7 @@ impl Engine {
     async fn wait_stop_inner(self: Arc<Self>) -> Result<()> {
         // set stop flag
         self.stopper.set_stop();
+        self.finality_recovery.stop();
         let publication_worker = self.publication_worker.lock().unwrap().clone();
         if let Some(worker) = &publication_worker { worker.stop(); }
         self.background_tasks.stop();

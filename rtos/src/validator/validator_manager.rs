@@ -1961,6 +1961,17 @@ impl ValidatorManagerImpl {
                 continue;
             }
             if let Some((_, runtime)) = &authenticated {
+                if self.engine.finality_recovery_owns(runtime) {
+                    // A recovery owner will wake this manager after checked join.
+                    // Preserve any existing group during a reservation race;
+                    // exclusive source DB ownership still decides who can start.
+                    if let Some(group) = self.current_sessions.get(&session_id) {
+                        new_current_sessions.insert(session_id.clone(), group.clone());
+                    }
+                    gc_validator_sessions.remove(&session_id);
+                    our_current_shards.remove(&ident);
+                    continue;
+                }
                 use consensus_common::session_runtime::LocalRole;
                 if matches!(runtime.local_role(), LocalRole::Validator(_)) {
                     our_current_shards.insert(ident.clone(), vsubset.clone());
@@ -2508,6 +2519,9 @@ impl ValidatorManagerImpl {
                     )?.bind_recovery_anchor(mc_state.block_id().clone())?);
                     Some((key, runtime))
                 } else { None };
+                if authenticated.as_ref().is_some_and(|(_, runtime)| self.engine.finality_recovery_owns(runtime)) {
+                    continue;
+                }
                 let local_id = match &authenticated {
                     Some((key, runtime)) => {
                         if matches!(
@@ -3012,6 +3026,9 @@ impl ValidatorManagerImpl {
         //let block_observer = self.initialize_block_observer(&last_applied_block_handle).await?;
 
         while !self.engine.check_stop() {
+            // Sample before update_shards so a release during that update is
+            // observed even if no later masterchain block arrives.
+            let recovery_generation = self.engine.finality_recovery_generation();
             log::trace!(
                 target: "validator_manager",
                 "Trying to load state for masterblock {}",
@@ -3069,12 +3086,16 @@ impl ValidatorManagerImpl {
                     "Waiting next applied masterblock after {}",
                     mc_handle.id().seq_no
                 );
-                match timeout(
-                    self.config.update_interval,
-                    self.engine.wait_next_applied_mc_block(&mc_handle, None),
-                )
-                .await
-                {
+                match tokio::select! {
+                    outcome = timeout(
+                        self.config.update_interval,
+                        self.engine.wait_next_applied_mc_block(&mc_handle, None),
+                    ) => outcome,
+                    changed = self.engine.wait_finality_recovery_change(recovery_generation) => {
+                        changed?;
+                        break mc_handle.clone();
+                    }
+                } {
                     Ok(r_res) => {
                         log::trace!(
                             target: "validator_manager",
