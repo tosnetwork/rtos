@@ -57,9 +57,10 @@ use storage::{
     },
     db::{
         filedb::FileDb,
-        rocksdb::{AccessType, RocksDb, CATCHAINS_DB_NAME, NODE_DB_NAME},
+        node::{open_node_db, CELLS_CF_NAME, CELLSCOUNTERS_CF_NAME},
+        rocksdb::{AccessType, RocksDb, CATCHAINS_DB_NAME},
     },
-    dynamic_boc_rc_db::{AsyncCellsStorageAdapter, DynamicBocDb},
+    dynamic_boc_rc_db::AsyncCellsStorageAdapter,
     shard_top_blocks_db::{ShardTopBlocksDb, SHARD_TOP_BLOCKS_DB_NAME},
     shardstate_db_async::{AllowStateGcResolver, CellsDbConfig, Job, ShardStateDb},
     traits::Serializable,
@@ -82,8 +83,6 @@ pub const DB_VERSION_8: u32 = 8; // with merge operator in counters CF
 pub const CURRENT_DB_VERSION: u32 = DB_VERSION_8;
 
 pub const SHARDSTATE_DB_NAME: &str = "shardstate_db";
-const CELLS_CF_NAME: &str = "cells_db_v6";
-const CELLSCOUNTERS_CF_NAME: &str = "cells_db_v6_counters";
 const SHARD_STATE_PERSISTENT_DB_NAME: &str = "shard_state_persistent_db";
 pub const ARCHIVE_STATES_DB_NAME: &str = "archive_states";
 pub const ARCHIVE_CELLS_CF_NAME: &str = "archive_cells_db";
@@ -365,29 +364,15 @@ impl InternalDb {
         #[cfg(feature = "telemetry")] telemetry: Arc<EngineTelemetry>,
         allocated: Arc<EngineAlloc>,
     ) -> Result<Self> {
-        let mut cfs_opts = HashMap::new();
-        let mut pending_caches = Vec::new();
-        if config.archival_mode.is_none() {
-            let (cells_opts, cells_cache) =
-                DynamicBocDb::build_cells_cf_options(&config.cells_db_config);
-            cfs_opts.insert(CELLS_CF_NAME.to_string(), cells_opts);
-            pending_caches.push(cells_cache);
-            let (counters_opts, counters_cache) =
-                DynamicBocDb::build_counters_cf_options(&config.cells_db_config);
-            cfs_opts.insert(CELLSCOUNTERS_CF_NAME.to_string(), counters_opts);
-            pending_caches.push(counters_cache);
-        }
         let access_type = access_type.unwrap_or(AccessType::ReadWrite);
         let can_create_db = access_type == AccessType::ReadWrite;
-        let db = RocksDb::new(
-            config.db_directory.as_str(),
-            NODE_DB_NAME,
-            cfs_opts,
+        // Existing dynamic counter CFs still need their merge operator when
+        // this startup selects archival state storage.
+        let db = open_node_db(
+            &config.db_directory,
+            &config.cells_db_config,
             access_type.clone(),
         )?;
-        for cache in pending_caches {
-            db.register_cache(cache);
-        }
         let db_catchain = RocksDb::new(
             config.db_directory.as_str(),
             CATCHAINS_DB_NAME,
@@ -1864,3 +1849,7 @@ impl InternalDb {
 #[cfg(test)]
 #[path = "../tests/test_internal_db.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/test_node_db_recovery.rs"]
+mod node_db_recovery_tests;
