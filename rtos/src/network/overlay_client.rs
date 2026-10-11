@@ -40,7 +40,7 @@ use rtos_api::{
     },
     BoxedDeserialize, BoxedSerialize,
 };
-use rtos_block::{fail, KeyId, KeyOption, Result};
+use rtos_block::{error, fail, KeyId, KeyOption, Result};
 use std::{
     collections::VecDeque,
     sync::{
@@ -793,6 +793,42 @@ impl OverlayClient {
         T: BoxedSerialize + std::fmt::Debug,
     {
         let (answer, roundtrip) = self.send_rldp_query(request, peer, attempt, v2).await?;
+        peer.query_success(roundtrip, true);
+        Ok(answer)
+    }
+
+    /// Bounded transport and transparent decompression; no legacy fallback.
+    pub async fn send_rldp_query_raw_bounded<T>(
+        &self,
+        request: &TaggedObject<T>,
+        peer: &Arc<Neighbour>,
+        attempt: u32,
+        v2: bool,
+        limits: adnl::QueryResponseLimits,
+    ) -> Result<Vec<u8>>
+    where
+        T: BoxedSerialize + std::fmt::Debug,
+    {
+        limits.validate()?;
+        let mut query = self.ctx.overlay_node().get_query_prefix(&self.ctx.id)?;
+        self.ctx.overlay_node().wire_profile().serialize_append(&mut query, &request.object)?;
+        let (answer, roundtrip) = self
+            .ctx
+            .overlay_node()
+            .query_via_rldp_bounded(
+                peer.id(),
+                &TaggedByteSlice {
+                    object: &query,
+                    #[cfg(feature = "telemetry")]
+                    tag: request.tag,
+                },
+                &self.ctx.id,
+                limits,
+                v2,
+                peer.roundtrip_rldp().map(|t| t + attempt as u64 * TIMEOUT_DELTA),
+            )
+            .await?;
+        let answer = answer.ok_or_else(|| error!("No bounded RLDP answer from {}", peer.id()))?;
         peer.query_success(roundtrip, true);
         Ok(answer)
     }

@@ -51,6 +51,124 @@ use rtos_block::{
 use std::sync::Arc;
 use storage::types::PersistentStatePartId;
 
+/// Per-request bounds. These limit encoded buffers and BOC cardinality, not total heap usage.
+#[derive(Clone, Copy, Debug)]
+pub struct NetworkDownloadLimits {
+    pub wire_bytes: usize,
+    pub response_bytes: usize,
+    pub expanded_bytes: usize,
+    pub block_bytes: usize,
+    pub proof_bytes: usize,
+    pub boc_cells: usize,
+    pub boc_depth: u16,
+}
+impl NetworkDownloadLimits {
+    pub fn proof(bytes: usize, cells: usize, depth: u16) -> Self {
+        Self {
+            wire_bytes: bytes,
+            response_bytes: bytes,
+            expanded_bytes: bytes,
+            block_bytes: 0,
+            proof_bytes: bytes,
+            boc_cells: cells,
+            boc_depth: depth,
+        }
+    }
+    fn transport(self) -> Result<adnl::QueryResponseLimits> {
+        let limits = adnl::QueryResponseLimits {
+            wire_bytes: self.wire_bytes,
+            decoded_bytes: self.response_bytes,
+        };
+        limits.validate()?;
+        if self.expanded_bytes > MAX_COMPRESSED_SIZE || self.boc_cells == 0 || self.boc_depth == 0 {
+            fail!("Invalid bounded download limits");
+        }
+        Ok(limits)
+    }
+    fn check_bytes(actual: usize, limit: usize) -> Result<()> {
+        if actual > limit {
+            return Err(adnl::ResponseLimitExceeded { limit, actual }.into());
+        }
+        Ok(())
+    }
+    fn parse_boc(self, data: &[u8], max_bytes: usize) -> Result<rtos_block::BocReaderResult> {
+        Self::check_bytes(data.len(), max_bytes)?;
+        let mut reader = rtos_block::BocReader::new().set_max_cell_depth(self.boc_depth);
+        let (header, _) = reader.read_header(&mut std::io::Cursor::new(data))?;
+        Self::check_bytes(header.cells_count, self.boc_cells)?;
+        Self::check_bytes(header.tot_cells_size, max_bytes)?;
+        reader.read(data)
+    }
+}
+
+// Preflight the raw LZ4 block without allocating its advertised output.
+fn check_lz4_expansion(input: &[u8], limit: usize) -> Result<()> {
+    fn length(input: &[u8], pos: &mut usize, initial: usize) -> Result<usize> {
+        let mut value = initial;
+        if initial == 15 {
+            loop {
+                let next = *input.get(*pos).ok_or_else(|| error!("Truncated LZ4 length"))? as usize;
+                *pos += 1;
+                value = value.checked_add(next).ok_or_else(|| error!("LZ4 length overflow"))?;
+                if next != 255 {
+                    break;
+                }
+            }
+        }
+        Ok(value)
+    }
+    let mut pos = 0;
+    let mut output = 0usize;
+    while pos < input.len() {
+        let token = input[pos];
+        pos += 1;
+        let literals = length(input, &mut pos, (token >> 4) as usize)?;
+        output = output.checked_add(literals).ok_or_else(|| error!("LZ4 length overflow"))?;
+        NetworkDownloadLimits::check_bytes(output, limit)?;
+        pos = pos.checked_add(literals).ok_or_else(|| error!("LZ4 length overflow"))?;
+        if pos > input.len() {
+            fail!("Truncated LZ4 literals");
+        }
+        if pos == input.len() {
+            break;
+        }
+        let offset = input.get(pos..pos + 2).ok_or_else(|| error!("Truncated LZ4 offset"))?;
+        let offset = u16::from_le_bytes([offset[0], offset[1]]) as usize;
+        if offset == 0 || offset > output {
+            fail!("Invalid LZ4 offset");
+        }
+        pos += 2;
+        let matched = length(input, &mut pos, (token & 15) as usize)?;
+        output = output
+            .checked_add(matched)
+            .and_then(|v| v.checked_add(4))
+            .ok_or_else(|| error!("LZ4 length overflow"))?;
+        NetworkDownloadLimits::check_bytes(output, limit)?;
+    }
+    Ok(())
+}
+
+struct LimitedBocOutput {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+impl std::io::Write for LimitedBocOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let actual = self.bytes.len().saturating_add(bytes.len());
+        if actual > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                adnl::ResponseLimitExceeded { limit: self.limit, actual },
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Wrapper for OverlayClient that provides methods for performing fullnode network requests
 pub struct FullNodeOverlayClient {
     #[cfg(test)]
@@ -356,6 +474,55 @@ impl FullNodeOverlayClient {
         BlockProofStuff::deserialize(block_id, proof, is_link)
     }
 
+    pub async fn download_block_proof_bounded(
+        &self,
+        block_id: &BlockIdExt,
+        is_link: bool,
+        key_block: bool,
+        limits: NetworkDownloadLimits,
+    ) -> Result<BlockProofStuff> {
+        let transport = limits.transport()?;
+        // Prepare
+        let request = if key_block {
+            PrepareKeyBlockProof { block: block_id.clone(), allow_partial: is_link.into() }
+                .into_tl_object()
+        } else {
+            PrepareBlockProof { block: block_id.clone(), allow_partial: is_link.into() }
+                .into_tl_object()
+        }
+        .into();
+        let (prepare, good_peer): (PreparedProof, _) =
+            self.client.send_adnl_query(&request, None, Some(Self::TIMEOUT_PREPARE), None).await?;
+        // Download
+        let (request, is_link) = match prepare {
+            PreparedProof::TonNode_PreparedProofEmpty => {
+                fail!("Got `TonNode_PreparedProofEmpty` from {}", good_peer.id())
+            }
+            PreparedProof::TonNode_PreparedProof => {
+                let request = if key_block {
+                    DownloadKeyBlockProof { block: block_id.clone() }.into_tl_object()
+                } else {
+                    DownloadBlockProof { block: block_id.clone() }.into_tl_object()
+                };
+                (request, false)
+            }
+            PreparedProof::TonNode_PreparedProofLink => {
+                let request = if key_block {
+                    DownloadKeyBlockProofLink { block: block_id.clone() }.into_tl_object()
+                } else {
+                    DownloadBlockProofLink { block: block_id.clone() }.into_tl_object()
+                };
+                (request, true)
+            }
+        };
+        let proof = self
+            .client
+            .send_rldp_query_raw_bounded(&request.into(), &good_peer, 0, true, transport)
+            .await?;
+        limits.parse_boc(&proof, limits.proof_bytes)?;
+        BlockProofStuff::deserialize(block_id, proof, is_link)
+    }
+
     // tonNode.prepareBlock block:tonNode.blockIdExt = tonNode.Prepared;
     // tonNode.downloadBlockFull block:tonNode.blockIdExt = tonNode.DataFull;
     // tonNode.dataFull id:tonNode.blockIdExt proof:bytes block:bytes is_link:Bool = tonNode.DataFull;
@@ -448,6 +615,133 @@ impl FullNodeOverlayClient {
                         fail!("DownloadBlockFull returned DataFullEmpty from {}", peer.id())
                     }
                 };
+                let proof =
+                    BlockProofStuff::deserialize(&id, proof_data, is_link).map_err(|e| {
+                        error!("Error deserializing block proof from {}: {}", peer.id(), e)
+                    })?;
+                let block = BlockStuff::deserialize_block_checked(id, Arc::new(block_data))
+                    .map_err(|e| error!("Error deserializing block from {}: {}", peer.id(), e))?;
+                Ok((block, proof))
+            });
+        match deserialized {
+            Ok(pair) => {
+                if !was_active {
+                    self.active_peers.insert(peer.id().clone()).ok();
+                }
+                Ok(pair)
+            }
+            Err(e) => {
+                self.active_peers.remove(peer.id());
+                Err(e)
+            }
+        }
+    }
+
+    pub async fn download_block_full_bounded(
+        &self,
+        id: &BlockIdExt,
+        fan_out_prepare: bool,
+        limits: NetworkDownloadLimits,
+    ) -> Result<(BlockStuff, BlockProofStuff)> {
+        let transport = limits.transport()?;
+        let (peer, was_active) = if fan_out_prepare {
+            // Probe FAN_OUT_PEERS in parallel with PrepareBlock; pick the
+            // first peer that says it has the block, then RLDP from it.
+            // The fan-out helper deliberately does not insert the winner into
+            // active_peers — promotion happens below on full success.
+            let request = PrepareBlock { block: id.clone() }.into_tl_object().into();
+            let (_prepare, peer): (Prepared, _) = self
+                .client
+                .send_adnl_query_fan_out(
+                    &request,
+                    Self::FAN_OUT_PEERS,
+                    Some(Self::TIMEOUT_PREPARE),
+                    |p: &Prepared| matches!(p, &Prepared::TonNode_Prepared),
+                    &self.active_peers,
+                )
+                .await?;
+            (peer, false)
+        } else {
+            // Skip the prepare round-trip: pick a neighbour and RLDP directly.
+            self.client.choose_peer(Some(&self.active_peers)).await?
+        };
+        log::debug!(
+            "download_block_full: sending RLDP to peer {}, id: {}, fan_out={fan_out_prepare}",
+            peer.id(),
+            id
+        );
+        let result = self
+            .client
+            .send_rldp_query_raw_bounded(
+                &TaggedObject {
+                    object: DownloadBlockFull { block: id.clone() },
+                    #[cfg(feature = "telemetry")]
+                    tag: DownloadBlockFull::constructor_const(),
+                },
+                &peer,
+                0,
+                true,
+                transport,
+            )
+            .await;
+        log::debug!(
+            "download_block_full: got {}, peer {}, id: {}",
+            if result.is_ok() { "OK" } else { "ERR" },
+            peer.id(),
+            id
+        );
+        let response = result.inspect_err(|_| {
+            self.active_peers.remove(peer.id());
+        })?;
+        let data_full: DataFull = self
+            .client
+            .network_context()
+            .stack
+            .overlay
+            .wire_profile()
+            .deserialize_value_bounded(&response, limits.response_bytes)?;
+        let id = id.clone();
+        let deserialized: Result<(BlockStuff, BlockProofStuff)> =
+            tokio::task::block_in_place(|| {
+                let (block_data, proof_data, is_link) = match data_full {
+                    DataFull::TonNode_DataFull(data_full) => {
+                        if id != data_full.id {
+                            fail!("Block with another id was received");
+                        }
+                        (data_full.block, data_full.proof, data_full.is_link.into())
+                    }
+                    DataFull::TonNode_DataFullCompressed(data_full) => {
+                        if id != data_full.id {
+                            fail!("Block with another id was received");
+                        }
+                        check_lz4_expansion(&data_full.compressed, limits.expanded_bytes)?;
+                        let decompressed = lz4_decompress(
+                            &data_full.compressed,
+                            Lz4DecompressMode::WithMaxSize(limits.expanded_bytes as i32),
+                        )?;
+                        let mut roots =
+                            limits.parse_boc(&decompressed, limits.expanded_bytes)?.roots;
+                        if roots.len() != 2 {
+                            fail!("DataFullCompressed contains {} roots instead of 2", roots.len());
+                        }
+                        let mut proof_output =
+                            LimitedBocOutput { bytes: Vec::new(), limit: limits.proof_bytes };
+                        BocWriter::with_root(&roots.remove(0))?.write(&mut proof_output)?;
+                        let proof_data = proof_output.bytes;
+                        // Block's boc here must be serialized absolutely
+                        // the same way as in collator, because of file hash concept.
+                        let mut block_output =
+                            LimitedBocOutput { bytes: Vec::new(), limit: limits.block_bytes };
+                        BocWriter::with_flags(roots, BocFlags::all())?.write(&mut block_output)?;
+                        let block_data = block_output.bytes;
+                        (block_data, proof_data, data_full.is_link.into())
+                    }
+                    DataFull::TonNode_DataFullEmpty => {
+                        fail!("DownloadBlockFull returned DataFullEmpty from {}", peer.id())
+                    }
+                };
+                limits.parse_boc(&block_data, limits.block_bytes)?;
+                limits.parse_boc(&proof_data, limits.proof_bytes)?;
                 let proof =
                     BlockProofStuff::deserialize(&id, proof_data, is_link).map_err(|e| {
                         error!("Error deserializing block proof from {}: {}", peer.id(), e)
@@ -833,5 +1127,38 @@ impl FullNodeOverlayClient {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod bounded_download_tests {
+    use super::*;
+    #[test]
+    fn bounded_download_boc_and_serialization_limits() {
+        let mut builder = rtos_block::BuilderData::new();
+        builder.checked_append_reference(rtos_block::Cell::default()).unwrap();
+        let cell = builder.into_cell().unwrap();
+        let encoded = write_boc(&cell).unwrap();
+        let limits = NetworkDownloadLimits::proof(encoded.len(), 1, 16);
+        assert!(limits
+            .parse_boc(&encoded, encoded.len())
+            .unwrap_err()
+            .downcast_ref::<adnl::ResponseLimitExceeded>()
+            .is_some());
+        let limits = NetworkDownloadLimits::proof(encoded.len(), 2, 16);
+        assert_eq!(limits.parse_boc(&encoded, encoded.len()).unwrap().roots[0], cell);
+        let mut output = LimitedBocOutput { bytes: Vec::new(), limit: encoded.len() - 1 };
+        assert!(BocWriter::with_root(&cell).unwrap().write(&mut output).is_err());
+        assert!(output.bytes.len() < encoded.len());
+    }
+    #[test]
+    fn bounded_download_lz4_preflight_rejects_before_expansion() {
+        let compressed = rtos_block::lz4_compress(&vec![7; 4096], false).unwrap();
+        check_lz4_expansion(&compressed, 4096).unwrap();
+        assert!(check_lz4_expansion(&compressed, 1024)
+            .unwrap_err()
+            .downcast_ref::<adnl::ResponseLimitExceeded>()
+            .is_some());
+        assert!(check_lz4_expansion(&[0xf0, 255], 4096).is_err());
     }
 }

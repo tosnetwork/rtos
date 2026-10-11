@@ -210,6 +210,7 @@ enum RecvParts {
 
 pub(crate) struct RecvTransfer {
     pub(crate) data: Vec<u8>,
+    pub(crate) failure: Option<anyhow::Error>,
     pub(crate) total_size: Option<usize>,
     #[cfg(feature = "debug")]
     pub(crate) timestamp: Arc<AtomicPtr<Instant>>,
@@ -256,6 +257,7 @@ impl RecvTransfer {
             complete,
             confirm,
             data: Vec::new(),
+            failure: None,
             expected_total_size,
             parts,
             start: Instant::now(),
@@ -316,7 +318,7 @@ impl RecvTransfer {
                 Constraints::MAX_TOTAL_TRANSFER_SIZE + Constraints::RLDP_ANSWER_TL_OVERHEAD;
             let cap = self.expected_total_size.map(|s| s.min(max_wire)).unwrap_or(max_wire);
             if total_size > cap {
-                fail!("RLDP total size {total_size} exceeds cap {cap}");
+                return Err(super::ResponseLimitExceeded { limit: cap, actual: total_size }.into());
             }
             self.total_size = Some(total_size);
             self.data
@@ -515,5 +517,37 @@ impl RecvTransferState {
     }
     pub(crate) fn set_updates(&self) {
         self.updates.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod bounded_receive_tests {
+    use super::*;
+    #[test]
+    fn bounded_receive_declared_wire_limit_precedes_allocation() {
+        let mut receiver = RecvTransfer::new(
+            [7; 32],
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            false,
+            Some(96),
+            #[cfg(feature = "debug")]
+            Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
+        );
+        let chunk = Chunk::V1(RldpMessagePart {
+            transfer_id: [7; 32].into(),
+            fec_type: FecType::Fec_RaptorQ(FecTypeRaptorQ {
+                data_size: 4096,
+                symbol_size: 768,
+                symbols_count: 6,
+            }),
+            part: 0,
+            total_size: 4096,
+            seqno: 0,
+            data: vec![0; 768],
+        });
+        let error = receiver.process_chunk(chunk).unwrap_err();
+        assert!(error.downcast_ref::<crate::ResponseLimitExceeded>().is_some());
+        assert_eq!(receiver.data.capacity(), 0);
+        assert!(receiver.total_size.is_none());
     }
 }

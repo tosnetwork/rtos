@@ -2190,6 +2190,49 @@ impl OverlayNode {
         rldp.query(data, max_answer_size, &peers, v2, roundtrip).await
     }
 
+    /// Send query via RLDP
+    pub async fn query_via_rldp_bounded(
+        &self,
+        dst: &Arc<KeyId>,
+        data: &TaggedByteSlice<'_>,
+        overlay_id: &Arc<OverlayShortId>,
+        limits: crate::rldp::QueryResponseLimits,
+        v2: bool,
+        roundtrip: Option<u64>,
+    ) -> Result<(Option<Vec<u8>>, u64)> {
+        let overlay = self.get_overlay(overlay_id, "Overlay admission")?;
+        let lease = overlay.tasks.enter()?;
+        #[cfg(test)]
+        self.pause_after_send_admission().await;
+        let (peers, _) = self
+            .prepare_to_send(
+                dst,
+                &overlay,
+                "Sending RLDP query to unknown overlay",
+                #[cfg(feature = "telemetry")]
+                data.tag,
+            )
+            .await?;
+        let Some(rldp) = self.rldp.get() else {
+            fail!("RLDP sender is not set in overlay node");
+        };
+        let rldp = rldp.clone();
+        let bytes = data.object.to_vec();
+        #[cfg(feature = "telemetry")]
+        let tag = data.tag;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        overlay.tasks.spawn_admitted("bounded overlay RLDP query", lease, async move {
+            let data = TaggedByteSlice {
+                object: &bytes,
+                #[cfg(feature = "telemetry")]
+                tag,
+            };
+            let result = rldp.query_bounded(&data, limits, &peers, v2, roundtrip).await;
+            let _ = tx.send(result);
+        });
+        rx.await.map_err(|_| error!("Bounded overlay RLDP worker stopped"))?
+    }
+
     /// Enable/disable broadcast retransmit
     pub fn set_broadcast_retransmit(&self, enabled: bool) {
         if enabled {

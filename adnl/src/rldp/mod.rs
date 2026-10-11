@@ -217,6 +217,34 @@ struct RldpTelemetry {
     send_transfers: Arc<Metric>,
 }
 
+pub use rtos_api::DecodeLimitExceeded as ResponseLimitExceeded;
+
+#[derive(Clone, Copy, Debug)]
+pub struct QueryResponseLimits {
+    pub wire_bytes: usize,
+    pub decoded_bytes: usize,
+}
+impl QueryResponseLimits {
+    pub fn validate(self) -> Result<()> {
+        for value in [self.wire_bytes, self.decoded_bytes] {
+            if value == 0 || value > Constraints::MAX_TOTAL_TRANSFER_SIZE {
+                return Err(ResponseLimitExceeded {
+                    limit: Constraints::MAX_TOTAL_TRANSFER_SIZE,
+                    actual: value,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+}
+struct BoundedReceive {
+    limits: QueryResponseLimits,
+    token: tokio_util::task::task_tracker::TaskTrackerToken,
+    done: tokio::sync::oneshot::Sender<()>,
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+
 /// Rldp Node
 pub struct RldpNode {
     adnl: Arc<AdnlNode>,
@@ -327,7 +355,7 @@ impl RldpNode {
         v2: bool,
         roundtrip: Option<u64>,
     ) -> Result<u64> {
-        let ret = self.outbound(data, None, peers, v2, roundtrip).await;
+        let ret = self.outbound(data, None, peers, v2, roundtrip, None).await;
         #[cfg(feature = "telemetry")]
         let prefix = if v2 { "RLDP STAT recv v2" } else { "RLDP STAT recv v1" };
         #[cfg(feature = "telemetry")]
@@ -342,6 +370,55 @@ impl RldpNode {
         ret.map(|(_, timeout)| timeout)
     }
 
+    /// Caller cancellation does not detach a scoped query or its receiver.
+    /// The ADNL owner joins both, including transfer cleanup during shutdown.
+    pub async fn query_bounded(
+        self: &Arc<Self>,
+        data: &TaggedByteSlice<'_>,
+        limits: QueryResponseLimits,
+        peers: &AdnlPeers,
+        v2: bool,
+        roundtrip: Option<u64>,
+    ) -> Result<(Option<Vec<u8>>, u64)> {
+        limits.validate()?;
+        static CAPACITY: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        let permit = Arc::new(
+            CAPACITY
+                .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32)))
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| error!("Bounded RLDP query capacity exhausted"))?,
+        );
+        let token = self.adnl.tasks().enter()?;
+        let receive_token = self.adnl.tasks().enter()?;
+        let bytes = data.object.to_vec();
+        #[cfg(feature = "telemetry")]
+        let tag = data.tag;
+        let peers = peers.clone();
+        let node = self.clone();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        self.adnl.tasks().spawn_admitted("bounded RLDP query", token, async move {
+            let (done, joined) = tokio::sync::oneshot::channel();
+            let scope =
+                BoundedReceive { limits, token: receive_token, done, permit: permit.clone() };
+            let data = TaggedByteSlice {
+                object: &bytes,
+                #[cfg(feature = "telemetry")]
+                tag,
+            };
+            let result = node
+                .outbound(&data, Some(limits.wire_bytes as u64), &peers, v2, roundtrip, Some(scope))
+                .await;
+            // Sender is dropped on every pre-receiver error. A spawned receiver
+            // remains admitted to ADNL until its real worker/supervisor joins.
+            let _ = joined.await;
+            drop(permit);
+            let _ = sent.send(result);
+        });
+        received.await.map_err(|_| error!("Bounded RLDP query owner failed"))?
+    }
+
     /// Send query
     pub async fn query(
         &self,
@@ -352,7 +429,7 @@ impl RldpNode {
         roundtrip: Option<u64>,
     ) -> Result<(Option<Vec<u8>>, u64)> {
         let max_answer_size = max_answer_size.or(Some(128 * 1024));
-        let ret = self.outbound(data, max_answer_size, peers, v2, roundtrip).await;
+        let ret = self.outbound(data, max_answer_size, peers, v2, roundtrip, None).await;
         #[cfg(feature = "telemetry")]
         let prefix = if v2 { "RLDP STAT query v2" } else { "RLDP STAT query v1" };
         #[cfg(feature = "telemetry")]
@@ -914,7 +991,10 @@ impl RldpNode {
         peers: &AdnlPeers,
         v2: bool,
         roundtrip: Option<u64>,
+        bounded: Option<BoundedReceive>,
     ) -> Result<(Option<Vec<u8>>, u64)> {
+        let response_limits = bounded.as_ref().map(|scope| scope.limits);
+        let retained_permit = bounded.as_ref().map(|scope| scope.permit.clone());
         #[cfg(feature = "telemetry")]
         let tag = data.tag;
         let data = if self.adnl.check_options(AdnlNode::OPTION_FORCE_COMPRESSION) {
@@ -1036,7 +1116,7 @@ impl RldpNode {
         );
         let res = match tokio::time::timeout(
             Duration::from_millis(Self::TIMEOUT_OUTBOUND_HARD_MS),
-            self.outbound_loop(send_context, recv_context, &send_transfer_id, v2, &peer),
+            self.outbound_loop(send_context, recv_context, &send_transfer_id, v2, &peer, bounded),
         )
         .await
         {
@@ -1069,13 +1149,35 @@ impl RldpNode {
             self.transfers.insert(recv_transfer_id, RldpTransfer::Done);
         }
         let transfers = self.transfers.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS * 2)).await;
-            transfers.remove(&send_transfer_id);
-            if let Some(recv_transfer_id) = recv_transfer_id {
-                transfers.remove(&recv_transfer_id);
+        if let Some(permit) = retained_permit {
+            let fallback = transfers.clone();
+            let owner = self.adnl.tasks().clone();
+            let cancellation = owner.clone();
+            if !owner.spawn("bounded RLDP transfer expiry", async move {
+                let _permit = permit;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS * 2)) => {},
+                    _ = cancellation.cancelled() => {},
+                }
+                transfers.remove(&send_transfer_id);
+                if let Some(id) = recv_transfer_id {
+                    transfers.remove(&id);
+                }
+            }) {
+                fallback.remove(&send_transfer_id);
+                if let Some(id) = recv_transfer_id {
+                    fallback.remove(&id);
+                }
             }
-        });
+        } else {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS * 2)).await;
+                transfers.remove(&send_transfer_id);
+                if let Some(id) = recv_transfer_id {
+                    transfers.remove(&id);
+                }
+            });
+        }
         #[cfg(feature = "telemetry")]
         let all = self.stats.transfers_sent_all.load(Ordering::Relaxed);
         #[cfg(feature = "telemetry")]
@@ -1090,18 +1192,50 @@ impl RldpNode {
             let Some(query_id) = query_id else {
                 fail!("Unexpected answer {answer:?} to RLDP message");
             };
-            match deserialize_boxed(&answer[..])?.downcast::<RldpMessageBoxed>() {
+            let decoded = match response_limits {
+                Some(limits) => Ok(rtos_api::WireProfile::Legacy
+                    .deserialize_value_bounded::<RldpMessageBoxed>(&answer, limits.wire_bytes)?),
+                None => deserialize_boxed(&answer[..])?.downcast::<RldpMessageBoxed>(),
+            };
+            match decoded {
                 Ok(RldpMessageBoxed::Rldp_Answer(answer)) => {
                     if answer.query_id.as_slice() != &query_id {
                         fail!("Unknown query ID in RLDP answer")
                     } else {
-                        let data = match DataCompression::decompress_raw(&answer.data) {
+                        let decompressed = match response_limits {
+                            Some(limits) => DataCompression::decompress_raw_bounded(
+                                &answer.data,
+                                limits.decoded_bytes,
+                            )?,
+                            None => DataCompression::decompress_raw(&answer.data),
+                        };
+                        let data = match decompressed {
                             Some(data) => {
                                 self.adnl.set_options(AdnlNode::OPTION_FORCE_COMPRESSION);
                                 data
                             }
-                            None => answer.data.to_vec(),
+                            None => {
+                                if let Some(limits) = response_limits {
+                                    if answer.data.len() > limits.decoded_bytes {
+                                        return Err(ResponseLimitExceeded {
+                                            limit: limits.decoded_bytes,
+                                            actual: answer.data.len(),
+                                        }
+                                        .into());
+                                    }
+                                }
+                                answer.data.to_vec()
+                            }
                         };
+                        if let Some(limits) = response_limits {
+                            if data.len() > limits.decoded_bytes {
+                                return Err(ResponseLimitExceeded {
+                                    limit: limits.decoded_bytes,
+                                    actual: data.len(),
+                                }
+                                .into());
+                            }
+                        }
                         if data.len() >= 4 {
                             log::trace!(
                                 target: TARGET,
@@ -1127,16 +1261,30 @@ impl RldpNode {
         send_transfer_id: &TransferId,
         v2: bool,
         peer: &Arc<RldpPeer>,
+        bounded: Option<BoundedReceive>,
     ) -> Result<Option<Vec<u8>>> {
         let transfer_str =
             Self::transfer_string(&send_context.transfer_id, &send_context.peers, "to");
+        let propagate_failure = bounded.is_some();
         let recv_state = if let Some(mut recv_context) = recv_context {
             let (ping, pong) = tokio::sync::mpsc::unbounded_channel();
             let recv_state = recv_context.recv_transfer.state().clone();
-            tokio::spawn(async move {
-                Self::receive_loop(&mut recv_context, v2).await;
-                ping.send(recv_context.recv_transfer)
-            });
+            if let Some(scope) = bounded {
+                self.adnl.tasks().spawn_admitted(
+                    "bounded RLDP receiver",
+                    scope.token,
+                    async move {
+                        Self::receive_loop(&mut recv_context, v2).await;
+                        let _ = ping.send(recv_context.recv_transfer);
+                        let _ = scope.done.send(());
+                    },
+                );
+            } else {
+                tokio::spawn(async move {
+                    Self::receive_loop(&mut recv_context, v2).await;
+                    ping.send(recv_context.recv_transfer)
+                });
+            }
             Some((recv_state, pong))
         } else {
             None
@@ -1170,7 +1318,7 @@ impl RldpNode {
         let Some((recv_state, mut pong)) = recv_state else {
             return Ok(None);
         };
-        Ok(self.wait_answer(peer, &transfer_str, recv_state, &mut pong).await)
+        self.wait_answer(peer, &transfer_str, recv_state, &mut pong, propagate_failure).await
     }
 
     async fn wait_answer(
@@ -1179,7 +1327,8 @@ impl RldpNode {
         transfer_str: &str,
         recv_state: Arc<RecvTransferState>,
         recv_pong: &mut tokio::sync::mpsc::UnboundedReceiver<RecvTransfer>,
-    ) -> Option<Vec<u8>> {
+        propagate_failure: bool,
+    ) -> Result<Option<Vec<u8>>> {
         let start_ms = peer.stats.v1.timestamp_ms();
         let mut last_warn_ms = start_ms;
         let mut last_diag_ms = start_ms;
@@ -1191,7 +1340,12 @@ impl RldpNode {
                 Ok(Some(reply)) => {
                     log::trace!(target: TARGET, "Got reply in {transfer_str}");
                     peer.stats.v1.update(self.min_timeout_ms);
-                    return Some(reply.data);
+                    if propagate_failure {
+                        if let Some(error) = reply.failure {
+                            return Err(error);
+                        }
+                    }
+                    return Ok(Some(reply.data));
                 }
                 Ok(None) => {
                     log::warn!(target: TARGET, "Error in RLDP transfer {transfer_str}");
@@ -1237,7 +1391,7 @@ impl RldpNode {
                 "RLDP query recv",
             );
         }
-        None
+        Ok(None)
     }
 
     #[cfg(test)]
@@ -1315,6 +1469,7 @@ impl RldpNode {
                         target: TARGET,
                         "{rldp} error in {transfer_str}: {e}, dropping transfer"
                     );
+                    context.recv_transfer.failure = Some(e);
                     break;
                 }
                 Ok(reply) => {
