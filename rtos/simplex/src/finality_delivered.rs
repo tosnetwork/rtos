@@ -300,8 +300,12 @@ impl PendingFinalityStore {
         {
             fail!("Delivered conflicts with canonical reference");
         }
-        let disk =
-            DeliveredDisk { schema: 1, reference: reference.clone(), generation: offer.generation };
+        let disk = DeliveredDisk {
+            schema: 1,
+            reference: reference.clone(),
+            generation: offer.generation,
+            node_confirmed: false,
+        };
         let bytes = serde_json::to_vec(&disk)?;
         if bytes.len() as u64 > MAX_REFERENCE_BYTES {
             fail!("Delivered exceeds record quota");
@@ -519,22 +523,41 @@ pub fn scan_finality_closures_namespace(namespace: &Path) -> Result<Vec<Finality
 }
 /// Stable source-ID order with wraparound. Advance `after` even when an item
 /// fails authentication/admission, so a low-ID failure cannot starve later debt.
+pub struct FinalityClosureBatch {
+    /// Includes per-record failures; those files remain untouched.
+    pub items: Vec<(UInt256, Result<FinalityCloseRecovery>)>,
+    /// Last visited ID, including confirmed and malformed records.
+    pub next_cursor: Option<UInt256>,
+}
 pub fn scan_finality_closures_namespace_batch(
     namespace: &Path,
     after: Option<&UInt256>,
     limit: usize,
 ) -> Result<Vec<FinalityCloseRecovery>> {
+    scan_finality_closures_namespace_report(namespace, after, limit)?
+        .items
+        .into_iter()
+        .map(|(_, item)| item)
+        .collect()
+}
+pub fn scan_finality_closures_namespace_report(
+    namespace: &Path,
+    after: Option<&UInt256>,
+    limit: usize,
+) -> Result<FinalityClosureBatch> {
     if limit == 0 || limit > MAX_REFERENCES {
         fail!("Invalid source closure batch limit");
     }
+    let mut batch = FinalityClosureBatch { items: Vec::new(), next_cursor: None };
     let directory = namespace.join(DIRECTORY);
     if !directory.exists() {
-        return Ok(Vec::new());
+        return Ok(batch);
     }
     let Some(store) = PendingFinalityStore::lock(directory)? else {
-        return Ok(Vec::new());
+        return Ok(batch);
     };
-    let mut ids = std::collections::BTreeMap::new();
+    let mut ids = std::collections::BTreeSet::new();
+    // Enumeration is bounded by physical directory quotas, before decoding.
     for path in store.paths()? {
         if !matches!(
             path.extension().and_then(|s| s.to_str()),
@@ -547,29 +570,36 @@ pub fn scan_finality_closures_namespace_batch(
             .and_then(|s| s.to_str())
             .ok_or_else(|| error!("Closure filename"))?
             .parse()?;
-        if store.confirmed_without_backup(&id)? {
-            continue;
-        }
-        ids.insert(id.to_hex_string(), id);
+        ids.insert(id);
     }
-    let mut ordered: Vec<_> = ids.into_values().collect();
+    let mut ordered: Vec<_> = ids.into_iter().collect();
     if let Some(after) = after {
-        let key = after.to_hex_string();
-        let split = ordered.partition_point(|id| id.to_hex_string() <= key);
+        let split = ordered.partition_point(|id| id <= after);
         ordered.rotate_left(split);
     }
-    let mut result = Vec::new();
     let mut bytes = 0u64;
     for id in ordered.into_iter().take(limit) {
-        if let Some(locator) = store.close_locator(&id)? {
-            bytes += serde_json::to_vec(&locator.reference)?.len() as u64;
-            if bytes > MAX_REFERENCE_TOTAL {
-                fail!("Closure scan byte bound");
+        batch.next_cursor = Some(id.clone());
+        let item = (|| -> Result<Option<FinalityCloseRecovery>> {
+            if store.confirmed_without_backup(&id)? {
+                return Ok(None);
             }
-            result.push(locator);
+            let locator = store.close_locator(&id)?;
+            if let Some(locator) = &locator {
+                bytes += serde_json::to_vec(&locator.reference)?.len() as u64;
+                if bytes > MAX_REFERENCE_TOTAL {
+                    fail!("Closure scan byte bound");
+                }
+            }
+            Ok(locator)
+        })();
+        match item {
+            Ok(Some(locator)) => batch.items.push((id, Ok(locator))),
+            Ok(None) => {}
+            Err(error) => batch.items.push((id, Err(error))),
         }
     }
-    Ok(result)
+    Ok(batch)
 }
 
 impl SourceFinalityDelivery {
@@ -775,9 +805,7 @@ mod tests {
     ) {
         let dir = crate::authenticated_fixture::TestDirectory::new();
         let (runtime, draft) = super::super::tests::fixture();
-        let runtime = Arc::new(
-            runtime.as_ref().clone().bind_recovery_anchor(runtime.pin().zerostate.clone()).unwrap(),
-        );
+        assert!(runtime.recovery_binding().is_some());
         let namespace =
             PathBuf::from(runtime.runtime_directory(dir.path().to_str().unwrap()).unwrap());
         let store = PendingFinalityStore::open(&namespace).unwrap();
@@ -794,7 +822,7 @@ mod tests {
     }
     #[test]
     fn source_delivered_exact_binding_sync_reopen_and_old_backup() {
-        let (_dir, runtime, store, record, offer) = setup();
+        let (_dir, runtime, store, record, offer) = super::tests::setup();
         let id = record.id().unwrap();
         let ack = store.directory.join(format!("{}.acked", id.to_hex_string()));
         let backup = std::fs::read(&ack).unwrap();
@@ -835,7 +863,7 @@ mod tests {
     }
     #[test]
     fn source_delivered_uncertain_sync_never_mints_and_requires_reopen() {
-        let (_dir, runtime, store, record, offer) = setup();
+        let (_dir, runtime, store, record, offer) = super::tests::setup();
         let id = record.id().unwrap();
         let directory = store.directory.clone();
         let reference = store.close_locator(&id).unwrap().unwrap().reference;
@@ -941,7 +969,7 @@ mod tests {
     }
     #[test]
     fn source_delivered_unsupported_retains_reference_and_never_confirms() {
-        let (_dir, runtime, store, record, offer) = setup();
+        let (_dir, runtime, store, record, offer) = super::tests::setup();
         store.compact(&record, offer.request.canonical.node_receipt.clone()).unwrap();
         let locator = store.close_locator(&record.id().unwrap()).unwrap().unwrap();
         let confirm: DeliveredCompletionSink =
@@ -965,7 +993,7 @@ mod boundary_tests {
     #[test]
     fn source_delivered_quota_and_non_mc_roles_preserve_original() {
         for (is_final, shard) in [
-            (false, rtos_block::ShardIdent::masterchain()),
+            (false, rtos_block::ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap()),
             (true, rtos_block::ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap()),
         ] {
             let dir = crate::authenticated_fixture::TestDirectory::new();
@@ -1002,5 +1030,42 @@ mod boundary_tests {
             .directory
             .join(format!("{}.acked", record.id().unwrap().to_hex_string()))
             .exists());
+    }
+    #[test]
+    fn source_delivered_report_advances_past_malformed_and_confirmed_items() {
+        let (_dir, runtime, store, record, offer) = super::tests::setup();
+        let good = record.id().unwrap();
+        let namespace = store.directory.parent().unwrap().to_owned();
+        let bad =
+            if good == UInt256::default() { UInt256::from([1; 32]) } else { UInt256::default() };
+        let bad_path = store.reference_path(&bad);
+        std::fs::create_dir_all(bad_path.parent().unwrap()).unwrap();
+        std::fs::write(&bad_path, b"not-json").unwrap();
+        drop(store);
+        let batch = scan_finality_closures_namespace_report(&namespace, None, 2).unwrap();
+        assert_eq!(batch.items.len(), 2);
+        assert!(batch.items.iter().any(|(id, item)| id == &bad && item.is_err()));
+        assert!(batch.items.iter().any(|(id, item)| id == &good && item.is_ok()));
+        assert_eq!(std::fs::read(&bad_path).unwrap(), b"not-json");
+        drop(batch);
+        let batch = scan_finality_closures_namespace_report(&namespace, Some(&bad), 1).unwrap();
+        assert_eq!(batch.next_cursor.as_ref(), Some(&good));
+        assert_eq!(batch.items.len(), 1);
+        drop(batch);
+        let store = PendingFinalityStore::open(&namespace).unwrap();
+        let locator = store.close_locator(&good).unwrap().unwrap();
+        store.commit_delivered(&runtime, &locator.reference, &offer).unwrap();
+        store.mark_node_confirmed(&good, &offer).unwrap();
+        drop(locator);
+        drop(store);
+        let batch = scan_finality_closures_namespace_report(&namespace, Some(&bad), 1).unwrap();
+        assert_eq!(batch.next_cursor.as_ref(), Some(&good));
+        assert!(batch.items.is_empty(), "confirmed still consumes the visited-ID budget");
+        let next = batch.next_cursor.clone();
+        drop(batch);
+        let batch = scan_finality_closures_namespace_report(&namespace, next.as_ref(), 1).unwrap();
+        assert_eq!(batch.items.len(), 1);
+        assert_eq!(batch.items[0].0, bad);
+        assert!(batch.items[0].1.is_err());
     }
 }

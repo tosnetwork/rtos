@@ -11690,3 +11690,121 @@ fn source_finality_main_worker_release_keeps_only_accepted_node_work_owned() {
     assert_eq!(crate::finality_delivery::scan_pending_finality(temp.path()).unwrap().len(), 1);
     drop(old_handle);
 }
+
+/// Exercises the real controller walk with two nonempty ancestors separated by
+/// empties. The PQ votes are real; candidate-book rehydration is explicit fixture
+/// input, while source intent/ACK/output files are reopened from disk.
+#[test]
+fn source_finality_controller_empty_trigger_seals_all_roles_after_cold_retry() {
+    use crate::finality_delivery::tests::{fixture_role, HeldSink};
+    use rtos_block::Serializable;
+    let temp = crate::authenticated_fixture::TestDirectory::new();
+    let (runtime, _) = fixture_role(true, ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap());
+    assert!(runtime.recovery_binding().is_some());
+    let namespace = runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap();
+    let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor)
+        .collect::<Result<Vec<_>>>().unwrap();
+    let options = SessionOptions { protocol: runtime.protocol(), proto_version: runtime.carrier_version(),
+        wire_profile: runtime.wire_profile(), slots_per_leader_window: runtime.slots_per_leader_window(),
+        ..Default::default() };
+    let transport = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71;32]).unwrap();
+    let description = Arc::new(SessionDescription::new_with_runtime(&options, runtime.session_id().clone(),
+        1, &nodes, transport, runtime.shard(), SystemTime::now(), None, Some(&runtime)).unwrap()
+        .bind_pq_session(runtime.catchain_seqno()).unwrap());
+    let stores: Vec<_> = [0xa9, 0xaa].iter().map(|seed|
+        rtos_pq_consensus::ConsensusKeyStore::from_seed(&[*seed;32],0).unwrap()).collect();
+    let mut chain: Vec<(RawCandidateId, ReceivedCandidate)> = Vec::new();
+    for (slot, empty) in [(0, false), (1, true), (2, false), (3, true)] {
+        let parent = chain.last().map(|(id,_)| id.clone());
+        let (block_id, data) = if empty {
+            let previous = &chain.last().unwrap().1;
+            (previous.block_id.clone(), previous.data.clone())
+        } else {
+            let mut block = rtos_block::Block::default();
+            block.set_global_id(runtime.pin().global_id);
+            let mut info = rtos_block::BlockInfo::default();
+            info.set_seq_no(slot + 1).unwrap(); info.set_shard(runtime.shard().clone());
+            block.write_info(&info).unwrap();
+            let cell = block.serialize().unwrap(); let bytes = rtos_block::write_boc(&cell).unwrap();
+            (BlockIdExt::with_params(runtime.shard().clone(), slot + 1, cell.repr_hash().clone(),
+                UInt256::calc_file_hash(&bytes)), consensus_common::ConsensusCommonFactory::create_block_payload(bytes))
+        };
+        let hash_data = if empty { make_candidate_hash_data_empty(block_id.clone(), parent.clone().unwrap()) }
+            else { make_candidate_hash_data_with_parent(block_id.clone(), UInt256::default(), parent.clone()) };
+        let bytes = rtos_api::serialize_boxed(&hash_data).unwrap();
+        let id = RawCandidateId { slot: SlotIndex::new(slot), hash: UInt256::calc_file_hash(&bytes) };
+        chain.push((id.clone(), ReceivedCandidate { slot:id.slot, source_idx:ValidatorIndex::new(0),
+            candidate_hash_data_bytes:bytes, root_hash:block_id.root_hash().clone(),file_hash:block_id.file_hash().clone(),
+            block_id,data,collated_data:consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new()),
+            gen_utime_ms:None,receive_time:SystemTime::now(),is_empty:empty,parent_id:parent }));
+    }
+    let sign = |id:&RawCandidateId, final_vote:bool| {
+        let boxed = TlCandidateId { slot:id.slot.value() as i32,hash:id.hash.clone() }.into_boxed();
+        let vote = if final_vote { rtos_api::ton::consensus::simplex::unsignedvote::FinalizeVote{id:boxed}.into_boxed() }
+            else { rtos_api::ton::consensus::simplex::unsignedvote::NotarizeVote{id:boxed}.into_boxed() };
+        let bytes = crate::utils::create_data_to_sign(runtime.session_id(), &crate::utils::serialize_unsigned_vote(&vote));
+        stores.iter().enumerate().map(|(i,s)| crate::certificate::VoteSignature {
+            validator_idx:ValidatorIndex::new(i as u32),signature:s.sign_consensus(&bytes).unwrap().bytes.to_vec()
+        }).collect::<Vec<_>>()
+    };
+    let trigger = chain[3].0.clone();
+    let event = BlockFinalizedEvent {slot:trigger.slot,block_hash:trigger.hash.clone(),block_id:None,
+        certificate:Arc::new(crate::certificate::Certificate { vote:crate::simplex_state::FinalizeVote {
+            slot:trigger.slot,block_hash:trigger.hash.clone()},signatures:sign(&trigger,true) })};
+    let listener = RecordingListener::new();
+    let listener_dyn:Arc<dyn consensus_common::SessionListener+Send+Sync> = listener.clone();
+    let make_processor = |sink:Arc<HeldSink>| {
+        let db = crate::database::SimplexDb::open(&namespace,"sealed-cold").unwrap();
+        let mut processor = make_pq_processor_with_description_for_test(db.clone(),description.clone());
+        let callbacks = Arc::new(crate::session_callbacks::SessionCallbacks::new(runtime.session_id().clone(),
+            Arc::new(AtomicBool::new(false)),false,Arc::new(TestCallbackQueue),Arc::downgrade(&listener_dyn))
+            .with_delivery_sink(Some(sink)));
+        callbacks.initialize_delivery(runtime.clone(),std::path::Path::new(&namespace)).unwrap();
+        callbacks.bind_delivery_start(runtime.pin().zerostate.clone()).unwrap();
+        processor.consensus.set_callbacks_for_test(callbacks.clone()); processor.callbacks=callbacks;
+        for (id,received) in &chain { processor.candidate_book_mut().insert_received(id.clone(),received.clone()); }
+        let root=&chain[0].0;
+        processor.simplex_state.set_notarize_certificate(&description,root.slot,&root.hash,
+            Arc::new(crate::certificate::Certificate { vote:crate::simplex_state::NotarizeVote {
+                slot:root.slot,block_hash:root.hash.clone()},signatures:sign(root,false) })).unwrap();
+        (db,processor)
+    };
+    let map = std::path::Path::new(&namespace).join("finality-intents/outputs-v1")
+        .join(format!("{}-{}.outputs",trigger.slot.value(),trigger.hash.to_hex_string()));
+    let sink=Arc::new(HeldSink::default());
+    let (db,mut processor)=make_processor(sink.clone());
+    processor.handle_block_finalized(event.clone());
+    assert!(!map.exists(),"a held node handoff cannot seal a complete walk");
+    // Resolve only Final. Approval is a separate debt and must keep the map absent.
+    let staged=std::mem::take(&mut *sink.0.lock().unwrap());
+    assert!(!staged.is_empty());
+    for (draft,done) in staged {
+        if matches!(draft.finality,consensus_common::SessionFinality::PqApproval(_)) {
+            done(Err(rtos_block::error!("held approval before restart")));
+        } else { done(Ok(UInt256::from([1;32]))); }
+    }
+    processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+    assert!(!map.exists(),"Final ACK must not fill an ancestor Approval hole");
+    for (_,done) in std::mem::take(&mut *sink.0.lock().unwrap()) {
+        done(Err(rtos_block::error!("restart with source debt")));
+    }
+    drop(processor); db.close(None).unwrap(); drop(db);
+    let sink=Arc::new(HeldSink::default());
+    let (db,mut processor)=make_processor(sink.clone());
+    let retained = processor.callbacks.pending_finality_intents().unwrap();
+    assert_eq!(retained.len(), 1, "cold replay comes from the durable source certificate");
+    processor.replay_finality_intent(runtime.wire_profile().deserialize_typed(&retained[0]).unwrap()).unwrap();
+    for _ in 0..8 {
+        for (_,done) in std::mem::take(&mut *sink.0.lock().unwrap()) { done(Ok(UInt256::from([2;32]))); }
+        processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+        if map.exists() { break; }
+    }
+    let value:serde_json::Value=serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
+    let outputs=value["outputs"].as_array().unwrap();
+    assert_eq!(outputs.len(),2,"empty nodes produce no output; both nonempty ancestors do");
+    for (index,role) in [(0,false),(2,true)] {
+        assert!(outputs.iter().any(|v|v["block_id"]==chain[index].1.block_id.to_string() && v["is_final"]==role));
+    }
+    assert_eq!(value["released"],false,"sealed handoff is not Delivered confirmation");
+    drop(processor); db.close(None).unwrap();
+}

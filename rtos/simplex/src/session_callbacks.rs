@@ -147,8 +147,12 @@ impl SessionCallbacks {
         self.delivered_completion = callback;
         self
     }
+    pub(crate) fn closing_enabled(&self) -> bool {
+        self.delivered_completion.is_some()
+    }
     pub(crate) fn maintain_finality_closing(&self) {
-        if let Some(source) = self.source_delivery.lock().unwrap().clone() {
+        let source = self.source_delivery.lock().unwrap().clone();
+        if let Some(source) = source {
             if let Err(error) = source.maintain_closing() {
                 log::error!("Source closure retained: {error}");
             }
