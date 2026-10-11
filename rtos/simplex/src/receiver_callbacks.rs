@@ -143,6 +143,9 @@ impl ReceiverListener for ReceiverCallbacks {
 
     /// Handle incoming certificate from network
     fn on_certificate(&self, source_idx: u32, certificate: Certificate) {
+        self.on_member_certificate(Some(source_idx), certificate);
+    }
+    fn on_member_certificate(&self, source_idx: Option<u32>, certificate: Certificate) {
         self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
             processor.on_certificate(source_idx, certificate);
         }));

@@ -69,7 +69,7 @@ pub(crate) struct SessionDescription {
     /// Total weight of all validators
     total_weight: ValidatorWeight,
     /// Index of this validator in the list of sources
-    self_idx: ValidatorIndex,
+    self_idx: Option<ValidatorIndex>,
     /// Shard identifier
     shard: ShardIdent,
     /// Local validator's private key (for signing votes and candidates)
@@ -113,6 +113,31 @@ impl SessionDescription {
         shard: &ShardIdent,
         session_creation_time: SystemTime,
         metrics_receiver: Option<MetricsHandle>,
+    ) -> Result<Self> {
+        Self::new_with_runtime(
+            options,
+            session_id,
+            initial_block_seqno,
+            nodes,
+            local_key,
+            shard,
+            session_creation_time,
+            metrics_receiver,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_runtime<N: Clone + Into<crate::SimplexSessionNode>>(
+        options: &SessionOptions,
+        session_id: SessionId,
+        initial_block_seqno: u32,
+        nodes: &[N],
+        local_key: PrivateKey,
+        shard: &ShardIdent,
+        session_creation_time: SystemTime,
+        metrics_receiver: Option<MetricsHandle>,
+        runtime: Option<&consensus_common::session_runtime::AuthenticatedSessionRuntime>,
     ) -> Result<Self> {
         let nodes: Vec<crate::SimplexSessionNode> = nodes.iter().cloned().map(Into::into).collect();
         let session_id_str = session_id.to_hex_string();
@@ -189,15 +214,37 @@ impl SessionDescription {
             sources.push(source);
         }
 
-        let self_idx = match local_idx {
-            Some(idx) => ValidatorIndex::from(idx),
-            None => {
-                fail!(
-                    "SessionDescription::new: can't find validator with local ID {} in sources",
-                    local_id
-                )
+        if let Some(runtime) = runtime {
+            if runtime.session_id() != &session_id
+                || runtime.shard() != shard
+                || runtime.local_adnl() != local_key.id()
+                || runtime.protocol() != options.protocol
+                || runtime.carrier_version() != options.proto_version
+                || runtime.slots_per_leader_window() != options.slots_per_leader_window
+                || runtime.wire_profile() != options.wire_profile
+                || runtime.committee().len() != nodes.len()
+            {
+                fail!("SessionDescription differs from authenticated runtime");
             }
-        };
+            for (node, member) in nodes.iter().zip(runtime.committee()) {
+                let expected = crate::SimplexSessionNode::from_descriptor(member)?;
+                if node.adnl_id != expected.adnl_id
+                    || node.identity.id() != expected.identity.id()
+                    || node.weight != expected.weight
+                {
+                    fail!("SessionDescription committee differs from authenticated runtime");
+                }
+            }
+            let role = local_idx
+                .map(|i| consensus_common::session_runtime::LocalRole::Validator(i as u32))
+                .unwrap_or(consensus_common::session_runtime::LocalRole::Observer);
+            if runtime.local_role() != role {
+                fail!("Authenticated local role mismatch");
+            }
+        } else if local_idx.is_none() {
+            fail!("Observer requires authenticated session runtime");
+        }
+        let self_idx = local_idx.map(ValidatorIndex::from);
 
         let metrics_receiver = metrics_receiver.unwrap_or_else(|| MetricsHandle::new(None));
 
@@ -251,13 +298,14 @@ impl SessionDescription {
     }
 
     pub fn is_pq(&self) -> bool {
-        self.sources[self.self_idx.value() as usize].public_key.pq_key().is_some()
+        self.sources.iter().any(|source| source.public_key.pq_key().is_some())
     }
 
     pub fn sign_own_vote(
         &self,
         vote: &crate::simplex_state::Vote,
     ) -> Result<rtos_api::ton::consensus::simplex::vote::Vote> {
+        self.require_validator_index()?;
         if !self.is_pq() {
             return Ok(crate::utils::sign_vote(
                 vote,
@@ -275,7 +323,7 @@ impl SessionDescription {
         candidate: rtos_api::ton::consensus::CandidateData,
     ) -> Result<rtos_api::ton::consensus::CandidateData> {
         let slot = *candidate.slot();
-        if slot < 0 || self.get_leader(SlotIndex::new(slot as u32)) != self.get_self_idx() {
+        if slot < 0 || Some(self.get_leader(SlotIndex::new(slot as u32))) != self.self_idx {
             fail!("candidate signer is not session leader");
         }
         let guard = self.own_signing.lock().map_err(|_| error!("signer capability poisoned"))?;
@@ -288,7 +336,7 @@ impl SessionDescription {
     pub fn recover_own_journal(&self, bootstrap: &mut crate::database::Bootstrap) -> Result<()> {
         let guard = self.own_signing.lock().map_err(|_| error!("signer capability poisoned"))?;
         match guard.as_ref() {
-            Some(signer) => signer.recover_bootstrap(bootstrap, self.self_idx),
+            Some(signer) => signer.recover_bootstrap(bootstrap, self.require_validator_index()?),
             None if bootstrap.own_journal.is_empty() => Ok(()),
             None => fail!("own journal requires authenticated binding"),
         }
@@ -310,6 +358,7 @@ impl SessionDescription {
         &self,
         coordinator: std::sync::Arc<crate::signing_coordinator::SigningCoordinator>,
     ) -> Result<()> {
+        self.require_validator_index()?;
         coordinator.check_session(self)?;
         let mut guard =
             self.own_signing.lock().map_err(|_| error!("signer capability poisoned"))?;
@@ -346,7 +395,8 @@ impl SessionDescription {
 
     /// Get local validator's private key
     pub fn get_legacy_signing_key(&self) -> Result<&PrivateKey> {
-        if self.sources[self.self_idx.value() as usize].public_key.pq_key().is_some() {
+        self.require_validator_index()?;
+        if self.sources.iter().any(|source| source.public_key.pq_key().is_some()) {
             fail!("PQ consensus signer is Disabled");
         }
         Ok(&self.local_key)
@@ -412,14 +462,27 @@ impl SessionDescription {
 
     /// Get this validator's index
     pub fn get_self_idx(&self) -> ValidatorIndex {
+        self.self_idx.expect("validator-only operation requires local validator role")
+    }
+
+    pub fn local_validator_index(&self) -> Option<ValidatorIndex> {
         self.self_idx
+    }
+    pub fn is_validator(&self) -> bool {
+        self.self_idx.is_some()
+    }
+    pub fn require_validator_index(&self) -> Result<ValidatorIndex> {
+        self.self_idx.ok_or_else(|| error!("Observer has no signing or voting authority"))
+    }
+    pub fn local_role_label(&self) -> String {
+        self.self_idx.map_or_else(|| "observer".into(), |index| index.to_string())
     }
 
     /// Check if the given validator index is this validator
     #[inline]
     #[cfg(test)]
     pub fn is_self(&self, idx: ValidatorIndex) -> bool {
-        idx == self.self_idx
+        Some(idx) == self.self_idx
     }
 
     /// Get shard identifier
@@ -480,7 +543,7 @@ impl SessionDescription {
     /// Is this node the leader for the given slot's window?
     #[cfg(test)]
     pub fn is_self_leader(&self, slot: SlotIndex) -> bool {
-        self.get_leader(slot) == self.self_idx
+        Some(self.get_leader(slot)) == self.self_idx
     }
 
     /*
@@ -541,7 +604,7 @@ impl fmt::Display for SessionDescription {
             "SessionDescription(nodes={}, total_weight={}, self_idx={})",
             self.sources.len(),
             self.total_weight,
-            self.self_idx
+            self.local_role_label()
         )
     }
 }

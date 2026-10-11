@@ -619,6 +619,26 @@ impl ConsensusFactory {
         Ok(Arc::new(SessionHolder::simplex(simplex_session)))
     }
 
+    /// Create from the manager's frozen authenticated config and role. Options
+    /// may tune local timing but cannot change protocol domains or leader schedule.
+    pub fn create_simplex_authenticated_session(
+        options: &SimplexSessionOptions,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        local_transport_key: &PrivateKey,
+        db_root: String,
+        overlay_manager: ConsensusOverlayManagerPtr,
+        listener: SessionListenerPtr,
+        trace_collector: Option<simplex::TraceCollector>,
+    ) -> consensus_common::Result<SessionHolderPtr> {
+        options.validate_authenticated(&runtime)?;
+        let mut options = options.clone();
+        options.use_callback_thread = false;
+        options.wait_for_db_init = true;
+        let db_path = runtime.runtime_directory(&db_root)?;
+        let session = simplex::SessionFactory::create_authenticated_session(&options, runtime, local_transport_key, db_path, overlay_manager, listener, trace_collector)?;
+        Ok(Arc::new(SessionHolder::simplex(session)))
+    }
+
     /// Create a test-only Simplex-compatible session backed by ConsensusEmulator.
     #[cfg(test)]
     pub fn create_emulator_based_session(

@@ -954,6 +954,7 @@ pub(crate) struct SimplexState {
 
     /// Number of validators
     num_validators: usize,
+    local_is_validator: bool,
 
     /// Mapping from candidate hash to CandidateId
     ///
@@ -1096,6 +1097,7 @@ impl SimplexState {
             pending_slots: BinaryHeap::new(),
             slot_votes: HashMap::new(),
             num_validators,
+            local_is_validator: desc.is_validator(),
             candidate_ids: HashMap::new(),
             first_non_progressed_slot: SlotIndex(0),
             skip_intervals: BTreeSet::new(),
@@ -2257,6 +2259,9 @@ impl SimplexState {
 
     /// Push a broadcast vote event.
     fn broadcast_vote(&mut self, vote: Vote) {
+        if !self.local_is_validator {
+            return;
+        }
         self.push_event_back(SimplexEvent::BroadcastVote(vote));
     }
 }
@@ -2284,7 +2289,9 @@ impl SimplexState {
 
         // Process expired timeouts
         // Reference: C++ alarm() → upon Timeout(s) do
-        self.process_timeouts(desc);
+        if self.local_is_validator {
+            self.process_timeouts(desc);
+        }
 
         // Dump state at trace level (compact one-line format)
         if log::log_enabled!(log::Level::Trace) {
@@ -2296,7 +2303,11 @@ impl SimplexState {
     ///
     /// Returns the timestamp when `check_all()` should be called.
     pub fn get_next_timeout(&self) -> Option<SystemTime> {
-        self.skip_timestamp
+        if self.local_is_validator {
+            self.skip_timestamp
+        } else {
+            None
+        }
     }
 
     /// Arm/reset startup timeouts when session processing actually starts.
@@ -2561,7 +2572,7 @@ impl SimplexState {
 
         log::trace!(
             "SimplexState::on_candidate: ({}/{}/{}) received {} parent={} leader={}",
-            desc.get_self_idx(),
+            desc.local_role_label(),
             window_idx,
             slot,
             Self::format_block(slot, &candidate.id.hash),
@@ -2740,7 +2751,7 @@ impl SimplexState {
 
         log::trace!(
             "SimplexState::on_vote: ({}/{}/{}) from {} {}",
-            desc.get_self_idx(),
+            desc.local_role_label(),
             window_idx,
             slot,
             validator_idx,
@@ -3587,6 +3598,9 @@ impl SimplexState {
         block_hash: &UInt256,
         parent: Option<&CandidateParentInfo>,
     ) -> bool {
+        if !self.local_is_validator {
+            return false;
+        }
         let window_idx = desc.get_window_idx(slot);
         let offset = desc.get_slot_offset_in_window(slot) as usize;
 
@@ -3672,6 +3686,9 @@ impl SimplexState {
     ///     state[s] ← state[s] ∪ {ItsOver}
     /// ```
     fn try_final(&mut self, desc: &SessionDescription, slot: SlotIndex, block_hash: &UInt256) {
+        if !self.local_is_validator {
+            return;
+        }
         let window_idx = desc.get_window_idx(slot);
         let offset = desc.get_slot_offset_in_window(slot) as usize;
 
@@ -3942,6 +3959,9 @@ impl SimplexState {
     ///         pendingBlocks[k] ← ⊥
     /// ```
     fn try_skip_window(&mut self, window_idx: WindowIndex) {
+        if !self.local_is_validator {
+            return;
+        }
         self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
 
         let start_slot = window_idx * self.slots_per_leader_window;
@@ -4781,7 +4801,7 @@ impl SimplexState {
             result.push_str(&format!(
                 "  - validators: {}, local_idx: {}\n",
                 self.num_validators,
-                desc.get_self_idx()
+                desc.local_role_label()
             ));
 
             // Thresholds

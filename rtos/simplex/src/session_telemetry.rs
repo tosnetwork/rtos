@@ -952,10 +952,10 @@ impl SessionTelemetry {
     pub(crate) fn record_candidate_ingress(
         &self,
         sender_idx: ValidatorIndex,
-        self_idx: ValidatorIndex,
+        self_idx: Option<ValidatorIndex>,
         is_broadcast_candidate: bool,
     ) {
-        if sender_idx == self_idx {
+        if Some(sender_idx) == self_idx {
             return;
         }
         if is_broadcast_candidate {
@@ -2275,7 +2275,7 @@ impl SessionTelemetry {
         r.push_str(&format!(
             "    validators={} local={} session_time={session_time:.1}s slot_duration={:.1}s\n",
             description.get_total_nodes(),
-            description.get_self_idx(),
+            description.local_role_label(),
             status.slot_duration_secs,
         ));
         r.push_str(&format!(
@@ -2493,7 +2493,8 @@ impl SessionTelemetry {
         if let Some(ref snap) = self.receiver_snapshot() {
             r.push_str("  peers:\n");
             for src in &snap.sources {
-                let is_self = src.source_idx == description.get_self_idx().0 as u32;
+                let is_self = Some(ValidatorIndex::new(src.source_idx))
+                    == description.local_validator_index();
                 let vi = ValidatorIndex::from(src.source_idx);
                 let weight = description.get_node_weight(vi);
                 let weight_pct = if total_weight > 0 {

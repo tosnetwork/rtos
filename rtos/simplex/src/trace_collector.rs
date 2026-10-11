@@ -266,7 +266,11 @@ impl TraceCollector {
         cc_seqno: u32,
     ) {
         let shard = desc.get_shard();
-        let self_idx = desc.get_self_idx();
+        let Some(self_idx) = desc.local_validator_index() else {
+            // The legacy Id event requires a validator index; do not invent one
+            // for observer telemetry.
+            return;
+        };
         let weight = desc.get_node_weight(self_idx);
         let opts = desc.opts();
 

@@ -71,6 +71,15 @@ impl ConsensusOverlayManager for ConsensusOverlayManagerImpl {
         )
     }
 
+    fn start_authenticated_overlay(
+        &self, key: &PrivateKey, id: &Arc<PrivateOverlayShortId>,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        listener: ConsensusOverlayListenerPtr, replay: ConsensusOverlayLogReplayListenerPtr,
+        transport: OverlayTransportType,
+    ) -> Result<ConsensusOverlayPtr> {
+        self.network.create_authenticated_consensus_client(self.validator_list_id.clone(), key, id, runtime, listener, replay, None, transport)
+    }
+
     /// Stop existing overlay
     fn stop_overlay(
         &self,

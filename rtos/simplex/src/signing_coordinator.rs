@@ -412,6 +412,7 @@ impl SigningCoordinator {
         &self,
         description: &crate::session_description::SessionDescription,
     ) -> Result<()> {
+        description.require_validator_index()?;
         let state = self.state.lock().map_err(|_| error!("journal lock poisoned"))?;
         let b = &state.header.binding;
         if b.session != *description.get_session_id().as_array()

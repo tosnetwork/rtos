@@ -368,6 +368,11 @@ pub(crate) trait ReceiverListener: Send + Sync {
     /// * `source_idx` - Validator index of the sender
     /// * `certificate` - Deserialized TL certificate object
     fn on_certificate(&self, source_idx: u32, certificate: Certificate);
+    fn on_member_certificate(&self, source_idx: Option<u32>, certificate: Certificate) {
+        if let Some(index) = source_idx {
+            self.on_certificate(index, certificate);
+        }
+    }
 
     /// Incoming block candidate (from broadcast or query response)
     ///
@@ -451,7 +456,8 @@ pub(crate) struct ReceiverImpl {
     /// Local ADNL ID
     local_adnl_id: PublicKeyHash,
     /// Local source index
-    local_idx: u32,
+    local_idx: Option<u32>,
+    membership: consensus_common::simplex_protocol::SimplexMembership,
     /// Receiver listener (weak reference to SessionProcessor)
     listener: ReceiverListenerPtr,
     /// Per-source statistics
@@ -910,19 +916,10 @@ impl ReceiverImpl {
         check_execution_time!(50_000);
         instrument!();
 
-        // Find source index
-        let source_idx = match self.adnl_to_idx.get(&adnl_id) {
-            Some(idx) => *idx,
-            None => {
-                log::warn!(
-                    "SimplexReceiver {}: received message from unknown ADNL ID {}",
-                    self.session_id.to_hex_string(),
-                    key_to_base64(&adnl_id)
-                );
-                return;
-            }
-        };
-
+        if self.membership.role(&adnl_id).is_err() {
+            return;
+        }
+        let source_idx = self.adnl_to_idx.get(&adnl_id).copied();
         // Capture raw bytes before deserialization (for misbehavior proofs)
         // Wrap in RawVoteData (Arc) early for memory-efficient sharing
         let raw_vote: RawVoteData = data.data().to_vec().into();
@@ -934,7 +931,7 @@ impl ReceiverImpl {
             Ok(msg) => msg,
             Err(err) => {
                 log::warn!(
-                    "SimplexReceiver {}: failed to deserialize message from source {}: {}",
+                    "SimplexReceiver {}: failed to deserialize message from source {:?}: {}",
                     self.session_id.to_hex_string(),
                     source_idx,
                     err
@@ -947,6 +944,9 @@ impl ReceiverImpl {
         // downcast returns Err(self) on failure, so we can try the next type
         let message = match message.downcast::<TlVoteBoxed>() {
             Ok(vote) => {
+                let Some(source_idx) = source_idx else {
+                    return;
+                };
                 // Avoid logging full TL vote (includes signature bytes) on the hot path.
                 let (kind, slot, hash_prefix) = match vote.vote() {
                     UnsignedVote::Consensus_Simplex_NotarizeVote(v) => {
@@ -960,7 +960,7 @@ impl ReceiverImpl {
                     }
                 };
                 log::trace!(
-                    "SimplexReceiver {}: received vote from source {} kind={} slot={} hash={}",
+                    "SimplexReceiver {}: received vote from source {:?} kind={} slot={} hash={}",
                     self.session_id.to_hex_string(),
                     source_idx,
                     kind,
@@ -990,7 +990,7 @@ impl ReceiverImpl {
                     }
                 };
                 log::trace!(
-                    "SimplexReceiver {}: received certificate from source {} kind={} slot={} hash={} sigs={}",
+                    "SimplexReceiver {}: received certificate from source {:?} kind={} slot={} hash={} sigs={}",
                     self.session_id.to_hex_string(),
                     source_idx,
                     kind,
@@ -1006,7 +1006,7 @@ impl ReceiverImpl {
 
         // Unknown message type
         log::warn!(
-            "SimplexReceiver {}: unknown message type from source {}",
+            "SimplexReceiver {}: unknown message type from source {:?}",
             self.session_id.to_hex_string(),
             source_idx
         );
@@ -1051,6 +1051,10 @@ impl ReceiverImpl {
     ) {
         check_execution_time!(50_000);
 
+        if self.membership.role(&adnl_id).is_err() {
+            response_callback(Err(error!("Query source is not an authenticated overlay member")));
+            return;
+        }
         let request_data = data.data();
         let object = match self.wire_profile.deserialize(request_data) {
             Ok(object) => object,
@@ -1186,6 +1190,9 @@ impl ReceiverImpl {
     /// * `vote` - Already signed TL vote to broadcast
     /// * `is_rebroadcast` - If true, this is a re-broadcast (no loopback, no save, marked as retransmission)
     fn send_vote_impl(&mut self, vote: TlVote, is_rebroadcast: bool) {
+        let Some(local_idx) = self.local_idx else {
+            return;
+        };
         check_execution_time!(20_000);
         instrument!();
 
@@ -1212,14 +1219,15 @@ impl ReceiverImpl {
 
         // Update metrics (bytes are per-message, multiplied by recipient count)
         let msg_size = payload.data().len() as u64;
-        let recipient_count = self.send_order.iter().filter(|&&idx| idx != self.local_idx).count();
+        let recipient_count =
+            self.send_order.iter().filter(|&&idx| Some(idx) != self.local_idx).count();
         self.out_messages_bytes.increment(msg_size * recipient_count as u64);
         self.out_bytes.increment(msg_size * recipient_count as u64);
         self.out_messages_count.increment(recipient_count as u64);
 
         // Send to all validators in shuffled order
         for &target_idx in &self.send_order {
-            if target_idx == self.local_idx {
+            if Some(target_idx) == self.local_idx {
                 continue; // Skip self
             }
 
@@ -1247,7 +1255,7 @@ impl ReceiverImpl {
                 self.session_id.to_hex_string()
             );
             if let Some(listener) = self.listener.upgrade() {
-                listener.on_vote(self.local_idx, vote.into_boxed(), raw_vote);
+                listener.on_vote(local_idx, vote.into_boxed(), raw_vote);
             }
         }
     }
@@ -1267,6 +1275,9 @@ impl ReceiverImpl {
         candidate_hash: UInt256,
         candidate: CandidateData,
     ) {
+        if self.local_idx.is_none() {
+            return;
+        }
         check_execution_time!(50_000);
         instrument!();
 
@@ -1368,7 +1379,7 @@ impl ReceiverImpl {
         self.out_bytes.increment(msg_size);
 
         // Update local source stats
-        if let Some(stats) = self.sources.get_mut(self.local_idx as usize) {
+        if let Some(stats) = self.local_idx.and_then(|index| self.sources.get_mut(index as usize)) {
             stats.out_broadcasts += 1;
             stats.last_send_time = Some(SystemTime::now());
         }
@@ -1389,30 +1400,10 @@ impl ReceiverImpl {
 
     fn send_serialized_certificate_to_all(&mut self, bytes: Vec<u8>) {
         let payload = ConsensusCommonFactory::create_block_payload(bytes.into());
-        let msg_size = payload.data().len() as u64;
-        let recipient_count = self.standstill_send_recipient_count();
-
-        self.out_messages_bytes.increment(msg_size * recipient_count);
-        self.out_bytes.increment(msg_size * recipient_count);
-        self.out_messages_count.increment(recipient_count);
-
-        for &target_idx in &self.send_order {
-            if target_idx == self.local_idx {
-                continue;
-            }
-
-            if let Some(stats) = self.sources.get_mut(target_idx as usize) {
-                stats.out_messages += 1;
-                stats.last_send_time = Some(SystemTime::now());
-
-                self.overlay.send_message(
-                    &stats.adnl_id,
-                    &self.local_adnl_id,
-                    &payload,
-                    false, // is_retransmission=false for simplex
-                );
-            }
-        }
+        // v0/v1 retain their historical broadcast-to-committee replay behavior.
+        let random = self.membership.members().any(|member|
+            self.membership.validator_index(member).is_err());
+        self.send_certificate_payload_to_members(&payload, random);
     }
 
     /// Shuffle send order for fairness
@@ -1755,14 +1746,14 @@ impl ReceiverImpl {
     /// # Arguments
     /// * `source_idx` - Validator index of the sender
     /// * `certificate` - Deserialized TL certificate object
-    fn process_incoming_certificate(&mut self, source_idx: u32, certificate: Certificate) {
+    fn process_incoming_certificate(&mut self, source_idx: Option<u32>, certificate: Certificate) {
         instrument!();
 
         // C++ parity (`pool.cpp` `is_banned()` precheck): skip processing of
         // certificate messages from temporarily banned peers entirely.
-        if self.is_source_temporarily_banned(source_idx) {
+        if source_idx.is_some_and(|index| self.is_source_temporarily_banned(index)) {
             log::trace!(
-                "SimplexReceiver {}: dropping certificate from temporarily banned source {}",
+                "SimplexReceiver {}: dropping certificate from temporarily banned source {:?}",
                 self.session_id.to_hex_string(),
                 source_idx
             );
@@ -1770,7 +1761,7 @@ impl ReceiverImpl {
         }
 
         // Update source stats
-        if let Some(stats) = self.sources.get_mut(source_idx as usize) {
+        if let Some(stats) = source_idx.and_then(|index| self.sources.get_mut(index as usize)) {
             stats.in_messages += 1;
             stats.last_recv_time = Some(SystemTime::now());
         }
@@ -1799,7 +1790,7 @@ impl ReceiverImpl {
             }
         };
         log::trace!(
-            "SimplexReceiver {}: received certificate from source {} kind={} slot={} hash={} sigs={}",
+            "SimplexReceiver {}: received certificate from source {:?} kind={} slot={} hash={} sigs={}",
             self.session_id.to_hex_string(),
             source_idx,
             kind,
@@ -1812,7 +1803,7 @@ impl ReceiverImpl {
         // a certificate only because its slot is ahead of the current vote horizon.
         if self.is_certificate_slot_too_old(slot) {
             log::trace!(
-                "SimplexReceiver {}: dropped old certificate from source {} - slot {} < {} kind={}",
+                "SimplexReceiver {}: dropped old certificate from source {:?} - slot {} < {} kind={}",
                 self.session_id.to_hex_string(),
                 source_idx,
                 slot,
@@ -1833,7 +1824,7 @@ impl ReceiverImpl {
         };
         if self.is_certificate_kind_accepted(slot, cert_kind) {
             log::trace!(
-                "SimplexReceiver {}: dropped duplicate certificate from source {} - \
+                "SimplexReceiver {}: dropped duplicate certificate from source {:?} - \
                 slot {} kind={} already accepted by FSM",
                 self.session_id.to_hex_string(),
                 source_idx,
@@ -1843,7 +1834,7 @@ impl ReceiverImpl {
             return;
         }
 
-        if let Some(stats) = self.sources.get_mut(source_idx as usize) {
+        if let Some(stats) = source_idx.and_then(|index| self.sources.get_mut(index as usize)) {
             let now = SystemTime::now();
             match kind {
                 "notarize" => {
@@ -1864,7 +1855,7 @@ impl ReceiverImpl {
         // Forward to listener for verification and application
         // SessionProcessor will verify the certificate signatures and update SimplexState
         if let Some(listener) = self.listener.upgrade() {
-            listener.on_certificate(source_idx, certificate);
+            listener.on_member_certificate(source_idx, certificate);
         }
     }
 
@@ -2096,37 +2087,31 @@ impl ReceiverImpl {
         let serialized = self.wire_profile.serialize(&certificate).expect("fixed wire carrier");
         let payload = ConsensusCommonFactory::create_block_payload(serialized.into());
 
-        log::trace!(
-            "SimplexReceiver {}: sending certificate to {} validators, size={}",
-            self.session_id.to_hex_string(),
-            self.send_order.len(),
-            payload.data().len()
-        );
+        self.send_certificate_payload_to_members(&payload, false);
+    }
 
-        // Update metrics
-        let msg_size = payload.data().len() as u64;
-        let recipient_count = self.send_order.iter().filter(|&&idx| idx != self.local_idx).count();
-        self.out_messages_bytes.increment(msg_size * recipient_count as u64);
-        self.out_bytes.increment(msg_size * recipient_count as u64);
-        self.out_messages_count.increment(recipient_count as u64);
-
-        // Send to all validators except self
-        for &target_idx in &self.send_order {
-            if target_idx == self.local_idx {
-                continue;
+    /// Certificates may be forwarded by observers. Initial publication reaches
+    /// every authenticated transport member; standstill gossip samples a member.
+    fn send_certificate_payload_to_members(&mut self, payload: &BlockPayloadPtr, random: bool) {
+        let mut targets: Vec<_> = self.membership.members()
+            .filter(|key| *key != &self.local_adnl_id).cloned().collect();
+        if random {
+            targets.shuffle(&mut rand::thread_rng());
+            targets.truncate(1);
+        }
+        let count = targets.len() as u64;
+        let bytes = payload.data().len() as u64 * count;
+        self.out_messages_bytes.increment(bytes);
+        self.out_bytes.increment(bytes);
+        self.out_messages_count.increment(count);
+        for target in targets {
+            if let Ok(index) = self.membership.validator_index(&target) {
+                if let Some(stats) = self.sources.get_mut(index as usize) {
+                    stats.out_messages += 1;
+                    stats.last_send_time = Some(SystemTime::now());
+                }
             }
-
-            if let Some(stats) = self.sources.get_mut(target_idx as usize) {
-                stats.out_messages += 1;
-                stats.last_send_time = Some(SystemTime::now());
-
-                self.overlay.send_message(
-                    &stats.adnl_id,
-                    &self.local_adnl_id,
-                    &payload,
-                    false, // is_retransmission not used in simplex
-                );
-            }
+            self.overlay.send_message(&target, &self.local_adnl_id, payload, false);
         }
     }
 
@@ -2547,7 +2532,7 @@ impl ReceiverImpl {
     }
 
     fn standstill_send_recipient_count(&self) -> u64 {
-        self.send_order.iter().filter(|&&idx| idx != self.local_idx).count() as u64
+        self.send_order.iter().filter(|&&idx| Some(idx) != self.local_idx).count() as u64
     }
 
     fn standstill_cost_recipient_count(&self) -> u64 {
@@ -3236,7 +3221,7 @@ impl ReceiverImpl {
         for offset in 0..len {
             let idx = (start_idx + offset) % len;
             let validator_idx = self.send_order[idx];
-            if validator_idx == self.local_idx {
+            if Some(validator_idx) == self.local_idx {
                 continue;
             }
             if let Some(ex) = exclude {
@@ -3256,7 +3241,7 @@ impl ReceiverImpl {
         for offset in 0..len {
             let idx = (start_idx + offset) % len;
             let validator_idx = self.send_order[idx];
-            if validator_idx == self.local_idx {
+            if Some(validator_idx) == self.local_idx {
                 continue;
             }
             if let Some(state_ro) = state {
@@ -3289,7 +3274,7 @@ impl ReceiverImpl {
         self.send_order
             .iter()
             .copied()
-            .filter(|idx| *idx != self.local_idx)
+            .filter(|idx| Some(*idx) != self.local_idx)
             .filter_map(|validator_idx| {
                 let not_before = state.peer_retry_not_before.get(&validator_idx).copied()?;
                 if not_before.duration_since(now).is_ok() {
@@ -4281,7 +4266,7 @@ impl ReceiverImpl {
         let sources_count = self.sources.len();
 
         log::debug!(
-            "SimplexReceiver {} debug dump (local_idx={}, sources_count={}):",
+            "SimplexReceiver {} debug dump (local_idx={:?}, sources_count={}):",
             session_id_short,
             self.local_idx,
             sources_count
@@ -4300,8 +4285,9 @@ impl ReceiverImpl {
                 .map(|d| format!("{:.1}s", d.as_secs_f64()))
                 .unwrap_or_else(|| "never".to_string());
 
-            let local_marker = if stats.source_idx == self.local_idx { " (local)" } else { "" };
-            let prefix = if stats.source_idx == self.local_idx { ">" } else { " " };
+            let local_marker =
+                if Some(stats.source_idx) == self.local_idx { " (local)" } else { "" };
+            let prefix = if Some(stats.source_idx) == self.local_idx { ">" } else { " " };
 
             log::debug!(
                 "{} {}v{:03}/{:03}: msgs={:4}/{:4}, bcasts={:4}/{:4}, \
@@ -4332,7 +4318,7 @@ impl ReceiverImpl {
         for stats in &self.sources {
             // Always count our own weight - we're always active locally
             // (we don't receive messages from ourselves, so last_recv_time is None)
-            if stats.source_idx == self.local_idx {
+            if Some(stats.source_idx) == self.local_idx {
                 active_weight += stats.weight;
                 continue;
             }
@@ -4356,7 +4342,9 @@ impl ReceiverImpl {
         let now = SystemTime::now();
         self.sources
             .iter()
-            .map(|s| if s.source_idx == self.local_idx { Some(now) } else { s.last_recv_time })
+            .map(
+                |s| if Some(s.source_idx) == self.local_idx { Some(now) } else { s.last_recv_time },
+            )
             .collect()
     }
 }
@@ -4668,27 +4656,81 @@ impl ReceiverWrapper {
         health_counters: Arc<ReceiverHealthCounters>,
         settings: ReceiverSettings,
     ) -> Result<ReceiverPtr> {
+        Self::create_with_runtime(
+            session_id,
+            shard,
+            ids,
+            local_key,
+            overlay_manager,
+            listener,
+            panicked_flag,
+            health_counters,
+            settings,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_with_runtime<N: Clone + Into<crate::SimplexSessionNode>>(
+        session_id: SessionId,
+        shard: &ShardIdent,
+        ids: &[N],
+        local_key: &PrivateKey,
+        overlay_manager: ConsensusOverlayManagerPtr,
+        listener: ReceiverListenerPtr,
+        panicked_flag: Arc<AtomicBool>,
+        health_counters: Arc<ReceiverHealthCounters>,
+        settings: ReceiverSettings,
+        runtime: Option<&consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+    ) -> Result<ReceiverPtr> {
         let ids: Vec<crate::SimplexSessionNode> = ids.iter().cloned().map(Into::into).collect();
-        settings.protocol.admits_runtime()?;
+        if runtime.is_none() {
+            settings.protocol.admits_runtime()?;
+        }
+        if let Some(runtime) = runtime {
+            if runtime.session_id() != &session_id
+                || runtime.shard() != shard
+                || runtime.local_adnl() != local_key.id()
+                || runtime.protocol() != settings.protocol
+                || runtime.carrier_version() != settings.proto_version
+                || runtime.slots_per_leader_window() != settings.slots_per_leader_window
+                || runtime.wire_profile() != settings.wire_profile
+            {
+                fail!("Receiver differs from authenticated runtime");
+            }
+        }
         if settings.wire_profile != overlay_manager.wire_profile() {
             fail!("Simplex receiver/overlay wire profile mismatch");
         }
         let ordered_adnl: Vec<_> = ids.iter().map(|node| node.adnl_id.clone()).collect();
-        let membership = consensus_common::simplex_protocol::SimplexMembership::new(
-            &ordered_adnl,
-            ordered_adnl.iter().cloned(),
-        )?;
-        let local_node = ids
-            .iter()
-            .find(|node| {
-                if node.identity.pq_key().is_some() {
-                    &node.adnl_id == local_key.id()
-                } else {
-                    node.identity.id() == local_key.id()
-                }
-            })
-            .ok_or_else(|| error!("Local key not found in node list"))?;
-        let local_idx = membership.validator_index(&local_node.adnl_id)?;
+        let membership = match runtime {
+            Some(runtime) => runtime.membership()?,
+            None => consensus_common::simplex_protocol::SimplexMembership::new(
+                &ordered_adnl,
+                ordered_adnl.iter().cloned(),
+            )?,
+        };
+        let local_node = ids.iter().find(|node| {
+            if node.identity.pq_key().is_some() {
+                &node.adnl_id == local_key.id()
+            } else {
+                node.identity.id() == local_key.id()
+            }
+        });
+        if runtime.is_none() && local_node.is_none() {
+            fail!("Local key not found in node list");
+        }
+        let local_adnl_id =
+            local_node.map(|node| node.adnl_id.clone()).unwrap_or_else(|| local_key.id().clone());
+        let local_idx = match membership.role(&local_adnl_id)? {
+            consensus_common::simplex_protocol::OverlayMemberRole::Validator(index) => Some(index),
+            consensus_common::simplex_protocol::OverlayMemberRole::Observer
+                if runtime.is_some() =>
+            {
+                None
+            }
+            _ => fail!("Observer requires authenticated runtime"),
+        };
 
         // Destructure once at the top so the rest of the function reads as if
         // each setting were still a free-standing parameter.
@@ -4801,17 +4843,29 @@ impl ReceiverWrapper {
         };
         // Block-sync overlay params (including overlay_id) live on the
         // validator-side ConsensusOverlayManagerImpl; simplex passes None.
-        let overlay = overlay_manager.start_overlay(
-            local_key,
-            &overlay_short_id,
-            &consensus_nodes,
-            Arc::downgrade(&overlay_data_listener),
-            Arc::downgrade(&overlay_replay_listener),
-            transport_type,
-            None,
-        )?;
-
-        let local_adnl_id = ids[local_idx as usize].adnl_id.clone();
+        let overlay = if let Some(runtime) = runtime {
+            if runtime.overlay_short_id()? != overlay_short_id {
+                fail!("Receiver overlay seed differs from authenticated committee");
+            }
+            overlay_manager.start_authenticated_overlay(
+                local_key,
+                &overlay_short_id,
+                Arc::new(runtime.clone()),
+                Arc::downgrade(&overlay_data_listener),
+                Arc::downgrade(&overlay_replay_listener),
+                transport_type,
+            )?
+        } else {
+            overlay_manager.start_overlay(
+                local_key,
+                &overlay_short_id,
+                &consensus_nodes,
+                Arc::downgrade(&overlay_data_listener),
+                Arc::downgrade(&overlay_replay_listener),
+                transport_type,
+                None,
+            )?
+        };
 
         // Build sources and mappings
         let mut sources = Vec::with_capacity(ids.len());
@@ -4873,6 +4927,7 @@ impl ReceiverWrapper {
                     local_key: local_key_clone,
                     local_adnl_id: local_adnl_id.clone(),
                     local_idx,
+                    membership,
                     listener: listener_clone,
                     sources,
                     adnl_to_idx,

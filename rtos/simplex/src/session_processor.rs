@@ -1125,6 +1125,9 @@ impl SessionProcessor {
                     self.consensus.insert_before_split(block_id, before_split);
                 }
                 if let Some(observed) = observed {
+                    if let Some(evidence) = observed.authentication {
+                        self.callbacks.notify_authenticated_candidate(evidence);
+                    }
                     self.callbacks.notify_candidate_observed(
                         observed.block_id,
                         observed.data,
@@ -2052,6 +2055,9 @@ impl ConsensusBackend for ConsensusBackendAdapter<'_> {
     }
 
     fn persist_our_vote(&mut self, tl_vote: &TlVote) {
+        let Some(local_index) = self.runtime.description().local_validator_index() else {
+            return;
+        };
         // Run-from-the-borrowing-backend twin of the former
         // `SessionProcessor::persist_our_vote_before_broadcast`: serialize the
         // signed vote, register the async `save_vote_async` write on the SXMAIN
@@ -2063,7 +2069,7 @@ impl ConsensusBackend for ConsensusBackendAdapter<'_> {
         let record = VoteRecord {
             vote_hash,
             data: serialized.into(),
-            node_idx: self.runtime.description().get_self_idx(),
+            node_idx: local_index,
             seqno: 0, // assigned by save_vote_async
         };
 
@@ -2672,9 +2678,13 @@ impl SessionProcessor {
     /// # Arguments
     /// * `source_idx` - Validator index of the sender
     /// * `tl_certificate` - Deserialized TL certificate object
-    pub(crate) fn on_certificate(&mut self, source_idx: u32, tl_certificate: Certificate) {
+    pub(crate) fn on_certificate(
+        &mut self,
+        source_idx: impl Into<Option<u32>>,
+        tl_certificate: Certificate,
+    ) {
         let verified = self.with_consensus_backend(|consensus, backend| {
-            consensus.on_certificate(backend, source_idx, tl_certificate)
+            consensus.on_certificate(backend, source_idx.into(), tl_certificate)
         });
         if verified {
             // Immediately process any state changes
@@ -3472,7 +3482,13 @@ impl SessionProcessor {
             .iter()
             .enumerate()
             .filter(|(i, ts)| {
-                *i != self.runtime.description().get_self_idx().0 as usize && ts.is_none()
+                Some(*i)
+                    != self
+                        .runtime
+                        .description()
+                        .local_validator_index()
+                        .map(|index| index.0 as usize)
+                    && ts.is_none()
             })
             .count();
         HealthCheckSnapshot {

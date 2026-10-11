@@ -613,6 +613,24 @@ impl SessionOptions {
     /// Validate options and return error if invalid
     pub fn validate(&self) -> Result<()> {
         self.protocol.admits_runtime()?;
+        self.validate_fields()
+    }
+
+    pub fn validate_authenticated(
+        &self,
+        runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+    ) -> Result<()> {
+        if self.protocol != runtime.protocol()
+            || self.proto_version != runtime.carrier_version()
+            || self.wire_profile != runtime.wire_profile()
+            || self.slots_per_leader_window != runtime.slots_per_leader_window()
+        {
+            fail!("Simplex options differ from authenticated session runtime");
+        }
+        self.validate_fields()
+    }
+
+    fn validate_fields(&self) -> Result<()> {
         if self.proto_version > 1 {
             fail!("Simplex supports protocol versions 0 and 1 only");
         }
@@ -876,6 +894,39 @@ impl SessionFactory {
         )
     }
 
+    pub fn create_authenticated_session(
+        options: &SessionOptions,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        local_transport_key: &PrivateKey,
+        db_path: String,
+        overlay_manager: ConsensusOverlayManagerPtr,
+        listener: SessionListenerPtr,
+        trace_collector: Option<TraceCollector>,
+    ) -> Result<SessionPtr> {
+        options.validate_authenticated(&runtime)?;
+        if runtime.local_adnl() != local_transport_key.id() {
+            fail!("Local transport key differs from authenticated runtime");
+        }
+        let nodes = runtime
+            .committee()
+            .iter()
+            .map(SimplexSessionNode::from_descriptor)
+            .collect::<Result<Vec<_>>>()?;
+        session::SessionImpl::create_with_runtime(
+            options,
+            runtime.session_id(),
+            runtime.shard(),
+            nodes,
+            local_transport_key,
+            db_path,
+            overlay_manager,
+            listener,
+            trace_collector,
+            runtime.catchain_seqno(),
+            Some(runtime.clone()),
+        )
+    }
+
     /// Create session with log replay
     pub fn create_session_replay(
         options: &SessionOptions,
@@ -896,4 +947,5 @@ impl SessionFactory {
 #[path = "tests/pq_fixture.rs"]
 pub(crate) mod pq_fixture;
 
+mod runtime_manifest;
 mod signing_coordinator;

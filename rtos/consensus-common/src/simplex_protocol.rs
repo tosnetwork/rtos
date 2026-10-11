@@ -88,6 +88,10 @@ impl SimplexMembership {
         Ok(Self { members, validators })
     }
 
+    pub fn members(&self) -> impl Iterator<Item = &PublicKeyHash> {
+        self.members.iter()
+    }
+
     pub fn role(&self, key: &PublicKeyHash) -> Result<OverlayMemberRole> {
         if let Some(index) = self.validators.get(key) {
             Ok(OverlayMemberRole::Validator(*index))

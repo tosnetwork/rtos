@@ -274,9 +274,9 @@ fn record_candidate_ingress_distinguishes_broadcast_and_query() {
     let other_idx =
         ValidatorIndex::from(if self_idx == ValidatorIndex::from(0u32) { 1u32 } else { 0u32 });
 
-    telemetry.record_candidate_ingress(other_idx, self_idx, /* is_broadcast */ true);
-    telemetry.record_candidate_ingress(other_idx, self_idx, /* is_broadcast */ true);
-    telemetry.record_candidate_ingress(other_idx, self_idx, /* is_broadcast */ false);
+    telemetry.record_candidate_ingress(other_idx, Some(self_idx), /* is_broadcast */ true);
+    telemetry.record_candidate_ingress(other_idx, Some(self_idx), /* is_broadcast */ true);
+    telemetry.record_candidate_ingress(other_idx, Some(self_idx), /* is_broadcast */ false);
 
     let snapshot = telemetry.metrics_receiver.snapshot();
     assert_eq!(snapshot.counters.get("simplex_candidate_received_broadcast").copied(), Some(2),);
@@ -291,8 +291,8 @@ fn record_candidate_ingress_ignores_self_loopback() {
 
     // Locally generated candidates loop back through `on_candidate_received`
     // but are not network ingress: counters must stay at zero.
-    telemetry.record_candidate_ingress(self_idx, self_idx, true);
-    telemetry.record_candidate_ingress(self_idx, self_idx, false);
+    telemetry.record_candidate_ingress(self_idx, Some(self_idx), true);
+    telemetry.record_candidate_ingress(self_idx, Some(self_idx), false);
 
     let snapshot = telemetry.metrics_receiver.snapshot();
     assert!(
