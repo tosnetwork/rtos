@@ -878,6 +878,10 @@ impl NodeNetwork {
 
 #[async_trait::async_trait]
 impl PrivateOverlayOperations for NodeNetwork {
+    fn wire_profile(&self) -> rtos_api::WireProfile {
+        self.network_context.stack.overlay.wire_profile()
+    }
+
     /// Check local validator membership, set up ADNL keys, and prepare overlay peers.
     ///
     /// Flow:
