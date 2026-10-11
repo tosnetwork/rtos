@@ -9,6 +9,7 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+use super::tasks::AdnlTasks;
 #[cfg(feature = "dump")]
 use crate::dump;
 #[cfg(feature = "telemetry")]
@@ -61,7 +62,6 @@ use std::{
         atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
     },
-    thread,
     time::{Duration, Instant},
 };
 #[cfg(feature = "dump")]
@@ -1610,7 +1610,6 @@ struct RecvPipeline {
     urgent: Queue<(PacketBuffer, Subchannel)>,
     proc_normal_packets: AtomicU64,
     proc_urgent_packets: AtomicU64,
-    runtime: tokio::runtime::Handle,
     subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
     #[cfg(feature = "static_workers")]
     sync: lockfree::queue::Queue<tokio::sync::oneshot::Sender<bool>>,
@@ -1618,11 +1617,7 @@ struct RecvPipeline {
 }
 
 impl RecvPipeline {
-    fn with_params(
-        adnl: Arc<AdnlNode>,
-        runtime: tokio::runtime::Handle,
-        subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
-    ) -> Self {
+    fn with_params(adnl: Arc<AdnlNode>, subscribers: Arc<Vec<Arc<dyn Subscriber>>>) -> Self {
         let mut max_workers = if let Some(pool) = adnl.config.recv_pipeline_pool {
             max(1, num_cpus::get() as u64 * pool as u64 / 100)
         } else {
@@ -1654,7 +1649,6 @@ impl RecvPipeline {
             ),
             proc_normal_packets: AtomicU64::new(0),
             proc_urgent_packets: AtomicU64::new(0),
-            runtime,
             subscribers,
             #[cfg(feature = "static_workers")]
             sync: lockfree::queue::Queue::new(),
@@ -1666,6 +1660,9 @@ impl RecvPipeline {
     async fn get(&self) -> Option<(PacketBuffer, Subchannel)> {
         let mut expired_run: u32 = 0;
         'again: loop {
+            if self.adnl.tasks.is_closed() {
+                return None;
+            }
             let ret = if let Some((data, subchannel)) = self.urgent.get() {
                 if data.expired_at <= Version::get() as u32 {
                     #[cfg(feature = "telemetry")]
@@ -1720,7 +1717,10 @@ impl RecvPipeline {
                 // tokio::time::sleep(Duration::from_millis(1)).await;
                 let (sender, reader) = tokio::sync::oneshot::channel();
                 self.sync.push(sender);
-                if let Ok(true) = reader.await {
+                if let Ok(true) = tokio::select! {
+                    _ = self.adnl.tasks.cancelled() => return None,
+                    result = reader => result,
+                } {
                     continue;
                 }
             }
@@ -1765,41 +1765,11 @@ impl RecvPipeline {
         self.spawn();
     }
 
-    async fn shutdown(&self) {
-        log::warn!(target: TARGET, "Stopping recv pipeline...");
-        let start = Instant::now();
-        let mut next_log = Duration::from_millis(AdnlNode::TIMEOUT_STOPPING_LOG_MS);
-        loop {
-            #[cfg(feature = "static_workers")]
-            while let Some(sender) = self.sync.pop() {
-                sender.send(false).ok();
-            }
-            let workers = self.workers.load(Ordering::Relaxed);
-            if workers == 0 {
-                break;
-            }
-            let elapsed = start.elapsed();
-            if elapsed >= next_log {
-                let urgent_in_proc = self.proc_urgent_packets.load(Ordering::Relaxed);
-                let normal_in_proc = self.proc_normal_packets.load(Ordering::Relaxed);
-                log::warn!(
-                    target: TARGET,
-                    "Still stopping recv pipeline, waited {}ms: \
-                    workers={workers}, processing urgent={urgent_in_proc} normal={normal_in_proc}",
-                    elapsed.as_millis()
-                );
-                next_log = elapsed + Duration::from_millis(AdnlNode::TIMEOUT_STOPPING_LOG_MS);
-            }
-            tokio::task::yield_now().await
-        }
-        log::warn!(target: TARGET, "Recv pipeline stopped after {}ms", start.elapsed().as_millis());
-    }
-
-    fn spawn(self: &Arc<Self>) {
+    fn reserve_worker(self: &Arc<Self>) -> Option<PipelineCountGuard> {
         loop {
             let workers = self.workers.load(Ordering::Relaxed);
             if workers >= self.max_workers {
-                return;
+                return None;
             }
             if self
                 .workers
@@ -1809,8 +1779,19 @@ impl RecvPipeline {
                 break;
             }
         }
+        Some(PipelineCountGuard { pipeline: self.clone(), kind: PipelineCount::Worker })
+    }
+
+    fn spawn(self: &Arc<Self>) {
+        if let Some(reservation) = self.reserve_worker() {
+            self.spawn_reserved(reservation);
+        }
+    }
+
+    fn spawn_reserved(self: &Arc<Self>, reservation: PipelineCountGuard) {
         let recv = self.clone();
-        self.runtime.spawn(async move {
+        self.adnl.tasks.spawn("receive pipeline", async move {
+            let _reservation = reservation;
             loop {
                 let (mut packet, subchannel) = match recv.get().await {
                     Some(job) => job,
@@ -1819,6 +1800,10 @@ impl RecvPipeline {
                 let urgent = match &subchannel {
                     Subchannel::Urgent(_) => true,
                     _ => false,
+                };
+                let processing = PipelineCountGuard {
+                    pipeline: recv.clone(),
+                    kind: if urgent { PipelineCount::Urgent } else { PipelineCount::Normal },
                 };
                 #[cfg(feature = "telemetry")]
                 recv.update_metric(urgent);
@@ -1839,17 +1824,12 @@ impl RecvPipeline {
                     }
                     _ => (),
                 }
-                if urgent {
-                    recv.proc_urgent_packets.fetch_sub(1, Ordering::Relaxed);
-                } else {
-                    recv.proc_normal_packets.fetch_sub(1, Ordering::Relaxed);
-                }
+                drop(processing);
                 #[cfg(feature = "telemetry")]
                 recv.update_metric(urgent);
                 // Yield execution after packet
                 tokio::task::yield_now().await
             }
-            recv.workers.fetch_sub(1, Ordering::Relaxed);
         });
     }
 
@@ -1868,6 +1848,26 @@ impl RecvPipeline {
                 .proc_packets
                 .update(self.proc_normal_packets.load(Ordering::Relaxed))
         }
+    }
+}
+
+enum PipelineCount {
+    Worker,
+    Normal,
+    Urgent,
+}
+struct PipelineCountGuard {
+    pipeline: Arc<RecvPipeline>,
+    kind: PipelineCount,
+}
+impl Drop for PipelineCountGuard {
+    fn drop(&mut self) {
+        let counter = match self.kind {
+            PipelineCount::Worker => &self.pipeline.workers,
+            PipelineCount::Normal => &self.pipeline.proc_normal_packets,
+            PipelineCount::Urgent => &self.pipeline.proc_urgent_packets,
+        };
+        counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -2269,6 +2269,7 @@ pub struct AdnlNode {
     start: Instant,
     start_timestamp: i32,
     stop: Arc<Stopper>,
+    tasks: Arc<AdnlTasks>,
     transfers: Arc<lockfree::map::Map<TransferId, Arc<Transfer>>>,
     #[cfg(feature = "telemetry")]
     telemetry: Telemetry,
@@ -2312,8 +2313,6 @@ impl AdnlNode {
     const TIMEOUT_QUERY_MIN_MS: u64 = 500;
     const TIMEOUT_QUERY_MAX_MS: u64 = 5000;
     const TIMEOUT_QUERY_STOP_MS: u64 = 1;
-    const TIMEOUT_SHUTDOWN_MS: u64 = 50;
-    const TIMEOUT_STOPPING_LOG_MS: u64 = 500;
     const TIMEOUT_TRANSFER_SEC: u64 = 5;
 
     /// Constructor
@@ -2440,6 +2439,7 @@ impl AdnlNode {
             start: Instant::now(),
             start_timestamp: Version::get(),
             stop: Arc::new(Stopper::new()),
+            tasks: AdnlTasks::new(),
             transfers: Arc::new(lockfree::map::Map::new()),
             #[cfg(feature = "telemetry")]
             telemetry,
@@ -2455,7 +2455,33 @@ impl AdnlNode {
             },
         };
         ret.queue_send_loopback_readers.push(queue_send_loopback_reader);
-        Ok(Arc::new(ret))
+        let node = Arc::new(ret);
+        let weak = Arc::downgrade(&node);
+        node.tasks.set_wake(move || {
+            if let Some(node) = weak.upgrade() {
+                node.stop.stop();
+                node.send_pipeline.shutdown();
+            }
+        });
+        let weak = Arc::downgrade(&node);
+        node.tasks.on_stopped(move || {
+            if let Some(node) = weak.upgrade() {
+                while node.send_pipeline.normal.get().is_some() {}
+                while node.send_pipeline.urgent.get().is_some() {}
+                while node.queue_monitor_queries.pop().is_some() {}
+                while node.queue_send_loopback_readers.pop().is_some() {}
+                let queries: Vec<_> = node.queries.iter().map(|entry| *entry.key()).collect();
+                for query in queries {
+                    node.queries.remove(&query);
+                }
+                let transfers: Vec<_> =
+                    node.transfers.iter().map(|entry| entry.key().clone()).collect();
+                for transfer in transfers {
+                    node.transfers.remove(&transfer);
+                }
+            }
+        });
+        Ok(node)
     }
 
     pub fn check(&self) {
@@ -2470,6 +2496,7 @@ impl AdnlNode {
         transport: impl Fn(&Arc<Self>) -> Result<(Box<dyn AdnlSender>, Box<dyn AdnlReceiver>)>,
         mut subscribers: Vec<Arc<dyn Subscriber>>,
     ) -> Result<()> {
+        let _starting = self.tasks.enter()?;
         let mut queue_send_loopback_reader = None;
         for _ in 0..1 {
             match self.queue_send_loopback_readers.pop() {
@@ -2479,6 +2506,7 @@ impl AdnlNode {
         }
         let mut queue_send_loopback_reader =
             queue_send_loopback_reader.ok_or_else(|| error!("Loopback reader is not set"))?;
+        let mut startup = AdnlStartupGuard { tasks: self.tasks.clone(), committed: false };
         let (sender, mut receiver) = transport(self)?;
         subscribers.push(Arc::new(AdnlPingSubscriber));
         // Subscribers poll
@@ -2493,7 +2521,7 @@ impl AdnlNode {
             let subscriber = subscriber.clone();
             let subscribers_stop = subscribers_stop.clone();
             subscribers_stop.fetch_add(1, Ordering::Relaxed);
-            tokio::spawn(async move {
+            self.tasks.spawn("subscriber poll", async move {
                 loop {
                     tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP_MS)).await;
                     if stop.is_stopped() {
@@ -2507,16 +2535,12 @@ impl AdnlNode {
                 }
             });
         }
-        let recv_pipeline = Arc::new(RecvPipeline::with_params(
-            self.clone(),
-            tokio::runtime::Handle::current(),
-            subscribers,
-        ));
+        let recv_pipeline = Arc::new(RecvPipeline::with_params(self.clone(), subscribers));
         // Monitoring watchdog
         let status = Arc::new(AtomicU64::new(0));
         let stat_mon = status.clone();
         let node = self.clone();
-        tokio::spawn(async move {
+        self.tasks.spawn_cancelable("monitor watchdog", async move {
             let mut check = 0;
             loop {
                 if node.stop.is_stopped() {
@@ -2536,8 +2560,7 @@ impl AdnlNode {
         });
         // Stopping watchdog
         let node = self.clone();
-        let recv_stop = recv_pipeline.clone();
-        tokio::spawn(async move {
+        self.tasks.spawn_cancelable("query watchdog", async move {
             let mut monitor_queries: Vec<(u128, QueryId)> = Vec::new();
             #[cfg(feature = "telemetry")]
             let mut last_check = Instant::now();
@@ -2577,21 +2600,6 @@ impl AdnlNode {
                 }
                 status.store(ts | 2, Ordering::Relaxed);
                 if node.stop.is_stopped() {
-                    node.send_pipeline.shutdown();
-                    let empty = KeyId::from_data([0u8; 32]);
-                    let peers = AdnlPeers::with_keys(empty.clone(), empty.clone());
-                    let stop = LoopbackData::Message((AdnlMessage::Adnl_Message_Nop, peers));
-                    if let Err(e) = node.queue_send_loopback_packets.send(stop) {
-                        log::warn!(target: TARGET, "Cannot close node loopback: {}", e);
-                    }
-                    recv_stop.shutdown().await;
-                    #[cfg(feature = "dump")]
-                    if let Some(dump) = node.dump.as_ref() {
-                        let stop = DumpRecord { alive: false, key_id: empty, msg: String::new() };
-                        if let Err(e) = dump.sender.send(stop) {
-                            log::warn!(target: TARGET, "Cannot close node dump: {}", e);
-                        }
-                    }
                     break;
                 }
                 status.store(ts | 3, Ordering::Relaxed);
@@ -2607,7 +2615,7 @@ impl AdnlNode {
                         "Try dropping query {:02x}{:02x}{:02x}{:02x}",
                         query_id[0], query_id[1], query_id[2], query_id[3]
                     );
-                    match Self::update_query(&node.queries, query_id, None).await {
+                    match node.update_query(query_id, None).await {
                         Err(e) => log::info!(
                             target: TARGET_QUERY,
                             "ERROR: {} when dropping query {:02x}{:02x}{:02x}{:02x}",
@@ -2638,7 +2646,7 @@ impl AdnlNode {
         // Remote connections
         let node = self.clone();
         let recv = recv_pipeline.clone();
-        thread::Builder::new().name("ADNL receiver".into()).spawn(move || {
+        self.tasks.thread("ADNL receiver".into(), move || {
             node.stop.acquire(Self::MASK_RECV);
             loop {
                 if node.stop.is_stopped() {
@@ -2671,7 +2679,7 @@ impl AdnlNode {
             log::warn!(target: TARGET, "Node socket receiver stopped");
         })?;
         let node = self.clone();
-        thread::Builder::new().name("ADNL sender".into()).spawn(move || {
+        self.tasks.thread("ADNL sender".into(), move || {
             node.stop.acquire(Self::MASK_SEND);
             loop {
                 let job = node.send_pipeline.get();
@@ -2687,8 +2695,8 @@ impl AdnlNode {
                         true,
                     ),
                     Err(e) => {
-                        log::error!(target: TARGET, "ERROR in send queue --> {}", e);
-                        continue;
+                        node.tasks.failed(format!("ADNL send queue: {e}"));
+                        break;
                     }
                 };
                 // Manage the throughput
@@ -2731,7 +2739,7 @@ impl AdnlNode {
         })?;
         // Local connections (loopback)
         let node = self.clone();
-        tokio::spawn(async move {
+        self.tasks.spawn_cancelable("loopback receive", async move {
             node.stop.acquire(Self::MASK_LOOPBACK);
             while let Some(data) = queue_send_loopback_reader.recv().await {
                 if node.stop.is_stopped() {
@@ -2755,7 +2763,7 @@ impl AdnlNode {
                         let peers =
                             AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
                         let subscribers = subscribers_local.clone();
-                        tokio::spawn(async move {
+                        node.tasks.clone().spawn("loopback message", async move {
                             match node
                                 .process_message(
                                     &subscribers,
@@ -2787,7 +2795,7 @@ impl AdnlNode {
             create_dir_all(&dump_path)?;
             dump_path.pop();
             if let Some(mut reader) = dump.reader.pop() {
-                tokio::spawn(async move {
+                self.tasks.spawn_cancelable("traffic dump", async move {
                     fn prepare(path: &PathBuf, file: &String, alive: bool) -> Result<PathBuf> {
                         let dst =
                             if alive { path.join("alive").join(file) } else { path.join(file) };
@@ -2805,9 +2813,9 @@ impl AdnlNode {
                         writeln!(file, "{}", msg)?;
                         Ok(())
                     }
-                    stop.fetch_or(Self::MASK_DUMP, Ordering::Relaxed);
+                    stop.acquire(Self::MASK_DUMP);
                     while let Some(record) = reader.recv().await {
-                        if (stop.load(Ordering::Relaxed) & Self::MASK_STOP) != 0 {
+                        if stop.is_stopped() {
                             break;
                         }
                         let file = format!("{}", record.key_id).replace("/", "_");
@@ -2823,11 +2831,15 @@ impl AdnlNode {
                         }
                     }
                     Self::graceful_close(reader).await;
-                    stop.fetch_and(!Self::MASK_DUMP, Ordering::Relaxed);
+                    stop.release(Self::MASK_DUMP);
                     log::warn!(target: TARGET, "Node dump stopped");
                 });
             }
         }
+        if self.tasks.is_closed() {
+            fail!("ADNL stopped during startup");
+        }
+        startup.committed = true;
         Ok(())
     }
 
@@ -2850,25 +2862,18 @@ impl AdnlNode {
 
     /// Stop node
     pub async fn stop(&self) {
-        log::warn!(target: TARGET, "Stopping ADNL node...");
-        self.stop.stop();
-        let mut elapsed_ms: u64 = 0;
-        loop {
-            tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP_MS)).await;
-            elapsed_ms += Self::TIMEOUT_QUERY_STOP_MS;
-            let running = self.stop.still_running();
-            if running == 0 {
-                break;
-            }
-            if elapsed_ms % Self::TIMEOUT_STOPPING_LOG_MS == 0 {
-                log::warn!(
-                    target: TARGET,
-                    "Still stopping ADNL node ({running:x}), waited {elapsed_ms}ms..."
-                );
-            }
+        if let Err(error) = self.stop_checked().await {
+            log::error!(target: TARGET, "{error}");
         }
-        tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_SHUTDOWN_MS)).await;
-        log::warn!(target: TARGET, "ADNL node stopped");
+    }
+
+    /// Wait for every admitted async worker and OS thread; errors remain sticky.
+    pub async fn stop_checked(&self) -> Result<()> {
+        self.tasks.wait().await
+    }
+
+    pub(crate) fn tasks(&self) -> &Arc<AdnlTasks> {
+        &self.tasks
     }
 
     /// Add key
@@ -3237,16 +3242,21 @@ impl AdnlNode {
         method: AdnlSendMethod,
         profile: rtos_api::WireProfile,
     ) -> Result<AdnlReplyWithStatus> {
+        let _request = self.tasks.enter()?;
         async fn wait_query(
             node: &Arc<AdnlNode>,
             context: &Arc<QuerySendContext>,
             peers: &AdnlPeers,
         ) -> Result<AdnlReplyWithStatus> {
-            context.reply_ping.wait().await;
+            tokio::select! {
+                _ = node.tasks.cancelled() => fail!("ADNL stopped while waiting for query"),
+                _ = context.reply_ping.wait() => {},
+            }
             node.process_query_result(context, peers)
         }
 
         async fn get_reply(
+            tasks: &AdnlTasks,
             reader: &mut tokio::sync::mpsc::UnboundedReceiver<(
                 Result<AdnlReplyWithStatus>,
                 Arc<QuerySendContext>,
@@ -3254,7 +3264,11 @@ impl AdnlNode {
             peers: &AdnlPeers,
             query: &TaggedTlObject,
         ) -> Result<AdnlReplyWithStatus> {
-            if let Some((reply_with_status, context)) = reader.recv().await {
+            let received = tokio::select! {
+                _ = tasks.cancelled() => fail!("ADNL stopped while receiving query reply"),
+                received = reader.recv() => received,
+            };
+            if let Some((reply_with_status, context)) = received {
                 match reply_with_status {
                     Err(e) => {
                         log::warn!(
@@ -3320,16 +3334,18 @@ impl AdnlNode {
                             let peers = peers.clone();
                             let sender = sender.clone();
                             let node = self.clone();
-                            tokio::spawn(async move {
-                                sender.send((wait_query(&node, &context, &peers).await, context))
+                            self.tasks.spawn_cancelable("query waiter", async move {
+                                let _ = sender
+                                    .send((wait_query(&node, &context, &peers).await, context));
                             });
                         }
-                        let reply_with_status = get_reply(&mut reader, peers, query).await?;
+                        let reply_with_status =
+                            get_reply(&self.tasks, &mut reader, peers, query).await?;
                         // We occasionally can receive both replies, and ordinary the first,
                         // But return first to avoid timeout.
                         // There is a tolerance based on several priority attempts.
                         if reply_with_status.reply.is_some() {
-                            tokio::spawn(async move {
+                            self.tasks.spawn_cancelable("query reply flush", async move {
                                 if reader.recv().await.is_some() {
                                     Self::graceful_close(reader).await
                                 } else {
@@ -3341,7 +3357,7 @@ impl AdnlNode {
                             });
                             Ok(reply_with_status)
                         } else {
-                            get_reply(&mut reader, peers, query).await
+                            get_reply(&self.tasks, &mut reader, peers, query).await
                         }
                     }
                 }
@@ -3416,6 +3432,7 @@ impl AdnlNode {
         peers: &AdnlPeers,
         method: AdnlSendMethod,
     ) -> Result<AdnlStatus> {
+        let _request = self.tasks.enter()?;
         let method = match method {
             AdnlSendMethod::Fast => AdnlSendMethodDetailed::FastNormal,
             AdnlSendMethod::Safe => AdnlSendMethodDetailed::Safe,
@@ -3977,7 +3994,7 @@ impl AdnlNode {
 
     async fn process_answer(&self, answer: &AdnlAnswerMessage, src: &Arc<KeyId>) -> Result<()> {
         let query_id = answer.query_id.as_slice().clone();
-        if !Self::update_query(&self.queries, query_id, Some(&answer.answer)).await? {
+        if !self.update_query(query_id, Some(&answer.answer)).await? {
             fail!("Received answer from {} to unknown query {:?}", src, answer)
         }
         Ok(())
@@ -4048,7 +4065,7 @@ impl AdnlNode {
                     let transfers_wait = self.transfers.clone();
                     let transfer_wait = transfer.val().clone();
                     let transfer_id_wait = transfer_id.clone();
-                    tokio::spawn(async move {
+                    self.tasks.spawn_cancelable("transfer expiry", async move {
                         loop {
                             tokio::time::sleep(Duration::from_millis(
                                 Self::TIMEOUT_TRANSFER_SEC * 100,
@@ -4158,13 +4175,14 @@ impl AdnlNode {
                         let query = format!("{:?}", query);
                         let method = method.clone();
                         let node = self.clone();
-                        tokio::spawn(async move {
+                        let pending = async move {
                             match answer.try_wait().await {
-                                Err(e) => log::error!(
-                                    target: TARGET,
-                                    "Error processing ADNL query {}: {}",
-                                    query, e
-                                ),
+                                Err(e) => {
+                                    if e.downcast_ref::<tokio::task::JoinError>().is_some() {
+                                        node.tasks.failed(format!("ADNL pending answer: {e}"));
+                                    }
+                                    log::error!(target: TARGET, "Error processing ADNL query {query}: {e}");
+                                }
                                 Ok(msg) => match reply(&node, msg.answer, &peers, &method) {
                                     Err(e) => log::error!(
                                         target: TARGET,
@@ -4173,7 +4191,11 @@ impl AdnlNode {
                                     _ => (),
                                 },
                             }
-                        });
+                        };
+                        if let Err(pending) = self.tasks.spawn_or_return("deferred reply", pending)
+                        {
+                            pending.await;
+                        }
                         return Ok(());
                     }
                     (None, msg) => msg,
@@ -4395,6 +4417,7 @@ impl AdnlNode {
         adnl_peers: &AdnlPeers,
         method: AdnlSendMethodDetailed,
     ) -> Result<(Option<Arc<AdnlChannel>>, MessageRepeat)> {
+        let _sending = self.tasks.enter()?;
         const SIZE_ANSWER_MSG: usize = 44;
         const SIZE_CONFIRM_CHANNEL_MSG: usize = 72;
         const SIZE_CREATE_CHANNEL_MSG: usize = 40;
@@ -4777,12 +4800,8 @@ impl AdnlNode {
         Ok(false)
     }
 
-    async fn update_query(
-        queries: &Arc<QueryCache>,
-        query_id: QueryId,
-        answer: Option<&[u8]>,
-    ) -> Result<bool> {
-        let insertion = queries.insert_with(query_id, |_, inserted, found| {
+    async fn update_query(&self, query_id: QueryId, answer: Option<&[u8]>) -> Result<bool> {
+        let insertion = self.queries.insert_with(query_id, |_, inserted, found| {
             if let Some(&(_, Query::Sent(_))) = found {
                 lockfree::map::Preview::New(if let Some(answer) = answer {
                     Query::Received(answer.to_vec())
@@ -4801,7 +4820,10 @@ impl AdnlNode {
             return Ok(false);
         };
         if let Query::Sent(pong) = removed.val() {
-            pong.wait().await;
+            tokio::select! {
+                _ = self.tasks.cancelled() => {},
+                _ = pong.wait() => {},
+            }
         } else {
             fail!(
                 "INTERNAL ERROR: ADNL query state mismatch, \
@@ -4862,3 +4884,19 @@ impl AdnlNode {
         }
     }
 }
+
+struct AdnlStartupGuard {
+    tasks: Arc<AdnlTasks>,
+    committed: bool,
+}
+impl Drop for AdnlStartupGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.tasks.close();
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "node_shutdown_tests.rs"]
+mod shutdown_tests;

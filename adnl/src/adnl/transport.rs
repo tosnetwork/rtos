@@ -10,6 +10,7 @@
 use crate::adnl::{
     common::{add_unbound_object_to_map, add_unbound_object_to_map_with_update, TARGET},
     node::AdnlNode,
+    tasks::AdnlTasks,
 };
 use rtos_block::{error, fail, Error, Result};
 use std::{
@@ -291,6 +292,7 @@ impl TcpStreamContext {
 }
 
 struct TcpReceiver {
+    tasks: Arc<AdnlTasks>,
     event_queue: VecDeque<SocketAddr>,
     events: mio::Events,
     next_token: usize,
@@ -337,6 +339,9 @@ impl TcpReceiver {
 
     fn recv_to_buf(&mut self, buf: &mut Vec<u8>) -> Result<bool> {
         loop {
+            if self.tasks.is_closed() {
+                return Ok(false);
+            }
             if self.udp_received {
                 break Ok(false);
             }
@@ -474,6 +479,7 @@ enum TcpSendStatus {
 }
 
 struct TcpSender {
+    tasks: Arc<AdnlTasks>,
     connections: Arc<Connections<TcpConnectionState>>,
     local_ip: u32,
     local_port: u16,
@@ -576,6 +582,9 @@ impl TcpSender {
         };
         let connections = ctx.sender.connections.clone();
         let (queue, activate) = loop {
+            if self.tasks.is_closed() {
+                fail!("ADNL TCP sender stopped");
+            }
             match connections.map().get(&socket_addr) {
                 None => {
                     // Create send queue in single thread context
@@ -594,6 +603,9 @@ impl TcpSender {
                             if conn.queue.check(true) {
                                 conn.queue.push(ctx);
                                 while !conn.queue.check(false) {
+                                    if self.tasks.is_closed() {
+                                        fail!("ADNL TCP sender stopped");
+                                    }
                                     thread::yield_now();
                                 }
                             } else {
@@ -625,13 +637,19 @@ impl TcpSender {
         // queue.sync.store(TcpSendQueue::SYNC_INACTIVE, Ordering::Relaxed);
         let node = node.clone();
         let name = format!("{socket_addr} ADNL TCP pending send");
-        thread::Builder::new().name(name).spawn(move || {
+        node.tasks().clone().thread(name, move || {
             if activate {
                 while !queue.activate(true) {
+                    if node.tasks().is_closed() {
+                        return;
+                    }
                     thread::yield_now();
                 }
             }
             loop {
+                if node.tasks().is_closed() {
+                    break;
+                }
                 let Some(ctx) = queue.pop() else {
                     if queue.activate(false) {
                         break;
@@ -651,6 +669,9 @@ impl TcpSender {
         let connections = ctx.sender.connections.clone();
         let convert_err = |e, msg| error!("error when {msg} to {socket_addr}: {e}");
         loop {
+            if ctx.sender.tasks.is_closed() {
+                fail!("ADNL TCP send cancelled");
+            }
             match connections.map().get(&socket_addr) {
                 None => fail!("Cannot create send queue to {socket_addr} in background"),
                 Some(state) => match state.val() {
@@ -799,7 +820,7 @@ impl TcpSender {
                     Ok(true)
                 }
             }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 thread::yield_now();
                 Ok(false)
             }
@@ -823,7 +844,7 @@ fn tcp_sender_receiver(node: &Arc<AdnlNode>) -> Result<(Arc<TcpSender>, TcpRecei
         };
         let sender = sender.clone();
         let name = format!("{} ADNL TCP accept", peer_addr);
-        thread::Builder::new().name(name).spawn(move || {
+        sender.tasks.clone().thread(name, move || {
             if let Err(e) = accept(socket, peer_addr, sender) {
                 log::warn!(target: TARGET, "ERROR in ADNL TCP acceptor: {e}");
             }
@@ -849,6 +870,9 @@ fn tcp_sender_receiver(node: &Arc<AdnlNode>) -> Result<(Arc<TcpSender>, TcpRecei
         };
         let start = Instant::now();
         while !context.read_len(SIZE_TCP_ADDRESS)? {
+            if sender.tasks.is_closed() {
+                fail!("ADNL TCP accept stopped");
+            }
             if start.elapsed() > TIMEOUT_TCP_CONNECT_MS {
                 fail!("Cannot read TCP address of peer {}, abort connection", context.peer_addr);
             }
@@ -892,6 +916,9 @@ fn tcp_sender_receiver(node: &Arc<AdnlNode>) -> Result<(Arc<TcpSender>, TcpRecei
         let mut offset = 0;
         let start = Instant::now();
         while !TcpSender::send_to_socket(&socket, &buf, &mut offset)? {
+            if sender.tasks.is_closed() {
+                fail!("ADNL TCP accept stopped");
+            }
             if start.elapsed() > TIMEOUT_TCP_CONNECT_MS {
                 fail!("Cannot send TCP confirmation to peer {peer_addr}, abort connection");
             }
@@ -919,6 +946,7 @@ fn tcp_sender_receiver(node: &Arc<AdnlNode>) -> Result<(Arc<TcpSender>, TcpRecei
     log::info!(target: TARGET, "ADNL TCP listening on {local}...");
     let (updates_sender, updates_receiver) = channel();
     let receiver = TcpReceiver {
+        tasks: node.tasks().clone(),
         event_queue: VecDeque::new(),
         events: mio::Events::with_capacity(SOCKET_TCP_BACKLOG),
         next_token: 1,
@@ -930,14 +958,25 @@ fn tcp_sender_receiver(node: &Arc<AdnlNode>) -> Result<(Arc<TcpSender>, TcpRecei
         updates: updates_receiver,
     };
     let sender = Arc::new(TcpSender {
+        tasks: node.tasks().clone(),
         connections: Connections::new(),
         local_ip,
         local_port,
         updates: updates_sender.clone(),
     });
+    let weak = Arc::downgrade(&sender);
+    node.tasks().on_stopped(move || {
+        if let Some(sender) = weak.upgrade() {
+            let addresses: Vec<_> =
+                sender.connections.map().iter().map(|entry| *entry.key()).collect();
+            for address in addresses {
+                sender.connections.map().remove(&address);
+            }
+        }
+    });
     let sender_context = sender.clone();
     let stop = node.stopper().clone();
-    thread::Builder::new().name("ADNL TCP listener".into()).spawn(move || {
+    node.tasks().thread("ADNL TCP listener".into(), move || {
         stop.acquire(AdnlNode::MASK_TRANSPORT);
         loop {
             if stop.is_stopped() {
@@ -976,7 +1015,7 @@ impl AdnlReceiver for UdpTcpReceiver {
                         Ok(Some(&buf[..len]))
                     }
                 }
-                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                     thread::yield_now();
                     Ok(None)
                 }
@@ -1002,6 +1041,7 @@ impl AdnlReceiver for UdpTcpReceiver {
 }
 
 struct UdpTcpSender {
+    tasks: Arc<AdnlTasks>,
     tcp: Option<Arc<TcpSender>>,
     udp: socket2::Socket,
 }
@@ -1011,7 +1051,10 @@ impl AdnlSender for UdpTcpSender {
         loop {
             match self.udp.send_to(data, &addr) {
                 Ok(usize) => break Ok(usize),
-                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    if self.tasks.is_closed() {
+                        fail!("ADNL UDP sender stopped");
+                    }
                     thread::yield_now();
                     continue;
                 }
@@ -1042,6 +1085,11 @@ fn create_sender_receiver(
     socket.set_reuse_address(true)?;
     if !udp_only {
         socket.set_nonblocking(true)?;
+    } else {
+        // The receive thread must observe shutdown even if the sender panics
+        // before emitting its wake packet. Stop still awaits its actual join.
+        socket.set_read_timeout(Some(TIMEOUT_TCP_SPIN_MS))?;
+        socket.set_write_timeout(Some(TIMEOUT_TCP_SPIN_MS))?;
     }
     let address = node.config().ip_address();
     socket.bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), address.port()).into())?;
@@ -1052,7 +1100,8 @@ fn create_sender_receiver(
         let (tcp_sender, tcp_receiver) = tcp_sender_receiver(node)?;
         (Some(tcp_sender), Some(tcp_receiver))
     };
-    let sender = UdpTcpSender { tcp: tcp_sender, udp: socket.try_clone()? };
+    let sender =
+        UdpTcpSender { tasks: node.tasks().clone(), tcp: tcp_sender, udp: socket.try_clone()? };
     let mut udp = mio::net::UdpSocket::from_std(socket.into());
     if let Some(tcp_receiver) = &mut tcp_receiver {
         tcp_receiver.poll.registry().register(
