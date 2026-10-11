@@ -15,6 +15,7 @@ pub(crate) struct RepairLeaseDomain {
     pub zerostate: BlockIdExt,
     pub global_id: i32,
     pub history_init: BlockIdExt,
+    pub source_recovery_anchor: BlockIdExt,
     pub session_id: UInt256,
     pub profile: UInt256,
     pub protocol: SimplexProtocol,
@@ -48,6 +49,7 @@ struct Wire {
     zerostate: String,
     global_id: i32,
     history_init: String,
+    source_recovery_anchor: String,
     session_id: String,
     profile: String,
     protocol: String,
@@ -69,6 +71,8 @@ impl RepairLeaseBinding {
             || !self.domain.zerostate.shard().is_masterchain()
             || self.domain.zerostate.seq_no() != 0
             || !self.domain.history_init.shard().is_masterchain()
+            || !self.domain.source_recovery_anchor.shard().is_masterchain()
+            || self.domain.source_recovery_anchor.seq_no() < self.domain.history_init.seq_no()
             || self.domain.protocol != SimplexProtocol::PrivateObserversPlumtree
             || self.domain.wire_profile != WireProfile::T0
             || self.close_generation == 0
@@ -94,6 +98,7 @@ impl RepairLeaseBinding {
             zerostate: d.zerostate.to_string(),
             global_id: d.global_id,
             history_init: d.history_init.to_string(),
+            source_recovery_anchor: d.source_recovery_anchor.to_string(),
             session_id: format!("{:x}", d.session_id),
             profile: format!("{:x}", d.profile),
             protocol: "private-observers-plumtree".into(),
@@ -145,6 +150,7 @@ impl RepairLeaseBinding {
                 zerostate: w.zerostate.parse()?,
                 global_id: w.global_id,
                 history_init: w.history_init.parse()?,
+                source_recovery_anchor: w.source_recovery_anchor.parse()?,
                 session_id: digest(&w.session_id)?,
                 profile: digest(&w.profile)?,
                 protocol: SimplexProtocol::PrivateObserversPlumtree,
