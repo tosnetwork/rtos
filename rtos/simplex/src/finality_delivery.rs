@@ -1,7 +1,7 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Source retention before node WAL acknowledgement. Records are untrusted on recovery.
 use consensus_common::{
-    finality_delivery::{FinalizedDeliveryDraft, CanonicalFinalityRequest, CanonicalFinalityRecord, FinalityDeliveryRole},
+    finality_delivery::{FinalizedDeliveryDraft, CanonicalFinalityRequest, CanonicalFinalityRecord, FinalityDeliveryRole, CloseFinalityRequest, CloseOffer, FinalityCloseDomain, FinalityTerminalLookup},
     session_runtime::{AuthenticatedSessionRuntime, SessionNetworkPin},
     simplex_protocol::SimplexProtocol,
     SessionFinality,
@@ -119,6 +119,16 @@ impl CanonicalReference {
     }
 }
 impl PendingFinalityRecord {
+    /// Exact legacy schema-1 digest, data only and never an authentication receipt.
+    pub fn canonical_digest(&self) -> Result<UInt256> { Ok(UInt256::calc_file_hash(&self.encode()?)) }
+    fn close_request(&self, receipt: UInt256) -> Result<CloseFinalityRequest> {
+        Ok(CloseFinalityRequest { canonical: self.request(receipt), domain: self.close_domain(),
+            source_digest: self.canonical_digest()?, created_at_unix_secs: self.created_at_unix_secs })
+    }
+    fn close_domain(&self) -> FinalityCloseDomain {
+        FinalityCloseDomain { pin: self.pin.clone(), protocol: self.protocol, carrier_version: self.carrier_version,
+            wire_profile: self.wire_profile, profile: self.profile.clone(), session_id: self.session_id.clone() }
+    }
     pub fn id(&self) -> Result<UInt256> {
         Ok(UInt256::calc_file_hash(&serde_json::to_vec(&(
             "rtos-source-finality-v1", self.pin.global_id, self.pin.zerostate.to_string(),
@@ -228,6 +238,25 @@ impl PendingFinalityRecord {
             local_adnl: self.local_adnl.clone(), local_validator_index: self.local_validator_index,
             source_validator: self.source_validator.clone() }
     }
+}
+
+/// Reconstruct precisely the old source schema from a node-authenticated reply.
+/// This function returns comparison data, not a proof of source synchronization.
+pub fn canonical_source_identity(runtime: &AuthenticatedSessionRuntime, reply: &CanonicalFinalityRecord)
+    -> Result<(UInt256, UInt256)> {
+    let mut source = None;
+    for descriptor in runtime.committee() {
+        let node = crate::SimplexSessionNode::from_descriptor(descriptor)?;
+        if UInt256::from(*node.identity.id().data()) == reply.request.source_validator { source = Some(node.identity); break; }
+    }
+    let draft = FinalizedDeliveryDraft { block_id: reply.request.block_id.clone(),
+        source_info: consensus_common::BlockSourceInfo { source: source.ok_or_else(|| error!("Canonical source not in committee"))?,
+            priority: consensus_common::BlockCandidatePriority { round: 0, priority: 0, first_block_round: 0 } },
+        data: reply.data.clone(), finality: reply.finality.clone(), last_mc_finalized_seqno: reply.last_mc_finalized_seqno,
+        candidate_already_sent: reply.candidate_already_sent, created_at_unix_secs: reply.created_at_unix_secs };
+    let record = PendingFinalityRecord::from_draft(runtime, &draft)?;
+    if record.request(reply.request.node_receipt.clone()) != reply.request { fail!("Canonical source runtime/origin mismatch"); }
+    Ok((record.id()?, record.canonical_digest()?))
 }
 
 pub(crate) struct PendingFinalityStore {
