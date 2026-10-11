@@ -752,6 +752,23 @@ impl ValidatorGroupImpl {
                 )
             }
             ConsensusOptions::Simplex(simplex_options) => {
+                if let Some(runtime) = &g.authenticated_runtime {
+                    let overlay_manager: ConsensusOverlayManagerPtr =
+                        Arc::new(ConsensusOverlayManagerImpl::new(
+                            g.engine.validator_network(),
+                            g.validator_list_id.clone(),
+                            block_sync_params_with_identity,
+                        ));
+                    return ConsensusFactory::create_simplex_authenticated_session(
+                        simplex_options,
+                        runtime.clone(),
+                        &g.local_key,
+                        db_root,
+                        overlay_manager,
+                        listener,
+                        g.engine.trace_collector(),
+                    );
+                }
                 let nodes = g
                     .validator_set
                     .list()
