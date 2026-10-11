@@ -142,7 +142,7 @@ fn bounded_config_key_history_traversal_matches_and_stops() {
     use crate::{dictionary::hashmapaug::HashmapAugType, KeyExtBlkRef, OldMcBlocksInfo};
     let mut index = OldMcBlocksInfo::default();
     for seq in 1..=32 {
-        index.set(&seq, &KeyExtBlkRef::fake(seq % 3 == 0, seq, seq as u64)).unwrap();
+        index.set_augmentable(&seq, &KeyExtBlkRef::fake(seq % 3 == 0, seq, seq as u64)).unwrap();
     }
     let budget = Budget::new(100_000, 1 << 20);
     for seq in 0..35 {
