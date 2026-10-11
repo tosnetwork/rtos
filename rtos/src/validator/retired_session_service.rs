@@ -87,11 +87,17 @@ impl RetiredSessionService {
         }
         // Keep every session and its namespace lease until the real blocking
         // shutdown certifies drain. Caller cancellation cannot detach this work.
-        while let Some(mut owner) = active.pop() {
-            loop {
-                if self.retire(&engine, &mut owner).await {
-                    break;
-                }
+        while !active.is_empty() {
+            let cleanup =
+                std::panic::AssertUnwindSafe(self.poll_owners(engine.stopper(), &mut active, true))
+                    .catch_unwind()
+                    .await;
+            if !matches!(cleanup, Ok(Ok(()))) {
+                // The vector still owns each lease, constructor and session.
+                // A cleanup panic cannot become a terminal service exemption.
+                log::error!("Retired recovery cleanup failed; retaining all unresolved owners");
+            }
+            if !active.is_empty() {
                 tokio::time::sleep(RETRY).await;
             }
         }
@@ -119,23 +125,7 @@ impl RetiredSessionService {
             if engine.check_stop() {
                 return Ok(());
             }
-            let mut index = 0;
-            while index < active.len() {
-                let owner = &mut active[index];
-                let done = owner.session.as_ref().is_some_and(|s| s.finality_recovery_complete());
-                let failed = owner.failure.is_some()
-                    || owner.session.as_ref().is_some_and(|s| s.is_panicked());
-                if done || failed || owner.started.elapsed() >= REPLAY_SLICE {
-                    if self.retire(engine, owner).await {
-                        if done {
-                            self.status.lock().unwrap_or_else(|e| e.into_inner()).completed += 1;
-                        }
-                        active.swap_remove(index);
-                        continue;
-                    }
-                }
-                index += 1;
-            }
+            self.poll_owners(engine.stopper(), active, false).await?;
             self.status.lock().unwrap_or_else(|e| e.into_inner()).active = active.len();
             let root = directory.clone();
             let after = cursor.clone();
@@ -222,10 +212,13 @@ impl RetiredSessionService {
             lease: Some(lease),
             session: None,
             failure: None,
+            constructing: None,
+            retiring: None,
+            completed: false,
             listener,
             started: tokio::time::Instant::now(),
         });
-        let result = tokio::task::spawn_blocking(move || {
+        let constructor = tokio::task::spawn_blocking(move || {
             simplex::SessionFactory::create_finality_recovery_session_checked(
                 authenticated.options(),
                 runtime,
@@ -236,83 +229,110 @@ impl RetiredSessionService {
                 weak_listener,
                 sink,
             )
-        })
-        .await;
-        let owner = active.last_mut().expect("admitted recovery owner");
-        match result {
-            Ok(Ok(session)) => owner.session = Some(session),
-            Ok(Err(failure)) => {
-                self.deferred(namespace, &failure);
-                owner.failure = Some(failure);
-            }
-            Err(error) => {
-                // Checked constructors must capture any post-allocation panic
-                // with an owned cleanup receipt. An unexpected join failure has
-                // no such proof: keep the lease and make shutdown wait.
-                engine.stopper().set_stop();
-                self.deferred(namespace, &error);
-                fail!("Retired constructor lost cleanup receipt: {error}");
-            }
-        }
+        });
+        active.last_mut().expect("admitted recovery owner").constructing = Some(constructor);
         Ok(())
     }
 
-    async fn retire(&self, engine: &Arc<Engine>, owner: &mut ActiveRecovery) -> bool {
-        let drained = if let Some(session) = &owner.session {
-            let session = session.clone();
-            match tokio::task::spawn_blocking(move || {
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    session.stop_checked()
-                }));
-                (session.threads_drained(), outcome)
-            })
-            .await
-            {
-                Ok((drained, outcome)) => {
-                    if !matches!(outcome, Ok(Ok(()))) {
-                        self.deferred(&owner.namespace, &"checked session shutdown failed");
-                        if drained {
-                            engine.stopper().report_service_failure(
+    /// Observe only completed jobs; one slow constructor or join never prevents
+    /// the actor from starting/retiring other independent namespaces.
+    async fn poll_owners(
+        &self,
+        stopper: &crate::engine::Stopper,
+        active: &mut Vec<ActiveRecovery>,
+        stopping: bool,
+    ) -> Result<()> {
+        let mut index = 0;
+        while index < active.len() {
+            let owner = &mut active[index];
+            if owner.constructing.as_ref().is_some_and(|job| job.is_finished()) {
+                let result = owner.constructing.take().unwrap().await;
+                match result {
+                    Ok(Ok(session)) => owner.session = Some(session),
+                    Ok(Err(failure)) => {
+                        owner.failure = Some(Arc::new(Mutex::new(failure)));
+                        self.deferred(
+                            &owner.namespace,
+                            &"checked construction failed; cleanup retained",
+                        );
+                    }
+                    Err(error) => {
+                        stopper.set_stop();
+                        self.deferred(&owner.namespace, &error);
+                        // No cleanup proof: keep this owner and lease forever,
+                        // rather than permit shutdown to close a possibly live DB.
+                        fail!("Retired constructor lost cleanup receipt: {error}");
+                    }
+                }
+            }
+            if owner.retiring.as_ref().is_some_and(|job| job.is_finished()) {
+                let outcome = owner.retiring.take().unwrap().await;
+                match outcome {
+                    Ok((true, failure)) => {
+                        owner.session.take();
+                        owner.failure.take();
+                        if let Some(lease) = owner.lease.take() {
+                            lease.release();
+                        }
+                        if owner.completed {
+                            self.status.lock().unwrap_or_else(|e| e.into_inner()).completed += 1;
+                        }
+                        if let Some(error) = failure {
+                            stopper.report_service_failure(
                                 0,
-                                "retired session joined with failure".into(),
+                                format!("retired recovery joined with failure: {error}"),
                             );
                         }
+                        active.swap_remove(index);
+                        continue;
                     }
-                    drained
-                }
-                Err(error) => {
-                    self.deferred(&owner.namespace, &error);
-                    false
+                    Ok((false, failure)) => {
+                        if let Some(error) = failure {
+                            self.deferred(&owner.namespace, &error);
+                        }
+                    }
+                    Err(error) => self.deferred(&owner.namespace, &error),
                 }
             }
-        } else if let Some(failure) = owner.failure.take() {
-            // The failure itself owns any partly constructed session. Never
-            // drop the only cleanup handle while a blocking retry is running.
-            let retained = Arc::new(Mutex::new(failure));
-            let work = retained.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                work.lock().unwrap_or_else(|e| e.into_inner()).retry_cleanup()
-            })
-            .await;
-            let failure = Arc::try_unwrap(retained)
-                .ok()
-                .expect("joined recovery cleanup")
-                .into_inner()
-                .unwrap_or_else(|e| e.into_inner());
-            let drained = result.is_ok_and(|done| done);
-            owner.failure = Some(failure);
-            drained
-        } else {
-            false
-        };
-        if drained {
-            owner.session.take();
-            owner.failure.take();
-            if let Some(lease) = owner.lease.take() {
-                lease.release();
+            if owner.constructing.is_none() && owner.retiring.is_none() {
+                let complete = owner
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.finality_recovery_complete());
+                owner.completed |= complete;
+                if stopping
+                    || complete
+                    || owner.failure.is_some()
+                    || owner.session.as_ref().is_some_and(|session| session.is_panicked())
+                    || owner.started.elapsed() >= REPLAY_SLICE
+                {
+                    if let Some(session) = &owner.session {
+                        let session = session.clone();
+                        owner.retiring = Some(tokio::task::spawn_blocking(move || {
+                            let outcome =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    session.stop_checked()
+                                }));
+                            let failure = match outcome {
+                                Ok(Ok(())) => None,
+                                Ok(Err(error)) => Some(error.to_string()),
+                                Err(_) => Some("checked session shutdown panicked".into()),
+                            };
+                            (session.namespace_drained(), failure)
+                        }));
+                    } else if let Some(failure) = &owner.failure {
+                        let failure = failure.clone();
+                        owner.retiring = Some(tokio::task::spawn_blocking(move || {
+                            let drained =
+                                failure.lock().unwrap_or_else(|e| e.into_inner()).retry_cleanup();
+                            (drained, None)
+                        }));
+                    }
+                }
             }
+            index += 1;
         }
-        drained
+        Ok(())
     }
 }
 
@@ -320,7 +340,14 @@ struct ActiveRecovery {
     namespace: PathBuf,
     lease: Option<RecoveryReservation>,
     session: Option<simplex::SessionPtr>,
-    failure: Option<simplex::SessionCreationFailure>,
+    failure: Option<Arc<Mutex<simplex::SessionCreationFailure>>>,
+    constructing: Option<
+        tokio::task::JoinHandle<
+            std::result::Result<simplex::SessionPtr, simplex::SessionCreationFailure>,
+        >,
+    >,
+    retiring: Option<tokio::task::JoinHandle<(bool, Option<String>)>>,
+    completed: bool,
     // Simplex only retains a Weak callback; keep this through checked join.
     #[allow(dead_code)]
     listener: Arc<dyn SessionListener + Send + Sync>,
@@ -406,6 +433,72 @@ impl SessionListener for RecoveryListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_recovery_slow_owned_jobs_do_not_block_other_namespace_cleanup() {
+        for constructing in [true, false] {
+            let service = RetiredSessionService {
+                status: Mutex::new(Default::default()),
+                initialized: tokio::sync::watch::channel(false).0,
+            };
+            let stopper = crate::engine::Stopper::new();
+            let new_owner = |name: &str| ActiveRecovery {
+                namespace: PathBuf::from(name),
+                lease: None,
+                session: None,
+                failure: None,
+                constructing: None,
+                retiring: None,
+                completed: false,
+                listener: Arc::new(RecoveryListener),
+                started: tokio::time::Instant::now(),
+            };
+            let (release, held) = std::sync::mpsc::channel();
+            let mut slow = new_owner("slow");
+            if constructing {
+                slow.constructing = Some(tokio::task::spawn_blocking(move || {
+                    held.recv().unwrap();
+                    Err(simplex::SessionCreationFailure::before_worker(error!(
+                        "controlled pre-worker failure"
+                    )))
+                }));
+            } else {
+                slow.retiring = Some(tokio::task::spawn_blocking(move || {
+                    held.recv().unwrap();
+                    (true, None)
+                }));
+            }
+            let mut independent = new_owner("independent");
+            independent.failure =
+                Some(Arc::new(Mutex::new(simplex::SessionCreationFailure::before_worker(error!(
+                    "independent pre-worker failure"
+                )))));
+            let mut active = vec![slow, independent];
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while active.len() != 1 {
+                    service.poll_owners(&stopper, &mut active, false).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("one blocked job delayed independent cleanup");
+            assert_eq!(active[0].namespace, PathBuf::from("slow"));
+            if constructing {
+                assert!(!active[0].constructing.as_ref().unwrap().is_finished());
+            } else {
+                assert!(!active[0].retiring.as_ref().unwrap().is_finished());
+            }
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !active.is_empty() {
+                    service.poll_owners(&stopper, &mut active, true).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("owned jobs did not join after release");
+        }
+    }
 
     #[test]
     fn retired_recovery_scan_round_robin_is_bounded_and_wraps() -> Result<()> {
