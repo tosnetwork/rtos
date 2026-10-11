@@ -898,6 +898,8 @@ async fn load_history_proof_impl<E: EngineOperations + ?Sized>(
                 }
             }
         }
+        #[cfg(test)]
+        budget.note_local_proof_fallback();
         if let Some(proof) =
             crate::retired_history::load_proof_with_budget(engine, id, checkpoint, Some(budget))
                 .await?

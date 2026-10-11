@@ -83,6 +83,8 @@ pub struct HistoryReadBudget {
     parsing: Mutex<()>,
     failed: AtomicBool,
     #[cfg(test)]
+    local_proof_fallbacks: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
     cell_gate: Mutex<Option<(tokio::sync::oneshot::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 #[derive(Clone, Copy)]
@@ -272,6 +274,8 @@ impl HistoryReadBudget {
             parsing: Mutex::new(()),
             failed: AtomicBool::new(false),
             #[cfg(test)]
+            local_proof_fallbacks: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
             cell_gate: Mutex::new(None),
         })
     }
@@ -343,6 +347,14 @@ impl HistoryReadBudget {
             }
         };
         Ok(ReadReservation { budget: self.clone(), kind, allowance, active: true })
+    }
+    #[cfg(test)]
+    pub(crate) fn note_local_proof_fallback(&self) {
+        self.local_proof_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(test)]
+    pub(crate) fn local_proof_fallbacks(&self) -> usize {
+        self.local_proof_fallbacks.load(Ordering::Relaxed)
     }
     pub(crate) fn step(&self) -> Result<()> {
         let mut u = self.usage.lock().map_err(|_| error!("History accounting poisoned"))?;
@@ -438,6 +450,7 @@ impl HistoryReadBudget {
                         .cell_bytes
                         .saturating_sub(usage.cell_bytes + usage.reserved_cell_bytes)
             {
+                self.failed.store(true, Ordering::Release);
                 return Err(HistoryBudgetExceeded("local artifact BOC header").into());
             }
         }
@@ -449,6 +462,13 @@ impl HistoryReadBudget {
                     self.usage.lock().map_err(|_| error!("History accounting poisoned"))?;
                 usage.cells += header.cells_count;
                 usage.cell_bytes += header.tot_cells_size;
+                // The parser has discarded every partial cell and has not
+                // published graph-cache entries. Keep all attempted work charged.
+                // A typed depth rejection is a limit, never replaceable syntax.
+                if error.downcast_ref::<rtos_block::CellDepthLimitExceeded>().is_some() {
+                    self.failed.store(true, Ordering::Release);
+                    return Err(error.context(HistoryBudgetExceeded("local artifact depth")));
+                }
                 return Err(error);
             }
         };
@@ -622,6 +642,29 @@ mod tests {
         assert!(budget.reserve_network_graph().is_err());
         reservation.finish(&root)?;
         assert_eq!(budget.usage.lock().unwrap().cells, count);
+        Ok(())
+    }
+    #[test]
+    fn history_budget_local_syntax_preserves_attempts_and_only_limits_poison() -> Result<()> {
+        let boc = rtos_block::write_boc(&Cell::default())?;
+        let mut truncated = boc.clone();
+        truncated.pop(); // header admitted, body incomplete
+        let budget = HistoryReadBudget::new(HistoryReadLimits::default());
+        budget.proof_bytes(&truncated)?;
+        let error = budget.parse_local_artifact(&truncated).unwrap_err();
+        assert!(!stops_fallback(&error), "ordinary syntax is not budget authority");
+        assert_eq!(budget.usage.lock().unwrap().cells, 1);
+        assert_eq!(budget.usage.lock().unwrap().proof_bytes, truncated.len());
+        budget.proof_bytes(&boc)?;
+        budget.parse_local_artifact(&boc)?;
+        let usage = budget.usage.lock().unwrap();
+        assert_eq!(usage.cells, 2, "failed parsing work must not be refunded");
+        assert_eq!(usage.proof_count, 2);
+        drop(usage);
+        let budget = HistoryReadBudget::new(HistoryReadLimits { cells: 1, ..Default::default() });
+        assert!(budget.parse_local_artifact(&truncated).is_err());
+        assert!(stops_fallback(&budget.parse_local_artifact(&boc).unwrap_err()));
+        assert!(budget.parse_local_artifact(&boc).is_err(), "no new quota after denial");
         Ok(())
     }
     #[test]
