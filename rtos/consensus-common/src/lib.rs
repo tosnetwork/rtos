@@ -599,23 +599,64 @@ pub trait AsyncKeyValueStorage: Send + Sync {
     }
 }
 
-/// Open-instance generation of one database directory, shared by every
-/// instance opened there while any instance or receipt still refers to it.
+/// Open-instance state of one database directory, shared by every instance
+/// opened there while any instance or receipt still refers to it.
 pub(crate) struct StorageGenerationSlot {
+    /// Advanced by every open attempt, including ones that later fail.
     pub(crate) generation: u64,
-    pub(crate) live: bool,
+    /// Instances registered and not yet torn down or rolled back.
+    pub(crate) live: u32,
 }
 pub(crate) type StorageGeneration = Arc<std::sync::Mutex<StorageGenerationSlot>>;
 
-/// Registers a newly opened instance of the database at `directory` and
-/// returns its slot and generation. The key is the canonical directory, so
-/// aliases share one slot; entries whose slot nobody holds are pruned, which
-/// bounds the map by live instances plus outstanding receipts.
-pub(crate) fn register_storage_instance(directory: &std::path::Path) -> (StorageGeneration, u64) {
+fn lock_generation(
+    slot: &StorageGeneration,
+) -> std::sync::MutexGuard<'_, StorageGenerationSlot> {
+    match slot.lock() {
+        Ok(state) => state,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Registers one open attempt of the database `parent/storage_id` before any
+/// worker starts, atomically taking a new generation and a live count. The
+/// key is the canonical parent plus the plain storage id, and an existing
+/// database child must be a real directory, so aliases share one slot.
+/// Entries nobody holds are pruned, bounding the map by live instances plus
+/// outstanding receipts. Every later failure must call
+/// `release_storage_instance`.
+pub(crate) fn register_storage_instance(
+    parent: &std::path::Path,
+    storage_id: &str,
+) -> Result<(StorageGeneration, u64)> {
     static REGISTRY: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Weak<std::sync::Mutex<StorageGenerationSlot>>>>,
+        std::sync::Mutex<
+            HashMap<std::path::PathBuf, std::sync::Weak<std::sync::Mutex<StorageGenerationSlot>>>,
+        >,
     > = std::sync::OnceLock::new();
-    let key = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_owned());
+    let mut components = std::path::Path::new(storage_id).components();
+    if !matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) {
+        rtos_block::fail!("Storage id {storage_id:?} is not one plain path component");
+    }
+    match std::fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => rtos_block::fail!("Storage parent {} is not a directory", parent.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(parent)?
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let canonical = std::fs::canonicalize(parent)?;
+    match std::fs::symlink_metadata(canonical.join(storage_id)) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => rtos_block::fail!("Storage directory {storage_id} is not a real directory"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let key = canonical.join(storage_id);
     let registry = REGISTRY.get_or_init(Default::default);
     let mut map = match registry.lock() {
         Ok(map) => map,
@@ -623,20 +664,31 @@ pub(crate) fn register_storage_instance(directory: &std::path::Path) -> (Storage
     };
     map.retain(|_, slot| slot.strong_count() > 0);
     let slot = map.get(&key).and_then(std::sync::Weak::upgrade).unwrap_or_else(|| {
-        Arc::new(std::sync::Mutex::new(StorageGenerationSlot { generation: 0, live: false }))
+        Arc::new(std::sync::Mutex::new(StorageGenerationSlot { generation: 0, live: 0 }))
     });
-    map.insert(key, Arc::downgrade(&slot));
     let generation = {
-        let mut state = match slot.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        // u64 generations per directory cannot be exhausted in practice.
-        state.generation = state.generation.saturating_add(1);
-        state.live = true;
-        state.generation
+        let mut state = lock_generation(&slot);
+        let generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| rtos_block::error!("Storage generation exhausted"))?;
+        let live = state
+            .live
+            .checked_add(1)
+            .ok_or_else(|| rtos_block::error!("Storage live count exhausted"))?;
+        state.generation = generation;
+        state.live = live;
+        generation
     };
-    (slot, generation)
+    map.insert(key, Arc::downgrade(&slot));
+    Ok((slot, generation))
+}
+
+/// Ends one registration: a failed open rolls back, a dropped instance
+/// finishes. The generation stays advanced, so no older receipt revives.
+pub(crate) fn release_storage_instance(slot: &StorageGeneration) {
+    let mut state = lock_generation(slot);
+    state.live = state.live.saturating_sub(1);
 }
 
 /// Outcome of one storage instance's final teardown, recorded by its `Drop`.
@@ -679,14 +731,11 @@ impl StorageTeardownReceipt {
     /// or when a newer instance was opened at the same database directory.
     pub fn check(&self) -> Result<()> {
         {
-            let state = match self.instance.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let state = lock_generation(&self.instance);
             if state.generation != self.generation {
                 rtos_block::fail!("Storage {} was reopened by a newer instance", self.storage_id);
             }
-            if state.live {
+            if state.live != 0 {
                 rtos_block::fail!("Storage {} has not been torn down", self.storage_id);
             }
         }

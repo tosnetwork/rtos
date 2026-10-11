@@ -88,10 +88,11 @@ impl RuntimeManifest {
         charge: &mut crate::finality_delivery::source_retirement::Charge,
     ) -> crate::finality_delivery::source_retirement::Refusal<(Self, rtos_block::UInt256)> {
         use crate::finality_delivery::source_retirement::{
-            existing_directory, failed, Bucket, RetirementRefusal, MANIFEST_WORKSPACE,
+            existing_directory, failed, manifest_workspace, Bucket, RetirementRefusal,
+            MANIFEST_WORKSPACE,
         };
         const MAX_MANIFEST_BYTES: u64 = 1 << 20;
-        charge.workspace("manifest", MANIFEST_WORKSPACE)?;
+        charge.workspace("manifest", manifest_workspace(runtime.committee().len())?)?;
         let expected = Self::bytes(runtime).map_err(failed)?;
         if expected.len() > MANIFEST_WORKSPACE {
             return Err(RetirementRefusal::Manifest("manifest exceeds its workspace bound".into()));

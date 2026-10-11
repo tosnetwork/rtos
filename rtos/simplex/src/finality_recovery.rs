@@ -80,12 +80,66 @@ struct DiskIntent {
     session_id: String,
     local_adnl: String,
     local_validator_index: Option<u32>,
+    #[serde(deserialize_with = "bounded_prev_blocks")]
     prev_blocks: Vec<String>,
     start_masterchain: String,
     slot: u32,
     candidate_hash: String,
     certificate: String,
 }
+/// A session has one or two parents; each is one block id in text form.
+const MAX_PREV_BLOCKS: usize = 2;
+const MAX_PREV_BLOCK_TEXT: usize = 512;
+
+/// Refuses an oversized parent list while parsing, before any element beyond
+/// the bound or any oversized string is allocated.
+fn bounded_prev_blocks<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error> {
+    struct Text(String);
+    impl<'de> Deserialize<'de> for Text {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            struct Visitor;
+            impl serde::de::Visitor<'_> for Visitor {
+                type Value = Text;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a bounded block id")
+                }
+                fn visit_str<E: serde::de::Error>(self, value: &str) -> std::result::Result<Text, E> {
+                    if value.len() > MAX_PREV_BLOCK_TEXT {
+                        return Err(E::custom("session parent text too long"));
+                    }
+                    Ok(Text(value.to_owned()))
+                }
+            }
+            deserializer.deserialize_str(Visitor)
+        }
+    }
+    struct Visitor;
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("at most two session parents")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Vec<String>, A::Error> {
+            let mut parents = Vec::with_capacity(MAX_PREV_BLOCKS);
+            while let Some(Text(parent)) = seq.next_element()? {
+                if parents.len() == MAX_PREV_BLOCKS {
+                    return Err(serde::de::Error::custom("too many session parents"));
+                }
+                parents.push(parent);
+            }
+            Ok(parents)
+        }
+    }
+    deserializer.deserialize_seq(Visitor)
+}
+
 impl SessionRecoveryRecord {
     pub fn validate_runtime(&self, runtime: &AuthenticatedSessionRuntime) -> Result<()> {
         if &self.pin != runtime.pin()

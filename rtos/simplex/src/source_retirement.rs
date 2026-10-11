@@ -108,6 +108,18 @@ pub(crate) enum Bucket {
 pub(crate) const PARSE_WORKSPACE_FACTOR: usize = 4;
 /// Upper bound for the runtime manifest the reader rebuilds for comparison.
 pub(crate) const MANIFEST_WORKSPACE: usize = 4096;
+/// Per committee member: its consensus node with PQ public key and its share
+/// of the committee digest input, each bounded by the PQ key size.
+const MANIFEST_PER_MEMBER: usize = 4096;
+
+/// Workspace for rebuilding the manifest, including the committee digest's
+/// per-member node and key buffers.
+pub(crate) fn manifest_workspace(committee: usize) -> Refusal<usize> {
+    committee
+        .checked_mul(MANIFEST_PER_MEMBER)
+        .and_then(|members| members.checked_add(MANIFEST_WORKSPACE))
+        .ok_or_else(|| exhausted("manifest workspace overflow"))
+}
 /// Per-entry overhead of the index, file list and digest beyond its strings.
 const ENTRY_OVERHEAD: usize = 256;
 

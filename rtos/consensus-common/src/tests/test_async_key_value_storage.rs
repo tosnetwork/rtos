@@ -1330,7 +1330,6 @@ fn test_teardown_receipt_is_invalidated_by_a_reopened_instance() {
     assert!(error.contains("reopened by a newer instance"), "{error}");
     let newer = second.teardown_receipt().unwrap();
     assert!(!receipt.same_instance(&newer));
-    second.mark_for_destroy();
     drop(second);
     newer.check().unwrap();
     assert!(receipt.check().is_err(), "an older receipt stays invalid after the newer drops");
@@ -1344,6 +1343,56 @@ fn test_teardown_receipt_is_invalidated_by_a_reopened_instance() {
     .unwrap();
     assert!(newer.check().is_err(), "an alias reopen invalidates the receipt");
     third.mark_for_destroy();
+}
+
+#[test]
+fn test_storage_registration_fails_closed_and_rolls_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let open = |path: &std::path::Path| {
+        ConsensusCommonFactory::create_async_key_value_storage(
+            path,
+            "registration",
+            create_test_options(),
+        )
+    };
+    // A parent that is a regular file, or a symlinked database child, is
+    // refused before anything is registered or started.
+    let root = create_test_db_path("registration_refusals");
+    let file_parent = root.join("file-parent");
+    std::fs::write(&file_parent, b"x").unwrap();
+    assert!(open(&file_parent).is_err());
+    let real = root.join("real-db");
+    std::fs::create_dir_all(&real).unwrap();
+    let linked = root.join("linked-parent");
+    std::fs::create_dir_all(&linked).unwrap();
+    std::os::unix::fs::symlink(&real, linked.join("registration")).unwrap();
+    assert!(open(&linked).is_err(), "a symlinked database child is refused");
+
+    // A failed concurrent open at RocksDB's own lock rolls back its live count
+    // but advances the generation: the live first instance stays unsatisfied
+    // and its receipt never revives.
+    let path = create_test_db_path("registration_interleaved");
+    let first = open(&path).unwrap();
+    let receipt = first.teardown_receipt().unwrap();
+    assert!(open(&path).is_err(), "RocksDB admits one instance per directory");
+    first.set(b"k".to_vec(), b"v".to_vec(), None).wait().unwrap();
+    assert!(receipt.check().is_err(), "the first instance is still live");
+    drop(first);
+    let error = receipt.check().unwrap_err().to_string();
+    assert!(error.contains("reopened by a newer instance"), "{error}");
+
+    // A database init failure rolls back too: a later valid open and its
+    // receipt behave normally.
+    let database = path.join("registration");
+    std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let failed = open(&path);
+    std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(failed.is_err(), "an unreadable database fails to initialize");
+    let reopened = open(&path).unwrap();
+    let newer = reopened.teardown_receipt().unwrap();
+    reopened.mark_for_destroy();
+    drop(reopened);
+    newer.check().unwrap();
 }
 
 #[test]

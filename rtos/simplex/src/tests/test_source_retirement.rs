@@ -853,3 +853,51 @@ fn source_retirement_largest_output_set_is_refused_before_parse_and_copy() {
     }
     assert_eq!(fixture.snapshot(), before);
 }
+
+#[test]
+fn source_retirement_parent_list_is_bounded_while_parsing() {
+    // Short strings cost three JSON bytes each but far more as native vector
+    // elements; the parser must refuse the list before it grows.
+    for (name, parents) in [
+        ("short-string flood", serde_json::json!(vec![""; 20_000])),
+        ("over-long parent", serde_json::json!(["x".repeat(513)])),
+    ] {
+        let fixture = released();
+        Released::edit_json(&fixture.output_set, |v| v["metadata"]["prev_blocks"] = parents.clone());
+        let before = fixture.snapshot();
+        match fixture.scan() {
+            Err(RetirementRefusal::LegacyFormat(_, message)) => {
+                assert!(message.contains("session parent"), "{name}: {message}")
+            }
+            other => panic!("{name}: expected a parse refusal, got {:?}", other.err()),
+        }
+        assert!(!fixture.store_locked(), "{name}: refusal releases the locks");
+        assert_eq!(fixture.snapshot(), before);
+    }
+}
+
+#[test]
+fn source_retirement_manifest_charge_covers_the_committee() {
+    // The charge grows with the committee whose digest the manifest rebuilds.
+    let base = manifest_workspace(0).unwrap();
+    let per_member = manifest_workspace(1).unwrap() - base;
+    assert!(per_member >= 1312 * 2, "covers a PQ public key in the node and the digest input");
+    assert_eq!(manifest_workspace(400).unwrap(), base + 400 * per_member);
+    assert!(manifest_workspace(usize::MAX).is_err());
+    let fixture = released();
+    let committee = fixture.runtime.committee().len();
+    let charge = manifest_workspace(committee).unwrap();
+    let refusal = scan_source_retirement(
+        fixture.runtime.clone(),
+        &fixture.namespace,
+        &fixture.teardown,
+        &Meter::new((None, None, Some(charge - 1))),
+    )
+    .err()
+    .unwrap();
+    match refusal {
+        RetirementRefusal::BudgetExhausted(message) => assert!(message.contains("manifest"), "{message}"),
+        other => panic!("expected the manifest charge to refuse first, got {other}"),
+    }
+    assert!(!fixture.store_locked());
+}
