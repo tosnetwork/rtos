@@ -23,9 +23,26 @@ pub struct SessionNetworkPin {
     pub zerostate: BlockIdExt,
 }
 
+/// Complete, owned session derivation coordinates for historical recovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionRecoveryCoordinates {
+    pub shard: ShardIdent,
+    pub catchain_seqno: u32,
+    pub vertical_seqno: u32,
+    pub last_key_block_seqno: u32,
+    pub new_catchain_ids: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionRecoveryBinding {
+    pub governing_masterchain: BlockIdExt,
+    pub coordinates: SessionRecoveryCoordinates,
+}
+
 #[derive(Clone, Debug)]
 pub struct AuthenticatedSessionRuntime {
     pin: SessionNetworkPin,
+    coordinates: SessionRecoveryCoordinates,
+    recovery_binding: Option<SessionRecoveryBinding>,
     profile: UInt256,
     session: UInt256,
     shard: ShardIdent,
@@ -102,6 +119,13 @@ impl AuthenticatedSessionRuntime {
             };
         Ok(Self {
             pin,
+            coordinates: SessionRecoveryCoordinates {
+                shard: coordinates.shard.clone(), catchain_seqno: coordinates.catchain_seqno,
+                vertical_seqno: coordinates.vertical_seqno,
+                last_key_block_seqno: coordinates.last_key_block_seqno,
+                new_catchain_ids: coordinates.new_catchain_ids,
+            },
+            recovery_binding: None,
             profile: identity.config_hash,
             session: identity.session_id,
             shard: coordinates.shard.clone(),
@@ -119,10 +143,30 @@ impl AuthenticatedSessionRuntime {
             pq_context,
         })
     }
+    /// Bind the exact authenticated MC state which supplied this configuration.
+    /// This checks consistency only: the caller must have authenticated the
+    /// anchor and its state against `pin`, not obtained it from a peer claim.
+    /// A runtime retains its first anchor; binding it twice is forbidden.
+    pub fn bind_recovery_anchor(mut self, anchor: BlockIdExt) -> Result<Self> {
+        if self.recovery_binding.is_some() { fail!("Session recovery anchor already bound"); }
+        if !anchor.shard().is_masterchain() || anchor.root_hash().is_zero() || anchor.file_hash().is_zero()
+            || (anchor.seq_no() == 0 && anchor != self.pin.zerostate) {
+            fail!("Invalid governing masterchain recovery anchor");
+        }
+        self.recovery_binding = Some(SessionRecoveryBinding {
+            governing_masterchain: anchor, coordinates: self.coordinates.clone(),
+        });
+        Ok(self)
+    }
+    pub fn recovery_binding(&self) -> Option<&SessionRecoveryBinding> { self.recovery_binding.as_ref() }
+
     /// Whether a live group may retain its immutable admission snapshot.
     /// The session hash alone does not encode a change to transport members.
     pub fn same_admission(&self, other: &Self) -> bool {
+        // Later MC snapshots can authenticate the same immutable admission.
+        // They must not rotate a live session solely to change its recovery anchor.
         self.pin == other.pin
+            && self.coordinates == other.coordinates
             && self.profile == other.profile
             && self.session == other.session
             && self.shard == other.shard
@@ -392,4 +436,26 @@ mod tests {
         assert!(create(pin, &absent, nodes).is_err());
         assert!(SimplexProtocol::try_from(3).is_err());
     }
+    #[test]
+    fn authenticated_recovery_anchor_retains_coordinates_without_spurious_rotation() {
+        let (pin, config, nodes) = fixture();
+        let shard = ShardIdent::masterchain();
+        let runtime = AuthenticatedSessionRuntime::from_authenticated_config(pin.clone(), &config,
+            coords(&shard), nodes, KeyId::from_data([99; 32])).unwrap();
+        assert!(runtime.recovery_binding().is_none());
+        let first = runtime.clone().bind_recovery_anchor(pin.zerostate.clone()).unwrap();
+        let later_anchor = BlockIdExt::with_params(shard.clone(), 1, UInt256::from([5; 32]), UInt256::from([6; 32]));
+        let later = runtime.clone().bind_recovery_anchor(later_anchor).unwrap();
+        assert!(first.same_admission(&later));
+        assert!(first.clone().bind_recovery_anchor(pin.zerostate.clone()).is_err());
+        assert!(runtime.bind_recovery_anchor(BlockIdExt::default()).is_err());
+        let binding = first.recovery_binding().unwrap();
+        assert_eq!(binding.governing_masterchain, pin.zerostate);
+        assert_eq!(binding.coordinates.shard, shard);
+        assert_eq!(binding.coordinates.catchain_seqno, coords(&shard).catchain_seqno);
+        assert_eq!(binding.coordinates.vertical_seqno, coords(&shard).vertical_seqno);
+        assert_eq!(binding.coordinates.last_key_block_seqno, coords(&shard).last_key_block_seqno);
+        assert_eq!(binding.coordinates.new_catchain_ids, coords(&shard).new_catchain_ids);
+    }
+
 }
