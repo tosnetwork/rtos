@@ -92,7 +92,9 @@ impl Pair {
             include_str!("testdata/recovery.json")
         })
         .unwrap();
-        let inclusion: serde_json::Value = serde_json::from_str(if v2 {
+        let inclusion: serde_json::Value = serde_json::from_str(if history_gc {
+            include_str!("testdata/v2-history-inclusion.json")
+        } else if v2 {
             include_str!("testdata/v2-propagation-inclusion.json")
         } else {
             include_str!("testdata/inclusion.json")

@@ -20,6 +20,7 @@ use std::{
 };
 
 const SCHEMA: u32 = 1;
+static IO_JOBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 static PREPARATIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 #[derive(Clone, Debug)]
@@ -293,7 +294,9 @@ async fn owned_io<T: Send + 'static>(
     engine: &dyn EngineOperations,
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
+    let permit = IO_JOBS.try_acquire().map_err(|_| error!("History IO capacity exhausted"))?;
     crate::types::service_tasks::spawn_owned(engine, "retired history IO", async move {
+        let _permit = permit;
         tokio::task::spawn_blocking(work)
             .await
             .map_err(|e| error!("Retired history IO join: {e}"))?
