@@ -44,6 +44,21 @@ impl AsyncOwner {
         let Some(handles) = handles.as_mut() else {
             return false;
         };
+        use futures::FutureExt;
+        // Observe actual completed joins on each admission; do not retain one
+        // task allocation per request for the entire session lifetime.
+        let mut index = 0;
+        while index < handles.len() {
+            match (&mut handles[index].1).now_or_never() {
+                Some(result) => {
+                    let (name, _) = handles.swap_remove(index);
+                    if let Err(error) = result {
+                        self.errors.lock().unwrap().push(format!("{name}: {error}"));
+                    }
+                }
+                None => index += 1,
+            }
+        }
         // Panic requests sibling cancellation immediately, not only when stop is called.
         let owner = self.clone();
         handles.push((
@@ -171,6 +186,27 @@ mod tests {
         assert!(first.contains("panic source"));
         assert_eq!(first, owner.wait().await.unwrap_err().to_string());
         assert!(owner.drained());
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overlay_owned_completed_workers_are_reaped_during_admission() {
+        let owner = AsyncOwner::new(Handle::current());
+        for _ in 0..2000 {
+            let (tx, rx) = oneshot::channel();
+            assert!(owner.spawn("short request", async move {
+                tx.send(()).unwrap();
+            }));
+            rx.await.unwrap();
+            // Actual completion may follow the response. Observe the handle
+            // rather than assuming the response means its destructor finished.
+            loop {
+                if owner.handles.lock().unwrap().as_ref().unwrap().last().unwrap().1.is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        assert!(owner.handles.lock().unwrap().as_ref().unwrap().len() <= 2);
+        owner.wait().await.unwrap();
     }
     #[tokio::test]
     async fn overlay_owned_sync_bridge_refuses_current_thread_runtime() {

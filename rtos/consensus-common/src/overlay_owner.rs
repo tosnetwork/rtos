@@ -6,16 +6,18 @@ use std::sync::{Arc, Mutex};
 /// resource joins even if a consensus worker unwinds before normal teardown.
 pub struct OverlayOwner {
     inner: ConsensusOverlayManagerPtr,
+    open: Mutex<bool>,
     overlays: Mutex<Vec<(Arc<adnl::PrivateOverlayShortId>, ConsensusOverlayPtr)>>,
 }
 impl OverlayOwner {
     pub fn new(inner: ConsensusOverlayManagerPtr) -> Arc<Self> {
-        Arc::new(Self { inner, overlays: Mutex::new(Vec::new()) })
+        Arc::new(Self { inner, open: Mutex::new(true), overlays: Mutex::new(Vec::new()) })
     }
     pub fn drained(&self) -> bool {
         self.overlays.lock().unwrap().iter().all(|(_, overlay)| self.inner.overlay_drained(overlay))
     }
     pub fn stop_checked(&self) -> Result<()> {
+        *self.open.lock().unwrap() = false;
         let overlays = self.overlays.lock().unwrap().clone();
         let mut errors = Vec::new();
         for (id, overlay) in overlays {

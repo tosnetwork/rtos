@@ -681,24 +681,20 @@ impl PeerStorage {
         peer
     }
 
-    fn remove_peers(&self, peers_to_remove: Vec<Arc<Peer>>) -> Result<()> {
-        // Serialize final lease retirement with acquisition; a new resolver must
-        // not race the old resolver deleting the same transport peer.
-        let mut peers_map = self.peers.lock().expect("PeerStorage mutex poisoned");
+    fn remove_peers(&self, peers: Vec<Arc<Peer>>) -> (bool, Result<()>) {
+        let mut map = self.peers.lock().expect("PeerStorage mutex poisoned");
         let mut errors = Vec::new();
-        for peer in peers_to_remove {
+        let mut drained = true;
+        for peer in peers {
             if peer.leases.fetch_sub(1, Ordering::AcqRel) == 1 {
-                peers_map.remove(&(peer.src_adnl_addr.clone(), peer.dst_adnl_addr.clone()));
+                map.remove(&(peer.src_adnl_addr.clone(), peer.dst_adnl_addr.clone()));
                 if let Err(error) = peer.stop_checked() {
                     errors.push(error.to_string());
                 }
+                drained &= peer.tasks.drained();
             }
         }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(error!("{}", errors.join("; ")))
-        }
+        (drained, if errors.is_empty() { Ok(()) } else { Err(error!("{}", errors.join("; "))) })
     }
 }
 
@@ -808,6 +804,7 @@ struct AdnlOverlay {
     shutdown: Arc<AsyncOwner>,
     shutdown_started: Mutex<bool>,
     shutdown_errors: Arc<Mutex<Vec<String>>>,
+    cleanup_complete: Arc<AtomicBool>,
     stack: Arc<NetworkStack>,                //ADNL network stack
     overlay_id: Arc<PrivateOverlayShortId>,  //private overlay short identifier
     local_id: PublicKeyHash,                 //local validator key hash
@@ -915,6 +912,20 @@ impl BroadcastCheck for BlockSyncCheck {
             ));
         }
         Ok(())
+    }
+}
+
+struct OverlayRegistration {
+    node: Arc<OverlayNode>,
+    ids: Vec<Arc<PrivateOverlayShortId>>,
+}
+impl Drop for OverlayRegistration {
+    fn drop(&mut self) {
+        for id in &self.ids {
+            if let Err(error) = self.node.delete_private_overlay(id) {
+                log::error!("Partial overlay construction cleanup: {error}");
+            }
+        }
     }
 }
 
@@ -1040,6 +1051,8 @@ impl AdnlOverlay {
             runtime: Some(runtime_handle.clone()),
         };
         stack.overlay.add_private_overlay(params, &local_adnl_key, &peers, use_quic, None)?;
+        let mut registration =
+            OverlayRegistration { node: stack.overlay.clone(), ids: vec![overlay_id.clone()] };
 
         // create the parallel block-sync overlay when enable_observers=true.
         // Membership is the prev|curr|next mc validator union (block_sync_params.members),
@@ -1090,6 +1103,7 @@ impl AdnlOverlay {
                         use_quic,
                         Some(check),
                     )?;
+                    registration.ids.push(bs_id.clone());
                     log::info!(
                         target: LOG_TARGET,
                         "created block-sync overlay {bs_id} (members={}, authorized={}, \
@@ -1196,6 +1210,7 @@ impl AdnlOverlay {
                 shutdown: AsyncOwner::new(runtime_handle.clone()),
                 shutdown_started: Mutex::new(false),
                 shutdown_errors: Arc::new(Mutex::new(Vec::new())),
+                cleanup_complete: Arc::new(AtomicBool::new(false)),
                 stack,
                 overlay_id: overlay_id.clone(),
                 local_id,
@@ -1218,6 +1233,8 @@ impl AdnlOverlay {
                 block_sync_stats: block_sync_stats_for_cyclic.clone(),
             }
         });
+
+        registration.ids.clear(); // The constructed overlay now owns teardown.
 
         // Add consumer to overlay node for message handling
         overlay.stack.overlay.add_consumer(&overlay_id, overlay.consumer.clone())?;
@@ -1265,6 +1282,7 @@ impl AdnlOverlay {
         let id = self.overlay_id.clone();
         let block_sync = self.block_sync_overlay_id.clone();
         let errors = self.shutdown_errors.clone();
+        let cleanup_complete = self.cleanup_complete.clone();
         let runtime = self.runtime_handle.clone();
         self.shutdown.spawn("overlay resource finalizer", async move {
             if let Err(error) = tasks.wait().await {
@@ -1276,17 +1294,22 @@ impl AdnlOverlay {
                     if let Err(error) = manager.stop_checked() {
                         errors_for_blocking.lock().unwrap().push(error.to_string());
                     }
-                    if let Err(error) = storage.remove_peers(peers) {
+                    let (peers_drained, peer_result) = storage.remove_peers(peers);
+                    let mut removed = true;
+                    if let Err(error) = peer_result {
                         errors_for_blocking.lock().unwrap().push(error.to_string());
                     }
                     if let Err(error) = overlay.delete_private_overlay(&id) {
+                        removed = false;
                         errors_for_blocking.lock().unwrap().push(error.to_string());
                     }
                     if let Some(id) = block_sync {
                         if let Err(error) = overlay.delete_private_overlay(&id) {
+                            removed = false;
                             errors_for_blocking.lock().unwrap().push(error.to_string());
                         }
                     }
+                    cleanup_complete.store(peers_drained && removed, Ordering::Release);
                 })
                 .await;
             if let Err(error) = result {
@@ -1314,7 +1337,10 @@ impl AdnlOverlay {
     }
 
     fn drained(&self) -> bool {
-        self.shutdown.drained() && self.tasks.drained() && self.task_processor_manager.drained()
+        self.cleanup_complete.load(Ordering::Acquire)
+            && self.shutdown.drained()
+            && self.tasks.drained()
+            && self.task_processor_manager.drained()
     }
 
     /// Process incoming query from consumer
