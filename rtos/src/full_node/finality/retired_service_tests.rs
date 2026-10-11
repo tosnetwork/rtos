@@ -297,16 +297,13 @@ fn connect_socket(left: &SpoolFixture, right: &SpoolFixture) {
         .adnl
         .add_peer(left.runtime.local_adnl(), remote.stack.adnl.ip_address_adnl(), None, &remote_key)
         .unwrap();
-    local
-        .stack
-        .quic
-        .as_ref()
-        .unwrap()
-        .add_peer_key(
-            remote_key.id().clone(),
-            remote.stack.quic.as_ref().unwrap().local_addr(remote_key.id()).unwrap(),
-        )
-        .unwrap();
+    let mut address = remote.stack.quic.as_ref().unwrap().local_addr(remote_key.id()).unwrap();
+    // NodeNetwork binds wildcard; all three real sockets in this fixture are
+    // on this host. Advertise loopback with the actual bound port, never port0.
+    assert!(address.ip().is_unspecified() || address.ip().is_loopback());
+    address.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+    assert_ne!(address.port(), 0);
+    local.stack.quic.as_ref().unwrap().add_peer_key(remote_key.id().clone(), address).unwrap();
 }
 /// Explicit trusted fixture setup, separate from session admission/recovery.
 /// Uses the same real async RocksDB factory as SimplexDb; no marker-file stand-in.
