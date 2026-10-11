@@ -110,6 +110,31 @@ async fn production_wrapper_held_query_profile_generation_and_sticky_failure() -
             let crate::engine_traits::ValidatorListOutcome::Selected { key, .. } = selected else {
                 fail!("fixture failed to register real local transport");
             };
+            // Private membership is activated only after ADNL has resolved the
+            // configured member's address. This dispatcher fixture has no DHT
+            // peer, so supply its public key/address through the real resolver
+            // destination API before normal overlay creation. Reserve the UDP
+            // endpoint throughout the exercise; this is not socket interop.
+            let local = network
+                .validator_context
+                .sets_contexts
+                .get(&list_id)
+                .unwrap()
+                .val()
+                .validator_adnl_key
+                .id()
+                .clone();
+            let remote =
+                bootstrap.validators.iter().find(|keys| keys.adnl_key.id() != &local).unwrap();
+            let endpoint = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            let address = adnl::node::IpAddress::from_versioned_string(
+                &endpoint.local_addr()?.to_string(),
+                None,
+            )?;
+            network.context().stack.overlay.add_private_peers_to_adnl(
+                &local,
+                vec![(address, None, remote.adnl_key.clone())],
+            )?;
             assert_eq!(wrapper.wire_profile(), rtos_api::WireProfile::T0);
             let id = PrivateOverlayShortId::from_data([82; 32]);
             let (entered, started) = tokio::sync::oneshot::channel();
@@ -131,15 +156,6 @@ async fn production_wrapper_held_query_profile_generation_and_sticky_failure() -
                 None,
             )?;
             assert!(network.validator_context.catchain_overlays.get(&id).is_some());
-            let local = network
-                .validator_context
-                .sets_contexts
-                .get(&list_id)
-                .unwrap()
-                .val()
-                .validator_adnl_key
-                .id()
-                .clone();
             let other = nodes.iter().find(|n| n.adnl_id != local).unwrap().adnl_id.clone();
             let peers = AdnlPeers::with_keys(local, other);
             let query = network
