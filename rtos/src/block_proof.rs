@@ -487,7 +487,7 @@ impl MasterchainProofVerifier {
             budget.record_history_proof(&proof)?;
             BootstrapAuthority::from_checkpoint(pin, proof)?
         };
-        proofs.sort_by_key(|p| p.id().seq_no());
+        proofs.sort_unstable_by_key(|p| p.id().seq_no());
         for proof in proofs {
             budget.step()?;
             if proof.id().seq_no() <= authority.id().seq_no() || proof.id().seq_no() > epoch {

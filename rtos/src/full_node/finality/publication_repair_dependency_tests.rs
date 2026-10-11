@@ -663,3 +663,6 @@ async fn mc_live_repair_archive_engine_cold_missing_index_and_corrupt_graph() {
         }
     }
 }
+
+#[path = "persistent_repair_custody_tests.rs"]
+mod persistent_custody_tests;

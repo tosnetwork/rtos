@@ -83,7 +83,10 @@ impl LeaseRecord {
             let id = d.validate()?;
             match d.kind.as_str() {
                 "state" | "capsule-state" => states.push(id),
-                _ => artifacts.push(id),
+                _ => {
+                    protection.protect_artifact_digest(id.clone(), &d.kind, d.digest.parse()?)?;
+                    artifacts.push(id);
+                }
             }
         }
         protection.protect(states, artifacts);
@@ -273,6 +276,7 @@ impl DependencyLeases {
         }
         // Authentication owns the shared read gate. Protection is installed
         // before the first write, so an uncertain write can only overprotect.
+        let _registration = self.protection.registration()?;
         record.protect(&self.protection)?;
         let next = memory.next.max(record.generation);
         let result = (|| {

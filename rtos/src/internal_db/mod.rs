@@ -894,7 +894,8 @@ impl InternalDb {
     }
 
     /// Input comes from the fresh authenticated repair closure. Preserve normal
-    /// archive ownership; a conflicting already archived payload is rejected.
+    /// archive ownership; repair a missing proof only with authenticated bytes
+    /// and an independently checked body before changing shared archive routing.
     pub(crate) async fn sync_repair_history_proof(
         &self,
         proof: &BlockProofStuff,
@@ -915,16 +916,59 @@ impl InternalDb {
                     filename_bytes: 512,
                 },
             )
-            .await?;
-        read.finish(&raw)?;
-        if raw.as_slice() != proof.data() {
-            fail!("Repair history physical proof differs");
-        }
+            .await;
+        let exact = match raw {
+            Ok(raw) => {
+                read.finish(&raw)?;
+                raw.as_slice() == proof.data()
+            }
+            Err(error) if crate::history_read_budget::stops_fallback(&error) => return Err(error),
+            Err(error) => {
+                if let Some(evidence) =
+                    error.downcast_ref::<storage::archives::bounded_read::ArchiveReadNotStarted>()
+                {
+                    read.refund_not_started(evidence)?;
+                }
+                false
+            }
+        };
         let entry = if proof.is_link() {
             PackageEntryId::ProofLink(proof.id())
         } else {
             PackageEntryId::Proof(proof.id())
         };
+        if !exact {
+            // Resetting archive routing affects both roles. First retain and
+            // verify the bounded real body, never sacrifice its existing route.
+            let body_read =
+                budget.reserve(crate::history_read_budget::ReadKind::State, 16 << 20)?;
+            let body = self
+                .load_block_data_raw_bounded(
+                    &handle,
+                    storage::archives::bounded_read::ArchiveReadLimits {
+                        data_bytes: body_read.allowance(),
+                        filename_bytes: 512,
+                    },
+                )
+                .await?;
+            body_read.finish(&body)?;
+            let body =
+                BlockStuff::deserialize_block_bounded(proof.id().clone(), Arc::new(body), budget)?;
+            body.verify_expected_id(proof.id())?;
+            let _body = handle.block_file_lock().write().await;
+            let _proof = handle.proof_file_lock().write().await;
+            self.archive_manager
+                .replace_file_durable(&PackageEntryId::Block(proof.id()), body.data())
+                .await?;
+            self.archive_manager.replace_file_durable(&entry, proof.data()).await?;
+            handle.reset_archived();
+            handle.set_data();
+            if proof.is_link() {
+                handle.set_proof_link();
+            } else {
+                handle.set_proof();
+            }
+        }
         self.archive_manager
             .sync_file(&handle, &entry, self.publication_sync_observer().as_deref())
             .await?;

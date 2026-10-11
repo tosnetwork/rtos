@@ -1,10 +1,9 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
-//! Live-only repair of an existing applied masterchain Final.
-//!
-//! This never authorizes spool reclamation. State pins are process-local; archive
-//! files and history have no persistent dependency lease here. Authentication is
-//! bounded across historical reads, Merkle apply and dedicated state persistence.
-//! Native database caches remain outside the request's Rust allocation accounting.
+//! Bounded repair of an existing applied masterchain Final.
+//! Live guards alone convey no release authority. The separate persistent
+//! entrypoint authenticates and durably protects an exact event's dependencies;
+//! the publication worker still owns the source Delivered/Released transaction.
+//! Native database caches remain outside request allocation accounting.
 use crate::{
     block::BlockStuff, block_proof::BlockProofStuff, engine::Engine,
     engine_traits::EngineOperations, shard_states_keeper::PinnedShardStateGuard,
@@ -598,6 +597,8 @@ pub(crate) async fn obtain_durable_mc_custody(
                 fail!("Repair body creator differs from event source");
             }
             let (dependencies, proofs) = budget.take_provenance()?;
+            use storage::bounded_cell::CellReadBudget;
+            budget.metadata(256 << 10)?;
             let digest = crate::publication_dependency_leases::dependency_digest(&dependencies)?;
             let ledger = leases.clone();
             let exact = binding.clone();
@@ -737,6 +738,8 @@ pub(crate) async fn reopen_durable_mc_custody(
             fail!("Repair body creator differs from event source");
         }
         let (dependencies, proofs) = budget.take_provenance()?;
+        use storage::bounded_cell::CellReadBudget;
+        budget.metadata(256 << 10)?;
         if dependencies != record.dependencies
             || crate::publication_dependency_leases::dependency_digest(&dependencies)?
                 != dependency_digest

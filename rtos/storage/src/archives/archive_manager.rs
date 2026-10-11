@@ -123,11 +123,32 @@ impl ArchiveManager {
         &self.unapplied_files_path
     }
 
+    fn check_repair_write<B: Borrow<BlockIdExt>>(
+        &self,
+        entry: &PackageEntryId<B>,
+        bytes: &[u8],
+    ) -> Result<()> {
+        match entry {
+            PackageEntryId::Block(id) => {
+                self.db.repair_protection().check_artifact_write(id.borrow(), "block", bytes)
+            }
+            PackageEntryId::Proof(id) => {
+                self.db.repair_protection().check_artifact_write(id.borrow(), "proof", bytes)
+            }
+            PackageEntryId::ProofLink(id) => {
+                self.db.repair_protection().check_artifact_write(id.borrow(), "proof-link", bytes)
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub async fn add_file<B: Borrow<BlockIdExt>>(
         &self,
         entry_id: &PackageEntryId<B>,
         data: &[u8],
     ) -> Result<()> {
+        let _mutation = self.db.repair_protection().artifact_mutation().await;
+        self.check_repair_write(entry_id, data)?;
         log::debug!(target: TARGET, "Saving unapplied file: {entry_id}");
         if data.is_empty() {
             fail!("Added file's {entry_id} data can't have zero length");
@@ -164,6 +185,8 @@ impl ArchiveManager {
         entry_id: &PackageEntryId<B>,
         bytes: &[u8],
     ) -> Result<()> {
+        let _mutation = self.db.repair_protection().artifact_mutation().await;
+        self.check_repair_write(entry_id, bytes)?;
         if bytes.is_empty() {
             fail!("Empty publication artifact");
         }
@@ -551,6 +574,8 @@ impl ArchiveManager {
         entry_id: &PackageEntryId<B>,
         key_archive: bool,
     ) -> Result<Vec<u8>> {
+        let _mutation = self.db.repair_protection().artifact_mutation().await;
+        self.check_repair_write(entry_id, &data)?;
         let mc_seq_no = get_mc_seq_no(handle);
         let is_key = handle.is_key_block()?;
         let package_id = {
@@ -719,6 +744,10 @@ impl ArchiveManager {
         archive_id: u32,
         starts_with_key_block: bool,
     ) -> Result<()> {
+        let _registration = self.db.repair_protection().deletion().await;
+        if self.db.repair_protection().archive_range(0, None) {
+            fail!("Archive regrouping conflicts with repair custody");
+        }
         let slice_id = self.get_package_id_force(archive_id, false, starts_with_key_block).await;
         self.get_or_create_import_desc(&slice_id, ShardIdent::masterchain().prefix_len()).await?;
         Ok(())

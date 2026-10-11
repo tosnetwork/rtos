@@ -146,3 +146,23 @@ fn persistent_repair_binding_strict_codec_no_approval_or_unknown_fields() -> Res
     .is_err());
     Ok(())
 }
+
+#[tokio::test]
+async fn persistent_repair_ledger_durable_sync_failure_and_wrong_domain() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (db, leases) = open(dir.path())?;
+    let budget = HistoryReadBudget::new(Default::default());
+    let generation = leases.begin(&binding(), dependencies(), &budget)?;
+    *leases.observer.lock().unwrap() = Some(Arc::new(|_, _| fail!("DurableCustody WAL failed")));
+    assert!(leases.durable(generation, &budget).is_err());
+    assert!(leases.lookup(generation, &budget).is_err());
+    assert!(leases.protection.state(&block(1)));
+    drop(leases);
+    drop(db);
+    let (_db, leases) = open(dir.path())?;
+    assert!(leases.protection.state(&block(1)));
+    // A recovered marker is still data, never an authentication capability.
+    assert!(leases.verify_domain(&block(0), &block(1)).is_err());
+    assert!(leases.protection.authentication().await.is_err());
+    Ok(())
+}

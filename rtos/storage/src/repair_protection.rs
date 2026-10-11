@@ -3,7 +3,7 @@
 //! No authority can be minted by this storage predicate.
 use rtos_block::{error, BlockIdExt, Result};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
@@ -12,19 +12,36 @@ use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 struct Protected {
     states: HashSet<BlockIdExt>,
     artifacts: HashSet<BlockIdExt>,
+    artifact_digests: HashMap<(BlockIdExt, String), rtos_block::UInt256>,
     poisoned: bool,
 }
 pub struct RepairProtection {
     gate: Arc<RwLock<()>>,
+    writes: Arc<RwLock<()>>,
     protected: Mutex<Protected>,
 }
 impl Default for RepairProtection {
     fn default() -> Self {
-        Self { gate: Arc::new(RwLock::new(())), protected: Mutex::new(Protected::default()) }
+        Self {
+            gate: Arc::new(RwLock::new(())),
+            writes: Arc::new(RwLock::new(())),
+            protected: Mutex::new(Protected::default()),
+        }
     }
 }
 impl RepairProtection {
     /// Retained by the real authenticated operation, not its observer.
+    pub async fn artifact_mutation(&self) -> OwnedRwLockReadGuard<()> {
+        self.writes.clone().read_owned().await
+    }
+    /// Registration refuses a concurrent physical write instead of waiting
+    /// while an async caller may own IO. The node keeps its original record.
+    pub fn registration(&self) -> Result<OwnedRwLockWriteGuard<()>> {
+        self.writes
+            .clone()
+            .try_write_owned()
+            .map_err(|_| error!("Repair artifact registration busy"))
+    }
     pub async fn authentication(&self) -> Result<OwnedRwLockReadGuard<()>> {
         let guard = self.gate.clone().read_owned().await;
         if self.protected.lock().map_err(|_| error!("Repair protection poisoned"))?.poisoned {
@@ -50,6 +67,33 @@ impl RepairProtection {
         let mut guard = self.protected.lock().unwrap();
         guard.states.extend(states);
         guard.artifacts.extend(artifacts);
+    }
+    pub fn protect_artifact_digest(
+        &self,
+        id: BlockIdExt,
+        kind: &str,
+        digest: rtos_block::UInt256,
+    ) -> Result<()> {
+        let mut guard = self.protected.lock().map_err(|_| error!("Repair protection poisoned"))?;
+        let key = (id, kind.to_owned());
+        if guard.artifact_digests.get(&key).is_some_and(|old| old != &digest) {
+            guard.poisoned = true;
+            return Err(error!("Conflicting durable artifact commitments"));
+        }
+        guard.artifact_digests.insert(key, digest);
+        Ok(())
+    }
+    pub fn check_artifact_write(&self, id: &BlockIdExt, kind: &str, bytes: &[u8]) -> Result<()> {
+        let guard = self.protected.lock().map_err(|_| error!("Repair protection poisoned"))?;
+        if guard.poisoned {
+            return Err(error!("Repair protection requires cold recovery"));
+        }
+        if let Some(expected) = guard.artifact_digests.get(&(id.clone(), kind.to_owned())) {
+            if expected != &rtos_block::UInt256::calc_file_hash(bytes) {
+                return Err(error!("Artifact replacement conflicts with repair custody"));
+            }
+        }
+        Ok(())
     }
     pub fn state(&self, id: &BlockIdExt) -> bool {
         self.protected.lock().map(|g| g.poisoned || g.states.contains(id)).unwrap_or(true)

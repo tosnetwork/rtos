@@ -67,6 +67,7 @@ impl Trace {
         proof: &BlockProofStuff,
         budget: &HistoryReadBudget,
     ) -> Result<()> {
+        budget.metadata(1024)?;
         let kind = if proof.is_link() { "proof-link" } else { "proof" };
         self.insert(
             Dependency {
@@ -93,6 +94,7 @@ impl Trace {
         root: Option<&UInt256>,
         budget: &HistoryReadBudget,
     ) -> Result<()> {
+        budget.metadata(1024)?;
         self.insert(
             Dependency {
                 kind: kind.into(),
@@ -113,8 +115,10 @@ impl Trace {
         root: &Cell,
         budget: &HistoryReadBudget,
     ) -> Result<()> {
-        if let Some(old) =
-            self.dependencies.iter().find(|d| d.kind == "state" && d.id == id.to_string())
+        require_materialized(root)?;
+        budget.metadata(1024)?;
+        let identity = id.to_string();
+        if let Some(old) = self.dependencies.iter().find(|d| d.kind == "state" && d.id == identity)
         {
             if old.root.as_deref() != Some(format!("{:x}", root.repr_hash()).as_str()) {
                 fail!("Conflicting repair state root");
@@ -159,7 +163,7 @@ impl Trace {
         )
     }
     pub(crate) fn take(&mut self) -> (Vec<Dependency>, Vec<BlockProofStuff>) {
-        self.dependencies.sort();
+        self.dependencies.sort_unstable();
         (std::mem::take(&mut self.dependencies), std::mem::take(&mut self.proofs))
     }
 }
