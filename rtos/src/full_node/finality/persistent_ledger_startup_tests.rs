@@ -10,7 +10,7 @@ use crate::{
 use std::collections::BTreeMap;
 
 fn physical_state(db: &Arc<RocksDb>) -> BTreeMap<String, BTreeMap<Vec<u8>, Vec<u8>>> {
-    ["cells_db_v6", "cells_db_v6_counters", crate::internal_db::SHARDSTATE_DB_NAME]
+    [storage::db::node::CELLS_CF_NAME, storage::db::node::CELLSCOUNTERS_CF_NAME, crate::internal_db::SHARDSTATE_DB_NAME]
         .into_iter()
         .map(|name| {
             let table = db.clone().table::<String>(name, false).unwrap();
@@ -28,7 +28,7 @@ fn physical_state(db: &Arc<RocksDb>) -> BTreeMap<String, BTreeMap<Vec<u8>, Vec<u
 }
 fn archive_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut files = BTreeMap::new();
-    let mut pending = vec![root.join("archives")];
+    let mut pending = vec![root.join(storage::archives::archive_manager::ArchiveManager::ARCHIVE_DIR)];
     while let Some(directory) = pending.pop() {
         for entry in std::fs::read_dir(directory).unwrap() {
             let entry = entry.unwrap();
