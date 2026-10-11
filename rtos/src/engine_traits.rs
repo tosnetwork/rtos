@@ -127,6 +127,10 @@ pub enum ValidatorListOutcome {
 
 #[async_trait::async_trait]
 pub trait PrivateOverlayOperations: Sync + Send {
+    fn wire_profile(&self) -> rtos_api::WireProfile {
+        rtos_api::WireProfile::Legacy
+    }
+
     async fn set_validator_list(
         &self,
         validator_list_id: UInt256,
