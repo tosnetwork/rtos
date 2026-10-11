@@ -71,6 +71,11 @@ pub struct FastSyncOverlayClient {
     pub(super) propagation_signer: Option<Arc<dyn KeyOption>>,
     tasks: Arc<OwnedTasks>,
     #[cfg(test)]
+    received_for_test: std::sync::Mutex<(
+        std::collections::HashSet<rtos_block::BlockIdExt>,
+        std::collections::HashSet<rtos_block::BlockIdExt>,
+    )>,
+    #[cfg(test)]
     exit_gate: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
@@ -147,6 +152,8 @@ impl FastSyncOverlayClient {
             propagation_signer: key.cloned(),
             tasks: Arc::new(OwnedTasks::child(owner, cancellation_token)),
             #[cfg(test)]
+            received_for_test: Default::default(),
+            #[cfg(test)]
             exit_gate: std::sync::Mutex::new(None),
         });
 
@@ -168,6 +175,12 @@ impl FastSyncOverlayClient {
 
     pub fn client(&self) -> &Arc<OverlayClient> {
         &self.client
+    }
+
+    #[cfg(test)]
+    pub(crate) fn received_candidate_and_finality(&self, id: &rtos_block::BlockIdExt) -> bool {
+        let seen = self.received_for_test.lock().unwrap();
+        seen.0.contains(id) && seen.1.contains(id)
     }
 
     #[cfg(test)]
@@ -272,9 +285,13 @@ impl FastSyncOverlayClient {
     ) -> Result<()> {
         match broadcast {
             Broadcast::TonNode_BlockFinalityBroadcast(broadcast) => {
+                #[cfg(test)]
+                let received_id = broadcast.id.clone();
                 self.engine.clone().process_block_finality_broadcast(
                     broadcast, src.clone(), received_bytes,
                 ).await?;
+                #[cfg(test)]
+                self.received_for_test.lock().unwrap().1.insert(received_id);
             }
             Broadcast::TonNode_BlockBroadcast(broadcast) => {
                 self.engine.clone().process_block_broadcast(broadcast, src.clone())
@@ -319,6 +336,8 @@ impl FastSyncOverlayClient {
                     broadcast.collator_signature.try_into().unwrap_or_default(),
                     broadcast.data,
                 )?;
+                #[cfg(test)]
+                self.received_for_test.lock().unwrap().0.insert(broadcast.id.clone());
             }
             Broadcast::TonNode_NewBlockCandidateBroadcastCompressed(broadcast) => {
                 log::debug!(
@@ -334,6 +353,8 @@ impl FastSyncOverlayClient {
                     broadcast.collator_signature.try_into().unwrap_or_default(),
                     data,
                 )?;
+                #[cfg(test)]
+                self.received_for_test.lock().unwrap().0.insert(broadcast.id.clone());
             }
             Broadcast::TonNode_NewBlockCandidateBroadcastCompressedV2(_broadcast) => log::warn!(
                 "NewBlockCandidateBroadcastCompressedV2 from {src} is not supported in fast sync overlay {} {}",
