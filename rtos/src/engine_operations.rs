@@ -173,7 +173,7 @@ impl EngineOperations for Engine {
                     budget.limits().depth,
                 );
                 let proof = client
-                    .download_block_proof_bounded(&id, is_link, key_block, limits)
+                    .download_block_proof_history(&id, is_link, key_block, limits, budget.clone(), graph)
                     .await
                     .map_err(|e| {
                         if e.downcast_ref::<adnl::ResponseLimitExceeded>().is_some() {
@@ -185,7 +185,6 @@ impl EngineOperations for Engine {
                         }
                     })?;
                 reservation.finish(proof.data())?;
-                graph.finish(proof.root_cell())?;
                 budget.proof(&proof)?;
                 Ok::<_, anyhow::Error>(proof)
             },

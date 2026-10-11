@@ -7,6 +7,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+use crate::history_read_budget::{HistoryReadBudget, NetworkGraphReservation};
 use crate::{
     block::BlockStuff,
     block_proof::BlockProofStuff,
@@ -49,6 +50,20 @@ use rtos_block::{
     Lz4DecompressMode, Result, ShardIdent,
 };
 use std::sync::Arc;
+
+struct HistoryNetworkDecode {
+    budget: Arc<HistoryReadBudget>,
+    graph: Option<NetworkGraphReservation>,
+}
+impl HistoryNetworkDecode {
+    fn parse(&mut self, inputs: &[&[u8]]) -> Result<Vec<rtos_block::BocReaderResult>> {
+        self.graph
+            .take()
+            .ok_or_else(|| error!("Network graph already consumed"))?
+            .parse_many(inputs)
+    }
+}
+
 use storage::types::PersistentStatePartId;
 
 /// Terminal rejection by the scoped BOC decoder (including malformed input and
@@ -71,16 +86,135 @@ fn checked_pss_slice(
     limits: adnl::QueryResponseLimits,
 ) -> Result<(i64, i64)> {
     limits.validate()?;
-    if max_size == 0 || max_size > (1 << 21)
-        || limits.wire_bytes > max_size || limits.decoded_bytes > max_size
+    if max_size == 0
+        || max_size > (1 << 21)
+        || limits.wire_bytes > max_size
+        || limits.decoded_bytes > max_size
     {
         fail!("Invalid bounded PSS slice size");
     }
-    let end = offset.checked_add(max_size).ok_or_else(|| rtos_block::error!("PSS range overflow"))?;
+    let end =
+        offset.checked_add(max_size).ok_or_else(|| rtos_block::error!("PSS range overflow"))?;
     let offset = i64::try_from(offset)?;
     let size = i64::try_from(max_size)?;
     i64::try_from(end)?;
     Ok((offset, size))
+}
+
+// Keep one decoding path for both network wrappers and deterministic tests.
+fn decode_bounded_pair(
+    id: &BlockIdExt,
+    data_full: DataFull,
+    limits: NetworkDownloadLimits,
+    mut history: Option<HistoryNetworkDecode>,
+) -> Result<(BlockStuff, BlockProofStuff)> {
+    let (block_data, proof_data, is_link, roots) = match data_full {
+        DataFull::TonNode_DataFull(value) => {
+            if id != &value.id {
+                fail!("Block with another id was received");
+            }
+            (value.block, value.proof, value.is_link.into(), None)
+        }
+        DataFull::TonNode_DataFullCompressed(value) => {
+            if id != &value.id {
+                fail!("Block with another id was received");
+            }
+            check_lz4_expansion(&value.compressed, limits.expanded_bytes)?;
+            let decompressed = lz4_decompress(
+                &value.compressed,
+                Lz4DecompressMode::WithMaxSize(limits.expanded_bytes as i32),
+            )?;
+            NetworkDownloadLimits::check_bytes(decompressed.len(), limits.expanded_bytes)?;
+            let mut roots = if let Some(history) = history.as_mut() {
+                history.parse(&[&decompressed])?.remove(0).roots
+            } else {
+                limits.parse_boc(&decompressed, limits.expanded_bytes)?.roots
+            };
+            if roots.len() != 2 {
+                fail!("DataFullCompressed contains {} roots instead of 2", roots.len());
+            }
+            let proof_root = roots.remove(0);
+            let block_root = roots.remove(0);
+            let (proof_data, block_data) = if let Some(history) = history.as_mut() {
+                (
+                    encode_history_network_boc(
+                        &proof_root,
+                        BocFlags::None,
+                        limits.proof_bytes,
+                        &history.budget,
+                    )?,
+                    encode_history_network_boc(
+                        &block_root,
+                        BocFlags::all(),
+                        limits.block_bytes,
+                        &history.budget,
+                    )?,
+                )
+            } else {
+                let mut proof_output =
+                    LimitedBocOutput { bytes: Vec::new(), limit: limits.proof_bytes };
+                BocWriter::with_root(&proof_root)?.write(&mut proof_output)?;
+                let mut block_output =
+                    LimitedBocOutput { bytes: Vec::new(), limit: limits.block_bytes };
+                BocWriter::with_flags([block_root.clone()], BocFlags::all())?
+                    .write(&mut block_output)?;
+                (proof_output.bytes, block_output.bytes)
+            };
+            (block_data, proof_data, value.is_link.into(), Some((block_root, proof_root)))
+        }
+        DataFull::TonNode_DataFullEmpty => fail!("DownloadBlockFull returned DataFullEmpty"),
+    };
+    if let Some(history) = history.as_mut() {
+        let (block_root, proof_root) = match roots {
+            Some(roots) => roots,
+            None => {
+                NetworkDownloadLimits::check_bytes(block_data.len(), limits.block_bytes)?;
+                NetworkDownloadLimits::check_bytes(proof_data.len(), limits.proof_bytes)?;
+                let mut parsed = history.parse(&[&block_data, &proof_data])?;
+                let block = parsed.remove(0).withdraw_single_root()?;
+                let proof = parsed.remove(0).withdraw_single_root()?;
+                (block, proof)
+            }
+        };
+        let proof = BlockProofStuff::from_parsed_history_root(
+            id,
+            proof_data,
+            is_link,
+            proof_root,
+            &history.budget,
+        )?;
+        let block = BlockStuff::from_parsed_history_root(
+            id.clone(),
+            Arc::new(block_data),
+            block_root,
+            &history.budget,
+        )?;
+        Ok((block, proof))
+    } else {
+        limits.parse_boc(&block_data, limits.block_bytes)?;
+        limits.parse_boc(&proof_data, limits.proof_bytes)?;
+        Ok((
+            BlockStuff::deserialize_block_checked(id.clone(), Arc::new(block_data))?,
+            BlockProofStuff::deserialize(id, proof_data, is_link)?,
+        ))
+    }
+}
+
+fn encode_history_network_boc(
+    root: &rtos_block::Cell,
+    flags: BocFlags,
+    limit: usize,
+    budget: &Arc<HistoryReadBudget>,
+) -> Result<Vec<u8>> {
+    let config_budget = crate::bounded_session_derivation::ConfigBudget(budget);
+    let writer = BocWriter::with_flags_bounded([root.clone()], flags, &config_budget)?;
+    let length = writer.calc_boc_size();
+    NetworkDownloadLimits::check_bytes(length, limit)?;
+    let output = writer.write_to_vec()?;
+    if output.len() != length {
+        fail!("Bounded network BOC length mismatch");
+    }
+    Ok(output)
 }
 
 /// Per-request bounds. These limit encoded buffers and BOC cardinality, not total heap usage.
@@ -517,6 +651,34 @@ impl FullNodeOverlayClient {
         key_block: bool,
         limits: NetworkDownloadLimits,
     ) -> Result<BlockProofStuff> {
+        self.download_block_proof_bounded_inner(block_id, is_link, key_block, limits, None).await
+    }
+    pub(crate) async fn download_block_proof_history(
+        &self,
+        block_id: &BlockIdExt,
+        is_link: bool,
+        key_block: bool,
+        limits: NetworkDownloadLimits,
+        budget: Arc<HistoryReadBudget>,
+        graph: NetworkGraphReservation,
+    ) -> Result<BlockProofStuff> {
+        self.download_block_proof_bounded_inner(
+            block_id,
+            is_link,
+            key_block,
+            limits,
+            Some(HistoryNetworkDecode { budget, graph: Some(graph) }),
+        )
+        .await
+    }
+    async fn download_block_proof_bounded_inner(
+        &self,
+        block_id: &BlockIdExt,
+        is_link: bool,
+        key_block: bool,
+        limits: NetworkDownloadLimits,
+        mut history: Option<HistoryNetworkDecode>,
+    ) -> Result<BlockProofStuff> {
         let transport = limits.transport()?;
         // Prepare
         let request = if key_block {
@@ -555,8 +717,20 @@ impl FullNodeOverlayClient {
             .client
             .send_rldp_query_raw_bounded(&request.into(), &good_peer, 0, true, transport)
             .await?;
-        limits.parse_boc(&proof, limits.proof_bytes)?;
-        BlockProofStuff::deserialize(block_id, proof, is_link)
+        NetworkDownloadLimits::check_bytes(proof.len(), limits.proof_bytes)?;
+        if let Some(history) = history.as_mut() {
+            let root = history.parse(&[&proof])?.remove(0).withdraw_single_root()?;
+            BlockProofStuff::from_parsed_history_root(
+                block_id,
+                proof,
+                is_link,
+                root,
+                &history.budget,
+            )
+        } else {
+            limits.parse_boc(&proof, limits.proof_bytes)?;
+            BlockProofStuff::deserialize(block_id, proof, is_link)
+        }
     }
 
     // tonNode.prepareBlock block:tonNode.blockIdExt = tonNode.Prepared;
@@ -679,6 +853,31 @@ impl FullNodeOverlayClient {
         fan_out_prepare: bool,
         limits: NetworkDownloadLimits,
     ) -> Result<(BlockStuff, BlockProofStuff)> {
+        self.download_block_full_bounded_inner(id, fan_out_prepare, limits, None).await
+    }
+    pub(crate) async fn download_block_full_history(
+        &self,
+        id: &BlockIdExt,
+        fan_out_prepare: bool,
+        limits: NetworkDownloadLimits,
+        budget: Arc<HistoryReadBudget>,
+        graph: NetworkGraphReservation,
+    ) -> Result<(BlockStuff, BlockProofStuff)> {
+        self.download_block_full_bounded_inner(
+            id,
+            fan_out_prepare,
+            limits,
+            Some(HistoryNetworkDecode { budget, graph: Some(graph) }),
+        )
+        .await
+    }
+    async fn download_block_full_bounded_inner(
+        &self,
+        id: &BlockIdExt,
+        fan_out_prepare: bool,
+        limits: NetworkDownloadLimits,
+        history: Option<HistoryNetworkDecode>,
+    ) -> Result<(BlockStuff, BlockProofStuff)> {
         let transport = limits.transport()?;
         let (peer, was_active) = if fan_out_prepare {
             // Probe FAN_OUT_PEERS in parallel with PrepareBlock; pick the
@@ -737,55 +936,8 @@ impl FullNodeOverlayClient {
             .wire_profile()
             .deserialize_value_bounded(&response, limits.response_bytes)?;
         let id = id.clone();
-        let deserialized: Result<(BlockStuff, BlockProofStuff)> =
-            tokio::task::block_in_place(|| {
-                let (block_data, proof_data, is_link) = match data_full {
-                    DataFull::TonNode_DataFull(data_full) => {
-                        if id != data_full.id {
-                            fail!("Block with another id was received");
-                        }
-                        (data_full.block, data_full.proof, data_full.is_link.into())
-                    }
-                    DataFull::TonNode_DataFullCompressed(data_full) => {
-                        if id != data_full.id {
-                            fail!("Block with another id was received");
-                        }
-                        check_lz4_expansion(&data_full.compressed, limits.expanded_bytes)?;
-                        let decompressed = lz4_decompress(
-                            &data_full.compressed,
-                            Lz4DecompressMode::WithMaxSize(limits.expanded_bytes as i32),
-                        )?;
-                        let mut roots =
-                            limits.parse_boc(&decompressed, limits.expanded_bytes)?.roots;
-                        if roots.len() != 2 {
-                            fail!("DataFullCompressed contains {} roots instead of 2", roots.len());
-                        }
-                        let mut proof_output =
-                            LimitedBocOutput { bytes: Vec::new(), limit: limits.proof_bytes };
-                        BocWriter::with_root(&roots.remove(0))?.write(&mut proof_output)?;
-                        let proof_data = proof_output.bytes;
-                        // Block's boc here must be serialized absolutely
-                        // the same way as in collator, because of file hash concept.
-                        let mut block_output =
-                            LimitedBocOutput { bytes: Vec::new(), limit: limits.block_bytes };
-                        BocWriter::with_flags(roots, BocFlags::all())?.write(&mut block_output)?;
-                        let block_data = block_output.bytes;
-                        (block_data, proof_data, data_full.is_link.into())
-                    }
-                    DataFull::TonNode_DataFullEmpty => {
-                        fail!("DownloadBlockFull returned DataFullEmpty from {}", peer.id())
-                    }
-                };
-                limits.parse_boc(&block_data, limits.block_bytes)?;
-                limits.parse_boc(&proof_data, limits.proof_bytes)?;
-                let proof =
-                    BlockProofStuff::deserialize(&id, proof_data, is_link).map_err(|e| {
-                        error!("Error deserializing block proof from {}: {}", peer.id(), e)
-                    })?;
-                let block = BlockStuff::deserialize_block_checked(id, Arc::new(block_data))
-                    .map_err(|e| error!("Error deserializing block from {}: {}", peer.id(), e))?;
-                Ok((block, proof))
-            });
+        let deserialized =
+            tokio::task::block_in_place(|| decode_bounded_pair(&id, data_full, limits, history));
         match deserialized {
             Ok(pair) => {
                 if !was_active {
@@ -864,7 +1016,9 @@ impl FullNodeOverlayClient {
         masterchain_block_id: &BlockIdExt,
         max_bytes: usize,
     ) -> Result<Option<(Arc<Neighbour>, usize)>> {
-        if max_bytes == 0 { fail!("Empty PSS budget"); }
+        if max_bytes == 0 {
+            fail!("Empty PSS budget");
+        }
         let (peer, _) = self.client.choose_peer(None).await?;
         let request = TaggedObject {
             object: GetPersistentStateSizeV2 {
@@ -877,11 +1031,23 @@ impl FullNodeOverlayClient {
             #[cfg(feature = "telemetry")]
             tag: GetPersistentStateSizeV2::constructor_const(),
         };
-        let bytes = self.client.send_rldp_query_raw_bounded(
-            &request, &peer, 0, true,
-            adnl::QueryResponseLimits { wire_bytes: 128, decoded_bytes: 12 },
-        ).await?;
-        let size: PersistentStateSize = self.client.network_context().stack.overlay.wire_profile().deserialize_value_bounded(&bytes, 12)?;
+        let bytes = self
+            .client
+            .send_rldp_query_raw_bounded(
+                &request,
+                &peer,
+                0,
+                true,
+                adnl::QueryResponseLimits { wire_bytes: 128, decoded_bytes: 12 },
+            )
+            .await?;
+        let size: PersistentStateSize = self
+            .client
+            .network_context()
+            .stack
+            .overlay
+            .wire_profile()
+            .deserialize_value_bounded(&bytes, 12)?;
         if self.client.network_context().stack.overlay.wire_profile().serialize(&size)? != bytes {
             fail!("Noncanonical PSS size response");
         }
@@ -889,9 +1055,13 @@ impl FullNodeOverlayClient {
             PersistentStateSize::TonNode_PersistentStateSizeNotFound => Ok(None),
             PersistentStateSize::TonNode_PersistentStateSize(size) => {
                 let size = usize::try_from(size.size)?;
-                if size == 0 { fail!("Empty advertised PSS"); }
+                if size == 0 {
+                    fail!("Empty advertised PSS");
+                }
                 if size > max_bytes {
-                    return Err(adnl::ResponseLimitExceeded { limit: max_bytes, actual: size }.into());
+                    return Err(
+                        adnl::ResponseLimitExceeded { limit: max_bytes, actual: size }.into()
+                    );
                 }
                 Ok(Some((peer, size)))
             }
@@ -1245,6 +1415,131 @@ impl FullNodeOverlayClient {
 #[cfg(test)]
 mod bounded_download_tests {
     use super::*;
+    mod pq_fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tl/rtos_api/tests/common/pq_finality.rs"
+        ));
+    }
+    // Real typed block and PQ carrier; this tests transport decoding, not authority.
+    fn history_pair_fixture() -> (BlockIdExt, Vec<u8>, Vec<u8>) {
+        use rtos_block::Serializable;
+        let root = pq_fixture::target_block().serialize().unwrap();
+        let mut body = Vec::new();
+        BocWriter::with_flags([root.clone()], BocFlags::all()).unwrap().write(&mut body).unwrap();
+        let id = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            42,
+            root.repr_hash().clone(),
+            rtos_block::UInt256::calc_file_hash(&body),
+        );
+        let carrier = pq_fixture::signed(&[0, 1], "finalize", "TOS-CONSENSUS-SIMPLEX-v1");
+        let proof = rtos_block::BlockProof::with_params(
+            id.clone(),
+            rtos_block::Cell::default(),
+            Some(rtos_block::BlockSignaturesVariant::SimplexPq(carrier)),
+        );
+        (id, body, write_boc(&proof.serialize().unwrap()).unwrap())
+    }
+    fn history_pair_response(
+        id: &BlockIdExt,
+        body: &[u8],
+        proof: &[u8],
+        compressed: bool,
+    ) -> DataFull {
+        use rtos_api::IntoBoxed;
+        if compressed {
+            let roots = [
+                rtos_block::read_single_root_boc(proof).unwrap(),
+                rtos_block::read_single_root_boc(body).unwrap(),
+            ];
+            let mut bytes = Vec::new();
+            BocWriter::with_roots(roots).unwrap().write(&mut bytes).unwrap();
+            rtos_api::ton::ton_node::datafull::DataFullCompressed {
+                id: id.clone(),
+                compressed: rtos_block::lz4_compress(&bytes, false).unwrap(),
+                is_link: false.into(),
+            }
+            .into_boxed()
+        } else {
+            rtos_api::ton::ton_node::datafull::DataFull {
+                id: id.clone(),
+                block: body.to_vec(),
+                proof: proof.to_vec(),
+                is_link: false.into(),
+            }
+            .into_boxed()
+        }
+    }
+    #[test]
+    fn bounded_history_network_pair_preserves_flags_and_shared_budget() {
+        let (id, body, proof) = history_pair_fixture();
+        let limits = NetworkDownloadLimits {
+            wire_bytes: 1 << 20,
+            response_bytes: 1 << 20,
+            expanded_bytes: 1 << 20,
+            block_bytes: 1 << 20,
+            proof_bytes: 1 << 20,
+            boc_cells: 10000,
+            boc_depth: 1024,
+        };
+        for compressed in [false, true] {
+            let budget = HistoryReadBudget::new(Default::default());
+            let graph = budget.reserve_network_graph().unwrap();
+            let (block, parsed) = decode_bounded_pair(
+                &id,
+                history_pair_response(&id, &body, &proof, compressed),
+                limits,
+                Some(HistoryNetworkDecode { budget: budget.clone(), graph: Some(graph) }),
+            )
+            .unwrap();
+            assert_eq!(block.data(), body);
+            assert_eq!(parsed.data(), proof);
+            let budget = HistoryReadBudget::new(crate::history_read_budget::HistoryReadLimits {
+                steps: 0,
+                ..Default::default()
+            });
+            let graph = budget.reserve_network_graph().unwrap();
+            let error = decode_bounded_pair(
+                &id,
+                history_pair_response(&id, &body, &proof, compressed),
+                limits,
+                Some(HistoryNetworkDecode { budget: budget.clone(), graph: Some(graph) }),
+            )
+            .err()
+            .expect("shared work budget denies parse");
+            assert!(crate::history_read_budget::stops_fallback(&error));
+            assert!(budget.step().is_err());
+        }
+    }
+    #[test]
+    fn bounded_history_network_pair_rejects_wrong_header_identity() {
+        let (mut id, body, proof) = history_pair_fixture();
+        id.seq_no += 1;
+        // Both wire and proof claim this id; the actual block header still says 42.
+        use rtos_block::{Deserializable, Serializable};
+        let mut parsed = rtos_block::BlockProof::construct_from_bytes(&proof).unwrap();
+        parsed.proof_for = id.clone();
+        let proof = parsed.write_to_bytes().unwrap();
+        let limits = NetworkDownloadLimits {
+            wire_bytes: 1 << 20,
+            response_bytes: 1 << 20,
+            expanded_bytes: 1 << 20,
+            block_bytes: 1 << 20,
+            proof_bytes: 1 << 20,
+            boc_cells: 10000,
+            boc_depth: 1024,
+        };
+        let budget = HistoryReadBudget::new(Default::default());
+        let graph = budget.reserve_network_graph().unwrap();
+        assert!(decode_bounded_pair(
+            &id,
+            history_pair_response(&id, &body, &proof, false),
+            limits,
+            Some(HistoryNetworkDecode { budget, graph: Some(graph) })
+        )
+        .is_err());
+    }
     #[test]
     fn bounded_download_boc_and_serialization_limits() {
         let mut builder = rtos_block::BuilderData::new();

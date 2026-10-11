@@ -165,6 +165,42 @@ pub(crate) struct NetworkGraphReservation {
     active: bool,
 }
 impl NetworkGraphReservation {
+    /// Convert the transport reservation into actual parser charges under the
+    /// same request lock. All roots (including compressed pair roots) share it.
+    pub(crate) fn parse_many(
+        mut self,
+        inputs: &[&[u8]],
+    ) -> Result<Vec<rtos_block::BocReaderResult>> {
+        let _parse = self.budget.parsing.lock().map_err(|_| error!("History parsing poisoned"))?;
+        {
+            let mut usage =
+                self.budget.usage.lock().map_err(|_| error!("History accounting poisoned"))?;
+            usage.reserved_cells -= self.cells;
+            usage.reserved_cell_bytes -= self.bytes;
+        }
+        self.active = false;
+        self.budget.healthy()?;
+        let result = (|| {
+            rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(
+                self.budget.as_ref(),
+                inputs
+                    .len()
+                    .checked_mul(std::mem::size_of::<rtos_block::BocReaderResult>())
+                    .ok_or_else(|| error!("Network root allocation overflow"))?,
+            )?;
+            let mut parsed = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                parsed.push(self.budget.parse_boc_roots_inner(input)?);
+            }
+            Ok(parsed)
+        })();
+        if result.is_err() {
+            self.budget.failed.store(true, Ordering::Release);
+        }
+        result.map_err(|error: anyhow::Error| {
+            error.context(HistoryBudgetExceeded("network BOC validation failed"))
+        })
+    }
     pub fn finish(self, root: &Cell) -> Result<()> {
         self.finish_many(&[root])
     }
@@ -223,7 +259,9 @@ impl HistoryReadBudget {
             Some(proofs) => {
                 let mut output = Vec::new();
                 output.try_reserve_exact(proofs.len())?;
-                for proof in proofs { output.push(proof.clone_with_budget(Some(self))?); }
+                for proof in proofs {
+                    output.push(proof.clone_with_budget(Some(self))?);
+                }
                 Ok(Some(output))
             }
             None => Ok(None),
@@ -447,7 +485,15 @@ impl HistoryReadBudget {
         let _parse = self.parsing.lock().map_err(|_| error!("History parsing poisoned"))?;
         self.healthy()?;
         let mut reader = rtos_block::BocReader::new().set_max_cell_depth(self.limits.depth);
-        let (header, _) = reader.read_header(&mut std::io::Cursor::new(bytes))?;
+        let config_budget = crate::bounded_session_derivation::ConfigBudget(self);
+        let (header, _) = reader
+            .read_header_bounded(&mut std::io::Cursor::new(bytes), &config_budget)
+            .map_err(|error| {
+                if stops_fallback(&error) {
+                    self.failed.store(true, Ordering::Release);
+                }
+                error
+            })?;
         {
             let usage = self.usage.lock().map_err(|_| error!("History accounting poisoned"))?;
             if header.cells_count
@@ -462,20 +508,24 @@ impl HistoryReadBudget {
                 return Err(HistoryBudgetExceeded("local artifact BOC header").into());
             }
         }
-        let parsed = reader.read(bytes).and_then(|boc| boc.withdraw_single_root());
+        let parsed =
+            reader.read_bounded(bytes, &config_budget).and_then(|boc| boc.withdraw_single_root());
         let root = match parsed {
             Ok(root) => root,
             Err(error) => {
                 let mut usage =
                     self.usage.lock().map_err(|_| error!("History accounting poisoned"))?;
                 usage.cells += header.cells_count;
-                usage.cell_bytes += header.tot_cells_size;
+                // The bounded reader already charged every attempted allocation.
+                // Keep cell-count admission spent on discarded malformed graphs.
                 // The parser has discarded every partial cell and has not
                 // published graph-cache entries. Keep all attempted work charged.
                 // A typed depth rejection is a limit, never replaceable syntax.
-                if error.downcast_ref::<rtos_block::CellDepthLimitExceeded>().is_some() {
+                if error.downcast_ref::<rtos_block::CellDepthLimitExceeded>().is_some()
+                    || stops_fallback(&error)
+                {
                     self.failed.store(true, Ordering::Release);
-                    return Err(error.context(HistoryBudgetExceeded("local artifact depth")));
+                    return Err(error.context(HistoryBudgetExceeded("local artifact parser limit")));
                 }
                 return Err(error);
             }
@@ -497,10 +547,15 @@ impl HistoryReadBudget {
         result.map_err(|error| error.context(HistoryBudgetExceeded("graph validation failed")))
     }
     fn parse_boc_inner(&self, bytes: &[u8]) -> Result<Cell> {
+        self.parse_boc_roots_inner(bytes)?.withdraw_single_root()
+    }
+    fn parse_boc_roots_inner(&self, bytes: &[u8]) -> Result<rtos_block::BocReaderResult> {
         // No await: serialize header admission with graph charging so shared
         // request callers cannot each parse against the same remaining quota.
         let mut reader = rtos_block::BocReader::new().set_max_cell_depth(self.limits.depth);
-        let (header, _) = reader.read_header(&mut std::io::Cursor::new(bytes))?;
+        let config_budget = crate::bounded_session_derivation::ConfigBudget(self);
+        let (header, _) =
+            reader.read_header_bounded(&mut std::io::Cursor::new(bytes), &config_budget)?;
         let u = self.usage.lock().map_err(|_| error!("History accounting poisoned"))?;
         if header.cells_count > self.limits.cells.saturating_sub(u.cells + u.reserved_cells)
             || header.tot_cells_size
@@ -509,9 +564,11 @@ impl HistoryReadBudget {
             return Err(HistoryBudgetExceeded("BOC header cells/bytes").into());
         }
         drop(u);
-        let root = reader.read(bytes)?.withdraw_single_root()?;
-        self.graph_inner(&root)?;
-        Ok(root)
+        let parsed = reader.read_bounded(bytes, &config_budget)?;
+        for root in &parsed.roots {
+            self.graph_inner(root)?;
+        }
+        Ok(parsed)
     }
 }
 
@@ -631,6 +688,45 @@ mod tests {
         assert_eq!(budget.usage.lock().unwrap().proof_bytes, 4);
         assert!(budget.reserve(ReadKind::Proof, 4).is_err());
 
+        Ok(())
+    }
+    #[test]
+    fn history_budget_network_parse_reservation_spends_shared_workspace() -> Result<()> {
+        let root = Cell::default();
+        let bytes = rtos_block::write_boc(&root)?;
+        let budget = HistoryReadBudget::new(Default::default());
+        let parsed = budget.reserve_network_graph()?.parse_many(&[&bytes, &bytes])?;
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].roots[0], root);
+        let usage = budget.usage.lock().unwrap();
+        let exact_bytes = usage.cell_bytes;
+        assert!(
+            exact_bytes > 2 * bytes.len(),
+            "parser allocations are charged, not just unique graph data"
+        );
+        assert_eq!(usage.reserved_cell_bytes, 0);
+        assert_eq!(usage.cells, 1, "graph identity is deduplicated but parse allocations are not");
+        drop(usage);
+        let budget = HistoryReadBudget::new(HistoryReadLimits {
+            cell_bytes: exact_bytes,
+            ..Default::default()
+        });
+        budget.reserve_network_graph()?.parse_many(&[&bytes, &bytes])?;
+        assert!(
+            budget.reserve_network_graph().is_err(),
+            "a second parse cannot create fresh workspace"
+        );
+        let budget = HistoryReadBudget::new(HistoryReadLimits {
+            cell_bytes: exact_bytes - 1,
+            ..Default::default()
+        });
+        let error = budget
+            .reserve_network_graph()?
+            .parse_many(&[&bytes, &bytes])
+            .err()
+            .expect("one byte below cumulative parser admission");
+        assert!(stops_fallback(&error));
+        assert!(budget.graph(&root).is_err());
         Ok(())
     }
     #[test]

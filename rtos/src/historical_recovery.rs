@@ -254,11 +254,10 @@ impl Request {
             .engine
             .overlay_client(id.shard())
             .await?
-            .download_block_full_bounded(id, false, limits)
+            .download_block_full_history(id, false, limits, self.budget.clone(), graph)
             .await?;
         body.finish(pair.0.data())?;
         proof.finish(pair.1.data())?;
-        graph.finish_many(&[pair.0.root_cell(), pair.1.root_cell()])?;
         Ok(pair)
     }
     async fn recover(

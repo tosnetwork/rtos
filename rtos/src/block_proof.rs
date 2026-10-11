@@ -679,8 +679,8 @@ impl MasterchainProofVerifier {
         let (protocol, committee, slots_per_leader_window, identity, carrier_version) =
             if let Some(budget) = budget {
                 let budget = ConfigBudget(budget);
-                let decoded =
-                    config.governing_session_config_bounded(id.shard().is_masterchain(), &budget)?;
+                let decoded = config
+                    .governing_session_config_bounded(id.shard().is_masterchain(), &budget)?;
                 let (committee, _) = decoded.current.calc_subset_bounded(
                     &decoded.catchain,
                     id.shard().shard_prefix_with_tag(),
@@ -876,6 +876,23 @@ impl BlockProofStuff {
             fail!(NodeError::InvalidData(format!("proof for non-masterchain block {}", block_id)))
         }
         Ok(BlockProofStuff { proof, root, is_link, id: block_id.clone(), data })
+    }
+
+    /// The caller has parsed these exact bytes under a network graph reservation
+    /// and consumed that reservation before entering typed-field decoding.
+    pub(crate) fn from_parsed_history_root(
+        block_id: &BlockIdExt,
+        data: Vec<u8>,
+        is_link: bool,
+        root: Cell,
+        budget: &HistoryReadBudget,
+    ) -> Result<Self> {
+        budget.step()?;
+        let proof = BlockProof::construct_from_cell_bounded(root.clone(), &ConfigBudget(budget))?;
+        if &proof.proof_for != block_id || (!block_id.is_masterchain() && !is_link) {
+            fail!("Bounded network proof identity/type mismatch");
+        }
+        Ok(Self { proof, root, is_link, id: block_id.clone(), data: Arc::new(data) })
     }
 
     pub(crate) fn deserialize_bounded(

@@ -261,12 +261,22 @@ async fn repair_owned(
             let (block, proof) = match local.take() {
                 Some(pair) => pair,
                 None => {
-                    let graph = budget.reserve_network_graph()?;
                     let body = budget
                         .reserve(crate::history_read_budget::ReadKind::State, MAX_ARTIFACT_BYTES)?;
                     let proof_bytes = budget
                         .reserve(crate::history_read_budget::ReadKind::Proof, MAX_ARTIFACT_BYTES)?;
-                    let bytes = body.allowance().min(proof_bytes.allowance()).min(graph.bytes / 2);
+                    let maximum = body.allowance().min(proof_bytes.allowance());
+                    // Wire, decoded TL, compressed expansion and output bytes
+                    // coexist before graph parsing. Admit them before reserving
+                    // the remaining graph capacity on this same request.
+                    rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(
+                        budget.as_ref(),
+                        maximum
+                            .checked_mul(6)
+                            .ok_or_else(|| error!("Repair network workspace overflow"))?,
+                    )?;
+                    let graph = budget.reserve_network_graph()?;
+                    let bytes = maximum.min(graph.bytes / 2);
                     let mut limits =
                         crate::network::full_node_overlay_client::NetworkDownloadLimits::proof(
                             bytes,
@@ -277,11 +287,16 @@ async fn repair_owned(
                     let pair = engine
                         .overlay_client(request.block_id.shard())
                         .await?
-                        .download_block_full_bounded(&request.block_id, false, limits)
+                        .download_block_full_history(
+                            &request.block_id,
+                            false,
+                            limits,
+                            budget.clone(),
+                            graph,
+                        )
                         .await?;
                     body.finish(pair.0.data())?;
                     proof_bytes.finish(pair.1.data())?;
-                    graph.finish_many(&[pair.0.root_cell(), pair.1.root_cell()])?;
                     pair
                 }
             };
