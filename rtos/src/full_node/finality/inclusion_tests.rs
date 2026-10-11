@@ -138,7 +138,10 @@ impl Pair {
             // a public observer outside that committee, so normal T0 policy
             // receives rather than marking both nodes as original senders.
             // No test manually activates Plumtree or bypasses an authority check.
-            for (dir, seed) in [(&provider_dir, 0x60), (&receiver_dir, 0x70)] {
+            for (dir, seed) in [
+                (&provider_dir, 0x60),
+                (&receiver_dir, if source_transport { 0x61 } else { 0x70 }),
+            ] {
                 let file = dir.join("config.json");
                 let mut config: serde_json::Value =
                     serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
@@ -150,7 +153,7 @@ impl Pair {
                         entry["data"] = serde_json::to_value(&key).unwrap();
                     }
                 }
-                if source_transport && seed == 0x60 {
+                if source_transport {
                     // The normal source factory requires an explicit stable
                     // validator -> transport binding. Derive it from the actual
                     // governing state and persist it for the cold-open phase.
@@ -158,7 +161,7 @@ impl Pair {
                         .unwrap().read_custom().unwrap().unwrap().config;
                     let validator = governing.validator_set().unwrap().list().iter()
                         .find(|member| member.adnl_addr().is_ok_and(|id| id == *transport.id()))
-                        .expect("provider fixture key must belong to the governing committee")
+                        .expect("source circulation key must belong to the governing committee")
                         .validator_id().unwrap();
                     config["validator_key_ring"][base64_encode(transport.id().data())] =
                         serde_json::to_value(&key).unwrap();

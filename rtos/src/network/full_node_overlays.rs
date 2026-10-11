@@ -1552,6 +1552,12 @@ impl FullNodeOverlaysRouter {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_fast_sync_received(&self, id: &rtos_block::BlockIdExt) -> bool {
+        self.fast_sync_overlay(id.shard())
+            .is_some_and(|overlay| overlay.received_candidate_and_finality(id))
+    }
+
     fn fast_sync_overlay(&self, shard: &ShardIdent) -> Option<Arc<FastSyncOverlayClient>> {
         let shard =
             trim_shard(shard, self.monitor_min_split_for_fast_sync.load(Ordering::Relaxed)).ok()?;

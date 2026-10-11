@@ -166,6 +166,25 @@ async fn circulation(events: usize) {
             })
             .await
             .expect("real network effects/custody/Delivered/Released did not finish");
+            // Real private FastSync receive processing, in addition to the
+            // publisher's actual transport receipts. Public-overlay reception
+            // cannot satisfy this observation.
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if pair.receiver.overlays_router().unwrap().test_fast_sync_received(&id) {
+                        assert!(pair.receiver.try_get_cached_block_candidate(&id).is_some());
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.expect("receiver did not process both real FastSync candidate and finality");
+            // Keep the receiving Engine's real applied frontier current so
+            // its production sync gate remains open throughout the long run.
+            // This happens only AFTER both network receive observations.
+            pair.receiver.clone().download_and_apply_block(&id, id.seq_no(), false)
+                .await.unwrap();
+            assert_eq!(pair.receiver.load_state(&id).await.unwrap().root_cell().repr_hash(),
+                expected.repr_hash());
             let entry = closed.iter().find(|x| x.binding.canonical.block_id == id).unwrap();
             assert_eq!(&entry.binding.domain.session_id, runtime.session_id());
             assert_eq!(entry.binding.canonical.source_validator, creator);
