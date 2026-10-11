@@ -1201,7 +1201,6 @@ pub async fn accept_pq_session_block(
         fail!("`prev` has invalid length");
     }
     let existing = engine.load_block_handle(&id)?;
-    let already_applied = existing.as_ref().is_some_and(|h| h.is_applied());
     let block = match data {
         Some(data) => BlockStuff::deserialize_block(id.clone(), Arc::new(data))?,
         None => match &existing {
@@ -1209,10 +1208,79 @@ pub async fn accept_pq_session_block(
             _ => engine.download_block(&id, Some(10)).await?.0,
         },
     };
+    persist_authenticated_pq_block(
+        block,
+        prev,
+        finality,
+        authenticated,
+        &verifier,
+        existing,
+        engine,
+    )
+    .await
+}
+
+/// Replay a Prepared or Ready outbox entry only after historical authentication.
+/// This completes acceptance, not publication or the durable Ready checkpoint.
+/// The caller retains the record identity for its subsequent outbox transition.
+pub(crate) async fn accept_authenticated_publication(
+    publication: crate::propagation_outbox_auth::AuthenticatedPublication,
+    engine: Arc<dyn EngineOperations>,
+) -> Result<(crate::propagation_outbox::UnverifiedRecord, AcceptedSessionBlock)> {
+    use consensus_common::SessionFinality;
+    let (entry, block, context, verified) = publication.into_parts();
+    // A valid receipt for one Engine must not authorize writes to another pin.
+    if context.zerostate() != engine.zerostate_id()?
+        || entry.record.domain.wire_profile != engine.validator_network().wire_profile()
+    {
+        fail!("Authenticated publication belongs to another Engine domain");
+    }
+    let (finality, authenticated) = if verified.is_final() {
+        let (carrier, proof) = verified.into_final()?;
+        (
+            SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(carrier.clone())),
+            AcceptedFinality::Final { carrier, _verified: proof },
+        )
+    } else {
+        let (carrier, proof) = verified.into_approval()?;
+        (
+            SessionFinality::PqApproval(carrier.clone()),
+            AcceptedFinality::Approval { carrier, _verified: proof },
+        )
+    };
+    let existing = engine.load_block_handle(block.id())?;
+    let accepted = persist_authenticated_pq_block(
+        block,
+        entry.record.prev.clone(),
+        finality,
+        authenticated,
+        context.verifier(),
+        existing,
+        engine,
+    )
+    .await?;
+    Ok((entry, accepted))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_authenticated_pq_block(
+    block: BlockStuff,
+    prev: Vec<BlockIdExt>,
+    finality: consensus_common::SessionFinality,
+    authenticated: AcceptedFinality,
+    verifier: &rtos_api::pq_finality::PqVerificationContext,
+    existing: Option<Arc<BlockHandle>>,
+    engine: Arc<dyn EngineOperations>,
+) -> Result<AcceptedSessionBlock> {
+    let id = block.id().clone();
+    if prev.is_empty() || prev.len() > 2 {
+        fail!("`prev` has invalid length");
+    }
+    let already_applied = existing.as_ref().is_some_and(|handle| handle.is_applied());
     precheck_header(&block, &prev, false, false)?;
     // Verify before constructing even a signature-free proof link. The live
     // approval has no serialized signature representation.
-    let proof = create_pq_session_proof(&block, &finality, &verifier)?;
+    let proof = create_pq_session_proof(&block, &finality, verifier)?;
     if already_applied {
         // Rebuild a verified publication result on retry without repeating apply
         // or replacing an already-final persisted proof with an approval link.

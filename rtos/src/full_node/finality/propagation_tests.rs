@@ -400,3 +400,114 @@ async fn propagation_authenticated_finalize_candidate_fallback_shares_receive_de
         std::panic::resume_unwind(panic);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publication_recovery_replays_prepared_and_ready_acceptance() {
+    use crate::{
+        block_proof::MasterchainProofVerifier,
+        propagation_outbox::{
+            Limits, OutboxDomain, PublicationEffect, PublicationKind, PublicationRecord,
+            PublicationStage, PublicationTarget, RecordId, StoredCarrier, UnverifiedRecord,
+        },
+        propagation_outbox_auth::authenticate_publication,
+        validator::accept_block::accept_authenticated_publication,
+    };
+    for final_role in [false, true] {
+        let pair = Pair::with_propagation_profile("included", false, true).await;
+        let result = std::panic::AssertUnwindSafe(async {
+            let fixture: serde_json::Value =
+                serde_json::from_str(include_str!("testdata/v2-propagation-recovery.json"))
+                    .unwrap();
+            let mut row = fixture["rows"][0].clone();
+            if !final_role {
+                row["signatures"] = row["approval_signatures"].clone();
+            }
+            let carrier = fixture_carrier(&row);
+            let network = if final_role {
+                rtos_api::pq_finality::PqNetworkSignatureSet::from_final_fields(&carrier).unwrap()
+            } else {
+                let approval =
+                    rtos_api::pq_finality::PqApproval::from_notarization_fields(carrier).unwrap();
+                rtos_api::pq_finality::PqNetworkSignatureSet::from_approval(&approval).unwrap()
+            };
+            let bytes = WireProfile::T0.serialize(&network.to_node().into_boxed()).unwrap();
+            let history = MasterchainProofVerifier::default();
+            let context = history
+                .pq_publication_context(
+                    pair.provider.as_ref(),
+                    pair.shard.id(),
+                    pair.shard.block().unwrap(),
+                )
+                .await
+                .unwrap();
+            let effect = PublicationEffect {
+                kind: PublicationKind::Block,
+                target: PublicationTarget::Public,
+            };
+            let mut entry = UnverifiedRecord {
+                id: RecordId(1),
+                stage: PublicationStage::Prepared,
+                record: PublicationRecord {
+                    domain: OutboxDomain {
+                        zerostate: context.zerostate().clone(),
+                        global_id: context.global_id(),
+                        wire_profile: WireProfile::T0,
+                    },
+                    protocol: context.protocol(),
+                    profile: context.profile().clone(),
+                    session_id: context.verifier().expected_session_id().clone(),
+                    block_id: pair.shard.id().clone(),
+                    block_data: pair.shard.data().to_vec(),
+                    proof_data: None,
+                    prev: vec![pair.shard.construct_prev_id().unwrap().0],
+                    carrier: if final_role {
+                        StoredCarrier::Final(bytes)
+                    } else {
+                        StoredCarrier::Approval(bytes)
+                    },
+                    locally_generated: false,
+                    created_at_unix_secs: 100,
+                    expires_at_unix_secs: 200,
+                    effects: vec![effect.clone()],
+                },
+                pending: vec![effect],
+            };
+            for stage in [PublicationStage::Prepared, PublicationStage::Ready] {
+                entry.stage = stage;
+                let receipt = authenticate_publication(
+                    &history,
+                    pair.provider.as_ref(),
+                    entry.clone(),
+                    &Limits::default(),
+                )
+                .await
+                .unwrap();
+                let (retained, accepted) =
+                    accept_authenticated_publication(receipt, pair.provider.clone()).await.unwrap();
+                assert_eq!(retained, entry);
+                assert_eq!(accepted.block(), &pair.shard);
+                assert_eq!(accepted.is_final(), final_role);
+                assert_eq!(accepted.phase(), AcceptancePhase::Preapplied);
+                let handle = pair.provider.load_block_handle(pair.shard.id()).unwrap().unwrap();
+                assert!(handle.has_state());
+                assert!(!handle.is_applied());
+                assert_eq!(
+                    pair.provider
+                        .load_state(pair.shard.id())
+                        .await
+                        .unwrap()
+                        .root_cell()
+                        .repr_hash(),
+                    &pair.shard_state_root
+                );
+            }
+        })
+        .catch_unwind()
+        .await;
+        pair.receiver.clone().wait_stop().await.unwrap();
+        pair.provider.clone().wait_stop().await.unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
