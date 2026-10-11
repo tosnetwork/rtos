@@ -251,10 +251,57 @@ async fn node_db_counter_wal_archival_mode_preserves_existing_dynamic_cells() ->
         create_engine_allocated(),
     )
     .await?;
-    verify(db.full_node_state_db.db(), root)?;
-    let physical = db.full_node_state_db.db().clone();
+    verify(&db.recovery_node_db, root)?;
+    let physical = db.recovery_node_db.clone();
     db.stop_states_db().await;
     drop(db);
     release(physical).await?;
     verify_second_open(root)
+}
+
+/// Negative control uses its own crash fixture: the destructive legacy open
+/// cannot affect either production-path positive control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_db_counter_wal_legacy_open_negative_control() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    crash_writer(dir.path()).await?;
+    let root = dir.path();
+    let expected: Vec<Row> = serde_json::from_slice(&fs::read(root.join("manifest.json"))?)?;
+    let legacy = RocksDb::new(
+        root.join("node_db"),
+        storage::db::rocksdb::NODE_DB_NAME,
+        None,
+        AccessType::ReadWrite,
+    );
+    match legacy {
+        Ok(db) => {
+            let actual = snapshot(&db);
+            assert!(
+                !matches!(&actual, Ok(rows) if rows == &expected),
+                "negative control did not expose the legacy recovery defect"
+            );
+            println!("legacy WAL recovery snapshot: {actual:?}");
+            drop(db);
+        }
+        Err(error) => println!("legacy WAL recovery open error: {error:#}"),
+    }
+    // Require the actual missing-operator diagnosis, not an unrelated failure
+    // or merely a deliberately absent row. Closing the owner flushes its LOG.
+    let log = fs::read_to_string(
+        root.join("node_db").join(storage::db::rocksdb::NODE_DB_NAME).join("LOG"),
+    )?;
+    let diagnosis: Vec<_> = log
+        .lines()
+        .filter(|line| {
+            line.contains("Merge requires") || line.contains("merge_operator != nullptr")
+        })
+        .collect();
+    assert!(
+        !diagnosis.is_empty(),
+        "legacy opener must report missing counter merge operator in RocksDB LOG"
+    );
+    for line in diagnosis {
+        println!("legacy RocksDB recovery: {line}");
+    }
+    Ok(())
 }

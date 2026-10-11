@@ -262,6 +262,8 @@ fn publication_durability_failure(error: anyhow::Error) -> anyhow::Error {
 }
 
 pub struct InternalDb {
+    #[cfg(test)]
+    recovery_node_db: Arc<RocksDb>,
     catchain_db: Arc<RocksDb>,
     block_handle_storage: Arc<BlockHandleStorage>,
     propagation_outbox_writer: Arc<AtomicBool>,
@@ -458,6 +460,8 @@ impl InternalDb {
         );
 
         let result = Self {
+            #[cfg(test)]
+            recovery_node_db: db.clone(),
             catchain_db: db_catchain,
             block_handle_storage,
             propagation_outbox_writer: Arc::new(AtomicBool::new(false)),
