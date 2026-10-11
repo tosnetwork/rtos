@@ -101,7 +101,7 @@ impl State {
         Ok((delivery, entry))
     }
 
-    async fn lookup_terminal(
+    pub(super) async fn lookup_terminal(
         &self,
         store: &Arc<PropagationOutbox>,
         runtime: &AuthenticatedSessionRuntime,
@@ -119,7 +119,7 @@ impl State {
         Ok(FinalityTerminalLookup::Retained)
     }
 
-    async fn offer_close(
+    pub(super) async fn offer_close(
         &self,
         store: &Arc<PropagationOutbox>,
         runtime: &AuthenticatedSessionRuntime,
@@ -191,7 +191,7 @@ impl State {
         .await
     }
 
-    async fn confirm_delivered(
+    pub(super) async fn confirm_delivered(
         &self,
         store: &Arc<PropagationOutbox>,
         runtime: &AuthenticatedSessionRuntime,

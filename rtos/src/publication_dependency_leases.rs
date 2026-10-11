@@ -104,7 +104,7 @@ impl DependencyLeases {
     pub(crate) fn open(db: Arc<RocksDb>, can_create: bool) -> Result<Arc<Self>> {
         let protection = db.repair_protection().clone();
         let outcome = (|| {
-            let table = RocksDbTable::<String>::with_db(db, CF, can_create)?;
+            let table = db.table::<String>(CF, can_create)?;
             let mut memory = Memory::default();
             table.for_each(&mut |key, raw| {
                 if key == b"next" {

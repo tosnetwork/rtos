@@ -3,7 +3,7 @@
 use super::super::retired_session_auth::authenticate_closing_runtime;
 use super::*;
 use consensus_common::finality_delivery::FinalityDeliveryRole;
-use simplex::finality_delivery::{close_source_id, scan_finality_closures_namespace};
+use simplex::finality_delivery::{close_source_id, scan_finality_closures_namespace_batch};
 
 const CLOSE_BATCH: usize = 16;
 
@@ -63,10 +63,25 @@ async fn replay_namespace(
     namespace: PathBuf,
     cursors: Arc<Mutex<std::collections::BTreeMap<PathBuf, rtos_block::UInt256>>>,
 ) -> Result<usize> {
+    let after = {
+        let cursors = cursors.lock().map_err(|_| error!("Closing cursor poisoned"))?;
+        if !cursors.contains_key(&namespace) && cursors.len() >= 16_384 {
+            fail!("Closing namespace cursor capacity exhausted");
+        }
+        cursors.get(&namespace).cloned()
+    };
     let path = namespace.clone();
-    let locators = tokio::task::spawn_blocking(move || scan_finality_closures_namespace(&path))
-        .await
-        .map_err(|e| error!("Source closing scan join: {e}"))??;
+    let locators = tokio::task::spawn_blocking(move || {
+        scan_finality_closures_namespace_batch(&path, after.as_ref(), CLOSE_BATCH)
+    })
+    .await
+    .map_err(|e| error!("Source closing scan join: {e}"))??;
+    if let Some(last) = locators.last() {
+        cursors
+            .lock()
+            .map_err(|_| error!("Closing cursor poisoned"))?
+            .insert(namespace.clone(), close_source_id(&last.request()?)?);
+    }
     let mut candidates = Vec::new();
     for locator in locators {
         let request = locator.request()?;
@@ -79,76 +94,76 @@ async fn replay_namespace(
             candidates.push((close_source_id(&request)?, locator));
         }
     }
-    candidates.sort_by(|a, b| a.0.cmp(&b.0));
     if candidates.is_empty() || engine.check_stop() {
         return Ok(0);
-    }
-    // Failed low IDs must not consume the same batch on every pass. All
-    // unselected store owners are dropped before any reservation is released.
-    {
-        let mut cursors = cursors.lock().map_err(|_| error!("Closing cursor poisoned"))?;
-        if !cursors.contains_key(&namespace) && cursors.len() >= 16_384 {
-            fail!("Closing namespace cursor capacity exhausted");
-        }
-        let offset = cursors
-            .get(&namespace)
-            .and_then(|last| candidates.iter().position(|(id, _)| id > last))
-            .unwrap_or(0);
-        candidates.rotate_left(offset);
-        candidates.truncate(CLOSE_BATCH);
-        cursors.insert(namespace.clone(), candidates.last().unwrap().0.clone());
     }
     let worker = engine.ensure_publication_worker().await?;
     let mut lease = None;
     let mut completions = Vec::new();
     let mut first_error = None;
-    for (_, locator) in candidates {
-        if engine.check_stop() {
-            drop(locator);
-            continue;
-        }
-        let authentication = async {
-            let request = locator.request()?;
-            tokio::time::timeout(
-                AUTH_TIMEOUT,
-                authenticate_closing_runtime(engine.as_ref(), &request, &namespace),
-            )
-            .await
-            .map_err(|_| error!("Source closing history temporarily unavailable"))?
-        }
-        .await;
-        let runtime = match authentication {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                first_error.get_or_insert(error);
+    let admission = std::panic::AssertUnwindSafe(async {
+        for (_, locator) in candidates {
+            if engine.check_stop() {
+                drop(locator);
                 continue;
             }
-        };
-        if lease.is_none() {
-            match engine.finality_recovery_registry().reserve(&runtime) {
-                Ok(Some(reservation)) => lease = Some(reservation),
-                Ok(None) => break,
+            let authentication = async {
+                let request = locator.request()?;
+                tokio::time::timeout(
+                    AUTH_TIMEOUT,
+                    authenticate_closing_runtime(engine.as_ref(), &request, &namespace),
+                )
+                .await
+                .map_err(|_| error!("Source closing history temporarily unavailable"))?
+            }
+            .await;
+            let runtime = match authentication {
+                Ok(runtime) => runtime,
                 Err(error) => {
                     first_error.get_or_insert(error);
-                    break;
+                    continue;
+                }
+            };
+            if lease.is_none() {
+                match engine.finality_recovery_registry().reserve(&runtime) {
+                    Ok(Some(reservation)) => lease = Some(reservation),
+                    Ok(None) => break,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                        break;
+                    }
+                }
+            }
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            // Retain the receiver before calling external admission code: it may panic
+            // after handing off its source owner.
+            completions.push(receiver);
+            let result = locator.resume(
+                runtime.clone(),
+                worker.sink(runtime.clone()),
+                worker.delivered_sink(runtime),
+                Box::new(move |result| {
+                    let _ = sender.send(result);
+                }),
+            );
+            match result {
+                Ok(()) => {}
+                Err(error) => {
+                    completions.pop();
+                    first_error.get_or_insert(error);
                 }
             }
         }
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        let result = locator.resume(
-            runtime.clone(),
-            worker.sink(runtime.clone()),
-            worker.delivered_sink(runtime),
-            Box::new(move |result| {
-                let _ = sender.send(result);
-            }),
+    })
+    .catch_unwind()
+    .await;
+    if admission.is_err() {
+        engine.stopper().set_stop();
+        engine.stopper().report_service_failure(
+            0,
+            "Source closing admission panicked; draining callbacks".into(),
         );
-        match result {
-            Ok(()) => completions.push(receiver),
-            Err(error) => {
-                first_error.get_or_insert(error);
-            }
-        }
+        first_error.get_or_insert_with(|| error!("Source closing admission panicked"));
     }
     let mut completed = 0;
     let mut lost_completion = false;
@@ -170,7 +185,12 @@ async fn replay_namespace(
             }
         }
     }
-    if !lost_completion {
+    if lost_completion {
+        engine
+            .stopper()
+            .report_service_failure(0, "Source closing callback lost its drain proof".into());
+    }
+    if !lost_completion && admission.is_ok() {
         if let Some(lease) = lease {
             lease.release();
         }
