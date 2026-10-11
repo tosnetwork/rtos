@@ -947,6 +947,7 @@ impl SessionFactory {
 #[path = "tests/pq_fixture.rs"]
 pub(crate) mod pq_fixture;
 
+pub mod finality_delivery;
 mod runtime_manifest;
 mod signing_coordinator;
 
