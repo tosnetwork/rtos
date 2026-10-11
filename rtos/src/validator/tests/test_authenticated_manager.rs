@@ -133,6 +133,7 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             *engine.normal_admission_gate.lock().unwrap() = Some((target_seqno, entered_tx, release_rx));
+            let race_done = tokio::sync::Notify::new();
             let race = async {
                 let runtime = tokio::time::timeout(Duration::from_secs(10), entered_rx).await
                     .map_err(|e| error!("manager phase=await-normal-admission-gate target_cc={target_seqno}: {e}"))?
@@ -142,9 +143,25 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
                 // actual atomic admission before the normal factory can start.
                 let token = engine.namespace_registry.reserve(&runtime)?.ok_or_else(|| error!("recovery lost gated race"))?;
                 release_tx.send(()).map_err(|e| error!("release normal gate: {e}"))?;
+                race_done.notify_one();
                 Ok::<_, anyhow::Error>((runtime, token))
             };
-            let (updated, race) = tokio::join!(manager.update_shards(state.clone()), race);
+            let updates = async {
+                manager.update_shards(state.clone()).await?;
+                let handle = engine.load_block_handle(state.block_id())?.unwrap();
+                loop {
+                    let generation = engine.namespace_registry.generation();
+                    tokio::select! {
+                        _ = race_done.notified() => return Ok::<_, anyhow::Error>(()),
+                        next = manager.wait_next_mc_or_materialization_retry(&handle, generation) => {
+                            anyhow::ensure!(next?.is_some(), "manager stopped before admission gate");
+                        }
+                    }
+                    manager.update_shards(state.clone()).await?;
+                }
+            };
+            let (updated, race) = tokio::join!(tokio::time::timeout(Duration::from_secs(12), updates), race);
+            let updated = updated.map_err(|e| error!("manager production retry helper timeout: {e}"))?;
             eprintln!("manager lifecycle: initial update result={updated:?}; race_ok={}", race.is_ok());
             updated?;
             let (runtime, token) = race?;
@@ -232,18 +249,21 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
     // get through its initial wait and create these additional real sessions.
     let spawned = if result.is_ok() && stopped.is_ok() {
         let baseline = engine.validator_network.authenticated_created.load(Ordering::SeqCst);
+        engine.fail_future_history_once.store(true, Ordering::SeqCst);
         let mut manager_config = ValidatorManagerConfig::default();
         manager_config.update_interval = Duration::from_millis(20);
         match spawn_validator_manager(engine.clone(), tokio::runtime::Handle::current(), manager_config) {
             Ok(task) => {
                 let started = tokio::time::timeout(Duration::from_secs(5), async {
-                    while engine.validator_network.authenticated_created.load(Ordering::SeqCst) < baseline + 2 {
+                    while engine.validator_network.authenticated_created.load(Ordering::SeqCst) < baseline + 4 {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 }).await;
+                let injected = engine.future_history_failure_seen.load(Ordering::SeqCst);
                 engine.stop.store(true, Ordering::SeqCst);
                 let joined = task.await;
-                started.map_err(|_| error!("outer manager did not create configured observer sessions"))
+                started.map_err(|_| error!("outer manager did not retry future materialization without a new MC"))
+                    .and_then(|_| if injected { Ok(()) } else { Err(error!("outer manager missed controlled future preparation failure")) })
                     .and_then(|_| joined.map_err(|error| error!("manager task failed: {error}")))
             }
             Err(error) => Err(error),

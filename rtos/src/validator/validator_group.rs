@@ -1447,7 +1447,17 @@ impl ValidatorGroup {
 
     /// Pre-create the consensus engine without starting the validation queue.
     /// Called for future-validator groups to warm up the session ahead of time.
+    pub async fn needs_materialization_retry(&self) -> bool {
+        if self.stop_requested.is_cancelled() { return false; }
+        self.group_impl.execute_sync(|g| {
+            g.session.is_none() && g.status < ValidatorGroupStatus::Stopping && !g.start_pending
+        }).await
+    }
+
     pub async fn pre_create_engine(self: Arc<ValidatorGroup>) -> Result<()> {
+        // This is only a cheap early exit; create_engine still checks ownership
+        // and lifecycle under the group lock after preparation.
+        if !self.needs_materialization_retry().await { return Ok(()); }
         self.prepare_retired_history(None).await?;
         self.prepare_durable_finality_sink().await?;
         let callback = self.make_validator_session_callback();

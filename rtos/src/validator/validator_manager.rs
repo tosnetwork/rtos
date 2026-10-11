@@ -845,6 +845,40 @@ struct ValidatorManagerImpl {
 }
 
 impl ValidatorManagerImpl {
+    /// Retry incomplete materialization even when neither MC nor recovery
+    /// ownership changes. A separate deadline prevents short stats intervals
+    /// from turning transient history/storage failures into a busy loop.
+    async fn wait_next_mc_or_materialization_retry(
+        &mut self,
+        current: &Arc<storage::block_handle_db::BlockHandle>,
+        recovery_generation: u64,
+    ) -> Result<Option<Arc<storage::block_handle_db::BlockHandle>>> {
+        let mut retry_at = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if self.engine.check_stop() { return Ok(None); }
+            tokio::select! {
+                next = self.engine.wait_next_applied_mc_block(current, None) => {
+                    return Ok(Some(next?.0));
+                }
+                changed = self.engine.wait_finality_recovery_change(recovery_generation) => {
+                    changed?;
+                    return Ok(Some(current.clone()));
+                }
+                _ = tokio::time::sleep_until(retry_at) => {
+                    for group in self.current_sessions.values().chain(self.future_sessions.values()) {
+                        if group.needs_materialization_retry().await {
+                            return Ok(Some(current.clone()));
+                        }
+                    }
+                    retry_at = tokio::time::Instant::now() + Duration::from_secs(1);
+                }
+                _ = tokio::time::sleep(self.config.update_interval.max(Duration::from_millis(10))) => {
+                    self.stats().await;
+                }
+            }
+        }
+    }
+
     fn create(
         engine: Arc<dyn EngineOperations>,
         rt: tokio::runtime::Handle,
@@ -3083,52 +3117,12 @@ impl ValidatorManagerImpl {
                 }
             }
 
-            mc_handle = loop {
-                log::trace!(target: "validator_manager", "Checking stop engine");
-                if self.engine.check_stop() {
-                    log::trace!(
-                        target: "validator_manager",
-                        "Engine is stopped. Exiting from invocation loop (while loading block)"
-                    );
-                    return Ok(());
-                }
-                log::trace!(target: "validator_manager", "Checked stop engine: going on");
-                self.stats().await;
-                log::trace!(
-                    target: "validator_manager",
-                    "Waiting next applied masterblock after {}",
-                    mc_handle.id().seq_no
-                );
-                match tokio::select! {
-                    outcome = timeout(
-                        self.config.update_interval,
-                        self.engine.wait_next_applied_mc_block(&mc_handle, None),
-                    ) => outcome,
-                    changed = self.engine.wait_finality_recovery_change(recovery_generation) => {
-                        changed?;
-                        break mc_handle.clone();
-                    }
-                } {
-                    Ok(r_res) => {
-                        log::trace!(
-                            target: "validator_manager",
-                            "Got next applied master block (result): {}",
-                            match &r_res {
-                                Err(e) => format!("Err({})", e),
-                                Ok((h, _bs)) => format!("Ok({})", h.id())
-                            }
-                        );
-                        break r_res?.0;
-                    }
-                    Err(tokio::time::error::Elapsed { .. }) => {
-                        log::warn!(
-                            target: "validator_manager",
-                            "Validator manager didn't receive next applied master block after {}",
-                            mc_handle.id()
-                        );
-                    }
-                }
-            }
+            mc_handle = match self.wait_next_mc_or_materialization_retry(
+                &mc_handle, recovery_generation,
+            ).await? {
+                Some(next) => next,
+                None => return Ok(()),
+            };
         }
 
         log::info!(
