@@ -234,14 +234,24 @@ impl PropagationOutbox {
         self.commit(&mut state, next)?;
         Ok(record)
     }
-    /// The serialized worker has already verified the source's opaque exact
-    /// confirmation. This method cannot be reached with a network boolean.
+    /// Require both private custody and the opaque source WAL confirmation.
+    /// The serialized worker additionally authenticates historical runtime and
+    /// ledger ownership; no caller can substitute a network boolean here.
     pub(crate) fn confirm_close(
         &self,
         binding: &RepairLeaseBinding,
         custody: &DurableMcFinalRepairCustody,
+        confirmation: &simplex::finality_delivery::DeliveredConfirmation,
     ) -> Result<ClosingRecord> {
-        self.confirm_close_inner(custody_record(binding, custody)?)
+        let expected = custody_record(binding, custody)?;
+        let offer = expected.offer();
+        if confirmation.offer() != &offer
+            || confirmation.source_id()
+                != &simplex::finality_delivery::close_source_id(&offer.request)?
+        {
+            fail!("Close requires the exact durable source confirmation");
+        }
+        self.confirm_close_inner(expected)
     }
     fn confirm_close_inner(&self, expected: ClosingRecord) -> Result<ClosingRecord> {
         let mut state = self.lock()?;
