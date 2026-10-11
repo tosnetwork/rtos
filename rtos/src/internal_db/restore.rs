@@ -24,7 +24,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
 };
 use storage::{cell_db::BROKEN_CELL_BEACON_FILE, traits::Serializable};
 
@@ -34,28 +33,20 @@ const LAST_MC_BLOCKS: u32 = 100;
 const SHARD_CLIENT_MC_BLOCK_CANDIDATES: u32 = 300;
 
 pub async fn check_db(
-    mut db: InternalDb,
+    db: &InternalDb,
     processed_wc: i32,
     restore_db_enabled: bool,
     force: bool,
     check_stop: &(dyn Fn() -> Result<()> + Sync),
     is_broken: Option<&AtomicBool>,
-) -> Result<InternalDb> {
-    async fn force_db_reset(
-        err: Error,
-        check_stop: &(dyn Fn() -> Result<()> + Sync),
-        is_broken: Option<&AtomicBool>,
-    ) -> ! {
+) -> Result<()> {
+    fn restore_failure(err: Error, is_broken: Option<&AtomicBool>) -> Error {
         if let Some(is_broken) = is_broken {
-            is_broken.store(true, Ordering::Relaxed)
+            is_broken.store(true, Ordering::Relaxed);
         }
-        log::error!("Error while restoring database: {}. Need to clear db and re-sync node.", err);
-        loop {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            if check_stop().is_err() {
-                std::process::exit(0xFF)
-            }
-        }
+        log::error!("Error while restoring database: {err}. Need to clear db and re-sync node.");
+        // Let the owning constructor drain storage tasks before reporting failure.
+        err
     }
 
     let unexpected_termination = check_unexpected_termination(&db.config.db_directory);
@@ -83,23 +74,21 @@ pub async fn check_db(
                     config is 'false', so restore operation is skipped. Node may work incorrectly."
                 );
             }
-            return Ok(db);
+            return Ok(());
         }
 
         set_restoring(&db.config.db_directory)?;
-        match restore_last_applied_mc_block(&db, check_stop).await {
+        match restore_last_applied_mc_block(db, check_stop).await {
             Ok(Some(last_applied_mc_block)) => {
                 let shard_client_mc_block = restore_shard_client_mc_block(
-                    &db,
+                    db,
                     &last_applied_mc_block,
                     processed_wc,
                     check_stop,
                 )
                 .await?;
-                db = match restore(db, &last_applied_mc_block, &shard_client_mc_block).await {
-                    Ok(db) => db,
-                    Err(err) => force_db_reset(err, check_stop, is_broken).await,
-                };
+                restore(db, &last_applied_mc_block, &shard_client_mc_block).await
+                    .map_err(|err| restore_failure(err, is_broken))?;
             }
             Ok(None) => {
                 log::info!(
@@ -107,12 +96,12 @@ pub async fn check_db(
                     ever booted in blockchain."
                 );
             }
-            Err(err) => force_db_reset(err, check_stop, is_broken).await,
+            Err(err) => return Err(restore_failure(err, is_broken)),
         }
         reset_restoring(&db.config.db_directory)?;
     }
     set_unexpected_termination(&db.config.db_directory)?;
-    Ok(db)
+    Ok(())
 }
 
 pub fn set_graceful_termination(db_dir: &str) {
@@ -267,10 +256,10 @@ async fn restore_shard_client_mc_block(
 }
 
 async fn restore(
-    db: InternalDb,
+    db: &InternalDb,
     last_applied_mc_block: &BlockStuff,
     shard_client_mc_block: &BlockStuff,
-) -> Result<InternalDb> {
+) -> Result<()> {
     let last_mc_block = if last_applied_mc_block.id().seq_no() > shard_client_mc_block.id().seq_no()
     {
         shard_client_mc_block
@@ -316,7 +305,7 @@ async fn restore(
 
     log::info!("Restore successfully finished");
 
-    Ok(db)
+    Ok(())
 }
 
 async fn check_shard_client_mc_block(

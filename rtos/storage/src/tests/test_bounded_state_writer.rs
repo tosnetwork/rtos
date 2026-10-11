@@ -90,7 +90,7 @@ fn count(db: &Arc<RocksDb>, cell: &Cell) -> Result<Option<u32>> {
     Ok(value)
 }
 async fn close(db: Arc<RocksDb>, states: Arc<ShardStateDb>) -> Result<()> {
-    states.stop().await;
+    states.stop().await.unwrap();
     drop(states);
     tokio::time::timeout(Duration::from_secs(10), async {
         while Arc::strong_count(&db) > 1 {
