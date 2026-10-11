@@ -246,10 +246,14 @@ async fn cold_window(window: i32) {
     let status = status.unwrap_or_else(|error| {
         panic!("child window {window}: {error}; log {}", dir.path().join("child.log").display())
     });
+    #[cfg(unix)]
+    let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+    #[cfg(not(unix))]
+    let signal: Option<i32> = None;
     assert_eq!(
         status.code(),
         Some(window),
-        "child log: {}",
+        "child status={status:?} signal={signal:?}; log: {}",
         std::fs::read_to_string(dir.path().join("child.log")).unwrap()
     );
     drop(child);
