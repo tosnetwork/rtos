@@ -196,7 +196,7 @@ async fn persistent_closure_crash_child() {
     .await;
     // Successful windows intentionally skip destructors. Every ordinary failure
     // still joins both Engines, rather than leaving a fixture-owned background task.
-    let _ = tokio::join!(pair.provider.clone().wait_stop(), pair.receiver.clone().wait_stop());
+    pair.stop_all().await;
     run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     panic!("crash child returned without selected exit");
 }

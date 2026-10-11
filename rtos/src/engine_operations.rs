@@ -1043,8 +1043,15 @@ impl EngineOperations for Engine {
     ) -> Result<()> {
         #[cfg(test)]
         self.test_finality_notifications.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        let received_id = broadcast.id.clone();
+        #[cfg(test)]
+        let observed = self.clone();
         let pending = self.pending_finality.clone();
-        crate::full_node::finality::receive(self, pending, broadcast, src, received_bytes).await
+        crate::full_node::finality::receive(self, pending, broadcast, src, received_bytes).await?;
+        #[cfg(test)]
+        observed.test_finality_received_ids.lock().unwrap().insert(received_id);
+        Ok(())
     }
 
     fn process_block_broadcast_v2(

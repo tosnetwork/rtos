@@ -67,6 +67,8 @@ struct Pair {
     _dir: tempfile::TempDir,
     receiver: Arc<Engine>,
     provider: Arc<Engine>,
+    // Only source-circulation fixtures add a true non-validator recipient.
+    observer: Option<Arc<Engine>>,
     anchor: BlockIdExt,
     shard: BlockStuff,
     shard_carrier: BlockSignaturesSimplexPq,
@@ -75,7 +77,18 @@ struct Pair {
     master_state_root: UInt256,
 }
 
+async fn stop_fixture_engines(engines: Vec<Arc<Engine>>) {
+    // Join every owner even if one shutdown reports an error.
+    let results = futures::future::join_all(engines.into_iter().map(|engine| engine.wait_stop())).await;
+    for result in results { result.unwrap(); }
+}
+
 impl Pair {
+    async fn stop_all(&self) {
+        let mut engines = vec![self.provider.clone(), self.receiver.clone()];
+        engines.extend(self.observer.iter().cloned());
+        stop_fixture_engines(engines).await;
+    }
     async fn new(variant: &str, corrupt_signature: bool) -> Self {
         Self::with_propagation_profile(variant, corrupt_signature, false).await
     }
@@ -138,15 +151,19 @@ impl Pair {
         let provider_dir = dir.path().join("provider");
         write_recovery_config(&receiver_dir, &anchor, true);
         write_recovery_config(&provider_dir, &anchor, true);
+        let observer_dir = source_transport.then(|| dir.path().join("observer"));
+        if let Some(path) = &observer_dir { write_recovery_config(path, &anchor, true); }
         if v2 {
             // The provider is a governing validator transport. The receiver is
             // a public observer outside that committee, so normal T0 policy
             // receives rather than marking both nodes as original senders.
             // No test manually activates Plumtree or bypasses an authority check.
-            for (dir, seed) in [
+            let mut configurations = vec![
                 (&provider_dir, 0x60),
                 (&receiver_dir, if source_transport { 0x61 } else { 0x70 }),
-            ] {
+            ];
+            if let Some(path) = &observer_dir { configurations.push((path, 0x70)); }
+            for (dir, seed) in configurations {
                 let file = dir.join("config.json");
                 let mut config: serde_json::Value =
                     serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
@@ -158,7 +175,7 @@ impl Pair {
                         entry["data"] = serde_json::to_value(&key).unwrap();
                     }
                 }
-                if source_transport {
+                if source_transport && seed != 0x70 {
                     // The normal source factory requires an explicit stable
                     // validator -> transport binding. Derive it from the actual
                     // governing state and persist it for the cold-open phase.
@@ -193,12 +210,23 @@ impl Pair {
         }
         let receiver = open_engine(&receiver_dir).await;
         let provider = open_engine(&provider_dir).await;
+        let observer = match &observer_dir {
+            Some(path) => Some(open_engine(path).await),
+            None => None,
+        };
+        let mut engines = vec![&receiver, &provider];
+        let mut routes = vec![(&receiver, &provider), (&provider, &receiver)];
+        if let Some(observer) = &observer {
+            engines.push(observer);
+            routes.extend([(&provider, observer), (observer, &provider),
+                (&receiver, observer), (observer, &receiver)]);
+        }
         let setup = std::panic::AssertUnwindSafe(async {
             if v2 {
                 // Private overlay creation requires a real ADNL route already
                 // present. Bootstrap transport reachability before normal config
                 // creates either public or fast overlays; do not bypass membership.
-                for (local, remote) in [(&receiver, &provider), (&provider, &receiver)] {
+                for &(local, remote) in &routes {
                     let local_adnl = &local.network().context().stack.adnl;
                     let remote_adnl = &remote.network().context().stack.adnl;
                     let local_key = local_adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
@@ -220,7 +248,7 @@ impl Pair {
                         .unwrap();
                 }
             }
-            for engine in [&receiver, &provider] {
+            for &engine in &engines {
                 for bytes in [&mc_data, &decode(&recovery["prev_state_boc"])] {
                     let root = read_single_root_boc(bytes).unwrap();
                     let state = ShardStateUnsplit::construct_from_cell(root.clone()).unwrap();
@@ -270,7 +298,7 @@ impl Pair {
                     master.id(),
                 )
                 .unwrap();
-            for (local, remote) in [(&receiver, &provider), (&provider, &receiver)] {
+            for &(local, remote) in &routes {
                 let local_adnl = &local.network().context().stack.adnl;
                 let remote_adnl = &remote.network().context().stack.adnl;
                 let local_key = local_adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
@@ -321,14 +349,16 @@ impl Pair {
         .catch_unwind()
         .await;
         if let Err(panic) = setup {
-            receiver.clone().wait_stop().await.unwrap();
-            provider.clone().wait_stop().await.unwrap();
+            stop_fixture_engines(engines.iter().map(|engine| (*engine).clone()).collect()).await;
             std::panic::resume_unwind(panic);
         }
+        drop(routes);
+        drop(engines);
         Self {
             _dir: dir,
             receiver,
             provider,
+            observer,
             anchor,
             shard,
             shard_carrier: fixture_carrier(&recovery["rows"][0]),
