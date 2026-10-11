@@ -66,6 +66,15 @@ pub struct BlockHandle {
     got_by_broadcast: AtomicBool,
 }
 
+/// Exclusive ownership of the transient migration bit. Only a successful
+/// acquisition may clear it; repairing routing flags never releases this owner.
+pub(crate) struct ArchiveMigrationGuard<'a>(&'a BlockHandle);
+impl Drop for ArchiveMigrationGuard<'_> {
+    fn drop(&mut self) {
+        self.0.meta.reset(FLAG_ARCHIVING, false);
+    }
+}
+
 impl BlockHandle {
     const SIZE: usize = BlockMeta::SIZE + ShardIdent::SIZE + 36;
 
@@ -390,8 +399,8 @@ impl BlockHandle {
         */
     }
 
-    pub fn set_moving_to_archive(&self) -> bool {
-        self.set_flag(FLAG_ARCHIVING)
+    pub(crate) fn try_begin_archive_migration(&self) -> Option<ArchiveMigrationGuard<'_>> {
+        self.set_flag(FLAG_ARCHIVING).then(|| ArchiveMigrationGuard(self))
     }
 
     pub fn block_file_lock(&self) -> &tokio::sync::RwLock<()> {

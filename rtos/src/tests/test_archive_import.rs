@@ -159,7 +159,7 @@ async fn test_import_and_verify() -> Result<()> {
     wait_for_db_release(node_db).await;
     let db = open_db(dir.path()).await?;
     fixture.assert_imported(&db, 4).await?;
-    db.stop_states_db().await;
+    db.stop_states_db().await.unwrap();
     Ok(())
 }
 
@@ -190,7 +190,7 @@ async fn test_import_resume() -> Result<()> {
     );
     let db = open_db(dir.path()).await?;
     fixture.assert_imported(&db, 2).await?;
-    db.stop_states_db().await;
+    db.stop_states_db().await.unwrap();
     drop(db);
     for entry in std::fs::read_dir(&all_archives)? {
         let entry = entry?;
@@ -203,7 +203,7 @@ async fn test_import_resume() -> Result<()> {
     wait_for_db_release(node_db).await;
     let db = open_db(dir.path()).await?;
     fixture.assert_imported(&db, 4).await?;
-    db.stop_states_db().await;
+    db.stop_states_db().await.unwrap();
     Ok(())
 }
 
@@ -222,7 +222,7 @@ async fn test_import_resume_respects_shard_client() -> Result<()> {
         let db = open_db(dir.path()).await?;
         fixture.assert_imported(&db, 4).await?;
         db.save_full_node_state(SHARD_CLIENT_MC_BLOCK, &fixture.id(2, false))?;
-        db.stop_states_db().await;
+        db.stop_states_db().await.unwrap();
     }
     let mut second = fixture.config(dir.path(), archives.clone());
     second.move_files = true;
@@ -240,7 +240,7 @@ async fn test_import_resume_respects_shard_client() -> Result<()> {
     );
     let db = open_db(dir.path()).await?;
     fixture.assert_imported(&db, 4).await?;
-    db.stop_states_db().await;
+    db.stop_states_db().await.unwrap();
     Ok(())
 }
 

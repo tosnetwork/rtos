@@ -1809,7 +1809,7 @@ mod tests {
             assert_eq!(outbox.pending()?[0].id, id);
             Ok(())
         }));
-        db.stop_states_db().await;
+        db.stop_states_db().await.unwrap();
         match result {
             Ok(result) => result,
             Err(panic) => std::panic::resume_unwind(panic),

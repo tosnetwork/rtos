@@ -313,9 +313,11 @@ impl ArchiveManager {
         mut on_success: impl FnMut() -> Result<()>,
     ) -> Result<()> {
         let _migration = self.db.repair_protection().deletion().await;
-        if !handle.set_moving_to_archive() {
+        if handle.is_archived() {
             return Ok(());
         }
+        let _owner = handle.try_begin_archive_migration()
+            .ok_or_else(|| error!("Archive migration already active for {}", handle.id()))?;
 
         let proof_inited = handle.has_proof();
         let prooflink_inited = handle.has_proof_link();
