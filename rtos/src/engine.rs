@@ -131,6 +131,8 @@ pub struct Engine {
     #[cfg(test)]
     pub(crate) test_finality_notifications: AtomicU64,
     #[cfg(test)]
+    pub(crate) test_finality_received_ids: std::sync::Mutex<std::collections::HashSet<BlockIdExt>>,
+    #[cfg(test)]
     pub(crate) parent_apply_test_gate: std::sync::Mutex<Option<Arc<parent_apply_tests::ApplyGate>>>,
     db: Arc<InternalDb>,
     candidate_db: CandidateDbPool,
@@ -961,6 +963,8 @@ impl Engine {
                     test_chain_time: AtomicU64::new(u64::MAX),
                     #[cfg(test)]
                     test_finality_notifications: AtomicU64::new(0),
+                    #[cfg(test)]
+                    test_finality_received_ids: Default::default(),
                     last_applied_mc_block_utime: AtomicU32::new(0),
                     last_known_mc_block_seqno: AtomicU32::new(0),
                     last_known_keyblock_seqno: AtomicU32::new(0),
