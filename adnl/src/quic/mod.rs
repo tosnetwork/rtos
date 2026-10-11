@@ -980,6 +980,23 @@ impl QuicNode {
         false
     }
 
+    /// Actual socket address serving this registered local identity, including
+    /// the OS-selected port when the configured bind port was zero.
+    pub fn local_addr(&self, key_id: &Arc<KeyId>) -> Result<SocketAddr> {
+        let state = self
+            .local_keys
+            .get(key_id)
+            .ok_or_else(|| error!("QUIC local identity is not registered: {key_id}"))?;
+        let endpoints =
+            self.endpoints.lock().map_err(|_| error!("QUIC endpoint registry poisoned"))?;
+        endpoints
+            .get(&state.val().bound_port)
+            .ok_or_else(|| error!("QUIC local identity has no endpoint"))?
+            .endpoint
+            .local_addr()
+            .map_err(Into::into)
+    }
+
     pub fn add_peer_key(&self, key_id: Arc<KeyId>, addr: SocketAddr) -> Result<()> {
         add_unbound_object_to_map_with_update(&self.peer_keys, key_id, |_| Ok(Some(addr)))?;
         Ok(())
@@ -2835,6 +2852,19 @@ mod handshake_tests {
         let address =
             node.endpoints.lock().unwrap().values().next().unwrap().endpoint.local_addr().unwrap();
         (node, key.id().clone(), address)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quic_bound_address_tracks_registered_identities() {
+        let (node, first, address) = node(171, "127.0.0.1:0".parse().unwrap());
+        let second = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[172; 32]).unwrap();
+        let missing = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[173; 32]).unwrap();
+        node.add_key(&[172; 32], second.id(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        assert_ne!(address.port(), 0);
+        assert_eq!(node.local_addr(&first).unwrap(), address);
+        assert_eq!(node.local_addr(second.id()).unwrap(), address);
+        assert!(node.local_addr(missing.id()).is_err());
+        node.shutdown_and_wait().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
