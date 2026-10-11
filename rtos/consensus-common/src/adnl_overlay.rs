@@ -7,6 +7,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+use crate::async_owner::AsyncOwner;
 use crate::{
     utils::MetricsHandle, BlockPayloadPtr, ConsensusCommonFactory, ConsensusNode, ConsensusOverlay,
     ConsensusOverlayListenerPtr, ConsensusOverlayLogReplayListenerPtr, ConsensusOverlayManager,
@@ -46,7 +47,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, Weak,
     },
     time::{Duration, Instant, SystemTime},
@@ -112,7 +113,7 @@ pub struct TaskProcessor {
     name: String,
     task_sender: mpsc::UnboundedSender<TaskDesc>,
     stop_requested: Arc<AtomicBool>,
-    is_stopped: Arc<AtomicBool>,
+    tasks: Arc<AsyncOwner>,
     post_counter: metrics::Counter,
 }
 
@@ -127,7 +128,7 @@ impl TaskProcessor {
 
         let (task_sender, mut task_receiver) = mpsc::unbounded_channel::<TaskDesc>();
         let stop_requested = Arc::new(AtomicBool::new(false));
-        let is_stopped = Arc::new(AtomicBool::new(false));
+        let tasks = AsyncOwner::new(runtime_handle.clone());
 
         let post_counter = metrics_handle
             .sink()
@@ -139,10 +140,9 @@ impl TaskProcessor {
         // Start the async task loop immediately
         let name_clone = name.clone();
         let stop_requested_clone = stop_requested.clone();
-        let is_stopped_clone = is_stopped.clone();
         let pull_counter_clone = pull_counter.clone();
 
-        let _ = runtime_handle.spawn(async move {
+        tasks.spawn("task processor", async move {
             const CHECK_INTERVAL: Duration = Duration::from_millis(100);
             const TASK_AGE_WARNING_THRESHOLD: Duration = Duration::from_secs(5);
             const WARNING_THROTTLE_INTERVAL: Duration = Duration::from_secs(10);
@@ -202,11 +202,9 @@ impl TaskProcessor {
 
             log::debug!(target: LOG_TARGET, "TaskProcessor loop finished: {}", name_clone);
 
-            // Mark as actually stopped
-            is_stopped_clone.store(true, Ordering::Relaxed);
         });
 
-        Self { name, task_sender, stop_requested, is_stopped, post_counter }
+        Self { name, task_sender, stop_requested, tasks, post_counter }
     }
 
     /// Post an async closure to the task queue
@@ -245,38 +243,15 @@ impl TaskProcessor {
 
         self.stop_async();
 
-        // Wait for is_stopped with small sleep delays
-        const STOP_WAIT_DELAY: Duration = Duration::from_millis(100);
-
-        let mut wait_count = 0;
-        while !self.is_stopped.load(Ordering::Relaxed) {
-            if wait_count % 10 == 0 {
-                // Log every second
-                log::info!(
-                    target: LOG_TARGET,
-                    "TaskProcessor {}: Waiting for stop completion... ({}ms)",
-                    self.name,
-                    wait_count * 100
-                );
-            }
-
-            std::thread::sleep(STOP_WAIT_DELAY);
-            wait_count += 1;
-        }
-
-        log::debug!(
-            target: LOG_TARGET,
-            "TaskProcessor {}: Stopped after {}ms",
-            self.name,
-            wait_count * 100
-        );
+        if let Err(error) = self.tasks.wait_sync() { log::error!("{error}"); }
     }
 }
 
 impl Drop for TaskProcessor {
     fn drop(&mut self) {
         log::debug!(target: LOG_TARGET, "Dropping TaskProcessor: {}", self.name);
-        self.stop();
+        self.stop_async();
+        self.tasks.close();
         log::debug!(target: LOG_TARGET, "Dropped TaskProcessor: {}", self.name);
     }
 }
@@ -290,7 +265,7 @@ pub struct TaskProcessorManager {
     processors: HashMap<u32, Arc<TaskProcessor>>,
     metrics_handle: MetricsHandle,
     stop_requested: Arc<AtomicBool>,
-    is_stopped: Arc<AtomicBool>,
+    tasks: Arc<AsyncOwner>,
     runtime_handle: tokio::runtime::Handle,
 }
 
@@ -310,7 +285,7 @@ impl TaskProcessorManager {
         let metrics_handle = MetricsHandle::new(Some(Duration::from_secs(30)));
         let mut processors = HashMap::new();
         let stop_requested = Arc::new(AtomicBool::new(false));
-        let is_stopped = Arc::new(AtomicBool::new(false));
+        let tasks = AsyncOwner::new(runtime_handle.clone());
         let mut processor_names = Vec::new();
 
         // Create TaskProcessor for each tag
@@ -337,7 +312,7 @@ impl TaskProcessorManager {
             processors,
             metrics_handle,
             stop_requested,
-            is_stopped,
+            tasks,
             runtime_handle,
         };
 
@@ -351,7 +326,6 @@ impl TaskProcessorManager {
     fn start_metrics_reporting(&self, processor_names: Vec<String>) {
         let metrics_handle = self.metrics_handle.clone();
         let stop_requested = self.stop_requested.clone();
-        let is_stopped = self.is_stopped.clone();
         let manager_name = self.name.clone();
 
         log::debug!(
@@ -359,7 +333,7 @@ impl TaskProcessorManager {
             "TaskProcessorManager {manager_name}: Starting metrics reporting"
         );
 
-        let _handle = self.runtime_handle.spawn(async move {
+        self.tasks.background("processor metrics", async move {
             const METRICS_DUMP_PERIOD: Duration = Duration::from_secs(30);
             const SLEEP_PERIOD: Duration = Duration::from_millis(300);
 
@@ -398,8 +372,7 @@ impl TaskProcessorManager {
                 "TaskProcessorManager {manager_name}: Metrics loop finished"
             );
 
-            // Mark as actually stopped
-            is_stopped.store(true, Ordering::Relaxed);
+
         });
     }
 
@@ -477,48 +450,21 @@ impl TaskProcessorManager {
 
         self.stop_async();
 
-        // Wait for is_stopped with small sleep delays
-        const STOP_WAIT_DELAY: Duration = Duration::from_millis(100);
+        if let Err(error) = self.stop_checked() { log::error!("{error}"); }
+    }
 
-        let mut wait_count = 0;
-        while !self.is_stopped.load(Ordering::Relaxed) {
-            if wait_count % 10 == 0 {
-                // Log every second
-                log::info!(
-                    target: LOG_TARGET,
-                    "TaskProcessorManager {}: Waiting for stop completion... ({}ms)",
-                    self.name,
-                    wait_count * 100
-                );
-            }
-
-            std::thread::sleep(STOP_WAIT_DELAY);
-            wait_count += 1;
+    fn stop_checked(&self) -> Result<()> {
+        self.stop_async();
+        let mut errors = Vec::new();
+        for processor in self.processors.values() {
+            if let Err(error) = processor.tasks.wait_sync() { errors.push(error.to_string()); }
         }
+        if let Err(error) = self.tasks.wait_sync() { errors.push(error.to_string()); }
+        if errors.is_empty() { Ok(()) } else { Err(error!("{}", errors.join("; "))) }
+    }
 
-        // Manually stop all task processors
-        log::debug!(
-            target: LOG_TARGET,
-            "TaskProcessorManager {}: Stopping {} TaskProcessors",
-            self.name,
-            self.processors.len()
-        );
-        for (tag, processor) in &self.processors {
-            log::trace!(
-                target: LOG_TARGET,
-                "TaskProcessorManager {}: Stopping TaskProcessor for tag={tag}",
-                self.name
-            );
-
-            processor.stop();
-        }
-
-        log::info!(
-            target: LOG_TARGET,
-            "TaskProcessorManager {}: Stopped after {}ms",
-            self.name,
-            wait_count * 100
-        );
+    fn drained(&self) -> bool {
+        self.tasks.drained() && self.processors.values().all(|processor| processor.tasks.drained())
     }
 }
 
@@ -530,7 +476,8 @@ impl Drop for TaskProcessorManager {
             self.name,
             self.processors.len()
         );
-        self.stop();
+        self.stop_async();
+        self.tasks.close();
         log::info!(target: LOG_TARGET, "TaskProcessorManager {}: Dropped", self.name);
     }
 }
@@ -540,12 +487,13 @@ impl Drop for TaskProcessorManager {
 */
 
 struct Peer {
+    leases: AtomicUsize,
     src_adnl_addr: Arc<KeyId>,
     dst_adnl_addr: Arc<KeyId>,
     overlay_node: Arc<OverlayNode>,
     dht_node: Arc<DhtNode>,
     is_stop_requested: Arc<AtomicBool>,
-    is_stopped: Arc<AtomicBool>,
+    tasks: Arc<AsyncOwner>,
 }
 
 impl Peer {
@@ -558,17 +506,18 @@ impl Peer {
         runtime_handle: tokio::runtime::Handle,
     ) -> Arc<Self> {
         let peer = Arc::new(Self {
+            leases: AtomicUsize::new(1),
             src_adnl_addr,
             dst_adnl_addr,
             overlay_node,
             dht_node,
             is_stop_requested: Arc::new(AtomicBool::new(false)),
-            is_stopped: Arc::new(AtomicBool::new(false)),
+            tasks: AsyncOwner::new(runtime_handle.clone()),
         });
 
         // Start address resolution loop
         let peer_clone = peer.clone();
-        runtime_handle.spawn(async move {
+        peer.tasks.background("peer resolver", async move {
             peer_clone.run_address_resolution_loop().await;
         });
 
@@ -659,56 +608,28 @@ impl Peer {
             log::warn!(target: LOG_TARGET, "Error deleting peer at loop exit: {:?}", e);
         }
 
-        // Mark as stopped (finished)
-        self.is_stopped.store(true, Ordering::Relaxed);
+
     }
 
     /// Stop peer resolution loop asynchronously
     fn stop_async(&self) {
         self.is_stop_requested.store(true, Ordering::Relaxed);
+        self.tasks.close();
     }
 
-    /// Stop peer resolution loop synchronously and wait for completion
-    fn stop(&self) {
-        log::trace!(
-            target: LOG_TARGET,
-            "Stopping Peer: {:?} -> {:?}",
-            self.src_adnl_addr,
-            self.dst_adnl_addr
-        );
-
-        // Stop the resolution loop
+    fn stop_checked(&self) -> Result<()> {
         self.stop_async();
-
-        // Wait for resolution loop to finish (sleep wait)
-        let mut wait_count = 0;
-        while !self.is_stopped.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            wait_count += 1;
-
-            if wait_count % 10 == 0 {
-                log::trace!(
-                    target: LOG_TARGET,
-                    "...waiting for peer resolution loop to finish: {:?} -> {:?}",
-                    self.src_adnl_addr,
-                    self.dst_adnl_addr,
-                );
-            }
-        }
-
-        log::trace!(
-            target: LOG_TARGET,
-            "Peer resolution loop finished: {:?} -> {:?}",
-            self.src_adnl_addr,
-            self.dst_adnl_addr
-        );
+        let result = self.tasks.wait_sync();
+        let cleanup = self.overlay_node.delete_private_peers(&self.src_adnl_addr, &[self.dst_adnl_addr.clone()]);
+        result.and(cleanup)
     }
+
 }
 
 impl Drop for Peer {
     fn drop(&mut self) {
-        // Call synchronous stop which waits for completion
-        self.stop();
+        self.stop_async();
+        self.tasks.close();
     }
 }
 
@@ -740,6 +661,7 @@ impl PeerStorage {
         // Try to upgrade existing weak reference
         if let Some(weak_peer) = peers.get(&key) {
             if let Some(peer) = weak_peer.upgrade() {
+                peer.leases.fetch_add(1, Ordering::Relaxed);
                 return peer;
             }
         }
@@ -751,39 +673,20 @@ impl PeerStorage {
         peer
     }
 
-    /// Remove peers with move semantics and stop last instances
-    fn remove_peers(&self, mut peers_to_remove: Vec<Arc<Peer>>) {
-        //hold the lock for the duration of the function to avoid race conditions for new peers creation
+    fn remove_peers(&self, peers_to_remove: Vec<Arc<Peer>>) -> Result<()> {
+        // Serialize final lease retirement with acquisition; a new resolver must
+        // not race the old resolver deleting the same transport peer.
         let mut peers_map = self.peers.lock().expect("PeerStorage mutex poisoned");
-
-        for peer in &peers_to_remove {
-            let key = (peer.src_adnl_addr.clone(), peer.dst_adnl_addr.clone());
-
-            // Check if this is the last strong reference (Arc::strong_count == 2: one in vec, one we're holding)
-            if Arc::strong_count(peer) == 2 {
-                // This is the last reference - stop the peer and remove from map
-                peer.stop_async();
-                peers_map.remove(&key);
-                log::trace!(
-                    target: LOG_TARGET,
-                    "PeerStorage: Stopping and removing last instance of peer {:?} -> {:?}",
-                    peer.src_adnl_addr,
-                    peer.dst_adnl_addr
-                );
+        let mut errors = Vec::new();
+        for peer in peers_to_remove {
+            if peer.leases.fetch_sub(1, Ordering::AcqRel) == 1 {
+                peers_map.remove(&(peer.src_adnl_addr.clone(), peer.dst_adnl_addr.clone()));
+                if let Err(error) = peer.stop_checked() { errors.push(error.to_string()); }
             }
         }
-
-        // Manually stop all peers (this waits for completion)
-        for peer in &peers_to_remove {
-            peer.stop();
-        }
-
-        let peers_count = peers_to_remove.len();
-
-        peers_to_remove.clear();
-
-        log::trace!(target: LOG_TARGET, "PeerStorage: Stopped {} peers", peers_count);
+        if errors.is_empty() { Ok(()) } else { Err(error!("{}", errors.join("; "))) }
     }
+
 }
 
 /*
@@ -888,6 +791,10 @@ impl Subscriber for AdnlOverlayConsumer {
 */
 
 struct AdnlOverlay {
+    tasks: Arc<AsyncOwner>,
+    shutdown: Arc<AsyncOwner>,
+    shutdown_started: Mutex<bool>,
+    shutdown_errors: Arc<Mutex<Vec<String>>>,
     stack: Arc<NetworkStack>,                //ADNL network stack
     overlay_id: Arc<PrivateOverlayShortId>,  //private overlay short identifier
     local_id: PublicKeyHash,                 //local validator key hash
@@ -899,11 +806,11 @@ struct AdnlOverlay {
     stop_requested: Arc<AtomicBool>,  //atomic flag indicating if overlay stop is requested
     consumer: Arc<AdnlOverlayConsumer>, //consumer for handling overlay messages
     runtime_handle: tokio::runtime::Handle, //runtime handle for spawning broadcast listeners
-    peers: Vec<Arc<Peer>>,            //active peers with address resolution
+    peers: Mutex<Vec<Arc<Peer>>>,            //active peers with address resolution
     peers_storage: Arc<PeerStorage>,  //peer storage for cleanup
     is_tcp_available: bool,           //flag indicating if TCP or QUIC is available for multicast
     is_quic_available: bool,          //flag indicating if QUIC transport is available
-    task_processor_manager: TaskProcessorManager, //task processor manager for sequential processing
+    task_processor_manager: Arc<TaskProcessorManager>, //task processor manager for sequential processing
     /// Short id of the parallel block-sync overlay; `Some` when `enable_observers=true`
     /// routes candidate broadcasts here instead of the consensus private overlay
     block_sync_overlay_id: Option<Arc<PrivateOverlayShortId>>,
@@ -1272,6 +1179,10 @@ impl AdnlOverlay {
                 .collect();
 
             AdnlOverlay {
+                tasks: AsyncOwner::new(runtime_handle.clone()),
+                shutdown: AsyncOwner::new(runtime_handle.clone()),
+                shutdown_started: Mutex::new(false),
+                shutdown_errors: Arc::new(Mutex::new(Vec::new())),
                 stack,
                 overlay_id: overlay_id.clone(),
                 local_id,
@@ -1282,12 +1193,12 @@ impl AdnlOverlay {
                 stop_requested: stop_requested.clone(),
                 consumer,
                 runtime_handle: runtime_handle.clone(),
-                peers: peer_objects,
+                peers: Mutex::new(peer_objects),
                 peers_storage: peer_storage.clone(),
                 is_tcp_available: is_tcp_available,
                 is_quic_available: quic_enabled,
                 all_node_ids: all_node_ids,
-                task_processor_manager,
+                task_processor_manager: Arc::new(task_processor_manager),
                 block_sync_overlay_id: block_sync_overlay_id_for_cyclic.clone(),
                 block_sync_consumer,
                 block_sync_authorized,
@@ -1306,7 +1217,11 @@ impl AdnlOverlay {
 
         // Periodic stats dump (lives as long as the overlay's stop flag is unset)
         if let Some(stats) = &overlay.block_sync_stats {
-            stats.clone().spawn_ticker(runtime_handle.clone(), overlay.stop_requested.clone());
+            let stats = stats.clone();
+            overlay.tasks.background("block sync metrics", async move {
+                let mut ticker = tokio::time::interval(crate::BLOCK_SYNC_STATS_LOG_INTERVAL);
+                loop { ticker.tick().await; stats.dump(); }
+            });
         }
 
         log::debug!(
@@ -1317,64 +1232,51 @@ impl AdnlOverlay {
         Ok(overlay)
     }
 
-    /// Stop the overlay and cleanup resources
-    pub fn stop(&self) {
-        log::trace!(target: LOG_TARGET, "Stopping AdnlOverlay: overlay_id={}", self.overlay_id);
-
-        // Use CAS to ensure stop is called only once
-        if self
-            .stop_requested
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
-            log::trace!(
-                target: LOG_TARGET,
-                "AdnlOverlay already stopped: overlay_id={}",
-                self.overlay_id
-            );
-            return; // Already stopped
-        }
-
-        // Final telemetry dump so short-lived sessions always log at least once
-        if let Some(stats) = &self.block_sync_stats {
-            stats.dump();
-        }
-
-        // Stop task processor manager synchronously
-        self.task_processor_manager.stop();
-
-        // Delete private overlay from ADNL node within tokio runtime context
-        let overlay_node = self.stack.overlay.clone();
-        let overlay_id = self.overlay_id.clone();
-        let block_sync_overlay_id = self.block_sync_overlay_id.clone();
-
-        // Use the stored runtime handle to run in proper tokio context
-        self.runtime_handle.block_on(async move {
-            if let Err(e) = overlay_node.delete_private_overlay(&overlay_id) {
-                log::warn!(target: LOG_TARGET, "Error deleting private overlay: {:?}", e);
-            }
-            if let Some(bs_id) = block_sync_overlay_id {
-                if let Err(e) = overlay_node.delete_private_overlay(&bs_id) {
-                    log::warn!(
-                        target: LOG_TARGET,
-                        "Error deleting block-sync overlay {bs_id}: {:?}", e,
-                    );
+    fn begin_stop(&self) {
+        let mut started = self.shutdown_started.lock().unwrap();
+        if *started { return; }
+        *started = true;
+        self.stop_requested.store(true, Ordering::Release);
+        self.tasks.close();
+        self.task_processor_manager.stop_async();
+        let tasks = self.tasks.clone();
+        let manager = self.task_processor_manager.clone();
+        let peers = std::mem::take(&mut *self.peers.lock().unwrap());
+        let storage = self.peers_storage.clone();
+        let overlay = self.stack.overlay.clone();
+        let id = self.overlay_id.clone();
+        let block_sync = self.block_sync_overlay_id.clone();
+        let errors = self.shutdown_errors.clone();
+        let runtime = self.runtime_handle.clone();
+        self.shutdown.spawn("overlay resource finalizer", async move {
+            if let Err(error) = tasks.wait().await { errors.lock().unwrap().push(error.to_string()); }
+            let errors_for_blocking = errors.clone();
+            let result = runtime.spawn_blocking(move || {
+                if let Err(error) = manager.stop_checked() { errors_for_blocking.lock().unwrap().push(error.to_string()); }
+                if let Err(error) = storage.remove_peers(peers) { errors_for_blocking.lock().unwrap().push(error.to_string()); }
+                if let Err(error) = overlay.delete_private_overlay(&id) { errors_for_blocking.lock().unwrap().push(error.to_string()); }
+                if let Some(id) = block_sync {
+                    if let Err(error) = overlay.delete_private_overlay(&id) { errors_for_blocking.lock().unwrap().push(error.to_string()); }
                 }
-            }
+            }).await;
+            if let Err(error) = result { errors.lock().unwrap().push(error.to_string()); }
         });
+        self.shutdown.close();
+    }
 
-        log::trace!(
-            target: LOG_TARGET,
-            "AdnlOverlay: Will cleanup {} peers on drop",
-            self.peers.len()
-        );
+    fn stop_checked(&self) -> Result<()> {
+        self.begin_stop();
+        self.shutdown.wait_sync()?;
+        let errors = self.shutdown_errors.lock().unwrap();
+        if errors.is_empty() { Ok(()) } else { Err(error!("{}", errors.join("; "))) }
+    }
 
-        log::debug!(
-            target: LOG_TARGET,
-            "Successfully stopped overlay: overlay_id={}, local_id={}",
-            self.overlay_id,
-            self.local_id
-        );
+    pub fn stop(&self) {
+        if let Err(error) = self.stop_checked() { log::error!("Overlay shutdown: {error}"); }
+    }
+
+    fn drained(&self) -> bool {
+        self.shutdown.drained() && self.tasks.drained() && self.task_processor_manager.drained()
     }
 
     /// Process incoming query from consumer
@@ -1392,91 +1294,32 @@ impl AdnlOverlay {
             e
         })?;
 
-        // Spawn async task for consensus query processing
-        let consensus_listener = self.listener.clone();
-        let peers = peers.clone();
-        let stop_requested = self.stop_requested.clone();
-
-        let handle = tokio::spawn(async move {
-            let (wait, mut queue_reader) = Wait::new();
-
-            // Check if overlay is stopped before processing
-            if stop_requested.load(Ordering::Relaxed) {
-                log::trace!(target: LOG_TARGET, "AdnlOverlay: Query cancelled - overlay stopped");
-                wait.respond(None); // Respond with None to close the waiter
-                let res = wait
-                    .wait(&mut queue_reader, true)
-                    .await
-                    .ok_or_else(|| error!("Waiting returned an internal error!"))?
-                    .ok_or_else(|| error!("Answer was not set!"))?;
-                return Ok(TimedAnswer {
-                    answer: res?,
-                    #[cfg(feature = "telemetry")]
-                    actual_start_at: None,
-                });
-            }
-
-            // Route query to consensus listener
-            if let Some(listener) = consensus_listener.upgrade() {
-                wait.request();
-                let wait_for_response = wait.clone();
-                let stop_requested_clone = stop_requested.clone();
-
-                listener.on_query(
-                    peers.other().clone(),
-                    &crate::ConsensusCommonFactory::create_block_payload(data),
-                    Box::new(move |result| {
-                        // Check if stopped before responding
-                        if stop_requested_clone.load(Ordering::Relaxed) {
-                            log::trace!(
-                                target: LOG_TARGET,
-                                "AdnlOverlay: Query response cancelled - overlay stopped"
-                            );
-                            wait_for_response.respond(None);
-                            return;
-                        }
-
-                        // Transform BlockPayloadPtr result to Answer
-                        let answer_result = result.and_then(|payload| {
-                            profile
-                                .deserialize(payload.data())
-                                .map(|answer| Some(Answer::Object(answer.into())))
-                        });
-                        wait_for_response.respond(Some(answer_result));
-                    }),
-                );
-            }
-
-            // Wait for response
-            let res = wait
-                .wait(&mut queue_reader, true)
-                .await
-                .ok_or_else(|| {
-                    log::warn!(
-                        target: LOG_TARGET,
-                        "AdnlOverlay: Waiting returned an internal error (query: {query:?})"
-                    );
-                    error!("Waiting returned an internal error!")
-                })?
-                .ok_or_else(|| error!("Answer was not set!"))?;
-
-            // Log timing and metrics
-            let elapsed = now.elapsed();
-            log::trace!(
-                target: LOG_TARGET,
-                "AdnlOverlay: query elapsed: {}ms",
-                elapsed.as_millis()
-            );
-            metrics::histogram!("rtos_node_network_consensus_overlay_query_seconds")
-                .record(elapsed);
-
-            Ok(TimedAnswer {
-                answer: res?,
-                #[cfg(feature = "telemetry")]
-                actual_start_at: None,
-            })
+        let listener = self.listener.clone();
+        let peer = peers.other().clone();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let admitted = self.tasks.spawn("accepted incoming query", async move {
+            let result = async move {
+                let listener = listener.upgrade().ok_or_else(|| error!("Overlay listener stopped"))?;
+                let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+                listener.on_query(peer, &crate::ConsensusCommonFactory::create_block_payload(data), Box::new(move |result| {
+                    let _ = answer_tx.send(result);
+                }));
+                // A dropped callback is terminal too. Once accepted, await its actual
+                // completion rather than detaching it when a stop waiter is cancelled.
+                let payload = answer_rx.await.map_err(|_| error!("Query callback dropped"))??;
+                let answer = profile.deserialize(payload.data())?;
+                metrics::histogram!("rtos_node_network_consensus_overlay_query_seconds").record(now.elapsed());
+                Ok(TimedAnswer { answer: Some(Answer::Object(answer.into())),
+                    #[cfg(feature = "telemetry")] actual_start_at: None })
+            }.await;
+            let _ = result_tx.send(result);
         });
-
+        if !admitted { fail!("Overlay query admission closed"); }
+        // Protocol API requires a JoinHandle. This proxy owns only the result receiver;
+        // the actual accepted operation remains owned above if the caller drops it.
+        let handle = self.runtime_handle.spawn(async move {
+            result_rx.await.map_err(|_| error!("Owned query worker failed"))?
+        });
         Ok(QueryResult::Consumed(QueryAnswer::Pending(handle)))
     }
 
@@ -1528,7 +1371,7 @@ impl AdnlOverlay {
         let overlay_weak = Arc::downgrade(&self);
         let overlay_node = self.stack.overlay.clone();
         let stop_requested = self.stop_requested.clone();
-        self.runtime_handle.spawn(async move {
+        self.tasks.background("overlay listener or send", async move {
             loop {
                 if stop_requested.load(Ordering::Relaxed) {
                     log::trace!(
@@ -1611,7 +1454,7 @@ impl AdnlOverlay {
         let stop_requested2 = self.stop_requested.clone();
 
         // Spawn task for regular broadcasts
-        self.runtime_handle.spawn(async move {
+        self.tasks.background("overlay listener or send", async move {
             log::trace!(
                 target: LOG_TARGET,
                 "AdnlOverlay::wait_broadcasts started for overlay_id={overlay_id}"
@@ -1670,7 +1513,7 @@ impl AdnlOverlay {
         let listener = self.listener.clone();
 
         // Spawn task for consensus broadcasts
-        self.runtime_handle.spawn(async move {
+        self.tasks.background("overlay listener or send", async move {
             log::trace!(
                 target: LOG_TARGET,
                 "AdnlOverlay::wait_consensus_broadcast started for overlay_id={overlay_id}"
@@ -1759,14 +1602,7 @@ impl AdnlOverlay {
 }
 
 impl Drop for AdnlOverlay {
-    fn drop(&mut self) {
-        log::debug!(target: LOG_TARGET, "Dropping AdnlOverlay: overlay_id={}", self.overlay_id);
-        self.stop();
-
-        // Take peers vector and pass to remove_peers for cleanup
-        let peers_vec = std::mem::take(&mut self.peers);
-        self.peers_storage.remove_peers(peers_vec);
-    }
+    fn drop(&mut self) { self.begin_stop(); }
 }
 
 impl ConsensusOverlay for AdnlOverlay {
@@ -1884,7 +1720,7 @@ impl ConsensusOverlay for AdnlOverlay {
             return;
         }
 
-        self.runtime_handle.spawn(async move {
+        self.tasks.background("overlay listener or send", async move {
             if stop_requested.load(Ordering::Relaxed) {
                 log::warn!(target: LOG_TARGET, "AdnlOverlay: Overlay {} was stopped!", &overlay_id);
                 return;
@@ -1951,7 +1787,6 @@ impl ConsensusOverlay for AdnlOverlay {
         let overlay_id = self.overlay_id.clone();
         let overlay_node = self.stack.overlay.clone();
         let stop_requested = self.stop_requested.clone();
-        let runtime_handle = self.runtime_handle.clone();
         let is_quic = self.is_quic_available;
 
         if stop_requested.load(Ordering::Relaxed) {
@@ -1959,7 +1794,7 @@ impl ConsensusOverlay for AdnlOverlay {
             return;
         }
 
-        runtime_handle.spawn(async move {
+        self.tasks.background("overlay RLDP query", async move {
             if stop_requested.load(Ordering::Relaxed) {
                 log::warn!(target: LOG_TARGET, "AdnlOverlay: Overlay {} was stopped!", &overlay_id);
                 return;
@@ -2055,7 +1890,7 @@ impl ConsensusOverlay for AdnlOverlay {
                 stats.bump_sent();
             }
 
-            self.runtime_handle.spawn(async move {
+            self.tasks.background("overlay listener or send", async move {
                 if stop_requested.load(Ordering::Relaxed) {
                     log::warn!(
                         target: LOG_TARGET,
@@ -2333,6 +2168,17 @@ impl ConsensusOverlayManager for AdnlOverlayManager {
         }
 
         Ok(overlay)
+    }
+
+    fn stop_overlay_checked(&self, id: &Arc<PrivateOverlayShortId>, overlay: &ConsensusOverlayPtr) -> Result<()> {
+        let implementation = overlay.get_impl().downcast_ref::<AdnlOverlay>().ok_or_else(|| error!("Unknown overlay implementation"))?;
+        let result = implementation.stop_checked();
+        if implementation.drained() { self.overlays.lock().remove(id); }
+        result
+    }
+
+    fn overlay_drained(&self, overlay: &ConsensusOverlayPtr) -> bool {
+        overlay.get_impl().downcast_ref::<AdnlOverlay>().is_some_and(AdnlOverlay::drained)
     }
 
     /// Stop existing consensus overlay
