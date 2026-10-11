@@ -1142,7 +1142,8 @@ mod bounded_download_tests {
         let limits = NetworkDownloadLimits::proof(encoded.len(), 1, 16);
         assert!(limits
             .parse_boc(&encoded, encoded.len())
-            .unwrap_err()
+            .err()
+            .expect("cell budget must reject")
             .downcast_ref::<adnl::ResponseLimitExceeded>()
             .is_some());
         let limits = NetworkDownloadLimits::proof(encoded.len(), 2, 16);

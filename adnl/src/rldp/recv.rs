@@ -533,7 +533,7 @@ mod bounded_receive_tests {
             #[cfg(feature = "debug")]
             Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
         );
-        let chunk = Chunk::V1(RldpMessagePart {
+        let chunk = Chunk::V1(RldpMessagePart(rtos_api::RldpChunk {
             transfer_id: [7; 32].into(),
             fec_type: FecType::Fec_RaptorQ(FecTypeRaptorQ {
                 data_size: 4096,
@@ -544,8 +544,9 @@ mod bounded_receive_tests {
             total_size: 4096,
             seqno: 0,
             data: vec![0; 768],
-        });
-        let error = receiver.process_chunk(chunk).unwrap_err();
+        }));
+        let error =
+            receiver.process_chunk(chunk).err().expect("declared wire size must be rejected");
         assert!(error.downcast_ref::<crate::ResponseLimitExceeded>().is_some());
         assert_eq!(receiver.data.capacity(), 0);
         assert!(receiver.total_size.is_none());

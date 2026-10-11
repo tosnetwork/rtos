@@ -45,8 +45,7 @@ fn bounded_rldp_real_compressed_answer_rejects_expansion_and_then_succeeds() {
         for _ in 0..2 {
             let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             let address = socket.local_addr().unwrap().to_string();
-            let config =
-                test_utils::get_adnl_config("bounded-rldp", &address, vec![0], true).await.unwrap();
+            let config = test_utils::generate_adnl_configs(&address, vec![0], None).unwrap().1;
             drop(socket);
             let node = AdnlNode::with_config(config).await.unwrap();
             node.set_options(AdnlNode::OPTION_FORCE_COMPRESSION);
@@ -134,8 +133,7 @@ fn bounded_rldp_cancelled_waiter_keeps_receiver_owned_until_stop() {
         for index in 0..2 {
             let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             let address = socket.local_addr().unwrap().to_string();
-            let config =
-                test_utils::get_adnl_config("bounded-rldp", &address, vec![0], true).await.unwrap();
+            let config = test_utils::generate_adnl_configs(&address, vec![0], None).unwrap().1;
             drop(socket);
             let node = AdnlNode::with_config(config).await.unwrap();
             node.set_options(AdnlNode::OPTION_FORCE_COMPRESSION);
