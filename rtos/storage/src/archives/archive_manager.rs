@@ -508,6 +508,11 @@ impl ArchiveManager {
         usage
     }
 
+    #[cfg(any(test, feature = "integration-test-support"))]
+    pub fn test_pause_gc_selection(&self) -> (tokio::sync::oneshot::Receiver<Vec<u32>>, Arc<tokio::sync::Notify>) {
+        self.file_maps.files().test_pause_gc_selection()
+    }
+
     pub async fn gc(&self, last_unneeded_key_block: &BlockIdExt) {
         if let Err(e) = self.file_maps.files().gc(last_unneeded_key_block).await {
             log::info!(target: TARGET, "archive_manager gc is error: {:?}", e);

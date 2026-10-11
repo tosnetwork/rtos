@@ -7,10 +7,22 @@ mod chain;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires RTOS_PUBLIC_FIXTURE_SIGNER; real Engine archive custody integration"]
 async fn persistent_repair_custody_real_pack_gc_control_and_cold_authentication() {
+    real_pack_gc(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires RTOS_PUBLIC_FIXTURE_SIGNER; real selected archive GC versus custody registration"]
+async fn persistent_repair_custody_selected_archive_gc_rechecks_actual_registration() {
+    real_pack_gc(true).await;
+}
+
+async fn real_pack_gc(preselected: bool) {
     use storage::archives::{package_entry_id::PackageEntryId, package_id::PackageId, ARCHIVE_SLICE_SIZE};
     let signer = std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER").unwrap();
     let mut fixture = fixture(false).await;
     let engine = fixture.engine.clone();
+    let mut gc_task = None;
+    let mut release_gc = None;
     let run = std::panic::AssertUnwindSafe(async {
         // MC1/2 occupy archive slice 0. A genuine new key block creates slice 3;
         // MC1 remains a physically readable, unleased control in the earlier slice.
@@ -45,6 +57,21 @@ async fn persistent_repair_custody_real_pack_gc_control_and_cold_authentication(
             protocol: context.protocol(), carrier_version: context.carrier_version(), wire_profile: WireProfile::T0,
         };
         let exact = binding(&fixture);
+        // This range selects both actual slices; it is not an authenticated ID.
+        let cutoff = BlockIdExt::with_params(ShardIdent::masterchain(), 3 + ARCHIVE_SLICE_SIZE,
+            UInt256::default(), UInt256::default());
+        if preselected {
+            let (selected, release) = engine.db().test_pause_archive_gc_selection();
+            release_gc = Some(release);
+            let gc_engine = engine.clone();
+            let gc_cutoff = cutoff.clone();
+            gc_task = Some(tokio::spawn(async move { gc_engine.db().archive_gc(&gc_cutoff).await }));
+            let keys = tokio::time::timeout(Duration::from_secs(30), selected).await
+                .expect("real archive GC must reach candidate selection").unwrap();
+            assert!(keys.contains(&0) && keys.contains(&3), "same GC batch must select both real slices: {keys:?}");
+            // No deletion lock is held here. Real authentication and durable
+            // registration must finish before this same selected batch resumes.
+        }
         let cap = obtain_durable_mc_custody(engine.clone(), fixture.request.clone(), exact.clone()).await.unwrap();
         let generation = cap.lease_generation();
         let digest = cap.dependency_digest().clone();
@@ -76,9 +103,12 @@ async fn persistent_repair_custody_real_pack_gc_control_and_cold_authentication(
         engine.load_block_proof(&control_handle, false).await.unwrap().check_proof(engine.as_ref()).await.unwrap();
         // Cutoff is only a GC range selector, never authentication authority.
         // It selects both slice 0 and slice 3 under the real production slice size.
-        let cutoff = BlockIdExt::with_params(ShardIdent::masterchain(), 3 + ARCHIVE_SLICE_SIZE,
-            UInt256::default(), UInt256::default());
-        engine.db().archive_gc(&cutoff).await.unwrap();
+        if let Some(release) = &release_gc { release.notify_one(); }
+        if let Some(task) = gc_task.take() {
+            task.await.unwrap().unwrap();
+        } else {
+            engine.db().archive_gc(&cutoff).await.unwrap();
+        }
         assert!(!control_pack.exists(), "same-cutoff unleased archive package must really be destroyed");
         assert!(protected_pack.exists(), "leased archive package must survive the same actual GC");
         assert!(engine.load_block(&control_handle).await.is_err());
@@ -86,11 +116,21 @@ async fn persistent_repair_custody_real_pack_gc_control_and_cold_authentication(
         assert_eq!(engine.load_block_proof(&handle, false).await.unwrap().data(), proof.data());
         (exact, generation, digest, control_pack, protected_pack)
     }).catch_unwind().await;
+    // Release/join the actual selected GC on every assertion-failure path.
+    if let Some(release) = release_gc { release.notify_one(); }
+    let gc_cleanup = match gc_task {
+        Some(task) => task.await.map_err(|e| rtos_block::error!("archive GC owner: {e}"))
+            .and_then(|result| result),
+        None => Ok(()),
+    };
     drop(engine);
     let Fixture { dir, engine, .. } = fixture;
-    close(engine).await;
+    let stopped = engine.clone().wait_stop().await;
+    drop(engine);
     let (exact, generation, digest, control_pack, protected_pack) =
         run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    gc_cleanup.unwrap();
+    stopped.unwrap();
     let engine = open_engine(dir.path()).await;
     let run = std::panic::AssertUnwindSafe(async {
         assert!(!control_pack.exists() && protected_pack.exists());
@@ -100,8 +140,10 @@ async fn persistent_repair_custody_real_pack_gc_control_and_cold_authentication(
         drop(cap);
         assert!(!control_pack.exists());
     }).catch_unwind().await;
-    close(engine).await;
+    let stopped = engine.clone().wait_stop().await;
+    drop(engine);
     run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    stopped.unwrap();
 }
 
 
