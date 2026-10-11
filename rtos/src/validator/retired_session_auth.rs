@@ -50,9 +50,18 @@ async fn authenticate_identity(
     pin: &SessionNetworkPin,
     binding: &SessionRecoveryBinding,
     local_adnl: &rtos_block::UInt256,
+    history: Option<&crate::historical_recovery::Request>,
 ) -> Result<(AuthenticatedSessionRuntime, Arc<ShardStateStuff>)> {
-    let verified = authenticate_recovered_state(engine, &binding.governing_masterchain).await?;
-    derive_identity(engine, pin, binding, local_adnl, &verified)
+    match history {
+        Some(history) => {
+            let verified = history.prepare(&binding.governing_masterchain).await?;
+            derive_identity(engine, pin, binding, local_adnl, &verified)
+        }
+        None => {
+            let verified = authenticate_recovered_state(engine, &binding.governing_masterchain).await?;
+            derive_identity(engine, pin, binding, local_adnl, &verified)
+        }
+    }
 }
 
 fn derive_identity(
@@ -145,6 +154,14 @@ pub(crate) async fn authenticate_closing_runtime(
     request: &CloseFinalityRequest,
     namespace: &Path,
 ) -> Result<Arc<AuthenticatedSessionRuntime>> {
+    authenticate_closing_runtime_in_request(engine, request, namespace, None).await
+}
+pub(crate) async fn authenticate_closing_runtime_in_request(
+    engine: &dyn EngineOperations,
+    request: &CloseFinalityRequest,
+    namespace: &Path,
+    history: Option<&crate::historical_recovery::Request>,
+) -> Result<Arc<AuthenticatedSessionRuntime>> {
     let domain = &request.domain;
     if domain.protocol != SimplexProtocol::PrivateObserversPlumtree
         || domain.wire_profile != WireProfile::T0
@@ -159,7 +176,7 @@ pub(crate) async fn authenticate_closing_runtime(
         .as_ref()
         .ok_or_else(|| error!("Closing identity lacks authenticated recovery anchor"))?;
     let (runtime, _) =
-        authenticate_identity(engine, &domain.pin, binding, &request.canonical.local_adnl).await?;
+        authenticate_identity(engine, &domain.pin, binding, &request.canonical.local_adnl, history).await?;
     validate_closing_identity(&runtime, request)?;
     let root = PathBuf::from(engine.db_root_dir()?).join("catchains");
     let expected = PathBuf::from(
@@ -252,6 +269,13 @@ pub(crate) async fn authenticate_retired_session(
     engine: &dyn EngineOperations,
     record: &SessionRecoveryRecord,
 ) -> Result<AuthenticatedRetiredSession> {
+    authenticate_retired_session_in_request(engine, record, None).await
+}
+pub(crate) async fn authenticate_retired_session_in_request(
+    engine: &dyn EngineOperations,
+    record: &SessionRecoveryRecord,
+    history: Option<&crate::historical_recovery::Request>,
+) -> Result<AuthenticatedRetiredSession> {
     if &record.pin.zerostate != engine.zerostate_id()? {
         fail!("Retired session network pin mismatch");
     }
@@ -262,7 +286,7 @@ pub(crate) async fn authenticate_retired_session(
     }
     let binding = &record.binding;
     let (runtime, state) =
-        authenticate_identity(engine, &record.pin, binding, &record.local_adnl).await?;
+        authenticate_identity(engine, &record.pin, binding, &record.local_adnl, history).await?;
     let coordinates = &binding.coordinates;
     let config = state.config_params()?;
     let role = match runtime.local_role() {
@@ -294,7 +318,10 @@ pub(crate) async fn authenticate_retired_session(
     if record.start_masterchain.seq_no() < binding.governing_masterchain.seq_no() {
         fail!("Retired session start predates governing anchor");
     }
-    let start = authenticate_recovered_state(engine, &record.start_masterchain).await?;
+    let start = match history {
+        Some(history) => history.prepare(&record.start_masterchain).await?,
+        None => Arc::new(authenticate_recovered_state(engine, &record.start_masterchain).await?),
+    };
     if start.state().block_id() != state.block_id()
         && !start.state().has_prev_block(state.block_id())?
     {
@@ -742,7 +769,7 @@ mod tests {
         for observer in [false, true] {
             let mut record = locator(&engine, 7, false, observer)?;
             let (expected, _) =
-                authenticate_identity(&engine, &record.pin, &record.binding, &record.local_adnl)
+                authenticate_identity(&engine, &record.pin, &record.binding, &record.local_adnl, None)
                     .await?;
             let request = closing_request(&record, expected.committee()[0].validator_id()?);
             // The closing API has no start/prev inputs. These invalid consensus
@@ -762,7 +789,7 @@ mod tests {
         let engine = history(0)?;
         let record = locator(&engine, 7, false, false)?;
         let (runtime, _) =
-            authenticate_identity(&engine, &record.pin, &record.binding, &record.local_adnl)
+            authenticate_identity(&engine, &record.pin, &record.binding, &record.local_adnl, None)
                 .await?;
         let valid = closing_request(&record, runtime.committee()[0].validator_id()?);
         for mutation in 0..12 {

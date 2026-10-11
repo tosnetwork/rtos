@@ -311,3 +311,6 @@ mod persistent_closure_crash_tests;
 
 #[path = "persistent_closure_write_failure_tests.rs"]
 mod persistent_closure_write_failure_tests;
+
+#[path = "historical_recovery_engine_tests.rs"]
+mod historical_recovery_engine_tests;

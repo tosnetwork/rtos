@@ -1,6 +1,5 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Closing replay after the full certificate/canonical payload has been retired.
-use super::super::retired_session_auth::authenticate_closing_runtime;
 use super::*;
 use consensus_common::finality_delivery::FinalityDeliveryRole;
 use simplex::finality_delivery::scan_finality_closures_namespace_report;
@@ -138,7 +137,7 @@ async fn replay_namespace(
                 }
                 tokio::time::timeout(
                     AUTH_TIMEOUT,
-                    authenticate_closing_runtime(engine.as_ref(), &request, &namespace),
+                    engine.clone().authenticate_closing_source_with_history(request.clone(), namespace.clone()),
                 )
                 .await
                 .map_err(|_| error!("Source closing history temporarily unavailable"))?

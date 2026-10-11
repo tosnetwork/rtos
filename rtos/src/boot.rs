@@ -726,8 +726,30 @@ pub(crate) async fn authenticate_recovered_state_evidence_with_budget<
     block_id: &BlockIdExt,
     state: Arc<crate::shard_state::ShardStateStuff>,
     evidence: Option<&[BlockProofStuff]>,
+    captured: Option<&mut Vec<BlockProofStuff>>,
+    budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+) -> Result<VerifiedMasterchainState> {
+    authenticate_recovered_state_inner(engine, block_id, state, evidence, captured, budget, true).await
+}
+
+/// Detached history candidates have no ordinary state DB custody. Authentication
+/// is identical; callers may record capsule provenance only after durable commit.
+pub(crate) async fn authenticate_detached_history_state<E: EngineOperations + ?Sized>(
+    engine: &E, block_id: &BlockIdExt,
+    state: Arc<crate::shard_state::ShardStateStuff>,
+    captured: &mut Vec<BlockProofStuff>,
+    budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
+) -> Result<VerifiedMasterchainState> {
+    authenticate_recovered_state_inner(engine, block_id, state, None, Some(captured), Some(budget), false).await
+}
+
+async fn authenticate_recovered_state_inner<E: EngineOperations + ?Sized>(
+    engine: &E, block_id: &BlockIdExt,
+    state: Arc<crate::shard_state::ShardStateStuff>,
+    evidence: Option<&[BlockProofStuff]>,
     mut captured: Option<&mut Vec<BlockProofStuff>>,
     budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+    ordinary_state: bool,
 ) -> Result<VerifiedMasterchainState> {
     if let Some(budget) = budget {
         budget.step()?;
@@ -761,7 +783,7 @@ pub(crate) async fn authenticate_recovered_state_evidence_with_budget<
     };
     if block_id == pin {
         let verified = history.authenticate_current_state(state)?;
-        if evidence.is_none() {
+        if ordinary_state && evidence.is_none() {
             if let Some(budget) = budget {
                 budget.record_state(block_id, verified.state().root_cell())?;
             }
@@ -799,7 +821,7 @@ pub(crate) async fn authenticate_recovered_state_evidence_with_budget<
     if !verified.state().has_prev_block(pin)? {
         fail!("Authenticated recovered state does not contain the local pin");
     }
-    if evidence.is_none() {
+    if ordinary_state && evidence.is_none() {
         if let Some(budget) = budget {
             budget.record_state(block_id, verified.state().root_cell())?;
         }
@@ -843,6 +865,11 @@ async fn recovery_evidence_proof<E: EngineOperations + ?Sized>(
             > 128 << 20
         {
             fail!("Recovery history proof bytes exceed bound");
+        }
+        if let Some(budget) = budget {
+            use storage::bounded_cell::CellReadBudget;
+            budget.metadata(std::mem::size_of::<BlockProofStuff>())?;
+            captured.try_reserve_exact(1)?;
         }
         captured.push(proof.clone());
     }

@@ -176,7 +176,7 @@ async fn load_pinned_bounded(
         .map_err(|error| error!("Repair state reader failed: {error}"))?
 }
 
-async fn read_pair(
+pub(crate) async fn read_pair(
     engine: &Engine,
     id: &BlockIdExt,
     budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
