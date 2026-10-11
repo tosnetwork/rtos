@@ -1790,6 +1790,11 @@ impl FinalityDeliveryTestDriver {
         }
         Ok(self.0.poll(draft)?.is_some())
     }
+    /// Same preparation performed by the real session factory. Call false only
+    /// for a newly created test session with no preexisting certificates.
+    pub fn prepare_intents(&self, has_existing_certificates: bool) -> Result<()> {
+        self.0.prepare_intents(has_existing_certificates)
+    }
     pub fn maintain(&self) -> Result<()> {
         self.0.maintain_closing()
     }

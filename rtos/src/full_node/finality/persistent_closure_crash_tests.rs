@@ -134,6 +134,9 @@ async fn persistent_closure_crash_child() {
             });
         let source =
             FinalityDeliveryTestDriver::open(runtime.clone(), &namespace, sink, confirm).unwrap();
+        // A fresh real session factory prepares this provenance directory before
+        // source delivery. Reopening parents never manufacture missing provenance.
+        source.prepare_intents(false).unwrap();
         let root = engine.load_state(pair.master.id()).await.unwrap().root_cell().clone();
         let (id, _, row) =
             chain::successor(&signer, pair.master.id(), &root, false, 0, cc, &creator);
@@ -206,6 +209,7 @@ impl Drop for ChildOwner {
     }
 }
 async fn cold_window(window: i32) {
+    let _ = env_logger::builder().is_test(true).try_init();
     let signer =
         std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER").expect("public fixture signer required");
     assert!(Path::new(&signer).is_file());
@@ -277,6 +281,7 @@ async fn cold_window(window: i32) {
     let mut previous = None;
     for reopen in 0..2 {
         let engine = open_engine(&provider).await;
+        let mut recovery_service = None;
         let run = std::panic::AssertUnwindSafe(async {
             let (active, closed) = inspect_closure_progress(engine.db(), &domain).unwrap();
             assert_eq!(closed.len(), 1, "actual close offer must precede each crash");
@@ -327,16 +332,13 @@ async fn cold_window(window: i32) {
             }
             engine.ensure_publication_worker().await.unwrap();
             let service = engine.ensure_retired_session_recovery().await.unwrap();
+            recovery_service = Some(service.clone());
             // This is the only recovery driver. No runtime, source payload,
             // SourceDriver, stage, resume, or manual node confirmation is supplied.
             let final_record = tokio::time::timeout(Duration::from_secs(90), async {
                 loop {
                     let (active, closed) = inspect_closure_progress(engine.db(), &domain).unwrap();
-                    if closed.len() == 1
-                        && closed[0].released
-                        && active.is_empty()
-                        && service.snapshot().active == 0
-                    {
+                    if closed.len() == 1 && closed[0].released && active.is_empty() {
                         let batch =
                             simplex::finality_delivery::scan_finality_closures_namespace_report(
                                 &namespace, None, 16,
@@ -350,7 +352,34 @@ async fn cold_window(window: i32) {
                 }
             })
             .await
-            .expect("background compact-only closing recovery must finish");
+            .unwrap_or_else(|timeout| {
+                let ledger =
+                    inspect_closure_progress(engine.db(), &domain).map(|(active, closed)| {
+                        (
+                            active.len(),
+                            closed.len(),
+                            closed.iter().filter(|record| record.released).count(),
+                        )
+                    });
+                let scanner = simplex::finality_delivery::scan_finality_closures_namespace_report(
+                    &namespace, None, 16,
+                )
+                .map(|batch| {
+                    let errors: Vec<_> = batch
+                        .items
+                        .iter()
+                        .filter_map(|(_, item)| item.as_ref().err().map(ToString::to_string))
+                        .collect();
+                    (batch.next_cursor.is_some(), batch.items.len(), errors)
+                });
+                panic!(
+                    "background compact-only closing recovery timed out: {timeout}; \
+                    window={window} reopen={reopen} service={:?} \
+                    ledger(active,closed,released)={ledger:?} \
+                    scanner(cursor,items,errors)={scanner:?}",
+                    service.snapshot()
+                );
+            });
             assert_eq!(final_record.binding, original.binding);
             assert_eq!(final_record.lease_generation, original.lease_generation);
             assert_eq!(final_record.dependency_digest, original.dependency_digest);
@@ -383,6 +412,13 @@ async fn cold_window(window: i32) {
         .catch_unwind()
         .await;
         engine.clone().wait_stop().await.unwrap();
+        if let Some(service) = recovery_service {
+            assert_eq!(
+                service.snapshot().active,
+                0,
+                "actual service shutdown must drain every owner"
+            );
+        }
         drop(engine);
         previous = Some(run.unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
     }
