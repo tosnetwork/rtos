@@ -163,3 +163,172 @@ fn bounded_proof_candidate_cell_construction_matches_and_refuses_before_cell() {
     assert!(BlockSignaturesSimplex::bytes_to_cell_tree_bounded(&vec![0; 1025], &Budget::ample())
         .is_err());
 }
+
+fn unique_balanced_graph(leaves: usize, payload: usize) -> Cell {
+    assert!(payload >= 4 && payload <= 127);
+    let mut level: Vec<_> = (0..leaves)
+        .map(|index| {
+            let mut bytes = vec![0x65; payload];
+            bytes[..4].copy_from_slice(&(index as u32).to_be_bytes());
+            BuilderData::with_raw(bytes, payload * 8).unwrap().into_cell().unwrap()
+        })
+        .collect();
+    while level.len() > 1 {
+        level = level
+            .chunks(2)
+            .map(|pair| {
+                if pair.len() == 1 {
+                    return pair[0].clone();
+                }
+                let mut node = BuilderData::new();
+                for child in pair {
+                    node.checked_append_reference(child.clone()).unwrap();
+                }
+                node.into_cell().unwrap()
+            })
+            .collect();
+    }
+    level.pop().unwrap()
+}
+fn assert_measured_boc(root: &Cell) -> usize {
+    let ordinary = crate::write_boc(root).unwrap().len();
+    assert_eq!(bounded_signature_boc_size(root, &Budget::ample()).unwrap(), ordinary);
+    ordinary
+}
+#[test]
+fn bounded_proof_materialization_precedes_candidate_and_root_reads() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let original = unique_balanced_graph(2, 8);
+    let pruned =
+        crate::MerkleUpdate::make_pruned_branch_cell(&original, 0).unwrap().into_cell().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let source = original.clone();
+    let loader: crate::CellLoader = Arc::new(move |_| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Ok(source.clone())
+    });
+    let lazy = Cell::lazy_from_pruned(&pruned, loader, 0).unwrap();
+    assert!(read_candidate_data_bounded(&lazy, &Budget::ample()).is_err());
+    assert!(bounded_signature_boc_size(&lazy, &Budget::ample()).is_err());
+    assert!(BlockProof::construct_from_cell_bounded(lazy, &Budget::ample()).is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "bounded admission invoked the real loader");
+    let mut parent = BuilderData::new();
+    parent.checked_append_reference(pruned).unwrap();
+    let virtualized = parent.into_cell().unwrap().virtualize(1);
+    assert_ne!(virtualized.virtualization(), 0);
+    assert!(read_candidate_data_bounded(&virtualized, &Budget::ample()).is_err());
+    assert!(bounded_signature_boc_size(&virtualized, &Budget::ample()).is_err());
+    assert!(crate::write_boc(&virtualized).is_err());
+}
+#[test]
+fn bounded_proof_boc_measurement_width_shared_and_exotic_graphs() {
+    let small = unique_balanced_graph(128, 8); // 128 leaves +127 branches =255.
+    let bytes = crate::write_boc(&small).unwrap();
+    assert_eq!(bytes[4] & 7, 1);
+    assert_eq!(bytes[6], 255);
+    assert_measured_boc(&small);
+    let mut outer = BuilderData::new();
+    outer.checked_append_reference(small.clone()).unwrap();
+    let wide = outer.into_cell().unwrap();
+    let bytes = crate::write_boc(&wide).unwrap();
+    assert_eq!(bytes[4] & 7, 2);
+    assert_eq!(&bytes[6..8], &[1, 0]);
+    assert_measured_boc(&wide);
+    let mut shared = BuilderData::new();
+    for _ in 0..4 {
+        shared.checked_append_reference(wide.clone()).unwrap();
+    }
+    assert_measured_boc(&shared.into_cell().unwrap());
+    let pruned =
+        crate::MerkleUpdate::make_pruned_branch_cell(&small, 0).unwrap().into_cell().unwrap();
+    assert_eq!(pruned.cell_type(), CellType::PrunedBranch);
+    assert_measured_boc(&pruned);
+    let proof = crate::MerkleProof::create(&small, |id| id == &small.repr_hash())
+        .unwrap()
+        .serialize()
+        .unwrap();
+    assert_eq!(proof.cell_type(), CellType::MerkleProof);
+    assert_measured_boc(&proof);
+    // Explicit stored hashes are stripped by BocWriter::None. They must not
+    // accidentally inflate the bounded measurement or change its identity.
+    let leaf = unique_balanced_graph(1, 8);
+    let raw = leaf.raw_data().unwrap();
+    let mut stored = vec![raw[0] | 0x10, raw[1]];
+    for hash in leaf.hashes() {
+        stored.extend_from_slice(hash.as_slice());
+    }
+    for depth in leaf.depths() {
+        stored.extend_from_slice(&depth.to_be_bytes());
+    }
+    stored.extend_from_slice(crate::cell::cell_data(raw));
+    let with_hashes = Cell::with_data_and_refs(&stored, true, &[], None, None).unwrap();
+    assert!(crate::cell::store_hashes(with_hashes.raw_data().unwrap()));
+    assert_eq!(with_hashes.repr_hash(), leaf.repr_hash());
+    assert_eq!(assert_measured_boc(&with_hashes), assert_measured_boc(&leaf));
+}
+#[test]
+fn bounded_proof_boc_measurement_one_mib_exact_and_both_sides() {
+    // Depth~13, not a deep chain. All127-byte leaves differ in their prefix,
+    // so no byte/hash dedup hides the limit. Each leaf adds135 serialized bytes.
+    let graph = unique_balanced_graph(7767, 127);
+    let base = assert_measured_boc(&graph);
+    let padding = PQ_SIGNATURE_BOC_MAX_BYTES - base;
+    assert!(padding > 0 && padding < 127);
+    for extra in [padding - 1, padding, padding + 1] {
+        let mut root = SliceData::load_cell_ref(&graph).unwrap().as_builder().unwrap();
+        root.append_raw(&vec![0x77; extra], extra * 8).unwrap();
+        let root = root.into_cell().unwrap();
+        let real = crate::write_boc(&root).unwrap().len();
+        assert_eq!(real, base + extra);
+        let bounded = bounded_signature_boc_size(&root, &Budget::ample());
+        if real <= PQ_SIGNATURE_BOC_MAX_BYTES {
+            assert_eq!(bounded.unwrap(), real);
+        } else {
+            assert_eq!(
+                pq_block_signature_reason_code(&bounded.unwrap_err()),
+                Some(PqBlockSignatureReasonCode::CarrierOversize)
+            );
+        }
+    }
+}
+#[test]
+fn bounded_proof_canonical_four_hundred_signers_without_chunk_dedup() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/pq-block-signature-vectors.txt"
+    ))
+    .unwrap();
+    let row: Vec<_> =
+        text.lines().find(|line| line.starts_with("valid-1\t")).unwrap().split('\t').collect();
+    let root = read_single_root_boc(&hex::decode(row[4]).unwrap()).unwrap();
+    let mut carrier = BlockSignaturesSimplexPq::construct_bounded(root, &Budget::ample()).unwrap();
+    carrier.signatures.clear();
+    carrier.sig_count = 400;
+    carrier.sig_weight = 400;
+    for signer in 0u32..400 {
+        let mut signature = vec![0x39; PQ_SIGNATURE_BYTES];
+        for (chunk_index, chunk) in signature.chunks_mut(127).enumerate() {
+            // Even the last partial chunk is long enough for both coordinates.
+            chunk[..4].copy_from_slice(&signer.to_be_bytes());
+            chunk[4..6].copy_from_slice(&(chunk_index as u16).to_be_bytes());
+        }
+        let mut id = [0u8; 32];
+        id[..4].copy_from_slice(&(signer + 1).to_be_bytes());
+        carrier.signatures.push(PqBlockSignaturePair {
+            validator_id: UInt256::from(id),
+            algorithm_id: MLDSA44_ALGORITHM_ID,
+            signature,
+        });
+    }
+    carrier.validate_structure_bounded(&Budget::ample()).unwrap();
+    let root = carrier.serialize().unwrap();
+    let actual = assert_measured_boc(&root);
+    assert!(actual > 1_000_000, "unexpected signature chunk dedup: {actual}");
+    assert!(actual <= 1_024_568, "canonical bound violated: {actual}");
+    assert_eq!(
+        BlockSignaturesSimplexPq::construct_bounded(root, &Budget::ample()).unwrap(),
+        carrier
+    );
+    // Structural-only fixture: these bytes are not claimed to be PQ signatures.
+}
