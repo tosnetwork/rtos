@@ -160,6 +160,25 @@ async fn historical_closing_first_cold_full_canonical_recovers_without_source_ru
         assert_eq!(entries.len(), 1);
         assert!(closes.is_empty(), "full canonical evidence must not already be compact custody");
         assert_eq!(capsule_manifests(engine), 0, "warm setup must never admit historical capsules");
+        // Normal apply may return while its PutState is queued. Establish real
+        // MC2/MC3 persistence before collecting MC2, so absence proves GC and
+        // MC3 stays a healthy ordinary head throughout cold recovery.
+        for id in [&target, &head] {
+            let handle = engine.load_block_handle(id).unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while !handle.has_saved_state()
+                    || !engine.db().test_contains_dynamic_state_record(id).unwrap()
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!(
+                "ordinary state must finish persistence before GC: {id}; saved={}, contains={:?}",
+                handle.has_saved_state(), engine.db().test_contains_dynamic_state_record(id)
+            ));
+            assert!(engine.db().test_contains_dynamic_state_record(id).unwrap());
+        }
         engine.shard_states_keeper().test_retire_history_state(&target);
         tokio::time::timeout(Duration::from_secs(20), async {
             while engine.db().test_contains_dynamic_state_record(&target).unwrap() {

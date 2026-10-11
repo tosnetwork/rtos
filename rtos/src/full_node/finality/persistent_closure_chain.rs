@@ -138,7 +138,10 @@ pub(super) fn successor_in_domain(
     transform: impl FnOnce(&mut ShardStateUnsplit),
 ) -> (BlockIdExt, Cell, Value) {
     let old_state = ShardStateUnsplit::construct_from_cell(old_cell.clone()).unwrap();
-    let config = old_state.read_custom().unwrap().unwrap().config;
+    let mut config = old_state.read_custom().unwrap().unwrap().config;
+    // A foreign-domain response must still be internally valid and signed for
+    // that domain, so rejection occurs at the requested exact block boundary.
+    config.set_config(ConfigParamEnum::ConfigParam19(global_id as u32)).unwrap();
     let seq = parent.seq_no + 1;
     let mut state = old_state.clone();
     state.set_global_id(global_id);
@@ -146,6 +149,7 @@ pub(super) fn successor_in_domain(
     state.set_gen_time(old_state.gen_time() + 1);
     state.set_gen_lt(old_state.gen_lt() + 5);
     let mut extra = state.read_custom().unwrap().unwrap();
+    extra.config = config.clone();
     advance_masterchain_history(&mut extra, parent, old_state.gen_lt(), key, epoch).unwrap();
     state.write_custom(Some(&extra)).unwrap();
     transform(&mut state);

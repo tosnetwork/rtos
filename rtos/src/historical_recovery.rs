@@ -46,6 +46,8 @@ pub(crate) struct Request {
     prepared: Mutex<Vec<Prepared>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
     _gc: tokio::sync::OwnedRwLockReadGuard<()>,
+    #[cfg(test)]
+    replay_limit: usize,
 }
 impl Request {
     pub(crate) async fn new(engine: Arc<Engine>) -> Result<Arc<Self>> {
@@ -63,11 +65,26 @@ impl Request {
             prepared: Mutex::new(Vec::new()),
             _permit: permit,
             _gc: gc,
+            #[cfg(test)]
+            replay_limit: MAX_REPLAY,
         }))
     }
     #[cfg(test)]
     pub(crate) async fn test_with_limits(engine: Arc<Engine>, limits: HistoryReadLimits) -> Result<Arc<Self>> {
         Self::with_limits(engine, limits).await
+    }
+    #[cfg(test)]
+    pub(crate) async fn test_with_replay_limit(engine: Arc<Engine>, limit: usize) -> Result<Arc<Self>> {
+        if limit == 0 || limit > MAX_REPLAY { fail!("Test replay limit must only lower the production bound"); }
+        let mut request = Self::new(engine).await?;
+        Arc::get_mut(&mut request).ok_or_else(|| error!("New history request unexpectedly shared"))?.replay_limit = limit;
+        Ok(request)
+    }
+    fn replay_limit(&self) -> usize {
+        #[cfg(test)]
+        { self.replay_limit }
+        #[cfg(not(test))]
+        { MAX_REPLAY }
     }
     #[cfg(test)]
     pub(crate) async fn test_snapshot(&self, id: &BlockIdExt) -> Result<Option<Arc<ShardStateStuff>>> {
@@ -265,7 +282,8 @@ impl Request {
         &self,
         requested: &BlockIdExt,
     ) -> Result<(VerifiedMasterchainState, Vec<BlockProofStuff>)> {
-        let mut suffix = BudgetStack::new(MAX_REPLAY);
+        let limit = self.replay_limit();
+        let mut suffix = BudgetStack::new(limit);
         let mut cursor = requested.clone();
         let mut traversed = 0usize;
         let snapshot = loop {
@@ -275,7 +293,7 @@ impl Request {
             if let Some(state) = self.snapshot(&cursor).await? {
                 break state;
             }
-            if cursor == *self.engine.init_mc_block_id() || traversed >= MAX_REPLAY {
+            if cursor == *self.engine.init_mc_block_id() || traversed >= limit {
                 fail!("No available snapshot within bounded historical ancestry");
             }
             let (block, proof) = self.pair(&cursor).await?;

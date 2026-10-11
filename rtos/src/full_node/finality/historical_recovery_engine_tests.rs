@@ -409,9 +409,20 @@ async fn recover_scenario(scenario: RecoveryScenario) {
             if scenario == RecoveryScenario::WrongRemoteParent {
                 wrong_parent.file_hash = UInt256::calc_file_hash(b"another exact parent");
             }
-            let (wrong_id, _, wrong_row) = chain::successor_in_domain(
+            let response_domain = if scenario == RecoveryScenario::WrongRemoteDomain { -238 } else { -239 };
+            let (wrong_id, wrong_root, wrong_row) = chain::successor_in_domain(
                 &signer, &wrong_parent, &first_root, false, 0, cc, &creator,
-                if scenario == RecoveryScenario::WrongRemoteDomain { -238 } else { -239 }, |_| {});
+                response_domain, |_| {});
+            // The helper verifies the genuine PQ signatures in this domain.
+            // Also require a consistent block/state/config before testing the
+            // production exact-request rejection rather than malformed setup.
+            let wrong_state = ShardStateUnsplit::construct_from_cell(wrong_root).unwrap();
+            assert_eq!(wrong_state.global_id(), response_domain);
+            assert!(matches!(
+                wrong_state.read_custom().unwrap().unwrap().config.config(19).unwrap(),
+                Some(rtos_block::ConfigParamEnum::ConfigParam19(id)) if id == response_domain as u32
+            ));
+            assert_eq!(fixture_block(&wrong_row).block().unwrap().global_id(), response_domain);
             assert_ne!(wrong_id, target);
             let reply = WireProfile::T0.serialize(&rtos_api::ton::ton_node::datafull::DataFull {
                 id: wrong_id, block: decode(&wrong_row["block_boc"]), proof: decode(&wrong_row["proof_boc"]), is_link: false.into(),
@@ -885,6 +896,12 @@ async fn recover_scenario(scenario: RecoveryScenario) {
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
+                // Capsule publication precedes the factory handoff. Keep the
+                // same total deadline and prove the autonomous owner actually
+                // constructed its session before shutdown can cancel it.
+                while service.snapshot().constructed == 0 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
             })
             .await
             .unwrap_or_else(|_| {
@@ -892,7 +909,7 @@ async fn recover_scenario(scenario: RecoveryScenario) {
                     let router = peer.overlays_router().unwrap();
                     (router.test_bounded_queries(), router.test_pss_observations())
                 }).collect();
-                panic!("autonomous capsule recovery timed out: {:?}; router_ready={}; peers={observations:?}",
+                panic!("autonomous capsule recovery/session construction timed out: {:?}; router_ready={}; peers={observations:?}",
                     service.snapshot(), cold.overlays_router().is_ok())
             });
             let after_queries: usize = peers.iter()
@@ -1262,3 +1279,6 @@ async fn historical_recovery_empty_and_insufficient_source_quorum_preserves_all_
 async fn historical_recovery_wrong_signed_session_preserves_all_capsules() {
     recover_scenario(RecoveryScenario::WrongSessionCertificate).await;
 }
+
+#[path = "historical_recovery_boundary_tests.rs"]
+mod boundary_tests;
