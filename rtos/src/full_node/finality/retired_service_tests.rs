@@ -631,7 +631,9 @@ async fn retired_service_socket_missing_body_reaches_node_wal_and_checked_join()
             }
             // Remove all live provider gossip before creating the target's bodyless debt.
             // Provider candidates remain only in its real session storage.
-            stop_socket_session(provider_session).await;
+            stop_socket_session(provider_session.clone()).await;
+            sessions.retain(|session| !Arc::ptr_eq(session, &provider_session));
+            drop(provider_session);
             restart_socket_engine(&mut target, &provider.engine).await;
             restart_socket_engine(&mut emitter, &provider.engine).await;
             connect_socket(&target, &emitter);
@@ -668,7 +670,9 @@ async fn retired_service_socket_missing_body_reaches_node_wal_and_checked_join()
                 target.engine.load_block_handle(target.block.id()).unwrap().is_none(),
                 "body appeared before any provider route"
             );
-            stop_socket_session(target_session).await;
+            stop_socket_session(target_session.clone()).await;
+            sessions.retain(|session| !Arc::ptr_eq(session, &target_session));
+            drop(target_session);
             raws.pop().unwrap().stop().await;
             let source_root =
                 std::path::PathBuf::from(target.engine.db_root_dir().unwrap()).join("catchains");
@@ -766,16 +770,36 @@ async fn retired_service_socket_missing_body_reaches_node_wal_and_checked_join()
         })
         .catch_unwind()
         .await;
+        // Preserve the first failure, but always attempt every independent owner
+        // and Engine drain before resuming it. A fixture assertion must not leave
+        // ADNL join threads blocking the test runtime forever.
+        let mut cleanup_panic = None;
         for raw in raws {
-            raw.stop().await;
+            if let Err(panic) = std::panic::AssertUnwindSafe(raw.stop()).catch_unwind().await {
+                cleanup_panic.get_or_insert(panic);
+            }
         }
         for session in sessions {
-            stop_socket_session(session).await;
+            if let Err(panic) =
+                std::panic::AssertUnwindSafe(stop_socket_session(session)).catch_unwind().await
+            {
+                cleanup_panic.get_or_insert(panic);
+            }
         }
-        target.engine.clone().wait_stop().await.unwrap();
-        provider.engine.clone().wait_stop().await.unwrap();
-        emitter.engine.clone().wait_stop().await.unwrap();
+        for engine in [&target.engine, &provider.engine, &emitter.engine] {
+            if let Err(panic) = std::panic::AssertUnwindSafe(async {
+                engine.clone().wait_stop().await.unwrap();
+            })
+            .catch_unwind()
+            .await
+            {
+                cleanup_panic.get_or_insert(panic);
+            }
+        }
         result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        if let Some(panic) = cleanup_panic {
+            std::panic::resume_unwind(panic);
+        }
         let expected = expected_socket_record(&target);
         let id = crate::propagation_outbox::delivery_id(&expected).unwrap();
         let stopped = std::mem::replace(&mut target.engine, emitter.engine.clone());
