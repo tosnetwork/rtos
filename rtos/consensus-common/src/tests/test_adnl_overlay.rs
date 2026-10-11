@@ -113,7 +113,7 @@ async fn overlay_owned_real_query_listener_join_and_response_handoff() {
         release: Mutex::new(release_rx),
         callback: Mutex::new(None),
     });
-    let listener_trait: Arc<dyn crate::ConsensusOverlayListener> = listener.clone();
+    let listener_trait: Arc<dyn crate::ConsensusOverlayListener + Send + Sync> = listener.clone();
     let overlay = real_overlay(Arc::downgrade(&listener_trait), 81).await;
     let peers =
         AdnlPeers::with_keys(overlay.local_adnl_key.id().clone(), KeyId::from_data([82; 32]));
@@ -147,7 +147,7 @@ async fn overlay_owned_real_query_listener_join_and_response_handoff() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn overlay_owned_real_processor_panic_sticky_after_join() {
     let (_, release_rx) = std::sync::mpsc::channel();
-    let listener: Arc<dyn crate::ConsensusOverlayListener> = Arc::new(HeldListener {
+    let listener: Arc<dyn crate::ConsensusOverlayListener + Send + Sync> = Arc::new(HeldListener {
         entered: Mutex::new(None),
         release: Mutex::new(release_rx),
         callback: Mutex::new(None),
