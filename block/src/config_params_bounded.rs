@@ -72,10 +72,36 @@ impl ConfigParams {
         let temporary = None;
         self.validator_param_bounded(36, temporary, budget)
     }
+    /// Retired identity also needs the next set to authorize its requested epoch.
     pub fn session_config_bounded(
         &self,
         masterchain: bool,
         budget: &dyn ConfigReadBudget,
+    ) -> Result<DecodedSessionConfig> {
+        self.decode_session_config_bounded(masterchain, budget, true, true)
+    }
+    /// Proof/PQ commitment reads current and Param28/29/30, never unused sets.
+    pub fn governing_session_config_bounded(
+        &self,
+        masterchain: bool,
+        budget: &dyn ConfigReadBudget,
+    ) -> Result<DecodedSessionConfig> {
+        self.decode_session_config_bounded(masterchain, budget, false, false)
+    }
+    /// Mirrors live runtime: previous/next membership is used only by protocol 2.
+    pub fn runtime_session_config_bounded(
+        &self,
+        masterchain: bool,
+        budget: &dyn ConfigReadBudget,
+    ) -> Result<DecodedSessionConfig> {
+        self.decode_session_config_bounded(masterchain, budget, false, true)
+    }
+    fn decode_session_config_bounded(
+        &self,
+        masterchain: bool,
+        budget: &dyn ConfigReadBudget,
+        always_next: bool,
+        transport_membership: bool,
     ) -> Result<DecodedSessionConfig> {
         config_budget::lookup(budget, 32)?;
         let catchain = self.catchain_config()?;
@@ -137,12 +163,17 @@ impl ConfigParams {
         let (previous_temporary, next_temporary) = (None, None);
         Ok(DecodedSessionConfig {
             current: self.validator_param_bounded(34, Some(35), budget)?,
-            previous: if selected.config.protocol_version == 2 {
+            previous: if transport_membership && selected.config.protocol_version == 2 {
                 self.validator_param_bounded(32, previous_temporary, budget)?
             } else {
                 ValidatorSet::default()
             },
-            next: self.validator_param_bounded(36, next_temporary, budget)?,
+            next: if always_next || (transport_membership && selected.config.protocol_version == 2)
+            {
+                self.validator_param_bounded(36, next_temporary, budget)?
+            } else {
+                ValidatorSet::default()
+            },
             catchain,
             consensus,
             selected,

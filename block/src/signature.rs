@@ -1372,3 +1372,9 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/test_pq_block_signature_vectors.rs"]
 mod pq_tests;
+
+include!("signature_bounded.rs");
+
+#[cfg(test)]
+#[path = "tests/test_signature_bounded.rs"]
+mod bounded_tests;
