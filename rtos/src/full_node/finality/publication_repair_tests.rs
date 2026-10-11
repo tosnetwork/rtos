@@ -353,11 +353,17 @@ async fn mc_live_repair_missing_root_preflights_budget_before_rebuilding_durable
     })
     .catch_unwind()
     .await;
-    pair.receiver.clone().wait_stop().await.unwrap();
-    pair.provider.clone().wait_stop().await.unwrap();
+    // A deliberate regression may poison the receiver's owned worker. Drain
+    // both Engines before propagating either that failure or the test panic.
+    let (receiver_stop, provider_stop) = tokio::join!(
+        pair.receiver.clone().wait_stop(),
+        pair.provider.clone().wait_stop(),
+    );
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
+    receiver_stop.unwrap();
+    provider_stop.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
