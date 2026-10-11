@@ -429,6 +429,18 @@ impl FullNodeOverlaysRouter {
         plan: &PropagationPlan,
     ) -> PropagationOutcome {
         let mut outcome = PropagationOutcome::default();
+        if plan.candidate_targets != TargetSet::NONE {
+            let candidate_outcome = match accepted.candidate_relay() {
+                Ok(candidate) => self.relay_validated_candidate(&candidate, plan).await,
+                Err(error) => failed_selected(
+                    PropagationKind::Candidate,
+                    plan.candidate_targets,
+                    plan.destination(),
+                    error,
+                ),
+            };
+            outcome.receipts.extend(candidate_outcome.receipts);
+        }
         if plan.block_targets != TargetSet::NONE || plan.finality_targets != TargetSet::NONE {
             let prepared: Result<_> = async {
                 let _admission = self.tasks.enter()?;

@@ -139,6 +139,12 @@ async fn propagation_authenticated_normal_finality_applies_by_mc_and_reopens() {
         assert_eq!(deferred.receipts[0].target, missing.target);
         assert!(matches!(deferred.receipts[0].status, PropagationStatus::Deferred(_)));
         assert!(deferred.needs_retry());
+        let plan = plan
+            .for_destination(&PropagationDestination {
+                kind: PropagationKind::Finality,
+                target: PropagationTarget::Public,
+            })
+            .unwrap();
         let outcome = pair.provider.propagate_accepted_session_block(&accepted, &plan).await;
         assert!(sent(&outcome, PropagationKind::Finality), "{outcome:?}");
         assert!(!outcome.needs_retry(), "{outcome:?}");
@@ -303,6 +309,88 @@ async fn propagation_authenticated_approval_uses_block_fec_without_finality() {
             pair.receiver.load_state(pair.shard.id()).await.unwrap().root_cell().repr_hash(),
             &pair.shard_state_root
         );
+    })
+    .catch_unwind()
+    .await;
+    pair.receiver.clone().wait_stop().await.unwrap();
+    pair.provider.clone().wait_stop().await.unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn propagation_authenticated_finalize_candidate_fallback_shares_receive_dedup() {
+    let pair = Pair::with_propagation_profile("included", false, true).await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/v2-propagation-recovery.json")).unwrap();
+        let mut row = fixture["rows"][0].clone();
+        row["signatures"] = row["approval_signatures"].clone();
+        let carrier = fixture_carrier(&row);
+        let approval =
+            rtos_api::pq_finality::PqApproval::from_notarization_fields(carrier).unwrap();
+        let context = governing_session(&pair).await;
+        let accepted = accept_pq_session_block(
+            pair.shard.id().clone(),
+            Some(pair.shard.data().to_vec()),
+            vec![pair.shard.construct_prev_id().unwrap().0],
+            SessionFinality::PqApproval(approval),
+            context,
+            pair.provider.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!accepted.is_final());
+        assert!(accepted.final_network_signatures().is_err());
+
+        let plan = PropagationPlan::for_event(
+            SimplexProtocol::PrivateObserversPlumtree,
+            PropagationEvent::Finalized,
+            pair.shard.id(),
+            true,
+            false,
+            false,
+            0,
+            false,
+        );
+        let outcome = pair.provider.propagate_accepted_session_block(&accepted, &plan).await;
+        assert!(sent(&outcome, PropagationKind::Candidate), "{outcome:?}");
+        assert!(!outcome.needs_retry(), "{outcome:?}");
+        assert!(!sent(&outcome, PropagationKind::Block));
+        assert!(!sent(&outcome, PropagationKind::Finality));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while pair.receiver.try_get_cached_block_candidate(pair.shard.id()).is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("finalize fallback must reach the real public candidate consumer");
+        let receive_plan = PropagationPlan::for_event(
+            SimplexProtocol::PrivateObserversPlumtree,
+            PropagationEvent::CandidateReceived,
+            pair.shard.id(),
+            true,
+            false,
+            false,
+            0,
+            false,
+        );
+        let duplicate = pair
+            .provider
+            .relay_validated_candidate(&accepted.candidate_relay().unwrap(), &receive_plan)
+            .await;
+        assert!(!duplicate.attempted(), "{duplicate:?}");
+        assert!(duplicate
+            .receipts
+            .iter()
+            .any(|r| matches!(r.status, PropagationStatus::Skipped(_))));
+        assert!(!duplicate.needs_retry());
+        assert!(!pair
+            .receiver
+            .load_block_handle(pair.shard.id())
+            .unwrap()
+            .is_some_and(|h| h.is_applied()));
     })
     .catch_unwind()
     .await;
