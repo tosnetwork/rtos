@@ -48,6 +48,63 @@ impl PqNetworkSignatureSet {
         Ok(result)
     }
 
+    pub fn from_node_bounded(
+        value: ton::ton_node::signature_set::signatureset::SimplexPq,
+        budget: &dyn ConfigReadBudget,
+    ) -> Result<Self> {
+        if value.signatures.len() > PQ_SIGNATURE_MAX_SIGNERS as usize {
+            fail!("PQ network signer count exceeds maximum");
+        }
+        let mut signatures = cb::vector(budget, value.signatures.len())?;
+        for pair in value.signatures {
+            budget.step()?;
+            signatures.push(PqBlockSignaturePair {
+                validator_id: pair.validator_id,
+                algorithm_id: u16::try_from(pair.algorithm_id)
+                    .map_err(|_| error!("PQ network algorithm out of range"))?,
+                signature: pair.signature,
+            });
+        }
+        let result = Self {
+            is_final: matches!(value.final_, ton::Bool::BoolTrue),
+            validator_info: ValidatorBaseInfo::with_params(
+                value.validator_set_hash as u32,
+                value.cc_seqno as u32,
+            ),
+            signatures,
+            session_id: value.session_id,
+            slot: value.slot as u32,
+            candidate: value.candidate,
+        };
+        result.validate_structure_bounded(budget)?;
+        Ok(result)
+    }
+
+    fn validate_structure_bounded(&self, budget: &dyn ConfigReadBudget) -> Result<()> {
+        if self.signatures.len() > PQ_SIGNATURE_MAX_SIGNERS as usize {
+            fail!("PQ network signer count exceeds maximum");
+        }
+        for (index, pair) in self.signatures.iter().enumerate() {
+            budget.step()?;
+            if pair.algorithm_id != MLDSA44_ALGORITHM_ID {
+                fail!("PQ network unsupported algorithm");
+            }
+            if pair.signature.len() != PQ_SIGNATURE_BYTES {
+                fail!("PQ network signature length");
+            }
+            for previous in &self.signatures[..index] {
+                budget.step()?;
+                if previous.validator_id == pair.validator_id {
+                    fail!("PQ network duplicate validator identity");
+                }
+            }
+        }
+        if serialize_budgeted(&self.candidate, budget)?.len() > 1024 {
+            fail!("PQ network candidate exceeds maximum");
+        }
+        Ok(())
+    }
+
     pub fn from_lite(
         value: ton::lite_server::signature_set::signatureset::SimplexPq,
     ) -> Result<Self> {
@@ -249,6 +306,70 @@ impl PqVerificationContext {
             let approval = PqApproval::from_notarization_fields(carrier)?;
             let verified = self.verify_approval(&approval)?;
             VerifiedNetworkRole::Approval(approval, verified)
+        };
+        Ok(VerifiedPqNetworkSignatures { evidence })
+    }
+}
+
+impl PqVerificationContext {
+    pub fn verify_network_bounded(
+        &self,
+        input: &PqNetworkSignatureSet,
+        budget: &dyn ConfigReadBudget,
+    ) -> Result<VerifiedPqNetworkSignatures> {
+        input.validate_structure_bounded(budget)?;
+        let mut members = cb::vector(budget, self.validators.len())?;
+        for member in &self.validators {
+            budget.step()?;
+            members.push((member.validator_id_bounded(budget)?, member.weight));
+        }
+        let mut weight = 0;
+        for pair in &input.signatures {
+            let mut found = None;
+            for (id, value) in &members {
+                budget.step()?;
+                if id == &pair.validator_id {
+                    found = Some(*value);
+                    break;
+                }
+            }
+            weight = rtos_block::checked_add_validator_weight(
+                weight,
+                found.ok_or_else(|| error!("PQ network signer is not in governing context"))?,
+            )?;
+        }
+        let mut signatures = cb::vector(budget, input.signatures.len())?;
+        for signature in &input.signatures {
+            budget.step()?;
+            budget.workspace(signature.signature.len())?;
+            signatures.push(signature.clone());
+        }
+        let candidate = serialize_budgeted(&input.candidate, budget)?;
+        let carrier = BlockSignaturesSimplexPq {
+            validator_info: input.validator_info.clone(),
+            sig_count: signatures.len() as u32,
+            sig_weight: weight,
+            signatures,
+            session_id: input.session_id.clone(),
+            slot: input.slot,
+            candidate_data: BlockSignaturesSimplex::bytes_to_cell_tree_bounded(&candidate, budget)?,
+        };
+        let evidence = if input.is_final {
+            let verified = self.verify_final_bounded(&carrier, budget)?;
+            VerifiedNetworkRole::Final(carrier, verified)
+        } else {
+            if self.block_id.shard().is_masterchain() {
+                fail!("masterchain requires final votes");
+            }
+            // Same structural/role verification as the ordinary approval path.
+            let weight = self.verify_role_bounded(&carrier, false, budget)?;
+            let verified = VerifiedPqApproval {
+                block_id: self.block_id.clone(),
+                session_id: self.session_id.clone(),
+                slot: carrier.slot,
+                weight,
+            };
+            VerifiedNetworkRole::Approval(PqApproval { data: carrier }, verified)
         };
         Ok(VerifiedPqNetworkSignatures { evidence })
     }

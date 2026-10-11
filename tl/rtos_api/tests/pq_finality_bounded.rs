@@ -133,3 +133,42 @@ fn pq_bounded_budget_is_cumulative_and_preserves_typed_refusal() {
             .is_some());
     }
 }
+
+#[test]
+fn pq_bounded_network_preserves_final_role_and_rejects_masterchain_approval() {
+    use rtos_api::pq_finality::{PqApproval, PqNetworkSignatureSet};
+    let context = context(&fixture::config(), &Budget::ample()).unwrap();
+    let carrier = fixture::signed(&[1], "finalize", DOMAIN);
+    let fields = PqNetworkSignatureSet::from_final_fields(&carrier).unwrap().to_node();
+    let parsed =
+        PqNetworkSignatureSet::from_node_bounded(fields.clone(), &Budget::ample()).unwrap();
+    let (bounded, receipt) =
+        context.verify_network_bounded(&parsed, &Budget::ample()).unwrap().into_final().unwrap();
+    assert_eq!(bounded, carrier);
+    assert_eq!(receipt.weight(), carrier.sig_weight);
+    assert!(context
+        .verify_network_bounded(&parsed, &Budget::new(0, usize::MAX))
+        .unwrap_err()
+        .downcast_ref::<Refused>()
+        .is_some());
+    assert!(PqNetworkSignatureSet::from_node_bounded(fields, &Budget::new(usize::MAX, 0))
+        .unwrap_err()
+        .downcast_ref::<Refused>()
+        .is_some());
+    let approval =
+        PqApproval::from_notarization_fields(fixture::signed(&[1], "notarize", DOMAIN)).unwrap();
+    let parsed = PqNetworkSignatureSet::from_node_bounded(
+        PqNetworkSignatureSet::from_approval(&approval).unwrap().to_node(),
+        &Budget::ample(),
+    )
+    .unwrap();
+    assert!(context.verify_network(&parsed).is_err());
+    assert!(context.verify_network_bounded(&parsed, &Budget::ample()).is_err());
+    let mut bad =
+        PqNetworkSignatureSet::from_final_fields(&fixture::signed(&[0, 1], "finalize", DOMAIN))
+            .unwrap()
+            .to_node();
+    bad.signatures[0].signature[0] ^= 1;
+    let bad = PqNetworkSignatureSet::from_node_bounded(bad, &Budget::ample()).unwrap();
+    assert!(context.verify_network_bounded(&bad, &Budget::ample()).is_err());
+}
