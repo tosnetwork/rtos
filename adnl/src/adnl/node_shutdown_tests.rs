@@ -8,7 +8,20 @@ use std::{
 };
 use tokio::sync::{oneshot, Notify};
 
-async fn node(seed: u8) -> (Arc<AdnlNode>, u16) {
+struct TestNode(Arc<AdnlNode>);
+impl std::ops::Deref for TestNode {
+    type Target = Arc<AdnlNode>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for TestNode {
+    fn drop(&mut self) {
+        self.0.tasks.close();
+    }
+}
+
+async fn node(seed: u8) -> (TestNode, u16) {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let port = socket.local_addr().unwrap().port();
     drop(socket);
@@ -24,7 +37,7 @@ async fn node(seed: u8) -> (Arc<AdnlNode>, u16) {
     )
     .await
     .unwrap();
-    (node, port)
+    (TestNode(node), port)
 }
 async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(5), future)
