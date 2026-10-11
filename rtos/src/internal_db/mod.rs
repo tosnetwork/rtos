@@ -2093,6 +2093,11 @@ impl InternalDb {
         self.archive_manager.clean_unapplied_files(ids).await;
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_pause_archive_gc_selection(&self) -> (tokio::sync::oneshot::Receiver<Vec<u32>>, Arc<tokio::sync::Notify>) {
+        self.archive_manager.test_pause_gc_selection()
+    }
+
     pub async fn archive_gc(&self, last_unneeded_key_block: &BlockIdExt) -> Result<()> {
         let _tc = time_checker!(|| format!("archive_gc {}", last_unneeded_key_block), 300);
         self.archive_manager.gc(last_unneeded_key_block).await;
