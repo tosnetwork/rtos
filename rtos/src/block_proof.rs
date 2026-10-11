@@ -717,13 +717,24 @@ impl BlockProofStuff {
         data: Vec<u8>,
         budget: &crate::history_read_budget::HistoryReadBudget,
     ) -> Result<Self> {
+        Self::deserialize_local_history(block_id, data, false, budget)
+    }
+
+    /// Ordinary archive bytes are replaceable evidence, not authenticated
+    /// authority. Parse failure may use another source under the SAME budget.
+    pub(crate) fn deserialize_local_history(
+        block_id: &BlockIdExt,
+        data: Vec<u8>,
+        is_link: bool,
+        budget: &crate::history_read_budget::HistoryReadBudget,
+    ) -> Result<Self> {
         budget.proof_bytes(&data)?;
         let root = budget.parse_local_artifact(&data)?;
         let proof = BlockProof::construct_from_cell(root.clone())?;
-        if &proof.proof_for != block_id || !block_id.is_masterchain() {
-            fail!("Local artifact proof identity mismatch");
+        if &proof.proof_for != block_id || (!block_id.is_masterchain() && !is_link) {
+            fail!("Local artifact proof identity/type mismatch");
         }
-        Ok(Self { proof, root, is_link: false, id: block_id.clone(), data: Arc::new(data) })
+        Ok(Self { proof, root, is_link, id: block_id.clone(), data: Arc::new(data) })
     }
 
     pub fn new(proof: BlockProof, is_link: bool) -> Result<Self> {

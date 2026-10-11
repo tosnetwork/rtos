@@ -242,3 +242,26 @@ async fn persistent_repair_custody_capsule_internal_closure_repairs_real_history
     close(engine).await;
     run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_repair_history_real_local_limits_never_enter_capsule_or_network_fallback() {
+    let Fixture { dir, engine, parent, .. } = fixture(true).await;
+    let result = std::panic::AssertUnwindSafe(async {
+        for depth_limit in [false, true] {
+            let mut limits = crate::history_read_budget::HistoryReadLimits::default();
+            if depth_limit { limits.depth = 0; } else { limits.cells = 0; }
+            let budget = crate::history_read_budget::HistoryReadBudget::new(limits);
+            for _ in 0..2 {
+                let error = crate::boot::load_history_proof_with_budget(
+                    engine.as_ref(), parent.id(), false, true, Some(&budget),
+                ).await.unwrap_err();
+                assert!(crate::history_read_budget::stops_fallback(&error), "{error:#}");
+                assert_eq!(budget.local_proof_fallbacks(), 0,
+                    "actual local proof resource denial must precede capsule/network fallback");
+            }
+        }
+    }).catch_unwind().await;
+    close(engine).await;
+    drop(dir);
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}

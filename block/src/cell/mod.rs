@@ -51,6 +51,20 @@ pub const MAX_LEVEL: usize = 3;
 pub const MAX_LEVEL_MASK: u8 = 7;
 pub const MAX_DEPTH: u16 = u16::MAX - 1;
 
+/// A construction resource limit, distinct from malformed cell data. Readers
+/// may replace malformed local artifacts, but must not retry past this limit.
+#[derive(Debug)]
+pub struct CellDepthLimitExceeded {
+    pub depth: u16,
+    pub limit: u16,
+}
+impl std::fmt::Display for CellDepthLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "depth {} > {}", self.depth, self.limit)
+    }
+}
+impl std::error::Error for CellDepthLimitExceeded {}
+
 // recommended maximum depth, this value is safe for stack. Use custom stack size
 // to use bigger depths (see `test_max_depth`).
 pub const MAX_SAFE_DEPTH: u16 = 2048;
@@ -1910,7 +1924,9 @@ impl Cell {
                 let (child_hash, child_depth) = refs.hash_depth(r_idx, i + is_merkle as usize);
                 cur_depth = max(cur_depth, child_depth + 1);
                 if cur_depth > max_depth {
-                    fail!("depth {} > {}", cur_depth, max_depth.min(MAX_DEPTH));
+                    return Err(CellDepthLimitExceeded {
+                        depth: cur_depth, limit: max_depth.min(MAX_DEPTH),
+                    }.into());
                 }
                 hasher.update(child_depth.to_be_bytes());
                 child_hashes.push(child_hash);

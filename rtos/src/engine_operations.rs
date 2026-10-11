@@ -142,7 +142,7 @@ impl EngineOperations for Engine {
                 }
             };
             reservation.finish(&bytes)?;
-            let proof = BlockProofStuff::deserialize_bounded(handle.id(), bytes, is_link, &budget)?;
+            let proof = BlockProofStuff::deserialize_local_history(handle.id(), bytes, is_link, &budget)?;
             budget.proof(&proof)?;
             Ok::<_, anyhow::Error>(proof)
         })?
