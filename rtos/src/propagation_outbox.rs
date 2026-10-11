@@ -16,7 +16,7 @@ use std::{
 
 const KEY: &str = "PropagationOutboxV1";
 const MAGIC: &[u8; 8] = b"RTOSPBOX";
-pub const SCHEMA_VERSION: u16 = 2;
+pub const SCHEMA_VERSION: u16 = 3;
 const DIGEST_BYTES: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,6 +146,7 @@ pub enum PublicationStage {
     Ready,
     DraftDurable,
     Completed,
+    AcceptedDraft,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -289,13 +290,35 @@ impl PropagationOutbox {
         if matches!(entry.stage, PublicationStage::Ready | PublicationStage::Completed) {
             return Ok(());
         }
-        if entry.stage == PublicationStage::DraftDurable {
+        if matches!(entry.stage, PublicationStage::DraftDurable | PublicationStage::AcceptedDraft) {
             fail!("Unresolved draft cannot become Ready");
         }
         entry.stage = if entry.pending.is_empty() {
             PublicationStage::Completed
         } else {
             PublicationStage::Ready
+        };
+        self.commit(&mut state, next)
+    }
+
+    /// Checkpoint actual acceptance independently of routing availability. A
+    /// persisted tag is not a receipt: recovery/query still authenticate and
+    /// perform idempotent acceptance before returning an AcceptedSessionBlock.
+    pub fn mark_accepted(&self, id: RecordId) -> Result<()> {
+        let mut state = self.lock()?;
+        let mut next = state.snapshot.clone();
+        let entry = next
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| error!("Unknown publication acceptance record"))?;
+        entry.stage = match entry.stage {
+            PublicationStage::DraftDurable => PublicationStage::AcceptedDraft,
+            PublicationStage::Prepared if entry.pending.is_empty() => PublicationStage::Completed,
+            PublicationStage::Prepared => PublicationStage::Ready,
+            PublicationStage::AcceptedDraft
+            | PublicationStage::Ready
+            | PublicationStage::Completed => return Ok(()),
         };
         self.commit(&mut state, next)
     }
@@ -416,14 +439,21 @@ impl PropagationOutbox {
         let mut next = state.snapshot.clone();
         let entry =
             next.entries.iter_mut().find(|e| e.id == id).ok_or_else(|| error!("Unknown draft"))?;
-        if entry.stage != PublicationStage::DraftDurable {
+        if entry.stage == PublicationStage::DraftDurable {
+            fail!("Cannot resolve targets before acceptance");
+        }
+        if entry.stage != PublicationStage::AcceptedDraft {
             return Ok(());
         }
         effects.sort();
         effects.dedup();
         entry.record.effects = effects.clone();
         entry.pending = effects;
-        entry.stage = PublicationStage::Prepared;
+        entry.stage = if entry.pending.is_empty() {
+            PublicationStage::Completed
+        } else {
+            PublicationStage::Ready
+        };
         validate_record(&entry.record, &self.domain, &self.limits)?;
         self.commit(&mut state, next)
     }
@@ -555,7 +585,7 @@ fn validate_pending(
     stage: PublicationStage,
     pending: &[PublicationEffect],
 ) -> Result<()> {
-    if (stage == PublicationStage::DraftDurable
+    if (matches!(stage, PublicationStage::DraftDurable | PublicationStage::AcceptedDraft)
         && (!pending.is_empty() || !record.effects.is_empty()))
         || (stage == PublicationStage::Completed && !pending.is_empty())
         || (stage == PublicationStage::Ready && pending.is_empty())
@@ -672,6 +702,7 @@ fn encode_snapshot(snapshot: &Snapshot, domain: &OutboxDomain, limits: &Limits) 
             PublicationStage::Ready => 1,
             PublicationStage::DraftDurable => 2,
             PublicationStage::Completed => 3,
+            PublicationStage::AcceptedDraft => 4,
         })?;
         out.byte(match record.protocol {
             SimplexProtocol::Private => 0,
@@ -809,7 +840,7 @@ fn decode_snapshot(bytes: &[u8], domain: &OutboxDomain, limits: &Limits) -> Resu
         fail!("Unknown outbox snapshot magic");
     }
     let version = u16::from_le_bytes(input.take(2)?.try_into()?);
-    if version != 1 && version != SCHEMA_VERSION {
+    if version != 1 && version != 2 && version != SCHEMA_VERSION {
         fail!("Unknown outbox schema version");
     }
     let wire_profile = match input.byte()? {
@@ -839,6 +870,7 @@ fn decode_snapshot(bytes: &[u8], domain: &OutboxDomain, limits: &Limits) -> Resu
             1 => PublicationStage::Ready,
             2 if version >= 2 => PublicationStage::DraftDurable,
             3 if version >= 2 => PublicationStage::Completed,
+            4 if version >= 3 => PublicationStage::AcceptedDraft,
             _ => return Err(error!("Unknown outbox publication stage")),
         };
         let protocol = SimplexProtocol::try_from(u32::from(input.byte()?))?;
@@ -923,8 +955,12 @@ fn decode_snapshot(bytes: &[u8], domain: &OutboxDomain, limits: &Limits) -> Resu
         }
     }
     if entries.iter().any(|e| {
-        matches!(e.stage, PublicationStage::DraftDurable | PublicationStage::Completed)
-            && !delivery_records.contains(&e.id)
+        matches!(
+            e.stage,
+            PublicationStage::DraftDurable
+                | PublicationStage::AcceptedDraft
+                | PublicationStage::Completed
+        ) && !delivery_records.contains(&e.id)
     }) {
         fail!("Delivery stage without identity");
     }
@@ -932,6 +968,30 @@ fn decode_snapshot(bytes: &[u8], domain: &OutboxDomain, limits: &Limits) -> Resu
         fail!("Trailing outbox snapshot bytes");
     }
     Ok(Snapshot { next_id, entries, deliveries })
+}
+
+/// Test-only observation of the existing atomic DB snapshot. Does not claim a
+/// writer, create a database key, or replace any state. Stop/join the actual
+/// writer before treating an observed in-progress write as a durability proof.
+#[cfg(test)]
+pub(crate) fn inspect_delivery(
+    db: &Arc<InternalDb>,
+    domain: &OutboxDomain,
+    limits: &Limits,
+    id: &UInt256,
+) -> Result<Option<(Delivery, UnverifiedRecord)>> {
+    validate_domain(domain)?;
+    validate_limits(limits)?;
+    let Some(bytes) = db.load_validator_state_raw_bounded(KEY, limits.max_snapshot_bytes)? else {
+        return Ok(None);
+    };
+    let snapshot = decode_snapshot(&bytes, domain, limits)?;
+    Ok(snapshot.deliveries.iter().find(|delivery| &delivery.delivery_id == id).map(|delivery| {
+        (
+            delivery.clone(),
+            snapshot.entries.iter().find(|entry| entry.id == delivery.record_id).unwrap().clone(),
+        )
+    }))
 }
 
 #[cfg(test)]
@@ -1043,6 +1103,9 @@ mod tests {
         assert_eq!(entry.stage, PublicationStage::DraftDurable);
         assert!(entry.pending.is_empty());
         assert!(store.mark_ready(delivery.record_id).is_err());
+        assert!(store.resolve_draft(delivery.record_id, Vec::new()).is_err());
+        store.mark_accepted(delivery.record_id)?;
+        assert_eq!(store.delivery(&delivery_id)?.unwrap().1.stage, PublicationStage::AcceptedDraft);
         let exact = vec![effect(PublicationKind::Block)];
         store.resolve_draft(delivery.record_id, exact.clone())?;
         store.resolve_draft(delivery.record_id, vec![effect(PublicationKind::Finality)])?;
@@ -1069,6 +1132,7 @@ mod tests {
         let approval_id = store.stage_draft(approval, 0, false, None)?;
         assert_ne!(delivery_id, approval_id);
         let id = store.delivery(&approval_id)?.unwrap().0.record_id;
+        store.mark_accepted(id)?;
         store.resolve_draft(id, Vec::new())?;
         store.mark_ready(id)?;
         assert_eq!(store.delivery(&approval_id)?.unwrap().1.stage, PublicationStage::Completed);
@@ -1088,6 +1152,7 @@ mod tests {
         let store = memory(disk, limits);
         let identity = store.stage_draft(record(1), 0, false, None)?;
         let id = store.delivery(&identity)?.unwrap().0.record_id;
+        store.mark_accepted(id)?;
         store.resolve_draft(id, Vec::new())?;
         store.mark_ready(id)?;
         assert!(store.stage_draft(record(2), 0, false, None).is_err());
@@ -1116,6 +1181,95 @@ mod tests {
         let migrated = disk.load(1 << 20)?.unwrap();
         assert_eq!(&migrated[8..10], &SCHEMA_VERSION.to_le_bytes());
         assert_eq!(decode_snapshot(&migrated, &domain(), &Limits::default())?.entries.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn outbox_accepted_draft_is_not_an_empty_or_expired_completion() -> Result<()> {
+        let disk = Arc::new(MemoryStore::default());
+        let store = memory(disk.clone(), Limits::default());
+        let original = record(1);
+        let identity = store.stage_draft(original.clone(), 7, false, None)?;
+        let id = store.delivery(&identity)?.unwrap().0.record_id;
+        assert!(original.is_expired(original.expires_at_unix_secs));
+        assert!(store.resolve_draft(id, Vec::new()).is_err());
+        store.mark_accepted(id)?;
+        assert!(store.mark_ready(id).is_err(), "unresolved targets must never appear Ready");
+        assert!(store.checkpoint_sent(id, &[]).is_err());
+        drop(store);
+        let store = memory(disk, Limits::default());
+        let (_, entry) = store.delivery(&identity)?.unwrap();
+        assert_eq!(entry.stage, PublicationStage::AcceptedDraft);
+        assert!(entry.pending.is_empty());
+        assert_eq!(entry.record.created_at_unix_secs, original.created_at_unix_secs);
+        assert_eq!(entry.record.expires_at_unix_secs, original.expires_at_unix_secs);
+        store.mark_accepted(id)?;
+        assert_eq!(store.delivery(&identity)?.unwrap().1.stage, PublicationStage::AcceptedDraft);
+        store.resolve_draft(id, Vec::new())?;
+        assert_eq!(store.delivery(&identity)?.unwrap().1.stage, PublicationStage::Completed);
+        Ok(())
+    }
+
+    #[test]
+    fn outbox_acceptance_checkpoint_uncertainty_is_not_acknowledged() -> Result<()> {
+        for failure in [1, 2] {
+            let disk = Arc::new(MemoryStore::default());
+            let store = memory(disk.clone(), Limits::default());
+            let identity = store.stage_draft(record(1), 0, false, None)?;
+            let id = store.delivery(&identity)?.unwrap().0.record_id;
+            disk.failure.store(failure, Ordering::SeqCst);
+            assert!(store.mark_accepted(id).is_err());
+            assert!(store.delivery(&identity).is_err());
+            drop(store);
+            disk.failure.store(0, Ordering::SeqCst);
+            let reopened = memory(disk, Limits::default());
+            assert_eq!(
+                reopened.delivery(&identity)?.unwrap().1.stage,
+                if failure == 1 {
+                    PublicationStage::DraftDurable
+                } else {
+                    PublicationStage::AcceptedDraft
+                }
+            );
+            // A caller must authenticate and accept again before this idempotent
+            // checkpoint; the recovered stage alone grants no receipt.
+            reopened.mark_accepted(id)?;
+            assert_eq!(
+                reopened.delivery(&identity)?.unwrap().1.stage,
+                PublicationStage::AcceptedDraft
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn outbox_version_two_upgrades_and_cannot_claim_new_accepted_stage() -> Result<()> {
+        let disk = Arc::new(MemoryStore::default());
+        let store = memory(disk.clone(), Limits::default());
+        let identity = store.stage_draft(record(1), 7, false, None)?;
+        let id = store.delivery(&identity)?.unwrap().0.record_id;
+        let mut bytes = disk.load(1 << 20)?.unwrap();
+        bytes[8..10].copy_from_slice(&2u16.to_le_bytes());
+        checksum(&mut bytes);
+        *disk.bytes.lock().unwrap() = Some(bytes);
+        drop(store);
+        let store = memory(disk.clone(), Limits::default());
+        assert_eq!(store.delivery(&identity)?.unwrap().0.record_id, id);
+        store.mark_accepted(id)?;
+        let accepted = disk.load(1 << 20)?.unwrap();
+        assert_eq!(&accepted[8..10], &3u16.to_le_bytes());
+        for version in [1u16, 2] {
+            let mut invalid = accepted.clone();
+            invalid[8..10].copy_from_slice(&version.to_le_bytes());
+            checksum(&mut invalid);
+            assert!(decode_snapshot(&invalid, &domain(), &Limits::default()).is_err());
+        }
+        for end in 0..accepted.len() {
+            assert!(decode_snapshot(&accepted[..end], &domain(), &Limits::default()).is_err());
+        }
+        let mut entry = store.delivery(&identity)?.unwrap().1;
+        entry.pending.push(effect(PublicationKind::Block));
+        assert!(validate_recovery_record(&entry, &Limits::default()).is_err());
         Ok(())
     }
 
@@ -1334,8 +1488,12 @@ mod tests {
         let outbox = PropagationOutbox::load(disk, domain(), Limits::default(), None).unwrap();
         if let Ok(stage) = std::env::var("RTOS_OUTBOX_DELIVERY_CRASH_STAGE") {
             let identity = outbox.stage_draft(record(1), 7, true, None).unwrap();
-            if stage == "completed" {
+            if stage == "accepted" || stage == "completed" {
                 let id = outbox.delivery(&identity).unwrap().unwrap().0.record_id;
+                outbox.mark_accepted(id).unwrap();
+                if stage == "accepted" {
+                    std::process::exit(73);
+                }
                 outbox.resolve_draft(id, Vec::new()).unwrap();
                 outbox.mark_ready(id).unwrap();
             }
@@ -1349,9 +1507,11 @@ mod tests {
 
     #[test]
     fn outbox_delivery_real_process_exit_preserves_draft_and_completed_identity() -> Result<()> {
-        for (mode, expected) in
-            [("draft", PublicationStage::DraftDurable), ("completed", PublicationStage::Completed)]
-        {
+        for (mode, expected) in [
+            ("draft", PublicationStage::DraftDurable),
+            ("accepted", PublicationStage::AcceptedDraft),
+            ("completed", PublicationStage::Completed),
+        ] {
             let directory = tempfile::tempdir()?;
             let result = Command::new(std::env::current_exe()?)
                 .arg("--exact")

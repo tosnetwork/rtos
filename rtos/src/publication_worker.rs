@@ -417,7 +417,7 @@ impl State {
         match command {
             Submission::Legacy(command) => self.submit_legacy(store, command).await,
             Submission::Draft {
-                record,
+                mut record,
                 last_mc,
                 candidate_already_sent,
                 completion,
@@ -449,7 +449,10 @@ impl State {
                         )
                         .await
                         .map_err(|_| error!("Recovery history timeout"))??;
-                        validate_origin(&authenticated, engine.as_ref(), &origin)?;
+                        // Reconstruct the original role claim from history, never
+                        // from today's (possibly retired) local key configuration.
+                        record.locally_generated =
+                            historical_origin(&authenticated, &origin)?.locally_generated;
                     }
                     self.write(store, move |store| {
                         store.stage_draft(record, last_mc, candidate_already_sent, Some(origin))
@@ -470,7 +473,6 @@ impl State {
                         .ok_or_else(|| error!("Unknown durable delivery ID"))?;
                     let engine =
                         self.engine.upgrade().ok_or_else(|| error!("Engine unavailable"))?;
-                    let entry = self.resolve_draft(store, &engine, entry).await?;
                     self.accept(store, engine, entry).await
                 }
                 .await;
@@ -524,9 +526,12 @@ impl State {
         store: &Arc<PropagationOutbox>,
         engine: &Arc<Engine>,
         entry: UnverifiedRecord,
-    ) -> Result<UnverifiedRecord> {
-        if entry.stage != PublicationStage::DraftDurable {
-            return Ok(entry);
+    ) -> Result<bool> {
+        if entry.stage == PublicationStage::DraftDurable {
+            fail!("Routing resolution requires actual acceptance first");
+        }
+        if entry.stage != PublicationStage::AcceptedDraft {
+            return Ok(true);
         }
         // Authenticate disk evidence before allowing its metadata to resolve destinations.
         let authenticated = tokio::time::timeout(
@@ -547,7 +552,12 @@ impl State {
             .ok_or_else(|| error!("Draft delivery metadata missing"))?;
         let origin =
             delivery.origin.as_ref().ok_or_else(|| error!("Draft recovery origin absent"))?;
-        validate_origin(&authenticated, engine.as_ref(), origin)?;
+        let claims = historical_origin(&authenticated, origin)?;
+        validate_creator_claim(&authenticated, &claims)?;
+        if !routing_available(engine.as_ref(), &claims)? {
+            metrics::counter!("rtos_publication_routing_blocked_total").increment(1);
+            return Ok(false);
+        }
         let plan = PropagationPlan::for_event(
             entry.record.protocol,
             PropagationEvent::Finalized,
@@ -570,11 +580,7 @@ impl State {
             effects.push(effect_from_destination(destination)?);
         }
         self.write(store, move |store| store.resolve_draft(id, effects)).await?;
-        self.snapshot(store)
-            .await?
-            .into_iter()
-            .find(|e| e.id == id)
-            .ok_or_else(|| error!("Resolved draft disappeared"))
+        Ok(true)
     }
     async fn accept(
         &self,
@@ -602,13 +608,43 @@ impl State {
                 .origin
                 .as_ref()
                 .ok_or_else(|| error!("Delivery recovery origin absent"))?;
-            validate_origin(&publication, engine.as_ref(), origin)?;
+            let claims = historical_origin(&publication, origin)?;
+            validate_creator_claim(&publication, &claims)?;
         }
         // Deliberately not cancelable: this phase can write state/proof data.
         let (entry, accepted) = accept_authenticated_publication(publication, engine).await?;
         let id = entry.id;
-        self.write(store, move |store| store.mark_ready(id)).await?;
+        self.write(store, move |store| store.mark_accepted(id)).await?;
         Ok(accepted)
+    }
+    async fn routing_ready(
+        &self,
+        store: &Arc<PropagationOutbox>,
+        engine: &Arc<Engine>,
+        entry: &UnverifiedRecord,
+    ) -> Result<bool> {
+        let id = entry.id;
+        let Some(delivery) = self.write(store, move |store| store.delivery_for_record(id)).await?
+        else {
+            // Version-1 legacy submissions have no handoff origin. Keep their
+            // historical authentication/plan contract; do not invent an origin.
+            return Ok(true);
+        };
+        let publication = tokio::time::timeout(
+            HISTORY_TIMEOUT,
+            authenticate_publication(
+                &engine.masterchain_proof_verifier,
+                engine.as_ref(),
+                entry.clone(),
+                &self.limits,
+            ),
+        )
+        .await
+        .map_err(|_| error!("Publication routing history timeout"))??;
+        let origin = delivery.origin.as_ref().ok_or_else(|| error!("Delivery origin absent"))?;
+        let claims = historical_origin(&publication, origin)?;
+        validate_creator_claim(&publication, &claims)?;
+        routing_available(engine.as_ref(), &claims)
     }
     async fn send_while_serving(
         &self,
@@ -684,12 +720,41 @@ impl State {
             selected
         }
     }
+    fn select_acceptance(
+        &self,
+        entries: &[UnverifiedRecord],
+        now: tokio::time::Instant,
+    ) -> Option<UnverifiedRecord> {
+        if entries.is_empty() {
+            return None;
+        }
+        let enabled = self.enabled.load(Ordering::Acquire);
+        let eligible = |entry: &UnverifiedRecord| {
+            matches!(entry.stage, PublicationStage::DraftDurable | PublicationStage::Prepared)
+                || (enabled && entry.stage == PublicationStage::AcceptedDraft)
+        };
+        let mut retry = self.acceptance_retry.lock().unwrap();
+        retry.retain(|id, _| entries.iter().any(|entry| entry.id.0 == *id && eligible(entry)));
+        let mut cursor = self.acceptance_cursor.lock().unwrap();
+        let start = entries.iter().position(|entry| entry.id.0 > *cursor).unwrap_or(0);
+        let entry = (0..entries.len())
+            .map(|offset| &entries[(start + offset) % entries.len()])
+            .find(|entry| {
+                eligible(entry) && !retry.get(&entry.id.0).is_some_and(|deadline| *deadline > now)
+            })
+            .cloned();
+        if let Some(entry) = &entry {
+            *cursor = entry.id.0;
+            retry.insert(entry.id.0, now + RETRY_INTERVAL);
+        }
+        entry
+    }
     async fn recover(
         &self,
         store: &Arc<PropagationOutbox>,
         receiver: &mut mpsc::Receiver<Submission>,
     ) {
-        if !self.enabled.load(Ordering::Acquire) || self.stop.is_cancelled() {
+        if self.stop.is_cancelled() {
             return;
         }
         let entries = match self.snapshot(store).await {
@@ -702,37 +767,15 @@ impl State {
         let now = tokio::time::Instant::now();
         let now_unix_secs =
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let has_send_work = entries.iter().any(|entry| {
-            entry.stage == PublicationStage::Ready && !entry.record.is_expired(now_unix_secs)
-        });
+        let has_send_work = self.enabled.load(Ordering::Acquire)
+            && entries.iter().any(|entry| {
+                entry.stage == PublicationStage::Ready && !entry.record.is_expired(now_unix_secs)
+            });
         // One slow historical debt cannot consume every scheduling turn while
         // already-accepted records have effects ready to send.
         let acceptance_turn = self.acceptance_turn.swap(true, Ordering::AcqRel);
         let selected = if acceptance_turn || !has_send_work {
-            let mut retry = self.acceptance_retry.lock().unwrap();
-            retry.retain(|id, _| {
-                entries.iter().any(|e| {
-                    e.id.0 == *id
-                        && matches!(
-                            e.stage,
-                            PublicationStage::DraftDurable | PublicationStage::Prepared
-                        )
-                })
-            });
-            let mut cursor = self.acceptance_cursor.lock().unwrap();
-            let start = entries.iter().position(|e| e.id.0 > *cursor).unwrap_or(0);
-            let entry = (0..entries.len())
-                .map(|offset| &entries[(start + offset) % entries.len()])
-                .find(|e| {
-                    matches!(e.stage, PublicationStage::DraftDurable | PublicationStage::Prepared)
-                        && !retry.get(&e.id.0).is_some_and(|deadline| *deadline > now)
-                })
-                .cloned();
-            if let Some(entry) = &entry {
-                *cursor = entry.id.0;
-                retry.insert(entry.id.0, now + RETRY_INTERVAL);
-            }
-            entry
+            self.select_acceptance(&entries, now)
         } else {
             None
         };
@@ -741,8 +784,23 @@ impl State {
             let retry_id = entry.id.0;
             if let Some(engine) = self.engine.upgrade() {
                 let result = async {
-                    let entry = self.resolve_draft(store, &engine, entry).await?;
-                    self.accept(store, engine, entry).await
+                    let id = entry.id;
+                    // Actual acceptance precedes routing and never depends on a
+                    // retired local key or publication expiry.
+                    self.accept(store, engine.clone(), entry).await?;
+                    if self.enabled.load(Ordering::Acquire) {
+                        let entry = self
+                            .snapshot(store)
+                            .await?
+                            .into_iter()
+                            .find(|entry| entry.id == id)
+                            .ok_or_else(|| error!("Accepted draft disappeared"))?;
+                        if !self.resolve_draft(store, &engine, entry).await? {
+                            self.acceptance_retry.lock().unwrap().insert(retry_id, tokio::time::Instant::now() + RETRY_INTERVAL);
+                            log::debug!("Accepted publication {retry_id} waits for original routing authority");
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(())
                 }
                 .await;
                 if let Err(error) = result {
@@ -750,10 +808,13 @@ impl State {
                         .lock()
                         .unwrap()
                         .insert(retry_id, tokio::time::Instant::now() + RETRY_INTERVAL);
-                    log::warn!("Durable delivery acceptance deferred: {error}");
+                    log::warn!("Durable delivery acceptance or routing retry deferred: {error}");
                 }
                 self.wake.notify_one();
             }
+            return;
+        }
+        if !self.enabled.load(Ordering::Acquire) {
             return;
         }
         let now_unix_secs =
@@ -786,6 +847,27 @@ impl State {
                     return;
                 }
             };
+            match self.routing_ready(store, &engine, &entry).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    metrics::counter!("rtos_publication_routing_blocked_total").increment(1);
+                    self.retry_after.lock().unwrap().insert(
+                        (entry.id.0, effect.clone()),
+                        tokio::time::Instant::now() + RETRY_INTERVAL,
+                    );
+                    self.wake.notify_one();
+                    return;
+                }
+                Err(error) => {
+                    log::warn!("Publication routing deferred: {error}");
+                    self.retry_after.lock().unwrap().insert(
+                        (entry.id.0, effect.clone()),
+                        tokio::time::Instant::now() + RETRY_INTERVAL,
+                    );
+                    self.wake.notify_one();
+                    return;
+                }
+            }
             let plan = match validate_plan(&entry) {
                 Ok(plan) => plan,
                 Err(_) => return,
@@ -843,11 +925,17 @@ impl State {
     }
 }
 
-fn validate_origin(
+/// Historical consistency of a stored local-role claim is not proof that this
+/// node currently possesses (or ever possessed) the claimed transport key.
+struct OriginClaims {
+    local_adnl: Arc<rtos_block::KeyId>,
+    local_validator: Option<UInt256>,
+    locally_generated: bool,
+}
+fn historical_origin(
     publication: &crate::propagation_outbox_auth::AuthenticatedPublication,
-    engine: &Engine,
     origin: &RecoveryOrigin,
-) -> Result<()> {
+) -> Result<OriginClaims> {
     if origin.carrier_version != publication.context().carrier_version() {
         fail!("Recovery carrier envelope version differs from history");
     }
@@ -859,33 +947,45 @@ fn validate_origin(
         fail!("Recovery creator is not bound to body and governing committee");
     }
     let transport = rtos_block::KeyId::from_data(*origin.local_adnl.as_array());
-    if engine.adnl_key_by_id(&transport).is_none() {
-        fail!("Recovery local transport key unavailable");
-    }
     let local_id = if let Some(index) = origin.local_validator_index {
         let member = committee
             .get(index as usize)
             .ok_or_else(|| error!("Recovery local validator index out of range"))?;
-        let id = member.validator_id()?;
-        if member.adnl_addr()? != transport
-            || !engine
-                .consensus_transport_bindings()?
-                .iter()
-                .any(|binding| binding.validator_id == id && binding.adnl_key_id == transport)
-        {
-            fail!("Recovery local validator transport binding is not authenticated");
+        if member.adnl_addr()? != transport {
+            fail!("Recovery local index and historical ADNL differ");
         }
-        Some(id)
+        Some(member.validator_id()?)
     } else {
         if committee.iter().any(|member| member.adnl_addr().ok().as_ref() == Some(&transport)) {
             fail!("Recovery observer role conflicts with historical validator transport");
         }
         None
     };
-    if publication.entry().record.locally_generated != (local_id.as_ref() == Some(&creator)) {
-        fail!("Recovery creator routing claim differs from authenticated local role");
+    Ok(OriginClaims {
+        local_adnl: transport,
+        locally_generated: local_id.as_ref() == Some(&creator),
+        local_validator: local_id,
+    })
+}
+fn validate_creator_claim(
+    publication: &crate::propagation_outbox_auth::AuthenticatedPublication,
+    claims: &OriginClaims,
+) -> Result<()> {
+    if publication.entry().record.locally_generated != claims.locally_generated {
+        fail!("Recovery creator routing claim differs from historical role claim");
     }
     Ok(())
+}
+fn routing_available(engine: &dyn EngineOperations, claims: &OriginClaims) -> Result<bool> {
+    if engine.adnl_key_by_id(&claims.local_adnl).is_none() {
+        return Ok(false);
+    }
+    match &claims.local_validator {
+        Some(id) => Ok(engine.consensus_transport_bindings()?.iter().any(|binding| {
+            &binding.validator_id == id && binding.adnl_key_id == claims.local_adnl
+        })),
+        None => Ok(true),
+    }
 }
 
 fn effect_from_destination(destination: PropagationDestination) -> Result<PublicationEffect> {
@@ -1111,6 +1211,58 @@ mod tests {
         };
         assert!(worker.admit_draft(request).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn publication_worker_disabled_accepts_expired_debt_but_does_not_resolve_routing() {
+        let state = state();
+        let now = tokio::time::Instant::now();
+        let mut draft = scheduling_entry(1, 1);
+        draft.stage = PublicationStage::DraftDurable;
+        draft.record.effects.clear();
+        draft.pending.clear();
+        let mut prepared = scheduling_entry(2, 1);
+        prepared.stage = PublicationStage::Prepared;
+        let mut accepted = draft.clone();
+        accepted.id = RecordId(3);
+        accepted.stage = PublicationStage::AcceptedDraft;
+        let mut completed = accepted.clone();
+        completed.id = RecordId(4);
+        completed.stage = PublicationStage::Completed;
+        let entries = vec![draft, prepared, accepted, completed];
+        assert_eq!(state.select_acceptance(&entries, now).unwrap().id, RecordId(1));
+        assert_eq!(state.select_acceptance(&entries, now).unwrap().id, RecordId(2));
+        assert!(state.select_acceptance(&entries, now).is_none());
+        assert!(state.select_retry(&entries, 100, now).is_none());
+        state.enabled.store(true, Ordering::Release);
+        assert_eq!(state.select_acceptance(&entries, now).unwrap().id, RecordId(3));
+        assert!(
+            state.select_acceptance(&entries, now).is_none(),
+            "Completed is not new acceptance debt"
+        );
+    }
+
+    #[test]
+    fn publication_worker_blocked_routing_does_not_hide_other_acceptance_or_sends() {
+        let state = state();
+        state.enabled.store(true, Ordering::Release);
+        let now = tokio::time::Instant::now();
+        let mut blocked = scheduling_entry(1, 200);
+        blocked.stage = PublicationStage::AcceptedDraft;
+        blocked.record.effects.clear();
+        blocked.pending.clear();
+        let mut draft = blocked.clone();
+        draft.id = RecordId(2);
+        draft.stage = PublicationStage::DraftDurable;
+        let ready = scheduling_entry(3, 200);
+        let entries = vec![blocked, draft, ready];
+        state.acceptance_retry.lock().unwrap().insert(1, now + RETRY_INTERVAL);
+        assert_eq!(state.select_acceptance(&entries, now).unwrap().id, RecordId(2));
+        assert_eq!(state.select_retry(&entries, 100, now).unwrap().0.id, RecordId(3));
+        assert_eq!(
+            state.select_acceptance(&entries, now + RETRY_INTERVAL).unwrap().id,
+            RecordId(1)
+        );
     }
 
     #[test]
