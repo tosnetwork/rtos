@@ -140,6 +140,12 @@ impl EngineOperations for Engine {
 
     // Validator specific operations
 
+    fn consensus_transport_bindings(
+        &self,
+    ) -> Result<Vec<crate::config::ConsensusTransportBinding>> {
+        self.network().config_handler().consensus_transport_bindings()
+    }
+
     fn get_validator_status(&self) -> bool {
         self.network().config_handler().get_validator_status()
     }

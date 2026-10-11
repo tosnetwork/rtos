@@ -227,6 +227,12 @@ pub trait EngineOperations: Sync + Send {
 
     // Validator specific operations
 
+    fn consensus_transport_bindings(
+        &self,
+    ) -> Result<Vec<crate::config::ConsensusTransportBinding>> {
+        Ok(Vec::new())
+    }
+
     fn get_validator_status(&self) -> bool {
         unimplemented!()
     }
