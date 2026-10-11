@@ -424,14 +424,14 @@ mod tests {
         let full = ShardIdent::with_tagged_prefix(0, rtos_block::SHARD_FULL)?;
         let (left, right) = full.split()?;
         if extra.shards().get_shard(&full)?.is_none() {
-            extra.shards_mut().add_workchain(
+            extra.shards.add_workchain(
                 0,
                 0,
                 UInt256::from([0x41; 32]),
                 UInt256::from([0x42; 32]),
             )?;
         }
-        extra.shards_mut().update_shard(&full, |mut top| {
+        extra.shards.update_shard(&full, |mut top| {
             top.seq_no = 17;
             top.next_catchain_seqno = 7;
             top.before_split = true;
@@ -446,7 +446,7 @@ mod tests {
             assert_eq!(record.prev_blocks[0].shard(), &full);
             authenticate_retired_session(&split, &record).await?;
         }
-        extra.shards_mut().split_shard(&full, |mut top| {
+        extra.shards.split_shard(&full, |mut top| {
             top.before_split = false;
             top.before_merge = true;
             let mut other = top.clone();
