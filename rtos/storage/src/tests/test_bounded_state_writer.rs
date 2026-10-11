@@ -307,3 +307,41 @@ async fn bounded_state_writer_absence_reservation_excludes_real_writer() -> Resu
     );
     close(db, states).await
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_repair_custody_preselected_delete_rechecks_at_actual_transaction() -> Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let (db, states) = open(dir.path())?;
+    let (root, child, first, second) = fixture();
+    states.put_bounded(&first, root.clone(), LIMITS, Budget::new(usize::MAX)).await?;
+    let budget = Budget::new(usize::MAX);
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    *budget.gate.lock().unwrap() = Some((entered, gate));
+    let writer = {
+        let owner = states.clone();
+        let id = second.clone();
+        let cell = root.clone();
+        tokio::spawn(async move { owner.put_bounded(&id, cell, LIMITS, budget).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), observed).await??;
+    // A decision and queue admission happened before registration. Only the
+    // actual delete consumer can prevent this old work item from deleting.
+    states.in_queue.fetch_add(1, Ordering::Relaxed);
+    states.storer.send(StateCommand::Work(Job::DeleteState(first.clone()), None)).unwrap();
+    let authentication = db.repair_protection().authentication().await?;
+    db.repair_protection().protect([first.clone()], []);
+    drop(authentication);
+    release.send(())?;
+    writer.await??;
+    states.sync_pending().await?;
+    assert!(states.contains_state_record(&first)?);
+    assert_eq!(write_boc(&states.get(&first)?)?, write_boc(&root)?);
+    assert_eq!(count(&db, &root)?, Some(2));
+    assert_eq!(count(&db, &child)?, Some(2));
+    delete(&states, &second).await?;
+    assert!(!states.contains_state_record(&second)?, "unleased control is actually deleted");
+    assert_eq!(count(&db, &root)?, Some(1));
+    close(db, states).await
+}

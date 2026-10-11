@@ -245,6 +245,7 @@ impl FileMapEntry {
 }
 
 pub struct FileMap {
+    protection: Arc<crate::repair_protection::RepairProtection>,
     storage: PackageIndexDb,
     elements: tokio::sync::RwLock<Vec<FileMapEntry>>, // new FileMapEntry every key_block
 }
@@ -259,6 +260,7 @@ impl FileMap {
         #[cfg(feature = "telemetry")] telemetry: &Arc<StorageTelemetry>,
         allocated: &Arc<StorageAlloc>,
     ) -> Result<Self> {
+        let protection = index_db.repair_protection().clone();
         let storage = PackageIndexDb::with_db(index_db, path, true)?;
         let mut index_pairs = Vec::new();
 
@@ -272,7 +274,8 @@ impl FileMap {
 
         let mut elements = Vec::new();
         for (key, value) in index_pairs {
-            let unneeded = key < last_unneeded_key_block;
+            let protected = protection.archive_range(key, None);
+            let unneeded = key < last_unneeded_key_block && !protected;
             let finalized = value.finalized() && Some(key) != last;
             log::info!(
                 target: TARGET,
@@ -295,6 +298,9 @@ impl FileMap {
             {
                 Ok(s) => s,
                 Err(e) => {
+                    if protected {
+                        return Err(e);
+                    }
                     log::warn!(target: TARGET, "Can't read archive slice {key}: {e}");
                     if unneeded {
                         match storage.delete(&key.into()) {
@@ -327,7 +333,7 @@ impl FileMap {
             telemetry.file_entries.update(allocated.file_entries.load(Ordering::Relaxed))
         }
 
-        Ok(Self { storage, elements: tokio::sync::RwLock::new(elements) })
+        Ok(Self { protection, storage, elements: tokio::sync::RwLock::new(elements) })
     }
 
     pub async fn put(
@@ -399,6 +405,7 @@ impl FileMap {
         }
 
         for key in slices {
+            let _deletion = self.protection.deletion().await;
             // Skip and retry next cycle on outstanding refs.
             let mut entry = {
                 let mut guard = self.elements.write().await;
@@ -406,6 +413,10 @@ impl FileMap {
                     log::error!(target: TARGET, "Archives GC: slice {key} not found");
                     continue;
                 };
+                let end = guard.get(pos + 1).map(|entry| entry.key);
+                if self.protection.archive_range(key, end) {
+                    continue;
+                }
                 if Arc::strong_count(&guard[pos].value) > 1 {
                     log::warn!(target: TARGET, "Archives GC: outstanding refs on {key}, skip");
                     continue;
@@ -499,6 +510,10 @@ impl FileMap {
         block_id: &BlockIdExt,
         delete_condition: &F,
     ) -> Result<()> {
+        let _deletion = self.protection.deletion().await;
+        if self.protection.archive_range(0, None) {
+            fail!("Archive truncation conflicts with repair custody");
+        }
         let mut guard = self.elements.write().await;
         log::trace!(
             target: TARGET,

@@ -1,10 +1,9 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
-//! Live-only repair of an existing applied masterchain Final.
-//!
-//! This never authorizes spool reclamation. State pins are process-local; archive
-//! files and history have no persistent dependency lease here. Authentication is
-//! bounded across historical reads, Merkle apply and dedicated state persistence.
-//! Native database caches remain outside the request's Rust allocation accounting.
+//! Bounded repair of an existing applied masterchain Final.
+//! Live guards alone convey no release authority. The separate persistent
+//! entrypoint authenticates and durably protects an exact event's dependencies;
+//! the publication worker still owns the source Delivered/Released transaction.
+//! Native database caches remain outside request allocation accounting.
 use crate::{
     block::BlockStuff, block_proof::BlockProofStuff, engine::Engine,
     engine_traits::EngineOperations, shard_states_keeper::PinnedShardStateGuard,
@@ -87,6 +86,7 @@ pub(crate) struct McFinalRepairCustody {
     proof: BlockProofStuff,
     parent: PinnedShardStateGuard,
     target: PinnedShardStateGuard,
+    budget: Arc<crate::history_read_budget::HistoryReadBudget>,
     _admission: Admission,
 }
 impl McFinalRepairCustody {
@@ -125,10 +125,7 @@ fn check_domain(engine: &Engine, request: &McFinalRepairRequest) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn repair_mc_final(
-    engine: Arc<Engine>,
-    request: McFinalRepairRequest,
-) -> Result<McFinalRepairCustody> {
+fn admit(engine: &Arc<Engine>, request: &McFinalRepairRequest) -> Result<Admission> {
     check_domain(engine.as_ref(), &request)?;
     static CAPACITY: OnceLock<Arc<Semaphore>> = OnceLock::new();
     let permit = CAPACITY
@@ -140,10 +137,23 @@ pub(crate) async fn repair_mc_final(
     if !active().lock().unwrap().insert(key.clone()) {
         fail!("MC repair target is busy");
     }
-    let admission = Admission { key, _permit: permit };
+    Ok(Admission { key, _permit: permit })
+}
+
+pub(crate) async fn repair_mc_final(
+    engine: Arc<Engine>,
+    request: McFinalRepairRequest,
+) -> Result<McFinalRepairCustody> {
+    let admission = admit(&engine, &request)?;
     let owner = engine.clone();
     let observed = spawn_owned(engine.as_ref(), "masterchain Final live repair", async move {
-        repair_owned(owner, request, admission).await
+        repair_owned(
+            owner,
+            request,
+            admission,
+            crate::history_read_budget::HistoryReadBudget::new(Default::default()),
+        )
+        .await
     })?;
     // The timeout cancels only observation; the Engine still joins the real
     // worker with admission, budget, pins and blocking IO retained.
@@ -231,12 +241,12 @@ async fn repair_owned(
     engine: Arc<Engine>,
     request: McFinalRepairRequest,
     admission: Admission,
+    budget: Arc<crate::history_read_budget::HistoryReadBudget>,
 ) -> Result<McFinalRepairCustody> {
     check_domain(engine.as_ref(), &request)?;
     // The Engine-owned worker awaits local file IO to completion. Do not put
     // this under the timeout below: tokio file IO can own a blocking operation
     // which would otherwise outlive its observer and admission permit.
-    let budget = crate::history_read_budget::HistoryReadBudget::new(Default::default());
     let mut local = match read_pair(engine.as_ref(), &request.block_id, &budget).await {
         Ok(pair) => Some(pair),
         Err(error) if crate::history_read_budget::stops_fallback(&error) => {
@@ -414,11 +424,16 @@ async fn repair_owned(
     drop(target_reservation); // transfer to the verified target's existing pin
     drop(existing_target);
     check_domain(engine.as_ref(), &request)?;
+    budget.record_bytes("block", candidate.block_id(), candidate.block().data(), None)?;
+    budget.record_history_proof(candidate.proof())?;
+    budget.record_state(parent.state().block_id(), parent.state().root_cell())?;
+    budget.record_state(target.state().block_id(), target.state().root_cell())?;
     Ok(McFinalRepairCustody {
         block: candidate.block().clone(),
         proof: candidate.proof().clone(),
         parent,
         target,
+        budget,
         _admission: admission,
     })
 }
@@ -495,4 +510,277 @@ pub(crate) fn assert_ordinary_durability_allowed(engine: &Engine) {
         !bounded_only_engines().lock().unwrap().contains(&(engine as *const Engine as usize)),
         "bounded repair entered ordinary durability/apply"
     );
+}
+
+/// Private capability: only the owned fresh-authentication handoff or verified
+/// cold replay below can construct it. It cannot be decoded from a ledger.
+pub(crate) struct DurableMcFinalRepairCustody {
+    binding: crate::repair_lease_binding::RepairLeaseBinding,
+    lease_generation: u64,
+    dependency_digest: UInt256,
+    _live: McFinalRepairCustody,
+}
+impl DurableMcFinalRepairCustody {
+    pub(crate) fn binding(&self) -> &crate::repair_lease_binding::RepairLeaseBinding {
+        &self.binding
+    }
+    pub(crate) fn lease_generation(&self) -> u64 {
+        self.lease_generation
+    }
+    pub(crate) fn dependency_digest(&self) -> &UInt256 {
+        &self.dependency_digest
+    }
+}
+fn check_binding(
+    request: &McFinalRepairRequest,
+    binding: &crate::repair_lease_binding::RepairLeaseBinding,
+) -> Result<()> {
+    binding.validate()?;
+    let domain = &binding.domain;
+    if binding.canonical.block_id != request.block_id
+        || domain.zerostate != request.pin.zerostate
+        || domain.global_id != request.pin.global_id
+        || domain.history_init != request.history_init
+        || domain.session_id != request.session_id
+        || domain.profile != request.profile
+        || domain.protocol != request.protocol
+        || domain.carrier_version != request.carrier_version
+        || domain.wire_profile != request.wire_profile
+    {
+        fail!("Repair event and authenticated request differ");
+    }
+    Ok(())
+}
+fn request_from_binding(
+    binding: &crate::repair_lease_binding::RepairLeaseBinding,
+) -> McFinalRepairRequest {
+    let d = &binding.domain;
+    McFinalRepairRequest {
+        pin: SessionNetworkPin { zerostate: d.zerostate.clone(), global_id: d.global_id },
+        history_init: d.history_init.clone(),
+        block_id: binding.canonical.block_id.clone(),
+        session_id: d.session_id.clone(),
+        profile: d.profile.clone(),
+        protocol: d.protocol,
+        carrier_version: d.carrier_version,
+        wire_profile: d.wire_profile,
+    }
+}
+pub(crate) async fn obtain_durable_mc_custody(
+    engine: Arc<Engine>,
+    request: McFinalRepairRequest,
+    binding: crate::repair_lease_binding::RepairLeaseBinding,
+) -> Result<DurableMcFinalRepairCustody> {
+    check_binding(&request, &binding)?;
+    let admission = admit(&engine, &request)?;
+    let owner = engine.clone();
+    let worker =
+        spawn_owned(engine.as_ref(), "persistent masterchain repair custody", async move {
+            let leases = owner.db().repair_leases().clone();
+            let _authentication = leases.protection().authentication().await?;
+            let budget = crate::history_read_budget::HistoryReadBudget::new(Default::default());
+            budget.enable_provenance();
+            let source_state = crate::retired_history::authenticate_state_with_budget(
+                owner.as_ref(),
+                &binding.domain.source_recovery_anchor,
+                Some(&budget),
+            )
+            .await?;
+            crate::validator::retired_session_auth::validate_close_recovery_binding(
+                owner.as_ref(),
+                &binding,
+                &source_state,
+            )?;
+            let live = repair_owned(owner.clone(), request, admission, budget.clone()).await?;
+            if live.block.block()?.read_extra()?.created_by() != &binding.canonical.source_validator
+            {
+                fail!("Repair body creator differs from event source");
+            }
+            let (dependencies, proofs) = budget.take_provenance()?;
+            use storage::bounded_cell::CellReadBudget;
+            budget.metadata(256 << 10)?;
+            let digest = crate::publication_dependency_leases::dependency_digest(&dependencies)?;
+            let ledger = leases.clone();
+            let exact = binding.clone();
+            let accounting = budget.clone();
+            let persisted_dependencies = dependencies.clone();
+            let generation = tokio::task::spawn_blocking(move || {
+                ledger.begin(&exact, persisted_dependencies, &accounting)
+            })
+            .await
+            .map_err(|e| error!("Repair protection writer: {e}"))??;
+            // Protecting is already durable. Any error below retains that protection
+            // and the original publication record; only success permits handoff.
+            let synchronized = async {
+                for proof in &proofs {
+                    owner.db().sync_repair_history_proof(proof, &budget).await?;
+                }
+                for dependency in &dependencies {
+                    if dependency.kind == "capsule-state" {
+                        crate::retired_history::sync_repair_capsule(
+                            owner.as_ref(),
+                            &dependency.validate()?,
+                            &dependency.digest,
+                            dependency.bytes,
+                            &budget,
+                        )
+                        .await?;
+                    }
+                }
+                owner.db().sync_publication_state().await
+            }
+            .await;
+            if let Err(error) = synchronized {
+                leases.poison();
+                return Err(error);
+            }
+
+            let ledger = leases.clone();
+            let accounting = budget.clone();
+            tokio::task::spawn_blocking(move || ledger.durable(generation, &accounting))
+                .await
+                .map_err(|e| error!("Repair custody writer: {e}"))??;
+            Ok(DurableMcFinalRepairCustody {
+                binding,
+                lease_generation: generation,
+                dependency_digest: digest,
+                _live: live,
+            })
+        })?;
+    worker.await.map_err(|e| error!("Persistent repair owner failed: {e}"))?
+}
+
+pub(crate) async fn reopen_durable_mc_custody(
+    engine: Arc<Engine>,
+    lease_generation: u64,
+    binding: crate::repair_lease_binding::RepairLeaseBinding,
+    dependency_digest: UInt256,
+) -> Result<DurableMcFinalRepairCustody> {
+    let request = request_from_binding(&binding);
+    check_binding(&request, &binding)?;
+    let admission = admit(&engine, &request)?;
+    let owner = engine.clone();
+    let worker = spawn_owned(engine.as_ref(), "cold persistent repair custody", async move {
+        let leases = owner.db().repair_leases().clone();
+        let _authentication = leases.protection().authentication().await?;
+        let budget = crate::history_read_budget::HistoryReadBudget::new(Default::default());
+        budget.enable_provenance();
+        let record = leases.lookup(lease_generation, &budget)?;
+        if record.state != crate::publication_dependency_leases::LeaseState::DurableCustody
+            || record.binding()? != binding
+            || record.dependency_digest != format!("{dependency_digest:x}")
+        {
+            fail!("Repair custody event/generation mismatch");
+        }
+        let mut proofs = Vec::new();
+        for dependency in &record.dependencies {
+            budget.step()?;
+            if !matches!(dependency.kind.as_str(), "proof" | "proof-link") {
+                continue;
+            }
+            let id = dependency.validate()?;
+            let handle = owner
+                .load_block_handle(&id)?
+                .ok_or_else(|| error!("Cold repair proof handle missing"))?;
+            let read = budget
+                .reserve(crate::history_read_budget::ReadKind::Proof, dependency.bytes as usize)?;
+            let bytes = owner
+                .db()
+                .load_block_proof_raw_bounded(
+                    &handle,
+                    dependency.kind == "proof-link",
+                    ArchiveReadLimits { data_bytes: read.allowance(), filename_bytes: 512 },
+                )
+                .await?;
+            read.finish(&bytes)?;
+            if bytes.len() as u64 != dependency.bytes
+                || format!("{:x}", UInt256::calc_file_hash(&bytes)) != dependency.digest
+            {
+                fail!("Cold repair proof digest mismatch");
+            }
+            use storage::bounded_cell::CellReadBudget;
+            budget.metadata(std::mem::size_of::<BlockProofStuff>())?;
+            proofs.try_reserve_exact(1)?;
+            proofs.push(BlockProofStuff::deserialize_bounded(
+                &id,
+                bytes,
+                dependency.kind == "proof-link",
+                &budget,
+            )?);
+        }
+        budget.set_replay_proofs(proofs);
+        // Authenticate capsule-internal closure as well as ordinary source
+        // recovery state. No latest-state hint or authority cache is required.
+        for dependency in &record.dependencies {
+            if dependency.kind == "capsule-state" {
+                let id = dependency.validate()?;
+                crate::retired_history::authenticate_state_with_budget(
+                    owner.as_ref(),
+                    &id,
+                    Some(&budget),
+                )
+                .await?;
+            }
+        }
+        let source_state = crate::retired_history::authenticate_state_with_budget(
+            owner.as_ref(),
+            &binding.domain.source_recovery_anchor,
+            Some(&budget),
+        )
+        .await?;
+        crate::validator::retired_session_auth::validate_close_recovery_binding(
+            owner.as_ref(),
+            &binding,
+            &source_state,
+        )?;
+        let live = repair_owned(owner.clone(), request, admission, budget.clone()).await?;
+        if live.block.block()?.read_extra()?.created_by() != &binding.canonical.source_validator {
+            fail!("Repair body creator differs from event source");
+        }
+        let (dependencies, proofs) = budget.take_provenance()?;
+        use storage::bounded_cell::CellReadBudget;
+        budget.metadata(256 << 10)?;
+        if dependencies != record.dependencies
+            || crate::publication_dependency_leases::dependency_digest(&dependencies)?
+                != dependency_digest
+        {
+            fail!("Cold authenticated dependency closure differs from durable lease");
+        }
+        let synchronized = async {
+            for proof in &proofs {
+                owner.db().sync_repair_history_proof(proof, &budget).await?;
+            }
+            for dependency in &dependencies {
+                if dependency.kind == "capsule-state" {
+                    crate::retired_history::sync_repair_capsule(
+                        owner.as_ref(),
+                        &dependency.validate()?,
+                        &dependency.digest,
+                        dependency.bytes,
+                        &budget,
+                    )
+                    .await?;
+                }
+            }
+            owner.db().sync_publication_state().await
+        }
+        .await;
+        if let Err(error) = synchronized {
+            leases.poison();
+            return Err(error);
+        }
+
+        let ledger = leases.clone();
+        let accounting = budget.clone();
+        tokio::task::spawn_blocking(move || ledger.durable(lease_generation, &accounting))
+            .await
+            .map_err(|e| error!("Cold repair custody writer: {e}"))??;
+        Ok(DurableMcFinalRepairCustody {
+            binding,
+            lease_generation,
+            dependency_digest,
+            _live: live,
+        })
+    })?;
+    worker.await.map_err(|e| error!("Cold repair owner failed: {e}"))?
 }

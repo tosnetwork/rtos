@@ -601,6 +601,14 @@ pub(crate) async fn authenticate_state_with_budget<E: EngineOperations + ?Sized>
         budget,
     )
     .await?;
+    if let Some(budget) = budget {
+        budget.record_bytes(
+            "capsule-state",
+            id,
+            &evidence.state,
+            Some(verified.state().root_cell().repr_hash()),
+        )?;
+    }
     if verified.state().state()?.global_id() != evidence.manifest.global_id {
         fail!("History global ID mismatch");
     }
@@ -918,3 +926,39 @@ mod tests {
 #[cfg(test)]
 #[path = "tests/test_retained_publication_history.rs"]
 mod publication_tests;
+
+/// Repeat real barriers for the exact already authenticated capsule dependency.
+/// Store admission holds its file lock; there is currently no capsule collector
+/// or same-ID replacement path. A future collector must consume repair leases.
+pub(crate) async fn sync_repair_capsule<E: EngineOperations + ?Sized>(
+    engine: &E,
+    id: &BlockIdExt,
+    expected_digest: &str,
+    expected_bytes: u64,
+    budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
+) -> Result<()> {
+    let path = root(engine)?;
+    let domain = Domain::from_engine(engine)?;
+    let id = id.clone();
+    let expected_digest = expected_digest.to_owned();
+    let budget = budget.clone();
+    owned_io(engine, move || {
+        let store = Store::open(path, Limits::default())?;
+        let evidence = store
+            .read_budget(&domain, &id, Some(&budget))?
+            .ok_or_else(|| error!("Repair capsule disappeared"))?;
+        if evidence.state.len() as u64 != expected_bytes
+            || format!("{:x}", UInt256::calc_file_hash(&evidence.state)) != expected_digest
+        {
+            fail!("Repair capsule state changed");
+        }
+        File::open(store.root.join(format!("{}.json", anchor_name(&domain, &id))))?.sync_all()?;
+        File::open(store.root.join(format!("{}.blob", evidence.manifest.state)))?.sync_all()?;
+        for proof in &evidence.manifest.proofs {
+            File::open(store.root.join(format!("{}.blob", proof.blob)))?.sync_all()?;
+        }
+        File::open(&store.root)?.sync_all()?;
+        Ok(())
+    })
+    .await
+}

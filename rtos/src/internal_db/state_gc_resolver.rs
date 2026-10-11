@@ -23,6 +23,7 @@ pub struct AllowStateGcSmartResolver {
     min_ref_mc_block: AtomicU32,
     min_actual_ss: lockfree::map::Map<ShardIdent, AtomicU32>,
     life_time_sec: u64,
+    repair_protection: Option<std::sync::Arc<storage::repair_protection::RepairProtection>>,
     pinned_roots: parking_lot::RwLock<HashMap<BlockIdExt, u32>>,
     #[cfg(test)]
     test_expired: std::sync::atomic::AtomicBool,
@@ -41,10 +42,20 @@ impl AllowStateGcSmartResolver {
             min_ref_mc_block: AtomicU32::new(0),
             min_actual_ss: lockfree::map::Map::new(),
             life_time_sec,
+            repair_protection: None,
             pinned_roots: parking_lot::RwLock::new(HashMap::new()),
             #[cfg(test)]
             test_expired: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn with_repair_protection(
+        life_time_sec: u64,
+        protection: std::sync::Arc<storage::repair_protection::RepairProtection>,
+    ) -> Self {
+        let mut resolver = Self::new(life_time_sec);
+        resolver.repair_protection = Some(protection);
+        resolver
     }
 
     pub async fn advance(
@@ -185,6 +196,9 @@ impl AllowStateGcSmartResolver {
     }
 
     fn allow_state_gc(&self, block_id: &BlockIdExt, saved_at: u64, gc_utime: u64) -> Result<bool> {
+        if self.repair_protection.as_ref().is_some_and(|p| p.state(block_id)) {
+            return Ok(false);
+        }
         let recent = gc_utime > saved_at && gc_utime - saved_at < self.life_time_sec;
         #[cfg(test)]
         let recent = recent && !self.test_expired.load(Ordering::Acquire);

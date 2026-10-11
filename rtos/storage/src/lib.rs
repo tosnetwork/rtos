@@ -189,3 +189,5 @@ pub(crate) const TARGET: &str = "storage";
 pub mod durability;
 
 pub mod bounded_cell;
+
+pub mod repair_protection;

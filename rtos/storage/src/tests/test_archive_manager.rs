@@ -855,9 +855,14 @@ async fn bounded_archive_manager_preserves_flags_and_reads_loose_and_packed() ->
     let dir = tempfile::tempdir()?;
     let (manager, db) = create_manager(dir.path().to_str().unwrap(), "bounded", false).await?;
     let (handles, _) = create_block_handle_storage(db.clone());
-    let id = BlockIdExt::with_params(ShardIdent::masterchain(), 1,
-        UInt256::with_array([7;32]), UInt256::with_array([8;32]));
-    let handle = handles.create_handle(id.clone(), BlockMeta::with_data(0,0,0,0,0), None)?.unwrap();
+    let id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        1,
+        UInt256::with_array([7; 32]),
+        UInt256::with_array([8; 32]),
+    );
+    let handle =
+        handles.create_handle(id.clone(), BlockMeta::with_data(0, 0, 0, 0, 0), None)?.unwrap();
     let entry = PackageEntryId::Proof(&id);
     manager.add_file(&entry, b"proof").await?;
     handle.set_proof();
@@ -869,17 +874,78 @@ async fn bounded_archive_manager_preserves_flags_and_reads_loose_and_packed() ->
             handle.set_archived();
         }
         assert_eq!(manager.get_file_bounded(&handle, &entry, limits).await?, b"proof");
-        let error = manager.get_file_bounded(&handle, &entry,
-            ArchiveReadLimits { data_bytes: 4, ..limits }).await.unwrap_err();
+        let error = manager
+            .get_file_bounded(&handle, &entry, ArchiveReadLimits { data_bytes: 4, ..limits })
+            .await
+            .unwrap_err();
         assert!(error.downcast_ref::<ArchiveReadLimitExceeded>().is_some());
         assert_eq!(handle.is_archived(), packed);
         assert!(handle.has_proof());
-        let error = manager.get_file_bounded(&handle, &entry,
-            ArchiveReadLimits { filename_bytes: 1, ..limits }).await.unwrap_err();
+        let error = manager
+            .get_file_bounded(&handle, &entry, ArchiveReadLimits { filename_bytes: 1, ..limits })
+            .await
+            .unwrap_err();
         assert!(error.downcast_ref::<ArchiveReadLimitExceeded>().is_some());
         assert_eq!(manager.get_file(&handle, &entry).await?, b"proof");
     }
-    drop(handle); drop(handles); drop(manager); drop(db);
+    drop(handle);
+    drop(handles);
+    drop(manager);
+    drop(db);
     // TempDir owns cleanup; avoid destroy_rocks_db removing its empty parent.
+    Ok(())
+}
+
+#[tokio::test]
+async fn persistent_repair_custody_archive_logical_protection_survives_pack_and_actual_gc(
+) -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (manager, db) = create_manager(dir.path().to_str().unwrap(), "custody", false).await?;
+    let (handles, _) = create_block_handle_storage(db.clone());
+    let mut saved = Vec::new();
+    for (index, seq) in [1, ARCHIVE_SLICE_SIZE + 1].into_iter().enumerate() {
+        let id = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            seq,
+            UInt256::from([index as u8 + 1; 32]),
+            UInt256::from([index as u8 + 3; 32]),
+        );
+        let handle =
+            handles.create_handle(id.clone(), BlockMeta::with_data(0, 0, 0, 0, 0), None)?.unwrap();
+        manager.add_file(&PackageEntryId::Proof(&id), b"proof").await?;
+        handle.set_proof();
+        handle.set_block_applied();
+        if index == 0 {
+            let authentication = db.repair_protection().authentication().await?;
+            db.repair_protection().protect([], [id.clone()]);
+            db.repair_protection().protect_artifact_digest(
+                id.clone(),
+                "proof",
+                UInt256::calc_file_hash(b"proof"),
+            )?;
+            drop(authentication);
+            manager.remove_file(&handle).await?;
+            assert_eq!(manager.get_file(&handle, &PackageEntryId::Proof(&id)).await?, b"proof");
+            assert!(manager
+                .replace_file_durable(&PackageEntryId::Proof(&id), b"other")
+                .await
+                .is_err());
+        }
+        manager.move_to_archive(&handle, || Ok(())).await?;
+        handle.set_archived();
+        saved.push((id, handle));
+    }
+    let cutoff = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        ARCHIVE_SLICE_SIZE * 2,
+        UInt256::default(),
+        UInt256::default(),
+    );
+    manager.gc(&cutoff).await;
+    assert_eq!(manager.get_file(&saved[0].1, &PackageEntryId::Proof(&saved[0].0)).await?, b"proof");
+    assert!(
+        manager.get_file(&saved[1].1, &PackageEntryId::Proof(&saved[1].0)).await.is_err(),
+        "unprotected package must really be destroyed"
+    );
     Ok(())
 }
