@@ -85,7 +85,7 @@ fn bounded_merkle_apply_rejects_loader_before_invocation_and_zero_admission() ->
         hits.fetch_add(1, Ordering::SeqCst);
         Err(error!("unexpected ambient loader"))
     });
-    let loaded = Cell::with_cell_and_loader(old.clone(), loader, None)?;
+    let loaded = Cell::with_cell_and_loader(old.clone(), &loader, None)?;
     assert!(update.apply_for_bounded(&loaded, &LIMITS, &Budget::new([usize::MAX; 3])).is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let budget = Budget::new([usize::MAX, 0, usize::MAX]);

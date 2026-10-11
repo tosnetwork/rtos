@@ -84,9 +84,10 @@ fn fixture() -> (Cell, Cell, BlockIdExt, BlockIdExt) {
 }
 fn count(db: &Arc<RocksDb>, cell: &Cell) -> Result<Option<u32>> {
     let table = db.clone().table::<UInt256>(CELLSCOUNTERS_CF_NAME, false)?;
-    Ok(table
+    let value = table
         .try_get_raw(cell.repr_hash().as_slice())?
-        .map(|raw| u32::from_le_bytes(raw[..].try_into().unwrap())))
+        .map(|raw| u32::from_le_bytes(raw[..].try_into().unwrap()));
+    Ok(value)
 }
 async fn close(db: Arc<RocksDb>, states: Arc<ShardStateDb>) -> Result<()> {
     states.stop().await;
