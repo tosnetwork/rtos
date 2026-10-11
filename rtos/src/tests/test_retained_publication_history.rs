@@ -108,6 +108,10 @@ impl EngineOperations for CapsuleEngine {
     ) -> Result<BlockProofStuff> {
         fail!("ordinary historical proof unavailable")
     }
+    async fn load_last_applied_mc_state_bounded(&self,
+        _budget: Arc<crate::history_read_budget::HistoryReadBudget>) -> Result<Arc<ShardStateStuff>> {
+        fail!("ordinary historical index unavailable")
+    }
     async fn load_last_applied_mc_state(&self) -> Result<Arc<ShardStateStuff>> {
         fail!("ordinary historical index unavailable")
     }

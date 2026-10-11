@@ -10,6 +10,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 pub mod filedb;
+pub mod node;
 pub mod rocksdb;
 
 #[cfg(test)]

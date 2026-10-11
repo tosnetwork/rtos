@@ -41,6 +41,34 @@ impl<'a> SliceReader<'a> {
     }
 }
 
+/// Validate all descriptor-derived slice bounds before any decoder allocation.
+pub fn validate_stored_cell_layout(data: &[u8]) -> Result<()> {
+    if data.len() < 2 || data.len() > STORED_CELL_MAX_RAW_LEN {
+        fail!("Invalid stored cell record length");
+    }
+    let body = full_len(data);
+    if body > data.len() || refs_count(data) > MAX_REFERENCES_COUNT {
+        fail!("Truncated stored cell body");
+    }
+    if data[0] & 8 != 0 && data[1] == 0 {
+        fail!("Empty exotic stored cell");
+    }
+    let extra = if store_hashes(data) {
+        0
+    } else {
+        let levels = if cell_type(data) == CellType::PrunedBranch {
+            0
+        } else {
+            level_mask(data).level() as usize
+        };
+        levels * (SHA256_SIZE + DEPTH_SIZE) + DEPTH_SIZE
+    };
+    if body + extra + refs_count(data) * (SHA256_SIZE + DEPTH_SIZE) != data.len() {
+        fail!("Invalid stored cell reference layout");
+    }
+    Ok(())
+}
+
 /// Deserialize cell data from DB and return a `Cell` (LoadedCell variant).
 pub fn deserialize_stored_cell(
     repr_hash: &UInt256,

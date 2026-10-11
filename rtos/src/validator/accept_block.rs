@@ -1266,6 +1266,61 @@ pub(crate) async fn accept_authenticated_publication(
     Ok((entry, accepted))
 }
 
+/// Reconstruct authenticated acceptance for an already applied MC block.
+/// This does not repair storage or authorize releasing any durable source record.
+/// The caller must complete the physical durability barrier before claiming custody.
+pub(crate) async fn accept_authenticated_mc_repair(
+    block: BlockStuff,
+    proof: BlockProofStuff,
+    context: crate::block_proof::PqPublicationContext,
+    engine: Arc<dyn EngineOperations>,
+    budget: Arc<crate::history_read_budget::HistoryReadBudget>,
+) -> Result<AcceptedSessionBlock> {
+    if !block.id().shard().is_masterchain()
+        || block.id().seq_no() == 0
+        || proof.is_link()
+        || proof.id() != block.id()
+    {
+        fail!("MC repair requires a nonzero masterchain block and its full proof");
+    }
+    if context.zerostate() != engine.zerostate_id()?
+        || context.history_init() != engine.init_mc_block_id()
+        || context.global_id() != block.block()?.global_id()
+        || engine.validator_network().wire_profile() != rtos_api::WireProfile::T0
+    {
+        fail!("MC repair context belongs to another Engine domain");
+    }
+    let existing = engine
+        .load_block_handle(block.id())?
+        .ok_or_else(|| error!("MC repair target handle is absent"))?;
+    if !existing.is_applied() {
+        fail!("MC repair target is not already applied");
+    }
+    // Check both hashes even when the caller obtained a BlockStuff through a
+    // legacy root-only decoder. No applied/has-data flag grants authentication.
+    block.verify_expected_id(block.id())?;
+    let (_, previous) = construct_and_check_prev_stuff(block.root_cell(), block.id(), false)?;
+    if previous.prev.len() != 1 || !previous.prev[0].shard().is_masterchain() {
+        fail!("MC repair requires exactly one masterchain parent");
+    }
+    precheck_header(&block, &previous.prev, false, false)?;
+    engine.check_masterchain_proof_bounded(&proof, budget).await?;
+    let BlockSignaturesVariant::SimplexPq(carrier) = proof.clone().drain_signatures()? else {
+        fail!("MC repair requires a PQ Final certificate");
+    };
+    let verified = context.verifier().verify_final(&carrier)?;
+    // Construct directly: never call apply or trust its already-applied shortcut.
+    // Preserve the authenticated original proof bytes for the subsequent barrier.
+    Ok(AcceptedSessionBlock {
+        block,
+        proof,
+        finality: AcceptedFinality::Final { carrier, _verified: verified },
+        prev: previous.prev,
+        phase: AcceptancePhase::Applied,
+        already_present: true,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn persist_authenticated_pq_block(
     block: BlockStuff,

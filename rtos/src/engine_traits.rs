@@ -375,28 +375,43 @@ pub trait EngineOperations: Sync + Send {
         unimplemented!()
     }
     async fn check_masterchain_proof_bounded(
-        &self, proof: &BlockProofStuff,
+        &self,
+        proof: &BlockProofStuff,
         budget: Arc<crate::history_read_budget::HistoryReadBudget>,
     ) -> Result<()> {
-        crate::block_proof::MasterchainProofVerifier::default().verify_bounded(self, proof, budget).await.map(|_| ())
+        crate::block_proof::MasterchainProofVerifier::default()
+            .verify_bounded(self, proof, budget)
+            .await
+            .map(|_| ())
     }
     async fn historical_pq_publication_context_bounded(
-        &self, id: &BlockIdExt, block: &rtos_block::Block,
+        &self,
+        id: &BlockIdExt,
+        block: &rtos_block::Block,
         budget: Arc<crate::history_read_budget::HistoryReadBudget>,
     ) -> Result<crate::block_proof::PqPublicationContext> {
-        crate::block_proof::MasterchainProofVerifier::default().pq_publication_context_bounded(self, id, block, budget).await
+        crate::block_proof::MasterchainProofVerifier::default()
+            .pq_publication_context_bounded(self, id, block, budget)
+            .await
     }
     async fn load_block_proof_bounded(
-        &self, _handle: &Arc<BlockHandle>, _is_link: bool,
+        &self,
+        _handle: &Arc<BlockHandle>,
+        _is_link: bool,
         _budget: Arc<crate::history_read_budget::HistoryReadBudget>,
     ) -> Result<BlockProofStuff> {
-        Err(crate::history_read_budget::UnsupportedBoundedHistoryRead("physical proof loader").into())
+        Err(crate::history_read_budget::UnsupportedBoundedHistoryRead("physical proof loader")
+            .into())
     }
     async fn download_block_proof_bounded(
-        &self, _id: &BlockIdExt, _is_link: bool, _key_block: bool,
+        &self,
+        _id: &BlockIdExt,
+        _is_link: bool,
+        _key_block: bool,
         _budget: Arc<crate::history_read_budget::HistoryReadBudget>,
     ) -> Result<BlockProofStuff> {
-        Err(crate::history_read_budget::UnsupportedBoundedHistoryRead("network proof loader").into())
+        Err(crate::history_read_budget::UnsupportedBoundedHistoryRead("network proof loader")
+            .into())
     }
 
     async fn check_masterchain_proof(&self, proof: &BlockProofStuff) -> Result<()> {
@@ -719,6 +734,31 @@ pub trait EngineOperations: Sync + Send {
     }
     async fn load_mc_zero_state(&self) -> Result<Arc<ShardStateStuff>> {
         unimplemented!()
+    }
+    async fn load_state_bounded(
+        &self,
+        _id: &BlockIdExt,
+        _budget: Arc<crate::history_read_budget::HistoryReadBudget>,
+    ) -> Result<Arc<ShardStateStuff>> {
+        Err(crate::history_read_budget::UnsupportedBoundedHistoryRead("state graph").into())
+    }
+    async fn load_last_applied_mc_state_bounded(
+        &self,
+        budget: Arc<crate::history_read_budget::HistoryReadBudget>,
+    ) -> Result<Arc<ShardStateStuff>> {
+        let id = self
+            .load_last_applied_mc_block_id()?
+            .ok_or_else(|| error!("Missing last applied state"))?;
+        self.load_state_bounded(&id, budget).await
+    }
+    async fn load_mc_zero_state_bounded(
+        &self,
+        budget: Arc<crate::history_read_budget::HistoryReadBudget>,
+    ) -> Result<Arc<ShardStateStuff>> {
+        let id = self.zerostate_id()?;
+        let state = self.load_state_bounded(id, budget).await?;
+        state.verify_zerostate(id)?;
+        Ok(state)
     }
     async fn load_state(&self, block_id: &BlockIdExt) -> Result<Arc<ShardStateStuff>> {
         unimplemented!()

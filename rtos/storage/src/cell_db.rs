@@ -265,6 +265,87 @@ impl CellDb {
         }
     }
 
+    /// Complete detached graph. No returned Cell retains a database loader.
+    pub fn load_detached(
+        &self,
+        root: &UInt256,
+        budget: &dyn crate::bounded_cell::CellReadBudget,
+    ) -> Result<Cell> {
+        use std::collections::{HashMap, HashSet};
+        enum Work {
+            Visit(UInt256, usize),
+            Build(UInt256, Cell),
+        }
+        let mut stack = vec![Work::Visit(root.clone(), 0)];
+        let mut visiting = HashSet::new();
+        let mut built: HashMap<UInt256, Cell> = HashMap::new();
+        let no_loader: CellLoader = Arc::new(|_| fail!("Detached decoder attempted child IO"));
+        while let Some(work) = stack.pop() {
+            budget.step()?;
+            match work {
+                Work::Visit(hash, depth) => {
+                    if depth > budget.max_depth() as usize {
+                        fail!("Detached graph depth exceeded");
+                    }
+                    if built.contains_key(&hash) {
+                        continue;
+                    }
+                    if visiting.contains(&hash) {
+                        fail!("Cycle in stored cell graph");
+                    }
+                    budget.admit_cell(&hash, crate::bounded_cell::CELL_READ_ALLOCATION, depth)?;
+                    // Do not invoke references on an ambient cached loader.
+                    let cached = self
+                        .cell_cache
+                        .get(&hash)
+                        .or_else(|| self.storing_cells.get(&hash).map(|v| v.val().clone()));
+                    let cell = if let Some(cell) = cached {
+                        let raw = crate::types::serialize_stored_cell(&cell)?;
+                        crate::types::validate_stored_cell_layout(&raw)?;
+                        deserialize_stored_cell(&hash, &raw, &no_loader)?
+                    } else {
+                        let raw = self
+                            .db
+                            .get_pinned_cf(&self.cells_cf()?, hash.as_slice())?
+                            .ok_or_else(|| error!("Missing bounded state cell {hash:x}"))?;
+                        crate::types::validate_stored_cell_layout(&raw)?;
+                        deserialize_stored_cell(&hash, &raw, &no_loader)?
+                    };
+                    if cell.repr_depth() > budget.max_depth() {
+                        fail!("Stored cell depth exceeded");
+                    }
+                    visiting.insert(hash.clone());
+                    stack.push(Work::Build(hash, cell.clone()));
+                    for i in (0..cell.references_count()).rev() {
+                        stack.push(Work::Visit(cell.reference_repr_hash(i)?, depth + 1));
+                    }
+                }
+                Work::Build(hash, cell) => {
+                    let children = (0..cell.references_count())
+                        .map(|i| {
+                            let id = cell.reference_repr_hash(i)?;
+                            built.get(&id).cloned().ok_or_else(|| error!("Missing detached child"))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let detached = Cell::with_data_and_refs(
+                        cell.raw_data()?,
+                        false,
+                        &children,
+                        Some(budget.max_depth()),
+                        None,
+                    )?;
+                    if detached.repr_hash() != &hash {
+                        fail!("Stored cell hash mismatch");
+                    }
+                    budget.complete_cell(&detached)?;
+                    visiting.remove(&hash);
+                    built.insert(hash, detached);
+                }
+            }
+        }
+        built.remove(root).ok_or_else(|| error!("Detached graph has no root"))
+    }
+
     pub(crate) fn load_cell(self: &Arc<Self>, cell_id: &UInt256) -> Result<Cell> {
         if let Some(cell) = self.cell_cache.get(cell_id) {
             #[cfg(feature = "telemetry")]
@@ -466,6 +547,109 @@ impl CellsStorage for CellByHashStorageAdapter {
             cell.write_data(write_hashes, dest)
         } else {
             fail!("Can't load cell {:x} from db", hash);
+        }
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Budget {
+        max: usize,
+        admitted: AtomicUsize,
+        completed: AtomicUsize,
+    }
+    impl Budget {
+        fn new(max: usize) -> Self {
+            Self { max, admitted: AtomicUsize::new(0), completed: AtomicUsize::new(0) }
+        }
+    }
+    impl crate::bounded_cell::CellReadBudget for Budget {
+        fn admit_cell(&self, _: &UInt256, _: usize, _: usize) -> Result<()> {
+            let n = self.admitted.fetch_add(1, Ordering::SeqCst);
+            if n >= self.max {
+                fail!("test cell admission exhausted");
+            }
+            Ok(())
+        }
+        fn complete_cell(&self, _: &Cell) -> Result<()> {
+            self.completed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn step(&self) -> Result<()> {
+            Ok(())
+        }
+        fn metadata(&self, _: usize) -> Result<()> {
+            Ok(())
+        }
+        fn max_depth(&self) -> u16 {
+            4096
+        }
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bounded_state_cells_cold_warm_and_detached() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = RocksDb::new(
+            dir.path().to_str().unwrap(),
+            "bounded",
+            None,
+            crate::db::rocksdb::AccessType::ReadWrite,
+        )?;
+        let boc = Arc::new(crate::dynamic_boc_rc_db::DynamicBocDb::with_db(
+            db.clone(),
+            "cells",
+            "counters",
+            &CellsDbConfig::default(),
+            #[cfg(feature = "telemetry")]
+            Arc::new(crate::StorageTelemetry::default()),
+            Arc::new(StorageAlloc::default()),
+        )?);
+        let original = crate::tests::utils::get_test_tree_of_cells();
+        boc.save_boc(original.clone(), &|| Ok(()))?;
+        let mut stack = vec![original.clone()];
+        let mut hashes = std::collections::HashSet::new();
+        while let Some(cell) = stack.pop() {
+            if hashes.insert(cell.repr_hash().clone()) {
+                for i in 0..cell.references_count() {
+                    stack.push(cell.reference(i)?);
+                }
+            }
+        }
+        let n = hashes.len();
+        for warm in [false, true] {
+            for hash in &hashes {
+                boc.cell_db().remove_from_cache(hash);
+                if warm {
+                    boc.load_cell(hash)?;
+                }
+            }
+            let denied = Budget::new(0);
+            assert!(boc.cell_db().load_detached(original.repr_hash(), &denied).is_err());
+            assert_eq!(denied.completed.load(Ordering::SeqCst), 0);
+            assert!(boc
+                .cell_db()
+                .load_detached(original.repr_hash(), &Budget::new(n - 1))
+                .is_err());
+            let budget = Budget::new(n);
+            let detached = boc.cell_db().load_detached(original.repr_hash(), &budget)?;
+            assert_eq!(budget.admitted.load(Ordering::SeqCst), n);
+            assert_eq!(budget.completed.load(Ordering::SeqCst), n);
+            assert_eq!(detached, original);
+        }
+        let detached = boc.cell_db().load_detached(original.repr_hash(), &Budget::new(n))?;
+        boc.delete_boc(original.repr_hash(), &|| Ok(()), |_| Ok(()))?;
+        assert!(boc.load_cell(original.repr_hash()).is_err());
+        assert_eq!(crate::tests::utils::count_tree_unique_cells(detached.clone()), n);
+        assert_eq!(rtos_block::write_boc(&detached)?, rtos_block::write_boc(&original)?);
+        Ok(())
+    }
+    #[test]
+    fn bounded_state_cell_layout_rejects_before_descriptor_access() {
+        for bytes in
+            [vec![], vec![0], vec![8, 0], vec![8, 0, 0, 0], vec![0, 255], vec![7, 0], vec![0; 1000]]
+        {
+            assert!(crate::types::validate_stored_cell_layout(&bytes).is_err(), "{bytes:?}");
         }
     }
 }

@@ -49,7 +49,10 @@ use storage::{
         BlockInfoDb, NEXT1_BLOCK_DB_NAME, NEXT2_BLOCK_DB_NAME, PREV1_BLOCK_DB_NAME,
         PREV2_BLOCK_DB_NAME,
     },
-    db::rocksdb::{AccessType, RocksDb, NODE_DB_NAME},
+    db::{
+        node::open_node_db,
+        rocksdb::{AccessType, RocksDb},
+    },
     shardstate_db_async::CellsDbConfig,
     traits::Serializable,
     types::BlockMeta,
@@ -265,7 +268,9 @@ pub async fn run_import(config: ImportConfig) -> Result<Arc<RocksDb>> {
     std::fs::create_dir_all(&config.node_db_path).map_err(|e| {
         error!("Cannot create node_db_path {}: {}", config.node_db_path.display(), e)
     })?;
-    let node_db = RocksDb::new(&config.node_db_path, NODE_DB_NAME, None, AccessType::ReadWrite)?;
+    // Import can resume in a database previously opened in dynamic mode.
+    let cells_db_config = CellsDbConfig::default();
+    let node_db = open_node_db(&config.node_db_path, &cells_db_config, AccessType::ReadWrite)?;
 
     let handle_db = Arc::new(BlockHandleDb::with_db(node_db.clone(), BLOCK_HANDLE_DB_NAME, true)?);
     let full_node_state_db = Arc::new(NodeStateDb::with_db(
@@ -314,7 +319,6 @@ pub async fn run_import(config: ImportConfig) -> Result<Arc<RocksDb>> {
         .await?,
     );
 
-    let cells_db_config = CellsDbConfig::default();
     let (archive_cells_opts, archive_cells_cache) =
         storage::cell_db::CellDb::build_cf_options(cells_db_config.cells_cache_size_bytes);
     let archive_states_db = RocksDb::new(

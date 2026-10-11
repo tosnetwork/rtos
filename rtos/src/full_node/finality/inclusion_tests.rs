@@ -1119,5 +1119,8 @@ mod retired_service_tests;
 #[path = "history_gc_tests.rs"]
 mod history_gc_tests;
 
+#[path = "publication_repair_tests.rs"]
+mod publication_repair_tests;
+
 #[path = "bounded_download_tests.rs"]
 mod bounded_download_tests;
