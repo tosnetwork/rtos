@@ -246,7 +246,7 @@ async fn test_overlay_client() {
         .unwrap();
     let neighbours = client.neighbours();
     assert!(neighbours.add(peer).unwrap());
-    match client
+    let reply = client
         .send_adnl_query::<AdnlPongBoxed>(
             &TaggedTlObject {
                 object: AdnlPing { value: 1 }.into_tl_object(),
@@ -257,8 +257,11 @@ async fn test_overlay_client() {
             Some(10),
             None,
         )
-        .await
-    {
+        .await;
+    // The runtime waits for owned ADNL thread joins. Close the network before
+    // checking the reply so a failed assertion cannot leave those threads live.
+    network.stop_adnl().await.unwrap();
+    match reply {
         Ok(_) => assert!(false),
         Err(e) => {
             println!("Error: {}", e);

@@ -697,14 +697,7 @@ async fn import_mc_blocks(
         let Some(entry) = maps.blocks.get(last_mc_block_id) else {
             fail!("Inconsistent blocks map: block {} is missing", last_mc_block_id.seq_no());
         };
-        let (handle, block, _proof) =
-            save_block(&sync_context.engine, last_mc_block_id, entry).await?;
-        log::debug!(target: TARGET, "Applying masterchain block: {last_mc_block_id}...");
-        sync_context
-            .engine
-            .clone()
-            .apply_block(&handle, &block, last_mc_block_id.seq_no(), false)
-            .await?;
+        save_block_owned(&sync_context.engine, last_mc_block_id, entry, true).await?;
     }
 
     log::debug!(target: TARGET, "Last applied MC seq_no = {}", last_mc_block_id.seq_no());
@@ -761,8 +754,7 @@ async fn import_shard_blocks(
             sync_context.engine.load_block(&mc_handle).await?.top_blocks(BASE_WORKCHAIN_ID)?;
 
         let mut bad_shards = HashSet::new();
-        let mut tasks: Vec<tokio::task::JoinHandle<Result<BlockIdExt>>> =
-            Vec::with_capacity(shard_blocks.len());
+        let mut tasks = Vec::with_capacity(shard_blocks.len());
         for id in shard_blocks {
             let absent_blocks = absent_blocks.clone();
             let engine = sync_context.engine.clone();
@@ -770,61 +762,57 @@ async fn import_shard_blocks(
             let maps = maps.clone();
             total_blocks += 1;
             bad_shards.insert(id.shard().clone());
-            let task = crate::types::service_tasks::spawn_owned(
-                engine.clone().as_ref(),
-                "archive shard import",
-                async move {
-                    log::debug!(
-                        target: TARGET,
-                        "Importing shardchain block: {id} for MC block: {}...",
-                        mc_handle.id()
-                    );
-                    if let Some(handle) = engine.load_block_handle(&id)? {
-                        if handle.is_applied() {
-                            log::debug!(target: TARGET, "Skipped already applied block: {id}");
-                            return Ok(id);
-                        }
-                        if id.seq_no() == 0 {
-                            log::info!(target: TARGET, "Downloading zerostate: {id}...");
-                            boot::download_zerostate(engine.as_ref(), &id).await?;
-                            return Ok(id);
-                        }
-                        log::debug!(target: TARGET, "Applying shardchain block: {id}...");
-                        let block = match maps.blocks.get(&id) {
-                            Some(entry) => match entry.block {
-                                Some(ref block) => Some(block.as_ref().clone()),
-                                None => engine.load_block(&handle).await.ok(),
-                            },
-                            None => {
-                                log::warn!(
-                                    target: TARGET,
-                                    "Shard block is not found in the package: {id}"
-                                );
-                                engine.load_block(&handle).await.ok()
-                            }
-                        };
-                        if let Some(block) = block {
-                            engine
-                                .apply_block(&handle, &block, mc_handle.id().seq_no(), false)
-                                .await?;
-                            return Ok(id);
-                        }
+            let task = spawn_archive_task(&engine.clone(), "archive shard import", async move {
+                #[cfg(test)]
+                archive_drain_tests::hold(&engine, 3).await?;
+                log::debug!(
+                    target: TARGET,
+                    "Importing shardchain block: {id} for MC block: {}...",
+                    mc_handle.id()
+                );
+                if let Some(handle) = engine.load_block_handle(&id)? {
+                    if handle.is_applied() {
+                        log::debug!(target: TARGET, "Skipped already applied block: {id}");
+                        return Ok(id);
                     }
-                    log::warn!(
-                        target: TARGET,
-                        "Shard block {id} is not found either in the package or among \
-                        unapplied blocks. Will try to download it directly"
-                    );
-                    absent_blocks.fetch_add(1, Ordering::Relaxed);
-                    engine.download_and_apply_block(&id, mc_handle.id().seq_no(), false).await?;
-                    Ok(id)
-                },
-            )?;
+                    if id.seq_no() == 0 {
+                        log::info!(target: TARGET, "Downloading zerostate: {id}...");
+                        boot::download_zerostate(engine.as_ref(), &id).await?;
+                        return Ok(id);
+                    }
+                    log::debug!(target: TARGET, "Applying shardchain block: {id}...");
+                    let block = match maps.blocks.get(&id) {
+                        Some(entry) => match entry.block {
+                            Some(ref block) => Some(block.as_ref().clone()),
+                            None => engine.load_block(&handle).await.ok(),
+                        },
+                        None => {
+                            log::warn!(
+                                target: TARGET,
+                                "Shard block is not found in the package: {id}"
+                            );
+                            engine.load_block(&handle).await.ok()
+                        }
+                    };
+                    if let Some(block) = block {
+                        engine.apply_block(&handle, &block, mc_handle.id().seq_no(), false).await?;
+                        return Ok(id);
+                    }
+                }
+                log::warn!(
+                    target: TARGET,
+                    "Shard block {id} is not found either in the package or among \
+                    unapplied blocks. Will try to download it directly"
+                );
+                absent_blocks.fetch_add(1, Ordering::Relaxed);
+                engine.download_and_apply_block(&id, mc_handle.id().seq_no(), false).await?;
+                Ok(id)
+            })?;
             tasks.push(task)
         }
 
         for res in futures::future::try_join_all(tasks).await?.into_iter() {
-            match res {
+            match res.observe() {
                 Ok(id) => {
                     bad_shards.remove(id.shard());
                 }
@@ -942,6 +930,18 @@ async fn save_block(
     block_id: &BlockIdExt,
     entry: &BlocksEntry,
 ) -> Result<(Arc<BlockHandle>, Arc<BlockStuff>, Arc<BlockProofStuff>)> {
+    save_block_owned(engine, block_id, entry, false).await
+}
+
+// Authentication is cancellation-safe and performs no writes. Once admitted, the
+// Engine owns the complete block/proof write and (for MC) normal apply operation.
+// Cancelling its observer must not strand a partially stored authenticated block.
+async fn save_block_owned(
+    engine: &Arc<dyn EngineOperations>,
+    block_id: &BlockIdExt,
+    entry: &BlocksEntry,
+    apply_mc: bool,
+) -> Result<(Arc<BlockHandle>, Arc<BlockStuff>, Arc<BlockProofStuff>)> {
     log::trace!(target: TARGET, "save_block: id = {}", block_id);
     let block = if let Some(ref block) = entry.block {
         Arc::clone(block)
@@ -955,17 +955,88 @@ async fn save_block(
         fail!("Proof{} not found in archive: {}", link_str, block_id);
     };
     crate::block_proof::check_block_proof_pair(engine.as_ref(), block_id, &block, &proof).await?;
-    let handle = engine.store_block(&block).await?.to_non_created().ok_or_else(|| {
-        error!("INTERNAL ERROR: mismatch in block {} store result during sync", block_id)
-    })?;
-    let handle = engine
-        .store_block_proof(block_id, Some(handle), &proof)
-        .await?
-        .to_non_created()
-        .ok_or_else(|| {
-        error!("INTERNAL ERROR: mismatch in block {} proof store result during sync", block_id)
-    })?;
-    Ok((handle, block, proof))
+    #[cfg(test)]
+    archive_drain_tests::hold(engine, 0).await?;
+    let worker_engine = engine.clone();
+    let block_id = block_id.clone();
+    spawn_archive_task(engine, "authenticated archive block", async move {
+        let engine = worker_engine.clone();
+        let handle = engine.store_block(&block).await?.to_non_created().ok_or_else(|| {
+            error!("INTERNAL ERROR: mismatch in block {} store result during sync", block_id)
+        })?;
+        #[cfg(test)]
+        archive_drain_tests::hold(&engine, 1).await?;
+        let handle = engine
+            .store_block_proof(&block_id, Some(handle), &proof)
+            .await?
+            .to_non_created()
+            .ok_or_else(|| {
+                error!(
+                    "INTERNAL ERROR: mismatch in block {} proof store result during sync",
+                    block_id
+                )
+            })?;
+        if apply_mc {
+            engine.clone().apply_block(&handle, &block, block_id.seq_no(), false).await?;
+        }
+        Ok((handle, block, proof))
+    })?
+    .await?
+    .observe()
+}
+
+// Keep acknowledgement with a completed result until its consumer handles it.
+// In particular, try_join_all may retain an early shard error while waiting for
+// siblings. Cancelling that aggregate must not silently acknowledge the error.
+struct ArchiveTaskResult<T> {
+    result: Result<T>,
+    acknowledge: tokio::sync::oneshot::Sender<()>,
+}
+impl<T> ArchiveTaskResult<T> {
+    fn observe(self) -> Result<T> {
+        let _ = self.acknowledge.send(());
+        self.result
+    }
+}
+
+fn spawn_archive_task<T: Send + 'static>(
+    engine: &Arc<dyn EngineOperations>,
+    name: &'static str,
+    future: impl std::future::Future<Output = Result<T>> + Send + 'static,
+) -> Result<impl std::future::Future<Output = Result<ArchiveTaskResult<T>>> + Send + 'static> {
+    let (sent, received) = tokio::sync::oneshot::channel();
+    let (acknowledge, observed) = tokio::sync::oneshot::channel();
+    let worker_engine = engine.clone();
+    #[cfg(test)]
+    let observer_engine = engine.clone();
+    let completion = engine.register_service_task(
+        name,
+        0,
+        Box::new(move || {
+            tokio::spawn(async move {
+                let result = future.await;
+                let failure = result.as_ref().err().map(|error| format!("{error:#}"));
+                let _ = sent.send(result);
+                if observed.await.is_err() {
+                    if let Some(error) = failure {
+                        worker_engine.report_service_failure(
+                            0,
+                            format!("Unobserved archive import failure ({name}): {error}"),
+                        );
+                    }
+                }
+            })
+        }),
+    )?;
+    Ok(async move {
+        let result = received.await?;
+        #[cfg(test)]
+        if name == "authenticated archive block" {
+            archive_drain_tests::hold(&observer_engine, 2).await?;
+        }
+        drop(completion); // The actual worker remains owned by ServiceTasks.
+        Ok(ArchiveTaskResult { result, acknowledge })
+    })
 }
 
 #[cfg(test)]
@@ -982,3 +1053,7 @@ pub(crate) async fn save_test_block(
 #[cfg(test)]
 #[path = "tests/test_sync.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/test_archive_drain.rs"]
+mod archive_drain_tests;
