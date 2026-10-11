@@ -765,9 +765,8 @@ impl InternalDb {
         // signatures. For a fully authenticated Final input, persist that exact
         // proof instead of preserving different, merely parsed disk evidence.
         // Approval inputs still cannot replace an existing Final proof.
-        let proof_ok = old_proof
-            .as_ref()
-            .is_ok_and(|stored| proof.is_link() || stored.data() == proof.data());
+        let proof_ok =
+            old_proof.as_ref().is_ok_and(|stored| proof.is_link() || stored.data() == proof.data());
         let selected = match old_proof {
             Ok(stored) if proof.is_link() || stored.data() == proof.data() => stored,
             Ok(_) => proof.clone(),
@@ -855,7 +854,9 @@ impl InternalDb {
         handle: &Arc<BlockHandle>,
         limits: storage::archives::bounded_read::ArchiveReadLimits,
     ) -> Result<Vec<u8>> {
-        self.archive_manager.get_file_bounded(handle, &PackageEntryId::Block(handle.id()), limits).await
+        self.archive_manager
+            .get_file_bounded(handle, &PackageEntryId::Block(handle.id()), limits)
+            .await
     }
 
     pub async fn load_block_proof_raw_bounded(
@@ -864,7 +865,11 @@ impl InternalDb {
         is_link: bool,
         limits: storage::archives::bounded_read::ArchiveReadLimits,
     ) -> Result<Vec<u8>> {
-        let entry = if is_link { PackageEntryId::ProofLink(handle.id()) } else { PackageEntryId::Proof(handle.id()) };
+        let entry = if is_link {
+            PackageEntryId::ProofLink(handle.id())
+        } else {
+            PackageEntryId::Proof(handle.id())
+        };
         self.archive_manager.get_file_bounded(handle, &entry, limits).await
     }
 
@@ -1120,6 +1125,26 @@ impl InternalDb {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn load_shard_state_bounded<T>(
+        &self,
+        id: &BlockIdExt,
+        budget: &dyn storage::bounded_cell::CellReadBudget,
+        pin: impl FnOnce(u64) -> Result<T>,
+    ) -> Result<(Arc<ShardStateStuff>, T)> {
+        let (root, lease) = match &self.state_db {
+            StateDb::Dynamic(db) => db.get_detached(id, budget, pin)?,
+            StateDb::Archive(db) => db.get_detached(id, budget, pin)?,
+        };
+        let state = ShardStateStuff::from_root_cell(
+            id.clone(),
+            root,
+            #[cfg(feature = "telemetry")]
+            &self.telemetry,
+            &self.allocated,
+        )?;
+        Ok((state, lease))
     }
 
     pub fn load_shard_state_dynamic(&self, id: &BlockIdExt) -> Result<Arc<ShardStateStuff>> {

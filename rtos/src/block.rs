@@ -77,6 +77,24 @@ impl BlockStuff {
         Self::deserialize_block(id, data)
     }
 
+    pub(crate) fn deserialize_block_bounded(
+        id: BlockIdExt,
+        data: Arc<Vec<u8>>,
+        budget: &crate::history_read_budget::HistoryReadBudget,
+    ) -> Result<Self> {
+        if UInt256::calc_file_hash(&data) != id.file_hash {
+            fail!("Bounded block file hash mismatch");
+        }
+        let root = budget.parse_boc(&data)?;
+        if root.repr_hash() != &id.root_hash {
+            fail!("Bounded block root hash mismatch");
+        }
+        let block = Block::construct_from_cell(root.clone())?;
+        let result = Self { id, block, root, data };
+        result.verify_expected_id(result.id())?;
+        Ok(result)
+    }
+
     pub fn deserialize_block(id: BlockIdExt, data: Arc<Vec<u8>>) -> Result<Self> {
         let root = BocReader::new().read(&*data)?.withdraw_single_root()?;
         if id.root_hash != *root.repr_hash() {

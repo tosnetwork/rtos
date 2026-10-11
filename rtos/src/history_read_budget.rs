@@ -54,7 +54,10 @@ impl std::fmt::Display for UnsupportedBoundedHistoryRead {
 impl std::error::Error for UnsupportedBoundedHistoryRead {}
 pub fn stops_fallback(e: &anyhow::Error) -> bool {
     e.downcast_ref::<HistoryBudgetExceeded>().is_some()
+        || e.downcast_ref::<storage::bounded_cell::InvalidBoundedState>().is_some()
         || e.downcast_ref::<UnsupportedBoundedHistoryRead>().is_some()
+        || e.downcast_ref::<crate::network::full_node_overlay_client::BoundedBocDecodeRejected>()
+            .is_some()
         || e.downcast_ref::<storage::archives::bounded_read::ArchiveReadLimitExceeded>().is_some()
 }
 #[derive(Default)]
@@ -76,6 +79,8 @@ pub struct HistoryReadBudget {
     usage: Mutex<Usage>,
     parsing: Mutex<()>,
     failed: AtomicBool,
+    #[cfg(test)]
+    cell_gate: Mutex<Option<(tokio::sync::oneshot::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 #[derive(Clone, Copy)]
 pub(crate) enum ReadKind {
@@ -155,7 +160,10 @@ pub(crate) struct NetworkGraphReservation {
     active: bool,
 }
 impl NetworkGraphReservation {
-    pub fn finish(mut self, root: &Cell) -> Result<()> {
+    pub fn finish(self, root: &Cell) -> Result<()> {
+        self.finish_many(&[root])
+    }
+    pub fn finish_many(mut self, roots: &[&Cell]) -> Result<()> {
         let _parse = self.budget.parsing.lock().map_err(|_| error!("History parsing poisoned"))?;
         {
             let mut usage =
@@ -165,7 +173,7 @@ impl NetworkGraphReservation {
         }
         self.active = false;
         self.budget.healthy()?;
-        let result = self.budget.graph_inner(root);
+        let result = roots.iter().try_for_each(|root| self.budget.graph_inner(root));
         if result.is_err() {
             self.budget.failed.store(true, Ordering::Release);
         }
@@ -201,7 +209,18 @@ impl HistoryReadBudget {
             usage: Mutex::new(Usage::default()),
             parsing: Mutex::new(()),
             failed: AtomicBool::new(false),
+            #[cfg(test)]
+            cell_gate: Mutex::new(None),
         })
+    }
+    #[cfg(test)]
+    pub(crate) fn pause_next_cell(
+        &self,
+    ) -> (tokio::sync::oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        assert!(self.cell_gate.lock().unwrap().replace((entered, wait)).is_none());
+        (observed, release)
     }
     fn healthy(&self) -> Result<()> {
         if self.failed.load(Ordering::Acquire) {
@@ -291,6 +310,21 @@ impl HistoryReadBudget {
         }
         Ok(())
     }
+    pub(crate) fn detached_read<T>(&self, read: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _parse = self.parsing.lock().map_err(|_| error!("History parsing poisoned"))?;
+        self.healthy()?;
+        let before = self.usage.lock().map_err(|_| error!("History accounting poisoned"))?.cells;
+        let result = read();
+        if result.is_err()
+            && self.usage.lock().map_err(|_| error!("History accounting poisoned"))?.cells != before
+        {
+            self.failed.store(true, Ordering::Release);
+            return result.map_err(|error| {
+                error.context(HistoryBudgetExceeded("detached state graph failed"))
+            });
+        }
+        result
+    }
     pub(crate) fn graph(&self, root: &Cell) -> Result<()> {
         let _parse = self.parsing.lock().map_err(|_| error!("History parsing poisoned"))?;
         self.healthy()?;
@@ -325,7 +359,46 @@ impl HistoryReadBudget {
         }
         Ok(())
     }
+    /// Local replaceable artifacts have no authority. Syntax failure consumes
+    /// declared parse work but cannot publish an incomplete graph/cache entry.
+    pub(crate) fn parse_local_artifact(&self, bytes: &[u8]) -> Result<Cell> {
+        let _parse = self.parsing.lock().map_err(|_| error!("History parsing poisoned"))?;
+        self.healthy()?;
+        let mut reader = rtos_block::BocReader::new().set_max_cell_depth(self.limits.depth);
+        let (header, _) = reader.read_header(&mut std::io::Cursor::new(bytes))?;
+        {
+            let usage = self.usage.lock().map_err(|_| error!("History accounting poisoned"))?;
+            if header.cells_count
+                > self.limits.cells.saturating_sub(usage.cells + usage.reserved_cells)
+                || header.tot_cells_size
+                    > self
+                        .limits
+                        .cell_bytes
+                        .saturating_sub(usage.cell_bytes + usage.reserved_cell_bytes)
+            {
+                return Err(HistoryBudgetExceeded("local artifact BOC header").into());
+            }
+        }
+        let parsed = reader.read(bytes).and_then(|boc| boc.withdraw_single_root());
+        let root = match parsed {
+            Ok(root) => root,
+            Err(error) => {
+                let mut usage =
+                    self.usage.lock().map_err(|_| error!("History accounting poisoned"))?;
+                usage.cells += header.cells_count;
+                usage.cell_bytes += header.tot_cells_size;
+                return Err(error);
+            }
+        };
+        let result = self.graph_inner(&root);
+        if result.is_err() {
+            self.failed.store(true, Ordering::Release);
+        }
+        result.map_err(|error| error.context(HistoryBudgetExceeded("artifact graph failed")))?;
+        Ok(root)
+    }
     pub(crate) fn parse_boc(&self, bytes: &[u8]) -> Result<Cell> {
+        let _parse = self.parsing.lock().map_err(|_| error!("History parsing poisoned"))?;
         self.healthy()?;
         let result = self.parse_boc_inner(bytes);
         if result.is_err() {
@@ -336,7 +409,6 @@ impl HistoryReadBudget {
     fn parse_boc_inner(&self, bytes: &[u8]) -> Result<Cell> {
         // No await: serialize header admission with graph charging so shared
         // request callers cannot each parse against the same remaining quota.
-        let _parse = self.parsing.lock().map_err(|_| error!("History parsing poisoned"))?;
         let mut reader = rtos_block::BocReader::new().set_max_cell_depth(self.limits.depth);
         let (header, _) = reader.read_header(&mut std::io::Cursor::new(bytes))?;
         let u = self.usage.lock().map_err(|_| error!("History accounting poisoned"))?;
@@ -350,6 +422,60 @@ impl HistoryReadBudget {
         let root = reader.read(bytes)?.withdraw_single_root()?;
         self.graph_inner(&root)?;
         Ok(root)
+    }
+}
+
+impl storage::bounded_cell::CellReadBudget for HistoryReadBudget {
+    fn admit_cell(&self, _hash: &UInt256, bytes: usize, depth: usize) -> Result<()> {
+        #[cfg(test)]
+        {
+            let gate = self.cell_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
+        }
+        self.healthy()?;
+        if depth > self.limits.depth as usize {
+            return Err(HistoryBudgetExceeded("detached cell depth").into());
+        }
+        let mut usage = self.usage.lock().map_err(|_| error!("History accounting poisoned"))?;
+        let mut cells = usage.cells;
+        let mut total = usage.cell_bytes;
+        add(
+            &mut cells,
+            1,
+            self.limits.cells.saturating_sub(usage.reserved_cells),
+            "detached cells",
+        )?;
+        add(
+            &mut total,
+            bytes,
+            self.limits.cell_bytes.saturating_sub(usage.reserved_cell_bytes),
+            "detached allocations",
+        )?;
+        usage.cells = cells;
+        usage.cell_bytes = total;
+        Ok(())
+    }
+    fn complete_cell(&self, cell: &Cell) -> Result<()> {
+        self.usage
+            .lock()
+            .map_err(|_| error!("History accounting poisoned"))?
+            .graphs
+            .insert(cell.repr_hash().clone());
+        Ok(())
+    }
+    fn step(&self) -> Result<()> {
+        HistoryReadBudget::step(self)
+    }
+    fn metadata(&self, bytes: usize) -> Result<()> {
+        self.healthy()?;
+        let mut usage = self.usage.lock().map_err(|_| error!("History accounting poisoned"))?;
+        add(&mut usage.metadata_bytes, bytes, self.limits.metadata_bytes, "state index bytes")
+    }
+    fn max_depth(&self) -> u16 {
+        self.limits.depth
     }
 }
 
@@ -416,6 +542,35 @@ mod tests {
         reservation.finish(&root)?;
         assert_eq!(budget.usage.lock().unwrap().cells, count);
         Ok(())
+    }
+    #[test]
+    fn history_budget_failed_detach_cannot_publish_partial_graph_to_competitor() {
+        use storage::bounded_cell::CellReadBudget;
+        let budget = HistoryReadBudget::new(Default::default());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_budget = budget.clone();
+        let first = std::thread::spawn(move || {
+            first_budget.detached_read(|| {
+                let root = Cell::default();
+                first_budget.admit_cell(root.repr_hash(), 4096, 0)?;
+                first_budget.complete_cell(&root)?;
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Err::<(), _>(error!("real traversal failed after a completed prefix"))
+            })
+        });
+        entered_rx.recv().unwrap();
+        let second_budget = budget.clone();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            attempt_tx.send(()).unwrap();
+            second_budget.graph(&Cell::default())
+        });
+        attempt_rx.recv().unwrap();
+        release_tx.send(()).unwrap();
+        assert!(stops_fallback(&first.join().unwrap().unwrap_err()));
+        assert!(stops_fallback(&second.join().unwrap().unwrap_err()));
     }
     #[test]
     fn history_budget_exact_distinct_proofs_and_attempts() -> Result<()> {

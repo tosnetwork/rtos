@@ -169,6 +169,7 @@ pub struct ShardStateDb {
     dynamic_boc_db: Arc<DynamicBocDb>,
     storer: tokio::sync::mpsc::UnboundedSender<StateCommand>,
     write_failure: tokio::sync::watch::Sender<Option<String>>,
+    bounded_read_gate: std::sync::RwLock<()>,
     in_queue: AtomicU32,
     stop: Arc<AtomicU8>,
     config: CellsDbConfig,
@@ -210,6 +211,7 @@ impl ShardStateDb {
             shardstate_db: Arc::new(RocksDbTable::with_db(db.clone(), shardstate_db_cf, true)?),
             dynamic_boc_db: Arc::new(dynamic_boc_db),
             storer: sender,
+            bounded_read_gate: std::sync::RwLock::new(()),
             write_failure: tokio::sync::watch::channel(None).0,
             in_queue: AtomicU32::new(0),
             stop: Arc::new(AtomicU8::new(0)),
@@ -552,6 +554,35 @@ impl ShardStateDb {
         Ok(root_cell)
     }
 
+    pub fn get_detached<T>(
+        &self,
+        id: &BlockIdExt,
+        budget: &dyn crate::bounded_cell::CellReadBudget,
+        pin: impl FnOnce(u64) -> Result<T>,
+    ) -> Result<(Cell, T)> {
+        let _gate = self
+            .bounded_read_gate
+            .read()
+            .map_err(|_| rtos_block::error!("State read gate poisoned"))?;
+        budget.metadata(DbEntry::SIZE)?;
+        let data = self.shardstate_db.get(id)?;
+        if data.len() != DbEntry::SIZE {
+            return Err(crate::bounded_cell::InvalidBoundedState("index length").into());
+        }
+        let entry = DbEntry::deserialize(&data)?;
+        if &entry.block_id != id {
+            return Err(crate::bounded_cell::InvalidBoundedState("index identity").into());
+        }
+        if let Some(gc) = self.gc_resolver.get() {
+            if gc.allow_state_gc(id, entry.save_utime, UnixTime::now())? {
+                fail!(StorageError::StateIsAllowedToGc(id.clone()));
+            }
+        }
+        let lease = pin(entry.save_utime)?;
+        let root = self.dynamic_boc_db.cell_db().load_detached(&entry.cell_id, budget)?;
+        Ok((root, lease))
+    }
+
     pub fn get_cell(&self, id: &UInt256) -> Result<Cell> {
         log::trace!(target: TARGET, "ShardStateDb::get_cell  id {:x}", id);
         self.dynamic_boc_db.load_cell(id)
@@ -723,7 +754,17 @@ impl ShardStateDb {
     fn delete_internal(self: Arc<Self>, id: &BlockIdExt) -> Result<()> {
         log::trace!(target: TARGET, "ShardStateDb::delete_internal  id {}", id);
 
+        let _gate = self
+            .bounded_read_gate
+            .write()
+            .map_err(|_| rtos_block::error!("State read gate poisoned"))?;
         let db_entry = DbEntry::deserialize(&self.shardstate_db.get(id)?)?;
+        // Eligibility may have changed after the asynchronous GC selection.
+        if let Some(gc) = self.gc_resolver.get() {
+            if !gc.allow_state_gc(id, db_entry.save_utime, UnixTime::now())? {
+                return Ok(());
+            }
+        }
 
         let ss_db = self.clone();
         let shardstate_db = self.shardstate_db.clone();
@@ -742,6 +783,107 @@ impl ShardStateDb {
         })?;
 
         log::trace!(target: TARGET, "ShardStateDb::delete_internal  DONE  id {}", id);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bounded_read_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    struct Policy(AtomicBool);
+    impl AllowStateGcResolver for Policy {
+        fn allow_state_gc(&self, _: &BlockIdExt, _: u64, _: u64) -> Result<bool> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+    }
+    struct Budget;
+    impl crate::bounded_cell::CellReadBudget for Budget {
+        fn admit_cell(&self, _: &UInt256, _: usize, _: usize) -> Result<()> {
+            Ok(())
+        }
+        fn complete_cell(&self, _: &Cell) -> Result<()> {
+            Ok(())
+        }
+        fn step(&self) -> Result<()> {
+            Ok(())
+        }
+        fn metadata(&self, _: usize) -> Result<()> {
+            Ok(())
+        }
+        fn max_depth(&self) -> u16 {
+            4096
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bounded_state_queued_delete_rechecks_pin_and_rejects_bad_index() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = RocksDb::new(
+            dir.path().to_str().unwrap(),
+            "bounded_gc",
+            None,
+            crate::db::rocksdb::AccessType::ReadWrite,
+        )?;
+        let states = ShardStateDb::new(
+            db,
+            "states",
+            "cells",
+            "counters",
+            CellsDbConfig::default(),
+            #[cfg(feature = "telemetry")]
+            Arc::new(crate::StorageTelemetry::default()),
+            Arc::new(crate::StorageAlloc::default()),
+        )?;
+        let root = Cell::default();
+        let id = BlockIdExt::with_params(
+            rtos_block::ShardIdent::masterchain(),
+            1,
+            root.repr_hash().clone(),
+            UInt256::default(),
+        );
+        states.clone().put_internal(&id, root.clone())?;
+        let policy = Arc::new(Policy(AtomicBool::new(false)));
+        assert!(states.gc_resolver.set(policy.clone()).is_ok());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let read_states = states.clone();
+        let read_id = id.clone();
+        let reader = tokio::task::spawn_blocking(move || {
+            read_states.get_detached(&read_id, &Budget, |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        entered_rx.await.unwrap();
+        // Represents a GC decision already queued before the reader pinned.
+        let delete_states = states.clone();
+        let delete_id = id.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut deletion = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            delete_states.delete_internal(&delete_id)
+        });
+        started_rx.await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut deletion).await.is_err());
+        release_tx.send(()).unwrap();
+        assert_eq!(reader.await.unwrap()?.0, root);
+        deletion.await.unwrap()?;
+        assert!(states.get(&id).is_ok(), "queued deletion must recheck the current pin policy");
+        policy.0.store(true, Ordering::SeqCst);
+        states.clone().delete_internal(&id)?;
+        assert!(states.get(&id).is_err(), "released policy permits actual deletion");
+        states.shardstate_db.put(&id, &[0u8])?;
+        let error = states.get_detached(&id, &Budget, |_| Ok(())).err().unwrap();
+        assert!(error.downcast_ref::<crate::bounded_cell::InvalidBoundedState>().is_some());
+        let mut other = id.clone();
+        other.seq_no += 1;
+        states
+            .shardstate_db
+            .put(&id, &DbEntry::with_params(other, root.repr_hash().clone(), 0).serialize())?;
+        let error = states.get_detached(&id, &Budget, |_| Ok(())).err().unwrap();
+        assert!(error.downcast_ref::<crate::bounded_cell::InvalidBoundedState>().is_some());
+        states.stop().await;
         Ok(())
     }
 }

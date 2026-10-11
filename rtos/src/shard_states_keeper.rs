@@ -43,6 +43,21 @@ use storage::{
     shardstate_db_async::{AllowStateGcResolver, SsNotificationCallback},
     types::PersistentStatePartId,
 };
+struct StateReadLease {
+    id: BlockIdExt,
+    resolver: Arc<AllowStateGcSmartResolver>,
+    active: bool,
+}
+impl Drop for StateReadLease {
+    fn drop(&mut self) {
+        if self.active {
+            if let Err(error) = self.resolver.unpin_state(&self.id) {
+                log::error!("Bounded state unpin failed: {error}");
+            }
+        }
+    }
+}
+
 pub struct PinnedShardStateGuard {
     state: Arc<ShardStateStuff>,
     gc_resolver: Arc<AllowStateGcSmartResolver>,
@@ -58,6 +73,9 @@ impl PinnedShardStateGuard {
             fail!(StorageError::StateIsAllowedToGc(state.block_id().clone()))
         }
         Ok(Self { state, gc_resolver })
+    }
+    pub(crate) fn state_arc(&self) -> Arc<ShardStateStuff> {
+        self.state.clone()
     }
     pub fn state(&self) -> &ShardStateStuff {
         &self.state
@@ -315,6 +333,28 @@ impl ShardStatesKeeper {
 
     /// Pin an existing physical state without cache fallback or catch-up writes.
     /// Repair callers must not turn a missing dependency into recursive recovery.
+    /// Synchronous and called only by the Engine-owned blocking reader.
+    pub(crate) fn load_and_pin_bounded_state(
+        &self,
+        id: &BlockIdExt,
+        budget: &crate::history_read_budget::HistoryReadBudget,
+    ) -> Result<PinnedShardStateGuard> {
+        budget.detached_read(|| {
+            let (state, mut lease) = self.db.load_shard_state_bounded(id, budget, |saved_at| {
+                if !self.gc_resolver.pin_state(id, saved_at, UnixTime::now())? {
+                    fail!(StorageError::StateIsAllowedToGc(id.clone()));
+                }
+                Ok(StateReadLease {
+                    id: id.clone(),
+                    resolver: self.gc_resolver.clone(),
+                    active: true,
+                })
+            })?;
+            lease.active = false;
+            Ok(PinnedShardStateGuard { state, gc_resolver: self.gc_resolver.clone() })
+        })
+    }
+
     pub(crate) fn load_and_pin_existing_state(
         &self,
         block_id: &BlockIdExt,

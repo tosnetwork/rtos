@@ -3,9 +3,8 @@
 //!
 //! This never authorizes spool reclamation. State pins are process-local; archive
 //! files and history have no persistent dependency lease here. Authentication is
-//! time bounded, but the historical verifier does not yet accept a cumulative
-//! byte/cell budget. In-memory Merkle construction and raw artifact reads also
-//! allocate before their result budgets can be checked. Do not describe this API as a complete bounded repair owner.
+//! bounded in historical proof/state reads. Merkle apply still allocates before
+//! its output check; this is not a complete peak-memory-bounded repair owner.
 use crate::{
     block::BlockStuff, block_proof::BlockProofStuff, engine::Engine,
     engine_traits::EngineOperations, shard_states_keeper::PinnedShardStateGuard,
@@ -19,7 +18,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
-use storage::archives::bounded_read::{ArchiveReadLimitExceeded, ArchiveReadLimits};
+use storage::archives::bounded_read::ArchiveReadLimits;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MAX_LIVE_REPAIRS: usize = 4;
@@ -116,11 +115,28 @@ pub(crate) async fn repair_mc_final(
     }
     let admission = Admission { key, _permit: permit };
     let owner = engine.clone();
-    spawn_owned(engine.as_ref(), "masterchain Final live repair", async move {
+    let observed = spawn_owned(engine.as_ref(), "masterchain Final live repair", async move {
         repair_owned(owner, request, admission).await
-    })?
-    .await
-    .map_err(|e| error!("MC repair worker failed: {e}"))?
+    })?;
+    // The timeout cancels only observation; the Engine still joins the real
+    // worker with admission, budget, pins and blocking IO retained.
+    tokio::time::timeout(READ_TIMEOUT, observed)
+        .await
+        .map_err(|_| error!("MC repair observation timed out"))?
+        .map_err(|e| error!("MC repair worker failed: {e}"))?
+}
+
+async fn load_pinned_bounded(
+    engine: &Engine,
+    id: &BlockIdExt,
+    budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
+) -> Result<PinnedShardStateGuard> {
+    let keeper = engine.shard_states_keeper().clone();
+    let id = id.clone();
+    let budget = budget.clone();
+    tokio::task::spawn_blocking(move || keeper.load_and_pin_bounded_state(&id, &budget))
+        .await
+        .map_err(|error| error!("Repair state reader failed: {error}"))?
 }
 
 async fn check_cells(root: &Cell) -> Result<()> {
@@ -154,7 +170,11 @@ async fn check_cells_with_limit(root: &Cell, max_cells: usize) -> Result<()> {
     Ok(())
 }
 
-async fn read_pair(engine: &Engine, id: &BlockIdExt) -> Result<(BlockStuff, BlockProofStuff)> {
+async fn read_pair(
+    engine: &Engine,
+    id: &BlockIdExt,
+    budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
+) -> Result<(BlockStuff, BlockProofStuff)> {
     let handle =
         engine.load_block_handle(id)?.ok_or_else(|| error!("MC repair handle disappeared"))?;
     let data_bytes = MAX_ARTIFACT_BYTES;
@@ -165,12 +185,50 @@ async fn read_pair(engine: &Engine, id: &BlockIdExt) -> Result<(BlockStuff, Bloc
         .remove(&(engine as *const Engine as usize))
         .unwrap_or(data_bytes);
     let limits = ArchiveReadLimits { data_bytes, filename_bytes: 512 };
-    let raw = engine.db().load_block_data_raw_bounded(&handle, limits).await?;
-    let proof = engine.db().load_block_proof_raw_bounded(&handle, false, limits).await?;
-    Ok((
-        BlockStuff::deserialize_block_checked(id.clone(), Arc::new(raw))?,
-        BlockProofStuff::deserialize(id, proof, false)?,
-    ))
+    let body = budget.reserve(crate::history_read_budget::ReadKind::State, data_bytes)?;
+    let raw = engine
+        .db()
+        .load_block_data_raw_bounded(
+            &handle,
+            ArchiveReadLimits { data_bytes: body.allowance(), ..limits },
+        )
+        .await;
+    let raw = match raw {
+        Ok(raw) => raw,
+        Err(error) => {
+            if let Some(evidence) =
+                error.downcast_ref::<storage::archives::bounded_read::ArchiveReadNotStarted>()
+            {
+                body.refund_not_started(evidence)?;
+            }
+            return Err(error);
+        }
+    };
+    body.finish(&raw)?;
+    let block = BlockStuff::deserialize_block_bounded(id.clone(), Arc::new(raw), budget)?;
+    let proof_read = budget.reserve(crate::history_read_budget::ReadKind::Proof, data_bytes)?;
+    let proof_raw = engine
+        .db()
+        .load_block_proof_raw_bounded(
+            &handle,
+            false,
+            ArchiveReadLimits { data_bytes: proof_read.allowance(), ..limits },
+        )
+        .await;
+    let proof_raw = match proof_raw {
+        Ok(raw) => raw,
+        Err(error) => {
+            if let Some(evidence) =
+                error.downcast_ref::<storage::archives::bounded_read::ArchiveReadNotStarted>()
+            {
+                proof_read.refund_not_started(evidence)?;
+            }
+            return Err(error);
+        }
+    };
+    proof_read.finish(&proof_raw)?;
+    let proof = BlockProofStuff::deserialize_local_artifact(id, proof_raw, budget)?;
+    Ok((block, proof))
 }
 
 async fn repair_owned(
@@ -182,25 +240,43 @@ async fn repair_owned(
     // The Engine-owned worker awaits local file IO to completion. Do not put
     // this under the timeout below: tokio file IO can own a blocking operation
     // which would otherwise outlive its observer and admission permit.
-    let mut local = match read_pair(engine.as_ref(), &request.block_id).await {
+    let budget = crate::history_read_budget::HistoryReadBudget::new(Default::default());
+    let mut local = match read_pair(engine.as_ref(), &request.block_id, &budget).await {
         Ok(pair) => Some(pair),
-        Err(error) if error.downcast_ref::<ArchiveReadLimitExceeded>().is_some() => {
+        Err(error) if crate::history_read_budget::stops_fallback(&error) => {
             return Err(error);
         }
         Err(_) => None,
     };
-    let (accepted, parent) = tokio::time::timeout(READ_TIMEOUT, async {
+    let (accepted, parent) = async {
         check_domain(engine.as_ref(), &request)?;
         let accepted = loop {
             let from_local = local.is_some();
             let (block, proof) = match local.take() {
                 Some(pair) => pair,
                 None => {
-                    engine
+                    let graph = budget.reserve_network_graph()?;
+                    let body = budget
+                        .reserve(crate::history_read_budget::ReadKind::State, MAX_ARTIFACT_BYTES)?;
+                    let proof_bytes = budget
+                        .reserve(crate::history_read_budget::ReadKind::Proof, MAX_ARTIFACT_BYTES)?;
+                    let bytes = body.allowance().min(proof_bytes.allowance()).min(graph.bytes / 2);
+                    let mut limits =
+                        crate::network::full_node_overlay_client::NetworkDownloadLimits::proof(
+                            bytes,
+                            graph.cells / 2,
+                            MAX_STATE_DEPTH as u16,
+                        );
+                    limits.block_bytes = bytes;
+                    let pair = engine
                         .overlay_client(request.block_id.shard())
                         .await?
-                        .download_block_full(&request.block_id, false)
-                        .await?
+                        .download_block_full_bounded(&request.block_id, false, limits)
+                        .await?;
+                    body.finish(pair.0.data())?;
+                    proof_bytes.finish(pair.1.data())?;
+                    graph.finish_many(&[pair.0.root_cell(), pair.1.root_cell()])?;
+                    pair
                 }
             };
             if block.data().len() > MAX_ARTIFACT_BYTES || proof.data().len() > MAX_ARTIFACT_BYTES {
@@ -210,8 +286,13 @@ async fn repair_owned(
             if proof.is_link() || proof.id() != &request.block_id {
                 fail!("MC repair requires full target proof");
             }
-            let context =
-                engine.historical_pq_publication_context(block.id(), block.block()?).await?;
+            let context = engine
+                .historical_pq_publication_context_bounded(
+                    block.id(),
+                    block.block()?,
+                    budget.clone(),
+                )
+                .await?;
             if context.zerostate() != &request.pin.zerostate
                 || context.history_init() != &request.history_init
                 || context.global_id() != request.pin.global_id
@@ -222,8 +303,19 @@ async fn repair_owned(
             {
                 fail!("MC repair authenticated history does not match requested coordinates");
             }
-            match accept_authenticated_mc_repair(block, proof, context, engine.clone()).await {
+            match accept_authenticated_mc_repair(
+                block,
+                proof,
+                context,
+                engine.clone(),
+                budget.clone(),
+            )
+            .await
+            {
                 Ok(accepted) => break accepted,
+                Err(error) if crate::history_read_budget::stops_fallback(&error) => {
+                    return Err(error)
+                }
                 Err(_) if from_local => continue,
                 Err(error) => return Err(error),
             }
@@ -233,21 +325,24 @@ async fn repair_owned(
         if second.is_some() || !parent_id.shard().is_masterchain() {
             fail!("MC repair requires one MC parent");
         }
-        let parent = engine.shard_states_keeper().load_and_pin_existing_state(&parent_id)?;
+        let parent = load_pinned_bounded(&engine, &parent_id, &budget).await?;
         check_cells(parent.state().root_cell()).await?;
         if parent.state().root_cell().repr_hash() != &block.block()?.read_state_update()?.old_hash {
             fail!("MC repair parent state does not match update");
         }
         // Existing root with missing children is deliberately a defer, not a rebuild.
-        if let Ok(state) = engine.db().load_shard_state_dynamic(&request.block_id) {
-            if state.root_cell().repr_hash() == &block.block()?.read_state_update()?.new_hash {
-                check_cells(state.root_cell()).await?;
+        match engine.load_state_bounded(&request.block_id, budget.clone()).await {
+            Ok(state) => {
+                if state.root_cell().repr_hash() == &block.block()?.read_state_update()?.new_hash {
+                    check_cells(state.root_cell()).await?;
+                }
             }
+            Err(error) if crate::history_read_budget::stops_fallback(&error) => return Err(error),
+            Err(_) => {} // Missing root may be reconstructed; partial graph failures cannot.
         }
         Ok::<_, anyhow::Error>((accepted, parent))
-    })
-    .await
-    .map_err(|_| error!("MC repair read/authentication timed out"))??;
+    }
+    .await?;
     // Preflight a candidate in ordinary memory before any durable write. The
     // blocking worker is awaited by this Engine-owned task WITHOUT a timeout;
     // abandoning its JoinHandle would detach a real accepted computation.
@@ -273,7 +368,7 @@ async fn repair_owned(
         gate.release.acquire().await.unwrap().forget();
     }
     engine.clone().ensure_publication_acceptance_durable(&accepted).await?;
-    let target = engine.shard_states_keeper().load_and_pin_existing_state(&request.block_id)?;
+    let target = load_pinned_bounded(&engine, &request.block_id, &budget).await?;
     check_cells(target.state().root_cell()).await?;
     if target.state().root_cell().repr_hash()
         != &accepted.block().block()?.read_state_update()?.new_hash

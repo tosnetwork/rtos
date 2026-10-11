@@ -807,6 +807,13 @@ impl crate::engine_traits::EngineOperations for RecoveryProofEngine {
     async fn check_masterchain_proof(&self, proof: &BlockProofStuff) -> rtos_block::Result<()> {
         self.verifier.verify(self, proof).await.map(|_| ())
     }
+    async fn load_last_applied_mc_state_bounded(&self,
+        budget: std::sync::Arc<crate::history_read_budget::HistoryReadBudget>,
+    ) -> rtos_block::Result<std::sync::Arc<crate::shard_state::ShardStateStuff>> {
+        // This adapter already owns the parsed fixture; production uses detached DB reads.
+        budget.graph(self.state.root_cell())?;
+        Ok(self.state.clone())
+    }
     async fn load_last_applied_mc_state(
         &self,
     ) -> rtos_block::Result<std::sync::Arc<crate::shard_state::ShardStateStuff>> {

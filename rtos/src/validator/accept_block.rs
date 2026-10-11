@@ -1274,6 +1274,7 @@ pub(crate) async fn accept_authenticated_mc_repair(
     proof: BlockProofStuff,
     context: crate::block_proof::PqPublicationContext,
     engine: Arc<dyn EngineOperations>,
+    budget: Arc<crate::history_read_budget::HistoryReadBudget>,
 ) -> Result<AcceptedSessionBlock> {
     if !block.id().shard().is_masterchain()
         || block.id().seq_no() == 0
@@ -1303,7 +1304,7 @@ pub(crate) async fn accept_authenticated_mc_repair(
         fail!("MC repair requires exactly one masterchain parent");
     }
     precheck_header(&block, &previous.prev, false, false)?;
-    proof.check_proof(engine.as_ref()).await?;
+    engine.check_masterchain_proof_bounded(&proof, budget).await?;
     let BlockSignaturesVariant::SimplexPq(carrier) = proof.clone().drain_signatures()? else {
         fail!("MC repair requires a PQ Final certificate");
     };

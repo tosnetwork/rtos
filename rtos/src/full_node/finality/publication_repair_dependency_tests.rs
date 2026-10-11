@@ -347,8 +347,11 @@ async fn mc_live_repair_dependency_missing_target_only_child_never_returns_custo
     assert!(table.try_get_raw(expected_root.as_slice()).unwrap().is_some());
     children.sort();
     let child = children.into_iter().next().unwrap();
-    let bytes = table.try_get_raw(child.as_slice()).unwrap()
-        .expect("selected target-only descendant must physically exist").to_vec();
+    let bytes = table
+        .try_get_raw(child.as_slice())
+        .unwrap()
+        .expect("selected target-only descendant must physically exist")
+        .to_vec();
     table.delete_raw(child.as_slice()).unwrap();
     db.sync_wal().unwrap();
     drop(table);
@@ -385,4 +388,59 @@ async fn mc_live_repair_dependency_missing_target_only_child_never_returns_custo
     .await;
     close(engine).await;
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_state_actual_engine_cold_warm_and_budget_rejection() {
+    use crate::history_read_budget::{HistoryBudgetExceeded, HistoryReadBudget, HistoryReadLimits};
+    let Fixture { dir, engine, parent: _, target, request: _ } = fixture(false).await;
+    close(engine).await;
+    let engine = open_engine(dir.path()).await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let expected = target.block().unwrap().read_state_update().unwrap().new_hash;
+        for _ in 0..2 {
+            let state = engine
+                .load_state_bounded(target.id(), HistoryReadBudget::new(Default::default()))
+                .await
+                .unwrap();
+            assert_eq!(state.root_cell().repr_hash(), &expected);
+            let denied = engine
+                .load_state_bounded(
+                    target.id(),
+                    HistoryReadBudget::new(HistoryReadLimits { cells: 0, ..Default::default() }),
+                )
+                .await
+                .err()
+                .unwrap();
+            assert!(denied.downcast_ref::<HistoryBudgetExceeded>().is_some());
+            // The failure does not poison global cells, state caches or ordinary boot.
+            assert_eq!(
+                engine.load_state(target.id()).await.unwrap().root_cell().repr_hash(),
+                &expected
+            );
+        }
+        let budget = HistoryReadBudget::new(Default::default());
+        let (entered, release) = budget.pause_next_cell();
+        let reader_engine = engine.clone();
+        let id = target.id().clone();
+        let reader =
+            tokio::spawn(async move { reader_engine.load_state_bounded(&id, budget).await });
+        entered.await.unwrap();
+        reader.abort();
+        assert!(reader.await.unwrap_err().is_cancelled());
+        let stopper_engine = engine.clone();
+        let mut stopped = tokio::spawn(async move { stopper_engine.wait_stop().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut stopped).await.is_err(),
+            "caller cancellation must not release the real blocking reader"
+        );
+        release.send(()).unwrap();
+        stopped.await.unwrap().unwrap();
+    })
+    .catch_unwind()
+    .await;
+    close(engine).await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }

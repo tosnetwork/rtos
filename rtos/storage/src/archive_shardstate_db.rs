@@ -115,6 +115,26 @@ impl ArchiveShardStateDb {
         self.boc_db.cell_db().load_cell(&db_entry.cell_id)
     }
 
+    pub fn get_detached<T>(
+        &self,
+        id: &BlockIdExt,
+        budget: &dyn crate::bounded_cell::CellReadBudget,
+        pin: impl FnOnce(u64) -> Result<T>,
+    ) -> Result<(Cell, T)> {
+        budget.metadata(DbEntry::SIZE)?;
+        let data = self.index.get(id)?;
+        if data.len() != DbEntry::SIZE {
+            return Err(crate::bounded_cell::InvalidBoundedState("archive index length").into());
+        }
+        let entry = DbEntry::deserialize(&data)?;
+        if &entry.block_id != id {
+            return Err(crate::bounded_cell::InvalidBoundedState("archive index identity").into());
+        }
+        let lease = pin(entry.save_utime)?;
+        let root = self.boc_db.cell_db().load_detached(&entry.cell_id, budget)?;
+        Ok((root, lease))
+    }
+
     pub fn get_cell(&self, id: &UInt256) -> Result<Cell> {
         self.boc_db.cell_db().load_cell(id)
     }

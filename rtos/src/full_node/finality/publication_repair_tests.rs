@@ -144,13 +144,29 @@ async fn mc_live_repair_real_peer_restores_missing_artifacts_and_reopens() {
             pair.receiver = open_engine(&pair._dir.path().join("receiver")).await;
             reconnect(&pair).await;
             let before = pair.provider.overlays_router().unwrap().test_block_download_queries();
-            let repaired = repair_mc_final(pair.receiver.clone(), expected).await.unwrap();
+            let repaired = repair_mc_final(pair.receiver.clone(), expected.clone()).await.unwrap();
             assert!(
                 pair.provider.overlays_router().unwrap().test_block_download_queries() > before
             );
             drop(repaired);
             pair.receiver.clone().wait_stop().await.unwrap();
             drop(std::mem::replace(&mut pair.receiver, pair.provider.clone()));
+            if loss_mode < 2 {
+                // Local malformed body/proof is replaceable, while actual byte
+                // allowance errors remain terminal (separate limit fixture).
+                std::fs::write(&path, [0u8, 1u8, 2u8]).unwrap();
+                pair.receiver = open_engine(&pair._dir.path().join("receiver")).await;
+                reconnect(&pair).await;
+                let before = pair.provider.overlays_router().unwrap().test_block_download_queries();
+                let repaired =
+                    repair_mc_final(pair.receiver.clone(), expected.clone()).await.unwrap();
+                assert!(
+                    pair.provider.overlays_router().unwrap().test_block_download_queries() > before
+                );
+                drop(repaired);
+                pair.receiver.clone().wait_stop().await.unwrap();
+                drop(std::mem::replace(&mut pair.receiver, pair.provider.clone()));
+            }
             pair.receiver = open_engine(&pair._dir.path().join("receiver")).await;
             let handle = pair.receiver.load_block_handle(pair.master.id()).unwrap().unwrap();
             assert_eq!(pair.receiver.load_block_raw(&handle).await.unwrap(), pair.master.data());

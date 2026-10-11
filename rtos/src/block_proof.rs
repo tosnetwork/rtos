@@ -273,21 +273,30 @@ impl MasterchainProofVerifier {
     }
 
     pub(crate) async fn verify<E: EngineOperations + ?Sized>(
-        &self, engine: &E, proof: &BlockProofStuff,
+        &self,
+        engine: &E,
+        proof: &BlockProofStuff,
     ) -> Result<VerifiedMasterchainProof> {
         self.verify_with_budget(engine, proof, None).await
     }
     pub(crate) async fn verify_bounded<E: EngineOperations + ?Sized>(
-        &self, engine: &E, proof: &BlockProofStuff,
+        &self,
+        engine: &E,
+        proof: &BlockProofStuff,
         budget: Arc<crate::history_read_budget::HistoryReadBudget>,
     ) -> Result<VerifiedMasterchainProof> {
         self.verify_with_budget(engine, proof, Some(&budget)).await
     }
     async fn verify_with_budget<E: EngineOperations + ?Sized>(
-        &self, engine: &E, proof: &BlockProofStuff,
+        &self,
+        engine: &E,
+        proof: &BlockProofStuff,
         budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
     ) -> Result<VerifiedMasterchainProof> {
-        if let Some(budget) = budget { budget.step()?; budget.proof(proof)?; }
+        if let Some(budget) = budget {
+            budget.step()?;
+            budget.proof(proof)?;
+        }
         if proof.is_link() || !proof.id().shard().is_masterchain_ext() {
             fail!("Masterchain finality requires a full proof");
         }
@@ -308,29 +317,42 @@ impl MasterchainProofVerifier {
         epoch: u32,
         budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
     ) -> Result<BootstrapAuthority> {
-        if let Some(budget) = budget { budget.step()?; }
+        if let Some(budget) = budget {
+            budget.step()?;
+        }
         let pin = engine.init_mc_block_id();
         if epoch < pin.seq_no {
             fail!("Governing epoch is outside the locally pinned history");
         }
         let hint = if epoch > pin.seq_no {
-            let ordinary = engine.load_last_applied_mc_state().await;
+            let ordinary = match budget {
+                Some(budget) => engine.load_last_applied_mc_state_bounded(budget.clone()).await,
+                None => engine.load_last_applied_mc_state().await,
+            };
             if budget.is_some() {
                 if let Err(error) = &ordinary {
-                    if crate::history_read_budget::stops_fallback(error) { return Err(ordinary.err().unwrap()); }
+                    if crate::history_read_budget::stops_fallback(error) {
+                        return Err(ordinary.err().unwrap());
+                    }
                 }
             }
-            if let (Some(budget), Ok(state)) = (budget, &ordinary) { budget.graph(state.root_cell())?; }
+            if let (Some(budget), Ok(state)) = (budget, &ordinary) {
+                budget.graph(state.root_cell())?;
+            }
             match ordinary {
                 Ok(state) if state.find_block_id(epoch).is_ok() => Some(state),
-                ordinary => match crate::retired_history::lookup_hint_with_budget(engine, epoch, budget).await? {
-                    Some(state) => Some(state),
-                    None => {
-                        let state = ordinary?;
-                        state.find_block_id(epoch)?;
-                        Some(state)
+                ordinary => {
+                    match crate::retired_history::lookup_hint_with_budget(engine, epoch, budget)
+                        .await?
+                    {
+                        Some(state) => Some(state),
+                        None => {
+                            let state = ordinary?;
+                            state.find_block_id(epoch)?;
+                            Some(state)
+                        }
                     }
-                },
+                }
             }
         } else {
             None
@@ -365,19 +387,29 @@ impl MasterchainProofVerifier {
                     if pin != engine.zerostate_id()? {
                         fail!("Proof pin differs from network zerostate");
                     }
-                    let state = engine.load_mc_zero_state().await?;
-                    if let Some(budget) = budget { budget.graph(state.root_cell())?; }
+                    let state = match budget {
+                        Some(budget) => engine.load_mc_zero_state_bounded(budget.clone()).await?,
+                        None => engine.load_mc_zero_state().await?,
+                    };
+                    if let Some(budget) = budget {
+                        budget.graph(state.root_cell())?;
+                    }
                     BootstrapAuthority::from_zerostate(pin, state)?
                 }
                 None => BootstrapAuthority::from_checkpoint(
                     pin,
-                    crate::boot::load_history_proof_with_budget(engine, pin, true, true, budget).await?,
+                    crate::boot::load_history_proof_with_budget(engine, pin, true, true, budget)
+                        .await?,
                 )?,
             };
-            if let Some(budget) = budget { history.charge_budget(budget)?; }
+            if let Some(budget) = budget {
+                history.charge_budget(budget)?;
+            }
             self.remember(history.clone());
             while history.id().seq_no < epoch {
-                if let Some(budget) = budget { budget.step()?; }
+                if let Some(budget) = budget {
+                    budget.step()?;
+                }
                 if engine.check_stop() {
                     fail!("Proof history authentication stopped");
                 }
@@ -396,7 +428,8 @@ impl MasterchainProofVerifier {
                     fail!("Historical proof index skipped the governing epoch");
                 }
                 let next_proof =
-                    crate::boot::load_history_proof_with_budget(engine, &next, false, true, budget).await?;
+                    crate::boot::load_history_proof_with_budget(engine, &next, false, true, budget)
+                        .await?;
                 history = history.advance_key_block(&next, next_proof)?;
                 self.remember(history.clone());
             }
@@ -405,7 +438,9 @@ impl MasterchainProofVerifier {
             }
             history
         };
-        if let Some(budget) = budget { history.charge_budget(budget)?; }
+        if let Some(budget) = budget {
+            history.charge_budget(budget)?;
+        }
         Ok(history)
     }
 
@@ -413,26 +448,33 @@ impl MasterchainProofVerifier {
     /// retry record. In particular, a stored protocol tag cannot select relay
     /// behavior for a different governing configuration after restart.
     pub(crate) async fn pq_publication_context<E: EngineOperations + ?Sized>(
-        &self, engine: &E, id: &BlockIdExt,
+        &self,
+        engine: &E,
+        id: &BlockIdExt,
         block: &Block,
     ) -> Result<PqPublicationContext> {
         self.pq_publication_context_with_budget(engine, id, block, None).await
     }
     pub(crate) async fn pq_publication_context_bounded<E: EngineOperations + ?Sized>(
-        &self, engine: &E, id: &BlockIdExt,
+        &self,
+        engine: &E,
+        id: &BlockIdExt,
         block: &Block,
         budget: Arc<crate::history_read_budget::HistoryReadBudget>,
     ) -> Result<PqPublicationContext> {
         self.pq_publication_context_with_budget(engine, id, block, Some(&budget)).await
     }
     async fn pq_publication_context_with_budget<E: EngineOperations + ?Sized>(
-        &self, engine: &E, id: &BlockIdExt,
+        &self,
+        engine: &E,
+        id: &BlockIdExt,
         block: &Block,
         budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
     ) -> Result<PqPublicationContext> {
         let verifier = self.pq_broadcast_context_with_budget(engine, id, block, budget).await?;
         let info = block.read_info()?;
-        let authority = self.governing_authority(engine, info.prev_key_block_seqno(), budget).await?;
+        let authority =
+            self.governing_authority(engine, info.prev_key_block_seqno(), budget).await?;
         let config = authority.config()?;
         let selected = config
             .selected_simplex_config(id.shard().is_masterchain())?
@@ -482,25 +524,32 @@ impl MasterchainProofVerifier {
     /// proof chain as masterchain proof verification. A state index is a lookup
     /// hint only: each authority transition is authenticated before config use.
     pub(crate) async fn pq_broadcast_context<E: EngineOperations + ?Sized>(
-        &self, engine: &E, id: &BlockIdExt,
+        &self,
+        engine: &E,
+        id: &BlockIdExt,
         block: &Block,
     ) -> Result<rtos_api::pq_finality::PqVerificationContext> {
         self.pq_broadcast_context_with_budget(engine, id, block, None).await
     }
     pub(crate) async fn pq_broadcast_context_bounded<E: EngineOperations + ?Sized>(
-        &self, engine: &E, id: &BlockIdExt,
+        &self,
+        engine: &E,
+        id: &BlockIdExt,
         block: &Block,
         budget: Arc<crate::history_read_budget::HistoryReadBudget>,
     ) -> Result<rtos_api::pq_finality::PqVerificationContext> {
         self.pq_broadcast_context_with_budget(engine, id, block, Some(&budget)).await
     }
     async fn pq_broadcast_context_with_budget<E: EngineOperations + ?Sized>(
-        &self, engine: &E, id: &BlockIdExt,
+        &self,
+        engine: &E,
+        id: &BlockIdExt,
         block: &Block,
         budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
     ) -> Result<rtos_api::pq_finality::PqVerificationContext> {
         let info = block.read_info()?;
-        let authority = self.governing_authority(engine, info.prev_key_block_seqno(), budget).await?;
+        let authority =
+            self.governing_authority(engine, info.prev_key_block_seqno(), budget).await?;
         if block.global_id() != authority.global_id {
             fail!("PQ broadcast global_id differs from authenticated history");
         }
@@ -587,7 +636,9 @@ impl BlockProofStuff {
     }
 
     pub(crate) fn deserialize_bounded(
-        block_id: &BlockIdExt, data: Vec<u8>, is_link: bool,
+        block_id: &BlockIdExt,
+        data: Vec<u8>,
+        is_link: bool,
         budget: &crate::history_read_budget::HistoryReadBudget,
     ) -> Result<Self> {
         budget.proof_bytes(&data)?;
@@ -597,6 +648,20 @@ impl BlockProofStuff {
             fail!("Bounded proof identity/type mismatch");
         }
         Ok(Self { proof, root, is_link, id: block_id.clone(), data: Arc::new(data) })
+    }
+
+    pub(crate) fn deserialize_local_artifact(
+        block_id: &BlockIdExt,
+        data: Vec<u8>,
+        budget: &crate::history_read_budget::HistoryReadBudget,
+    ) -> Result<Self> {
+        budget.proof_bytes(&data)?;
+        let root = budget.parse_local_artifact(&data)?;
+        let proof = BlockProof::construct_from_cell(root.clone())?;
+        if &proof.proof_for != block_id || !block_id.is_masterchain() {
+            fail!("Local artifact proof identity mismatch");
+        }
+        Ok(Self { proof, root, is_link: false, id: block_id.clone(), data: Arc::new(data) })
     }
 
     pub fn new(proof: BlockProof, is_link: bool) -> Result<Self> {
