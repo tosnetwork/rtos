@@ -981,3 +981,64 @@ async fn archive_migration_error_retry_and_live_repair_remigration() -> Result<(
     assert_eq!(manager.get_file(&handle, &entry).await?, b"repaired-proof");
     Ok(())
 }
+
+#[tokio::test]
+async fn archive_unleased_startup_still_recovers_uncommitted_tail_and_appends() -> Result<()> {
+    use crate::archives::{archive_slice::ArchiveSlice, package_id::{PackageId, PackageType}};
+    use std::io::Write;
+    let dir = tempfile::tempdir()?;
+    let (manager, db) = create_manager(dir.path().to_str().unwrap(), "tail-control", false).await?;
+    let (handles, _) = create_block_handle_storage(db.clone());
+    let id = BlockIdExt::with_params(ShardIdent::masterchain(), 1,
+        UInt256::from([1; 32]), UInt256::from([2; 32]));
+    let handle = handles.create_handle(id.clone(), BlockMeta::with_data(0, 0, 0, 0, 0), None)?.unwrap();
+    let entry = PackageEntryId::Proof(&id);
+    manager.add_file(&entry, b"original-proof").await?;
+    handle.set_proof();
+    manager.move_to_archive(&handle, || { handle.set_archived(); Ok(()) }).await?;
+    let root = Arc::new(dir.path().join("tail-control"));
+    let path = PackageId::for_block(0).full_path(&root, id.shard())?;
+    let original = std::fs::read(&path)?;
+    drop(manager);
+    let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+    file.write_all(b"uncommitted-tail")?;
+    file.sync_all()?;
+    drop(file);
+    assert!(std::fs::metadata(&path)?.len() > original.len() as u64);
+    let slice = ArchiveSlice::with_data(db.repair_protection().clone(), db.clone(), root,
+        0, PackageType::Blocks, false, false,
+        #[cfg(feature = "telemetry")]
+        Arc::new(StorageTelemetry::default()), Arc::new(StorageAlloc::default())).await?;
+    assert_eq!(std::fs::read(&path)?, original, "unleased normal recovery must still trim its uncommitted tail");
+    slice.add_file(&handle, &entry, b"next-proof".to_vec()).await?;
+    assert_eq!(slice.get_file(&handle, &entry).await?.unwrap().data(), b"next-proof");
+    Ok(())
+}
+
+#[tokio::test]
+async fn archive_protected_key_package_append_metadata_cold_reopen() -> Result<()> {
+    use crate::archives::{archive_slice::ArchiveSlice, package_id::PackageType};
+    let dir = tempfile::tempdir()?;
+    let (manager, db) = create_manager(dir.path().to_str().unwrap(), "key-reopen", false).await?;
+    let (handles, _) = create_block_handle_storage(db.clone());
+    let id = BlockIdExt::with_params(ShardIdent::masterchain(), 3,
+        UInt256::from([3; 32]), UInt256::from([4; 32]));
+    let handle = handles.create_handle(id.clone(), BlockMeta::with_data(FLAG_KEY_BLOCK, 0, 0, 0, 0), None)?.unwrap();
+    let entry = PackageEntryId::Proof(&id);
+    manager.add_file(&entry, b"key-proof").await?;
+    handle.set_proof();
+    manager.move_to_archive(&handle, || { handle.set_archived(); Ok(()) }).await?;
+    drop(manager);
+    // Storage predicate fixture only; real authenticated custody is covered by Engine.
+    db.repair_protection().protect([], [id.clone()]);
+    let root = Arc::new(dir.path().join("key-reopen"));
+    for bytes in [b"key-proof".as_slice(), b"appended-key-proof".as_slice()] {
+        let slice = ArchiveSlice::with_data(db.repair_protection().clone(), db.clone(), root.clone(),
+            0, PackageType::KeyBlocks, false, false,
+            #[cfg(feature = "telemetry")]
+            Arc::new(StorageTelemetry::default()), Arc::new(StorageAlloc::default())).await?;
+        assert_eq!(slice.get_file(&handle, &entry).await?.unwrap().data(), bytes);
+        slice.add_file(&handle, &entry, b"appended-key-proof".to_vec()).await?;
+    }
+    Ok(())
+}

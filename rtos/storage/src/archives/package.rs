@@ -79,6 +79,25 @@ impl Package {
         })
     }
 
+    /// Validate a leased existing package without any repair or creation. Use
+    /// the same descriptor for validation and later append access.
+    pub(crate) async fn open_existing_exact(path: PathBuf, read_only: bool, logical_size: u64) -> Result<Self> {
+        let mut file = tokio::fs::OpenOptions::new().read(true).write(!read_only).open(&path).await
+            .map_err(|error| error!("Protected package open failed for {}: {error}", path.display()))?;
+        let expected = logical_size.checked_add(PKG_HEADER_SIZE as u64)
+            .ok_or_else(|| error!("Protected package size overflow"))?;
+        let size = file.metadata().await?.len();
+        if size != expected || size < PKG_HEADER_SIZE as u64 {
+            fail!("Protected package physical length differs from durable metadata");
+        }
+        read_header(&mut file).await?;
+        file.seek(SeekFrom::End(0)).await?;
+        Ok(Self {
+            path, read_only, size: AtomicU64::new(size),
+            write_mutex: tokio::sync::Mutex::new(if read_only { None } else { Some(file) }),
+        })
+    }
+
     pub fn size(&self) -> u64 {
         self.size.load(Ordering::SeqCst) - PKG_HEADER_SIZE as u64
     }
@@ -350,6 +369,35 @@ mod bounded_tests {
         std::fs::write(&path, data)?;
         let error = package.read_entry_bounded(0, limits).await.err().unwrap();
         assert!(error.downcast_ref::<ArchiveReadLimitExceeded>().is_some());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod protected_open_tests {
+    use super::*;
+    #[tokio::test]
+    async fn protected_package_exact_open_checks_readonly_magic_and_allows_valid_append() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("protected.pack");
+        let package = Package::open(path.clone(), false, true).await?;
+        let entry = PackageEntry::with_data("first".into(), b"first".to_vec());
+        package.append_entry(&entry, |_, _| Ok(())).await?;
+        let size = package.size();
+        drop(package);
+        let original = std::fs::read(&path)?;
+        let mut damaged = original.clone();
+        damaged[0] ^= 0xff;
+        std::fs::write(&path, &damaged)?;
+        assert!(Package::open_existing_exact(path.clone(), true, size).await.is_err());
+        assert_eq!(std::fs::read(&path)?, damaged);
+        std::fs::write(&path, &original)?;
+        let package = Package::open_existing_exact(path.clone(), false, size).await?;
+        package.append_entry(&entry, |_, _| Ok(())).await?;
+        let appended = package.size();
+        assert!(appended > size);
+        drop(package);
+        assert!(Package::open_existing_exact(path.clone(), true, appended).await.is_ok());
         Ok(())
     }
 }

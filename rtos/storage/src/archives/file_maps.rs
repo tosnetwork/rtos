@@ -289,6 +289,7 @@ impl FileMap {
             );
             let (slice_db, slice_root_path) = db_provider.db_for_archive(key).await?;
             let archive_slice = match ArchiveSlice::with_data(
+                protection.clone(),
                 slice_db,
                 slice_root_path,
                 key,

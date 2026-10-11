@@ -7,16 +7,22 @@ mod chain;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires RTOS_PUBLIC_FIXTURE_SIGNER; real Engine archive custody integration"]
 async fn persistent_repair_custody_real_pack_gc_control_and_cold_authentication() {
-    real_pack_gc(false).await;
+    real_pack_gc(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires RTOS_PUBLIC_FIXTURE_SIGNER; real selected archive GC versus custody registration"]
 async fn persistent_repair_custody_selected_archive_gc_rechecks_actual_registration() {
-    real_pack_gc(true).await;
+    real_pack_gc(true, false).await;
 }
 
-async fn real_pack_gc(preselected: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires RTOS_PUBLIC_FIXTURE_SIGNER; protected package cold corruption preservation"]
+async fn persistent_repair_custody_protected_pack_cold_damage_is_nondestructive() {
+    real_pack_gc(false, true).await;
+}
+
+async fn real_pack_gc(preselected: bool, cold_damage: bool) {
     use storage::archives::{package_entry_id::PackageEntryId, package_id::PackageId, ARCHIVE_SLICE_SIZE};
     let signer = std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER").unwrap();
     let mut fixture = fixture(false).await;
@@ -131,6 +137,13 @@ async fn real_pack_gc(preselected: bool) {
         run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     gc_cleanup.unwrap();
     stopped.unwrap();
+    if cold_damage {
+        protected_pack_cold_damage_checks(dir.path(), &protected_pack, generation, &exact, &digest).await;
+        let root = protected_pack.ancestors().nth(4).unwrap();
+        let key_pack = PackageId::for_key_block(0).full_path(root, &rtos_block::ShardIdent::masterchain()).unwrap();
+        assert!(key_pack.exists(), "real MC3 key proof must have a non-sliced provider");
+        protected_pack_cold_damage_checks(dir.path(), &key_pack, generation, &exact, &digest).await;
+    }
     let engine = open_engine(dir.path()).await;
     let run = std::panic::AssertUnwindSafe(async {
         assert!(!control_pack.exists() && protected_pack.exists());
@@ -275,4 +288,81 @@ async fn persistent_repair_archive_metadata_wal_failure_retains_loose_and_cold_r
     drop(engine);
     run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     stopped.unwrap();
+}
+
+
+async fn protected_pack_cold_damage_checks(
+    directory: &Path, pack: &Path, generation: u64, exact: &RepairLeaseBinding, digest: &UInt256,
+) {
+    use crate::{config::TonNodeConfig, engine::{EngineFlags, Stopper}};
+    use std::collections::BTreeMap;
+    // PackageId::full_path is <db>/archive/packages/<group>/<package>.
+    let root = pack.ancestors().nth(4).unwrap();
+    let snapshot = || {
+        let db = open_cells_for_fault_injection(root);
+        ["files", "key_files", "repair_dependency_leases_v1", "entry_meta_db_3",
+            "block_index_db_3", "offsets_db_3", "status_db_3", "entry_meta_key_db_0",
+            "block_index_key_db_0", "offsets_key_db_0", "status_key_db_0"].into_iter().map(|name| {
+            let table = db.clone().table::<String>(name, false).unwrap();
+            let mut rows = BTreeMap::new();
+            table.for_each(&mut |key, bytes| { rows.insert(key.to_vec(), bytes.to_vec()); Ok(true) }).unwrap();
+            (name.to_owned(), rows)
+        }).collect::<BTreeMap<_, _>>()
+    };
+    let original = std::fs::read(pack).unwrap();
+    assert!(original.len() > 8);
+    for mode in ["bad-magic", "short-header", "short-body", "extra-tail", "missing"] {
+        let before = snapshot();
+        let mut damaged = original.clone();
+        match mode {
+            "bad-magic" => damaged[0] ^= 0xff,
+            "short-header" => damaged.truncate(2),
+            "short-body" => { damaged.pop(); },
+            "extra-tail" => damaged.extend_from_slice(b"uncommitted-tail"),
+            "missing" => (),
+            _ => unreachable!(),
+        }
+        if mode == "missing" { std::fs::remove_file(pack).unwrap(); }
+        else { std::fs::write(pack, &damaged).unwrap(); }
+        let config = TonNodeConfig::from_file(directory.to_str().unwrap(), "config.json", None, "config.json", None).await.unwrap();
+        let stopper = Arc::new(Stopper::new());
+        let result = Engine::new(config,
+            EngineFlags { initial_sync_disabled: true, force_check_db: false, truncate_db: None },
+            stopper.clone()).await;
+        let (rejection, unexpected_stop) = match result {
+            Ok(engine) => (None, Some(engine.wait_stop().await)),
+            Err(error) => (Some(error), None),
+        };
+        let drained = tokio::time::timeout(Duration::from_secs(20), async {
+            while Arc::strong_count(&stopper) != 1 { tokio::task::yield_now().await; }
+        }).await;
+        let after_file = std::fs::read(pack).ok();
+        // Restore exact fixture evidence before assertions, even on regression.
+        std::fs::write(pack, &original).unwrap();
+        std::fs::File::open(pack).unwrap().sync_all().unwrap();
+        std::fs::File::open(pack.parent().unwrap()).unwrap().sync_all().unwrap();
+        let after = snapshot();
+        if let Some(result) = unexpected_stop { result.unwrap(); }
+        drained.expect("failed package startup must drain actual constructor owners");
+        let error = rejection.expect("protected pack damage must reject Engine construction");
+        let message = format!("{error:#}");
+        let expected = match mode {
+            "bad-magic" => "Package file header mismatch",
+            "missing" => "Protected package open failed",
+            _ => "Protected package physical length differs from durable metadata",
+        };
+        assert!(message.contains(expected), "protected {mode} rejected for unexpected reason: {message}");
+        assert_eq!(after_file, if mode == "missing" { None } else { Some(damaged) },
+            "protected {mode} must not be rewritten, recreated or deleted");
+        assert_eq!(after, before, "protected {mode} must preserve archive indexes and ledger");
+        let engine = open_engine(directory).await;
+        let verified = std::panic::AssertUnwindSafe(async {
+            let cap = reopen_durable_mc_custody(engine.clone(), generation, exact.clone(), digest.clone()).await.unwrap();
+            assert_eq!(cap.binding(), exact);
+        }).catch_unwind().await;
+        let stopped = engine.clone().wait_stop().await;
+        drop(engine);
+        verified.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        stopped.unwrap();
+    }
 }
