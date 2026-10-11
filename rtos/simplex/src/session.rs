@@ -309,6 +309,7 @@ pub(crate) struct SessionImpl {
     /// `Arc` so the queue's `flush()` runs in the correct order
     /// relative to `SessionProcessor` teardown.
     _callbacks: Arc<SessionCallbacks>,
+    recovery_complete: Arc<AtomicBool>,
     /// Session identifier
     session_id: SessionId,
     /// Activity node for session lifetime tracking
@@ -388,6 +389,7 @@ impl ConsensusSession for SessionImpl {
 }
 
 impl SimplexSession for SessionImpl {
+    fn finality_recovery_complete(&self) -> bool { self.recovery_complete.load(Ordering::Acquire) }
     fn ensure_candidate_available(
         &self,
         block_id: BlockIdExt,
@@ -516,6 +518,8 @@ impl SessionImpl {
         authenticated_runtime: Option<
             Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
         >,
+        recovery_only: bool,
+        recovery_complete: Arc<AtomicBool>,
         #[cfg(test)] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
     ) {
         log::info!(
@@ -807,6 +811,11 @@ impl SessionImpl {
             .unwrap()
             .clone()
             .expect("SimplexSession start flag set without explicit prev blocks");
+        if authenticated_runtime.is_some() {
+            if let Err(error) = callbacks.bind_delivery_start(min_masterchain_block_id.clone()) {
+                fail_startup(error, "Cannot bind source session start anchor"); return;
+            }
+        }
         let initial_block_seqno =
             session_start_prev_blocks.iter().map(|id| id.seq_no).max().unwrap_or(0) + 1;
         log::info!(
@@ -836,6 +845,7 @@ impl SessionImpl {
         )
         .and_then(|d| d.bind_pq_session(catchain_seqno))
         .and_then(|description| {
+            let description = description.with_recovery_only(recovery_only);
             #[cfg(test)]
             if let Some(coordinator) = &test_coordinator {
                 description.install_test_coordinator(coordinator.clone())?;
@@ -862,7 +872,7 @@ impl SessionImpl {
             db,
             startup_errors.get(),
             health_counters,
-            callbacks,
+            callbacks.clone(),
             trace_collector,
             catchain_seqno,
         ) {
@@ -937,8 +947,32 @@ impl SessionImpl {
         // Arm FSM skip timeouts now that overlay warmup and bootstrap
         // recovery are complete.  Matches C++ Start event timing.
         processor.start();
+        if authenticated_runtime.is_some() {
+            let replay = callbacks.pending_finality_intents().and_then(|certificates| {
+                for bytes in certificates {
+                    let wire = options.wire_profile.deserialize_typed(&bytes)?;
+                    processor.on_certificate(None::<u32>, wire);
+                }
+                Ok(())
+            });
+            if let Err(error) = replay {
+                processor.stop(false);
+                fail_startup(error, "Source final certificate recovery failed");
+                return;
+            }
+        }
 
         loop {
+            if recovery_only {
+                match callbacks.pending_finality_intents() {
+                    Ok(pending) => recovery_complete.store(pending.is_empty(), Ordering::Release),
+                    Err(error) => {
+                        processor.stop(false);
+                        fail_startup(error, "Source recovery progress cannot be established");
+                        return;
+                    }
+                }
+            }
             {
                 session_activity_node.tick();
                 loop_counter.increment(1);
@@ -1332,7 +1366,7 @@ impl SessionImpl {
         delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
     ) -> Result<SessionPtr> {
         Self::create_with_profile(options, session_id, shard, ids, local_key, db_path,
-            overlay_manager, listener, trace_collector, catchain_seqno, authenticated_runtime, delivery_sink,
+            overlay_manager, listener, trace_collector, catchain_seqno, authenticated_runtime, delivery_sink, false,
             #[cfg(test)] None)
     }
 
@@ -1352,6 +1386,7 @@ impl SessionImpl {
             Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
         >,
         delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
+        recovery_only: bool,
         #[cfg(test)] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
     ) -> Result<SessionPtr> {
         log::info!(
@@ -1388,6 +1423,7 @@ impl SessionImpl {
         );
 
         // Create thread synchronization flags
+        let recovery_complete = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let destroy_db_flag = Arc::new(AtomicBool::new(false));
         let start_flag = Arc::new(AtomicBool::new(false));
@@ -1444,6 +1480,7 @@ impl SessionImpl {
             panicked_flag: panicked_flag.clone(),
             main_task_queue: main_task_queue.clone(),
             _callbacks: callbacks.clone(),
+            recovery_complete: recovery_complete.clone(),
             session_id: session_id.clone(),
             _activity_node: session_activity_node.clone(),
             _receiver_listener: receiver_listener,
@@ -1504,6 +1541,8 @@ impl SessionImpl {
                         trace_collector,
                         catchain_seqno,
                         authenticated_runtime,
+                        recovery_only,
+                        recovery_complete,
                         #[cfg(test)] test_signer,
                     );
                 }));

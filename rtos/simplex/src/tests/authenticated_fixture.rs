@@ -73,7 +73,7 @@ pub fn runtime_with_members_on_shard(
             members,
             transport.id().clone(),
         )
-        .unwrap(),
+        .unwrap().bind_recovery_anchor(BlockIdExt::with_params(ShardIdent::masterchain(), 0, UInt256::from([21; 32]), UInt256::from([22; 32]))).unwrap(),
     );
     let options = crate::SessionOptions {
         protocol: runtime.protocol(),

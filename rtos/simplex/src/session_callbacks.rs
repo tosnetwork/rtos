@@ -135,6 +135,18 @@ impl SessionCallbacks {
         Ok(())
     }
 
+    fn delivery_source(&self) -> rtos_block::Result<Arc<crate::finality_delivery::SourceFinalityDelivery>> {
+        self.source_delivery.lock().unwrap().clone().ok_or_else(|| rtos_block::error!("Source delivery not initialized"))
+    }
+    pub(crate) fn bind_delivery_start(&self, anchor: BlockIdExt) -> rtos_block::Result<()> { self.delivery_source()?.bind_start(anchor) }
+    pub(crate) fn retain_finality_intent(&self, prevs: Vec<BlockIdExt>, event: &crate::simplex_state::BlockFinalizedEvent) -> rtos_block::Result<()> {
+        self.delivery_source()?.retain_intent(prevs, event)
+    }
+    pub(crate) fn resolve_finality_intent(&self, id: &crate::block::RawCandidateId) -> rtos_block::Result<()> {
+        self.delivery_source()?.resolve_intent(id)
+    }
+    pub(crate) fn pending_finality_intents(&self) -> rtos_block::Result<Vec<Vec<u8>>> { self.delivery_source()?.pending_intents() }
+
     pub(crate) fn poll_durable_finality(&self, draft: consensus_common::finality_delivery::FinalizedDeliveryDraft) -> rtos_block::Result<bool> {
         let source = self.source_delivery.lock().unwrap().clone().ok_or_else(|| rtos_block::error!("Source delivery not initialized"))?;
         if let Some((id, draft)) = source.poll(draft)? {

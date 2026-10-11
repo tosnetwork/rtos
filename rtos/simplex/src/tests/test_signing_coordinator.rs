@@ -936,7 +936,7 @@ fn custody_binding_rejects_wrong_backend_before_journal_creation() {
 fn custody_randomized_signatures_require_exact_journal_replay() {
     let h = Harness::custody(rtos_api::WireProfile::T0);
     let b = binding(&h.description);
-    let preimage = h.coordinator.preimage(&b, &vote_decision(&vote("notarize")).unwrap()).unwrap();
+    let preimage = SigningCoordinator::preimage(&b, &vote_decision(&vote("notarize")).unwrap()).unwrap();
     let store = h.store.as_ref().unwrap();
     let first = store.sign_consensus(&preimage).unwrap();
     let second = store.sign_consensus(&preimage).unwrap();

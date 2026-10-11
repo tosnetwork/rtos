@@ -280,7 +280,7 @@ async fn authenticated_validator_isolated_worker_signs_and_retains_journal_on_de
     let result = (|| -> Result<()> {
         let create = |initialize| SessionImpl::create_with_profile(&options, runtime.session_id(), runtime.shard(), nodes.clone(),
             &key, path.to_str().unwrap().to_owned(), manager.clone(), Arc::downgrade(&listener), None,
-            runtime.catchain_seqno(), Some(runtime.clone()), Some(Arc::new(RejectFinalitySink)), Some(crate::signing_coordinator::TestSessionSigner {
+            runtime.catchain_seqno(), Some(runtime.clone()), Some(Arc::new(RejectFinalitySink)), false, Some(crate::signing_coordinator::TestSessionSigner {
                 store: store.clone(), owner_root: directory.path().to_owned(), generation: 1, initialize,
             }));
         let session = create(true)?;

@@ -752,6 +752,11 @@ impl SessionOptions {
 /// simplex_session.notify_mc_finalized(applied_top_for_session_shard);
 /// ```
 pub trait SimplexSession: ConsensusSession {
+    /// All retained source intents have reached durable node custody. This is
+    /// progress only: owners must still checked-stop and join before releasing
+    /// the namespace. False also covers sessions not in recovery-only mode.
+    fn finality_recovery_complete(&self) -> bool { false }
+
     /// Notify session about the current applied top for its shard
     ///
     /// # Purpose
@@ -928,6 +933,32 @@ impl SessionFactory {
             Some(runtime.clone()),
             delivery_sink,
         )
+    }
+
+    /// Recover a retired namespace after Engine authenticates both its historical
+    /// configuration and session-start parents. No signer or producer is enabled.
+    pub fn create_finality_recovery_session(
+        options: &SessionOptions,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        local_transport_key: &PrivateKey,
+        db_root: &str,
+        recovery: &finality_recovery::SessionRecoveryRecord,
+        overlay_manager: ConsensusOverlayManagerPtr,
+        listener: SessionListenerPtr,
+        delivery_sink: consensus_common::finality_delivery::DurableFinalitySinkPtr,
+    ) -> Result<SessionPtr> {
+        options.validate_authenticated(&runtime)?;
+        recovery.validate_runtime(&runtime)?;
+        let directory = std::path::PathBuf::from(runtime.runtime_directory(db_root)?);
+        if directory != recovery.namespace { fail!("Recovery namespace differs from authenticated runtime"); }
+        if runtime.local_adnl() != local_transport_key.id() { fail!("Recovery transport key differs from authenticated runtime"); }
+        let nodes = runtime.committee().iter().map(SimplexSessionNode::from_descriptor).collect::<Result<Vec<_>>>()?;
+        let session = session::SessionImpl::create_with_profile(options, runtime.session_id(), runtime.shard(),
+            nodes, local_transport_key, directory.to_string_lossy().into_owned(), overlay_manager,
+            listener, None, runtime.catchain_seqno(), Some(runtime.clone()), Some(delivery_sink), true,
+            #[cfg(test)] None)?;
+        session.start(recovery.prev_blocks.clone(), recovery.start_masterchain.clone());
+        Ok(session)
     }
 
     /// Create session with log replay

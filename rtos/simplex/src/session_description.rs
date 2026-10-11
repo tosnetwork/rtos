@@ -71,6 +71,7 @@ pub(crate) struct SessionDescription {
     total_weight: ValidatorWeight,
     /// Index of this validator in the list of sources
     self_idx: Option<ValidatorIndex>,
+    recovery_only: bool,
     /// Shard identifier
     shard: ShardIdent,
     /// Local validator's private key (for signing votes and candidates)
@@ -257,6 +258,7 @@ impl SessionDescription {
             own_signing: std::sync::Mutex::new(None),
             pq_context: None,
             authenticated_runtime: runtime.cloned(),
+            recovery_only: false,
             session_id,
             options,
             initial_block_seqno,
@@ -330,6 +332,7 @@ impl SessionDescription {
         &self,
         candidate: rtos_api::ton::consensus::CandidateData,
     ) -> Result<rtos_api::ton::consensus::CandidateData> {
+        self.require_validator_index()?;
         let slot = *candidate.slot();
         if slot < 0 || Some(self.get_leader(SlotIndex::new(slot as u32))) != self.self_idx {
             fail!("candidate signer is not session leader");
@@ -342,6 +345,7 @@ impl SessionDescription {
     }
 
     pub fn recover_own_journal(&self, bootstrap: &mut crate::database::Bootstrap) -> Result<()> {
+        if self.recovery_only { return self.verify_own_journal(&bootstrap.own_journal); }
         let guard = self.own_signing.lock().map_err(|_| error!("signer capability poisoned"))?;
         match guard.as_ref() {
             Some(signer) => signer.recover_bootstrap(bootstrap, self.require_validator_index()?),
@@ -351,6 +355,9 @@ impl SessionDescription {
     }
 
     pub fn verify_own_journal(&self, raw: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        if self.recovery_only {
+            return crate::signing_coordinator::verify_recovery_journal(self.authenticated_runtime.as_ref().ok_or_else(|| error!("Recovery requires authenticated runtime"))?, raw);
+        }
         let guard = self.own_signing.lock().map_err(|_| error!("signer capability poisoned"))?;
         match guard.as_ref() {
             Some(signer) => signer.verify_bootstrap(raw),
@@ -476,10 +483,12 @@ impl SessionDescription {
     pub fn local_validator_index(&self) -> Option<ValidatorIndex> {
         self.self_idx
     }
+    pub(crate) fn with_recovery_only(mut self, enabled: bool) -> Self { self.recovery_only = enabled; self }
     pub fn is_validator(&self) -> bool {
-        self.self_idx.is_some()
+        !self.recovery_only && self.self_idx.is_some()
     }
     pub fn require_validator_index(&self) -> Result<ValidatorIndex> {
+        if self.recovery_only { fail!("Retired recovery has no signing or voting authority"); }
         self.self_idx.ok_or_else(|| error!("Observer has no signing or voting authority"))
     }
     pub fn local_role_label(&self) -> String {
