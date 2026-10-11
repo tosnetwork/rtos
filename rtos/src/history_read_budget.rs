@@ -219,7 +219,15 @@ impl HistoryReadBudget {
                 proofs.len() * std::mem::size_of::<crate::block_proof::BlockProofStuff>(),
             )?;
         }
-        Ok(proofs.clone())
+        match proofs.as_ref() {
+            Some(proofs) => {
+                let mut output = Vec::new();
+                output.try_reserve_exact(proofs.len())?;
+                for proof in proofs { output.push(proof.clone_with_budget(Some(self))?); }
+                Ok(Some(output))
+            }
+            None => Ok(None),
+        }
     }
     pub(crate) fn enable_provenance(&self) {
         *self.provenance.lock().unwrap() = Some(Default::default());

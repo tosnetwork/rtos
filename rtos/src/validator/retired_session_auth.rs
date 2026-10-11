@@ -55,11 +55,11 @@ async fn authenticate_identity(
     match history {
         Some(history) => {
             let verified = history.prepare(&binding.governing_masterchain).await?;
-            derive_identity(engine, pin, binding, local_adnl, &verified)
+            derive_identity(engine, pin, binding, local_adnl, &verified, Some(history.budget()))
         }
         None => {
             let verified = authenticate_recovered_state(engine, &binding.governing_masterchain).await?;
-            derive_identity(engine, pin, binding, local_adnl, &verified)
+            derive_identity(engine, pin, binding, local_adnl, &verified, None)
         }
     }
 }
@@ -70,6 +70,7 @@ fn derive_identity(
     binding: &SessionRecoveryBinding,
     local_adnl: &rtos_block::UInt256,
     verified: &crate::block_proof::VerifiedMasterchainState,
+    request: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
 ) -> Result<(AuthenticatedSessionRuntime, Arc<ShardStateStuff>)> {
     if &pin.zerostate != engine.zerostate_id()? {
         fail!("Closing/retired network pin mismatch");
@@ -95,14 +96,25 @@ fn derive_identity(
         fail!("Retired session derivation coordinates mismatch");
     }
     let config = state.config_params()?;
-    let catchain = config.catchain_config()?;
+    let budget = request.map(|b| crate::bounded_session_derivation::ConfigBudget(b.as_ref()));
+    let decoded = budget.as_ref().map(|b| config.session_config_bounded(coordinates.shard.is_masterchain(), b)).transpose()?;
+    let ordinary = if decoded.is_none() {
+        Some((config.validator_set()?, config.next_validator_set()?, config.catchain_config()?))
+    } else { None };
+    let (current, next, catchain) = match (&decoded, &ordinary) {
+        (Some(config), _) => (&config.current, &config.next, &config.catchain),
+        (_, Some((current, next, catchain))) => (current, next, catchain),
+        _ => unreachable!(),
+    };
     let (current_cc, lifetime) = if coordinates.shard.is_masterchain() {
         (extra.validator_info.catchain_seqno, catchain.mc_catchain_lifetime)
     } else {
-        (extra.shards().calc_shard_cc_seqno(&coordinates.shard)?, catchain.shard_catchain_lifetime)
+        let cc = match &budget {
+            Some(budget) => extra.shards().calc_shard_cc_seqno_bounded(&coordinates.shard, budget)?,
+            None => extra.shards().calc_shard_cc_seqno(&coordinates.shard)?,
+        };
+        (cc, catchain.shard_catchain_lifetime)
     };
-    let current = config.validator_set()?;
-    let next = config.next_validator_set()?;
     let set = if coordinates.catchain_seqno == current_cc {
         &current
     } else if current_cc.checked_add(1) == Some(coordinates.catchain_seqno) {
@@ -119,30 +131,30 @@ fn derive_identity(
     } else {
         fail!("Retired session catchain is outside current/next schedule");
     };
-    let subset = try_calc_subset_for_workchain_standard(
-        set,
-        config,
-        &coordinates.shard,
-        coordinates.catchain_seqno,
-    )?
-    .ok_or_else(|| error!("Retired session committee unavailable"))?;
-    let runtime = AuthenticatedSessionRuntime::from_authenticated_config(
-        SessionNetworkPin {
-            global_id: state.state()?.global_id(),
-            zerostate: engine.zerostate_id()?.clone(),
-        },
-        config,
-        SessionCoordinates {
-            shard: &coordinates.shard,
-            catchain_seqno: coordinates.catchain_seqno,
-            vertical_seqno: coordinates.vertical_seqno,
-            last_key_block_seqno: key_seqno,
-            new_catchain_ids: coordinates.new_catchain_ids,
-        },
-        subset.validators,
-        KeyId::from_data(*local_adnl.as_array()),
-    )?
-    .bind_recovery_anchor(binding.governing_masterchain.clone())?;
+    let runtime_pin = SessionNetworkPin {
+        global_id: state.state()?.global_id(), zerostate: engine.zerostate_id()?.clone(),
+    };
+    let runtime_coordinates = SessionCoordinates {
+        shard: &coordinates.shard, catchain_seqno: coordinates.catchain_seqno,
+        vertical_seqno: coordinates.vertical_seqno, last_key_block_seqno: key_seqno,
+        new_catchain_ids: coordinates.new_catchain_ids,
+    };
+    let runtime = match (&decoded, &budget) {
+        (Some(decoded), Some(budget)) => {
+            let (validators, _) = set.calc_subset_bounded(catchain,
+                coordinates.shard.shard_prefix_with_tag(), coordinates.shard.workchain_id(),
+                coordinates.catchain_seqno, budget)?;
+            AuthenticatedSessionRuntime::from_decoded_config_bounded(runtime_pin, decoded,
+                runtime_coordinates, validators, KeyId::from_data(*local_adnl.as_array()), budget)?
+        }
+        _ => {
+            let subset = try_calc_subset_for_workchain_standard(set, config,
+                &coordinates.shard, coordinates.catchain_seqno)?
+                .ok_or_else(|| error!("Retired session committee unavailable"))?;
+            AuthenticatedSessionRuntime::from_authenticated_config(runtime_pin, config,
+                runtime_coordinates, subset.validators, KeyId::from_data(*local_adnl.as_array()))?
+        }
+    }.bind_recovery_anchor(binding.governing_masterchain.clone())?;
     Ok((runtime, state))
 }
 
@@ -177,7 +189,7 @@ pub(crate) async fn authenticate_closing_runtime_in_request(
         .ok_or_else(|| error!("Closing identity lacks authenticated recovery anchor"))?;
     let (runtime, _) =
         authenticate_identity(engine, &domain.pin, binding, &request.canonical.local_adnl, history).await?;
-    validate_closing_identity(&runtime, request)?;
+    validate_closing_identity(&runtime, request, history.map(|h| h.budget()))?;
     let root = PathBuf::from(engine.db_root_dir()?).join("catchains");
     let expected = PathBuf::from(
         runtime.runtime_directory(root.to_str().ok_or_else(|| error!("Invalid DB root"))?)?,
@@ -191,6 +203,7 @@ pub(crate) async fn authenticate_closing_runtime_in_request(
 fn validate_closing_identity(
     runtime: &AuthenticatedSessionRuntime,
     request: &CloseFinalityRequest,
+    history: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
 ) -> Result<()> {
     let domain = &request.domain;
     let binding = domain
@@ -209,6 +222,16 @@ fn validate_closing_identity(
         LocalRole::Validator(i) => Some(i),
         LocalRole::Observer => None,
     };
+    let mut source_member = false;
+    for member in runtime.committee() {
+        let matches = match history {
+            Some(history) => member.validator_id_bounded(
+                &crate::bounded_session_derivation::ConfigBudget(history.as_ref()))?
+                == request.canonical.source_validator,
+            None => member.validator_id().ok().as_ref() == Some(&request.canonical.source_validator),
+        };
+        if matches { source_member = true; break; }
+    }
     if runtime.protocol() != domain.protocol
         || runtime.carrier_version() != domain.carrier_version
         || runtime.wire_profile() != domain.wire_profile
@@ -217,10 +240,7 @@ fn validate_closing_identity(
         || role != request.canonical.local_validator_index
         || runtime.recovery_binding() != Some(binding)
         || runtime.shard() != request.canonical.block_id.shard()
-        || !runtime
-            .committee()
-            .iter()
-            .any(|v| v.validator_id().ok().as_ref() == Some(&request.canonical.source_validator))
+        || !source_member
     {
         fail!("Closing source historical identity/role mismatch");
     }
@@ -247,7 +267,7 @@ pub(crate) fn validate_close_recovery_binding(
     let pin =
         SessionNetworkPin { zerostate: domain.zerostate.clone(), global_id: domain.global_id };
     let (runtime, _) =
-        derive_identity(engine, &pin, &recovery, &binding.canonical.local_adnl, verified)?;
+        derive_identity(engine, &pin, &recovery, &binding.canonical.local_adnl, verified, None)?;
     let request = CloseFinalityRequest {
         canonical: binding.canonical.clone(),
         domain: FinalityCloseDomain {
@@ -262,7 +282,7 @@ pub(crate) fn validate_close_recovery_binding(
         source_digest: binding.source_digest.clone(),
         created_at_unix_secs: binding.created_at_unix_secs,
     };
-    validate_closing_identity(&runtime, &request)
+    validate_closing_identity(&runtime, &request, None)
 }
 
 pub(crate) async fn authenticate_retired_session(
@@ -327,13 +347,31 @@ pub(crate) async fn authenticate_retired_session_in_request(
     {
         fail!("Retired session start does not descend from governing anchor");
     }
-    let parents = authenticated_start_parents(start.state(), &coordinates.shard)?;
+    let parents = match history {
+        Some(history) => crate::bounded_session_derivation::authenticated_start_parents(
+            start.state(), &coordinates.shard, history.budget())?,
+        None => authenticated_start_parents(start.state(), &coordinates.shard)?,
+    };
     if record.prev_blocks != parents {
         fail!("Retired session previous block floor mismatch");
     }
-    let options =
-        super::validator_manager::build_historical_simplex_options(config, &coordinates.shard)?;
+    let options = match history {
+        Some(history) => {
+            let budget = crate::bounded_session_derivation::ConfigBudget(history.budget().as_ref());
+            let decoded = config.session_config_bounded(coordinates.shard.is_masterchain(), &budget)?;
+            super::validator_manager::build_historical_simplex_options_decoded(&decoded, &coordinates.shard)?
+        }
+        None => super::validator_manager::build_historical_simplex_options(config, &coordinates.shard)?,
+    };
     options.validate_authenticated(&runtime)?;
+    if let Some(history) = history {
+        use rtos_block::merkle_apply_budget::MerkleApplyBudget;
+        let bytes = record.prev_blocks.len().checked_mul(std::mem::size_of::<BlockIdExt>())
+            .and_then(|n| n.checked_add(record.namespace.as_os_str().len()))
+            .and_then(|n| n.checked_add(4096))
+            .ok_or_else(|| error!("Historical locator clone workspace overflow"))?;
+        history.budget().workspace(bytes)?;
+    }
     Ok(AuthenticatedRetiredSession { runtime: Arc::new(runtime), options, record: record.clone() })
 }
 
@@ -848,7 +886,7 @@ mod tests {
         let verified =
             authenticate_recovered_state(&engine, &record.binding.governing_masterchain).await?;
         let (runtime, _) =
-            derive_identity(&engine, &record.pin, &record.binding, &record.local_adnl, &verified)?;
+            derive_identity(&engine, &record.pin, &record.binding, &record.local_adnl, &verified, None)?;
         let request = closing_request(&record, runtime.committee()[0].validator_id()?);
         let binding = RepairLeaseBinding {
             record_id: 1,
