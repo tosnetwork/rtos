@@ -77,6 +77,31 @@ async fn authenticated_manager_current_authentication_error_exits_real_invocatio
     run_authenticated_manager_observer_lifecycle(false, None, false, Some(false)).await
 }
 
+/// Direct fixture updates must obey the invocation's same typed-only policy.
+/// Fault assertions below intentionally call update_shards directly instead.
+async fn update_with_history_retry(
+    manager: &mut ValidatorManagerImpl,
+    state: Arc<ShardStateStuff>,
+) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let generation = manager.engine.finality_recovery_generation();
+            match manager.update_shards(state.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(error) if crate::retired_history::is_retryable(&error) => {
+                    eprintln!("manager fixture: typed preparation defer: {error}");
+                    let handle = manager.engine.load_block_handle(state.block_id())?
+                        .ok_or_else(|| error!("fixture retry MC handle absent"))?;
+                    let next = manager.wait_next_mc_or_materialization_retry(&handle, generation)
+                        .await?.ok_or_else(|| error!("fixture manager stopped during history retry"))?;
+                    anyhow::ensure!(next.id() == state.block_id(), "fixture received unexpected MC during retry");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }).await.map_err(|error| error!("fixture typed history retry deadline: {error}"))?
+}
+
 async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, admission_race: Option<u32>, idle_retry: bool, current_retry: Option<bool>) -> Result<()> {
     use adnl::{node::AdnlNode, DhtNode, OverlayNode, RldpNode, NetworkStack};
     let _ = env_logger::builder().is_test(true).try_init();
@@ -209,7 +234,7 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
                 Ok::<_, anyhow::Error>((runtime, token))
             };
             let updates = async {
-                manager.update_shards(state.clone()).await?;
+                update_with_history_retry(&mut manager, state.clone()).await?;
                 let handle = engine.load_block_handle(state.block_id())?.unwrap();
                 loop {
                     let generation = engine.namespace_registry.generation();
@@ -219,7 +244,7 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
                             anyhow::ensure!(next?.is_some(), "manager stopped before admission gate");
                         }
                     }
-                    manager.update_shards(state.clone()).await?;
+                    update_with_history_retry(&mut manager, state.clone()).await?;
                 }
             };
             let (updated, race) = tokio::join!(tokio::time::timeout(Duration::from_secs(12), updates), race);
@@ -236,7 +261,7 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
             token.release();
             engine.namespace_registry.wait_changed(generation).await?;
             anyhow::ensure!(!did_create, "normal loser created a competing session");
-            manager.update_shards(state.clone()).await?;
+            update_with_history_retry(&mut manager, state.clone()).await?;
             let groups = if target_seqno == 0 { &manager.current_sessions } else { &manager.future_sessions };
             anyhow::ensure!(Arc::ptr_eq(&loser, groups.get(runtime.session_id()).unwrap()), "same-state retry replaced loser group");
             // Existing future groups must warm up again on this same MC state;
@@ -253,7 +278,7 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
                         } => break,
                         next = manager.wait_next_mc_or_materialization_retry(&handle, generation) => { next?; }
                     }
-                    manager.update_shards(state.clone()).await?;
+                    update_with_history_retry(&mut manager, state.clone()).await?;
                 }
                 Ok::<_, anyhow::Error>(())
             }).await.map_err(|e| error!("same-state warm retry: {e}"))??;
@@ -262,7 +287,7 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
             anyhow::ensure!(engine.namespace_registry.reserve(&runtime)?.is_none(),
                 "recovery competed with the live normal session");
         } else {
-            manager.update_shards(state.clone()).await?;
+            update_with_history_retry(&mut manager, state.clone()).await?;
         }
         if idle_retry {
             let handle = engine.load_block_handle(state.block_id())?.unwrap();
@@ -279,7 +304,7 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
                     if ready == 3 && engine.future_history_failure_seen.load(Ordering::SeqCst) { break; }
                     let generation = engine.namespace_registry.generation();
                     manager.wait_next_mc_or_materialization_retry(&handle, generation).await?;
-                    manager.update_shards(state.clone()).await?;
+                    update_with_history_retry(&mut manager, state.clone()).await?;
                 }
                 Ok::<_, anyhow::Error>(())
             }).await.map_err(|e| error!("idle fixture settle: {e}"))??;
@@ -294,7 +319,7 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
             anyhow::ensure!(next.id() == handle.id(), "idle retry changed MC");
             anyhow::ensure!(engine.namespace_registry.generation() == generation,
                 "namespace notification masked idle timer evidence");
-            manager.update_shards(state.clone()).await?;
+            update_with_history_retry(&mut manager, state.clone()).await?;
             tokio::time::timeout(Duration::from_secs(5), async {
                 while !target.snapshot().await.has_engine { tokio::time::sleep(Duration::from_millis(10)).await; }
             }).await.map_err(|e| error!("idle future failed materialization after timer: {e}"))?;
@@ -337,7 +362,7 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
         }))?;
         let next = install_signed_manager_successor(engine.as_ref(), &bootstrap, &state)?;
         engine.install_masterchain_state(next.clone(), Some(state.block_id().clone()))?;
-        manager.update_shards(next.clone()).await?;
+        update_with_history_retry(&mut manager, next.clone()).await?;
         wait_for_manager_sessions(&manager).await?;
         for (id, old) in first {
             let replacement = manager.current_sessions.get(&id).ok_or_else(|| error!("same-session replacement missing"))?;
@@ -347,7 +372,7 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
             anyhow::ensure!(replacement.authenticated_runtime().unwrap().members().contains(&rtos_block::KeyId::from_data([81; 32])));
         }
         let unchanged = manager.current_sessions.clone();
-        manager.update_shards(next).await?;
+        update_with_history_retry(&mut manager, next).await?;
         for (id, original) in unchanged {
             let retained = manager.current_sessions.get(&id).ok_or_else(|| error!("unchanged admission disappeared"))?;
             anyhow::ensure!(Arc::ptr_eq(&original, retained), "unchanged admission was recreated");
