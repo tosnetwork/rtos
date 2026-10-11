@@ -32,6 +32,8 @@ const REPLAY_SLICE: Duration = Duration::from_secs(30);
 pub(crate) struct RecoveryServiceSnapshot {
     pub active: usize,
     pub completed: u64,
+    #[cfg(test)]
+    pub constructed: u64,
     pub passes: u64,
     pub deferred: u64,
 }
@@ -267,13 +269,21 @@ impl RetiredSessionService {
             if owner.constructing.as_ref().is_some_and(|job| job.is_finished()) {
                 let result = owner.constructing.take().unwrap().await;
                 match result {
-                    Ok(Ok(session)) => owner.session = Some(session),
+                    Ok(Ok(session)) => {
+                        owner.session = Some(session);
+                        #[cfg(test)]
+                        {
+                            let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+                            status.constructed = status.constructed.saturating_add(1);
+                        }
+                    }
                     Ok(Err(failure)) => {
-                        owner.failure = Some(Arc::new(Mutex::new(failure)));
-                        self.deferred(
-                            &owner.namespace,
-                            &"checked construction failed; cleanup retained",
+                        let diagnostic = format!(
+                            "checked construction failed; stopping={stopping}, stop_requested={}, failure={failure:?}",
+                            stopper.check_stop(),
                         );
+                        owner.failure = Some(Arc::new(Mutex::new(failure)));
+                        self.deferred(&owner.namespace, &diagnostic);
                     }
                     Err(error) => {
                         stopper.set_stop();
