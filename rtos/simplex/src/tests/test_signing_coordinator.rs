@@ -169,20 +169,23 @@ impl Harness {
             .unwrap_or_else(|| self.calls.load(Ordering::SeqCst))
     }
     pub fn custody(wire_profile: rtos_api::WireProfile) -> Self {
+        Self::custody_with_key(wire_profile, [0x91; 32], 0)
+    }
+    pub fn custody_with_key(
+        wire_profile: rtos_api::WireProfile,
+        seed: [u8; 32],
+        expire_at: u32,
+    ) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("rtos-custody-journal-{}", UInt256::rand()));
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let seed_path = root.join("public-test.seed");
-        std::fs::write(&seed_path, [0x91; 32]).unwrap();
+        std::fs::write(&seed_path, seed).unwrap();
         std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let custody = rtos_pq_consensus::PqConsensusCustody::load(
             UInt256::from([2; 32]),
-            &[rtos_pq_consensus::ConfiguredKey {
-                key_file: seed_path,
-                valid_from: 0,
-                expire_at: 0,
-            }],
+            &[rtos_pq_consensus::ConfiguredKey { key_file: seed_path, valid_from: 0, expire_at }],
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32,
         )
         .unwrap();
@@ -190,10 +193,12 @@ impl Harness {
             custody.held_keys(&UInt256::from([2; 32])).values().next().unwrap().store.clone();
         let description = custody_description(wire_profile, &store);
         let db = crate::database::SimplexDb::open(root.join("db"), "own-signing").unwrap();
+        let mut journal_binding = binding(&description);
+        journal_binding.expire_at = u64::from(store.expire_at());
         let coordinator = Arc::new(
             SigningCoordinator::open(
                 db.clone(),
-                binding(&description),
+                journal_binding,
                 description.get_source_public_key(description.get_self_idx()).clone(),
                 &root,
                 true,
@@ -226,10 +231,14 @@ impl Harness {
             Some(store) => custody_backend(&description, store.clone()),
             None => signer(calls.clone()),
         };
+        let mut journal_binding = binding(&description);
+        if let Some(store) = &store {
+            journal_binding.expire_at = u64::from(store.expire_at());
+        }
         let coordinator = Arc::new(
             SigningCoordinator::open(
                 db.clone(),
-                binding(&description),
+                journal_binding,
                 description.get_source_public_key(description.get_self_idx()).clone(),
                 &root,
                 false,
@@ -942,4 +951,47 @@ fn custody_randomized_signatures_require_exact_journal_replay() {
         rtos_api::serialize_boxed(&replay.into_boxed()).unwrap()
     );
     assert_eq!(h.signature_count(), 3);
+}
+
+#[test]
+fn custody_pending_intent_is_a_durable_conflict_tombstone() {
+    for candidate in [false, true] {
+        let h = Harness::custody(rtos_api::WireProfile::T0);
+        *h.coordinator.fail_at.lock().unwrap() = Some("after_intent");
+        if candidate {
+            assert!(h.coordinator.candidate(empty()).is_err());
+        } else {
+            assert!(h.coordinator.vote(&vote("notarize")).is_err());
+        }
+        let h = h.reopen();
+        if candidate {
+            let mut other = empty();
+            if let CandidateData::Consensus_Empty(ref mut c) = other {
+                c.block.seq_no += 1;
+            }
+            assert!(h.coordinator.candidate(other).is_err());
+        } else {
+            let other =
+                utils::extract_vote(&f::vote("ordinary", "notarize", 1, f::CONTEXT)).unwrap();
+            assert!(h.coordinator.vote(&other).is_err());
+        }
+        assert_eq!(
+            h.signature_count(),
+            0,
+            "a durable conflicting intent must refuse before the signer"
+        );
+    }
+    for (a, b) in [
+        ("notarize", "notarize"),
+        ("notarize", "finalize"),
+        ("finalize", "notarize"),
+        ("finalize", "finalize"),
+    ] {
+        let h = Harness::custody(rtos_api::WireProfile::T0);
+        h.coordinator.vote(&vote(a)).unwrap();
+        let h = h.reopen();
+        let other = utils::extract_vote(&f::vote("ordinary", b, 1, f::CONTEXT)).unwrap();
+        assert!(h.coordinator.vote(&other).is_err());
+        assert_eq!(h.signature_count(), 1);
+    }
 }

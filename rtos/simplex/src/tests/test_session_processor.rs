@@ -11334,3 +11334,32 @@ fn custody_real_candidate_recovery_uses_durable_carrier() {
         }
     }
 }
+
+#[test]
+fn custody_retired_backend_stops_real_vote_publication() {
+    use crate::signing_coordinator::tests::{vote, Harness};
+    let h = Harness::custody_with_key(rtos_api::WireProfile::T0, [0xa7; 32], 4_000_000_000);
+    h.description.install_test_coordinator(h.coordinator.clone()).unwrap();
+    let mut processor =
+        make_pq_processor_with_description_for_test(h.db.clone(), h.description.clone());
+    let receiver = MockReceiver::new();
+    processor.receiver = receiver.clone();
+    // Custody observes its own actual deadline after capability installation.
+    // The coordinator's wall clock remains valid; the real backend must refuse.
+    assert!(h.store.as_ref().unwrap().expired_at(4_000_000_000));
+    for role in ["notarize", "finalize", "skip"] {
+        processor.with_consensus_backend(|controller, backend| {
+            controller.broadcast_vote_after_persist(backend, vote(role));
+        });
+    }
+    assert!(receiver
+        .drain_actions()
+        .iter()
+        .all(|action| !matches!(action, ReceiverAction::SendVote { .. })));
+    assert_eq!(h.signature_count(), 0);
+    assert!(h.store.as_ref().unwrap().signatures_refused_after_expiry() > 0);
+    assert!(
+        h.coordinator.vote(&vote("notarize")).is_err(),
+        "backend failure must poison subsequent signing"
+    );
+}
