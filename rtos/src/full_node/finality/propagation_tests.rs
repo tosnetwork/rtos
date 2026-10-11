@@ -127,9 +127,18 @@ async fn propagation_authenticated_normal_finality_applies_by_mc_and_reopens() {
         let outcome = pair.provider.propagate_accepted_session_block(&accepted, &plan).await;
         assert!(sent(&outcome, PropagationKind::Finality), "{outcome:?}");
         assert!(!outcome.needs_retry(), "{outcome:?}");
-        pair.wait_preapplied().await;
         let (expected_wire, expected_id) = pair.finality_wire();
-        let received = pair.receiver.network().test_broadcast_faults.receipts();
+        let received = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let receipts = pair.receiver.network().test_broadcast_faults.receipts();
+                if receipts.iter().any(|r| r.simple_id == Some(expected_id)) {
+                    break receipts;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("normal finality carrier must reach the remote transport before recovery");
         let receipt = received
             .iter()
             .find(|r| r.simple_id == Some(expected_id) && !r.dropped && r.error.is_none())
@@ -149,6 +158,7 @@ async fn propagation_authenticated_normal_finality_applies_by_mc_and_reopens() {
                 .unwrap();
             std::fs::write(directory.join("normal.transport-id"), expected_id).unwrap();
         }
+        pair.wait_preapplied().await;
         let receiver_handle = pair.receiver.load_block_handle(pair.shard.id()).unwrap().unwrap();
         assert!(!receiver_handle.is_applied());
         assert_eq!(
@@ -243,6 +253,16 @@ async fn propagation_authenticated_approval_uses_block_fec_without_finality() {
         );
         assert!(plan.block_targets.public);
         assert_eq!(plan.finality_targets, crate::validator::propagation::TargetSet::NONE);
+        let destinations =
+            pair.provider.resolve_propagation_targets(pair.shard.id(), &plan).await.unwrap();
+        let public = destinations
+            .iter()
+            .find(|destination| {
+                destination.kind == PropagationKind::Block
+                    && destination.target == PropagationTarget::Public
+            })
+            .expect("normal resolver must freeze the public block destination");
+        let plan = plan.for_destination(public).unwrap();
         let outcome = pair.provider.propagate_accepted_session_block(&accepted, &plan).await;
         assert!(sent(&outcome, PropagationKind::Block), "{outcome:?}");
         assert!(!outcome.receipts.iter().any(|r| r.kind == PropagationKind::Finality));

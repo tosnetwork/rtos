@@ -3364,6 +3364,9 @@ impl OverlayNode {
             plumtree_now(),
             Instant::now(),
         )?;
+        if !actions.iter().any(|action| matches!(action, plumtree::Action::Send { .. })) {
+            fail!("Plumtree publication has no outbound neighbour; retry after peer discovery");
+        }
         overlay.execute_plumtree(actions).await
     }
 }

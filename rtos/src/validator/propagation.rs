@@ -56,6 +56,9 @@ impl PropagationPlan {
         &self,
         destination: &PropagationDestination,
     ) -> rtos_block::Result<Self> {
+        if self.exact_destination.as_ref().is_some_and(|saved| saved != destination) {
+            rtos_block::fail!("Cannot change a previously resolved propagation destination");
+        }
         let targets = self.targets_for(destination.kind);
         let allowed = match &destination.target {
             PropagationTarget::Public => targets.public,
@@ -340,6 +343,13 @@ mod tests {
         assert_eq!(retry.candidate_targets, TargetSet::NONE);
         assert_eq!(retry.finality_targets, TargetSet::CUSTOM);
         assert_eq!(retry.destination(), Some(&destination));
+        assert!(retry
+            .for_destination(&PropagationDestination {
+                kind: PropagationKind::Finality,
+                target: PropagationTarget::Custom("new-name".into()),
+            })
+            .is_err());
+        assert!(retry.for_destination(&destination).is_ok());
         let failed =
             PropagationOutcome::failed_for_plan(PropagationKind::Finality, &retry, "closed");
         assert_eq!(failed.receipts.len(), 1);
