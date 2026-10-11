@@ -244,7 +244,7 @@ fn bounded_proof_boc_measurement_width_shared_and_exotic_graphs() {
         crate::MerkleUpdate::make_pruned_branch_cell(&small, 0).unwrap().into_cell().unwrap();
     assert_eq!(pruned.cell_type(), CellType::PrunedBranch);
     assert_measured_boc(&pruned);
-    let proof = crate::MerkleProof::create(&small, |id| id == &small.repr_hash())
+    let proof = crate::MerkleProof::create(&small, |id| id == small.repr_hash())
         .unwrap()
         .serialize()
         .unwrap();
