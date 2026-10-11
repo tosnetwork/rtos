@@ -785,10 +785,16 @@ mod configuration_tests {
                             b"configuration transport probe",
                         )
                         .await;
-                    assert_eq!(
-                        sent.is_ok(),
-                        protocol == 2,
-                        "typed protocol must select actual transport activation: {sent:?}"
+                    let error = sent
+                        .expect_err("an isolated overlay has no outbound neighbours")
+                        .to_string();
+                    assert!(
+                        error.contains(if protocol == 2 {
+                            "no outbound neighbour"
+                        } else {
+                            "disabled"
+                        }),
+                        "typed protocol must select actual transport activation: {error}"
                     );
                 }
                 if protocol == 2 {
@@ -827,10 +833,13 @@ mod configuration_tests {
                         .clone()
                         .unwrap();
                     assert_ne!(signer.id(), new_signer.id());
-                    replacement
+                    assert!(replacement
                         .overlay_client()
                         .broadcast_plumtree(&new_signer, Some([94; 32]), b"replacement generation")
-                        .await?;
+                        .await
+                        .expect_err("replacement still has no outbound neighbours")
+                        .to_string()
+                        .contains("no outbound neighbour"));
                 }
                 Ok::<_, anyhow::Error>(())
             })

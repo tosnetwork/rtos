@@ -141,6 +141,32 @@ impl Pair {
         let receiver = open_engine(&receiver_dir).await;
         let provider = open_engine(&provider_dir).await;
         let setup = std::panic::AssertUnwindSafe(async {
+            if v2 {
+                // Private overlay creation requires a real ADNL route already
+                // present. Bootstrap transport reachability before normal config
+                // creates either public or fast overlays; do not bypass membership.
+                for (local, remote) in [(&receiver, &provider), (&provider, &receiver)] {
+                    let local_adnl = &local.network().context().stack.adnl;
+                    let remote_adnl = &remote.network().context().stack.adnl;
+                    let local_key = local_adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
+                    let remote_key = remote_adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
+                    local_adnl
+                        .add_peer(local_key.id(), remote_adnl.ip_address_adnl(), None, &remote_key)
+                        .unwrap();
+                    local
+                        .network()
+                        .context()
+                        .stack
+                        .quic
+                        .as_ref()
+                        .unwrap()
+                        .add_peer_key(
+                            remote_key.id().clone(),
+                            remote.network().context().quic_address.unwrap(),
+                        )
+                        .unwrap();
+                }
+            }
             for engine in [&receiver, &provider] {
                 for bytes in [&mc_data, &decode(&recovery["prev_state_boc"])] {
                     let root = read_single_root_boc(bytes).unwrap();
@@ -216,7 +242,7 @@ impl Pair {
                 let peer = local_adnl
                     .add_peer(local_key.id(), remote_adnl.ip_address_adnl(), None, &remote_key)
                     .unwrap()
-                    .unwrap();
+                    .unwrap_or_else(|| remote_key.id().clone());
                 for shard_id in [shard.id().shard(), anchor.shard()] {
                     let client = local.overlay_client(shard_id).await.unwrap();
                     client.overlay_client().neighbours().add(peer.clone()).unwrap();

@@ -159,7 +159,12 @@ async fn propagation_authenticated_normal_finality_applies_by_mc_and_reopens() {
             }
         })
         .await
-        .expect("normal finality carrier must reach the remote transport before recovery");
+        .unwrap_or_else(|error| {
+            panic!(
+                "normal finality carrier missing: {error}; expected={expected_id:?}; actual={:?}",
+                pair.receiver.network().test_broadcast_faults.receipts()
+            )
+        });
         let receipt = received
             .iter()
             .find(|r| r.simple_id == Some(expected_id) && !r.dropped && r.error.is_none())
