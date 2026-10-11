@@ -199,6 +199,11 @@ pub fn authenticate_source_history_debt(
         if bytes.len() != length {
             fail!("Source history intent changed size during read");
         }
+        // TL vectors reserve up to 1024 elements before reading their first
+        // item; even a tiny malformed certificate can trigger this allocation.
+        budget.workspace(
+            1024 * std::mem::size_of::<rtos_api::ton::consensus::simplex::VoteSignature>(),
+        )?;
         let (actual, certificate) = decode_intent(&path, &record.namespace, &bytes)?;
         if !same_record(record, &actual) {
             fail!("Source history certificate locator mismatch");
@@ -362,6 +367,34 @@ mod tests {
         let failure = authenticate_source_history_debt(&changed, &runtime, &Budget).err().unwrap();
         assert!(failure.to_string().contains("locator mismatch"));
         assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(authenticate_source_history_debt(&record, &runtime, &Budget).is_ok());
+    }
+    #[test]
+    fn source_history_debt_initial_tl_vector_is_charged_before_decode() {
+        struct DenyVector;
+        impl SourceHistoryDebtBudget for DenyVector {
+            fn step(&self) -> Result<()> {
+                Ok(())
+            }
+            fn workspace(&self, bytes: usize) -> Result<()> {
+                if bytes
+                    == 1024
+                        * std::mem::size_of::<rtos_api::ton::consensus::simplex::VoteSignature>()
+                {
+                    fail!("injected TL vector allocation limit");
+                }
+                Ok(())
+            }
+            fn read_bytes(&self, _: usize) -> Result<()> {
+                Ok(())
+            }
+        }
+        let root = crate::authenticated_fixture::TestDirectory::new();
+        let (runtime, record, path) = retained(root.path());
+        let bytes = std::fs::read(&path).unwrap();
+        let error = authenticate_source_history_debt(&record, &runtime, &DenyVector).err().unwrap();
+        assert!(error.to_string().contains("TL vector allocation limit"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert!(authenticate_source_history_debt(&record, &runtime, &Budget).is_ok());
     }
 }
