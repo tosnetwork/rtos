@@ -1085,6 +1085,7 @@ impl ValidatorGroup {
             || runtime.local_adnl().data() != self.local_key.id().data()
             || runtime.protocol() != options.protocol
             || runtime.carrier_version() != options.proto_version
+            || runtime.slots_per_leader_window() != options.slots_per_leader_window
             || runtime.wire_profile() != options.wire_profile
         {
             fail!("Authenticated runtime differs from group identity or options");
