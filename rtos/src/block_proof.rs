@@ -209,6 +209,34 @@ impl Default for MasterchainProofVerifier {
     }
 }
 
+/// Routing policy recovered from the same authenticated governing history as
+/// the PQ verifier. Serialized outbox metadata cannot construct this receipt.
+pub struct PqPublicationContext {
+    zerostate: BlockIdExt,
+    global_id: i32,
+    protocol: consensus_common::simplex_protocol::SimplexProtocol,
+    profile: UInt256,
+    verifier: rtos_api::pq_finality::PqVerificationContext,
+}
+
+impl PqPublicationContext {
+    pub fn zerostate(&self) -> &BlockIdExt {
+        &self.zerostate
+    }
+    pub fn global_id(&self) -> i32 {
+        self.global_id
+    }
+    pub fn protocol(&self) -> consensus_common::simplex_protocol::SimplexProtocol {
+        self.protocol
+    }
+    pub fn profile(&self) -> &UInt256 {
+        &self.profile
+    }
+    pub fn verifier(&self) -> &rtos_api::pq_finality::PqVerificationContext {
+        &self.verifier
+    }
+}
+
 impl MasterchainProofVerifier {
     fn remember(&self, authority: BootstrapAuthority) {
         // Large valid proofs remain verifiable without being retained. This is
@@ -320,6 +348,55 @@ impl MasterchainProofVerifier {
             history
         };
         Ok(history)
+    }
+
+    /// Recover publication policy from authenticated history rather than the
+    /// retry record. In particular, a stored protocol tag cannot select relay
+    /// behavior for a different governing configuration after restart.
+    pub(crate) async fn pq_publication_context<E: EngineOperations + ?Sized>(
+        &self,
+        engine: &E,
+        id: &BlockIdExt,
+        block: &Block,
+    ) -> Result<PqPublicationContext> {
+        let verifier = self.pq_broadcast_context(engine, id, block).await?;
+        let info = block.read_info()?;
+        let authority = self.governing_authority(engine, info.prev_key_block_seqno()).await?;
+        let config = authority.config()?;
+        let selected = config
+            .selected_simplex_config(id.shard().is_masterchain())?
+            .ok_or_else(|| error!("Publication history has no selected Simplex config"))?;
+        let protocol = consensus_common::simplex_protocol::SimplexProtocol::try_from(u32::from(
+            selected.config.protocol_version,
+        ))?;
+        let (committee, _) = config.validator_set()?.calc_subset(
+            &config.catchain_config()?,
+            id.shard().shard_prefix_with_tag(),
+            id.shard().workchain_id(),
+            info.gen_catchain_seqno(),
+        )?;
+        let identity = rtos_api::session_identity::derive_session_from_config(
+            authority.global_id,
+            &config,
+            rtos_api::session_identity::SessionCoordinates {
+                shard: id.shard(),
+                catchain_seqno: info.gen_catchain_seqno(),
+                vertical_seqno: info.vert_seq_no(),
+                last_key_block_seqno: info.prev_key_block_seqno(),
+                new_catchain_ids: false,
+            },
+            &committee,
+        )?;
+        if &identity.session_id != verifier.expected_session_id() {
+            fail!("Publication policy differs from authenticated PQ session");
+        }
+        Ok(PqPublicationContext {
+            zerostate: engine.zerostate_id()?.clone(),
+            global_id: authority.global_id,
+            protocol,
+            profile: identity.config_hash,
+            verifier,
+        })
     }
 
     /// Resolve a historical broadcast epoch through the same pinned key-block
