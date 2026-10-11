@@ -339,24 +339,18 @@ impl State {
             }
         }
     }
-    async fn recover(
+    fn select_retry(
         &self,
-        store: &Arc<PropagationOutbox>,
-        receiver: &mut mpsc::Receiver<Submission>,
-    ) {
-        if !self.enabled.load(Ordering::Acquire) || self.stop.is_cancelled() {
-            return;
-        }
-        let entries = match self.snapshot(store).await {
-            Ok(entries) => entries,
-            Err(_) => return,
-        };
+        entries: &[UnverifiedRecord],
+        now_unix_secs: u64,
+        now: tokio::time::Instant,
+    ) -> Option<(UnverifiedRecord, PublicationEffect)> {
         if entries.is_empty() {
-            return;
+            return None;
         }
         // Round-robin eligible effects. Success advances immediately; failure
         // has a separate minimum one-second backoff for each exact target.
-        let selected = {
+        {
             let mut cursor = self.cursor.lock().unwrap();
             let mut retry = self.retry_after.lock().unwrap();
             cursor.1.retain(|id, _| entries.iter().any(|entry| entry.id.0 == *id));
@@ -364,10 +358,13 @@ impl State {
                 entries.iter().any(|entry| entry.id.0 == *id && entry.pending.contains(effect))
             });
             let start = entries.iter().position(|entry| entry.id.0 > cursor.0).unwrap_or(0);
-            let now = tokio::time::Instant::now();
             let mut selected = None;
             for index in 0..entries.len() {
                 let entry = &entries[(start + index) % entries.len()];
+                // Expired intents stay durable, but cannot delay live work.
+                if entry.record.is_expired(now_unix_secs) {
+                    continue;
+                }
                 let offset = *cursor.1.get(&entry.id.0).unwrap_or(&0);
                 for step in 0..entry.pending.len() {
                     let index = (offset + step) % entry.pending.len();
@@ -386,12 +383,31 @@ impl State {
                 }
             }
             selected
+        }
+    }
+    async fn recover(
+        &self,
+        store: &Arc<PropagationOutbox>,
+        receiver: &mut mpsc::Receiver<Submission>,
+    ) {
+        if !self.enabled.load(Ordering::Acquire) || self.stop.is_cancelled() {
+            return;
+        }
+        let entries = match self.snapshot(store).await {
+            Ok(entries) => entries,
+            Err(_) => return,
         };
+        if entries.is_empty() {
+            return;
+        }
+        let now_unix_secs =
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let selected = self.select_retry(&entries, now_unix_secs, tokio::time::Instant::now());
         let Some((entry, effect)) = selected else {
             return;
         };
         drop(entries);
-        for entry in [entry] {
+        {
             if self.stop.is_cancelled() {
                 return;
             }
@@ -399,7 +415,7 @@ impl State {
             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
             if entry.record.is_expired(now) {
                 metrics::counter!("rtos_publication_expired_pending_total").increment(1);
-                continue; // Never acknowledge or discard unsent expired work.
+                return; // Never acknowledge or discard unsent expired work.
             }
             let accepted = match self.accept(store, engine.clone(), entry.clone()).await {
                 Ok(accepted) => accepted,
@@ -411,14 +427,14 @@ impl State {
                         tokio::time::Instant::now() + RETRY_INTERVAL,
                     );
                     self.wake.notify_one();
-                    continue;
+                    return;
                 }
             };
             let plan = match validate_plan(&entry) {
                 Ok(plan) => plan,
                 Err(_) => continue,
             };
-            for effect in [effect] {
+            {
                 if self.stop.is_cancelled() {
                     return;
                 }
@@ -435,7 +451,7 @@ impl State {
                         tokio::time::Instant::now() + RETRY_INTERVAL,
                     );
                     self.wake.notify_one();
-                    continue;
+                    return;
                 };
                 let sent = outcome.receipts.iter().any(|receipt| {
                     receipt.kind == destination.kind
@@ -524,6 +540,69 @@ mod tests {
             cursor: Mutex::new(Default::default()),
             retry_after: Mutex::new(Default::default()),
         })
+    }
+    fn scheduling_entry(id: u64, expires: u64) -> UnverifiedRecord {
+        // Only scheduling coordinates are relevant; this is not an authentication fixture.
+        let effect =
+            PublicationEffect { kind: PublicationKind::Block, target: PublicationTarget::Public };
+        UnverifiedRecord {
+            id: RecordId(id),
+            stage: PublicationStage::Ready,
+            pending: vec![effect.clone()],
+            record: PublicationRecord {
+                domain: OutboxDomain {
+                    zerostate: Default::default(),
+                    global_id: 0,
+                    wire_profile: rtos_api::WireProfile::T0,
+                },
+                protocol:
+                    consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree,
+                profile: Default::default(),
+                session_id: Default::default(),
+                block_id: Default::default(),
+                block_data: vec![],
+                proof_data: None,
+                prev: vec![],
+                carrier: crate::propagation_outbox::StoredCarrier::Final(vec![]),
+                locally_generated: false,
+                created_at_unix_secs: 1,
+                expires_at_unix_secs: expires,
+                effects: vec![effect],
+            },
+        }
+    }
+    #[test]
+    fn publication_worker_live_effect_is_not_delayed_by_expired_records() {
+        let state = state();
+        let mut entries: Vec<_> = (1..=1023).map(|id| scheduling_entry(id, 100)).collect();
+        entries.push(scheduling_entry(1024, 200));
+        let now = tokio::time::Instant::now();
+        let selected = state.select_retry(&entries, 100, now).unwrap();
+        assert_eq!(selected.0.id, RecordId(1024));
+        assert_eq!(entries.len(), 1024, "expired records must remain durable");
+        assert!(state.select_retry(&entries, 100, now).is_none(), "live target must obey backoff");
+        assert_eq!(
+            state.select_retry(&entries, 100, now + RETRY_INTERVAL).unwrap().0.id,
+            RecordId(1024)
+        );
+        assert!(state.select_retry(&entries, 200, now + RETRY_INTERVAL).is_none());
+    }
+    #[test]
+    fn publication_worker_failure_backoff_does_not_block_other_exact_targets() {
+        let state = state();
+        let mut first = scheduling_entry(1, 200);
+        let second_effect = PublicationEffect {
+            kind: PublicationKind::Finality,
+            target: PublicationTarget::Public,
+        };
+        first.pending.push(second_effect.clone());
+        first.record.effects.push(second_effect.clone());
+        let entries = vec![first, scheduling_entry(2, 200)];
+        let now = tokio::time::Instant::now();
+        assert_eq!(state.select_retry(&entries, 100, now).unwrap().0.id, RecordId(1));
+        assert_eq!(state.select_retry(&entries, 100, now).unwrap().0.id, RecordId(2));
+        assert_eq!(state.select_retry(&entries, 100, now).unwrap().1, second_effect);
+        assert!(state.select_retry(&entries, 100, now).is_none());
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn publication_worker_cancelled_waiter_retains_real_blocking_write() {
