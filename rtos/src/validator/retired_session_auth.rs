@@ -226,6 +226,10 @@ mod tests {
         let mut extra = state.read_custom()?.unwrap();
         extra.validator_info.catchain_seqno = 7;
         extra.after_key_block = true;
+        let mut catchain = extra.config.catchain_config()?;
+        catchain.mc_catchain_lifetime = 100;
+        catchain.shard_catchain_lifetime = 100;
+        extra.config.set_config(rtos_block::ConfigParamEnum::ConfigParam28(catchain))?;
         let current = extra.config.validator_set()?;
         let mut next = current.list().to_vec();
         next.rotate_left(1);
@@ -318,11 +322,11 @@ mod tests {
     #[tokio::test]
     async fn retired_session_auth_rebuilds_current_next_and_observer_from_pinned_state(
     ) -> Result<()> {
-        for next_since in [0, u32::MAX] {
+        for next_since in [1100, 1101] {
             let engine = history(next_since)?;
             for observer in [false, true] {
                 for cc in [7, 8] {
-                    let record = locator(&engine, cc, cc == 8 && next_since == 0, observer)?;
+                    let record = locator(&engine, cc, cc == 8 && next_since == 1100, observer)?;
                     let runtime = authenticate_retired_session(&engine, &record).await?;
                     assert_eq!(runtime.session_id(), &record.session_id);
                     assert_eq!(runtime.recovery_binding(), Some(&record.binding));
@@ -330,6 +334,20 @@ mod tests {
                 }
             }
         }
+        // This authenticated-but-invalid schedule must remain rejected. Do not
+        // let the fixture fix silently turn zero-period input into a default.
+        let original = history(1100)?;
+        let mut state = original.state.state()?.clone();
+        let mut extra = state.read_custom()?.unwrap();
+        let mut catchain = extra.config.catchain_config()?;
+        catchain.mc_catchain_lifetime = 0;
+        extra.config.set_config(rtos_block::ConfigParamEnum::ConfigParam28(catchain))?;
+        state.write_custom(Some(&extra))?;
+        let zero = pinned(state)?;
+        let error = authenticate_retired_session(&zero, &locator(&zero, 8, true, false)?)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Zero historical catchain lifetime"), "{error}");
         Ok(())
     }
 
