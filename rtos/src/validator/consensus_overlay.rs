@@ -35,6 +35,18 @@ impl ConsensusOverlayManagerImpl {
 }
 
 impl ConsensusOverlayManager for ConsensusOverlayManagerImpl {
+    fn wire_profile(&self) -> rtos_api::WireProfile { self.network.wire_profile() }
+
+    fn stop_overlay_checked(
+        &self, id: &Arc<PrivateOverlayShortId>, overlay: &ConsensusOverlayPtr,
+    ) -> Result<()> {
+        self.network.stop_catchain_client_checked(id, overlay)
+    }
+
+    fn overlay_drained(&self, overlay: &ConsensusOverlayPtr) -> bool {
+        self.network.catchain_client_drained(overlay)
+    }
+
     fn start_overlay(
         &self,
         local_validator_key: &PrivateKey,
