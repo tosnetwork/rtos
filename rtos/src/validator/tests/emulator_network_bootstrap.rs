@@ -445,6 +445,10 @@ fn write_global_config(config_dir: &Path, zerostate_id: &BlockIdExt) -> Result<(
 }
 
 fn write_node_config(config_dir: &Path, validators: &[TestValidatorKeyPair]) -> Result<PathBuf> {
+    // Keep this isolated fixture away from the default ADNL-port-plus-offset
+    // derivation: ADNL port zero would select privileged QUIC port 1000.
+    let quic_socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let quic_address = quic_socket.local_addr()?.to_string();
     let (adnl_node, _) = AdnlNodeConfig::with_ip_address_and_private_key_tags(
         "127.0.0.1:0",
         vec![NodeNetwork::TAG_DHT_KEY, NodeNetwork::TAG_OVERLAY_KEY],
@@ -468,6 +472,7 @@ fn write_node_config(config_dir: &Path, validators: &[TestValidatorKeyPair]) -> 
         "sync_by_archives": false,
         "restore_db": false,
         "adnl_node": adnl_node,
+        "ip_address_quic": quic_address,
         "validator_keys": validator_keys,
         "validator_key_ring": validator_key_ring,
         "json_rpc_server": null,
