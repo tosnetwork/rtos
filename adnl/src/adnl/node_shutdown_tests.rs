@@ -291,3 +291,65 @@ async fn adnl_owned_thread_join_survives_all_waiters_cancelled() {
     })
     .await;
 }
+
+struct PanicSender {
+    _sender: Box<dyn AdnlSender>,
+}
+impl AdnlSender for PanicSender {
+    fn send_fast(&self, _: &[u8], _: socket2::SockAddr) -> Result<usize> {
+        panic!("injected actual sender thread panic");
+    }
+    fn send_safe(
+        &self,
+        _: Vec<u8>,
+        _: socket2::SockAddr,
+        _: &Arc<AdnlNode>,
+    ) -> Result<Option<usize>> {
+        panic!("injected sender");
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adnl_owned_sender_panic_wakes_blocking_udp_receiver() {
+    let (node, port) = node(48).await;
+    node.start(
+        |node| {
+            let (sender, receiver) = udp_sender_receiver(node)?;
+            Ok((Box::new(PanicSender { _sender: sender }), receiver))
+        },
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    node.send_pipeline.put_normal(SendJob::Data(SendData {
+        destination: 0x7F0000010000 | u64::from(port),
+        data: vec![1],
+        method: AdnlSendMethodDetailed::FastNormal,
+    }));
+    bounded(node.tasks.cancelled()).await;
+    assert!(bounded(node.stop_checked()).await.unwrap_err().to_string().contains("ADNL sender"));
+    udp_released(port);
+    let weak = Arc::downgrade(&node);
+    drop(node);
+    assert!(weak.upgrade().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adnl_owned_partial_transport_startup_closes_registered_threads() {
+    let (node, port) = node(49).await;
+    let result = node
+        .start(
+            |node| {
+                let _resources = udp_tcp_sender_receiver(node)?;
+                fail!("injected failure after TCP listener registration")
+            },
+            Vec::new(),
+        )
+        .await;
+    assert!(result.is_err());
+    bounded(node.stop_checked()).await.unwrap();
+    udp_released(port);
+    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).expect("startup leaked TCP listener");
+    let weak = Arc::downgrade(&node);
+    drop(node);
+    assert!(weak.upgrade().is_none());
+}
