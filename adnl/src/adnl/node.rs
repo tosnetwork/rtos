@@ -1765,11 +1765,11 @@ impl RecvPipeline {
         self.spawn();
     }
 
-    fn spawn(self: &Arc<Self>) {
+    fn reserve_worker(self: &Arc<Self>) -> Option<PipelineCountGuard> {
         loop {
             let workers = self.workers.load(Ordering::Relaxed);
             if workers >= self.max_workers {
-                return;
+                return None;
             }
             if self
                 .workers
@@ -1779,8 +1779,19 @@ impl RecvPipeline {
                 break;
             }
         }
+        Some(PipelineCountGuard { pipeline: self.clone(), kind: PipelineCount::Worker })
+    }
+
+    fn spawn(self: &Arc<Self>) {
+        if let Some(reservation) = self.reserve_worker() {
+            self.spawn_reserved(reservation);
+        }
+    }
+
+    fn spawn_reserved(self: &Arc<Self>, reservation: PipelineCountGuard) {
         let recv = self.clone();
         self.adnl.tasks.spawn("receive pipeline", async move {
+            let _reservation = reservation;
             loop {
                 let (mut packet, subchannel) = match recv.get().await {
                     Some(job) => job,
@@ -1789,6 +1800,10 @@ impl RecvPipeline {
                 let urgent = match &subchannel {
                     Subchannel::Urgent(_) => true,
                     _ => false,
+                };
+                let processing = PipelineCountGuard {
+                    pipeline: recv.clone(),
+                    kind: if urgent { PipelineCount::Urgent } else { PipelineCount::Normal },
                 };
                 #[cfg(feature = "telemetry")]
                 recv.update_metric(urgent);
@@ -1809,17 +1824,12 @@ impl RecvPipeline {
                     }
                     _ => (),
                 }
-                if urgent {
-                    recv.proc_urgent_packets.fetch_sub(1, Ordering::Relaxed);
-                } else {
-                    recv.proc_normal_packets.fetch_sub(1, Ordering::Relaxed);
-                }
+                drop(processing);
                 #[cfg(feature = "telemetry")]
                 recv.update_metric(urgent);
                 // Yield execution after packet
                 tokio::task::yield_now().await
             }
-            recv.workers.fetch_sub(1, Ordering::Relaxed);
         });
     }
 
@@ -1838,6 +1848,26 @@ impl RecvPipeline {
                 .proc_packets
                 .update(self.proc_normal_packets.load(Ordering::Relaxed))
         }
+    }
+}
+
+enum PipelineCount {
+    Worker,
+    Normal,
+    Urgent,
+}
+struct PipelineCountGuard {
+    pipeline: Arc<RecvPipeline>,
+    kind: PipelineCount,
+}
+impl Drop for PipelineCountGuard {
+    fn drop(&mut self) {
+        let counter = match self.kind {
+            PipelineCount::Worker => &self.pipeline.workers,
+            PipelineCount::Normal => &self.pipeline.proc_normal_packets,
+            PipelineCount::Urgent => &self.pipeline.proc_urgent_packets,
+        };
+        counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

@@ -870,6 +870,9 @@ fn tcp_sender_receiver(node: &Arc<AdnlNode>) -> Result<(Arc<TcpSender>, TcpRecei
         };
         let start = Instant::now();
         while !context.read_len(SIZE_TCP_ADDRESS)? {
+            if sender.tasks.is_closed() {
+                fail!("ADNL TCP accept stopped");
+            }
             if start.elapsed() > TIMEOUT_TCP_CONNECT_MS {
                 fail!("Cannot read TCP address of peer {}, abort connection", context.peer_addr);
             }
@@ -913,6 +916,9 @@ fn tcp_sender_receiver(node: &Arc<AdnlNode>) -> Result<(Arc<TcpSender>, TcpRecei
         let mut offset = 0;
         let start = Instant::now();
         while !TcpSender::send_to_socket(&socket, &buf, &mut offset)? {
+            if sender.tasks.is_closed() {
+                fail!("ADNL TCP accept stopped");
+            }
             if start.elapsed() > TIMEOUT_TCP_CONNECT_MS {
                 fail!("Cannot send TCP confirmation to peer {peer_addr}, abort connection");
             }

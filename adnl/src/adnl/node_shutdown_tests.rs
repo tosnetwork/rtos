@@ -408,3 +408,71 @@ async fn adnl_owned_normal_tcp_query_then_transport_owner_release() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn adnl_owned_pipeline_stop_between_reservation_and_admission() {
+    let (node, _) = node(52).await;
+    let pipeline = Arc::new(RecvPipeline::with_params(node.clone(), Arc::new(Vec::new())));
+    let reservation = pipeline.reserve_worker().unwrap();
+    assert_eq!(pipeline.workers.load(Ordering::Acquire), 1);
+    // This is the exact production split between the successful workers CAS
+    // and owner admission, ordered explicitly rather than by scheduling delays.
+    node.tasks.close();
+    pipeline.spawn_reserved(reservation);
+    assert_eq!(pipeline.workers.load(Ordering::Acquire), 0);
+    assert_eq!(pipeline.proc_normal_packets.load(Ordering::Acquire), 0);
+    assert_eq!(pipeline.proc_urgent_packets.load(Ordering::Acquire), 0);
+    bounded(node.stop_checked()).await.unwrap();
+}
+
+struct PanicCustom;
+#[async_trait::async_trait]
+impl Subscriber for PanicCustom {
+    async fn try_consume_custom(&self, _: &[u8], _: &AdnlPeers) -> Result<bool> {
+        panic!("injected panic inside receive pipeline processing");
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adnl_owned_pipeline_panic_returns_worker_and_processing_counts() {
+    let (server, port) = node(53).await;
+    let (client, _) = node(54).await;
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let socket = tokio::net::UdpSocket::from_std(socket).unwrap();
+    let pipeline =
+        Arc::new(RecvPipeline::with_params(server.clone(), Arc::new(vec![Arc::new(PanicCustom)])));
+    client.start_over_udp(Vec::new()).await.unwrap();
+    let local = client.key_by_tag(0).unwrap();
+    let remote = server.key_by_tag(0).unwrap();
+    client.add_peer(local.id(), server.ip_address_adnl(), None, &remote).unwrap();
+    let peers = AdnlPeers::with_keys(local.id().clone(), remote.id().clone());
+    client
+        .send_custom(
+            &TaggedByteSlice {
+                object: b"panic in subscriber",
+                #[cfg(feature = "telemetry")]
+                tag: 0,
+            },
+            &peers,
+        )
+        .await
+        .unwrap();
+    bounded(async {
+        let mut bytes = [0; 1500];
+        loop {
+            tokio::select! {
+                _ = server.tasks.cancelled() => break,
+                packet = socket.recv(&mut bytes) => { pipeline.put(bytes[..packet.unwrap()].to_vec()); }
+            }
+        }
+    }).await;
+    assert!(bounded(server.stop_checked())
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("receive pipeline"));
+    assert_eq!(pipeline.workers.load(Ordering::Acquire), 0);
+    assert_eq!(pipeline.proc_normal_packets.load(Ordering::Acquire), 0);
+    assert_eq!(pipeline.proc_urgent_packets.load(Ordering::Acquire), 0);
+    bounded(client.stop_checked()).await.unwrap();
+}
