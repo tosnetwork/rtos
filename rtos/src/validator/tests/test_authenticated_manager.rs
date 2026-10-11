@@ -5,6 +5,14 @@ use super::*;
 use consensus_common::session_runtime::{AuthenticatedSessionRuntime, LocalRole, SessionNetworkPin};
 
 fn configure(bootstrap: &mut EmulatorNetworkBootstrap, observer: &PrivateKey) -> Result<()> {
+    // Public fixture transport seeds make the independently signed history
+    // reproducible. This does not install any PQ signing capability in the node.
+    for (index, validator) in bootstrap.validators.iter_mut().enumerate() {
+        let (json, key) = Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[0x60 + index as u8; 32])?;
+        validator.adnl_key_json = json;
+        validator.validator_descr.adnl_addr = Some(UInt256::from(*key.id().data()));
+        validator.adnl_key = key;
+    }
     let fixture: serde_json::Value = serde_json::from_str(include_str!("../../../../tl/rtos_api/tests/data/live-pq.json"))?;
     let members: Vec<_> = (0..2).map(|index| {
         let row = fixture["rows"].as_array().unwrap().iter().find(|row|
@@ -190,7 +198,7 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
         bootstrap.config_params.set_config(ConfigParamEnum::ConfigParam32(rtos_block::ConfigParam32 {
             prev_validators: ValidatorSet::with_cc_seqno(0, u32::MAX, 2, 0, previous_members)?,
         }))?;
-        let next = engine.build_masterchain_state(&bootstrap, 1)?;
+        let next = install_signed_manager_successor(engine.as_ref(), &bootstrap, &state)?;
         engine.install_masterchain_state(next.clone(), Some(state.block_id().clone()))?;
         manager.update_shards(next.clone()).await?;
         wait_for_manager_sessions(&manager).await?;
@@ -303,4 +311,33 @@ async fn authenticated_group_rejects_anchor_schedule_and_rebinding() -> Result<(
         assert!(group(options.clone()).with_authenticated_runtime(wrong).is_err());
     }
     Ok(())
+}
+
+/// Install a real block/state commitment and its independent quorum signature.
+/// The normal lifecycle test still derives its changed state locally; a fixture
+/// generated for another configuration or predecessor cannot satisfy this check.
+fn install_signed_manager_successor(engine: &BootstrapTestEngine, bootstrap: &EmulatorNetworkBootstrap,
+    previous: &Arc<ShardStateStuff>) -> Result<Arc<ShardStateStuff>> {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("data/manager-history.json"))?;
+    anyhow::ensure!(fixture["zero"] == previous.block_id().to_string(), "signed fixture genesis differs");
+    let expected = engine.build_masterchain_state(bootstrap, 1)?;
+    let mut expected = expected.state()?.clone();
+    let mut extra = expected.read_custom()?.unwrap();
+    extra.prev_blocks.set(&0, &rtos_block::KeyExtBlkRef { key: true, blk_ref: ext_blk_ref(previous.block_id()) },
+        &rtos_block::KeyMaxLt { key: true, max_end_lt: 0 })?;
+    expected.write_custom(Some(&extra))?;
+    let bytes = hex::decode(fixture["block_boc"].as_str().ok_or_else(|| error!("Missing block fixture"))?)?;
+    let root = rtos_block::read_single_root_boc(&bytes)?;
+    let id = BlockIdExt::with_params(ShardIdent::masterchain(), 1, root.repr_hash().clone(), UInt256::calc_file_hash(&bytes));
+    let block = BlockStuff::deserialize_block_checked(id.clone(), Arc::new(bytes))?;
+    let state = ShardStateStuff::deserialize_state(id.clone(), &hex::decode(fixture["state_boc"].as_str().unwrap())?,
+        #[cfg(feature = "telemetry")] &engine.telemetry, &engine.allocated)?;
+    anyhow::ensure!(expected.serialize()?.repr_hash() == state.root_cell().repr_hash(), "signed successor differs from requested admission change");
+    let update = block.block()?.read_state_update()?;
+    anyhow::ensure!(&update.old_hash == previous.root_cell().repr_hash() && &update.new_hash == state.root_cell().repr_hash(), "state update commitments differ");
+    let proof = crate::block_proof::BlockProofStuff::deserialize(&id,
+        hex::decode(fixture["proof_boc"].as_str().unwrap())?, false)?;
+    engine.blocks.write().unwrap().insert(id.clone(), block);
+    engine.historical_proofs.write().unwrap().insert(id, proof);
+    Ok(state)
 }

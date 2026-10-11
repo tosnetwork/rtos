@@ -677,6 +677,7 @@ struct BootstrapTestEngine {
     normal_admission_gate: std::sync::Mutex<Option<(u32, tokio::sync::oneshot::Sender<Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>>, std::sync::mpsc::Receiver<()>)>>,
     states: RwLock<HashMap<BlockIdExt, Arc<ShardStateStuff>>>,
     blocks: RwLock<HashMap<BlockIdExt, BlockStuff>>,
+    historical_proofs: RwLock<HashMap<BlockIdExt, crate::block_proof::BlockProofStuff>>,
     last_applied_mc_block_id: RwLock<Option<Arc<BlockIdExt>>>,
     last_rotation_block_id: RwLock<Option<Arc<BlockIdExt>>>,
     validation_status: RwLock<ValidationStatus>,
@@ -738,6 +739,7 @@ impl BootstrapTestEngine {
             normal_admission_gate: std::sync::Mutex::new(None),
             states: RwLock::new(HashMap::new()),
             blocks: RwLock::new(HashMap::new()),
+            historical_proofs: RwLock::new(HashMap::new()),
             last_applied_mc_block_id: RwLock::new(None),
             last_rotation_block_id: RwLock::new(None),
             validation_status: RwLock::new(ValidationStatus::Disabled),
@@ -836,7 +838,10 @@ impl BootstrapTestEngine {
         state: Arc<ShardStateStuff>,
         prev_id: Option<BlockIdExt>,
     ) -> Result<Arc<BlockHandle>> {
-        let block = make_masterchain_block(state.block_id().clone(), prev_id)?;
+        let block = match self.blocks.read().unwrap().get(state.block_id()).cloned() {
+            Some(block) => block,
+            None => make_masterchain_block(state.block_id().clone(), prev_id)?,
+        };
         let handle = if state.block_id().seq_no == 0 {
             self.db
                 .create_or_load_block_handle(state.block_id(), None, Some(0), None)?
@@ -1029,6 +1034,10 @@ impl EngineOperations for BootstrapTestEngine {
     }
 
     async fn load_block_proof(&self, handle: &Arc<BlockHandle>, is_link: bool) -> Result<crate::block_proof::BlockProofStuff> {
+        if let Some(proof) = self.historical_proofs.read().unwrap().get(handle.id()).cloned() {
+            if proof.is_link() != is_link { fail!("Fixture proof role mismatch"); }
+            return Ok(proof);
+        }
         self.db.load_block_proof(handle, is_link).await
     }
 
