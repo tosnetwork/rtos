@@ -146,6 +146,7 @@ impl SessionCallbacks {
     pub(crate) fn resolve_finality_intent(&self, id: &crate::block::RawCandidateId) -> rtos_block::Result<()> {
         self.delivery_source()?.resolve_intent(id)
     }
+    pub(crate) fn pending_finality_intent_count(&self) -> rtos_block::Result<usize> { self.delivery_source()?.pending_intent_count() }
     pub(crate) fn pending_finality_intents(&self) -> rtos_block::Result<Vec<Vec<u8>>> { self.delivery_source()?.pending_intents() }
 
     pub(crate) fn poll_durable_finality(&self, draft: consensus_common::finality_delivery::FinalizedDeliveryDraft) -> rtos_block::Result<bool> {
