@@ -2319,3 +2319,6 @@ fn classical_target_receiver_real_candidate_repair_for_protocols_zero_one() {
         b.stop();
     }
 }
+
+#[path = "test_authenticated_receiver.rs"]
+mod authenticated_receiver;
