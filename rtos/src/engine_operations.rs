@@ -674,8 +674,7 @@ impl EngineOperations for Engine {
             }
 
             if let Some((block, proof)) = self
-                .download_block_awaiters()
-                .do_or_wait(id, None, self.download_block_worker(id, limit, None))
+                .download_block_with_policy(id, limit, None)
                 .await?
             {
                 log::trace!("download_block {} downloaded", id);

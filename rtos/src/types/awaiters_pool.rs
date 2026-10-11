@@ -173,6 +173,26 @@ where
         Ok(())
     }
 
+    /// Publish the same successful external result to matching policies. Each
+    /// finalize still removes only the exact operation instance it observed.
+    pub fn shunt_matching(
+        &self,
+        matches: impl Fn(&I) -> bool,
+        operation: impl FnOnce() -> Result<R>,
+    ) -> Result<()> {
+        let mut result = None;
+        let mut operation = Some(operation);
+        for entry in self.ops_awaiters.iter() {
+            if matches(entry.key()) {
+                if result.is_none() {
+                    result = Some(operation.take().unwrap()()?);
+                }
+                self.finalize(entry.key(), entry.val(), Ok(result.as_ref().unwrap().clone()));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn shunt_async(
         &self,
         id: &I,
