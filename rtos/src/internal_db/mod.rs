@@ -291,6 +291,10 @@ pub struct InternalDb {
     state_db: StateDb,
     repair_leases: Arc<crate::publication_dependency_leases::DependencyLeases>,
     archive_manager: Arc<ArchiveManager>,
+    archive_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
+    archive_admission: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    archive_test_gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     shard_top_blocks_db: ShardTopBlocksDb,
     full_node_state_db: Arc<NodeStateDb>,
 
@@ -423,6 +427,40 @@ impl InternalDb {
             allocated.storage.clone(),
         ));
 
+        let last_unneeded_key_block_id =
+            block_handle_storage.load_full_node_state(LAST_UNNEEDED_KEY_BLOCK)?.unwrap_or_default();
+        let db_root_path = Arc::new(PathBuf::from(&config.db_directory));
+        let db_provider: Arc<dyn ArchiveDbProvider> =
+            if let Some(ref archival_config) = config.archival_mode {
+                let router = Arc::new(EpochRouter::new(archival_config).await?);
+                Arc::new(EpochDbProvider::new(router))
+            } else {
+                Arc::new(SingleDbProvider::new(db.clone(), db_root_path.clone()))
+            };
+        let archive_manager = Arc::new(
+            ArchiveManager::with_data(
+                db.clone(),
+                db_root_path,
+                db_provider,
+                last_unneeded_key_block_id.seq_no(),
+                monitor_min_split,
+                #[cfg(feature = "telemetry")]
+                telemetry.storage.clone(),
+                allocated.storage.clone(),
+            )
+            .await?,
+        );
+
+        // Complete every fallible passive constructor before starting the
+        // self-owned dynamic state worker. A rejected archive must release the
+        // node DB without leaving a worker holding its RocksDB lock.
+        let prev1_block_db = BlockInfoDb::with_db(db.clone(), PREV1_BLOCK_DB_NAME, can_create_db)?;
+        let prev2_block_db = BlockInfoDb::with_db(db.clone(), PREV2_BLOCK_DB_NAME, can_create_db)?;
+        let next1_block_db = BlockInfoDb::with_db(db.clone(), NEXT1_BLOCK_DB_NAME, can_create_db)?;
+        let next2_block_db = BlockInfoDb::with_db(db.clone(), NEXT2_BLOCK_DB_NAME, can_create_db)?;
+        let shard_top_blocks_db = ShardTopBlocksDb::with_db(
+            db.clone(), SHARD_TOP_BLOCKS_DB_NAME, can_create_db,
+        )?;
         let state_db = if config.archival_mode.is_some() {
             let (archive_cells_opts, archive_cells_cache) =
                 storage::cell_db::CellDb::build_cf_options(
@@ -456,31 +494,12 @@ impl InternalDb {
                 allocated.storage.clone(),
             )?)
         };
-        let last_unneeded_key_block_id =
-            block_handle_storage.load_full_node_state(LAST_UNNEEDED_KEY_BLOCK)?.unwrap_or_default();
-        let db_root_path = Arc::new(PathBuf::from(&config.db_directory));
-        let db_provider: Arc<dyn ArchiveDbProvider> =
-            if let Some(ref archival_config) = config.archival_mode {
-                let router = Arc::new(EpochRouter::new(archival_config).await?);
-                Arc::new(EpochDbProvider::new(router))
-            } else {
-                Arc::new(SingleDbProvider::new(db.clone(), db_root_path.clone()))
-            };
-        let archive_manager = Arc::new(
-            ArchiveManager::with_data(
-                db.clone(),
-                db_root_path,
-                db_provider,
-                last_unneeded_key_block_id.seq_no(),
-                monitor_min_split,
-                #[cfg(feature = "telemetry")]
-                telemetry.storage.clone(),
-                allocated.storage.clone(),
-            )
-            .await?,
-        );
-
+        // No fallible operations follow successful state-worker admission.
         let result = Self {
+            archive_tasks: Arc::default(),
+            archive_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            archive_test_gate: Default::default(),
             repair_leases,
             #[cfg(test)]
             recovery_node_db: db.clone(),
@@ -493,20 +512,16 @@ impl InternalDb {
             publication_sync_observer: std::sync::Mutex::new(None),
             #[cfg(test)]
             bounded_repair_sync_observer: std::sync::Mutex::new(None),
-            prev1_block_db: BlockInfoDb::with_db(db.clone(), PREV1_BLOCK_DB_NAME, can_create_db)?,
-            prev2_block_db: BlockInfoDb::with_db(db.clone(), PREV2_BLOCK_DB_NAME, can_create_db)?,
-            next1_block_db: BlockInfoDb::with_db(db.clone(), NEXT1_BLOCK_DB_NAME, can_create_db)?,
-            next2_block_db: BlockInfoDb::with_db(db.clone(), NEXT2_BLOCK_DB_NAME, can_create_db)?,
+            prev1_block_db,
+            prev2_block_db,
+            next1_block_db,
+            next2_block_db,
             shard_state_persistent_db: Arc::new(FileDb::with_path(
                 Path::new(config.db_directory.as_str()).join(SHARD_STATE_PERSISTENT_DB_NAME),
             )),
             state_db,
             archive_manager,
-            shard_top_blocks_db: ShardTopBlocksDb::with_db(
-                db,
-                SHARD_TOP_BLOCKS_DB_NAME,
-                can_create_db,
-            )?,
+            shard_top_blocks_db,
             full_node_state_db,
             cells_gc_interval: Arc::new(AtomicU32::new(config.cells_gc_interval_sec)),
             config,
@@ -595,10 +610,28 @@ impl InternalDb {
         }
     }
 
-    pub async fn stop_states_db(&self) {
+    pub async fn stop_states_db(&self) -> Result<()> {
+        // Close admission first, wake permit waiters, and join every actual IO
+        // owner even if its caller has disappeared. A failed owner must not skip
+        // shutdown of the state worker, nor disappear from the shutdown result.
+        self.archive_admission.close();
+        let archived = self.archive_tasks.wait().await;
         if let StateDb::Dynamic(db) = &self.state_db {
-            db.stop().await
+            db.stop().await;
         }
+        archived
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_archive_admission_closed(&self) -> bool {
+        self.archive_admission.is_closed()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_hold_archive_migration(
+        &self, entered: Arc<tokio::sync::Notify>, release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.archive_test_gate.lock().unwrap() = Some((entered, release));
     }
 
     fn store_block_handle(
@@ -1907,18 +1940,53 @@ impl InternalDb {
         let handle = self
             .load_block_handle(id)?
             .ok_or_else(|| error!("Cannot load handle for archiving block {}", id))?;
-        if handle.is_archived() {
-            return Ok(());
-        }
-        self.archive_manager
-            .move_to_archive(&handle, || {
-                if handle.set_archived() {
-                    self.store_block_handle(&handle, callback.clone())?;
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|err| error!("Failed to move block to archive: {}. Error: {}", id, err))
+        // Even an in-memory archived flag cannot bypass closed admission after
+        // an uncertain metadata result. Acquire before inspecting that flag.
+        let permit = self.archive_admission.clone().acquire_owned().await
+            .map_err(|_| error!("Archive migration admission stopped"))?;
+        let manager = self.archive_manager.clone();
+        let handles = self.block_handle_storage.clone();
+        let tasks = self.archive_tasks.clone();
+        let admission = self.archive_admission.clone();
+        let observer = self.publication_sync_observer();
+        let block_id = id.clone();
+        #[cfg(test)]
+        let gate = self.archive_test_gate.lock().unwrap().take();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        self.archive_tasks.spawn("archive migration IO", async move {
+            let _permit = permit;
+            #[cfg(test)]
+            if let Some((entered, release)) = gate {
+                entered.notify_one();
+                release.notified().await;
+            }
+            // This worker is not abortable by the observation future. Package IO,
+            // migration flag and deletion gate all live inside its awaited work.
+            use futures::FutureExt;
+            let result = std::panic::AssertUnwindSafe(
+                manager.move_to_archive_with_completion(&handle, || {
+                    let handles = handles.clone();
+                    let handle = handle.clone();
+                    let callback = callback.clone();
+                    let observer = observer.clone();
+                    async move {
+                        if handle.set_archived() {
+                            handles.save_handle(&handle, callback)?;
+                        }
+                        handles.sync_pending_observed(observer).await
+                    }
+                })
+            ).catch_unwind().await
+                .map_err(|_| error!("Archive migration panicked for {block_id}"))
+                .and_then(|result| result)
+                .map_err(|err| error!("Failed to move block to archive: {block_id}. Error: {err}"));
+            if let Err(error) = &result {
+                admission.close();
+                tasks.record_error(format!("archive migration {block_id}: {error}"));
+            }
+            let _ = sent.send(result);
+        })?;
+        received.await.map_err(|error| error!("Archive migration owner failed: {error}"))?
     }
 
     #[allow(dead_code)]
@@ -2030,6 +2098,11 @@ impl InternalDb {
     pub async fn clean_unapplied_files(&self, ids: &[BlockIdExt]) {
         let _tc = time_checker!(|| "clean_unapplied_files", 300);
         self.archive_manager.clean_unapplied_files(ids).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pause_archive_gc_selection(&self) -> (tokio::sync::oneshot::Receiver<Vec<u32>>, Arc<tokio::sync::Notify>) {
+        self.archive_manager.test_pause_gc_selection()
     }
 
     pub async fn archive_gc(&self, last_unneeded_key_block: &BlockIdExt) -> Result<()> {

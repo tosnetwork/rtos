@@ -208,6 +208,6 @@ async fn test_snapshot_cache_and_merge_require_authenticated_state_identity() ->
         }
     }
     stopper.set_stop();
-    engine.db.stop_states_db().await;
+    engine.db.stop_states_db().await.unwrap();
     Ok(())
 }

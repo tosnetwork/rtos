@@ -1053,7 +1053,9 @@ impl Engine {
                     }
                 }
                 if let Some(db) = opened_db.take() {
-                    db.stop_states_db().await;
+                    if let Err(error) = db.stop_states_db().await {
+                        rollback_stopper.report_service_failure(0, format!("DB rollback drain: {error}"));
+                    }
                 }
                 if let Err(error) = rollback_network.stop_adnl().await {
                     rollback_stopper.report_service_failure(
@@ -1338,7 +1340,9 @@ impl Engine {
         let _ = self.stopper.clone().wait_stop_except(Self::MASK_SERVICE_SHARDSTATE_GC).await;
         #[cfg(test)]
         self.state_db_stop_started.store(true, Ordering::Release);
-        self.db.stop_states_db().await;
+        if let Err(error) = self.db.stop_states_db().await {
+            self.stopper.report_service_failure(0, format!("DB archive/state drain: {error}"));
+        }
         self.stopper.release_stop(Self::MASK_SERVICE_SHARDSTATE_GC);
         // Producers have stopped. Close the queue and flush accepted metadata
         // writes before releasing the Engine/database owner.

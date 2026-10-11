@@ -78,7 +78,7 @@ async fn create_db(test_name: &str, monitor_min_split: u8) -> Result<InternalDb>
 }
 
 async fn stop_db(db: &InternalDb) {
-    db.stop_states_db().await;
+    db.stop_states_db().await.unwrap();
     set_graceful_termination(&db.config.db_directory);
 }
 

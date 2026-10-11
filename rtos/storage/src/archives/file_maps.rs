@@ -244,7 +244,12 @@ impl FileMapEntry {
     }
 }
 
+#[cfg(any(test, feature = "integration-test-support"))]
+type GcSelectionPause = (tokio::sync::oneshot::Sender<Vec<u32>>, Arc<tokio::sync::Notify>);
+
 pub struct FileMap {
+    #[cfg(any(test, feature = "integration-test-support"))]
+    test_gc_selection: std::sync::Mutex<Option<GcSelectionPause>>,
     protection: Arc<crate::repair_protection::RepairProtection>,
     storage: PackageIndexDb,
     elements: tokio::sync::RwLock<Vec<FileMapEntry>>, // new FileMapEntry every key_block
@@ -284,6 +289,7 @@ impl FileMap {
             );
             let (slice_db, slice_root_path) = db_provider.db_for_archive(key).await?;
             let archive_slice = match ArchiveSlice::with_data(
+                protection.clone(),
                 slice_db,
                 slice_root_path,
                 key,
@@ -333,7 +339,11 @@ impl FileMap {
             telemetry.file_entries.update(allocated.file_entries.load(Ordering::Relaxed))
         }
 
-        Ok(Self { protection, storage, elements: tokio::sync::RwLock::new(elements) })
+        Ok(Self {
+            protection, storage, elements: tokio::sync::RwLock::new(elements),
+            #[cfg(any(test, feature = "integration-test-support"))]
+            test_gc_selection: Default::default(),
+        })
     }
 
     pub async fn put(
@@ -389,12 +399,30 @@ impl FileMap {
         marked_packages
     }
 
+    /// Pause exactly one selection before taking any deletion lock. Only keys
+    /// are observed: retaining archive Arcs here would itself prevent real GC.
+    #[cfg(any(test, feature = "integration-test-support"))]
+    pub fn test_pause_gc_selection(&self) -> (tokio::sync::oneshot::Receiver<Vec<u32>>, Arc<tokio::sync::Notify>) {
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_gc_selection.lock().unwrap() = Some((sent, release.clone()));
+        (received, release)
+    }
+
     pub async fn gc(&self, last_unneeded_key_block: &BlockIdExt) -> Result<()> {
         log::info!(
             target: TARGET,
             "Archives GC started, last_unneeded_key_block: {last_unneeded_key_block}"
         );
         let slices = self.get_unneeded_entries(last_unneeded_key_block).await;
+        #[cfg(any(test, feature = "integration-test-support"))]
+        {
+            let pause = self.test_gc_selection.lock().unwrap().take();
+            if let Some((sent, release)) = pause {
+                let _ = sent.send(slices.clone());
+                release.notified().await;
+            }
+        }
         log::info!(target: TARGET, "Archives GC: found {} unneeded slices", slices.len());
 
         // Roll back a partial gc step on failure.

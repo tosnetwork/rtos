@@ -783,4 +783,102 @@ mod tests {
         assert!(encode_snapshot(&bad, &domain(), &limits).is_err());
         Ok(())
     }
+    #[test]
+    fn close_real_compact_admission_capacity_preserves_snapshot_and_canonical() -> Result<()> {
+        use storage::{block_handle_db::NodeStateDb, db::rocksdb::{AccessType, RocksDb}};
+        struct CapacityDisk(NodeStateDb);
+        impl SnapshotStore for CapacityDisk {
+            fn load(&self, maximum: usize) -> Result<Option<Vec<u8>>> {
+                let value = self.0.try_get_raw(KEY.as_bytes())?;
+                if value.as_ref().is_some_and(|v| v.len() > maximum) { fail!("snapshot limit"); }
+                Ok(value.map(|v| v.to_vec()))
+            }
+            fn replace_sync(&self, bytes: &[u8]) -> Result<()> {
+                self.0.put_raw_sync(KEY.as_bytes(), bytes)
+            }
+        }
+        fn reopen(path: &std::path::Path) -> Result<PropagationOutbox> {
+            let db = RocksDb::new(path, "compact-capacity", None, AccessType::ReadWrite)?;
+            let disk = Arc::new(CapacityDisk(NodeStateDb::with_db(db, "snapshot", true)?));
+            PropagationOutbox::load(disk, domain(), Limits::default(), None)
+        }
+        let dir = tempfile::tempdir()?;
+        let store = reopen(dir.path())?;
+        let (d1, e1, first) = setup(&store, 1)?;
+        let (d2, e2, second) = setup(&store, 2)?;
+        let first_size = first.binding.encode()?.len() + 45;
+        let second_size = second.binding.encode()?.len() + 45;
+        let mut snapshot = store.lock()?.snapshot.clone();
+        let mut total = 0usize;
+        // Seed codec-valid Released history, not capabilities or authenticated
+        // events. The two pending records use the real admission transaction.
+        for n in 3..MAX_CLOSE_RECORDS as u32 + 3 {
+            let mut row = first.clone();
+            row.released = true;
+            row.lease_generation = u64::from(n);
+            row.binding.record_id = u64::from(n);
+            row.binding.close_generation = u64::from(n);
+            row.binding.canonical.block_id = id(n);
+            row.binding.delivery_id = delivery_coordinates(&domain(), row.binding.domain.protocol,
+                &row.binding.domain.profile, &row.binding.domain.session_id,
+                &row.binding.canonical.block_id, true)?;
+            row.binding.canonical.node_receipt = row.binding.delivery_id.clone();
+            let size = row.binding.encode()?.len() + 45;
+            if snapshot.closing.len() + 1 >= MAX_CLOSE_RECORDS
+                || total + size + first_size > MAX_CLOSE_BYTES { break; }
+            total += size;
+            snapshot.closing.push(row);
+        }
+        // Decimal timestamps are legitimate bounded fields. Fill any small
+        // remainder caused by differing numeric ID widths, without padding JSON
+        // or raising production limits, so exactly one offered row still fits.
+        if snapshot.closing.len() + 1 < MAX_CLOSE_RECORDS {
+            for row in snapshot.closing.iter_mut().rev() {
+                if total + first_size + second_size > MAX_CLOSE_BYTES { break; }
+                let original = row.binding.encode()?.len();
+                for digits in 3..=19u32 {
+                    row.binding.expires_at_unix_secs = 10u64.pow(digits - 1);
+                    let extra = row.binding.encode()?.len() - original;
+                    if total + extra + first_size + second_size > MAX_CLOSE_BYTES {
+                        assert!(total + extra + first_size <= MAX_CLOSE_BYTES);
+                        break;
+                    }
+                }
+                total += row.binding.encode()?.len() - original;
+            }
+        }
+        snapshot.next_id = snapshot.closing.len() as u64 + 3;
+        snapshot.next_close_generation = snapshot.next_id;
+        assert!(snapshot.closing.len() + 1 == MAX_CLOSE_RECORDS
+            || total + first_size + second_size > MAX_CLOSE_BYTES);
+        let seed = encode_snapshot(&snapshot, &domain(), &Limits::default())?;
+        store.store.replace_sync(&seed)?;
+        drop(store);
+        let store = reopen(dir.path())?;
+        store.begin_close_offer_inner(first.clone(), &d1, &e1)?;
+        let before = store.store.load(Limits::default().max_snapshot_bytes)?.unwrap();
+        let error = store.begin_close_offer_inner(second.clone(), &d2, &e2)
+            .unwrap_err().to_string();
+        if snapshot.closing.len() + 1 == MAX_CLOSE_RECORDS {
+            assert!(error.contains("Invalid close history capacity/allocator"), "{error}");
+        } else {
+            assert!(error.contains("Invalid close history binding or quota"), "{error}");
+        }
+        assert_eq!(store.store.load(Limits::default().max_snapshot_bytes)?.unwrap(), before);
+        assert!(store.delivery(&d1.delivery_id)?.is_some());
+        assert!(store.delivery(&d2.delivery_id)?.is_some());
+        assert_eq!(store.lookup_close(&d1.delivery_id)?, Some(first.clone()));
+        assert_eq!(store.lookup_close(&d2.delivery_id)?, None);
+        eprintln!("compact admission boundary: records={}, bytes={}, rejection={error}",
+            snapshot.closing.len() + 1, total + first_size);
+        drop(store);
+        let store = reopen(dir.path())?;
+        assert_eq!(store.store.load(Limits::default().max_snapshot_bytes)?.unwrap(), before);
+        assert!(store.delivery(&d1.delivery_id)?.is_some());
+        assert!(store.delivery(&d2.delivery_id)?.is_some());
+        assert_eq!(store.lookup_close(&d1.delivery_id)?, Some(first));
+        assert_eq!(store.lookup_close(&d2.delivery_id)?, None);
+        Ok(())
+    }
+
 }

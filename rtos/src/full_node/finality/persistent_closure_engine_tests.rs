@@ -120,6 +120,9 @@ async fn circulation(events: usize) {
         let mut backup = None;
         let mut generations = std::collections::HashSet::new();
         for index in 0..events {
+            // A long run must keep normal signed discovery advertisements fresh;
+            // successful historical publication does not exempt peers from TTL.
+            pair.refresh_public_advertisements().await;
             let (id, expected, row) =
                 chain::successor(&signer, &parent, &root, false, 0, cc, &creator);
             let block = fixture_block(&row);

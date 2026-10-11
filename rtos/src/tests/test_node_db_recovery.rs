@@ -253,7 +253,7 @@ async fn node_db_counter_wal_archival_mode_preserves_existing_dynamic_cells() ->
     .await?;
     verify(&db.recovery_node_db, root)?;
     let physical = db.recovery_node_db.clone();
-    db.stop_states_db().await;
+    db.stop_states_db().await.unwrap();
     drop(db);
     release(physical).await?;
     verify_second_open(root)

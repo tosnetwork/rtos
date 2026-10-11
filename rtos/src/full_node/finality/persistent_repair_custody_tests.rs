@@ -269,5 +269,7 @@ async fn persistent_repair_history_real_local_limits_never_enter_capsule_or_netw
 #[path = "persistent_custody_crash_tests.rs"]
 mod crash_tests;
 
+#[path = "persistent_custody_archive_tests.rs"]
+mod archive_tests;
 #[path = "persistent_ledger_startup_tests.rs"]
 mod ledger_startup_tests;
