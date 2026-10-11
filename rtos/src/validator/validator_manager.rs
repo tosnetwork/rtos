@@ -3132,6 +3132,9 @@ fn spawn_validator_manager(
             Ok(bindings) => bindings.is_empty(),
             Err(error) => {
                 engine.report_service_failure(0, format!("Invalid consensus transport configuration: {error}"));
+                // No group or session has been created. This owner has finished;
+                // retain the failure, but do not leave a phantom live service.
+                engine.release_stop(Engine::MASK_SERVICE_VALIDATOR_MANAGER);
                 return;
             }
         } {

@@ -13,6 +13,7 @@ struct LifecycleEngine {
     fail_teardown: std::sync::atomic::AtomicBool,
     invocations: std::sync::atomic::AtomicUsize,
     panic_invocation: std::sync::atomic::AtomicBool,
+    invalid_transport: std::sync::atomic::AtomicBool,
     reported: std::sync::Mutex<Vec<(u32, String)>>,
     stopper: Arc<crate::engine::Stopper>,
     candidate_deletes: std::sync::atomic::AtomicUsize,
@@ -68,7 +69,15 @@ impl EngineOperations for LifecycleEngine {
         self.stopping.store(true, Ordering::Release);
     }
     fn get_validator_status(&self) -> bool {
-        true
+        !self.invalid_transport.load(Ordering::Acquire)
+    }
+    fn consensus_transport_bindings(
+        &self,
+    ) -> Result<Vec<crate::config::ConsensusTransportBinding>> {
+        if self.invalid_transport.load(Ordering::Acquire) {
+            fail!("controlled invalid transport configuration");
+        }
+        Ok(Vec::new())
     }
     fn acquire_stop(&self, mask: u32) {
         assert_eq!(mask, Engine::MASK_SERVICE_VALIDATOR_MANAGER);
@@ -446,4 +455,25 @@ async fn test_manager_lifecycle_observer_callback_panic_retains_owner_until_join
     assert!(observer.teardown_drained());
     manager.report_teardown_failure(error.to_string());
     assert_eq!(engine.reported.lock().unwrap()[1].0, Engine::MASK_SERVICE_VALIDATOR_MANAGER);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_manager_lifecycle_invalid_transport_releases_unstarted_owner() {
+    let engine = Arc::new(LifecycleEngine::default());
+    engine.invalid_transport.store(true, Ordering::Release);
+    let task = spawn_validator_manager(
+        engine.clone(),
+        tokio::runtime::Handle::current(),
+        ValidatorManagerConfig::default(),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+    assert!(engine.acquired.load(Ordering::Acquire));
+    assert!(engine.released.load(Ordering::Acquire));
+    assert_eq!(engine.invocations.load(Ordering::Relaxed), 0);
+    let terminal = tokio::time::timeout(Duration::from_secs(5), engine.stopper.clone().wait_stop())
+        .await
+        .expect("invalid startup retained a live manager mask");
+    assert!(terminal.unwrap_err().to_string().contains("invalid transport configuration"));
+    assert_eq!(engine.reported.lock().unwrap().len(), 1);
 }
