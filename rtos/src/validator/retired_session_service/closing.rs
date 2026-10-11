@@ -3,7 +3,7 @@
 use super::super::retired_session_auth::authenticate_closing_runtime;
 use super::*;
 use consensus_common::finality_delivery::FinalityDeliveryRole;
-use simplex::finality_delivery::{close_source_id, scan_finality_closures_namespace_batch};
+use simplex::finality_delivery::scan_finality_closures_namespace_report;
 
 const CLOSE_BATCH: usize = 16;
 
@@ -26,7 +26,16 @@ impl RetiredSessionService {
         // timeout nor caller cancellation may detach admitted source callbacks.
         active.push(ActiveClosure {
             namespace: path.clone(),
-            job: tokio::spawn(async move { replay_namespace(engine, path, cursors).await }),
+            job: tokio::spawn(async move {
+                replay_namespace(
+                    engine,
+                    path,
+                    cursors,
+                    #[cfg(test)]
+                    None,
+                )
+                .await
+            }),
         });
     }
 
@@ -62,6 +71,7 @@ async fn replay_namespace(
     engine: Arc<Engine>,
     namespace: PathBuf,
     cursors: Arc<Mutex<std::collections::BTreeMap<PathBuf, rtos_block::UInt256>>>,
+    #[cfg(test)] test_gate: Option<Arc<ClosureAdmissionGate>>,
 ) -> Result<usize> {
     let after = {
         let cursors = cursors.lock().map_err(|_| error!("Closing cursor poisoned"))?;
@@ -71,36 +81,46 @@ async fn replay_namespace(
         cursors.get(&namespace).cloned()
     };
     let path = namespace.clone();
-    let locators = tokio::task::spawn_blocking(move || {
-        scan_finality_closures_namespace_batch(&path, after.as_ref(), CLOSE_BATCH)
+    let batch = tokio::task::spawn_blocking(move || {
+        scan_finality_closures_namespace_report(&path, after.as_ref(), CLOSE_BATCH)
     })
     .await
     .map_err(|e| error!("Source closing scan join: {e}"))??;
-    if let Some(last) = locators.last() {
+    if let Some(last) = batch.next_cursor {
         cursors
             .lock()
             .map_err(|_| error!("Closing cursor poisoned"))?
-            .insert(namespace.clone(), close_source_id(&last.request()?)?);
+            .insert(namespace.clone(), last);
     }
     let mut candidates = Vec::new();
-    for locator in locators {
-        let request = locator.request()?;
+    let mut first_error = None;
+    for (id, locator) in batch.items {
+        let (locator, request) = match locator.and_then(|locator| {
+            let request = locator.request()?;
+            Ok((locator, request))
+        }) {
+            Ok(value) => value,
+            Err(error) => {
+                log::warn!(target: "validator", "Source closing {} item {id}: {error}", namespace.display());
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
         // Legacy references without an authenticated recovery binding still
         // need the full historical session recovery path.
         if request.domain.recovery_binding.is_some()
             && request.canonical.role == FinalityDeliveryRole::Final
             && request.canonical.block_id.shard().is_masterchain()
         {
-            candidates.push((close_source_id(&request)?, locator));
+            candidates.push((id, locator));
         }
     }
     if candidates.is_empty() || engine.check_stop() {
-        return Ok(0);
+        return first_error.map_or(Ok(0), Err);
     }
     let worker = engine.ensure_publication_worker().await?;
     let mut lease = None;
     let mut completions = Vec::new();
-    let mut first_error = None;
     let admission = std::panic::AssertUnwindSafe(async {
         for (_, locator) in candidates {
             if engine.check_stop() {
@@ -134,13 +154,29 @@ async fn replay_namespace(
                     }
                 }
             }
+            #[cfg(test)]
+            if let Some(gate) = &test_gate {
+                if !completions.is_empty() {
+                    gate.entered.notified().await;
+                    gate.panicking.store(true, std::sync::atomic::Ordering::Release);
+                    panic!("injected subsequent source admission panic");
+                }
+            }
+            let sink = worker.sink(runtime.clone());
+            #[cfg(test)]
+            let sink = if let Some(gate) = &test_gate {
+                Arc::new(HeldTerminalSink { delegate: sink, gate: gate.clone() })
+                    as consensus_common::finality_delivery::DurableFinalitySinkPtr
+            } else {
+                sink
+            };
             let (sender, receiver) = tokio::sync::oneshot::channel();
             // Retain the receiver before calling external admission code: it may panic
             // after handing off its source owner.
             completions.push(receiver);
             let result = locator.resume(
                 runtime.clone(),
-                worker.sink(runtime.clone()),
+                sink,
                 worker.delivered_sink(runtime),
                 Box::new(move |result| {
                     let _ = sender.send(result);
@@ -199,4 +235,193 @@ async fn replay_namespace(
         return Err(error);
     }
     Ok(completed)
+}
+
+// Per-job test admission interposition. The delegate still authenticates and
+// executes the real node lookup; only its actual source continuation is held.
+#[cfg(test)]
+#[derive(Default)]
+struct ClosureAdmissionGate {
+    state: Mutex<ClosureGateState>,
+    entered: tokio::sync::Notify,
+    panicking: std::sync::atomic::AtomicBool,
+    lookup_ok: std::sync::atomic::AtomicBool,
+}
+#[cfg(test)]
+#[derive(Default)]
+struct ClosureGateState {
+    opened: bool,
+    held: Option<Box<dyn FnOnce() + Send>>,
+}
+#[cfg(test)]
+impl ClosureAdmissionGate {
+    fn register(&self, callback: Box<dyn FnOnce() + Send>) {
+        let ready = {
+            let mut state = self.state.lock().unwrap();
+            if state.opened {
+                Some(callback)
+            } else {
+                assert!(state.held.is_none(), "only the first admission uses this gate");
+                state.held = Some(callback);
+                None
+            }
+        };
+        if let Some(callback) = ready {
+            callback();
+        }
+    }
+    fn release(&self) {
+        let callback = {
+            let mut state = self.state.lock().unwrap();
+            state.opened = true;
+            state.held.take()
+        };
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+}
+#[cfg(test)]
+struct HeldTerminalSink {
+    delegate: consensus_common::finality_delivery::DurableFinalitySinkPtr,
+    gate: Arc<ClosureAdmissionGate>,
+}
+#[cfg(test)]
+impl consensus_common::finality_delivery::DurableFinalitySink for HeldTerminalSink {
+    fn stage(
+        &self,
+        draft: consensus_common::finality_delivery::FinalizedDeliveryDraft,
+        completion: consensus_common::finality_delivery::FinalizedDeliveryCompletion,
+    ) -> Result<()> {
+        self.delegate.stage(draft, completion)
+    }
+    fn lookup_terminal(
+        &self,
+        request: consensus_common::finality_delivery::CloseFinalityRequest,
+        completion: consensus_common::finality_delivery::FinalityTerminalCompletion,
+    ) -> Result<()> {
+        let gate = self.gate.clone();
+        self.delegate.lookup_terminal(
+            request,
+            Box::new(move |result| {
+                gate.lookup_ok.store(result.is_ok(), std::sync::atomic::Ordering::Release);
+                gate.register(Box::new(move || completion(result)));
+                gate.entered.notify_one();
+            }),
+        )
+    }
+    fn offer_close(
+        &self,
+        request: consensus_common::finality_delivery::CloseFinalityRequest,
+        completion: consensus_common::finality_delivery::FinalityCloseCompletion,
+    ) -> Result<()> {
+        self.delegate.offer_close(request, completion)
+    }
+}
+
+/// Called by an actual Engine/source fixture after its two live handoffs have
+/// produced synced references and the live source owner has been dropped.
+#[cfg(test)]
+pub(crate) async fn test_admission_panic_drains_real_source(
+    engine: Arc<Engine>,
+    namespace: PathBuf,
+    runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+    release_before_register: bool,
+) {
+    use std::sync::atomic::Ordering;
+    let service = RetiredSessionService {
+        status: Mutex::new(Default::default()),
+        initialized: tokio::sync::watch::channel(false).0,
+        close_cursors: Arc::new(Mutex::new(Default::default())),
+    };
+    let gate = Arc::new(ClosureAdmissionGate::default());
+    if release_before_register {
+        gate.release();
+    }
+    struct Release(Arc<ClosureAdmissionGate>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    let release = Release(gate.clone());
+    let task_engine = engine.clone();
+    let task_path = namespace.clone();
+    let cursors = service.close_cursors.clone();
+    let task_gate = gate.clone();
+    let mut active = vec![ActiveClosure {
+        namespace: namespace.clone(),
+        job: tokio::spawn(async move {
+            replay_namespace(task_engine, task_path, cursors, Some(task_gate)).await
+        }),
+    }];
+    let result = std::panic::AssertUnwindSafe(async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !gate.panicking.load(Ordering::Acquire) || !engine.check_stop() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("second admission must panic after actual first lookup");
+        assert!(gate.lookup_ok.load(Ordering::Acquire), "real Engine lookup must succeed");
+        if !release_before_register {
+            service.poll_closures(&engine, &mut active);
+            assert_eq!(active.len(), 1, "held source completion must retain actual job");
+            assert_eq!(service.snapshot().deferred, 0, "job must not report terminal before drain");
+            assert!(engine.finality_recovery_registry().owns(&runtime));
+            assert!(engine
+                .finality_recovery_registry()
+                .reserve_normal(&runtime)
+                .unwrap()
+                .is_none());
+            assert!(
+                simplex::finality_delivery::scan_finality_closures_namespace(&namespace)
+                    .unwrap()
+                    .is_empty(),
+                "real source file lock must still be held"
+            );
+        }
+        gate.release();
+    })
+    .catch_unwind()
+    .await;
+    // Release on every failure, then collect the real join before propagating it.
+    drop(release);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !active.is_empty() {
+            service.poll_closures(&engine, &mut active);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("admitted source work must reach a terminal join after gate release");
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    assert_eq!(service.snapshot().deferred, 1, "panic remains a reported failure");
+    assert!(
+        engine.finality_recovery_registry().owns(&runtime),
+        "panic reservation remains fail-closed"
+    );
+    let locators =
+        simplex::finality_delivery::scan_finality_closures_namespace(&namespace).unwrap();
+    assert!(!locators.is_empty(), "terminal job must have dropped every source store lock owner");
+    drop(locators);
+}
+
+#[cfg(test)]
+#[test]
+fn source_closing_gate_release_before_registration_is_permanent_and_lock_free() {
+    let gate = Arc::new(ClosureAdmissionGate::default());
+    gate.release();
+    let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for _ in 0..2 {
+        let owner = gate.clone();
+        let completed = completed.clone();
+        gate.register(Box::new(move || {
+            // Reentrant release proves the continuation is called outside the mutex.
+            owner.release();
+            completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+    }
+    assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(gate.state.lock().unwrap().held.is_none());
 }
