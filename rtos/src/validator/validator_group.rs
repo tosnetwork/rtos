@@ -983,6 +983,8 @@ pub struct ValidatorGroup {
     // Constructed once from the manager's governing session identity and subset.
     // An invalid PQ snapshot remains an error, never a classical fallback.
     pq_session: std::result::Result<Option<rtos_api::pq_finality::PqSessionContext>, String>,
+    authenticated_runtime:
+        Option<Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>>,
     #[allow(dead_code)]
     allow_unsafe_self_blocks_resync: bool,
 
@@ -1059,6 +1061,43 @@ impl ResolverBackend for ValidatorGroup {
 }
 
 impl ValidatorGroup {
+    /// Attach the manager's frozen governing snapshot before publishing the group.
+    /// Authentication of the governing state belongs to the caller; this boundary
+    /// rejects mismatched options, committee, session and local transport identity.
+    pub fn with_authenticated_runtime(
+        mut self,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+    ) -> Result<Self> {
+        use consensus_common::session_runtime::LocalRole;
+        let ConsensusOptions::Simplex(options) = &self.consensus_options else {
+            fail!("Authenticated Simplex runtime requires Simplex options");
+        };
+        if runtime.session_id() != &self.session_id
+            || runtime.shard() != &self.shard
+            || runtime.catchain_seqno() != self.general_session_info.catchain_seqno
+            || runtime.committee() != self.validator_set.list()
+            || runtime.local_adnl().data() != self.local_key.id().data()
+            || runtime.protocol() != options.protocol
+            || runtime.carrier_version() != options.proto_version
+            || runtime.wire_profile() != options.wire_profile
+        {
+            fail!("Authenticated runtime differs from group identity or options");
+        }
+        self.local_identity = match runtime.local_role() {
+            LocalRole::Observer => None,
+            LocalRole::Validator(index) => {
+                Some(consensus_common::ValidatorIdentity::from_descriptor(
+                    runtime.committee().get(index as usize).ok_or_else(|| {
+                        error!("Authenticated local validator index out of range")
+                    })?,
+                )?)
+            }
+        };
+        self.pq_session = Ok(runtime.pq_context().cloned());
+        self.authenticated_runtime = Some(runtime);
+        Ok(self)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         general_session_info: Arc<GeneralSessionInfo>,
@@ -1150,6 +1189,7 @@ impl ValidatorGroup {
             session_id,
             validator_set,
             pq_session,
+            authenticated_runtime: None,
             consensus_options,
             is_accelerated_consensus_enabled: is_accelerated,
             engine,
