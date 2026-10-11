@@ -1221,7 +1221,11 @@ impl PrivateOverlayOperations for NodeNetwork {
                 fail!("Consensus overlay generation does not match registered id {id}");
             }
             Some(_) => {}
-            None if manager.overlay_drained(overlay) => return Ok(()),
+            None if manager.overlay_drained(overlay) => {
+                // Completion does not imply success: retrieve the retained
+                // worker result even after this generation left the registry.
+                return manager.stop_overlay_checked(id, overlay);
+            }
             None => fail!("Consensus overlay is not registered under id {id}"),
         }
         let result = manager.stop_overlay_checked(id, overlay);
