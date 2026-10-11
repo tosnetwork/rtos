@@ -1118,7 +1118,7 @@ impl EngineOperations for Engine {
         self: Arc<Self>,
         runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
     ) -> Result<consensus_common::finality_delivery::DurableFinalitySinkPtr> {
-        if runtime.pin().zerostate != *self.zerostate_id()?
+        if runtime.pin().zerostate != *self.zerostate_id()
             || runtime.wire_profile() != self.validator_network().wire_profile()
             || runtime.pin().global_id
                 != self.load_last_applied_mc_state().await?.state()?.global_id()
