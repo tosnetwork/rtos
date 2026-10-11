@@ -3,8 +3,8 @@
 //!
 //! This never authorizes spool reclamation. State pins are process-local; archive
 //! files and history have no persistent dependency lease here. Authentication is
-//! bounded in historical proof/state reads. Merkle apply still allocates before
-//! its output check; this is not a complete peak-memory-bounded repair owner.
+//! bounded across historical reads, Merkle apply and dedicated state persistence.
+//! Native database caches remain outside the request's Rust allocation accounting.
 use crate::{
     block::BlockStuff, block_proof::BlockProofStuff, engine::Engine,
     engine_traits::EngineOperations, shard_states_keeper::PinnedShardStateGuard,
@@ -24,7 +24,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 const MAX_LIVE_REPAIRS: usize = 4;
 const MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STATE_CELLS: usize = 1_000_000;
-const MAX_STATE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_STATE_DEPTH: usize = 4096;
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -38,6 +37,31 @@ pub(crate) struct McFinalRepairRequest {
     pub protocol: SimplexProtocol,
     pub carrier_version: u32,
     pub wire_profile: WireProfile,
+}
+
+/// Only this module can construct the binding between authenticated Final bytes
+/// and the bounded Merkle result. Not serializable and not durable custody.
+pub(crate) struct PreparedRepairCandidate {
+    accepted: crate::validator::accept_block::AcceptedSessionBlock,
+    root: Cell,
+    budget: Arc<crate::history_read_budget::HistoryReadBudget>,
+}
+impl PreparedRepairCandidate {
+    pub(crate) fn budget(&self) -> &Arc<crate::history_read_budget::HistoryReadBudget> {
+        &self.budget
+    }
+    pub(crate) fn block_id(&self) -> &BlockIdExt {
+        self.accepted.block().id()
+    }
+    pub(crate) fn block(&self) -> &BlockStuff {
+        self.accepted.block()
+    }
+    pub(crate) fn proof(&self) -> &BlockProofStuff {
+        self.accepted.proof()
+    }
+    pub(crate) fn root(&self) -> &Cell {
+        &self.root
+    }
 }
 
 struct Admission {
@@ -139,37 +163,6 @@ async fn load_pinned_bounded(
         .map_err(|error| error!("Repair state reader failed: {error}"))?
 }
 
-async fn check_cells(root: &Cell) -> Result<()> {
-    check_cells_with_limit(root, MAX_STATE_CELLS).await
-}
-
-async fn check_cells_with_limit(root: &Cell, max_cells: usize) -> Result<()> {
-    let mut stack = vec![(root.clone(), 0usize)];
-    let mut visited = HashSet::new();
-    let mut bytes = 0usize;
-    while let Some((cell, depth)) = stack.pop() {
-        if depth > MAX_STATE_DEPTH {
-            fail!("MC repair state depth exceeds budget");
-        }
-        if !visited.insert(cell.repr_hash().clone()) {
-            continue;
-        }
-        bytes = bytes
-            .checked_add((cell.bit_length() + 7) / 8 + 32)
-            .ok_or_else(|| error!("MC repair state byte count overflow"))?;
-        if visited.len() > max_cells || bytes > MAX_STATE_BYTES {
-            fail!("MC repair state exceeds cell/byte budget");
-        }
-        for index in 0..cell.references_count() {
-            stack.push((cell.reference(index)?, depth + 1));
-        }
-        if visited.len() % 512 == 0 {
-            tokio::task::yield_now().await;
-        }
-    }
-    Ok(())
-}
-
 async fn read_pair(
     engine: &Engine,
     id: &BlockIdExt,
@@ -248,7 +241,7 @@ async fn repair_owned(
         }
         Err(_) => None,
     };
-    let (accepted, parent) = async {
+    let (accepted, parent, existing_target) = async {
         check_domain(engine.as_ref(), &request)?;
         let accepted = loop {
             let from_local = local.is_some();
@@ -326,32 +319,28 @@ async fn repair_owned(
             fail!("MC repair requires one MC parent");
         }
         let parent = load_pinned_bounded(&engine, &parent_id, &budget).await?;
-        check_cells(parent.state().root_cell()).await?;
         if parent.state().root_cell().repr_hash() != &block.block()?.read_state_update()?.old_hash {
             fail!("MC repair parent state does not match update");
         }
-        // Existing root with missing children is deliberately a defer, not a rebuild.
-        match engine.load_state_bounded(&request.block_id, budget.clone()).await {
-            Ok(state) => {
-                if state.root_cell().repr_hash() == &block.block()?.read_state_update()?.new_hash {
-                    check_cells(state.root_cell()).await?;
-                }
+        // Only absence of the physical index admits reconstruction. GC denial,
+        // malformed index and missing root/child are never equivalent to absence.
+        let existing_target = if engine.db().has_repair_state_index(&request.block_id)? {
+            let target = load_pinned_bounded(&engine, &request.block_id, &budget).await?;
+            if target.state().root_cell().repr_hash()
+                != &block.block()?.read_state_update()?.new_hash
+            {
+                fail!("Existing repair target root conflicts with Final");
             }
-            Err(error) if crate::history_read_budget::stops_fallback(&error) => return Err(error),
-            Err(_) => {} // Missing root may be reconstructed; partial graph failures cannot.
-        }
-        Ok::<_, anyhow::Error>((accepted, parent))
+            Some(target)
+        } else {
+            None
+        };
+        Ok::<_, anyhow::Error>((accepted, parent, existing_target))
     }
     .await?;
-    // Preflight a candidate in ordinary memory before any durable write. The
-    // blocking worker is awaited by this Engine-owned task WITHOUT a timeout;
-    // abandoning its JoinHandle would detach a real accepted computation.
     let update = accepted.block().block()?.read_state_update()?;
     let old_root = parent.state().root_cell().clone();
-    let candidate = tokio::task::spawn_blocking(move || update.apply_for(&old_root))
-        .await
-        .map_err(|error| error!("MC repair candidate construction failed: {error}"))??
-        .0;
+    let expected_root = update.new_hash.clone();
     let candidate_limit = MAX_STATE_CELLS;
     #[cfg(test)]
     let candidate_limit = candidate_test_limits()
@@ -359,26 +348,72 @@ async fn repair_owned(
         .unwrap()
         .remove(&(Arc::as_ptr(&engine) as usize))
         .unwrap_or(candidate_limit);
-    check_cells_with_limit(&candidate, candidate_limit).await?;
-    // Construction itself has no allocator budget yet. This check prevents an
-    // over-budget candidate being persisted, not peak memory use during apply.
+    let apply_budget = budget.clone();
+    let limits = rtos_block::merkle_apply_budget::MerkleApplyLimits {
+        max_entries: candidate_limit.min(budget.limits().cells),
+        max_depth: budget.limits().depth,
+    };
+    let root = tokio::task::spawn_blocking(move || {
+        update.apply_for_bounded(&old_root, &limits, apply_budget.as_ref())
+    })
+    .await
+    .map_err(|error| error!("MC repair bounded candidate failed: {error}"))??
+    .0;
+    if root.repr_hash() != &expected_root {
+        fail!("Bounded repair candidate root mismatch");
+    }
+    // Header parsing only sees the fully admitted detached candidate graph.
+    let state = crate::shard_state::ShardStateStuff::from_root_cell(
+        accepted.block().id().clone(),
+        root.clone(),
+        #[cfg(feature = "telemetry")]
+        engine.engine_telemetry(),
+        engine.engine_allocated(),
+    )?;
+    if state.state()?.global_id() != request.pin.global_id {
+        fail!("Repair candidate global id mismatch");
+    }
+    let candidate = PreparedRepairCandidate { accepted, root, budget: budget.clone() };
+    let target_reservation = if existing_target.is_none() {
+        engine.shard_states_keeper().reserve_repair_target(&candidate)?
+    } else {
+        None
+    };
+    // If another writer materialized the target before reservation, it must be
+    // fully readable and agree with the authenticated candidate before writes.
+    let existing_target = if existing_target.is_none() && target_reservation.is_none() {
+        let target = load_pinned_bounded(&engine, candidate.block_id(), &budget).await?;
+        if target.state().root_cell().repr_hash() != candidate.root().repr_hash() {
+            fail!("Concurrent repair state conflict");
+        }
+        Some(target)
+    } else {
+        existing_target
+    };
     #[cfg(test)]
     if let Some(gate) = take_test_gate(&engine) {
         gate.entered.add_permits(1);
         gate.release.acquire().await.unwrap().forget();
     }
-    engine.clone().ensure_publication_acceptance_durable(&accepted).await?;
+    let handle = engine.db().ensure_repair_artifacts(&candidate).await?;
+    if existing_target.is_none() {
+        engine.db().store_repair_candidate(&candidate).await?;
+    }
+    engine.db().sync_publication_state().await?;
     let target = load_pinned_bounded(&engine, &request.block_id, &budget).await?;
-    check_cells(target.state().root_cell()).await?;
-    if target.state().root_cell().repr_hash()
-        != &accepted.block().block()?.read_state_update()?.new_hash
-    {
+    if target.state().root_cell().repr_hash() != candidate.root().repr_hash() {
         fail!("MC repair persisted state mismatch");
     }
+    handle.set_state();
+    handle.set_state_saved();
+    engine.db().repair_publication_links(&handle, candidate.accepted.previous_blocks())?;
+    engine.db().sync_publication_metadata(&handle).await?;
+    drop(target_reservation); // transfer to the verified target's existing pin
+    drop(existing_target);
     check_domain(engine.as_ref(), &request)?;
     Ok(McFinalRepairCustody {
-        block: accepted.block().clone(),
-        proof: accepted.proof().clone(),
+        block: candidate.block().clone(),
+        proof: candidate.proof().clone(),
         parent,
         target,
         _admission: admission,
@@ -430,4 +465,31 @@ fn artifact_test_limits() -> &'static Mutex<std::collections::HashMap<usize, usi
 #[cfg(test)]
 pub(crate) fn limit_next_artifact_for_test(engine: &Arc<Engine>, bytes: usize) {
     artifact_test_limits().lock().unwrap().insert(Arc::as_ptr(engine) as usize, bytes);
+}
+
+#[cfg(test)]
+fn bounded_only_engines() -> &'static Mutex<HashSet<usize>> {
+    static ENGINES: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    ENGINES.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) struct BoundedOnlyGuard(usize);
+#[cfg(test)]
+impl Drop for BoundedOnlyGuard {
+    fn drop(&mut self) {
+        bounded_only_engines().lock().unwrap().remove(&self.0);
+    }
+}
+#[cfg(test)]
+pub(crate) fn require_bounded_durability(engine: &Arc<Engine>) -> BoundedOnlyGuard {
+    let id = Arc::as_ptr(engine) as usize;
+    assert!(bounded_only_engines().lock().unwrap().insert(id));
+    BoundedOnlyGuard(id)
+}
+#[cfg(test)]
+pub(crate) fn assert_ordinary_durability_allowed(engine: &Engine) {
+    assert!(
+        !bounded_only_engines().lock().unwrap().contains(&(engine as *const Engine as usize)),
+        "bounded repair entered ordinary durability/apply"
+    );
 }

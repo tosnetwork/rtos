@@ -42,7 +42,8 @@ impl AllowStateGcSmartResolver {
             min_actual_ss: lockfree::map::Map::new(),
             life_time_sec,
             pinned_roots: parking_lot::RwLock::new(HashMap::new()),
-            #[cfg(test)] test_expired: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            test_expired: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -117,6 +118,13 @@ impl AllowStateGcSmartResolver {
 
     pub fn pin_state(&self, block_id: &BlockIdExt, saved_at: u64, gc_utime: u64) -> Result<bool> {
         let mut pinned_roots = self.pinned_roots.write();
+        // Transfer an existing live pin (including a repair reservation) without
+        // manufacturing a new GC exemption after eligibility has advanced.
+        if let Some(count) = pinned_roots.get_mut(block_id) {
+            *count =
+                count.checked_add(1).ok_or_else(|| rtos_block::error!("State pin overflow"))?;
+            return Ok(true);
+        }
         let allow = AllowStateGcSmartResolver::allow_state_gc(self, block_id, saved_at, gc_utime)?;
         if allow {
             return Ok(false);
@@ -135,6 +143,15 @@ impl AllowStateGcSmartResolver {
                 1
             });
         Ok(true)
+    }
+
+    /// Private repair reservation after authenticated candidate construction.
+    /// Caller holds the storage write/GC gate and has proved index absence.
+    pub(crate) fn reserve_absent_repair_state(&self, id: &BlockIdExt) -> Result<()> {
+        let mut pins = self.pinned_roots.write();
+        let count = pins.entry(id.clone()).or_insert(0);
+        *count = count.checked_add(1).ok_or_else(|| rtos_block::error!("Repair pin overflow"))?;
+        Ok(())
     }
 
     pub fn add_pin_for_state(&self, block_id: &BlockIdExt) -> Result<()> {
@@ -200,5 +217,30 @@ impl AllowStateGcResolver for AllowStateGcSmartResolver {
         let old = AllowStateGcSmartResolver::allow_state_gc(self, block_id, saved_at, gc_utime)?;
         let pinned = self.pinned_roots.read().get(block_id).map(|c| *c > 0).unwrap_or(false);
         Ok(old && !pinned)
+    }
+}
+
+#[cfg(test)]
+mod repair_pin_tests {
+    use super::*;
+    #[test]
+    fn repair_target_pin_transfers_without_relaxing_ordinary_gc() {
+        let resolver = AllowStateGcSmartResolver::new(0);
+        let id = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            7,
+            Default::default(),
+            Default::default(),
+        );
+        resolver.test_advance_expired_mc_boundary(8);
+        assert!(!resolver.pin_state(&id, 0, 0).unwrap());
+        assert!(AllowStateGcResolver::allow_state_gc(&resolver, &id, 0, 0).unwrap());
+        resolver.reserve_absent_repair_state(&id).unwrap();
+        assert!(resolver.pin_state(&id, 0, 0).unwrap(), "transfer existing reservation");
+        resolver.unpin_state(&id).unwrap();
+        assert!(!AllowStateGcResolver::allow_state_gc(&resolver, &id, 0, 0).unwrap());
+        resolver.unpin_state(&id).unwrap();
+        assert!(AllowStateGcResolver::allow_state_gc(&resolver, &id, 0, 0).unwrap());
+        assert!(!resolver.pin_state(&id, 0, 0).unwrap(), "no permanent GC exception");
     }
 }

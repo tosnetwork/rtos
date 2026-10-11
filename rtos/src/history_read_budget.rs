@@ -55,6 +55,7 @@ impl std::error::Error for UnsupportedBoundedHistoryRead {}
 pub fn stops_fallback(e: &anyhow::Error) -> bool {
     e.downcast_ref::<HistoryBudgetExceeded>().is_some()
         || e.downcast_ref::<storage::bounded_cell::InvalidBoundedState>().is_some()
+        || e.downcast_ref::<rtos_block::merkle_apply_budget::MerkleApplyLimitExceeded>().is_some()
         || e.downcast_ref::<UnsupportedBoundedHistoryRead>().is_some()
         || e.downcast_ref::<crate::network::full_node_overlay_client::BoundedBocDecodeRejected>()
             .is_some()
@@ -422,6 +423,25 @@ impl HistoryReadBudget {
         let root = reader.read(bytes)?.withdraw_single_root()?;
         self.graph_inner(&root)?;
         Ok(root)
+    }
+}
+
+impl rtos_block::merkle_apply_budget::MerkleApplyBudget for HistoryReadBudget {
+    fn step(&self) -> Result<()> {
+        self.healthy()?;
+        HistoryReadBudget::step(self)
+    }
+    fn workspace(&self, bytes: usize) -> Result<()> {
+        self.healthy()?;
+        let mut usage = self.usage.lock().map_err(|_| error!("History accounting poisoned"))?;
+        let limit = self.limits.cell_bytes.saturating_sub(usage.reserved_cell_bytes);
+        add(&mut usage.cell_bytes, bytes, limit, "Merkle workspace")
+    }
+    fn new_cell(&self, bytes: usize) -> Result<()> {
+        storage::bounded_cell::CellReadBudget::admit_cell(self, &UInt256::default(), bytes, 0)
+    }
+    fn max_depth(&self) -> u16 {
+        self.limits.depth
     }
 }
 
