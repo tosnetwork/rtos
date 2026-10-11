@@ -131,7 +131,9 @@ impl Pair {
                         entry["data"] = serde_json::to_value(&key).unwrap();
                     }
                 }
-                config["ip_address_quic"] = "127.0.0.1:0".into();
+                let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                config["ip_address_quic"] = socket.local_addr().unwrap().to_string().into();
+                drop(socket);
                 std::fs::write(file, serde_json::to_vec(&config).unwrap()).unwrap();
             }
         }
@@ -189,6 +191,23 @@ impl Pair {
             let remote_adnl = &remote.network().context().stack.adnl;
             let local_key = local_adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
             let remote_key = remote_adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
+            if v2 {
+                // Isolated nodes have no external DHT. Supply the peer's actual
+                // advertised route; local endpoint binding still belongs solely
+                // to normal production configuration activation.
+                local
+                    .network()
+                    .context()
+                    .stack
+                    .quic
+                    .as_ref()
+                    .unwrap()
+                    .add_peer_key(
+                        remote_key.id().clone(),
+                        remote.network().context().quic_address.unwrap(),
+                    )
+                    .unwrap();
+            }
             let peer = local_adnl
                 .add_peer(local_key.id(), remote_adnl.ip_address_adnl(), None, &remote_key)
                 .unwrap()

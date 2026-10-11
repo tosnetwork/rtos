@@ -137,6 +137,7 @@ impl FullNodeOverlaysRouter {
     ) -> Result<()> {
         let config = self.propagation_config.read().unwrap();
         if let Some(config) = config.as_ref().filter(|c| c.enabled(client.shard())) {
+            self.network.ensure_public_overlay_quic()?;
             client.overlay_client().configure_plumtree(config.policy(false))?;
         }
         Ok(())

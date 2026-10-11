@@ -60,6 +60,28 @@ async fn propagation_authenticated_normal_finality_applies_by_mc_and_reopens() {
     let pair = Pair::with_propagation_profile("included", false, true).await;
     let mut services = None;
     let result = std::panic::AssertUnwindSafe(async {
+        let client = pair.receiver.overlay_client(pair.shard.id().shard()).await.unwrap();
+        let prefix = WireProfile::T0
+            .serialize(
+                &rtos_api::ton::overlay::message::Message {
+                    overlay: UInt256::from(*client.overlay_client().id().data()),
+                }
+                .into_boxed(),
+            )
+            .unwrap();
+        let sender = pair
+            .provider
+            .network()
+            .context()
+            .stack
+            .adnl
+            .key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)
+            .unwrap();
+        pair.receiver.network().test_broadcast_faults.configure(
+            *sender.id().data(),
+            prefix.clone(),
+            0,
+        );
         let context = governing_session(&pair).await;
         let previous = pair.shard.construct_prev_id().unwrap().0;
         let mut bad = pair.shard_carrier.clone();
@@ -106,6 +128,27 @@ async fn propagation_authenticated_normal_finality_applies_by_mc_and_reopens() {
         assert!(sent(&outcome, PropagationKind::Finality), "{outcome:?}");
         assert!(!outcome.needs_retry(), "{outcome:?}");
         pair.wait_preapplied().await;
+        let (expected_wire, expected_id) = pair.finality_wire();
+        let received = pair.receiver.network().test_broadcast_faults.receipts();
+        let receipt = received
+            .iter()
+            .find(|r| r.simple_id == Some(expected_id) && !r.dropped && r.error.is_none())
+            .expect("normal sender must emit the T0 certificate-bound simple transport ID");
+        let carrier: rtos_api::ton::overlay::Broadcast =
+            WireProfile::T0.deserialize_typed(&receipt.wire[prefix.len()..]).unwrap();
+        let rtos_api::ton::overlay::Broadcast::Overlay_BroadcastPlumtreeSimple(carrier) = carrier
+        else {
+            panic!("finality must use simple Plumtree");
+        };
+        assert_eq!(carrier.data, expected_wire);
+        if let Ok(directory) = std::env::var("RTOS_V2_PROPAGATION_EVIDENCE_DIR") {
+            let directory = std::path::PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("normal.finality"), &carrier.data).unwrap();
+            std::fs::write(directory.join("normal.plumtree"), &receipt.wire[prefix.len()..])
+                .unwrap();
+            std::fs::write(directory.join("normal.transport-id"), expected_id).unwrap();
+        }
         let receiver_handle = pair.receiver.load_block_handle(pair.shard.id()).unwrap().unwrap();
         assert!(!receiver_handle.is_applied());
         assert_eq!(

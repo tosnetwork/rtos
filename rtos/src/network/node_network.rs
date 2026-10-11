@@ -480,6 +480,24 @@ impl NodeNetwork {
         Self::periodic_store_ip_addr(dht, node_key, None, cancellation_token)
     }
 
+    /// Plumtree public overlays also receive and repair on observer-only nodes.
+    /// Their primary transport identity must be bound even when no validator
+    /// registration activates a separate private-overlay key.
+    pub(crate) fn ensure_public_overlay_quic(&self) -> Result<()> {
+        let context = &self.network_context;
+        let quic = context
+            .stack
+            .quic
+            .as_ref()
+            .ok_or_else(|| error!("Public Plumtree transport requires QUIC"))?;
+        let key = context.stack.adnl.key_by_tag(Self::TAG_OVERLAY_KEY)?;
+        let (_, bind) = Self::compute_quic_bind_addr(
+            context.stack.adnl.ip_address_adnl(),
+            context.quic_address,
+        )?;
+        Self::bind_quic_key(quic, &key, bind)
+    }
+
     fn bind_quic_key(
         quic: &Arc<adnl::QuicNode>,
         key: &Arc<dyn KeyOption>,
