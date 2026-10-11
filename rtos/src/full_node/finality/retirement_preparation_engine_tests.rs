@@ -52,6 +52,28 @@ impl HoldingSink {
         };
         completion.expect("a held lookup")(answer.expect("the node answered the held lookup"));
     }
+    /// Cleanup on every path: deliver whatever is still held, waiting a
+    /// bounded time for the node's answer.
+    async fn release_if_held(&self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let ready = {
+                let held = self.held.lock().unwrap();
+                held.completion.is_none() || held.answer.is_some()
+            };
+            if ready || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (answer, completion) = {
+            let mut held = self.held.lock().unwrap();
+            (held.answer.take(), held.completion.take())
+        };
+        if let Some(completion) = completion {
+            completion(answer.unwrap_or_else(|| Err(rtos_block::error!("test cleanup"))));
+        }
+    }
     async fn wait_holding(&self) {
         tokio::time::timeout(Duration::from_secs(60), async {
             while !self.holding() {
@@ -94,10 +116,15 @@ impl DurableFinalitySink for HoldingSink {
         }
         self.held.lock().unwrap().completion = Some(completion);
         let held = self.held.clone();
-        self.inner.lookup_terminal(
+        let admitted = self.inner.lookup_terminal(
             request,
             Box::new(move |answer| held.lock().unwrap().answer = Some(answer)),
-        )
+        );
+        if admitted.is_err() {
+            // Not admitted: the caller's completion must not run, so drop it.
+            self.held.lock().unwrap().completion = None;
+        }
+        admitted
     }
 }
 
@@ -108,6 +135,10 @@ async fn retirement_preparation_real_group_handoff_and_refusals() {
         .expect("set RTOS_PUBLIC_FIXTURE_SIGNER to the archived public-only fixture signer");
     assert!(Path::new(&signer).is_file());
     let pair = Pair::with_source_transport("included").await;
+    // Held completions and stop tasks are drained on every path before the
+    // engines stop, including assertion failures.
+    let pending: std::sync::Mutex<(Vec<Arc<HoldingSink>>, Vec<Arc<ValidatorGroup>>)> =
+        Default::default();
     let run = std::panic::AssertUnwindSafe(async {
         let engine = &pair.provider;
         engine.clone().download_and_apply_block(pair.master.id(), 1, false).await.unwrap();
@@ -166,7 +197,14 @@ async fn retirement_preparation_real_group_handoff_and_refusals() {
             FinalityDeliveryTestDriver::open(runtime.clone(), &namespace, sink, confirm)
         };
         let source_locked = || async { open_driver().await.is_err() };
-        let lease_held = || engine.reserve_normal_session_namespace(&runtime).unwrap().is_none();
+        // Probing admission must not occupy the namespace: release any lease won.
+        let lease_held = || match engine.reserve_normal_session_namespace(&runtime).unwrap() {
+            Some(probe) => {
+                probe.release();
+                false
+            }
+            None => true,
+        };
         let make_group = || {
             let options = crate::validator::validator_manager::build_historical_simplex_options(
                 &zero.config_params().unwrap(),
@@ -188,7 +226,7 @@ async fn retirement_preparation_real_group_handoff_and_refusals() {
                 committee.clone(),
             )
             .unwrap();
-            Arc::new(
+            let group = Arc::new(
                 ValidatorGroup::new(
                     info,
                     local_key.clone(),
@@ -203,7 +241,9 @@ async fn retirement_preparation_real_group_handoff_and_refusals() {
                 )
                 .with_authenticated_runtime(runtime.clone())
                 .unwrap(),
-            )
+            );
+            pending.lock().unwrap().1.push(group.clone());
+            group
         };
         let holding_group = || async {
             let group = make_group();
@@ -211,6 +251,7 @@ async fn retirement_preparation_real_group_handoff_and_refusals() {
                 engine.clone().durable_finality_sink(runtime.clone()).await.unwrap(),
             );
             assert!(group.install_durable_finality_sink_for_test(sink.clone()));
+            pending.lock().unwrap().0.push(sink.clone());
             (group, sink)
         };
         let stop = |group: Arc<ValidatorGroup>| async move {
@@ -300,7 +341,10 @@ async fn retirement_preparation_real_group_handoff_and_refusals() {
         assert_eq!(group.retirement_scans_started_for_test(), 0, "no scan while it is held");
         assert!(lease_held(), "the lease stays registered through the held callback");
         sink.release();
-        stopping.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(60), stopping)
+            .await
+            .expect("stop finished after the callback drained")
+            .unwrap();
         match group.take_retirement_outcome().unwrap() {
             Some(RetirementOutcome::Refused(refused)) => {
                 assert!(refused.drained(), "the callback drained before the proof: {}", refused.refusal());
@@ -383,12 +427,48 @@ async fn retirement_preparation_real_group_handoff_and_refusals() {
         assert!(refused.abandon().is_ok());
         assert!(!lease_held());
 
-        // (c) Corrupt node custody: the real lookup fails, and the refusal keeps
-        // the scan with its locks and the lease.
+        // (c) Corrupt node custody: every lookup reopens custody and rereads
+        // the dependency proofs, so a damaged proof makes the real lookup
+        // fail. The refusal keeps the scan with its locks and the lease.
+        use storage::archives::package_entry_id::{GetFileName, PackageEntryId};
+        let lease = engine
+            .db()
+            .repair_leases()
+            .lookup(
+                closed[0].lease_generation,
+                &crate::history_read_budget::HistoryReadBudget::new(Default::default()),
+            )
+            .unwrap();
+        let root_dir = PathBuf::from(engine.db_root_dir().unwrap());
+        let proof_path = lease
+            .dependencies
+            .iter()
+            .filter_map(|dependency| {
+                let id = dependency.validate().ok()?;
+                let name = match dependency.kind.as_str() {
+                    "proof" => PackageEntryId::Proof(&id).filename_short(),
+                    "proof-link" => PackageEntryId::ProofLink(&id).filename_short(),
+                    _ => return None,
+                };
+                Some(root_dir.join("archive/unapplied").join(name))
+            })
+            .find(|path| path.exists())
+            .expect("a loose dependency proof of the custody lease");
+        let original = std::fs::read(&proof_path).unwrap();
+        let mut damaged = original.clone();
+        let last = damaged.len() - 1;
+        damaged[last] ^= 0xff;
         let group = make_group();
         group.clone().pre_create_engine().await.unwrap();
-        engine.db().save_validator_state_raw("PropagationOutboxV1", b"corrupt custody").unwrap();
-        stop(group.clone()).await;
+        std::fs::write(&proof_path, &damaged).unwrap();
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(60),
+            group.clone().stop_for_retirement_preparation(tokio::runtime::Handle::current()),
+        )
+        .await;
+        // Restore the exact evidence before any assertion.
+        std::fs::write(&proof_path, &original).unwrap();
+        stopped.expect("retirement stop did not finish").unwrap();
         let refused = match group.take_retirement_outcome().unwrap() {
             Some(RetirementOutcome::Refused(refused)) => refused,
             Some(RetirementOutcome::Prepared(_)) => panic!("corrupt custody issued a preparation"),
@@ -413,6 +493,24 @@ async fn retirement_preparation_real_group_handoff_and_refusals() {
     })
     .catch_unwind()
     .await;
+    let (sinks, groups) = std::mem::take(&mut *pending.lock().unwrap());
+    for sink in sinks {
+        sink.release_if_held().await;
+    }
+    // Joining a started stop means awaiting its shared teardown completion.
+    for group in groups {
+        let rt = tokio::runtime::Handle::current();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(60),
+            group.clone().stop_for_retirement_preparation(rt),
+        )
+        .await;
+        match group.take_retirement_outcome() {
+            Ok(Some(RetirementOutcome::Prepared(owner))) => owner.abandon(),
+            Ok(Some(RetirementOutcome::Refused(refused))) => drop(refused.abandon()),
+            _ => {}
+        }
+    }
     pair.stop_all().await;
     run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
