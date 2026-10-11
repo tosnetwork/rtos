@@ -51,6 +51,20 @@ use rtos_block::{
 use std::sync::Arc;
 use storage::types::PersistentStatePartId;
 
+/// Terminal rejection by the scoped BOC decoder (including malformed input and
+/// depth limits). The original decoder error remains in the error chain; this
+/// context deliberately does not invent an actual size or match error strings.
+#[derive(Debug)]
+pub struct BoundedBocDecodeRejected {
+    pub phase: &'static str,
+}
+impl std::fmt::Display for BoundedBocDecodeRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bounded network BOC {} rejected", self.phase)
+    }
+}
+impl std::error::Error for BoundedBocDecodeRejected {}
+
 /// Per-request bounds. These limit encoded buffers and BOC cardinality, not total heap usage.
 #[derive(Clone, Copy, Debug)]
 pub struct NetworkDownloadLimits {
@@ -94,10 +108,14 @@ impl NetworkDownloadLimits {
     fn parse_boc(self, data: &[u8], max_bytes: usize) -> Result<rtos_block::BocReaderResult> {
         Self::check_bytes(data.len(), max_bytes)?;
         let mut reader = rtos_block::BocReader::new().set_max_cell_depth(self.boc_depth);
-        let (header, _) = reader.read_header(&mut std::io::Cursor::new(data))?;
+        let (header, _) = reader
+            .read_header(&mut std::io::Cursor::new(data))
+            .map_err(|error| error.context(BoundedBocDecodeRejected { phase: "header" }))?;
         Self::check_bytes(header.cells_count, self.boc_cells)?;
         Self::check_bytes(header.tot_cells_size, max_bytes)?;
-        reader.read(data)
+        reader
+            .read(data)
+            .map_err(|error| error.context(BoundedBocDecodeRejected { phase: "graph" }))
     }
 }
 

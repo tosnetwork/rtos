@@ -3,7 +3,7 @@
 //! never the downloader, budget checker, decoder, or transport.
 use super::*;
 use crate::history_read_budget::{HistoryBudgetExceeded, HistoryReadBudget, HistoryReadLimits};
-use crate::network::full_node_overlay_client::NetworkDownloadLimits;
+use crate::network::full_node_overlay_client::{BoundedBocDecodeRejected, NetworkDownloadLimits};
 use rtos_api::{
     ton::ton_node::datafull::{DataFull, DataFullCompressed},
     WireProfile,
@@ -138,7 +138,20 @@ async fn bounded_download_e2e_declared_wire_and_graph_rejection() {
         let (block, proof) = artifacts(&pair).await;
         let client = pair.receiver.overlay_client(pair.master.id().shard()).await.unwrap();
         let valid = full_bytes(&pair, block.clone(), proof.clone());
-        let field = 4 + rtos_api::serialize_bare(pair.master.id()).unwrap().len();
+        // serialize_bare() is historically named but writes a constructor.
+        // The nested lowercase blockIdExt field is actually bare: use the
+        // serializer operation that the generated DataFull encoder uses.
+        let mut bare_id = Vec::new();
+        rtos_api::Serializer::with_profile(&mut bare_id, WireProfile::T0)
+            .write_bare(pair.master.id())
+            .unwrap();
+        let field = 4 + bare_id.len();
+        assert_eq!(&valid[4..field], bare_id.as_slice());
+        assert_eq!(valid[field], 254, "fixture proof has a u24 byte length");
+        assert_eq!(
+            u32::from_le_bytes([valid[field + 1], valid[field + 2], valid[field + 3], 0]) as usize,
+            proof.len()
+        );
         let mut malicious = valid[..field].to_vec();
         malicious.extend_from_slice(&[254, 0xff, 0xff, 0x7f]);
         inject(&pair, malicious);
@@ -159,6 +172,17 @@ async fn bounded_download_e2e_declared_wire_and_graph_rejection() {
         let error =
             client.download_block_full_bounded(pair.master.id(), false, cap).await.err().unwrap();
         assert!(error.downcast_ref::<adnl::ResponseLimitExceeded>().is_some());
+        inject(&pair, valid.clone());
+        let before_depth = count(&pair);
+        let mut depth_cap = limits(proof.len(), block.len());
+        depth_cap.boc_depth = 1;
+        let error = client
+            .download_block_full_bounded(pair.master.id(), false, depth_cap)
+            .await
+            .err()
+            .expect("real nested BOC must exceed depth one");
+        assert!(error.downcast_ref::<BoundedBocDecodeRejected>().is_some(), "{error:#}");
+        assert_eq!(count(&pair), before_depth + 1);
         inject(&pair, valid);
         client
             .download_block_full_bounded(pair.master.id(), false, limits(proof.len(), block.len()))
