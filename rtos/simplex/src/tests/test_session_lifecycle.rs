@@ -157,6 +157,46 @@ fn session_lifecycle_init_failure_callback_disabled_and_future_destroy() {
     assert!(!database.exists(), "destroy must remove even an unstarted future session DB");
 }
 
+#[test]
+fn checked_creation_failure_joins_workers_and_retains_cleanup_error() {
+    let dir = TestDirectory::new();
+    let listener = Arc::new(Listener::default());
+    let id = UInt256::rand();
+    let bad = dir.path().join("not-a-directory");
+    std::fs::write(&bad, b"fixture").unwrap();
+    let error = create(&bad, &id, &listener, true).err().expect("worker DB init must fail");
+    let failure = error.downcast_ref::<crate::SessionCreationFailure>().expect("typed cleanup receipt");
+    assert!(failure.cleanup_drained());
+    // No worker retains the failed namespace: the same path can now become a DB.
+    std::fs::remove_file(&bad).unwrap();
+    let session = create(&bad, &id, &listener, true).unwrap();
+    session.stop_checked().unwrap();
+    assert!(session.threads_drained());
+}
+
+#[test]
+fn checked_creation_failure_waits_for_actual_worker_exit() {
+    let dir = TestDirectory::new();
+    let listener = Arc::new(Listener::default());
+    let session = create(dir.path(), &UInt256::rand(), &listener, true).unwrap();
+    let (entered, observed) = std::sync::mpsc::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    *session.as_any().downcast_ref::<SessionImpl>().unwrap().worker_exit_gate.lock().unwrap() = Some((entered, wait));
+    let retained = session.clone();
+    let cleanup = thread::spawn(move || crate::SessionCreationFailure::after_attempt(
+        rtos_block::error!("injected post-construction failure"), Some(retained)));
+    let reached = observed.recv_timeout(Duration::from_secs(10));
+    let returned_early = cleanup.is_finished();
+    let _ = release.send(());
+    let mut failure = cleanup.join().unwrap();
+    reached.unwrap();
+    assert!(!returned_early, "cleanup receipt must wait for the real worker join");
+    assert!(failure.cleanup_drained());
+    assert!(failure.retry_cleanup());
+    assert!(session.threads_drained());
+    assert!(failure.to_string().contains("injected post-construction failure"));
+}
+
 struct TestDirectory(std::path::PathBuf);
 impl TestDirectory {
     fn new() -> Self {
@@ -446,5 +486,53 @@ async fn source_finality_real_retired_worker_preserves_missing_body_obligation()
     })();
     drop(manager);
     adnl.stop_checked().await.unwrap();
+    result.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_finality_namespace_release_waits_for_real_node_completion() {
+    use adnl::{node::{AdnlNode, AdnlNodeConfig}, DhtNode, NetworkStack, OverlayNode, RldpNode};
+    let directory = TestDirectory::new();
+    let (runtime, draft) = crate::finality_delivery::tests::fixture();
+    let key = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71; 32]).unwrap();
+    let options = crate::SessionOptions { protocol: runtime.protocol(), proto_version: runtime.carrier_version(),
+        wire_profile: runtime.wire_profile(), slots_per_leader_window: runtime.slots_per_leader_window(),
+        wait_for_db_init: true, ..Default::default() };
+    let path = std::path::PathBuf::from(runtime.runtime_directory(directory.path().to_str().unwrap()).unwrap());
+    let (_, config) = AdnlNodeConfig::from_ip_address_and_private_keys("127.0.0.1:0", vec![([0x71; 32], 0)]).unwrap();
+    let adnl = AdnlNode::with_config(config).await.unwrap();
+    let dht = DhtNode::with_adnl_node(adnl.clone(), 0).unwrap();
+    let overlay = OverlayNode::with_params_and_profile(adnl.clone(), &[25; 32], 0, rtos_api::WireProfile::T0).unwrap();
+    let rldp = RldpNode::with_params(adnl.clone(), vec![overlay.clone()], None).unwrap();
+    overlay.set_rldp(rldp.clone()).unwrap();
+    let stack = Arc::new(NetworkStack { adnl: adnl.clone(), dht, overlay, rldp, quic: None });
+    adnl.start_over_udp(vec![stack.overlay.clone(), stack.dht.clone(), stack.rldp.clone()]).await.unwrap();
+    let manager = ConsensusCommonFactory::create_adnl_overlay_manager(tokio::runtime::Handle::current(), stack, None, false).unwrap();
+    let listener: Arc<dyn SessionListener + Send + Sync> = Arc::new(Listener::default());
+    let sink = Arc::new(crate::finality_delivery::tests::HeldSink::default());
+    let result = (|| -> Result<()> {
+        for succeed in [false, true] {
+            let session = crate::SessionFactory::create_authenticated_session(&options, runtime.clone(), &key,
+                path.to_string_lossy().into_owned(), manager.clone(), Arc::downgrade(&listener), None, Some(sink.clone()))?;
+            let callbacks = &session.as_any().downcast_ref::<SessionImpl>().unwrap()._callbacks;
+            callbacks.bind_delivery_start(runtime.pin().zerostate.clone())?;
+            anyhow::ensure!(!callbacks.poll_durable_finality(draft.clone())?);
+            session.stop_checked()?;
+            let workers_joined = session.threads_drained();
+            let namespace_early = session.namespace_drained();
+            let reopened_early = crate::finality_delivery::SourceFinalityDelivery::open(runtime.clone(), &path, sink.clone()).is_ok();
+            let (_, completion) = sink.0.lock().unwrap().pop().unwrap();
+            completion(if succeed { Ok(UInt256::from([88; 32])) } else { Err(rtos_block::error!("held WAL failure")) });
+            anyhow::ensure!(workers_joined && !namespace_early && !reopened_early,
+                "worker join cannot release namespace retained by node completion");
+            anyhow::ensure!(session.namespace_drained(), "source completion failed to release real stores");
+            let reopened = crate::finality_delivery::SourceFinalityDelivery::open(runtime.clone(), &path, sink.clone())?;
+            drop(reopened);
+        }
+        Ok(())
+    })();
+    drop(manager);
+    let drained = adnl.stop_checked().await;
+    drained.unwrap();
     result.unwrap();
 }

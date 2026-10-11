@@ -345,6 +345,13 @@ pub struct SessionHolder {
 }
 
 impl SessionHolder {
+    pub(crate) fn namespace_drained(&self) -> bool {
+        match &self.inner {
+            SessionInner::Simplex(session) => session.namespace_drained(),
+            _ => self.inner.as_common_session().threads_drained(),
+        }
+    }
+
     /// Create a new catchain session holder
     pub fn catchain(session: CatchainSessionPtr) -> Self {
         SessionHolder { inner: SessionInner::Catchain(session) }
@@ -630,13 +637,13 @@ impl ConsensusFactory {
         listener: SessionListenerPtr,
         trace_collector: Option<simplex::TraceCollector>,
         delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
-    ) -> consensus_common::Result<SessionHolderPtr> {
-        options.validate_authenticated(&runtime)?;
+    ) -> std::result::Result<SessionHolderPtr, simplex::SessionCreationFailure> {
+        options.validate_authenticated(&runtime).map_err(simplex::SessionCreationFailure::before_worker)?;
         let mut options = options.clone();
         options.use_callback_thread = false;
         options.wait_for_db_init = true;
-        let db_path = runtime.runtime_directory(&db_root)?;
-        let session = simplex::SessionFactory::create_authenticated_session(
+        let db_path = runtime.runtime_directory(&db_root).map_err(simplex::SessionCreationFailure::before_worker)?;
+        let session = simplex::SessionFactory::create_authenticated_session_checked(
             &options,
             runtime,
             local_transport_key,

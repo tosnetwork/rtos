@@ -3,7 +3,7 @@
 use consensus_common::session_runtime::{AuthenticatedSessionRuntime, LocalRole};
 use rtos_block::{error, fail, Result, UInt256};
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     sync::{Arc, Mutex},
 };
 
@@ -21,10 +21,17 @@ fn role_key(role: LocalRole, local_adnl: UInt256) -> RecoveryRole {
         LocalRole::Observer => RecoveryRole::Observer(local_adnl),
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdmissionKind {
+    Normal,
+    Recovery,
+}
+
 #[derive(Default)]
 struct Reservations {
     stopping: bool,
-    occupied: HashSet<RecoveryKey>,
+    occupied: HashMap<RecoveryKey, (AdmissionKind, u64)>,
+    next_lease: u64,
 }
 
 pub(crate) struct RecoveryRegistry {
@@ -50,7 +57,12 @@ impl RecoveryRegistry {
         *self.changed.borrow()
     }
     pub(crate) fn owns(&self, runtime: &AuthenticatedSessionRuntime) -> bool {
-        self.reservations.lock().unwrap().occupied.contains(&Self::key(runtime))
+        self.reservations
+            .lock()
+            .unwrap()
+            .occupied
+            .get(&Self::key(runtime))
+            .is_some_and(|(kind, _)| *kind == AdmissionKind::Recovery)
     }
     pub(crate) fn reserve(
         self: &Arc<Self>,
@@ -58,16 +70,35 @@ impl RecoveryRegistry {
     ) -> Result<Option<RecoveryReservation>> {
         self.reserve_key(Self::key(runtime))
     }
+    pub(crate) fn reserve_normal(
+        self: &Arc<Self>,
+        runtime: &AuthenticatedSessionRuntime,
+    ) -> Result<Option<RecoveryReservation>> {
+        self.reserve_kind(Self::key(runtime), AdmissionKind::Normal)
+    }
     fn reserve_key(self: &Arc<Self>, key: RecoveryKey) -> Result<Option<RecoveryReservation>> {
+        self.reserve_kind(key, AdmissionKind::Recovery)
+    }
+    fn reserve_kind(
+        self: &Arc<Self>,
+        key: RecoveryKey,
+        kind: AdmissionKind,
+    ) -> Result<Option<RecoveryReservation>> {
         let mut state = self.reservations.lock().unwrap();
         if state.stopping {
             fail!("Recovery session admission stopped");
         }
-        if !state.occupied.insert(key.clone()) {
+        if state.occupied.contains_key(&key) {
             return Ok(None);
         }
+        state.next_lease = state
+            .next_lease
+            .checked_add(1)
+            .ok_or_else(|| error!("Session admission generation exhausted"))?;
+        let lease = state.next_lease;
+        state.occupied.insert(key.clone(), (kind, lease));
         self.changed.send_modify(|generation| *generation = generation.wrapping_add(1));
-        Ok(Some(RecoveryReservation { registry: self.clone(), key }))
+        Ok(Some(RecoveryReservation { registry: self.clone(), key, lease }))
     }
     pub(crate) fn stop(&self) {
         self.reservations.lock().unwrap().stopping = true;
@@ -90,13 +121,22 @@ impl RecoveryRegistry {
 /// Release is explicit and belongs after checked session shutdown/join (or a
 /// failed construction which created no session). Dropping an observer or an
 /// unwinding owner must not advertise the namespace as free while threads live.
-pub(crate) struct RecoveryReservation {
+pub struct RecoveryReservation {
     registry: Arc<RecoveryRegistry>,
     key: RecoveryKey,
+    lease: u64,
 }
 impl RecoveryReservation {
     pub(crate) fn release(self) {
-        let removed = self.registry.reservations.lock().unwrap().occupied.remove(&self.key);
+        let removed = {
+            let mut state = self.registry.reservations.lock().unwrap();
+            if state.occupied.get(&self.key).is_some_and(|(_, lease)| *lease == self.lease) {
+                state.occupied.remove(&self.key);
+                true
+            } else {
+                false
+            }
+        };
         if removed {
             self.registry
                 .changed
@@ -138,6 +178,44 @@ mod tests {
         validator.release();
         assert!(registry.reservations.lock().unwrap().occupied.is_empty());
     }
+    #[test]
+    fn normal_and_recovery_admission_are_atomic_and_stale_release_is_harmless() {
+        for first in [AdmissionKind::Normal, AdmissionKind::Recovery] {
+            let registry = Arc::new(RecoveryRegistry::default());
+            let key = (UInt256::from([9; 32]), RecoveryRole::Validator);
+            let owner = registry.reserve_kind(key.clone(), first).unwrap().unwrap();
+            let stale = RecoveryReservation {
+                registry: registry.clone(),
+                key: key.clone(),
+                lease: owner.lease,
+            };
+            let other = registry.clone();
+            let other_key = key.clone();
+            let loser = std::thread::spawn(move || {
+                other
+                    .reserve_kind(
+                        other_key,
+                        if first == AdmissionKind::Normal {
+                            AdmissionKind::Recovery
+                        } else {
+                            AdmissionKind::Normal
+                        },
+                    )
+                    .unwrap()
+                    .is_none()
+            });
+            assert!(loser.join().unwrap());
+            owner.release();
+            let next = registry.reserve_kind(key.clone(), AdmissionKind::Normal).unwrap().unwrap();
+            let generation = registry.generation();
+            stale.release();
+            assert_eq!(registry.generation(), generation);
+            assert!(registry.reserve_key(key).unwrap().is_none());
+            next.release();
+            assert!(registry.reservations.lock().unwrap().occupied.is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn recovery_registry_release_wakes_same_state_without_losing_notifications() {
         let registry = Arc::new(RecoveryRegistry::default());
@@ -153,15 +231,15 @@ mod tests {
         )
         .await
         .is_err());
-        assert!(registry.reservations.lock().unwrap().occupied.contains(&key));
+        assert!(registry.reservations.lock().unwrap().occupied.contains_key(&key));
         lease.release();
         // Release precedes subscription: a Notify-only design could lose this wakeup.
         registry.wait_changed(held).await.unwrap();
-        assert!(!registry.reservations.lock().unwrap().occupied.contains(&key));
+        assert!(!registry.reservations.lock().unwrap().occupied.contains_key(&key));
         let lease = registry.reserve_key(key.clone()).unwrap().unwrap();
         drop(lease);
         assert!(
-            registry.reservations.lock().unwrap().occupied.contains(&key),
+            registry.reservations.lock().unwrap().occupied.contains_key(&key),
             "unwinding cannot release a possibly live session"
         );
         let seen = registry.generation();

@@ -11670,16 +11670,22 @@ fn source_finality_main_worker_release_keeps_only_accepted_node_work_owned() {
     let old_handle = Arc::new(callbacks.with_listener(Arc::downgrade(&listener_dyn)));
     assert!(!callbacks.poll_durable_finality(draft).unwrap());
     drop(main_worker);
+    assert!(!callbacks.source_namespace_drained());
+    assert!(!old_handle.source_namespace_drained());
     assert!(callbacks.initialize_delivery(runtime.clone(), std::path::Path::new(&namespace)).is_err(),
         "accepted node work must retain source lock after main worker joins");
     assert!(crate::finality_delivery::scan_pending_finality(temp.path()).unwrap().is_empty());
     let (_, complete) = sink.0.lock().unwrap().pop().unwrap();
     complete(Err(rtos_block::error!("Node WAL failed after source stop")));
+    assert!(callbacks.source_namespace_drained());
+    assert!(old_handle.source_namespace_drained());
     let recoverable = crate::finality_delivery::scan_pending_finality(temp.path()).unwrap();
     assert_eq!(recoverable.len(), 1); drop(recoverable);
     let next_worker = callbacks.delivery_lifetime();
     callbacks.initialize_delivery(runtime, std::path::Path::new(&namespace)).unwrap();
+    assert!(!callbacks.source_namespace_drained());
     drop(next_worker);
+    assert!(callbacks.source_namespace_drained());
     // Both old source/listener handles remain alive; neither retains the lock.
     assert_eq!(crate::finality_delivery::scan_pending_finality(temp.path()).unwrap().len(), 1);
     drop(old_handle);

@@ -683,11 +683,10 @@ impl ValidatorGroupImpl {
     fn reset_after_start_failure(&mut self) {
         log::warn!(target: "validator",
             "SESSION_LIFECYCLE: reset_after_failure shard={} cc_seqno={} session_id={:x} \
-             status={} -> created (session dropped, will retry)",
+             status={} -> retry (existing session ownership retained)",
             self.shard, self.cc_seqno, self.session_id, self.status);
-        self.session = None;
         self.start_pending = false;
-        self.status = ValidatorGroupStatus::Created;
+        self.status = if self.session.is_some() { ValidatorGroupStatus::EngineCreated } else { ValidatorGroupStatus::Created };
     }
 
     /// Get the consensus type for this validator group
@@ -765,7 +764,17 @@ impl ValidatorGroupImpl {
                             g.validator_list_id.clone(),
                             block_sync_params_with_identity,
                         ));
-                    return ConsensusFactory::create_simplex_authenticated_session(
+                    let mut admission = g.namespace_admission.lock().unwrap();
+                    if let Some(failure) = admission.failed.as_mut() {
+                        if !failure.retry_cleanup() { fail!("Prior normal constructor is not drained: {failure}"); }
+                        admission.failed = None;
+                        if let Some(token) = admission.reservation.take() { token.release(); }
+                    }
+                    if admission.reservation.is_none() {
+                        admission.reservation = Some(g.engine.reserve_normal_session_namespace(runtime)?
+                            .ok_or_else(|| error!("Session namespace is occupied; retry after generation change"))?);
+                    }
+                    let created = ConsensusFactory::create_simplex_authenticated_session(
                         simplex_options,
                         runtime.clone(),
                         &g.local_key,
@@ -775,6 +784,18 @@ impl ValidatorGroupImpl {
                         g.engine.trace_collector(),
                         g.durable_finality_sink.get().cloned(),
                     );
+                    return match created {
+                        Ok(session) => Ok(session),
+                        Err(failure) if failure.cleanup_drained() => {
+                            if let Some(token) = admission.reservation.take() { token.release(); }
+                            Err(failure.into_error())
+                        }
+                        Err(failure) => {
+                            let error = error!("Normal session construction retains undrained ownership: {failure}");
+                            admission.failed = Some(failure);
+                            Err(error)
+                        }
+                    };
                 }
                 let nodes = g
                     .validator_set
@@ -992,6 +1013,12 @@ impl ValidatorGroupImpl {
     }
 }
 
+#[derive(Default)]
+struct NormalNamespaceAdmission {
+    reservation: Option<super::finality_recovery_owner::RecoveryReservation>,
+    failed: Option<simplex::SessionCreationFailure>,
+}
+
 pub struct ValidatorGroup {
     general_session_info: Arc<GeneralSessionInfo>,
     local_key: PrivateKey,
@@ -1009,6 +1036,7 @@ pub struct ValidatorGroup {
     pq_session: std::result::Result<Option<rtos_api::pq_finality::PqSessionContext>, String>,
     authenticated_runtime:
         Option<Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>>,
+    namespace_admission: Mutex<NormalNamespaceAdmission>,
     durable_finality_sink:
         tokio::sync::OnceCell<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
     #[allow(dead_code)]
@@ -1232,6 +1260,7 @@ impl ValidatorGroup {
             pq_session,
             authenticated_runtime: None,
             durable_finality_sink: tokio::sync::OnceCell::new(),
+            namespace_admission: Mutex::new(NormalNamespaceAdmission::default()),
             candidate_relays: Mutex::new(Default::default()),
             consensus_options,
             is_accelerated_consensus_enabled: is_accelerated,
@@ -1569,7 +1598,12 @@ impl ValidatorGroup {
                 } else {
                     session.stop_checked()
                 };
-                (session.threads_drained(), result)
+                // Node-owned accepted completions can outlive the OS workers.
+                // Keep the reservation until their actual source stores release.
+                while session.threads_drained() && !session.namespace_drained() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                (session.namespace_drained(), result)
             } else {
                 (true, Ok(()))
             }
@@ -1586,16 +1620,37 @@ impl ValidatorGroup {
         // consensus workers exited. Only its returned result certifies the join.
         let (drained, result) =
             session_result.map_err(|e| error!("consensus session teardown failed: {e}"))?;
-        self.teardown_drained.store(drained, Ordering::Release);
+        let group_for_cleanup = self.clone();
+        let construction_drained = rt.spawn_blocking(move || {
+            let mut admission = group_for_cleanup.namespace_admission.lock().unwrap();
+            if let Some(failure) = admission.failed.as_mut() {
+                while !failure.retry_cleanup() {
+                    // Accepted node work owns its completion independently of
+                    // the failed constructor; its receipt must release first.
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            admission.failed = None;
+            true
+        }).await.map_err(|error| error!("Normal constructor cleanup join failed: {error}"))?;
+        let drained = drained && construction_drained;
+        // Candidate cleanup can still touch this namespace after workers have
+        // joined. Keep admission closed until that last operation has finished.
+        let database_result = if drained && destroy_database {
+            self.destroy_db().await
+        } else { Ok(()) };
+        if drained && database_result.is_ok() {
+            let mut admission = self.namespace_admission.lock().unwrap();
+            if let Some(token) = admission.reservation.take() { token.release(); }
+        }
+        self.teardown_drained.store(drained && database_result.is_ok(), Ordering::Release);
+        database_result?;
         result?;
         if !drained {
             fail!("consensus session did not prove resource drain");
         }
         if self.task_panicked.load(Ordering::Acquire) {
             fail!("validator group task panicked during its lifetime");
-        }
-        if destroy_database {
-            self.destroy_db().await?;
         }
         self.group_impl
             .execute_sync(|gi| {

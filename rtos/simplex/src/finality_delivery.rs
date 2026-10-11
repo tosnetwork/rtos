@@ -341,6 +341,12 @@ pub(crate) struct SourceFinalityDelivery {
     intents: crate::finality_recovery::FinalityIntentStore,
     start_masterchain: Mutex<Option<BlockIdExt>>,
     stages: Mutex<std::collections::HashMap<UInt256, SourceStage>>,
+    // Last field: publish release only after all stores and their file locks drop.
+    namespace_release: SourceNamespaceRelease,
+}
+struct SourceNamespaceRelease(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for SourceNamespaceRelease {
+    fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::Release); }
 }
 enum SourceStage {
     Running,
@@ -354,8 +360,10 @@ impl SourceFinalityDelivery {
         Ok(Arc::new(Self { runtime, store: PendingFinalityStore::open(namespace)?, sink,
             intents: crate::finality_recovery::FinalityIntentStore::new(namespace),
             start_masterchain: Mutex::new(None),
-            stages: Mutex::new(std::collections::HashMap::new()) }))
+            stages: Mutex::new(std::collections::HashMap::new()),
+            namespace_release: SourceNamespaceRelease(Arc::new(std::sync::atomic::AtomicBool::new(false))) }))
     }
+    pub(crate) fn namespace_release_receipt(&self) -> Arc<std::sync::atomic::AtomicBool> { self.namespace_release.0.clone() }
     pub(crate) fn prepare_intents(&self, has_existing_certificates: bool) -> Result<()> { self.intents.prepare(has_existing_certificates) }
     pub(crate) fn bind_start(&self, anchor: BlockIdExt) -> Result<()> {
         let mut slot = self.start_masterchain.lock().unwrap();

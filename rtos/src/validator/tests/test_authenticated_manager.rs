@@ -35,15 +35,20 @@ fn configure(bootstrap: &mut EmulatorNetworkBootstrap, observer: &PrivateKey) ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_manager_creates_transport_only_observer_and_retires_real_groups() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(false).await
+    run_authenticated_manager_observer_lifecycle(false, false).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_manager_retries_transient_sink_initialization_on_same_group() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(true).await
+    run_authenticated_manager_observer_lifecycle(true, false).await
 }
 
-async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authenticated_manager_retries_normal_loser_after_recovery_admission_on_same_state() -> Result<()> {
+    run_authenticated_manager_observer_lifecycle(false, true).await
+}
+
+async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, admission_race: bool) -> Result<()> {
     use adnl::{node::AdnlNode, DhtNode, OverlayNode, RldpNode, NetworkStack};
     let observer: PrivateKey = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71; 32])?;
     let mut bootstrap = EmulatorNetworkBootstrap::build(2)?;
@@ -108,7 +113,34 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool) -
             anyhow::ensure!(!group.snapshot().await.has_engine, "failed admission created consensus engine");
             Some((id.clone(), group.clone()))
         } else { None };
-        manager.update_shards(state.clone()).await?;
+        if admission_race {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *engine.normal_admission_gate.lock().unwrap() = Some((entered_tx, release_rx));
+            let race = async {
+                let runtime = tokio::time::timeout(Duration::from_secs(10), entered_rx).await??;
+                // Normal manager already selected its group. Recovery now wins
+                // actual atomic admission before the normal factory can start.
+                let token = engine.namespace_registry.reserve(&runtime)?.ok_or_else(|| error!("recovery lost gated race"))?;
+                release_tx.send(()).map_err(|e| error!("release normal gate: {e}"))?;
+                Ok::<_, anyhow::Error>((runtime, token))
+            };
+            let (updated, race) = tokio::join!(manager.update_shards(state.clone()), race);
+            updated?;
+            let (runtime, token) = race?;
+            let loser = manager.current_sessions.get(runtime.session_id()).ok_or_else(|| error!("normal loser group disappeared"))?.clone();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while loser.is_start_pending().await && std::time::Instant::now() < deadline { tokio::time::sleep(Duration::from_millis(10)).await; }
+            let did_create = loser.snapshot().await.has_engine;
+            let generation = engine.namespace_registry.generation();
+            token.release();
+            engine.namespace_registry.wait_changed(generation).await?;
+            anyhow::ensure!(!did_create, "normal loser created a competing session");
+            manager.update_shards(state.clone()).await?;
+            anyhow::ensure!(Arc::ptr_eq(&loser, manager.current_sessions.get(runtime.session_id()).unwrap()), "same-state retry replaced loser group");
+        } else {
+            manager.update_shards(state.clone()).await?;
+        }
         if let Some((id, original)) = failed_group {
             let retried = manager.current_sessions.get(&id).ok_or_else(|| error!("Failed group was lost during retry"))?;
             anyhow::ensure!(Arc::ptr_eq(&original, retried), "Retry replaced the group instead of releasing its reservation");

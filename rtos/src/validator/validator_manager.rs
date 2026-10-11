@@ -116,6 +116,20 @@ fn mc_registered_top_for_shard(
     mc_state_extra.shards().find_shard(shard).map(|record| record.map(|r| r.block_id().clone()))
 }
 
+/// Rebuild protocol options from the authenticated historical config, without
+/// emulator overrides or current-node timing defaults.
+pub(crate) fn build_historical_simplex_options(config: &rtos_block::ConfigParams, shard: &ShardIdent) -> Result<simplex::SessionOptions> {
+    let consensus = match config.config(29)? {
+        Some(ConfigParamEnum::ConfigParam29(value)) => value,
+        _ => fail!("Historical Param 29 is unavailable"),
+    };
+    let catchain = config.catchain_config()?;
+    let selected = config.selected_simplex_config(shard.is_masterchain())?
+        .ok_or_else(|| error!("Historical Simplex config is unavailable"))?;
+    let base = get_session_options(&consensus, &catchain, false, &None);
+    build_runtime_simplex_session_options(shard, &selected.config, &base)
+}
+
 fn build_runtime_simplex_session_options(
     shard: &ShardIdent,
     cfg: &SimplexConfig,
@@ -2561,7 +2575,6 @@ impl ValidatorManagerImpl {
                     continue;
                 }
 
-                let is_new = !self.future_sessions.contains_key(&session_id);
                 let group = if let Some(group) = self.future_sessions.get(&session_id) {
                     group.clone()
                 } else {
@@ -2600,7 +2613,7 @@ impl ValidatorManagerImpl {
                     group
                 };
 
-                if is_new && self.sync_complete {
+                if self.sync_complete {
                     log::debug!(target: "validator_manager",
                         "Pre-creating engine for future session shard={} cc_seqno={} session_id={:x}",
                         ident, next_cc_seqno, session_id);

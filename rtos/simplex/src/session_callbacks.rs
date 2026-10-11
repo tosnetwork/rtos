@@ -83,6 +83,7 @@ pub(crate) struct SessionCallbacks {
     listener: SessionListenerPtr,
     delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
     source_delivery: Arc<std::sync::Mutex<Option<Arc<crate::finality_delivery::SourceFinalityDelivery>>>>,
+    source_release: Arc<std::sync::Mutex<Option<Arc<AtomicBool>>>>,
 }
 
 /// The main worker owns the live source slot. Stopped SessionImpl/listener
@@ -114,7 +115,7 @@ impl SessionCallbacks {
         task_queue: CallbackTaskQueuePtr,
         listener: SessionListenerPtr,
     ) -> Self {
-        Self { session_id, stop_flag, use_callback_thread, task_queue, listener, delivery_sink: None, source_delivery: Arc::new(std::sync::Mutex::new(None)) }
+        Self { session_id, stop_flag, use_callback_thread, task_queue, listener, delivery_sink: None, source_delivery: Arc::new(std::sync::Mutex::new(None)), source_release: Arc::new(std::sync::Mutex::new(None)) }
     }
 
     pub(crate) fn with_delivery_sink(mut self, sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>) -> Self {
@@ -131,8 +132,13 @@ impl SessionCallbacks {
         let source = crate::finality_delivery::SourceFinalityDelivery::open(runtime, namespace, sink)?;
         let mut slot = self.source_delivery.lock().unwrap();
         if slot.is_some() { return Err(rtos_block::error!("Source delivery already initialized")); }
+        *self.source_release.lock().unwrap() = Some(source.namespace_release_receipt());
         *slot = Some(source);
         Ok(())
+    }
+
+    pub(crate) fn source_namespace_drained(&self) -> bool {
+        self.source_release.lock().unwrap().as_ref().map_or(true, |released| released.load(Ordering::Acquire))
     }
 
     fn delivery_source(&self) -> rtos_block::Result<Arc<crate::finality_delivery::SourceFinalityDelivery>> {
@@ -175,6 +181,7 @@ impl SessionCallbacks {
             listener,
             delivery_sink: self.delivery_sink.clone(),
             source_delivery: self.source_delivery.clone(),
+            source_release: self.source_release.clone(),
         }
     }
 

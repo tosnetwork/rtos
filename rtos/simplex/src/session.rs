@@ -390,6 +390,10 @@ impl ConsensusSession for SessionImpl {
 }
 
 impl SimplexSession for SessionImpl {
+    fn namespace_drained(&self) -> bool {
+        self.threads_drained() && self._callbacks.source_namespace_drained()
+    }
+
     fn finality_recovery_complete(&self) -> bool { self.recovery_complete.load(Ordering::Acquire) }
     fn finality_recovery_pending(&self) -> Option<usize> {
         let count = self.recovery_pending.load(Ordering::Acquire);
@@ -1414,6 +1418,55 @@ impl SessionImpl {
         recovery_only: bool,
         #[cfg(test)] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
     ) -> Result<SessionPtr> {
+        Self::create_with_profile_checked(options, session_id, shard, ids, local_key, db_path, overlay_manager, listener, trace_collector, catchain_seqno, authenticated_runtime, delivery_sink, recovery_only, #[cfg(test)] test_signer).map_err(crate::SessionCreationFailure::into_error)
+    }
+
+    pub(crate) fn create_with_profile_checked(
+        options: &SessionOptions,
+        session_id: &SessionId,
+        shard: &ShardIdent,
+        ids: Vec<crate::SimplexSessionNode>,
+        local_key: &PrivateKey,
+        db_path: String,
+        overlay_manager: ConsensusOverlayManagerPtr,
+        listener: SessionListenerPtr,
+        trace_collector: Option<TraceCollector>,
+        catchain_seqno: u32,
+        authenticated_runtime: Option<
+            Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        >,
+        delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
+        recovery_only: bool,
+        #[cfg(test)] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
+    ) -> std::result::Result<SessionPtr, crate::SessionCreationFailure> {
+        let mut owner: Option<SessionPtr> = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Self::create_with_profile_inner(options, session_id, shard, ids, local_key, db_path, overlay_manager, listener, trace_collector, catchain_seqno, authenticated_runtime, delivery_sink, recovery_only, #[cfg(test)] test_signer, &mut owner)));
+        match result {
+            Ok(Ok(session)) => Ok(session),
+            Ok(Err(error)) => Err(crate::SessionCreationFailure::after_attempt(error, owner)),
+            Err(_) => Err(crate::SessionCreationFailure::after_attempt(error!("Session construction panicked"), owner)),
+        }
+    }
+
+    pub(crate) fn create_with_profile_inner(
+        options: &SessionOptions,
+        session_id: &SessionId,
+        shard: &ShardIdent,
+        ids: Vec<crate::SimplexSessionNode>,
+        local_key: &PrivateKey,
+        db_path: String,
+        overlay_manager: ConsensusOverlayManagerPtr,
+        listener: SessionListenerPtr,
+        trace_collector: Option<TraceCollector>,
+        catchain_seqno: u32,
+        authenticated_runtime: Option<
+            Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        >,
+        delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
+        recovery_only: bool,
+        #[cfg(test)] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
+        failure_owner: &mut Option<SessionPtr>,
+    ) -> Result<SessionPtr> {
         log::info!(
             "Creating SimplexSession (session_id is {}, shard={}, nodes_count={}, db_path={})",
             session_id.to_hex_string(),
@@ -1514,6 +1567,7 @@ impl SessionImpl {
         };
 
         let session = Arc::new(session);
+        *failure_owner = Some(session.clone());
 
         // Clone variables for threads
         let stop_flag_for_main_loop = stop_flag.clone();

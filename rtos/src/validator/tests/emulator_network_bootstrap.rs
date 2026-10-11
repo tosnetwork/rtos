@@ -673,6 +673,8 @@ struct BootstrapTestEngine {
     validator_network: Arc<BootstrapValidatorNetwork>,
     transport_config: Option<Arc<crate::config::NodeConfigHandler>>,
     fail_finality_sink_once: AtomicBool,
+    namespace_registry: Arc<crate::validator::finality_recovery_owner::RecoveryRegistry>,
+    normal_admission_gate: std::sync::Mutex<Option<(tokio::sync::oneshot::Sender<Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>>, std::sync::mpsc::Receiver<()>)>>,
     states: RwLock<HashMap<BlockIdExt, Arc<ShardStateStuff>>>,
     blocks: RwLock<HashMap<BlockIdExt, BlockStuff>>,
     last_applied_mc_block_id: RwLock<Option<Arc<BlockIdExt>>>,
@@ -732,6 +734,8 @@ impl BootstrapTestEngine {
             validator_network: Arc::new(BootstrapValidatorNetwork::new(local_keys)),
             transport_config: None,
             fail_finality_sink_once: AtomicBool::new(false),
+            namespace_registry: Arc::new(crate::validator::finality_recovery_owner::RecoveryRegistry::default()),
+            normal_admission_gate: std::sync::Mutex::new(None),
             states: RwLock::new(HashMap::new()),
             blocks: RwLock::new(HashMap::new()),
             last_applied_mc_block_id: RwLock::new(None),
@@ -867,6 +871,19 @@ impl consensus_common::finality_delivery::DurableFinalitySink for BootstrapUnava
 
 #[async_trait::async_trait]
 impl EngineOperations for BootstrapTestEngine {
+    fn reserve_normal_session_namespace(&self, runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime)
+        -> Result<Option<crate::validator::finality_recovery_owner::RecoveryReservation>> {
+        let gate = self.normal_admission_gate.lock().unwrap().take();
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(Arc::new(runtime.clone()));
+            release.recv_timeout(Duration::from_secs(10)).map_err(|e| error!("normal admission test gate: {e}"))?;
+        }
+        self.namespace_registry.reserve_normal(runtime)
+    }
+    fn finality_recovery_generation(&self) -> u64 { self.namespace_registry.generation() }
+    fn finality_recovery_owns(&self, runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime) -> bool { self.namespace_registry.owns(runtime) }
+    async fn wait_finality_recovery_change(&self, seen: u64) -> Result<()> { self.namespace_registry.wait_changed(seen).await }
+
     async fn durable_finality_sink(
         self: Arc<Self>,
         _runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,

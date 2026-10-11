@@ -752,6 +752,9 @@ impl SessionOptions {
 /// simplex_session.notify_mc_finalized(applied_top_for_session_shard);
 /// ```
 pub trait SimplexSession: ConsensusSession {
+    /// Checked workers and all accepted source completions released namespace locks.
+    /// Unsupported implementations cannot certify namespace reuse.
+    fn namespace_drained(&self) -> bool { false }
     /// All retained source intents have reached durable node custody. This is
     /// progress only: owners must still checked-stop and join before releasing
     /// the namespace. False also covers sessions not in recovery-only mode.
@@ -827,7 +830,50 @@ pub trait SimplexSession: ConsensusSession {
 // `SessionFactory`: entry points to build overlay managers and create
 // live / log-replay sessions.
 
-/// Factory for creating Simplex sessions and related objects
+/// Failed construction retains any worker whose resource join is not yet
+/// proved. An error does not imply leaked resources, and success is not inferred
+/// merely from the outer spawn_blocking result.
+pub struct SessionCreationFailure {
+    error: rtos_block::Error,
+    retained: Option<SessionPtr>,
+    drained: bool,
+}
+impl std::fmt::Debug for SessionCreationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionCreationFailure").field("error", &self.error).field("cleanup_drained", &self.drained).finish()
+    }
+}
+impl std::fmt::Display for SessionCreationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{} (construction drained={})", self.error, self.drained) }
+}
+impl std::error::Error for SessionCreationFailure {}
+impl SessionCreationFailure {
+    /// Only for validation errors before any session worker was constructed.
+    pub fn before_worker(error: rtos_block::Error) -> Self { Self { error, retained: None, drained: true } }
+    pub(crate) fn after_attempt(error: rtos_block::Error, retained: Option<SessionPtr>) -> Self {
+        let mut failure = Self { error, drained: retained.is_none(), retained };
+        failure.retry_cleanup(); failure
+    }
+    pub fn cleanup_drained(&self) -> bool { self.drained }
+    pub fn retry_cleanup(&mut self) -> bool {
+        if let Some(session) = &self.retained {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let result = session.stop_checked();
+                (session.namespace_drained(), result)
+            })) {
+                Ok((drained, result)) => {
+                    self.drained = drained;
+                    if let Err(error) = result { log::error!("Failed constructor cleanup: {error}; drained={drained}"); }
+                }
+                Err(_) => { self.drained = false; log::error!("Failed constructor cleanup panicked; retaining owner"); }
+            }
+            if self.drained { self.retained = None; }
+        }
+        self.drained
+    }
+    pub fn into_error(self) -> rtos_block::Error { anyhow::Error::new(self) }
+}
+
 pub struct SessionFactory;
 
 impl SessionFactory {
@@ -912,6 +958,20 @@ impl SessionFactory {
         trace_collector: Option<TraceCollector>,
         delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
     ) -> Result<SessionPtr> {
+        Self::create_authenticated_session_checked(options, runtime, local_transport_key, db_path, overlay_manager, listener, trace_collector, delivery_sink).map_err(SessionCreationFailure::into_error)
+    }
+
+    pub fn create_authenticated_session_checked(
+        options: &SessionOptions,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        local_transport_key: &PrivateKey,
+        db_path: String,
+        overlay_manager: ConsensusOverlayManagerPtr,
+        listener: SessionListenerPtr,
+        trace_collector: Option<TraceCollector>,
+        delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
+    ) -> std::result::Result<SessionPtr, SessionCreationFailure> {
+        let nodes = (|| -> Result<_> {
         options.validate_authenticated(&runtime)?;
         if delivery_sink.is_none() { fail!("Authenticated v2 session requires durable finality sink"); }
         if runtime.local_adnl() != local_transport_key.id() {
@@ -922,8 +982,13 @@ impl SessionFactory {
             .iter()
             .map(SimplexSessionNode::from_descriptor)
             .collect::<Result<Vec<_>>>()?;
-        session::SessionImpl::create_with_runtime(
-            options,
+
+        Ok(nodes)
+        })().map_err(SessionCreationFailure::before_worker)?;
+        let mut checked_options = options.clone();
+        checked_options.wait_for_db_init = true;
+        session::SessionImpl::create_with_profile_checked(
+            &checked_options,
             runtime.session_id(),
             runtime.shard(),
             nodes,
@@ -935,6 +1000,8 @@ impl SessionFactory {
             runtime.catchain_seqno(),
             Some(runtime.clone()),
             delivery_sink,
+            false,
+            #[cfg(test)] None,
         )
     }
 
@@ -950,17 +1017,41 @@ impl SessionFactory {
         listener: SessionListenerPtr,
         delivery_sink: consensus_common::finality_delivery::DurableFinalitySinkPtr,
     ) -> Result<SessionPtr> {
+        Self::create_finality_recovery_session_checked(options, runtime, local_transport_key, db_root, recovery, overlay_manager, listener, delivery_sink).map_err(SessionCreationFailure::into_error)
+    }
+
+    pub fn create_finality_recovery_session_checked(
+        options: &SessionOptions,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        local_transport_key: &PrivateKey,
+        db_root: &str,
+        recovery: &finality_recovery::SessionRecoveryRecord,
+        overlay_manager: ConsensusOverlayManagerPtr,
+        listener: SessionListenerPtr,
+        delivery_sink: consensus_common::finality_delivery::DurableFinalitySinkPtr,
+    ) -> std::result::Result<SessionPtr, SessionCreationFailure> {
+        let (directory, nodes) = (|| -> Result<_> {
         options.validate_authenticated(&runtime)?;
         recovery.validate_runtime(&runtime)?;
+        if recovery.prev_blocks.is_empty() || recovery.prev_blocks.len() > 2 { fail!("Recovery requires one or two authenticated parents"); }
         let directory = std::path::PathBuf::from(runtime.runtime_directory(db_root)?);
         if directory != recovery.namespace { fail!("Recovery namespace differs from authenticated runtime"); }
         if runtime.local_adnl() != local_transport_key.id() { fail!("Recovery transport key differs from authenticated runtime"); }
         let nodes = runtime.committee().iter().map(SimplexSessionNode::from_descriptor).collect::<Result<Vec<_>>>()?;
-        let session = session::SessionImpl::create_with_profile(options, runtime.session_id(), runtime.shard(),
+
+        Ok((directory, nodes))
+        })().map_err(SessionCreationFailure::before_worker)?;
+        let mut checked_options = options.clone();
+        checked_options.wait_for_db_init = true;
+        let session = session::SessionImpl::create_with_profile_checked(&checked_options, runtime.session_id(), runtime.shard(),
             nodes, local_transport_key, directory.to_string_lossy().into_owned(), overlay_manager,
             listener, None, runtime.catchain_seqno(), Some(runtime.clone()), Some(delivery_sink), true,
             #[cfg(test)] None)?;
-        session.start(recovery.prev_blocks.clone(), recovery.start_masterchain.clone());
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.start(recovery.prev_blocks.clone(), recovery.start_masterchain.clone());
+        })).is_err() {
+            return Err(SessionCreationFailure::after_attempt(rtos_block::error!("Recovery session start panicked"), Some(session)));
+        }
         Ok(session)
     }
 
