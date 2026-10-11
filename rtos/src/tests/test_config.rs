@@ -814,7 +814,13 @@ async fn config_scheduler_vault_failure_retries_retirement() {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            if !output.status.success() {
+            if !output.status.success()
+                || !String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed")
+                || !String::from_utf8_lossy(&output.stderr)
+                    .contains(&format!("ACTUAL_VAULT_WRITE_FAILED {namespace}:"))
+                || !String::from_utf8_lossy(&output.stdout)
+                    .contains(&format!("RETIREMENT_CHILD_COMPLETED {namespace}"))
+            {
                 failures.push(namespace);
             }
         }
@@ -954,4 +960,5 @@ async fn config_scheduler_vault_failure_retries_retirement() {
     // Retirement prevents new acquisition, not use of an Arc returned earlier.
     assert!(keys[0].sign(b"previously acquired capability").is_ok());
     drop(vault);
+    println!("RETIREMENT_CHILD_COMPLETED {namespace}");
 }
