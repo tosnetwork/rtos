@@ -397,11 +397,29 @@ async fn recover_scenario(scenario: RecoveryScenario) {
             const PART: usize = 2 << 20;
             let before = retained_source_bytes(&namespace);
             pss_fault_at(&pair, &target, PART as i64, &[]);
+            let peers = [&pair.receiver, pair.observer.as_ref().unwrap()];
+            let observation_starts: Vec<_> = peers.iter()
+                .map(|peer| peer.overlays_router().unwrap().test_pss_observations().len()).collect();
             let error = engine.clone().authenticate_retired_source_with_history(record.clone()).await.err()
                 .expect("missing second part must not authenticate a truncated snapshot");
+            let observations: Vec<_> = peers.iter().enumerate().flat_map(|(index, peer)| {
+                let observations = peer.overlays_router().unwrap().test_pss_observations();
+                let current = &observations[observation_starts[index]..];
+                eprintln!("MissingTailAfterFullPart peer={index} target={target:?} error={error:#} PSS observations={current:?}");
+                for (id, offset, size) in current.iter().filter(|(id, _, _)| id == &target) {
+                    let phase = match offset {
+                        None => "size-query",
+                        Some(0) => "first-real-part",
+                        Some(offset) if *offset == PART as i64 => "second-missing-part",
+                        Some(_) => "other-part",
+                    };
+                    // A Some(size) records a server-produced reply, not client delivery.
+                    let event = if size.is_some() { "server-reply-produced" } else { "server-query-received" };
+                    eprintln!("MissingTailAfterFullPart peer={index} phase={phase} event={event} id={id:?} offset={offset:?} size={size:?}");
+                }
+                observations
+            }).collect();
             assert!(format!("{error:#}").contains("Historical snapshot part is missing or short"), "{error:#}");
-            let observations: Vec<_> = [&pair.receiver, pair.observer.as_ref().unwrap()].iter()
-                .flat_map(|peer| peer.overlays_router().unwrap().test_pss_observations()).collect();
             assert!(observations.iter().any(|(id, offset, size)| id == &target && *offset == Some(0) && *size == Some(PART)),
                 "first part must come from the real persistent-state file: {observations:?}");
             assert!(observations.iter().any(|(id, offset, size)| id == &target && *offset == Some(PART as i64) && *size == Some(0)));
