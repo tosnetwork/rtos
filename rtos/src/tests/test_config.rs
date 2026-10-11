@@ -19,6 +19,7 @@ fn make_test_config_handler() -> NodeConfigHandler {
         sender,
         key_ring: Arc::new(lockfree::map::Map::new()),
         validator_keys: Arc::new(ValidatorKeys::new()),
+        consensus_transport_bindings: Vec::new(),
     }
 }
 
@@ -961,4 +962,53 @@ async fn config_scheduler_vault_failure_retries_retirement() {
     assert!(keys[0].sign(b"previously acquired capability").is_ok());
     drop(vault);
     println!("RETIREMENT_CHILD_COMPLETED {namespace}");
+}
+
+#[tokio::test]
+async fn explicit_consensus_transport_has_no_validator_signing_identity() -> Result<()> {
+    let (json, key) = Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[91; 32])?;
+    let mut config = scheduler_test_config();
+    config.validator_key_ring = Some(HashMap::from([(base64_encode(key.id().data()), json)]));
+    config.consensus_transport_bindings = vec![ConsensusTransportBindingJson {
+        validator_id: base64_encode([92; 32]), adnl_key_id: base64_encode(key.id().data()),
+    }];
+    let (handler, context) = NodeConfigHandler::create(config, tokio::runtime::Handle::current())?;
+    handler.clone().start_sheduler(context, vec![])?;
+    let result = async {
+        anyhow::ensure!(!handler.get_validator_status());
+        anyhow::ensure!(handler.get_actual_validator_keys()?.is_empty());
+        let bindings = handler.consensus_transport_bindings()?;
+        anyhow::ensure!(bindings.len() == 1 && bindings[0].validator_id == UInt256::from([92; 32]));
+        anyhow::ensure!(handler.consensus_transport_key(key.id()).await?.id() == key.id());
+        anyhow::ensure!(handler.get_validator_key(key.id()).await.is_none());
+        anyhow::ensure!(handler.consensus_transport_key(&KeyId::from_data([93; 32])).await.is_err());
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    handler.stop_and_wait().await?;
+    result
+}
+
+#[tokio::test]
+async fn explicit_consensus_transport_rejects_duplicate_missing_and_wrong_keys() -> Result<()> {
+    let binding = ConsensusTransportBindingJson { validator_id: base64_encode([92; 32]), adnl_key_id: base64_encode([93; 32]) };
+    for same_stable in [true, false] {
+        let mut config = scheduler_test_config();
+        let mut other = binding.clone();
+        if same_stable { other.adnl_key_id = base64_encode([94; 32]); }
+        else { other.validator_id = base64_encode([94; 32]); }
+        config.consensus_transport_bindings = vec![binding.clone(), other];
+        anyhow::ensure!(NodeConfigHandler::create(config, tokio::runtime::Handle::current()).is_err());
+    }
+    for wrong_key in [false, true] {
+        let mut config = scheduler_test_config();
+        config.consensus_transport_bindings = vec![binding.clone()];
+        if wrong_key {
+            let (json, _) = Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[91; 32])?;
+            config.validator_key_ring = Some(HashMap::from([(binding.adnl_key_id.clone(), json)]));
+        }
+        let (handler, context) = NodeConfigHandler::create(config, tokio::runtime::Handle::current())?;
+        anyhow::ensure!(handler.clone().start_sheduler(context, vec![]).is_err());
+        handler.stop_and_wait().await?;
+    }
+    Ok(())
 }

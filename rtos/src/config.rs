@@ -468,6 +468,9 @@ pub struct TonNodeConfig {
     #[serde(default)]
     extensions: NodeExtensions,
     validator_keys: Option<Vec<ValidatorKeysJson>>,
+    /// Explicit local transport ownership only; never a consensus signing key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    consensus_transport_bindings: Vec<ConsensusTransportBindingJson>,
     #[serde(skip_serializing)]
     control_server_port: Option<u16>,
     control_server: Option<AdnlServerConfigJson>,
@@ -531,6 +534,21 @@ impl NodeExtensions {
     fn is_default(&self) -> bool {
         self == &Self::default()
     }
+}
+
+/// Local, operator-configured binding. Both identifiers are base64-encoded 32 bytes.
+/// Governing state must independently authenticate the stable identity/ADNL pair.
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ConsensusTransportBindingJson {
+    pub validator_id: String,
+    pub adnl_key_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsensusTransportBinding {
+    pub validator_id: UInt256,
+    pub adnl_key_id: Arc<KeyId>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
@@ -1452,6 +1470,7 @@ pub struct NodeConfigHandler {
     sender: tokio::sync::mpsc::UnboundedSender<(Arc<Wait<Answer>>, Task)>,
     key_ring: Arc<lockfree::map::Map<String, Arc<dyn KeyOption>>>,
     validator_keys: Arc<ValidatorKeys>,
+    consensus_transport_bindings: Vec<ConsensusTransportBinding>,
 }
 
 impl NodeConfigHandler {
@@ -1487,6 +1506,19 @@ impl NodeConfigHandler {
         config: TonNodeConfig,
         runtime_handle: tokio::runtime::Handle,
     ) -> Result<(Arc<Self>, NodeConfigHandlerContext)> {
+        let mut stable_ids = std::collections::HashSet::new();
+        let mut transport_ids = std::collections::HashSet::new();
+        let mut bindings = Vec::new();
+        for binding in &config.consensus_transport_bindings {
+            let stable: [u8; 32] = base64_decode(&binding.validator_id)?.as_slice().try_into()?;
+            let transport: [u8; 32] = base64_decode(&binding.adnl_key_id)?.as_slice().try_into()?;
+            if !stable_ids.insert(stable) || !transport_ids.insert(transport) {
+                fail!("Duplicate consensus transport identity or ADNL binding");
+            }
+            bindings.push(ConsensusTransportBinding {
+                validator_id: UInt256::from(stable), adnl_key_id: KeyId::from_data(transport),
+            });
+        }
         let (sender, reader) = tokio::sync::mpsc::unbounded_channel();
         let config_handler = Arc::new(NodeConfigHandler {
             scheduler: Arc::default(),
@@ -1496,6 +1528,7 @@ impl NodeConfigHandler {
             sender,
             key_ring: Arc::new(lockfree::map::Map::new()),
             validator_keys: Arc::new(ValidatorKeys::new()),
+            consensus_transport_bindings: bindings,
         });
 
         Ok((config_handler, NodeConfigHandlerContext { reader, config }))
@@ -1564,6 +1597,24 @@ impl NodeConfigHandler {
             return Ok(None);
         }
         Ok(Some(publish()))
+    }
+
+    pub fn consensus_transport_bindings(&self) -> Result<Vec<ConsensusTransportBinding>> {
+        Ok(self.consensus_transport_bindings.clone())
+    }
+
+    /// Only explicit local transport bindings can access this path. This grants
+    /// no consensus authority; callers must check the authenticated governing set.
+    pub async fn consensus_transport_key(&self, id: &Arc<KeyId>) -> Result<Arc<dyn KeyOption>> {
+        if !self.consensus_transport_bindings.iter().any(|binding| &binding.adnl_key_id == id) {
+            fail!("ADNL key is not an explicitly configured consensus transport");
+        }
+        let key = self.get_key_raw(*id.data()).await
+            .ok_or_else(|| error!("Configured consensus transport private key is unavailable"))?;
+        if key.id() != id {
+            fail!("Configured consensus transport key identity mismatch");
+        }
+        Ok(key)
     }
 
     pub fn get_validator_status(&self) -> bool {
@@ -2069,6 +2120,17 @@ impl NodeConfigHandler {
                 if let Err(e) = self.add_key_to_dynamic_key_ring(key_id.to_string(), key) {
                     log::warn!("fail added key from key ring: {}", e);
                 }
+            }
+        }
+
+        // Explicit transport-only identities must resolve to their actual local
+        // private key. A malformed/missing key is a configuration error, not an
+        // invitation to substitute the ordinary fullnode overlay key.
+        for binding in &self.consensus_transport_bindings {
+            let key = Self::get_key(config, *binding.adnl_key_id.data())
+                .ok_or_else(|| error!("Configured consensus transport private key is unavailable"))?;
+            if key.id() != &binding.adnl_key_id {
+                fail!("Configured consensus transport key identity mismatch");
             }
         }
 
