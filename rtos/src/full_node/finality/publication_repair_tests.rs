@@ -440,3 +440,8 @@ async fn mc_live_repair_missing_artifacts_without_peer_defers_without_custody() 
         std::panic::resume_unwind(panic);
     }
 }
+
+#[path = "publication_repair_dependency_tests.rs"]
+mod publication_repair_dependency_tests;
+#[path = "publication_repair_limit_tests.rs"]
+mod publication_repair_limit_tests;
