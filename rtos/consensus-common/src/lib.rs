@@ -16,6 +16,7 @@
 mod async_owner;
 pub mod overlay_owner;
 pub mod session_runtime;
+pub mod finality_delivery;
 pub mod simplex_protocol;
 pub mod thread_owner;
 mod validator_identity;
@@ -1597,6 +1598,16 @@ pub trait SessionListener: Send + Sync {
 
     /// Independent PQ candidate authentication evidence; never inferred from observation flags.
     fn on_authenticated_candidate(&self, _evidence: CandidateAuthenticationEvidence) {}
+
+    /// Notification after the node-owned sink confirms a durable record.
+    /// The node worker owns acceptance/publication; this callback is observational
+    /// and must not regenerate a second intent from the source draft.
+    fn on_durable_block_finalized(
+        &self,
+        _receipt_id: UInt256,
+        _draft: finality_delivery::FinalizedDeliveryDraft,
+    ) {
+    }
 
     /// A block is ready for validator-side acceptance (Simplex only).
     /// `SessionFinality` distinguishes a final certificate from a temporary
