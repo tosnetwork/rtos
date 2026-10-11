@@ -19,6 +19,36 @@ fn retained_source_bytes(namespace: &Path) -> std::collections::BTreeMap<PathBuf
     result
 }
 
+fn pss_fault(pair: &Pair, id: &BlockIdExt, bytes: &[u8]) {
+    let requester = pair
+        .provider
+        .network()
+        .context()
+        .stack
+        .adnl
+        .key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)
+        .unwrap()
+        .id()
+        .clone();
+    for peer in [&pair.receiver, pair.observer.as_ref().unwrap()] {
+        peer.overlays_router().unwrap().test_pss_reply(
+            requester.clone(),
+            rtos_api::ton::ton_node::persistentstateidv2::PersistentStateIdV2 {
+                block: id.clone(),
+                masterchain_block: id.clone(),
+                effective_shard: 0,
+            },
+            Some(0),
+            bytes.to_vec(),
+        );
+    }
+}
+fn clear_faults(pair: &Pair) {
+    for peer in [&pair.receiver, pair.observer.as_ref().unwrap()] {
+        peer.overlays_router().unwrap().test_clear_history_replies();
+    }
+}
+
 async fn recover_source(mode: u8) {
     let signer = std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER").unwrap();
     let pair = Pair::with_source_options("included", false, true, true, true).await;
@@ -29,7 +59,7 @@ async fn recover_source(mode: u8) {
         let config = first.config_params().unwrap();
         let cc = pair.master.block().unwrap().read_info().unwrap().gen_catchain_seqno();
         let creator = config.validator_set().unwrap().list()[0].validator_id().unwrap();
-        let (target, target_root, row) =
+        let (mut target, mut target_root, row) =
             chain::successor(&signer, pair.master.id(), first.root_cell(), false, 0, cc, &creator);
         let block = fixture_block(&row);
         let proof =
@@ -40,6 +70,20 @@ async fn recover_source(mode: u8) {
             owner.store_block_proof(&target, Some(handle), &proof).await.unwrap();
             owner.clone().download_and_apply_block(&target, 2, false).await.unwrap();
         }
+        let hole = if mode == 10 {
+            let middle = target.clone();
+            let (id, root, row) = chain::successor(&signer, &target, &target_root, false, 0, cc, &creator);
+            let block = fixture_block(&row);
+            let proof = BlockProofStuff::deserialize(&id, decode(&row["proof_boc"]), false).unwrap();
+            for owner in [&pair.provider, &pair.receiver, pair.observer.as_ref().unwrap()] {
+                let handle = owner.store_block(&block).await.unwrap().to_any();
+                owner.store_block_proof(&id, Some(handle), &proof).await.unwrap();
+                owner.clone().download_and_apply_block(&id, id.seq_no(), false).await.unwrap();
+            }
+            target = id;
+            target_root = root;
+            Some(middle)
+        } else { None };
         // Only MC1 has a persistent snapshot on the peer. MC2 must be replayed.
         for peer in [&pair.receiver, pair.observer.as_ref().unwrap()] {
             peer.clone().download_and_apply_block(pair.master.id(), 1, false).await.unwrap();
@@ -173,6 +217,14 @@ async fn recover_source(mode: u8) {
                 }
             }).await.expect("both distinct governing/start anchors must actually be GC'd");
         }
+        if let Some(middle) = &hole {
+            engine.shard_states_keeper().test_retire_history_state(middle);
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while engine.db().test_contains_dynamic_state_record(middle).unwrap() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.expect("actual intermediate state GC must precede chain-hole test");
+        }
         if mode == 1 || mode == 2 {
             if mode == 1 {
                 engine.db().test_remove_archived_artifacts(&target).await.unwrap();
@@ -208,6 +260,74 @@ async fn recover_source(mode: u8) {
                     .is_some(),
                 "{error:#}"
             );
+        }
+        if mode == 8 || mode == 9 {
+            let before = retained_source_bytes(&namespace);
+            let bytes = if mode == 8 {
+                let mut state = first.state().unwrap().clone();
+                state.set_gen_time(state.gen_time() + 1);
+                let bytes = rtos_block::write_boc(&state.serialize().unwrap()).unwrap();
+                assert_eq!(bytes.len(), rtos_block::write_boc(first.root_cell()).unwrap().len(),
+                    "wrong root must pass exact part-length admission");
+                bytes
+            } else { Vec::new() };
+            pss_fault(&pair, pair.master.id(), &bytes);
+            let error = engine.clone().authenticate_retired_source_with_history(record.clone())
+                .await.err().expect("remote malformed historical snapshot must be rejected");
+            clear_faults(&pair);
+            let expected = if mode == 8 { "Snapshot root differs from authenticated block state root" }
+                else { "Historical snapshot part is missing or short" };
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert_eq!(retained_source_bytes(&namespace), before);
+            assert_eq!(engine.load_last_applied_mc_block_id().unwrap(), head);
+            assert!(!engine.db().test_contains_dynamic_state_record(&target).unwrap());
+            assert!(crate::retired_history::authenticate_capsule_with_budget(engine.as_ref(), &target, None)
+                .await.unwrap().is_none());
+        }
+        if let Some(middle) = &hole {
+            let before = retained_source_bytes(&namespace);
+            engine.db().test_remove_archived_artifacts(middle).await.unwrap();
+            let requester = engine.network().context().stack.adnl
+                .key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap().id().clone();
+            let missing = WireProfile::T0.serialize(&rtos_api::ton::ton_node::DataFull::TonNode_DataFullEmpty).unwrap();
+            let mut count_before = 0;
+            for peer in [&pair.receiver, pair.observer.as_ref().unwrap()] {
+                count_before += peer.overlays_router().unwrap().test_bounded_queries();
+                peer.overlays_router().unwrap().test_bounded_reply(requester.clone(), middle.clone(), true, missing.clone());
+            }
+            let error = engine.clone().authenticate_retired_source_with_history(record.clone())
+                .await.err().expect("real missing intermediate successor must stop replay");
+            let count_after: usize = [&pair.receiver, pair.observer.as_ref().unwrap()].iter()
+                .map(|p| p.overlays_router().unwrap().test_bounded_queries()).sum();
+            clear_faults(&pair);
+            assert!(count_after > count_before, "chain-hole refusal must consume a real peer reply");
+            assert!(format!("{error:#}").contains("DownloadBlockFull returned DataFullEmpty"), "{error:#}");
+            assert_eq!(retained_source_bytes(&namespace), before);
+            assert_eq!(engine.load_last_applied_mc_block_id().unwrap(), head);
+            assert!(crate::retired_history::authenticate_capsule_with_budget(engine.as_ref(), &target, None)
+                .await.unwrap().is_none());
+        }
+        if mode == 11 || mode == 12 {
+            let before = retained_source_bytes(&namespace);
+            let bytes = rtos_block::write_boc(first.root_cell()).unwrap();
+            let mut limits = crate::history_read_budget::HistoryReadLimits::default();
+            if mode == 11 { limits.state_boc_bytes = bytes.len() * 2 - 1; }
+            else { limits.depth = first.root_cell().repr_depth().checked_sub(1).unwrap(); }
+            let request = crate::historical_recovery::Request::test_with_limits(engine.clone(), limits).await.unwrap();
+            if mode == 11 {
+                let received = request.test_snapshot(pair.master.id()).await.unwrap().unwrap();
+                assert_eq!(received.root_cell().repr_hash(), first.root_cell().repr_hash(),
+                    "first actual remote snapshot must fit before cumulative rejection");
+            }
+            for _ in 0..2 {
+                let error = request.test_snapshot(pair.master.id()).await.err().unwrap();
+                assert!(crate::history_read_budget::stops_fallback(&error), "{error:#}");
+            }
+            drop(request);
+            assert_eq!(retained_source_bytes(&namespace), before);
+            assert_eq!(engine.load_last_applied_mc_block_id().unwrap(), head);
+            assert!(crate::retired_history::authenticate_capsule_with_budget(engine.as_ref(), &target, None)
+                .await.unwrap().is_none());
         }
         if let Some(request) = &closing {
             let worker = engine.ensure_publication_worker().await.unwrap();
@@ -459,4 +579,34 @@ async fn historical_recovery_second_anchor_uncertainty_keeps_first_and_source_de
 #[ignore = "real source certificate PQ failure and restored control; RTOS_PUBLIC_FIXTURE_SIGNER required"]
 async fn historical_recovery_valid_identity_bad_source_pq_cannot_commit_capsule() {
     recover_source(7).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real remote state-root rejection; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_remote_wrong_root_preserves_source_and_no_capsule() {
+    recover_source(8).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real missing PSS part rejection; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_remote_short_part_preserves_source_and_no_capsule() {
+    recover_source(9).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "actual repeated remote PSS cumulative budget; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_remote_cumulative_bytes_do_not_reset() {
+    recover_source(11).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "actual remote PSS depth limit; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_remote_depth_limit_stays_failed_on_same_request() {
+    recover_source(12).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real absent intermediate state/body and peer hole; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_missing_intermediate_successor_refuses_replay() {
+    recover_source(10).await;
 }

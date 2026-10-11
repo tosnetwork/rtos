@@ -112,6 +112,12 @@ impl FullNodeOverlayService {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_clear_history_replies(&self) {
+        self.pss_reply.lock().unwrap().take();
+        self.bounded_reply.lock().unwrap().take();
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_pss_reply(&self, peer: Arc<rtos_block::KeyId>, state: PersistentStateIdV2, offset: Option<i64>, bytes: Vec<u8>) {
         let mut reply = self.pss_reply.lock().unwrap();
         assert!(reply.is_none(), "unused scoped PSS reply");

@@ -49,6 +49,9 @@ pub(crate) struct Request {
 }
 impl Request {
     pub(crate) async fn new(engine: Arc<Engine>) -> Result<Arc<Self>> {
+        Self::with_limits(engine, HistoryReadLimits::default()).await
+    }
+    async fn with_limits(engine: Arc<Engine>, limits: HistoryReadLimits) -> Result<Arc<Self>> {
         let permit = REQUESTS
             .clone()
             .try_acquire_owned()
@@ -56,11 +59,19 @@ impl Request {
         let gc = engine.db().repair_leases().protection().authentication().await?;
         Ok(Arc::new(Self {
             engine,
-            budget: HistoryReadBudget::new(HistoryReadLimits::default()),
+            budget: HistoryReadBudget::new(limits),
             prepared: Mutex::new(Vec::new()),
             _permit: permit,
             _gc: gc,
         }))
+    }
+    #[cfg(test)]
+    pub(crate) async fn test_with_limits(engine: Arc<Engine>, limits: HistoryReadLimits) -> Result<Arc<Self>> {
+        Self::with_limits(engine, limits).await
+    }
+    #[cfg(test)]
+    pub(crate) async fn test_snapshot(&self, id: &BlockIdExt) -> Result<Option<Arc<ShardStateStuff>>> {
+        self.snapshot(id).await
     }
     pub(crate) fn budget(&self) -> &Arc<HistoryReadBudget> {
         &self.budget
@@ -166,7 +177,7 @@ impl Request {
         };
         let reservation = self.budget.reserve(ReadKind::State, length)?;
         if reservation.allowance() != length {
-            fail!("Snapshot exceeds remaining history bytes");
+            return Err(crate::history_read_budget::HistoryBudgetExceeded("snapshot cumulative bytes").into());
         }
         rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(
             self.budget.as_ref(),

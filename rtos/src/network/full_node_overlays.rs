@@ -306,6 +306,9 @@ impl FullNodeOverlaysRouter {
         self.service.test_bounded_reply(peer, id, full, bytes);
     }
     #[cfg(test)]
+    pub(crate) fn test_clear_history_replies(&self) { self.service.test_clear_history_replies(); }
+
+    #[cfg(test)]
     pub(crate) fn test_pss_reply(&self, peer: Arc<rtos_block::KeyId>, state: rtos_api::ton::ton_node::persistentstateidv2::PersistentStateIdV2, offset: Option<i64>, bytes: Vec<u8>) {
         self.service.test_pss_reply(peer, state, offset, bytes);
     }
