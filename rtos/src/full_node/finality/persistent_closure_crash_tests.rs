@@ -134,6 +134,9 @@ async fn persistent_closure_crash_child() {
             });
         let source =
             FinalityDeliveryTestDriver::open(runtime.clone(), &namespace, sink, confirm).unwrap();
+        // A fresh real session factory prepares this provenance directory before
+        // source delivery. Reopening parents never manufacture missing provenance.
+        source.prepare_intents(false).unwrap();
         let root = engine.load_state(pair.master.id()).await.unwrap().root_cell().clone();
         let (id, _, row) =
             chain::successor(&signer, pair.master.id(), &root, false, 0, cc, &creator);
@@ -277,6 +280,7 @@ async fn cold_window(window: i32) {
     let mut previous = None;
     for reopen in 0..2 {
         let engine = open_engine(&provider).await;
+        let mut recovery_service = None;
         let run = std::panic::AssertUnwindSafe(async {
             let (active, closed) = inspect_closure_progress(engine.db(), &domain).unwrap();
             assert_eq!(closed.len(), 1, "actual close offer must precede each crash");
@@ -327,16 +331,13 @@ async fn cold_window(window: i32) {
             }
             engine.ensure_publication_worker().await.unwrap();
             let service = engine.ensure_retired_session_recovery().await.unwrap();
+            recovery_service = Some(service.clone());
             // This is the only recovery driver. No runtime, source payload,
             // SourceDriver, stage, resume, or manual node confirmation is supplied.
             let final_record = tokio::time::timeout(Duration::from_secs(90), async {
                 loop {
                     let (active, closed) = inspect_closure_progress(engine.db(), &domain).unwrap();
-                    if closed.len() == 1
-                        && closed[0].released
-                        && active.is_empty()
-                        && service.snapshot().active == 0
-                    {
+                    if closed.len() == 1 && closed[0].released && active.is_empty() {
                         let batch =
                             simplex::finality_delivery::scan_finality_closures_namespace_report(
                                 &namespace, None, 16,
@@ -383,6 +384,13 @@ async fn cold_window(window: i32) {
         .catch_unwind()
         .await;
         engine.clone().wait_stop().await.unwrap();
+        if let Some(service) = recovery_service {
+            assert_eq!(
+                service.snapshot().active,
+                0,
+                "actual service shutdown must drain every owner"
+            );
+        }
         drop(engine);
         previous = Some(run.unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
     }
