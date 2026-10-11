@@ -51,10 +51,23 @@ async fn authenticate_identity(
     binding: &SessionRecoveryBinding,
     local_adnl: &rtos_block::UInt256,
 ) -> Result<(AuthenticatedSessionRuntime, Arc<ShardStateStuff>)> {
+    let verified = authenticate_recovered_state(engine, &binding.governing_masterchain).await?;
+    derive_identity(engine, pin, binding, local_adnl, &verified)
+}
+
+fn derive_identity(
+    engine: &dyn EngineOperations,
+    pin: &SessionNetworkPin,
+    binding: &SessionRecoveryBinding,
+    local_adnl: &rtos_block::UInt256,
+    verified: &crate::block_proof::VerifiedMasterchainState,
+) -> Result<(AuthenticatedSessionRuntime, Arc<ShardStateStuff>)> {
     if &pin.zerostate != engine.zerostate_id()? {
         fail!("Closing/retired network pin mismatch");
     }
-    let verified = authenticate_recovered_state(engine, &binding.governing_masterchain).await?;
+    if verified.state().block_id() != &binding.governing_masterchain {
+        fail!("Verified source recovery anchor differs from binding");
+    }
     let state = verified.state().clone();
     if state.state()?.global_id() != pin.global_id {
         fail!("Retired session global ID mismatch");
@@ -147,6 +160,34 @@ pub(crate) async fn authenticate_closing_runtime(
         .ok_or_else(|| error!("Closing identity lacks authenticated recovery anchor"))?;
     let (runtime, _) =
         authenticate_identity(engine, &domain.pin, binding, &request.canonical.local_adnl).await?;
+    validate_closing_identity(&runtime, request)?;
+    let root = PathBuf::from(engine.db_root_dir()?).join("catchains");
+    let expected = PathBuf::from(
+        runtime.runtime_directory(root.to_str().ok_or_else(|| error!("Invalid DB root"))?)?,
+    );
+    if namespace != expected {
+        fail!("Closing source namespace mismatch");
+    }
+    Ok(Arc::new(runtime))
+}
+
+fn validate_closing_identity(
+    runtime: &AuthenticatedSessionRuntime,
+    request: &CloseFinalityRequest,
+) -> Result<()> {
+    let domain = &request.domain;
+    let binding = domain
+        .recovery_binding
+        .as_ref()
+        .ok_or_else(|| error!("Closing identity lacks recovery anchor"))?;
+    if domain.protocol != SimplexProtocol::PrivateObserversPlumtree
+        || domain.wire_profile != WireProfile::T0
+        || request.canonical.role != FinalityDeliveryRole::Final
+        || !request.canonical.block_id.shard().is_masterchain()
+        || request.canonical.block_id.seq_no() == 0
+    {
+        fail!("Unsupported closing source domain/role");
+    }
     let role = match runtime.local_role() {
         LocalRole::Validator(i) => Some(i),
         LocalRole::Observer => None,
@@ -166,14 +207,45 @@ pub(crate) async fn authenticate_closing_runtime(
     {
         fail!("Closing source historical identity/role mismatch");
     }
-    let root = PathBuf::from(engine.db_root_dir()?).join("catchains");
-    let expected = PathBuf::from(
-        runtime.runtime_directory(root.to_str().ok_or_else(|| error!("Invalid DB root"))?)?,
-    );
-    if namespace != expected {
-        fail!("Closing source namespace mismatch");
+    Ok(())
+}
+
+/// Consume the caller's already authenticated state under its own read budget.
+/// No IO or unbudgeted reauthentication occurs in this identity derivation.
+pub(crate) fn validate_close_recovery_binding(
+    engine: &dyn EngineOperations,
+    binding: &crate::repair_lease_binding::RepairLeaseBinding,
+    verified: &crate::block_proof::VerifiedMasterchainState,
+) -> Result<()> {
+    use consensus_common::finality_delivery::FinalityCloseDomain;
+    binding.validate()?;
+    let domain = &binding.domain;
+    if &domain.history_init != engine.init_mc_block_id() {
+        fail!("Close history checkpoint mismatch");
     }
-    Ok(Arc::new(runtime))
+    let recovery = SessionRecoveryBinding {
+        governing_masterchain: domain.source_recovery_anchor.clone(),
+        coordinates: domain.source_recovery_coordinates.clone(),
+    };
+    let pin =
+        SessionNetworkPin { zerostate: domain.zerostate.clone(), global_id: domain.global_id };
+    let (runtime, _) =
+        derive_identity(engine, &pin, &recovery, &binding.canonical.local_adnl, verified)?;
+    let request = CloseFinalityRequest {
+        canonical: binding.canonical.clone(),
+        domain: FinalityCloseDomain {
+            pin,
+            protocol: domain.protocol,
+            carrier_version: domain.carrier_version,
+            wire_profile: domain.wire_profile,
+            profile: domain.profile.clone(),
+            session_id: domain.session_id.clone(),
+            recovery_binding: Some(recovery),
+        },
+        source_digest: binding.source_digest.clone(),
+        created_at_unix_secs: binding.created_at_unix_secs,
+    };
+    validate_closing_identity(&runtime, &request)
 }
 
 pub(crate) async fn authenticate_retired_session(
@@ -739,6 +811,56 @@ mod tests {
         let mut forged = history(1101)?;
         forged.pin = engine.pin.clone();
         assert!(authenticate_closing_runtime(&forged, &valid, &record.namespace).await.is_err());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn closing_binding_uses_exact_preverified_anchor_and_shared_derivation() -> Result<()> {
+        use crate::repair_lease_binding::{RepairLeaseBinding, RepairLeaseDomain};
+        let engine = history(0)?;
+        let record = locator(&engine, 7, false, false)?;
+        let verified =
+            authenticate_recovered_state(&engine, &record.binding.governing_masterchain).await?;
+        let (runtime, _) =
+            derive_identity(&engine, &record.pin, &record.binding, &record.local_adnl, &verified)?;
+        let request = closing_request(&record, runtime.committee()[0].validator_id()?);
+        let binding = RepairLeaseBinding {
+            record_id: 1,
+            delivery_id: request.canonical.node_receipt.clone(),
+            canonical: request.canonical,
+            domain: RepairLeaseDomain {
+                zerostate: record.pin.zerostate,
+                global_id: record.pin.global_id,
+                history_init: engine.pin.clone(),
+                source_recovery_anchor: record.binding.governing_masterchain,
+                source_recovery_coordinates: record.binding.coordinates,
+                protocol: record.protocol,
+                profile: record.profile,
+                session_id: record.session_id,
+                carrier_version: record.carrier_version,
+                wire_profile: record.wire_profile,
+            },
+            source_digest: request.source_digest,
+            canonical_digest: UInt256::from([7; 32]),
+            created_at_unix_secs: 100,
+            expires_at_unix_secs: 200,
+            effects_digest: UInt256::from([8; 32]),
+            close_generation: 1,
+        };
+        validate_close_recovery_binding(&engine, &binding, &verified)?;
+        for variant in 0..5 {
+            let mut bad = binding.clone();
+            match variant {
+                0 => bad.domain.source_recovery_anchor.file_hash = UInt256::default(),
+                1 => bad.domain.source_recovery_coordinates.catchain_seqno += 5,
+                2 => bad.domain.session_id = UInt256::default(),
+                3 => bad.canonical.local_validator_index = None,
+                _ => bad.domain.history_init.file_hash = UInt256::default(),
+            }
+            assert!(
+                validate_close_recovery_binding(&engine, &bad, &verified).is_err(),
+                "case {variant}"
+            );
+        }
         Ok(())
     }
 }
