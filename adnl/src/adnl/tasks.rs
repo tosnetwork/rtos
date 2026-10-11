@@ -8,7 +8,7 @@ use std::{
 };
 use tokio_util::{
     sync::CancellationToken,
-    task::{TaskTracker, TaskTrackerToken},
+    task::{task_tracker::TaskTrackerToken, TaskTracker},
 };
 
 /// Owns actual async task and OS-thread joins. Closing admission and acquiring a
@@ -37,6 +37,7 @@ impl AdnlTasks {
             cleanup: Mutex::new(Vec::new()),
         })
     }
+    // Register during construction or while holding an admitted startup lease.
     pub fn on_stopped(&self, cleanup: impl FnOnce() + Send + 'static) {
         self.cleanup.lock().unwrap().push(Box::new(cleanup));
     }

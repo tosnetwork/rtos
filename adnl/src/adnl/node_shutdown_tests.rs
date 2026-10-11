@@ -3,7 +3,7 @@ use super::*;
 use crate::common::{QueryAnswer, TimedAnswer};
 use rtos_api::AnyBoxedSerialize;
 use std::{
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{TcpStream, UdpSocket},
     sync::atomic::AtomicBool,
 };
 use tokio::sync::{oneshot, Notify};
@@ -33,6 +33,15 @@ async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
 }
 fn udp_released(port: u16) {
     UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).expect("UDP socket still owned");
+}
+
+fn tcp_released(port: u16) {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    socket.set_reuse_address(true).unwrap();
+    socket
+        .bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port).into())
+        .expect("TCP listener still owned");
+    socket.listen(1).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -163,7 +172,7 @@ async fn adnl_owned_tcp_accept_and_udp_are_joined() {
     bounded(node.stop_checked()).await.unwrap();
     drop(peer);
     udp_released(port);
-    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).expect("TCP listener still owned");
+    tcp_released(port);
     let weak = Arc::downgrade(&node);
     drop(node);
     assert!(weak.upgrade().is_none());
@@ -348,7 +357,7 @@ async fn adnl_owned_partial_transport_startup_closes_registered_threads() {
     assert!(result.is_err());
     bounded(node.stop_checked()).await.unwrap();
     udp_released(port);
-    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).expect("startup leaked TCP listener");
+    tcp_released(port);
     let weak = Arc::downgrade(&node);
     drop(node);
     assert!(weak.upgrade().is_none());
