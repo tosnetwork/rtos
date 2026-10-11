@@ -2694,7 +2694,7 @@ impl SessionProcessor {
         let certificate = crate::certificate::Certificate::<crate::simplex_state::Vote>::from_tl(
             &wire, &description, description.get_session_id())?;
         let crate::simplex_state::Vote::Finalize(vote) = certificate.vote else { rtos_block::fail!("Source recovery requires FinalCert"); };
-        let event = BlockFinalizedEvent { slot: vote.slot, block_hash: vote.block_hash.clone(), block_id: None,
+        let event = crate::simplex_state::BlockFinalizedEvent { slot: vote.slot, block_hash: vote.block_hash.clone(), block_id: None,
             certificate: Arc::new(crate::certificate::Certificate { vote, signatures: certificate.signatures }) };
         self.with_consensus_backend(|controller, backend| controller.handle_block_finalized(backend, event));
         self.check_all();
