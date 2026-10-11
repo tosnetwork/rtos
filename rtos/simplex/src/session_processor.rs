@@ -949,7 +949,9 @@ impl SessionProcessor {
         // Reset awake time to far future, will be updated by various checks
         self.reset_next_awake_time();
         // Closing work must remain reachable even when consensus has no pending slot.
-        self.runtime.set_next_awake_time(now + Duration::from_secs(1));
+        if self.callbacks.closing_enabled() {
+            self.runtime.set_next_awake_time(now + Duration::from_secs(1));
+        }
 
         // Stalled consensus detection
         // Debug dump if no finalizations for ROUND_DEBUG_PERIOD (stalled consensus)
