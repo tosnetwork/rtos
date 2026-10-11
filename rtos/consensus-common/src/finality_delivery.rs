@@ -56,12 +56,12 @@ pub struct CanonicalFinalityRecord {
     pub created_at_unix_secs: u64,
 }
 
-pub type CanonicalFinalityCompletion =
-    Box<dyn FnOnce(Result<CanonicalFinalityRecord>) + Send>;
+pub type CanonicalFinalityCompletion = Box<dyn FnOnce(Result<CanonicalFinalityRecord>) + Send>;
 
 /// Lookup data only; none of these public values authorizes deletion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FinalityCloseDomain {
+    pub recovery_binding: Option<crate::session_runtime::SessionRecoveryBinding>,
     pub pin: crate::session_runtime::SessionNetworkPin,
     pub protocol: crate::simplex_protocol::SimplexProtocol,
     pub carrier_version: u32,
@@ -71,8 +71,15 @@ pub struct FinalityCloseDomain {
 }
 impl FinalityCloseDomain {
     pub fn from_runtime(runtime: &crate::session_runtime::AuthenticatedSessionRuntime) -> Self {
-        Self { pin: runtime.pin().clone(), protocol: runtime.protocol(), carrier_version: runtime.carrier_version(),
-            wire_profile: runtime.wire_profile(), profile: runtime.profile().clone(), session_id: runtime.session_id().clone() }
+        Self {
+            recovery_binding: runtime.recovery_binding().cloned(),
+            pin: runtime.pin().clone(),
+            protocol: runtime.protocol(),
+            carrier_version: runtime.carrier_version(),
+            wire_profile: runtime.wire_profile(),
+            profile: runtime.profile().clone(),
+            session_id: runtime.session_id().clone(),
+        }
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,10 +106,18 @@ pub type FinalityCloseCompletion = Box<dyn FnOnce(Result<CloseOffer>) + Send>;
 pub trait DurableFinalitySink: Send + Sync {
     /// Owned exactly-once completion after admission. Unsupported keeps original
     /// source retention; public requests/offers are not consumed confirmations.
-    fn lookup_terminal(&self, _request: CloseFinalityRequest, _completion: FinalityTerminalCompletion) -> Result<()> {
+    fn lookup_terminal(
+        &self,
+        _request: CloseFinalityRequest,
+        _completion: FinalityTerminalCompletion,
+    ) -> Result<()> {
         rtos_block::fail!("Finality terminal lookup is unsupported")
     }
-    fn offer_close(&self, _request: CloseFinalityRequest, _completion: FinalityCloseCompletion) -> Result<()> {
+    fn offer_close(
+        &self,
+        _request: CloseFinalityRequest,
+        _completion: FinalityCloseCompletion,
+    ) -> Result<()> {
         rtos_block::fail!("Finality closing is unsupported")
     }
 

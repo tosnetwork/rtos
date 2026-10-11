@@ -82,7 +82,9 @@ pub(crate) struct SessionCallbacks {
     /// re-checks `upgrade()` and silently drops when the listener is gone.
     listener: SessionListenerPtr,
     delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
-    source_delivery: Arc<std::sync::Mutex<Option<Arc<crate::finality_delivery::SourceFinalityDelivery>>>>,
+    delivered_completion: Option<crate::finality_delivery::DeliveredCompletionSink>,
+    source_delivery:
+        Arc<std::sync::Mutex<Option<Arc<crate::finality_delivery::SourceFinalityDelivery>>>>,
     source_release: Arc<std::sync::Mutex<Option<Arc<AtomicBool>>>>,
 }
 
@@ -93,7 +95,9 @@ pub(crate) struct SourceDeliveryLifetime(
     Arc<std::sync::Mutex<Option<Arc<crate::finality_delivery::SourceFinalityDelivery>>>>,
 );
 impl Drop for SourceDeliveryLifetime {
-    fn drop(&mut self) { self.0.lock().unwrap().take(); }
+    fn drop(&mut self) {
+        self.0.lock().unwrap().take();
+    }
 }
 
 // ======================================================================
@@ -115,53 +119,141 @@ impl SessionCallbacks {
         task_queue: CallbackTaskQueuePtr,
         listener: SessionListenerPtr,
     ) -> Self {
-        Self { session_id, stop_flag, use_callback_thread, task_queue, listener, delivery_sink: None, source_delivery: Arc::new(std::sync::Mutex::new(None)), source_release: Arc::new(std::sync::Mutex::new(None)) }
+        Self {
+            session_id,
+            stop_flag,
+            use_callback_thread,
+            task_queue,
+            listener,
+            delivery_sink: None,
+            delivered_completion: None,
+            source_delivery: Arc::new(std::sync::Mutex::new(None)),
+            source_release: Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 
-    pub(crate) fn with_delivery_sink(mut self, sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>) -> Self {
+    pub(crate) fn with_delivery_sink(
+        mut self,
+        sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
+    ) -> Self {
         self.delivery_sink = sink;
         self
+    }
+
+    pub(crate) fn with_delivered_completion(
+        mut self,
+        callback: Option<crate::finality_delivery::DeliveredCompletionSink>,
+    ) -> Self {
+        self.delivered_completion = callback;
+        self
+    }
+    pub(crate) fn maintain_finality_closing(&self) {
+        if let Some(source) = self.source_delivery.lock().unwrap().clone() {
+            if let Err(error) = source.maintain_closing() {
+                log::error!("Source closure retained: {error}");
+            }
+        }
     }
 
     pub(crate) fn delivery_lifetime(&self) -> SourceDeliveryLifetime {
         SourceDeliveryLifetime(self.source_delivery.clone())
     }
 
-    pub(crate) fn initialize_delivery(&self, runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>, namespace: &std::path::Path) -> rtos_block::Result<()> {
-        let sink = self.delivery_sink.clone().ok_or_else(|| rtos_block::error!("Missing durable sink"))?;
-        let source = crate::finality_delivery::SourceFinalityDelivery::open(runtime, namespace, sink)?;
+    pub(crate) fn initialize_delivery(
+        &self,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        namespace: &std::path::Path,
+    ) -> rtos_block::Result<()> {
+        let sink =
+            self.delivery_sink.clone().ok_or_else(|| rtos_block::error!("Missing durable sink"))?;
+        let source = crate::finality_delivery::SourceFinalityDelivery::open_with_delivered(
+            runtime,
+            namespace,
+            sink,
+            self.delivered_completion.clone(),
+        )?;
         let mut slot = self.source_delivery.lock().unwrap();
-        if slot.is_some() { return Err(rtos_block::error!("Source delivery already initialized")); }
+        if slot.is_some() {
+            return Err(rtos_block::error!("Source delivery already initialized"));
+        }
         *self.source_release.lock().unwrap() = Some(source.namespace_release_receipt());
         *slot = Some(source);
         Ok(())
     }
 
     pub(crate) fn source_namespace_drained(&self) -> bool {
-        self.source_release.lock().unwrap().as_ref().map_or(true, |released| released.load(Ordering::Acquire))
+        self.source_release
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(true, |released| released.load(Ordering::Acquire))
     }
 
-    fn delivery_source(&self) -> rtos_block::Result<Arc<crate::finality_delivery::SourceFinalityDelivery>> {
-        self.source_delivery.lock().unwrap().clone().ok_or_else(|| rtos_block::error!("Source delivery not initialized"))
+    fn delivery_source(
+        &self,
+    ) -> rtos_block::Result<Arc<crate::finality_delivery::SourceFinalityDelivery>> {
+        self.source_delivery
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| rtos_block::error!("Source delivery not initialized"))
     }
-    pub(crate) fn prepare_finality_intents(&self, has_existing_certificates: bool) -> rtos_block::Result<()> { self.delivery_source()?.prepare_intents(has_existing_certificates) }
-    pub(crate) fn bind_delivery_start(&self, anchor: BlockIdExt) -> rtos_block::Result<()> { self.delivery_source()?.bind_start(anchor) }
-    pub(crate) fn retain_finality_intent(&self, prevs: Vec<BlockIdExt>, event: &crate::simplex_state::BlockFinalizedEvent) -> rtos_block::Result<()> {
+    pub(crate) fn prepare_finality_intents(
+        &self,
+        has_existing_certificates: bool,
+    ) -> rtos_block::Result<()> {
+        self.delivery_source()?.prepare_intents(has_existing_certificates)
+    }
+    pub(crate) fn bind_delivery_start(&self, anchor: BlockIdExt) -> rtos_block::Result<()> {
+        self.delivery_source()?.bind_start(anchor)
+    }
+    pub(crate) fn retain_finality_intent(
+        &self,
+        prevs: Vec<BlockIdExt>,
+        event: &crate::simplex_state::BlockFinalizedEvent,
+    ) -> rtos_block::Result<()> {
         self.delivery_source()?.retain_intent(prevs, event)
     }
-    pub(crate) fn resolve_finality_intent(&self, id: &crate::block::RawCandidateId) -> rtos_block::Result<()> {
+    pub(crate) fn seal_finality_outputs(&self,id:&crate::block::RawCandidateId,outputs:Vec<crate::finality_recovery::ExpectedFinalityOutput>)->rtos_block::Result<()> {
+        self.delivery_source()?.seal_outputs(id,outputs)
+    }
+    pub(crate) fn resolve_finality_intent(
+        &self,
+        id: &crate::block::RawCandidateId,
+    ) -> rtos_block::Result<()> {
         self.delivery_source()?.resolve_intent(id)
     }
-    pub(crate) fn pending_finality_intent_count(&self) -> rtos_block::Result<usize> { self.delivery_source()?.pending_intent_count() }
-    pub(crate) fn pending_finality_intents(&self) -> rtos_block::Result<Vec<Vec<u8>>> { self.delivery_source()?.pending_intents() }
+    pub(crate) fn pending_finality_intent_count(&self) -> rtos_block::Result<usize> {
+        self.delivery_source()?.pending_intent_count()
+    }
+    pub(crate) fn pending_finality_intents(&self) -> rtos_block::Result<Vec<Vec<u8>>> {
+        self.delivery_source()?.pending_intents()
+    }
 
-    pub(crate) fn poll_durable_finality(&self, draft: consensus_common::finality_delivery::FinalizedDeliveryDraft) -> rtos_block::Result<bool> {
-        let source = self.source_delivery.lock().unwrap().clone().ok_or_else(|| rtos_block::error!("Source delivery not initialized"))?;
+    pub(crate) fn poll_durable_finality(
+        &self,
+        draft: consensus_common::finality_delivery::FinalizedDeliveryDraft,
+    ) -> rtos_block::Result<bool> {
+        let source = self
+            .source_delivery
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| rtos_block::error!("Source delivery not initialized"))?;
+        if source.consumed(&draft)? {
+            return Ok(true);
+        }
         if let Some((id, draft)) = source.poll(draft)? {
             let listener = self.listener.clone();
-            self.invoke(move || { if let Some(listener) = listener.upgrade() { listener.on_durable_block_finalized(id, draft); } });
+            self.invoke(move || {
+                if let Some(listener) = listener.upgrade() {
+                    listener.on_durable_block_finalized(id, draft);
+                }
+            });
             Ok(true)
-        } else { Ok(false) }
+        } else {
+            Ok(false)
+        }
     }
 
     /// Clone this callbacks aspect with a different session listener.
@@ -180,6 +272,7 @@ impl SessionCallbacks {
             task_queue: self.task_queue.clone(),
             listener,
             delivery_sink: self.delivery_sink.clone(),
+            delivered_completion: self.delivered_completion.clone(),
             source_delivery: self.source_delivery.clone(),
             source_release: self.source_release.clone(),
         }
