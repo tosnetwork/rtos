@@ -404,24 +404,22 @@ async fn choose_mc_state(
 fn precheck_header(
     block: &BlockStuff,
     prev: &[BlockIdExt],
-    is_fake: bool,
+    _is_fake: bool,
     is_fork: bool,
 ) -> Result<()> {
     let block_descr = fmt_block_id_short(block.id());
 
     log::trace!(target: "validator", "({}): precheck_header", block_descr);
 
-    // 1. root hash and file hash check (root hash was checked in BlockStuff constructor)
-
-    if is_fake || is_fork {
-        let file_hash = UInt256::calc_file_hash(block.data());
-        if *block.id().file_hash() != file_hash {
-            fail!(
-                "block root hash mismatch: expected {}, , found {}",
-                block.id().file_hash().to_hex_string(),
-                file_hash.to_hex_string()
-            )
-        }
+    // Root equality alone does not bind BOC bytes to the signed block ID.
+    // Ordinary PQ acceptance and recovery must check the file hash too.
+    let file_hash = UInt256::calc_file_hash(block.data());
+    if block.id().file_hash() != &file_hash {
+        fail!(
+            "block file hash mismatch: expected {}, found {}",
+            block.id().file_hash().to_hex_string(),
+            file_hash.to_hex_string()
+        );
     }
 
     // 2. check header fields
