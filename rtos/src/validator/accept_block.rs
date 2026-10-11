@@ -1039,6 +1039,24 @@ impl AcceptedSessionBlock {
             }
         }
     }
+    /// A quorum-authenticated accepted block may fill the candidate relay gap
+    /// when the earlier CandidateReceived callback did not reach this node.
+    /// This receipt does not promote notarization into finality authority.
+    pub fn candidate_relay(&self) -> Result<super::propagation::ValidatedCandidateRelay> {
+        let session_id = match &self.finality {
+            AcceptedFinality::Final { _verified, .. } => _verified.session_id(),
+            AcceptedFinality::Approval { _verified, .. } => _verified.session_id(),
+        };
+        let signatures = self.network_signatures()?;
+        let info = signatures.validator_info();
+        Ok(super::propagation::ValidatedCandidateRelay::from_validated_group_candidate(
+            self.block.clone(),
+            info.catchain_seqno,
+            info.validator_list_hash_short,
+            session_id.clone(),
+        ))
+    }
+
     pub fn final_network_signatures(&self) -> Result<rtos_api::pq_finality::PqNetworkSignatureSet> {
         if !self.is_final() {
             fail!("Approval cannot authorize finality publication");

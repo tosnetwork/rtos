@@ -181,9 +181,10 @@ impl CandidateRelayDeduplicator {
     }
 }
 
-/// The crate's validated group callback constructs this only after the candidate
-/// leader/source and PQ evidence checks. BlockStuff checks bytes/IDs; this wrapper
-/// itself does not perform those consensus checks or confer final-proof authority.
+/// Constructed by the validated group callback after leader/source/PQ checks,
+/// or by acceptance after verifying a quorum bound to the exact candidate and
+/// block bytes. This wrapper itself performs no consensus verification and does
+/// not confer final-proof authority (an accepted approval may also relay).
 #[derive(Clone)]
 pub struct ValidatedCandidateRelay {
     block: BlockStuff,
