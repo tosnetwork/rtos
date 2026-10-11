@@ -1707,7 +1707,7 @@ impl ConsensusController {
                     &trigger_id.hash.to_hex_string()[..8],
                 );
                 self.telemetry.increment_error();
-                return true;
+                return self.description.authenticated_runtime().is_none();
             }
             if !visited.insert(current_id.clone()) {
                 log::error!(
@@ -1720,7 +1720,7 @@ impl ConsensusController {
                     &trigger_id.hash.to_hex_string()[..8],
                 );
                 self.telemetry.increment_error();
-                return true;
+                return self.description.authenticated_runtime().is_none();
             }
 
             // Step 1: resolve candidate metadata/body holder.
@@ -1828,6 +1828,7 @@ impl ConsensusController {
             }
 
             let Some(parent_id) = received.parent_id else {
+                if has_final_cert && self.description.authenticated_runtime().is_some() { complete = false; }
                 break;
             };
 
@@ -2192,6 +2193,7 @@ impl ConsensusController {
         has_final_cert: bool,
         applied_floor: u32,
     ) -> bool {
+        if self.description.authenticated_runtime().is_some() && has_final_cert { return true; }
         if self.description.get_shard().is_masterchain() {
             return has_final_cert;
         }

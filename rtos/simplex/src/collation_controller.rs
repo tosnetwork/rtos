@@ -1235,7 +1235,7 @@ impl CollationController {
             return None;
         }
 
-        let self_idx = self.description.local_validator_index()?;
+        let self_idx = self.description.require_validator_index().ok()?;
         let leader = self.description.get_leader(slot);
         if leader != self_idx {
             log::trace!(
@@ -1515,7 +1515,7 @@ impl CollationController {
             return;
         }
 
-        let Some(self_idx) = self.description.local_validator_index() else {
+        let Some(self_idx) = self.description.require_validator_index().ok() else {
             return;
         };
         let leader = self.description.get_leader(current_slot);
@@ -3120,7 +3120,7 @@ impl CollationController {
         // Simulate receiving our own block via on_candidate_received so it goes
         // through the same path as network-received blocks and lands in
         // received_candidates uniformly (deferred onto SXMAIN via the backend).
-        let Some(local_index) = self.description.local_validator_index() else {
+        let Some(local_index) = self.description.require_validator_index().ok() else {
             return;
         };
         let self_idx = local_index.value();
@@ -3186,7 +3186,7 @@ impl CollationController {
         }
 
         // Must be the leader for the target slot.
-        let Some(self_idx) = self.description.local_validator_index() else {
+        let Some(self_idx) = self.description.require_validator_index().ok() else {
             return;
         };
         let leader = self.description.get_leader(target_slot);
@@ -3877,7 +3877,7 @@ impl CollationController {
         parent: &Option<CandidateParentInfo>,
         is_empty: bool,
     ) -> Option<(UInt256, ValidatorIndex, Vec<u8>, Vec<u8>)> {
-        let self_idx = self.description.local_validator_index()?;
+        let self_idx = self.description.require_validator_index().ok()?;
         let parent_info = parent.as_ref().map(|p| (p.slot, &p.hash));
         let candidate_hash_data_bytes = if is_empty {
             let Some(p) = parent.as_ref() else {

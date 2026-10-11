@@ -6,7 +6,7 @@ use consensus_common::*;
 use rtos_block::{BlockSignaturesVariant, Ed25519KeyOption, Result, UInt256, ZeroizingBytes};
 
 #[derive(Default)]
-struct Listener(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+struct Listener(Mutex<Option<Box<dyn FnOnce() + Send>>>, std::sync::atomic::AtomicUsize);
 impl SessionListener for Listener {
     fn on_candidate(
         &self,
@@ -24,6 +24,7 @@ impl SessionListener for Listener {
         _: CollationParentHint,
         _: ValidatorBlockCandidateCallback,
     ) {
+        self.1.fetch_add(1, Ordering::SeqCst);
     }
     fn on_block_committed(
         &self,
@@ -264,7 +265,7 @@ async fn authenticated_validator_isolated_worker_signs_and_retains_journal_on_de
         nodes.iter().map(|node| node.descriptor.clone().unwrap()).collect(), keys[1].clone());
     options.first_block_timeout = Duration::from_millis(30);
     options.target_rate = Duration::from_millis(30);
-    let path = directory.path().join("validator");
+    let path = std::path::PathBuf::from(runtime.runtime_directory(directory.path().to_str().unwrap()).unwrap());
     crate::runtime_manifest::RuntimeManifest::provision_test_validator(&runtime, &path).unwrap();
     let (_, config) = AdnlNodeConfig::from_ip_address_and_private_keys("127.0.0.1:0", vec![([0x73; 32], 0)]).unwrap();
     let adnl = AdnlNode::with_config(config).await.unwrap();
@@ -276,7 +277,8 @@ async fn authenticated_validator_isolated_worker_signs_and_retains_journal_on_de
     let stack = Arc::new(NetworkStack { adnl: adnl.clone(), dht, overlay, rldp, quic: None });
     adnl.start_over_udp(vec![stack.overlay.clone(), stack.dht.clone(), stack.rldp.clone()]).await.unwrap();
     let manager = ConsensusCommonFactory::create_adnl_overlay_manager(tokio::runtime::Handle::current(), stack, None, false).unwrap();
-    let listener: Arc<dyn SessionListener + Send + Sync> = Arc::new(Listener::default());
+    let concrete_listener = Arc::new(Listener::default());
+    let listener: Arc<dyn SessionListener + Send + Sync> = concrete_listener.clone();
     let result = (|| -> Result<()> {
         let create = |initialize| SessionImpl::create_with_profile(&options, runtime.session_id(), runtime.shard(), nodes.clone(),
             &key, path.to_str().unwrap().to_owned(), manager.clone(), Arc::downgrade(&listener), None,
@@ -312,6 +314,33 @@ async fn authenticated_validator_isolated_worker_signs_and_retains_journal_on_de
         anyhow::ensure!(drained);
         anyhow::ensure!(read_journal()? == before, "destroy or recovery changed durable signed decisions");
         anyhow::ensure!(store.consensus_signatures_produced() == count, "recovery invoked native signer");
+        let record = crate::finality_recovery::SessionRecoveryRecord {
+            pin: runtime.pin().clone(), binding: runtime.recovery_binding().unwrap().clone(),
+            protocol: runtime.protocol(), carrier_version: runtime.carrier_version(), wire_profile: runtime.wire_profile(),
+            profile: runtime.profile().clone(), session_id: runtime.session_id().clone(),
+            local_adnl: UInt256::from(*runtime.local_adnl().data()), local_validator_index: Some(1),
+            prev_blocks: vec![runtime.pin().zerostate.clone()], start_masterchain: runtime.pin().zerostate.clone(),
+            namespace: path.clone(),
+        };
+        let collations = concrete_listener.1.load(Ordering::SeqCst);
+        // Start the real worker with the old validator journal, but no signer.
+        let retired = crate::SessionFactory::create_finality_recovery_session(&options, runtime.clone(), &key,
+            directory.path().to_str().unwrap(), &record, manager.clone(), Arc::downgrade(&listener), Arc::new(RejectFinalitySink))?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !retired.finality_recovery_complete() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let complete = retired.finality_recovery_complete();
+        // Cross several original producer deadlines, retaining the old role.
+        std::thread::sleep(Duration::from_millis(150));
+        let stopped = retired.stop_checked();
+        let drained = retired.threads_drained();
+        stopped?;
+        anyhow::ensure!(complete && drained, "Read-only worker did not complete and join");
+        anyhow::ensure!(concrete_listener.1.load(Ordering::SeqCst) == collations, "Retired worker requested collation");
+        anyhow::ensure!(store.consensus_signatures_produced() == count, "Retired worker invoked native signer");
+        anyhow::ensure!(read_journal()? == before, "Retired worker mutated the own journal");
+
         Ok(())
     })();
     drop(manager);

@@ -721,6 +721,7 @@ impl SessionImpl {
             )
             .and_then(|description| description.bind_pq_session(catchain_seqno))
             .and_then(|description| {
+                let description = description.with_recovery_only(recovery_only);
                 #[cfg(test)]
                 if let Some(coordinator) = &test_coordinator {
                     description.install_test_coordinator(coordinator.clone())?;

@@ -11537,16 +11537,20 @@ fn authenticated_observer_nonempty_query_emits_leader_evidence_after_pq_verifica
 
 #[test]
 fn source_finality_controller_waits_for_wal_before_persist_sent_and_gc() {
-    source_finality_controller_case(false);
+    source_finality_controller_case(false, false);
 }
 #[test]
 fn source_finality_controller_approval_upgrades_to_final_after_separate_wal_ack() {
-    source_finality_controller_case(true);
+    source_finality_controller_case(true, false);
 }
-fn source_finality_controller_case(upgrade: bool) {
+#[test]
+fn source_finality_retained_final_certificate_cannot_be_skipped_by_later_applied_floor() {
+    source_finality_controller_case(false, true);
+}
+fn source_finality_controller_case(upgrade: bool, high_floor: bool) {
     use crate::finality_delivery::tests::{fixture, fixture_role, HeldSink};
     let temp = crate::authenticated_fixture::TestDirectory::new();
-    let (runtime, draft) = if upgrade { fixture_role(true, ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap()) } else { fixture() };
+    let (runtime, draft) = if upgrade || high_floor { fixture_role(true, ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap()) } else { fixture() };
     let namespace = runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap();
     let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor)
         .collect::<rtos_block::Result<Vec<_>>>().unwrap();
@@ -11615,6 +11619,11 @@ fn source_finality_controller_case(upgrade: bool) {
         processor.with_consensus_backend(|controller, backend| assert!(controller.maybe_apply_finalized_state(backend, &candidate_id, false)));
         db.sync(Some(Duration::from_secs(5))).unwrap();
         assert!(!db.load_finalized_blocks().unwrap()[0].is_final);
+    }
+    if high_floor {
+        let mut later = draft.block_id.clone();
+        later.seq_no += 100;
+        processor.set_mc_finalized_block(later);
     }
     processor.handle_block_finalized(event);
     assert_eq!(sink.0.lock().unwrap().len(), 1);
