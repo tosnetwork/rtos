@@ -437,3 +437,197 @@ async fn archive_drain_received_error_requires_acknowledgement() {
         assert!(!engine.load_block_handle(&fixture.id(1, false)).unwrap().unwrap().is_applied());
     }
 }
+
+async fn shard_archive(dir: &Path) -> ArchiveContext {
+    let mut master = maps(dir).await;
+    master.mc_blocks_ids = Arc::new(
+        master
+            .mc_blocks_ids
+            .iter()
+            .filter(|(seq, _)| **seq == 1)
+            .map(|(seq, id)| (*seq, id.clone()))
+            .collect(),
+    );
+    let shard = read_package(
+        &std::fs::read(dir.join("archives/archive.00001.0:8000000000000000.pack")).unwrap(),
+    )
+    .await
+    .unwrap();
+    ArchiveContext {
+        absent_shards: Default::default(),
+        loaded_shards: HashMap::from([(ShardIdent::full(0), shard)]),
+        master: Some(master),
+        need_shards: true,
+        shards_count: 1,
+    }
+}
+async fn import_shards(engine: Arc<dyn EngineOperations>, archive: ArchiveContext) -> Result<()> {
+    let (wait, _) = Wait::new();
+    let mut context = SyncContext { concurrency: 1, downloads: 1, engine, wait };
+    assert!(import_shard_blocks(&mut context, 1, archive).await?.is_none());
+    Ok(())
+}
+async fn assert_shard_applied(engine: &Arc<Engine>, fixture: &Fixture) {
+    let id = fixture.id(1, true);
+    let handle = engine.load_block_handle(&id).unwrap().unwrap();
+    assert!(handle.is_applied(), "accepted shard import did not complete normal apply");
+    let state = engine.load_state(&id).await.unwrap();
+    let data: serde_json::Value =
+        serde_json::from_str(include_str!("static/archive-mc-wc.json")).unwrap();
+    let expected = read_single_root_boc(
+        &hex::decode(data["cases"][0]["wc_state_boc"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state.root_cell().repr_hash(), expected.repr_hash());
+    engine.load_block_proof(&handle, true).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn archive_drain_shard_cancel_drains_apply_and_recovers_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new();
+    let engine = prepare(dir.path(), &fixture, false).await;
+    import_first(engine.clone(), maps(dir.path()).await, fixture.id(0, false)).await.unwrap();
+    let ops: Arc<dyn EngineOperations> = engine.clone();
+    let gate = Arc::new(Gate { stage: 3, entered: Notify::new(), release: Semaphore::new(0) });
+    let _registration = install(&ops, &gate);
+    let archive = shard_archive(dir.path()).await;
+    let worker = tokio::spawn({
+        let ops = ops.clone();
+        async move { import_shards(ops, archive).await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), gate.entered.notified()).await.unwrap();
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    let shutting = tokio::spawn(engine.clone().wait_stop());
+    while !engine.check_stop() {
+        tokio::task::yield_now().await;
+    }
+    assert!(!shutting.is_finished());
+    gate.release.add_permits(1);
+    shutting.await.unwrap().unwrap();
+    assert_shard_applied(&engine, &fixture).await;
+    // Cancellation interrupted the consumer cursor update, not accepted apply.
+    assert_eq!(
+        engine.load_shard_client_mc_block_id().unwrap().unwrap().as_ref(),
+        &fixture.id(0, false)
+    );
+    gates().lock().unwrap().remove(&key(&ops));
+    drop(ops);
+    drop(engine);
+    let reopened = open(dir.path()).await;
+    assert_shard_applied(&reopened, &fixture).await;
+    import_shards(reopened.clone(), shard_archive(dir.path()).await).await.unwrap();
+    assert_eq!(
+        reopened.load_shard_client_mc_block_id().unwrap().unwrap().as_ref(),
+        &fixture.id(1, false)
+    );
+    stop(reopened.clone()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn archive_drain_shard_unobserved_file_failure_is_sticky_and_retryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new();
+    let engine = prepare(dir.path(), &fixture, false).await;
+    import_first(engine.clone(), maps(dir.path()).await, fixture.id(0, false)).await.unwrap();
+    let ops: Arc<dyn EngineOperations> = engine.clone();
+    let gate = Arc::new(Gate { stage: 3, entered: Notify::new(), release: Semaphore::new(0) });
+    let _registration = install(&ops, &gate);
+    let archive = shard_archive(dir.path()).await;
+    let worker = tokio::spawn({
+        let ops = ops.clone();
+        async move { import_shards(ops, archive).await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), gate.entered.notified()).await.unwrap();
+    use storage::archives::package_entry_id::{GetFileName, PackageEntryId};
+    let obstruction = dir
+        .path()
+        .join("db/archive/unapplied")
+        .join(PackageEntryId::ProofLink(fixture.id(1, true)).filename_short());
+    let proof = std::fs::read(&obstruction).unwrap();
+    std::fs::remove_file(&obstruction).unwrap();
+    std::fs::create_dir(&obstruction).unwrap();
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    gate.release.add_permits(1);
+    let error = tokio::time::timeout(Duration::from_secs(30), engine.clone().wait_stop())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("Unobserved archive import failure (archive shard import)"),
+        "{error:#}"
+    );
+    assert!(error.to_string().contains("Is a directory"), "{error:#}");
+    assert!(!engine.load_block_handle(&fixture.id(1, true)).unwrap().unwrap().is_applied());
+    assert_eq!(
+        engine.load_shard_client_mc_block_id().unwrap().unwrap().as_ref(),
+        &fixture.id(0, false)
+    );
+    gates().lock().unwrap().remove(&key(&ops));
+    drop(ops);
+    drop(engine);
+    std::fs::remove_dir(&obstruction).unwrap();
+    std::fs::write(&obstruction, proof).unwrap();
+    let reopened = open(dir.path()).await;
+    import_shards(reopened.clone(), shard_archive(dir.path()).await).await.unwrap();
+    assert_shard_applied(&reopened, &fixture).await;
+    assert_eq!(
+        reopened.load_shard_client_mc_block_id().unwrap().unwrap().as_ref(),
+        &fixture.id(1, false)
+    );
+    stop(reopened.clone()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn archive_drain_aggregate_cancel_does_not_ack_buffered_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new();
+    let engine = prepare(dir.path(), &fixture, false).await;
+    let ops: Arc<dyn EngineOperations> = engine.clone();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Semaphore::new(0));
+    let path = dir.path().to_path_buf();
+    let first = spawn_archive_task(&ops, "buffered archive error", async move {
+        // A real filesystem error reaches the same retained result path.
+        tokio::fs::read(path).await?;
+        Ok(())
+    })
+    .unwrap();
+    let second = spawn_archive_task(&ops, "held archive sibling", {
+        let release = release.clone();
+        async move {
+            release.acquire().await.unwrap().forget();
+            Ok(())
+        }
+    })
+    .unwrap();
+    let aggregate = tokio::spawn({
+        let entered = entered.clone();
+        async move {
+            use futures::FutureExt;
+            let first = first
+                .map(move |result| {
+                    entered.notify_one();
+                    result
+                })
+                .boxed();
+            futures::future::try_join_all(vec![first, second.boxed()]).await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(30), entered.notified()).await.unwrap();
+    // The first Err is now buffered as a receipt inside try_join_all.
+    aggregate.abort();
+    assert!(matches!(aggregate.await,Err(error) if error.is_cancelled()));
+    release.add_permits(1);
+    let error = tokio::time::timeout(Duration::from_secs(30), engine.clone().wait_stop())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("Unobserved archive import failure (buffered archive error)"),
+        "{error:#}"
+    );
+    assert!(error.to_string().contains("Is a directory"), "{error:#}");
+}

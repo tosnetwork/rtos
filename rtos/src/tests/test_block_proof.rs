@@ -959,7 +959,7 @@ async fn test_warm_recovery_accepts_pinned_states_only_with_matching_roots() {
                 .unwrap();
             handle.set_block_applied();
             let engine = RecoveryProofEngine {
-            workers: Default::default(),
+                workers: Default::default(),
                 pin: pin.clone(),
                 state,
                 entries: vec![(handle, proof)],
@@ -1030,7 +1030,7 @@ async fn test_live_proof_history_cache_never_caches_incoming_certificates() {
         })
         .collect();
     let engine = RecoveryProofEngine {
-            workers: Default::default(),
+        workers: Default::default(),
         pin,
         state,
         entries,
