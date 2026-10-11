@@ -239,6 +239,13 @@ impl SendPartV1 {
         }
         let upto = offset + Constraints::SLICE.min(self.state.total - offset);
         let RldpMessagePart(chunk) = &mut self.chunk;
+        // Only the sender owns the encoder and may reset its symbol cursor.
+        // A Complete can arrive while an old-part FEC job is still running.
+        // Resetting in that receive callback would feed ESI 0 to its repair
+        // encoder after its source packets have already been consumed.
+        if self.core.encoder.is_none() || chunk.part != part as i32 {
+            self.state.core.seqno_send.store(0, Ordering::Relaxed);
+        }
         self.core.start(part, offset..upto, chunk)
     }
 
@@ -747,7 +754,6 @@ impl SendPartStateV1 {
         if self.part.compare_exchange(part - 1, part, Ordering::Relaxed, Ordering::Relaxed).is_ok()
         {
             self.seqno_recv.store(0, Ordering::Relaxed);
-            self.core.seqno_send.store(0, Ordering::Relaxed);
             self.ping.send(()).ok();
         }
     }
@@ -1101,5 +1107,49 @@ mod owned_ack_tests {
             drop(part);
             assert!(!peer.stats.is_only_probe());
         }
+    }
+}
+
+#[cfg(test)]
+mod v1_completion_tests {
+    use super::*;
+
+    #[test]
+    fn rldp_v1_complete_keeps_old_encoder_cursor_until_sender_starts_next_part() {
+        let (ping, _pong) = tokio::sync::mpsc::unbounded_channel();
+        let data: Arc<[u8]> = vec![42; Constraints::SLICE + 32].into();
+        let (SendTransfer::V1(mut sender), _) =
+            SendTransfer::new(data, [7; 32], Arc::new(AtomicU64::new(0)), ping, false).unwrap()
+        else {
+            unreachable!()
+        };
+        // Exercise the actual old-part encoder with one source symbol rather
+        // than encoding a full 2 MB part just to arrange the completion race.
+        let count = sender.core.start(0, 0..32, &mut sender.chunk.0).unwrap();
+        assert_eq!(count, 1);
+        sender.prepare_chunk().unwrap();
+        assert_eq!(sender.chunk.0.seqno, 0);
+        let state = sender.state().clone();
+        assert_eq!(state.core.seqno_send(), 1);
+
+        // Deterministically inject the receive callback between two real FEC
+        // jobs. The next old-part job must use a repair ESI, never reset to 0.
+        state.set_next_part(1);
+        state.set_next_part(1); // duplicate Complete cannot change the cursor
+        assert_eq!(state.core.seqno_send(), 1);
+        sender.prepare_chunk().unwrap();
+        assert_eq!(sender.chunk.0.seqno, 1);
+        assert!(state.is_transfer_finished_or_next_part(0).unwrap());
+
+        // The actual next-part initializer selects the small final slice and
+        // resets the shared cursor before that new encoder emits source ESI 0.
+        assert_eq!(sender.start_next_part().unwrap(), 1);
+        assert_eq!(state.core.seqno_send(), 0);
+        sender.prepare_chunk().unwrap();
+        assert_eq!(sender.chunk.0.part, 1);
+        assert_eq!(sender.chunk.0.seqno, 0);
+        state.set_next_part(2);
+        assert_eq!(sender.start_next_part().unwrap(), 0);
+        assert_eq!(state.core.seqno_send(), 1);
     }
 }
