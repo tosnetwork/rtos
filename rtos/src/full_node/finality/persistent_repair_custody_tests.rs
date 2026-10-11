@@ -135,8 +135,16 @@ async fn persistent_repair_custody_missing_parent_refuses_durable_lease() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn persistent_repair_custody_capsule_internal_closure_repairs_real_history_then_cold_checks()
-{
+async fn persistent_repair_custody_capsule_internal_closure_repairs_real_history_then_cold_checks() {
+    capsule_cold_integrity(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn historical_recovery_protected_capsule_cold_corruption_preserves_exact_custody() {
+    capsule_cold_integrity(true).await;
+}
+
+async fn capsule_cold_integrity(corrupt: bool) {
     let fixture = fixture(true).await;
     let exact = binding(&fixture);
     let Fixture { dir, engine, parent, target, request } = fixture;
@@ -217,6 +225,51 @@ async fn persistent_repair_custody_capsule_internal_closure_repairs_real_history
     close(engine).await;
     let (generation, digest) = run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     let capsule = root.join("retired-history-v1");
+    if corrupt {
+        let (manifest_path, original_manifest, manifest) = std::fs::read_dir(&capsule).unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                if path.extension().is_none_or(|ext| ext != "json") { return None; }
+                let bytes = std::fs::read(&path).unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                (value["id"] == parent.id().to_string()).then_some((path, bytes, value))
+            }).next().expect("real protected parent capsule manifest must exist");
+        let blob_path = capsule.join(format!("{}.blob", manifest["state"].as_str().unwrap()));
+        let original_blob = std::fs::read(&blob_path).unwrap();
+        for case in ["domain", "checksum"] {
+            let (path, original, damaged, expected) = if case == "domain" {
+                let mut value = manifest.clone();
+                value["domain"]["init"] = target.id().to_string().into();
+                (&manifest_path, &original_manifest, serde_json::to_vec(&value).unwrap(), "domain/schema mismatch")
+            } else {
+                let mut bytes = original_blob.clone();
+                bytes[0] ^= 1;
+                (&blob_path, &original_blob, bytes, "checksum mismatch")
+            };
+            std::fs::write(path, &damaged).unwrap();
+            let engine = open_engine(dir.path()).await;
+            let run = std::panic::AssertUnwindSafe(async {
+                let error = reopen_durable_mc_custody(engine.clone(), generation, exact.clone(), digest.clone())
+                    .await.err().expect("corrupt protected capsule must refuse private custody");
+                assert!(format!("{error:#}").contains(expected), "{case}: {error:#}");
+                assert_eq!(std::fs::read(path).unwrap(), damaged,
+                    "failed protected capsule authentication must not replace damaged evidence");
+                assert!(!engine.shard_states_keeper().allow_state_gc(parent.id()).unwrap(),
+                    "cold ledger must still protect dependencies after authentication refusal");
+            }).catch_unwind().await;
+            close(engine).await;
+            // Restore the exact physical backup even if an assertion failed.
+            std::fs::write(path, original).unwrap();
+            run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let engine = open_engine(dir.path()).await;
+            let run = std::panic::AssertUnwindSafe(async {
+                drop(reopen_durable_mc_custody(engine.clone(), generation, exact.clone(), digest.clone()).await.unwrap());
+            }).catch_unwind().await;
+            close(engine).await;
+            run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        }
+        return;
+    }
     let withdrawn = root.join("withdrawn-custody-capsule");
     std::fs::rename(&capsule, &withdrawn).unwrap();
     let engine = open_engine(dir.path()).await;
