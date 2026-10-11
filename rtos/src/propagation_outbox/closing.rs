@@ -36,6 +36,12 @@ impl ClosingRecord {
                     protocol: d.protocol,
                     carrier_version: d.carrier_version,
                     wire_profile: d.wire_profile,
+                    recovery_binding: Some(
+                        consensus_common::session_runtime::SessionRecoveryBinding {
+                            governing_masterchain: d.source_recovery_anchor.clone(),
+                            coordinates: d.source_recovery_coordinates.clone(),
+                        },
+                    ),
                     profile: d.profile.clone(),
                     session_id: d.session_id.clone(),
                 },
@@ -495,6 +501,15 @@ mod tests {
                 zerostate: id(0),
                 global_id: -1,
                 history_init: id(0),
+                source_recovery_anchor: id(0),
+                source_recovery_coordinates:
+                    consensus_common::session_runtime::SessionRecoveryCoordinates {
+                        shard: ShardIdent::masterchain(),
+                        catchain_seqno: 1,
+                        vertical_seqno: 0,
+                        last_key_block_seqno: 0,
+                        new_catchain_ids: false,
+                    },
                 protocol: e.record.protocol,
                 profile: e.record.profile.clone(),
                 session_id: e.record.session_id.clone(),
