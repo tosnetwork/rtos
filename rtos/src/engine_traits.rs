@@ -385,6 +385,18 @@ pub trait EngineOperations: Sync + Send {
             .await
     }
 
+    /// Authenticate both finality context and dissemination policy for recovery.
+    /// Persisted protocol/profile fields are claims until matched to this result.
+    async fn historical_pq_publication_context(
+        &self,
+        id: &BlockIdExt,
+        block: &rtos_block::Block,
+    ) -> Result<crate::block_proof::PqPublicationContext> {
+        crate::block_proof::MasterchainProofVerifier::default()
+            .pq_publication_context(self, id, block)
+            .await
+    }
+
     async fn load_actual_config_params(&self) -> Result<ConfigParams> {
         match self.load_last_applied_mc_block_id()? {
             Some(block_id) => {

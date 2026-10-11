@@ -100,6 +100,14 @@ impl EngineOperations for Engine {
         self.masterchain_proof_verifier.verify(self, proof).await.map(|_| ())
     }
 
+    async fn historical_pq_publication_context(
+        &self,
+        id: &BlockIdExt,
+        block: &rtos_block::Block,
+    ) -> Result<crate::block_proof::PqPublicationContext> {
+        self.masterchain_proof_verifier.pq_publication_context(self, id, block).await
+    }
+
     async fn historical_pq_broadcast_context(
         &self,
         id: &BlockIdExt,
