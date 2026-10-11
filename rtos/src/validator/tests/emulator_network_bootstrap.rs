@@ -674,6 +674,7 @@ struct BootstrapTestEngine {
     transport_config: Option<Arc<crate::config::NodeConfigHandler>>,
     fail_finality_sink_once: AtomicBool,
     fail_future_history_once: AtomicBool,
+    fail_future_history_until_released: AtomicBool,
     future_history_failure_seen: AtomicBool,
     namespace_registry: Arc<crate::validator::finality_recovery_owner::RecoveryRegistry>,
     normal_admission_gate: std::sync::Mutex<Option<(u32, tokio::sync::oneshot::Sender<Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>>, std::sync::mpsc::Receiver<()>)>>,
@@ -738,6 +739,7 @@ impl BootstrapTestEngine {
             transport_config: None,
             fail_finality_sink_once: AtomicBool::new(false),
             fail_future_history_once: AtomicBool::new(false),
+            fail_future_history_until_released: AtomicBool::new(false),
             future_history_failure_seen: AtomicBool::new(false),
             namespace_registry: Arc::new(crate::validator::finality_recovery_owner::RecoveryRegistry::default()),
             normal_admission_gate: std::sync::Mutex::new(None),
@@ -1054,7 +1056,8 @@ impl EngineOperations for BootstrapTestEngine {
         let shard = runtime.shard().clone();
         let cc = runtime.catchain_seqno();
         if runtime.shard().is_masterchain() && cc == 1
-            && self.fail_future_history_once.swap(false, Ordering::SeqCst) {
+            && (self.fail_future_history_until_released.load(Ordering::SeqCst)
+                || self.fail_future_history_once.swap(false, Ordering::SeqCst)) {
             self.future_history_failure_seen.store(true, Ordering::SeqCst);
             fail!("Injected transient future history preparation failure");
         }

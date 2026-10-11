@@ -44,25 +44,30 @@ fn configure(bootstrap: &mut EmulatorNetworkBootstrap, observer: &PrivateKey) ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_manager_creates_transport_only_observer_and_retires_real_groups() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(false, None).await
+    run_authenticated_manager_observer_lifecycle(false, None, false).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_manager_retries_transient_sink_initialization_on_same_group() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(true, None).await
+    run_authenticated_manager_observer_lifecycle(true, None, false).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_manager_retries_normal_loser_after_recovery_admission_on_same_state() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(false, Some(0)).await
+    run_authenticated_manager_observer_lifecycle(false, Some(0), false).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_manager_retries_existing_future_after_recovery_admission_on_same_state() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(false, Some(1)).await
+    run_authenticated_manager_observer_lifecycle(false, Some(1), false).await
 }
 
-async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, admission_race: Option<u32>) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authenticated_manager_retries_idle_future_without_namespace_notification() -> Result<()> {
+    run_authenticated_manager_observer_lifecycle(false, None, true).await
+}
+
+async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, admission_race: Option<u32>, idle_retry: bool) -> Result<()> {
     use adnl::{node::AdnlNode, DhtNode, OverlayNode, RldpNode, NetworkStack};
     let _ = env_logger::builder().is_test(true).try_init();
     eprintln!("manager lifecycle: begin admission_race={admission_race:?}");
@@ -118,6 +123,7 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
         anyhow::ensure!(manager.authenticated_transport_key(&wrong_binding, &[]).is_err(),
             "configured stable identity was accepted with wrong governing ADNL");
         engine.install_masterchain_state(state.clone(), None)?;
+        engine.fail_future_history_until_released.store(idle_retry, Ordering::SeqCst);
         let failed_group = if fail_initial_sink {
             engine.fail_finality_sink_once.store(true, Ordering::SeqCst);
             let error = manager.update_shards(state.clone()).await.err()
@@ -179,15 +185,66 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
             anyhow::ensure!(Arc::ptr_eq(&loser, groups.get(runtime.session_id()).unwrap()), "same-state retry replaced loser group");
             // Existing future groups must warm up again on this same MC state;
             // the original is_new gate leaves this exact Arc permanently idle.
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while !loser.snapshot().await.has_engine && std::time::Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            anyhow::ensure!(loser.snapshot().await.has_engine, "same-state retry did not warm existing session");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let handle = engine.load_block_handle(state.block_id())?.unwrap();
+                while !loser.snapshot().await.has_engine {
+                    let generation = engine.namespace_registry.generation();
+                    tokio::select! {
+                        _ = async {
+                            while !loser.snapshot().await.has_engine {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        } => break,
+                        next = manager.wait_next_mc_or_materialization_retry(&handle, generation) => { next?; }
+                    }
+                    manager.update_shards(state.clone()).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }).await.map_err(|e| error!("same-state warm retry: {e}"))??;
+            anyhow::ensure!(Arc::ptr_eq(&loser, manager.current_sessions.get(runtime.session_id())
+                .or_else(|| manager.future_sessions.get(runtime.session_id())).unwrap()), "warm retry replaced original Arc");
             anyhow::ensure!(engine.namespace_registry.reserve(&runtime)?.is_none(),
                 "recovery competed with the live normal session");
         } else {
             manager.update_shards(state.clone()).await?;
+        }
+        if idle_retry {
+            let handle = engine.load_block_handle(state.block_id())?.unwrap();
+            let target = manager.future_sessions.values().find(|g| {
+                g.authenticated_runtime().is_some_and(|r| r.shard().is_masterchain() && r.catchain_seqno() == 1)
+            }).ok_or_else(|| error!("idle target future absent"))?.clone();
+            // Let every unrelated namespace settle before sampling the generation.
+            tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    let mut ready = 0;
+                    for group in manager.current_sessions.values().chain(manager.future_sessions.values()) {
+                        if !Arc::ptr_eq(group, &target) && group.snapshot().await.has_engine { ready += 1; }
+                    }
+                    if ready == 3 && engine.future_history_failure_seen.load(Ordering::SeqCst) { break; }
+                    let generation = engine.namespace_registry.generation();
+                    manager.wait_next_mc_or_materialization_retry(&handle, generation).await?;
+                    manager.update_shards(state.clone()).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }).await.map_err(|e| error!("idle fixture settle: {e}"))??;
+            anyhow::ensure!(!target.snapshot().await.has_engine, "held failure unexpectedly materialized target");
+            let generation = engine.namespace_registry.generation();
+            // Pure fault release: no registry mutation, wakeup or new MC input.
+            engine.fail_future_history_until_released.store(false, Ordering::SeqCst);
+            let next = tokio::time::timeout(Duration::from_secs(3),
+                manager.wait_next_mc_or_materialization_retry(&handle, generation))
+                .await.map_err(|e| error!("idle materialization timer did not retry: {e}"))??
+                .ok_or_else(|| error!("idle manager unexpectedly stopped"))?;
+            anyhow::ensure!(next.id() == handle.id(), "idle retry changed MC");
+            anyhow::ensure!(engine.namespace_registry.generation() == generation,
+                "namespace notification masked idle timer evidence");
+            manager.update_shards(state.clone()).await?;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !target.snapshot().await.has_engine { tokio::time::sleep(Duration::from_millis(10)).await; }
+            }).await.map_err(|e| error!("idle future failed materialization after timer: {e}"))?;
+            let runtime = target.authenticated_runtime().unwrap();
+            anyhow::ensure!(Arc::ptr_eq(&target, manager.future_sessions.get(runtime.session_id()).unwrap()));
+            anyhow::ensure!(engine.namespace_registry.reserve(runtime)?.is_none(), "idle retry lost namespace ownership");
         }
         if let Some((id, original)) = failed_group {
             let retried = manager.current_sessions.get(&id).ok_or_else(|| error!("Failed group was lost during retry"))?;
