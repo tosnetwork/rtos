@@ -337,7 +337,7 @@ impl HistoryReadBudget {
         // No await: serialize header admission with graph charging so shared
         // request callers cannot each parse against the same remaining quota.
         let _parse = self.parsing.lock().map_err(|_| error!("History parsing poisoned"))?;
-        let reader = rtos_block::BocReader::new().set_max_cell_depth(self.limits.depth);
+        let mut reader = rtos_block::BocReader::new().set_max_cell_depth(self.limits.depth);
         let (header, _) = reader.read_header(&mut std::io::Cursor::new(bytes))?;
         let u = self.usage.lock().map_err(|_| error!("History accounting poisoned"))?;
         if header.cells_count > self.limits.cells.saturating_sub(u.cells + u.reserved_cells)
