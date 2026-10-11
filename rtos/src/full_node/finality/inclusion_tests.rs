@@ -85,6 +85,17 @@ impl Pair {
     }
 
     async fn with_gc_options(variant: &str, corrupt_signature: bool, v2: bool, history_gc: bool) -> Self {
+        Self::with_source_options(variant, corrupt_signature, v2, history_gc, false).await
+    }
+
+    async fn with_source_transport(variant: &str) -> Self {
+        Self::with_source_options(variant, false, true, false, true).await
+    }
+
+    async fn with_source_options(
+        variant: &str, corrupt_signature: bool, v2: bool, history_gc: bool,
+        source_transport: bool,
+    ) -> Self {
         let _ = env_logger::builder().is_test(true).try_init();
         let recovery: serde_json::Value = serde_json::from_str(if v2 {
             include_str!("testdata/v2-propagation-recovery.json")
@@ -131,13 +142,30 @@ impl Pair {
                 let file = dir.join("config.json");
                 let mut config: serde_json::Value =
                     serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-                let (key, _) =
+                let (key, transport) =
                     Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[seed; 32])
                         .unwrap();
                 for entry in config["adnl_node"]["keys"].as_array_mut().unwrap() {
                     if entry["tag"] == NodeNetwork::TAG_OVERLAY_KEY {
                         entry["data"] = serde_json::to_value(&key).unwrap();
                     }
+                }
+                if source_transport && seed == 0x60 {
+                    // The normal source factory requires an explicit stable
+                    // validator -> transport binding. Derive it from the actual
+                    // governing state and persist it for the cold-open phase.
+                    let governing = ShardStateUnsplit::construct_from_cell(mc_root.clone())
+                        .unwrap().read_custom().unwrap().unwrap().config;
+                    let validator = governing.validator_set().unwrap().list().iter()
+                        .find(|member| member.adnl_addr().is_ok_and(|id| id == *transport.id()))
+                        .expect("provider fixture key must belong to the governing committee")
+                        .validator_id().unwrap();
+                    config["validator_key_ring"][base64_encode(transport.id().data())] =
+                        serde_json::to_value(&key).unwrap();
+                    config["consensus_transport_bindings"] = serde_json::json!([{
+                        "validator_id": base64_encode(validator.as_slice()),
+                        "adnl_key_id": base64_encode(transport.id().data()),
+                    }]);
                 }
                 let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
                 config["ip_address_quic"] = socket.local_addr().unwrap().to_string().into();
