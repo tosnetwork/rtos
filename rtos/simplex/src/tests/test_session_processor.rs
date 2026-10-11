@@ -11636,3 +11636,35 @@ fn source_finality_controller_case(upgrade: bool) {
     assert!(sink.0.lock().unwrap().is_empty(), "duplicate retry must not stage again");
     drop(processor); db.close(None).unwrap();
 }
+
+#[test]
+fn source_finality_main_worker_release_keeps_only_accepted_node_work_owned() {
+    use crate::finality_delivery::tests::{fixture, HeldSink};
+    let temp = crate::authenticated_fixture::TestDirectory::new();
+    let (runtime, draft) = fixture();
+    let namespace = runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap();
+    let listener = RecordingListener::new();
+    let listener_dyn: Arc<dyn consensus_common::SessionListener + Send + Sync> = listener.clone();
+    let sink = Arc::new(HeldSink::default());
+    let callbacks = Arc::new(crate::session_callbacks::SessionCallbacks::new(runtime.session_id().clone(),
+        Arc::new(AtomicBool::new(false)), false, Arc::new(TestCallbackQueue), Arc::downgrade(&listener_dyn))
+        .with_delivery_sink(Some(sink.clone())));
+    let main_worker = callbacks.delivery_lifetime();
+    callbacks.initialize_delivery(runtime.clone(), std::path::Path::new(&namespace)).unwrap();
+    let old_handle = Arc::new(callbacks.with_listener(Arc::downgrade(&listener_dyn)));
+    assert!(!callbacks.poll_durable_finality(draft).unwrap());
+    drop(main_worker);
+    assert!(callbacks.initialize_delivery(runtime.clone(), std::path::Path::new(&namespace)).is_err(),
+        "accepted node work must retain source lock after main worker joins");
+    assert!(crate::finality_delivery::scan_pending_finality(temp.path()).unwrap().is_empty());
+    let (_, complete) = sink.0.lock().unwrap().pop().unwrap();
+    complete(Err(rtos_block::error!("Node WAL failed after source stop")));
+    let recoverable = crate::finality_delivery::scan_pending_finality(temp.path()).unwrap();
+    assert_eq!(recoverable.len(), 1); drop(recoverable);
+    let next_worker = callbacks.delivery_lifetime();
+    callbacks.initialize_delivery(runtime, std::path::Path::new(&namespace)).unwrap();
+    drop(next_worker);
+    // Both old source/listener handles remain alive; neither retains the lock.
+    assert_eq!(crate::finality_delivery::scan_pending_finality(temp.path()).unwrap().len(), 1);
+    drop(old_handle);
+}

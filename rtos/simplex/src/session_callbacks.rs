@@ -82,7 +82,17 @@ pub(crate) struct SessionCallbacks {
     /// re-checks `upgrade()` and silently drops when the listener is gone.
     listener: SessionListenerPtr,
     delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
-    source_delivery: std::sync::OnceLock<Arc<crate::finality_delivery::SourceFinalityDelivery>>,
+    source_delivery: Arc<std::sync::Mutex<Option<Arc<crate::finality_delivery::SourceFinalityDelivery>>>>,
+}
+
+/// The main worker owns the live source slot. Stopped SessionImpl/listener
+/// clones share this slot and cannot prolong its file lock. Accepted node work
+/// retains its own SourceFinalityDelivery Arc until completion.
+pub(crate) struct SourceDeliveryLifetime(
+    Arc<std::sync::Mutex<Option<Arc<crate::finality_delivery::SourceFinalityDelivery>>>>,
+);
+impl Drop for SourceDeliveryLifetime {
+    fn drop(&mut self) { self.0.lock().unwrap().take(); }
 }
 
 // ======================================================================
@@ -104,7 +114,7 @@ impl SessionCallbacks {
         task_queue: CallbackTaskQueuePtr,
         listener: SessionListenerPtr,
     ) -> Self {
-        Self { session_id, stop_flag, use_callback_thread, task_queue, listener, delivery_sink: None, source_delivery: std::sync::OnceLock::new() }
+        Self { session_id, stop_flag, use_callback_thread, task_queue, listener, delivery_sink: None, source_delivery: Arc::new(std::sync::Mutex::new(None)) }
     }
 
     pub(crate) fn with_delivery_sink(mut self, sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>) -> Self {
@@ -112,14 +122,21 @@ impl SessionCallbacks {
         self
     }
 
+    pub(crate) fn delivery_lifetime(&self) -> SourceDeliveryLifetime {
+        SourceDeliveryLifetime(self.source_delivery.clone())
+    }
+
     pub(crate) fn initialize_delivery(&self, runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>, namespace: &std::path::Path) -> rtos_block::Result<()> {
         let sink = self.delivery_sink.clone().ok_or_else(|| rtos_block::error!("Missing durable sink"))?;
         let source = crate::finality_delivery::SourceFinalityDelivery::open(runtime, namespace, sink)?;
-        self.source_delivery.set(source).map_err(|_| rtos_block::error!("Source delivery already initialized"))
+        let mut slot = self.source_delivery.lock().unwrap();
+        if slot.is_some() { return Err(rtos_block::error!("Source delivery already initialized")); }
+        *slot = Some(source);
+        Ok(())
     }
 
     pub(crate) fn poll_durable_finality(&self, draft: consensus_common::finality_delivery::FinalizedDeliveryDraft) -> rtos_block::Result<bool> {
-        let source = self.source_delivery.get().ok_or_else(|| rtos_block::error!("Source delivery not initialized"))?;
+        let source = self.source_delivery.lock().unwrap().clone().ok_or_else(|| rtos_block::error!("Source delivery not initialized"))?;
         if let Some((id, draft)) = source.poll(draft)? {
             let listener = self.listener.clone();
             self.invoke(move || { if let Some(listener) = listener.upgrade() { listener.on_durable_block_finalized(id, draft); } });
