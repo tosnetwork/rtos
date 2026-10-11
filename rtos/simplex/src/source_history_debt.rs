@@ -72,7 +72,7 @@ pub fn authenticate_source_history_debt(
         || runtime.wire_profile() != record.wire_profile
         || runtime.profile() != &record.profile
         || runtime.session_id() != &record.session_id
-        || runtime.local_adnl() != &record.local_adnl
+        || UInt256::from(*runtime.local_adnl().data()) != record.local_adnl
         || role != record.local_validator_index
     {
         fail!("Source history debt differs from authenticated runtime");
