@@ -158,8 +158,19 @@ pub fn compute_validator_list_id(
             shard.write_to(&mut serialized)?;
             hasher.update(serialized.data());
         }
-        for x in list {
-            hasher.update(x.compute_node_id_short()?.as_slice());
+        if list.iter().any(|member| member.pq_key().is_some()) {
+            // This is a Rust network-registry cache key, not the consensus session
+            // or wire validator-set hash. A stable validator ID alone would reuse
+            // stale transport/PQ material after rotation. Use the already verified
+            // target descriptor commitment (identity, key identity, weight, ADNL).
+            rtos_block::validate_validator_list(list)?;
+            hasher.update(b"rtos-validator-list-pq-v1");
+            hasher.update(ValidatorSet::hash_preimage(list, 0)?);
+        } else {
+            // Preserve historical classical registry IDs byte for byte.
+            for member in list {
+                hasher.update(member.compute_node_id_short()?.as_slice());
+            }
         }
         let hash: [u8; 32] = hasher.finalize();
         Ok(Some(hash.into()))

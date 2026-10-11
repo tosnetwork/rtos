@@ -45,13 +45,57 @@ pub(crate) struct SigningBinding {
     pub expire_at: u64,
     pub shard_workchain: i32,
     pub shard_prefix: u64,
+    /// Carrier envelope version. This retains the schema-2 meaning.
     pub protocol: u32,
+    /// Schema 3 independently binds the typed Param30 protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simplex_protocol: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_adnl: Option<[u8; 32]>,
     pub local_index: u32,
     pub validator_count: u32,
     pub slots_per_window: u32,
 }
 
 impl SigningBinding {
+    /// Construct schema 3 solely from an authenticated runtime. Provisioning and
+    /// custody remain separate capabilities; this does not enable a signer.
+    pub(crate) fn from_authenticated_runtime(
+        runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+        generation: u64,
+        expire_at: u64,
+    ) -> Result<Self> {
+        let consensus_common::session_runtime::LocalRole::Validator(index) = runtime.local_role() else {
+            fail!("Observer cannot own a signing journal");
+        };
+        let member = runtime.committee().get(index as usize)
+            .ok_or_else(|| error!("Runtime validator index is outside committee"))?;
+        let identity = ValidatorIdentity::from_descriptor(member)?;
+        let key = identity.pq_key().ok_or_else(|| error!("Authenticated journal requires PQ key"))?;
+        let pin = runtime.pin();
+        Ok(Self {
+            schema: 3, wire_profile: runtime.wire_profile() as u8,
+            global_id: pin.global_id, zerostate_workchain: pin.zerostate.shard().workchain_id(),
+            zerostate_root: *pin.zerostate.root_hash().as_array(), zerostate_file: *pin.zerostate.file_hash().as_array(),
+            profile: *runtime.profile().as_array(), session: *runtime.session_id().as_array(),
+            committee: *runtime.committee_digest()?.as_array(), validator: *identity.id().data(),
+            algorithm: u32::from(key.algorithm_id), key_id: *key.key_id.as_array(), public_key: key.public_key.clone(),
+            generation, expire_at, shard_workchain: runtime.shard().workchain_id(),
+            shard_prefix: runtime.shard().shard_prefix_with_tag(), protocol: runtime.carrier_version(),
+            simplex_protocol: Some(runtime.protocol().version()), local_adnl: Some(*runtime.local_adnl().data()),
+            local_index: index, validator_count: runtime.committee().len().try_into()?,
+            slots_per_window: runtime.slots_per_leader_window(),
+        })
+    }
+
+    fn validate_schema(&self) -> Result<()> {
+        match (self.schema, self.simplex_protocol, self.local_adnl) {
+            (2, None, None) => Ok(()),
+            (3, Some(protocol), Some(adnl)) if protocol <= 2 && adnl != [0; 32] => Ok(()),
+            _ => fail!("unsupported or inconsistent signing binding schema"),
+        }
+    }
+
     fn wire(&self) -> Result<rtos_api::WireProfile> {
         match self.wire_profile {
             0 => Ok(rtos_api::WireProfile::Legacy),
@@ -127,9 +171,10 @@ fn key(decision: &Decision) -> Result<Vec<u8>> {
 pub(crate) fn validate_record(key_bytes: &[u8], value: &[u8]) -> Result<()> {
     if key_bytes == HEADER {
         let header: Header = decode(value)?;
-        if header.binding.schema != 2 {
-            fail!("unsupported signing header schema");
-        }
+        header
+            .binding
+            .validate_schema()
+            .map_err(|e| error!("unsupported signing header schema: {e}"))?;
         header.binding.wire()?;
     } else {
         let record: Record = decode(value)?;
@@ -254,6 +299,30 @@ impl Signer {
         }))
     }
 }
+/// Isolated test capability: compiled out of production and never sourced from
+/// node configuration. It exercises the actual session worker/journal/custody path.
+#[cfg(test)]
+pub(crate) struct TestSessionSigner {
+    pub store: std::sync::Arc<rtos_pq_consensus::ConsensusKeyStore>,
+    pub owner_root: std::path::PathBuf,
+    pub generation: u64,
+    pub initialize: bool,
+}
+#[cfg(test)]
+impl TestSessionSigner {
+    pub(crate) fn open(self, runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+        db: SimplexDbPtr) -> Result<std::sync::Arc<SigningCoordinator>> {
+        let binding = SigningBinding::from_authenticated_runtime(runtime, self.generation, u64::from(self.store.expire_at()))?;
+        let member = &runtime.committee()[binding.local_index as usize];
+        let stable = member.validator_id()?;
+        let mut custody = rtos_pq_consensus::PqConsensusCustody::default();
+        custody.install(stable.clone(), self.store.clone(), 0, self.store.expire_at())?;
+        let signer = Signer::from_test_custody(&custody, &stable, member)?;
+        Ok(std::sync::Arc::new(SigningCoordinator::open(db, binding,
+            ValidatorIdentity::from_descriptor(member)?, &self.owner_root, self.initialize, signer)?))
+    }
+}
+
 struct State {
     header: Header,
     records: BTreeMap<Vec<u8>, Record>,
@@ -289,9 +358,7 @@ impl SigningCoordinator {
         signer: Signer,
     ) -> Result<Self> {
         let pq = identity.pq_key().ok_or_else(|| error!("journal requires PQ identity"))?;
-        if binding.schema != 2 {
-            fail!("unsupported signing binding schema");
-        }
+        binding.validate_schema()?;
         if binding.protocol > 1
             || binding.generation == 0
             || binding.slots_per_window == 0
@@ -399,13 +466,27 @@ impl SigningCoordinator {
         &self,
         description: &crate::session_description::SessionDescription,
     ) -> Result<()> {
+        description.require_validator_index()?;
         let state = self.state.lock().map_err(|_| error!("journal lock poisoned"))?;
         let b = &state.header.binding;
+        if let Some(runtime) = description.authenticated_runtime() {
+            let expected = SigningBinding::from_authenticated_runtime(runtime, b.generation, b.expire_at)?;
+            if b != &expected {
+                fail!("Signing journal differs from authenticated runtime domain");
+            }
+        }
         if b.session != *description.get_session_id().as_array()
             || b.committee != *description.committee_digest().as_array()
             || b.validator
                 != *description.get_source_public_key_hash(description.get_self_idx()).data()
             || b.protocol != description.opts().proto_version
+            || match b.simplex_protocol {
+                Some(protocol) => protocol != description.opts().protocol.version(),
+                None => description.opts().protocol.version() > 1,
+            }
+            || b.local_adnl.is_some_and(|adnl| {
+                adnl != *description.get_source_adnl_id(description.get_self_idx()).data()
+            })
             || b.wire()? != description.opts().wire_profile
             || b.local_index != description.get_self_idx().value()
             || b.validator_count as usize != description.get_total_nodes()

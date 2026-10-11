@@ -53,6 +53,8 @@ pub(crate) fn binding(d: &SessionDescription) -> SigningBinding {
         shard_workchain: -1,
         shard_prefix: 0x8000000000000000,
         protocol: 0,
+        simplex_protocol: None,
+        local_adnl: None,
         local_index: 1,
         validator_count: 2,
         slots_per_window: 1,
@@ -994,4 +996,123 @@ fn custody_pending_intent_is_a_durable_conflict_tombstone() {
         assert!(h.coordinator.vote(&other).is_err());
         assert_eq!(h.signature_count(), 1);
     }
+}
+
+#[test]
+fn schema3_binds_typed_and_carrier_domains_without_upgrading_schema2() {
+    let description = description();
+    let identity = description.get_source_public_key(description.get_self_idx()).clone();
+    let legacy = binding(&description);
+    let legacy_bytes = encode(&legacy).unwrap();
+    assert!(!String::from_utf8(legacy_bytes.clone()).unwrap().contains("simplex_protocol"));
+    assert_eq!(encode(&decode::<SigningBinding>(&legacy_bytes).unwrap()).unwrap(), legacy_bytes);
+    let root = std::env::temp_dir().join(format!("rtos-schema3-{}", UInt256::rand()));
+    std::fs::create_dir(&root).unwrap();
+    let db = crate::database::SimplexDb::open(root.join("db"), "schema3").unwrap();
+    let mut v3 = legacy.clone();
+    v3.schema = 3;
+    v3.simplex_protocol = Some(description.opts().protocol.version());
+    v3.local_adnl = Some(*description.get_source_adnl_id(description.get_self_idx()).data());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let open = |binding, initialize| {
+        SigningCoordinator::open(
+            db.clone(),
+            binding,
+            identity.clone(),
+            &root,
+            initialize,
+            signer(calls.clone()),
+        )
+    };
+    let coordinator = open(v3.clone(), true).unwrap();
+    coordinator.check_session(&description).unwrap();
+    coordinator.vote(&vote("notarize")).unwrap();
+    drop(coordinator);
+    let owner_path = root.join(format!("{}.signer", hex::encode(v3.validator)));
+    let owner_before = std::fs::read(&owner_path).unwrap();
+    let before = db.storage.get_by_prefix(Vec::new(), None).wait().unwrap();
+    for mode in 0..6 {
+        let mut mismatch = v3.clone();
+        match mode {
+            0 => mismatch.simplex_protocol = Some(1),
+            1 => mismatch.protocol = 1,
+            2 => mismatch.local_adnl = Some([88; 32]),
+            3 => mismatch.simplex_protocol = None,
+            4 => mismatch = legacy.clone(),
+            _ => mismatch.generation += 1,
+        }
+        assert!(open(mismatch, false).is_err(), "mode {mode}");
+        assert_eq!(std::fs::read(&owner_path).unwrap(), owner_before);
+        assert_eq!(db.storage.get_by_prefix(Vec::new(), None).wait().unwrap(), before);
+    }
+    let coordinator = open(v3, false).unwrap();
+    coordinator.check_session(&description).unwrap();
+    coordinator.vote(&vote("notarize")).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "recovery must reuse exact bytes");
+    drop(coordinator);
+    db.close(None).unwrap();
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn authenticated_schema3_native_signing_and_exact_recovery_bind_runtime() {
+    let root = crate::authenticated_fixture::TestDirectory::new();
+    let store = Arc::new(rtos_pq_consensus::ConsensusKeyStore::from_seed(&[0x96; 32], 0).unwrap());
+    let (mut nodes, keys) = f::members();
+    nodes[1] = crate::SimplexSessionNode::from_descriptor(&custody_descriptor(&store)).unwrap();
+    let members = nodes.iter().map(|node| node.descriptor.clone().unwrap()).collect();
+    let (runtime, transport, options) = crate::authenticated_fixture::runtime_with_members(members, keys[1].clone());
+    let make_description = || Arc::new(SessionDescription::new_with_runtime(
+        &options, runtime.session_id().clone(), 42, &nodes, transport.clone(), runtime.shard(),
+        SystemTime::now(), None, Some(&runtime),
+    ).unwrap().bind_pq_session(runtime.catchain_seqno()).unwrap());
+    let description = make_description();
+    let binding = SigningBinding::from_authenticated_runtime(&runtime, 1, 0).unwrap();
+    assert_eq!((binding.simplex_protocol, binding.protocol), (Some(2), runtime.carrier_version()));
+    let (observer, _, _) = crate::authenticated_fixture::runtime(false);
+    assert!(SigningBinding::from_authenticated_runtime(&observer, 1, 0).is_err());
+    let db = crate::database::SimplexDb::open(root.path().join("db"), "v2-journal").unwrap();
+    let identity = description.get_source_public_key(description.get_self_idx()).clone();
+    let coordinator = Arc::new(SigningCoordinator::open(db.clone(), binding.clone(), identity.clone(),
+        root.path(), true, custody_backend(&description, store.clone())).unwrap());
+    // Equal session/committee is insufficient: the attached authenticated runtime
+    // also pins the full network anchor and selected Param30 profile.
+    for mode in 0..5 {
+        {
+            let mut state = coordinator.state.lock().unwrap();
+            match mode {
+                0 => state.header.binding.global_id += 1,
+                1 => state.header.binding.zerostate_root[0] ^= 1,
+                2 => state.header.binding.zerostate_file[0] ^= 1,
+                3 => state.header.binding.profile[0] ^= 1,
+                _ => { state.header.binding.schema = 2; state.header.binding.simplex_protocol = None; state.header.binding.local_adnl = None; }
+            }
+        }
+        assert!(coordinator.check_session(&description).is_err(), "domain {mode}");
+        coordinator.state.lock().unwrap().header.binding = binding.clone();
+    }
+    description.install_test_coordinator(coordinator.clone()).unwrap();
+    let original = description.sign_own_vote(&vote("skip")).unwrap();
+    let wire = options.wire_profile.serialize(&original.into_boxed()).unwrap();
+    assert_eq!(store.consensus_signatures_produced(), 1);
+    drop(description);
+    drop(coordinator);
+    let before = db.storage.get_by_prefix(Vec::new(), None).wait().unwrap();
+    let description = make_description();
+    let recovered = Arc::new(SigningCoordinator::open(db.clone(), binding.clone(), identity.clone(),
+        root.path(), false, custody_backend(&description, store.clone())).unwrap());
+    description.install_test_coordinator(recovered.clone()).unwrap();
+    assert_eq!(options.wire_profile.serialize(&description.sign_own_vote(&vote("skip")).unwrap().into_boxed()).unwrap(), wire);
+    assert_eq!(store.consensus_signatures_produced(), 1, "recovery must not invoke native signer again");
+    drop(description);
+    drop(recovered);
+    for mode in 0..3 {
+        let mut mismatch = binding.clone();
+        match mode { 0 => mismatch.simplex_protocol = Some(1), 1 => mismatch.protocol ^= 1, _ => mismatch.local_adnl = Some([77; 32]) }
+        assert!(SigningCoordinator::open(db.clone(), mismatch, identity.clone(), root.path(), false,
+            custody_backend(&make_description(), store.clone())).is_err());
+        assert_eq!(db.storage.get_by_prefix(Vec::new(), None).wait().unwrap(), before);
+    }
+    db.close(None).unwrap();
 }

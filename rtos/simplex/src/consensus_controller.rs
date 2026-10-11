@@ -711,7 +711,7 @@ impl ConsensusController {
 
         // Trace: record the verified incoming vote for other validators (skip our own loopback).
         if let Some(tc) = &self.trace_collector {
-            if source_idx != self.description.get_self_idx() {
+            if Some(source_idx) != self.description.local_validator_index() {
                 tc.record_vote_received(
                     self.session_id(),
                     source_idx.value() as i32,
@@ -891,10 +891,10 @@ impl ConsensusController {
     pub(crate) fn on_certificate(
         &mut self,
         backend: &mut dyn ConsensusBackend,
-        source_idx: u32,
+        source_idx: impl Into<Option<u32>>,
         tl_certificate: Certificate,
     ) -> bool {
-        let source_idx = ValidatorIndex::new(source_idx);
+        let source_idx = source_idx.into().map(ValidatorIndex::new);
 
         // Avoid logging the full TL certificate (includes signature bytes) on the hot path.
         // It is extremely verbose and materially slows down trace-enabled test runs.
@@ -906,7 +906,7 @@ impl ConsensusController {
                         if *v.id.slot() < 0 {
                             log::warn!(
                                 "Session {} on_certificate: REJECTED - \
-                                negative slot {} in NotarizeVote from source_idx={source_idx}",
+                                negative slot {} in NotarizeVote from source_idx={source_idx:?}",
                                 self.session_id().to_hex_string(),
                                 v.id.slot()
                             );
@@ -920,7 +920,7 @@ impl ConsensusController {
                         if *v.id.slot() < 0 {
                             log::warn!(
                                 "Session {} on_certificate: REJECTED - \
-                                negative slot {} in FinalizeVote from source_idx={source_idx}",
+                                negative slot {} in FinalizeVote from source_idx={source_idx:?}",
                                 self.session_id().to_hex_string(),
                                 v.id.slot()
                             );
@@ -934,7 +934,7 @@ impl ConsensusController {
                         if v.slot < 0 {
                             log::warn!(
                                 "Session {} on_certificate: REJECTED - \
-                                negative slot {} in SkipVote from source_idx={source_idx}",
+                                negative slot {} in SkipVote from source_idx={source_idx:?}",
                                 self.session_id().to_hex_string(),
                                 v.slot
                             );
@@ -951,7 +951,7 @@ impl ConsensusController {
             .map(|h| hex::encode(&h.as_slice()[..4]))
             .unwrap_or_else(|| "-".to_string());
         log::debug!(
-            "Session {} on_certificate: source_idx={} kind={} slot={} hash={} sigs={}",
+            "Session {} on_certificate: source_idx={:?} kind={} slot={} hash={} sigs={}",
             self.session_id().to_hex_string(),
             source_idx,
             tl_kind,
@@ -961,9 +961,9 @@ impl ConsensusController {
         );
 
         // Validate source index - must be a known validator in the session
-        if !source_idx.is_valid(self.description.get_total_nodes()) {
+        if source_idx.is_some_and(|index| !index.is_valid(self.description.get_total_nodes())) {
             log::warn!(
-                "Session {} on_certificate: REJECTED - invalid source_idx={} (max={})",
+                "Session {} on_certificate: REJECTED - invalid source_idx={:?} (max={})",
                 self.session_id().to_hex_string(),
                 source_idx,
                 self.description.get_total_nodes()
@@ -981,7 +981,7 @@ impl ConsensusController {
             log::trace!(
                 "Session {} on_certificate: dropping old certificate slot={tl_slot} \
                 (< first_non_finalized={fsm_first_non_finalized_slot}) kind={tl_kind} \
-                from source_idx={source_idx}",
+                from source_idx={source_idx:?}",
                 &self.session_id().to_hex_string()[..8],
             );
             return false;
@@ -1003,7 +1003,7 @@ impl ConsensusController {
                 self.telemetry.cert_verify_fail_counter.increment(1);
                 self.telemetry.cert_verify_fails_total.fetch_add(1, Ordering::Relaxed);
                 log::warn!(
-                    "Session {} on_certificate: REJECTED from source_idx={}: {}",
+                    "Session {} on_certificate: REJECTED from source_idx={:?}: {}",
                     self.session_id().to_hex_string(),
                     source_idx,
                     e
@@ -1011,7 +1011,9 @@ impl ConsensusController {
                 // C++ parity (`pool.cpp`): bad-signature certificates trigger a
                 // temporary peer ban so repeated forged traffic cannot starve
                 // the receiver/processor pipeline.
-                backend.ban_source_for_bad_signature(source_idx.value());
+                if let Some(index) = source_idx {
+                    backend.ban_source_for_bad_signature(index.value());
+                }
                 return false;
             }
         };
@@ -1032,7 +1034,7 @@ impl ConsensusController {
             if !backend.candidate_book().has_real_body(&candidate_id) {
                 log::debug!(
                     "Session {} on_certificate: {tl_kind} cert for missing candidate \
-                    slot={tl_slot} hash={} from source_idx={source_idx}, requesting",
+                    slot={tl_slot} hash={} from source_idx={source_idx:?}, requesting",
                     &self.session_id().to_hex_string()[..8],
                     &hash.to_hex_string()[..8]
                 );
@@ -1494,7 +1496,7 @@ impl ConsensusController {
             let observed_flags = CandidateObservedFlags {
                 body_present: true,
                 parent_ready: true,
-                local_collated: source_idx == self.description.get_self_idx(),
+                local_collated: Some(source_idx) == self.description.local_validator_index(),
             };
             self.callbacks.notify_candidate_observed(block_id, data, collated_data, observed_flags);
         }

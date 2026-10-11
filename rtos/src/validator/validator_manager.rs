@@ -125,7 +125,7 @@ fn build_runtime_simplex_session_options(
     let protocol = consensus_common::simplex_protocol::SimplexProtocol::try_from(u32::from(
         cfg.protocol_version,
     ))?;
-    protocol.admits_runtime()?;
+    // V2 is admitted only through the authenticated factory selected below.
     let np = &cfg.noncritical_params;
     Ok(SimplexSessionOptions {
         wire_profile: rtos_api::WireProfile::T0,
@@ -941,6 +941,52 @@ impl ValidatorManagerImpl {
         find_local_validator_key(validators, self.validator_list_status.get_local_keys())
     }
 
+    /// Resolve transport ownership independently of a PQ signing capability.
+    /// Every candidate identity comes from this authenticated governing snapshot;
+    /// only a key actually loaded by the engine may be selected.
+    fn authenticated_transport_key(
+        &self,
+        config: &rtos_block::ConfigParams,
+        preferred: &[ValidatorDescr],
+    ) -> Result<Option<PublicKey>> {
+        let sets =
+            [config.validator_set()?, config.prev_validator_set()?, config.next_validator_set()?];
+        let bindings = self.engine.consensus_transport_bindings()?;
+        for binding in &bindings {
+            let known = sets.iter().flat_map(|set| set.list())
+                .filter(|member| member.validator_id().is_ok_and(|id| id == binding.validator_id))
+                .collect::<Vec<_>>();
+            if !known.is_empty() && !known.iter().any(|member|
+                member.adnl_addr().is_ok_and(|id| id == binding.adnl_key_id)) {
+                fail!("Configured consensus transport differs from governing descriptor");
+            }
+        }
+        for member in preferred.iter().chain(sets.iter().flat_map(|set| set.list())) {
+            let id = member.adnl_addr()?;
+            let stable = member.validator_id()?;
+            if !bindings.iter().any(|binding| binding.validator_id == stable && binding.adnl_key_id == id) {
+                continue;
+            }
+            if let Some(key) = self.engine.adnl_key_by_id(&id) {
+                if key.id() != &id {
+                    fail!("Engine returned a transport key with a different identity");
+                }
+                return Ok(Some(key));
+            }
+        }
+        Ok(None)
+    }
+
+    fn has_authenticated_v2_transport(&self, config: &rtos_block::ConfigParams) -> Result<bool> {
+        let mut enabled = false;
+        for masterchain in [false, true] {
+            if let Some(selected) = config.selected_simplex_config(masterchain)? {
+                enabled |= selected.config.protocol_version == 2;
+            }
+        }
+        Ok(enabled && self.authenticated_transport_key(config, &[])?.is_some())
+    }
+
     /// Try to spawn a `BlockSyncObserver` for a shard we are not validating
     ///
     /// Requires `enable_observers=true` (caller has already checked via `Some(bs_params)`)
@@ -1244,6 +1290,12 @@ impl ValidatorManagerImpl {
     /// Mirrors C++ group destruction logic in `update_shards()` (`manager.cpp`).
     fn retire_group(&mut self, id: UInt256, group: Arc<ValidatorGroup>, destroy: bool) {
         self.destroyed_sessions.insert(id.clone());
+        self.retire_group_generation(id, group, destroy);
+    }
+
+    // Replacing an authenticated admission keeps the session ID live. Only the
+    // old instance is retired; the ordinary destruction blacklist is unchanged.
+    fn retire_group_generation(&mut self, id: UInt256, group: Arc<ValidatorGroup>, destroy: bool) {
         if !self.retiring_groups.iter().any(|(_, old, _)| Arc::ptr_eq(old, &group)) {
             let consensus = if group.is_simplex() { "simplex" } else { "catchain" };
             self.retiring_groups.push((id, group, destroy));
@@ -1734,17 +1786,15 @@ impl ValidatorManagerImpl {
         master_cc_range: &RangeInclusive<u32>,
         last_masterchain_block: &BlockIdExt,
     ) -> Result<()> {
+        let full_validator_set = mc_state_extra.config.validator_set()?;
         let validator_list_id = match self.validator_list_status.curr.as_ref() {
             Some(list_id) => list_id.clone(),
-            None => {
-                log::trace!(
-                    target: "validator_manager",
-                    "Skipping current-session start: local node is not in current validator list"
-                );
-                return Ok(());
+            None if self.has_authenticated_v2_transport(mc_state.config_params()?)? => {
+                compute_validator_list_id(full_validator_set.list(), None)?
+                    .ok_or_else(|| error!("Authenticated current set is empty"))?
             }
+            None => return Ok(()),
         };
-        let full_validator_set = mc_state_extra.config.validator_set()?;
 
         let catchain_config = self.read_catchain_config(mc_state)?;
 
@@ -1878,7 +1928,62 @@ impl ValidatorManagerImpl {
                 }
             };
 
-            if let Some(local_id) = &local_id_option {
+            let authenticated = if consensus_options.as_simplex().is_some_and(|options|
+                options.protocol == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree)
+            {
+                self.authenticated_transport_key(mc_state.config_params()?, &subset.validators)?
+                    .map(|key| {
+                        use consensus_common::session_runtime::{AuthenticatedSessionRuntime, SessionNetworkPin};
+                        let runtime = AuthenticatedSessionRuntime::from_authenticated_config(
+                            SessionNetworkPin {
+                                global_id: mc_state.state()?.global_id(),
+                                zerostate: self.engine.zerostate_id()?.clone(),
+                            },
+                            mc_state.config_params()?,
+                            rtos_api::session_identity::SessionCoordinates {
+                                shard: &ident,
+                                catchain_seqno: cc_seqno,
+                                vertical_seqno: max_vertical_seqno,
+                                last_key_block_seqno: keyblock_seqno,
+                                new_catchain_ids: false,
+                            },
+                            vsubset.list().to_vec(),
+                            key.id().clone(),
+                        )?;
+                        Ok::<_, anyhow::Error>((key, Arc::new(runtime)))
+                    }).transpose()?
+            } else { None };
+            if consensus_options.as_simplex().is_some_and(|options|
+                options.protocol == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree)
+                && authenticated.is_none() {
+                // No transport ownership, and no fallback to a PQ signing identity.
+                continue;
+            }
+            if let Some((_, runtime)) = &authenticated {
+                use consensus_common::session_runtime::LocalRole;
+                if matches!(runtime.local_role(), LocalRole::Validator(_)) {
+                    our_current_shards.insert(ident.clone(), vsubset.clone());
+                } else {
+                    our_current_shards.remove(&ident);
+                }
+                // Admission changes can happen without changing the committee/session
+                // hash. Drain the previous generation before publishing its replacement.
+                let incompatible = |group: &Arc<ValidatorGroup>| {
+                    !group.authenticated_runtime().is_some_and(|old| old.same_admission(runtime))
+                };
+                if self.current_sessions.get(&session_id).is_some_and(incompatible) {
+                    let old = self.current_sessions.remove(&session_id).unwrap();
+                    self.retire_group_generation(session_id.clone(), old, false);
+                }
+                if self.future_sessions.get(&session_id).is_some_and(incompatible) {
+                    let old = self.future_sessions.remove(&session_id).unwrap();
+                    self.retire_group_generation(session_id.clone(), old, false);
+                }
+                self.drain_retiring().await?;
+            }
+            let session_key =
+                authenticated.as_ref().map(|(key, _)| key).or(local_id_option.as_ref());
+            if let Some(local_id) = session_key {
                 self.retire_observer(&session_id);
                 self.drain_retiring().await?;
                 log::debug!(
@@ -1938,7 +2043,7 @@ impl ValidatorManagerImpl {
                             "consensus" => consensus_name
                         )
                         .increment(1);
-                        Arc::new(ValidatorGroup::new(
+                        let group = ValidatorGroup::new(
                             general_session_info.clone(),
                             local_id.clone(),
                             session_id.clone(),
@@ -1949,7 +2054,13 @@ impl ValidatorManagerImpl {
                             engine,
                             allow_unsafe_self_blocks_resync,
                             block_sync_overlay_params.clone(),
-                        ))
+                        );
+                        Arc::new(match &authenticated {
+                            Some((_, runtime)) => {
+                                group.with_authenticated_runtime(runtime.clone())?
+                            }
+                            None => group,
+                        })
                     }
                 };
                 // Promotion removed the future owner. Register the selected
@@ -2068,7 +2179,9 @@ impl ValidatorManagerImpl {
             mc_state.block_id().seq_no, master_cc_seqno,
             self.current_sessions.len(), self.future_sessions.len());
 
-        if !self.update_validator_lists(&mc_state).await? {
+        let has_validator_key = self.update_validator_lists(&mc_state).await?;
+        let has_v2_transport = self.has_authenticated_v2_transport(mc_state.config_params()?)?;
+        if !has_validator_key && !has_v2_transport {
             log::info!(target: "validator_manager",
                 "VALIDATION_STATUS: not a validator (not in prev/curr/next set), disabling");
             self.disable_validation(true).await?;
@@ -2081,9 +2194,19 @@ impl ValidatorManagerImpl {
         let observer_only =
             self.validator_list_status.curr.is_none() && self.validator_list_status.next.is_none();
         if observer_only {
-            log::info!(target: "validator_manager",
-                "VALIDATION_STATUS: prev-only (observer mode), validator groups disabled");
-            self.disable_validation(true).await?;
+            if has_v2_transport {
+                // Observer sessions still own their runtime and receive state, but
+                // must not advertise validator eligibility or acquire signer rights.
+                self.engine.set_will_validate(false);
+                self.engine.set_validation_status(ValidationStatus::Disabled);
+                if !self.sync_complete {
+                    self.sync_complete = self.engine.check_sync().await?;
+                }
+            } else {
+                log::info!(target: "validator_manager",
+                    "VALIDATION_STATUS: prev-only (observer mode), validator groups disabled");
+                self.disable_validation(true).await?;
+            }
         }
 
         let last_masterchain_block = mc_state.block_id();
@@ -2287,7 +2410,7 @@ impl ValidatorManagerImpl {
         // Iterate over shards and start all missing sessions
         log::trace!(target: "validator_manager", "Starting missing sessions");
         let validation_status = self.engine.validation_status();
-        if validation_status.allows_validate() {
+        if validation_status.allows_validate() || has_v2_transport {
             self.start_sessions(
                 new_shards,
                 &mut our_current_shards,
@@ -2313,8 +2436,8 @@ impl ValidatorManagerImpl {
                 mc_validators.append(&mut wc.validators.clone());
             }
 
-            if let Some(local_id) = self.find_us_for_list(&wc.validators, next_val_list_id) {
-                owned_future_shards += 1;
+            let legacy_local_key = self.find_us_for_list(&wc.validators, next_val_list_id);
+            if legacy_local_key.is_some() || has_v2_transport {
                 let max_vertical_seqno = self.engine.hardforks().len() as u32;
                 if self.is_accelerated_consensus_enabled_for_shard(mc_state_extra, &ident) {
                     fail!("accelerated consensus has not been admitted for the target protocol");
@@ -2371,6 +2494,49 @@ impl ValidatorManagerImpl {
                     }
                 };
 
+                let authenticated = if consensus_options.as_simplex().is_some_and(|options|
+                    options.protocol == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree) {
+                    let Some(key) = self.authenticated_transport_key(mc_state.config_params()?, &wc.validators)? else { continue; };
+                    use consensus_common::session_runtime::{AuthenticatedSessionRuntime, SessionNetworkPin};
+                    let runtime = Arc::new(AuthenticatedSessionRuntime::from_authenticated_config(
+                        SessionNetworkPin { global_id: mc_state.state()?.global_id(), zerostate: self.engine.zerostate_id()?.clone() },
+                        mc_state.config_params()?,
+                        rtos_api::session_identity::SessionCoordinates { shard: ident, catchain_seqno: *next_cc_seqno,
+                            vertical_seqno: max_vertical_seqno, last_key_block_seqno: keyblock_seqno, new_catchain_ids: false },
+                        vsubset.list().to_vec(), key.id().clone(),
+                    )?);
+                    Some((key, runtime))
+                } else { None };
+                let local_id = match &authenticated {
+                    Some((key, runtime)) => {
+                        if matches!(
+                            runtime.local_role(),
+                            consensus_common::session_runtime::LocalRole::Validator(_)
+                        ) {
+                            owned_future_shards += 1;
+                        }
+                        key.clone()
+                    }
+                    None => match legacy_local_key {
+                        Some(key) => {
+                            owned_future_shards += 1;
+                            key
+                        }
+                        None => continue,
+                    },
+                };
+                if let Some((_, runtime)) = &authenticated {
+                    if self.future_sessions.get(&session_id).is_some_and(|group| {
+                        !group
+                            .authenticated_runtime()
+                            .is_some_and(|old| old.same_admission(runtime))
+                    }) {
+                        let old = self.future_sessions.remove(&session_id).unwrap();
+                        self.retire_group_generation(session_id.clone(), old, false);
+                        self.drain_retiring().await?;
+                    }
+                }
+
                 if self.current_sessions.contains_key(&session_id) {
                     log::trace!(
                         target: "validator_manager",
@@ -2381,39 +2547,43 @@ impl ValidatorManagerImpl {
                 }
 
                 let is_new = !self.future_sessions.contains_key(&session_id);
-                let group = self
-                    .future_sessions
-                    .entry(session_id.clone())
-                    .or_insert_with(|| {
-                        let consensus_name = match &consensus_options {
-                            ConsensusOptions::Simplex(_) => "simplex",
-                            #[cfg(test)]
-                            ConsensusOptions::Emulator(_) => "emulator",
-                            ConsensusOptions::Catchain(_) => "catchain",
-                        };
-                        log::info!(target: "validator_manager",
+                let group = if let Some(group) = self.future_sessions.get(&session_id) {
+                    group.clone()
+                } else {
+                    let consensus_name = match &consensus_options {
+                        ConsensusOptions::Simplex(_) => "simplex",
+                        #[cfg(test)]
+                        ConsensusOptions::Emulator(_) => "emulator",
+                        ConsensusOptions::Catchain(_) => "catchain",
+                    };
+                    log::info!(target: "validator_manager",
                             "SESSION_LIFECYCLE: create_future shard={} cc_seqno={} \
                             session_id={:x} consensus={}",
                             ident, next_cc_seqno, session_id, consensus_name);
-                        metrics::counter!(
-                            "rtos_node_validator_session_created_total",
-                            "consensus" => consensus_name
-                        )
-                        .increment(1);
-                        Arc::new(ValidatorGroup::new(
-                            new_session_info,
-                            local_id,
-                            session_id.clone(),
-                            next_val_list_id.clone(),
-                            vsubset.clone(),
-                            *epoch_utime_since,
-                            consensus_options.clone(),
-                            self.engine.clone(),
-                            self.config.unsafe_resync_catchains.contains(next_cc_seqno),
-                            block_sync_overlay_params.clone(),
-                        ))
-                    })
-                    .clone();
+                    metrics::counter!(
+                        "rtos_node_validator_session_created_total",
+                        "consensus" => consensus_name
+                    )
+                    .increment(1);
+                    let group = ValidatorGroup::new(
+                        new_session_info,
+                        local_id,
+                        session_id.clone(),
+                        next_val_list_id.clone(),
+                        vsubset.clone(),
+                        *epoch_utime_since,
+                        consensus_options.clone(),
+                        self.engine.clone(),
+                        self.config.unsafe_resync_catchains.contains(next_cc_seqno),
+                        block_sync_overlay_params.clone(),
+                    );
+                    let group = Arc::new(match &authenticated {
+                        Some((_, runtime)) => group.with_authenticated_runtime(runtime.clone())?,
+                        None => group,
+                    });
+                    self.future_sessions.insert(session_id.clone(), group.clone());
+                    group
+                };
 
                 if is_new && self.sync_complete {
                     log::debug!(target: "validator_manager",
@@ -2958,7 +3128,13 @@ fn spawn_validator_manager(
             target: "validator_manager",
             "checking if current node is a validator during {CHECK_VALIDATOR_TIMEOUT} secs"
         );
-        while !engine.get_validator_status() {
+        while !engine.get_validator_status() && match engine.consensus_transport_bindings() {
+            Ok(bindings) => bindings.is_empty(),
+            Err(error) => {
+                engine.report_service_failure(0, format!("Invalid consensus transport configuration: {error}"));
+                return;
+            }
+        } {
             log::trace!(target: "validator_manager", "Not a validator, waiting...");
             let _ = engine.clear_last_rotation_block_id();
             let _ = engine.clear_destroyed_session_ids();

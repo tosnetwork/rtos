@@ -1235,7 +1235,7 @@ impl CollationController {
             return None;
         }
 
-        let self_idx = self.description.get_self_idx();
+        let self_idx = self.description.local_validator_index()?;
         let leader = self.description.get_leader(slot);
         if leader != self_idx {
             log::trace!(
@@ -1515,7 +1515,9 @@ impl CollationController {
             return;
         }
 
-        let self_idx = self.description.get_self_idx();
+        let Some(self_idx) = self.description.local_validator_index() else {
+            return;
+        };
         let leader = self.description.get_leader(current_slot);
 
         // Only the slot leader collates.
@@ -3118,7 +3120,10 @@ impl CollationController {
         // Simulate receiving our own block via on_candidate_received so it goes
         // through the same path as network-received blocks and lands in
         // received_candidates uniformly (deferred onto SXMAIN via the backend).
-        let self_idx = self.description.get_self_idx().value();
+        let Some(local_index) = self.description.local_validator_index() else {
+            return;
+        };
+        let self_idx = local_index.value();
         backend.self_receive_candidate(self_idx, tl_candidate_data_for_self);
 
         log::trace!(
@@ -3181,7 +3186,9 @@ impl CollationController {
         }
 
         // Must be the leader for the target slot.
-        let self_idx = self.description.get_self_idx();
+        let Some(self_idx) = self.description.local_validator_index() else {
+            return;
+        };
         let leader = self.description.get_leader(target_slot);
         if leader != self_idx {
             log::trace!(
@@ -3775,7 +3782,7 @@ impl CollationController {
             collated_data: collated_data.data().to_vec(),
             creator: self
                 .description
-                .get_source_public_key(self.description.get_self_idx())
+                .get_source_public_key(self.description.require_validator_index()?)
                 .clone(),
         };
 
@@ -3870,7 +3877,7 @@ impl CollationController {
         parent: &Option<CandidateParentInfo>,
         is_empty: bool,
     ) -> Option<(UInt256, ValidatorIndex, Vec<u8>, Vec<u8>)> {
-        let self_idx = self.description.get_self_idx();
+        let self_idx = self.description.local_validator_index()?;
         let parent_info = parent.as_ref().map(|p| (p.slot, &p.hash));
         let candidate_hash_data_bytes = if is_empty {
             let Some(p) = parent.as_ref() else {

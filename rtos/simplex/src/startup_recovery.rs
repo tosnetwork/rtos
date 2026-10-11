@@ -168,7 +168,7 @@ pub(crate) struct SessionStartupRecoveryProcessor {
     description: Arc<SessionDescription>,
 
     /// Self validator index (cached from description)
-    self_idx: ValidatorIndex,
+    self_idx: Option<ValidatorIndex>,
 
     /// Loaded bootstrap data (consumed during apply_bootstrap)
     bootstrap: Option<Bootstrap>,
@@ -199,13 +199,13 @@ impl SessionStartupRecoveryProcessor {
         description: Arc<SessionDescription>,
         bootstrap: Bootstrap,
     ) -> Self {
-        let self_idx = description.get_self_idx();
+        let self_idx = description.local_validator_index();
 
         log::info!(
             target: LOG_TARGET,
-            "Session {}: creating recovery processor (self_idx={}, {} finalized)",
+            "Session {}: creating recovery processor (self_idx={:?}, {} finalized)",
             session_id.to_hex_string(),
-            self_idx.value(),
+            self_idx,
             bootstrap.finalized_blocks.len()
         );
 
@@ -1037,7 +1037,7 @@ impl SessionStartupRecoveryProcessor {
 
         for vote_record in votes {
             // Only process OUR votes
-            if vote_record.node_idx != self.self_idx {
+            if Some(vote_record.node_idx) != self.self_idx {
                 continue;
             }
 
@@ -1750,7 +1750,7 @@ impl SessionStartupRecoveryProcessor {
                 candidate_id.clone(),
                 ReceivedCandidate {
                     slot,
-                    source_idx: self.description.get_self_idx(),
+                    source_idx: self.description.get_leader(slot),
                     candidate_hash_data_bytes: Vec::new(),
                     block_id: block_id.clone(),
                     root_hash: block_id.root_hash.clone(),
@@ -2217,12 +2217,12 @@ impl SessionStartupRecoveryProcessor {
         }
 
         // 3) Cache our historical votes for standstill replay
-        let self_idx = self.description.get_self_idx();
+        let self_idx = self.description.local_validator_index();
         let mut cached_votes = 0u32;
         let mut vote_parse_errors = 0u32;
 
         for record in votes {
-            if record.node_idx != self_idx {
+            if Some(record.node_idx) != self_idx {
                 continue;
             }
 

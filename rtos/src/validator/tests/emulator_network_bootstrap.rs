@@ -571,11 +571,14 @@ where
 struct BootstrapValidatorNetwork {
     local_keys: Vec<PrivateKey>,
     contexts: RwLock<HashMap<UInt256, bool>>,
+    authenticated: Option<consensus_common::ConsensusOverlayManagerPtr>,
+    transport_keys: Vec<PrivateKey>,
+    authenticated_created: std::sync::atomic::AtomicUsize,
 }
 
 impl BootstrapValidatorNetwork {
     fn new(local_keys: Vec<PrivateKey>) -> Self {
-        Self { local_keys, contexts: RwLock::new(HashMap::new()) }
+        Self { local_keys, contexts: RwLock::new(HashMap::new()), authenticated: None, transport_keys: Vec::new(), authenticated_created: Default::default() }
     }
 
     fn select_local_keys(&self, validators: &[CatchainNode]) -> Vec<PrivateKey> {
@@ -597,6 +600,29 @@ impl BootstrapValidatorNetwork {
 
 #[async_trait::async_trait]
 impl PrivateOverlayOperations for BootstrapValidatorNetwork {
+    fn wire_profile(&self) -> rtos_api::WireProfile {
+        self.authenticated.as_ref().map_or(rtos_api::WireProfile::Legacy, |m| m.wire_profile())
+    }
+    fn create_authenticated_consensus_client(
+        &self, _: UInt256, key: &PrivateKey, id: &Arc<PrivateOverlayShortId>,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        listener: consensus_common::ConsensusOverlayListenerPtr,
+        replay: consensus_common::ConsensusOverlayLogReplayListenerPtr,
+        _: Option<u8>, transport: OverlayTransportType,
+    ) -> Result<consensus_common::ConsensusOverlayPtr> {
+        let overlay = self.authenticated.as_ref().ok_or_else(|| error!("No authenticated test transport"))?
+            .start_authenticated_overlay(key, id, runtime, listener, replay, transport)?;
+        self.authenticated_created.fetch_add(1, Ordering::SeqCst);
+        Ok(overlay)
+    }
+    fn stop_catchain_client_checked(&self, id: &Arc<PrivateOverlayShortId>, overlay: &consensus_common::ConsensusOverlayPtr) -> Result<()> {
+        self.authenticated.as_ref().ok_or_else(|| error!("No authenticated test transport"))?
+            .stop_overlay_checked(id, overlay)
+    }
+    fn catchain_client_drained(&self, overlay: &consensus_common::ConsensusOverlayPtr) -> bool {
+        self.authenticated.as_ref().is_some_and(|manager| manager.overlay_drained(overlay))
+    }
+
     async fn set_validator_list(
         &self,
         validator_list_id: UInt256,
@@ -645,6 +671,7 @@ impl PrivateOverlayOperations for BootstrapValidatorNetwork {
 struct BootstrapTestEngine {
     db: Arc<InternalDb>,
     validator_network: Arc<BootstrapValidatorNetwork>,
+    transport_config: Option<Arc<crate::config::NodeConfigHandler>>,
     states: RwLock<HashMap<BlockIdExt, Arc<ShardStateStuff>>>,
     blocks: RwLock<HashMap<BlockIdExt, BlockStuff>>,
     last_applied_mc_block_id: RwLock<Option<Arc<BlockIdExt>>>,
@@ -702,6 +729,7 @@ impl BootstrapTestEngine {
         Ok(Self {
             db,
             validator_network: Arc::new(BootstrapValidatorNetwork::new(local_keys)),
+            transport_config: None,
             states: RwLock::new(HashMap::new()),
             blocks: RwLock::new(HashMap::new()),
             last_applied_mc_block_id: RwLock::new(None),
@@ -823,6 +851,11 @@ impl BootstrapTestEngine {
 
 #[async_trait::async_trait]
 impl EngineOperations for BootstrapTestEngine {
+    fn zerostate_id(&self) -> Result<&BlockIdExt> { Ok(&self.init_mc_block_id) }
+    fn adnl_key_by_id(&self, id: &Arc<rtos_block::KeyId>) -> Option<PrivateKey> {
+        self.validator_network.transport_keys.iter().find(|key| key.id() == id).cloned()
+    }
+
     async fn check_sync(&self) -> Result<bool> {
         Ok(true)
     }
@@ -832,7 +865,11 @@ impl EngineOperations for BootstrapTestEngine {
     }
 
     fn get_validator_status(&self) -> bool {
-        true
+        self.transport_config.as_ref().map_or(true, |config| config.get_validator_status())
+    }
+
+    fn consensus_transport_bindings(&self) -> Result<Vec<crate::config::ConsensusTransportBinding>> {
+        self.transport_config.as_ref().map_or_else(|| Ok(Vec::new()), |config| config.consensus_transport_bindings())
     }
 
     fn validator_network(&self) -> Arc<dyn PrivateOverlayOperations> {
@@ -983,6 +1020,16 @@ impl EngineOperations for BootstrapTestEngine {
 
     fn engine_allocated(&self) -> &Arc<crate::engine_traits::EngineAlloc> {
         &self.allocated
+    }
+
+    fn register_service_task(&self, _: &'static str, _: u32,
+        start: Box<dyn FnOnce() -> tokio::task::JoinHandle<()> + Send>) -> Result<tokio::task::JoinHandle<()>> {
+        // Test caller owns and joins the returned actual manager task.
+        Ok(start())
+    }
+
+    async fn wait_next_applied_mc_block(&self, _: &BlockHandle, _: Option<u64>) -> Result<(Arc<BlockHandle>, BlockStuff)> {
+        futures::future::pending().await
     }
 
     fn acquire_stop(&self, _mask: u32) {}
@@ -1383,7 +1430,7 @@ async fn test_manager_rejects_unadmitted_simplex_configurations() -> Result<()> 
             &bootstrap.validator_set,
         )
     };
-    // Valid codec input, but no runtime may silently reinterpret these versions.
+    // Typed v2 is supported only with PQ membership; future versions remain unsupported.
     for version in [2, 3] {
         let mut config = bootstrap.config_params.clone();
         config.set_config(ConfigParamEnum::ConfigParam30(NewConsensusConfigAll {
@@ -1410,7 +1457,11 @@ async fn test_manager_rejects_unadmitted_simplex_configurations() -> Result<()> 
             &engine.allocated,
         )?;
         let error = select(&state).err().expect("manager must refuse the version").to_string();
-        assert!(error.contains(&format!("protocol version {version}")), "{error}");
+        if version == 2 {
+            assert!(error.contains("PQ consensus keys for every member"), "{error}");
+        } else {
+            assert!(error.contains(&format!("protocol version {version}")), "{error}");
+        }
     }
     // No configured Simplex is not permission to enter classical consensus.
     bootstrap
@@ -1478,3 +1529,6 @@ async fn test_manager_session_identity_binds_governing_state() -> Result<()> {
     }
     Ok(())
 }
+
+#[path = "test_authenticated_manager.rs"]
+mod authenticated_manager;

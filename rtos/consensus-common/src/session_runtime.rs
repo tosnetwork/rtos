@@ -64,7 +64,13 @@ impl AuthenticatedSessionRuntime {
             .selected_simplex_config(coordinates.shard.is_masterchain())?
             .ok_or_else(|| error!("Authenticated session has no selected Param30"))?;
         let protocol = SimplexProtocol::try_from(u32::from(selected.config.protocol_version))?;
-        let carrier_version = u32::from(config.consensus_config()?.proto_version);
+        let carrier = config.consensus_config()?;
+        let carrier_version = u32::from(carrier.proto_version);
+        let max_candidate_size = u32::try_from(
+            u64::from(carrier.max_block_bytes)
+                + u64::from(carrier.max_collated_bytes)
+                + (1u64 << 20),
+        )?;
         let identity = derive_session_from_config(pin.global_id, config, coordinates, &committee)?;
         let ordered =
             committee.iter().map(ValidatorDescr::adnl_addr).collect::<Result<Vec<_>>>()?;
@@ -103,11 +109,7 @@ impl AuthenticatedSessionRuntime {
             protocol,
             carrier_version,
             slots_per_leader_window: selected.config.slots_per_leader_window,
-            max_candidate_size: config
-                .consensus_config()?
-                .max_block_bytes
-                .saturating_add(config.consensus_config()?.max_collated_bytes)
-                .saturating_add(crate::BLOCK_SYNC_BROADCAST_SIZE_MARGIN),
+            max_candidate_size,
             wire_profile: WireProfile::T0,
             committee,
             members: members.into_iter().collect(),
@@ -116,6 +118,64 @@ impl AuthenticatedSessionRuntime {
             local_adnl,
             pq_context,
         })
+    }
+    /// Whether a live group may retain its immutable admission snapshot.
+    /// The session hash alone does not encode a change to transport members.
+    pub fn same_admission(&self, other: &Self) -> bool {
+        self.pin == other.pin
+            && self.profile == other.profile
+            && self.session == other.session
+            && self.shard == other.shard
+            && self.catchain_seqno == other.catchain_seqno
+            && self.protocol == other.protocol
+            && self.carrier_version == other.carrier_version
+            && self.slots_per_leader_window == other.slots_per_leader_window
+            && self.max_candidate_size == other.max_candidate_size
+            && self.wire_profile == other.wire_profile
+            && self.committee == other.committee
+            && self.members == other.members
+            && self.current_total_set == other.current_total_set
+            && self.local_role == other.local_role
+            && self.local_adnl == other.local_adnl
+    }
+
+    pub fn runtime_directory(&self, root: &str) -> Result<String> {
+        if self.protocol != SimplexProtocol::PrivateObserversPlumtree {
+            return crate::simplex_protocol::SimplexNamespace {
+                protocol: self.protocol,
+                role: self.local_role,
+                shard: &self.shard,
+                catchain_seqno: self.catchain_seqno,
+                session_id: &self.session,
+            }
+            .runtime_directory(root);
+        }
+        let role = match self.local_role {
+            LocalRole::Validator(_) => "validator".to_owned(),
+            LocalRole::Observer => format!("observer.{}", hex::encode(self.local_adnl.data())),
+        };
+        Ok(format!(
+            "{root}/consensus/v2/consensus.{}.{:016x}.{}.{}.{}",
+            self.shard.workchain_id(),
+            self.shard.shard_prefix_with_tag(),
+            self.catchain_seqno,
+            self.session.to_hex_string(),
+            role
+        ))
+    }
+    pub fn committee_digest(&self) -> Result<UInt256> {
+        let mut bytes = Vec::new();
+        for (node, member) in self.consensus_nodes()?.iter().zip(&self.committee) {
+            bytes.extend_from_slice(node.public_key.id().data());
+            bytes.extend_from_slice(node.adnl_id.data());
+            bytes.extend_from_slice(&member.weight.to_le_bytes());
+            if let Some(key) = node.public_key.pq_key() {
+                bytes.extend_from_slice(&key.algorithm_id.to_le_bytes());
+                bytes.extend_from_slice(key.key_id.as_slice());
+                bytes.extend_from_slice(&key.public_key);
+            }
+        }
+        Ok(UInt256::calc_file_hash(&bytes))
     }
     pub fn consensus_nodes(&self) -> Result<Vec<crate::ConsensusNode>> {
         self.committee

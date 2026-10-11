@@ -402,12 +402,13 @@ enum ListenerEvent {
 /// Listener that records all commits and skips for verification
 struct RecordingListener {
     events: Arc<Mutex<Vec<ListenerEvent>>>,
+    authenticated: Mutex<Vec<consensus_common::CandidateAuthenticationEvidence>>,
 }
 
 #[allow(dead_code)]
 impl RecordingListener {
     fn new() -> Arc<Self> {
-        Arc::new(Self { events: Arc::new(Mutex::new(Vec::new())) })
+        Arc::new(Self { events: Arc::new(Mutex::new(Vec::new())), authenticated: Mutex::new(Vec::new()) })
     }
 
     /// Get all recorded events (drains the list)
@@ -422,6 +423,9 @@ impl RecordingListener {
 }
 
 impl consensus_common::SessionListener for RecordingListener {
+    fn on_authenticated_candidate(&self, evidence: consensus_common::CandidateAuthenticationEvidence) {
+        self.authenticated.lock().unwrap().push(evidence);
+    }
     fn on_candidate(
         &self,
         _source_info: BlockSourceInfo,
@@ -11362,4 +11366,171 @@ fn custody_retired_backend_stops_real_vote_publication() {
         h.coordinator.vote(&vote("notarize")).is_err(),
         "backend failure must poison subsequent signing"
     );
+}
+
+#[test]
+fn authenticated_observer_processor_accepts_only_valid_pq_quorum_without_signing() {
+    let directory = crate::authenticated_fixture::TestDirectory::new();
+    let stores: Vec<_> = [0xa1, 0xa2].into_iter().map(|seed| {
+        rtos_pq_consensus::ConsensusKeyStore::from_seed(&[seed; 32], 0).unwrap()
+    }).collect();
+    let (_, keys) = crate::pq_fixture::members();
+    let members = stores.iter().enumerate().map(|(index, store)| {
+        rtos_block::ValidatorDescr::with_pq_params(
+            UInt256::from([index as u8 + 1; 32]), store.consensus_key().clone(),
+            index as u64 + 1, UInt256::from(*keys[index].id().data()),
+        )
+    }).collect();
+    let observer = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71; 32]).unwrap();
+    let (runtime, transport, options) =
+        crate::authenticated_fixture::runtime_with_members(members, observer);
+    let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor)
+        .collect::<Result<Vec<_>>>().unwrap();
+    let description = Arc::new(SessionDescription::new_with_runtime(
+        &options, runtime.session_id().clone(), 1, &nodes, transport, runtime.shard(),
+        SystemTime::now(), None, Some(&runtime),
+    ).unwrap().bind_pq_session(runtime.catchain_seqno()).unwrap());
+    assert!(description.local_validator_index().is_none());
+    let db = crate::database::SimplexDb::open(directory.path().join("db"), "observer-cert").unwrap();
+    let receiver = MockReceiver::new();
+    let mut processor = make_pq_processor_with_description_for_test(db.clone(), description);
+    processor.receiver = receiver.clone();
+    let make_certificate = |session: &SessionId, signers: &[usize], corrupt: bool| {
+        let vote = SkipVote { slot: 0 }.into_boxed();
+        let preimage = crate::utils::create_data_to_sign(
+            session, &crate::utils::serialize_unsigned_vote(&vote),
+        );
+        let signatures = signers.iter().map(|&index| {
+            let mut signature = stores[index].sign_consensus(&preimage).unwrap().bytes.to_vec();
+            if corrupt { signature[0] ^= 1; }
+            VoteSignature { who: index as i32, signature }.into_boxed()
+        }).collect();
+        Certificate { vote, signatures: VoteSignatureSet { votes: signatures }.into_boxed() }
+            .into_boxed()
+    };
+    let invalid = [
+        make_certificate(runtime.session_id(), &[0], false), // weight 1 < quorum 2
+        make_certificate(runtime.session_id(), &[0, 0], false), // duplicate cannot add weight
+        make_certificate(&UInt256::from([0xff; 32]), &[0, 1], false),
+        make_certificate(runtime.session_id(), &[0, 1], true),
+    ];
+    let valid = make_certificate(runtime.session_id(), &[0, 1], false);
+    let calls: Vec<_> = stores.iter().map(|store| store.consensus_signatures_produced()).collect();
+    receiver.drain_actions();
+    for certificate in invalid {
+        // None is a transport observer, not a forged committee index zero.
+        processor.on_certificate(None::<u32>, certificate);
+        assert!(!processor.simplex_state.has_skip_certificate(SlotIndex::new(0)));
+        assert!(db.load_skip_cert_by_slot(SlotIndex::new(0), Duration::from_secs(5)).unwrap().is_none());
+        assert!(!receiver.drain_actions().iter().any(|action| matches!(action,
+            ReceiverAction::SendVote { .. } | ReceiverAction::SendCertificate { .. }
+        )));
+    }
+    processor.on_certificate(None::<u32>, valid.clone());
+    let drain = |processor: &mut SessionProcessor| {
+        for _ in 0..16 {
+            db.sync(Some(Duration::from_secs(5))).unwrap();
+            processor.process_pending_async_db_results();
+            if processor.database.pending_is_empty() { return; }
+        }
+        panic!("certificate continuations did not drain after actual storage barriers");
+    };
+    drain(&mut processor);
+    assert!(processor.simplex_state.has_skip_certificate(SlotIndex::new(0)));
+    assert!(db.load_skip_cert_by_slot(SlotIndex::new(0), Duration::from_secs(5)).unwrap().is_some());
+    let actions = receiver.drain_actions();
+    assert_eq!(actions.iter().filter(|action| matches!(action, ReceiverAction::SendCertificate { .. })).count(), 1);
+    assert!(!actions.iter().any(|action| matches!(action,
+        ReceiverAction::SendVote { .. } | ReceiverAction::CacheOurVoteForStandstill { .. }
+    )));
+    processor.on_certificate(None::<u32>, valid);
+    drain(&mut processor);
+    assert!(!receiver.drain_actions().iter().any(|action| matches!(action,
+        ReceiverAction::SendVote { .. } | ReceiverAction::SendCertificate { .. }
+    )));
+    assert_eq!(calls, stores.iter().map(|store| store.consensus_signatures_produced()).collect::<Vec<_>>());
+    drop(processor);
+    db.close(None).unwrap();
+}
+
+#[test]
+fn authenticated_observer_nonempty_query_emits_leader_evidence_after_pq_verification() {
+    use rtos_block::Serializable;
+    let directory = crate::authenticated_fixture::TestDirectory::new();
+    let store = rtos_pq_consensus::ConsensusKeyStore::from_seed(&[0xa3; 32], 0).unwrap();
+    let (mut nodes, _) = crate::pq_fixture::members();
+    nodes[1] = crate::SimplexSessionNode::from_descriptor(
+        &crate::signing_coordinator::tests::custody_descriptor(&store),
+    ).unwrap();
+    let observer = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71; 32]).unwrap();
+    let (runtime, transport, options) = crate::authenticated_fixture::runtime_with_members(
+        nodes.iter().map(|node| node.descriptor.clone().unwrap()).collect(), observer,
+    );
+    let description = Arc::new(SessionDescription::new_with_runtime(
+        &options, runtime.session_id().clone(), 1, &nodes, transport, runtime.shard(),
+        SystemTime::now(), None, Some(&runtime),
+    ).unwrap().bind_pq_session(runtime.catchain_seqno()).unwrap());
+    let db = crate::database::SimplexDb::open(directory.path().join("db"), "observer-body").unwrap();
+    let receiver = MockReceiver::new();
+    let mut processor = make_pq_processor_with_description_for_test(db.clone(), description);
+    processor.receiver = receiver.clone();
+    let listener = RecordingListener::new();
+    let listener_dyn: Arc<dyn consensus_common::SessionListener + Send + Sync> = listener.clone();
+    processor.callbacks = Arc::new(crate::session_callbacks::SessionCallbacks::new(
+        runtime.session_id().clone(), Arc::new(AtomicBool::new(false)), false,
+        Arc::new(TestCallbackQueue), Arc::downgrade(&listener_dyn),
+    ));
+    let mut block = rtos_block::Block::default();
+    block.set_global_id(runtime.pin().global_id);
+    let mut info = rtos_block::BlockInfo::default();
+    info.set_seq_no(1).unwrap();
+    info.set_shard(runtime.shard().clone());
+    block.write_info(&info).unwrap();
+    let cell = block.serialize().unwrap();
+    let data = rtos_block::write_boc(&cell).unwrap();
+    let collated = make_test_boc(b"authenticated-observer", BocFlags::Crc32);
+    let slot = SlotIndex::new(options.slots_per_leader_window);
+    let bytes = make_validator_session_candidate_bytes(1, cell.repr_hash().clone(), data.clone(), collated.clone());
+    let hash = crate::utils::compute_candidate_id_hash_from_bytes(
+        slot, &bytes, None, runtime.shard(), 1 << 20, options.proto_version,
+    ).unwrap();
+    let signature = store.sign_consensus(&crate::utils::create_data_to_sign(
+        runtime.session_id(), &crate::utils::create_candidate_id_to_sign(slot, &hash),
+    )).unwrap().bytes.to_vec();
+    let candidate = rtos_api::ton::consensus::candidatedata::Block {
+        slot: slot.value() as i32,
+        parent: rtos_api::ton::consensus::CandidateParent::Consensus_CandidateWithoutParents,
+        candidate: bytes,
+        signature,
+    }.into_boxed();
+    let vote = rtos_api::ton::consensus::simplex::unsignedvote::NotarizeVote {
+        id: TlCandidateId { slot: slot.value() as i32, hash: hash.clone() }.into_boxed(),
+    }.into_boxed();
+    let cert = Certificate { signatures: VoteSignatureSet { votes: vec![VoteSignature {
+        who: 1, signature: store.sign_consensus(&crate::utils::create_data_to_sign(
+            runtime.session_id(), &crate::utils::serialize_unsigned_vote(&vote),
+        )).unwrap().bytes.to_vec(),
+    }.into_boxed()] }.into_boxed(), vote }.into_boxed();
+    let certificate = options.wire_profile.serialize(&cert).unwrap();
+    let mut bad = candidate.clone();
+    let CandidateData::Consensus_Block(ref mut value) = bad else { unreachable!() };
+    value.signature[0] ^= 1;
+    // Query relay comes from member zero; the scheduled author is member one.
+    processor.on_candidate_received(0, bad, Some(certificate.clone()));
+    assert!(listener.authenticated.lock().unwrap().is_empty());
+    processor.on_candidate_received(0, candidate, Some(certificate));
+    let evidence = listener.authenticated.lock().unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].creator_index, 1);
+    assert_eq!(evidence[0].creator_adnl, nodes[1].adnl_id);
+    assert_eq!(evidence[0].data.data().as_slice(), data.as_slice());
+    assert_eq!(evidence[0].collated_data.data().as_slice(), collated.as_slice());
+    assert_eq!(evidence[0].block_id.root_hash(), cell.repr_hash());
+    assert_eq!(evidence[0].session_id, *runtime.session_id());
+    drop(evidence);
+    db.sync(Some(Duration::from_secs(5))).unwrap();
+    processor.process_pending_async_db_results();
+    assert!(!receiver.drain_actions().iter().any(|action| matches!(action, ReceiverAction::SendVote { .. })));
+    drop(processor);
+    db.close(None).unwrap();
 }

@@ -102,6 +102,7 @@ pub(crate) const RESOLVER_AVAILABILITY_MAX_RETRIES: u32 = 6;
 /// Validator-layer observe payload surfaced by ingress for the shell to deliver
 /// via `SessionCallbacks::notify_candidate_observed` (non-empty blocks only).
 pub(crate) struct CandidateObserved {
+    pub authentication: Option<consensus_common::CandidateAuthenticationEvidence>,
     pub block_id: BlockIdExt,
     pub data: crate::BlockPayloadPtr,
     pub collated_data: crate::BlockPayloadPtr,
@@ -356,7 +357,7 @@ impl CandidateController {
         let slot = SlotIndex::new(slot);
         let is_broadcast_candidate = notar_cert.is_none();
         let is_local_self_candidate =
-            is_broadcast_candidate && sender_idx == self.description.get_self_idx();
+            is_broadcast_candidate && Some(sender_idx) == self.description.local_validator_index();
         self.record_ingress(sender_idx, is_broadcast_candidate);
 
         // Reject far-future slots (DoS protection) — before any signature verification
@@ -855,6 +856,17 @@ impl CandidateController {
             };
             observed = Some(CandidateObserved {
                 block_id: block_id.clone(),
+                authentication: leader_key.pq_key().map(|_| consensus_common::CandidateAuthenticationEvidence {
+                    session_id: self.session_id().clone(),
+                    slot: slot.value(),
+                    creator_index: leader_idx.value(),
+                    creator_adnl: self.description.get_source_adnl_id(leader_idx).clone(),
+                    candidate_hash_data: candidate_hash_data_bytes_for_db.clone(),
+                    signature: raw_candidate.signature.clone(),
+                    block_id: block_id.clone(),
+                    data: observed_data.clone(),
+                    collated_data: observed_collated_data.clone(),
+                }),
                 data: observed_data,
                 collated_data: observed_collated_data,
                 flags: observed_flags,
@@ -913,7 +925,7 @@ impl CandidateController {
     fn record_ingress(&self, sender_idx: ValidatorIndex, is_broadcast_candidate: bool) {
         self.telemetry.record_candidate_ingress(
             sender_idx,
-            self.description.get_self_idx(),
+            self.description.local_validator_index(),
             is_broadcast_candidate,
         );
     }

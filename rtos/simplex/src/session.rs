@@ -513,6 +513,10 @@ impl SessionImpl {
         init_result_sender: Sender<Result<()>>,
         trace_collector: Option<TraceCollector>,
         catchain_seqno: u32,
+        authenticated_runtime: Option<
+            Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        >,
+        #[cfg(test)] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
     ) {
         log::info!(
             "SimplexSession main loop is started (session_id is {}); \
@@ -572,6 +576,27 @@ impl SessionImpl {
             is_stopped_flag.store(true, Ordering::Release);
         };
 
+        // Authenticated validator journals survive group retirement. Deletion must
+        // never erase the only durable record of already signed decisions.
+        let may_destroy_database = !authenticated_runtime.as_ref().is_some_and(|runtime|
+            matches!(runtime.local_role(), consensus_common::session_runtime::LocalRole::Validator(_)));
+        let _runtime_manifest = match authenticated_runtime.as_ref().filter(|runtime| {
+            runtime.protocol()
+                == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
+        }) {
+            Some(runtime) => match crate::runtime_manifest::RuntimeManifest::open(
+                runtime,
+                std::path::Path::new(&db_path),
+            ) {
+                Ok(manifest) => Some(manifest),
+                Err(error) => {
+                    fail_startup(error, "durable runtime admission failed");
+                    return;
+                }
+            },
+            None => None,
+        };
+
         // Phase 4: Open database (cancellable via stop_flag)
         let storage_id = session_id.to_hex_string();
         let db = match crate::database::SimplexDb::open(&db_path, &storage_id) {
@@ -582,6 +607,17 @@ impl SessionImpl {
             }
         };
 
+        #[cfg(test)]
+        let test_coordinator = match test_signer {
+            Some(profile) => match authenticated_runtime.as_deref()
+                .ok_or_else(|| error!("Isolated signer requires authenticated runtime"))
+                .and_then(|runtime| profile.open(runtime, db.clone())) {
+                Ok(coordinator) => Some(coordinator),
+                Err(error) => { fail_startup(error, "isolated signer admission failed"); return; }
+            },
+            None => None,
+        };
+
         // Check if we should stop before loading bootstrap
         if should_stop_flag.load(Ordering::Relaxed) {
             log::info!("Session {} stopping before bootstrap load", session_id.to_hex_string());
@@ -589,7 +625,7 @@ impl SessionImpl {
                 let _ =
                     init_result_sender.send(Err(error!("Session stopped before bootstrap load")));
             }
-            if destroy_db_flag.load(Ordering::Acquire) {
+            if may_destroy_database && destroy_db_flag.load(Ordering::Acquire) {
                 db.mark_for_destroy();
             }
             is_stopped_flag.store(true, Ordering::Release);
@@ -609,7 +645,7 @@ impl SessionImpl {
         );
         let pq_session = ids.iter().any(|node| node.identity.pq_key().is_some());
         let create_receiver = || {
-            crate::receiver::ReceiverWrapper::create(
+            crate::receiver::ReceiverWrapper::create_with_runtime(
                 session_id.clone(),
                 &shard,
                 &ids,
@@ -619,6 +655,7 @@ impl SessionImpl {
                 panicked_flag.clone(),
                 health_counters.clone(),
                 receiver_settings,
+                authenticated_runtime.as_deref(),
             )
         };
         // Classical restart keeps its early overlay registration. PQ input is
@@ -659,7 +696,7 @@ impl SessionImpl {
         };
 
         if pq_session {
-            let authentication = SessionDescription::new(
+            let authentication = SessionDescription::new_with_runtime(
                 &options,
                 session_id.clone(),
                 1,
@@ -668,8 +705,16 @@ impl SessionImpl {
                 &shard,
                 session_creation_time,
                 Some(metrics_receiver.clone()),
+                authenticated_runtime.as_deref(),
             )
             .and_then(|description| description.bind_pq_session(catchain_seqno))
+            .and_then(|description| {
+                #[cfg(test)]
+                if let Some(coordinator) = &test_coordinator {
+                    description.install_test_coordinator(coordinator.clone())?;
+                }
+                Ok(description)
+            })
             .and_then(|description| {
                 SessionStartupRecoveryProcessor::new(
                     session_id.clone(),
@@ -740,7 +785,7 @@ impl SessionImpl {
                         "SimplexSession {} stopped while waiting for start()",
                         session_id.to_hex_string()
                     );
-                    if destroy_db_flag.load(Ordering::Acquire) {
+                    if may_destroy_database && destroy_db_flag.load(Ordering::Acquire) {
                         db.mark_for_destroy();
                     }
                     is_stopped_flag.store(true, Ordering::Release);
@@ -770,7 +815,7 @@ impl SessionImpl {
         receiver.start();
 
         // Phase 4a: Create session description (immutable session configuration)
-        let description = match SessionDescription::new(
+        let description = match SessionDescription::new_with_runtime(
             &options,
             session_id.clone(),
             initial_block_seqno,
@@ -779,8 +824,16 @@ impl SessionImpl {
             &shard,
             session_creation_time,
             Some(metrics_receiver.clone()),
+            authenticated_runtime.as_deref(),
         )
         .and_then(|d| d.bind_pq_session(catchain_seqno))
+        .and_then(|description| {
+            #[cfg(test)]
+            if let Some(coordinator) = &test_coordinator {
+                description.install_test_coordinator(coordinator.clone())?;
+            }
+            Ok(description)
+        })
         {
             Ok(d) => Arc::new(d),
             Err(err) => {
@@ -884,7 +937,7 @@ impl SessionImpl {
 
                 // Check if the main loop should be stopped
                 if should_stop_flag.load(Ordering::Relaxed) {
-                    processor.stop(destroy_db_flag.load(Ordering::Relaxed));
+                    processor.stop(may_destroy_database && destroy_db_flag.load(Ordering::Relaxed));
                     break;
                 }
 
@@ -1237,6 +1290,59 @@ impl SessionImpl {
         trace_collector: Option<TraceCollector>,
         catchain_seqno: u32,
     ) -> Result<SessionPtr> {
+        Self::create_with_runtime(
+            options,
+            session_id,
+            shard,
+            ids,
+            local_key,
+            db_path,
+            overlay_manager,
+            listener,
+            trace_collector,
+            catchain_seqno,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_runtime(
+        options: &SessionOptions,
+        session_id: &SessionId,
+        shard: &ShardIdent,
+        ids: Vec<crate::SimplexSessionNode>,
+        local_key: &PrivateKey,
+        db_path: String,
+        overlay_manager: ConsensusOverlayManagerPtr,
+        listener: SessionListenerPtr,
+        trace_collector: Option<TraceCollector>,
+        catchain_seqno: u32,
+        authenticated_runtime: Option<
+            Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        >,
+    ) -> Result<SessionPtr> {
+        Self::create_with_profile(options, session_id, shard, ids, local_key, db_path,
+            overlay_manager, listener, trace_collector, catchain_seqno, authenticated_runtime,
+            #[cfg(test)] None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_with_profile(
+        options: &SessionOptions,
+        session_id: &SessionId,
+        shard: &ShardIdent,
+        ids: Vec<crate::SimplexSessionNode>,
+        local_key: &PrivateKey,
+        db_path: String,
+        overlay_manager: ConsensusOverlayManagerPtr,
+        listener: SessionListenerPtr,
+        trace_collector: Option<TraceCollector>,
+        catchain_seqno: u32,
+        authenticated_runtime: Option<
+            Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        >,
+        #[cfg(test)] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
+    ) -> Result<SessionPtr> {
         log::info!(
             "Creating SimplexSession (session_id is {}, shard={}, nodes_count={}, db_path={})",
             session_id.to_hex_string(),
@@ -1245,7 +1351,11 @@ impl SessionImpl {
             db_path
         );
 
-        options.validate()?;
+        match &authenticated_runtime {
+            Some(runtime) => options.validate_authenticated(runtime)?,
+            None => options.validate()?,
+        }
+
         let session_creation_time = SystemTime::now();
 
         // Ensure panics in SX threads are logged as FATAL with backtrace.
@@ -1379,6 +1489,8 @@ impl SessionImpl {
                         init_result_sender,
                         trace_collector,
                         catchain_seqno,
+                        authenticated_runtime,
+                        #[cfg(test)] test_signer,
                     );
                 }));
 

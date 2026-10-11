@@ -2374,14 +2374,15 @@ impl ConsensusOverlayManager for AdnlOverlayManager {
         transport: OverlayTransportType,
     ) -> Result<ConsensusOverlayPtr> {
         let _lifecycle = self.lifecycle.lock().unwrap();
+        if key.id() != runtime.local_adnl()
+            || id != &runtime.overlay_short_id()?
+            || runtime.wire_profile() != self.stack.overlay.wire_profile()
+        {
+            fail!("Authenticated overlay key, ID or wire profile mismatch");
+        }
         if let Some(existing) = self.overlays.lock().get(id) {
-            let same = existing.private_runtime.as_ref().is_some_and(|old| {
-                old.pin() == runtime.pin()
-                    && old.session_id() == runtime.session_id()
-                    && old.profile() == runtime.profile()
-                    && old.local_adnl() == runtime.local_adnl()
-                    && old.members() == runtime.members()
-            });
+            let same =
+                existing.private_runtime.as_ref().is_some_and(|old| old.same_admission(&runtime));
             if !same {
                 fail!("Existing overlay belongs to a different runtime");
             }
