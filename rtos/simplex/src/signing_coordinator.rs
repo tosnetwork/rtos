@@ -45,13 +45,27 @@ pub(crate) struct SigningBinding {
     pub expire_at: u64,
     pub shard_workchain: i32,
     pub shard_prefix: u64,
+    /// Carrier envelope version. This retains the schema-2 meaning.
     pub protocol: u32,
+    /// Schema 3 independently binds the typed Param30 protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simplex_protocol: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_adnl: Option<[u8; 32]>,
     pub local_index: u32,
     pub validator_count: u32,
     pub slots_per_window: u32,
 }
 
 impl SigningBinding {
+    fn validate_schema(&self) -> Result<()> {
+        match (self.schema, self.simplex_protocol, self.local_adnl) {
+            (2, None, None) => Ok(()),
+            (3, Some(protocol), Some(adnl)) if protocol <= 2 && adnl != [0; 32] => Ok(()),
+            _ => fail!("unsupported or inconsistent signing binding schema"),
+        }
+    }
+
     fn wire(&self) -> Result<rtos_api::WireProfile> {
         match self.wire_profile {
             0 => Ok(rtos_api::WireProfile::Legacy),
@@ -127,9 +141,10 @@ fn key(decision: &Decision) -> Result<Vec<u8>> {
 pub(crate) fn validate_record(key_bytes: &[u8], value: &[u8]) -> Result<()> {
     if key_bytes == HEADER {
         let header: Header = decode(value)?;
-        if header.binding.schema != 2 {
-            fail!("unsupported signing header schema");
-        }
+        header
+            .binding
+            .validate_schema()
+            .map_err(|e| error!("unsupported signing header schema: {e}"))?;
         header.binding.wire()?;
     } else {
         let record: Record = decode(value)?;
@@ -289,9 +304,7 @@ impl SigningCoordinator {
         signer: Signer,
     ) -> Result<Self> {
         let pq = identity.pq_key().ok_or_else(|| error!("journal requires PQ identity"))?;
-        if binding.schema != 2 {
-            fail!("unsupported signing binding schema");
-        }
+        binding.validate_schema()?;
         if binding.protocol > 1
             || binding.generation == 0
             || binding.slots_per_window == 0
@@ -406,6 +419,13 @@ impl SigningCoordinator {
             || b.validator
                 != *description.get_source_public_key_hash(description.get_self_idx()).data()
             || b.protocol != description.opts().proto_version
+            || match b.simplex_protocol {
+                Some(protocol) => protocol != description.opts().protocol.version(),
+                None => description.opts().protocol.version() > 1,
+            }
+            || b.local_adnl.is_some_and(|adnl| {
+                adnl != *description.get_source_adnl_id(description.get_self_idx()).data()
+            })
             || b.wire()? != description.opts().wire_profile
             || b.local_index != description.get_self_idx().value()
             || b.validator_count as usize != description.get_total_nodes()

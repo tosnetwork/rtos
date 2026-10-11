@@ -31,6 +31,14 @@ impl TryFrom<u32> for SimplexProtocol {
 }
 
 impl SimplexProtocol {
+    pub fn version(self) -> u32 {
+        match self {
+            Self::Private => 0,
+            Self::BlockSync => 1,
+            Self::PrivateObserversPlumtree => 2,
+        }
+    }
+
     pub fn uses_block_sync(self) -> bool {
         self == Self::BlockSync
     }
