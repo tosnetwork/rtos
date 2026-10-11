@@ -589,11 +589,19 @@ async fn recover_scenario(scenario: RecoveryScenario) {
                         .is_some_and(|value| value["certificate"].is_string())
                 }).expect("actual retained FinalCert");
                 let capsule_root = Path::new(engine.db_root_dir().unwrap()).join("retired-history-v1");
-                let manifests = || std::fs::read_dir(&capsule_root).unwrap()
-                    .filter_map(|entry| { let path = entry.unwrap().path();
+                let manifests = || {
+                    let entries = match std::fs::read_dir(&capsule_root) {
+                        Ok(entries) => entries,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return std::collections::BTreeMap::new();
+                        }
+                        Err(error) => panic!("read capsule manifests {}: {error}", capsule_root.display()),
+                    };
+                    entries.filter_map(|entry| { let path = entry.unwrap().path();
                         (path.extension().and_then(|v| v.to_str()) == Some("json"))
                             .then(|| (path.clone(), std::fs::read(path).unwrap()))
-                    }).collect::<std::collections::BTreeMap<_, _>>();
+                    }).collect::<std::collections::BTreeMap<_, _>>()
+                };
                 let before_capsules = manifests();
                 let variants: &[usize] = if scenario == RecoveryScenario::InsufficientSourceQuorum { &[0, 1] } else { &[0] };
                 for &votes_to_keep in variants {
