@@ -134,6 +134,28 @@ impl PqSessionContext {
             validators: self.validators.clone(),
         })
     }
+    pub fn for_block_bounded(
+        &self,
+        block_id: BlockIdExt,
+        budget: &dyn ConfigReadBudget,
+    ) -> Result<PqVerificationContext> {
+        if block_id.shard() != &self.shard {
+            fail!("PQ block shard differs from authenticated session shard");
+        }
+        let mut validators = cb::vector(budget, self.validators.len())?;
+        for validator in &self.validators {
+            validators.push(validator.clone_bounded(budget)?);
+        }
+        Ok(PqVerificationContext {
+            block_id,
+            session_id: self.session_id.clone(),
+            catchain_seqno: self.catchain_seqno,
+            subset_hash: self.subset_hash,
+            total_weight: self.total_weight,
+            validators,
+        })
+    }
+
     pub fn validator_info(&self) -> rtos_block::ValidatorBaseInfo {
         rtos_block::ValidatorBaseInfo::with_params(self.subset_hash, self.catchain_seqno)
     }
@@ -378,6 +400,21 @@ impl PqVerificationContext {
         carrier: &BlockSignaturesSimplexPq,
         budget: &dyn ConfigReadBudget,
     ) -> Result<VerifiedPqSignatures> {
+        let weight = self.verify_role_bounded(carrier, true, budget)?;
+        Ok(VerifiedPqSignatures {
+            block_id: self.block_id.clone(),
+            session_id: self.session_id.clone(),
+            slot: carrier.slot,
+            weight,
+        })
+    }
+
+    fn verify_role_bounded(
+        &self,
+        carrier: &BlockSignaturesSimplexPq,
+        is_final: bool,
+        budget: &dyn ConfigReadBudget,
+    ) -> Result<u64> {
         carrier.validate_structure_bounded(budget)?;
         if carrier.validator_info.catchain_seqno != self.catchain_seqno {
             fail!("PQ catchain seqno mismatch");
@@ -388,7 +425,7 @@ impl PqVerificationContext {
         if carrier.session_id != self.session_id {
             fail!("PQ carried session differs from governing expected session");
         }
-        let message = vote_preimage_with_budget(&self.block_id, carrier, true, Some(budget))?;
+        let message = vote_preimage_with_budget(&self.block_id, carrier, is_final, Some(budget))?;
         let mut members = cb::vector(budget, self.validators.len())?;
         let mut weights = cb::vector(budget, self.validators.len())?;
         for member in &self.validators {
@@ -424,12 +461,7 @@ impl PqVerificationContext {
         if !has_quorum(weight, self.total_weight) {
             fail!("PQ insufficient verified weight: {weight} of {}", self.total_weight);
         }
-        Ok(VerifiedPqSignatures {
-            block_id: self.block_id.clone(),
-            session_id: self.session_id.clone(),
-            slot: carrier.slot,
-            weight,
-        })
+        Ok(weight)
     }
 
     pub fn verify_approval(&self, approval: &PqApproval) -> Result<VerifiedPqApproval> {
