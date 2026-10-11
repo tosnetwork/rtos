@@ -1,9 +1,10 @@
+use rtos_block::BlockSignaturesVariant;
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 use consensus_common::{
-    AsyncCollationRequestPtr, BlockHash, BlockSignaturesVariant, BlockSourceInfo,
-    CollationParentHint, PublicKey, Session as _, SessionListener, SessionStats,
-    ValidatorBlockCandidateCallback, ValidatorBlockCandidateDecisionCallback,
+    AsyncCollationRequestPtr, BlockHash, BlockSourceInfo, CollationParentHint, PublicKey,
+    SessionListener, SessionStats, ValidatorBlockCandidateCallback,
+    ValidatorBlockCandidateDecisionCallback,
 };
 use std::sync::mpsc;
 struct Listener;
