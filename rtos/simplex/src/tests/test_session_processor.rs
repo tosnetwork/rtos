@@ -11363,3 +11363,88 @@ fn custody_retired_backend_stops_real_vote_publication() {
         "backend failure must poison subsequent signing"
     );
 }
+
+#[test]
+fn authenticated_observer_processor_accepts_only_valid_pq_quorum_without_signing() {
+    let directory = crate::authenticated_fixture::TestDirectory::new();
+    let stores: Vec<_> = [0xa1, 0xa2].into_iter().map(|seed| {
+        rtos_pq_consensus::ConsensusKeyStore::from_seed(&[seed; 32], 0).unwrap()
+    }).collect();
+    let (_, keys) = crate::pq_fixture::members();
+    let members = stores.iter().enumerate().map(|(index, store)| {
+        rtos_block::ValidatorDescr::with_pq_params(
+            UInt256::from([index as u8 + 1; 32]), store.consensus_key().clone(),
+            index as u64 + 1, UInt256::from(*keys[index].id().data()),
+        )
+    }).collect();
+    let observer = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71; 32]).unwrap();
+    let (runtime, transport, options) =
+        crate::authenticated_fixture::runtime_with_members(members, observer);
+    let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor)
+        .collect::<Result<Vec<_>>>().unwrap();
+    let description = Arc::new(SessionDescription::new_with_runtime(
+        &options, runtime.session_id().clone(), 1, &nodes, transport, runtime.shard(),
+        SystemTime::now(), None, Some(&runtime),
+    ).unwrap().bind_pq_session(runtime.catchain_seqno()).unwrap());
+    assert!(description.local_validator_index().is_none());
+    let db = crate::database::SimplexDb::open(directory.path().join("db"), "observer-cert").unwrap();
+    let receiver = MockReceiver::new();
+    let mut processor = make_pq_processor_with_description_for_test(db.clone(), description);
+    processor.receiver = receiver.clone();
+    let make_certificate = |session: &SessionId, signers: &[usize], corrupt: bool| {
+        let vote = SkipVote { slot: 0 }.into_boxed();
+        let preimage = crate::utils::create_data_to_sign(
+            session, &crate::utils::serialize_unsigned_vote(&vote),
+        );
+        let signatures = signers.iter().map(|&index| {
+            let mut signature = stores[index].sign_consensus(&preimage).unwrap().bytes.to_vec();
+            if corrupt { signature[0] ^= 1; }
+            VoteSignature { who: index as i32, signature }.into_boxed()
+        }).collect();
+        Certificate { vote, signatures: VoteSignatureSet { votes: signatures }.into_boxed() }
+            .into_boxed()
+    };
+    let invalid = [
+        make_certificate(runtime.session_id(), &[0], false), // weight 1 < quorum 2
+        make_certificate(runtime.session_id(), &[0, 0], false), // duplicate cannot add weight
+        make_certificate(&UInt256::from([0xff; 32]), &[0, 1], false),
+        make_certificate(runtime.session_id(), &[0, 1], true),
+    ];
+    let valid = make_certificate(runtime.session_id(), &[0, 1], false);
+    let calls: Vec<_> = stores.iter().map(|store| store.consensus_signatures_produced()).collect();
+    receiver.drain_actions();
+    for certificate in invalid {
+        // None is a transport observer, not a forged committee index zero.
+        processor.on_certificate(None::<u32>, certificate);
+        assert!(!processor.simplex_state.has_skip_certificate(SlotIndex::new(0)));
+        assert!(db.load_skip_cert_by_slot(SlotIndex::new(0), Duration::from_secs(5)).unwrap().is_none());
+        assert!(!receiver.drain_actions().iter().any(|action| matches!(action,
+            ReceiverAction::SendVote { .. } | ReceiverAction::SendCertificate { .. }
+        )));
+    }
+    processor.on_certificate(None::<u32>, valid.clone());
+    let drain = |processor: &mut SessionProcessor| {
+        for _ in 0..16 {
+            db.sync(Some(Duration::from_secs(5))).unwrap();
+            processor.process_pending_async_db_results();
+            if processor.database.pending_is_empty() { return; }
+        }
+        panic!("certificate continuations did not drain after actual storage barriers");
+    };
+    drain(&mut processor);
+    assert!(processor.simplex_state.has_skip_certificate(SlotIndex::new(0)));
+    assert!(db.load_skip_cert_by_slot(SlotIndex::new(0), Duration::from_secs(5)).unwrap().is_some());
+    let actions = receiver.drain_actions();
+    assert_eq!(actions.iter().filter(|action| matches!(action, ReceiverAction::SendCertificate { .. })).count(), 1);
+    assert!(!actions.iter().any(|action| matches!(action,
+        ReceiverAction::SendVote { .. } | ReceiverAction::CacheOurVoteForStandstill { .. }
+    )));
+    processor.on_certificate(None::<u32>, valid);
+    drain(&mut processor);
+    assert!(!receiver.drain_actions().iter().any(|action| matches!(action,
+        ReceiverAction::SendVote { .. } | ReceiverAction::SendCertificate { .. }
+    )));
+    assert_eq!(calls, stores.iter().map(|store| store.consensus_signatures_produced()).collect::<Vec<_>>());
+    drop(processor);
+    db.close(None).unwrap();
+}
