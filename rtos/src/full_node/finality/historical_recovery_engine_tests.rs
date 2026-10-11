@@ -82,7 +82,7 @@ async fn recover_source(mode: u8) {
                 local,
             )
             .unwrap()
-            .bind_recovery_anchor(target.clone())
+            .bind_recovery_anchor(if mode == 6 { pair.master.id().clone() } else { target.clone() })
             .unwrap(),
         );
         let namespace = PathBuf::from(
@@ -165,6 +165,14 @@ async fn recover_source(mode: u8) {
         })
         .await
         .expect("real GC must remove historical target before recovery");
+        if mode == 6 {
+            engine.shard_states_keeper().test_retire_history_state(pair.master.id());
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while engine.db().test_contains_dynamic_state_record(pair.master.id()).unwrap() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.expect("both distinct governing/start anchors must actually be GC'd");
+        }
         if mode == 1 || mode == 2 {
             if mode == 1 {
                 engine.db().test_remove_archived_artifacts(&target).await.unwrap();
@@ -283,10 +291,11 @@ async fn recover_source(mode: u8) {
                 assert_eq!(control.syncs(), 1);
                 assert_eq!(retained_source_bytes(&namespace), before);
             }
-            if mode == 5 {
+            if mode == 5 || mode == 6 {
                 let before = retained_source_bytes(&namespace);
                 let control =
-                    crate::historical_recovery::test_hooks::install(engine.as_ref(), false, true);
+                    crate::historical_recovery::test_hooks::install(engine.as_ref(), false, mode == 5);
+                if mode == 6 { control.fail_on_sync(2); }
                 let error = engine
                     .clone()
                     .authenticate_retired_source_with_history(record.clone())
@@ -297,7 +306,12 @@ async fn recover_source(mode: u8) {
                     error.downcast_ref::<std::io::Error>().and_then(|e| e.raw_os_error()),
                     Some(5)
                 );
-                assert_eq!(control.syncs(), 1);
+                assert_eq!(control.syncs(), if mode == 6 { 2 } else { 1 });
+                if mode == 6 {
+                    assert!(crate::retired_history::authenticate_capsule_with_budget(
+                        engine.as_ref(), pair.master.id(), None).await.unwrap().is_some(),
+                        "first authorized anchor must survive second-anchor uncertainty");
+                }
                 assert_eq!(retained_source_bytes(&namespace), before);
                 // The first attempt genuinely persisted bytes before the
                 // application-visible EIO. Reading them is not durability ACK:
@@ -307,8 +321,31 @@ async fn recover_source(mode: u8) {
                     .authenticate_retired_source_with_history(record.clone())
                     .await
                     .unwrap();
-                assert_eq!(control.syncs(), 2);
+                assert_eq!(control.syncs(), if mode == 6 { 4 } else { 2 });
                 assert_eq!(retained_source_bytes(&namespace), before);
+            }
+            if mode == 7 {
+                let files = retained_source_bytes(&namespace);
+                let (path, original) = files.iter().find(|(_, bytes)| {
+                    serde_json::from_slice::<serde_json::Value>(bytes).ok()
+                        .is_some_and(|value| value["certificate"].is_string())
+                }).expect("production retain_intent must store a genuine FinalCert");
+                let mut disk: serde_json::Value = serde_json::from_slice(original).unwrap();
+                let mut raw = hex::decode(disk["certificate"].as_str().unwrap()).unwrap();
+                let wire: rtos_api::ton::consensus::simplex::Certificate =
+                    WireProfile::T0.deserialize_value_bounded(&raw, raw.len()).unwrap();
+                let signature = wire.signatures().votes()[0].signature();
+                let offset = raw.windows(signature.len()).position(|v| v == signature.as_slice()).unwrap();
+                raw[offset] ^= 1;
+                disk["certificate"] = hex::encode(raw).into();
+                let invalid = serde_json::to_vec(&disk).unwrap();
+                std::fs::write(path, &invalid).unwrap();
+                assert!(engine.clone().authenticate_retired_source_with_history(record.clone()).await.is_err(),
+                    "publicly derivable historical identity must not authorize a bad retained certificate");
+                assert_eq!(std::fs::read(path).unwrap(), invalid, "failed authentication must preserve source debt");
+                assert!(crate::retired_history::authenticate_capsule_with_budget(engine.as_ref(), &target, None)
+                    .await.unwrap().is_none(), "bad certificate must not consume durable anchor quota");
+                std::fs::write(path, original).unwrap();
             }
             let authenticated = engine
                 .clone()
@@ -410,4 +447,16 @@ async fn historical_recovery_cancelled_observer_retains_source_and_budget_until_
 #[ignore = "actual capsule sync boundary uncertainty; RTOS_PUBLIC_FIXTURE_SIGNER required"]
 async fn historical_recovery_uncertain_sync_preserves_debt_and_rebarriers_before_retry() {
     recover_source(5).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two actual capsule commits with second unknown sync; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_second_anchor_uncertainty_keeps_first_and_source_debt() {
+    recover_source(6).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real source certificate PQ failure and restored control; RTOS_PUBLIC_FIXTURE_SIGNER required"]
+async fn historical_recovery_valid_identity_bad_source_pq_cannot_commit_capsule() {
+    recover_source(7).await;
 }
