@@ -320,6 +320,11 @@ impl MasterchainProofVerifier {
         if let Some(budget) = budget {
             budget.step()?;
         }
+        if let Some(budget) = budget {
+            if let Some(proofs) = budget.replay_proofs()? {
+                return self.governing_repair_closure(engine, epoch, proofs, budget).await;
+            }
+        }
         let pin = engine.init_mc_block_id();
         if epoch < pin.seq_no {
             fail!("Governing epoch is outside the locally pinned history");
@@ -361,13 +366,20 @@ impl MasterchainProofVerifier {
             Some(state) => state.find_block_id(epoch)?,
             None => pin.clone(),
         };
-        let cached = self.authorities.lock().get(&(pin.clone(), governing.clone())).cloned();
+        let capture = budget.is_some_and(|b| b.provenance_enabled());
+        let cached = if capture {
+            None
+        } else {
+            self.authorities.lock().get(&(pin.clone(), governing.clone())).cloned()
+        };
         let history = if let Some(history) = cached {
             history
         } else {
             // Use the newest already-authenticated predecessor that agrees with
             // the lookup index; the index itself conveys no authority.
-            let predecessor = {
+            let predecessor = if capture {
+                None
+            } else {
                 let cache = self.authorities.lock();
                 cache
                     .iter()
@@ -393,6 +405,7 @@ impl MasterchainProofVerifier {
                     };
                     if let Some(budget) = budget {
                         budget.graph(state.root_cell())?;
+                        budget.record_state(pin, state.root_cell())?;
                     }
                     BootstrapAuthority::from_zerostate(pin, state)?
                 }
@@ -442,6 +455,55 @@ impl MasterchainProofVerifier {
             history.charge_budget(budget)?;
         }
         Ok(history)
+    }
+
+    /// Only identities in the caller's bounded closure are locators. Every
+    /// transition is reauthenticated from the actual Engine pin, without caches
+    /// or dependence on a future latest-state history dictionary.
+    async fn governing_repair_closure<E: EngineOperations + ?Sized>(
+        &self,
+        engine: &E,
+        epoch: u32,
+        mut proofs: Vec<BlockProofStuff>,
+        budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
+    ) -> Result<BootstrapAuthority> {
+        let pin = engine.init_mc_block_id();
+        if epoch < pin.seq_no() {
+            fail!("Repair closure precedes pin");
+        }
+        let mut authority = if pin.seq_no() == 0 {
+            if pin != engine.zerostate_id()? {
+                fail!("Repair closure pin mismatch");
+            }
+            let zero = engine.load_mc_zero_state_bounded(budget.clone()).await?;
+            budget.record_state(pin, zero.root_cell())?;
+            BootstrapAuthority::from_zerostate(pin, zero)?
+        } else {
+            let proof = proofs
+                .iter()
+                .find(|p| p.id() == pin)
+                .ok_or_else(|| error!("Repair closure missing checkpoint"))?
+                .clone();
+            budget.record_history_proof(&proof)?;
+            BootstrapAuthority::from_checkpoint(pin, proof)?
+        };
+        proofs.sort_by_key(|p| p.id().seq_no());
+        for proof in proofs {
+            budget.step()?;
+            if proof.id().seq_no() <= authority.id().seq_no() || proof.id().seq_no() > epoch {
+                continue;
+            }
+            if !proof.pre_check_block_proof()?.1.key_block() {
+                continue;
+            }
+            budget.record_history_proof(&proof)?;
+            authority = authority.advance_key_block(proof.id(), proof.clone())?;
+        }
+        if authority.id().seq_no() != epoch {
+            fail!("Repair closure missing governing key proof");
+        }
+        authority.charge_budget(budget)?;
+        Ok(authority)
     }
 
     /// Recover publication policy from authenticated history rather than the

@@ -142,7 +142,7 @@ impl ShardStatesKeeper {
         allocated: Arc<EngineAlloc>,
     ) -> Result<Arc<Self>> {
         log::trace!("start_states_gc");
-        let gc_resolver = Arc::new(AllowStateGcSmartResolver::new(cells_lifetime_sec));
+        let gc_resolver = Arc::new(AllowStateGcSmartResolver::with_repair_protection(cells_lifetime_sec, db.repair_leases().protection().clone()));
         let cache_resolver = Arc::new(AllowStateGcSmartResolver::new(0));
         db.start_states_gc(gc_resolver.clone());
 

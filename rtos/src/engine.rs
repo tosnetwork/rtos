@@ -827,6 +827,7 @@ impl Engine {
                 }
                 stopper.release_stop(Self::MASK_SERVICE_DB_RESTORE);
                 let db = db?;
+                db.repair_leases().verify_domain(&zero_state_id, &init_mc_block_id)?;
 
                 let mut hardforks = global_config.hardforks()?;
                 hardforks.sort_by(|a, b| a.seq_no.cmp(&b.seq_no));

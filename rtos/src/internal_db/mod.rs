@@ -277,6 +277,7 @@ pub struct InternalDb {
     next2_block_db: BlockInfoDb,
     shard_state_persistent_db: Arc<FileDb>,
     state_db: StateDb,
+    repair_leases: Arc<crate::publication_dependency_leases::DependencyLeases>,
     archive_manager: Arc<ArchiveManager>,
     shard_top_blocks_db: ShardTopBlocksDb,
     full_node_state_db: Arc<NodeStateDb>,
@@ -300,6 +301,12 @@ impl Drop for PropagationOutboxWriterLease {
 }
 
 impl InternalDb {
+    pub(crate) fn repair_leases(
+        &self,
+    ) -> &Arc<crate::publication_dependency_leases::DependencyLeases> {
+        &self.repair_leases
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn with_update(
         config: InternalDbConfig,
@@ -373,6 +380,10 @@ impl InternalDb {
         // Existing dynamic counter CFs still need their merge operator when
         // this startup selects archival state storage.
         let db = open_node_db(&config.db_directory, &config.cells_db_config, access_type.clone())?;
+        let repair_leases = crate::publication_dependency_leases::DependencyLeases::open(
+            db.clone(),
+            can_create_db,
+        )?;
         let db_catchain = RocksDb::new(
             config.db_directory.as_str(),
             CATCHAINS_DB_NAME,
@@ -458,6 +469,7 @@ impl InternalDb {
         );
 
         let result = Self {
+            repair_leases,
             #[cfg(test)]
             recovery_node_db: db.clone(),
             catchain_db: db_catchain,
@@ -879,6 +891,44 @@ impl InternalDb {
             fail!("Durable repair proof changed");
         }
         Ok(handle)
+    }
+
+    /// Input comes from the fresh authenticated repair closure. Preserve normal
+    /// archive ownership; a conflicting already archived payload is rejected.
+    pub(crate) async fn sync_repair_history_proof(
+        &self,
+        proof: &BlockProofStuff,
+        budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
+    ) -> Result<()> {
+        self.store_block_proof(proof.id(), None, proof, None).await?;
+        let handle = self
+            .load_block_handle(proof.id())?
+            .ok_or_else(|| error!("Repair history handle missing"))?;
+        let read =
+            budget.reserve(crate::history_read_budget::ReadKind::Proof, proof.data().len())?;
+        let raw = self
+            .load_block_proof_raw_bounded(
+                &handle,
+                proof.is_link(),
+                storage::archives::bounded_read::ArchiveReadLimits {
+                    data_bytes: read.allowance(),
+                    filename_bytes: 512,
+                },
+            )
+            .await?;
+        read.finish(&raw)?;
+        if raw.as_slice() != proof.data() {
+            fail!("Repair history physical proof differs");
+        }
+        let entry = if proof.is_link() {
+            PackageEntryId::ProofLink(proof.id())
+        } else {
+            PackageEntryId::Proof(proof.id())
+        };
+        self.archive_manager
+            .sync_file(&handle, &entry, self.publication_sync_observer().as_deref())
+            .await?;
+        self.sync_publication_metadata(&handle).await
     }
 
     pub(crate) fn has_repair_state_index(&self, id: &BlockIdExt) -> Result<bool> {
@@ -1656,6 +1706,11 @@ impl InternalDb {
         })?;
 
         for id in for_delete {
+            let protection = self.repair_leases.protection();
+            let _deletion = protection.deletion().await;
+            if protection.state(&id) {
+                continue;
+            }
             match self.shard_state_persistent_db.delete_file(&id).await {
                 Ok(_) => log::debug!("shard_state_persistent_gc: {:x} deleted", id.root_hash()),
                 Err(e) => log::warn!(
@@ -2001,6 +2056,13 @@ impl InternalDb {
 
         // truncate handles and prev/next links
         fn clear_dbs(db: &InternalDb, id: BlockIdExt) {
+            let protection = db.repair_leases.protection();
+            let Some(_deletion) = protection.try_deletion() else {
+                return;
+            };
+            if protection.artifact(&id) || protection.state(&id) {
+                return;
+            }
             log::trace!("truncate_database: trying to drop handle {}", id);
             let _ = db.block_handle_storage.drop_handle(id.clone(), None);
             let _ = db.prev2_block_db.delete(&id);
@@ -2036,6 +2098,13 @@ impl InternalDb {
 
         // truncate info related with last handles
         fn clear_last_handle(db: &InternalDb, id: &BlockIdExt) {
+            let protection = db.repair_leases.protection();
+            let Some(_deletion) = protection.try_deletion() else {
+                return;
+            };
+            if protection.artifact(id) || protection.state(id) {
+                return;
+            }
             log::trace!("truncate_database: clear_last_handle {}", id);
             let _ = db.next1_block_db.delete(id);
             if let Ok(Some(handle)) = db.load_block_handle(id) {

@@ -894,6 +894,13 @@ impl ShardStateDb {
 
     fn delete_internal(self: Arc<Self>, id: &BlockIdExt) -> Result<()> {
         log::trace!(target: TARGET, "ShardStateDb::delete_internal  id {}", id);
+        let protection = self.dynamic_boc_db.cell_db().db().repair_protection();
+        let Some(_deletion) = protection.try_deletion() else {
+            return Ok(());
+        };
+        if protection.state(id) {
+            return Ok(());
+        }
 
         let _gate = self
             .bounded_read_gate

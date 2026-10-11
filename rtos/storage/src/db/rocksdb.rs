@@ -46,9 +46,14 @@ pub struct RocksDb {
     locks: lockfree::map::Map<String, AtomicI32>,
     // Block caches attached to this DB's column families.
     caches: Mutex<Vec<Cache>>,
+    repair_protection: Arc<crate::repair_protection::RepairProtection>,
 }
 
 impl RocksDb {
+    pub fn repair_protection(&self) -> &Arc<crate::repair_protection::RepairProtection> {
+        &self.repair_protection
+    }
+
     /// Creates new instance with given path and ability to additionally configure options
     pub fn new(
         path: impl AsRef<Path>,
@@ -93,6 +98,7 @@ impl RocksDb {
 
         // Clean up CFs from old archives in-place.
         if !matches!(access_type, AccessType::ReadOnly | AccessType::Secondary(_))
+            && !cfs.iter().any(|cf| cf == "repair_dependency_leases_v1")
             && cfs.len() > 100
         {
             Self::clean_up_old_cf(&db, &cfs)
@@ -100,6 +106,7 @@ impl RocksDb {
         }
 
         Ok(Arc::new(Self {
+            repair_protection: Arc::new(Default::default()),
             db: Some(db),
             locks: lockfree::map::Map::new(),
             caches: Mutex::new(Vec::new()),

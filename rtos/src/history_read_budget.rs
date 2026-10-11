@@ -76,6 +76,8 @@ struct Usage {
     graphs: HashSet<UInt256>,
 }
 pub struct HistoryReadBudget {
+    provenance: Mutex<Option<crate::repair_provenance::Trace>>,
+    replay_proofs: Mutex<Option<Vec<crate::block_proof::BlockProofStuff>>>,
     limits: HistoryReadLimits,
     usage: Mutex<Usage>,
     parsing: Mutex<()>,
@@ -204,9 +206,68 @@ fn add(value: &mut usize, amount: usize, limit: usize, label: &'static str) -> R
     Ok(())
 }
 impl HistoryReadBudget {
+    pub(crate) fn set_replay_proofs(&self, proofs: Vec<crate::block_proof::BlockProofStuff>) {
+        *self.replay_proofs.lock().unwrap() = Some(proofs);
+    }
+    pub(crate) fn replay_proofs(&self) -> Result<Option<Vec<crate::block_proof::BlockProofStuff>>> {
+        use storage::bounded_cell::CellReadBudget;
+        let proofs = self.replay_proofs.lock().unwrap();
+        if let Some(proofs) = proofs.as_ref() {
+            self.metadata(
+                proofs.len() * std::mem::size_of::<crate::block_proof::BlockProofStuff>(),
+            )?;
+        }
+        Ok(proofs.clone())
+    }
+    pub(crate) fn enable_provenance(&self) {
+        *self.provenance.lock().unwrap() = Some(Default::default());
+    }
+    pub(crate) fn provenance_enabled(&self) -> bool {
+        self.provenance.lock().unwrap().is_some()
+    }
+    pub(crate) fn record_history_proof(
+        &self,
+        proof: &crate::block_proof::BlockProofStuff,
+    ) -> Result<()> {
+        if let Some(trace) = self.provenance.lock().unwrap().as_mut() {
+            trace.proof(proof, self)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn record_state(&self, id: &rtos_block::BlockIdExt, root: &Cell) -> Result<()> {
+        if let Some(trace) = self.provenance.lock().unwrap().as_mut() {
+            trace.state(id, root, self)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn record_bytes(
+        &self,
+        kind: &str,
+        id: &rtos_block::BlockIdExt,
+        bytes: &[u8],
+        root: Option<&UInt256>,
+    ) -> Result<()> {
+        if let Some(trace) = self.provenance.lock().unwrap().as_mut() {
+            trace.bytes(kind, id, bytes, root, self)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn take_provenance(
+        &self,
+    ) -> Result<(Vec<crate::repair_provenance::Dependency>, Vec<crate::block_proof::BlockProofStuff>)>
+    {
+        self.provenance
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map(|t| t.take())
+            .ok_or_else(|| error!("No authenticated dependency recorder"))
+    }
     pub fn new(limits: HistoryReadLimits) -> Arc<Self> {
         Arc::new(Self {
             limits,
+            provenance: Mutex::new(None),
+            replay_proofs: Mutex::new(None),
             usage: Mutex::new(Usage::default()),
             parsing: Mutex::new(()),
             failed: AtomicBool::new(false),

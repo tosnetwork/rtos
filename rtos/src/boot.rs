@@ -750,6 +750,7 @@ pub(crate) async fn authenticate_recovered_state_evidence_with_budget<
         };
         if let Some(budget) = budget {
             budget.graph(zero.root_cell())?;
+            budget.record_state(pin, zero.root_cell())?;
         }
         BootstrapAuthority::from_zerostate(pin, zero)?
     } else {
@@ -759,7 +760,13 @@ pub(crate) async fn authenticate_recovered_state_evidence_with_budget<
         BootstrapAuthority::from_checkpoint(pin, proof)?
     };
     if block_id == pin {
-        return history.authenticate_current_state(state);
+        let verified = history.authenticate_current_state(state)?;
+        if evidence.is_none() {
+            if let Some(budget) = budget {
+                budget.record_state(block_id, verified.state().root_cell())?;
+            }
+        }
+        return Ok(verified);
     }
     // Untrusted augmented dictionaries may omit or substitute keys. Every
     // returned proof must still name the preceding authenticated governing epoch.
@@ -792,6 +799,11 @@ pub(crate) async fn authenticate_recovered_state_evidence_with_budget<
     if !verified.state().has_prev_block(pin)? {
         fail!("Authenticated recovered state does not contain the local pin");
     }
+    if evidence.is_none() {
+        if let Some(budget) = budget {
+            budget.record_state(block_id, verified.state().root_cell())?;
+        }
+    }
     Ok(verified)
 }
 
@@ -821,6 +833,7 @@ async fn recovery_evidence_proof<E: EngineOperations + ?Sized>(
     };
     if let Some(budget) = budget {
         budget.proof(&proof)?;
+        budget.record_history_proof(&proof)?;
     }
     if let Some(captured) = captured.as_mut() {
         if proof.data().len() > 8 << 20 {
@@ -846,6 +859,20 @@ pub(crate) async fn load_history_proof<E: EngineOperations + ?Sized>(
 }
 
 pub(crate) async fn load_history_proof_with_budget<E: EngineOperations + ?Sized>(
+    engine: &E,
+    id: &BlockIdExt,
+    checkpoint: bool,
+    key_block: bool,
+    budget: Option<&Arc<crate::history_read_budget::HistoryReadBudget>>,
+) -> Result<BlockProofStuff> {
+    let proof = load_history_proof_impl(engine, id, checkpoint, key_block, budget).await?;
+    if let Some(budget) = budget {
+        budget.record_history_proof(&proof)?;
+    }
+    Ok(proof)
+}
+
+async fn load_history_proof_impl<E: EngineOperations + ?Sized>(
     engine: &E,
     id: &BlockIdExt,
     checkpoint: bool,

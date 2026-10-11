@@ -223,19 +223,31 @@ impl ArchiveManager {
     ) -> Result<Vec<u8>> {
         let _lock = match entry_id {
             PackageEntryId::Block(_) => handle.block_file_lock().read().await,
-            PackageEntryId::Proof(_) | PackageEntryId::ProofLink(_) => handle.proof_file_lock().read().await,
+            PackageEntryId::Proof(_) | PackageEntryId::ProofLink(_) => {
+                handle.proof_file_lock().read().await
+            }
             _ => fail!("Unsupported bounded archive entry"),
         };
         if handle.is_archived() {
-            let package_id = self.get_package_id(get_mc_seq_no(handle), handle.is_key_block()?).await?;
-            let fd = self.get_file_desc(&package_id, false).await?
+            let package_id =
+                self.get_package_id(get_mc_seq_no(handle), handle.is_key_block()?).await?;
+            let fd = self
+                .get_file_desc(&package_id, false)
+                .await?
                 .ok_or_else(|| error!("Bounded archive descriptor missing"))?;
-            let entry = fd.archive_slice().get_file_bounded(handle, entry_id, limits).await?
+            let entry = fd
+                .archive_slice()
+                .get_file_bounded(handle, entry_id, limits)
+                .await?
                 .ok_or_else(|| error!("Bounded archive entry missing"))?;
             return Ok(entry.take_data());
         }
         let filename = entry_id.filename_short();
-        super::bounded_read::check_length("filename", filename.len() as u64, limits.filename_bytes)?;
+        super::bounded_read::check_length(
+            "filename",
+            filename.len() as u64,
+            limits.filename_bytes,
+        )?;
         super::bounded_read::read_loose(&self.unapplied_files_path.join(filename), limits).await
     }
 
@@ -277,6 +289,7 @@ impl ArchiveManager {
         handle: &BlockHandle,
         mut on_success: impl FnMut() -> Result<()>,
     ) -> Result<()> {
+        let _migration = self.db.repair_protection().deletion().await;
         if !handle.set_moving_to_archive() {
             return Ok(());
         }
@@ -336,6 +349,10 @@ impl ArchiveManager {
     }
 
     pub async fn remove_file(&self, handle: &BlockHandle) -> Result<()> {
+        let _deletion = self.db.repair_protection().deletion().await;
+        if self.db.repair_protection().artifact(handle.id()) {
+            return Ok(());
+        }
         let proof_filename = if handle.has_proof_link() {
             let entry_id = PackageEntryId::ProofLink(handle.id());
             log::debug!(target: TARGET, "Remove unapplied proof link file: {}", entry_id);
@@ -385,6 +402,10 @@ impl ArchiveManager {
                 Ok((shard, seq_no)) => {
                     for id in ids {
                         if shard.intersect_with(id.shard()) && (seq_no < id.seq_no()) {
+                            let _deletion = self.db.repair_protection().deletion().await;
+                            if self.db.repair_protection().artifact_position(&shard, seq_no) {
+                                continue;
+                            }
                             if let Err(err) = tokio::fs::remove_file(entry.path()).await {
                                 log::warn!(
                                     "clean_unapplied_files: cannot remove {:?}: {}",
@@ -712,6 +733,10 @@ impl ArchiveManager {
         move_file: bool,
         contains_key_block: bool,
     ) -> Result<()> {
+        let _replacement = self.db.repair_protection().deletion().await;
+        if self.db.repair_protection().archive_range(0, None) {
+            fail!("Archive package replacement conflicts with persistent repair custody");
+        }
         let slice_id = self.get_package_id_force(archive_id, false, contains_key_block).await;
         let fd = self.get_or_create_import_desc(&slice_id, shard.prefix_len()).await?;
 
