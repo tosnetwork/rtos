@@ -145,6 +145,7 @@ pub struct Engine {
     persistence_tasks: crate::types::owned_tasks::OwnedTasks,
     publication_worker: std::sync::Mutex<Option<Arc<crate::publication_worker::PublicationWorker>>>,
     finality_recovery: Arc<crate::validator::finality_recovery_owner::RecoveryRegistry>,
+    retired_recovery: std::sync::Mutex<Option<Arc<crate::validator::retired_session_service::RetiredSessionService>>>,
 
     shard_states_awaiters: AwaitersPool<BlockIdExt, Arc<ShardStateStuff>>,
     block_applying_awaiters: AwaitersPool<BlockIdExt, ()>,
@@ -560,6 +561,9 @@ impl Stopper {
         if bitmap & Engine::MASK_SERVICE_VALIDATOR_MANAGER != 0 {
             ss.push_str("validator manager, ");
         }
+        if bitmap & Engine::MASK_SERVICE_RETIRED_RECOVERY != 0 {
+            ss.push_str("retired consensus recovery, ");
+        }
         if bitmap & Engine::MASK_SERVICE_ARCHIVES_GC != 0 {
             ss.push_str("archives gc, ");
         }
@@ -599,6 +603,7 @@ impl Engine {
     pub const MASK_SERVICE_DB_RESTORE: u32 = 0x0400;
     pub const MASK_SERVICE_ARCHIVES_GC: u32 = 0x0800;
     pub const MASK_SERVICE_SS_CACHE_KEEPER: u32 = 0x1000;
+    pub const MASK_SERVICE_RETIRED_RECOVERY: u32 = 0x2000;
 
     // Sync status (ordered by normal flow: boot → states → finish boot → archives → blocks → synced)
     pub const SYNC_STATUS_START_BOOT: u32 = 1;
@@ -938,6 +943,7 @@ impl Engine {
                     background_tasks: Arc::new(Default::default()),
                     publication_worker: std::sync::Mutex::new(None),
                     finality_recovery: Arc::new(Default::default()),
+                    retired_recovery: std::sync::Mutex::new(None),
                     ingress_tasks: Arc::new(crate::types::owned_tasks::OwnedTasks::new(
                         tokio_util::sync::CancellationToken::new(),
                     )),
@@ -1169,6 +1175,22 @@ impl Engine {
 
     pub(crate) fn finality_recovery_registry(&self) -> &Arc<crate::validator::finality_recovery_owner::RecoveryRegistry> {
         &self.finality_recovery
+    }
+
+    pub(crate) async fn ensure_retired_session_recovery(
+        self: &Arc<Self>,
+    ) -> Result<Arc<crate::validator::retired_session_service::RetiredSessionService>> {
+        let service = {
+            let mut slot = self.retired_recovery.lock().unwrap();
+            if self.check_stop() { fail!("Retired recovery admission stopped"); }
+            if let Some(service) = slot.as_ref() { service.clone() } else {
+                let service = crate::validator::retired_session_service::RetiredSessionService::start(self.clone())?;
+                *slot = Some(service.clone());
+                service
+            }
+        };
+        service.wait_initial_scan().await?;
+        Ok(service)
     }
 
     pub(crate) async fn ensure_publication_worker(
@@ -2990,6 +3012,7 @@ pub async fn run(
             // enabled only after fast-sync initialization below.
             engine.ensure_publication_worker().await?;
             crate::validator::recover_retained_finality(engine.clone()).await?;
+            engine.ensure_retired_session_recovery().await?;
 
             // Start validator manager, which will start validator sessions when necessary
             start_validator_manager(

@@ -233,33 +233,38 @@ pub fn scan_finality_recovery(root: &std::path::Path) -> Result<Vec<SessionRecov
     for entry in std::fs::read_dir(base)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() { continue; }
-        let namespace = entry.path();
-        let owner_path = namespace.join("finality-pending");
-        if !owner_path.exists() {
-            if namespace.join("session-runtime.json").exists() { fail!("Legacy runtime lacks source recovery provenance: {}", namespace.display()); }
-            continue;
-        }
-        let Some(_owner) = crate::finality_delivery::PendingFinalityStore::lock(owner_path)? else { continue; };
-        let store = FinalityIntentStore::new(&namespace);
-        if !namespace.join(DIRECTORY).is_dir() { fail!("Legacy source lacks final certificate recovery provenance: {}", namespace.display()); }
-        let mut found: Option<SessionRecoveryRecord> = None;
-        for path in store.paths()? {
-            let (record, _) = read_intent(&path, &namespace)?;
-            if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                if let Some(existing) = &found {
-                    if existing.binding != record.binding || existing.session_id != record.session_id
-                        || existing.prev_blocks != record.prev_blocks || existing.local_adnl != record.local_adnl
-                        || existing.start_masterchain != record.start_masterchain || existing.pin != record.pin
-                        || existing.profile != record.profile || existing.local_validator_index != record.local_validator_index {
-                        fail!("Conflicting source recovery contexts within namespace");
-                    }
-                } else { found = Some(record); }
-            }
-        }
-        if let Some(record) = found { sessions.push(record); }
+        if let Some(record) = scan_finality_recovery_namespace(&entry.path())? { sessions.push(record); }
         if sessions.len() >= 128 { break; }
     }
     Ok(sessions)
+}
+
+/// Scan one namespace so Engine can isolate malformed/legacy records and fairly
+/// revisit other sessions. None means no idle unresolved work, not authentication.
+pub fn scan_finality_recovery_namespace(namespace: &std::path::Path) -> Result<Option<SessionRecoveryRecord>> {
+    let owner_path = namespace.join("finality-pending");
+    if !owner_path.exists() {
+        if namespace.join("session-runtime.json").exists() { fail!("Legacy runtime lacks source recovery provenance: {}", namespace.display()); }
+        return Ok(None);
+    }
+    let Some(_owner) = crate::finality_delivery::PendingFinalityStore::lock(owner_path)? else { return Ok(None); };
+    let store = FinalityIntentStore::new(namespace);
+    if !namespace.join(DIRECTORY).is_dir() { fail!("Legacy source lacks final certificate recovery provenance: {}", namespace.display()); }
+    let mut found: Option<SessionRecoveryRecord> = None;
+    for path in store.paths()? {
+        let (record, _) = read_intent(&path, namespace)?;
+        if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            if let Some(existing) = &found {
+                if existing.binding != record.binding || existing.session_id != record.session_id
+                    || existing.prev_blocks != record.prev_blocks || existing.local_adnl != record.local_adnl
+                    || existing.start_masterchain != record.start_masterchain || existing.pin != record.pin
+                    || existing.profile != record.profile || existing.local_validator_index != record.local_validator_index {
+                    fail!("Conflicting source recovery contexts within namespace");
+                }
+            } else { found = Some(record); }
+        }
+    }
+    Ok(found)
 }
 
 #[cfg(test)]

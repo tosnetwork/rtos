@@ -101,6 +101,7 @@ impl Submission {
 struct SessionSink {
     worker: Arc<PublicationWorker>,
     runtime: Arc<AuthenticatedSessionRuntime>,
+    historical: bool,
 }
 impl DurableFinalitySink for SessionSink {
     fn stage(
@@ -123,7 +124,7 @@ impl DurableFinalitySink for SessionSink {
                     LocalRole::Observer => None,
                 },
             },
-            historical: false,
+            historical: self.historical,
         };
         // On admission failure the source owns retry and completion must not run.
         self.worker.admit_draft(request)
@@ -244,8 +245,25 @@ impl PublicationWorker {
         self: &Arc<Self>,
         runtime: Arc<AuthenticatedSessionRuntime>,
     ) -> DurableFinalitySinkPtr {
-        Arc::new(SessionSink { worker: self.clone(), runtime })
+        Arc::new(SessionSink { worker: self.clone(), runtime, historical: false })
     }
+    /// Only the historical authenticator can create this receipt. Each draft is
+    /// independently authenticated again before WAL custody; current routing or
+    /// local secret availability cannot erase a retired session's delivery debt.
+    pub(crate) fn historical_sink(
+        self: &Arc<Self>,
+        authenticated: &crate::validator::retired_session_auth::AuthenticatedRetiredSession,
+    ) -> Result<DurableFinalitySinkPtr> {
+        let runtime = authenticated.runtime().clone();
+        let engine = self.state.engine.upgrade().ok_or_else(|| error!("Engine unavailable"))?;
+        if &runtime.pin().zerostate != engine.zerostate_id()
+            || runtime.wire_profile() != engine.validator_network().wire_profile()
+        {
+            fail!("Historical sink belongs to another Engine domain");
+        }
+        Ok(Arc::new(SessionSink { worker: self.clone(), runtime, historical: true }))
+    }
+
     fn admit_draft(&self, request: Submission) -> Result<()> {
         let result = (|| {
             let sender =

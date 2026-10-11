@@ -928,6 +928,13 @@ pub trait EngineOperations: Sync + Send {
         rtos_block::fail!("Durable publication acceptance is unsupported")
     }
 
+    fn reserve_normal_session_namespace(
+        &self,
+        _runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+    ) -> Result<Option<crate::validator::finality_recovery_owner::RecoveryReservation>> {
+        rtos_block::fail!("Atomic consensus namespace admission is unavailable")
+    }
+
     fn finality_recovery_generation(&self) -> u64 {
         0
     }

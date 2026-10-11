@@ -1167,6 +1167,13 @@ impl EngineOperations for Engine {
         Ok(())
     }
 
+    fn reserve_normal_session_namespace(
+        &self,
+        runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+    ) -> Result<Option<crate::validator::finality_recovery_owner::RecoveryReservation>> {
+        self.finality_recovery_registry().reserve_normal(runtime)
+    }
+
     fn finality_recovery_generation(&self) -> u64 {
         self.finality_recovery_registry().generation()
     }
