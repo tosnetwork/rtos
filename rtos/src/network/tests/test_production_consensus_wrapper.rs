@@ -249,3 +249,53 @@ async fn production_wrapper_held_query_profile_generation_and_sticky_failure() -
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn production_network_loads_explicit_consensus_transport_without_validator_identity(
+) -> Result<()> {
+    let bootstrap = EmulatorNetworkBootstrap::build(2)?;
+    let transport = bootstrap.validators[0].adnl_key.clone();
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&bootstrap.config_path)?)?;
+    config["ip_address_quic"] = "127.0.0.1:0".into();
+    config["validator_keys"] = serde_json::json!([]);
+    config["consensus_transport_bindings"] = serde_json::json!([{
+        "validator_id": rtos_block::base64_encode(&[71; 32]),
+        "adnl_key_id": rtos_block::base64_encode(transport.id().data()),
+    }]);
+    std::fs::write(&bootstrap.config_path, serde_json::to_vec(&config)?)?;
+    let network = NodeNetwork::new(
+        bootstrap.load_node_config().await?,
+        tokio_util::sync::CancellationToken::new(),
+        #[cfg(feature = "telemetry")]
+        crate::collator_test_bundle::create_engine_telemetry(),
+        create_engine_allocated(),
+    )
+    .await?;
+    let result = std::panic::AssertUnwindSafe(async {
+        assert!(!network.config_handler().get_validator_status());
+        let loaded = network.context().stack.adnl.key_by_id(transport.id())?;
+        assert_eq!(loaded.id(), transport.id());
+        assert_eq!(network.config_handler().consensus_transport_bindings()?.len(), 1);
+        // A separately held key is not loaded merely because it exists in the
+        // keyring: only explicit bindings authorize transport activation.
+        assert!(network
+            .context()
+            .stack
+            .adnl
+            .key_by_id(bootstrap.validators[1].adnl_key.id())
+            .is_err());
+        Ok::<_, anyhow::Error>(())
+    })
+    .catch_unwind()
+    .await;
+    let cleanup = network.stop_adnl().await;
+    match result {
+        Ok(result) => {
+            result?;
+            cleanup?;
+        }
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+    Ok(())
+}
