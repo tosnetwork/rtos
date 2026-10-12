@@ -565,6 +565,69 @@ impl EngineOperations for Engine {
         self.db().drop_validator_state_raw(DESTROYED_VALIDATOR_SESSIONS)
     }
 
+    fn persist_validator_retirement(
+        &self,
+        fence: &HashSet<UInt256>,
+        records: &[consensus_common::validator_cleanup::PendingValidatorCleanup],
+    ) -> Result<()> {
+        use consensus_common::validator_cleanup::{encode_record, record_key};
+        let mut puts = Vec::with_capacity(records.len().saturating_add(1));
+        let mut deletes = Vec::new();
+        if fence.is_empty() {
+            deletes.push(DESTROYED_VALIDATOR_SESSIONS.to_owned());
+        } else {
+            puts.push((DESTROYED_VALIDATOR_SESSIONS.to_owned(), serialize_destroyed_session_ids(fence)));
+        }
+        for record in records {
+            puts.push((record_key(&record.session_id), encode_record(record)));
+        }
+        self.db().write_validator_state_batch_sync(&puts, &deletes)
+    }
+
+    fn load_validator_cleanup_page(
+        &self,
+        after: &str,
+        max_keys: usize,
+    ) -> Result<consensus_common::validator_cleanup::Page> {
+        use consensus_common::validator_cleanup::{
+            decode_record, Page, MAX_RECORD_BYTES, RECORD_KEY_PREFIX,
+        };
+        let (entries, last_key, reached_end) = self.db().scan_validator_state_prefix(
+            RECORD_KEY_PREFIX,
+            after,
+            max_keys,
+            MAX_RECORD_BYTES,
+        )?;
+        // A malformed record never grants authority; it is skipped but the
+        // cursor still moves past its key.
+        let records = entries
+            .iter()
+            .filter_map(|(key, value)| {
+                decode_record(value).filter(|record| {
+                    *key == consensus_common::validator_cleanup::record_key(&record.session_id)
+                })
+            })
+            .collect();
+        Ok(Page { records, last_key, reached_end })
+    }
+
+    fn load_validator_cleanup_record(
+        &self,
+        session: &UInt256,
+    ) -> Result<Option<consensus_common::validator_cleanup::PendingValidatorCleanup>> {
+        use consensus_common::validator_cleanup::{decode_record, record_key, MAX_RECORD_BYTES};
+        Ok(self
+            .db()
+            .load_validator_state_key_bounded(&record_key(session), MAX_RECORD_BYTES)?
+            .and_then(|value| decode_record(&value))
+            .filter(|record| &record.session_id == session))
+    }
+
+    fn erase_validator_cleanup_record(&self, session: &UInt256) -> Result<()> {
+        let key = consensus_common::validator_cleanup::record_key(session);
+        self.db().write_validator_state_batch_sync(&[], &[key])
+    }
+
     fn save_block_candidate(
         &self,
         session_id: &SessionId,

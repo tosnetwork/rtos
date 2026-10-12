@@ -492,6 +492,34 @@ pub trait EngineOperations: Sync + Send {
     fn clear_destroyed_session_ids(&self) -> Result<()> {
         unimplemented!()
     }
+    /// Persists the destroyed-session fence together with new cleanup records
+    /// in one synced batch; groups may close only after it succeeds.
+    fn persist_validator_retirement(
+        &self,
+        _fence: &HashSet<UInt256>,
+        _records: &[consensus_common::validator_cleanup::PendingValidatorCleanup],
+    ) -> Result<()> {
+        rtos_block::fail!("Validator retirement persistence is unavailable")
+    }
+    /// One bounded page of durable cleanup records strictly after `after`.
+    fn load_validator_cleanup_page(
+        &self,
+        _after: &str,
+        _max_keys: usize,
+    ) -> Result<consensus_common::validator_cleanup::Page> {
+        rtos_block::fail!("Validator cleanup records are unavailable")
+    }
+    /// The durable cleanup record of one session, if any.
+    fn load_validator_cleanup_record(
+        &self,
+        _session: &UInt256,
+    ) -> Result<Option<consensus_common::validator_cleanup::PendingValidatorCleanup>> {
+        rtos_block::fail!("Validator cleanup records are unavailable")
+    }
+    /// Erases one session's cleanup record with a synced write.
+    fn erase_validator_cleanup_record(&self, _session: &UInt256) -> Result<()> {
+        rtos_block::fail!("Validator cleanup records are unavailable")
+    }
     fn save_block_candidate(
         &self,
         session_id: &SessionId,

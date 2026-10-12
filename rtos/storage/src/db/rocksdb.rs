@@ -485,6 +485,56 @@ impl<K: DbKey + Send + Sync> RocksDbTable<K> {
         fail!("Attempt to write into dropped table {}", self.family)
     }
 
+    /// Atomically applies every put and delete in one WriteBatch and waits for
+    /// its WAL durability barrier, so a crash keeps all of them or none.
+    pub fn write_batch_sync(&self, puts: &[(&[u8], &[u8])], deletes: &[&[u8]]) -> Result<()> {
+        if let Some(lock) = self.db.locks.get(&self.family) {
+            let lock = lock.val();
+            if lock.fetch_add(1, Ordering::Relaxed) >= 0 {
+                let result = (|| {
+                    let cf = self.cf()?;
+                    let mut batch = WriteBatch::default();
+                    for (key, value) in puts {
+                        batch.put_cf(&cf, key, value);
+                    }
+                    for key in deletes {
+                        batch.delete_cf(&cf, key);
+                    }
+                    let mut options = WriteOptions::default();
+                    options.disable_wal(false);
+                    options.set_sync(true);
+                    self.db.write_opt(batch, &options)?;
+                    Ok(())
+                })();
+                lock.fetch_sub(1, Ordering::Relaxed);
+                return result;
+            }
+        }
+        fail!("Attempt to write into dropped table {}", self.family)
+    }
+
+    /// Visits entries in key order starting at the first key >= `start`.
+    pub fn for_each_from(&self, start: &[u8], predicate: DbPredicateMut) -> Result<bool> {
+        if let Some(lock) = self.db.locks.get(&self.family) {
+            let lock = lock.val();
+            if lock.fetch_add(1, Ordering::Relaxed) >= 0 {
+                let result = (|| {
+                    let mode = IteratorMode::From(start, rocksdb::Direction::Forward);
+                    for item in self.db.iterator_cf(&self.cf()?, mode) {
+                        let (key, value) = item?;
+                        if !predicate(key.as_ref(), value.as_ref())? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                })();
+                lock.fetch_sub(1, Ordering::Relaxed);
+                return result;
+            }
+        }
+        fail!("Attempt to iterate over dropped table {}", self.family)
+    }
+
     /// Atomically replace one value and wait for its WAL durability barrier.
     /// Unlike put_raw, success includes RocksDB's synchronous WAL write. WAL
     /// must remain enabled: sync without WAL would not persist this memtable.

@@ -763,6 +763,67 @@ impl BlockHandleStorage {
         }
     }
 
+    /// Atomically puts and deletes several validator-state keys in one synced
+    /// batch. Keys may be dynamic; none may alias a cached block-id state.
+    pub fn write_validator_state_batch_sync(
+        &self,
+        puts: &[(String, Vec<u8>)],
+        deletes: &[String],
+    ) -> Result<()> {
+        for key in puts.iter().map(|(key, _)| key).chain(deletes) {
+            self.delete_state(key)?;
+        }
+        let puts: Vec<(&[u8], &[u8])> =
+            puts.iter().map(|(key, value)| (key.as_bytes(), value.as_slice())).collect();
+        let deletes: Vec<&[u8]> = deletes.iter().map(|key| key.as_bytes()).collect();
+        self.validator_state_db.write_batch_sync(&puts, &deletes)
+    }
+
+    /// Reads at most `max_keys` validator-state entries whose key starts with
+    /// `prefix`, strictly after `after` (or from the prefix when empty), each
+    /// value at most `max_value_bytes`. Returns the entries, the last key
+    /// read, and whether the prefix range was exhausted.
+    pub fn scan_validator_state_prefix(
+        &self,
+        prefix: &str,
+        after: &str,
+        max_keys: usize,
+        max_value_bytes: usize,
+    ) -> Result<(Vec<(String, Vec<u8>)>, String, bool)> {
+        let start = if after.is_empty() { prefix } else { after };
+        let mut entries = Vec::new();
+        let mut last_key = String::new();
+        let mut reached_end = true;
+        let mut failure = None;
+        self.validator_state_db.for_each_from(start.as_bytes(), &mut |key, value| {
+            if !key.starts_with(prefix.as_bytes()) {
+                return Ok(false);
+            }
+            if key == after.as_bytes() {
+                return Ok(true);
+            }
+            if entries.len() == max_keys {
+                reached_end = false;
+                return Ok(false);
+            }
+            let Ok(key) = std::str::from_utf8(key) else {
+                failure = Some(error!("Validator-state key under {prefix} is not UTF-8"));
+                return Ok(false);
+            };
+            if value.len() > max_value_bytes {
+                failure = Some(error!("Validator-state value {key} exceeds {max_value_bytes} bytes"));
+                return Ok(false);
+            }
+            last_key = key.to_owned();
+            entries.push((last_key.clone(), value.to_vec()));
+            Ok(true)
+        })?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok((entries, last_key, reached_end))
+    }
+
     pub fn drop_validator_state_raw(&self, key: &str) -> Result<()> {
         self.delete_state(key)?;
         self.validator_state_db.delete_raw(key.as_bytes())

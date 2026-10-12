@@ -2082,6 +2082,34 @@ impl InternalDb {
         Ok(())
     }
 
+    /// Atomically puts and deletes several (possibly dynamic) validator-state
+    /// keys with one synced batch.
+    pub fn write_validator_state_batch_sync(
+        &self,
+        puts: &[(String, Vec<u8>)],
+        deletes: &[String],
+    ) -> Result<()> {
+        self.block_handle_storage.write_validator_state_batch_sync(puts, deletes)
+    }
+
+    pub fn scan_validator_state_prefix(
+        &self,
+        prefix: &str,
+        after: &str,
+        max_keys: usize,
+        max_value_bytes: usize,
+    ) -> Result<(Vec<(String, Vec<u8>)>, String, bool)> {
+        self.block_handle_storage.scan_validator_state_prefix(prefix, after, max_keys, max_value_bytes)
+    }
+
+    pub fn load_validator_state_key_bounded(
+        &self,
+        key: &str,
+        maximum: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        self.block_handle_storage.load_validator_state_raw_bounded(key, maximum)
+    }
+
     pub fn load_validator_state_raw_bounded(
         &self,
         key: &'static str,

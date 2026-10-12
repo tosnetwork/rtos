@@ -231,3 +231,53 @@ async fn archive_migration_guard_retains_exclusive_owner_across_routing_reset() 
     assert!(result.is_err());
     assert!(handle.try_begin_archive_migration().is_some());
 }
+
+#[tokio::test]
+async fn test_validator_state_batch_and_prefix_scan() {
+    const DB_NAME: &str = "test_validator_state_batch_and_prefix_scan";
+    let db = RocksDb::new(DB_PATH, DB_NAME, None, AccessType::ReadWrite).unwrap();
+    let (storage, _) = create_block_handle_storage(db);
+    // One batch puts several dynamic keys and neighbours outside the prefix.
+    let puts: Vec<(String, Vec<u8>)> = (0..5u8)
+        .map(|i| (format!("Cleanup.{i:02}"), vec![i; 4]))
+        .chain([("CleanupX".to_owned(), vec![9]), ("Cleanuo.zz".to_owned(), vec![8])])
+        .collect();
+    storage.write_validator_state_batch_sync(&puts, &[]).unwrap();
+    // Paging: strictly after the cursor, bounded, and only under the prefix.
+    let keys = |page: &[(String, Vec<u8>)]| page.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
+    let (page, last, end) = storage.scan_validator_state_prefix("Cleanup.", "", 2, 16).unwrap();
+    assert_eq!(keys(&page), ["Cleanup.00", "Cleanup.01"]);
+    assert_eq!(last, "Cleanup.01");
+    assert!(!end);
+    let (page, last, end) = storage.scan_validator_state_prefix("Cleanup.", &last, 2, 16).unwrap();
+    assert_eq!(keys(&page), ["Cleanup.02", "Cleanup.03"]);
+    assert!(!end);
+    let (page, _, end) = storage.scan_validator_state_prefix("Cleanup.", &last, 2, 16).unwrap();
+    assert_eq!(keys(&page), ["Cleanup.04"]);
+    assert!(end, "the next key is outside the prefix");
+    // One batch deletes and replaces atomically.
+    storage
+        .write_validator_state_batch_sync(
+            &[("Cleanup.04".to_owned(), vec![7])],
+            &["Cleanup.00".to_owned(), "Cleanup.01".to_owned()],
+        )
+        .unwrap();
+    let (page, _, end) = storage.scan_validator_state_prefix("Cleanup.", "", 10, 16).unwrap();
+    assert_eq!(
+        page,
+        vec![
+            ("Cleanup.02".to_owned(), vec![2; 4]),
+            ("Cleanup.03".to_owned(), vec![3; 4]),
+            ("Cleanup.04".to_owned(), vec![7]),
+        ]
+    );
+    assert!(end);
+    // An oversized value refuses the scan instead of being returned.
+    storage
+        .write_validator_state_batch_sync(&[("Cleanup.05".to_owned(), vec![0; 17])], &[])
+        .unwrap();
+    assert!(storage.scan_validator_state_prefix("Cleanup.", "", 10, 16).is_err());
+    assert_eq!(storage.load_validator_state_raw("CleanupX").unwrap(), Some(vec![9]));
+    drop(storage);
+    destroy_rocks_db(DB_PATH, DB_NAME).await.unwrap();
+}
