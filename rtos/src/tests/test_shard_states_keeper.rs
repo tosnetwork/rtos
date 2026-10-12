@@ -318,3 +318,81 @@ async fn test_cleanup_floor_custody_restores_and_never_replaces_a_missing_floor(
     engine.db.stop_states_db().await.unwrap();
     Ok(())
 }
+
+/// Stores a masterchain state for `id`; with `prev`, its history records it.
+async fn store_mc_state(
+    keeper: &Arc<ShardStatesKeeper>,
+    id: &BlockIdExt,
+    prev: Option<&BlockIdExt>,
+) -> Result<()> {
+    use crate::collator_test_bundle::create_block_handle_storage;
+    use rtos_block::{ExtBlkRef, HashmapAugType, KeyExtBlkRef, KeyMaxLt, McStateExtra};
+    let mut header = ShardStateUnsplit::with_ident(ShardIdent::masterchain());
+    header.set_seq_no(id.seq_no());
+    let mut extra = McStateExtra::default();
+    if let Some(prev) = prev {
+        let reference = KeyExtBlkRef {
+            key: false,
+            blk_ref: ExtBlkRef {
+                end_lt: 0,
+                seq_no: prev.seq_no(),
+                root_hash: prev.root_hash().clone(),
+                file_hash: prev.file_hash().clone(),
+            },
+        };
+        extra.prev_blocks.set(&prev.seq_no(), &reference, &KeyMaxLt { key: false, max_end_lt: 0 })?;
+    }
+    header.write_custom(Some(&extra))?;
+    let state = ShardStateStuff::from_state(
+        id.clone(),
+        header,
+        #[cfg(feature = "telemetry")]
+        &keeper.telemetry,
+        &keeper.allocated,
+    )?;
+    let handles = create_block_handle_storage(None)?;
+    let handle =
+        handles.create_handle(id.clone(), storage::types::BlockMeta::default(), None)?.unwrap();
+    keeper.store_state(&handle, state, None, true).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cleanup_floor_adoption_is_monotonic_and_uncertain_writes_fail_closed() -> Result<()> {
+    use consensus_common::validator_cleanup::{decode_checkpoint, GC_FLOOR_KEY};
+    let mc = |seqno: u32, hash: u8| {
+        BlockIdExt::with_params(ShardIdent::masterchain(), seqno, UInt256::from([hash; 32]), UInt256::from([hash; 32]))
+    };
+    let (older, floor, successor, fork) = (mc(41, 1), mc(42, 2), mc(43, 3), mc(43, 4));
+    let dir = tempfile::tempdir()?;
+    let engine = TestEngine::new_db_dir(dir.path().to_str().unwrap(), None).await?;
+    let stopper = Arc::new(Stopper::new());
+    let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
+    store_mc_state(&keeper, &older, None).await?;
+    store_mc_state(&keeper, &floor, None).await?;
+    store_mc_state(&keeper, &successor, Some(&floor)).await?;
+    store_mc_state(&keeper, &fork, None).await?;
+    keeper.adopt_cleanup_floor(&floor, wait_pin(&keeper, &floor).await?)?;
+    // No regression, and no fork that does not record the current floor.
+    assert!(keeper.adopt_cleanup_floor(&older, wait_pin(&keeper, &older).await?).is_err());
+    assert!(keeper.adopt_cleanup_floor(&fork, wait_pin(&keeper, &fork).await?).is_err());
+    assert_eq!(keeper.cleanup_floor().map(|(id, _)| id), Some(floor.clone()));
+    // A write that committed but reported an error leaves the floor uncertain:
+    // cleanup is disabled and nothing can be adopted until the key is re-read.
+    keeper.fail_floor_write_after_commit.store(true, std::sync::atomic::Ordering::Release);
+    assert!(keeper.adopt_cleanup_floor(&successor, wait_pin(&keeper, &successor).await?).is_err());
+    assert!(keeper.cleanup_floor().is_none(), "uncertain disables cleanup");
+    assert!(!keeper.cleanup_floor_unset());
+    assert!(keeper.adopt_cleanup_floor(&successor, wait_pin(&keeper, &successor).await?).is_err());
+    let durable = engine
+        .db
+        .load_validator_state_key_bounded(GC_FLOOR_KEY, 256)?
+        .and_then(|value| decode_checkpoint(&value));
+    assert_eq!(durable, Some(successor.clone()), "the write committed");
+    keeper.resolve_uncertain_cleanup_floor()?;
+    assert_eq!(keeper.cleanup_floor().map(|(id, _)| id), Some(successor.clone()));
+    assert!(keeper.adopt_cleanup_floor(&floor, wait_pin(&keeper, &floor).await?).is_err());
+    stopper.set_stop();
+    engine.db.stop_states_db().await.unwrap();
+    Ok(())
+}

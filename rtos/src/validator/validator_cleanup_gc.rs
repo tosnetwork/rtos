@@ -85,6 +85,7 @@ async fn advance_inputs(
 /// went missing is left alone: cleanup stays disabled.
 pub(crate) async fn maintain_cleanup_floor(engine: &Arc<Engine>) -> Result<()> {
     let keeper = engine.shard_states_keeper();
+    keeper.resolve_uncertain_cleanup_floor()?;
     let Some((inputs, last)) = advance_inputs(engine).await? else {
         return Ok(());
     };

@@ -126,6 +126,8 @@ pub struct ShardStatesKeeper {
     cleanup_floor: parking_lot::Mutex<CleanupFloor>,
     /// The reference state TTL that the floor's state age must exceed.
     cleanup_state_ttl: u64,
+    #[cfg(test)]
+    fail_floor_write_after_commit: std::sync::atomic::AtomicBool,
     #[cfg(feature = "telemetry")]
     telemetry: Arc<EngineTelemetry>,
     allocated: Arc<EngineAlloc>,
@@ -140,6 +142,13 @@ pub(crate) enum CleanupFloor {
     /// The persisted floor's state was gone at boot: the key is kept and
     /// cleanup stays disabled; no replacement is ever bootstrapped.
     Missing(BlockIdExt),
+    /// A floor write returned an error, so the durable key may hold either
+    /// floor. Both pins are kept and cleanup is disabled until the key is
+    /// re-read.
+    Uncertain {
+        previous: Option<(BlockIdExt, PinnedShardStateGuard)>,
+        candidate: (BlockIdExt, PinnedShardStateGuard),
+    },
 }
 
 impl ShardStatesKeeper {
@@ -180,6 +189,8 @@ impl ShardStatesKeeper {
             states_cache_mode,
             cleanup_floor: parking_lot::Mutex::new(cleanup_floor),
             cleanup_state_ttl: cells_lifetime_sec,
+            #[cfg(test)]
+            fail_floor_write_after_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "telemetry")]
             telemetry,
             allocated,
@@ -231,8 +242,44 @@ impl ShardStatesKeeper {
     pub(crate) fn cleanup_floor(&self) -> Option<(BlockIdExt, Arc<ShardStateStuff>)> {
         match &*self.cleanup_floor.lock() {
             CleanupFloor::Pinned(id, guard) => Some((id.clone(), guard.state_arc())),
-            CleanupFloor::Unset | CleanupFloor::Missing(_) => None,
+            CleanupFloor::Unset | CleanupFloor::Missing(_) | CleanupFloor::Uncertain { .. } => None,
         }
+    }
+
+    /// Re-reads the durable key after an uncertain write. The floor it names
+    /// is kept pinned and the other pin dropped; any other value stays
+    /// uncertain.
+    pub(crate) fn resolve_uncertain_cleanup_floor(&self) -> Result<()> {
+        use consensus_common::validator_cleanup::{decode_checkpoint, GC_FLOOR_KEY};
+        let mut slot = self.cleanup_floor.lock();
+        let CleanupFloor::Uncertain { previous, candidate } = &*slot else {
+            return Ok(());
+        };
+        let durable = self
+            .db
+            .load_validator_state_key_bounded(GC_FLOOR_KEY, 256)?
+            .and_then(|value| decode_checkpoint(&value));
+        let resolved = if durable.as_ref() == Some(&candidate.0) {
+            Some(true)
+        } else if durable.as_ref() == previous.as_ref().map(|(id, _)| id) {
+            Some(false)
+        } else {
+            None
+        };
+        let Some(take_candidate) = resolved else {
+            return Ok(());
+        };
+        let CleanupFloor::Uncertain { previous, candidate } =
+            std::mem::replace(&mut *slot, CleanupFloor::Unset)
+        else {
+            return Ok(());
+        };
+        *slot = match (take_candidate, previous) {
+            (true, _) => CleanupFloor::Pinned(candidate.0, candidate.1),
+            (false, Some((id, guard))) => CleanupFloor::Pinned(id, guard),
+            (false, None) => CleanupFloor::Unset,
+        };
+        Ok(())
     }
 
     /// True when no floor was ever persisted, so a first-run adoption may run.
@@ -257,19 +304,50 @@ impl ShardStatesKeeper {
         id: &BlockIdExt,
         guard: PinnedShardStateGuard,
     ) -> Result<()> {
-        use consensus_common::validator_cleanup::{encode_checkpoint, GC_FLOOR_KEY};
-        if guard.state().block_id() != id {
-            fail!("Cleanup floor pin does not match its block");
+        use consensus_common::validator_cleanup::{
+            encode_checkpoint, is_full_masterchain_checkpoint, GC_FLOOR_KEY,
+        };
+        if guard.state().block_id() != id || !is_full_masterchain_checkpoint(id) {
+            fail!("Cleanup floor pin does not match a full masterchain block");
         }
         let mut slot = self.cleanup_floor.lock();
-        if let CleanupFloor::Missing(old) = &*slot {
-            fail!("Cleanup floor {old} is unavailable; it is never replaced");
+        // Monotonic under the slot lock: only a strict descendant of the
+        // current floor, so a stale caller can never move it back.
+        match &*slot {
+            CleanupFloor::Missing(old) => {
+                fail!("Cleanup floor {old} is unavailable; it is never replaced")
+            }
+            CleanupFloor::Uncertain { .. } => {
+                fail!("Cleanup floor write is uncertain; resolve it before adopting")
+            }
+            CleanupFloor::Pinned(current, _) => {
+                if id.seq_no() <= current.seq_no() || !guard.state().has_prev_block(current)? {
+                    fail!("Cleanup floor {id} is not a strict descendant of {current}");
+                }
+            }
+            CleanupFloor::Unset => {}
         }
-        self.db.write_validator_state_batch_sync(
-            &[(GC_FLOOR_KEY.to_owned(), encode_checkpoint(id))],
-            &[],
-        )?;
-        let previous = std::mem::replace(&mut *slot, CleanupFloor::Pinned(id.clone(), guard));
+        let written = self
+            .db
+            .write_validator_state_batch_sync(&[(GC_FLOOR_KEY.to_owned(), encode_checkpoint(id))], &[]);
+        #[cfg(test)]
+        let written = written.and_then(|()| {
+            if self.fail_floor_write_after_commit.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                fail!("injected floor write error after commit");
+            }
+            Ok(())
+        });
+        let previous = std::mem::replace(&mut *slot, CleanupFloor::Unset);
+        let previous = match previous {
+            CleanupFloor::Pinned(old, old_guard) => Some((old, old_guard)),
+            _ => None,
+        };
+        if let Err(error) = written {
+            // The key may hold either floor: keep both pins, disable cleanup.
+            *slot = CleanupFloor::Uncertain { previous, candidate: (id.clone(), guard) };
+            return Err(error);
+        }
+        *slot = CleanupFloor::Pinned(id.clone(), guard);
         drop(slot);
         drop(previous);
         Ok(())
