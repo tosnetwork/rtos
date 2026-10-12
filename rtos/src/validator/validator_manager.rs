@@ -117,20 +117,27 @@ fn mc_registered_top_for_shard(
 
 /// Rebuild protocol options from the authenticated historical config, without
 /// emulator overrides or current-node timing defaults.
-pub(crate) fn build_historical_simplex_options(config: &rtos_block::ConfigParams, shard: &ShardIdent) -> Result<simplex::SessionOptions> {
+pub(crate) fn build_historical_simplex_options(
+    config: &rtos_block::ConfigParams,
+    shard: &ShardIdent,
+) -> Result<simplex::SessionOptions> {
     let consensus = match config.config(29)? {
         Some(ConfigParamEnum::ConfigParam29(value)) => value,
         _ => fail!("Historical Param 29 is unavailable"),
     };
     let catchain = config.catchain_config()?;
-    let selected = config.selected_simplex_config(shard.is_masterchain())?
+    let selected = config
+        .selected_simplex_config(shard.is_masterchain())?
         .ok_or_else(|| error!("Historical Simplex config is unavailable"))?;
     let base = get_session_options(&consensus, &catchain, false, &None);
     build_runtime_simplex_session_options(shard, &selected.config, &base)
 }
 
 /// Reuse already decoded, request-budgeted historical parameters.
-pub(crate) fn build_historical_simplex_options_decoded(config: &rtos_block::DecodedSessionConfig, shard: &ShardIdent) -> Result<simplex::SessionOptions> {
+pub(crate) fn build_historical_simplex_options_decoded(
+    config: &rtos_block::DecodedSessionConfig,
+    shard: &ShardIdent,
+) -> Result<simplex::SessionOptions> {
     let base = get_session_options(&config.consensus, &config.catchain, false, &None);
     build_runtime_simplex_session_options(shard, &config.selected.config, &base)
 }
@@ -869,7 +876,9 @@ impl ValidatorManagerImpl {
     ) -> Result<Option<Arc<storage::block_handle_db::BlockHandle>>> {
         let mut retry_at = tokio::time::Instant::now() + Duration::from_secs(1);
         loop {
-            if self.engine.check_stop() { return Ok(None); }
+            if self.engine.check_stop() {
+                return Ok(None);
+            }
             tokio::select! {
                 next = self.engine.wait_next_applied_mc_block(current, None) => {
                     return Ok(Some(next?.0));
@@ -1018,18 +1027,26 @@ impl ValidatorManagerImpl {
             [config.validator_set()?, config.prev_validator_set()?, config.next_validator_set()?];
         let bindings = self.engine.consensus_transport_bindings()?;
         for binding in &bindings {
-            let known = sets.iter().flat_map(|set| set.list())
+            let known = sets
+                .iter()
+                .flat_map(|set| set.list())
                 .filter(|member| member.validator_id().is_ok_and(|id| id == binding.validator_id))
                 .collect::<Vec<_>>();
-            if !known.is_empty() && !known.iter().any(|member|
-                member.adnl_addr().is_ok_and(|id| id == binding.adnl_key_id)) {
+            if !known.is_empty()
+                && !known
+                    .iter()
+                    .any(|member| member.adnl_addr().is_ok_and(|id| id == binding.adnl_key_id))
+            {
                 fail!("Configured consensus transport differs from governing descriptor");
             }
         }
         for member in preferred.iter().chain(sets.iter().flat_map(|set| set.list())) {
             let id = member.adnl_addr()?;
             let stable = member.validator_id()?;
-            if !bindings.iter().any(|binding| binding.validator_id == stable && binding.adnl_key_id == id) {
+            if !bindings
+                .iter()
+                .any(|binding| binding.validator_id == stable && binding.adnl_key_id == id)
+            {
                 continue;
             }
             if let Some(key) = self.engine.adnl_key_by_id(&id) {
@@ -1434,10 +1451,10 @@ impl ValidatorManagerImpl {
         // retiring group may begin to close, so a crash mid-close always
         // leaves a record for its namespace.
         if self.fence_dirty || !self.pending_cleanup_records.is_empty() {
-            if let Err(error) = self
-                .engine
-                .persist_validator_retirement(&self.destroyed_sessions, &self.pending_cleanup_records)
-            {
+            if let Err(error) = self.engine.persist_validator_retirement(
+                &self.destroyed_sessions,
+                &self.pending_cleanup_records,
+            ) {
                 // No group closes without its durable record; latch like any
                 // other teardown failure so every aggregator reports it.
                 self.lifecycle_errors.insert(format!("retirement persistence: {error}"));
@@ -1506,7 +1523,10 @@ impl ValidatorManagerImpl {
         Ok(())
     }
 
-    async fn stop_and_remove_sessions(&mut self, sessions_to_remove: &HashSet<UInt256>) -> Result<()> {
+    async fn stop_and_remove_sessions(
+        &mut self,
+        sessions_to_remove: &HashSet<UInt256>,
+    ) -> Result<()> {
         for id in sessions_to_remove {
             if let Some(group) = self.current_sessions.remove(id) {
                 self.retire_group(id.clone(), group);
@@ -2674,7 +2694,10 @@ impl ValidatorManagerImpl {
                     )?.bind_recovery_anchor(mc_state.block_id().clone())?);
                     Some((key, runtime))
                 } else { None };
-                if authenticated.as_ref().is_some_and(|(_, runtime)| self.engine.finality_recovery_owns(runtime)) {
+                if authenticated
+                    .as_ref()
+                    .is_some_and(|(_, runtime)| self.engine.finality_recovery_owns(runtime))
+                {
                     continue;
                 }
                 let local_id = match &authenticated {
@@ -3232,9 +3255,10 @@ impl ValidatorManagerImpl {
                 }
             }
 
-            mc_handle = match self.wait_next_mc_or_materialization_retry(
-                &mc_handle, recovery_generation,
-            ).await? {
+            mc_handle = match self
+                .wait_next_mc_or_materialization_retry(&mc_handle, recovery_generation)
+                .await?
+            {
                 Some(next) => next,
                 None => return Ok(()),
             };

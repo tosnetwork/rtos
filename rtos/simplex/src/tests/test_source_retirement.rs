@@ -863,7 +863,9 @@ fn source_retirement_parent_list_is_bounded_while_parsing() {
         ("over-long parent", serde_json::json!(["x".repeat(513)])),
     ] {
         let fixture = released();
-        Released::edit_json(&fixture.output_set, |v| v["metadata"]["prev_blocks"] = parents.clone());
+        Released::edit_json(&fixture.output_set, |v| {
+            v["metadata"]["prev_blocks"] = parents.clone()
+        });
         let before = fixture.snapshot();
         match fixture.scan() {
             Err(RetirementRefusal::LegacyFormat(_, message)) => {
@@ -896,7 +898,9 @@ fn source_retirement_manifest_charge_covers_the_committee() {
     .err()
     .unwrap();
     match refusal {
-        RetirementRefusal::BudgetExhausted(message) => assert!(message.contains("manifest"), "{message}"),
+        RetirementRefusal::BudgetExhausted(message) => {
+            assert!(message.contains("manifest"), "{message}")
+        }
         other => panic!("expected the manifest charge to refuse first, got {other}"),
     }
     assert!(!fixture.store_locked());

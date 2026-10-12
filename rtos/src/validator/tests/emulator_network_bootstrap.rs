@@ -578,7 +578,13 @@ struct BootstrapValidatorNetwork {
 
 impl BootstrapValidatorNetwork {
     fn new(local_keys: Vec<PrivateKey>) -> Self {
-        Self { local_keys, contexts: RwLock::new(HashMap::new()), authenticated: None, transport_keys: Vec::new(), authenticated_created: Default::default() }
+        Self {
+            local_keys,
+            contexts: RwLock::new(HashMap::new()),
+            authenticated: None,
+            transport_keys: Vec::new(),
+            authenticated_created: Default::default(),
+        }
     }
 
     fn select_local_keys(&self, validators: &[CatchainNode]) -> Vec<PrivateKey> {
@@ -604,19 +610,32 @@ impl PrivateOverlayOperations for BootstrapValidatorNetwork {
         self.authenticated.as_ref().map_or(rtos_api::WireProfile::Legacy, |m| m.wire_profile())
     }
     fn create_authenticated_consensus_client(
-        &self, _: UInt256, key: &PrivateKey, id: &Arc<PrivateOverlayShortId>,
+        &self,
+        _: UInt256,
+        key: &PrivateKey,
+        id: &Arc<PrivateOverlayShortId>,
         runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
         listener: consensus_common::ConsensusOverlayListenerPtr,
         replay: consensus_common::ConsensusOverlayLogReplayListenerPtr,
-        _: Option<u8>, transport: OverlayTransportType,
+        _: Option<u8>,
+        transport: OverlayTransportType,
     ) -> Result<consensus_common::ConsensusOverlayPtr> {
-        let overlay = self.authenticated.as_ref().ok_or_else(|| error!("No authenticated test transport"))?
+        let overlay = self
+            .authenticated
+            .as_ref()
+            .ok_or_else(|| error!("No authenticated test transport"))?
             .start_authenticated_overlay(key, id, runtime, listener, replay, transport)?;
         self.authenticated_created.fetch_add(1, Ordering::SeqCst);
         Ok(overlay)
     }
-    fn stop_catchain_client_checked(&self, id: &Arc<PrivateOverlayShortId>, overlay: &consensus_common::ConsensusOverlayPtr) -> Result<()> {
-        self.authenticated.as_ref().ok_or_else(|| error!("No authenticated test transport"))?
+    fn stop_catchain_client_checked(
+        &self,
+        id: &Arc<PrivateOverlayShortId>,
+        overlay: &consensus_common::ConsensusOverlayPtr,
+    ) -> Result<()> {
+        self.authenticated
+            .as_ref()
+            .ok_or_else(|| error!("No authenticated test transport"))?
             .stop_overlay_checked(id, overlay)
     }
     fn catchain_client_drained(&self, overlay: &consensus_common::ConsensusOverlayPtr) -> bool {
@@ -679,7 +698,15 @@ struct BootstrapTestEngine {
     fail_future_history_until_released: AtomicBool,
     future_history_failure_seen: AtomicBool,
     namespace_registry: Arc<crate::validator::finality_recovery_owner::RecoveryRegistry>,
-    normal_admission_gate: std::sync::Mutex<Option<(u32, tokio::sync::oneshot::Sender<Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>>, std::sync::mpsc::Receiver<()>)>>,
+    normal_admission_gate: std::sync::Mutex<
+        Option<(
+            u32,
+            tokio::sync::oneshot::Sender<
+                Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+            >,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     states: RwLock<HashMap<BlockIdExt, Arc<ShardStateStuff>>>,
     blocks: RwLock<HashMap<BlockIdExt, BlockStuff>>,
     historical_proofs: RwLock<HashMap<BlockIdExt, crate::block_proof::BlockProofStuff>>,
@@ -745,7 +772,9 @@ impl BootstrapTestEngine {
             fail_future_history_once: AtomicBool::new(false),
             fail_future_history_until_released: AtomicBool::new(false),
             future_history_failure_seen: AtomicBool::new(false),
-            namespace_registry: Arc::new(crate::validator::finality_recovery_owner::RecoveryRegistry::default()),
+            namespace_registry: Arc::new(
+                crate::validator::finality_recovery_owner::RecoveryRegistry::default(),
+            ),
             normal_admission_gate: std::sync::Mutex::new(None),
             states: RwLock::new(HashMap::new()),
             blocks: RwLock::new(HashMap::new()),
@@ -886,24 +915,45 @@ impl consensus_common::finality_delivery::DurableFinalitySink for BootstrapUnava
 
 #[async_trait::async_trait]
 impl EngineOperations for BootstrapTestEngine {
-    fn reserve_normal_session_namespace(&self, runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime)
-        -> Result<Option<crate::validator::finality_recovery_owner::RecoveryReservation>> {
+    fn reserve_normal_session_namespace(
+        &self,
+        runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+    ) -> Result<Option<crate::validator::finality_recovery_owner::RecoveryReservation>> {
         let gate = {
             let mut gate = self.normal_admission_gate.lock().unwrap();
-            if runtime.shard().is_masterchain() && gate.as_ref().is_some_and(|(seqno, _, _)| *seqno == runtime.catchain_seqno()) {
+            if runtime.shard().is_masterchain()
+                && gate.as_ref().is_some_and(|(seqno, _, _)| *seqno == runtime.catchain_seqno())
+            {
                 gate.take()
-            } else { None }
+            } else {
+                None
+            }
         };
         if let Some((_, entered, release)) = gate {
-            eprintln!("manager admission: gate hit shard={} cc={}", runtime.shard(), runtime.catchain_seqno());
+            eprintln!(
+                "manager admission: gate hit shard={} cc={}",
+                runtime.shard(),
+                runtime.catchain_seqno()
+            );
             let _ = entered.send(Arc::new(runtime.clone()));
-            release.recv_timeout(Duration::from_secs(10)).map_err(|e| error!("normal admission test gate: {e}"))?;
+            release
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|e| error!("normal admission test gate: {e}"))?;
         }
         self.namespace_registry.reserve_normal(runtime)
     }
-    fn finality_recovery_generation(&self) -> u64 { self.namespace_registry.generation() }
-    fn finality_recovery_owns(&self, runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime) -> bool { self.namespace_registry.owns(runtime) }
-    async fn wait_finality_recovery_change(&self, seen: u64) -> Result<()> { self.namespace_registry.wait_changed(seen).await }
+    fn finality_recovery_generation(&self) -> u64 {
+        self.namespace_registry.generation()
+    }
+    fn finality_recovery_owns(
+        &self,
+        runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+    ) -> bool {
+        self.namespace_registry.owns(runtime)
+    }
+    async fn wait_finality_recovery_change(&self, seen: u64) -> Result<()> {
+        self.namespace_registry.wait_changed(seen).await
+    }
 
     async fn durable_finality_sink(
         self: Arc<Self>,
@@ -915,7 +965,9 @@ impl EngineOperations for BootstrapTestEngine {
         Ok(Arc::new(BootstrapUnavailableFinalitySink))
     }
 
-    fn zerostate_id(&self) -> Result<&BlockIdExt> { Ok(&self.init_mc_block_id) }
+    fn zerostate_id(&self) -> Result<&BlockIdExt> {
+        Ok(&self.init_mc_block_id)
+    }
     fn adnl_key_by_id(&self, id: &Arc<rtos_block::KeyId>) -> Option<PrivateKey> {
         self.validator_network.transport_keys.iter().find(|key| key.id() == id).cloned()
     }
@@ -932,8 +984,12 @@ impl EngineOperations for BootstrapTestEngine {
         self.transport_config.as_ref().map_or(true, |config| config.get_validator_status())
     }
 
-    fn consensus_transport_bindings(&self) -> Result<Vec<crate::config::ConsensusTransportBinding>> {
-        self.transport_config.as_ref().map_or_else(|| Ok(Vec::new()), |config| config.consensus_transport_bindings())
+    fn consensus_transport_bindings(
+        &self,
+    ) -> Result<Vec<crate::config::ConsensusTransportBinding>> {
+        self.transport_config
+            .as_ref()
+            .map_or_else(|| Ok(Vec::new()), |config| config.consensus_transport_bindings())
     }
 
     fn validator_network(&self) -> Arc<dyn PrivateOverlayOperations> {
@@ -1055,19 +1111,34 @@ impl EngineOperations for BootstrapTestEngine {
         Ok(true)
     }
 
-    async fn load_block_proof(&self, handle: &Arc<BlockHandle>, is_link: bool) -> Result<crate::block_proof::BlockProofStuff> {
+    async fn load_block_proof(
+        &self,
+        handle: &Arc<BlockHandle>,
+        is_link: bool,
+    ) -> Result<crate::block_proof::BlockProofStuff> {
         if let Some(proof) = self.historical_proofs.read().unwrap().get(handle.id()).cloned() {
-            if proof.is_link() != is_link { fail!("Fixture proof role mismatch"); }
+            if proof.is_link() != is_link {
+                fail!("Fixture proof role mismatch");
+            }
             return Ok(proof);
         }
         self.db.load_block_proof(handle, is_link).await
     }
 
-    async fn download_block_proof(&self, id: &BlockIdExt, _: bool, _: bool) -> Result<crate::block_proof::BlockProofStuff> {
+    async fn download_block_proof(
+        &self,
+        id: &BlockIdExt,
+        _: bool,
+        _: bool,
+    ) -> Result<crate::block_proof::BlockProofStuff> {
         fail!("Bootstrap fixture lacks signed historical proof for {id}")
     }
 
-    async fn prepare_retired_history(self: Arc<Self>, runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>, start: BlockIdExt) -> Result<()> {
+    async fn prepare_retired_history(
+        self: Arc<Self>,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        start: BlockIdExt,
+    ) -> Result<()> {
         let shard = runtime.shard().clone();
         let cc = runtime.catchain_seqno();
         if runtime.shard().is_masterchain() && cc == 0 {
@@ -1075,13 +1146,17 @@ impl EngineOperations for BootstrapTestEngine {
                 fail!("Injected permanent historical authentication rejection");
             }
             if self.fail_current_history_busy_once.swap(false, Ordering::SeqCst) {
-                return Err(anyhow::Error::new(crate::retired_history::RetryableHistoryError::WriterBusy)
-                    .context("Injected current history writer contention"));
+                return Err(anyhow::Error::new(
+                    crate::retired_history::RetryableHistoryError::WriterBusy,
+                )
+                .context("Injected current history writer contention"));
             }
         }
-        if runtime.shard().is_masterchain() && cc == 1
+        if runtime.shard().is_masterchain()
+            && cc == 1
             && (self.fail_future_history_until_released.load(Ordering::SeqCst)
-                || self.fail_future_history_once.swap(false, Ordering::SeqCst)) {
+                || self.fail_future_history_once.swap(false, Ordering::SeqCst))
+        {
             self.future_history_failure_seen.store(true, Ordering::SeqCst);
             fail!("Injected transient future history preparation failure");
         }
@@ -1095,11 +1170,16 @@ impl EngineOperations for BootstrapTestEngine {
         self.load_state(&self.init_mc_block_id).await
     }
 
-    async fn load_and_pin_state(&self, id: &BlockIdExt) -> Result<crate::shard_states_keeper::PinnedShardStateGuard> {
+    async fn load_and_pin_state(
+        &self,
+        id: &BlockIdExt,
+    ) -> Result<crate::shard_states_keeper::PinnedShardStateGuard> {
         // This in-memory fixture does not run GC; retain the same real guard API
         // as production rather than bypassing the preparation contract.
-        crate::shard_states_keeper::PinnedShardStateGuard::new(self.load_state(id).await?,
-            Arc::new(crate::internal_db::state_gc_resolver::AllowStateGcSmartResolver::new(0)))
+        crate::shard_states_keeper::PinnedShardStateGuard::new(
+            self.load_state(id).await?,
+            Arc::new(crate::internal_db::state_gc_resolver::AllowStateGcSmartResolver::new(0)),
+        )
     }
 
     async fn load_state(&self, block_id: &BlockIdExt) -> Result<Arc<ShardStateStuff>> {
@@ -1141,19 +1221,29 @@ impl EngineOperations for BootstrapTestEngine {
     }
 
     #[cfg(feature = "telemetry")]
-    fn engine_telemetry(&self) -> &Arc<crate::engine_traits::EngineTelemetry> { &self.telemetry }
+    fn engine_telemetry(&self) -> &Arc<crate::engine_traits::EngineTelemetry> {
+        &self.telemetry
+    }
 
     fn engine_allocated(&self) -> &Arc<crate::engine_traits::EngineAlloc> {
         &self.allocated
     }
 
-    fn register_service_task(&self, _: &'static str, _: u32,
-        start: Box<dyn FnOnce() -> tokio::task::JoinHandle<()> + Send>) -> Result<tokio::task::JoinHandle<()>> {
+    fn register_service_task(
+        &self,
+        _: &'static str,
+        _: u32,
+        start: Box<dyn FnOnce() -> tokio::task::JoinHandle<()> + Send>,
+    ) -> Result<tokio::task::JoinHandle<()>> {
         // Test caller owns and joins the returned actual manager task.
         Ok(start())
     }
 
-    async fn wait_next_applied_mc_block(&self, _: &BlockHandle, _: Option<u64>) -> Result<(Arc<BlockHandle>, BlockStuff)> {
+    async fn wait_next_applied_mc_block(
+        &self,
+        _: &BlockHandle,
+        _: Option<u64>,
+    ) -> Result<(Arc<BlockHandle>, BlockStuff)> {
         futures::future::pending().await
     }
 
@@ -1386,12 +1476,9 @@ async fn test_manager_creates_emulator_sessions_from_generated_mc_states() -> Re
 
     let session_ids =
         manager.current_sessions.keys().cloned().collect::<std::collections::HashSet<_>>();
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        manager.stop_and_remove_sessions(&session_ids),
-    )
-    .await
-    .expect("manager session teardown watchdog")?;
+    tokio::time::timeout(Duration::from_secs(10), manager.stop_and_remove_sessions(&session_ids))
+        .await
+        .expect("manager session teardown watchdog")?;
 
     Ok(())
 }
@@ -1484,12 +1571,9 @@ async fn test_manager_selects_validator_key_by_validator_key_order() -> Result<(
 
     let session_ids =
         manager.current_sessions.keys().cloned().collect::<std::collections::HashSet<_>>();
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        manager.stop_and_remove_sessions(&session_ids),
-    )
-    .await
-    .expect("manager session teardown watchdog")?;
+    tokio::time::timeout(Duration::from_secs(10), manager.stop_and_remove_sessions(&session_ids))
+        .await
+        .expect("manager session teardown watchdog")?;
 
     Ok(())
 }

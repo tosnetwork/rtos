@@ -38,11 +38,11 @@ use std::{
 };
 #[path = "finality_intent_outputs.rs"]
 mod outputs;
+#[cfg(test)]
+pub(crate) use outputs::MAX_SEALED_SET_FILE;
 pub(crate) use outputs::{
     retirement_sealed_sets, ExpectedFinalityOutput, MAX_RETIREMENT_SETS, MAX_RETIREMENT_SET_BYTES,
 };
-#[cfg(test)]
-pub(crate) use outputs::MAX_SEALED_SET_FILE;
 const DIRECTORY: &str = "finality-intents";
 const MAX_INTENT_BYTES: u64 = 16 << 20;
 const MAX_INTENT_TOTAL: u64 = 64 << 20;
@@ -107,7 +107,10 @@ fn bounded_prev_blocks<'de, D: serde::Deserializer<'de>>(
                 fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                     f.write_str("a bounded block id")
                 }
-                fn visit_str<E: serde::de::Error>(self, value: &str) -> std::result::Result<Text, E> {
+                fn visit_str<E: serde::de::Error>(
+                    self,
+                    value: &str,
+                ) -> std::result::Result<Text, E> {
                     if value.len() > MAX_PREV_BLOCK_TEXT {
                         return Err(E::custom("session parent text too long"));
                     }
@@ -235,13 +238,19 @@ fn read_intent(
     }
     decode_intent(path, namespace, &bytes)
 }
-fn decode_intent(path: &std::path::Path, namespace: &std::path::Path, bytes: &[u8])
-    -> Result<(SessionRecoveryRecord, Vec<u8>)> {
+fn decode_intent(
+    path: &std::path::Path,
+    namespace: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(SessionRecoveryRecord, Vec<u8>)> {
     let (record, certificate, _) = decode_intent_typed(path, namespace, bytes)?;
     Ok((record, certificate))
 }
-fn decode_intent_typed(path: &std::path::Path, namespace: &std::path::Path, bytes: &[u8])
-    -> Result<(SessionRecoveryRecord, Vec<u8>, rtos_api::ton::consensus::simplex::Certificate)> {
+fn decode_intent_typed(
+    path: &std::path::Path,
+    namespace: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(SessionRecoveryRecord, Vec<u8>, rtos_api::ton::consensus::simplex::Certificate)> {
     let disk: DiskIntent = if path.extension().and_then(|s| s.to_str()) == Some("complete") {
         let completed: CompletedIntent = serde_json::from_slice(&bytes)?;
         if completed.schema != 1 {
@@ -781,7 +790,10 @@ pub fn scan_finality_recovery_namespace(
 
 #[path = "source_history_debt.rs"]
 mod history_debt;
-pub use history_debt::{authenticate_source_history_debt, SourceHistoryDebt, SourceHistoryDebtBudget, SourceHistoryDebtBusy};
+pub use history_debt::{
+    authenticate_source_history_debt, SourceHistoryDebt, SourceHistoryDebtBudget,
+    SourceHistoryDebtBusy,
+};
 
 #[cfg(test)]
 mod tests {

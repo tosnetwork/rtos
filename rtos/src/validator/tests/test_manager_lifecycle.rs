@@ -19,7 +19,8 @@ struct LifecycleEngine {
     candidate_deletes: std::sync::atomic::AtomicUsize,
     fail_candidates: std::sync::atomic::AtomicBool,
     state_gate: Option<Arc<StateGate>>,
-    retired_records: std::sync::Mutex<Vec<consensus_common::validator_cleanup::PendingValidatorCleanup>>,
+    retired_records:
+        std::sync::Mutex<Vec<consensus_common::validator_cleanup::PendingValidatorCleanup>>,
     retirement_fence: std::sync::Mutex<HashSet<UInt256>>,
     fail_retirement: std::sync::atomic::AtomicBool,
     no_applied_mc: std::sync::atomic::AtomicBool,
@@ -286,9 +287,15 @@ async fn test_manager_lifecycle_retirement_persists_before_any_group_closes() {
             _ => unreachable!(),
         }
         .unwrap_err();
-        assert!(failure.to_string().contains("retirement persistence failure"), "{path}: {failure}");
+        assert!(
+            failure.to_string().contains("retirement persistence failure"),
+            "{path}: {failure}"
+        );
         // No durable record means no group may begin to close.
-        assert!(!group.stop_requested.is_cancelled(), "{path}: closed before its record was durable");
+        assert!(
+            !group.stop_requested.is_cancelled(),
+            "{path}: closed before its record was durable"
+        );
         assert!(manager
             .retiring_groups
             .iter()

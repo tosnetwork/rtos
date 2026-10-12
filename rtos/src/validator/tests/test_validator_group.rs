@@ -1463,7 +1463,11 @@ async fn test_group_retirement_keeps_lease_until_abandon_and_ordinary_stop_relea
         }
         group.clone().stop_for_retirement_preparation(rt).await.unwrap();
         let refused = refused_outcome(&group);
-        assert!(matches!(refused.refusal(), RetirementRefusal::Unsupported(_)), "{}", refused.refusal());
+        assert!(
+            matches!(refused.refusal(), RetirementRefusal::Unsupported(_)),
+            "{}",
+            refused.refusal()
+        );
         assert!(refused.holds_reservation(), "the lease moved into the outcome");
         assert!(!refused.drained(), "without a drain proof the lease is never releasable");
         assert_eq!(
@@ -1493,10 +1497,13 @@ async fn test_group_retirement_outcome_survives_cancelled_waiter() {
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
     release.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), group.clone().stop_for_retirement_preparation(rt))
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        group.clone().stop_for_retirement_preparation(rt),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let refused = refused_outcome(&group);
     assert!(!refused.drained(), "recorded once despite the cancelled waiter");
 }

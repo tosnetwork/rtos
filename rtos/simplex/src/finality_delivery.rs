@@ -561,9 +561,7 @@ impl PendingFinalityStore {
     }
     /// Locks an existing store without provisioning anything: a missing or
     /// symlinked directory or lock file is refused, never created.
-    pub(crate) fn lock_existing(
-        directory: PathBuf,
-    ) -> source_retirement::Refusal<Arc<Self>> {
+    pub(crate) fn lock_existing(directory: PathBuf) -> source_retirement::Refusal<Arc<Self>> {
         source_retirement::existing_directory(&directory)?;
         let path = directory.join(".lock");
         match std::fs::symlink_metadata(&path) {

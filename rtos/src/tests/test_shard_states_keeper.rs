@@ -213,7 +213,10 @@ async fn test_snapshot_cache_and_merge_require_authenticated_state_identity() ->
 }
 
 /// The state write is asynchronous; pin once it is physically present.
-async fn wait_pin(keeper: &Arc<ShardStatesKeeper>, id: &BlockIdExt) -> Result<PinnedShardStateGuard> {
+async fn wait_pin(
+    keeper: &Arc<ShardStatesKeeper>,
+    id: &BlockIdExt,
+) -> Result<PinnedShardStateGuard> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         match keeper.pin_cleanup_candidate(id) {
@@ -225,9 +228,9 @@ async fn wait_pin(keeper: &Arc<ShardStatesKeeper>, id: &BlockIdExt) -> Result<Pi
 }
 
 fn floor_keeper(db: Arc<InternalDb>, stopper: Arc<Stopper>) -> Result<Arc<ShardStatesKeeper>> {
+    use crate::collator_test_bundle::create_engine_allocated;
     #[cfg(feature = "telemetry")]
     use crate::collator_test_bundle::create_engine_telemetry;
-    use crate::collator_test_bundle::create_engine_allocated;
     ShardStatesKeeper::new(
         db,
         false,
@@ -255,7 +258,9 @@ async fn test_cleanup_floor_custody_restores_and_never_replaces_a_missing_floor(
         UInt256::from([2; 32]),
     );
     let floor_key = |db: &InternalDb| -> Result<Option<BlockIdExt>> {
-        Ok(db.load_validator_state_key_bounded(GC_FLOOR_KEY, 256)?.and_then(|v| decode_checkpoint(&v)))
+        Ok(db
+            .load_validator_state_key_bounded(GC_FLOOR_KEY, 256)?
+            .and_then(|v| decode_checkpoint(&v)))
     };
 
     // A floor is adopted only with a deletion-coordinated pin, persisted synced.
@@ -291,9 +296,10 @@ async fn test_cleanup_floor_custody_restores_and_never_replaces_a_missing_floor(
     // disabled, the key is kept, and no replacement is ever adopted.
     let dir = tempfile::tempdir()?;
     let engine = TestEngine::new_db_dir(dir.path().to_str().unwrap(), None).await?;
-    engine
-        .db
-        .write_validator_state_batch_sync(&[(GC_FLOOR_KEY.to_owned(), encode_checkpoint(&id))], &[])?;
+    engine.db.write_validator_state_batch_sync(
+        &[(GC_FLOOR_KEY.to_owned(), encode_checkpoint(&id))],
+        &[],
+    )?;
     let stopper = Arc::new(Stopper::new());
     let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
     assert!(keeper.cleanup_floor().is_none());
@@ -340,7 +346,11 @@ async fn store_mc_state(
                 file_hash: prev.file_hash().clone(),
             },
         };
-        extra.prev_blocks.set(&prev.seq_no(), &reference, &KeyMaxLt { key: false, max_end_lt: 0 })?;
+        extra.prev_blocks.set(
+            &prev.seq_no(),
+            &reference,
+            &KeyMaxLt { key: false, max_end_lt: 0 },
+        )?;
     }
     header.write_custom(Some(&extra))?;
     let state = ShardStateStuff::from_state(
@@ -361,7 +371,12 @@ async fn store_mc_state(
 async fn test_cleanup_floor_adoption_is_monotonic_and_uncertain_writes_fail_closed() -> Result<()> {
     use consensus_common::validator_cleanup::{decode_checkpoint, GC_FLOOR_KEY};
     let mc = |seqno: u32, hash: u8| {
-        BlockIdExt::with_params(ShardIdent::masterchain(), seqno, UInt256::from([hash; 32]), UInt256::from([hash; 32]))
+        BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            seqno,
+            UInt256::from([hash; 32]),
+            UInt256::from([hash; 32]),
+        )
     };
     let (older, floor, successor, fork) = (mc(41, 1), mc(42, 2), mc(43, 3), mc(43, 4));
     let dir = tempfile::tempdir()?;
@@ -389,9 +404,45 @@ async fn test_cleanup_floor_adoption_is_monotonic_and_uncertain_writes_fail_clos
         .load_validator_state_key_bounded(GC_FLOOR_KEY, 256)?
         .and_then(|value| decode_checkpoint(&value));
     assert_eq!(durable, Some(successor.clone()), "the write committed");
+    // The read-back alone is not durability: a failed re-write stays uncertain.
+    keeper.fail_floor_resolve_write.store(true, std::sync::atomic::Ordering::Release);
+    assert!(keeper.resolve_uncertain_cleanup_floor().is_err());
+    assert!(keeper.cleanup_floor().is_none(), "a failed re-write keeps cleanup disabled");
+    assert!(!keeper.cleanup_floor_unset());
     keeper.resolve_uncertain_cleanup_floor()?;
     assert_eq!(keeper.cleanup_floor().map(|(id, _)| id), Some(successor.clone()));
     assert!(keeper.adopt_cleanup_floor(&floor, wait_pin(&keeper, &floor).await?).is_err());
+    stopper.set_stop();
+    engine.db.stop_states_db().await.unwrap();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_uncertain_first_floor_resolves_only_from_a_genuinely_absent_key() -> Result<()> {
+    use consensus_common::validator_cleanup::GC_FLOOR_KEY;
+    let floor = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        42,
+        UInt256::from([2; 32]),
+        UInt256::from([2; 32]),
+    );
+    let dir = tempfile::tempdir()?;
+    let engine = TestEngine::new_db_dir(dir.path().to_str().unwrap(), None).await?;
+    let stopper = Arc::new(Stopper::new());
+    let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
+    store_mc_state(&keeper, &floor, None).await?;
+    keeper.fail_floor_write_after_commit.store(true, std::sync::atomic::Ordering::Release);
+    assert!(keeper.adopt_cleanup_floor(&floor, wait_pin(&keeper, &floor).await?).is_err());
+    // Malformed bytes are not absence: no fresh bootstrap may follow.
+    engine.db.write_validator_state_batch_sync(&[(GC_FLOOR_KEY.to_owned(), vec![0xff; 7])], &[])?;
+    keeper.resolve_uncertain_cleanup_floor()?;
+    assert!(keeper.cleanup_floor().is_none());
+    assert!(!keeper.cleanup_floor_unset(), "malformed key stays uncertain");
+    // A genuinely absent key with no previous floor resolves to unset.
+    engine.db.write_validator_state_batch_sync(&[], &[GC_FLOOR_KEY.to_owned()])?;
+    keeper.resolve_uncertain_cleanup_floor()?;
+    assert!(keeper.cleanup_floor_unset());
+    assert!(engine.db.load_validator_state_key_bounded(GC_FLOOR_KEY, 256)?.is_none());
     stopper.set_stop();
     engine.db.stop_states_db().await.unwrap();
     Ok(())

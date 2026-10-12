@@ -142,7 +142,8 @@ impl EngineOperations for Engine {
                 }
             };
             reservation.finish(&bytes)?;
-            let proof = BlockProofStuff::deserialize_local_history(handle.id(), bytes, is_link, &budget)?;
+            let proof =
+                BlockProofStuff::deserialize_local_history(handle.id(), bytes, is_link, &budget)?;
             budget.proof(&proof)?;
             Ok::<_, anyhow::Error>(proof)
         })?
@@ -173,7 +174,14 @@ impl EngineOperations for Engine {
                     budget.limits().depth,
                 );
                 let proof = client
-                    .download_block_proof_history(&id, is_link, key_block, limits, budget.clone(), graph)
+                    .download_block_proof_history(
+                        &id,
+                        is_link,
+                        key_block,
+                        limits,
+                        budget.clone(),
+                        graph,
+                    )
                     .await
                     .map_err(|e| {
                         if e.downcast_ref::<adnl::ResponseLimitExceeded>().is_some() {
@@ -576,7 +584,10 @@ impl EngineOperations for Engine {
         if fence.is_empty() {
             deletes.push(DESTROYED_VALIDATOR_SESSIONS.to_owned());
         } else {
-            puts.push((DESTROYED_VALIDATOR_SESSIONS.to_owned(), serialize_destroyed_session_ids(fence)));
+            puts.push((
+                DESTROYED_VALIDATOR_SESSIONS.to_owned(),
+                serialize_destroyed_session_ids(fence),
+            ));
         }
         for record in records {
             puts.push((record_key(&record.session_id), encode_record(record)));
@@ -736,10 +747,7 @@ impl EngineOperations for Engine {
                 }
             }
 
-            if let Some((block, proof)) = self
-                .download_block_with_policy(id, limit, None)
-                .await?
-            {
+            if let Some((block, proof)) = self.download_block_with_policy(id, limit, None).await? {
                 log::trace!("download_block {} downloaded", id);
                 block.verify_expected_id(id)?;
                 if proof.id() != id {
@@ -905,13 +913,15 @@ impl EngineOperations for Engine {
     }
 
     async fn authenticate_closing_source_with_history(
-        self: Arc<Self>, request: consensus_common::finality_delivery::CloseFinalityRequest,
+        self: Arc<Self>,
+        request: consensus_common::finality_delivery::CloseFinalityRequest,
         namespace: std::path::PathBuf,
     ) -> Result<Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>> {
         crate::historical_recovery::authenticate_closing(self, request, namespace).await
     }
     async fn authenticate_retired_source_with_history(
-        self: Arc<Self>, record: simplex::finality_recovery::SessionRecoveryRecord,
+        self: Arc<Self>,
+        record: simplex::finality_recovery::SessionRecoveryRecord,
     ) -> Result<crate::validator::retired_session_auth::AuthenticatedRetiredSession> {
         crate::historical_recovery::authenticate_retired(self, record).await
     }

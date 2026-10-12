@@ -14,9 +14,9 @@
 
 // Internal modules
 mod async_owner;
+pub mod finality_delivery;
 pub mod overlay_owner;
 pub mod session_runtime;
-pub mod finality_delivery;
 pub mod simplex_protocol;
 pub mod thread_owner;
 mod validator_identity;
@@ -610,9 +610,7 @@ pub(crate) struct StorageGenerationSlot {
 }
 pub(crate) type StorageGeneration = Arc<std::sync::Mutex<StorageGenerationSlot>>;
 
-fn lock_generation(
-    slot: &StorageGeneration,
-) -> std::sync::MutexGuard<'_, StorageGenerationSlot> {
+fn lock_generation(slot: &StorageGeneration) -> std::sync::MutexGuard<'_, StorageGenerationSlot> {
     match slot.lock() {
         Ok(state) => state,
         Err(poisoned) => poisoned.into_inner(),
@@ -715,7 +713,13 @@ impl StorageTeardownReceipt {
         instance: StorageGeneration,
         generation: u64,
     ) -> Self {
-        Self { outcome, storage_id: storage_id.to_string(), path: path.to_owned(), instance, generation }
+        Self {
+            outcome,
+            storage_id: storage_id.to_string(),
+            path: path.to_owned(),
+            instance,
+            generation,
+        }
     }
 
     /// Identifier the observed instance was opened with.

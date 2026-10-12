@@ -484,6 +484,10 @@ enum HandleCommand {
     Barrier(tokio::sync::oneshot::Sender<Result<()>>, crate::durability::SyncObservation),
 }
 
+/// One page of a validator-state prefix scan: the entries read, the last key
+/// read, and whether the prefix range was exhausted.
+pub type ValidatorStatePage = (Vec<(String, Vec<u8>)>, String, bool);
+
 pub struct BlockHandleStorage {
     handle_db: Arc<BlockHandleDb>,
     handle_cache: Arc<BlockHandleCache>,
@@ -789,7 +793,7 @@ impl BlockHandleStorage {
         after: &str,
         max_keys: usize,
         max_value_bytes: usize,
-    ) -> Result<(Vec<(String, Vec<u8>)>, String, bool)> {
+    ) -> Result<ValidatorStatePage> {
         let start = if after.is_empty() { prefix } else { after };
         let mut entries = Vec::new();
         let mut examined = 0usize;

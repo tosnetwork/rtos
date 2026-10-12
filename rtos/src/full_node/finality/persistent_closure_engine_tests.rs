@@ -182,20 +182,26 @@ async fn circulation(events: usize) {
             tokio::time::timeout(Duration::from_secs(90), async {
                 loop {
                     let (active, _) = inspect_closure_progress(engine.db(), &domain).unwrap();
-                    if let Some(entry) = active.iter().find(|e|
-                        e.record.block_id == id && e.stage == crate::propagation_outbox::PublicationStage::Completed) {
+                    if let Some(entry) = active.iter().find(|e| {
+                        e.record.block_id == id
+                            && e.stage == crate::propagation_outbox::PublicationStage::Completed
+                    }) {
                         use crate::propagation_outbox::{PublicationKind, PublicationTarget};
                         assert!(entry.pending.is_empty());
                         for kind in [PublicationKind::Candidate, PublicationKind::Finality] {
-                            assert!(entry.record.effects.iter().any(|effect|
-                                effect.kind == kind && effect.target == PublicationTarget::FastSync),
-                                "real FastSync effect was removed from the completed plan");
+                            assert!(
+                                entry.record.effects.iter().any(|effect| effect.kind == kind
+                                    && effect.target == PublicationTarget::FastSync),
+                                "real FastSync effect was removed from the completed plan"
+                            );
                         }
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-            }).await.expect("real worker FastSync/Public effects did not complete");
+            })
+            .await
+            .expect("real worker FastSync/Public effects did not complete");
             let closed = tokio::time::timeout(Duration::from_secs(90), async {
                 loop {
                     driver.maintain().unwrap();
@@ -219,16 +225,21 @@ async fn circulation(events: usize) {
             tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
                     if observer.test_finality_received_ids.lock().unwrap().contains(&id)
-                        && observer.try_get_cached_block_candidate(&id).is_some() {
+                        && observer.try_get_cached_block_candidate(&id).is_some()
+                    {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-            }).await.expect("public observer did not process the exact candidate and finality");
+            })
+            .await
+            .expect("public observer did not process the exact candidate and finality");
             // Keep the real receiving frontier current AFTER ingress checks.
             observer.clone().download_and_apply_block(&id, id.seq_no(), false).await.unwrap();
-            assert_eq!(observer.load_state(&id).await.unwrap().root_cell().repr_hash(),
-                expected.repr_hash());
+            assert_eq!(
+                observer.load_state(&id).await.unwrap().root_cell().repr_hash(),
+                expected.repr_hash()
+            );
             let entry = closed.iter().find(|x| x.binding.canonical.block_id == id).unwrap();
             assert_eq!(&entry.binding.domain.session_id, runtime.session_id());
             assert_eq!(entry.binding.canonical.source_validator, creator);
@@ -238,14 +249,32 @@ async fn circulation(events: usize) {
                 "the test must actually complete publication effects"
             );
             if index == 0 {
-                let before = engine.db().load_validator_state_raw_bounded(
-                    "PropagationOutboxV1", crate::propagation_outbox::Limits::default().max_snapshot_bytes).unwrap();
+                let before = engine
+                    .db()
+                    .load_validator_state_raw_bounded(
+                        "PropagationOutboxV1",
+                        crate::propagation_outbox::Limits::default().max_snapshot_bytes,
+                    )
+                    .unwrap();
                 let worker = engine.ensure_publication_worker().await.unwrap();
-                assert!(worker.authorize_closing_history_debt(entry.offer().request,
-                    runtime.clone(), crate::history_read_budget::HistoryReadBudget::new(Default::default()))
-                    .await.is_err(), "real compact Released record must not mint new history admission");
-                let after = engine.db().load_validator_state_raw_bounded(
-                    "PropagationOutboxV1", crate::propagation_outbox::Limits::default().max_snapshot_bytes).unwrap();
+                assert!(
+                    worker
+                        .authorize_closing_history_debt(
+                            entry.offer().request,
+                            runtime.clone(),
+                            crate::history_read_budget::HistoryReadBudget::new(Default::default())
+                        )
+                        .await
+                        .is_err(),
+                    "real compact Released record must not mint new history admission"
+                );
+                let after = engine
+                    .db()
+                    .load_validator_state_raw_bounded(
+                        "PropagationOutboxV1",
+                        crate::propagation_outbox::Limits::default().max_snapshot_bytes,
+                    )
+                    .unwrap();
                 assert_eq!(after, before, "failed compact admission mutated durable outbox");
             }
             assert!(generations.insert(entry.lease_generation));

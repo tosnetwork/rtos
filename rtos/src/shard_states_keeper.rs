@@ -128,6 +128,8 @@ pub struct ShardStatesKeeper {
     cleanup_state_ttl: u64,
     #[cfg(test)]
     fail_floor_write_after_commit: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_floor_resolve_write: std::sync::atomic::AtomicBool,
     #[cfg(feature = "telemetry")]
     telemetry: Arc<EngineTelemetry>,
     allocated: Arc<EngineAlloc>,
@@ -167,7 +169,10 @@ impl ShardStatesKeeper {
         allocated: Arc<EngineAlloc>,
     ) -> Result<Arc<Self>> {
         log::trace!("start_states_gc");
-        let gc_resolver = Arc::new(AllowStateGcSmartResolver::with_repair_protection(cells_lifetime_sec, db.repair_leases().protection().clone()));
+        let gc_resolver = Arc::new(AllowStateGcSmartResolver::with_repair_protection(
+            cells_lifetime_sec,
+            db.repair_leases().protection().clone(),
+        ));
         let cache_resolver = Arc::new(AllowStateGcSmartResolver::new(0));
         // Re-pin the persisted cleanup floor before state GC can run.
         let cleanup_floor = Self::restore_cleanup_floor(&db, &gc_resolver)?;
@@ -191,6 +196,8 @@ impl ShardStatesKeeper {
             cleanup_state_ttl: cells_lifetime_sec,
             #[cfg(test)]
             fail_floor_write_after_commit: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_floor_resolve_write: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "telemetry")]
             telemetry,
             allocated,
@@ -206,12 +213,13 @@ impl ShardStatesKeeper {
     ) -> Result<PinnedShardStateGuard> {
         let budget = crate::history_read_budget::HistoryReadBudget::new(Default::default());
         budget.detached_read(|| {
-            let (state, mut lease) = db.load_shard_state_bounded(id, budget.as_ref(), |saved_at| {
-                if !resolver.pin_state(id, saved_at, UnixTime::now())? {
-                    fail!(StorageError::StateIsAllowedToGc(id.clone()));
-                }
-                Ok(StateReadLease { id: id.clone(), resolver: resolver.clone(), active: true })
-            })?;
+            let (state, mut lease) =
+                db.load_shard_state_bounded(id, budget.as_ref(), |saved_at| {
+                    if !resolver.pin_state(id, saved_at, UnixTime::now())? {
+                        fail!(StorageError::StateIsAllowedToGc(id.clone()));
+                    }
+                    Ok(StateReadLease { id: id.clone(), resolver: resolver.clone(), active: true })
+                })?;
             lease.active = false;
             Ok(PinnedShardStateGuard { state, gc_resolver: resolver.clone() })
         })
@@ -246,29 +254,46 @@ impl ShardStatesKeeper {
         }
     }
 
-    /// Re-reads the durable key after an uncertain write. The floor it names
-    /// is kept pinned and the other pin dropped; any other value stays
-    /// uncertain.
+    /// Re-reads the durable key after an uncertain write. Only a key that
+    /// decodes to one of the two floors, or a genuinely absent key when there
+    /// was no previous floor, selects it; the selection is then re-written
+    /// synced, because a read-back does not prove the failed write durable.
+    /// Malformed bytes, any other value or a failed re-write stay uncertain
+    /// with both pins kept.
     pub(crate) fn resolve_uncertain_cleanup_floor(&self) -> Result<()> {
-        use consensus_common::validator_cleanup::{decode_checkpoint, GC_FLOOR_KEY};
+        use consensus_common::validator_cleanup::{
+            decode_checkpoint, encode_checkpoint, GC_FLOOR_KEY,
+        };
         let mut slot = self.cleanup_floor.lock();
         let CleanupFloor::Uncertain { previous, candidate } = &*slot else {
             return Ok(());
         };
-        let durable = self
-            .db
-            .load_validator_state_key_bounded(GC_FLOOR_KEY, 256)?
-            .and_then(|value| decode_checkpoint(&value));
-        let resolved = if durable.as_ref() == Some(&candidate.0) {
-            Some(true)
-        } else if durable.as_ref() == previous.as_ref().map(|(id, _)| id) {
-            Some(false)
-        } else {
-            None
+        let take_candidate = match self.db.load_validator_state_key_bounded(GC_FLOOR_KEY, 256)? {
+            None if previous.is_none() => false,
+            None => return Ok(()),
+            Some(value) => match decode_checkpoint(&value) {
+                Some(id) if id == candidate.0 => true,
+                Some(id) if previous.as_ref().is_some_and(|(prev, _)| *prev == id) => false,
+                _ => return Ok(()),
+            },
         };
-        let Some(take_candidate) = resolved else {
-            return Ok(());
+        let selected =
+            if take_candidate { Some(&candidate.0) } else { previous.as_ref().map(|(id, _)| id) };
+        let rewritten = match selected {
+            Some(id) => self.db.write_validator_state_batch_sync(
+                &[(GC_FLOOR_KEY.to_owned(), encode_checkpoint(id))],
+                &[],
+            ),
+            None => self.db.write_validator_state_batch_sync(&[], &[GC_FLOOR_KEY.to_owned()]),
         };
+        #[cfg(test)]
+        let rewritten = rewritten.and_then(|()| {
+            if self.fail_floor_resolve_write.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                fail!("injected floor resolution write error");
+            }
+            Ok(())
+        });
+        rewritten?;
         let CleanupFloor::Uncertain { previous, candidate } =
             std::mem::replace(&mut *slot, CleanupFloor::Unset)
         else {
@@ -327,9 +352,10 @@ impl ShardStatesKeeper {
             }
             CleanupFloor::Unset => {}
         }
-        let written = self
-            .db
-            .write_validator_state_batch_sync(&[(GC_FLOOR_KEY.to_owned(), encode_checkpoint(id))], &[]);
+        let written = self.db.write_validator_state_batch_sync(
+            &[(GC_FLOOR_KEY.to_owned(), encode_checkpoint(id))],
+            &[],
+        );
         #[cfg(test)]
         let written = written.and_then(|()| {
             if self.fail_floor_write_after_commit.swap(false, std::sync::atomic::Ordering::AcqRel) {

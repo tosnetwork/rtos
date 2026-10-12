@@ -147,7 +147,9 @@ pub struct Engine {
     persistence_tasks: crate::types::owned_tasks::OwnedTasks,
     publication_worker: std::sync::Mutex<Option<Arc<crate::publication_worker::PublicationWorker>>>,
     finality_recovery: Arc<crate::validator::finality_recovery_owner::RecoveryRegistry>,
-    retired_recovery: std::sync::Mutex<Option<Arc<crate::validator::retired_session_service::RetiredSessionService>>>,
+    retired_recovery: std::sync::Mutex<
+        Option<Arc<crate::validator::retired_session_service::RetiredSessionService>>,
+    >,
 
     shard_states_awaiters: AwaitersPool<BlockIdExt, Arc<ShardStateStuff>>,
     block_applying_awaiters: AwaitersPool<BlockIdExt, ()>,
@@ -832,7 +834,8 @@ impl Engine {
                     .await?;
                     #[cfg(test)]
                     {
-                        *stopper.construction_control_address.lock().unwrap() = Some(server.local_addr());
+                        *stopper.construction_control_address.lock().unwrap() =
+                            Some(server.local_addr());
                     }
                     status_server = Some(server);
                     #[cfg(test)]
@@ -1098,7 +1101,8 @@ impl Engine {
                 }
                 if let Some(db) = opened_db.take() {
                     if let Err(error) = db.stop_states_db().await {
-                        rollback_stopper.report_service_failure(0, format!("DB rollback drain: {error}"));
+                        rollback_stopper
+                            .report_service_failure(0, format!("DB rollback drain: {error}"));
                     }
                 }
                 if let Err(error) = rollback_network.stop_adnl().await {
@@ -1224,7 +1228,9 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn finality_recovery_registry(&self) -> &Arc<crate::validator::finality_recovery_owner::RecoveryRegistry> {
+    pub(crate) fn finality_recovery_registry(
+        &self,
+    ) -> &Arc<crate::validator::finality_recovery_owner::RecoveryRegistry> {
         &self.finality_recovery
     }
 
@@ -1233,9 +1239,16 @@ impl Engine {
     ) -> Result<Arc<crate::validator::retired_session_service::RetiredSessionService>> {
         let service = {
             let mut slot = self.retired_recovery.lock().unwrap();
-            if self.check_stop() { fail!("Retired recovery admission stopped"); }
-            if let Some(service) = slot.as_ref() { service.clone() } else {
-                let service = crate::validator::retired_session_service::RetiredSessionService::start(self.clone())?;
+            if self.check_stop() {
+                fail!("Retired recovery admission stopped");
+            }
+            if let Some(service) = slot.as_ref() {
+                service.clone()
+            } else {
+                let service =
+                    crate::validator::retired_session_service::RetiredSessionService::start(
+                        self.clone(),
+                    )?;
                 *slot = Some(service.clone());
                 service
             }
@@ -1247,7 +1260,9 @@ impl Engine {
     pub(crate) async fn ensure_publication_worker(
         self: &Arc<Self>,
     ) -> Result<Arc<crate::publication_worker::PublicationWorker>> {
-        if self.stopper.check_stop() { fail!("Engine publication admission stopped"); }
+        if self.stopper.check_stop() {
+            fail!("Engine publication admission stopped");
+        }
         let existing = self.publication_worker.lock().unwrap().clone();
         if let Some(worker) = existing {
             worker.ready().await?;
@@ -1263,7 +1278,9 @@ impl Engine {
         };
         let worker = {
             let mut slot = self.publication_worker.lock().unwrap();
-            if self.stopper.check_stop() { fail!("Engine publication admission stopped"); }
+            if self.stopper.check_stop() {
+                fail!("Engine publication admission stopped");
+            }
             match slot.as_ref() {
                 Some(worker) => worker.clone(),
                 None => {
@@ -1287,7 +1304,9 @@ impl Engine {
         self.stopper.set_stop();
         self.finality_recovery.stop();
         let publication_worker = self.publication_worker.lock().unwrap().clone();
-        if let Some(worker) = &publication_worker { worker.stop(); }
+        if let Some(worker) = &publication_worker {
+            worker.stop();
+        }
         self.background_tasks.stop();
         self.ingress_tasks.stop();
         let finality_tasks = self.pending_finality.lock().tasks.clone();
@@ -1837,9 +1856,7 @@ impl Engine {
                 let (attempts, timeout) =
                     if pre_apply { (Some(10), Some((50, 15, 500))) } else { (None, None) };
 
-                break self
-                    .download_block_with_policy(id, attempts, timeout)
-                    .await?;
+                break self.download_block_with_policy(id, attempts, timeout).await?;
             };
 
             if let Some((block, proof)) = block_n_proof {

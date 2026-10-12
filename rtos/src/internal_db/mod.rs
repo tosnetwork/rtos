@@ -294,7 +294,8 @@ pub struct InternalDb {
     archive_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
     archive_admission: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
-    archive_test_gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    archive_test_gate:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     shard_top_blocks_db: ShardTopBlocksDb,
     full_node_state_db: Arc<NodeStateDb>,
 
@@ -383,12 +384,16 @@ impl InternalDb {
                 check_db(&db, 0, restore_db_enabled, force_check_db, check_stop, is_broken).await?;
             }
             Ok::<(), rtos_block::Error>(())
-        }).catch_unwind().await;
+        })
+        .catch_unwind()
+        .await;
         match checked {
             Ok(Ok(())) => (),
             Ok(Err(error)) => {
                 if let Err(cleanup) = db.stop_states_db().await {
-                    return Err(error!("DB startup failed: {error:#}; storage cleanup failed: {cleanup:#}"));
+                    return Err(error!(
+                        "DB startup failed: {error:#}; storage cleanup failed: {cleanup:#}"
+                    ));
                 }
                 return Err(error);
             }
@@ -477,9 +482,8 @@ impl InternalDb {
         let prev2_block_db = BlockInfoDb::with_db(db.clone(), PREV2_BLOCK_DB_NAME, can_create_db)?;
         let next1_block_db = BlockInfoDb::with_db(db.clone(), NEXT1_BLOCK_DB_NAME, can_create_db)?;
         let next2_block_db = BlockInfoDb::with_db(db.clone(), NEXT2_BLOCK_DB_NAME, can_create_db)?;
-        let shard_top_blocks_db = ShardTopBlocksDb::with_db(
-            db.clone(), SHARD_TOP_BLOCKS_DB_NAME, can_create_db,
-        )?;
+        let shard_top_blocks_db =
+            ShardTopBlocksDb::with_db(db.clone(), SHARD_TOP_BLOCKS_DB_NAME, can_create_db)?;
         let state_db = if config.archival_mode.is_some() {
             let (archive_cells_opts, archive_cells_cache) =
                 storage::cell_db::CellDb::build_cf_options(
@@ -640,7 +644,9 @@ impl InternalDb {
             StateDb::Archive(_) => Ok(()),
         };
         match (archived, states) {
-            (Err(a), Err(s)) => Err(error!("Archive shutdown failed: {a:#}; state shutdown failed: {s:#}")),
+            (Err(a), Err(s)) => {
+                Err(error!("Archive shutdown failed: {a:#}; state shutdown failed: {s:#}"))
+            }
             (Err(error), _) | (_, Err(error)) => Err(error),
             _ => Ok(()),
         }
@@ -653,7 +659,9 @@ impl InternalDb {
 
     #[cfg(test)]
     pub(crate) fn test_hold_archive_migration(
-        &self, entered: Arc<tokio::sync::Notify>, release: Arc<tokio::sync::Notify>,
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
     ) {
         *self.archive_test_gate.lock().unwrap() = Some((entered, release));
     }
@@ -1966,7 +1974,11 @@ impl InternalDb {
             .ok_or_else(|| error!("Cannot load handle for archiving block {}", id))?;
         // Even an in-memory archived flag cannot bypass closed admission after
         // an uncertain metadata result. Acquire before inspecting that flag.
-        let permit = self.archive_admission.clone().acquire_owned().await
+        let permit = self
+            .archive_admission
+            .clone()
+            .acquire_owned()
+            .await
             .map_err(|_| error!("Archive migration admission stopped"))?;
         let manager = self.archive_manager.clone();
         let handles = self.block_handle_storage.clone();
@@ -1987,8 +1999,9 @@ impl InternalDb {
             // This worker is not abortable by the observation future. Package IO,
             // migration flag and deletion gate all live inside its awaited work.
             use futures::FutureExt;
-            let result = std::panic::AssertUnwindSafe(
-                manager.move_to_archive_with_completion(&handle, || {
+            let result = std::panic::AssertUnwindSafe(manager.move_to_archive_with_completion(
+                &handle,
+                || {
                     let handles = handles.clone();
                     let handle = handle.clone();
                     let callback = callback.clone();
@@ -1999,11 +2012,13 @@ impl InternalDb {
                         }
                         handles.sync_pending_observed(observer).await
                     }
-                })
-            ).catch_unwind().await
-                .map_err(|_| error!("Archive migration panicked for {block_id}"))
-                .and_then(|result| result)
-                .map_err(|err| error!("Failed to move block to archive: {block_id}. Error: {err}"));
+                },
+            ))
+            .catch_unwind()
+            .await
+            .map_err(|_| error!("Archive migration panicked for {block_id}"))
+            .and_then(|result| result)
+            .map_err(|err| error!("Failed to move block to archive: {block_id}. Error: {err}"));
             if let Err(error) = &result {
                 admission.close();
                 tasks.record_error(format!("archive migration {block_id}: {error}"));
@@ -2098,8 +2113,13 @@ impl InternalDb {
         after: &str,
         max_keys: usize,
         max_value_bytes: usize,
-    ) -> Result<(Vec<(String, Vec<u8>)>, String, bool)> {
-        self.block_handle_storage.scan_validator_state_prefix(prefix, after, max_keys, max_value_bytes)
+    ) -> Result<storage::block_handle_db::ValidatorStatePage> {
+        self.block_handle_storage.scan_validator_state_prefix(
+            prefix,
+            after,
+            max_keys,
+            max_value_bytes,
+        )
     }
 
     pub fn load_validator_state_key_bounded(
@@ -2154,12 +2174,15 @@ impl InternalDb {
 
     #[cfg(test)]
     pub(crate) async fn test_remove_archived_artifacts(&self, id: &BlockIdExt) -> Result<()> {
-        let handle = self.load_block_handle(id)?.ok_or_else(|| error!("Fault fixture handle absent"))?;
+        let handle =
+            self.load_block_handle(id)?.ok_or_else(|| error!("Fault fixture handle absent"))?;
         self.archive_manager.test_remove_archived_artifacts(&handle).await
     }
 
     #[cfg(test)]
-    pub(crate) fn test_pause_archive_gc_selection(&self) -> (tokio::sync::oneshot::Receiver<Vec<u32>>, Arc<tokio::sync::Notify>) {
+    pub(crate) fn test_pause_archive_gc_selection(
+        &self,
+    ) -> (tokio::sync::oneshot::Receiver<Vec<u32>>, Arc<tokio::sync::Notify>) {
         self.archive_manager.test_pause_gc_selection()
     }
 

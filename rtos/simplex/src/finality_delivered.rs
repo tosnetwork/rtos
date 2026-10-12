@@ -812,8 +812,7 @@ impl PendingFinalityStore {
         &self,
         runtime: &AuthenticatedSessionRuntime,
         charge: &mut super::source_retirement::Charge,
-    ) -> super::source_retirement::Refusal<Vec<super::source_retirement::RetirementDelivered>>
-    {
+    ) -> super::source_retirement::Refusal<Vec<super::source_retirement::RetirementDelivered>> {
         use super::source_retirement::{
             existing_directory, failed, read_bounded, Bucket, RetirementDelivered,
             RetirementRefusal,

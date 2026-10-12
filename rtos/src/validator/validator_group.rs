@@ -686,7 +686,11 @@ impl ValidatorGroupImpl {
              status={} -> retry (existing session ownership retained)",
             self.shard, self.cc_seqno, self.session_id, self.status);
         self.start_pending = false;
-        self.status = if self.session.is_some() { ValidatorGroupStatus::EngineCreated } else { ValidatorGroupStatus::Created };
+        self.status = if self.session.is_some() {
+            ValidatorGroupStatus::EngineCreated
+        } else {
+            ValidatorGroupStatus::Created
+        };
     }
 
     /// Get the consensus type for this validator group
@@ -766,9 +770,13 @@ impl ValidatorGroupImpl {
                         ));
                     let mut admission = g.namespace_admission.lock().unwrap();
                     if let Some(failure) = admission.failed.as_mut() {
-                        if !failure.retry_cleanup() { fail!("Prior normal constructor is not drained: {failure}"); }
+                        if !failure.retry_cleanup() {
+                            fail!("Prior normal constructor is not drained: {failure}");
+                        }
                         admission.failed = None;
-                        if let Some(token) = admission.reservation.take() { token.release(); }
+                        if let Some(token) = admission.reservation.take() {
+                            token.release();
+                        }
                     }
                     if admission.reservation.is_none() {
                         admission.reservation = Some(g.engine.reserve_normal_session_namespace(runtime)?
@@ -788,7 +796,9 @@ impl ValidatorGroupImpl {
                     return match created {
                         Ok(session) => Ok(session),
                         Err(failure) if failure.cleanup_drained() => {
-                            if let Some(token) = admission.reservation.take() { token.release(); }
+                            if let Some(token) = admission.reservation.take() {
+                                token.release();
+                            }
                             Err(failure.into_error())
                         }
                         Err(failure) => {
@@ -1081,10 +1091,7 @@ pub struct ValidatorGroup {
     #[cfg(test)]
     session_exit_observed: CancellationToken,
     stop_completion: Mutex<
-        Option<(
-            StopPolicy,
-            tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>,
-        )>,
+        Option<(StopPolicy, tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>)>,
     >,
     retirement_outcome: Mutex<Option<super::retirement_preparation::RetirementOutcome>>,
     /// Stable owner of the namespace lease while retirement is prepared, so an
@@ -1492,7 +1499,9 @@ impl ValidatorGroup {
             .get_or_try_init(|| self.engine.clone().durable_finality_sink(runtime.clone()))
             .await?;
         self.delivered_finality_sink
-            .get_or_try_init(|| self.engine.clone().durable_finality_delivered_sink(runtime.clone()))
+            .get_or_try_init(|| {
+                self.engine.clone().durable_finality_delivered_sink(runtime.clone())
+            })
             .await?;
         Ok(())
     }
@@ -1500,16 +1509,22 @@ impl ValidatorGroup {
     /// Pre-create the consensus engine without starting the validation queue.
     /// Called for future-validator groups to warm up the session ahead of time.
     pub async fn needs_materialization_retry(&self) -> bool {
-        if self.stop_requested.is_cancelled() { return false; }
-        self.group_impl.execute_sync(|g| {
-            g.session.is_none() && g.status < ValidatorGroupStatus::Stopping && !g.start_pending
-        }).await
+        if self.stop_requested.is_cancelled() {
+            return false;
+        }
+        self.group_impl
+            .execute_sync(|g| {
+                g.session.is_none() && g.status < ValidatorGroupStatus::Stopping && !g.start_pending
+            })
+            .await
     }
 
     pub async fn pre_create_engine(self: Arc<ValidatorGroup>) -> Result<()> {
         // This is only a cheap early exit; create_engine still checks ownership
         // and lifecycle under the group lock after preparation.
-        if !self.needs_materialization_retry().await { return Ok(()); }
+        if !self.needs_materialization_retry().await {
+            return Ok(());
+        }
         self.prepare_retired_history(None).await?;
         self.prepare_durable_finality_sink().await?;
         let callback = self.make_validator_session_callback();
@@ -1750,9 +1765,10 @@ impl ValidatorGroup {
         simplex::finality_delivery::source_retirement::RetirementRefusal,
     > {
         use simplex::finality_delivery::source_retirement::RetirementRefusal;
-        let runtime = self.authenticated_runtime.clone().ok_or(RetirementRefusal::Unsupported(
-            "session without authenticated runtime",
-        ))?;
+        let runtime = self
+            .authenticated_runtime
+            .clone()
+            .ok_or(RetirementRefusal::Unsupported("session without authenticated runtime"))?;
         let teardown = teardown.ok_or_else(|| {
             RetirementRefusal::DatabaseTeardown("session opened no certifiable storage".into())
         })?;
@@ -1866,7 +1882,11 @@ impl ValidatorGroup {
         self.teardown_drained.load(Ordering::Acquire)
     }
 
-    async fn stop_inner(self: Arc<Self>, rt: tokio::runtime::Handle, policy: StopPolicy) -> Result<()> {
+    async fn stop_inner(
+        self: Arc<Self>,
+        rt: tokio::runtime::Handle,
+        policy: StopPolicy,
+    ) -> Result<()> {
         let destroy_database = policy == StopPolicy::Destroy;
         self.set_status(ValidatorGroupStatus::Stopping).await?;
         *self.task_admission_closed.lock().expect("task admission poisoned") = true;
@@ -1912,7 +1932,8 @@ impl ValidatorGroup {
             && match (&namespace_session, &storage_teardown) {
                 (None, _) => true,
                 (Some(_), Some(receipt)) => {
-                    receipt.storage_id() == self.session_id.to_hex_string() && receipt.check().is_ok()
+                    receipt.storage_id() == self.session_id.to_hex_string()
+                        && receipt.check().is_ok()
                 }
                 (Some(_), None) => false,
             };
@@ -1928,26 +1949,35 @@ impl ValidatorGroup {
         }
         loop {
             let group_for_cleanup = self.clone();
-            let construction_drained = rt.spawn_blocking(move || {
-                let mut admission = group_for_cleanup.namespace_admission.lock().unwrap();
-                let complete = admission.failed.as_mut().map_or(true, |failure| failure.retry_cleanup());
-                if complete { admission.failed = None; }
-                complete
-            }).await.map_err(|error| error!("Normal constructor cleanup join failed: {error}"))?;
-            if construction_drained { break; }
+            let construction_drained = rt
+                .spawn_blocking(move || {
+                    let mut admission = group_for_cleanup.namespace_admission.lock().unwrap();
+                    let complete =
+                        admission.failed.as_mut().map_or(true, |failure| failure.retry_cleanup());
+                    if complete {
+                        admission.failed = None;
+                    }
+                    complete
+                })
+                .await
+                .map_err(|error| error!("Normal constructor cleanup join failed: {error}"))?;
+            if construction_drained {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         // Candidate cleanup can still touch this namespace after workers have
         // joined. Keep admission closed until that last operation has finished.
-        let database_result = if drained && destroy_database {
-            self.destroy_db().await
-        } else { Ok(()) };
+        let database_result =
+            if drained && destroy_database { self.destroy_db().await } else { Ok(()) };
         // A retirement stop keeps the lease in admission here. Every early
         // return below hands it to an undrained refusal; only a fully checked
         // teardown passes it to preparation.
         if drained && database_result.is_ok() && policy != StopPolicy::PrepareRetirement {
             let mut admission = self.namespace_admission.lock().unwrap();
-            if let Some(token) = admission.reservation.take() { token.release(); }
+            if let Some(token) = admission.reservation.take() {
+                token.release();
+            }
         }
         self.teardown_drained.store(drained && database_result.is_ok(), Ordering::Release);
         database_result?;

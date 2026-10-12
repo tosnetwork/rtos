@@ -349,7 +349,8 @@ impl RocksDbAsyncKeyValueStorage {
         let storage_id_owned = storage_id.to_string();
         // Registered before any worker starts; every failure below rolls back.
         let (instance, generation) = crate::register_storage_instance(&path, storage_id)?;
-        let opened = Self::open_registered(path, storage_id_owned, options, instance.clone(), generation);
+        let opened =
+            Self::open_registered(path, storage_id_owned, options, instance.clone(), generation);
         if opened.is_err() {
             crate::release_storage_instance(&instance);
         }
@@ -1402,7 +1403,8 @@ impl Drop for RocksDbAsyncKeyValueStorage {
         }
 
         crate::release_storage_instance(&self.instance);
-        let _ = self.teardown.set(if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) });
+        let _ =
+            self.teardown.set(if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) });
 
         log::info!(
             target: LOG_TARGET,
