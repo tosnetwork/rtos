@@ -3621,3 +3621,33 @@ mod lifecycle_tests;
 #[cfg(test)]
 #[path = "tests/test_manager_cleanup.rs"]
 mod cleanup_tests;
+
+/// Drives the manager's retirement and cleanup paths against any engine,
+/// for integration tests outside this module.
+#[cfg(test)]
+pub(crate) struct CleanupHarness(ValidatorManagerImpl);
+
+#[cfg(test)]
+impl CleanupHarness {
+    pub(crate) fn new(engine: Arc<dyn EngineOperations>) -> Self {
+        Self(ValidatorManagerImpl::create(
+            engine,
+            tokio::runtime::Handle::current(),
+            ValidatorManagerConfig::default(),
+        ))
+    }
+    /// Retires a group through the production path: fence and cleanup
+    /// record persisted synced, then the preserving close.
+    pub(crate) async fn retire(&mut self, id: UInt256, group: Arc<ValidatorGroup>) -> Result<()> {
+        self.0.retire_group(id, group);
+        self.0.drain_retiring().await
+    }
+    /// One cleanup tick, then every dispatched delete joined and completed.
+    pub(crate) async fn tick(&mut self) {
+        self.0.run_cleanup_tick().await;
+        self.0.drain_cleanup_workers().await;
+    }
+    pub(crate) fn delete_in_flight(&self, session: &UInt256) -> bool {
+        self.0.cleanup.is_delete_in_flight(session)
+    }
+}

@@ -558,3 +558,257 @@ async fn retirement_preparation_real_group_handoff_and_refusals() {
     pair.stop_all().await;
     run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
+
+/// Stores a synthetic masterchain state with its handle in the real engine.
+/// F0/F1 are synthetic: they exercise the real keeper, storage, oracles and
+/// deleter, not authenticated-chain coverage.
+async fn store_synthetic_mc_state(
+    engine: &Arc<Engine>,
+    id: &BlockIdExt,
+    catchain_seqno: u32,
+    prev: Option<&BlockIdExt>,
+    shards: Option<rtos_block::ShardHashes>,
+) -> Arc<crate::shard_state::ShardStateStuff> {
+    use rtos_block::{ExtBlkRef, HashmapAugType, KeyExtBlkRef, KeyMaxLt, McStateExtra};
+    let mut header = rtos_block::ShardStateUnsplit::with_ident(ShardIdent::masterchain());
+    header.set_seq_no(id.seq_no());
+    let mut extra = McStateExtra::default();
+    extra.validator_info.catchain_seqno = catchain_seqno;
+    if let Some(shards) = shards {
+        extra.shards = shards;
+    }
+    if let Some(prev) = prev {
+        let reference = KeyExtBlkRef {
+            key: false,
+            blk_ref: ExtBlkRef {
+                end_lt: 0,
+                seq_no: prev.seq_no(),
+                root_hash: prev.root_hash().clone(),
+                file_hash: prev.file_hash().clone(),
+            },
+        };
+        extra
+            .prev_blocks
+            .set(&prev.seq_no(), &reference, &KeyMaxLt { key: false, max_end_lt: 0 })
+            .unwrap();
+    }
+    header.write_custom(Some(&extra)).unwrap();
+    let keeper = engine.shard_states_keeper();
+    let state = crate::shard_state::ShardStateStuff::from_state(
+        id.clone(),
+        header,
+        #[cfg(feature = "telemetry")]
+        &crate::collator_test_bundle::create_engine_telemetry(),
+        &crate::collator_test_bundle::create_engine_allocated(),
+    )
+    .unwrap();
+    let handle = engine.db().create_test_block_handle(id).unwrap();
+    keeper.store_state(&handle, state, None, true).await.unwrap();
+    engine.load_state(id).await.unwrap()
+}
+
+async fn pin_floor(engine: &Arc<Engine>, id: &BlockIdExt) {
+    let keeper = engine.shard_states_keeper();
+    let guard = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match keeper.pin_cleanup_candidate(id) {
+                Ok(guard) => break guard,
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("the stored state can be pinned");
+    keeper.adopt_cleanup_floor(id, guard).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires explicit public fixture signer and real multi-Engine network/WAL"]
+async fn validator_cleanup_real_engine_keeps_until_the_floor_passes_then_deletes() {
+    use crate::validator::{
+        validator_cleanup_gc::{ancestor_or_equal, shard_catchain_seqno},
+        validator_manager::CleanupHarness,
+    };
+    use consensus_common::validator_cleanup::{make_record, NamespaceLayout};
+    let signer = std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER")
+        .expect("set RTOS_PUBLIC_FIXTURE_SIGNER to the archived public-only fixture signer");
+    assert!(Path::new(&signer).is_file());
+    let pair = Pair::with_source_transport("included").await;
+    let groups: std::sync::Mutex<Vec<Arc<ValidatorGroup>>> = Default::default();
+    let run = std::panic::AssertUnwindSafe(async {
+        let engine = &pair.provider;
+        engine.clone().download_and_apply_block(pair.master.id(), 1, false).await.unwrap();
+        let zero = engine.load_state(&pair.anchor).await.unwrap();
+        let config = zero.config_params().unwrap();
+        let cc = pair.master.block().unwrap().read_info().unwrap().gen_catchain_seqno();
+        let (committee, _) = config
+            .validator_set()
+            .unwrap()
+            .calc_subset(&config.catchain_config().unwrap(), SHARD_FULL, -1, cc)
+            .unwrap();
+        let local_key =
+            engine.network().context().stack.adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
+        let runtime = Arc::new(
+            AuthenticatedSessionRuntime::from_authenticated_config(
+                SessionNetworkPin { global_id: -239, zerostate: pair.anchor.clone() },
+                config,
+                rtos_api::session_identity::SessionCoordinates {
+                    shard: pair.anchor.shard(),
+                    catchain_seqno: cc,
+                    vertical_seqno: 0,
+                    last_key_block_seqno: 0,
+                    new_catchain_ids: false,
+                },
+                committee.clone(),
+                local_key.id().clone(),
+            )
+            .unwrap()
+            .bind_recovery_anchor(pair.anchor.clone())
+            .unwrap(),
+        );
+        let options = crate::validator::validator_manager::build_historical_simplex_options(
+            &zero.config_params().unwrap(),
+            &pair.anchor.shard(),
+        )
+        .unwrap();
+        let info = Arc::new(GeneralSessionInfo {
+            shard: pair.anchor.shard().clone(),
+            opts_hash: UInt256::default(),
+            catchain_seqno: cc,
+            key_seqno: 0,
+            max_vertical_seqno: 0,
+        });
+        let set = ValidatorSet::with_cc_seqno(
+            0,
+            u32::MAX,
+            u16::try_from(committee.len()).unwrap(),
+            cc,
+            committee.clone(),
+        )
+        .unwrap();
+        let v2_session = runtime.session_id().clone();
+        let group = Arc::new(
+            ValidatorGroup::new(
+                info,
+                local_key.clone(),
+                v2_session.clone(),
+                UInt256::default(),
+                set,
+                0,
+                ConsensusOptions::Simplex(options),
+                engine.clone(),
+                false,
+                None,
+            )
+            .with_authenticated_runtime(runtime.clone())
+            .unwrap(),
+        );
+        groups.lock().unwrap().push(group.clone());
+
+        // (a) Production retirement through the manager on the real engine:
+        // fence and an authenticated record, synced in the real DB.
+        let mut manager = CleanupHarness::new(engine.clone());
+        manager.retire(v2_session.clone(), group).await.unwrap();
+        let v2_record = engine.load_validator_cleanup_record(&v2_session).unwrap();
+        assert!(v2_record.is_some(), "retirement persisted the record");
+        assert!(engine.load_destroyed_session_ids().unwrap().contains(&v2_session));
+
+        // (b) A retired V1 namespace on the same real DB: a real storage
+        // instance opened and cleanly torn down, and a real candidate table.
+        let (f0, f1) = (
+            BlockIdExt::with_params(
+                ShardIdent::masterchain(),
+                5000,
+                UInt256::from([0x50; 32]),
+                UInt256::from([0x51; 32]),
+            ),
+            BlockIdExt::with_params(
+                ShardIdent::masterchain(),
+                5001,
+                UInt256::from([0x52; 32]),
+                UInt256::from([0x53; 32]),
+            ),
+        );
+        let v1_session = UInt256::from([0xa1; 32]);
+        let v1 = make_record(&v1_session, &NamespaceLayout::V1, &ShardIdent::masterchain(), 5, &f1)
+            .unwrap();
+        let mut fence: std::collections::HashSet<UInt256> =
+            engine.load_destroyed_session_ids().unwrap().into_iter().collect();
+        fence.insert(v1_session.clone());
+        engine.persist_validator_retirement(&fence, std::slice::from_ref(&v1)).unwrap();
+        let root = PathBuf::from(engine.db_root_dir().unwrap());
+        let namespace = root.join("catchains/consensus").join(&v1.namespace);
+        let candidates = root.join("catchains").join(format!("candidates{:x}", v1_session));
+        drop(
+            consensus_common::ConsensusCommonFactory::create_async_key_value_storage(
+                &namespace,
+                &v1_session.to_hex_string(),
+                consensus_common::AsyncKeyValueStorageOptions { use_callback_thread: false },
+            )
+            .unwrap(),
+        );
+        drop(engine.get_candidate_table(&v1_session).unwrap());
+        assert!(namespace.is_dir() && candidates.is_dir());
+
+        // (c) Synthetic states in the real engine: F0 at catchain 5, F1 at 10
+        // recording F0, with a split workchain 0 for the oracle checks.
+        let mut shards = rtos_block::ShardHashes::default();
+        shards.add_workchain(0, 0, UInt256::from([1; 32]), UInt256::from([2; 32])).unwrap();
+        let full = ShardIdent::full(0);
+        shards
+            .split_shard(&full, |mut left| {
+                left.next_catchain_seqno = 7;
+                let mut right = left.clone();
+                right.next_catchain_seqno = 9;
+                Ok((left, right))
+            })
+            .unwrap();
+        store_synthetic_mc_state(engine, &f0, 5, None, None).await;
+        let f1_state = store_synthetic_mc_state(engine, &f1, 10, Some(&f0), Some(shards)).await;
+
+        // (d) Oracles on the stored F1 state.
+        assert!(ancestor_or_equal(&f1_state, &f1));
+        assert!(ancestor_or_equal(&f1_state, &f0));
+        let fork = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            5000,
+            UInt256::from([0x60; 32]),
+            UInt256::from([0x61; 32]),
+        );
+        assert!(!ancestor_or_equal(&f1_state, &fork), "a fork at F0's seqno is not an ancestor");
+        let (left, right) = full.split().unwrap();
+        assert_eq!(shard_catchain_seqno(&f1_state, &ShardIdent::masterchain()), Some(10));
+        assert_eq!(shard_catchain_seqno(&f1_state, &left), Some(7));
+        assert_eq!(shard_catchain_seqno(&f1_state, &right), Some(9));
+        assert_eq!(shard_catchain_seqno(&f1_state, &left.split().unwrap().0), Some(7));
+        assert_eq!(shard_catchain_seqno(&f1_state, &full), Some(10), "a merge is max + 1");
+        assert_eq!(shard_catchain_seqno(&f1_state, &ShardIdent::full(5)), None);
+
+        // (e) Floor at F0: the checkpoint is not ancestor-or-equal and 5 is
+        // not below 5, so the record is kept and nothing is deleted.
+        pin_floor(engine, &f0).await;
+        manager.tick().await;
+        assert!(namespace.is_dir() && candidates.is_dir(), "kept before eligibility");
+        assert!(engine.load_validator_cleanup_record(&v1_session).unwrap().is_some());
+        assert!(!manager.delete_in_flight(&v1_session));
+
+        // (f) Floor at F1: deleted through the real deleter, record erased,
+        // fence untouched, the authenticated record still kept.
+        pin_floor(engine, &f1).await;
+        manager.tick().await;
+        assert!(!namespace.exists() && !candidates.exists(), "deleted after eligibility");
+        assert!(engine.load_validator_cleanup_record(&v1_session).unwrap().is_none());
+        assert!(!manager.delete_in_flight(&v1_session));
+        let fence_now = engine.load_destroyed_session_ids().unwrap();
+        assert!(fence_now.contains(&v1_session) && fence_now.contains(&v2_session));
+        assert!(engine.load_validator_cleanup_record(&v2_session).unwrap().is_some());
+    })
+    .catch_unwind()
+    .await;
+    for group in std::mem::take(&mut *groups.lock().unwrap()) {
+        let terminal = group.clone().stop(tokio::runtime::Handle::current(), false).await;
+        log::info!("cleanup test group teardown: {terminal:?}");
+    }
+    pair.stop_all().await;
+    run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
