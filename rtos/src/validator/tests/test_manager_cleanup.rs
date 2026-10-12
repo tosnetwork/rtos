@@ -1204,3 +1204,32 @@ async fn test_cleanup_runs_nothing_before_this_process_has_its_incarnation() {
     let token = engine.v2_seen.lock().unwrap()[0].1;
     assert_eq!(token.attempt >> 32, 1, "the first successful incarnation");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_shutdown_waits_for_an_aborted_attempts_running_child() {
+    let engine = CleanupEngine::new();
+    set_floor(&engine);
+    let record = v2_record(1, true);
+    v2_prepare(&engine, &record);
+    let (finish, wait) = std::sync::mpsc::channel::<()>();
+    engine.script(vec![V2Script::PanicWithChild(Arc::new(Mutex::new(wait)))]);
+    let mut manager = manager(engine.clone());
+    manager.run_cleanup_tick().await;
+    {
+        let stop = manager.stop_validation();
+        tokio::pin!(stop);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut stop).await.is_err(),
+            "shutdown must not return while a child holds the reservations"
+        );
+        assert_eq!(v2_held(&engine, &record), (true, true));
+        assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 1, "nothing new starts");
+        finish.send(()).unwrap();
+        for child in std::mem::take(&mut *engine.children.lock().unwrap()) {
+            child.join().unwrap();
+        }
+        stop.await.unwrap();
+    }
+    assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 1);
+    assert!(manager.cleanup_v2_held.values().all(|held| Arc::strong_count(held) == 1));
+}

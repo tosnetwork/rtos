@@ -1586,6 +1586,16 @@ impl ValidatorManagerImpl {
         }
     }
 
+    /// Shutdown only: waits until no child or owner request of any attempt
+    /// still holds a share of an authenticated namespace's reservations. It
+    /// starts nothing new; what remains held is kept until the manager drops.
+    async fn drain_cleanup_shares(&mut self) {
+        while self.cleanup_v2_held.values().any(|held| Arc::strong_count(held) > 1) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            self.drain_cleanup_workers().await;
+        }
+    }
+
     /// Retry incomplete materialization even when neither MC nor recovery
     /// ownership changes. A separate deadline prevents short stats intervals
     /// from turning transient history/storage failures into a busy loop.
@@ -2654,6 +2664,7 @@ impl ValidatorManagerImpl {
         let _ = self.drain_retiring().await;
         self.background_tasks.wait().await;
         self.drain_cleanup_workers().await;
+        self.drain_cleanup_shares().await;
         if self.background_panicked.load(Ordering::Acquire) {
             self.lifecycle_errors.insert("manager background task panicked".to_owned());
         }
