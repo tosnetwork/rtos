@@ -2149,3 +2149,6 @@ impl FinalityDeliveryTestDriver {
 #[cfg(test)]
 #[path = "canonical_identity_budget_tests.rs"]
 mod canonical_identity_budget_tests;
+#[cfg(test)]
+#[path = "finality_disk_full_tests.rs"]
+mod finality_disk_full_tests;

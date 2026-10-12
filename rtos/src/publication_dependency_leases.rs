@@ -419,6 +419,9 @@ impl DependencyLeases {
 #[cfg(test)]
 #[path = "tests/test_persistent_repair_ledger.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "tests/test_disk_full_ledger.rs"]
+pub(crate) mod disk_full_tests;
 
 /// A journaled lease generation as the ledger holds it.
 #[derive(Clone, Debug)]

@@ -54,7 +54,7 @@ use std::{collections::HashSet, ops::Deref, sync::Arc};
 use storage::{block_handle_db::BlockHandle, types::PersistentStatePartId};
 use validator_session::{BlockHash, SessionId, ValidatorBlockCandidate};
 
-fn serialize_destroyed_session_ids(ids: &HashSet<UInt256>) -> Vec<u8> {
+pub(crate) fn serialize_destroyed_session_ids(ids: &HashSet<UInt256>) -> Vec<u8> {
     let mut sorted_ids = ids.iter().cloned().collect::<Vec<_>>();
     sorted_ids.sort_by(|left, right| left.as_slice().cmp(right.as_slice()));
 
@@ -66,7 +66,7 @@ fn serialize_destroyed_session_ids(ids: &HashSet<UInt256>) -> Vec<u8> {
     data
 }
 
-fn deserialize_destroyed_session_ids(data: &[u8]) -> Result<Vec<UInt256>> {
+pub(crate) fn deserialize_destroyed_session_ids(data: &[u8]) -> Result<Vec<UInt256>> {
     if data.len() < 4 {
         fail!("Destroyed-session payload is too short: {}", data.len());
     }
@@ -572,21 +572,7 @@ impl EngineOperations for Engine {
         fence: &HashSet<UInt256>,
         records: &[consensus_common::validator_cleanup::PendingValidatorCleanup],
     ) -> Result<()> {
-        use consensus_common::validator_cleanup::{encode_record, record_key};
-        let mut puts = Vec::with_capacity(records.len().saturating_add(1));
-        let mut deletes = Vec::new();
-        if fence.is_empty() {
-            deletes.push(DESTROYED_VALIDATOR_SESSIONS.to_owned());
-        } else {
-            puts.push((
-                DESTROYED_VALIDATOR_SESSIONS.to_owned(),
-                serialize_destroyed_session_ids(fence),
-            ));
-        }
-        for record in records {
-            puts.push((record_key(&record.namespace), encode_record(record)?));
-        }
-        self.db().write_validator_state_batch_sync(&puts, &deletes)
+        crate::validator::validator_cleanup_gc::persist_retirement(self.db(), fence, records)
     }
 
     fn load_validator_cleanup_page(
@@ -633,14 +619,7 @@ impl EngineOperations for Engine {
         namespace: &str,
         claim: Option<&UInt256>,
     ) -> Result<()> {
-        use consensus_common::validator_cleanup::{candidate_claim_key, record_key};
-        // The claim names the last namespace so its executor can find any
-        // record the session gains again.
-        let puts: Vec<(String, Vec<u8>)> = claim
-            .map(|session| (candidate_claim_key(session), namespace.as_bytes().to_vec()))
-            .into_iter()
-            .collect();
-        self.db().write_validator_state_batch_sync(&puts, &[record_key(namespace)])
+        crate::validator::validator_cleanup_gc::erase_record(self.db(), namespace, claim)
     }
 
     fn session_has_other_cleanup_records(

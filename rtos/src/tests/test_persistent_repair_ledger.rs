@@ -71,6 +71,20 @@ fn open(path: &std::path::Path) -> Result<(Arc<RocksDb>, Arc<DependencyLeases>)>
     let leases = DependencyLeases::open(db.clone(), true)?;
     Ok((db, leases))
 }
+pub(super) fn binding_for_disk_full() -> RepairLeaseBinding {
+    binding()
+}
+pub(super) fn dependencies_for_disk_full() -> Vec<Dependency> {
+    dependencies()
+}
+pub(super) fn dependency_block_for_disk_full() -> BlockIdExt {
+    block(1)
+}
+pub(super) fn open_for_disk_full(
+    path: &std::path::Path,
+) -> Result<(Arc<RocksDb>, Arc<DependencyLeases>)> {
+    open(path)
+}
 #[tokio::test]
 async fn persistent_repair_ledger_protecting_cold_recovery_and_generation_binding() -> Result<()> {
     let dir = tempfile::tempdir()?;

@@ -741,6 +741,11 @@ impl BlockHandleStorage {
             .map_err(|_| error!("Cannot store validator state {}: storer thread dropped", id))
     }
 
+    /// Flushes the validator-state memtable, switching to a fresh WAL.
+    pub fn flush_validator_state(&self) -> Result<()> {
+        self.validator_state_db.flush_family()
+    }
+
     pub fn save_validator_state_raw(&self, key: &str, data: &[u8]) -> Result<()> {
         self.delete_state(key)?;
         self.validator_state_db.put_raw(key.as_bytes(), data)

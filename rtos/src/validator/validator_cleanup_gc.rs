@@ -360,6 +360,47 @@ pub(crate) fn session_has_other_records(
     Ok(false)
 }
 
+/// The fence together with new cleanup records, one synced batch; an empty
+/// fence deletes its key.
+pub(crate) fn persist_retirement(
+    db: &crate::internal_db::InternalDb,
+    fence: &std::collections::HashSet<UInt256>,
+    records: &[PendingValidatorCleanup],
+) -> Result<()> {
+    use crate::internal_db::DESTROYED_VALIDATOR_SESSIONS;
+    use consensus_common::validator_cleanup::{encode_record, record_key};
+    let mut puts = Vec::with_capacity(records.len().saturating_add(1));
+    let mut deletes = Vec::new();
+    if fence.is_empty() {
+        deletes.push(DESTROYED_VALIDATOR_SESSIONS.to_owned());
+    } else {
+        puts.push((
+            DESTROYED_VALIDATOR_SESSIONS.to_owned(),
+            crate::engine_operations::serialize_destroyed_session_ids(fence),
+        ));
+    }
+    for record in records {
+        puts.push((record_key(&record.namespace), encode_record(record)?));
+    }
+    db.write_validator_state_batch_sync(&puts, &deletes)
+}
+
+/// Erases a cleanup record, with the session's candidate claim when given,
+/// in one synced batch. The claim names the last namespace so its executor
+/// can find any record the session gains again.
+pub(crate) fn erase_record(
+    db: &crate::internal_db::InternalDb,
+    namespace: &str,
+    claim: Option<&UInt256>,
+) -> Result<()> {
+    use consensus_common::validator_cleanup::{candidate_claim_key, record_key};
+    let puts: Vec<(String, Vec<u8>)> = claim
+        .map(|session| (candidate_claim_key(session), namespace.as_bytes().to_vec()))
+        .into_iter()
+        .collect();
+    db.write_validator_state_batch_sync(&puts, &[record_key(namespace)])
+}
+
 /// Durable key of the cleanup incarnation (u64 little-endian).
 const CLEANUP_INCARNATION_KEY: &str = "ValidatorCleanupIncarnationV1";
 

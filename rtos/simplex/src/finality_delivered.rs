@@ -1349,3 +1349,7 @@ mod boundary_tests {
 #[cfg(test)]
 #[path = "finality_delivered_capacity_tests.rs"]
 mod capacity_tests;
+
+#[cfg(test)]
+#[path = "finality_delivered_disk_full_tests.rs"]
+mod disk_full_tests;

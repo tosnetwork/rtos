@@ -2053,6 +2053,13 @@ impl InternalDb {
         self.block_handle_storage.save_full_node_state(key.to_string(), block_id)
     }
 
+    /// Switches the validator-state DB to a fresh WAL (tests only), so its
+    /// next write must allocate.
+    #[cfg(test)]
+    pub(crate) fn rotate_validator_state_wal_for_test(&self) -> Result<()> {
+        self.block_handle_storage.flush_validator_state()
+    }
+
     /// Refuses a truncation whose new head lies below the durable
     /// validator-cleanup GC floor, or when that key is malformed.
     pub(crate) fn check_truncation_above_cleanup_floor(&self, new_head_seqno: u32) -> Result<()> {

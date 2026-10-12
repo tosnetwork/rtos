@@ -890,3 +890,101 @@ async fn test_direct_database_truncation_refuses_below_the_durable_floor() -> Re
     db.stop_states_db().await.unwrap();
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "disk-full harness only"]
+async fn disk_full_floor_adoption_is_uncertain_then_resolves_previous_or_candidate() -> Result<()> {
+    use crate::publication_dependency_leases::disk_full_tests::{enospc_root, Filler};
+    use consensus_common::validator_cleanup::{decode_checkpoint, GC_FLOOR_KEY};
+    let mc = |seqno: u32, hash: u8| {
+        BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            seqno,
+            UInt256::from([hash; 32]),
+            UInt256::from([hash; 32]),
+        )
+    };
+    let (floor, successor) = (mc(42, 2), mc(43, 3));
+    let root = enospc_root().join("floor");
+    std::fs::create_dir_all(&root)?;
+    let durable = |db: &InternalDb| -> Result<Option<BlockIdExt>> {
+        Ok(db
+            .load_validator_state_key_bounded(GC_FLOOR_KEY, 256)?
+            .and_then(|v| decode_checkpoint(&v)))
+    };
+    let engine = TestEngine::new_db_dir(root.to_str().unwrap(), None).await?;
+    let stopper = Arc::new(Stopper::new());
+    let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
+    store_mc_state(&keeper, &floor, None).await?;
+    store_mc_state(&keeper, &successor, Some(&floor)).await?;
+    keeper.adopt_cleanup_floor(
+        &floor,
+        wait_pin(&keeper, &floor).await?,
+        keeper.cleanup_floor_epoch(),
+    )?;
+    let candidate = wait_pin(&keeper, &successor).await?;
+    engine.db.rotate_validator_state_wal_for_test()?;
+    let filler = Filler::fill(&root);
+    let error = keeper
+        .adopt_cleanup_floor(&successor, candidate, keeper.cleanup_floor_epoch())
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("No space left on device"), "{error:#}");
+    // The store's contract: the floor is uncertain, cleanup is disabled and
+    // nothing is adopted until the key is re-read.
+    assert!(keeper.cleanup_floor().is_none());
+    assert!(!keeper.cleanup_floor_unset());
+    filler.free();
+    // In process, the DB still refuses writes after its WAL error: the
+    // re-write cannot confirm either floor, so the floor stays uncertain.
+    let resolved_in_process =
+        keeper.resolve_uncertain_cleanup_floor(keeper.cleanup_floor_epoch()).is_ok();
+    if !resolved_in_process {
+        assert!(keeper.cleanup_floor().is_none(), "still fail-closed");
+    }
+    stopper.set_stop();
+    engine.db.stop_states_db().await.unwrap();
+    drop(keeper);
+    drop(engine);
+    // Cold reopen of the same directory: the durable floor is exactly the
+    // previous one or the complete candidate, and is restored and pinned.
+    let engine = TestEngine::new_db_dir(root.to_str().unwrap(), None).await?;
+    let stopper = Arc::new(Stopper::new());
+    let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
+    let after = durable(&engine.db)?;
+    assert!(after == Some(floor.clone()) || after == Some(successor.clone()), "{after:?}");
+    assert_eq!(keeper.cleanup_floor().map(|(id, _)| id), after, "restored exactly");
+    stopper.set_stop();
+    engine.db.stop_states_db().await.unwrap();
+    eprintln!("ENOSPC-CASE V3 resolved_in_process={resolved_in_process} durable_after={after:?}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "disk-full harness only"]
+async fn disk_full_incarnation_is_refused_then_advances_past_any_applied_value() -> Result<()> {
+    use crate::publication_dependency_leases::disk_full_tests::{enospc_root, Filler};
+    use crate::validator::validator_cleanup_gc::next_cleanup_incarnation;
+    let root = enospc_root().join("incarnation");
+    std::fs::create_dir_all(&root)?;
+    let engine = TestEngine::new_db_dir(root.to_str().unwrap(), None).await?;
+    let first = next_cleanup_incarnation(&engine.db)?;
+    engine.db.rotate_validator_state_wal_for_test()?;
+    let filler = Filler::fill(&root);
+    let error = next_cleanup_incarnation(&engine.db).unwrap_err();
+    assert!(format!("{error:#}").contains("No space left on device"), "{error:#}");
+    filler.free();
+    // In process the DB keeps refusing writes after its WAL error: no
+    // incarnation is established, so no attempt of any kind can start.
+    let in_process = next_cleanup_incarnation(&engine.db);
+    engine.db.stop_states_db().await.unwrap();
+    drop(engine);
+    // After a cold reopen the next advance only ever moves forward, past any
+    // value the failed write may have applied.
+    let engine = TestEngine::new_db_dir(root.to_str().unwrap(), None).await?;
+    let next = next_cleanup_incarnation(&engine.db)?;
+    let floor = in_process.as_ref().map_or(first, |value| *value);
+    assert!(next > floor && next <= first + 3, "{first} -> {in_process:?} -> {next}");
+    engine.db.stop_states_db().await.unwrap();
+    eprintln!("ENOSPC-CASE V4 first={first} in_process={in_process:?} next={next}");
+    Ok(())
+}

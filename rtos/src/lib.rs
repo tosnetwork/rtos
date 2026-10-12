@@ -55,6 +55,10 @@ include!("../../common/src/info.rs");
 #[path = "tests/test_helper.rs"]
 pub mod test_helper;
 
+#[cfg(test)]
+#[path = "tests/test_disk_full_validator_state.rs"]
+mod disk_full_validator_state_tests;
+
 pub(crate) mod history_read_budget;
 
 mod repair_lease_binding;

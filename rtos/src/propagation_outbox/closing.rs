@@ -690,6 +690,51 @@ mod tests {
         }
         Ok(())
     }
+    /// P5-07.12 phase 1, V5: the close removal and its journal are one synced
+    /// batch of the real validator-state DB. On a full disk the store fails
+    /// closed, and a cold reopen shows both previous or both intended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "disk-full harness only"]
+    async fn disk_full_close_removal_and_journal_are_all_or_nothing() -> Result<()> {
+        use crate::publication_dependency_leases::disk_full_tests::{enospc_root, Filler};
+        let root = enospc_root().join("outbox");
+        std::fs::create_dir_all(&root)?;
+        let limits = Limits { max_records: 1, ..Limits::default() };
+        let engine =
+            crate::test_helper::TestEngine::new_db_dir(root.to_str().unwrap(), None).await?;
+        let store = PropagationOutbox::open(engine.db.clone(), domain(), limits.clone())?;
+        let (first, second) = released_pair(&store)?;
+        let journal_key = "DiskFullJournal".to_string();
+        engine.db.rotate_validator_state_wal_for_test()?;
+        let filler = Filler::fill(&root);
+        let error = store
+            .remove_cleanup_closes(&[association(&first)?], &[(journal_key.clone(), vec![1])])
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("No space left on device"), "{error:#}");
+        // The outbox fails closed in process until it is reopened.
+        assert!(store.lookup_close(&first.binding.delivery_id).is_err());
+        filler.free();
+        drop(store);
+        engine.db.stop_states_db().await.unwrap();
+        drop(engine);
+        let engine =
+            crate::test_helper::TestEngine::new_db_dir(root.to_str().unwrap(), None).await?;
+        let store = PropagationOutbox::open(engine.db.clone(), domain(), limits)?;
+        let close_present = store.lookup_close(&first.binding.delivery_id)?.is_some();
+        let journal = engine.db.load_validator_state_key_bounded(&journal_key, 16)?;
+        match (close_present, journal) {
+            (true, None) => eprintln!("ENOSPC-CASE V5 previous"),
+            (false, Some(value)) => {
+                assert_eq!(value, vec![1]);
+                eprintln!("ENOSPC-CASE V5 intended");
+            }
+            other => panic!("torn close removal batch: {other:?}"),
+        }
+        assert_eq!(store.lookup_close(&second.binding.delivery_id)?, Some(second), "untouched");
+        drop(store);
+        engine.db.stop_states_db().await.unwrap();
+        Ok(())
+    }
     #[test]
     fn close_legacy_coordinates_require_exact_original_evidence() -> Result<()> {
         let store = open(Arc::new(Disk::default()));

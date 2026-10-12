@@ -367,6 +367,17 @@ pub struct RocksDbTable<K> {
 }
 
 impl<K: DbKey + Send + Sync> RocksDbTable<K> {
+    /// Flushes this column family's memtable; RocksDB then writes to a fresh
+    /// WAL file.
+    pub fn flush_family(&self) -> Result<()> {
+        let raw = self.db.db();
+        let family = raw
+            .cf_handle(&self.family)
+            .ok_or_else(|| error!("Column family {} is not open", self.family))?;
+        raw.flush_cf(&family)?;
+        Ok(())
+    }
+
     pub(crate) fn put_in_batch(
         &self,
         batch: &mut WriteBatch,
