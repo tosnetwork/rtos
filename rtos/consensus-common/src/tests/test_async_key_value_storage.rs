@@ -1427,3 +1427,74 @@ fn test_teardown_receipt_rejects_detached_worker_thread() {
     assert!(error.contains("detached after stop timeout"), "{error}");
     release_tx.send(()).unwrap();
 }
+
+#[test]
+fn test_cleanup_reservation_excludes_openers_and_needs_a_clean_idle_directory() {
+    let path = create_test_db_path("cleanup_reservation");
+    let open = || {
+        ConsensusCommonFactory::create_async_key_value_storage(
+            &path,
+            "reserved",
+            create_test_options(),
+        )
+    };
+    // Never opened here: reservable, and no opener gets in while it is held.
+    let reservation = crate::reserve_storage_cleanup(&path, "reserved").unwrap().unwrap();
+    assert!(crate::reserve_storage_cleanup(&path, "reserved").unwrap().is_none());
+    let refused = open().err().expect("open must be refused while reserved").to_string();
+    assert!(refused.contains("reserved for cleanup"), "{refused}");
+    drop(reservation);
+    // A live instance is never reservable; its clean teardown makes it so.
+    let storage = open().unwrap();
+    assert!(crate::reserve_storage_cleanup(&path, "reserved").unwrap().is_none());
+    drop(storage);
+    let reservation = crate::reserve_storage_cleanup(&path, "reserved").unwrap().unwrap();
+    assert!(reservation.key().ends_with("reserved"));
+    drop(reservation);
+    open().unwrap().mark_for_destroy();
+}
+
+#[test]
+fn test_unclean_teardown_taints_the_directory_beyond_pruning() {
+    let path = create_test_db_path("cleanup_taint");
+    let (slot, _) = crate::register_storage_instance(&path, "tainted").unwrap();
+    assert!(crate::reserve_storage_cleanup(&path, "tainted").unwrap().is_none());
+    crate::release_storage_instance(&slot, false);
+    assert!(crate::reserve_storage_cleanup(&path, "tainted").unwrap().is_none());
+    // Dropping the last slot reference lets the registry prune it; the taint
+    // survives, so the directory stays unreservable.
+    drop(slot);
+    let (other, _) = crate::register_storage_instance(&path, "unrelated").unwrap();
+    crate::release_storage_instance(&other, true);
+    drop(other);
+    assert!(crate::reserve_storage_cleanup(&path, "tainted").unwrap().is_none());
+    assert!(crate::reserve_storage_cleanup(&path, "unrelated").unwrap().is_some());
+}
+
+#[test]
+fn test_taint_is_sticky_per_key_and_overflow_disables_reservations() {
+    let mut taint = crate::StorageTaint { keys: Default::default(), overflowed: false };
+    let key = PathBuf::from("/a/one");
+    assert!(!taint.record(key.clone(), 2));
+    assert!(!taint.record(key.clone(), 2), "a repeated failure adds nothing");
+    assert_eq!(taint.keys.len(), 1);
+    assert!(!taint.record(PathBuf::from("/a/two"), 2));
+    assert!(taint.record(PathBuf::from("/a/three"), 2), "the first overflow reports");
+    assert!(taint.overflowed);
+    assert!(!taint.record(PathBuf::from("/a/four"), 2), "overflow reports once");
+    assert_eq!(taint.keys.len(), 2, "taint is never evicted");
+}
+
+#[test]
+fn test_cleanup_reservation_never_creates_a_missing_directory() {
+    let root = create_test_db_path("cleanup_missing");
+    let parent = root.join("gone").join("namespace");
+    let reservation = crate::reserve_storage_cleanup(&parent, "sid").unwrap().unwrap();
+    assert!(!root.join("gone").exists());
+    // A later registration builds the same key, so it is excluded.
+    let refused = crate::register_storage_instance(&parent, "sid").err().unwrap().to_string();
+    assert!(refused.contains("reserved for cleanup"), "{refused}");
+    drop(reservation);
+    let (slot, _) = crate::register_storage_instance(&parent, "sid").unwrap();
+    crate::release_storage_instance(&slot, true);
+}

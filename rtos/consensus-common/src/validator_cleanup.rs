@@ -207,6 +207,8 @@ pub type GcShardCatchainSeqnoFn<'a> = dyn Fn(&ShardIdent) -> Option<u32> + 'a;
 pub type SessionIsLiveFn<'a> = dyn Fn(&UInt256) -> bool + 'a;
 /// Whether the retiring group confirmed its close for the recorded incarnation.
 pub type SessionIsClosedFn<'a> = dyn Fn(&UInt256) -> bool + 'a;
+/// Local veto over a record that the gate would otherwise allow.
+pub type CustodyVetoFn<'a> = dyn Fn(&PendingValidatorCleanup) -> bool + 'a;
 
 /// On-chain obsolescence, bound to the durable GC floor. True only when the
 /// retirement checkpoint is the GC block or its ancestor and the namespace's
@@ -383,6 +385,8 @@ pub struct Oracles<'a> {
     pub ancestor_or_equal_of_gc: &'a AncestorOfGcFn<'a>,
     pub gc_shard_catchain_seqno: &'a GcShardCatchainSeqnoFn<'a>,
     pub is_live: &'a SessionIsLiveFn<'a>,
+    /// Extra local veto beside the gate: true keeps the record.
+    pub custody_veto: &'a CustodyVetoFn<'a>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -530,6 +534,7 @@ impl ValidatorCleanupManager {
         for record in &page.records {
             let held = self.held_in_memory(&record.session_id);
             let eligible = !held
+                && !(oracles.custody_veto)(record)
                 && cleanup_eligible(
                     record,
                     &oracles.gc,
@@ -664,6 +669,16 @@ impl ValidatorCleanupManager {
         if matches {
             self.in_flight.remove(session);
         }
+    }
+
+    /// Confirmed deletes whose durable erase has not been acknowledged yet,
+    /// as (session, generation, attempt), for an erase retry.
+    pub fn erasing_entries(&self) -> Vec<(UInt256, u64, u64)> {
+        self.in_flight
+            .iter()
+            .filter(|(_, entry)| entry.state == InFlightState::Erasing)
+            .map(|(session, entry)| (session.clone(), entry.generation, entry.attempt_id))
+            .collect()
     }
 
     pub fn in_first_scan(&self) -> bool {

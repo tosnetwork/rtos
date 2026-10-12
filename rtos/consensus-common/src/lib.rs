@@ -601,12 +601,18 @@ pub trait AsyncKeyValueStorage: Send + Sync {
 }
 
 /// Open-instance state of one database directory, shared by every instance
-/// opened there while any instance or receipt still refers to it.
+/// opened there while any instance, receipt or cleanup reservation still
+/// refers to it.
 pub(crate) struct StorageGenerationSlot {
     /// Advanced by every open attempt, including ones that later fail.
     pub(crate) generation: u64,
     /// Instances registered and not yet torn down or rolled back.
     pub(crate) live: u32,
+    /// Whether the last instance released here was torn down cleanly.
+    pub(crate) last_clean: bool,
+    /// Held by a cleanup reservation: no instance may open meanwhile.
+    pub(crate) cleanup_reserved: bool,
+    key: std::path::PathBuf,
 }
 pub(crate) type StorageGeneration = Arc<std::sync::Mutex<StorageGenerationSlot>>;
 
@@ -617,22 +623,63 @@ fn lock_generation(slot: &StorageGeneration) -> std::sync::MutexGuard<'_, Storag
     }
 }
 
-/// Registers one open attempt of the database `parent/storage_id` before any
-/// worker starts, atomically taking a new generation and a live count. The
-/// key is the canonical parent plus the plain storage id, and an existing
-/// database child must be a real directory, so aliases share one slot.
-/// Entries nobody holds are pruned, bounding the map by live instances plus
-/// outstanding receipts. Every later failure must call
-/// `release_storage_instance`.
-pub(crate) fn register_storage_instance(
-    parent: &std::path::Path,
-    storage_id: &str,
-) -> Result<(StorageGeneration, u64)> {
-    static REGISTRY: std::sync::OnceLock<
-        std::sync::Mutex<
-            HashMap<std::path::PathBuf, std::sync::Weak<std::sync::Mutex<StorageGenerationSlot>>>,
-        >,
-    > = std::sync::OnceLock::new();
+type StorageRegistry =
+    HashMap<std::path::PathBuf, std::sync::Weak<std::sync::Mutex<StorageGenerationSlot>>>;
+
+fn storage_registry() -> std::sync::MutexGuard<'static, StorageRegistry> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<StorageRegistry>> =
+        std::sync::OnceLock::new();
+    match REGISTRY.get_or_init(Default::default).lock() {
+        Ok(map) => map,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Database keys whose instance was ever torn down uncleanly in this process
+/// (detached or panicked workers) are tainted. Taint is sticky and never
+/// evicted, so such a directory cannot be reserved for cleanup until the
+/// process restarts.
+pub const MAX_TAINTED_STORAGE_KEYS: usize = 1024;
+
+pub(crate) struct StorageTaint {
+    pub(crate) keys: std::collections::HashSet<std::path::PathBuf>,
+    /// Set once a taint could not be recorded: every reservation is refused.
+    pub(crate) overflowed: bool,
+}
+
+impl StorageTaint {
+    /// Records one unclean teardown at `key`. A key already tainted adds
+    /// nothing; past `capacity` the set overflows instead, which refuses
+    /// every reservation. Returns true when this call overflowed it.
+    pub(crate) fn record(&mut self, key: std::path::PathBuf, capacity: usize) -> bool {
+        if self.keys.contains(&key) {
+            return false;
+        }
+        if self.keys.len() < capacity {
+            self.keys.insert(key);
+            return false;
+        }
+        let first = !self.overflowed;
+        self.overflowed = true;
+        first
+    }
+}
+
+fn storage_taint() -> std::sync::MutexGuard<'static, StorageTaint> {
+    static TAINT: std::sync::OnceLock<std::sync::Mutex<StorageTaint>> = std::sync::OnceLock::new();
+    let taint = TAINT.get_or_init(|| {
+        std::sync::Mutex::new(StorageTaint {
+            keys: std::collections::HashSet::new(),
+            overflowed: false,
+        })
+    });
+    match taint.lock() {
+        Ok(taint) => taint,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn plain_storage_id(storage_id: &str) -> Result<()> {
     let mut components = std::path::Path::new(storage_id).components();
     if !matches!(
         (components.next(), components.next()),
@@ -640,6 +687,22 @@ pub(crate) fn register_storage_instance(
     ) {
         rtos_block::fail!("Storage id {storage_id:?} is not one plain path component");
     }
+    Ok(())
+}
+
+/// Registers one open attempt of the database `parent/storage_id` before any
+/// worker starts, atomically taking a new generation and a live count. The
+/// key is the canonical parent plus the plain storage id, and an existing
+/// database child must be a real directory, so aliases share one slot.
+/// Entries nobody holds are pruned, bounding the map by live instances plus
+/// outstanding receipts and reservations. Refused while a cleanup
+/// reservation holds the directory. Every later failure must call
+/// `release_storage_instance`.
+pub(crate) fn register_storage_instance(
+    parent: &std::path::Path,
+    storage_id: &str,
+) -> Result<(StorageGeneration, u64)> {
+    plain_storage_id(storage_id)?;
     match std::fs::symlink_metadata(parent) {
         Ok(metadata) if metadata.file_type().is_dir() => {}
         Ok(_) => rtos_block::fail!("Storage parent {} is not a directory", parent.display()),
@@ -656,17 +719,22 @@ pub(crate) fn register_storage_instance(
         Err(error) => return Err(error.into()),
     }
     let key = canonical.join(storage_id);
-    let registry = REGISTRY.get_or_init(Default::default);
-    let mut map = match registry.lock() {
-        Ok(map) => map,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut map = storage_registry();
     map.retain(|_, slot| slot.strong_count() > 0);
     let slot = map.get(&key).and_then(std::sync::Weak::upgrade).unwrap_or_else(|| {
-        Arc::new(std::sync::Mutex::new(StorageGenerationSlot { generation: 0, live: 0 }))
+        Arc::new(std::sync::Mutex::new(StorageGenerationSlot {
+            generation: 0,
+            live: 0,
+            last_clean: true,
+            cleanup_reserved: false,
+            key: key.clone(),
+        }))
     });
     let generation = {
         let mut state = lock_generation(&slot);
+        if state.cleanup_reserved {
+            rtos_block::fail!("Storage {} is reserved for cleanup", key.display());
+        }
         let generation = state
             .generation
             .checked_add(1)
@@ -684,10 +752,114 @@ pub(crate) fn register_storage_instance(
 }
 
 /// Ends one registration: a failed open rolls back, a dropped instance
-/// finishes. The generation stays advanced, so no older receipt revives.
-pub(crate) fn release_storage_instance(slot: &StorageGeneration) {
-    let mut state = lock_generation(slot);
-    state.live = state.live.saturating_sub(1);
+/// finishes. The generation stays advanced, so no older receipt revives. An
+/// unclean release (any worker detached, panicked or not joined) taints the
+/// directory for the rest of the process.
+pub(crate) fn release_storage_instance(slot: &StorageGeneration, clean: bool) {
+    let key = {
+        let mut state = lock_generation(slot);
+        state.live = state.live.saturating_sub(1);
+        state.last_clean = clean;
+        state.key.clone()
+    };
+    if !clean && storage_taint().record(key, MAX_TAINTED_STORAGE_KEYS) {
+        log::error!(
+            "Storage taint capacity {MAX_TAINTED_STORAGE_KEYS} exhausted: \
+             consensus storage cleanup is disabled for this process"
+        );
+    }
+}
+
+/// The canonical key of `parent/storage_id` without creating anything: the
+/// deepest existing ancestor of `parent` is canonicalized and the missing
+/// tail appended, so it equals the key a later registration would build.
+fn canonical_storage_key(
+    parent: &std::path::Path,
+    storage_id: &str,
+) -> Result<std::path::PathBuf> {
+    plain_storage_id(storage_id)?;
+    let mut existing = parent;
+    let mut tail = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let (Some(name), Some(up)) = (existing.file_name(), existing.parent()) else {
+                    rtos_block::fail!("Storage parent {} has no existing ancestor", parent.display())
+                };
+                tail.push(name.to_owned());
+                existing = up;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let base = if existing.as_os_str().is_empty() { std::path::Path::new(".") } else { existing };
+    let mut key = std::fs::canonicalize(base)?;
+    for name in tail.iter().rev() {
+        key.push(name);
+    }
+    key.push(storage_id);
+    Ok(key)
+}
+
+/// Exclusive cleanup authority over one database directory in this process.
+/// While it is held no instance can open there; dropping it releases the
+/// directory.
+pub struct StorageCleanupReservation {
+    slot: StorageGeneration,
+}
+
+impl StorageCleanupReservation {
+    /// The canonical database key this reservation holds.
+    pub fn key(&self) -> std::path::PathBuf {
+        lock_generation(&self.slot).key.clone()
+    }
+}
+
+impl Drop for StorageCleanupReservation {
+    fn drop(&mut self) {
+        lock_generation(&self.slot).cleanup_reserved = false;
+    }
+}
+
+/// Reserves `parent/storage_id` for deletion. `None` means occupied: an
+/// instance is live, the last teardown there was unclean, the directory is
+/// tainted, another reservation holds it, or the taint capacity overflowed.
+/// Never creates directories.
+pub fn reserve_storage_cleanup(
+    parent: &std::path::Path,
+    storage_id: &str,
+) -> Result<Option<StorageCleanupReservation>> {
+    let key = canonical_storage_key(parent, storage_id)?;
+    let mut map = storage_registry();
+    {
+        let taint = storage_taint();
+        if taint.overflowed || taint.keys.contains(&key) {
+            return Ok(None);
+        }
+    }
+    map.retain(|_, slot| slot.strong_count() > 0);
+    let slot = match map.get(&key).and_then(std::sync::Weak::upgrade) {
+        Some(slot) => {
+            {
+                let mut state = lock_generation(&slot);
+                if state.live != 0 || !state.last_clean || state.cleanup_reserved {
+                    return Ok(None);
+                }
+                state.cleanup_reserved = true;
+            }
+            slot
+        }
+        None => Arc::new(std::sync::Mutex::new(StorageGenerationSlot {
+            generation: 0,
+            live: 0,
+            last_clean: true,
+            cleanup_reserved: true,
+            key: key.clone(),
+        })),
+    };
+    map.insert(key, Arc::downgrade(&slot));
+    Ok(Some(StorageCleanupReservation { slot }))
 }
 
 /// Outcome of one storage instance's final teardown, recorded by its `Drop`.

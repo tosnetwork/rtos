@@ -349,10 +349,19 @@ impl RocksDbAsyncKeyValueStorage {
         let storage_id_owned = storage_id.to_string();
         // Registered before any worker starts; every failure below rolls back.
         let (instance, generation) = crate::register_storage_instance(&path, storage_id)?;
-        let opened =
-            Self::open_registered(path, storage_id_owned, options, instance.clone(), generation);
+        // Stays true unless a worker thread was started and not joined
+        // cleanly; an unclean rollback taints the directory.
+        let mut workers_clean = true;
+        let opened = Self::open_registered(
+            path,
+            storage_id_owned,
+            options,
+            instance.clone(),
+            generation,
+            &mut workers_clean,
+        );
         if opened.is_err() {
-            crate::release_storage_instance(&instance);
+            crate::release_storage_instance(&instance, workers_clean);
         }
         opened
     }
@@ -363,6 +372,7 @@ impl RocksDbAsyncKeyValueStorage {
         options: AsyncKeyValueStorageOptions,
         instance: crate::StorageGeneration,
         generation: u64,
+        workers_clean: &mut bool,
     ) -> Result<AsyncKeyValueStoragePtr> {
         let storage_id = storage_id_owned.as_str();
 
@@ -444,13 +454,18 @@ impl RocksDbAsyncKeyValueStorage {
             .map_err(|e| rtos_block::error!("Failed to spawn DB processing thread: {}", e))?;
 
         // Wait for initialization result
-        let init_result = init_rx.recv().map_err(|_| {
-            rtos_block::error!("AsyncKeyValueStorage {}: init channel closed", storage_id)
-        })?;
+        let init_result = match init_rx.recv() {
+            Ok(result) => result,
+            Err(_) => {
+                // The worker dropped its sender: it has exited or is exiting.
+                *workers_clean = db_thread.join().is_ok();
+                rtos_block::fail!("AsyncKeyValueStorage {}: init channel closed", storage_id)
+            }
+        };
 
         if let Err(e) = init_result {
             // Wait for DB thread to exit
-            let _ = db_thread.join();
+            *workers_clean = db_thread.join().is_ok();
             return Err(e);
         }
         let mut db_thread_cleanup = Some(db_thread);
@@ -489,7 +504,9 @@ impl RocksDbAsyncKeyValueStorage {
                         // The DB worker already runs: stop and join it before
                         // the caller rolls the registration back.
                         is_stop_requested.store(true, Ordering::SeqCst);
-                        let _ = db_thread_cleanup.take().map(|handle| handle.join());
+                        *workers_clean = db_thread_cleanup
+                            .take()
+                            .is_none_or(|handle| handle.join().is_ok());
                         rtos_block::error!("Failed to spawn callback thread: {}", e)
                     })?;
 
@@ -1402,7 +1419,7 @@ impl Drop for RocksDbAsyncKeyValueStorage {
             let _ = self.callback_thread_handle.take();
         }
 
-        crate::release_storage_instance(&self.instance);
+        crate::release_storage_instance(&self.instance, failures.is_empty());
         let _ =
             self.teardown.set(if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) });
 

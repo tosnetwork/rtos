@@ -258,6 +258,7 @@ struct Scan {
     manager: ValidatorCleanupManager,
     store: BTreeMap<String, PendingValidatorCleanup>,
     live: BTreeSet<UInt256>,
+    vetoed: BTreeSet<UInt256>,
 }
 impl Scan {
     fn new() -> Self {
@@ -265,6 +266,7 @@ impl Scan {
             manager: ValidatorCleanupManager::default(),
             store: BTreeMap::new(),
             live: BTreeSet::new(),
+            vetoed: BTreeSet::new(),
         }
     }
     fn put(&mut self, record: PendingValidatorCleanup) {
@@ -289,11 +291,14 @@ impl Scan {
         let is_live = move |s: &UInt256| live.contains(s);
         let ancestor = |q: &BlockIdExt| q.seq_no() <= 500;
         let cc = |_: &ShardIdent| Some(10);
+        let vetoed = self.vetoed.clone();
+        let veto = move |r: &PendingValidatorCleanup| vetoed.contains(&r.session_id);
         let oracles = Oracles {
             gc: checkpoint(500),
             ancestor_or_equal_of_gc: &ancestor,
             gc_shard_catchain_seqno: &cc,
             is_live: &is_live,
+            custody_veto: &veto,
         };
         let candidates = self.manager.on_page(&request, &page, &oracles);
         let mut reserved = Vec::new();
@@ -412,11 +417,13 @@ fn validator_cleanup_manager_point_read_rejects_changed_or_failed_records() {
     let ancestor = |q: &BlockIdExt| q.seq_no() <= 500;
     let cc = |_: &ShardIdent| Some(10);
     let no = |_: &UInt256| false;
+    let no_veto = |_: &PendingValidatorCleanup| false;
     let oracles = Oracles {
         gc: checkpoint(500),
         ancestor_or_equal_of_gc: &ancestor,
         gc_shard_catchain_seqno: &cc,
         is_live: &no,
+        custody_veto: &no_veto,
     };
     let candidates = scan.manager.on_page(&request, &page, &oracles);
     assert_eq!(candidates.len(), 1);
@@ -600,4 +607,24 @@ fn validator_cleanup_gc_floor_advances_only_behind_every_frontier() {
     assert!(!may_advance_gc(1000, 9_000, &ready), "state not older than the TTL");
     assert!(may_advance_gc(1000, 8_999, &ready));
     assert!(!may_advance_gc(u32::MAX, 0, &ready), "seqno + 1024 overflow refuses");
+}
+
+#[test]
+fn validator_cleanup_manager_honours_the_custody_veto_and_lists_pending_erases() {
+    let rec = record(1, 100);
+    let sid = rec.session_id.clone();
+    let mut scan = Scan::new();
+    scan.put(rec.clone());
+    scan.vetoed.insert(sid.clone());
+    assert!(scan.pass().unwrap().is_empty(), "a vetoed record is never reserved");
+    scan.vetoed.clear();
+    let r = scan.pass().unwrap().remove(0);
+    assert!(scan.manager.erasing_entries().is_empty(), "deleting is not erasing");
+    assert!(scan.manager.on_delete_completed(&sid, r.generation, r.attempt_id, true));
+    // A failed erase leaves the entry erasing and in flight for a retry.
+    assert_eq!(scan.manager.erasing_entries(), vec![(sid.clone(), r.generation, r.attempt_id)]);
+    assert!(scan.manager.is_delete_in_flight(&sid));
+    scan.manager.on_erase_acknowledged(&sid, r.generation, r.attempt_id);
+    assert!(scan.manager.erasing_entries().is_empty());
+    assert!(!scan.manager.is_delete_in_flight(&sid));
 }
