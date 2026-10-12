@@ -668,3 +668,45 @@ async fn test_cleanup_floor_driver_refuses_a_fork_successor_and_a_live_floor() -
     engine.db.stop_states_db().await.unwrap();
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cleanup_sibling_scan_counts_oversized_records() -> Result<()> {
+    use crate::validator::validator_cleanup_gc::session_has_other_records;
+    use consensus_common::validator_cleanup::{
+        encode_record, make_record, record_key, NamespaceLayout,
+    };
+    let dir = tempfile::tempdir()?;
+    let engine = TestEngine::new_db_dir(dir.path().to_str().unwrap(), None).await?;
+    let session = UInt256::from([0x77; 32]);
+    let checkpoint = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        9,
+        UInt256::from([1; 32]),
+        UInt256::from([2; 32]),
+    );
+    let make = |layout| {
+        make_record(&session, &layout, &ShardIdent::masterchain(), 5, &checkpoint).unwrap()
+    };
+    let own = make(NamespaceLayout::V2Validator);
+    let observer = make(NamespaceLayout::V2Observer(UInt256::from([0x01; 32])));
+    let later = make(NamespaceLayout::V2Observer(UInt256::from([0xfe; 32])));
+    engine.db.write_validator_state_batch_sync(
+        &[(record_key(&own.namespace), encode_record(&own))],
+        &[],
+    )?;
+    assert!(!session_has_other_records(&engine.db, &own.namespace, &session)?);
+    // An oversized sibling sorting before a valid one is still a holder: the
+    // scan never skips a key because of its value.
+    engine.db.write_validator_state_batch_sync(
+        &[(record_key(&observer.namespace), vec![0u8; 1 << 16])],
+        &[],
+    )?;
+    assert!(session_has_other_records(&engine.db, &own.namespace, &session)?);
+    engine.db.write_validator_state_batch_sync(
+        &[(record_key(&later.namespace), encode_record(&later))],
+        &[],
+    )?;
+    assert!(session_has_other_records(&engine.db, &own.namespace, &session)?);
+    assert!(session_has_other_records(&engine.db, &later.namespace, &session)?);
+    Ok(())
+}

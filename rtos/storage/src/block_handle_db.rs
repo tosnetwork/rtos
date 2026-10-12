@@ -830,6 +830,28 @@ impl BlockHandleStorage {
         Ok((entries, last_key, reached_end))
     }
 
+    /// Whether any validator-state key under `prefix` other than `except`
+    /// exists. Key-only: a value's size or validity never hides a key, and a
+    /// non-UTF-8 key counts as present.
+    pub fn validator_state_prefix_has_key_other_than(
+        &self,
+        prefix: &str,
+        except: &str,
+    ) -> Result<bool> {
+        let mut found = false;
+        self.validator_state_db.for_each_from(prefix.as_bytes(), &mut |key, _| {
+            if !key.starts_with(prefix.as_bytes()) {
+                return Ok(false);
+            }
+            if key == except.as_bytes() {
+                return Ok(true);
+            }
+            found = true;
+            Ok(false)
+        })?;
+        Ok(found)
+    }
+
     pub fn drop_validator_state_raw(&self, key: &str) -> Result<()> {
         self.delete_state(key)?;
         self.validator_state_db.delete_raw(key.as_bytes())

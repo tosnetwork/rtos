@@ -549,7 +549,7 @@ impl ValidatorCleanupManager {
     /// The page to read at this tick, or nothing when a pass is running or
     /// in-flight capacity is exhausted.
     pub fn begin_tick(&mut self) -> Option<PageRequest> {
-        if self.pass.active || self.in_flight.len() >= Self::MAX_IN_FLIGHT {
+        if self.pass.active || self.operation_count() >= Self::MAX_IN_FLIGHT {
             return None;
         }
         let token = Self::next(&mut self.next_token);
@@ -582,7 +582,7 @@ impl ValidatorCleanupManager {
         if !self.is_current_pass(request.token) {
             return candidates;
         }
-        let capacity = Self::MAX_IN_FLIGHT.saturating_sub(self.in_flight.len());
+        let capacity = Self::MAX_IN_FLIGHT.saturating_sub(self.operation_count());
         let room = Self::DISPATCH_BUDGET.min(capacity);
         let closed = |_: &UInt256| true; // open retirements are held below
         let mut stopped = false;
@@ -649,7 +649,7 @@ impl ValidatorCleanupManager {
         }
         if self.held_in_memory(candidate)
             || is_live(&candidate.session_id)
-            || self.in_flight.len() >= Self::MAX_IN_FLIGHT
+            || self.operation_count() >= Self::MAX_IN_FLIGHT
         {
             return None;
         }
@@ -749,8 +749,7 @@ impl ValidatorCleanupManager {
         if self.live_generation.contains_key(session)
             || self.open_retirements.values().any(|(owner, _)| owner == session)
             || self.is_delete_in_flight(session)
-            || self.in_flight.len().saturating_add(self.claims_in_flight.len())
-                >= Self::MAX_IN_FLIGHT
+            || self.operation_count() >= Self::MAX_IN_FLIGHT
         {
             return None;
         }
@@ -776,8 +775,13 @@ impl ValidatorCleanupManager {
     pub fn pass_running(&self) -> bool {
         self.pass.active
     }
+    /// Namespace deletes and candidate claims together: the one budget the
+    /// `MAX_IN_FLIGHT` cap applies to.
+    pub fn operation_count(&self) -> usize {
+        self.in_flight.len().saturating_add(self.claims_in_flight.len())
+    }
     pub fn in_flight_count(&self) -> usize {
-        self.in_flight.len()
+        self.operation_count()
     }
     pub fn open_retirement_count(&self) -> usize {
         self.open_retirements.len()

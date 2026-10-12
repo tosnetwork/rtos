@@ -2116,6 +2116,14 @@ impl InternalDb {
         self.block_handle_storage.write_validator_state_batch_sync(puts, deletes)
     }
 
+    pub fn validator_state_prefix_has_key_other_than(
+        &self,
+        prefix: &str,
+        except: &str,
+    ) -> Result<bool> {
+        self.block_handle_storage.validator_state_prefix_has_key_other_than(prefix, except)
+    }
+
     pub fn scan_validator_state_prefix(
         &self,
         prefix: &str,

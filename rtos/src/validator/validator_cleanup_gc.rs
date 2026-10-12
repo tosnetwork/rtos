@@ -301,3 +301,23 @@ pub(crate) fn delete_candidate_table(
     remove_if_directory(&candidates)?;
     Ok(confirmed_absent(&candidates))
 }
+
+/// Whether any cleanup record key of `session` other than `namespace`'s own
+/// exists, across the session's V1 and authenticated prefixes. Key-only, so
+/// an oversized or malformed sibling still counts.
+pub(crate) fn session_has_other_records(
+    db: &crate::internal_db::InternalDb,
+    namespace: &str,
+    session: &UInt256,
+) -> Result<bool> {
+    use consensus_common::validator_cleanup::{record_key, session_record_prefixes};
+    let parsed = parse_canonical_namespace_name(namespace, session)
+        .ok_or_else(|| error!("Cleanup namespace is not canonical"))?;
+    let own = record_key(namespace);
+    for prefix in session_record_prefixes(&parsed.shard, parsed.catchain_seqno, session) {
+        if db.validator_state_prefix_has_key_other_than(&prefix, &own)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}

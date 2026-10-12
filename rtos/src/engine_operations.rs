@@ -650,21 +650,11 @@ impl EngineOperations for Engine {
     }
 
     fn session_has_other_cleanup_records(&self, namespace: &str, session: &UInt256) -> Result<bool> {
-        use consensus_common::validator_cleanup::{
-            parse_canonical_namespace_name, record_key, session_record_prefixes, MAX_RECORD_BYTES,
-        };
-        let parsed = parse_canonical_namespace_name(namespace, session)
-            .ok_or_else(|| error!("Cleanup namespace is not canonical"))?;
-        let own = record_key(namespace);
-        for prefix in session_record_prefixes(&parsed.shard, parsed.catchain_seqno, session) {
-            // Two keys suffice to find one other than this namespace's own.
-            let (entries, _, _) =
-                self.db().scan_validator_state_prefix(&prefix, "", 2, MAX_RECORD_BYTES)?;
-            if entries.iter().any(|(key, _)| *key != own) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        crate::validator::validator_cleanup_gc::session_has_other_records(
+            self.db(),
+            namespace,
+            session,
+        )
     }
 
     fn load_candidate_claims_page(

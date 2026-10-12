@@ -697,3 +697,23 @@ fn validator_cleanup_candidate_claims_are_session_serialized() {
     manager.on_close_confirmed(&rec.namespace, generation);
     assert!(manager.begin_claim(&sid).is_some());
 }
+
+#[test]
+fn validator_cleanup_cap_counts_claims_and_namespaces_together() {
+    let mut scan = Scan::new();
+    for i in 0..20u8 {
+        scan.put(record(i, 100));
+    }
+    // Sixty claims leave room for exactly four namespace deletes.
+    for i in 0..60u8 {
+        let claimed = UInt256::from([200u8.wrapping_add(i); 32]);
+        assert!(scan.manager.begin_claim(&claimed).is_some(), "claim {i}");
+    }
+    let claims = scan.manager.operation_count();
+    assert_eq!(claims, 60);
+    let reserved = scan.pass().unwrap();
+    assert_eq!(reserved.len(), ValidatorCleanupManager::MAX_IN_FLIGHT - 60);
+    assert_eq!(scan.manager.operation_count(), ValidatorCleanupManager::MAX_IN_FLIGHT);
+    assert!(scan.manager.begin_tick().is_none(), "the combined cap skips the tick");
+    assert!(scan.manager.begin_claim(&session(250)).is_none(), "and refuses another claim");
+}
