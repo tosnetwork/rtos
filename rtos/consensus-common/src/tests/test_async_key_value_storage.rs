@@ -1498,3 +1498,51 @@ fn test_cleanup_reservation_never_creates_a_missing_directory() {
     let (slot, _) = crate::register_storage_instance(&parent, "sid").unwrap();
     crate::release_storage_instance(&slot, true);
 }
+
+#[test]
+fn test_unclean_release_publishes_its_taint_before_any_reservation_can_run() {
+    let path = create_test_db_path("cleanup_taint_gap");
+    let (unclean, _) = crate::register_storage_instance(&path, "gap").unwrap();
+    let (clean, _) = crate::register_storage_instance(&path, "gap").unwrap();
+    let key = std::fs::canonicalize(&path).unwrap().join("gap");
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let result_rx = Arc::new(std::sync::Mutex::new(result_rx));
+    let racer: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> = Default::default();
+    let held_in_gap = Arc::new(AtomicBool::new(false));
+    let (racer_slot, racer_path, held, gap_rx) =
+        (racer.clone(), path.clone(), held_in_gap.clone(), result_rx.clone());
+    let hook: crate::ReleaseHook = Box::new(move || {
+        // Inside the unclean release, slot updated, taint not yet recorded:
+        // the other instance's clean release and a reservation must wait.
+        let handle = std::thread::spawn(move || {
+            crate::release_storage_instance(&clean, true);
+            let reserved = crate::reserve_storage_cleanup(&racer_path, "gap").unwrap().is_some();
+            result_tx.send(reserved).unwrap();
+        });
+        *racer_slot.lock().unwrap() = Some(handle);
+        let raced = gap_rx.lock().unwrap().recv_timeout(Duration::from_millis(200)).is_ok();
+        held.store(!raced, Ordering::SeqCst);
+        false
+    });
+    *crate::RELEASE_HOOK.lock().unwrap() = Some((key, hook));
+    crate::release_storage_instance(&unclean, false);
+    racer.lock().unwrap().take().expect("the hook ran").join().unwrap();
+    assert!(
+        held_in_gap.load(Ordering::SeqCst),
+        "the racing release and reservation were held while the unclean release ran"
+    );
+    assert!(!result_rx.lock().unwrap().recv().unwrap(), "no reservation after an unclean release");
+}
+
+#[test]
+fn test_clean_release_never_clears_an_earlier_unclean_one() {
+    let path = create_test_db_path("cleanup_sticky");
+    let (unclean, _) = crate::register_storage_instance(&path, "sticky").unwrap();
+    let (clean, _) = crate::register_storage_instance(&path, "sticky").unwrap();
+    let key = std::fs::canonicalize(&path).unwrap().join("sticky");
+    // Skip the taint record: the slot flag alone must refuse.
+    *crate::RELEASE_HOOK.lock().unwrap() = Some((key, Box::new(|| true)));
+    crate::release_storage_instance(&unclean, false);
+    crate::release_storage_instance(&clean, true);
+    assert!(crate::reserve_storage_cleanup(&path, "sticky").unwrap().is_none());
+}

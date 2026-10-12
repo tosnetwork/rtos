@@ -504,9 +504,8 @@ impl RocksDbAsyncKeyValueStorage {
                         // The DB worker already runs: stop and join it before
                         // the caller rolls the registration back.
                         is_stop_requested.store(true, Ordering::SeqCst);
-                        *workers_clean = db_thread_cleanup
-                            .take()
-                            .is_none_or(|handle| handle.join().is_ok());
+                        *workers_clean =
+                            db_thread_cleanup.take().is_none_or(|handle| handle.join().is_ok());
                         rtos_block::error!("Failed to spawn callback thread: {}", e)
                     })?;
 

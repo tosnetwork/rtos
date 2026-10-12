@@ -754,15 +754,20 @@ pub(crate) fn register_storage_instance(
 /// Ends one registration: a failed open rolls back, a dropped instance
 /// finishes. The generation stays advanced, so no older receipt revives. An
 /// unclean release (any worker detached, panicked or not joined) taints the
-/// directory for the rest of the process.
+/// directory for the rest of the process. The slot update and the taint are
+/// published under the slot lock (order slot -> taint), and `last_clean` is
+/// sticky, so a concurrent clean release can never open a window in which a
+/// cleanup reservation sees an eligible slot before the taint exists.
 pub(crate) fn release_storage_instance(slot: &StorageGeneration, clean: bool) {
-    let key = {
-        let mut state = lock_generation(slot);
-        state.live = state.live.saturating_sub(1);
-        state.last_clean = clean;
-        state.key.clone()
-    };
-    if !clean && storage_taint().record(key, MAX_TAINTED_STORAGE_KEYS) {
+    let mut state = lock_generation(slot);
+    state.live = state.live.saturating_sub(1);
+    state.last_clean &= clean;
+    #[cfg(test)]
+    let skip_taint = run_release_hook(&state.key);
+    #[cfg(not(test))]
+    let skip_taint = false;
+    if !clean && !skip_taint && storage_taint().record(state.key.clone(), MAX_TAINTED_STORAGE_KEYS)
+    {
         log::error!(
             "Storage taint capacity {MAX_TAINTED_STORAGE_KEYS} exhausted: \
              consensus storage cleanup is disabled for this process"
@@ -770,13 +775,38 @@ pub(crate) fn release_storage_instance(slot: &StorageGeneration, clean: bool) {
     }
 }
 
+/// Test hook fired inside a release of `key` while the slot lock is held,
+/// after the slot update and before the taint; returning true skips the
+/// taint so the sticky slot flag alone can be checked.
+#[cfg(test)]
+pub(crate) type ReleaseHook = Box<dyn FnOnce() -> bool + Send>;
+
+#[cfg(test)]
+pub(crate) static RELEASE_HOOK: std::sync::Mutex<Option<(std::path::PathBuf, ReleaseHook)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn run_release_hook(key: &std::path::Path) -> bool {
+    let hook = {
+        let mut slot = match RELEASE_HOOK.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match slot.take() {
+            Some((hooked, hook)) if hooked == key => Some(hook),
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    };
+    hook.is_some_and(|hook| hook())
+}
+
 /// The canonical key of `parent/storage_id` without creating anything: the
 /// deepest existing ancestor of `parent` is canonicalized and the missing
 /// tail appended, so it equals the key a later registration would build.
-fn canonical_storage_key(
-    parent: &std::path::Path,
-    storage_id: &str,
-) -> Result<std::path::PathBuf> {
+fn canonical_storage_key(parent: &std::path::Path, storage_id: &str) -> Result<std::path::PathBuf> {
     plain_storage_id(storage_id)?;
     let mut existing = parent;
     let mut tail = Vec::new();
@@ -785,7 +815,10 @@ fn canonical_storage_key(
             Ok(_) => break,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let (Some(name), Some(up)) = (existing.file_name(), existing.parent()) else {
-                    rtos_block::fail!("Storage parent {} has no existing ancestor", parent.display())
+                    rtos_block::fail!(
+                        "Storage parent {} has no existing ancestor",
+                        parent.display()
+                    )
                 };
                 tail.push(name.to_owned());
                 existing = up;
