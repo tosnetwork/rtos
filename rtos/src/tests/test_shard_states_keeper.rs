@@ -480,3 +480,191 @@ async fn test_cleanup_floor_is_re_pinned_from_the_same_db_after_restart() -> Res
     engine.db.stop_states_db().await.unwrap();
     Ok(())
 }
+
+/// The floor driver's inputs read from a real `InternalDb` and keeper with
+/// the same calls the engine makes.
+struct DbFloorSource {
+    db: Arc<InternalDb>,
+    keeper: Arc<ShardStatesKeeper>,
+}
+
+#[async_trait::async_trait]
+impl crate::validator::validator_cleanup_gc::CleanupFloorSource for DbFloorSource {
+    async fn last_applied_mc_state(&self) -> Result<Arc<ShardStateStuff>> {
+        match self.db.load_full_node_state(crate::internal_db::LAST_APPLIED_MC_BLOCK)? {
+            Some(id) => self.keeper.load_state(&id).await,
+            None => fail!("No last applied MC block set"),
+        }
+    }
+    fn last_rotation_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
+        self.db.load_validator_state(crate::internal_db::LAST_ROTATION_MC_BLOCK)
+    }
+    fn shard_client_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
+        self.db.load_full_node_state(crate::internal_db::SHARD_CLIENT_MC_BLOCK)
+    }
+    fn pss_keeper_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
+        self.db.load_full_node_state(crate::internal_db::PSS_KEEPER_MC_BLOCK)
+    }
+    fn block_next1(&self, id: &BlockIdExt) -> Result<BlockIdExt> {
+        self.db.load_block_next1(id)
+    }
+    fn keeper(&self) -> Arc<ShardStatesKeeper> {
+        self.keeper.clone()
+    }
+}
+
+/// Stores a synthetic masterchain state with a handle in the real handle DB.
+async fn store_driver_state(
+    keeper: &Arc<ShardStatesKeeper>,
+    db: &InternalDb,
+    id: &BlockIdExt,
+    prev: Option<&BlockIdExt>,
+    gen_time: u32,
+    min_ref: u32,
+) -> Result<Arc<storage::block_handle_db::BlockHandle>> {
+    use rtos_block::{ExtBlkRef, HashmapAugType, KeyExtBlkRef, KeyMaxLt, McStateExtra};
+    let mut header = ShardStateUnsplit::with_ident(ShardIdent::masterchain());
+    header.set_seq_no(id.seq_no());
+    header.set_gen_time(gen_time);
+    header.set_min_ref_mc_seqno(min_ref);
+    let mut extra = McStateExtra::default();
+    extra.after_key_block = true;
+    if let Some(prev) = prev {
+        let reference = KeyExtBlkRef {
+            key: false,
+            blk_ref: ExtBlkRef {
+                end_lt: 0,
+                seq_no: prev.seq_no(),
+                root_hash: prev.root_hash().clone(),
+                file_hash: prev.file_hash().clone(),
+            },
+        };
+        extra.prev_blocks.set(
+            &prev.seq_no(),
+            &reference,
+            &KeyMaxLt { key: false, max_end_lt: 0 },
+        )?;
+    }
+    header.write_custom(Some(&extra))?;
+    let state = ShardStateStuff::from_state(
+        id.clone(),
+        header,
+        #[cfg(feature = "telemetry")]
+        &keeper.telemetry,
+        &keeper.allocated,
+    )?;
+    let handle = db.create_test_block_handle(id)?;
+    keeper.store_state(&handle, state, None, true).await?;
+    Ok(handle)
+}
+
+fn driver_mc(seqno: u32, hash: u8) -> BlockIdExt {
+    BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        seqno,
+        UInt256::from([hash; 32]),
+        UInt256::from([hash; 32]),
+    )
+}
+
+/// A real DB with floor F (MC 100, expired), its successor `next` linked as
+/// next1, last applied L at MC 2000, and frontiers rotation 1800, shard
+/// client 1900 and PSS keeper `pss`. The floor is adopted at F.
+async fn driver_fixture(
+    dir: &std::path::Path,
+    next: &BlockIdExt,
+    next_prev: Option<&BlockIdExt>,
+    floor_gen_time: u32,
+    pss: u32,
+) -> Result<(TestEngine, Arc<Stopper>, DbFloorSource)> {
+    let engine = TestEngine::new_db_dir(dir.to_str().unwrap(), None).await?;
+    let stopper = Arc::new(Stopper::new());
+    let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
+    let floor = driver_mc(100, 1);
+    let now = u32::try_from(rtos_block::UnixTime::now()).unwrap_or(u32::MAX);
+    let floor_handle =
+        store_driver_state(&keeper, &engine.db, &floor, None, floor_gen_time, 0).await?;
+    store_driver_state(&keeper, &engine.db, next, next_prev, 1, 0).await?;
+    let last = driver_mc(2000, 9);
+    store_driver_state(&keeper, &engine.db, &last, None, now, 1500).await?;
+    engine.db.store_block_next1(&floor_handle, next, None)?;
+    engine
+        .db
+        .save_validator_state(crate::internal_db::LAST_ROTATION_MC_BLOCK, &driver_mc(1800, 7))?;
+    engine
+        .db
+        .save_full_node_state(crate::internal_db::SHARD_CLIENT_MC_BLOCK, &driver_mc(1900, 8))?;
+    engine.db.save_full_node_state(crate::internal_db::PSS_KEEPER_MC_BLOCK, &driver_mc(pss, 6))?;
+    engine.db.save_full_node_state(crate::internal_db::LAST_APPLIED_MC_BLOCK, &last)?;
+    keeper.adopt_cleanup_floor(&floor, wait_pin(&keeper, &floor).await?)?;
+    let source = DbFloorSource { db: engine.db.clone(), keeper };
+    Ok((engine, stopper, source))
+}
+
+fn durable_floor(db: &InternalDb) -> Result<Option<BlockIdExt>> {
+    use consensus_common::validator_cleanup::{decode_checkpoint, GC_FLOOR_KEY};
+    Ok(db.load_validator_state_key_bounded(GC_FLOOR_KEY, 256)?.and_then(|v| decode_checkpoint(&v)))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cleanup_floor_driver_advances_one_verified_step_on_real_storage() -> Result<()> {
+    use crate::validator::validator_cleanup_gc::maintain_cleanup_floor;
+    let (floor, successor) = (driver_mc(100, 1), driver_mc(101, 2));
+    let current = |source: &DbFloorSource| source.keeper.cleanup_floor().map(|(id, _)| id);
+
+    // A frontier at the floor blocks advancement: floor and key stay F.
+    let dir = tempfile::tempdir()?;
+    let (engine, stopper, source) =
+        driver_fixture(dir.path(), &successor, Some(&floor), 1, 100).await?;
+    maintain_cleanup_floor(&source).await?;
+    assert_eq!(current(&source), Some(floor.clone()));
+    assert_eq!(durable_floor(&engine.db)?, Some(floor.clone()));
+
+    // Every frontier clear and F expired: exactly one step, to the stored
+    // next1, synced before publication.
+    engine.db.save_full_node_state(crate::internal_db::PSS_KEEPER_MC_BLOCK, &driver_mc(1950, 6))?;
+    maintain_cleanup_floor(&source).await?;
+    assert_eq!(current(&source), Some(successor.clone()));
+    assert_eq!(durable_floor(&engine.db)?, Some(successor.clone()));
+    let (_, pinned) = source.keeper.cleanup_floor().unwrap();
+    assert_eq!(pinned.block_id(), &successor);
+    // No next1 from S: the next call errs and the floor stays S.
+    assert!(maintain_cleanup_floor(&source).await.is_err());
+    assert_eq!(current(&source), Some(successor.clone()));
+    assert_eq!(durable_floor(&engine.db)?, Some(successor));
+    stopper.set_stop();
+    engine.db.stop_states_db().await.unwrap();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cleanup_floor_driver_refuses_a_fork_successor_and_a_live_floor() -> Result<()> {
+    use crate::validator::validator_cleanup_gc::maintain_cleanup_floor;
+    let floor = driver_mc(100, 1);
+    let current = |source: &DbFloorSource| source.keeper.cleanup_floor().map(|(id, _)| id);
+
+    // next1 names a fork whose history does not record F: refused, F kept.
+    let fork = driver_mc(101, 3);
+    let dir = tempfile::tempdir()?;
+    let (engine, stopper, source) = driver_fixture(dir.path(), &fork, None, 1, 1950).await?;
+    let error = maintain_cleanup_floor(&source).await.unwrap_err().to_string();
+    assert!(error.contains("not a verified descendant"), "{error}");
+    assert_eq!(current(&source), Some(floor.clone()));
+    assert_eq!(durable_floor(&engine.db)?, Some(floor.clone()));
+    stopper.set_stop();
+    engine.db.stop_states_db().await.unwrap();
+
+    // A floor younger than the state TTL never advances.
+    let successor = driver_mc(101, 2);
+    let dir = tempfile::tempdir()?;
+    let future =
+        u32::try_from(rtos_block::UnixTime::now()).unwrap_or(u32::MAX).saturating_add(100_000);
+    let (engine, stopper, source) =
+        driver_fixture(dir.path(), &successor, Some(&floor), future, 1950).await?;
+    maintain_cleanup_floor(&source).await?;
+    assert_eq!(current(&source), Some(floor.clone()));
+    assert_eq!(durable_floor(&engine.db)?, Some(floor));
+    stopper.set_stop();
+    engine.db.stop_states_db().await.unwrap();
+    Ok(())
+}

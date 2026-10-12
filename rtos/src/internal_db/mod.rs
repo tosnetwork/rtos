@@ -739,6 +739,15 @@ impl InternalDb {
         }
     }
 
+    /// Creates a block handle without block data, for tests that build
+    /// masterchain links over synthetic states.
+    #[cfg(test)]
+    pub(crate) fn create_test_block_handle(&self, id: &BlockIdExt) -> Result<Arc<BlockHandle>> {
+        self.block_handle_storage
+            .create_handle(id.clone(), BlockMeta::default(), None)?
+            .ok_or_else(|| error!("Block handle for {id} already exists"))
+    }
+
     pub fn load_block_handle(&self, id: &BlockIdExt) -> Result<Option<Arc<BlockHandle>>> {
         let _tc = time_checker!(|| format!("load_block_handle {}", id), 30);
         self.block_handle_storage.load_handle_by_id(id)
