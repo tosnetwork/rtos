@@ -59,17 +59,43 @@ struct LegacySubmission {
 
 /// Accepted-but-uncompleted requests per session. A request counts from
 /// before it is enqueued until its callback or response has been delivered.
+pub(crate) struct OutstandingRequests(Mutex<OutstandingState>);
 #[derive(Default)]
-pub(crate) struct OutstandingRequests(Mutex<std::collections::HashMap<UInt256, usize>>);
+struct OutstandingState {
+    counts: std::collections::HashMap<UInt256, usize>,
+    /// A broken invariant (an extra release): no session is ever quiescent
+    /// again in this process.
+    poisoned: bool,
+}
 impl OutstandingRequests {
-    fn begin(self: &Arc<Self>, session: &UInt256) -> Outstanding {
-        let mut map = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        let count = map.entry(session.clone()).or_insert(0);
-        *count = count.saturating_add(1);
-        Outstanding { map: self.clone(), session: session.clone() }
+    fn lock(&self) -> std::sync::MutexGuard<'_, OutstandingState> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
     }
+    /// Counts one request of `session`; a count that cannot grow refuses it.
+    fn begin(self: &Arc<Self>, session: &UInt256) -> Result<Outstanding> {
+        let mut state = self.lock();
+        let count = state.counts.entry(session.clone()).or_insert(0);
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| error!("Outstanding publication requests exhausted"))?;
+        Ok(Outstanding { map: self.clone(), session: session.clone() })
+    }
+    /// Requests of `session` still outstanding; `usize::MAX` once poisoned.
     pub(crate) fn count(&self, session: &UInt256) -> usize {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).get(session).copied().unwrap_or(0)
+        let state = self.lock();
+        if state.poisoned {
+            return usize::MAX;
+        }
+        state.counts.get(session).copied().unwrap_or(0)
+    }
+    #[cfg(test)]
+    fn set_for_test(&self, session: &UInt256, count: usize) {
+        self.lock().counts.insert(session.clone(), count);
+    }
+}
+impl Default for OutstandingRequests {
+    fn default() -> Self {
+        Self(Mutex::new(OutstandingState::default()))
     }
 }
 /// One outstanding request; dropping it ends the count.
@@ -79,11 +105,21 @@ pub(crate) struct Outstanding {
 }
 impl Drop for Outstanding {
     fn drop(&mut self) {
-        let mut map = self.map.0.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(count) = map.get_mut(&self.session) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                map.remove(&self.session);
+        let mut state = self.map.lock();
+        match state.counts.get_mut(&self.session) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                if *count == 0 {
+                    state.counts.remove(&self.session);
+                }
+            }
+            _ => {
+                if !state.poisoned {
+                    log::error!(
+                        "Outstanding publication request count underflow; cleanup projections refused"
+                    );
+                }
+                state.poisoned = true;
             }
         }
     }
@@ -255,30 +291,52 @@ impl Submission {
     /// Counts this request as outstanding for its session before it is
     /// enqueued. The count ends when its callback or response is delivered,
     /// or when a rejected request is dropped.
-    fn track(&mut self, outstanding: &Arc<OutstandingRequests>) {
+    fn track(&mut self, outstanding: &Arc<OutstandingRequests>) -> Result<()> {
         match self {
             Self::Terminal { runtime, completion, .. } => {
-                hold(&mut completion.0, outstanding.begin(runtime.session_id()))
+                hold(&mut completion.0, outstanding.begin(runtime.session_id())?)
             }
             Self::OfferClose { runtime, completion, .. } => {
-                hold(&mut completion.0, outstanding.begin(runtime.session_id()))
+                hold(&mut completion.0, outstanding.begin(runtime.session_id())?)
             }
             Self::SourceDelivered { runtime, completion, .. } => {
-                hold(&mut completion.0, outstanding.begin(runtime.session_id()))
+                hold(&mut completion.0, outstanding.begin(runtime.session_id())?)
             }
             Self::Canonical { runtime, completion, .. } => {
-                hold(&mut completion.0, outstanding.begin(runtime.session_id()))
+                hold(&mut completion.0, outstanding.begin(runtime.session_id())?)
             }
             Self::Draft { record, completion, .. } => {
-                hold(&mut completion.0, outstanding.begin(&record.session_id))
+                hold(&mut completion.0, outstanding.begin(&record.session_id)?)
             }
             Self::HistoryDebt { runtime, response, .. } => {
-                response.outstanding = Some(outstanding.begin(runtime.session_id()))
+                response.outstanding = Some(outstanding.begin(runtime.session_id())?)
             }
             Self::Legacy(request) => {
-                request.response.outstanding = Some(outstanding.begin(&request.record.session_id))
+                request.response.outstanding = Some(outstanding.begin(&request.record.session_id)?)
             }
             Self::Query { .. } | Self::CleanupProjection { .. } => {}
+        }
+        Ok(())
+    }
+    /// A request that was not admitted: its callback must not run.
+    fn disarm(self) {
+        match self {
+            Self::Terminal { mut completion, .. } => {
+                completion.0.take();
+            }
+            Self::OfferClose { mut completion, .. } => {
+                completion.0.take();
+            }
+            Self::SourceDelivered { mut completion, .. } => {
+                completion.0.take();
+            }
+            Self::Draft { mut completion, .. } => {
+                completion.0.take();
+            }
+            Self::Canonical { mut completion, .. } => {
+                completion.0.take();
+            }
+            _ => {}
         }
     }
 }
@@ -455,7 +513,7 @@ impl PublicationWorker {
             }
             let mut request =
                 Submission::Legacy(LegacySubmission { record, response: Responder::new(response) });
-            request.track(&self.state.outstanding);
+            request.track(&self.state.outstanding)?;
             sender
                 .as_ref()
                 .ok_or_else(|| error!("Publication admission closed"))?
@@ -488,7 +546,10 @@ impl PublicationWorker {
     }
 
     fn admit_draft(&self, mut request: Submission) -> Result<()> {
-        request.track(&self.state.outstanding);
+        if let Err(error) = request.track(&self.state.outstanding) {
+            request.disarm();
+            return Err(error);
+        }
         let result = (|| {
             let sender =
                 self.sender.lock().map_err(|_| error!("Publication admission poisoned"))?;
@@ -504,24 +565,7 @@ impl PublicationWorker {
             },
             Err(_) => request,
         };
-        match rejected {
-            Submission::Terminal { mut completion, .. } => {
-                completion.0.take();
-            }
-            Submission::OfferClose { mut completion, .. } => {
-                completion.0.take();
-            }
-            Submission::SourceDelivered { mut completion, .. } => {
-                completion.0.take();
-            }
-            Submission::Draft { mut completion, .. } => {
-                completion.0.take();
-            }
-            Submission::Canonical { mut completion, .. } => {
-                completion.0.take();
-            }
-            _ => {}
-        }
+        rejected.disarm();
         fail!("Publication draft queue full or closed; retain source evidence")
     }
     pub(crate) async fn recover_draft(
@@ -788,24 +832,27 @@ impl State {
                 self.wake.notify_one();
             }
             Submission::CleanupProjection { selection, expected, inventory, response } => {
-                // One owner transition: no other request is handled meanwhile.
+                // One owner transition, judged by the race-free protocol:
+                // quiescent before reading, both stores read with their epochs,
+                // and quiescent with unchanged epochs after judging.
                 let result = (|| {
                     let engine =
                         self.engine.upgrade().ok_or_else(|| error!("Engine unavailable"))?;
-                    let (entries, deliveries, closing) = store.cleanup_view()?;
-                    let leases = engine.db().repair_leases().records_snapshot()?;
-                    let other_outstanding = self.outstanding.count(&selection.session);
-                    Ok(cleanup_projection::project_cleanup(
+                    let leases = engine.db().repair_leases().clone();
+                    let session = selection.session.clone();
+                    let sources = cleanup_projection::JudgeSources {
+                        outstanding: &|| self.outstanding.count(&session),
+                        read_outbox: &|budget| store.cleanup_view_for(&session, budget),
+                        read_leases: &|budget| leases.records_for(&session, budget),
+                        outbox_epoch: &|| store.mutation_epoch(),
+                        lease_epoch: &|| leases.mutation_epoch(),
+                    };
+                    Ok(cleanup_projection::judge_cleanup(
                         &selection,
                         &expected,
                         &inventory,
-                        &cleanup_projection::ProjectionInput {
-                            entries: &entries,
-                            deliveries: &deliveries,
-                            closing: &closing,
-                            leases: &leases,
-                            other_outstanding,
-                        },
+                        &sources,
+                        cleanup_projection::ProjectionBudget::default(),
                     ))
                 })();
                 let _ = response.send(result);
@@ -1753,7 +1800,7 @@ mod tests {
         let mut callback: Option<Box<dyn FnOnce(Result<()>) + Send>> = Some(Box::new(move |_| {
             *seen.lock().unwrap() = Some(probe.count(&probe_session));
         }));
-        hold(&mut callback, map.begin(&session));
+        hold(&mut callback, map.begin(&session).unwrap());
         assert_eq!(map.count(&session), 1);
         ClosingCompletion(callback).finish(Ok(()));
         assert_eq!(*observed.lock().unwrap(), Some(1), "outstanding through the callback");
@@ -1761,36 +1808,83 @@ mod tests {
         // A panicking callback still ends the count after unwinding.
         let mut callback: Option<Box<dyn FnOnce(Result<()>) + Send>> =
             Some(Box::new(|_| panic!("callback panicked")));
-        hold(&mut callback, map.begin(&session));
+        hold(&mut callback, map.begin(&session).unwrap());
         ClosingCompletion(callback).finish(Ok(()));
         assert_eq!(map.count(&session), 0);
         // A completion dropped by the owner runs its callback, then ends.
         let mut callback: Option<Box<dyn FnOnce(Result<()>) + Send>> = Some(Box::new(|_| {}));
-        hold(&mut callback, map.begin(&session));
+        hold(&mut callback, map.begin(&session).unwrap());
         drop(ClosingCompletion(callback));
         assert_eq!(map.count(&session), 0);
         // A oneshot response ends the count after the value is handed over,
         // and an unsent dropped response ends it too.
         let (sender, mut receiver) = oneshot::channel::<u8>();
         let mut responder = Responder::new(sender);
-        responder.outstanding = Some(map.begin(&session));
+        responder.outstanding = Some(map.begin(&session).unwrap());
         assert_eq!(map.count(&session), 1);
         responder.send(7).unwrap();
         assert_eq!(receiver.try_recv().unwrap(), 7);
         assert_eq!(map.count(&session), 0);
         let (sender, _receiver) = oneshot::channel::<u8>();
         let mut responder = Responder::new(sender);
-        responder.outstanding = Some(map.begin(&session));
+        responder.outstanding = Some(map.begin(&session).unwrap());
         drop(responder);
         assert_eq!(map.count(&session), 0);
         // Counts are per session and never underflow.
         let other = UInt256::from([0x32; 32]);
-        let first = map.begin(&session);
-        let second = map.begin(&other);
+        let first = map.begin(&session).unwrap();
+        let second = map.begin(&other).unwrap();
         assert_eq!((map.count(&session), map.count(&other)), (1, 1));
         drop(first);
         drop(second);
         assert_eq!((map.count(&session), map.count(&other)), (0, 0));
+    }
+
+    #[test]
+    fn outstanding_counts_refuse_overflow_and_poison_on_underflow() {
+        use std::sync::atomic::AtomicUsize;
+        let worker = PublicationWorker {
+            sender: Mutex::new(None),
+            tasks: Arc::new(OwnedTasks::default()),
+            state: state(),
+        };
+        let record = scheduling_entry(1, 200).record;
+        let session = record.session_id.clone();
+        // One below the maximum still admits; at the maximum admission is
+        // refused before anything is enqueued and the callback never runs.
+        worker.state.outstanding.set_for_test(&session, usize::MAX - 1);
+        let last = worker.state.outstanding.begin(&session).unwrap();
+        assert_eq!(worker.outstanding_for_test(&session), usize::MAX);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let request = Submission::Draft {
+            record: record.clone(),
+            last_mc: 0,
+            candidate_already_sent: false,
+            historical: false,
+            origin: RecoveryOrigin {
+                carrier_version: 1,
+                local_adnl: UInt256::default(),
+                source_validator: UInt256::default(),
+                local_validator_index: None,
+            },
+            completion: Completion(Some(Box::new(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }))),
+        };
+        let refused = worker.admit_draft(request).unwrap_err().to_string();
+        assert!(refused.contains("exhausted"), "{refused}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a refused admission never completes");
+        assert_eq!(worker.outstanding_for_test(&session), usize::MAX);
+        drop(last);
+        worker.state.outstanding.set_for_test(&session, 0);
+        // An extra release is a broken invariant: no session is ever
+        // quiescent again.
+        let token = worker.state.outstanding.begin(&session).unwrap();
+        worker.state.outstanding.set_for_test(&session, 0);
+        drop(token);
+        assert_eq!(worker.outstanding_for_test(&session), usize::MAX);
+        assert_eq!(worker.outstanding_for_test(&UInt256::from([0x77; 32])), usize::MAX);
     }
 
     #[test]

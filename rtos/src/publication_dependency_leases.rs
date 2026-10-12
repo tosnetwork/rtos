@@ -42,6 +42,9 @@ struct Memory {
     records: BTreeMap<u64, LeaseRecord>,
     identities: BTreeMap<(u64, u64), u64>,
     poisoned: bool,
+    /// Advanced by every commit attempt and poisoning; None once exhausted,
+    /// which refuses every cleanup projection.
+    mutation_epoch: Option<u64>,
 }
 pub(crate) struct DependencyLeases {
     table: RocksDbTable<String>,
@@ -122,7 +125,7 @@ impl DependencyLeases {
         let protection = db.repair_protection().clone();
         let outcome = (|| {
             let table = db.table::<String>(CF, can_create)?;
-            let mut memory = Memory::default();
+            let mut memory = Memory { mutation_epoch: Some(0), ..Memory::default() };
             table.for_each(&mut |key, raw| {
                 if key == b"next" {
                     if raw.len() != 8 {
@@ -186,7 +189,9 @@ impl DependencyLeases {
         outcome
     }
     pub(crate) fn poison(&self) {
-        self.memory.lock().unwrap().poisoned = true;
+        let mut memory = self.memory.lock().unwrap();
+        memory.mutation_epoch = memory.mutation_epoch.and_then(|epoch| epoch.checked_add(1));
+        memory.poisoned = true;
         self.protection.poison();
     }
     pub(crate) fn protection(&self) -> &Arc<RepairProtection> {
@@ -203,14 +208,35 @@ impl DependencyLeases {
         }
         Ok(())
     }
-    /// Every lease record, read under the ledger lock, for a cleanup
-    /// projection.
-    pub(crate) fn records_snapshot(&self) -> Result<Vec<LeaseRecord>> {
+    /// The lease records of `session`, selected under the ledger lock with
+    /// every decode and copy charged to `budget`, and the ledger epoch they
+    /// were read at.
+    pub(crate) fn records_for(
+        &self,
+        session: &UInt256,
+        budget: &mut crate::publication_worker::cleanup_projection::ProjectionBudget,
+    ) -> Result<(Vec<LeaseRecord>, Option<u64>)> {
         let memory = self.memory.lock().map_err(|_| error!("Repair ledger poisoned"))?;
         if memory.poisoned {
             fail!("Repair ledger requires cold recovery");
         }
-        Ok(memory.records.values().cloned().collect())
+        let selected = crate::publication_worker::cleanup_projection::select_leases(
+            session,
+            memory.records.values(),
+            budget,
+        )?;
+        Ok((selected, memory.mutation_epoch))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_mutation_epoch_for_test(&self) {
+        self.memory.lock().unwrap().mutation_epoch = Some(u64::MAX);
+    }
+
+    /// The ledger epoch, read under its lock; None once exhausted.
+    pub(crate) fn mutation_epoch(&self) -> Result<Option<u64>> {
+        let memory = self.memory.lock().map_err(|_| error!("Repair ledger poisoned"))?;
+        Ok(memory.mutation_epoch)
     }
 
     pub(crate) fn lookup(
@@ -295,6 +321,7 @@ impl DependencyLeases {
         Ok(record)
     }
     fn commit(&self, memory: &mut Memory, record: LeaseRecord) -> Result<()> {
+        memory.mutation_epoch = memory.mutation_epoch.and_then(|epoch| epoch.checked_add(1));
         let bytes = serde_json::to_vec(&record)?;
         if bytes.len() > MAX_RECORD_BYTES {
             fail!("Repair lease record too large");

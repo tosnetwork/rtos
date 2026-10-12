@@ -136,8 +136,11 @@ pub(crate) fn project_cleanup(
     runtime: &ExpectedIdentity,
     inventory: &[RetirementItem],
     input: &ProjectionInput<'_>,
+    budget: &mut ProjectionBudget,
 ) -> CleanupDecision {
     let veto = |reason: String| CleanupDecision::Veto(reason);
+    // Every map or set insertion below is charged before it is made.
+    let entry = MAP_ENTRY_OVERHEAD.saturating_add(std::mem::size_of::<RepairLeaseBinding>());
     if input.other_outstanding != 0 {
         return veto(format!("{} outstanding request(s) of the session", input.other_outstanding));
     }
@@ -174,6 +177,9 @@ pub(crate) fn project_cleanup(
         if !close.released {
             return veto(format!("close {:x} is not Released", close.binding.delivery_id));
         }
+        if budget.charge(entry).is_err() {
+            return veto("projection budget exhausted".into());
+        }
         if closes.insert(close.binding.delivery_id.clone(), close).is_some() {
             return veto(format!("two closes for delivery {:x}", close.binding.delivery_id));
         }
@@ -181,6 +187,14 @@ pub(crate) fn project_cleanup(
     // Leases of this namespace, including orphans without a close.
     let mut leases: BTreeMap<u64, (&LeaseRecord, RepairLeaseBinding)> = BTreeMap::new();
     for lease in input.leases {
+        if budget
+            .transient(
+                lease.binding.len().saturating_add(std::mem::size_of::<RepairLeaseBinding>()),
+            )
+            .is_err()
+        {
+            return veto("projection decode workspace exhausted".into());
+        }
         let binding = match lease.binding() {
             Ok(binding) => binding,
             Err(error) => return veto(format!("lease {} binding: {error}", lease.generation)),
@@ -190,6 +204,9 @@ pub(crate) fn project_cleanup(
         }
         if let Some(reason) = binding_mismatch(&binding, runtime) {
             return veto(reason);
+        }
+        if budget.charge(entry).is_err() {
+            return veto("projection budget exhausted".into());
         }
         leases.insert(lease.generation, (lease, binding));
     }
@@ -202,6 +219,9 @@ pub(crate) fn project_cleanup(
             || lease.dependency_digest != format!("{:x}", close.dependency_digest)
         {
             return veto(format!("lease {} does not match its close", lease.generation));
+        }
+        if budget.charge(MAP_ENTRY_OVERHEAD).is_err() {
+            return veto("projection budget exhausted".into());
         }
         if !referenced.insert(close.lease_generation) {
             return veto(format!("lease {} serves two closes", close.lease_generation));
@@ -226,11 +246,202 @@ pub(crate) fn project_cleanup(
         if close.offer() != item.offer {
             return veto(format!("source item {:x} offer differs", item.source_id));
         }
+        if budget.charge(MAP_ENTRY_OVERHEAD).is_err() {
+            return veto("projection budget exhausted".into());
+        }
         if !seen.insert(item.source_id.clone()) {
             return veto(format!("source item {:x} appears twice", item.source_id));
         }
     }
     CleanupDecision::WouldDelete { closes: closes.len() }
+}
+
+/// Bounds every allocation a projection makes. `items`/`bytes` are the
+/// cumulative copy budget (selected data, maps, sets); `transient` bounds the
+/// reusable workspace of decoding one record, which unrelated records pass
+/// through without consuming the cumulative budget.
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectionBudget {
+    items: usize,
+    bytes: usize,
+    transient: usize,
+}
+
+/// A map or set insertion: the entry plus a conservative node overhead.
+const MAP_ENTRY_OVERHEAD: usize = 64;
+
+impl Default for ProjectionBudget {
+    fn default() -> Self {
+        Self::new(4096, 8 << 20, 64 << 10)
+    }
+}
+
+impl ProjectionBudget {
+    pub(crate) fn new(items: usize, bytes: usize, transient: usize) -> Self {
+        Self { items, bytes, transient }
+    }
+    /// Charges one allocation of `bytes` before it is made.
+    pub(crate) fn charge(&mut self, bytes: usize) -> Result<()> {
+        let items = self.items.checked_sub(1);
+        let left = self.bytes.checked_sub(bytes);
+        match (items, left) {
+            (Some(items), Some(left)) => {
+                self.items = items;
+                self.bytes = left;
+                Ok(())
+            }
+            _ => rtos_block::fail!("projection budget exhausted"),
+        }
+    }
+    /// Checks a transient decoding workspace of `bytes`; nothing is consumed.
+    pub(crate) fn transient(&self, bytes: usize) -> Result<()> {
+        if bytes > self.transient {
+            rtos_block::fail!("projection decode workspace exhausted");
+        }
+        Ok(())
+    }
+}
+
+/// Conservative in-memory size of a retained entry copy.
+fn entry_bytes(entry: &UnverifiedRecord) -> usize {
+    let record = &entry.record;
+    std::mem::size_of::<UnverifiedRecord>()
+        .saturating_add(record.block_data.len())
+        .saturating_add(record.proof_data.as_ref().map_or(0, Vec::len))
+        .saturating_add(record.carrier.bytes().len())
+        .saturating_add(record.prev.len().saturating_mul(std::mem::size_of::<BlockIdExt>()))
+        .saturating_add(
+            record
+                .effects
+                .len()
+                .saturating_add(entry.pending.len())
+                .saturating_mul(std::mem::size_of::<crate::propagation_outbox::PublicationEffect>()),
+        )
+}
+
+fn lease_bytes(lease: &LeaseRecord) -> usize {
+    std::mem::size_of::<LeaseRecord>()
+        .saturating_add(lease.binding.len())
+        .saturating_add(lease.dependency_digest.len())
+        .saturating_add(
+            lease
+                .dependencies
+                .len()
+                .saturating_mul(std::mem::size_of::<crate::repair_provenance::Dependency>()),
+        )
+}
+
+/// The outbox data of one session, copied under the writer lock.
+pub(crate) struct OutboxSelection {
+    pub entries: Vec<UnverifiedRecord>,
+    pub deliveries: Vec<Delivery>,
+    pub closing: Vec<ClosingRecord>,
+}
+
+/// Copies only `session`'s entries, their deliveries and its closes, charging
+/// every copy before it is made.
+pub(crate) fn select_outbox(
+    session: &UInt256,
+    entries: &[UnverifiedRecord],
+    deliveries: &[Delivery],
+    closing: &[ClosingRecord],
+    budget: &mut ProjectionBudget,
+) -> Result<OutboxSelection> {
+    let mut selection =
+        OutboxSelection { entries: Vec::new(), deliveries: Vec::new(), closing: Vec::new() };
+    let mut ids = BTreeSet::new();
+    for entry in entries.iter().filter(|entry| &entry.record.session_id == session) {
+        budget.charge(entry_bytes(entry).saturating_add(MAP_ENTRY_OVERHEAD))?;
+        ids.insert(entry.id);
+        selection.entries.push(entry.clone());
+    }
+    for delivery in deliveries.iter().filter(|delivery| ids.contains(&delivery.record_id)) {
+        budget.charge(std::mem::size_of::<Delivery>())?;
+        selection.deliveries.push(delivery.clone());
+    }
+    for close in closing.iter().filter(|close| &close.binding.domain.session_id == session) {
+        budget.charge(std::mem::size_of::<ClosingRecord>())?;
+        selection.closing.push(close.clone());
+    }
+    Ok(selection)
+}
+
+/// Copies only `session`'s lease records. Each binding is decoded in the
+/// transient workspace first; only a selected record is charged and copied.
+pub(crate) fn select_leases<'a>(
+    session: &UInt256,
+    records: impl Iterator<Item = &'a LeaseRecord>,
+    budget: &mut ProjectionBudget,
+) -> Result<Vec<LeaseRecord>> {
+    let mut selected = Vec::new();
+    for record in records {
+        budget.transient(
+            record.binding.len().saturating_add(std::mem::size_of::<RepairLeaseBinding>()),
+        )?;
+        if &record.binding()?.domain.session_id != session {
+            continue;
+        }
+        budget.charge(lease_bytes(record))?;
+        selected.push(record.clone());
+    }
+    Ok(selected)
+}
+
+/// The race-free judgement protocol: the session must be quiescent before
+/// anything is read; both stores are read with the epoch they were read at;
+/// after judging, the session must still be quiescent and both epochs
+/// unchanged. Any exhausted epoch, budget or read failure is a veto.
+pub(crate) struct JudgeSources<'a> {
+    pub outstanding: &'a dyn Fn() -> usize,
+    pub read_outbox: &'a dyn Fn(&mut ProjectionBudget) -> Result<(OutboxSelection, Option<u64>)>,
+    pub read_leases: &'a dyn Fn(&mut ProjectionBudget) -> Result<(Vec<LeaseRecord>, Option<u64>)>,
+    pub outbox_epoch: &'a dyn Fn() -> Result<Option<u64>>,
+    pub lease_epoch: &'a dyn Fn() -> Result<Option<u64>>,
+}
+
+pub(crate) fn judge_cleanup(
+    selection: &NamespaceSelection,
+    expected: &ExpectedIdentity,
+    inventory: &[RetirementItem],
+    sources: &JudgeSources<'_>,
+    mut budget: ProjectionBudget,
+) -> CleanupDecision {
+    let veto = |reason: String| CleanupDecision::Veto(reason);
+    let busy = (sources.outstanding)();
+    if busy != 0 {
+        return veto(format!("{busy} outstanding request(s) of the session"));
+    }
+    let (outbox, outbox_epoch) = match (sources.read_outbox)(&mut budget) {
+        Ok(read) => read,
+        Err(error) => return veto(format!("outbox projection: {error}")),
+    };
+    let (leases, lease_epoch) = match (sources.read_leases)(&mut budget) {
+        Ok(read) => read,
+        Err(error) => return veto(format!("lease projection: {error}")),
+    };
+    let (Some(outbox_epoch), Some(lease_epoch)) = (outbox_epoch, lease_epoch) else {
+        return veto("store mutation epoch exhausted".into());
+    };
+    let decision = project_cleanup(
+        selection,
+        expected,
+        inventory,
+        &ProjectionInput {
+            entries: &outbox.entries,
+            deliveries: &outbox.deliveries,
+            closing: &outbox.closing,
+            leases: &leases,
+            other_outstanding: 0,
+        },
+        &mut budget,
+    );
+    let busy = (sources.outstanding)();
+    let unchanged = matches!((sources.outbox_epoch)(), Ok(Some(epoch)) if epoch == outbox_epoch)
+        && matches!((sources.lease_epoch)(), Ok(Some(epoch)) if epoch == lease_epoch);
+    if busy != 0 || !unchanged {
+        return veto("projection raced a mutation".into());
+    }
+    decision
 }
 
 #[cfg(test)]

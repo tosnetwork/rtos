@@ -202,6 +202,9 @@ struct Snapshot {
 struct State {
     snapshot: Snapshot,
     failed: Option<String>,
+    /// Advanced by every write attempt, successful or not; None once
+    /// exhausted, which refuses every cleanup projection.
+    mutation_epoch: Option<u64>,
 }
 
 pub struct PropagationOutbox {
@@ -246,7 +249,7 @@ impl PropagationOutbox {
             store,
             domain,
             limits,
-            state: Mutex::new(State { snapshot, failed: None }),
+            state: Mutex::new(State { snapshot, failed: None, mutation_epoch: Some(0) }),
             _writer: writer,
         })
     }
@@ -430,17 +433,34 @@ impl PropagationOutbox {
         Ok(delivery_id)
     }
 
-    /// The retained entries, deliveries and close history, read under the
-    /// writer lock for a cleanup projection in the owner's transition.
-    pub(crate) fn cleanup_view(
+    /// The write epoch, read under the writer lock; None once exhausted.
+    pub(crate) fn mutation_epoch(&self) -> Result<Option<u64>> {
+        Ok(self.lock()?.mutation_epoch)
+    }
+
+    /// The retained data of `session`, selected under the writer lock with
+    /// every copy charged to `budget`, and the write epoch it was read at.
+    pub(crate) fn cleanup_view_for(
         &self,
-    ) -> Result<(Vec<UnverifiedRecord>, Vec<Delivery>, Vec<closing::ClosingRecord>)> {
+        session: &UInt256,
+        budget: &mut crate::publication_worker::cleanup_projection::ProjectionBudget,
+    ) -> Result<(crate::publication_worker::cleanup_projection::OutboxSelection, Option<u64>)> {
         let state = self.lock()?;
-        Ok((
-            state.snapshot.entries.clone(),
-            state.snapshot.deliveries.clone(),
-            state.snapshot.closing.clone(),
-        ))
+        let selection = crate::publication_worker::cleanup_projection::select_outbox(
+            session,
+            &state.snapshot.entries,
+            &state.snapshot.deliveries,
+            &state.snapshot.closing,
+            budget,
+        )?;
+        Ok((selection, state.mutation_epoch))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_mutation_epoch_for_test(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.mutation_epoch = Some(u64::MAX);
+        }
     }
 
     /// Observe sticky writer health without cloning any retained entries.
@@ -543,6 +563,7 @@ impl PropagationOutbox {
     }
 
     fn commit(&self, state: &mut State, next: Snapshot) -> Result<()> {
+        state.mutation_epoch = state.mutation_epoch.and_then(|epoch| epoch.checked_add(1));
         let bytes = encode_snapshot(&next, &self.domain, &self.limits)?;
         if let Err(error) = self.store.replace_sync(&bytes) {
             // I/O errors can occur after a write became visible. Do not keep
@@ -1254,6 +1275,29 @@ mod tests {
     }
     fn memory(store: Arc<MemoryStore>, limits: Limits) -> PropagationOutbox {
         PropagationOutbox::load(store, domain(), limits, None).unwrap()
+    }
+
+    #[test]
+    fn outbox_mutation_epoch_advances_on_every_write_and_fails_closed_on_exhaustion() -> Result<()>
+    {
+        let disk = Arc::new(MemoryStore::default());
+        let store = memory(disk.clone(), Limits::default());
+        let start = store.mutation_epoch()?.unwrap();
+        store.enqueue(record(1))?;
+        let after_write = store.mutation_epoch()?.unwrap();
+        assert!(after_write > start, "a write advances the epoch");
+        // A failed write still advances it before the outbox turns sticky.
+        disk.failure.store(1, Ordering::Release);
+        assert!(store.enqueue(record(2)).is_err());
+        assert!(store.mutation_epoch().is_err(), "an uncertain outbox refuses every read");
+        // Exhaustion is permanent: no later write wraps the epoch back.
+        let store = memory(Arc::new(MemoryStore::default()), Limits::default());
+        store.exhaust_mutation_epoch_for_test();
+        store.enqueue(record(3))?;
+        assert_eq!(store.mutation_epoch()?, None);
+        store.enqueue(record(4))?;
+        assert_eq!(store.mutation_epoch()?, None);
+        Ok(())
     }
 
     #[test]

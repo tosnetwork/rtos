@@ -133,6 +133,7 @@ impl World {
                 leases: &self.leases,
                 other_outstanding: self.outstanding,
             },
+            &mut ProjectionBudget::default(),
         )
     }
 }
@@ -295,4 +296,229 @@ fn projection_judges_namespaces_of_one_session_independently() {
         world.judge(&observer_selection, &observer_identity, &items),
         CleanupDecision::WouldDelete { closes: 1 }
     );
+}
+
+/// Fake sources for the judging protocol, with scripted epochs.
+struct Script {
+    world: World,
+    outstanding: std::cell::Cell<[usize; 2]>,
+    calls: std::cell::Cell<usize>,
+    outbox_epochs: [Option<u64>; 2],
+    lease_epochs: [Option<u64>; 2],
+}
+impl Script {
+    fn stable(world: World) -> Self {
+        Self {
+            world,
+            outstanding: std::cell::Cell::new([0, 0]),
+            calls: std::cell::Cell::new(0),
+            outbox_epochs: [Some(5), Some(5)],
+            lease_epochs: [Some(9), Some(9)],
+        }
+    }
+    fn judge(&self, items: &[RetirementItem]) -> CleanupDecision {
+        let outstanding = || {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            self.outstanding.get()[call.min(1)]
+        };
+        let read_outbox = |budget: &mut ProjectionBudget| {
+            let selection = select_outbox(
+                &UInt256::from(SESSION),
+                &self.world.entries,
+                &self.world.deliveries,
+                &self.world.closing,
+                budget,
+            )?;
+            Ok((selection, self.outbox_epochs[0]))
+        };
+        let read_leases = |budget: &mut ProjectionBudget| {
+            Ok((
+                select_leases(&UInt256::from(SESSION), self.world.leases.iter(), budget)?,
+                self.lease_epochs[0],
+            ))
+        };
+        let outbox_epoch = || Ok(self.outbox_epochs[1]);
+        let lease_epoch = || Ok(self.lease_epochs[1]);
+        judge_cleanup(
+            &validator_selection(),
+            &validator(),
+            items,
+            &JudgeSources {
+                outstanding: &outstanding,
+                read_outbox: &read_outbox,
+                read_leases: &read_leases,
+                outbox_epoch: &outbox_epoch,
+                lease_epoch: &lease_epoch,
+            },
+            ProjectionBudget::default(),
+        )
+    }
+}
+
+#[test]
+fn judging_requires_quiescence_and_unchanged_epochs_around_the_reads() {
+    let identity = validator();
+    let (world, items) = World::released(&[1], &identity);
+    let script = Script::stable(world);
+    assert_eq!(script.judge(&items), CleanupDecision::WouldDelete { closes: 1 });
+    // A request outstanding before anything is read.
+    let (world, items) = World::released(&[1], &identity);
+    let script = Script::stable(world);
+    script.outstanding.set([1, 0]);
+    vetoed(script.judge(&items), "outstanding");
+    // A request admitted while judging and still running afterwards.
+    let (world, items) = World::released(&[1], &identity);
+    let script = Script::stable(world);
+    script.outstanding.set([0, 1]);
+    vetoed(script.judge(&items), "raced a mutation");
+    // A request that admitted, mutated and completed between the reads: the
+    // count is zero on both sides, but an epoch moved.
+    let (world, items) = World::released(&[1], &identity);
+    let mut script = Script::stable(world);
+    script.outbox_epochs = [Some(5), Some(6)];
+    vetoed(script.judge(&items), "raced a mutation");
+    let (world, items) = World::released(&[1], &identity);
+    let mut script = Script::stable(world);
+    script.lease_epochs = [Some(9), Some(10)];
+    vetoed(script.judge(&items), "raced a mutation");
+    // An exhausted epoch refuses before judging.
+    let (world, items) = World::released(&[1], &identity);
+    let mut script = Script::stable(world);
+    script.outbox_epochs = [None, None];
+    vetoed(script.judge(&items), "epoch exhausted");
+}
+
+#[test]
+fn selection_copies_only_the_session_and_charges_before_allocating() {
+    let identity = validator();
+    let (mut world, items) = World::released(&[1, 2], &identity);
+    // 2000 closes, leases and retained entries of unrelated sessions.
+    for n in 0..2000u32 {
+        let mut stranger = identity.clone();
+        stranger.session = UInt256::from_slice(&[
+            (n % 251) as u8 + 1,
+            (n / 251) as u8 + 100,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+        ]);
+        let mut close = close(3, &stranger, u64::from(n) + 100, false);
+        close.binding.delivery_id = UInt256::from_slice(&[
+            n as u8,
+            (n >> 8) as u8,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+        ]);
+        close.binding.canonical.node_receipt = close.binding.delivery_id.clone();
+        world.leases.push(lease(close.lease_generation, &close));
+        world.closing.push(close);
+    }
+    let mut budget = ProjectionBudget::default();
+    let outbox = select_outbox(
+        &UInt256::from(SESSION),
+        &world.entries,
+        &world.deliveries,
+        &world.closing,
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(outbox.closing.len(), 2, "only the target session is copied");
+    let leases = select_leases(&UInt256::from(SESSION), world.leases.iter(), &mut budget).unwrap();
+    assert_eq!(leases.len(), 2);
+    let script = Script::stable(world);
+    assert_eq!(script.judge(&items), CleanupDecision::WouldDelete { closes: 2 });
+    // A copy budget too small for the selected data refuses.
+    let mut tiny = ProjectionBudget::new(1, 8 << 20, 64 << 10);
+    assert!(
+        select_outbox(&UInt256::from(SESSION), &[], &[], &script.world.closing, &mut tiny).is_err()
+    );
+    let mut small_bytes = ProjectionBudget::new(4096, 16, 64 << 10);
+    assert!(select_outbox(
+        &UInt256::from(SESSION),
+        &[],
+        &[],
+        &script.world.closing,
+        &mut small_bytes
+    )
+    .is_err());
+    // Unrelated records only pass through the transient decode workspace,
+    // which still bounds each decode.
+    let mut roomy = ProjectionBudget::new(2, 8 << 20, 64 << 10);
+    assert!(select_leases(&UInt256::from(SESSION), script.world.leases.iter(), &mut roomy).is_ok());
+    let mut cramped = ProjectionBudget::new(4096, 8 << 20, 8);
+    assert!(
+        select_leases(&UInt256::from(SESSION), script.world.leases.iter(), &mut cramped).is_err()
+    );
+    // Exhaustion inside the judgement is a veto, never a partial result.
+    let mut exhausted = ProjectionBudget::new(0, 0, 64 << 10);
+    let decision = project_cleanup(
+        &validator_selection(),
+        &identity,
+        &items,
+        &ProjectionInput {
+            entries: &[],
+            deliveries: &[],
+            closing: &script.world.closing,
+            leases: &[],
+            other_outstanding: 0,
+        },
+        &mut exhausted,
+    );
+    vetoed(decision, "budget exhausted");
 }

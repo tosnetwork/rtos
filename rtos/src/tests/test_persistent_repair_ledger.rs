@@ -265,3 +265,27 @@ async fn persistent_repair_ledger_real_small_record_capacity_preserves_cold_reco
 async fn persistent_repair_ledger_real_large_record_byte_capacity_preserves_cold_records() -> Result<()> {
     ledger_real_capacity(MAX_DEPENDENCIES).await
 }
+
+#[test]
+fn persistent_repair_ledger_mutation_epoch_tracks_commits_poison_and_exhaustion() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (_db, leases) = open(dir.path())?;
+    let budget = HistoryReadBudget::new(Default::default());
+    let start = leases.mutation_epoch()?.expect("a fresh ledger has an epoch");
+    let generation = leases.begin(&binding(), dependencies(), &budget)?;
+    let after_begin = leases.mutation_epoch()?.unwrap();
+    assert!(after_begin > start, "a lease commit advances the epoch");
+    leases.durable(generation, &budget)?;
+    let after_durable = leases.mutation_epoch()?.unwrap();
+    assert!(after_durable > after_begin, "a state transition advances the epoch");
+    // Exhaustion is permanent; poisoning still counts as a mutation.
+    leases.exhaust_mutation_epoch_for_test();
+    leases.durable(generation, &budget)?;
+    assert_eq!(leases.mutation_epoch()?, None);
+    let dir = tempfile::tempdir()?;
+    let (_db, leases) = open(dir.path())?;
+    let before = leases.mutation_epoch()?.unwrap();
+    leases.poison();
+    assert!(leases.mutation_epoch()?.unwrap() > before, "poisoning advances the epoch");
+    Ok(())
+}
