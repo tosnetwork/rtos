@@ -8,6 +8,9 @@
 //! permanently retired. This module holds the record, its strict encoding, the
 //! canonical directory names it may act on, the deletion gate and the driver
 //! state machine. It has no I/O, so every decision is unit-testable.
+use crate::session_runtime::{
+    SessionNetworkPin, SessionRecoveryBinding, SessionRecoveryCoordinates,
+};
 use crate::Result;
 use rtos_block::{BlockIdExt, ShardIdent, UInt256};
 use std::collections::BTreeMap;
@@ -106,19 +109,37 @@ pub fn is_full_masterchain_checkpoint(block: &BlockIdExt) -> bool {
 }
 
 /// One durable cleanup intent: a session, the masterchain checkpoint at which
-/// it retired, and the exact namespace to reclaim once retirement is proven.
+/// it retired, the exact namespace to reclaim once retirement is proven and,
+/// for an authenticated namespace, the identity that re-authenticates it from
+/// history after a restart.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingValidatorCleanup {
     pub session_id: UInt256,
     pub retirement_checkpoint: BlockIdExt,
     pub namespace: String,
+    pub identity: Option<CleanupIdentity>,
 }
 
-const RECORD_VERSION: u8 = 1;
-// version(1) + session(32) + workchain(4) + shard(8) + seqno(4) + root(32) + file(32)
-const FIXED_PREFIX: usize = 1 + 32 + 4 + 8 + 4 + 32 + 32;
-/// Upper bound for one encoded record; the longest layout is an observer name.
-pub const MAX_RECORD_BYTES: usize = FIXED_PREFIX + 512;
+/// What a cold cleanup needs to re-authenticate an authenticated namespace:
+/// the network pin, the recovery binding and the local ADNL it ran with.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupIdentity {
+    pub pin: SessionNetworkPin,
+    pub binding: SessionRecoveryBinding,
+    pub local_adnl: UInt256,
+}
+
+const RECORD_VERSION: u8 = 2;
+const BLOCK_ID_BYTES: usize = 4 + 8 + 4 + 32 + 32;
+// version(1) + session(32) + checkpoint + namespace length(2)
+const FIXED_PREFIX: usize = 1 + 32 + BLOCK_ID_BYTES + 2;
+// global id(4) + zerostate + governing block + coordinates (4 + 8 + 4 + 4 + 4 + 1) + ADNL(32)
+const IDENTITY_BYTES: usize = 4 + BLOCK_ID_BYTES + BLOCK_ID_BYTES + 25 + 32;
+const MAX_NAMESPACE_BYTES: usize = 512;
+#[cfg(test)]
+pub(crate) const FIXED_PREFIX_FOR_TEST: usize = FIXED_PREFIX;
+/// Upper bound for one encoded record.
+pub const MAX_RECORD_BYTES: usize = FIXED_PREFIX + MAX_NAMESPACE_BYTES + 1 + IDENTITY_BYTES;
 
 /// Key prefix for records. Each physical namespace has its own key (the
 /// prefix plus its canonical relative name), so retirement and erase are
@@ -173,56 +194,200 @@ pub fn make_record(
     if parse_canonical_namespace_name(&namespace, session_id).is_none() {
         rtos_block::fail!("Cleanup namespace is not canonical");
     }
+    if namespace.len() > MAX_NAMESPACE_BYTES {
+        rtos_block::fail!("Cleanup namespace exceeds the record bound");
+    }
     Ok(PendingValidatorCleanup {
         session_id: session_id.clone(),
         retirement_checkpoint: retirement_checkpoint.clone(),
         namespace,
+        identity: None,
     })
 }
 
-/// Deterministic little-endian encoding, versioned so an old record is
-/// rejected rather than misread.
-pub fn encode_record(record: &PendingValidatorCleanup) -> Vec<u8> {
-    let id = &record.retirement_checkpoint;
-    let mut out = Vec::with_capacity(FIXED_PREFIX + record.namespace.len());
-    out.push(RECORD_VERSION);
-    out.extend_from_slice(record.session_id.as_slice());
+fn put_block_id(out: &mut Vec<u8>, id: &BlockIdExt) {
     out.extend_from_slice(&id.shard().workchain_id().to_le_bytes());
     out.extend_from_slice(&id.shard().shard_prefix_with_tag().to_le_bytes());
     out.extend_from_slice(&id.seq_no().to_le_bytes());
     out.extend_from_slice(id.root_hash().as_slice());
     out.extend_from_slice(id.file_hash().as_slice());
-    out.extend_from_slice(record.namespace.as_bytes());
+}
+
+/// A strict little-endian reader: every read is bounds-checked.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+impl<'a> Reader<'a> {
+    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        let end = self.at.checked_add(len)?;
+        let slice = self.bytes.get(self.at..end)?;
+        self.at = end;
+        Some(slice)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        self.take(1).map(|b| b[0])
+    }
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn i32(&mut self) -> Option<i32> {
+        Some(i32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn hash(&mut self) -> Option<UInt256> {
+        Some(UInt256::from_slice(self.take(32)?))
+    }
+    fn shard(&mut self) -> Option<ShardIdent> {
+        let workchain = self.i32()?;
+        ShardIdent::with_tagged_prefix(workchain, self.u64()?).ok()
+    }
+    fn block_id(&mut self) -> Option<BlockIdExt> {
+        let shard = self.shard()?;
+        let seqno = self.u32()?;
+        let root = self.hash()?;
+        Some(BlockIdExt::with_params(shard, seqno, root, self.hash()?))
+    }
+    fn done(&self) -> bool {
+        self.at == self.bytes.len()
+    }
+}
+
+/// Whether `identity` fits `namespace`: only an authenticated layout carries
+/// one, its coordinates name the namespace's shard and catchain seqno, and an
+/// observer's ADNL is the one in its name.
+fn identity_fits(parsed: &ParsedNamespace, identity: Option<&CleanupIdentity>) -> bool {
+    match (&parsed.layout, identity) {
+        (NamespaceLayout::V1, None) => true,
+        (NamespaceLayout::V1, Some(_)) => false,
+        (_, None) => true,
+        (layout, Some(identity)) => {
+            let coordinates = &identity.binding.coordinates;
+            coordinates.shard == parsed.shard
+                && coordinates.catchain_seqno == parsed.catchain_seqno
+                && identity.pin.zerostate.shard().is_masterchain()
+                && identity.binding.governing_masterchain.shard().is_masterchain()
+                && match layout {
+                    NamespaceLayout::V2Observer(adnl) => adnl == &identity.local_adnl,
+                    _ => true,
+                }
+        }
+    }
+}
+
+impl PendingValidatorCleanup {
+    /// Attaches the re-authentication identity of an authenticated namespace.
+    pub fn with_identity(mut self, identity: CleanupIdentity) -> Result<Self> {
+        let parsed = parse_canonical_namespace_name(&self.namespace, &self.session_id)
+            .ok_or_else(|| rtos_block::error!("Cleanup namespace is not canonical"))?;
+        if !identity_fits(&parsed, Some(&identity)) {
+            rtos_block::fail!("Cleanup identity does not fit its namespace");
+        }
+        self.identity = Some(identity);
+        Ok(self)
+    }
+}
+
+/// Deterministic little-endian encoding, versioned so an old record is
+/// rejected rather than misread.
+pub fn encode_record(record: &PendingValidatorCleanup) -> Vec<u8> {
+    let mut out = Vec::with_capacity(MAX_RECORD_BYTES);
+    out.push(RECORD_VERSION);
+    out.extend_from_slice(record.session_id.as_slice());
+    put_block_id(&mut out, &record.retirement_checkpoint);
+    // Canonical names are far below the cap; `make_record` and decode both
+    // enforce it, so the length always fits.
+    let name = record.namespace.as_bytes();
+    out.extend_from_slice(&(name.len().min(MAX_NAMESPACE_BYTES) as u16).to_le_bytes());
+    out.extend_from_slice(&name[..name.len().min(MAX_NAMESPACE_BYTES)]);
+    match &record.identity {
+        None => out.push(0),
+        Some(identity) => {
+            out.push(1);
+            out.extend_from_slice(&identity.pin.global_id.to_le_bytes());
+            put_block_id(&mut out, &identity.pin.zerostate);
+            put_block_id(&mut out, &identity.binding.governing_masterchain);
+            let coordinates = &identity.binding.coordinates;
+            out.extend_from_slice(&coordinates.shard.workchain_id().to_le_bytes());
+            out.extend_from_slice(&coordinates.shard.shard_prefix_with_tag().to_le_bytes());
+            out.extend_from_slice(&coordinates.catchain_seqno.to_le_bytes());
+            out.extend_from_slice(&coordinates.vertical_seqno.to_le_bytes());
+            out.extend_from_slice(&coordinates.last_key_block_seqno.to_le_bytes());
+            out.push(u8::from(coordinates.new_catchain_ids));
+            out.extend_from_slice(identity.local_adnl.as_slice());
+        }
+    }
     out
 }
 
 /// Strict decode. Anything inconsistent yields nothing: a malformed safety
 /// record never grants authority to delete (at worst a directory leaks).
 pub fn decode_record(value: &[u8]) -> Option<PendingValidatorCleanup> {
-    if value.len() < FIXED_PREFIX || value.len() > MAX_RECORD_BYTES {
+    if value.len() < FIXED_PREFIX + 1 || value.len() > MAX_RECORD_BYTES {
         return None;
     }
-    if *value.first()? != RECORD_VERSION {
+    let mut reader = Reader { bytes: value, at: 0 };
+    if reader.u8()? != RECORD_VERSION {
         return None;
     }
-    let session_id = UInt256::from_slice(value.get(1..33)?);
-    let workchain = i32::from_le_bytes(value.get(33..37)?.try_into().ok()?);
-    let shard = u64::from_le_bytes(value.get(37..45)?.try_into().ok()?);
-    let seqno = u32::from_le_bytes(value.get(45..49)?.try_into().ok()?);
-    let root = UInt256::from_slice(value.get(49..81)?);
-    let file = UInt256::from_slice(value.get(81..113)?);
-    let namespace = std::str::from_utf8(value.get(FIXED_PREFIX..)?).ok()?.to_owned();
-    let checkpoint = BlockIdExt::with_params(
-        ShardIdent::with_tagged_prefix(workchain, shard).ok()?,
-        seqno,
-        root,
-        file,
-    );
+    let session_id = reader.hash()?;
+    let checkpoint = reader.block_id()?;
     if !is_full_masterchain_checkpoint(&checkpoint) {
         return None;
     }
-    parse_canonical_namespace_name(&namespace, &session_id)?;
-    Some(PendingValidatorCleanup { session_id, retirement_checkpoint: checkpoint, namespace })
+    let name_len = usize::from(reader.u16()?);
+    if name_len > MAX_NAMESPACE_BYTES {
+        return None;
+    }
+    let namespace = std::str::from_utf8(reader.take(name_len)?).ok()?.to_owned();
+    let parsed = parse_canonical_namespace_name(&namespace, &session_id)?;
+    let identity = match reader.u8()? {
+        0 => None,
+        1 => {
+            let global_id = reader.i32()?;
+            let zerostate = reader.block_id()?;
+            let governing_masterchain = reader.block_id()?;
+            let shard = reader.shard()?;
+            let catchain_seqno = reader.u32()?;
+            let vertical_seqno = reader.u32()?;
+            let last_key_block_seqno = reader.u32()?;
+            let new_catchain_ids = match reader.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let local_adnl = reader.hash()?;
+            Some(CleanupIdentity {
+                pin: SessionNetworkPin { global_id, zerostate },
+                binding: SessionRecoveryBinding {
+                    governing_masterchain,
+                    coordinates: SessionRecoveryCoordinates {
+                        shard,
+                        catchain_seqno,
+                        vertical_seqno,
+                        last_key_block_seqno,
+                        new_catchain_ids,
+                    },
+                },
+                local_adnl,
+            })
+        }
+        _ => return None,
+    };
+    if !reader.done() || !identity_fits(&parsed, identity.as_ref()) {
+        return None;
+    }
+    Some(PendingValidatorCleanup {
+        session_id,
+        retirement_checkpoint: checkpoint,
+        namespace,
+        identity,
+    })
 }
 
 /// The retirement checkpoint is the GC block or a verified ancestor of it on

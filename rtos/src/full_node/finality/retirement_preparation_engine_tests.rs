@@ -720,6 +720,14 @@ async fn validator_cleanup_real_engine_keeps_until_the_floor_passes_then_deletes
         };
         let v2_ns = v2_namespace(engine).expect("retirement persisted the record");
         assert!(v2_ns.starts_with("v2/"), "an authenticated namespace record");
+        let identity = engine
+            .load_validator_cleanup_record(&v2_ns)
+            .unwrap()
+            .and_then(|record| record.identity)
+            .expect("an authenticated record carries its re-authentication identity");
+        assert_eq!(Some(&identity.binding), runtime.recovery_binding());
+        assert_eq!(&identity.pin, runtime.pin());
+        assert_eq!(identity.local_adnl, UInt256::from(*runtime.local_adnl().data()));
         assert!(engine.load_destroyed_session_ids().unwrap().contains(&v2_session));
 
         // (b) A retired V1 namespace on the same real DB: a real storage

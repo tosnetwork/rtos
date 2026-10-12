@@ -25,6 +25,9 @@ fn role_key(role: LocalRole, local_adnl: UInt256) -> RecoveryRole {
 pub(crate) enum AdmissionKind {
     Normal,
     Recovery,
+    /// Exclusive deletion authority over a retired authenticated namespace:
+    /// no session, recovery or closure replay may open it meanwhile.
+    Cleanup,
 }
 
 #[derive(Default)]
@@ -100,12 +103,37 @@ impl RecoveryRegistry {
         self.changed.send_modify(|generation| *generation = generation.wrapping_add(1));
         Ok(Some(RecoveryReservation { registry: self.clone(), key, lease }))
     }
+    /// Reserves a retired authenticated namespace for cleanup, keyed exactly
+    /// like the runtime that ran there. `None` means a session, recovery or
+    /// another cleanup holds it. A V1 namespace has no admission key.
+    pub(crate) fn reserve_cleanup(
+        self: &Arc<Self>,
+        session: &UInt256,
+        layout: &consensus_common::validator_cleanup::NamespaceLayout,
+    ) -> Result<Option<RecoveryReservation>> {
+        use consensus_common::validator_cleanup::NamespaceLayout;
+        let role = match layout {
+            NamespaceLayout::V1 => fail!("A V1 namespace has no admission key"),
+            NamespaceLayout::V2Validator => RecoveryRole::Validator,
+            NamespaceLayout::V2Observer(adnl) => RecoveryRole::Observer(adnl.clone()),
+        };
+        self.reserve_kind((session.clone(), role), AdmissionKind::Cleanup)
+    }
     #[cfg(test)]
     pub(crate) fn reserve_validator_for_test(
         self: &Arc<Self>,
         session: UInt256,
     ) -> Result<Option<RecoveryReservation>> {
         self.reserve_kind((session, RecoveryRole::Validator), AdmissionKind::Normal)
+    }
+    #[cfg(test)]
+    fn owns_key_for_test(&self, key: &RecoveryKey) -> bool {
+        self.reservations
+            .lock()
+            .unwrap()
+            .occupied
+            .get(key)
+            .is_some_and(|(kind, _)| *kind == AdmissionKind::Recovery)
     }
     #[cfg(test)]
     pub(crate) fn validator_reserved_for_test(&self, session: &UInt256) -> bool {
@@ -229,6 +257,42 @@ mod tests {
             next.release();
             assert!(registry.reservations.lock().unwrap().occupied.is_empty());
         }
+    }
+
+    #[test]
+    fn cleanup_admission_excludes_sessions_and_recovery_per_physical_namespace() {
+        use consensus_common::validator_cleanup::NamespaceLayout;
+        let registry = Arc::new(RecoveryRegistry::default());
+        let session = UInt256::from([6; 32]);
+        let adnl = UInt256::from([7; 32]);
+        let validator_key = (session.clone(), RecoveryRole::Validator);
+        let observer_key = (session.clone(), RecoveryRole::Observer(adnl.clone()));
+        // Cleanup holds the validator namespace: no session or recovery opens it.
+        let cleanup =
+            registry.reserve_cleanup(&session, &NamespaceLayout::V2Validator).unwrap().unwrap();
+        assert!(registry
+            .reserve_kind(validator_key.clone(), AdmissionKind::Normal)
+            .unwrap()
+            .is_none());
+        assert!(registry.reserve_key(validator_key.clone()).unwrap().is_none());
+        assert!(!registry.owns_key_for_test(&validator_key), "cleanup is not a recovery owner");
+        // The observer namespace of the same session is independent.
+        let observer = registry
+            .reserve_cleanup(&session, &NamespaceLayout::V2Observer(adnl))
+            .unwrap()
+            .unwrap();
+        assert!(registry.reserve_key(observer_key.clone()).unwrap().is_none());
+        // A live session refuses cleanup.
+        cleanup.release();
+        let live = registry.reserve_kind(validator_key, AdmissionKind::Normal).unwrap().unwrap();
+        assert!(registry
+            .reserve_cleanup(&session, &NamespaceLayout::V2Validator)
+            .unwrap()
+            .is_none());
+        assert!(registry.reserve_cleanup(&session, &NamespaceLayout::V1).is_err());
+        live.release();
+        observer.release();
+        assert!(registry.reservations.lock().unwrap().occupied.is_empty());
     }
 
     #[tokio::test]

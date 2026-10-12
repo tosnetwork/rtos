@@ -1802,7 +1802,26 @@ impl ValidatorManagerImpl {
             }
             _ => NamespaceLayout::V1,
         };
-        make_record(id, &layout, group.shard(), group.cc_seqno(), &checkpoint)
+        let record = make_record(id, &layout, group.shard(), group.cc_seqno(), &checkpoint)?;
+        if layout == NamespaceLayout::V1 {
+            return Ok(record);
+        }
+        // An authenticated namespace is re-verified from history before any
+        // delete, so its record carries the identity that re-authenticates
+        // it. Without a recovery binding no record is written: the fence
+        // keeps the session and its namespace is only ever retained.
+        let runtime = group
+            .authenticated_runtime()
+            .ok_or_else(|| error!("Authenticated namespace without its runtime"))?;
+        let binding = runtime
+            .recovery_binding()
+            .cloned()
+            .ok_or_else(|| error!("Authenticated runtime without a recovery binding"))?;
+        record.with_identity(consensus_common::validator_cleanup::CleanupIdentity {
+            pin: runtime.pin().clone(),
+            binding,
+            local_adnl: UInt256::from(*runtime.local_adnl().data()),
+        })
     }
 
     // Replacing an authenticated admission keeps the session ID live. Only the

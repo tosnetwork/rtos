@@ -905,3 +905,35 @@ fn source_retirement_manifest_charge_covers_the_committee() {
     }
     assert!(!fixture.store_locked());
 }
+
+#[test]
+fn retirement_scan_accepts_only_the_namespace_cleanup_reservation_as_cold_quiescence() {
+    let fixture = released();
+    let session = fixture.runtime.session_id().to_hex_string();
+    // The namespace database's own reservation proves cold quiescence.
+    let reservation =
+        consensus_common::reserve_storage_cleanup(&fixture.namespace, &session).unwrap().unwrap();
+    let scan = scan_source_retirement_with(
+        fixture.runtime.clone(),
+        &fixture.namespace,
+        Quiescence::Reserved(&reservation),
+        &Budget,
+    )
+    .unwrap();
+    assert_eq!(scan.items.len(), 1);
+    drop(scan);
+    drop(reservation);
+    // A reservation of any other directory is refused before anything is read.
+    let other = consensus_common::reserve_storage_cleanup(&fixture.namespace, "another-storage")
+        .unwrap()
+        .unwrap();
+    let refusal = scan_source_retirement_with(
+        fixture.runtime.clone(),
+        &fixture.namespace,
+        Quiescence::Reserved(&other),
+        &Budget,
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(refusal, RetirementRefusal::DatabaseTeardown(_)), "{refusal}");
+}

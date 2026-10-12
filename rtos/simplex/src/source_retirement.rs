@@ -377,6 +377,15 @@ struct InventoryDigestInput {
     items: Vec<(String, u64)>,
 }
 
+/// What proves no storage instance of the namespace runs during the scan.
+pub enum Quiescence<'a> {
+    /// The session's own instance was torn down cleanly (live retirement).
+    Teardown(&'a StorageTeardownReceipt),
+    /// The exclusive storage cleanup reservation of the namespace database
+    /// (cold cleanup): no instance can open while it is held.
+    Reserved(&'a consensus_common::StorageCleanupReservation),
+}
+
 /// Exclusive, read-only scan of a drained source namespace. Call from a
 /// blocking job after the session's storage instance was torn down; `teardown`
 /// must observe that exact instance. Busy means another owner holds a lock.
@@ -384,6 +393,16 @@ pub fn scan_source_retirement(
     runtime: Arc<AuthenticatedSessionRuntime>,
     namespace: &Path,
     teardown: &StorageTeardownReceipt,
+    budget: &dyn SourceHistoryDebtBudget,
+) -> Refusal<PendingRetirementScan> {
+    scan_source_retirement_with(runtime, namespace, Quiescence::Teardown(teardown), budget)
+}
+
+/// The same scan with either quiescence proof.
+pub fn scan_source_retirement_with(
+    runtime: Arc<AuthenticatedSessionRuntime>,
+    namespace: &Path,
+    quiescence: Quiescence<'_>,
     budget: &dyn SourceHistoryDebtBudget,
 ) -> Refusal<PendingRetirementScan> {
     if runtime.protocol() != SimplexProtocol::PrivateObserversPlumtree {
@@ -395,16 +414,31 @@ pub fn scan_source_retirement(
     if !runtime.shard().is_masterchain() {
         return Err(RetirementRefusal::Unsupported("only masterchain Final reaches Released"));
     }
-    // The receipt must observe this session's own storage at this namespace.
-    // RocksDB admits one instance per directory, and an outcome exists only
-    // after that instance's last reference is gone.
-    if teardown.storage_id() != runtime.session_id().to_hex_string() || teardown.path() != namespace
-    {
-        return Err(RetirementRefusal::DatabaseTeardown(
-            "receipt observes another storage instance".into(),
-        ));
+    let storage_id = runtime.session_id().to_hex_string();
+    match quiescence {
+        // The receipt must observe this session's own storage at this
+        // namespace. RocksDB admits one instance per directory, and an
+        // outcome exists only after that instance's last reference is gone.
+        Quiescence::Teardown(teardown) => {
+            if teardown.storage_id() != storage_id || teardown.path() != namespace {
+                return Err(RetirementRefusal::DatabaseTeardown(
+                    "receipt observes another storage instance".into(),
+                ));
+            }
+            teardown.check().map_err(|e| RetirementRefusal::DatabaseTeardown(format!("{e:#}")))?;
+        }
+        // The reservation must hold exactly this namespace's database key.
+        Quiescence::Reserved(reservation) => {
+            let expected = std::fs::canonicalize(namespace)
+                .map_err(|e| RetirementRefusal::DatabaseTeardown(format!("{e:#}")))?
+                .join(&storage_id);
+            if reservation.key() != expected {
+                return Err(RetirementRefusal::DatabaseTeardown(
+                    "reservation holds another storage directory".into(),
+                ));
+            }
+        }
     }
-    teardown.check().map_err(|e| RetirementRefusal::DatabaseTeardown(format!("{e:#}")))?;
     existing_directory(namespace)?;
     let mut charge = Charge::new(budget);
     let (manifest, manifest_digest) =

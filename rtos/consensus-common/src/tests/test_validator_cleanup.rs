@@ -38,41 +38,103 @@ fn layouts() -> Vec<NamespaceLayout> {
     ]
 }
 
-#[test]
-fn validator_cleanup_record_round_trips_for_every_layout() {
+fn identity_for(layout: &NamespaceLayout) -> CleanupIdentity {
+    let local_adnl = match layout {
+        NamespaceLayout::V2Observer(adnl) => adnl.clone(),
+        _ => UInt256::from([0x5c; 32]),
+    };
+    CleanupIdentity {
+        pin: SessionNetworkPin { global_id: -239, zerostate: checkpoint(0) },
+        binding: SessionRecoveryBinding {
+            governing_masterchain: checkpoint(90),
+            coordinates: SessionRecoveryCoordinates {
+                shard: masterchain(),
+                catchain_seqno: 7,
+                vertical_seqno: 0,
+                last_key_block_seqno: 80,
+                new_catchain_ids: true,
+            },
+        },
+        local_adnl,
+    }
+}
+
+/// Every layout, plus each authenticated layout with its identity.
+fn sample_records() -> Vec<PendingValidatorCleanup> {
+    let mut records = Vec::new();
     for layout in layouts() {
         let record =
             make_record(&session(9), &layout, &masterchain(), 7, &checkpoint(100)).unwrap();
+        if layout != NamespaceLayout::V1 {
+            records.push(record.clone().with_identity(identity_for(&layout)).unwrap());
+        }
+        records.push(record);
+    }
+    records
+}
+
+#[test]
+fn validator_cleanup_record_round_trips_for_every_layout() {
+    for record in sample_records() {
         let bytes = encode_record(&record);
-        assert_eq!(decode_record(&bytes), Some(record.clone()), "{layout:?}");
-        // Every truncation and a wrong version are rejected.
+        assert!(bytes.len() <= MAX_RECORD_BYTES);
+        assert_eq!(decode_record(&bytes), Some(record.clone()), "{record:?}");
+        // Every truncation, a wrong version, a bad flag and a trailing byte
+        // are rejected.
         for length in 0..bytes.len() {
-            assert!(decode_record(&bytes[..length]).is_none(), "{layout:?} truncated to {length}");
+            assert!(decode_record(&bytes[..length]).is_none(), "truncated to {length}");
         }
         let mut versioned = bytes.clone();
-        versioned[0] = 2;
-        assert!(decode_record(&versioned).is_none());
-        let mut tailed = bytes;
-        tailed.push(b'x');
-        assert!(decode_record(&tailed).is_none(), "a trailing byte breaks the canonical name");
+        versioned[0] = 1;
+        assert!(decode_record(&versioned).is_none(), "the previous version is dropped");
+        let mut tailed = bytes.clone();
+        tailed.push(0);
+        assert!(decode_record(&tailed).is_none(), "trailing bytes are rejected");
+        let flag = FIXED_PREFIX_FOR_TEST + record.namespace.len();
+        let mut flagged = bytes;
+        flagged[flag] = 2;
+        assert!(decode_record(&flagged).is_none(), "an unknown identity flag");
     }
+}
+
+#[test]
+fn validator_cleanup_identity_must_fit_its_namespace() {
+    let base = |layout: NamespaceLayout| {
+        make_record(&session(3), &layout, &masterchain(), 7, &checkpoint(100)).unwrap()
+    };
+    let v1 = base(NamespaceLayout::V1);
+    assert!(v1.clone().with_identity(identity_for(&NamespaceLayout::V2Validator)).is_err());
+    let observer = NamespaceLayout::V2Observer(UInt256::from([0xab; 32]));
+    let mut wrong_adnl = identity_for(&observer);
+    wrong_adnl.local_adnl = UInt256::from([0xcd; 32]);
+    assert!(base(observer.clone()).with_identity(wrong_adnl).is_err());
+    let mut wrong_cc = identity_for(&NamespaceLayout::V2Validator);
+    wrong_cc.binding.coordinates.catchain_seqno = 8;
+    assert!(base(NamespaceLayout::V2Validator).with_identity(wrong_cc.clone()).is_err());
+    // A forged identity on the wire is rejected the same way.
+    let mut forged = base(NamespaceLayout::V2Validator);
+    forged.identity = Some(wrong_cc);
+    assert!(decode_record(&encode_record(&forged)).is_none());
+    let mut on_v1 = v1;
+    on_v1.identity = Some(identity_for(&NamespaceLayout::V2Validator));
+    assert!(decode_record(&encode_record(&on_v1)).is_none());
 }
 
 #[test]
 fn validator_cleanup_wire_format_is_pinned() {
     let record = record(1, 100);
     let bytes = encode_record(&record);
-    assert_eq!(bytes[0], 1);
+    let name = format!("consensus.-1.8000000000000000.7.{}", session(1).to_hex_string());
+    assert_eq!(bytes[0], 2);
     assert_eq!(&bytes[1..33], &[1u8; 32]);
     assert_eq!(&bytes[33..37], &(-1i32).to_le_bytes());
     assert_eq!(&bytes[37..45], &0x8000_0000_0000_0000u64.to_le_bytes());
     assert_eq!(&bytes[45..49], &100u32.to_le_bytes());
     assert_eq!(&bytes[49..81], &[0x11; 32]);
     assert_eq!(&bytes[81..113], &[0x22; 32]);
-    assert_eq!(
-        std::str::from_utf8(&bytes[113..]).unwrap(),
-        format!("consensus.-1.8000000000000000.7.{}", session(1).to_hex_string())
-    );
+    assert_eq!(&bytes[113..115], &(name.len() as u16).to_le_bytes());
+    assert_eq!(std::str::from_utf8(&bytes[115..115 + name.len()]).unwrap(), name);
+    assert_eq!(&bytes[115 + name.len()..], &[0u8], "no identity on a V1 record");
     assert_eq!(
         record_key(&record.namespace),
         format!(
