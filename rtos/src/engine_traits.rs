@@ -520,6 +520,23 @@ pub trait EngineOperations: Sync + Send {
     fn erase_validator_cleanup_record(&self, _session: &UInt256) -> Result<()> {
         rtos_block::fail!("Validator cleanup records are unavailable")
     }
+    /// Bootstraps or advances the durable cleanup GC floor by at most one step.
+    async fn maintain_validator_cleanup_floor(&self) -> Result<()> {
+        rtos_block::fail!("Validator cleanup floor is unavailable")
+    }
+    /// The published cleanup GC floor and its pinned state; None disables
+    /// deletion.
+    fn validator_cleanup_floor(&self) -> Option<(BlockIdExt, Arc<ShardStateStuff>)> {
+        None
+    }
+    /// Blocking: deletes one retired namespace already reserved for cleanup;
+    /// true only when it is confirmed gone.
+    fn delete_validator_consensus_namespace(
+        &self,
+        _record: &consensus_common::validator_cleanup::PendingValidatorCleanup,
+    ) -> Result<bool> {
+        rtos_block::fail!("Validator consensus namespace deletion is unavailable")
+    }
     fn save_block_candidate(
         &self,
         session_id: &SessionId,

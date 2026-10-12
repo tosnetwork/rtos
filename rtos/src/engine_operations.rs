@@ -639,6 +639,25 @@ impl EngineOperations for Engine {
         self.db().write_validator_state_batch_sync(&[], &[key])
     }
 
+    async fn maintain_validator_cleanup_floor(&self) -> Result<()> {
+        crate::validator::validator_cleanup_gc::maintain_cleanup_floor(self).await
+    }
+
+    fn validator_cleanup_floor(&self) -> Option<(BlockIdExt, Arc<ShardStateStuff>)> {
+        self.shard_states_keeper().cleanup_floor()
+    }
+
+    fn delete_validator_consensus_namespace(
+        &self,
+        record: &consensus_common::validator_cleanup::PendingValidatorCleanup,
+    ) -> Result<bool> {
+        crate::validator::validator_cleanup_gc::delete_v1_namespace(
+            self.db_root_dir()?,
+            record,
+            &|session| self.destroy_candidate_table(session),
+        )
+    }
+
     fn save_block_candidate(
         &self,
         session_id: &SessionId,

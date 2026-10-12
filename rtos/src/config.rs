@@ -1516,7 +1516,8 @@ impl NodeConfigHandler {
                 fail!("Duplicate consensus transport identity or ADNL binding");
             }
             bindings.push(ConsensusTransportBinding {
-                validator_id: UInt256::from(stable), adnl_key_id: KeyId::from_data(transport),
+                validator_id: UInt256::from(stable),
+                adnl_key_id: KeyId::from_data(transport),
             });
         }
         let (sender, reader) = tokio::sync::mpsc::unbounded_channel();
@@ -1609,7 +1610,9 @@ impl NodeConfigHandler {
         if !self.consensus_transport_bindings.iter().any(|binding| &binding.adnl_key_id == id) {
             fail!("ADNL key is not an explicitly configured consensus transport");
         }
-        let key = self.get_key_raw(*id.data()).await
+        let key = self
+            .get_key_raw(*id.data())
+            .await
             .ok_or_else(|| error!("Configured consensus transport private key is unavailable"))?;
         if key.id() != id {
             fail!("Configured consensus transport key identity mismatch");
@@ -2127,8 +2130,9 @@ impl NodeConfigHandler {
         // private key. A malformed/missing key is a configuration error, not an
         // invitation to substitute the ordinary fullnode overlay key.
         for binding in &self.consensus_transport_bindings {
-            let key = Self::get_key(config, *binding.adnl_key_id.data())
-                .ok_or_else(|| error!("Configured consensus transport private key is unavailable"))?;
+            let key = Self::get_key(config, *binding.adnl_key_id.data()).ok_or_else(|| {
+                error!("Configured consensus transport private key is unavailable")
+            })?;
             if key.id() != &binding.adnl_key_id {
                 fail!("Configured consensus transport key identity mismatch");
             }
@@ -2657,6 +2661,12 @@ pub struct ValidatorManagerConfig {
     pub unsafe_catchain_rotates: HashMap<u32, (u32, u32)>,
     pub no_countdown_for_zerostate: bool,
     pub accelerated_consensus_disabled: bool,
+    /// Checkpoint-bound deletion of retired validator consensus namespaces.
+    /// A start-up choice: when off no cleanup tick runs and durable records
+    /// accumulate until a later start with cleanup on reclaims them.
+    pub consensus_cleanup_enabled: bool,
+    /// Period of the cleanup tick: at most one pass per tick.
+    pub consensus_cleanup_tick: Duration,
     #[cfg(test)]
     pub test_emulator_consensus: Option<TestEmulatorConsensusConfig>,
 }
@@ -2674,6 +2684,8 @@ struct ValidatorManagerConfigImpl {
     unsafe_resync_catchains: Vec<u32>,
     #[serde(default)]
     unsafe_catchain_rotates: Vec<UnsafeCatchainRotation>,
+    #[serde(default)]
+    disable_validator_consensus_cleanup: bool,
     #[cfg(test)]
     #[serde(default)]
     test_emulator_consensus: Option<TestEmulatorConsensusConfigJson>,
@@ -2734,6 +2746,10 @@ impl ValidatorManagerConfig {
                     Ok(cfg) => cfg,
                 };
 
+                if config.disable_validator_consensus_cleanup {
+                    validator_config.consensus_cleanup_enabled = false;
+                }
+
                 for resync in config.unsafe_resync_catchains.into_iter() {
                     validator_config.unsafe_resync_catchains.insert(resync);
                 }
@@ -2790,6 +2806,10 @@ impl Default for ValidatorManagerConfig {
             unsafe_catchain_rotates: HashMap::new(),
             no_countdown_for_zerostate: false,
             accelerated_consensus_disabled: false,
+            consensus_cleanup_enabled: true,
+            consensus_cleanup_tick: Duration::from_secs(
+                consensus_common::validator_cleanup::ValidatorCleanupManager::TICK_SECONDS,
+            ),
             #[cfg(test)]
             test_emulator_consensus: None,
         }

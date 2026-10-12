@@ -5,10 +5,14 @@
 //! successor at a time, and never regresses.
 use crate::{engine::Engine, engine_traits::EngineOperations, shard_state::ShardStateStuff};
 use consensus_common::validator_cleanup::{
-    may_advance_gc, should_adopt_safe_checkpoint, CleanupAncestry, GcAdvanceInputs,
+    may_advance_gc, parse_canonical_namespace_name, should_adopt_safe_checkpoint, CleanupAncestry,
+    GcAdvanceInputs, NamespaceLayout, ParsedNamespace, PendingValidatorCleanup,
 };
-use rtos_block::{error, BlockIdExt, HashmapAugType, Result, ShardIdent, UnixTime};
-use std::sync::Arc;
+use rtos_block::{error, fail, BlockIdExt, HashmapAugType, Result, ShardIdent, UInt256, UnixTime};
+use std::{
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
 
 /// Candidates examined by the first-run floor search.
 const BOOTSTRAP_CANDIDATES: u32 = 64;
@@ -47,7 +51,7 @@ pub(crate) fn shard_catchain_seqno(floor: &ShardStateStuff, shard: &ShardIdent) 
 }
 
 async fn advance_inputs(
-    engine: &Arc<Engine>,
+    engine: &Engine,
 ) -> Result<Option<(GcAdvanceInputs, Arc<ShardStateStuff>)>> {
     let last = engine.load_last_applied_mc_state().await?;
     let extra = last.shard_state_extra()?;
@@ -83,7 +87,7 @@ async fn advance_inputs(
 
 /// Bootstraps or advances the floor by at most one step. A floor whose state
 /// went missing is left alone: cleanup stays disabled.
-pub(crate) async fn maintain_cleanup_floor(engine: &Arc<Engine>) -> Result<()> {
+pub(crate) async fn maintain_cleanup_floor(engine: &Engine) -> Result<()> {
     let keeper = engine.shard_states_keeper();
     keeper.resolve_uncertain_cleanup_floor()?;
     let Some((inputs, last)) = advance_inputs(engine).await? else {
@@ -120,7 +124,7 @@ pub(crate) async fn maintain_cleanup_floor(engine: &Arc<Engine>) -> Result<()> {
     keeper.adopt_cleanup_floor(&next, guard)
 }
 
-fn bootstrap(engine: &Arc<Engine>, inputs: &GcAdvanceInputs, last: &ShardStateStuff) -> Result<()> {
+fn bootstrap(engine: &Engine, inputs: &GcAdvanceInputs, last: &ShardStateStuff) -> Result<()> {
     let keeper = engine.shard_states_keeper();
     let bound = [
         inputs.last_rotation_seqno,
@@ -152,4 +156,99 @@ fn bootstrap(engine: &Arc<Engine>, inputs: &GcAdvanceInputs, last: &ShardStateSt
         return keeper.adopt_cleanup_floor(&candidate, guard);
     }
     Ok(())
+}
+
+/// Stage-local custody veto: only the V1 layout may be deleted here. An
+/// authenticated (v2) namespace waits for its source finality custody to be
+/// re-verified, so it is kept; an unparsable name is kept too.
+pub(crate) fn v1_only_custody_veto(record: &PendingValidatorCleanup) -> bool {
+    !matches!(
+        parse_canonical_namespace_name(&record.namespace, &record.session_id),
+        Some(ParsedNamespace { layout: NamespaceLayout::V1, .. })
+    )
+}
+
+/// The storage registration key of a V1 record's consensus database: the
+/// namespace directory and the session's storage id, exactly what the
+/// session's database open registers. None for any other layout or a name
+/// that is not the canonical single component for the session.
+pub(crate) fn namespace_storage(
+    db_root: &str,
+    record: &PendingValidatorCleanup,
+) -> Option<(PathBuf, String)> {
+    if v1_only_custody_veto(record) || !is_single_component(&record.namespace) {
+        return None;
+    }
+    let parent = consensus_root(db_root).join(&record.namespace);
+    Some((parent, record.session_id.to_hex_string()))
+}
+
+fn consensus_root(db_root: &str) -> PathBuf {
+    Path::new(db_root).join("catchains").join("consensus")
+}
+
+fn candidates_path(db_root: &str, session_id: &UInt256) -> PathBuf {
+    Path::new(db_root).join("catchains").join(format!("candidates{:x}", session_id))
+}
+
+fn is_single_component(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!((components.next(), components.next()), (Some(Component::Normal(_)), None))
+}
+
+/// Whether `path` may be removed: absent, or a real directory whose parent is
+/// canonically `root`. A symlink, a file or a foreign parent refuses.
+fn removable_under(path: &Path, root: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            let Some(parent) = path.parent() else { return Ok(false) };
+            Ok(std::fs::canonicalize(parent)? == std::fs::canonicalize(root)?)
+        }
+        Ok(_) => Ok(false),
+    }
+}
+
+fn remove_if_directory(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(std::fs::remove_dir_all(path)?),
+        Ok(_) => fail!("{} is no longer a real directory", path.display()),
+    }
+}
+
+fn confirmed_absent(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Deletes a retired V1 namespace and its candidate table. The caller already
+/// established eligibility under the gate and holds the storage cleanup
+/// reservation; this is only the blocking filesystem step. Every path check
+/// runs before anything is destroyed. Returns true only when both paths are
+/// confirmed absent; any refusal or error leaves the record for a later
+/// cycle.
+pub(crate) fn delete_v1_namespace(
+    db_root: &str,
+    record: &PendingValidatorCleanup,
+    destroy_candidates: &dyn Fn(&UInt256) -> Result<bool>,
+) -> Result<bool> {
+    let Some((namespace, _)) = namespace_storage(db_root, record) else {
+        return Ok(false);
+    };
+    let catchains = Path::new(db_root).join("catchains");
+    let candidates = candidates_path(db_root, &record.session_id);
+    if !removable_under(&namespace, &consensus_root(db_root))?
+        || !removable_under(&candidates, &catchains)?
+    {
+        return Ok(false);
+    }
+    remove_if_directory(&namespace)?;
+    // A shared handle (Ok(false)) means someone still uses the table.
+    if !destroy_candidates(&record.session_id)? {
+        return Ok(false);
+    }
+    remove_if_directory(&candidates)?;
+    Ok(confirmed_absent(&namespace) && confirmed_absent(&candidates))
 }

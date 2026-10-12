@@ -447,3 +447,36 @@ async fn test_uncertain_first_floor_resolves_only_from_a_genuinely_absent_key() 
     engine.db.stop_states_db().await.unwrap();
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cleanup_floor_is_re_pinned_from_the_same_db_after_restart() -> Result<()> {
+    let floor = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        42,
+        UInt256::from([2; 32]),
+        UInt256::from([2; 32]),
+    );
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().to_str().unwrap().to_owned();
+    {
+        let engine = TestEngine::new_db_dir(&path, None).await?;
+        let stopper = Arc::new(Stopper::new());
+        let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
+        store_mc_state(&keeper, &floor, None).await?;
+        keeper.adopt_cleanup_floor(&floor, wait_pin(&keeper, &floor).await?)?;
+        stopper.set_stop();
+        engine.db.stop_states_db().await.unwrap();
+    }
+    // A restart on the same database restores and pins the persisted floor
+    // before states GC runs: it is published again, not a first run.
+    let engine = TestEngine::new_db_dir(&path, None).await?;
+    let stopper = Arc::new(Stopper::new());
+    let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
+    let (restored, state) = keeper.cleanup_floor().expect("the floor is re-pinned at boot");
+    assert_eq!(restored, floor);
+    assert_eq!(state.block_id(), &floor, "the pinned state is the floor's own");
+    assert!(!keeper.cleanup_floor_unset());
+    stopper.set_stop();
+    engine.db.stop_states_db().await.unwrap();
+    Ok(())
+}
