@@ -343,3 +343,22 @@ async fn persistent_repair_ledger_release_is_counted_exact_and_deferred_while_re
     assert_eq!(leases.protection.references(&block(1)), (0, 0));
     Ok(())
 }
+
+#[test]
+fn persistent_repair_ledger_release_fails_closed_when_protection_was_not_registered() -> Result<()> {
+    use crate::publication_dependency_leases::LeaseRelease;
+    let dir = tempfile::tempdir()?;
+    let (_db, leases) = open(dir.path())?;
+    let budget = HistoryReadBudget::new(Default::default());
+    let digest = dependency_digest(&dependencies())?;
+    let generation = leases.begin(&binding(), dependencies(), &budget)?;
+    // The protection vanished behind the ledger's back.
+    assert!(leases.protection.unregister(generation)?);
+    assert!(leases.release(generation, &binding(), &digest).is_err());
+    // No retry may report success afterwards.
+    let retry = leases.release(generation, &binding(), &digest);
+    assert!(!matches!(retry, Ok(LeaseRelease::AbsentAlreadyReleased) | Ok(LeaseRelease::Released)));
+    assert!(retry.is_err());
+    assert!(leases.protection.state(&block(99)), "protection is poisoned");
+    Ok(())
+}

@@ -162,10 +162,10 @@ impl RepairProtection {
             let key = (id.clone(), kind.clone());
             match guard.artifact_digests.get_mut(&key) {
                 Some((_, count)) if *count > 1 => *count -= 1,
-                Some(_) => {
+                Some((_, 1)) => {
                     guard.artifact_digests.remove(&key);
                 }
-                None => intact = false,
+                Some(_) | None => intact = false,
             }
         }
         if !intact {
@@ -282,6 +282,21 @@ mod tests {
         assert_eq!(protection.references(&id(9)), (0, 1));
         // A conflicting commitment still requires cold recovery.
         assert!(protection.state(&id(100)), "conflicting commitments poison the predicate");
+    }
+
+    #[test]
+    fn a_zero_digest_count_is_inconsistent() {
+        let protection = RepairProtection::default();
+        protection.register(1, artifact(6, 1)).unwrap();
+        protection
+            .protected
+            .lock()
+            .unwrap()
+            .artifact_digests
+            .values_mut()
+            .for_each(|(_, count)| *count = 0);
+        assert!(protection.unregister(1).is_err());
+        assert!(protection.artifact(&id(201)), "poisoned protection protects everything");
     }
 
     #[test]

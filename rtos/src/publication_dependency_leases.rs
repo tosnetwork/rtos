@@ -440,7 +440,14 @@ impl DependencyLeases {
         }
         memory.records.remove(&generation);
         memory.bytes = memory.bytes.saturating_sub(size);
-        self.protection.unregister(generation)?;
+        // The record existed, so its protection must have been registered
+        // and must release cleanly; anything else is a broken invariant and
+        // no later call may report success.
+        if !matches!(self.protection.unregister(generation), Ok(true)) {
+            memory.poisoned = true;
+            self.protection.poison();
+            fail!("Repair lease {generation} protection was not released cleanly");
+        }
         Ok(LeaseRelease::Released)
     }
 }
