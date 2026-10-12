@@ -9,7 +9,7 @@ use crate::{
 };
 use consensus_common::validator_cleanup::{
     may_advance_gc, parse_canonical_namespace_name, should_adopt_safe_checkpoint, CleanupAncestry,
-    CleanupVerdict, GcAdvanceInputs, NamespaceLayout, ParsedNamespace, PendingValidatorCleanup,
+    GcAdvanceInputs, NamespaceLayout, ParsedNamespace, PendingValidatorCleanup,
 };
 use rtos_block::{error, fail, BlockIdExt, HashmapAugType, Result, ShardIdent, UInt256, UnixTime};
 use std::{
@@ -376,85 +376,333 @@ fn namespace_role(
     }
 }
 
-/// The dry cleanup attempt of one retired authenticated namespace. The
-/// caller holds its storage cleanup reservation (moved in, dropped at the
-/// end) and its Cleanup admission. Re-authenticates the namespace from the
-/// identity its record carries, scans it under the reservation (accepting a
-/// complete empty namespace as a locked zero-item scan), reconciles every
-/// item with the node, and asks the publication owner to judge the node-side
-/// projection. Changes nothing durable; a refusal is a veto, not an error.
-pub(crate) async fn prepare_v2_cleanup(
+/// What a cleanup attempt of an authenticated namespace holds: the storage
+/// cleanup reservation of its database and its exclusive Cleanup admission.
+pub struct CleanupHeld {
+    pub storage: consensus_common::StorageCleanupReservation,
+    pub admission: crate::validator::finality_recovery_owner::RecoveryReservation,
+}
+
+impl CleanupHeld {
+    /// Releases both; the admission is never released implicitly.
+    pub(crate) fn release(self) {
+        let Self { storage, admission } = self;
+        admission.release();
+        drop(storage);
+    }
+}
+
+/// Outcome of one journaled attempt of an authenticated namespace.
+pub enum V2Outcome {
+    /// Refused before anything was journaled; what it held is released.
+    Kept(String),
+    /// Journaled, then stopped short: the holder keeps the namespace and
+    /// retries later.
+    Retained { reason: String, held: CleanupHeld },
+    /// The namespace is gone and every node obligation released: erase the
+    /// record, keeping `held` until the erase is acknowledged.
+    Gone { held: CleanupHeld },
+    /// A journal write's outcome is unknown: `intended` must be confirmed by
+    /// a successful synced re-write before anything else happens.
+    Uncertain { intended: PendingValidatorCleanup, reason: String, held: CleanupHeld },
+}
+
+/// Deletes a retired authenticated namespace directory: `v2/` plus one plain
+/// component, whose parent must canonically be `consensus/v2`. True only
+/// when it is confirmed absent.
+pub(crate) fn delete_authenticated_namespace(
+    db_root: &str,
+    record: &PendingValidatorCleanup,
+) -> Result<bool> {
+    let Some((namespace, _)) = namespace_storage_any(db_root, record) else {
+        return Ok(false);
+    };
+    if !v1_only_custody_veto(record) {
+        return Ok(false);
+    }
+    if !removable_under(&namespace, &consensus_root(db_root).join("v2"))? {
+        return Ok(false);
+    }
+    remove_if_directory(&namespace)?;
+    Ok(confirmed_absent(&namespace))
+}
+
+/// Writes `record` synced, or reports the uncertain write.
+fn write_journal(engine: &Engine, record: &PendingValidatorCleanup) -> Result<()> {
+    use consensus_common::validator_cleanup::{encode_record, record_key};
+    engine.db().write_validator_state_batch_sync(
+        &[(record_key(&record.namespace), encode_record(record))],
+        &[],
+    )
+}
+
+/// The journaled cleanup attempt of one retired authenticated namespace,
+/// holding its storage reservation and Cleanup admission. From Pending it
+/// re-authenticates, scans under the reservation and reconciles, then the
+/// publication owner judges and journals B0 (Deleting) in one transition.
+/// From any journaled state (fresh or resumed after a restart) it continues:
+/// B1 removes the directory, B1′ journals Deleted, B2 removes the node's
+/// closes together with journaling Releasing, B3 releases each lease. A
+/// resumed Deleting or Deleted first re-authenticates and re-verifies
+/// physical custody of every journaled association.
+pub(crate) async fn execute_v2_cleanup(
     engine: Arc<Engine>,
     record: PendingValidatorCleanup,
-    storage: consensus_common::StorageCleanupReservation,
-) -> Result<CleanupVerdict> {
-    use crate::publication_worker::cleanup_projection::{
-        copy_inventory, CleanupDecision, ExpectedIdentity, NamespaceSelection, ProjectionBudget,
+    held: CleanupHeld,
+) -> Result<V2Outcome> {
+    use crate::publication_worker::{
+        cleanup_projection::{
+            copy_inventory, ExpectedIdentity, NamespaceSelection, ProjectionBudget,
+        },
+        cleanup_steps::{CleanupStep, CleanupStepOutcome},
     };
+    use consensus_common::validator_cleanup::{CleanupJournal, JournalPayload};
     use simplex::finality_delivery::source_retirement::{
         scan_source_retirement_with, EmptyInventoryPolicy, Quiescence,
     };
+    let retained = |reason: String, held: CleanupHeld| Ok(V2Outcome::Retained { reason, held });
     let role = namespace_role(&record)?;
-    let runtime = match tokio::time::timeout(
-        CLEANUP_AUTH_TIMEOUT,
-        crate::validator::retired_session_auth::authenticate_cleanup_identity(
-            engine.as_ref(),
-            &record,
-        ),
-    )
-    .await
-    {
-        Ok(Ok(runtime)) => runtime,
-        Ok(Err(error)) => return Ok(CleanupVerdict::Veto(format!("re-authentication: {error}"))),
-        Err(_) => return Ok(CleanupVerdict::Veto("re-authentication timed out".into())),
-    };
-    let namespace = consensus_root(engine.db_root_dir()?).join(&record.namespace);
-    let scan_runtime = runtime.clone();
-    let (scanned, storage) = tokio::task::spawn_blocking(move || {
-        let scanned = scan_source_retirement_with(
-            scan_runtime,
-            &namespace,
-            Quiescence::Reserved(&storage),
-            EmptyInventoryPolicy::Accept,
-            &crate::validator::validator_group::RetirementBudget,
-        );
-        (scanned, storage)
-    })
-    .await
-    .map_err(|e| error!("Cleanup scan join: {e}"))?;
-    let scan = match scanned {
-        Ok(scan) => scan,
-        Err(refusal) => return Ok(CleanupVerdict::Veto(format!("source scan: {refusal}"))),
+    let identity_record = record.clone();
+    let authenticate = || async {
+        match tokio::time::timeout(
+            CLEANUP_AUTH_TIMEOUT,
+            crate::validator::retired_session_auth::authenticate_cleanup_identity(
+                engine.as_ref(),
+                &identity_record,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(runtime)) => Ok(runtime),
+            Ok(Err(error)) => Err(format!("re-authentication: {error}")),
+            Err(_) => Err("re-authentication timed out".to_string()),
+        }
     };
     let worker = engine.ensure_publication_worker().await?;
-    let sink = worker.sink(runtime.clone());
-    let preparation = match scan
-        .reconcile(sink.as_ref(), &crate::validator::validator_group::RetirementBudget)
+    let mut record = record;
+    let mut held = held;
+    let mut resumed = record.journal != CleanupJournal::Pending;
+    if record.journal == CleanupJournal::Pending {
+        let runtime = match authenticate().await {
+            Ok(runtime) => runtime,
+            Err(reason) => {
+                held.release();
+                return Ok(V2Outcome::Kept(reason));
+            }
+        };
+        let namespace = consensus_root(engine.db_root_dir()?).join(&record.namespace);
+        let scan_runtime = runtime.clone();
+        let CleanupHeld { storage, admission } = held;
+        let (scanned, storage) = tokio::task::spawn_blocking(move || {
+            let scanned = scan_source_retirement_with(
+                scan_runtime,
+                &namespace,
+                Quiescence::Reserved(&storage),
+                EmptyInventoryPolicy::Accept,
+                &crate::validator::validator_group::RetirementBudget,
+            );
+            (scanned, storage)
+        })
         .await
-    {
-        Ok(preparation) => preparation,
-        Err(failure) => return Ok(CleanupVerdict::Veto(format!("reconcile: {}", failure.refusal))),
-    };
-    // The inventory copy is charged before it is made; the remaining budget
-    // travels with the request.
-    let mut budget = ProjectionBudget::default();
-    let inventory = match copy_inventory(preparation.inventory(), &mut budget) {
-        Ok(inventory) => inventory,
-        Err(error) => return Ok(CleanupVerdict::Veto(format!("projection: {error}"))),
-    };
-    let decision = worker
-        .project_cleanup(
-            NamespaceSelection { session: record.session_id.clone(), role },
-            ExpectedIdentity::of(&runtime)?,
-            inventory,
-            budget,
-        )
-        .await?;
-    // The scan's locks and the reservation span the whole decision.
-    drop(preparation);
-    drop(storage);
-    Ok(match decision {
-        CleanupDecision::WouldDelete { closes } => CleanupVerdict::WouldDelete { closes },
-        CleanupDecision::Veto(reason) => CleanupVerdict::Veto(reason),
-    })
+        .map_err(|e| error!("Cleanup scan join: {e}"))?;
+        held = CleanupHeld { storage, admission };
+        let scan = match scanned {
+            Ok(scan) => scan,
+            Err(refusal) => {
+                held.release();
+                return Ok(V2Outcome::Kept(format!("source scan: {refusal}")));
+            }
+        };
+        let sink = worker.sink(runtime.clone());
+        let preparation = match scan
+            .reconcile(sink.as_ref(), &crate::validator::validator_group::RetirementBudget)
+            .await
+        {
+            Ok(preparation) => preparation,
+            Err(failure) => {
+                held.release();
+                return Ok(V2Outcome::Kept(format!("reconcile: {}", failure.refusal)));
+            }
+        };
+        let mut budget = ProjectionBudget::default();
+        let inventory = match copy_inventory(preparation.inventory(), &mut budget) {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                held.release();
+                return Ok(V2Outcome::Kept(format!("projection: {error}")));
+            }
+        };
+        let intended = PendingValidatorCleanup {
+            journal: CleanupJournal::Deleting(JournalPayload {
+                attempt: 0,
+                generation: 0,
+                manifest_digest: preparation.manifest_digest().clone(),
+                inventory_digest: preparation.inventory_digest().clone(),
+                associations: Vec::new(),
+            }),
+            ..record.clone()
+        };
+        let outcome = worker
+            .cleanup_step(CleanupStep::Commit {
+                selection: NamespaceSelection { session: record.session_id.clone(), role },
+                expected: ExpectedIdentity::of(&runtime)?,
+                inventory,
+                budget,
+                intended,
+            })
+            .await;
+        // The scan's locks span the whole decision.
+        drop(preparation);
+        match outcome {
+            Ok(CleanupStepOutcome::Committed(committed)) => record = committed,
+            Ok(CleanupStepOutcome::Uncertain(intended, reason)) => {
+                return Ok(V2Outcome::Uncertain { intended, reason, held })
+            }
+            Ok(CleanupStepOutcome::Vetoed(reason)) => {
+                held.release();
+                return Ok(V2Outcome::Kept(reason));
+            }
+            Ok(other) => {
+                held.release();
+                return Ok(V2Outcome::Kept(format!("unexpected B0 outcome {other:?}")));
+            }
+            Err(error) => {
+                held.release();
+                return Ok(V2Outcome::Kept(format!("B0: {error}")));
+            }
+        }
+        resumed = false;
+    }
+    loop {
+        let Some(payload) = record.journal.payload().cloned() else {
+            return retained("journal lost its payload".into(), held);
+        };
+        // A resumed journal re-establishes the runtime and physical custody
+        // of every association before removing anything further.
+        if resumed
+            && matches!(record.journal, CleanupJournal::Deleting(_) | CleanupJournal::Deleted(_))
+        {
+            let runtime = match authenticate().await {
+                Ok(runtime) => runtime,
+                Err(reason) => return retained(reason, held),
+            };
+            let expected = ExpectedIdentity::of(&runtime)?;
+            let leases = engine.db().repair_leases().clone();
+            for association in &payload.associations {
+                let binding = match leases.binding_for(
+                    association.lease_generation,
+                    &association.binding_digest,
+                    &association.dependency_digest,
+                ) {
+                    Ok(Some(binding)) => binding,
+                    Ok(None) => {
+                        return retained(
+                            format!("lease {} no longer matches", association.lease_generation),
+                            held,
+                        )
+                    }
+                    Err(error) => return retained(format!("lease ledger: {error}"), held),
+                };
+                if let Err(error) = crate::publication_repair::reopen_durable_mc_custody(
+                    engine.clone(),
+                    association.lease_generation,
+                    binding,
+                    association.dependency_digest.clone(),
+                )
+                .await
+                {
+                    return retained(format!("custody: {error}"), held);
+                }
+            }
+            match worker
+                .cleanup_step(CleanupStep::Verify {
+                    expected,
+                    associations: payload.associations.clone(),
+                })
+                .await
+            {
+                Ok(CleanupStepOutcome::Verified) => {}
+                Ok(CleanupStepOutcome::Vetoed(reason)) => return retained(reason, held),
+                Ok(other) => return retained(format!("unexpected verify outcome {other:?}"), held),
+                Err(error) => return retained(format!("verify: {error}"), held),
+            }
+            resumed = false;
+        }
+        match &record.journal {
+            CleanupJournal::Pending => return retained("journal regressed".into(), held),
+            CleanupJournal::Deleting(_) => {
+                let root = engine.db_root_dir()?.to_owned();
+                let target = record.clone();
+                let gone = tokio::task::spawn_blocking(move || {
+                    delete_authenticated_namespace(&root, &target)
+                })
+                .await
+                .map_err(|e| error!("Cleanup delete join: {e}"))?;
+                match gone {
+                    Ok(true) => {}
+                    Ok(false) => return retained("namespace not confirmed gone".into(), held),
+                    Err(error) => return retained(format!("namespace delete: {error}"), held),
+                }
+                let next = PendingValidatorCleanup {
+                    journal: CleanupJournal::Deleted(payload.clone()),
+                    ..record.clone()
+                };
+                if let Err(error) = write_journal(&engine, &next) {
+                    return Ok(V2Outcome::Uncertain {
+                        intended: next,
+                        reason: error.to_string(),
+                        held,
+                    });
+                }
+                record = next;
+            }
+            CleanupJournal::Deleted(_) => {
+                let next = PendingValidatorCleanup {
+                    journal: CleanupJournal::Releasing(payload.clone()),
+                    ..record.clone()
+                };
+                match worker
+                    .cleanup_step(CleanupStep::ReleaseCloses { intended: next.clone() })
+                    .await
+                {
+                    Ok(CleanupStepOutcome::ClosesReleased) => record = next,
+                    Ok(CleanupStepOutcome::Uncertain(intended, reason)) => {
+                        return Ok(V2Outcome::Uncertain { intended, reason, held })
+                    }
+                    Ok(CleanupStepOutcome::Vetoed(reason)) => return retained(reason, held),
+                    Ok(other) => return retained(format!("unexpected B2 outcome {other:?}"), held),
+                    Err(error) => return retained(format!("B2: {error}"), held),
+                }
+            }
+            CleanupJournal::Releasing(_) => {
+                use crate::publication_dependency_leases::LeaseRelease;
+                for association in &payload.associations {
+                    match worker
+                        .cleanup_step(CleanupStep::ReleaseLease {
+                            association: association.clone(),
+                        })
+                        .await
+                    {
+                        Ok(CleanupStepOutcome::Lease(
+                            LeaseRelease::Released | LeaseRelease::AbsentAlreadyReleased,
+                        )) => {}
+                        Ok(CleanupStepOutcome::Lease(LeaseRelease::Busy)) => {
+                            return retained("lease release busy".into(), held)
+                        }
+                        Ok(other) => {
+                            return retained(format!("lease release refused: {other:?}"), held)
+                        }
+                        // A poisoned ledger needs a reopen; keep everything.
+                        Err(error) => {
+                            return retained(
+                                format!("lease release, reopen required: {error}"),
+                                held,
+                            )
+                        }
+                    }
+                }
+                return Ok(V2Outcome::Gone { held });
+            }
+        }
+    }
 }

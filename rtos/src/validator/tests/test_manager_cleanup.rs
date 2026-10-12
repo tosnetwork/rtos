@@ -30,6 +30,14 @@ enum DeleteBehaviour {
     Held(Arc<Mutex<std::sync::mpsc::Receiver<()>>>),
 }
 
+/// What the fake journaled attempt returns; it defaults to Kept.
+#[derive(Clone)]
+enum V2Script {
+    Retained,
+    Gone,
+    Uncertain(PendingValidatorCleanup),
+}
+
 struct CleanupEngine {
     root: tempfile::TempDir,
     root_str: String,
@@ -42,7 +50,11 @@ struct CleanupEngine {
     claim_erase_failures: AtomicUsize,
     admitted: Mutex<HashSet<UInt256>>,
     registry: Arc<crate::validator::finality_recovery_owner::RecoveryRegistry>,
-    v2_verdict: Mutex<Option<consensus_common::validator_cleanup::CleanupVerdict>>,
+    v2_script: Mutex<std::collections::VecDeque<V2Script>>,
+    v2_seen: Mutex<Vec<PendingValidatorCleanup>>,
+    rewrites: Mutex<Vec<PendingValidatorCleanup>>,
+    rewrite_failures: AtomicUsize,
+    erase_applied_failures: AtomicUsize,
     v2_attempts: AtomicUsize,
     page_reads: AtomicUsize,
     stop: AtomicBool,
@@ -64,11 +76,18 @@ impl CleanupEngine {
             claim_erase_failures: AtomicUsize::new(0),
             admitted: Mutex::new(HashSet::new()),
             registry: Default::default(),
-            v2_verdict: Mutex::new(None),
+            v2_script: Mutex::new(Default::default()),
+            v2_seen: Mutex::new(Vec::new()),
+            rewrites: Mutex::new(Vec::new()),
+            rewrite_failures: AtomicUsize::new(0),
+            erase_applied_failures: AtomicUsize::new(0),
             v2_attempts: AtomicUsize::new(0),
             page_reads: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
         })
+    }
+    fn script(&self, steps: &[V2Script]) {
+        self.v2_script.lock().unwrap().extend(steps.iter().cloned());
     }
     fn put(&self, record: &PendingValidatorCleanup) {
         self.records.lock().unwrap().insert(record_key(&record.namespace), record.clone());
@@ -173,6 +192,13 @@ impl EngineOperations for CleanupEngine {
         if let Some(session) = claim {
             self.claims.lock().unwrap().insert(session.clone(), namespace.to_owned());
         }
+        if self
+            .erase_applied_failures
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            fail!("injected erase sync failure after applying");
+        }
         Ok(())
     }
     fn session_has_other_cleanup_records(
@@ -229,23 +255,43 @@ impl EngineOperations for CleanupEngine {
     ) -> Result<Option<crate::validator::finality_recovery_owner::RecoveryReservation>> {
         self.registry.reserve_cleanup(session, layout)
     }
-    async fn prepare_v2_cleanup(
+    async fn execute_v2_cleanup(
         self: Arc<Self>,
         record: PendingValidatorCleanup,
-        storage: consensus_common::StorageCleanupReservation,
-    ) -> Result<consensus_common::validator_cleanup::CleanupVerdict> {
+        held: crate::validator::validator_cleanup_gc::CleanupHeld,
+    ) -> Result<crate::validator::validator_cleanup_gc::V2Outcome> {
+        use crate::validator::validator_cleanup_gc::V2Outcome;
         self.v2_attempts.fetch_add(1, Ordering::Relaxed);
         // The attempt holds the namespace's storage reservation and admission.
-        let parsed = consensus_common::validator_cleanup::parse_canonical_namespace_name(
-            &record.namespace,
-            &record.session_id,
-        )
-        .unwrap();
-        assert!(self.registry.reserve_cleanup(&record.session_id, &parsed.layout)?.is_none());
-        assert!(storage.key().ends_with(record.session_id.to_hex_string()));
-        Ok(self.v2_verdict.lock().unwrap().clone().unwrap_or(
-            consensus_common::validator_cleanup::CleanupVerdict::WouldDelete { closes: 0 },
-        ))
+        assert!(self
+            .registry
+            .reserve_cleanup(&record.session_id, &NamespaceLayout::V2Validator)?
+            .is_none());
+        assert!(held.storage.key().ends_with(record.session_id.to_hex_string()));
+        self.v2_seen.lock().unwrap().push(record);
+        let reason = "scripted".to_string();
+        let step = self.v2_script.lock().unwrap().pop_front();
+        Ok(match step {
+            None => {
+                held.release();
+                V2Outcome::Kept(reason)
+            }
+            Some(V2Script::Retained) => V2Outcome::Retained { reason, held },
+            Some(V2Script::Gone) => V2Outcome::Gone { held },
+            Some(V2Script::Uncertain(intended)) => V2Outcome::Uncertain { intended, reason, held },
+        })
+    }
+    fn rewrite_validator_cleanup_record(&self, record: &PendingValidatorCleanup) -> Result<()> {
+        if self
+            .rewrite_failures
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            fail!("injected re-write failure");
+        }
+        self.put(record);
+        self.rewrites.lock().unwrap().push(record.clone());
+        Ok(())
     }
     fn admit_candidate_table(&self, session: &UInt256) -> Result<()> {
         self.admitted.lock().unwrap().insert(session.clone());
@@ -792,47 +838,238 @@ fn v2_record(byte: u8, identity: bool) -> PendingValidatorCleanup {
         .unwrap()
 }
 
+fn with_journal(
+    record: &PendingValidatorCleanup,
+    journal: consensus_common::validator_cleanup::CleanupJournal,
+) -> PendingValidatorCleanup {
+    PendingValidatorCleanup { journal, ..record.clone() }
+}
+
+fn payload(byte: u8) -> consensus_common::validator_cleanup::JournalPayload {
+    consensus_common::validator_cleanup::JournalPayload {
+        attempt: 0,
+        generation: 0,
+        manifest_digest: UInt256::from([byte; 32]),
+        inventory_digest: UInt256::from([byte.wrapping_add(1); 32]),
+        associations: Vec::new(),
+    }
+}
+
+/// Whether the namespace's storage reservation and Cleanup admission are
+/// each still held by someone (each probe is released at once).
+fn v2_held(engine: &CleanupEngine, record: &PendingValidatorCleanup) -> (bool, bool) {
+    let storage = consensus_common::reserve_storage_cleanup(
+        &engine.namespace_dir(record),
+        &record.session_id.to_hex_string(),
+    )
+    .unwrap();
+    let admission =
+        engine.registry.reserve_cleanup(&record.session_id, &NamespaceLayout::V2Validator).unwrap();
+    let held = (storage.is_none(), admission.is_none());
+    if let Some(admission) = admission {
+        admission.release();
+    }
+    drop(storage);
+    held
+}
+
+fn v2_prepare(engine: &CleanupEngine, record: &PendingValidatorCleanup) {
+    engine.put(record);
+    std::fs::create_dir_all(engine.namespace_dir(record).join(record.session_id.to_hex_string()))
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_cleanup_runs_a_dry_attempt_under_storage_and_admission_then_keeps_everything() {
-    use consensus_common::validator_cleanup::CleanupVerdict;
+async fn test_v2_kept_attempt_releases_everything_and_keeps_the_record() {
     let engine = CleanupEngine::new();
     set_floor(&engine);
     let record = v2_record(1, true);
     let without_identity = v2_record(2, false);
-    engine.put(&record);
+    v2_prepare(&engine, &record);
     engine.put(&without_identity);
-    let namespace = engine.namespace_dir(&record);
-    std::fs::create_dir_all(namespace.join(record.session_id.to_hex_string())).unwrap();
     let mut manager = manager(engine.clone());
     manager.run_cleanup_tick().await;
     manager.drain_cleanup_workers().await;
     assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 1, "only the record with an identity");
+    assert_eq!(engine.v2_seen.lock().unwrap()[0], record);
     assert_eq!(
-        manager.cleanup_v2_verdicts.get(&record.namespace),
-        Some(&CleanupVerdict::WouldDelete { closes: 0 })
+        manager.cleanup_v2_verdicts.get(&record.namespace).map(String::as_str),
+        Some("kept: scripted")
     );
-    // A dry run deletes nothing and releases everything it held.
     assert!(engine.has_record(&record) && engine.has_record(&without_identity));
-    assert!(namespace.exists());
+    assert!(engine.namespace_dir(&record).exists());
     assert!(!manager.cleanup.is_delete_in_flight(&record.session_id));
-    assert!(consensus_common::reserve_storage_cleanup(
-        &namespace,
-        &record.session_id.to_hex_string()
-    )
-    .unwrap()
-    .is_some());
-    let admission =
-        engine.registry.reserve_cleanup(&record.session_id, &NamespaceLayout::V2Validator);
-    admission.unwrap().expect("the attempt released its admission").release();
+    assert!(manager.cleanup_v2_parked.is_empty());
+    assert_eq!(v2_held(&engine, &record), (false, false), "a kept attempt releases both");
     // A namespace held by a session is never attempted.
     let live = engine
         .registry
         .reserve_cleanup(&record.session_id, &NamespaceLayout::V2Validator)
         .unwrap()
         .unwrap();
-    *engine.v2_verdict.lock().unwrap() = Some(CleanupVerdict::Veto("never asked".into()));
     manager.run_cleanup_tick().await;
     manager.drain_cleanup_workers().await;
     assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 1, "an occupied admission refuses");
     live.release();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_retained_attempt_keeps_its_reservations_and_resumes_from_the_durable_journal() {
+    use consensus_common::validator_cleanup::CleanupJournal;
+    let engine = CleanupEngine::new();
+    set_floor(&engine);
+    let record = v2_record(1, true);
+    v2_prepare(&engine, &record);
+    engine.script(&[V2Script::Retained, V2Script::Retained, V2Script::Gone]);
+    let mut manager = manager(engine.clone());
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    assert_eq!(
+        manager.cleanup_v2_verdicts.get(&record.namespace).map(String::as_str),
+        Some("retained: scripted")
+    );
+    assert!(manager.cleanup_v2_parked.contains_key(&record.namespace));
+    assert!(manager.cleanup.is_delete_in_flight(&record.session_id));
+    assert_eq!(v2_held(&engine, &record), (true, true), "parked keeps both reservations");
+    // The attempt progressed durably; the resume continues from there.
+    let deleted = with_journal(&record, CleanupJournal::Deleted(payload(7)));
+    engine.put(&deleted);
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 2, "one resume per tick");
+    assert_eq!(engine.v2_seen.lock().unwrap()[1], deleted);
+    assert_eq!(v2_held(&engine, &record), (true, true));
+    // An absent durable record is never resumed from.
+    engine.records.lock().unwrap().remove(&record_key(&record.namespace));
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 2, "absent record: stays parked");
+    assert_eq!(v2_held(&engine, &record), (true, true));
+    let releasing = with_journal(&record, CleanupJournal::Releasing(payload(7)));
+    engine.put(&releasing);
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 3);
+    assert_eq!(engine.v2_seen.lock().unwrap()[2], releasing);
+    assert_eq!(
+        manager.cleanup_v2_verdicts.get(&record.namespace).map(String::as_str),
+        Some("gone")
+    );
+    assert!(!engine.has_record(&record), "gone: the record is erased");
+    assert!(engine.has_claim(&record.session_id), "the last holder wrote the claim");
+    assert!(manager.cleanup_v2_parked.is_empty() && manager.cleanup_v2_erasing.is_empty());
+    assert!(!manager.cleanup.is_delete_in_flight(&record.session_id));
+    assert_eq!(v2_held(&engine, &record), (false, false), "released after the erase ack");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_uncertain_write_is_confirmed_by_a_synced_rewrite_before_resuming() {
+    use consensus_common::validator_cleanup::CleanupJournal;
+    let engine = CleanupEngine::new();
+    set_floor(&engine);
+    let record = v2_record(1, true);
+    let deleting = with_journal(&record, CleanupJournal::Deleting(payload(7)));
+    let deleted = with_journal(&record, CleanupJournal::Deleted(payload(7)));
+    v2_prepare(&engine, &deleting);
+    engine.script(&[V2Script::Uncertain(deleted.clone()), V2Script::Retained]);
+    let mut manager = manager(engine.clone());
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    assert!(matches!(
+        manager.cleanup_v2_parked.get(&record.namespace),
+        Some(V2Parked::Uncertain { .. })
+    ));
+    assert_eq!(v2_held(&engine, &record), (true, true));
+    // Neither the intended nor the previous state: never decided from it.
+    let other = with_journal(&record, CleanupJournal::Releasing(payload(7)));
+    engine.put(&other);
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 1);
+    assert!(engine.rewrites.lock().unwrap().is_empty());
+    assert_eq!(
+        manager.cleanup_v2_verdicts.get(&record.namespace).map(String::as_str),
+        Some("uncertain: unexpected durable state")
+    );
+    // The previous state, but its re-write fails: still parked.
+    engine.put(&deleting);
+    engine.rewrite_failures.store(1, Ordering::Relaxed);
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 1);
+    assert!(matches!(
+        manager.cleanup_v2_parked.get(&record.namespace),
+        Some(V2Parked::Uncertain { .. })
+    ));
+    assert_eq!(v2_held(&engine, &record), (true, true));
+    // Confirmed by a successful re-write, then resumed from exactly it.
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    assert_eq!(*engine.rewrites.lock().unwrap(), vec![deleting.clone()]);
+    assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 2);
+    assert_eq!(engine.v2_seen.lock().unwrap()[1], deleting);
+    assert!(matches!(
+        manager.cleanup_v2_parked.get(&record.namespace),
+        Some(V2Parked::Retained { .. })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_uncertain_write_that_applied_resumes_from_the_intended_state() {
+    use consensus_common::validator_cleanup::CleanupJournal;
+    let engine = CleanupEngine::new();
+    set_floor(&engine);
+    let record = v2_record(1, true);
+    let deleted = with_journal(&record, CleanupJournal::Deleted(payload(7)));
+    let releasing = with_journal(&record, CleanupJournal::Releasing(payload(7)));
+    v2_prepare(&engine, &deleted);
+    engine.script(&[V2Script::Uncertain(releasing.clone()), V2Script::Retained]);
+    let mut manager = manager(engine.clone());
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    // The write did apply.
+    engine.put(&releasing);
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    assert_eq!(*engine.rewrites.lock().unwrap(), vec![releasing.clone()]);
+    assert_eq!(engine.v2_seen.lock().unwrap()[1], releasing);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_gone_erase_is_one_batch_decided_once_and_holds_until_acknowledged() {
+    let engine = CleanupEngine::new();
+    set_floor(&engine);
+    let record = v2_record(1, true);
+    v2_prepare(&engine, &record);
+    engine.script(&[V2Script::Gone]);
+    // The erase applies but its sync reports an error.
+    engine.erase_applied_failures.store(1, Ordering::Relaxed);
+    let mut manager = manager(engine.clone());
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    assert!(!engine.has_record(&record) && engine.has_claim(&record.session_id));
+    assert_eq!(
+        manager.cleanup_erase_claims.get(&record.namespace),
+        Some(&Some(record.session_id.clone()))
+    );
+    assert_eq!(v2_held(&engine, &record), (true, true), "an unacknowledged erase keeps both");
+    assert!(manager.cleanup.is_delete_in_flight(&record.session_id));
+    // Another holder of the session appears: the retry still re-writes the
+    // decided batch, so an applied claim is never withdrawn; the claim
+    // executor supersedes it by its own check.
+    let other = make_record(
+        &record.session_id,
+        &NamespaceLayout::V1,
+        &ShardIdent::masterchain(),
+        5,
+        &mc_id(40, 4),
+    )
+    .unwrap();
+    engine.put(&other);
+    engine.claims.lock().unwrap().clear();
+    manager.retry_cleanup_erases();
+    assert!(engine.has_claim(&record.session_id), "the retry wrote the decided claim");
+    assert!(manager.cleanup_erase_claims.is_empty() && manager.cleanup_v2_erasing.is_empty());
+    assert_eq!(v2_held(&engine, &record), (false, false), "released on the ack");
+    assert!(!manager.cleanup.is_delete_in_flight(&record.session_id));
 }

@@ -118,6 +118,8 @@ pub struct PendingValidatorCleanup {
     pub retirement_checkpoint: BlockIdExt,
     pub namespace: String,
     pub identity: Option<CleanupIdentity>,
+    /// The deletion journal; always Pending for a V1 namespace.
+    pub journal: CleanupJournal,
 }
 
 /// What a cold cleanup needs to re-authenticate an authenticated namespace:
@@ -129,7 +131,7 @@ pub struct CleanupIdentity {
     pub local_adnl: UInt256,
 }
 
-const RECORD_VERSION: u8 = 2;
+const RECORD_VERSION: u8 = 3;
 const BLOCK_ID_BYTES: usize = 4 + 8 + 4 + 32 + 32;
 // version(1) + session(32) + checkpoint + namespace length(2)
 const FIXED_PREFIX: usize = 1 + 32 + BLOCK_ID_BYTES + 2;
@@ -139,16 +141,69 @@ const MAX_NAMESPACE_BYTES: usize = 512;
 #[cfg(test)]
 pub(crate) const FIXED_PREFIX_FOR_TEST: usize = FIXED_PREFIX;
 /// Upper bound for one encoded record.
-pub const MAX_RECORD_BYTES: usize = FIXED_PREFIX + MAX_NAMESPACE_BYTES + 1 + IDENTITY_BYTES;
+pub const MAX_RECORD_BYTES: usize = FIXED_PREFIX
+    + MAX_NAMESPACE_BYTES
+    + 1
+    + IDENTITY_BYTES
+    + 1
+    + JOURNAL_HEADER_BYTES
+    + MAX_JOURNAL_ASSOCIATIONS * ASSOCIATION_BYTES;
+/// Most associations one journal may carry.
+pub const MAX_JOURNAL_ASSOCIATIONS: usize = 1024;
+const ASSOCIATION_BYTES: usize = 32 + 8 + 8 + 32 + 32;
+// attempt, generation, manifest digest, inventory digest, association count.
+const JOURNAL_HEADER_BYTES: usize = 8 + 8 + 32 + 32 + 4;
 
-/// Outcome of a cold re-verification of an authenticated namespace.
+/// One node obligation bound at B0: the Released close of `delivery_id`
+/// (offer generation `close_generation`), its lease, and the digests of the
+/// lease's dependencies and of the full binding verified at B0.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CleanupVerdict {
-    /// Every node obligation is Released and exactly covered by the source.
-    WouldDelete {
-        closes: usize,
-    },
-    Veto(String),
+pub struct CleanupAssociation {
+    pub delivery_id: UInt256,
+    pub close_generation: u64,
+    pub lease_generation: u64,
+    pub dependency_digest: UInt256,
+    pub binding_digest: UInt256,
+}
+
+/// What a journaled deletion decided at B0; identical across its states.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalPayload {
+    pub attempt: u64,
+    pub generation: u64,
+    pub manifest_digest: UInt256,
+    pub inventory_digest: UInt256,
+    pub associations: Vec<CleanupAssociation>,
+}
+
+/// The deletion journal of an authenticated namespace, kept in its record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CleanupJournal {
+    /// Retired; nothing decided yet.
+    Pending,
+    /// B0: decided, the namespace may be removed.
+    Deleting(JournalPayload),
+    /// B1′: the namespace is confirmed gone.
+    Deleted(JournalPayload),
+    /// B2: the node's closes are removed; leases are being released.
+    Releasing(JournalPayload),
+}
+
+impl CleanupJournal {
+    fn tag(&self) -> u8 {
+        match self {
+            Self::Pending => 0,
+            Self::Deleting(_) => 1,
+            Self::Deleted(_) => 2,
+            Self::Releasing(_) => 3,
+        }
+    }
+    pub fn payload(&self) -> Option<&JournalPayload> {
+        match self {
+            Self::Pending => None,
+            Self::Deleting(p) | Self::Deleted(p) | Self::Releasing(p) => Some(p),
+        }
+    }
 }
 
 /// Key prefix for records. Each physical namespace has its own key (the
@@ -212,6 +267,7 @@ pub fn make_record(
         retirement_checkpoint: retirement_checkpoint.clone(),
         namespace,
         identity: None,
+        journal: CleanupJournal::Pending,
     })
 }
 
@@ -332,6 +388,23 @@ pub fn encode_record(record: &PendingValidatorCleanup) -> Vec<u8> {
             out.extend_from_slice(identity.local_adnl.as_slice());
         }
     }
+    out.push(record.journal.tag());
+    if let Some(payload) = record.journal.payload() {
+        out.extend_from_slice(&payload.attempt.to_le_bytes());
+        out.extend_from_slice(&payload.generation.to_le_bytes());
+        out.extend_from_slice(payload.manifest_digest.as_slice());
+        out.extend_from_slice(payload.inventory_digest.as_slice());
+        // Construction keeps the count within the cap.
+        let count = payload.associations.len().min(MAX_JOURNAL_ASSOCIATIONS);
+        out.extend_from_slice(&(count as u32).to_le_bytes());
+        for association in payload.associations.iter().take(count) {
+            out.extend_from_slice(association.delivery_id.as_slice());
+            out.extend_from_slice(&association.close_generation.to_le_bytes());
+            out.extend_from_slice(&association.lease_generation.to_le_bytes());
+            out.extend_from_slice(association.dependency_digest.as_slice());
+            out.extend_from_slice(association.binding_digest.as_slice());
+        }
+    }
     out
 }
 
@@ -389,7 +462,47 @@ pub fn decode_record(value: &[u8]) -> Option<PendingValidatorCleanup> {
         }
         _ => return None,
     };
+    let tag = reader.u8()?;
+    let journal = if tag == 0 {
+        CleanupJournal::Pending
+    } else {
+        let attempt = reader.u64()?;
+        let generation = reader.u64()?;
+        let manifest_digest = reader.hash()?;
+        let inventory_digest = reader.hash()?;
+        let count = usize::try_from(reader.u32()?).ok()?;
+        // Bound and exact length before any allocation.
+        if count > MAX_JOURNAL_ASSOCIATIONS
+            || value.len().checked_sub(reader.at)? != count.checked_mul(ASSOCIATION_BYTES)?
+        {
+            return None;
+        }
+        let mut associations = Vec::with_capacity(count);
+        for _ in 0..count {
+            associations.push(CleanupAssociation {
+                delivery_id: reader.hash()?,
+                close_generation: reader.u64()?,
+                lease_generation: reader.u64()?,
+                dependency_digest: reader.hash()?,
+                binding_digest: reader.hash()?,
+            });
+        }
+        let payload =
+            JournalPayload { attempt, generation, manifest_digest, inventory_digest, associations };
+        match tag {
+            1 => CleanupJournal::Deleting(payload),
+            2 => CleanupJournal::Deleted(payload),
+            3 => CleanupJournal::Releasing(payload),
+            _ => return None,
+        }
+    };
     if !reader.done() || !identity_fits(&parsed, identity.as_ref()) {
+        return None;
+    }
+    // Only an authenticated namespace with its identity carries a journal.
+    if journal != CleanupJournal::Pending
+        && (identity.is_none() || parsed.layout == NamespaceLayout::V1)
+    {
         return None;
     }
     Some(PendingValidatorCleanup {
@@ -397,6 +510,7 @@ pub fn decode_record(value: &[u8]) -> Option<PendingValidatorCleanup> {
         retirement_checkpoint: checkpoint,
         namespace,
         identity,
+        journal,
     })
 }
 

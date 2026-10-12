@@ -828,9 +828,38 @@ async fn validator_cleanup_real_engine_keeps_until_the_floor_passes_then_deletes
         assert!(!manager.delete_in_flight(&v1_session));
 
         // (f) Floor at F1: deleted through the real deleter, record erased,
-        // fence untouched, the authenticated record still kept.
+        // fence untouched. The authenticated namespace's first attempt is
+        // raced by an outbox write between its judgement and B0: vetoed,
+        // nothing journaled, everything it held released.
+        let worker = engine.ensure_publication_worker().await.unwrap();
+        worker.set_cleanup_commit_hook(Some(Arc::new(
+            |store: &crate::propagation_outbox::PropagationOutbox| {
+                store.bump_mutation_epoch_for_test()
+            },
+        )));
         pin_floor(engine, &f1).await;
         manager.tick().await;
+        worker.set_cleanup_commit_hook(None);
+        assert_eq!(
+            manager.v2_outcome(&v2_ns).as_deref(),
+            Some("kept: projection raced a mutation before B0")
+        );
+        assert!(v2_dir.is_dir(), "a vetoed B0 deletes nothing");
+        assert_eq!(
+            engine.load_validator_cleanup_record(&v2_ns).unwrap().unwrap().journal,
+            consensus_common::validator_cleanup::CleanupJournal::Pending,
+            "a vetoed B0 journals nothing"
+        );
+        assert!(!manager.delete_in_flight(&v2_session));
+        engine
+            .finality_recovery_registry()
+            .reserve_cleanup(
+                &v2_session,
+                &consensus_common::validator_cleanup::NamespaceLayout::V2Validator,
+            )
+            .unwrap()
+            .expect("the vetoed attempt released its admission")
+            .release_for_test();
         assert!(!namespace.exists(), "deleted after eligibility");
         assert!(engine.load_validator_cleanup_record(&v1.namespace).unwrap().is_none());
         // The session's last namespace wrote the durable claim; the shared
@@ -838,22 +867,40 @@ async fn validator_cleanup_real_engine_keeps_until_the_floor_passes_then_deletes
         assert!(candidates.exists(), "the candidate table waits for the claim");
         let claim_key = consensus_common::validator_cleanup::candidate_claim_key(&v1_session);
         assert!(engine.db().load_validator_state_key_bounded(&claim_key, 512).unwrap().is_some());
+        // The next attempt is raced by a lease-ledger write instead: vetoed
+        // the same way, while the V1 claim runs.
+        let leases = engine.db().repair_leases().clone();
+        worker.set_cleanup_commit_hook(Some(Arc::new(
+            move |_: &crate::propagation_outbox::PropagationOutbox| {
+                leases.bump_mutation_epoch_for_test()
+            },
+        )));
         manager.tick().await;
+        worker.set_cleanup_commit_hook(None);
+        assert_eq!(
+            manager.v2_outcome(&v2_ns).as_deref(),
+            Some("kept: projection raced a mutation before B0")
+        );
+        assert!(v2_dir.is_dir());
         assert!(!candidates.exists(), "the claim deleted the candidate table");
         assert!(engine.db().load_validator_state_key_bounded(&claim_key, 512).unwrap().is_none());
         assert!(engine.get_candidate_table(&v1_session).is_err(), "admission was revoked");
         assert!(!manager.delete_in_flight(&v1_session));
         let fence_now = engine.load_destroyed_session_ids().unwrap();
         assert!(fence_now.contains(&v1_session) && fence_now.contains(&v2_session));
-        assert!(engine.load_validator_cleanup_record(&v2_ns).unwrap().is_some());
-        // The v2 record became eligible at F1 and ran the real dry attempt:
-        // re-authenticated from history, scanned under its reservation as a
-        // locked empty scan, reconciled, and judged by the publication owner.
-        assert_eq!(
-            manager.v2_verdict(&v2_ns),
-            Some(consensus_common::validator_cleanup::CleanupVerdict::WouldDelete { closes: 0 })
-        );
-        assert!(v2_dir.is_dir(), "a dry decision deletes nothing");
+        manager.tick().await;
+        // Unraced, the authenticated namespace's next attempt runs the real
+        // journaled path: re-authenticated from history, scanned under its
+        // reservation as a locked empty scan, reconciled, judged and
+        // journaled by the publication owner, then deleted, released and
+        // erased with its session's claim.
+        assert_eq!(manager.v2_outcome(&v2_ns).as_deref(), Some("gone"));
+        assert!(!v2_dir.exists(), "the authenticated namespace is deleted");
+        assert!(engine.load_validator_cleanup_record(&v2_ns).unwrap().is_none());
+        let v2_claim = consensus_common::validator_cleanup::candidate_claim_key(&v2_session);
+        assert!(engine.db().load_validator_state_key_bounded(&v2_claim, 512).unwrap().is_some());
+        manager.tick().await;
+        assert!(engine.db().load_validator_state_key_bounded(&v2_claim, 512).unwrap().is_none());
         assert!(!manager.delete_in_flight(&v2_session));
         assert!(engine
             .finality_recovery_registry()

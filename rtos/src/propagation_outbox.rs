@@ -162,6 +162,10 @@ pub struct UnverifiedRecord {
 trait SnapshotStore: Send + Sync {
     fn load(&self, maximum: usize) -> Result<Option<Vec<u8>>>;
     fn replace_sync(&self, bytes: &[u8]) -> Result<()>;
+    /// The snapshot plus further keys of the same database, one synced batch.
+    fn replace_sync_with(&self, _bytes: &[u8], _extra: &[(String, Vec<u8>)]) -> Result<()> {
+        fail!("Snapshot store cannot write further keys atomically")
+    }
 }
 impl SnapshotStore for InternalDb {
     fn load(&self, maximum: usize) -> Result<Option<Vec<u8>>> {
@@ -169,6 +173,9 @@ impl SnapshotStore for InternalDb {
     }
     fn replace_sync(&self, bytes: &[u8]) -> Result<()> {
         self.save_validator_state_raw_sync(KEY, bytes)
+    }
+    fn replace_sync_with(&self, bytes: &[u8], extra: &[(String, Vec<u8>)]) -> Result<()> {
+        self.save_outbox_with_sync(bytes, extra)
     }
 }
 
@@ -433,6 +440,47 @@ impl PropagationOutbox {
         Ok(delivery_id)
     }
 
+    /// Runs `f` with the write epoch and the close history while holding the
+    /// writer lock, so no outbox write can interleave with what `f` does.
+    pub(crate) fn with_cleanup_lock<R>(
+        &self,
+        f: impl FnOnce(Option<u64>, &[ClosingRecord]) -> Result<R>,
+    ) -> Result<R> {
+        let state = self.lock()?;
+        f(state.mutation_epoch, &state.snapshot.closing)
+    }
+
+    /// Removes exactly the closes `associations` name, each still Released
+    /// and bound to the recorded lease, generations and binding digest, and
+    /// writes `extra` keys in the same synced batch. Refuses, changing
+    /// nothing, if any does not match.
+    pub(crate) fn remove_cleanup_closes(
+        &self,
+        associations: &[consensus_common::validator_cleanup::CleanupAssociation],
+        extra: &[(String, Vec<u8>)],
+    ) -> Result<std::result::Result<(), String>> {
+        let mut state = self.lock()?;
+        for association in associations {
+            let found = state
+                .snapshot
+                .closing
+                .iter()
+                .find(|close| close.binding.delivery_id == association.delivery_id);
+            let Some(close) = found else {
+                return Ok(Err(format!("close {:x} is missing", association.delivery_id)));
+            };
+            if let Some(reason) = closing::association_mismatch(close, association)? {
+                return Ok(Err(reason));
+            }
+        }
+        let mut next = state.snapshot.clone();
+        next.closing.retain(|close| {
+            !associations.iter().any(|a| a.delivery_id == close.binding.delivery_id)
+        });
+        self.commit_with(&mut state, next, extra)?;
+        Ok(Ok(()))
+    }
+
     /// The write epoch, read under the writer lock; None once exhausted.
     pub(crate) fn mutation_epoch(&self) -> Result<Option<u64>> {
         Ok(self.lock()?.mutation_epoch)
@@ -454,6 +502,14 @@ impl PropagationOutbox {
             budget,
         )?;
         Ok((selection, state.mutation_epoch))
+    }
+
+    /// Advances the write epoch as any committed write would.
+    #[cfg(test)]
+    pub(crate) fn bump_mutation_epoch_for_test(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.mutation_epoch = state.mutation_epoch.and_then(|epoch| epoch.checked_add(1));
+        }
     }
 
     #[cfg(test)]
@@ -563,9 +619,25 @@ impl PropagationOutbox {
     }
 
     fn commit(&self, state: &mut State, next: Snapshot) -> Result<()> {
+        self.commit_with(state, next, &[])
+    }
+
+    /// Commits the next snapshot, and `extra` keys of the same database in
+    /// the same synced batch.
+    fn commit_with(
+        &self,
+        state: &mut State,
+        next: Snapshot,
+        extra: &[(String, Vec<u8>)],
+    ) -> Result<()> {
         state.mutation_epoch = state.mutation_epoch.and_then(|epoch| epoch.checked_add(1));
         let bytes = encode_snapshot(&next, &self.domain, &self.limits)?;
-        if let Err(error) = self.store.replace_sync(&bytes) {
+        let written = if extra.is_empty() {
+            self.store.replace_sync(&bytes)
+        } else {
+            self.store.replace_sync_with(&bytes, extra)
+        };
+        if let Err(error) = written {
             // I/O errors can occur after a write became visible. Do not keep
             // mutating an in-memory snapshot that may no longer match the WAL.
             state.failed = Some(error.to_string());

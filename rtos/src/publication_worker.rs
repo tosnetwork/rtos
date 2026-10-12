@@ -2,6 +2,7 @@
 //! One bounded publication actor. Accepted blocking writes retain their real join
 //! independently of the caller's response future. Idle loops never own Engine.
 pub(crate) mod cleanup_projection;
+pub(crate) mod cleanup_steps;
 mod closing;
 mod history_debt;
 pub(crate) use history_debt::NodeHistoryDebt;
@@ -245,15 +246,10 @@ enum Submission {
         id: UInt256,
         response: oneshot::Sender<Result<AcceptedSessionBlock>>,
     },
-    /// Read-only cleanup judgement of one retired namespace; not a session
-    /// request, so it never counts itself as outstanding.
-    CleanupProjection {
-        selection: cleanup_projection::NamespaceSelection,
-        expected: cleanup_projection::ExpectedIdentity,
-        inventory: Vec<simplex::finality_delivery::source_retirement::RetirementItem>,
-        /// The attempt's remaining budget, after the inventory copy.
-        budget: cleanup_projection::ProjectionBudget,
-        response: oneshot::Sender<Result<cleanup_projection::CleanupDecision>>,
+    /// One journaled deletion step, run as one owner transition.
+    Cleanup {
+        step: cleanup_steps::CleanupStep,
+        response: oneshot::Sender<Result<cleanup_steps::CleanupStepOutcome>>,
     },
 }
 impl Submission {
@@ -285,8 +281,8 @@ impl Submission {
             Self::Query { response, .. } => {
                 let _ = response.send(Err(error!("Publication query shutdown")));
             }
-            Self::CleanupProjection { response, .. } => {
-                let _ = response.send(Err(error!("Publication cleanup projection shutdown")));
+            Self::Cleanup { response, .. } => {
+                let _ = response.send(Err(error!("Publication cleanup step shutdown")));
             }
         }
     }
@@ -316,7 +312,7 @@ impl Submission {
             Self::Legacy(request) => {
                 request.response.outstanding = Some(outstanding.begin(&request.record.session_id)?)
             }
-            Self::Query { .. } | Self::CleanupProjection { .. } => {}
+            Self::Query { .. } | Self::Cleanup { .. } => {}
         }
         Ok(())
     }
@@ -424,6 +420,9 @@ struct State {
     acceptance_retry: Mutex<std::collections::BTreeMap<u64, tokio::time::Instant>>,
     retry_after: Mutex<std::collections::BTreeMap<(u64, PublicationEffect), tokio::time::Instant>>,
     outstanding: Arc<OutstandingRequests>,
+    #[cfg(test)]
+    cleanup_commit_hook:
+        Mutex<Option<Arc<dyn Fn(&crate::propagation_outbox::PropagationOutbox) + Send + Sync>>>,
 }
 pub(crate) struct PublicationWorker {
     sender: Mutex<Option<mpsc::Sender<Submission>>>,
@@ -449,6 +448,8 @@ impl PublicationWorker {
             acceptance_retry: Mutex::new(Default::default()),
             retry_after: Mutex::new(Default::default()),
             outstanding: Default::default(),
+            #[cfg(test)]
+            cleanup_commit_hook: Mutex::new(None),
         });
         let tasks = Arc::new(OwnedTasks::default());
         let result = Arc::new(Self {
@@ -613,41 +614,36 @@ impl PublicationWorker {
         }
         result.await.map_err(|e| error!("Publication query owner: {e}"))?
     }
-    /// Judges one retired authenticated namespace in the owner's transition,
-    /// serialized with every other owner request. Read-only.
-    pub(crate) async fn project_cleanup(
+    #[cfg(test)]
+    pub(crate) fn outstanding_for_test(&self, session: &UInt256) -> usize {
+        self.state.outstanding.count(session)
+    }
+    /// Runs one journaled deletion step in the owner's transition.
+    pub(crate) async fn cleanup_step(
         &self,
-        selection: cleanup_projection::NamespaceSelection,
-        expected: cleanup_projection::ExpectedIdentity,
-        inventory: Vec<simplex::finality_delivery::source_retirement::RetirementItem>,
-        budget: cleanup_projection::ProjectionBudget,
-    ) -> Result<cleanup_projection::CleanupDecision> {
+        step: cleanup_steps::CleanupStep,
+    ) -> Result<cleanup_steps::CleanupStepOutcome> {
         let (response, result) = oneshot::channel();
         {
-            let sender = self
-                .sender
-                .lock()
-                .map_err(|_| error!("Publication projection admission poisoned"))?;
+            let sender =
+                self.sender.lock().map_err(|_| error!("Publication cleanup admission poisoned"))?;
             if self.state.stop.is_cancelled() || self.state.fatal.load(Ordering::Acquire) {
                 fail!("Publication owner stopped");
             }
             sender
                 .as_ref()
                 .ok_or_else(|| error!("Publication owner stopped"))?
-                .try_send(Submission::CleanupProjection {
-                    selection,
-                    expected,
-                    inventory,
-                    budget,
-                    response,
-                })
-                .map_err(|_| error!("Publication projection queue full"))?;
+                .try_send(Submission::Cleanup { step, response })
+                .map_err(|_| error!("Publication cleanup queue full"))?;
         }
-        result.await.map_err(|e| error!("Publication projection owner: {e}"))?
+        result.await.map_err(|e| error!("Publication cleanup owner: {e}"))?
     }
     #[cfg(test)]
-    pub(crate) fn outstanding_for_test(&self, session: &UInt256) -> usize {
-        self.state.outstanding.count(session)
+    pub(crate) fn set_cleanup_commit_hook(
+        &self,
+        hook: Option<Arc<dyn Fn(&crate::propagation_outbox::PropagationOutbox) + Send + Sync>>,
+    ) {
+        *self.state.cleanup_commit_hook.lock().unwrap() = hook;
     }
     pub(crate) fn stop(&self) {
         self.sender.lock().unwrap_or_else(|p| p.into_inner()).take();
@@ -835,27 +831,8 @@ impl State {
                 completion.finish(result);
                 self.wake.notify_one();
             }
-            Submission::CleanupProjection { selection, expected, inventory, budget, response } => {
-                // One owner transition, judged by the race-free protocol:
-                // quiescent before reading, both stores read with their epochs,
-                // and quiescent with unchanged epochs after judging.
-                let result = (|| {
-                    let engine =
-                        self.engine.upgrade().ok_or_else(|| error!("Engine unavailable"))?;
-                    let leases = engine.db().repair_leases().clone();
-                    let session = selection.session.clone();
-                    let sources = cleanup_projection::JudgeSources {
-                        outstanding: &|| self.outstanding.count(&session),
-                        read_outbox: &|budget| store.cleanup_view_for(&session, budget),
-                        read_leases: &|budget| leases.records_for(&session, budget),
-                        outbox_epoch: &|| store.mutation_epoch(),
-                        lease_epoch: &|| leases.mutation_epoch(),
-                    };
-                    Ok(cleanup_projection::judge_cleanup(
-                        &selection, &expected, &inventory, &sources, budget,
-                    ))
-                })();
-                let _ = response.send(result);
+            Submission::Cleanup { step, response } => {
+                let _ = response.send(self.cleanup_step(store, step));
             }
             Submission::Query { id, response } => {
                 // Caller cancellation only drops this response; acceptance and IO remain actor-owned.
@@ -1693,6 +1670,8 @@ mod tests {
             acceptance_retry: Mutex::new(Default::default()),
             retry_after: Mutex::new(Default::default()),
             outstanding: Default::default(),
+            #[cfg(test)]
+            cleanup_commit_hook: Mutex::new(None),
         })
     }
     fn scheduling_entry(id: u64, expires: u64) -> UnverifiedRecord {

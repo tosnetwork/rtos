@@ -85,7 +85,7 @@ fn validator_cleanup_record_round_trips_for_every_layout() {
             assert!(decode_record(&bytes[..length]).is_none(), "truncated to {length}");
         }
         let mut versioned = bytes.clone();
-        versioned[0] = 1;
+        versioned[0] = 2;
         assert!(decode_record(&versioned).is_none(), "the previous version is dropped");
         let mut tailed = bytes.clone();
         tailed.push(0);
@@ -125,7 +125,7 @@ fn validator_cleanup_wire_format_is_pinned() {
     let record = record(1, 100);
     let bytes = encode_record(&record);
     let name = format!("consensus.-1.8000000000000000.7.{}", session(1).to_hex_string());
-    assert_eq!(bytes[0], 2);
+    assert_eq!(bytes[0], 3);
     assert_eq!(&bytes[1..33], &[1u8; 32]);
     assert_eq!(&bytes[33..37], &(-1i32).to_le_bytes());
     assert_eq!(&bytes[37..45], &0x8000_0000_0000_0000u64.to_le_bytes());
@@ -134,7 +134,7 @@ fn validator_cleanup_wire_format_is_pinned() {
     assert_eq!(&bytes[81..113], &[0x22; 32]);
     assert_eq!(&bytes[113..115], &(name.len() as u16).to_le_bytes());
     assert_eq!(std::str::from_utf8(&bytes[115..115 + name.len()]).unwrap(), name);
-    assert_eq!(&bytes[115 + name.len()..], &[0u8], "no identity on a V1 record");
+    assert_eq!(&bytes[115 + name.len()..], &[0u8, 0u8], "no identity, a Pending journal");
     assert_eq!(
         record_key(&record.namespace),
         format!(
@@ -778,4 +778,76 @@ fn validator_cleanup_cap_counts_claims_and_namespaces_together() {
     assert_eq!(scan.manager.operation_count(), ValidatorCleanupManager::MAX_IN_FLIGHT);
     assert!(scan.manager.begin_tick().is_none(), "the combined cap skips the tick");
     assert!(scan.manager.begin_claim(&session(250)).is_none(), "and refuses another claim");
+}
+
+fn payload(associations: usize) -> JournalPayload {
+    JournalPayload {
+        attempt: 7,
+        generation: 3,
+        manifest_digest: UInt256::from([0x61; 32]),
+        inventory_digest: UInt256::from([0x62; 32]),
+        associations: (0..associations)
+            .map(|n| CleanupAssociation {
+                delivery_id: UInt256::from([n as u8; 32]),
+                close_generation: n as u64 + 1,
+                lease_generation: n as u64 + 100,
+                dependency_digest: UInt256::from([0x63; 32]),
+                binding_digest: UInt256::from([0x64; 32]),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn validator_cleanup_journal_round_trips_and_is_bounded() {
+    let layout = NamespaceLayout::V2Validator;
+    let base = make_record(&session(9), &layout, &masterchain(), 7, &checkpoint(100))
+        .unwrap()
+        .with_identity(identity_for(&layout))
+        .unwrap();
+    for journal in [
+        CleanupJournal::Pending,
+        CleanupJournal::Deleting(payload(0)),
+        CleanupJournal::Deleted(payload(3)),
+        CleanupJournal::Releasing(payload(MAX_JOURNAL_ASSOCIATIONS)),
+    ] {
+        let record = PendingValidatorCleanup { journal, ..base.clone() };
+        let bytes = encode_record(&record);
+        assert!(bytes.len() <= MAX_RECORD_BYTES);
+        assert_eq!(decode_record(&bytes), Some(record.clone()));
+        for length in [bytes.len() - 1, bytes.len() / 2] {
+            assert!(decode_record(&bytes[..length]).is_none(), "truncated to {length}");
+        }
+        let mut tailed = bytes.clone();
+        tailed.push(0);
+        assert!(decode_record(&tailed).is_none());
+    }
+    // An unknown state, an over-cap count and a count that disagrees with
+    // the length are rejected before allocating.
+    let record =
+        PendingValidatorCleanup { journal: CleanupJournal::Deleted(payload(2)), ..base.clone() };
+    let bytes = encode_record(&record);
+    let tag = bytes.len() - 2 * 112 - 84 - 1;
+    let mut unknown = bytes.clone();
+    unknown[tag] = 9;
+    assert!(decode_record(&unknown).is_none());
+    let count = tag + 1 + 80;
+    let mut over = bytes.clone();
+    over[count..count + 4].copy_from_slice(&(MAX_JOURNAL_ASSOCIATIONS as u32 + 1).to_le_bytes());
+    assert!(decode_record(&over).is_none());
+    let mut short = bytes;
+    short[count..count + 4].copy_from_slice(&3u32.to_le_bytes());
+    assert!(decode_record(&short).is_none());
+    // Only an authenticated namespace with its identity carries a journal.
+    let v1 = make_record(&session(9), &NamespaceLayout::V1, &masterchain(), 7, &checkpoint(100))
+        .unwrap();
+    let journaled_v1 =
+        PendingValidatorCleanup { journal: CleanupJournal::Deleting(payload(1)), ..v1 };
+    assert!(decode_record(&encode_record(&journaled_v1)).is_none());
+    let anonymous = PendingValidatorCleanup {
+        identity: None,
+        journal: CleanupJournal::Deleting(payload(1)),
+        ..base
+    };
+    assert!(decode_record(&encode_record(&anonymous)).is_none());
 }

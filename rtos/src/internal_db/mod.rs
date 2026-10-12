@@ -2106,6 +2106,26 @@ impl InternalDb {
         Ok(())
     }
 
+    /// The outbox snapshot and further validator-state keys in one synced
+    /// batch, observed like a plain outbox write.
+    pub fn save_outbox_with_sync(&self, data: &[u8], extra: &[(String, Vec<u8>)]) -> Result<()> {
+        #[cfg(test)]
+        let observer = self.outbox_sync_observer.lock().unwrap().clone();
+        #[cfg(test)]
+        if let Some(observer) = &observer {
+            observer(OutboxSyncBoundary::BeforeWrite, data)?;
+        }
+        let mut puts = Vec::with_capacity(extra.len().saturating_add(1));
+        puts.push(("PropagationOutboxV1".to_owned(), data.to_vec()));
+        puts.extend(extra.iter().cloned());
+        self.block_handle_storage.write_validator_state_batch_sync(&puts, &[])?;
+        #[cfg(test)]
+        if let Some(observer) = &observer {
+            observer(OutboxSyncBoundary::AfterSuccessfulSync, data)?;
+        }
+        Ok(())
+    }
+
     /// Atomically puts and deletes several (possibly dynamic) validator-state
     /// keys with one synced batch.
     pub fn write_validator_state_batch_sync(

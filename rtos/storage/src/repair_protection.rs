@@ -27,12 +27,6 @@ struct Protected {
     poisoned: bool,
 }
 
-fn add(count: &mut HashMap<BlockIdExt, u32>, id: &BlockIdExt) -> Option<()> {
-    let slot = count.entry(id.clone()).or_insert(0);
-    *slot = slot.checked_add(1)?;
-    Some(())
-}
-
 fn sub(count: &mut HashMap<BlockIdExt, u32>, id: &BlockIdExt) -> Option<()> {
     let slot = count.get_mut(id)?;
     *slot = slot.checked_sub(1)?;

@@ -649,7 +649,11 @@ impl EngineOperations for Engine {
         self.db().write_validator_state_batch_sync(&puts, &[record_key(namespace)])
     }
 
-    fn session_has_other_cleanup_records(&self, namespace: &str, session: &UInt256) -> Result<bool> {
+    fn session_has_other_cleanup_records(
+        &self,
+        namespace: &str,
+        session: &UInt256,
+    ) -> Result<bool> {
         crate::validator::validator_cleanup_gc::session_has_other_records(
             self.db(),
             namespace,
@@ -693,12 +697,23 @@ impl EngineOperations for Engine {
         self.finality_recovery_registry().reserve_cleanup(session, layout)
     }
 
-    async fn prepare_v2_cleanup(
+    async fn execute_v2_cleanup(
         self: Arc<Self>,
         record: consensus_common::validator_cleanup::PendingValidatorCleanup,
-        storage: consensus_common::StorageCleanupReservation,
-    ) -> Result<consensus_common::validator_cleanup::CleanupVerdict> {
-        crate::validator::validator_cleanup_gc::prepare_v2_cleanup(self, record, storage).await
+        held: crate::validator::validator_cleanup_gc::CleanupHeld,
+    ) -> Result<crate::validator::validator_cleanup_gc::V2Outcome> {
+        crate::validator::validator_cleanup_gc::execute_v2_cleanup(self, record, held).await
+    }
+
+    fn rewrite_validator_cleanup_record(
+        &self,
+        record: &consensus_common::validator_cleanup::PendingValidatorCleanup,
+    ) -> Result<()> {
+        use consensus_common::validator_cleanup::{encode_record, record_key};
+        self.db().write_validator_state_batch_sync(
+            &[(record_key(&record.namespace), encode_record(record))],
+            &[],
+        )
     }
 
     fn admit_candidate_table(&self, session: &UInt256) -> Result<()> {

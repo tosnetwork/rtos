@@ -32,6 +32,29 @@ pub(super) fn restore_legacy_request(
     Ok(expected)
 }
 
+/// Why a close no longer matches the association recorded at B0, if it
+/// does not: it must be Released, bound to the same lease and generations,
+/// and its full binding must hash to the recorded digest.
+pub(crate) fn association_mismatch(
+    close: &ClosingRecord,
+    association: &consensus_common::validator_cleanup::CleanupAssociation,
+) -> Result<Option<String>> {
+    let id = &association.delivery_id;
+    let reason = if !close.released {
+        Some(format!("close {id:x} is not Released"))
+    } else if close.lease_generation != association.lease_generation
+        || close.binding.close_generation != association.close_generation
+        || close.dependency_digest != association.dependency_digest
+    {
+        Some(format!("close {id:x} changed its lease or generation"))
+    } else if UInt256::calc_file_hash(&close.binding.encode()?) != association.binding_digest {
+        Some(format!("close {id:x} binding differs from the journal"))
+    } else {
+        None
+    };
+    Ok(reason)
+}
+
 impl ClosingRecord {
     pub(crate) fn offer(&self) -> consensus_common::finality_delivery::CloseOffer {
         use consensus_common::finality_delivery::{
@@ -440,6 +463,7 @@ mod tests {
     #[derive(Default)]
     struct Disk {
         bytes: Mutex<Option<Vec<u8>>>,
+        extra: Mutex<Vec<(String, Vec<u8>)>>,
         fail: AtomicU8,
     }
     impl SnapshotStore for Disk {
@@ -456,6 +480,18 @@ mod tests {
                 fail!("before");
             }
             *self.bytes.lock().unwrap() = Some(bytes.to_vec());
+            if failure == 2 {
+                fail!("after");
+            }
+            Ok(())
+        }
+        fn replace_sync_with(&self, bytes: &[u8], extra: &[(String, Vec<u8>)]) -> Result<()> {
+            let failure = self.fail.load(Ordering::SeqCst);
+            if failure == 1 {
+                fail!("before");
+            }
+            *self.bytes.lock().unwrap() = Some(bytes.to_vec());
+            self.extra.lock().unwrap().extend(extra.iter().cloned());
             if failure == 2 {
                 fail!("after");
             }
@@ -560,6 +596,99 @@ mod tests {
                 released: false,
             },
         ))
+    }
+    fn association(
+        close: &ClosingRecord,
+    ) -> Result<consensus_common::validator_cleanup::CleanupAssociation> {
+        Ok(consensus_common::validator_cleanup::CleanupAssociation {
+            delivery_id: close.binding.delivery_id.clone(),
+            close_generation: close.binding.close_generation,
+            lease_generation: close.lease_generation,
+            dependency_digest: close.dependency_digest.clone(),
+            binding_digest: UInt256::calc_file_hash(&close.binding.encode()?),
+        })
+    }
+    /// Two Released closes; returns them in order.
+    fn released_pair(store: &PropagationOutbox) -> Result<(ClosingRecord, ClosingRecord)> {
+        let (d, e, c) = setup(store, 1)?;
+        store.begin_close_offer_inner(c.clone(), &d, &e)?;
+        let first = store.confirm_close_inner(c)?;
+        let (d, e, c) = setup(store, 2)?;
+        store.begin_close_offer_inner(c.clone(), &d, &e)?;
+        let second = store.confirm_close_inner(c)?;
+        Ok((first, second))
+    }
+    #[test]
+    fn cleanup_close_removal_refuses_any_mismatch_changing_nothing() -> Result<()> {
+        let disk = Arc::new(Disk::default());
+        let store = open(disk.clone());
+        let journal = vec![("journal".to_string(), vec![1u8])];
+        let (d, e, c) = setup(&store, 1)?;
+        store.begin_close_offer_inner(c.clone(), &d, &e)?;
+        let unreleased = association(&c)?;
+        let refused = store.remove_cleanup_closes(&[unreleased], &journal)?.unwrap_err();
+        assert!(refused.contains("not Released"), "{refused}");
+        let first = store.confirm_close_inner(c)?;
+        let (d, e, c) = setup(&store, 2)?;
+        store.begin_close_offer_inner(c.clone(), &d, &e)?;
+        let second = store.confirm_close_inner(c)?;
+        let (a, b) = (association(&first)?, association(&second)?);
+        for kind in 0..5 {
+            let mut wrong = b.clone();
+            match kind {
+                0 => wrong.delivery_id = UInt256::from([99; 32]),
+                1 => wrong.lease_generation += 1,
+                2 => wrong.close_generation += 1,
+                3 => wrong.dependency_digest = UInt256::default(),
+                _ => wrong.binding_digest = UInt256::default(),
+            }
+            let epoch = store.mutation_epoch()?;
+            // A mismatch anywhere in the list refuses the whole batch.
+            assert!(store.remove_cleanup_closes(&[a.clone(), wrong], &journal)?.is_err());
+            assert_eq!(store.mutation_epoch()?, epoch, "nothing was committed");
+            assert!(store.lookup_close(&first.binding.delivery_id)?.is_some());
+            assert!(store.lookup_close(&second.binding.delivery_id)?.is_some());
+        }
+        assert!(disk.extra.lock().unwrap().is_empty(), "no journal without the removal");
+        Ok(())
+    }
+    #[test]
+    fn cleanup_close_removal_is_exact_and_atomic_with_the_journal() -> Result<()> {
+        let disk = Arc::new(Disk::default());
+        let store = open(disk.clone());
+        let journal = vec![("journal".to_string(), vec![1u8])];
+        let (first, second) = released_pair(&store)?;
+        let epoch = store.mutation_epoch()?.unwrap();
+        store.remove_cleanup_closes(&[association(&first)?], &journal)?.unwrap();
+        assert_eq!(store.mutation_epoch()?, Some(epoch + 1));
+        assert!(store.lookup_close(&first.binding.delivery_id)?.is_none());
+        assert_eq!(store.lookup_close(&second.binding.delivery_id)?, Some(second.clone()));
+        assert_eq!(*disk.extra.lock().unwrap(), journal);
+        drop(store);
+        let store = open(disk);
+        assert!(store.lookup_close(&first.binding.delivery_id)?.is_none(), "durable");
+        assert_eq!(store.lookup_close(&second.binding.delivery_id)?, Some(second));
+        Ok(())
+    }
+    #[test]
+    fn cleanup_close_removal_uncertainty_fails_closed_until_reopen() -> Result<()> {
+        for failure in [1, 2] {
+            let disk = Arc::new(Disk::default());
+            let store = open(disk.clone());
+            let journal = vec![("journal".to_string(), vec![1u8])];
+            let (first, _) = released_pair(&store)?;
+            disk.fail.store(failure, Ordering::SeqCst);
+            assert!(store.remove_cleanup_closes(&[association(&first)?], &journal).is_err());
+            assert!(store.lookup_close(&first.binding.delivery_id).is_err(), "fails closed");
+            assert!(store.with_cleanup_lock(|_, _| Ok(())).is_err());
+            disk.fail.store(0, Ordering::SeqCst);
+            drop(store);
+            let store = open(disk.clone());
+            let applied = failure == 2;
+            assert_eq!(store.lookup_close(&first.binding.delivery_id)?.is_none(), applied);
+            assert_eq!(disk.extra.lock().unwrap().is_empty(), !applied, "one batch");
+        }
+        Ok(())
     }
     #[test]
     fn close_legacy_coordinates_require_exact_original_evidence() -> Result<()> {
@@ -785,12 +914,17 @@ mod tests {
     }
     #[test]
     fn close_real_compact_admission_capacity_preserves_snapshot_and_canonical() -> Result<()> {
-        use storage::{block_handle_db::NodeStateDb, db::rocksdb::{AccessType, RocksDb}};
+        use storage::{
+            block_handle_db::NodeStateDb,
+            db::rocksdb::{AccessType, RocksDb},
+        };
         struct CapacityDisk(NodeStateDb);
         impl SnapshotStore for CapacityDisk {
             fn load(&self, maximum: usize) -> Result<Option<Vec<u8>>> {
                 let value = self.0.try_get_raw(KEY.as_bytes())?;
-                if value.as_ref().is_some_and(|v| v.len() > maximum) { fail!("snapshot limit"); }
+                if value.as_ref().is_some_and(|v| v.len() > maximum) {
+                    fail!("snapshot limit");
+                }
                 Ok(value.map(|v| v.to_vec()))
             }
             fn replace_sync(&self, bytes: &[u8]) -> Result<()> {
@@ -819,13 +953,21 @@ mod tests {
             row.binding.record_id = u64::from(n);
             row.binding.close_generation = u64::from(n);
             row.binding.canonical.block_id = id(n);
-            row.binding.delivery_id = delivery_coordinates(&domain(), row.binding.domain.protocol,
-                &row.binding.domain.profile, &row.binding.domain.session_id,
-                &row.binding.canonical.block_id, true)?;
+            row.binding.delivery_id = delivery_coordinates(
+                &domain(),
+                row.binding.domain.protocol,
+                &row.binding.domain.profile,
+                &row.binding.domain.session_id,
+                &row.binding.canonical.block_id,
+                true,
+            )?;
             row.binding.canonical.node_receipt = row.binding.delivery_id.clone();
             let size = row.binding.encode()?.len() + 45;
             if snapshot.closing.len() + 1 >= MAX_CLOSE_RECORDS
-                || total + size + first_size > MAX_CLOSE_BYTES { break; }
+                || total + size + first_size > MAX_CLOSE_BYTES
+            {
+                break;
+            }
             total += size;
             snapshot.closing.push(row);
         }
@@ -834,7 +976,9 @@ mod tests {
         // or raising production limits, so exactly one offered row still fits.
         if snapshot.closing.len() + 1 < MAX_CLOSE_RECORDS {
             for row in snapshot.closing.iter_mut().rev() {
-                if total + first_size + second_size > MAX_CLOSE_BYTES { break; }
+                if total + first_size + second_size > MAX_CLOSE_BYTES {
+                    break;
+                }
                 let original = row.binding.encode()?.len();
                 for digits in 3..=19u32 {
                     row.binding.expires_at_unix_secs = 10u64.pow(digits - 1);
@@ -849,16 +993,18 @@ mod tests {
         }
         snapshot.next_id = snapshot.closing.len() as u64 + 3;
         snapshot.next_close_generation = snapshot.next_id;
-        assert!(snapshot.closing.len() + 1 == MAX_CLOSE_RECORDS
-            || total + first_size + second_size > MAX_CLOSE_BYTES);
+        assert!(
+            snapshot.closing.len() + 1 == MAX_CLOSE_RECORDS
+                || total + first_size + second_size > MAX_CLOSE_BYTES
+        );
         let seed = encode_snapshot(&snapshot, &domain(), &Limits::default())?;
         store.store.replace_sync(&seed)?;
         drop(store);
         let store = reopen(dir.path())?;
         store.begin_close_offer_inner(first.clone(), &d1, &e1)?;
         let before = store.store.load(Limits::default().max_snapshot_bytes)?.unwrap();
-        let error = store.begin_close_offer_inner(second.clone(), &d2, &e2)
-            .unwrap_err().to_string();
+        let error =
+            store.begin_close_offer_inner(second.clone(), &d2, &e2).unwrap_err().to_string();
         if snapshot.closing.len() + 1 == MAX_CLOSE_RECORDS {
             assert!(error.contains("Invalid close history capacity/allocator"), "{error}");
         } else {
@@ -869,8 +1015,11 @@ mod tests {
         assert!(store.delivery(&d2.delivery_id)?.is_some());
         assert_eq!(store.lookup_close(&d1.delivery_id)?, Some(first.clone()));
         assert_eq!(store.lookup_close(&d2.delivery_id)?, None);
-        eprintln!("compact admission boundary: records={}, bytes={}, rejection={error}",
-            snapshot.closing.len() + 1, total + first_size);
+        eprintln!(
+            "compact admission boundary: records={}, bytes={}, rejection={error}",
+            snapshot.closing.len() + 1,
+            total + first_size
+        );
         drop(store);
         let store = reopen(dir.path())?;
         assert_eq!(store.store.load(Limits::default().max_snapshot_bytes)?.unwrap(), before);
@@ -880,5 +1029,4 @@ mod tests {
         assert_eq!(store.lookup_close(&d2.delivery_id)?, None);
         Ok(())
     }
-
 }

@@ -104,7 +104,10 @@ fn binding_selected(binding: &RepairLeaseBinding, selection: &NamespaceSelection
 }
 
 /// A selected binding must belong exactly to the re-authenticated runtime.
-fn binding_mismatch(binding: &RepairLeaseBinding, expected: &ExpectedIdentity) -> Option<String> {
+pub(crate) fn binding_mismatch(
+    binding: &RepairLeaseBinding,
+    expected: &ExpectedIdentity,
+) -> Option<String> {
     let domain = &binding.domain;
     let checks = [
         (domain.zerostate == expected.zerostate, "zerostate"),
@@ -131,6 +134,7 @@ fn binding_mismatch(binding: &RepairLeaseBinding, expected: &ExpectedIdentity) -
 /// of the session; no retained entry or delivery of the namespace (a release
 /// removes them); and an exact bijection between the namespace's Released
 /// ClosingRecords, their leases and the source inventory.
+#[cfg(test)]
 pub(crate) fn project_cleanup(
     selection: &NamespaceSelection,
     runtime: &ExpectedIdentity,
@@ -138,7 +142,19 @@ pub(crate) fn project_cleanup(
     input: &ProjectionInput<'_>,
     budget: &mut ProjectionBudget,
 ) -> CleanupDecision {
-    let veto = |reason: String| CleanupDecision::Veto(reason);
+    project_cleanup_inner(selection, runtime, inventory, input, budget).0
+}
+
+/// The projection plus, for WouldDelete, the associations of its Released
+/// closes, built from the same validated data.
+fn project_cleanup_inner(
+    selection: &NamespaceSelection,
+    runtime: &ExpectedIdentity,
+    inventory: &[RetirementItem],
+    input: &ProjectionInput<'_>,
+    budget: &mut ProjectionBudget,
+) -> (CleanupDecision, Vec<consensus_common::validator_cleanup::CleanupAssociation>) {
+    let veto = |reason: String| (CleanupDecision::Veto(reason), Vec::new());
     // Every map or set insertion below is charged before it is made.
     if input.other_outstanding != 0 {
         return veto(format!("{} outstanding request(s) of the session", input.other_outstanding));
@@ -247,7 +263,28 @@ pub(crate) fn project_cleanup(
             return veto(format!("source item {:x} appears twice", item.source_id));
         }
     }
-    CleanupDecision::WouldDelete { closes: closes.len() }
+    let mut associations = match reserved::<consensus_common::validator_cleanup::CleanupAssociation>(
+        closes.len(),
+        0,
+        budget,
+    ) {
+        Ok(associations) => associations,
+        Err(_) => return veto("projection budget exhausted".into()),
+    };
+    for close in closes.values() {
+        let encoded = match close.binding.encode() {
+            Ok(encoded) => encoded,
+            Err(error) => return veto(format!("close binding: {error}")),
+        };
+        associations.push(consensus_common::validator_cleanup::CleanupAssociation {
+            delivery_id: close.binding.delivery_id.clone(),
+            close_generation: close.binding.close_generation,
+            lease_generation: close.lease_generation,
+            dependency_digest: close.dependency_digest.clone(),
+            binding_digest: UInt256::calc_file_hash(&encoded),
+        });
+    }
+    (CleanupDecision::WouldDelete { closes: closes.len() }, associations)
 }
 
 /// Bounds every allocation a projection makes. `items`/`bytes` are the
@@ -441,14 +478,37 @@ pub(crate) struct JudgeSources<'a> {
     pub lease_epoch: &'a dyn Fn() -> Result<Option<u64>>,
 }
 
+/// A judgement with the associations of its WouldDelete and the (outbox,
+/// ledger) epochs both reads and the recheck agreed on.
+pub(crate) struct Judgement {
+    pub decision: CleanupDecision,
+    pub associations: Vec<consensus_common::validator_cleanup::CleanupAssociation>,
+    pub epochs: Option<(u64, u64)>,
+}
+
+#[cfg(test)]
 pub(crate) fn judge_cleanup(
     selection: &NamespaceSelection,
     expected: &ExpectedIdentity,
     inventory: &[RetirementItem],
     sources: &JudgeSources<'_>,
-    mut budget: ProjectionBudget,
+    budget: ProjectionBudget,
 ) -> CleanupDecision {
-    let veto = |reason: String| CleanupDecision::Veto(reason);
+    judge_cleanup_detailed(selection, expected, inventory, sources, budget).decision
+}
+
+pub(crate) fn judge_cleanup_detailed(
+    selection: &NamespaceSelection,
+    expected: &ExpectedIdentity,
+    inventory: &[RetirementItem],
+    sources: &JudgeSources<'_>,
+    mut budget: ProjectionBudget,
+) -> Judgement {
+    let veto = |reason: String| Judgement {
+        decision: CleanupDecision::Veto(reason),
+        associations: Vec::new(),
+        epochs: None,
+    };
     let busy = (sources.outstanding)();
     if busy != 0 {
         return veto(format!("{busy} outstanding request(s) of the session"));
@@ -464,7 +524,7 @@ pub(crate) fn judge_cleanup(
     let (Some(outbox_epoch), Some(lease_epoch)) = (outbox_epoch, lease_epoch) else {
         return veto("store mutation epoch exhausted".into());
     };
-    let decision = project_cleanup(
+    let (decision, associations) = project_cleanup_inner(
         selection,
         expected,
         inventory,
@@ -483,7 +543,7 @@ pub(crate) fn judge_cleanup(
     if busy != 0 || !unchanged {
         return veto("projection raced a mutation".into());
     }
-    decision
+    Judgement { decision, associations, epochs: Some((outbox_epoch, lease_epoch)) }
 }
 
 #[cfg(test)]

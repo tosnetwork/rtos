@@ -228,9 +228,52 @@ impl DependencyLeases {
         Ok((selected, memory.mutation_epoch))
     }
 
+    /// Advances the ledger epoch as any committed lease write would.
+    #[cfg(test)]
+    pub(crate) fn bump_mutation_epoch_for_test(&self) {
+        let mut memory = self.memory.lock().unwrap();
+        memory.mutation_epoch = memory.mutation_epoch.and_then(|epoch| epoch.checked_add(1));
+    }
+
     #[cfg(test)]
     pub(crate) fn exhaust_mutation_epoch_for_test(&self) {
         self.memory.lock().unwrap().mutation_epoch = Some(u64::MAX);
+    }
+
+    /// Runs `f` with the ledger epoch while holding the ledger lock, so no
+    /// lease commit or poisoning can interleave with what `f` does.
+    pub(crate) fn with_cleanup_lock<R>(
+        &self,
+        f: impl FnOnce(Option<u64>) -> Result<R>,
+    ) -> Result<R> {
+        let memory = self.memory.lock().map_err(|_| error!("Repair ledger poisoned"))?;
+        if memory.poisoned {
+            fail!("Repair ledger requires cold recovery");
+        }
+        f(memory.mutation_epoch)
+    }
+
+    /// The binding of lease `generation` if its full encoded binding hashes
+    /// to `binding_digest` and its dependencies to `dependency_digest`.
+    pub(crate) fn binding_for(
+        &self,
+        generation: u64,
+        binding_digest: &UInt256,
+        dependency_digest: &UInt256,
+    ) -> Result<Option<RepairLeaseBinding>> {
+        let memory = self.memory.lock().map_err(|_| error!("Repair ledger poisoned"))?;
+        if memory.poisoned {
+            fail!("Repair ledger requires cold recovery");
+        }
+        match memory.records.get(&generation) {
+            Some(record)
+                if &UInt256::calc_file_hash(&record.binding) == binding_digest
+                    && record.dependency_digest == format!("{dependency_digest:x}") =>
+            {
+                Ok(Some(record.binding()?))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// The ledger epoch, read under its lock; None once exhausted.
@@ -396,10 +439,23 @@ impl DependencyLeases {
     /// only then do memory and protection counts drop. Generations are never
     /// reused and `next` never decreases, so a repeated release cannot touch
     /// a newer lease. An uncertain delete poisons the ledger and protection.
+    #[cfg(test)]
     pub(crate) fn release(
         &self,
         generation: u64,
         expected_binding: &RepairLeaseBinding,
+        expected_digest: &UInt256,
+    ) -> Result<LeaseRelease> {
+        let binding_digest = UInt256::calc_file_hash(&expected_binding.encode()?);
+        self.release_for(generation, &binding_digest, expected_digest)
+    }
+
+    /// `release` keyed by the digest of the full encoded binding recorded at
+    /// B0: the lease must still hold a binding with exactly that digest.
+    pub(crate) fn release_for(
+        &self,
+        generation: u64,
+        binding_digest: &UInt256,
         expected_digest: &UInt256,
     ) -> Result<LeaseRelease> {
         let Some(_gate) = self.protection.try_deletion() else {
@@ -412,11 +468,12 @@ impl DependencyLeases {
         let Some(record) = memory.records.get(&generation) else {
             return Ok(LeaseRelease::AbsentAlreadyReleased);
         };
-        if record.binding != expected_binding.encode()?
+        if &UInt256::calc_file_hash(&record.binding) != binding_digest
             || record.dependency_digest != format!("{expected_digest:x}")
         {
             return Ok(LeaseRelease::Mismatch);
         }
+        let binding = record.binding()?;
         let size = serde_json::to_vec(record)?.len();
         memory.mutation_epoch = memory.mutation_epoch.and_then(|epoch| epoch.checked_add(1));
         let result = (|| {
@@ -434,7 +491,7 @@ impl DependencyLeases {
             self.protection.poison();
             return Err(error);
         }
-        let identity = (expected_binding.record_id, expected_binding.close_generation);
+        let identity = (binding.record_id, binding.close_generation);
         if memory.identities.get(&identity) == Some(&generation) {
             memory.identities.remove(&identity);
         }
