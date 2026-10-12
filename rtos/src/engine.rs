@@ -2768,14 +2768,17 @@ impl Engine {
             block_id,
             prev_block_id
         );
+        // Before any work that can write: no floor is adopted while
+        // truncating, and none may lie above the new head; the database
+        // checks its durable floor as well.
+        let _truncation = self.shard_states_keeper().begin_truncation(prev_block_id.seq_no())?;
         // check if previous state is present
+        #[cfg(test)]
+        TRUNCATION_LOADED_PREVIOUS_STATE.store(true, std::sync::atomic::Ordering::SeqCst);
         self.load_state(&prev_block_id)
             .await
             .map_err(|err| error!("no previous block state present for {}", err))?;
 
-        // No floor is adopted while truncating, and none may lie above the
-        // new head; the database checks its durable floor as well.
-        let _truncation = self.shard_states_keeper().begin_truncation(prev_block_id.seq_no())?;
         self.db().truncate_database(&block_id).await?;
         self.save_last_applied_mc_block_id(&prev_block_id)?;
 
@@ -2799,6 +2802,11 @@ impl Engine {
                 self.save_archives_gc_mc_block_id(&prev_block_id)?;
             }
         }
+        #[cfg(test)]
+        TRUNCATION_HELD_AFTER_HEAD_REWRITES.store(
+            self.shard_states_keeper().truncation_active(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         log::warn!("Database successfully truncated, new last mc block is {}", prev_block_id);
         Ok(())
     }
@@ -2824,6 +2832,18 @@ impl Engine {
         }
     }
 }
+
+/// Whether the truncation guard was still held after the last head-key
+/// rewrite of the most recent truncation (tests only).
+/// Whether the most recent truncation reached the previous-state load
+/// (tests only).
+#[cfg(test)]
+pub(crate) static TRUNCATION_LOADED_PREVIOUS_STATE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) static TRUNCATION_HELD_AFTER_HEAD_REWRITES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) async fn load_zero_state(engine: &Arc<Engine>, path: &str) -> Result<bool> {
     let zero_id = engine.zerostate_id();

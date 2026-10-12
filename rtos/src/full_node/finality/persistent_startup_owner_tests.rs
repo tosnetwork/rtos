@@ -120,3 +120,74 @@ async fn persistent_startup_owner_missing_truncate_block_releases_actual_db() {
 async fn persistent_startup_owner_restoring_marker_error_releases_actual_db() {
     failed_startup(2).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_truncation_completes_at_the_floor_and_refuses_below_it() {
+    use consensus_common::validator_cleanup::{encode_checkpoint, GC_FLOOR_KEY};
+    for floor_above_head in [true, false] {
+        let Fixture { dir, engine, parent, target, .. } = fixture(false).await;
+        // The floor is persisted and restored (and pinned) by a reopened keeper.
+        let floor = if floor_above_head { target.id().clone() } else { parent.id().clone() };
+        engine
+            .db()
+            .write_validator_state_batch_sync(
+                &[(GC_FLOOR_KEY.to_owned(), encode_checkpoint(&floor))],
+                &[],
+            )
+            .unwrap();
+        close(engine).await;
+        let engine = open_engine(dir.path()).await;
+        let run = std::panic::AssertUnwindSafe(async {
+            assert_eq!(engine.validator_cleanup_floor().map(|(id, _)| id), Some(floor.clone()));
+            let floor_key =
+                || engine.db().load_validator_state_key_bounded(GC_FLOOR_KEY, 256).unwrap();
+            let heads = || {
+                (
+                    engine.load_last_applied_mc_block_id().unwrap(),
+                    engine.load_shard_client_mc_block_id().unwrap(),
+                    engine.load_pss_keeper_mc_block_id().unwrap(),
+                    engine.load_last_rotation_block_id().unwrap(),
+                    engine.load_archives_gc_mc_block_id().unwrap(),
+                )
+            };
+            let (key_before, heads_before) = (floor_key(), heads());
+            assert_eq!(heads_before.0.as_deref(), Some(target.id()));
+            crate::engine::TRUNCATION_HELD_AFTER_HEAD_REWRITES
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            crate::engine::TRUNCATION_LOADED_PREVIOUS_STATE
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let result = engine.truncate_database(target.id().seq_no()).await;
+            assert_eq!(floor_key(), key_before, "the floor key is never touched");
+            assert_eq!(engine.validator_cleanup_floor().map(|(id, _)| id), Some(floor.clone()));
+            if floor_above_head {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("below the cleanup floor"), "{error}");
+                assert!(
+                    !crate::engine::TRUNCATION_LOADED_PREVIOUS_STATE
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "refused before any state work"
+                );
+                assert_eq!(heads(), heads_before, "every head key unchanged");
+                assert!(engine.load_block_handle(target.id()).unwrap().is_some());
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    engine.load_last_applied_mc_block_id().unwrap().as_deref(),
+                    Some(parent.id())
+                );
+                assert!(
+                    crate::engine::TRUNCATION_HELD_AFTER_HEAD_REWRITES
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "the guard is held through the head rewrites"
+                );
+            }
+            let keeper = engine.shard_states_keeper();
+            assert!(!keeper.truncation_active(), "the guard is released at the end");
+            drop(keeper.begin_truncation(floor.seq_no()).unwrap());
+        })
+        .catch_unwind()
+        .await;
+        close(engine).await;
+        run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    }
+}

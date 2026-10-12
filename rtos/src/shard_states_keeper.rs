@@ -385,6 +385,12 @@ impl ShardStatesKeeper {
         Ok(TruncationGuard { keeper: self.clone(), exit })
     }
 
+    /// Whether a truncation is admitted and not yet ended.
+    pub(crate) fn truncation_active(&self) -> bool {
+        let _slot = self.cleanup_floor.lock();
+        self.truncating.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_floor_epoch_for_test(&self, epoch: u64) {
         let _slot = self.cleanup_floor.lock();
