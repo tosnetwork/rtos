@@ -36,6 +36,8 @@ pub(crate) struct RepairLeaseBinding {
     pub effects_digest: UInt256,
     pub close_generation: u64,
 }
+/// Size of the parsed decoding intermediate, for workspace bounds.
+pub(crate) const WIRE_STRUCT_BYTES: usize = std::mem::size_of::<Wire>();
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Wire {

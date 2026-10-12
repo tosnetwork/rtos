@@ -484,7 +484,7 @@ fn selection_copies_only_the_session_and_charges_before_allocating() {
     let script = Script::stable(world);
     assert_eq!(script.judge(&items), CleanupDecision::WouldDelete { closes: 2 });
     // A copy budget too small for the selected data refuses.
-    let mut tiny = ProjectionBudget::new(1, 8 << 20, 64 << 10);
+    let mut tiny = ProjectionBudget::new(0, 8 << 20, 64 << 10);
     assert!(
         select_outbox(&UInt256::from(SESSION), &[], &[], &script.world.closing, &mut tiny).is_err()
     );
@@ -521,4 +521,47 @@ fn selection_copies_only_the_session_and_charges_before_allocating() {
         &mut exhausted,
     );
     vetoed(decision, "budget exhausted");
+}
+
+#[test]
+fn allocation_charges_cover_capacity_nested_strings_inventory_and_decoding() {
+    let identity = validator();
+    let (world, items) = World::released(&[1], &identity);
+    let session = UInt256::from(SESSION);
+    // One selected element: its exact capacity is charged, no more.
+    let slot = std::mem::size_of::<ClosingRecord>();
+    let mut exact = ProjectionBudget::new(1, slot, 64 << 10);
+    let selection = select_outbox(&session, &[], &[], &world.closing, &mut exact).unwrap();
+    assert_eq!(selection.closing.len(), 1);
+    assert_eq!(selection.closing.capacity(), 1, "allocated with exactly the charged capacity");
+    let mut short = ProjectionBudget::new(1, slot - 1, 64 << 10);
+    assert!(select_outbox(&session, &[], &[], &world.closing, &mut short).is_err());
+    // Nested dependency strings count toward a selected lease.
+    let mut heavy = world.leases[0].clone();
+    heavy.dependencies = vec![crate::repair_provenance::Dependency {
+        kind: "state".into(),
+        id: "x".repeat(4096),
+        digest: "y".repeat(4096),
+        bytes: 1,
+        root: Some("z".repeat(4096)),
+    }];
+    let shallow = std::mem::size_of::<LeaseRecord>() + heavy.binding.len() + 1024;
+    let mut budget = ProjectionBudget::new(4, shallow, 64 << 10);
+    assert!(select_leases(&session, std::iter::once(&heavy), &mut budget).is_err());
+    let mut budget = ProjectionBudget::new(4, shallow + 3 * 4096 + 1024, 64 << 10);
+    assert!(select_leases(&session, std::iter::once(&heavy), &mut budget).is_ok());
+    // The inventory copy is charged before it is made.
+    let mut budget = ProjectionBudget::new(4, std::mem::size_of::<RetirementItem>() - 1, 64 << 10);
+    assert!(copy_inventory(&items, &mut budget).is_err());
+    let mut budget = ProjectionBudget::new(4, std::mem::size_of::<RetirementItem>(), 64 << 10);
+    assert_eq!(copy_inventory(&items, &mut budget).unwrap().capacity(), 1);
+    // Decoding needs a multiple of the encoded length (owned strings per
+    // field and the parsed intermediate), not just the encoded length.
+    let structs =
+        crate::repair_lease_binding::WIRE_STRUCT_BYTES + std::mem::size_of::<RepairLeaseBinding>();
+    let encoded = world.leases[0].binding.len();
+    let mut budget = ProjectionBudget::new(4096, 8 << 20, 2 * encoded + structs);
+    assert!(select_leases(&session, world.leases.iter(), &mut budget).is_err());
+    let mut budget = ProjectionBudget::new(4096, 8 << 20, 4 * encoded + structs);
+    assert!(select_leases(&session, world.leases.iter(), &mut budget).is_ok());
 }

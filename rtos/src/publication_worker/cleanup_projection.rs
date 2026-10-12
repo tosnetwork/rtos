@@ -140,7 +140,6 @@ pub(crate) fn project_cleanup(
 ) -> CleanupDecision {
     let veto = |reason: String| CleanupDecision::Veto(reason);
     // Every map or set insertion below is charged before it is made.
-    let entry = MAP_ENTRY_OVERHEAD.saturating_add(std::mem::size_of::<RepairLeaseBinding>());
     if input.other_outstanding != 0 {
         return veto(format!("{} outstanding request(s) of the session", input.other_outstanding));
     }
@@ -177,7 +176,7 @@ pub(crate) fn project_cleanup(
         if !close.released {
             return veto(format!("close {:x} is not Released", close.binding.delivery_id));
         }
-        if budget.charge(entry).is_err() {
+        if budget.charge(map_insert::<UInt256, &ClosingRecord>()).is_err() {
             return veto("projection budget exhausted".into());
         }
         if closes.insert(close.binding.delivery_id.clone(), close).is_some() {
@@ -187,12 +186,7 @@ pub(crate) fn project_cleanup(
     // Leases of this namespace, including orphans without a close.
     let mut leases: BTreeMap<u64, (&LeaseRecord, RepairLeaseBinding)> = BTreeMap::new();
     for lease in input.leases {
-        if budget
-            .transient(
-                lease.binding.len().saturating_add(std::mem::size_of::<RepairLeaseBinding>()),
-            )
-            .is_err()
-        {
+        if budget.transient(binding_decode_workspace(&lease.binding)).is_err() {
             return veto("projection decode workspace exhausted".into());
         }
         let binding = match lease.binding() {
@@ -205,7 +199,7 @@ pub(crate) fn project_cleanup(
         if let Some(reason) = binding_mismatch(&binding, runtime) {
             return veto(reason);
         }
-        if budget.charge(entry).is_err() {
+        if budget.charge(map_insert::<u64, (&LeaseRecord, RepairLeaseBinding)>()).is_err() {
             return veto("projection budget exhausted".into());
         }
         leases.insert(lease.generation, (lease, binding));
@@ -220,7 +214,7 @@ pub(crate) fn project_cleanup(
         {
             return veto(format!("lease {} does not match its close", lease.generation));
         }
-        if budget.charge(MAP_ENTRY_OVERHEAD).is_err() {
+        if budget.charge(map_insert::<u64, ()>()).is_err() {
             return veto("projection budget exhausted".into());
         }
         if !referenced.insert(close.lease_generation) {
@@ -246,7 +240,7 @@ pub(crate) fn project_cleanup(
         if close.offer() != item.offer {
             return veto(format!("source item {:x} offer differs", item.source_id));
         }
-        if budget.charge(MAP_ENTRY_OVERHEAD).is_err() {
+        if budget.charge(map_insert::<UInt256, ()>()).is_err() {
             return veto("projection budget exhausted".into());
         }
         if !seen.insert(item.source_id.clone()) {
@@ -267,8 +261,15 @@ pub(crate) struct ProjectionBudget {
     transient: usize,
 }
 
-/// A map or set insertion: the entry plus a conservative node overhead.
-const MAP_ENTRY_OVERHEAD: usize = 64;
+/// A B-tree map or set insertion may allocate a whole node: charge a full
+/// node of `MAP_NODE_ENTRIES` entries plus edges per insertion.
+const MAP_NODE_ENTRIES: usize = 12;
+const MAP_NODE_OVERHEAD: usize = 256;
+fn map_insert<K, V>() -> usize {
+    MAP_NODE_ENTRIES
+        .saturating_mul(std::mem::size_of::<K>().saturating_add(std::mem::size_of::<V>()))
+        .saturating_add(MAP_NODE_OVERHEAD)
+}
 
 impl Default for ProjectionBudget {
     fn default() -> Self {
@@ -302,11 +303,12 @@ impl ProjectionBudget {
     }
 }
 
-/// Conservative in-memory size of a retained entry copy.
-fn entry_bytes(entry: &UnverifiedRecord) -> usize {
+/// Conservative in-memory heap of a retained entry copy (beyond its slot).
+fn entry_heap(entry: &UnverifiedRecord) -> usize {
     let record = &entry.record;
-    std::mem::size_of::<UnverifiedRecord>()
-        .saturating_add(record.block_data.len())
+    record
+        .block_data
+        .len()
         .saturating_add(record.proof_data.as_ref().map_or(0, Vec::len))
         .saturating_add(record.carrier.bytes().len())
         .saturating_add(record.prev.len().saturating_mul(std::mem::size_of::<BlockIdExt>()))
@@ -319,16 +321,38 @@ fn entry_bytes(entry: &UnverifiedRecord) -> usize {
         )
 }
 
-fn lease_bytes(lease: &LeaseRecord) -> usize {
-    std::mem::size_of::<LeaseRecord>()
-        .saturating_add(lease.binding.len())
-        .saturating_add(lease.dependency_digest.len())
-        .saturating_add(
-            lease
-                .dependencies
-                .len()
-                .saturating_mul(std::mem::size_of::<crate::repair_provenance::Dependency>()),
-        )
+/// Conservative heap of a lease record copy, nested strings included.
+fn lease_heap(lease: &LeaseRecord) -> usize {
+    let mut heap = lease.binding.len().saturating_add(lease.dependency_digest.len());
+    for dependency in &lease.dependencies {
+        heap = heap
+            .saturating_add(std::mem::size_of::<crate::repair_provenance::Dependency>())
+            .saturating_add(dependency.kind.len())
+            .saturating_add(dependency.id.len())
+            .saturating_add(dependency.digest.len())
+            .saturating_add(dependency.root.as_ref().map_or(0, String::len));
+    }
+    heap
+}
+
+/// Workspace of decoding one lease binding: serde's owned strings (at most
+/// the encoded length each pass), the parsed intermediate and the result.
+fn binding_decode_workspace(encoded: &[u8]) -> usize {
+    encoded
+        .len()
+        .saturating_mul(4)
+        .saturating_add(crate::repair_lease_binding::WIRE_STRUCT_BYTES)
+        .saturating_add(std::mem::size_of::<RepairLeaseBinding>())
+}
+
+/// A vector of exactly `count` elements of `T`, allocated only after its
+/// slots plus `heap` were charged.
+fn reserved<T>(count: usize, heap: usize, budget: &mut ProjectionBudget) -> Result<Vec<T>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    budget.charge(count.saturating_mul(std::mem::size_of::<T>()).saturating_add(heap))?;
+    Ok(Vec::with_capacity(count))
 }
 
 /// The outbox data of one session, copied under the writer lock.
@@ -338,8 +362,9 @@ pub(crate) struct OutboxSelection {
     pub closing: Vec<ClosingRecord>,
 }
 
-/// Copies only `session`'s entries, their deliveries and its closes, charging
-/// every copy before it is made.
+/// Copies only `session`'s entries, their deliveries and its closes. Each
+/// part is counted first and allocated with exactly that capacity after the
+/// slots and nested heap were charged.
 pub(crate) fn select_outbox(
     session: &UInt256,
     entries: &[UnverifiedRecord],
@@ -347,44 +372,61 @@ pub(crate) fn select_outbox(
     closing: &[ClosingRecord],
     budget: &mut ProjectionBudget,
 ) -> Result<OutboxSelection> {
-    let mut selection =
-        OutboxSelection { entries: Vec::new(), deliveries: Vec::new(), closing: Vec::new() };
-    let mut ids = BTreeSet::new();
-    for entry in entries.iter().filter(|entry| &entry.record.session_id == session) {
-        budget.charge(entry_bytes(entry).saturating_add(MAP_ENTRY_OVERHEAD))?;
-        ids.insert(entry.id);
-        selection.entries.push(entry.clone());
-    }
-    for delivery in deliveries.iter().filter(|delivery| ids.contains(&delivery.record_id)) {
-        budget.charge(std::mem::size_of::<Delivery>())?;
-        selection.deliveries.push(delivery.clone());
-    }
-    for close in closing.iter().filter(|close| &close.binding.domain.session_id == session) {
-        budget.charge(std::mem::size_of::<ClosingRecord>())?;
-        selection.closing.push(close.clone());
-    }
-    Ok(selection)
+    let selected = |entry: &&UnverifiedRecord| &entry.record.session_id == session;
+    let (count, heap) = entries
+        .iter()
+        .filter(selected)
+        .fold((0usize, 0usize), |(n, h), e| (n.saturating_add(1), h.saturating_add(entry_heap(e))));
+    let mut chosen = reserved::<UnverifiedRecord>(count, heap, budget)?;
+    chosen.extend(entries.iter().filter(selected).cloned());
+    let owned = |delivery: &&Delivery| chosen.iter().any(|entry| entry.id == delivery.record_id);
+    let count = deliveries.iter().filter(owned).count();
+    let mut chosen_deliveries = reserved::<Delivery>(count, 0, budget)?;
+    chosen_deliveries.extend(deliveries.iter().filter(owned).cloned());
+    let closes = |close: &&ClosingRecord| &close.binding.domain.session_id == session;
+    let count = closing.iter().filter(closes).count();
+    let mut chosen_closes = reserved::<ClosingRecord>(count, 0, budget)?;
+    chosen_closes.extend(closing.iter().filter(closes).cloned());
+    Ok(OutboxSelection { entries: chosen, deliveries: chosen_deliveries, closing: chosen_closes })
 }
 
 /// Copies only `session`'s lease records. Each binding is decoded in the
-/// transient workspace first; only a selected record is charged and copied.
+/// transient workspace (checked before decoding) to count the selection,
+/// the exact vector is charged with its nested heap, then filled.
 pub(crate) fn select_leases<'a>(
     session: &UInt256,
-    records: impl Iterator<Item = &'a LeaseRecord>,
+    records: impl Iterator<Item = &'a LeaseRecord> + Clone,
     budget: &mut ProjectionBudget,
 ) -> Result<Vec<LeaseRecord>> {
-    let mut selected = Vec::new();
-    for record in records {
-        budget.transient(
-            record.binding.len().saturating_add(std::mem::size_of::<RepairLeaseBinding>()),
-        )?;
-        if &record.binding()?.domain.session_id != session {
-            continue;
+    let mut count = 0usize;
+    let mut heap = 0usize;
+    for record in records.clone() {
+        budget.transient(binding_decode_workspace(&record.binding))?;
+        if &record.binding()?.domain.session_id == session {
+            count = count.saturating_add(1);
+            heap = heap.saturating_add(lease_heap(record));
         }
-        budget.charge(lease_bytes(record))?;
-        selected.push(record.clone());
+    }
+    let mut selected = reserved::<LeaseRecord>(count, heap, budget)?;
+    for record in records {
+        if selected.len() == count {
+            break;
+        }
+        if &record.binding()?.domain.session_id == session {
+            selected.push(record.clone());
+        }
     }
     Ok(selected)
+}
+
+/// Charges and copies the source inventory before it leaves the attempt.
+pub(crate) fn copy_inventory(
+    inventory: &[RetirementItem],
+    budget: &mut ProjectionBudget,
+) -> Result<Vec<RetirementItem>> {
+    let mut copy = reserved::<RetirementItem>(inventory.len(), 0, budget)?;
+    copy.extend_from_slice(inventory);
+    Ok(copy)
 }
 
 /// The race-free judgement protocol: the session must be quiescent before

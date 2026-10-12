@@ -389,7 +389,7 @@ pub(crate) async fn prepare_v2_cleanup(
     storage: consensus_common::StorageCleanupReservation,
 ) -> Result<CleanupVerdict> {
     use crate::publication_worker::cleanup_projection::{
-        CleanupDecision, ExpectedIdentity, NamespaceSelection,
+        copy_inventory, CleanupDecision, ExpectedIdentity, NamespaceSelection, ProjectionBudget,
     };
     use simplex::finality_delivery::source_retirement::{
         scan_source_retirement_with, EmptyInventoryPolicy, Quiescence,
@@ -435,11 +435,19 @@ pub(crate) async fn prepare_v2_cleanup(
         Ok(preparation) => preparation,
         Err(failure) => return Ok(CleanupVerdict::Veto(format!("reconcile: {}", failure.refusal))),
     };
+    // The inventory copy is charged before it is made; the remaining budget
+    // travels with the request.
+    let mut budget = ProjectionBudget::default();
+    let inventory = match copy_inventory(preparation.inventory(), &mut budget) {
+        Ok(inventory) => inventory,
+        Err(error) => return Ok(CleanupVerdict::Veto(format!("projection: {error}"))),
+    };
     let decision = worker
         .project_cleanup(
             NamespaceSelection { session: record.session_id.clone(), role },
             ExpectedIdentity::of(&runtime)?,
-            preparation.inventory().to_vec(),
+            inventory,
+            budget,
         )
         .await?;
     // The scan's locks and the reservation span the whole decision.

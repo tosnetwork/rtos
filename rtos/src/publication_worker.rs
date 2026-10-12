@@ -251,6 +251,8 @@ enum Submission {
         selection: cleanup_projection::NamespaceSelection,
         expected: cleanup_projection::ExpectedIdentity,
         inventory: Vec<simplex::finality_delivery::source_retirement::RetirementItem>,
+        /// The attempt's remaining budget, after the inventory copy.
+        budget: cleanup_projection::ProjectionBudget,
         response: oneshot::Sender<Result<cleanup_projection::CleanupDecision>>,
     },
 }
@@ -618,6 +620,7 @@ impl PublicationWorker {
         selection: cleanup_projection::NamespaceSelection,
         expected: cleanup_projection::ExpectedIdentity,
         inventory: Vec<simplex::finality_delivery::source_retirement::RetirementItem>,
+        budget: cleanup_projection::ProjectionBudget,
     ) -> Result<cleanup_projection::CleanupDecision> {
         let (response, result) = oneshot::channel();
         {
@@ -635,6 +638,7 @@ impl PublicationWorker {
                     selection,
                     expected,
                     inventory,
+                    budget,
                     response,
                 })
                 .map_err(|_| error!("Publication projection queue full"))?;
@@ -831,7 +835,7 @@ impl State {
                 completion.finish(result);
                 self.wake.notify_one();
             }
-            Submission::CleanupProjection { selection, expected, inventory, response } => {
+            Submission::CleanupProjection { selection, expected, inventory, budget, response } => {
                 // One owner transition, judged by the race-free protocol:
                 // quiescent before reading, both stores read with their epochs,
                 // and quiescent with unchanged epochs after judging.
@@ -848,11 +852,7 @@ impl State {
                         lease_epoch: &|| leases.mutation_epoch(),
                     };
                     Ok(cleanup_projection::judge_cleanup(
-                        &selection,
-                        &expected,
-                        &inventory,
-                        &sources,
-                        cleanup_projection::ProjectionBudget::default(),
+                        &selection, &expected, &inventory, &sources, budget,
                     ))
                 })();
                 let _ = response.send(result);
