@@ -124,6 +124,13 @@ pub struct ShardStatesKeeper {
     /// The validator-cleanup GC floor and its state pin, held by the owner of
     /// state GC so the floor's state can never be collected under it.
     cleanup_floor: parking_lot::Mutex<CleanupFloor>,
+    /// Advanced when a truncation is admitted and again when it ends; floor
+    /// work prepared at another epoch is refused. Changed only under the
+    /// `cleanup_floor` lock.
+    floor_epoch: std::sync::atomic::AtomicU64,
+    /// A truncation is running; no floor is adopted or resolved meanwhile.
+    /// Changed only under the `cleanup_floor` lock.
+    truncating: std::sync::atomic::AtomicBool,
     /// The reference state TTL that the floor's state age must exceed.
     cleanup_state_ttl: u64,
     #[cfg(test)]
@@ -133,6 +140,22 @@ pub struct ShardStatesKeeper {
     #[cfg(feature = "telemetry")]
     telemetry: Arc<EngineTelemetry>,
     allocated: Arc<EngineAlloc>,
+}
+
+/// One admitted database truncation. Dropping it publishes the epoch
+/// reserved at admission and lets floor work resume.
+pub(crate) struct TruncationGuard {
+    keeper: Arc<ShardStatesKeeper>,
+    exit: u64,
+}
+
+impl Drop for TruncationGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let _slot = self.keeper.cleanup_floor.lock();
+        self.keeper.floor_epoch.store(self.exit, Ordering::Release);
+        self.keeper.truncating.store(false, Ordering::Release);
+    }
 }
 
 /// Custody of the validator-cleanup GC floor.
@@ -193,6 +216,8 @@ impl ShardStatesKeeper {
             pss_prev_part_max_size,
             states_cache_mode,
             cleanup_floor: parking_lot::Mutex::new(cleanup_floor),
+            floor_epoch: std::sync::atomic::AtomicU64::new(0),
+            truncating: std::sync::atomic::AtomicBool::new(false),
             cleanup_state_ttl: cells_lifetime_sec,
             #[cfg(test)]
             fail_floor_write_after_commit: std::sync::atomic::AtomicBool::new(false),
@@ -260,11 +285,12 @@ impl ShardStatesKeeper {
     /// synced, because a read-back does not prove the failed write durable.
     /// Malformed bytes, any other value or a failed re-write stay uncertain
     /// with both pins kept.
-    pub(crate) fn resolve_uncertain_cleanup_floor(&self) -> Result<()> {
+    pub(crate) fn resolve_uncertain_cleanup_floor(&self, epoch: u64) -> Result<()> {
         use consensus_common::validator_cleanup::{
             decode_checkpoint, encode_checkpoint, GC_FLOOR_KEY,
         };
         let mut slot = self.cleanup_floor.lock();
+        self.check_floor_epoch(epoch)?;
         let CleanupFloor::Uncertain { previous, candidate } = &*slot else {
             return Ok(());
         };
@@ -307,6 +333,64 @@ impl ShardStatesKeeper {
         Ok(())
     }
 
+    /// The floor epoch; floor work starts by reading it and passes it to
+    /// the adoption, which refuses if a truncation ran in between.
+    pub(crate) fn cleanup_floor_epoch(&self) -> u64 {
+        let _slot = self.cleanup_floor.lock();
+        self.floor_epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Under the slot lock: no truncation runs and `epoch` is current.
+    fn check_floor_epoch(&self, epoch: u64) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.truncating.load(Ordering::Acquire) {
+            fail!("Cleanup floor is frozen while the database is truncated");
+        }
+        if self.floor_epoch.load(Ordering::Acquire) != epoch {
+            fail!("Cleanup floor work predates a database truncation");
+        }
+        Ok(())
+    }
+
+    /// Admits one truncation to `new_head_seqno`: refused while another runs,
+    /// when the epoch cannot advance twice, or when any floor the slot knows
+    /// (both pins while uncertain) lies above the new head. Floor adoption
+    /// and resolution are refused until the guard drops.
+    pub(crate) fn begin_truncation(
+        self: &Arc<Self>,
+        new_head_seqno: u32,
+    ) -> Result<TruncationGuard> {
+        use std::sync::atomic::Ordering;
+        let slot = self.cleanup_floor.lock();
+        if self.truncating.load(Ordering::Acquire) {
+            fail!("A database truncation is already running");
+        }
+        let entry = self.floor_epoch.load(Ordering::Acquire);
+        let exit = entry
+            .checked_add(2)
+            .ok_or_else(|| error!("Cleanup floor epoch exhausted; truncation refused"))?;
+        let floors: Vec<&BlockIdExt> = match &*slot {
+            CleanupFloor::Unset => vec![],
+            CleanupFloor::Pinned(id, _) | CleanupFloor::Missing(id) => vec![id],
+            CleanupFloor::Uncertain { previous, candidate } => {
+                previous.iter().map(|(id, _)| id).chain([&candidate.0]).collect()
+            }
+        };
+        if let Some(floor) = floors.iter().find(|id| id.seq_no() > new_head_seqno) {
+            fail!("Truncation to {new_head_seqno} would go below the cleanup floor {floor}");
+        }
+        self.truncating.store(true, Ordering::Release);
+        self.floor_epoch.store(entry + 1, Ordering::Release);
+        drop(slot);
+        Ok(TruncationGuard { keeper: self.clone(), exit })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_floor_epoch_for_test(&self, epoch: u64) {
+        let _slot = self.cleanup_floor.lock();
+        self.floor_epoch.store(epoch, std::sync::atomic::Ordering::Release);
+    }
+
     /// True when no floor was ever persisted, so a first-run adoption may run.
     pub(crate) fn cleanup_floor_unset(&self) -> bool {
         matches!(&*self.cleanup_floor.lock(), CleanupFloor::Unset)
@@ -328,6 +412,7 @@ impl ShardStatesKeeper {
         &self,
         id: &BlockIdExt,
         guard: PinnedShardStateGuard,
+        epoch: u64,
     ) -> Result<()> {
         use consensus_common::validator_cleanup::{
             encode_checkpoint, is_full_masterchain_checkpoint, GC_FLOOR_KEY,
@@ -336,6 +421,7 @@ impl ShardStatesKeeper {
             fail!("Cleanup floor pin does not match a full masterchain block");
         }
         let mut slot = self.cleanup_floor.lock();
+        self.check_floor_epoch(epoch)?;
         // Monotonic under the slot lock: only a strict descendant of the
         // current floor, so a stale caller can never move it back.
         match &*slot {

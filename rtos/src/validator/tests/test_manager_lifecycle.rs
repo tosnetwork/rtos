@@ -24,6 +24,8 @@ struct LifecycleEngine {
     retirement_fence: std::sync::Mutex<HashSet<UInt256>>,
     fail_retirement: std::sync::atomic::AtomicBool,
     no_applied_mc: std::sync::atomic::AtomicBool,
+    rotation: std::sync::Mutex<Option<BlockIdExt>>,
+    fail_rotation: std::sync::atomic::AtomicBool,
 }
 
 struct StateGate {
@@ -66,6 +68,16 @@ impl EngineOperations for LifecycleEngine {
         }
         *self.retirement_fence.lock().unwrap() = fence.clone();
         self.retired_records.lock().unwrap().extend_from_slice(records);
+        Ok(())
+    }
+    fn load_last_rotation_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
+        Ok(self.rotation.lock().unwrap().clone().map(Arc::new))
+    }
+    fn save_last_rotation_block_id(&self, id: &BlockIdExt) -> Result<()> {
+        if self.fail_rotation.load(Ordering::Relaxed) {
+            fail!("controlled rotation block failure");
+        }
+        *self.rotation.lock().unwrap() = Some(id.clone());
         Ok(())
     }
     fn remove_last_validation_time(&self, _: &ShardIdent) {}
@@ -568,4 +580,94 @@ async fn test_manager_lifecycle_invalid_transport_releases_unstarted_owner() {
         .expect("invalid startup retained a live manager mask");
     assert!(terminal.unwrap_err().to_string().contains("invalid transport configuration"));
     assert_eq!(engine.reported.lock().unwrap().len(), 1);
+}
+
+fn mc(seqno: u32) -> BlockIdExt {
+    BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        seqno,
+        UInt256::from([seqno as u8; 32]),
+        UInt256::from([seqno as u8; 32]),
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_manager_lifecycle_rotation_prunes_exactly_the_captured_fence() {
+    let engine = Arc::new(LifecycleEngine::default());
+    let mut manager = manager_fixture(engine.clone());
+    let (a, b) = (UInt256::rand(), UInt256::rand());
+    manager.destroyed_sessions = HashSet::from([a.clone(), b.clone()]);
+    *engine.retirement_fence.lock().unwrap() = manager.destroyed_sessions.clone();
+    manager.rotate_init_block(&mc(20)).unwrap();
+    assert_eq!(*engine.rotation.lock().unwrap(), Some(mc(20)));
+    assert!(manager.destroyed_sessions.is_empty(), "the captured sessions are pruned");
+    assert!(engine.retirement_fence.lock().unwrap().is_empty(), "durably");
+    assert!(engine.retired_records.lock().unwrap().is_empty(), "records are never written");
+    // An empty fence: the rotation block still advances, nothing is written.
+    engine.fail_retirement.store(true, Ordering::Relaxed);
+    manager.rotate_init_block(&mc(21)).unwrap();
+    assert_eq!(*engine.rotation.lock().unwrap(), Some(mc(21)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_manager_lifecycle_failed_rotation_writes_prune_nothing_and_are_retried() {
+    let id = UInt256::rand();
+    // The rotation block save fails: nothing is pruned, the failure latches.
+    let engine = Arc::new(LifecycleEngine::default());
+    let mut manager = manager_fixture(engine.clone());
+    manager.destroyed_sessions = HashSet::from([id.clone()]);
+    *engine.retirement_fence.lock().unwrap() = manager.destroyed_sessions.clone();
+    engine.fail_rotation.store(true, Ordering::Relaxed);
+    let error = manager.rotate_init_block(&mc(20)).unwrap_err().to_string();
+    assert!(error.contains("controlled rotation block failure"), "{error}");
+    assert!(manager.destroyed_sessions.contains(&id));
+    assert!(engine.retirement_fence.lock().unwrap().contains(&id));
+    assert_eq!(*engine.rotation.lock().unwrap(), None);
+    // The fence write fails after the rotation block was saved: the
+    // in-memory fence keeps the captured IDs and the failure latches.
+    let engine = Arc::new(LifecycleEngine::default());
+    let mut manager = manager_fixture(engine.clone());
+    manager.destroyed_sessions = HashSet::from([id.clone()]);
+    *engine.retirement_fence.lock().unwrap() = manager.destroyed_sessions.clone();
+    engine.fail_retirement.store(true, Ordering::Relaxed);
+    let error = manager.rotate_init_block(&mc(20)).unwrap_err().to_string();
+    assert!(error.contains("fence pruning"), "{error}");
+    assert!(manager.destroyed_sessions.contains(&id), "not published before the write");
+    assert!(engine.retirement_fence.lock().unwrap().contains(&id));
+    assert_eq!(*engine.rotation.lock().unwrap(), Some(mc(20)));
+    // A later rotation retries the pruning once the failure is resolved.
+    engine.fail_retirement.store(false, Ordering::Relaxed);
+    manager.lifecycle_errors.clear();
+    manager.rotate_init_block(&mc(21)).unwrap();
+    assert!(manager.destroyed_sessions.is_empty());
+    assert!(engine.retirement_fence.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_manager_lifecycle_disable_reasons_keep_fence_and_rotation() {
+    for reason in [DisableReason::Retire, DisableReason::Shutdown] {
+        let engine = Arc::new(LifecycleEngine::default());
+        *engine.rotation.lock().unwrap() = Some(mc(20));
+        let mut manager = manager_fixture(engine.clone());
+        let earlier = UInt256::rand();
+        manager.destroyed_sessions.insert(earlier.clone());
+        let id = UInt256::rand();
+        manager.current_sessions.insert(id.clone(), group_fixture(engine.clone()));
+        manager.disable_validation(reason).await.unwrap();
+        assert_eq!(*engine.rotation.lock().unwrap(), Some(mc(20)), "{reason:?} keeps the rotation");
+        assert!(manager.destroyed_sessions.contains(&earlier), "{reason:?} keeps the fence");
+        assert!(engine.persisted.lock().unwrap().contains(&earlier));
+        let records = engine.retired_records.lock().unwrap().clone();
+        match reason {
+            DisableReason::Retire => {
+                assert_eq!(records.len(), 1, "a retirement records the group");
+                assert_eq!(records[0].session_id, id);
+                assert!(manager.destroyed_sessions.contains(&id), "and fences it");
+            }
+            DisableReason::Shutdown => {
+                assert!(records.is_empty(), "a shutdown records nothing");
+                assert!(!manager.destroyed_sessions.contains(&id), "and fences nothing");
+            }
+        }
+    }
 }

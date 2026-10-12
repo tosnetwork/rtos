@@ -545,12 +545,10 @@ impl EngineOperations for Engine {
         self.db().load_validator_state(LAST_ROTATION_MC_BLOCK)
     }
 
+    /// Synced, like the init-block save it ports; every writer of this key
+    /// goes through here, so no queued write can land after it.
     fn save_last_rotation_block_id(&self, id: &BlockIdExt) -> Result<()> {
-        self.db().save_validator_state(LAST_ROTATION_MC_BLOCK, id)
-    }
-
-    fn clear_last_rotation_block_id(&self) -> Result<()> {
-        self.db().drop_validator_state(LAST_ROTATION_MC_BLOCK)
+        self.db().save_validator_state_sync(LAST_ROTATION_MC_BLOCK, id)
     }
 
     fn load_destroyed_session_ids(&self) -> Result<Vec<UInt256>> {
@@ -567,10 +565,6 @@ impl EngineOperations for Engine {
             let data = serialize_destroyed_session_ids(ids);
             self.db().save_validator_state_raw(DESTROYED_VALIDATOR_SESSIONS, &data)
         }
-    }
-
-    fn clear_destroyed_session_ids(&self) -> Result<()> {
-        self.db().drop_validator_state_raw(DESTROYED_VALIDATOR_SESSIONS)
     }
 
     fn persist_validator_retirement(

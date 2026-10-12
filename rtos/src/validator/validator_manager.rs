@@ -881,6 +881,14 @@ fn journal_state(journal: &consensus_common::validator_cleanup::CleanupJournal) 
     }
 }
 
+/// Why validation is disabled: a retirement fences and records every group;
+/// a shutdown does neither. Neither clears the fence or the rotation block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DisableReason {
+    Retire,
+    Shutdown,
+}
+
 /// What a cleanup worker produced.
 enum CleanupOutcome {
     Gone(Result<bool>),
@@ -1731,16 +1739,30 @@ impl ValidatorManagerImpl {
         self.engine.save_destroyed_session_ids(&self.destroyed_sessions)
     }
 
-    fn clear_destroyed_sessions(&mut self) -> Result<()> {
-        if !self.destroyed_sessions.is_empty() {
-            log::debug!(
-                target: "validator_manager",
-                "Clearing {} destroyed session IDs",
-                self.destroyed_sessions.len()
-            );
-            self.destroyed_sessions.clear();
+    /// An all-shards rotation (as T0 `updated_init_block`): capture the
+    /// fence, save the rotation block synced, then remove exactly the
+    /// captured sessions with a synced fence write, publishing the pruned
+    /// fence in memory only after that write succeeds. Cleanup records are
+    /// never touched. A failed write prunes nothing and is latched.
+    fn rotate_init_block(&mut self, block: &BlockIdExt) -> Result<()> {
+        let captured = self.destroyed_sessions.clone();
+        if let Err(error) = self.engine.save_last_rotation_block_id(block) {
+            self.lifecycle_errors.insert(format!("init block rotation: {error}"));
+            return self.check_lifecycle_errors();
         }
-        self.engine.clear_destroyed_session_ids()
+        if captured.is_empty() {
+            return Ok(());
+        }
+        let remaining: HashSet<UInt256> =
+            self.destroyed_sessions.difference(&captured).cloned().collect();
+        if let Err(error) = self.engine.persist_validator_retirement(&remaining, &[]) {
+            self.lifecycle_errors.insert(format!("fence pruning: {error}"));
+            return self.check_lifecycle_errors();
+        }
+        log::debug!(target: "validator_manager",
+            "Pruned {} destroyed session IDs at rotation {block}", captured.len());
+        self.destroyed_sessions = remaining;
+        Ok(())
     }
 
     /// Find the first matching local key for a subset using a specific validator list.
@@ -2197,6 +2219,52 @@ impl ValidatorManagerImpl {
         })
     }
 
+    /// Retires the old group of a replaced authenticated admission. The
+    /// session stays live, so the fence is unchanged. A v2 observer namespace
+    /// is keyed by its local ADNL: when the replacement no longer uses it
+    /// (another ADNL, or a validator role), the old namespace is orphaned
+    /// and gets a durable cleanup record, persisted before the old group
+    /// closes. Any other replacement reuses its namespace and records nothing.
+    fn retire_replaced_admission(
+        &mut self,
+        id: UInt256,
+        old: Arc<ValidatorGroup>,
+        replacement: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+    ) {
+        use consensus_common::{session_runtime::LocalRole, validator_cleanup::NamespaceLayout};
+        let layout = |runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime| {
+            match runtime.local_role() {
+                LocalRole::Validator(_) => NamespaceLayout::V2Validator,
+                LocalRole::Observer => {
+                    NamespaceLayout::V2Observer(UInt256::from(*runtime.local_adnl().data()))
+                }
+            }
+        };
+        let orphaned = old.authenticated_runtime().is_some_and(|previous| {
+            matches!(layout(&previous), NamespaceLayout::V2Observer(_))
+                && layout(&previous) != layout(replacement)
+        });
+        let generation = if orphaned {
+            match self.cleanup_record(&id, &old) {
+                Ok(record) => {
+                    let generation = self.cleanup.on_group_retired(&record);
+                    let namespace = record.namespace.clone();
+                    self.pending_cleanup_records.push(record);
+                    Some((namespace, generation))
+                }
+                Err(error) => {
+                    log::error!(target: "validator_manager",
+                        "No cleanup record for the orphaned observer namespace of {id:x}; \
+                        it is retained: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.retire_group_generation(id, old, generation);
+    }
+
     // Replacing an authenticated admission keeps the session ID live. Only the
     // old instance is retired; the ordinary destruction blacklist is unchanged.
     fn retire_group_generation(
@@ -2627,12 +2695,12 @@ impl ValidatorManagerImpl {
         Ok(())
     }
 
-    async fn disable_validation(&mut self, clear_rotation: bool) -> Result<()> {
+    async fn disable_validation(&mut self, reason: DisableReason) -> Result<()> {
         let prev_status = self.engine.validation_status();
         let n_current = self.current_sessions.len();
         let n_future = self.future_sessions.len();
         log::info!(target: "validator_manager",
-            "VALIDATION_STATUS: {prev_status:?} -> Disabled (clear_rotation={clear_rotation}, \
+            "VALIDATION_STATUS: {prev_status:?} -> Disabled (reason={reason:?}, \
             current_sessions={n_current}, future_sessions={n_future})"
         );
 
@@ -2645,7 +2713,7 @@ impl ValidatorManagerImpl {
             .into_iter()
             .chain(std::mem::take(&mut self.future_sessions))
         {
-            if clear_rotation {
+            if reason == DisableReason::Retire {
                 self.retire_group(id, group);
             } else {
                 // Shutdown is not a retirement: no fence, no cleanup record.
@@ -2672,12 +2740,8 @@ impl ValidatorManagerImpl {
         self.background_tasks.reopen();
         self.garbage_collect().await;
         self.engine.set_will_validate(false);
-        if clear_rotation {
-            self.clear_destroyed_sessions()?;
-            self.engine.clear_last_rotation_block_id()?;
-        } else {
-            self.persist_destroyed_sessions()?;
-        }
+        // Neither reason clears the fence or the rotation block (as T0).
+        self.persist_destroyed_sessions()?;
         log::info!(target: "validator_manager",
             "VALIDATION_STATUS: Disabled complete (stopped {} current + {} future sessions)",
             n_current, n_future);
@@ -2685,7 +2749,7 @@ impl ValidatorManagerImpl {
     }
 
     async fn stop_validation(&mut self) -> Result<()> {
-        self.disable_validation(false).await
+        self.disable_validation(DisableReason::Shutdown).await
     }
 
     fn enable_validation(&mut self) {
@@ -2934,11 +2998,11 @@ impl ValidatorManagerImpl {
                 };
                 if self.current_sessions.get(&session_id).is_some_and(incompatible) {
                     let old = self.current_sessions.remove(&session_id).unwrap();
-                    self.retire_group_generation(session_id.clone(), old, None);
+                    self.retire_replaced_admission(session_id.clone(), old, runtime);
                 }
                 if self.future_sessions.get(&session_id).is_some_and(incompatible) {
                     let old = self.future_sessions.remove(&session_id).unwrap();
-                    self.retire_group_generation(session_id.clone(), old, None);
+                    self.retire_replaced_admission(session_id.clone(), old, runtime);
                 }
                 self.drain_retiring().await?;
             }
@@ -3146,7 +3210,7 @@ impl ValidatorManagerImpl {
         if !has_validator_key && !has_v2_transport {
             log::info!(target: "validator_manager",
                 "VALIDATION_STATUS: not a validator (not in prev/curr/next set), disabling");
-            self.disable_validation(true).await?;
+            self.disable_validation(DisableReason::Retire).await?;
             return Ok(());
         }
 
@@ -3167,7 +3231,7 @@ impl ValidatorManagerImpl {
             } else {
                 log::info!(target: "validator_manager",
                     "VALIDATION_STATUS: prev-only (observer mode), validator groups disabled");
-                self.disable_validation(true).await?;
+                self.disable_validation(DisableReason::Retire).await?;
             }
         }
 
@@ -3508,7 +3572,7 @@ impl ValidatorManagerImpl {
                             .is_some_and(|old| old.same_admission(runtime))
                     }) {
                         let old = self.future_sessions.remove(&session_id).unwrap();
-                        self.retire_group_generation(session_id.clone(), old, None);
+                        self.retire_replaced_admission(session_id.clone(), old, runtime);
                         self.drain_retiring().await?;
                     }
                 }
@@ -3608,8 +3672,7 @@ impl ValidatorManagerImpl {
 
         if rotate_all_shards(mc_state_extra) {
             log::info!(target: "validator_manager", "New last rotation block: {}", last_masterchain_block);
-            self.engine.save_last_rotation_block_id(last_masterchain_block)?;
-            self.clear_destroyed_sessions()?;
+            self.rotate_init_block(last_masterchain_block)?;
         } else {
             self.persist_destroyed_sessions()?;
         }
@@ -4090,8 +4153,6 @@ fn spawn_validator_manager(
             }
         } {
             log::trace!(target: "validator_manager", "Not a validator, waiting...");
-            let _ = engine.clear_last_rotation_block_id();
-            let _ = engine.clear_destroyed_session_ids();
             for _ in 0..CHECK_VALIDATOR_TIMEOUT {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 if engine.check_stop() {

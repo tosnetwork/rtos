@@ -2053,6 +2053,32 @@ impl InternalDb {
         self.block_handle_storage.save_full_node_state(key.to_string(), block_id)
     }
 
+    /// Refuses a truncation whose new head lies below the durable
+    /// validator-cleanup GC floor, or when that key is malformed.
+    pub(crate) fn check_truncation_above_cleanup_floor(&self, new_head_seqno: u32) -> Result<()> {
+        use consensus_common::validator_cleanup::{decode_checkpoint, GC_FLOOR_KEY};
+        let Some(value) = self.load_validator_state_key_bounded(GC_FLOOR_KEY, 256)? else {
+            return Ok(());
+        };
+        let floor = decode_checkpoint(&value)
+            .ok_or_else(|| error!("Malformed validator-cleanup GC floor; truncation refused"))?;
+        if floor.seq_no() > new_head_seqno {
+            fail!("Truncation to {new_head_seqno} would go below the cleanup floor {floor}");
+        }
+        Ok(())
+    }
+
+    /// `save_validator_state` as one synced write, readable by
+    /// `load_validator_state`.
+    pub fn save_validator_state_sync(
+        &self,
+        key: &'static str,
+        block_id: &BlockIdExt,
+    ) -> Result<()> {
+        let value = storage::traits::Serializable::serialize(block_id).as_ref().to_vec();
+        self.block_handle_storage.write_validator_state_batch_sync(&[(key.to_owned(), value)], &[])
+    }
+
     pub fn drop_validator_state(&self, key: &'static str) -> Result<()> {
         let _tc = time_checker!(|| format!("drop_validator_state {}", key), 30);
         self.block_handle_storage.drop_validator_state(key.to_string())
@@ -2316,6 +2342,8 @@ impl InternalDb {
     pub async fn truncate_database(&self, mc_block_id: &BlockIdExt) -> Result<()> {
         // store shard blocks to truncate
         let prev_id = self.load_block_prev1(mc_block_id)?;
+        // Never below the validator-cleanup GC floor, on every path.
+        self.check_truncation_above_cleanup_floor(prev_id.seq_no())?;
         let prev_handle = self
             .load_block_handle(&prev_id)?
             .ok_or_else(|| error!("there is no handle for block {}", prev_id))?;

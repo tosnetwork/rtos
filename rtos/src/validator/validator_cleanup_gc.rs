@@ -126,12 +126,14 @@ async fn advance_inputs(
 /// went missing is left alone: cleanup stays disabled.
 pub(crate) async fn maintain_cleanup_floor(source: &dyn CleanupFloorSource) -> Result<()> {
     let keeper = source.keeper();
-    keeper.resolve_uncertain_cleanup_floor()?;
+    // Before any frontier is read: work from another epoch is refused.
+    let epoch = keeper.cleanup_floor_epoch();
+    keeper.resolve_uncertain_cleanup_floor(epoch)?;
     let Some((inputs, last)) = advance_inputs(source).await? else {
         return Ok(());
     };
     if keeper.cleanup_floor_unset() {
-        return bootstrap(&keeper, &inputs, &last);
+        return bootstrap(&keeper, &inputs, &last, epoch);
     }
     let Some((floor_id, floor_state)) = keeper.cleanup_floor() else {
         return Ok(());
@@ -158,13 +160,14 @@ pub(crate) async fn maintain_cleanup_floor(source: &dyn CleanupFloorSource) -> R
             "Cleanup floor successor {next} is not a verified descendant of {floor_id}"
         ));
     }
-    keeper.adopt_cleanup_floor(&next, guard)
+    keeper.adopt_cleanup_floor(&next, guard, epoch)
 }
 
 fn bootstrap(
     keeper: &ShardStatesKeeper,
     inputs: &GcAdvanceInputs,
     last: &ShardStateStuff,
+    epoch: u64,
 ) -> Result<()> {
     let bound = [
         inputs.last_rotation_seqno,
@@ -193,7 +196,7 @@ fn bootstrap(
         if u64::from(guard.state().state()?.gen_time()) >= expiry {
             continue;
         }
-        return keeper.adopt_cleanup_floor(&candidate, guard);
+        return keeper.adopt_cleanup_floor(&candidate, guard, epoch);
     }
     Ok(())
 }

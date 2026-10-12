@@ -480,16 +480,10 @@ pub trait EngineOperations: Sync + Send {
     fn save_last_rotation_block_id(&self, info: &BlockIdExt) -> Result<()> {
         unimplemented!()
     }
-    fn clear_last_rotation_block_id(&self) -> Result<()> {
-        unimplemented!()
-    }
     fn load_destroyed_session_ids(&self) -> Result<Vec<UInt256>> {
         unimplemented!()
     }
     fn save_destroyed_session_ids(&self, _ids: &HashSet<UInt256>) -> Result<()> {
-        unimplemented!()
-    }
-    fn clear_destroyed_session_ids(&self) -> Result<()> {
         unimplemented!()
     }
     /// Persists the destroyed-session fence together with new cleanup records

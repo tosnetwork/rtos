@@ -619,7 +619,7 @@ pub(super) async fn pin_floor(engine: &Arc<Engine>, id: &BlockIdExt) {
     })
     .await
     .expect("the stored state can be pinned");
-    keeper.adopt_cleanup_floor(id, guard).unwrap();
+    keeper.adopt_cleanup_floor(id, guard, keeper.cleanup_floor_epoch()).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

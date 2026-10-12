@@ -2773,6 +2773,9 @@ impl Engine {
             .await
             .map_err(|err| error!("no previous block state present for {}", err))?;
 
+        // No floor is adopted while truncating, and none may lie above the
+        // new head; the database checks its durable floor as well.
+        let _truncation = self.shard_states_keeper().begin_truncation(prev_block_id.seq_no())?;
         self.db().truncate_database(&block_id).await?;
         self.save_last_applied_mc_block_id(&prev_block_id)?;
 

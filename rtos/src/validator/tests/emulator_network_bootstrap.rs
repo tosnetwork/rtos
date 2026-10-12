@@ -1077,11 +1077,6 @@ impl EngineOperations for BootstrapTestEngine {
         Ok(())
     }
 
-    fn clear_last_rotation_block_id(&self) -> Result<()> {
-        *self.last_rotation_block_id.write().unwrap() = None;
-        Ok(())
-    }
-
     fn load_destroyed_session_ids(&self) -> Result<Vec<UInt256>> {
         Ok(Vec::new())
     }
@@ -1092,16 +1087,14 @@ impl EngineOperations for BootstrapTestEngine {
         records: &[consensus_common::validator_cleanup::PendingValidatorCleanup],
     ) -> Result<()> {
         use consensus_common::validator_cleanup::{encode_record, record_key};
-        let puts: Vec<_> =
-            records.iter().map(|r| Ok((record_key(&r.namespace), encode_record(r)?))).collect::<Result<_>>()?;
+        let puts: Vec<_> = records
+            .iter()
+            .map(|r| Ok((record_key(&r.namespace), encode_record(r)?)))
+            .collect::<Result<_>>()?;
         self.db.write_validator_state_batch_sync(&puts, &[])?;
         self.save_destroyed_session_ids(fence)
     }
     fn save_destroyed_session_ids(&self, _ids: &std::collections::HashSet<UInt256>) -> Result<()> {
-        Ok(())
-    }
-
-    fn clear_destroyed_session_ids(&self) -> Result<()> {
         Ok(())
     }
 

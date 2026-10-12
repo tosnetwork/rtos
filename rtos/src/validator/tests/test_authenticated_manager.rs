@@ -507,3 +507,94 @@ fn install_signed_manager_successor(engine: &BootstrapTestEngine, bootstrap: &Em
     engine.historical_proofs.write().unwrap().insert(id, proof);
     Ok(state)
 }
+
+#[tokio::test]
+async fn replaced_observer_admission_records_only_an_orphaned_namespace() -> Result<()> {
+    use consensus_common::validator_cleanup::{parse_canonical_namespace_name, NamespaceLayout};
+    let key_a = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71; 32])?;
+    let key_b = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x72; 32])?;
+    let mut bootstrap = EmulatorNetworkBootstrap::build(2)?;
+    configure(&mut bootstrap, &key_a)?;
+    let engine = Arc::new(BootstrapTestEngine::new_with_local_keys(&bootstrap, Vec::new()).await?);
+    let state = engine.build_masterchain_state(&bootstrap, 0)?;
+    engine.install_masterchain_state(state.clone(), None)?;
+    let shard = ShardIdent::masterchain();
+    let (info, id) =
+        derive_governing_session_info(&state, &shard, bootstrap.validator_set.list(), 0, 0, 0)?;
+    let runtime = |key: &PrivateKey| -> Result<Arc<AuthenticatedSessionRuntime>> {
+        Ok(Arc::new(
+            AuthenticatedSessionRuntime::from_authenticated_config(
+                SessionNetworkPin {
+                    global_id: state.state()?.global_id(),
+                    zerostate: bootstrap.zerostate_id.clone(),
+                },
+                state.config_params()?,
+                rtos_api::session_identity::SessionCoordinates {
+                    shard: &shard,
+                    catchain_seqno: 0,
+                    vertical_seqno: 0,
+                    last_key_block_seqno: 0,
+                    new_catchain_ids: false,
+                },
+                bootstrap.validator_set.list().to_vec(),
+                key.id().clone(),
+            )?
+            .bind_recovery_anchor(bootstrap.zerostate_id.clone())?,
+        ))
+    };
+    let group = |key: &PrivateKey, runtime: Arc<AuthenticatedSessionRuntime>| -> Result<Arc<ValidatorGroup>> {
+        let options = SimplexSessionOptions {
+            protocol: runtime.protocol(),
+            proto_version: runtime.carrier_version(),
+            wire_profile: runtime.wire_profile(),
+            slots_per_leader_window: runtime.slots_per_leader_window(),
+            ..Default::default()
+        };
+        Ok(Arc::new(
+            ValidatorGroup::new(
+                info.clone(),
+                key.clone(),
+                id.clone(),
+                UInt256::from([1; 32]),
+                bootstrap.validator_set.clone(),
+                0,
+                ConsensusOptions::Simplex(options),
+                engine.clone(),
+                false,
+                None,
+            )
+            .with_authenticated_runtime(runtime)?,
+        ))
+    };
+    let (runtime_a, runtime_b) = (runtime(&key_a)?, runtime(&key_b)?);
+    assert_eq!(runtime_a.session_id(), runtime_b.session_id(), "one session");
+    assert_eq!(runtime_a.local_role(), LocalRole::Observer);
+    let mut manager = ValidatorManagerImpl::create(
+        engine.clone(),
+        tokio::runtime::Handle::current(),
+        ValidatorManagerConfig::default(),
+    );
+    let fence = manager.destroyed_sessions.clone();
+    // The same ADNL keeps its namespace: nothing is recorded.
+    let same = runtime(&key_a)?;
+    manager.retire_replaced_admission(id.clone(), group(&key_a, runtime_a.clone())?, &same);
+    assert!(manager.pending_cleanup_records.is_empty());
+    assert!(manager.retiring_groups.iter().all(|(_, _, generation)| generation.is_none()));
+    // Another ADNL orphans the old observer namespace: one record, no fence.
+    manager.retire_replaced_admission(id.clone(), group(&key_a, runtime_a.clone())?, &runtime_b);
+    assert_eq!(manager.pending_cleanup_records.len(), 1);
+    let record = manager.pending_cleanup_records[0].clone();
+    assert_eq!(&record.session_id, &id);
+    let adnl_a = UInt256::from(*runtime_a.local_adnl().data());
+    assert_eq!(
+        parse_canonical_namespace_name(&record.namespace, &id).map(|parsed| parsed.layout),
+        Some(NamespaceLayout::V2Observer(adnl_a.clone()))
+    );
+    assert_eq!(record.identity.as_ref().map(|identity| &identity.local_adnl), Some(&adnl_a));
+    assert_eq!(manager.destroyed_sessions, fence, "the session stays live: no fence");
+    assert!(manager
+        .retiring_groups
+        .iter()
+        .any(|(_, _, generation)| generation.as_ref().is_some_and(|(ns, _)| ns == &record.namespace)));
+    Ok(())
+}

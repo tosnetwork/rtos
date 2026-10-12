@@ -285,7 +285,7 @@ async fn test_cleanup_floor_custody_restores_and_never_replaces_a_missing_floor(
     )?;
     keeper.store_state(&handle, state, None, true).await?;
     let guard = wait_pin(&keeper, &id).await?;
-    keeper.adopt_cleanup_floor(&id, guard)?;
+    keeper.adopt_cleanup_floor(&id, guard, keeper.cleanup_floor_epoch())?;
     assert_eq!(keeper.cleanup_floor().map(|(floor, _)| floor), Some(id.clone()));
     assert!(!keeper.cleanup_floor_unset());
     assert_eq!(floor_key(&engine.db)?, Some(id.clone()), "persisted before publication");
@@ -318,8 +318,14 @@ async fn test_cleanup_floor_custody_restores_and_never_replaces_a_missing_floor(
         handles.create_handle(id.clone(), storage::types::BlockMeta::default(), None)?.unwrap();
     keeper.store_state(&handle, state, None, true).await?;
     let guard = wait_pin(&keeper, &id).await?;
-    assert!(keeper.adopt_cleanup_floor(&id, guard).is_err(), "never replaced");
-    assert_eq!(floor_key(&engine.db)?, Some(id), "the key is retained");
+    assert!(
+        keeper.adopt_cleanup_floor(&id, guard, keeper.cleanup_floor_epoch()).is_err(),
+        "never replaced"
+    );
+    assert_eq!(floor_key(&engine.db)?, Some(id.clone()), "the key is retained");
+    // A missing floor still bounds truncation.
+    assert!(keeper.begin_truncation(41).is_err(), "never below a missing floor");
+    drop(keeper.begin_truncation(42)?);
     stopper.set_stop();
     engine.db.stop_states_db().await.unwrap();
     Ok(())
@@ -387,18 +393,38 @@ async fn test_cleanup_floor_adoption_is_monotonic_and_uncertain_writes_fail_clos
     store_mc_state(&keeper, &floor, None).await?;
     store_mc_state(&keeper, &successor, Some(&floor)).await?;
     store_mc_state(&keeper, &fork, None).await?;
-    keeper.adopt_cleanup_floor(&floor, wait_pin(&keeper, &floor).await?)?;
+    keeper.adopt_cleanup_floor(
+        &floor,
+        wait_pin(&keeper, &floor).await?,
+        keeper.cleanup_floor_epoch(),
+    )?;
     // No regression, and no fork that does not record the current floor.
-    assert!(keeper.adopt_cleanup_floor(&older, wait_pin(&keeper, &older).await?).is_err());
-    assert!(keeper.adopt_cleanup_floor(&fork, wait_pin(&keeper, &fork).await?).is_err());
+    assert!(keeper
+        .adopt_cleanup_floor(&older, wait_pin(&keeper, &older).await?, keeper.cleanup_floor_epoch())
+        .is_err());
+    assert!(keeper
+        .adopt_cleanup_floor(&fork, wait_pin(&keeper, &fork).await?, keeper.cleanup_floor_epoch())
+        .is_err());
     assert_eq!(keeper.cleanup_floor().map(|(id, _)| id), Some(floor.clone()));
     // A write that committed but reported an error leaves the floor uncertain:
     // cleanup is disabled and nothing can be adopted until the key is re-read.
     keeper.fail_floor_write_after_commit.store(true, std::sync::atomic::Ordering::Release);
-    assert!(keeper.adopt_cleanup_floor(&successor, wait_pin(&keeper, &successor).await?).is_err());
+    assert!(keeper
+        .adopt_cleanup_floor(
+            &successor,
+            wait_pin(&keeper, &successor).await?,
+            keeper.cleanup_floor_epoch()
+        )
+        .is_err());
     assert!(keeper.cleanup_floor().is_none(), "uncertain disables cleanup");
     assert!(!keeper.cleanup_floor_unset());
-    assert!(keeper.adopt_cleanup_floor(&successor, wait_pin(&keeper, &successor).await?).is_err());
+    assert!(keeper
+        .adopt_cleanup_floor(
+            &successor,
+            wait_pin(&keeper, &successor).await?,
+            keeper.cleanup_floor_epoch()
+        )
+        .is_err());
     let durable = engine
         .db
         .load_validator_state_key_bounded(GC_FLOOR_KEY, 256)?
@@ -406,12 +432,14 @@ async fn test_cleanup_floor_adoption_is_monotonic_and_uncertain_writes_fail_clos
     assert_eq!(durable, Some(successor.clone()), "the write committed");
     // The read-back alone is not durability: a failed re-write stays uncertain.
     keeper.fail_floor_resolve_write.store(true, std::sync::atomic::Ordering::Release);
-    assert!(keeper.resolve_uncertain_cleanup_floor().is_err());
+    assert!(keeper.resolve_uncertain_cleanup_floor(keeper.cleanup_floor_epoch()).is_err());
     assert!(keeper.cleanup_floor().is_none(), "a failed re-write keeps cleanup disabled");
     assert!(!keeper.cleanup_floor_unset());
-    keeper.resolve_uncertain_cleanup_floor()?;
+    keeper.resolve_uncertain_cleanup_floor(keeper.cleanup_floor_epoch())?;
     assert_eq!(keeper.cleanup_floor().map(|(id, _)| id), Some(successor.clone()));
-    assert!(keeper.adopt_cleanup_floor(&floor, wait_pin(&keeper, &floor).await?).is_err());
+    assert!(keeper
+        .adopt_cleanup_floor(&floor, wait_pin(&keeper, &floor).await?, keeper.cleanup_floor_epoch())
+        .is_err());
     stopper.set_stop();
     engine.db.stop_states_db().await.unwrap();
     Ok(())
@@ -432,15 +460,17 @@ async fn test_uncertain_first_floor_resolves_only_from_a_genuinely_absent_key() 
     let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
     store_mc_state(&keeper, &floor, None).await?;
     keeper.fail_floor_write_after_commit.store(true, std::sync::atomic::Ordering::Release);
-    assert!(keeper.adopt_cleanup_floor(&floor, wait_pin(&keeper, &floor).await?).is_err());
+    assert!(keeper
+        .adopt_cleanup_floor(&floor, wait_pin(&keeper, &floor).await?, keeper.cleanup_floor_epoch())
+        .is_err());
     // Malformed bytes are not absence: no fresh bootstrap may follow.
     engine.db.write_validator_state_batch_sync(&[(GC_FLOOR_KEY.to_owned(), vec![0xff; 7])], &[])?;
-    keeper.resolve_uncertain_cleanup_floor()?;
+    keeper.resolve_uncertain_cleanup_floor(keeper.cleanup_floor_epoch())?;
     assert!(keeper.cleanup_floor().is_none());
     assert!(!keeper.cleanup_floor_unset(), "malformed key stays uncertain");
     // A genuinely absent key with no previous floor resolves to unset.
     engine.db.write_validator_state_batch_sync(&[], &[GC_FLOOR_KEY.to_owned()])?;
-    keeper.resolve_uncertain_cleanup_floor()?;
+    keeper.resolve_uncertain_cleanup_floor(keeper.cleanup_floor_epoch())?;
     assert!(keeper.cleanup_floor_unset());
     assert!(engine.db.load_validator_state_key_bounded(GC_FLOOR_KEY, 256)?.is_none());
     stopper.set_stop();
@@ -463,7 +493,11 @@ async fn test_cleanup_floor_is_re_pinned_from_the_same_db_after_restart() -> Res
         let stopper = Arc::new(Stopper::new());
         let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
         store_mc_state(&keeper, &floor, None).await?;
-        keeper.adopt_cleanup_floor(&floor, wait_pin(&keeper, &floor).await?)?;
+        keeper.adopt_cleanup_floor(
+            &floor,
+            wait_pin(&keeper, &floor).await?,
+            keeper.cleanup_floor_epoch(),
+        )?;
         stopper.set_stop();
         engine.db.stop_states_db().await.unwrap();
     }
@@ -596,7 +630,11 @@ async fn driver_fixture(
         .save_full_node_state(crate::internal_db::SHARD_CLIENT_MC_BLOCK, &driver_mc(1900, 8))?;
     engine.db.save_full_node_state(crate::internal_db::PSS_KEEPER_MC_BLOCK, &driver_mc(pss, 6))?;
     engine.db.save_full_node_state(crate::internal_db::LAST_APPLIED_MC_BLOCK, &last)?;
-    keeper.adopt_cleanup_floor(&floor, wait_pin(&keeper, &floor).await?)?;
+    keeper.adopt_cleanup_floor(
+        &floor,
+        wait_pin(&keeper, &floor).await?,
+        keeper.cleanup_floor_epoch(),
+    )?;
     let source = DbFloorSource { db: engine.db.clone(), keeper };
     Ok((engine, stopper, source))
 }
@@ -708,5 +746,147 @@ async fn test_cleanup_sibling_scan_counts_oversized_records() -> Result<()> {
     )?;
     assert!(session_has_other_records(&engine.db, &own.namespace, &session)?);
     assert!(session_has_other_records(&engine.db, &later.namespace, &session)?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_synced_validator_state_block_id_round_trips_and_replaces() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let engine = TestEngine::new_db_dir(dir.path().to_str().unwrap(), None).await?;
+    let key = "LastRotationBlockIdSyncTest";
+    let first = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        20,
+        UInt256::from([3; 32]),
+        UInt256::from([4; 32]),
+    );
+    let second = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        21,
+        UInt256::from([5; 32]),
+        UInt256::from([6; 32]),
+    );
+    engine.db.save_validator_state_sync(key, &second)?;
+    assert_eq!(engine.db.load_validator_state(key)?.as_deref(), Some(&second));
+    engine.db.save_validator_state_sync(key, &first)?;
+    assert_eq!(engine.db.load_validator_state(key)?.as_deref(), Some(&first));
+    engine.db.stop_states_db().await.unwrap();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_truncation_is_exclusive_bounded_by_the_floor_and_invalidates_floor_work() -> Result<()>
+{
+    let mc = |seqno: u32, hash: u8| {
+        BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            seqno,
+            UInt256::from([hash; 32]),
+            UInt256::from([hash; 32]),
+        )
+    };
+    let (floor, successor, next) = (mc(42, 2), mc(43, 3), mc(44, 4));
+    let dir = tempfile::tempdir()?;
+    let engine = TestEngine::new_db_dir(dir.path().to_str().unwrap(), None).await?;
+    let stopper = Arc::new(Stopper::new());
+    let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
+    store_mc_state(&keeper, &floor, None).await?;
+    store_mc_state(&keeper, &successor, Some(&floor)).await?;
+    store_mc_state(&keeper, &next, Some(&successor)).await?;
+    keeper.adopt_cleanup_floor(
+        &floor,
+        wait_pin(&keeper, &floor).await?,
+        keeper.cleanup_floor_epoch(),
+    )?;
+
+    // Never below the floor; at the floor itself it is admitted.
+    assert!(keeper.begin_truncation(41).is_err());
+    drop(keeper.begin_truncation(42)?);
+
+    // Floor work prepared before a truncation: epoch read, candidate pinned.
+    let stale = keeper.cleanup_floor_epoch();
+    let prepared = wait_pin(&keeper, &successor).await?;
+    let truncation = keeper.begin_truncation(50)?;
+    // Exclusive: a second admission is refused and cannot end the first.
+    assert!(keeper.begin_truncation(50).is_err());
+    assert!(keeper.begin_truncation(50).is_err(), "the refused attempt did not clear it");
+    // Frozen: no adoption or resolution, even with the current epoch.
+    let current = keeper.cleanup_floor_epoch();
+    assert!(keeper
+        .adopt_cleanup_floor(&successor, wait_pin(&keeper, &successor).await?, current)
+        .is_err());
+    assert!(keeper.resolve_uncertain_cleanup_floor(current).is_err());
+    drop(truncation);
+    assert_eq!(keeper.cleanup_floor_epoch(), stale + 2, "both increments published");
+    // The work prepared before the truncation is refused; fresh work is not.
+    assert!(keeper.adopt_cleanup_floor(&successor, prepared, stale).is_err());
+    assert_eq!(keeper.cleanup_floor().map(|(id, _)| id), Some(floor.clone()));
+    keeper.adopt_cleanup_floor(
+        &successor,
+        wait_pin(&keeper, &successor).await?,
+        keeper.cleanup_floor_epoch(),
+    )?;
+    assert_eq!(keeper.cleanup_floor().map(|(id, _)| id), Some(successor.clone()));
+
+    // While uncertain, both pins bound truncation.
+    keeper.fail_floor_write_after_commit.store(true, std::sync::atomic::Ordering::Release);
+    assert!(keeper
+        .adopt_cleanup_floor(&next, wait_pin(&keeper, &next).await?, keeper.cleanup_floor_epoch())
+        .is_err());
+    assert!(keeper.cleanup_floor().is_none(), "uncertain");
+    assert!(keeper.begin_truncation(43).is_err(), "the candidate lies above the head");
+    drop(keeper.begin_truncation(44)?);
+
+    // Exhaustion: both increments are reserved up front, or nothing changes.
+    keeper.set_floor_epoch_for_test(u64::MAX - 1);
+    assert!(keeper.begin_truncation(50).is_err());
+    assert_eq!(keeper.cleanup_floor_epoch(), u64::MAX - 1);
+    keeper.set_floor_epoch_for_test(u64::MAX - 2);
+    drop(keeper.begin_truncation(50)?);
+    assert_eq!(keeper.cleanup_floor_epoch(), u64::MAX);
+    stopper.set_stop();
+    engine.db.stop_states_db().await.unwrap();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_direct_database_truncation_refuses_below_the_durable_floor() -> Result<()> {
+    use consensus_common::validator_cleanup::{decode_checkpoint, encode_checkpoint, GC_FLOOR_KEY};
+    let mc = |seqno: u32| {
+        BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            seqno,
+            UInt256::from([seqno as u8; 32]),
+            UInt256::from([seqno as u8; 32]),
+        )
+    };
+    let dir = tempfile::tempdir()?;
+    let engine = TestEngine::new_db_dir(dir.path().to_str().unwrap(), None).await?;
+    let db = engine.db.clone();
+    // The block to truncate from (50); its new head would be 49.
+    let target = mc(50);
+    let handle = db.create_test_block_handle(&target)?;
+    db.store_block_prev1(&handle, &mc(49), None)?;
+    let floor_bytes = |db: &InternalDb| db.load_validator_state_key_bounded(GC_FLOOR_KEY, 256);
+    for (floor, refused) in [(mc(60), true), (mc(50), true), (mc(49), false), (mc(30), false)] {
+        db.write_validator_state_batch_sync(
+            &[(GC_FLOOR_KEY.to_owned(), encode_checkpoint(&floor))],
+            &[],
+        )?;
+        let before = floor_bytes(&db)?;
+        let error = db.truncate_database(&target).await.unwrap_err().to_string();
+        assert_eq!(error.contains("below the cleanup floor"), refused, "{floor}: {error}");
+        if !refused {
+            // Past the check, it fails later on this synthetic chain.
+            assert!(error.contains("no handle"), "{error}");
+        }
+        assert!(db.load_block_handle(&target)?.is_some(), "nothing truncated");
+        assert_eq!(floor_bytes(&db)?, before, "the floor key is never touched");
+        assert_eq!(before.and_then(|v| decode_checkpoint(&v)), Some(floor));
+    }
+    db.write_validator_state_batch_sync(&[(GC_FLOOR_KEY.to_owned(), vec![1, 2, 3])], &[])?;
+    let error = db.truncate_database(&target).await.unwrap_err().to_string();
+    assert!(error.contains("Malformed validator-cleanup GC floor"), "{error}");
+    db.stop_states_db().await.unwrap();
     Ok(())
 }
