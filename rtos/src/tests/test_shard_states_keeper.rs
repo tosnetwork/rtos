@@ -894,7 +894,7 @@ async fn test_direct_database_truncation_refuses_below_the_durable_floor() -> Re
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "disk-full harness only"]
 async fn disk_full_floor_adoption_is_uncertain_then_resolves_previous_or_candidate() -> Result<()> {
-    use crate::publication_dependency_leases::disk_full_tests::{enospc_root, Filler};
+    use crate::publication_dependency_leases::disk_full_tests::{control, enospc_root, Filler};
     use consensus_common::validator_cleanup::{decode_checkpoint, GC_FLOOR_KEY};
     let mc = |seqno: u32, hash: u8| {
         BlockIdExt::with_params(
@@ -924,6 +924,15 @@ async fn disk_full_floor_adoption_is_uncertain_then_resolves_previous_or_candida
     )?;
     let candidate = wait_pin(&keeper, &successor).await?;
     engine.db.rotate_validator_state_wal_for_test()?;
+    if control() {
+        keeper.adopt_cleanup_floor(&successor, candidate, keeper.cleanup_floor_epoch())?;
+        assert_eq!(durable(&engine.db)?, Some(successor.clone()));
+        assert_eq!(keeper.cleanup_floor().map(|(id, _)| id), Some(successor));
+        stopper.set_stop();
+        engine.db.stop_states_db().await.unwrap();
+        eprintln!("ENOSPC-CASE V3 control ok");
+        return Ok(());
+    }
     let filler = Filler::fill(&root);
     let error = keeper
         .adopt_cleanup_floor(&successor, candidate, keeper.cleanup_floor_epoch())
@@ -962,13 +971,19 @@ async fn disk_full_floor_adoption_is_uncertain_then_resolves_previous_or_candida
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "disk-full harness only"]
 async fn disk_full_incarnation_is_refused_then_advances_past_any_applied_value() -> Result<()> {
-    use crate::publication_dependency_leases::disk_full_tests::{enospc_root, Filler};
+    use crate::publication_dependency_leases::disk_full_tests::{control, enospc_root, Filler};
     use crate::validator::validator_cleanup_gc::next_cleanup_incarnation;
     let root = enospc_root().join("incarnation");
     std::fs::create_dir_all(&root)?;
     let engine = TestEngine::new_db_dir(root.to_str().unwrap(), None).await?;
     let first = next_cleanup_incarnation(&engine.db)?;
     engine.db.rotate_validator_state_wal_for_test()?;
+    if control() {
+        assert_eq!(next_cleanup_incarnation(&engine.db)?, first + 1);
+        engine.db.stop_states_db().await.unwrap();
+        eprintln!("ENOSPC-CASE V4 control ok");
+        return Ok(());
+    }
     let filler = Filler::fill(&root);
     let error = next_cleanup_incarnation(&engine.db).unwrap_err();
     assert!(format!("{error:#}").contains("No space left on device"), "{error:#}");

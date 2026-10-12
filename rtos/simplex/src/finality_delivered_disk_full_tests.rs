@@ -41,6 +41,12 @@ fn disk_full_source_delivered_marker() {
     let offer = CloseOffer { request, generation: 1 };
     let reference = store.close_locator(&id).unwrap().unwrap().reference;
     let delivered = store.delivered_path(&id);
+    if std::env::var("RTOS_ENOSPC_CONTROL").as_deref() == Ok("1") {
+        drop(store.commit_delivered(&runtime, &reference, &offer).unwrap());
+        assert_eq!(DeliveredDisk::read(&delivered).unwrap().offer().unwrap(), offer);
+        eprintln!("ENOSPC-CASE delivered control ok");
+        return;
+    }
     let filler = fill(&root);
     let error = store.commit_delivered(&runtime, &reference, &offer).err().expect("full disk");
     assert!(format!("{error:#}").contains("No space left on device"), "{error:#}");
@@ -49,20 +55,21 @@ fn disk_full_source_delivered_marker() {
         assert_eq!(DeliveredDisk::read(&delivered).unwrap().offer().unwrap(), offer);
     }
     std::fs::remove_file(filler).unwrap();
-    // The documented retry: in process unless the store latched "reopen
-    // required", then after a reopen.
+    // In process the store latches "reopen required": it fails closed.
     let in_process = store.commit_delivered(&runtime, &reference, &offer).map(drop);
-    let reopened = in_process.is_err();
-    if reopened {
-        let message = format!("{:#}", in_process.unwrap_err());
-        assert!(message.contains("reopen required"), "{message}");
-        drop(store);
-        let store = open();
-        drop(store.commit_delivered(&runtime, &reference, &offer).unwrap());
-    } else {
-        drop(store);
+    let message = format!("{:#}", in_process.expect_err("the store latches after a failed write"));
+    assert!(message.contains("reopen required"), "{message}");
+    drop(store);
+    // Cold reopen before any further retry: no partial marker is final.
+    if delivered.exists() {
+        assert_eq!(DeliveredDisk::read(&delivered).unwrap().offer().unwrap(), offer);
     }
+    let reopened_store = open();
+    if !delivered.exists() {
+        drop(reopened_store.commit_delivered(&runtime, &reference, &offer).unwrap());
+    }
+    drop(reopened_store);
     let store = open();
     assert_eq!(DeliveredDisk::read(&store.delivered_path(&id)).unwrap().offer().unwrap(), offer);
-    eprintln!("ENOSPC-CASE delivered reopened={reopened}");
+    eprintln!("ENOSPC-CASE delivered latched, recovered after reopen");
 }

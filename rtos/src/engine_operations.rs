@@ -606,12 +606,7 @@ impl EngineOperations for Engine {
         &self,
         namespace: &str,
     ) -> Result<Option<consensus_common::validator_cleanup::PendingValidatorCleanup>> {
-        use consensus_common::validator_cleanup::{decode_record, record_key, MAX_RECORD_BYTES};
-        Ok(self
-            .db()
-            .load_validator_state_key_bounded(&record_key(namespace), MAX_RECORD_BYTES)?
-            .and_then(|value| decode_record(&value))
-            .filter(|record| record.namespace == namespace))
+        crate::validator::validator_cleanup_gc::load_record(self.db(), namespace)
     }
 
     fn erase_validator_cleanup_record(

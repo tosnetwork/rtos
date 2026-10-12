@@ -696,7 +696,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "disk-full harness only"]
     async fn disk_full_close_removal_and_journal_are_all_or_nothing() -> Result<()> {
-        use crate::publication_dependency_leases::disk_full_tests::{enospc_root, Filler};
+        use crate::publication_dependency_leases::disk_full_tests::{control, enospc_root, Filler};
         let root = enospc_root().join("outbox");
         std::fs::create_dir_all(&root)?;
         let limits = Limits { max_records: 1, ..Limits::default() };
@@ -706,6 +706,20 @@ mod tests {
         let (first, second) = released_pair(&store)?;
         let journal_key = "DiskFullJournal".to_string();
         engine.db.rotate_validator_state_wal_for_test()?;
+        if control() {
+            store
+                .remove_cleanup_closes(&[association(&first)?], &[(journal_key.clone(), vec![1])])?
+                .unwrap();
+            assert!(store.lookup_close(&first.binding.delivery_id)?.is_none());
+            assert_eq!(
+                engine.db.load_validator_state_key_bounded(&journal_key, 16)?,
+                Some(vec![1])
+            );
+            drop(store);
+            engine.db.stop_states_db().await.unwrap();
+            eprintln!("ENOSPC-CASE V5 control ok");
+            return Ok(());
+        }
         let filler = Filler::fill(&root);
         let error = store
             .remove_cleanup_closes(&[association(&first)?], &[(journal_key.clone(), vec![1])])

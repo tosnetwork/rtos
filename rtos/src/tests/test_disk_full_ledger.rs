@@ -1,7 +1,9 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Lease ledger under a full disk (P5-07.12 phase 1, cases L1/L2). These run
 //! only inside the disk-full harness: an unprivileged mount namespace whose
-//! `RTOS_ENOSPC_ROOT` is a size-limited tmpfs, traced from outside.
+//! `RTOS_ENOSPC_ROOT` is a size-limited tmpfs, traced from outside. With
+//! `RTOS_ENOSPC_CONTROL=1` each case runs its positive control instead: the
+//! same target write with ample space, which must succeed.
 use super::*;
 use crate::history_read_budget::HistoryReadBudget;
 
@@ -37,6 +39,11 @@ pub(crate) fn enospc_root() -> std::path::PathBuf {
     )
 }
 
+/// The positive-control run of a case: its target write with ample space.
+pub(crate) fn control() -> bool {
+    std::env::var("RTOS_ENOSPC_CONTROL").as_deref() == Ok("1")
+}
+
 fn other_binding(record_id: u64) -> crate::repair_lease_binding::RepairLeaseBinding {
     let mut binding = super::tests::binding_for_disk_full();
     binding.record_id = record_id;
@@ -62,16 +69,27 @@ fn protection_matches(leases: &DependencyLeases, present: usize) {
     );
 }
 
-/// Present and complete (its binding as written), or absent.
+/// Present and complete — binding, dependencies, digest and state exactly
+/// as written — or absent.
 fn absent_or_complete(
     leases: &DependencyLeases,
     generation: u64,
     expected: &crate::repair_lease_binding::RepairLeaseBinding,
+    state: LeaseState,
 ) -> bool {
     let budget = HistoryReadBudget::new(Default::default());
+    let deps = super::tests::dependencies_for_disk_full();
     match leases.lookup(generation, &budget) {
         Ok(record) => {
-            assert_eq!(&record.binding().unwrap(), expected, "a present lease is complete");
+            assert_eq!(record.generation, generation);
+            assert_eq!(&record.binding().unwrap(), expected, "complete binding");
+            assert_eq!(record.dependencies, deps, "complete dependencies");
+            assert_eq!(
+                record.dependency_digest,
+                format!("{:x}", dependency_digest(&deps).unwrap()),
+                "complete digest"
+            );
+            assert_eq!(record.state, state, "complete state");
             true
         }
         Err(_) => false,
@@ -88,6 +106,12 @@ async fn disk_full_ledger_begin_poisons_and_cold_reopen_is_previous_or_complete(
     let (db, leases) = super::tests::open_for_disk_full(&root)?;
     let first = leases.begin(&other_binding(1), deps.clone(), &budget)?;
     rotate_wal(&db);
+    if control() {
+        let second = leases.begin(&other_binding(2), deps, &budget)?;
+        assert!(absent_or_complete(&leases, second, &other_binding(2), LeaseState::Protecting));
+        eprintln!("ENOSPC-CASE L1 control ok");
+        return Ok(());
+    }
     let filler = Filler::fill(&root);
     let error = leases.begin(&other_binding(2), deps.clone(), &budget).unwrap_err();
     assert!(format!("{error:#}").contains("No space left on device"), "{error:#}");
@@ -98,8 +122,12 @@ async fn disk_full_ledger_begin_poisons_and_cold_reopen_is_previous_or_complete(
     drop(leases);
     drop(db);
     let (_db, reopened) = super::tests::open_for_disk_full(&root)?;
-    assert!(absent_or_complete(&reopened, first, &other_binding(1)), "acknowledged lease survives");
-    let second = absent_or_complete(&reopened, first + 1, &other_binding(2));
+    assert!(
+        absent_or_complete(&reopened, first, &other_binding(1), LeaseState::Protecting),
+        "acknowledged lease survives"
+    );
+    let second =
+        absent_or_complete(&reopened, first + 1, &other_binding(2), LeaseState::Protecting);
     protection_matches(&reopened, 1 + usize::from(second));
     // Recovery: a new lease is acknowledged after the reopen.
     reopened.begin(&other_binding(4), deps, &budget)?;
@@ -110,18 +138,24 @@ async fn disk_full_ledger_begin_poisons_and_cold_reopen_is_previous_or_complete(
 #[tokio::test]
 #[ignore = "disk-full harness only"]
 async fn disk_full_ledger_release_poisons_and_keeps_protection() -> Result<()> {
-    use crate::publication_dependency_leases::LeaseRelease;
     let root = enospc_root().join("ledger-release");
     std::fs::create_dir_all(&root)?;
     let budget = HistoryReadBudget::new(Default::default());
     let deps = super::tests::dependencies_for_disk_full();
-    let digest = crate::publication_dependency_leases::dependency_digest(&deps)?;
+    let digest = dependency_digest(&deps)?;
     let binding = other_binding(1);
     let binding_digest = UInt256::calc_file_hash(&binding.encode()?);
     let (db, leases) = super::tests::open_for_disk_full(&root)?;
     let generation = leases.begin(&binding, deps.clone(), &budget)?;
     leases.durable(generation, &budget)?;
     rotate_wal(&db);
+    if control() {
+        let released = leases.release_checked(generation, &binding_digest, &digest, |_| None)?;
+        assert_eq!(released, LeaseRelease::Released);
+        protection_matches(&leases, 0);
+        eprintln!("ENOSPC-CASE L2 control ok");
+        return Ok(());
+    }
     let filler = Filler::fill(&root);
     let error = leases.release_checked(generation, &binding_digest, &digest, |_| None);
     assert!(!matches!(error, Ok(LeaseRelease::Released)), "never acknowledged: {error:?}");
@@ -133,7 +167,7 @@ async fn disk_full_ledger_release_poisons_and_keeps_protection() -> Result<()> {
     drop(leases);
     drop(db);
     let (_db, reopened) = super::tests::open_for_disk_full(&root)?;
-    let present = absent_or_complete(&reopened, generation, &binding);
+    let present = absent_or_complete(&reopened, generation, &binding, LeaseState::DurableCustody);
     protection_matches(&reopened, usize::from(present));
     // Recovery: the release is retried and acknowledged, or found done.
     let retried = reopened.release_checked(generation, &binding_digest, &digest, |_| None)?;

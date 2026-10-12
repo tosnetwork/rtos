@@ -579,30 +579,39 @@ fn test_stop(_namespace: &str, _point: CleanupPoint) -> bool {
 /// Writes `next` synced only if the durable record still reads back as
 /// exactly `previous`. Err is a refusal with nothing written; `Ok(Err)`
 /// is an uncertain write.
-fn write_journal(
-    engine: &Engine,
+pub(crate) fn write_journal(
+    db: &crate::internal_db::InternalDb,
     previous: &PendingValidatorCleanup,
     next: &PendingValidatorCleanup,
 ) -> Result<std::result::Result<(), String>> {
     use consensus_common::validator_cleanup::{encode_record, record_key};
     let encoded = encode_record(next)?;
-    match engine.load_validator_cleanup_record(&next.namespace)? {
+    match load_record(db, &next.namespace)? {
         Some(durable) if &durable == previous => {}
         _ => fail!("Durable cleanup journal changed under the attempt"),
     }
     #[cfg(test)]
     if let Some(applied) = take_write_fault(&next.namespace, CleanupPoint::AfterB1Prime) {
         if applied {
-            engine
-                .db()
-                .write_validator_state_batch_sync(&[(record_key(&next.namespace), encoded)], &[])?;
+            db.write_validator_state_batch_sync(&[(record_key(&next.namespace), encoded)], &[])?;
         }
         return Ok(Err("injected journal write fault".into()));
     }
-    Ok(engine
-        .db()
+    Ok(db
         .write_validator_state_batch_sync(&[(record_key(&next.namespace), encoded)], &[])
         .map_err(|error| error.to_string()))
+}
+
+/// The durable cleanup record of `namespace`, if it decodes and names it.
+pub(crate) fn load_record(
+    db: &crate::internal_db::InternalDb,
+    namespace: &str,
+) -> Result<Option<PendingValidatorCleanup>> {
+    use consensus_common::validator_cleanup::{decode_record, record_key, MAX_RECORD_BYTES};
+    Ok(db
+        .load_validator_state_key_bounded(&record_key(namespace), MAX_RECORD_BYTES)?
+        .and_then(|value| decode_record(&value))
+        .filter(|record| record.namespace == namespace))
 }
 
 /// The journaled cleanup attempt of one retired authenticated namespace
@@ -773,7 +782,7 @@ async fn run_v2_cleanup(
             },
             ..record.clone()
         };
-        if let Err(reason) = write_journal(engine, &record, &restamped)? {
+        if let Err(reason) = write_journal(engine.db(), &record, &restamped)? {
             return Ok(V2Outcome::Uncertain { intended: restamped, previous: record, reason });
         }
         record = restamped;
@@ -881,7 +890,7 @@ async fn run_v2_cleanup(
                     journal: CleanupJournal::Deleted(payload.clone()),
                     ..record.clone()
                 };
-                if let Err(reason) = write_journal(engine, &record, &next)? {
+                if let Err(reason) = write_journal(engine.db(), &record, &next)? {
                     return Ok(V2Outcome::Uncertain { intended: next, previous: record, reason });
                 }
                 record = next;
