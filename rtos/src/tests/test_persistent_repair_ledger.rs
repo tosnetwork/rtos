@@ -289,3 +289,57 @@ fn persistent_repair_ledger_mutation_epoch_tracks_commits_poison_and_exhaustion(
     assert!(leases.mutation_epoch()?.unwrap() > before, "poisoning advances the epoch");
     Ok(())
 }
+
+#[tokio::test]
+async fn persistent_repair_ledger_release_is_counted_exact_and_deferred_while_read() -> Result<()> {
+    use crate::publication_dependency_leases::LeaseRelease;
+    let dir = tempfile::tempdir()?;
+    let (db, leases) = open(dir.path())?;
+    let budget = HistoryReadBudget::new(Default::default());
+    // Two leases protecting the same state.
+    let first = binding();
+    let mut second = binding();
+    second.record_id = 2;
+    second.close_generation = 2;
+    let digest = dependency_digest(&dependencies())?;
+    let g1 = leases.begin(&first, dependencies(), &budget)?;
+    let g2 = leases.begin(&second, dependencies(), &budget)?;
+    assert_eq!(leases.protection.references(&block(1)), (2, 0));
+    // An authenticated reader defers the release with nothing changed.
+    let reader = leases.protection.authentication().await?;
+    assert_eq!(leases.release(g1, &first, &digest)?, LeaseRelease::Busy);
+    assert_eq!(leases.protection.references(&block(1)), (2, 0));
+    drop(reader);
+    // A GC deletion pass holding the gate defers it the same way.
+    let gc = leases.protection.try_deletion().expect("no other gate holder");
+    assert_eq!(leases.release(g1, &first, &digest)?, LeaseRelease::Busy);
+    drop(gc);
+    // A mismatched binding or digest is refused and keeps everything.
+    assert_eq!(leases.release(g1, &second, &digest)?, LeaseRelease::Mismatch);
+    assert_eq!(leases.release(g1, &first, &UInt256::default())?, LeaseRelease::Mismatch);
+    let epoch = leases.mutation_epoch()?.unwrap();
+    assert_eq!(leases.release(g1, &first, &digest)?, LeaseRelease::Released);
+    assert!(leases.mutation_epoch()?.unwrap() > epoch);
+    assert!(leases.protection.state(&block(1)), "the other lease still protects the state");
+    assert_eq!(leases.protection.references(&block(1)), (1, 0));
+    assert_eq!(leases.release(g1, &first, &digest)?, LeaseRelease::AbsentAlreadyReleased);
+    // A restart rebuilds exactly the remaining protection; generations are
+    // never reused.
+    drop(leases);
+    drop(db);
+    let (db, leases) = open(dir.path())?;
+    assert_eq!(leases.protection.references(&block(1)), (1, 0));
+    let mut third = binding();
+    third.record_id = 3;
+    third.close_generation = 3;
+    let g3 = leases.begin(&third, dependencies(), &budget)?;
+    assert!(g3 > g2, "a released generation is never reused");
+    assert_eq!(leases.release(g2, &second, &digest)?, LeaseRelease::Released);
+    assert_eq!(leases.release(g3, &third, &digest)?, LeaseRelease::Released);
+    assert!(!leases.protection.state(&block(1)), "the last release unprotects");
+    drop(leases);
+    drop(db);
+    let (_db, leases) = open(dir.path())?;
+    assert_eq!(leases.protection.references(&block(1)), (0, 0));
+    Ok(())
+}

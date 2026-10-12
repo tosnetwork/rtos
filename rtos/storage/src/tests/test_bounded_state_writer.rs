@@ -331,7 +331,13 @@ async fn persistent_repair_custody_preselected_delete_rechecks_at_actual_transac
     states.in_queue.fetch_add(1, Ordering::Relaxed);
     states.storer.send(StateCommand::Work(Job::DeleteState(first.clone()), None)).unwrap();
     let authentication = db.repair_protection().authentication().await?;
-    db.repair_protection().protect([first.clone()], []);
+    db.repair_protection().register(
+        1,
+        crate::repair_protection::LeaseProtection {
+            states: vec![first.clone()],
+            ..Default::default()
+        },
+    )?;
     drop(authentication);
     release.send(())?;
     writer.await??;

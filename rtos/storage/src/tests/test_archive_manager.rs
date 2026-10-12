@@ -917,11 +917,13 @@ async fn persistent_repair_custody_archive_logical_protection_survives_pack_and_
         handle.set_block_applied();
         if index == 0 {
             let authentication = db.repair_protection().authentication().await?;
-            db.repair_protection().protect([], [id.clone()]);
-            db.repair_protection().protect_artifact_digest(
-                id.clone(),
-                "proof",
-                UInt256::calc_file_hash(b"proof"),
+            db.repair_protection().register(
+                1,
+                crate::repair_protection::LeaseProtection {
+                    artifacts: vec![id.clone()],
+                    digests: vec![(id.clone(), "proof".into(), UInt256::calc_file_hash(b"proof"))],
+                    ..Default::default()
+                },
             )?;
             drop(authentication);
             manager.remove_file(&handle).await?;
@@ -1030,7 +1032,13 @@ async fn archive_protected_key_package_append_metadata_cold_reopen() -> Result<(
     manager.move_to_archive(&handle, || { handle.set_archived(); Ok(()) }).await?;
     drop(manager);
     // Storage predicate fixture only; real authenticated custody is covered by Engine.
-    db.repair_protection().protect([], [id.clone()]);
+    db.repair_protection().register(
+        1,
+        crate::repair_protection::LeaseProtection {
+            artifacts: vec![id.clone()],
+            ..Default::default()
+        },
+    )?;
     let root = Arc::new(dir.path().join("key-reopen"));
     for bytes in [b"key-proof".as_slice(), b"appended-key-proof".as_slice()] {
         let slice = ArchiveSlice::with_data(db.repair_protection().clone(), db.clone(), root.clone(),

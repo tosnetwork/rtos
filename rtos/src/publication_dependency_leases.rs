@@ -96,21 +96,21 @@ impl LeaseRecord {
         }
         Ok(())
     }
+    /// Registers this lease's protection once per generation; the whole set
+    /// is validated before any count changes.
     fn protect(&self, protection: &RepairProtection) -> Result<()> {
-        let mut states = Vec::new();
-        let mut artifacts = Vec::new();
+        let mut set = storage::repair_protection::LeaseProtection::default();
         for d in &self.dependencies {
             let id = d.validate()?;
             match d.kind.as_str() {
-                "state" | "capsule-state" => states.push(id),
+                "state" | "capsule-state" => set.states.push(id),
                 _ => {
-                    protection.protect_artifact_digest(id.clone(), &d.kind, d.digest.parse()?)?;
-                    artifacts.push(id);
+                    set.digests.push((id.clone(), d.kind.clone(), d.digest.parse()?));
+                    set.artifacts.push(id);
                 }
             }
         }
-        protection.protect(states, artifacts);
-        Ok(())
+        protection.register(self.generation, set)
     }
 }
 pub(crate) fn dependency_digest(dependencies: &[Dependency]) -> Result<UInt256> {
@@ -373,3 +373,74 @@ impl DependencyLeases {
 #[cfg(test)]
 #[path = "tests/test_persistent_repair_ledger.rs"]
 mod tests;
+
+/// Outcome of releasing one lease for cleanup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LeaseRelease {
+    /// The durable record was removed synced and its protection released.
+    Released,
+    /// No such generation: already released by an earlier attempt.
+    AbsentAlreadyReleased,
+    /// The generation holds another binding or digest: nothing changed.
+    Mismatch,
+    /// An authenticated reader or a GC deletion holds the gate: nothing
+    /// changed; retry later.
+    Busy,
+}
+
+impl DependencyLeases {
+    /// Releases lease `generation` if it still holds exactly the expected
+    /// binding and dependency digest. Runs only while holding the deletion
+    /// gate (never waiting for it), so no authenticated reader relies on the
+    /// protection being removed. The durable record is deleted synced first;
+    /// only then do memory and protection counts drop. Generations are never
+    /// reused and `next` never decreases, so a repeated release cannot touch
+    /// a newer lease. An uncertain delete poisons the ledger and protection.
+    pub(crate) fn release(
+        &self,
+        generation: u64,
+        expected_binding: &RepairLeaseBinding,
+        expected_digest: &UInt256,
+    ) -> Result<LeaseRelease> {
+        let Some(_gate) = self.protection.try_deletion() else {
+            return Ok(LeaseRelease::Busy);
+        };
+        let mut memory = self.memory.lock().map_err(|_| error!("Repair ledger poisoned"))?;
+        if memory.poisoned {
+            fail!("Repair ledger requires cold recovery");
+        }
+        let Some(record) = memory.records.get(&generation) else {
+            return Ok(LeaseRelease::AbsentAlreadyReleased);
+        };
+        if record.binding != expected_binding.encode()?
+            || record.dependency_digest != format!("{expected_digest:x}")
+        {
+            return Ok(LeaseRelease::Mismatch);
+        }
+        let size = serde_json::to_vec(record)?.len();
+        memory.mutation_epoch = memory.mutation_epoch.and_then(|epoch| epoch.checked_add(1));
+        let result = (|| {
+            let mut batch = self.table.begin_transaction()?;
+            batch.delete_raw(format!("lease/{generation:020}").as_bytes())?;
+            batch.commit()?;
+            #[cfg(test)]
+            let observer = self.observer.lock().unwrap().clone();
+            #[cfg(not(test))]
+            let observer: storage::durability::SyncObservation = None;
+            self.table.sync_wal_observed(observer.as_deref())
+        })();
+        if let Err(error) = result {
+            memory.poisoned = true;
+            self.protection.poison();
+            return Err(error);
+        }
+        let identity = (expected_binding.record_id, expected_binding.close_generation);
+        if memory.identities.get(&identity) == Some(&generation) {
+            memory.identities.remove(&identity);
+        }
+        memory.records.remove(&generation);
+        memory.bytes = memory.bytes.saturating_sub(size);
+        self.protection.unregister(generation)?;
+        Ok(LeaseRelease::Released)
+    }
+}
