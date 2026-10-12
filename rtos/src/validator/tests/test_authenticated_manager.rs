@@ -380,7 +380,7 @@ async fn run_authenticated_manager_observer_lifecycle(fail_initial_sink: bool, a
         Ok::<_, anyhow::Error>(())
     }.await;
     let ids = manager.current_sessions.keys().chain(manager.future_sessions.keys()).cloned().collect();
-    let stopped = manager.stop_and_remove_sessions(&ids, false).await;
+    let stopped = manager.stop_and_remove_sessions(&ids).await;
     drop(manager);
     // Drive the outer production spawn entry with the real configuration
     // handler's false validator status. Only explicit transport eligibility can

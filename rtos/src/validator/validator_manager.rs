@@ -822,7 +822,13 @@ struct ValidatorManagerImpl {
     future_sessions: HashMap<UInt256, Arc<ValidatorGroup>>,
     // Retiring objects remain owned across cancellation and failed teardown.
     // The first retirement fixes the database policy for all later waiters.
-    retiring_groups: Vec<(UInt256, Arc<ValidatorGroup>, bool)>,
+    /// Groups being stopped, with the cleanup generation their close confirms
+    /// (None when nothing was recorded, e.g. shutdown or admission replacement).
+    retiring_groups: Vec<(UInt256, Arc<ValidatorGroup>, Option<u64>)>,
+    /// Cleanup records built at retirement, persisted with the fence before
+    /// any of their groups may close.
+    pending_cleanup_records: Vec<consensus_common::validator_cleanup::PendingValidatorCleanup>,
+    cleanup: consensus_common::validator_cleanup::ValidatorCleanupManager,
     retiring_observers: Vec<Arc<super::block_sync_observer::BlockSyncObserver>>,
     lifecycle_errors: HashSet<String>,
     background_tasks: tokio_util::task::TaskTracker,
@@ -896,6 +902,8 @@ impl ValidatorManagerImpl {
             current_sessions: HashMap::default(),
             future_sessions: HashMap::default(),
             retiring_groups: Vec::new(),
+            pending_cleanup_records: Vec::new(),
+            cleanup: Default::default(),
             retiring_observers: Vec::new(),
             lifecycle_errors: HashSet::new(),
             background_tasks: tokio_util::task::TaskTracker::new(),
@@ -1338,20 +1346,71 @@ impl ValidatorManagerImpl {
         }
     }
 
-    /// Stop sessions that are no longer active or pending, and record their IDs in the
-    /// destroyed-session blacklist to prevent recreation within the same masterchain cycle.
-    /// Mirrors C++ group destruction logic in `update_shards()` (`manager.cpp`).
-    fn retire_group(&mut self, id: UInt256, group: Arc<ValidatorGroup>, destroy: bool) {
+    /// Retires a group that is no longer active or pending: fence the session
+    /// against recreation and record a durable cleanup intent. The group then
+    /// closes WITHOUT deleting its namespace; deletion happens only later under
+    /// the checkpoint-bound cleanup gate. Mirrors the reference retirement in
+    /// `update_shards()`.
+    fn retire_group(&mut self, id: UInt256, group: Arc<ValidatorGroup>) {
         self.destroyed_sessions.insert(id.clone());
-        self.retire_group_generation(id, group, destroy);
+        let generation = match self.cleanup_record(&id, &group) {
+            Ok(record) => {
+                let generation = self.cleanup.on_group_retired(&record);
+                self.pending_cleanup_records.push(record);
+                Some(generation)
+            }
+            Err(error) => {
+                // Without a record the namespace is only ever kept, never deleted.
+                log::error!(target: "validator_manager",
+                    "No cleanup record for retired session {id:x}; its namespace is retained: {error}");
+                None
+            }
+        };
+        self.retire_group_generation(id, group, generation);
+    }
+
+    /// The durable cleanup record for a retiring group, bound to the last
+    /// applied masterchain block as its retirement checkpoint.
+    fn cleanup_record(
+        &self,
+        id: &UInt256,
+        group: &ValidatorGroup,
+    ) -> Result<consensus_common::validator_cleanup::PendingValidatorCleanup> {
+        use consensus_common::validator_cleanup::{make_record, NamespaceLayout};
+        let checkpoint = self
+            .engine
+            .load_last_applied_mc_block_id()?
+            .ok_or_else(|| error!("No applied masterchain block to bind the retirement to"))?;
+        let layout = match group.authenticated_runtime() {
+            Some(runtime)
+                if runtime.protocol()
+                    == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree =>
+            {
+                match runtime.local_role() {
+                    consensus_common::session_runtime::LocalRole::Validator(_) => {
+                        NamespaceLayout::V2Validator
+                    }
+                    consensus_common::session_runtime::LocalRole::Observer => {
+                        NamespaceLayout::V2Observer(UInt256::from(*runtime.local_adnl().data()))
+                    }
+                }
+            }
+            _ => NamespaceLayout::V1,
+        };
+        make_record(id, &layout, group.shard(), group.cc_seqno(), &checkpoint)
     }
 
     // Replacing an authenticated admission keeps the session ID live. Only the
     // old instance is retired; the ordinary destruction blacklist is unchanged.
-    fn retire_group_generation(&mut self, id: UInt256, group: Arc<ValidatorGroup>, destroy: bool) {
+    fn retire_group_generation(
+        &mut self,
+        id: UInt256,
+        group: Arc<ValidatorGroup>,
+        generation: Option<u64>,
+    ) {
         if !self.retiring_groups.iter().any(|(_, old, _)| Arc::ptr_eq(old, &group)) {
             let consensus = if group.is_simplex() { "simplex" } else { "catchain" };
-            self.retiring_groups.push((id, group, destroy));
+            self.retiring_groups.push((id, group, generation));
             metrics::counter!("rtos_node_validator_session_destroyed_total", "consensus" => consensus).increment(1);
         }
     }
@@ -1366,15 +1425,37 @@ impl ValidatorManagerImpl {
     // Every object is registered before the first await. A cancelled caller can
     // resume this drain without forgetting siblings or changing their policy.
     async fn drain_retiring(&mut self) -> Result<()> {
+        // The fence and every new cleanup record are durable before any
+        // retiring group may begin to close, so a crash mid-close always
+        // leaves a record for its namespace.
+        if !self.pending_cleanup_records.is_empty() {
+            if let Err(error) = self
+                .engine
+                .persist_validator_retirement(&self.destroyed_sessions, &self.pending_cleanup_records)
+            {
+                // No group closes without its durable record; latch like any
+                // other teardown failure so every aggregator reports it.
+                self.lifecycle_errors.insert(format!("retirement persistence: {error}"));
+                return self.check_lifecycle_errors();
+            }
+            self.pending_cleanup_records.clear();
+        }
         let rt = self.rt.clone();
         let groups = self.retiring_groups.clone();
         let results = futures::future::join_all(
-            groups.iter().map(|(_, group, destroy)| group.clone().stop(rt.clone(), *destroy)),
+            groups.iter().map(|(_, group, _)| group.clone().stop(rt.clone(), false)),
         )
         .await;
-        for ((id, group, _), result) in groups.into_iter().zip(results) {
+        for ((id, group, generation), result) in groups.into_iter().zip(results) {
             match result {
                 Ok(()) => {
+                    // Condition D: only a verified teardown confirms the close
+                    // of the incarnation the record was retired at.
+                    if let Some(generation) = generation {
+                        if group.storage_close_verified() {
+                            self.cleanup.on_close_confirmed(&id, generation);
+                        }
+                    }
                     self.retiring_groups.retain(|(_, old, _)| !Arc::ptr_eq(old, &group));
                     if !self.is_active_shard(group.shard()).await {
                         self.engine.remove_last_validation_time(group.shard());
@@ -1419,19 +1500,15 @@ impl ValidatorManagerImpl {
         Ok(())
     }
 
-    async fn stop_and_remove_sessions(
-        &mut self,
-        sessions_to_remove: &HashSet<UInt256>,
-        destroy_database: bool,
-    ) -> Result<()> {
+    async fn stop_and_remove_sessions(&mut self, sessions_to_remove: &HashSet<UInt256>) -> Result<()> {
         for id in sessions_to_remove {
-            self.destroyed_sessions.insert(id.clone());
             if let Some(group) = self.current_sessions.remove(id) {
-                self.retire_group(id.clone(), group, destroy_database);
+                self.retire_group(id.clone(), group);
             }
             if let Some(group) = self.future_sessions.remove(id) {
-                self.retire_group(id.clone(), group, destroy_database);
+                self.retire_group(id.clone(), group);
             }
+            self.destroyed_sessions.insert(id.clone());
         }
         self.drain_retiring().await
     }
@@ -1443,7 +1520,7 @@ impl ValidatorManagerImpl {
         let old = std::mem::replace(&mut self.current_sessions, selected);
         for (id, group) in old {
             if !self.current_sessions.get(&id).is_some_and(|new| Arc::ptr_eq(new, &group)) {
-                self.retire_group(id, group, true);
+                self.retire_group(id, group);
             }
         }
         self.drain_retiring().await
@@ -1466,7 +1543,7 @@ impl ValidatorManagerImpl {
             .collect();
         for id in stale_ids {
             let group = self.future_sessions.remove(&id).expect("collected future owner");
-            self.retire_group(id, group, true);
+            self.retire_group(id, group);
         }
         self.drain_retiring().await
     }
@@ -1765,7 +1842,12 @@ impl ValidatorManagerImpl {
             .into_iter()
             .chain(std::mem::take(&mut self.future_sessions))
         {
-            self.retire_group(id, group, clear_rotation);
+            if clear_rotation {
+                self.retire_group(id, group);
+            } else {
+                // Shutdown is not a retirement: no fence, no cleanup record.
+                self.retire_group_generation(id, group, None);
+            }
         }
         let observer_ids: Vec<_> = self.block_sync_observers.keys().cloned().collect();
         for id in observer_ids {
@@ -1956,6 +2038,12 @@ impl ValidatorManagerImpl {
                 );
                 continue;
             }
+            // Creation waits while a cleanup delete of this session is in flight.
+            if self.cleanup.is_delete_in_flight(&session_id) {
+                log::info!(target: "validator_manager",
+                    "Deferring session {session_id:x} for shard {ident}: cleanup delete in flight");
+                continue;
+            }
 
             // Select consensus type based on ConfigParam 30. Computed
             // unconditionally so the observer branch (below) can also see
@@ -2038,11 +2126,11 @@ impl ValidatorManagerImpl {
                 };
                 if self.current_sessions.get(&session_id).is_some_and(incompatible) {
                     let old = self.current_sessions.remove(&session_id).unwrap();
-                    self.retire_group_generation(session_id.clone(), old, false);
+                    self.retire_group_generation(session_id.clone(), old, None);
                 }
                 if self.future_sessions.get(&session_id).is_some_and(incompatible) {
                     let old = self.future_sessions.remove(&session_id).unwrap();
-                    self.retire_group_generation(session_id.clone(), old, false);
+                    self.retire_group_generation(session_id.clone(), old, None);
                 }
                 self.drain_retiring().await?;
             }
@@ -2108,6 +2196,7 @@ impl ValidatorManagerImpl {
                             "consensus" => consensus_name
                         )
                         .increment(1);
+                        self.cleanup.on_group_created(&session_id);
                         let group = ValidatorGroup::new(
                             general_session_info.clone(),
                             local_id.clone(),
@@ -2534,6 +2623,11 @@ impl ValidatorManagerImpl {
                     );
                     continue;
                 }
+                if self.cleanup.is_delete_in_flight(&session_id) {
+                    log::info!(target: "validator_manager",
+                        "Deferring future session {session_id:x} for shard {ident}: cleanup delete in flight");
+                    continue;
+                }
 
                 let vsubset = wc.compute_validator_set(*next_cc_seqno)?;
                 let current_session_options = sessions_options.get_session_options(&ident);
@@ -2600,7 +2694,7 @@ impl ValidatorManagerImpl {
                             .is_some_and(|old| old.same_admission(runtime))
                     }) {
                         let old = self.future_sessions.remove(&session_id).unwrap();
-                        self.retire_group_generation(session_id.clone(), old, false);
+                        self.retire_group_generation(session_id.clone(), old, None);
                         self.drain_retiring().await?;
                     }
                 }
@@ -2632,6 +2726,7 @@ impl ValidatorManagerImpl {
                         "consensus" => consensus_name
                     )
                     .increment(1);
+                    self.cleanup.on_group_created(&session_id);
                     let group = ValidatorGroup::new(
                         new_session_info,
                         local_id,
@@ -2695,7 +2790,7 @@ impl ValidatorManagerImpl {
         self.notify_simplex_sessions_applied_tops(mc_state.as_ref(), mc_state_extra);
 
         log::trace!(target: "validator_manager", "starting stop&remove");
-        self.stop_and_remove_sessions(&gc_validator_sessions, true).await?;
+        self.stop_and_remove_sessions(&gc_validator_sessions).await?;
 
         if rotate_all_shards(mc_state_extra) {
             log::info!(target: "validator_manager", "New last rotation block: {}", last_masterchain_block);

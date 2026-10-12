@@ -1074,6 +1074,9 @@ pub struct ValidatorGroup {
     task_admission_closed: Mutex<bool>,
     task_panicked: Arc<AtomicBool>,
     teardown_drained: AtomicBool,
+    /// The checked stop drained and the session's own storage instance was
+    /// verified torn down (or the group never ran a session).
+    storage_close_verified: AtomicBool,
     pub(super) stop_requested: CancellationToken,
     #[cfg(test)]
     session_exit_observed: CancellationToken,
@@ -1310,6 +1313,7 @@ impl ValidatorGroup {
             task_admission_closed: Mutex::new(false),
             task_panicked: Arc::new(AtomicBool::new(false)),
             teardown_drained: AtomicBool::new(false),
+            storage_close_verified: AtomicBool::new(false),
             stop_requested: CancellationToken::new(),
             #[cfg(test)]
             session_exit_observed: CancellationToken::new(),
@@ -1853,6 +1857,11 @@ impl ValidatorGroup {
         self.group_impl.execute_sync(|group| group.session.is_some()).await
     }
 
+    /// True once a checked stop verified the session's storage teardown.
+    pub(super) fn storage_close_verified(&self) -> bool {
+        self.storage_close_verified.load(Ordering::Acquire)
+    }
+
     pub(super) fn teardown_drained(&self) -> bool {
         self.teardown_drained.load(Ordering::Acquire)
     }
@@ -1896,6 +1905,18 @@ impl ValidatorGroup {
         // Read after the checked join: startup can no longer open storage.
         let storage_teardown =
             namespace_session.as_ref().and_then(|session| session.storage_teardown_receipt());
+        // Cleanup condition D: a session that ran must show its own storage
+        // instance torn down cleanly; a missing receipt never confirms.
+        let close_verified = drained
+            && result.is_ok()
+            && match (&namespace_session, &storage_teardown) {
+                (None, _) => true,
+                (Some(_), Some(receipt)) => {
+                    receipt.storage_id() == self.session_id.to_hex_string() && receipt.check().is_ok()
+                }
+                (Some(_), None) => false,
+            };
+        self.storage_close_verified.store(close_verified, Ordering::Release);
         if drained {
             if let Some(session) = namespace_session {
                 // Node WAL tasks may need the blocking pool themselves. Wait

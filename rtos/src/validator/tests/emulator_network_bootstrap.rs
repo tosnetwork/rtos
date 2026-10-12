@@ -1030,6 +1030,17 @@ impl EngineOperations for BootstrapTestEngine {
         Ok(Vec::new())
     }
 
+    fn persist_validator_retirement(
+        &self,
+        fence: &std::collections::HashSet<UInt256>,
+        records: &[consensus_common::validator_cleanup::PendingValidatorCleanup],
+    ) -> Result<()> {
+        use consensus_common::validator_cleanup::{encode_record, record_key};
+        let puts: Vec<_> =
+            records.iter().map(|r| (record_key(&r.session_id), encode_record(r))).collect();
+        self.db.write_validator_state_batch_sync(&puts, &[])?;
+        self.save_destroyed_session_ids(fence)
+    }
     fn save_destroyed_session_ids(&self, _ids: &std::collections::HashSet<UInt256>) -> Result<()> {
         Ok(())
     }
@@ -1377,7 +1388,7 @@ async fn test_manager_creates_emulator_sessions_from_generated_mc_states() -> Re
         manager.current_sessions.keys().cloned().collect::<std::collections::HashSet<_>>();
     tokio::time::timeout(
         Duration::from_secs(10),
-        manager.stop_and_remove_sessions(&session_ids, true),
+        manager.stop_and_remove_sessions(&session_ids),
     )
     .await
     .expect("manager session teardown watchdog")?;
@@ -1475,7 +1486,7 @@ async fn test_manager_selects_validator_key_by_validator_key_order() -> Result<(
         manager.current_sessions.keys().cloned().collect::<std::collections::HashSet<_>>();
     tokio::time::timeout(
         Duration::from_secs(10),
-        manager.stop_and_remove_sessions(&session_ids, true),
+        manager.stop_and_remove_sessions(&session_ids),
     )
     .await
     .expect("manager session teardown watchdog")?;

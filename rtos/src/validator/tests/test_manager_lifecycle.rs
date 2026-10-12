@@ -19,6 +19,9 @@ struct LifecycleEngine {
     candidate_deletes: std::sync::atomic::AtomicUsize,
     fail_candidates: std::sync::atomic::AtomicBool,
     state_gate: Option<Arc<StateGate>>,
+    retired_records: std::sync::Mutex<Vec<consensus_common::validator_cleanup::PendingValidatorCleanup>>,
+    retirement_fence: std::sync::Mutex<HashSet<UInt256>>,
+    fail_retirement: std::sync::atomic::AtomicBool,
 }
 
 struct StateGate {
@@ -40,6 +43,26 @@ impl EngineOperations for LifecycleEngine {
             .register(name, mask, start)
     }
 
+    fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
+        Ok(Some(Arc::new(BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            9,
+            UInt256::from([1; 32]),
+            UInt256::from([2; 32]),
+        ))))
+    }
+    fn persist_validator_retirement(
+        &self,
+        fence: &HashSet<UInt256>,
+        records: &[consensus_common::validator_cleanup::PendingValidatorCleanup],
+    ) -> Result<()> {
+        if self.fail_retirement.load(Ordering::Relaxed) {
+            fail!("controlled retirement persistence failure");
+        }
+        *self.retirement_fence.lock().unwrap() = fence.clone();
+        self.retired_records.lock().unwrap().extend_from_slice(records);
+        Ok(())
+    }
     fn remove_last_validation_time(&self, _: &ShardIdent) {}
     fn remove_last_collation_time(&self, _: &ShardIdent) {}
     fn destroy_block_candidates(&self, _: &UInt256) -> Result<bool> {
@@ -183,7 +206,9 @@ async fn test_manager_lifecycle_drains_current_future_and_observer_before_restar
     assert!(!returned_early, "manager returned before old sessions exited");
     assert!(manager.current_sessions.is_empty() && manager.future_sessions.is_empty());
     assert!(manager.block_sync_observers.is_empty());
-    assert_eq!(*engine.persisted.lock().unwrap(), HashSet::from([current_id, future_id]));
+    // Shutdown is not a retirement: no fence and no cleanup record.
+    assert!(engine.persisted.lock().unwrap().is_empty(), "{current_id:x} {future_id:x}");
+    assert!(engine.retired_records.lock().unwrap().is_empty());
     // A new same-ID observer must register only after the old manager is drained.
     let replacement = fixture.create().unwrap();
     replacement.stop_and_wait().await.unwrap();
@@ -208,13 +233,20 @@ async fn test_manager_lifecycle_gc_then_preserving_shutdown_keeps_first_policy()
     let id = UInt256::rand();
     let group = group_fixture(engine.clone());
     manager.current_sessions.insert(id.clone(), group.clone());
-    manager.stop_and_remove_sessions(&HashSet::from([id]), true).await.unwrap();
+    manager.stop_and_remove_sessions(&HashSet::from([id.clone()])).await.unwrap();
     assert!(manager.current_sessions.is_empty() && manager.retiring_groups.is_empty());
+    // Retirement records a durable cleanup intent with the fence and deletes
+    // nothing: the namespace and its candidates wait for the cleanup gate.
+    let records = engine.retired_records.lock().unwrap().clone();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].session_id, id);
+    assert!(engine.retirement_fence.lock().unwrap().contains(&id));
+    assert_eq!(engine.candidate_deletes.load(Ordering::Relaxed), 0);
     manager.stop_validation().await.unwrap();
-    assert_eq!(engine.candidate_deletes.load(Ordering::Relaxed), 1);
+    assert_eq!(engine.candidate_deletes.load(Ordering::Relaxed), 0);
     // Manager must not obtain success by weakening the group's policy check.
     assert!(group
-        .stop(tokio::runtime::Handle::current(), false)
+        .stop(tokio::runtime::Handle::current(), true)
         .await
         .unwrap_err()
         .to_string()
@@ -222,47 +254,52 @@ async fn test_manager_lifecycle_gc_then_preserving_shutdown_keeps_first_policy()
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn test_manager_lifecycle_retirement_errors_survive_all_group_removal_paths() {
+async fn test_manager_lifecycle_retirement_persists_before_any_group_closes() {
     for path in ["current_gc", "future_gc", "map_swap", "future_cull"] {
-        let bad = Arc::new(LifecycleEngine::default());
-        bad.fail_candidates.store(true, Ordering::Relaxed);
         let engine = Arc::new(LifecycleEngine::default());
+        engine.fail_retirement.store(true, Ordering::Relaxed);
         let mut manager = manager_fixture(engine.clone());
         let id = UInt256::rand();
-        let group = group_fixture(bad.clone());
+        let group = group_fixture(engine.clone());
         let failure = match path {
             "current_gc" => {
                 manager.current_sessions.insert(id.clone(), group.clone());
-                manager.stop_and_remove_sessions(&HashSet::from([id]), true).await
+                manager.stop_and_remove_sessions(&HashSet::from([id.clone()])).await
             }
             "future_gc" => {
                 manager.future_sessions.insert(id.clone(), group.clone());
-                manager.stop_and_remove_sessions(&HashSet::from([id]), true).await
+                manager.stop_and_remove_sessions(&HashSet::from([id.clone()])).await
             }
             "map_swap" => {
-                manager.current_sessions.insert(id, group.clone());
+                manager.current_sessions.insert(id.clone(), group.clone());
                 manager.replace_current_sessions(HashMap::new()).await
             }
             "future_cull" => {
                 manager.current_sessions.insert(UInt256::rand(), group_fixture(engine.clone()));
-                manager.future_sessions.insert(id, group.clone());
+                manager.future_sessions.insert(id.clone(), group.clone());
                 manager.cull_stale_future_sessions().await
             }
             _ => unreachable!(),
         }
         .unwrap_err();
-        assert!(failure.to_string().contains("candidate delete failure"), "{path}: {failure}");
+        assert!(failure.to_string().contains("retirement persistence failure"), "{path}: {failure}");
+        // No durable record means no group may begin to close.
+        assert!(!group.stop_requested.is_cancelled(), "{path}: closed before its record was durable");
         assert!(manager
             .retiring_groups
             .iter()
-            .any(|(_, owner, destroy)| Arc::ptr_eq(owner, &group) && *destroy));
-        // A recovered underlying service must not erase the uncertified result.
-        bad.fail_candidates.store(false, Ordering::Relaxed);
+            .any(|(_, owner, generation)| Arc::ptr_eq(owner, &group) && generation.is_some()));
+        assert_eq!(manager.pending_cleanup_records.len(), 1, "{path}: the record stays pending");
+        // Once persistence recovers, the same record is written and the group
+        // closes, while the latched failure is still reported, not erased.
+        engine.fail_retirement.store(false, Ordering::Relaxed);
         let error = manager.stop_validation().await.unwrap_err();
-        assert!(error.to_string().contains("candidate delete failure"), "{path}: {error}");
-        assert!(!error.to_string().contains("conflicting"), "retirement policy was changed");
-        assert_eq!(bad.candidate_deletes.load(Ordering::Relaxed), 1);
-        assert_eq!(manager.retiring_groups.len(), 1, "healthy sibling must still drain");
+        assert!(error.to_string().contains("retirement persistence failure"), "{path}: {error}");
+        assert!(group.stop_requested.is_cancelled());
+        let records = engine.retired_records.lock().unwrap().clone();
+        assert!(records.iter().any(|record| record.session_id == id), "{path}");
+        assert!(manager.retiring_groups.is_empty());
+        assert_eq!(engine.candidate_deletes.load(Ordering::Relaxed), 0);
     }
 }
 
@@ -282,17 +319,18 @@ async fn test_manager_lifecycle_cancelled_gc_retains_all_owners_and_policy() {
     }
     let ids = manager.current_sessions.keys().cloned().collect();
     {
-        let mut gc = Box::pin(manager.stop_and_remove_sessions(&ids, true));
+        let mut gc = Box::pin(manager.stop_and_remove_sessions(&ids));
         assert!(futures::poll!(&mut gc).is_pending());
         tokio::join!(first.stop_requested.cancelled(), second.stop_requested.cancelled());
         // Dropping this waiter must retain both registered retirement owners.
     }
     assert_eq!(manager.retiring_groups.len(), 2);
+    assert_eq!(engine.retired_records.lock().unwrap().len(), 2, "records durable before close");
     let mut stop = Box::pin(manager.stop_validation());
     assert!(futures::poll!(&mut stop).is_pending());
     gate.add_permits(2);
     tokio::time::timeout(Duration::from_secs(5), stop).await.unwrap().unwrap();
-    assert_eq!(engine.candidate_deletes.load(Ordering::Relaxed), 2);
+    assert_eq!(engine.candidate_deletes.load(Ordering::Relaxed), 0);
     assert!(manager.retiring_groups.is_empty());
 }
 
@@ -308,12 +346,12 @@ async fn test_manager_lifecycle_tracks_actual_split_precalculation_and_panic() {
             Arc::new(LifecycleEngine { state_gate: Some(gate.clone()), ..Default::default() });
         let mut manager = manager_fixture(engine.clone());
         if panic {
-            engine.fail_candidates.store(true, Ordering::Relaxed);
+            engine.fail_retirement.store(true, Ordering::Relaxed);
             // A rotation failure and a background panic must both survive aggregation.
             let group = group_fixture(engine.clone());
             let id = UInt256::rand();
             manager.current_sessions.insert(id.clone(), group);
-            manager.stop_and_remove_sessions(&HashSet::from([id]), true).await.unwrap_err();
+            manager.stop_and_remove_sessions(&HashSet::from([id])).await.unwrap_err();
         }
         let owners_before = Arc::strong_count(&engine);
         manager.spawn_split_queue_precalculation(BlockIdExt::default());
@@ -329,7 +367,7 @@ async fn test_manager_lifecycle_tracks_actual_split_precalculation_and_panic() {
         if panic {
             let error = result.unwrap_err().to_string();
             assert!(error.contains("background task panicked"));
-            assert!(error.contains("candidate delete failure"));
+            assert!(error.contains("retirement persistence failure"));
         } else {
             result.unwrap();
         }
