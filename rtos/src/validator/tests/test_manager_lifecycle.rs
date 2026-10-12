@@ -335,6 +335,29 @@ async fn test_manager_lifecycle_fence_is_durable_before_close_even_without_recor
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_manager_lifecycle_authenticated_group_without_runtime_writes_no_record() {
+    let engine = Arc::new(LifecycleEngine::default());
+    let mut manager = manager_fixture(engine.clone());
+    let id = UInt256::rand();
+    let options = simplex::SessionOptions {
+        protocol: consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree,
+        ..Default::default()
+    };
+    let group = super::super::validator_group::tests::make_simplex_group_with_options(
+        engine.clone(),
+        options,
+    );
+    assert!(group.authenticated_runtime().is_none());
+    manager.current_sessions.insert(id.clone(), group.clone());
+    let _ = manager.stop_and_remove_sessions(&HashSet::from([id.clone()])).await;
+    assert!(engine.retirement_fence.lock().unwrap().contains(&id), "the fence keeps the session");
+    assert!(
+        engine.retired_records.lock().unwrap().is_empty(),
+        "an authenticated group is never recorded as a V1 directory"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_manager_lifecycle_cancelled_gc_retains_all_owners_and_policy() {
     let engine = Arc::new(LifecycleEngine::default());
     let mut manager = manager_fixture(engine.clone());

@@ -1873,6 +1873,17 @@ impl ValidatorGroup {
         self.group_impl.execute_sync(|group| group.session.is_some()).await
     }
 
+    /// Whether the group is configured for the authenticated Simplex
+    /// protocol, whose namespaces are authenticated (v2) directories.
+    pub(super) fn configured_authenticated_protocol(&self) -> bool {
+        matches!(
+            &self.consensus_options,
+            ConsensusOptions::Simplex(options)
+                if options.protocol
+                    == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
+        )
+    }
+
     /// True once a checked stop verified the session's storage teardown.
     pub(super) fn storage_close_verified(&self) -> bool {
         self.storage_close_verified.load(Ordering::Acquire)

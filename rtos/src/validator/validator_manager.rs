@@ -1786,21 +1786,27 @@ impl ValidatorManagerImpl {
             .engine
             .load_last_applied_mc_block_id()?
             .ok_or_else(|| error!("No applied masterchain block to bind the retirement to"))?;
-        let layout = match group.authenticated_runtime() {
-            Some(runtime)
-                if runtime.protocol()
-                    == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree =>
-            {
-                match runtime.local_role() {
-                    consensus_common::session_runtime::LocalRole::Validator(_) => {
-                        NamespaceLayout::V2Validator
-                    }
-                    consensus_common::session_runtime::LocalRole::Observer => {
-                        NamespaceLayout::V2Observer(UInt256::from(*runtime.local_adnl().data()))
-                    }
+        // The configured protocol decides the layout: an authenticated group
+        // whose runtime is missing is never mistaken for a V1 directory.
+        let authenticated = group.configured_authenticated_protocol()
+            || group.authenticated_runtime().is_some_and(|runtime| {
+                runtime.protocol()
+                    == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
+            });
+        let layout = if authenticated {
+            let runtime = group
+                .authenticated_runtime()
+                .ok_or_else(|| error!("Authenticated group without its runtime"))?;
+            match runtime.local_role() {
+                consensus_common::session_runtime::LocalRole::Validator(_) => {
+                    NamespaceLayout::V2Validator
+                }
+                consensus_common::session_runtime::LocalRole::Observer => {
+                    NamespaceLayout::V2Observer(UInt256::from(*runtime.local_adnl().data()))
                 }
             }
-            _ => NamespaceLayout::V1,
+        } else {
+            NamespaceLayout::V1
         };
         let record = make_record(id, &layout, group.shard(), group.cc_seqno(), &checkpoint)?;
         if layout == NamespaceLayout::V1 {
