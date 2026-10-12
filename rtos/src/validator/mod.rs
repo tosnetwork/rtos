@@ -25,6 +25,7 @@ pub mod propagation;
 pub(crate) mod retired_session_auth;
 pub(crate) mod retired_session_service;
 pub mod retirement_preparation;
+pub(crate) mod validator_cleanup_gc;
 mod out_msg_queue_cleaner;
 pub mod out_msg_queue_manager;
 pub mod state_resolver_cache;

@@ -121,9 +121,25 @@ pub struct ShardStatesKeeper {
     pss_cells_cache_max_count: usize,
     pss_prev_part_max_size: usize,
     states_cache_mode: ShardStatesCacheMode,
+    /// The validator-cleanup GC floor and its state pin, held by the owner of
+    /// state GC so the floor's state can never be collected under it.
+    cleanup_floor: parking_lot::Mutex<CleanupFloor>,
+    /// The reference state TTL that the floor's state age must exceed.
+    cleanup_state_ttl: u64,
     #[cfg(feature = "telemetry")]
     telemetry: Arc<EngineTelemetry>,
     allocated: Arc<EngineAlloc>,
+}
+
+/// Custody of the validator-cleanup GC floor.
+pub(crate) enum CleanupFloor {
+    /// No floor was ever persisted; a first-run adoption may set one.
+    Unset,
+    /// The persisted floor and the pin that keeps its state alive.
+    Pinned(BlockIdExt, PinnedShardStateGuard),
+    /// The persisted floor's state was gone at boot: the key is kept and
+    /// cleanup stays disabled; no replacement is ever bootstrapped.
+    Missing(BlockIdExt),
 }
 
 impl ShardStatesKeeper {
@@ -144,6 +160,8 @@ impl ShardStatesKeeper {
         log::trace!("start_states_gc");
         let gc_resolver = Arc::new(AllowStateGcSmartResolver::with_repair_protection(cells_lifetime_sec, db.repair_leases().protection().clone()));
         let cache_resolver = Arc::new(AllowStateGcSmartResolver::new(0));
+        // Re-pin the persisted cleanup floor before state GC can run.
+        let cleanup_floor = Self::restore_cleanup_floor(&db, &gc_resolver)?;
         db.start_states_gc(gc_resolver.clone());
 
         Ok(Arc::new(ShardStatesKeeper {
@@ -160,10 +178,101 @@ impl ShardStatesKeeper {
             pss_cells_cache_max_count,
             pss_prev_part_max_size,
             states_cache_mode,
+            cleanup_floor: parking_lot::Mutex::new(cleanup_floor),
+            cleanup_state_ttl: cells_lifetime_sec,
             #[cfg(feature = "telemetry")]
             telemetry,
             allocated,
         }))
+    }
+
+    /// Pins `id` through a physical read coordinated with state deletion: the
+    /// pin is taken inside the read, so GC cannot remove the state between.
+    fn pin_physical_state(
+        db: &InternalDb,
+        resolver: &Arc<AllowStateGcSmartResolver>,
+        id: &BlockIdExt,
+    ) -> Result<PinnedShardStateGuard> {
+        let budget = crate::history_read_budget::HistoryReadBudget::new(Default::default());
+        budget.detached_read(|| {
+            let (state, mut lease) = db.load_shard_state_bounded(id, budget.as_ref(), |saved_at| {
+                if !resolver.pin_state(id, saved_at, UnixTime::now())? {
+                    fail!(StorageError::StateIsAllowedToGc(id.clone()));
+                }
+                Ok(StateReadLease { id: id.clone(), resolver: resolver.clone(), active: true })
+            })?;
+            lease.active = false;
+            Ok(PinnedShardStateGuard { state, gc_resolver: resolver.clone() })
+        })
+    }
+
+    fn restore_cleanup_floor(
+        db: &InternalDb,
+        resolver: &Arc<AllowStateGcSmartResolver>,
+    ) -> Result<CleanupFloor> {
+        use consensus_common::validator_cleanup::{decode_checkpoint, GC_FLOOR_KEY};
+        let Some(value) = db.load_validator_state_key_bounded(GC_FLOOR_KEY, 256)? else {
+            return Ok(CleanupFloor::Unset);
+        };
+        let id = decode_checkpoint(&value)
+            .ok_or_else(|| error!("Malformed persisted validator-cleanup GC floor"))?;
+        Ok(match Self::pin_physical_state(db, resolver, &id) {
+            Ok(guard) => CleanupFloor::Pinned(id, guard),
+            Err(error) => {
+                log::error!(
+                    "Validator-cleanup GC floor {id} state is unavailable; cleanup stays disabled: {error}"
+                );
+                CleanupFloor::Missing(id)
+            }
+        })
+    }
+
+    /// The current cleanup floor and its pinned state, if one is in custody.
+    pub(crate) fn cleanup_floor(&self) -> Option<(BlockIdExt, Arc<ShardStateStuff>)> {
+        match &*self.cleanup_floor.lock() {
+            CleanupFloor::Pinned(id, guard) => Some((id.clone(), guard.state_arc())),
+            CleanupFloor::Unset | CleanupFloor::Missing(_) => None,
+        }
+    }
+
+    /// True when no floor was ever persisted, so a first-run adoption may run.
+    pub(crate) fn cleanup_floor_unset(&self) -> bool {
+        matches!(&*self.cleanup_floor.lock(), CleanupFloor::Unset)
+    }
+
+    pub(crate) fn cleanup_state_ttl(&self) -> u64 {
+        self.cleanup_state_ttl
+    }
+
+    /// Pins a candidate floor state through a deletion-coordinated read.
+    pub(crate) fn pin_cleanup_candidate(&self, id: &BlockIdExt) -> Result<PinnedShardStateGuard> {
+        Self::pin_physical_state(&self.db, &self.gc_resolver, id)
+    }
+
+    /// Adopts a new floor: the key is persisted synced before the floor is
+    /// published, and the previous pin drops only afterwards. A floor whose
+    /// state went missing is never replaced.
+    pub(crate) fn adopt_cleanup_floor(
+        &self,
+        id: &BlockIdExt,
+        guard: PinnedShardStateGuard,
+    ) -> Result<()> {
+        use consensus_common::validator_cleanup::{encode_checkpoint, GC_FLOOR_KEY};
+        if guard.state().block_id() != id {
+            fail!("Cleanup floor pin does not match its block");
+        }
+        let mut slot = self.cleanup_floor.lock();
+        if let CleanupFloor::Missing(old) = &*slot {
+            fail!("Cleanup floor {old} is unavailable; it is never replaced");
+        }
+        self.db.write_validator_state_batch_sync(
+            &[(GC_FLOOR_KEY.to_owned(), encode_checkpoint(id))],
+            &[],
+        )?;
+        let previous = std::mem::replace(&mut *slot, CleanupFloor::Pinned(id.clone(), guard));
+        drop(slot);
+        drop(previous);
+        Ok(())
     }
 
     pub async fn start(

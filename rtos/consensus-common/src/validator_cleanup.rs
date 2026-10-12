@@ -286,6 +286,71 @@ pub fn should_adopt_safe_checkpoint(
     }
 }
 
+/// Durable key of the cleanup GC masterchain floor.
+pub const GC_FLOOR_KEY: &str = "ValidatorCleanupGcMcBlockId";
+const CHECKPOINT_BYTES: usize = 4 + 8 + 4 + 32 + 32;
+
+/// Encodes a full masterchain checkpoint for the durable GC floor key.
+pub fn encode_checkpoint(id: &BlockIdExt) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CHECKPOINT_BYTES);
+    out.extend_from_slice(&id.shard().workchain_id().to_le_bytes());
+    out.extend_from_slice(&id.shard().shard_prefix_with_tag().to_le_bytes());
+    out.extend_from_slice(&id.seq_no().to_le_bytes());
+    out.extend_from_slice(id.root_hash().as_slice());
+    out.extend_from_slice(id.file_hash().as_slice());
+    out
+}
+
+/// Strict decode of the GC floor; anything but a full masterchain block fails.
+pub fn decode_checkpoint(value: &[u8]) -> Option<BlockIdExt> {
+    if value.len() != CHECKPOINT_BYTES {
+        return None;
+    }
+    let workchain = i32::from_le_bytes(value.get(0..4)?.try_into().ok()?);
+    let shard = u64::from_le_bytes(value.get(4..12)?.try_into().ok()?);
+    let seqno = u32::from_le_bytes(value.get(12..16)?.try_into().ok()?);
+    let id = BlockIdExt::with_params(
+        ShardIdent::with_tagged_prefix(workchain, shard).ok()?,
+        seqno,
+        UInt256::from_slice(value.get(16..48)?),
+        UInt256::from_slice(value.get(48..80)?),
+    );
+    is_full_masterchain_checkpoint(&id).then_some(id)
+}
+
+/// Frontiers the GC floor must stay strictly below before it may advance,
+/// as in the reference `try_advance_gc_masterchain_block`.
+#[derive(Clone, Debug, Default)]
+pub struct GcAdvanceInputs {
+    pub last_rotation_seqno: u32,
+    pub min_ref_mc_seqno: u32,
+    pub last_applied_seqno: u32,
+    pub last_key_block_seqno: u32,
+    pub shard_client_seqno: u32,
+    pub pss_keeper_seqno: u32,
+    pub now: u64,
+    pub state_ttl: u64,
+}
+
+/// Whether the floor at `floor_seqno` with state time `floor_utime` may
+/// advance one step. Arithmetic is checked; overflow refuses.
+pub fn may_advance_gc(floor_seqno: u32, floor_utime: u64, inputs: &GcAdvanceInputs) -> bool {
+    let Some(behind_head) = floor_seqno.checked_add(1024) else {
+        return false;
+    };
+    let Some(expiry) = inputs.now.checked_sub(inputs.state_ttl) else {
+        return false;
+    };
+    inputs.last_applied_seqno > 0
+        && floor_seqno < inputs.last_rotation_seqno
+        && floor_seqno < inputs.min_ref_mc_seqno
+        && behind_head < inputs.last_applied_seqno
+        && floor_seqno < inputs.last_key_block_seqno
+        && floor_seqno < inputs.shard_client_seqno
+        && floor_seqno < inputs.pss_keeper_seqno
+        && floor_utime < expiry
+}
+
 /// A record reserved for deletion. Both tokens are threaded back through the
 /// completion, so a stale or duplicate completion is rejected.
 #[derive(Clone, Debug, Eq, PartialEq)]

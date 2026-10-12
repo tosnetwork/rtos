@@ -550,3 +550,54 @@ fn validator_cleanup_records_retired_after_gc_are_kept() {
     assert_eq!(reserved.len(), 1);
     assert_eq!(reserved[0].record.session_id, session(1));
 }
+
+#[test]
+fn validator_cleanup_gc_floor_codec_is_strict() {
+    let id = checkpoint(500);
+    let bytes = encode_checkpoint(&id);
+    assert_eq!(decode_checkpoint(&bytes), Some(id));
+    for length in 0..bytes.len() {
+        assert!(decode_checkpoint(&bytes[..length]).is_none());
+    }
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert!(decode_checkpoint(&longer).is_none());
+    let shard = BlockIdExt::with_params(
+        ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap(),
+        5,
+        UInt256::from([1; 32]),
+        UInt256::from([1; 32]),
+    );
+    assert!(decode_checkpoint(&encode_checkpoint(&shard)).is_none(), "masterchain only");
+}
+
+#[test]
+fn validator_cleanup_gc_floor_advances_only_behind_every_frontier() {
+    let ready = GcAdvanceInputs {
+        last_rotation_seqno: 2000,
+        min_ref_mc_seqno: 2000,
+        last_applied_seqno: 3000,
+        last_key_block_seqno: 2000,
+        shard_client_seqno: 2000,
+        pss_keeper_seqno: 2000,
+        now: 10_000,
+        state_ttl: 1_000,
+    };
+    assert!(may_advance_gc(1000, 8_000, &ready));
+    let blocked: Vec<(&str, GcAdvanceInputs)> = vec![
+        ("rotation", GcAdvanceInputs { last_rotation_seqno: 1000, ..ready.clone() }),
+        ("min ref", GcAdvanceInputs { min_ref_mc_seqno: 1000, ..ready.clone() }),
+        ("1024 behind head", GcAdvanceInputs { last_applied_seqno: 2024, ..ready.clone() }),
+        ("key block", GcAdvanceInputs { last_key_block_seqno: 1000, ..ready.clone() }),
+        ("shard client", GcAdvanceInputs { shard_client_seqno: 1000, ..ready.clone() }),
+        ("pss keeper", GcAdvanceInputs { pss_keeper_seqno: 1000, ..ready.clone() }),
+        ("no head", GcAdvanceInputs { last_applied_seqno: 0, ..ready.clone() }),
+        ("ttl underflow", GcAdvanceInputs { state_ttl: 20_000, ..ready.clone() }),
+    ];
+    for (name, inputs) in blocked {
+        assert!(!may_advance_gc(1000, 8_000, &inputs), "{name}");
+    }
+    assert!(!may_advance_gc(1000, 9_000, &ready), "state not older than the TTL");
+    assert!(may_advance_gc(1000, 8_999, &ready));
+    assert!(!may_advance_gc(u32::MAX, 0, &ready), "seqno + 1024 overflow refuses");
+}

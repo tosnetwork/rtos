@@ -211,3 +211,110 @@ async fn test_snapshot_cache_and_merge_require_authenticated_state_identity() ->
     engine.db.stop_states_db().await.unwrap();
     Ok(())
 }
+
+/// The state write is asynchronous; pin once it is physically present.
+async fn wait_pin(keeper: &Arc<ShardStatesKeeper>, id: &BlockIdExt) -> Result<PinnedShardStateGuard> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        match keeper.pin_cleanup_candidate(id) {
+            Ok(guard) => return Ok(guard),
+            Err(error) if std::time::Instant::now() >= deadline => return Err(error),
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
+    }
+}
+
+fn floor_keeper(db: Arc<InternalDb>, stopper: Arc<Stopper>) -> Result<Arc<ShardStatesKeeper>> {
+    #[cfg(feature = "telemetry")]
+    use crate::collator_test_bundle::create_engine_telemetry;
+    use crate::collator_test_bundle::create_engine_allocated;
+    ShardStatesKeeper::new(
+        db,
+        false,
+        true,
+        0,
+        0,
+        ShardStatesCacheMode::Moderate,
+        3600,
+        stopper,
+        100,
+        #[cfg(feature = "telemetry")]
+        create_engine_telemetry(),
+        create_engine_allocated(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cleanup_floor_custody_restores_and_never_replaces_a_missing_floor() -> Result<()> {
+    use crate::collator_test_bundle::create_block_handle_storage;
+    use consensus_common::validator_cleanup::{decode_checkpoint, encode_checkpoint, GC_FLOOR_KEY};
+    let id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        42,
+        UInt256::from([1; 32]),
+        UInt256::from([2; 32]),
+    );
+    let floor_key = |db: &InternalDb| -> Result<Option<BlockIdExt>> {
+        Ok(db.load_validator_state_key_bounded(GC_FLOOR_KEY, 256)?.and_then(|v| decode_checkpoint(&v)))
+    };
+
+    // A floor is adopted only with a deletion-coordinated pin, persisted synced.
+    let dir = tempfile::tempdir()?;
+    let engine = TestEngine::new_db_dir(dir.path().to_str().unwrap(), None).await?;
+    let stopper = Arc::new(Stopper::new());
+    let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
+    assert!(keeper.cleanup_floor_unset());
+    assert!(keeper.cleanup_floor().is_none());
+    assert!(keeper.pin_cleanup_candidate(&id).is_err(), "no physical state, no pin");
+    let handles = create_block_handle_storage(None)?;
+    let handle =
+        handles.create_handle(id.clone(), storage::types::BlockMeta::default(), None)?.unwrap();
+    let mut header = ShardStateUnsplit::with_ident(ShardIdent::masterchain());
+    header.set_seq_no(42);
+    let state = ShardStateStuff::from_state(
+        id.clone(),
+        header,
+        #[cfg(feature = "telemetry")]
+        &keeper.telemetry,
+        &keeper.allocated,
+    )?;
+    keeper.store_state(&handle, state, None, true).await?;
+    let guard = wait_pin(&keeper, &id).await?;
+    keeper.adopt_cleanup_floor(&id, guard)?;
+    assert_eq!(keeper.cleanup_floor().map(|(floor, _)| floor), Some(id.clone()));
+    assert!(!keeper.cleanup_floor_unset());
+    assert_eq!(floor_key(&engine.db)?, Some(id.clone()), "persisted before publication");
+    stopper.set_stop();
+    engine.db.stop_states_db().await.unwrap();
+
+    // A persisted floor whose state is gone stays Missing: cleanup is
+    // disabled, the key is kept, and no replacement is ever adopted.
+    let dir = tempfile::tempdir()?;
+    let engine = TestEngine::new_db_dir(dir.path().to_str().unwrap(), None).await?;
+    engine
+        .db
+        .write_validator_state_batch_sync(&[(GC_FLOOR_KEY.to_owned(), encode_checkpoint(&id))], &[])?;
+    let stopper = Arc::new(Stopper::new());
+    let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
+    assert!(keeper.cleanup_floor().is_none());
+    assert!(!keeper.cleanup_floor_unset(), "a missing floor is not a first run");
+    let mut header = ShardStateUnsplit::with_ident(ShardIdent::masterchain());
+    header.set_seq_no(42);
+    let state = ShardStateStuff::from_state(
+        id.clone(),
+        header,
+        #[cfg(feature = "telemetry")]
+        &keeper.telemetry,
+        &keeper.allocated,
+    )?;
+    let handles = create_block_handle_storage(None)?;
+    let handle =
+        handles.create_handle(id.clone(), storage::types::BlockMeta::default(), None)?.unwrap();
+    keeper.store_state(&handle, state, None, true).await?;
+    let guard = wait_pin(&keeper, &id).await?;
+    assert!(keeper.adopt_cleanup_floor(&id, guard).is_err(), "never replaced");
+    assert_eq!(floor_key(&engine.db)?, Some(id), "the key is retained");
+    stopper.set_stop();
+    engine.db.stop_states_db().await.unwrap();
+    Ok(())
+}
