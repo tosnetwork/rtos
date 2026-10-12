@@ -53,6 +53,21 @@ pub(crate) struct DependencyLeases {
     commit_hook: Mutex<Option<Arc<dyn Fn(&LeaseRecord) + Send + Sync>>>,
 }
 impl LeaseRecord {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        generation: u64,
+        binding: &RepairLeaseBinding,
+        dependency_digest: &UInt256,
+    ) -> Result<Self> {
+        Ok(Self {
+            schema: 1,
+            generation,
+            binding: binding.encode()?,
+            dependencies: Vec::new(),
+            dependency_digest: format!("{dependency_digest:x}"),
+            state: LeaseState::DurableCustody,
+        })
+    }
     pub(crate) fn binding(&self) -> Result<RepairLeaseBinding> {
         RepairLeaseBinding::decode(&self.binding)
     }

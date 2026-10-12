@@ -17,7 +17,7 @@ use std::{
 const KEY: &str = "PropagationOutboxV1";
 const MAGIC: &[u8; 8] = b"RTOSPBOX";
 pub const SCHEMA_VERSION: u16 = 4;
-mod closing;
+pub(crate) mod closing;
 pub(crate) use closing::{canonical_intent_digest, effects_digest, ClosingRecord};
 const DIGEST_BYTES: usize = 32;
 

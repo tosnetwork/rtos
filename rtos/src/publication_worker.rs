@@ -1,6 +1,7 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! One bounded publication actor. Accepted blocking writes retain their real join
 //! independently of the caller's response future. Idle loops never own Engine.
+pub(crate) mod cleanup_projection;
 mod closing;
 mod history_debt;
 pub(crate) use history_debt::NodeHistoryDebt;
