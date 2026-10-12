@@ -230,9 +230,10 @@ pub fn session_is_onchain_obsolete(
     {
         return false;
     }
+    // An unknown value and the u32::MAX sentinel both veto deletion.
     match gc_shard_catchain_seqno(&parsed.shard) {
-        Some(current) => parsed.catchain_seqno < current,
-        None => false,
+        Some(current) if current != u32::MAX => parsed.catchain_seqno < current,
+        _ => false,
     }
 }
 

@@ -224,6 +224,10 @@ fn validator_cleanup_eligible_requires_all_four_conditions() {
     assert!(!cleanup_eligible(&r, &gc, &ancestor, &cc, &yes, &yes), "live");
     assert!(!cleanup_eligible(&r, &gc, &ancestor, &cc, &no, &no), "not closed");
     assert!(!cleanup_eligible(&r, &gc, &ancestor, &|_: &ShardIdent| None, &no, &yes), "cc unknown");
+    assert!(
+        !cleanup_eligible(&r, &gc, &ancestor, &|_: &ShardIdent| Some(u32::MAX), &no, &yes),
+        "the u32::MAX sentinel vetoes"
+    );
     assert!(!cleanup_eligible(&r, &gc, &|_: &BlockIdExt| false, &cc, &no, &yes), "not ancestor");
 }
 

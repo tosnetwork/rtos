@@ -272,11 +272,22 @@ async fn test_validator_state_batch_and_prefix_scan() {
         ]
     );
     assert!(end);
-    // An oversized value refuses the scan instead of being returned.
+    // An oversized value is counted and passed, never returned, and the
+    // cursor moves past it to the valid record that follows.
     storage
-        .write_validator_state_batch_sync(&[("Cleanup.05".to_owned(), vec![0; 17])], &[])
+        .write_validator_state_batch_sync(
+            &[("Cleanup.05".to_owned(), vec![0; 17]), ("Cleanup.06".to_owned(), vec![6])],
+            &[],
+        )
         .unwrap();
-    assert!(storage.scan_validator_state_prefix("Cleanup.", "", 10, 16).is_err());
+    let (page, last, end) =
+        storage.scan_validator_state_prefix("Cleanup.", "Cleanup.04", 1, 16).unwrap();
+    assert!(page.is_empty());
+    assert_eq!(last, "Cleanup.05");
+    assert!(!end);
+    let (page, _, end) = storage.scan_validator_state_prefix("Cleanup.", &last, 1, 16).unwrap();
+    assert_eq!(page, vec![("Cleanup.06".to_owned(), vec![6])]);
+    assert!(end);
     assert_eq!(storage.load_validator_state_raw("CleanupX").unwrap(), Some(vec![9]));
     drop(storage);
     destroy_rocks_db(DB_PATH, DB_NAME).await.unwrap();

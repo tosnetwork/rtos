@@ -22,6 +22,7 @@ struct LifecycleEngine {
     retired_records: std::sync::Mutex<Vec<consensus_common::validator_cleanup::PendingValidatorCleanup>>,
     retirement_fence: std::sync::Mutex<HashSet<UInt256>>,
     fail_retirement: std::sync::atomic::AtomicBool,
+    no_applied_mc: std::sync::atomic::AtomicBool,
 }
 
 struct StateGate {
@@ -44,6 +45,9 @@ impl EngineOperations for LifecycleEngine {
     }
 
     fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
+        if self.no_applied_mc.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         Ok(Some(Arc::new(BlockIdExt::with_params(
             ShardIdent::masterchain(),
             9,
@@ -301,6 +305,26 @@ async fn test_manager_lifecycle_retirement_persists_before_any_group_closes() {
         assert!(manager.retiring_groups.is_empty());
         assert_eq!(engine.candidate_deletes.load(Ordering::Relaxed), 0);
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_manager_lifecycle_fence_is_durable_before_close_even_without_record() {
+    let engine = Arc::new(LifecycleEngine::default());
+    engine.no_applied_mc.store(true, Ordering::Relaxed);
+    engine.fail_retirement.store(true, Ordering::Relaxed);
+    let mut manager = manager_fixture(engine.clone());
+    let id = UInt256::rand();
+    let group = group_fixture(engine.clone());
+    manager.current_sessions.insert(id.clone(), group.clone());
+    let error = manager.stop_and_remove_sessions(&HashSet::from([id.clone()])).await.unwrap_err();
+    assert!(error.to_string().contains("retirement persistence failure"), "{error}");
+    assert!(manager.pending_cleanup_records.is_empty(), "no record could be built");
+    assert!(!group.stop_requested.is_cancelled(), "a fence that is not durable blocks the close");
+    engine.fail_retirement.store(false, Ordering::Relaxed);
+    assert!(manager.stop_validation().await.is_err(), "the latched failure stays reported");
+    assert!(group.stop_requested.is_cancelled());
+    assert!(engine.retirement_fence.lock().unwrap().contains(&id), "fence synced before close");
+    assert!(engine.retired_records.lock().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "current_thread")]

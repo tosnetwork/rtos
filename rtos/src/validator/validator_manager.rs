@@ -828,6 +828,9 @@ struct ValidatorManagerImpl {
     /// Cleanup records built at retirement, persisted with the fence before
     /// any of their groups may close.
     pending_cleanup_records: Vec<consensus_common::validator_cleanup::PendingValidatorCleanup>,
+    /// The fence gained a retirement that is not yet synced; no retiring group
+    /// may close until it is, even if its cleanup record could not be built.
+    fence_dirty: bool,
     cleanup: consensus_common::validator_cleanup::ValidatorCleanupManager,
     retiring_observers: Vec<Arc<super::block_sync_observer::BlockSyncObserver>>,
     lifecycle_errors: HashSet<String>,
@@ -903,6 +906,7 @@ impl ValidatorManagerImpl {
             future_sessions: HashMap::default(),
             retiring_groups: Vec::new(),
             pending_cleanup_records: Vec::new(),
+            fence_dirty: false,
             cleanup: Default::default(),
             retiring_observers: Vec::new(),
             lifecycle_errors: HashSet::new(),
@@ -1353,6 +1357,7 @@ impl ValidatorManagerImpl {
     /// `update_shards()`.
     fn retire_group(&mut self, id: UInt256, group: Arc<ValidatorGroup>) {
         self.destroyed_sessions.insert(id.clone());
+        self.fence_dirty = true;
         let generation = match self.cleanup_record(&id, &group) {
             Ok(record) => {
                 let generation = self.cleanup.on_group_retired(&record);
@@ -1428,7 +1433,7 @@ impl ValidatorManagerImpl {
         // The fence and every new cleanup record are durable before any
         // retiring group may begin to close, so a crash mid-close always
         // leaves a record for its namespace.
-        if !self.pending_cleanup_records.is_empty() {
+        if self.fence_dirty || !self.pending_cleanup_records.is_empty() {
             if let Err(error) = self
                 .engine
                 .persist_validator_retirement(&self.destroyed_sessions, &self.pending_cleanup_records)
@@ -1439,6 +1444,7 @@ impl ValidatorManagerImpl {
                 return self.check_lifecycle_errors();
             }
             self.pending_cleanup_records.clear();
+            self.fence_dirty = false;
         }
         let rt = self.rt.clone();
         let groups = self.retiring_groups.clone();
@@ -1508,7 +1514,9 @@ impl ValidatorManagerImpl {
             if let Some(group) = self.future_sessions.remove(id) {
                 self.retire_group(id.clone(), group);
             }
-            self.destroyed_sessions.insert(id.clone());
+            if self.destroyed_sessions.insert(id.clone()) {
+                self.fence_dirty = true;
+            }
         }
         self.drain_retiring().await
     }

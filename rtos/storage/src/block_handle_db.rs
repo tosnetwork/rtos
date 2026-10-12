@@ -792,6 +792,7 @@ impl BlockHandleStorage {
     ) -> Result<(Vec<(String, Vec<u8>)>, String, bool)> {
         let start = if after.is_empty() { prefix } else { after };
         let mut entries = Vec::new();
+        let mut examined = 0usize;
         let mut last_key = String::new();
         let mut reached_end = true;
         let mut failure = None;
@@ -802,7 +803,7 @@ impl BlockHandleStorage {
             if key == after.as_bytes() {
                 return Ok(true);
             }
-            if entries.len() == max_keys {
+            if examined == max_keys {
                 reached_end = false;
                 return Ok(false);
             }
@@ -810,12 +811,13 @@ impl BlockHandleStorage {
                 failure = Some(error!("Validator-state key under {prefix} is not UTF-8"));
                 return Ok(false);
             };
-            if value.len() > max_value_bytes {
-                failure = Some(error!("Validator-state value {key} exceeds {max_value_bytes} bytes"));
-                return Ok(false);
-            }
+            examined = examined.saturating_add(1);
             last_key = key.to_owned();
-            entries.push((last_key.clone(), value.to_vec()));
+            // An oversized value is counted and passed, never copied, so one
+            // malformed entry cannot hold the cursor in place.
+            if value.len() <= max_value_bytes {
+                entries.push((last_key.clone(), value.to_vec()));
+            }
             Ok(true)
         })?;
         if let Some(error) = failure {
