@@ -826,9 +826,32 @@ const CLEANUP_CLAIM_PAGE: usize = 64;
 /// A dispatched cleanup worker: one namespace delete, or one session's
 /// candidate-table delete for its durable claim.
 enum CleanupWork {
-    Namespace { namespace: String, session: UInt256, generation: u64, attempt: u64 },
-    Claim { session: UInt256, attempt: u64 },
+    Namespace {
+        namespace: String,
+        session: UInt256,
+        generation: u64,
+        attempt: u64,
+    },
+    Claim {
+        session: UInt256,
+        attempt: u64,
+    },
+    /// A dry re-verification of an authenticated namespace.
+    V2Dry {
+        namespace: String,
+        generation: u64,
+        attempt: u64,
+    },
 }
+
+/// What a cleanup worker produced.
+enum CleanupOutcome {
+    Gone(Result<bool>),
+    Verdict(Result<consensus_common::validator_cleanup::CleanupVerdict>),
+}
+
+/// Dry verdicts kept for observability.
+const CLEANUP_VERDICTS_KEPT: usize = 256;
 
 struct ValidatorManagerImpl {
     engine: Arc<dyn EngineOperations>,
@@ -852,7 +875,10 @@ struct ValidatorManagerImpl {
     /// Next cleanup tick; persists across wakeups of the manager loop.
     cleanup_tick_at: tokio::time::Instant,
     /// Blocking delete workers; joined before shutdown returns.
-    cleanup_workers: tokio::task::JoinSet<Result<bool>>,
+    cleanup_workers: tokio::task::JoinSet<CleanupOutcome>,
+    /// The last dry verdict per authenticated namespace (bounded).
+    cleanup_v2_verdicts:
+        std::collections::BTreeMap<String, consensus_common::validator_cleanup::CleanupVerdict>,
     cleanup_worker_ids: HashMap<tokio::task::Id, CleanupWork>,
     /// Storage cleanup reservations by namespace, with the attempt holding it.
     cleanup_storage: HashMap<String, (u64, consensus_common::StorageCleanupReservation)>,
@@ -941,7 +967,7 @@ impl ValidatorManagerImpl {
                 let ancestor =
                     |checkpoint: &BlockIdExt| gc::ancestor_or_equal(&gc_state, checkpoint);
                 let catchain = |shard: &ShardIdent| gc::shard_catchain_seqno(&gc_state, shard);
-                let veto = gc::v1_only_custody_veto;
+                let veto = gc::authenticated_cleanup_veto;
                 let oracles = Oracles {
                     gc: gc_id.clone(),
                     ancestor_or_equal_of_gc: &ancestor,
@@ -956,7 +982,7 @@ impl ValidatorManagerImpl {
                     // while this delete is reserved, and a live or unclean
                     // namespace refuses.
                     let storage = match db_root.as_deref() {
-                        Ok(root) => match gc::namespace_storage(root, &candidate) {
+                        Ok(root) => match gc::namespace_storage_any(root, &candidate) {
                             Some((parent, id)) => {
                                 consensus_common::reserve_storage_cleanup(&parent, &id)
                                     .ok()
@@ -978,9 +1004,42 @@ impl ValidatorManagerImpl {
                     ) else {
                         continue;
                     };
-                    match storage {
-                        Some(storage) => reserved.push((item, storage)),
-                        None => {
+                    // An authenticated namespace also takes the exclusive
+                    // Cleanup admission, so no session or replay opens it.
+                    let admission =
+                        match consensus_common::validator_cleanup::parse_canonical_namespace_name(
+                            &item.record.namespace,
+                            &item.record.session_id,
+                        ) {
+                            Some(parsed)
+                                if parsed.layout
+                                    != consensus_common::validator_cleanup::NamespaceLayout::V1 =>
+                            {
+                                match self.engine.reserve_cleanup_admission(
+                                    &item.record.session_id,
+                                    &parsed.layout,
+                                ) {
+                                    Ok(Some(admission)) => Some(Some(admission)),
+                                    _ => None,
+                                }
+                            }
+                            Some(_) => Some(None),
+                            None => None,
+                        };
+                    match (storage, admission) {
+                        (Some(storage), Some(admission)) => {
+                            reserved.push((item, storage, admission))
+                        }
+                        (_, Some(Some(admission))) => {
+                            admission.release();
+                            self.cleanup.on_delete_completed(
+                                &item.record.namespace,
+                                item.generation,
+                                item.attempt_id,
+                                false,
+                            );
+                        }
+                        _ => {
                             // Storage is occupied: release the driver's
                             // reservation; a later cycle examines it again.
                             self.cleanup.on_delete_completed(
@@ -1003,8 +1062,11 @@ impl ValidatorManagerImpl {
                         );
                     }
                 }
-                for (item, storage) in reserved {
-                    self.dispatch_cleanup_delete(item, storage);
+                for (item, storage, admission) in reserved {
+                    match admission {
+                        None => self.dispatch_cleanup_delete(item, storage),
+                        Some(admission) => self.dispatch_v2_dry(item, storage, admission),
+                    }
                 }
             }
         }
@@ -1066,9 +1128,10 @@ impl ValidatorManagerImpl {
                 "VALCLEANUP claim session={} attempt={attempt}", session.to_hex_string());
             let engine = self.engine.clone();
             let target = session.clone();
-            let handle = self
-                .cleanup_workers
-                .spawn_blocking_on(move || engine.delete_candidate_table(&target), &self.rt);
+            let handle = self.cleanup_workers.spawn_blocking_on(
+                move || CleanupOutcome::Gone(engine.delete_candidate_table(&target)),
+                &self.rt,
+            );
             self.cleanup_worker_ids.insert(handle.id(), CleanupWork::Claim { session, attempt });
         }
     }
@@ -1089,7 +1152,7 @@ impl ValidatorManagerImpl {
         let engine = self.engine.clone();
         let record = item.record.clone();
         let handle = self.cleanup_workers.spawn_blocking_on(
-            move || engine.delete_validator_consensus_namespace(&record),
+            move || CleanupOutcome::Gone(engine.delete_validator_consensus_namespace(&record)),
             &self.rt,
         );
         self.cleanup_worker_ids.insert(
@@ -1110,21 +1173,40 @@ impl ValidatorManagerImpl {
     /// and a later cycle sees the durable record or claim again.
     fn on_cleanup_worker_joined(
         &mut self,
-        joined: std::result::Result<(tokio::task::Id, Result<bool>), tokio::task::JoinError>,
+        joined: std::result::Result<(tokio::task::Id, CleanupOutcome), tokio::task::JoinError>,
     ) {
-        let (id, gone) = match joined {
-            Ok((id, Ok(gone))) => (id, gone),
-            Ok((id, Err(e))) => {
+        use consensus_common::validator_cleanup::CleanupVerdict;
+        let (id, gone, verdict) = match joined {
+            Ok((id, CleanupOutcome::Gone(Ok(gone)))) => (id, gone, None),
+            Ok((id, CleanupOutcome::Gone(Err(e)))) => {
                 log::warn!(target: "validator_manager", "VALCLEANUP delete failed: {e}");
-                (id, false)
+                (id, false, None)
             }
+            Ok((id, CleanupOutcome::Verdict(verdict))) => (id, false, Some(verdict)),
             Err(e) => {
                 log::warn!(target: "validator_manager", "VALCLEANUP delete worker did not finish: {e}");
-                (e.id(), false)
+                (e.id(), false, None)
             }
         };
         match self.cleanup_worker_ids.remove(&id) {
             None => {}
+            Some(CleanupWork::V2Dry { namespace, generation, attempt }) => {
+                let verdict = match verdict {
+                    Some(Ok(verdict)) => verdict,
+                    Some(Err(e)) => CleanupVerdict::Veto(format!("attempt failed: {e}")),
+                    None => CleanupVerdict::Veto("attempt did not finish".into()),
+                };
+                log::info!(target: "validator_manager",
+                    "VALCLEANUP v2_decision dir={namespace} attempt={attempt} decision={verdict:?}");
+                if self.cleanup_v2_verdicts.len() >= CLEANUP_VERDICTS_KEPT
+                    && !self.cleanup_v2_verdicts.contains_key(&namespace)
+                {
+                    self.cleanup_v2_verdicts.pop_first();
+                }
+                self.cleanup_v2_verdicts.insert(namespace.clone(), verdict);
+                // Dry run: nothing is deleted, the record stays durable.
+                self.cleanup.on_delete_completed(&namespace, generation, attempt, false);
+            }
             Some(CleanupWork::Namespace { namespace, session, generation, attempt }) => {
                 if gone {
                     log::info!(target: "validator_manager",
@@ -1155,6 +1237,34 @@ impl ValidatorManagerImpl {
                 self.cleanup.end_claim(&session, attempt);
             }
         }
+    }
+
+    /// Hands one reserved authenticated namespace to an owned dry attempt.
+    /// The storage reservation moves into it; the Cleanup admission is
+    /// released after the attempt (a panic keeps it held, failing closed).
+    fn dispatch_v2_dry(
+        &mut self,
+        item: consensus_common::validator_cleanup::ReservedDelete,
+        storage: consensus_common::StorageCleanupReservation,
+        admission: super::finality_recovery_owner::RecoveryReservation,
+    ) {
+        let namespace = item.record.namespace.clone();
+        log::info!(target: "validator_manager",
+            "VALCLEANUP v2_reserve dir={namespace} attempt={}", item.attempt_id);
+        let engine = self.engine.clone();
+        let record = item.record.clone();
+        let handle = self.cleanup_workers.spawn_on(
+            async move {
+                let verdict = engine.prepare_v2_cleanup(record, storage).await;
+                admission.release();
+                CleanupOutcome::Verdict(verdict)
+            },
+            &self.rt,
+        );
+        self.cleanup_worker_ids.insert(
+            handle.id(),
+            CleanupWork::V2Dry { namespace, generation: item.generation, attempt: item.attempt_id },
+        );
     }
 
     /// Synced erase of a confirmed-gone record. When this namespace is the
@@ -1299,6 +1409,7 @@ impl ValidatorManagerImpl {
             cleanup_worker_ids: HashMap::new(),
             cleanup_storage: HashMap::new(),
             cleanup_claim_cursor: String::new(),
+            cleanup_v2_verdicts: std::collections::BTreeMap::new(),
             retiring_observers: Vec::new(),
             lifecycle_errors: HashSet::new(),
             background_tasks: tokio_util::task::TaskTracker::new(),
@@ -3820,6 +3931,12 @@ impl CleanupHarness {
     pub(crate) async fn tick(&mut self) {
         self.0.run_cleanup_tick().await;
         self.0.drain_cleanup_workers().await;
+    }
+    pub(crate) fn v2_verdict(
+        &self,
+        namespace: &str,
+    ) -> Option<consensus_common::validator_cleanup::CleanupVerdict> {
+        self.0.cleanup_v2_verdicts.get(namespace).cloned()
     }
     pub(crate) fn delete_in_flight(&self, session: &UInt256) -> bool {
         self.0.cleanup.is_delete_in_flight(session)

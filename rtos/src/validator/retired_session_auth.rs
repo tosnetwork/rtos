@@ -349,6 +349,37 @@ fn validate_close_recovery_binding_inner(
     validate_closing_identity(&runtime, &request, budget)
 }
 
+/// Re-authenticates a retired authenticated namespace for cleanup from the
+/// identity its durable record carries. The runtime must be exactly the one
+/// whose directory the record names; it authorizes no deletion by itself.
+pub(crate) async fn authenticate_cleanup_identity(
+    engine: &dyn EngineOperations,
+    record: &consensus_common::validator_cleanup::PendingValidatorCleanup,
+) -> Result<Arc<AuthenticatedSessionRuntime>> {
+    let identity =
+        record.identity.as_ref().ok_or_else(|| error!("Cleanup record without identity"))?;
+    if &identity.pin.zerostate != engine.zerostate_id()? {
+        fail!("Cleanup identity network pin mismatch");
+    }
+    let (runtime, _, _) =
+        authenticate_identity(engine, &identity.pin, &identity.binding, &identity.local_adnl, None)
+            .await?;
+    if runtime.session_id() != &record.session_id
+        || runtime.protocol() != SimplexProtocol::PrivateObserversPlumtree
+        || runtime.recovery_binding() != Some(&identity.binding)
+    {
+        fail!("Cleanup identity re-authenticated another session");
+    }
+    let root = PathBuf::from(engine.db_root_dir()?).join("catchains");
+    let expected = PathBuf::from(
+        runtime.runtime_directory(root.to_str().ok_or_else(|| error!("Invalid DB root"))?)?,
+    );
+    if expected != root.join("consensus").join(&record.namespace) {
+        fail!("Cleanup identity re-authenticated another namespace");
+    }
+    Ok(Arc::new(runtime))
+}
+
 pub(crate) async fn authenticate_retired_session(
     engine: &dyn EngineOperations,
     record: &SessionRecoveryRecord,

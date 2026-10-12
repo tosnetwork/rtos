@@ -470,9 +470,17 @@ impl PropagationOutbox {
         if state.snapshot.closing.iter().any(|closed| &closed.binding.delivery_id == id) {
             fail!("Compacted closing history requires its existing exact custody evidence");
         }
-        let delivery = state.snapshot.deliveries.iter().find(|d| &d.delivery_id == id)
+        let delivery = state
+            .snapshot
+            .deliveries
+            .iter()
+            .find(|d| &d.delivery_id == id)
             .ok_or_else(|| error!("Historical debt has no retained full delivery"))?;
-        let entry = state.snapshot.entries.iter().find(|e| e.id == delivery.record_id)
+        let entry = state
+            .snapshot
+            .entries
+            .iter()
+            .find(|e| e.id == delivery.record_id)
             .ok_or_else(|| error!("Historical debt has no retained full canonical record"))?;
         consume(delivery, entry)
     }
@@ -1091,10 +1099,13 @@ pub(crate) fn load_legacy_close_request(
         global_id: request.domain.pin.global_id,
         wire_profile: request.domain.wire_profile,
     };
-    let bytes = db.load_validator_state_raw_bounded(KEY, limits.max_snapshot_bytes)?
+    let bytes = db
+        .load_validator_state_raw_bounded(KEY, limits.max_snapshot_bytes)?
         .ok_or_else(|| error!("Legacy source close has no node ledger"))?;
     let snapshot = decode_snapshot(&bytes, &domain, &limits)?;
-    let record = snapshot.closing.iter()
+    let record = snapshot
+        .closing
+        .iter()
         .find(|record| record.binding.delivery_id == request.canonical.node_receipt)
         .ok_or_else(|| error!("Legacy source close has no exact node closing record"))?;
     closing::restore_legacy_request(request, record)
@@ -1127,7 +1138,8 @@ pub(crate) fn inspect_delivery(
 /// Read-only coherent observation. Never opens a competing outbox writer.
 #[cfg(test)]
 pub(crate) fn inspect_closure_progress(
-    db: &Arc<InternalDb>, domain: &OutboxDomain,
+    db: &Arc<InternalDb>,
+    domain: &OutboxDomain,
 ) -> Result<(Vec<UnverifiedRecord>, Vec<ClosingRecord>)> {
     let limits = Limits::default();
     let Some(bytes) = db.load_validator_state_raw_bounded(KEY, limits.max_snapshot_bytes)? else {
@@ -1139,7 +1151,8 @@ pub(crate) fn inspect_closure_progress(
 /// Pure validation of the actual bytes about to reach the synchronous DB API.
 #[cfg(test)]
 pub(crate) fn inspect_closure_snapshot(
-    bytes: &[u8], domain: &OutboxDomain,
+    bytes: &[u8],
+    domain: &OutboxDomain,
 ) -> Result<(Vec<UnverifiedRecord>, Vec<ClosingRecord>)> {
     let snapshot = decode_snapshot(bytes, domain, &Limits::default())?;
     Ok((snapshot.entries, snapshot.closing))
@@ -1299,9 +1312,11 @@ mod tests {
         assert!(store.stage_draft(record(1), 0, false, None).is_err());
         assert!(store.pending().is_err());
         assert!(store.check_health().is_err());
-        assert!(store.with_history_delivery::<()>(&delivery_id(&record(1))?, |_, _| {
-            panic!("uncertain WAL must not expose history admission evidence")
-        }).is_err());
+        assert!(store
+            .with_history_delivery::<()>(&delivery_id(&record(1))?, |_, _| {
+                panic!("uncertain WAL must not expose history admission evidence")
+            })
+            .is_err());
         drop(store);
         disk.failure.store(0, Ordering::SeqCst);
         let store = memory(disk, limits);

@@ -116,7 +116,12 @@ impl World {
         let items = closing.iter().map(item).collect();
         (Self { entries: vec![], deliveries: vec![], closing, leases, outstanding: 0 }, items)
     }
-    fn judge(&self, selection: &NamespaceSelection, identity: &ExpectedIdentity, items: &[RetirementItem]) -> CleanupDecision {
+    fn judge(
+        &self,
+        selection: &NamespaceSelection,
+        identity: &ExpectedIdentity,
+        items: &[RetirementItem],
+    ) -> CleanupDecision {
         project_cleanup(
             selection,
             identity,
@@ -177,9 +182,15 @@ fn retained(session: [u8; 32], origin: Option<RecoveryOrigin>) -> (UnverifiedRec
 fn projection_accepts_exact_released_coverage_and_an_empty_namespace() {
     let identity = validator();
     let (world, items) = World::released(&[1, 2], &identity);
-    assert_eq!(world.judge(&validator_selection(), &identity, &items), CleanupDecision::WouldDelete { closes: 2 });
+    assert_eq!(
+        world.judge(&validator_selection(), &identity, &items),
+        CleanupDecision::WouldDelete { closes: 2 }
+    );
     let (empty, none) = World::released(&[], &identity);
-    assert_eq!(empty.judge(&validator_selection(), &identity, &none), CleanupDecision::WouldDelete { closes: 0 });
+    assert_eq!(
+        empty.judge(&validator_selection(), &identity, &none),
+        CleanupDecision::WouldDelete { closes: 0 }
+    );
 }
 
 #[test]

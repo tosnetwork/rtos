@@ -377,6 +377,15 @@ struct InventoryDigestInput {
     items: Vec<(String, u64)>,
 }
 
+/// How a structurally complete namespace with no outputs is treated. The
+/// live retirement refuses it; a cold cleanup accepts it as a validated
+/// zero-item scan that keeps its locks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmptyInventoryPolicy {
+    Refuse,
+    Accept,
+}
+
 /// What proves no storage instance of the namespace runs during the scan.
 pub enum Quiescence<'a> {
     /// The session's own instance was torn down cleanly (live retirement).
@@ -395,7 +404,13 @@ pub fn scan_source_retirement(
     teardown: &StorageTeardownReceipt,
     budget: &dyn SourceHistoryDebtBudget,
 ) -> Refusal<PendingRetirementScan> {
-    scan_source_retirement_with(runtime, namespace, Quiescence::Teardown(teardown), budget)
+    scan_source_retirement_with(
+        runtime,
+        namespace,
+        Quiescence::Teardown(teardown),
+        EmptyInventoryPolicy::Refuse,
+        budget,
+    )
 }
 
 /// The same scan with either quiescence proof.
@@ -403,6 +418,7 @@ pub fn scan_source_retirement_with(
     runtime: Arc<AuthenticatedSessionRuntime>,
     namespace: &Path,
     quiescence: Quiescence<'_>,
+    empty: EmptyInventoryPolicy,
     budget: &dyn SourceHistoryDebtBudget,
 ) -> Refusal<PendingRetirementScan> {
     if runtime.protocol() != SimplexProtocol::PrivateObserversPlumtree {
@@ -447,7 +463,13 @@ pub fn scan_source_retirement_with(
     let delivered = store.retirement_delivered(&runtime, &mut charge)?;
     let sets = crate::finality_recovery::retirement_sealed_sets(namespace, &runtime, &mut charge)?;
     if sets.is_empty() && delivered.is_empty() {
-        return Err(RetirementRefusal::EmptyInventory);
+        if empty == EmptyInventoryPolicy::Refuse {
+            return Err(RetirementRefusal::EmptyInventory);
+        }
+        // A zero-item scan is a complete namespace by construction: the
+        // manifest read above requires the session database, the pending
+        // store is open and locked, and the sealed-set read requires the
+        // intents directory.
     }
     let files_count = sets
         .len()

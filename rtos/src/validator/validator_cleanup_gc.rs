@@ -9,7 +9,7 @@ use crate::{
 };
 use consensus_common::validator_cleanup::{
     may_advance_gc, parse_canonical_namespace_name, should_adopt_safe_checkpoint, CleanupAncestry,
-    GcAdvanceInputs, NamespaceLayout, ParsedNamespace, PendingValidatorCleanup,
+    CleanupVerdict, GcAdvanceInputs, NamespaceLayout, ParsedNamespace, PendingValidatorCleanup,
 };
 use rtos_block::{error, fail, BlockIdExt, HashmapAugType, Result, ShardIdent, UInt256, UnixTime};
 use std::{
@@ -223,6 +223,41 @@ pub(crate) fn namespace_storage(
     Some((parent, record.session_id.to_hex_string()))
 }
 
+/// Custody veto for the cleanup pass: an unparsable name is kept; an
+/// authenticated namespace is kept unless its record carries the identity
+/// that re-authenticates it and it is a masterchain namespace (only
+/// masterchain Final outputs reach Released).
+pub(crate) fn authenticated_cleanup_veto(record: &PendingValidatorCleanup) -> bool {
+    match parse_canonical_namespace_name(&record.namespace, &record.session_id) {
+        None => true,
+        Some(ParsedNamespace { layout: NamespaceLayout::V1, .. }) => false,
+        Some(parsed) => record.identity.is_none() || !parsed.shard.is_masterchain(),
+    }
+}
+
+/// The storage registration key of any record's namespace database: the
+/// namespace directory and the session's storage id. A V1 name is one plain
+/// component; an authenticated name is `v2/` plus one plain component.
+pub(crate) fn namespace_storage_any(
+    db_root: &str,
+    record: &PendingValidatorCleanup,
+) -> Option<(PathBuf, String)> {
+    let parsed = parse_canonical_namespace_name(&record.namespace, &record.session_id)?;
+    let mut components = Path::new(&record.namespace).components();
+    let shaped = match parsed.layout {
+        NamespaceLayout::V1 => {
+            matches!((components.next(), components.next()), (Some(Component::Normal(_)), None))
+        }
+        _ => matches!(
+            (components.next(), components.next(), components.next()),
+            (Some(Component::Normal(v2)), Some(Component::Normal(_)), None) if v2 == "v2"
+        ),
+    };
+    shaped.then(|| {
+        (consensus_root(db_root).join(&record.namespace), record.session_id.to_hex_string())
+    })
+}
+
 fn consensus_root(db_root: &str) -> PathBuf {
     Path::new(db_root).join("catchains").join("consensus")
 }
@@ -320,4 +355,98 @@ pub(crate) fn session_has_other_records(
         }
     }
     Ok(false)
+}
+
+/// Re-authentication of a cold namespace waits at most this long for history.
+const CLEANUP_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The physical-namespace role of an authenticated record.
+fn namespace_role(
+    record: &PendingValidatorCleanup,
+) -> Result<crate::publication_worker::cleanup_projection::NamespaceRole> {
+    use crate::publication_worker::cleanup_projection::NamespaceRole;
+    match parse_canonical_namespace_name(&record.namespace, &record.session_id) {
+        Some(ParsedNamespace { layout: NamespaceLayout::V2Validator, .. }) => {
+            Ok(NamespaceRole::Validator)
+        }
+        Some(ParsedNamespace { layout: NamespaceLayout::V2Observer(adnl), .. }) => {
+            Ok(NamespaceRole::Observer(adnl))
+        }
+        _ => fail!("Cleanup record is not an authenticated namespace"),
+    }
+}
+
+/// The dry cleanup attempt of one retired authenticated namespace. The
+/// caller holds its storage cleanup reservation (moved in, dropped at the
+/// end) and its Cleanup admission. Re-authenticates the namespace from the
+/// identity its record carries, scans it under the reservation (accepting a
+/// complete empty namespace as a locked zero-item scan), reconciles every
+/// item with the node, and asks the publication owner to judge the node-side
+/// projection. Changes nothing durable; a refusal is a veto, not an error.
+pub(crate) async fn prepare_v2_cleanup(
+    engine: Arc<Engine>,
+    record: PendingValidatorCleanup,
+    storage: consensus_common::StorageCleanupReservation,
+) -> Result<CleanupVerdict> {
+    use crate::publication_worker::cleanup_projection::{
+        CleanupDecision, ExpectedIdentity, NamespaceSelection,
+    };
+    use simplex::finality_delivery::source_retirement::{
+        scan_source_retirement_with, EmptyInventoryPolicy, Quiescence,
+    };
+    let role = namespace_role(&record)?;
+    let runtime = match tokio::time::timeout(
+        CLEANUP_AUTH_TIMEOUT,
+        crate::validator::retired_session_auth::authenticate_cleanup_identity(
+            engine.as_ref(),
+            &record,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(runtime)) => runtime,
+        Ok(Err(error)) => return Ok(CleanupVerdict::Veto(format!("re-authentication: {error}"))),
+        Err(_) => return Ok(CleanupVerdict::Veto("re-authentication timed out".into())),
+    };
+    let namespace = consensus_root(engine.db_root_dir()?).join(&record.namespace);
+    let scan_runtime = runtime.clone();
+    let (scanned, storage) = tokio::task::spawn_blocking(move || {
+        let scanned = scan_source_retirement_with(
+            scan_runtime,
+            &namespace,
+            Quiescence::Reserved(&storage),
+            EmptyInventoryPolicy::Accept,
+            &crate::validator::validator_group::RetirementBudget,
+        );
+        (scanned, storage)
+    })
+    .await
+    .map_err(|e| error!("Cleanup scan join: {e}"))?;
+    let scan = match scanned {
+        Ok(scan) => scan,
+        Err(refusal) => return Ok(CleanupVerdict::Veto(format!("source scan: {refusal}"))),
+    };
+    let worker = engine.ensure_publication_worker().await?;
+    let sink = worker.sink(runtime.clone());
+    let preparation = match scan
+        .reconcile(sink.as_ref(), &crate::validator::validator_group::RetirementBudget)
+        .await
+    {
+        Ok(preparation) => preparation,
+        Err(failure) => return Ok(CleanupVerdict::Veto(format!("reconcile: {}", failure.refusal))),
+    };
+    let decision = worker
+        .project_cleanup(
+            NamespaceSelection { session: record.session_id.clone(), role },
+            ExpectedIdentity::of(&runtime)?,
+            preparation.inventory().to_vec(),
+        )
+        .await?;
+    // The scan's locks and the reservation span the whole decision.
+    drop(preparation);
+    drop(storage);
+    Ok(match decision {
+        CleanupDecision::WouldDelete { closes } => CleanupVerdict::WouldDelete { closes },
+        CleanupDecision::Veto(reason) => CleanupVerdict::Veto(reason),
+    })
 }

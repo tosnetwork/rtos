@@ -41,6 +41,9 @@ struct CleanupEngine {
     claims: Mutex<BTreeMap<UInt256, String>>,
     claim_erase_failures: AtomicUsize,
     admitted: Mutex<HashSet<UInt256>>,
+    registry: Arc<crate::validator::finality_recovery_owner::RecoveryRegistry>,
+    v2_verdict: Mutex<Option<consensus_common::validator_cleanup::CleanupVerdict>>,
+    v2_attempts: AtomicUsize,
     page_reads: AtomicUsize,
     stop: AtomicBool,
 }
@@ -60,6 +63,9 @@ impl CleanupEngine {
             claims: Mutex::new(BTreeMap::new()),
             claim_erase_failures: AtomicUsize::new(0),
             admitted: Mutex::new(HashSet::new()),
+            registry: Default::default(),
+            v2_verdict: Mutex::new(None),
+            v2_attempts: AtomicUsize::new(0),
             page_reads: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
         })
@@ -215,6 +221,31 @@ impl EngineOperations for CleanupEngine {
         }
         self.claims.lock().unwrap().remove(session);
         Ok(())
+    }
+    fn reserve_cleanup_admission(
+        &self,
+        session: &UInt256,
+        layout: &NamespaceLayout,
+    ) -> Result<Option<crate::validator::finality_recovery_owner::RecoveryReservation>> {
+        self.registry.reserve_cleanup(session, layout)
+    }
+    async fn prepare_v2_cleanup(
+        self: Arc<Self>,
+        record: PendingValidatorCleanup,
+        storage: consensus_common::StorageCleanupReservation,
+    ) -> Result<consensus_common::validator_cleanup::CleanupVerdict> {
+        self.v2_attempts.fetch_add(1, Ordering::Relaxed);
+        // The attempt holds the namespace's storage reservation and admission.
+        let parsed = consensus_common::validator_cleanup::parse_canonical_namespace_name(
+            &record.namespace,
+            &record.session_id,
+        )
+        .unwrap();
+        assert!(self.registry.reserve_cleanup(&record.session_id, &parsed.layout)?.is_none());
+        assert!(storage.key().ends_with(record.session_id.to_hex_string()));
+        Ok(self.v2_verdict.lock().unwrap().clone().unwrap_or(
+            consensus_common::validator_cleanup::CleanupVerdict::WouldDelete { closes: 0 },
+        ))
     }
     fn admit_candidate_table(&self, session: &UInt256) -> Result<()> {
         self.admitted.lock().unwrap().insert(session.clone());
@@ -725,4 +756,83 @@ fn test_candidate_tables_open_only_for_admitted_sessions() {
     assert!(table.exists());
     assert!(pool.revoke_and_destroy(&session).unwrap());
     assert!(pool.get_db(&session).is_err(), "revoked with the destroy");
+}
+
+fn v2_record(byte: u8, identity: bool) -> PendingValidatorCleanup {
+    use consensus_common::{
+        session_runtime::{SessionNetworkPin, SessionRecoveryBinding, SessionRecoveryCoordinates},
+        validator_cleanup::CleanupIdentity,
+    };
+    let record = make_record(
+        &UInt256::from([byte; 32]),
+        &NamespaceLayout::V2Validator,
+        &ShardIdent::masterchain(),
+        5,
+        &mc_id(40, 4),
+    )
+    .unwrap();
+    if !identity {
+        return record;
+    }
+    record
+        .with_identity(CleanupIdentity {
+            pin: SessionNetworkPin { global_id: -239, zerostate: mc_id(0, 1) },
+            binding: SessionRecoveryBinding {
+                governing_masterchain: mc_id(30, 3),
+                coordinates: SessionRecoveryCoordinates {
+                    shard: ShardIdent::masterchain(),
+                    catchain_seqno: 5,
+                    vertical_seqno: 0,
+                    last_key_block_seqno: 0,
+                    new_catchain_ids: false,
+                },
+            },
+            local_adnl: UInt256::from([0x5c; 32]),
+        })
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_cleanup_runs_a_dry_attempt_under_storage_and_admission_then_keeps_everything() {
+    use consensus_common::validator_cleanup::CleanupVerdict;
+    let engine = CleanupEngine::new();
+    set_floor(&engine);
+    let record = v2_record(1, true);
+    let without_identity = v2_record(2, false);
+    engine.put(&record);
+    engine.put(&without_identity);
+    let namespace = engine.namespace_dir(&record);
+    std::fs::create_dir_all(namespace.join(record.session_id.to_hex_string())).unwrap();
+    let mut manager = manager(engine.clone());
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 1, "only the record with an identity");
+    assert_eq!(
+        manager.cleanup_v2_verdicts.get(&record.namespace),
+        Some(&CleanupVerdict::WouldDelete { closes: 0 })
+    );
+    // A dry run deletes nothing and releases everything it held.
+    assert!(engine.has_record(&record) && engine.has_record(&without_identity));
+    assert!(namespace.exists());
+    assert!(!manager.cleanup.is_delete_in_flight(&record.session_id));
+    assert!(consensus_common::reserve_storage_cleanup(
+        &namespace,
+        &record.session_id.to_hex_string()
+    )
+    .unwrap()
+    .is_some());
+    let admission =
+        engine.registry.reserve_cleanup(&record.session_id, &NamespaceLayout::V2Validator);
+    admission.unwrap().expect("the attempt released its admission").release();
+    // A namespace held by a session is never attempted.
+    let live = engine
+        .registry
+        .reserve_cleanup(&record.session_id, &NamespaceLayout::V2Validator)
+        .unwrap()
+        .unwrap();
+    *engine.v2_verdict.lock().unwrap() = Some(CleanupVerdict::Veto("never asked".into()));
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 1, "an occupied admission refuses");
+    live.release();
 }

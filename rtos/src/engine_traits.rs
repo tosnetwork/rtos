@@ -551,6 +551,24 @@ pub trait EngineOperations: Sync + Send {
     fn admit_candidate_table(&self, _session: &UInt256) -> Result<()> {
         Ok(())
     }
+    /// Reserves a retired authenticated namespace for cleanup: no session,
+    /// recovery or replay may open it while the reservation is held.
+    fn reserve_cleanup_admission(
+        &self,
+        _session: &UInt256,
+        _layout: &consensus_common::validator_cleanup::NamespaceLayout,
+    ) -> Result<Option<crate::validator::finality_recovery_owner::RecoveryReservation>> {
+        rtos_block::fail!("Cleanup admission is unavailable")
+    }
+    /// The dry cleanup attempt of a retired authenticated namespace whose
+    /// storage cleanup reservation is moved in. Changes nothing durable.
+    async fn prepare_v2_cleanup(
+        self: Arc<Self>,
+        _record: consensus_common::validator_cleanup::PendingValidatorCleanup,
+        _storage: consensus_common::StorageCleanupReservation,
+    ) -> Result<consensus_common::validator_cleanup::CleanupVerdict> {
+        rtos_block::fail!("Authenticated namespace cleanup is unavailable")
+    }
     /// Blocking: deletes `session`'s candidate table for its claim; true only
     /// when it is confirmed gone.
     fn delete_candidate_table(&self, _session: &UInt256) -> Result<bool> {

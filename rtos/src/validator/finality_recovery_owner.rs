@@ -170,6 +170,11 @@ pub struct RecoveryReservation {
     lease: u64,
 }
 impl RecoveryReservation {
+    #[cfg(test)]
+    pub(crate) fn release_for_test(self) -> bool {
+        self.release();
+        true
+    }
     pub(crate) fn release(self) {
         let removed = {
             let mut state = self.registry.reservations.lock().unwrap();

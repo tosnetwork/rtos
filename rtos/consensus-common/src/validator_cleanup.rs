@@ -141,6 +141,16 @@ pub(crate) const FIXED_PREFIX_FOR_TEST: usize = FIXED_PREFIX;
 /// Upper bound for one encoded record.
 pub const MAX_RECORD_BYTES: usize = FIXED_PREFIX + MAX_NAMESPACE_BYTES + 1 + IDENTITY_BYTES;
 
+/// Outcome of a cold re-verification of an authenticated namespace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CleanupVerdict {
+    /// Every node obligation is Released and exactly covered by the source.
+    WouldDelete {
+        closes: usize,
+    },
+    Veto(String),
+}
+
 /// Key prefix for records. Each physical namespace has its own key (the
 /// prefix plus its canonical relative name), so retirement and erase are
 /// single-key writes and namespaces sharing a session never overwrite each

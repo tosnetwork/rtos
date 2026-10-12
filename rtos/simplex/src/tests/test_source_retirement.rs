@@ -917,6 +917,7 @@ fn retirement_scan_accepts_only_the_namespace_cleanup_reservation_as_cold_quiesc
         fixture.runtime.clone(),
         &fixture.namespace,
         Quiescence::Reserved(&reservation),
+        EmptyInventoryPolicy::Refuse,
         &Budget,
     )
     .unwrap();
@@ -931,9 +932,68 @@ fn retirement_scan_accepts_only_the_namespace_cleanup_reservation_as_cold_quiesc
         fixture.runtime.clone(),
         &fixture.namespace,
         Quiescence::Reserved(&other),
+        EmptyInventoryPolicy::Refuse,
         &Budget,
     )
     .err()
     .unwrap();
     assert!(matches!(refusal, RetirementRefusal::DatabaseTeardown(_)), "{refusal}");
+}
+
+/// A complete authenticated namespace with no outputs: manifest, a torn-down
+/// session database, the pending store and the intents directory.
+fn empty_namespace(
+) -> (crate::authenticated_fixture::TestDirectory, Arc<AuthenticatedSessionRuntime>, PathBuf) {
+    let dir = crate::authenticated_fixture::TestDirectory::new();
+    let (runtime, _) = crate::finality_delivery::tests::fixture();
+    let namespace = PathBuf::from(runtime.runtime_directory(dir.path().to_str().unwrap()).unwrap());
+    drop(crate::runtime_manifest::RuntimeManifest::open(&runtime, &namespace).unwrap());
+    let database =
+        crate::database::SimplexDb::open(&namespace, &runtime.session_id().to_hex_string())
+            .unwrap();
+    database.close(None).unwrap();
+    drop(database);
+    let store = PendingFinalityStore::open(&namespace).unwrap();
+    *store.runtime_binding.lock().unwrap() =
+        runtime.recovery_binding().map(delivered::DiskRecoveryBinding::from_binding);
+    drop(store);
+    std::fs::create_dir_all(namespace.join("finality-intents")).unwrap();
+    (dir, runtime, namespace)
+}
+
+#[test]
+fn empty_inventory_is_refused_live_and_accepted_cold_with_locks_held() {
+    let (_dir, runtime, namespace) = empty_namespace();
+    let session = runtime.session_id().to_hex_string();
+    let reservation =
+        consensus_common::reserve_storage_cleanup(&namespace, &session).unwrap().unwrap();
+    let scan = |policy| {
+        scan_source_retirement_with(
+            runtime.clone(),
+            &namespace,
+            Quiescence::Reserved(&reservation),
+            policy,
+            &Budget,
+        )
+    };
+    let refusal = scan(EmptyInventoryPolicy::Refuse).err().unwrap();
+    assert!(matches!(refusal, RetirementRefusal::EmptyInventory), "{refusal}");
+    let accepted = scan(EmptyInventoryPolicy::Accept).unwrap();
+    assert!(accepted.items.is_empty());
+    assert!(
+        PendingFinalityStore::lock(namespace.join(DIRECTORY)).unwrap().is_none(),
+        "the zero-item scan keeps the pending store locked"
+    );
+    drop(accepted);
+    assert!(PendingFinalityStore::lock(namespace.join(DIRECTORY)).unwrap().is_some());
+    // Incomplete structure is never accepted as empty: no session database,
+    // or no intents directory.
+    let database = namespace.join(&session);
+    std::fs::rename(&database, namespace.join("moved-db")).unwrap();
+    let refusal = scan(EmptyInventoryPolicy::Accept).err().unwrap();
+    assert!(matches!(&refusal, RetirementRefusal::Missing(path) if path == &database), "{refusal}");
+    std::fs::rename(namespace.join("moved-db"), &database).unwrap();
+    std::fs::remove_dir(namespace.join("finality-intents")).unwrap();
+    let refusal = scan(EmptyInventoryPolicy::Accept).err().unwrap();
+    assert!(matches!(refusal, RetirementRefusal::Missing(_)), "{refusal}");
 }

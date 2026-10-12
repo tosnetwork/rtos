@@ -27,10 +27,10 @@ use crate::{
 use consensus_common::{
     finality_delivery::{
         CanonicalFinalityCompletion, CanonicalFinalityRecord, CanonicalFinalityRequest,
-        CloseFinalityRequest, CloseOffer, FinalityCloseCompletion, FinalityCloseDomain,
-        FinalityTerminalCompletion, FinalityTerminalLookup,
-        DurableFinalitySink, DurableFinalitySinkPtr, FinalityDeliveryRole,
-        FinalizedDeliveryCompletion, FinalizedDeliveryDraft,
+        CloseFinalityRequest, CloseOffer, DurableFinalitySink, DurableFinalitySinkPtr,
+        FinalityCloseCompletion, FinalityCloseDomain, FinalityDeliveryRole,
+        FinalityTerminalCompletion, FinalityTerminalLookup, FinalizedDeliveryCompletion,
+        FinalizedDeliveryDraft,
     },
     session_runtime::{AuthenticatedSessionRuntime, LocalRole},
     SessionFinality,
@@ -107,10 +107,7 @@ impl<T> Responder<T> {
 }
 /// Wraps a callback so the request stays outstanding until it has run,
 /// including while it unwinds.
-fn hold<T: 'static>(
-    callback: &mut Option<Box<dyn FnOnce(Result<T>) + Send>>,
-    token: Outstanding,
-) {
+fn hold<T: 'static>(callback: &mut Option<Box<dyn FnOnce(Result<T>) + Send>>, token: Outstanding) {
     if let Some(inner) = callback.take() {
         *callback = Some(Box::new(move |result| {
             let _token = token;
@@ -227,9 +224,15 @@ impl Submission {
             Self::HistoryDebt { response, .. } => {
                 let _ = response.send(Err(error!("Publication history admission shutdown")));
             }
-            Self::Terminal { completion, .. } => completion.finish(Err(error!("Publication closing shutdown"))),
-            Self::OfferClose { completion, .. } => completion.finish(Err(error!("Publication closing shutdown"))),
-            Self::SourceDelivered { completion, .. } => completion.finish(Err(error!("Publication closing shutdown"))),
+            Self::Terminal { completion, .. } => {
+                completion.finish(Err(error!("Publication closing shutdown")))
+            }
+            Self::OfferClose { completion, .. } => {
+                completion.finish(Err(error!("Publication closing shutdown")))
+            }
+            Self::SourceDelivered { completion, .. } => {
+                completion.finish(Err(error!("Publication closing shutdown")))
+            }
             Self::Canonical { completion, .. } => {
                 completion.finish(Err(error!("Publication retention shutdown")))
             }
@@ -285,14 +288,26 @@ struct SessionSink {
     historical: bool,
 }
 impl DurableFinalitySink for SessionSink {
-    fn lookup_terminal(&self, request: CloseFinalityRequest, completion: FinalityTerminalCompletion) -> Result<()> {
+    fn lookup_terminal(
+        &self,
+        request: CloseFinalityRequest,
+        completion: FinalityTerminalCompletion,
+    ) -> Result<()> {
         self.worker.admit_draft(Submission::Terminal {
-            request, runtime: self.runtime.clone(), completion: ClosingCompletion(Some(completion)),
+            request,
+            runtime: self.runtime.clone(),
+            completion: ClosingCompletion(Some(completion)),
         })
     }
-    fn offer_close(&self, request: CloseFinalityRequest, completion: FinalityCloseCompletion) -> Result<()> {
+    fn offer_close(
+        &self,
+        request: CloseFinalityRequest,
+        completion: FinalityCloseCompletion,
+    ) -> Result<()> {
         self.worker.admit_draft(Submission::OfferClose {
-            request, runtime: self.runtime.clone(), completion: ClosingCompletion(Some(completion)),
+            request,
+            runtime: self.runtime.clone(),
+            completion: ClosingCompletion(Some(completion)),
         })
     }
 
@@ -490,9 +505,15 @@ impl PublicationWorker {
             Err(_) => request,
         };
         match rejected {
-            Submission::Terminal { mut completion, .. } => { completion.0.take(); }
-            Submission::OfferClose { mut completion, .. } => { completion.0.take(); }
-            Submission::SourceDelivered { mut completion, .. } => { completion.0.take(); }
+            Submission::Terminal { mut completion, .. } => {
+                completion.0.take();
+            }
+            Submission::OfferClose { mut completion, .. } => {
+                completion.0.take();
+            }
+            Submission::SourceDelivered { mut completion, .. } => {
+                completion.0.take();
+            }
             Submission::Draft { mut completion, .. } => {
                 completion.0.take();
             }
@@ -556,15 +577,22 @@ impl PublicationWorker {
     ) -> Result<cleanup_projection::CleanupDecision> {
         let (response, result) = oneshot::channel();
         {
-            let sender =
-                self.sender.lock().map_err(|_| error!("Publication projection admission poisoned"))?;
+            let sender = self
+                .sender
+                .lock()
+                .map_err(|_| error!("Publication projection admission poisoned"))?;
             if self.state.stop.is_cancelled() || self.state.fatal.load(Ordering::Acquire) {
                 fail!("Publication owner stopped");
             }
             sender
                 .as_ref()
                 .ok_or_else(|| error!("Publication owner stopped"))?
-                .try_send(Submission::CleanupProjection { selection, expected, inventory, response })
+                .try_send(Submission::CleanupProjection {
+                    selection,
+                    expected,
+                    inventory,
+                    response,
+                })
                 .map_err(|_| error!("Publication projection queue full"))?;
         }
         result.await.map_err(|e| error!("Publication projection owner: {e}"))?
@@ -1357,9 +1385,9 @@ pub(crate) fn inspect_canonical_record(
     request: &CanonicalFinalityRequest,
 ) -> Result<CanonicalFinalityRecord> {
     let limits = Limits::default();
-    let (delivery, entry) = crate::propagation_outbox::inspect_delivery(
-        db, domain, &limits, &request.node_receipt,
-    )?.ok_or_else(|| error!("Cold canonical delivery missing"))?;
+    let (delivery, entry) =
+        crate::propagation_outbox::inspect_delivery(db, domain, &limits, &request.node_receipt)?
+            .ok_or_else(|| error!("Cold canonical delivery missing"))?;
     canonical_record(runtime, request, &delivery, &entry, &limits)
 }
 
@@ -1432,9 +1460,9 @@ fn canonical_record_inner(
         fail!("Canonical body ancestry differs from retained record");
     }
     let wire: rtos_api::ton::ton_node::SignatureSet = if budget.is_some() {
-        runtime.wire_profile().deserialize_value_bounded(
-            record.carrier.bytes(), record.carrier.bytes().len(),
-        )?
+        runtime
+            .wire_profile()
+            .deserialize_value_bounded(record.carrier.bytes(), record.carrier.bytes().len())?
     } else {
         runtime.wire_profile().deserialize_typed(record.carrier.bytes())?
     };
@@ -1444,23 +1472,26 @@ fn canonical_record_inner(
     let rtos_api::ton::ton_node::SignatureSet::TonNode_SignatureSet_SimplexPq(fields) = wire else {
         fail!("Canonical retention requires a PQ carrier");
     };
-    let context = runtime.pq_context()
-        .ok_or_else(|| error!("Canonical retention needs PQ runtime"))?;
+    let context =
+        runtime.pq_context().ok_or_else(|| error!("Canonical retention needs PQ runtime"))?;
     let verifier = match budget {
         Some(budget) => context.for_block_bounded(
-            record.block_id.clone(), &crate::bounded_session_derivation::ConfigBudget(budget),
+            record.block_id.clone(),
+            &crate::bounded_session_derivation::ConfigBudget(budget),
         )?,
         None => context.for_block(record.block_id.clone())?,
     };
     let network = match budget {
         Some(budget) => PqNetworkSignatureSet::from_node_bounded(
-            fields, &crate::bounded_session_derivation::ConfigBudget(budget),
+            fields,
+            &crate::bounded_session_derivation::ConfigBudget(budget),
         )?,
         None => PqNetworkSignatureSet::from_node(fields)?,
     };
     let verified = match budget {
         Some(budget) => verifier.verify_network_bounded(
-            &network, &crate::bounded_session_derivation::ConfigBudget(budget),
+            &network,
+            &crate::bounded_session_derivation::ConfigBudget(budget),
         )?,
         None => verifier.verify_network(&network)?,
     };
@@ -1711,7 +1742,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
-
     #[test]
     fn outstanding_request_spans_its_callback_and_rolls_back_on_rejection() {
         let session = UInt256::from([0x31; 32]);
@@ -1720,10 +1750,9 @@ mod tests {
         let observed = Arc::new(Mutex::new(None));
         let (seen, probe) = (observed.clone(), map.clone());
         let probe_session = session.clone();
-        let mut callback: Option<Box<dyn FnOnce(Result<()>) + Send>> =
-            Some(Box::new(move |_| {
-                *seen.lock().unwrap() = Some(probe.count(&probe_session));
-            }));
+        let mut callback: Option<Box<dyn FnOnce(Result<()>) + Send>> = Some(Box::new(move |_| {
+            *seen.lock().unwrap() = Some(probe.count(&probe_session));
+        }));
         hold(&mut callback, map.begin(&session));
         assert_eq!(map.count(&session), 1);
         ClosingCompletion(callback).finish(Ok(()));

@@ -566,7 +566,7 @@ async fn store_synthetic_mc_state(
     engine: &Arc<Engine>,
     id: &BlockIdExt,
     catchain_seqno: u32,
-    prev: Option<&BlockIdExt>,
+    prev: &[&BlockIdExt],
     shards: Option<rtos_block::ShardHashes>,
 ) -> Arc<crate::shard_state::ShardStateStuff> {
     use rtos_block::{ExtBlkRef, HashmapAugType, KeyExtBlkRef, KeyMaxLt, McStateExtra};
@@ -577,7 +577,7 @@ async fn store_synthetic_mc_state(
     if let Some(shards) = shards {
         extra.shards = shards;
     }
-    if let Some(prev) = prev {
+    for prev in prev {
         let reference = KeyExtBlkRef {
             key: false,
             blk_ref: ExtBlkRef {
@@ -728,6 +728,18 @@ async fn validator_cleanup_real_engine_keeps_until_the_floor_passes_then_deletes
         assert_eq!(Some(&identity.binding), runtime.recovery_binding());
         assert_eq!(&identity.pin, runtime.pin());
         assert_eq!(identity.local_adnl, UInt256::from(*runtime.local_adnl().data()));
+        // The retired v2 namespace as a session leaves it: complete and empty.
+        let v2_dir =
+            PathBuf::from(engine.db_root_dir().unwrap()).join("catchains/consensus").join(&v2_ns);
+        FinalityDeliveryTestDriver::provision_validator_namespace(&runtime, &v2_dir).unwrap();
+        {
+            let sink = engine.clone().durable_finality_sink(runtime.clone()).await.unwrap();
+            let confirm =
+                engine.ensure_publication_worker().await.unwrap().delivered_sink(runtime.clone());
+            let driver =
+                FinalityDeliveryTestDriver::open(runtime.clone(), &v2_dir, sink, confirm).unwrap();
+            driver.prepare_intents(false).unwrap();
+        }
         assert!(engine.load_destroyed_session_ids().unwrap().contains(&v2_session));
 
         // (b) A retired V1 namespace on the same real DB: a real storage
@@ -781,8 +793,13 @@ async fn validator_cleanup_real_engine_keeps_until_the_floor_passes_then_deletes
                 Ok((left, right))
             })
             .unwrap();
-        store_synthetic_mc_state(engine, &f0, 5, None, None).await;
-        let f1_state = store_synthetic_mc_state(engine, &f1, 10, Some(&f0), Some(shards)).await;
+        // F1 also records the real masterchain block the v2 group retired at,
+        // so that record becomes eligible at F1 too.
+        let v2_checkpoint =
+            engine.load_validator_cleanup_record(&v2_ns).unwrap().unwrap().retirement_checkpoint;
+        store_synthetic_mc_state(engine, &f0, 5, &[], None).await;
+        let f1_state =
+            store_synthetic_mc_state(engine, &f1, 10, &[&f0, &v2_checkpoint], Some(shards)).await;
 
         // (d) Oracles on the stored F1 state.
         assert!(ancestor_or_equal(&f1_state, &f1));
@@ -829,6 +846,24 @@ async fn validator_cleanup_real_engine_keeps_until_the_floor_passes_then_deletes
         let fence_now = engine.load_destroyed_session_ids().unwrap();
         assert!(fence_now.contains(&v1_session) && fence_now.contains(&v2_session));
         assert!(engine.load_validator_cleanup_record(&v2_ns).unwrap().is_some());
+        // The v2 record became eligible at F1 and ran the real dry attempt:
+        // re-authenticated from history, scanned under its reservation as a
+        // locked empty scan, reconciled, and judged by the publication owner.
+        assert_eq!(
+            manager.v2_verdict(&v2_ns),
+            Some(consensus_common::validator_cleanup::CleanupVerdict::WouldDelete { closes: 0 })
+        );
+        assert!(v2_dir.is_dir(), "a dry decision deletes nothing");
+        assert!(!manager.delete_in_flight(&v2_session));
+        assert!(engine
+            .finality_recovery_registry()
+            .reserve_cleanup(
+                &v2_session,
+                &consensus_common::validator_cleanup::NamespaceLayout::V2Validator
+            )
+            .unwrap()
+            .expect("the attempt released its admission")
+            .release_for_test());
     })
     .catch_unwind()
     .await;

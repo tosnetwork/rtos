@@ -35,7 +35,9 @@ pub(crate) struct NamespaceSelection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CleanupDecision {
     /// Every node obligation of the namespace is Released and exactly covered.
-    WouldDelete { closes: usize },
+    WouldDelete {
+        closes: usize,
+    },
     Veto(String),
 }
 

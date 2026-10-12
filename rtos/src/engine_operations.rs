@@ -685,6 +685,22 @@ impl EngineOperations for Engine {
         self.db().write_validator_state_batch_sync(&[], &[key])
     }
 
+    fn reserve_cleanup_admission(
+        &self,
+        session: &UInt256,
+        layout: &consensus_common::validator_cleanup::NamespaceLayout,
+    ) -> Result<Option<crate::validator::finality_recovery_owner::RecoveryReservation>> {
+        self.finality_recovery_registry().reserve_cleanup(session, layout)
+    }
+
+    async fn prepare_v2_cleanup(
+        self: Arc<Self>,
+        record: consensus_common::validator_cleanup::PendingValidatorCleanup,
+        storage: consensus_common::StorageCleanupReservation,
+    ) -> Result<consensus_common::validator_cleanup::CleanupVerdict> {
+        crate::validator::validator_cleanup_gc::prepare_v2_cleanup(self, record, storage).await
+    }
+
     fn admit_candidate_table(&self, session: &UInt256) -> Result<()> {
         self.admit_candidate_session(session)
     }

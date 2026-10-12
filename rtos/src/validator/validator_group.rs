@@ -1035,7 +1035,7 @@ enum StopPolicy {
 }
 
 /// Retirement preparation relies on the scan's own hard item and byte caps.
-struct RetirementBudget;
+pub(crate) struct RetirementBudget;
 impl simplex::finality_recovery::SourceHistoryDebtBudget for RetirementBudget {
     fn step(&self) -> Result<()> {
         Ok(())
