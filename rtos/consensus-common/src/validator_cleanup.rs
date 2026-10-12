@@ -360,17 +360,29 @@ impl PendingValidatorCleanup {
 }
 
 /// Deterministic little-endian encoding, versioned so an old record is
-/// rejected rather than misread.
-pub fn encode_record(record: &PendingValidatorCleanup) -> Vec<u8> {
+/// rejected rather than misread. A namespace name or journal beyond its cap
+/// is refused, never truncated.
+pub fn encode_record(record: &PendingValidatorCleanup) -> Result<Vec<u8>> {
+    let name = record.namespace.as_bytes();
+    if name.len() > MAX_NAMESPACE_BYTES {
+        rtos_block::fail!("Cleanup namespace name exceeds {MAX_NAMESPACE_BYTES} bytes");
+    }
+    if let Some(payload) = record.journal.payload() {
+        if payload.associations.len() > MAX_JOURNAL_ASSOCIATIONS {
+            rtos_block::fail!(
+                "Cleanup journal has {} associations, more than {MAX_JOURNAL_ASSOCIATIONS}",
+                payload.associations.len()
+            );
+        }
+    }
     let mut out = Vec::with_capacity(MAX_RECORD_BYTES);
     out.push(RECORD_VERSION);
     out.extend_from_slice(record.session_id.as_slice());
     put_block_id(&mut out, &record.retirement_checkpoint);
-    // Canonical names are far below the cap; `make_record` and decode both
-    // enforce it, so the length always fits.
-    let name = record.namespace.as_bytes();
-    out.extend_from_slice(&(name.len().min(MAX_NAMESPACE_BYTES) as u16).to_le_bytes());
-    out.extend_from_slice(&name[..name.len().min(MAX_NAMESPACE_BYTES)]);
+    let length = u16::try_from(name.len())
+        .map_err(|_| rtos_block::error!("Cleanup namespace name length does not fit"))?;
+    out.extend_from_slice(&length.to_le_bytes());
+    out.extend_from_slice(name);
     match &record.identity {
         None => out.push(0),
         Some(identity) => {
@@ -394,10 +406,10 @@ pub fn encode_record(record: &PendingValidatorCleanup) -> Vec<u8> {
         out.extend_from_slice(&payload.generation.to_le_bytes());
         out.extend_from_slice(payload.manifest_digest.as_slice());
         out.extend_from_slice(payload.inventory_digest.as_slice());
-        // Construction keeps the count within the cap.
-        let count = payload.associations.len().min(MAX_JOURNAL_ASSOCIATIONS);
-        out.extend_from_slice(&(count as u32).to_le_bytes());
-        for association in payload.associations.iter().take(count) {
+        let count = u32::try_from(payload.associations.len())
+            .map_err(|_| rtos_block::error!("Cleanup journal count does not fit"))?;
+        out.extend_from_slice(&count.to_le_bytes());
+        for association in &payload.associations {
             out.extend_from_slice(association.delivery_id.as_slice());
             out.extend_from_slice(&association.close_generation.to_le_bytes());
             out.extend_from_slice(&association.lease_generation.to_le_bytes());
@@ -405,7 +417,7 @@ pub fn encode_record(record: &PendingValidatorCleanup) -> Vec<u8> {
             out.extend_from_slice(association.binding_digest.as_slice());
         }
     }
-    out
+    Ok(out)
 }
 
 /// Strict decode. Anything inconsistent yields nothing: a malformed safety
@@ -757,7 +769,9 @@ pub struct ValidatorCleanupManager {
     claims_in_flight: BTreeMap<UInt256, u64>,
     live_generation: BTreeMap<UInt256, u64>,
     next_generation: u64,
-    next_attempt: u64,
+    /// `incarnation << 32 | n`: attempts of different processes never
+    /// collide; None until the durable incarnation is established.
+    next_attempt: Option<u64>,
     next_token: u64,
     cursor: String,
     pass: Pass,
@@ -776,6 +790,45 @@ impl ValidatorCleanupManager {
     fn next(counter: &mut u64) -> u64 {
         *counter = counter.saturating_add(1);
         *counter
+    }
+
+    /// Bases every attempt id of this process on its durable incarnation,
+    /// once, before any attempt: false (nothing changed) if already
+    /// established or the incarnation does not fit 32 bits.
+    pub fn establish_incarnation(&mut self, incarnation: u64) -> bool {
+        if self.next_attempt.is_some() {
+            return false;
+        }
+        let Ok(incarnation) = u32::try_from(incarnation) else {
+            return false;
+        };
+        self.next_attempt = Some(u64::from(incarnation) << 32);
+        true
+    }
+
+    pub fn incarnation_established(&self) -> bool {
+        self.next_attempt.is_some()
+    }
+
+    /// Moves the low half of the attempt counter (tests only).
+    #[cfg(test)]
+    pub(crate) fn set_attempt_low_for_test(&mut self, low: u64) {
+        if let Some(current) = self.next_attempt.as_mut() {
+            *current = (*current & !u64::from(u32::MAX)) | low;
+        }
+    }
+
+    /// The next attempt id: none before the incarnation is established, and
+    /// none once this incarnation's 2^32 - 1 ids are used (never spilling
+    /// into the next incarnation's range).
+    fn allocate_attempt(&mut self) -> Option<u64> {
+        let current = self.next_attempt?;
+        if current & u64::from(u32::MAX) == u64::from(u32::MAX) {
+            return None;
+        }
+        let next = current.checked_add(1)?;
+        self.next_attempt = Some(next);
+        Some(next)
     }
 
     /// A group for `session` is about to be created. The caller must first
@@ -942,7 +995,7 @@ impl ValidatorCleanupManager {
         {
             return None;
         }
-        let attempt_id = Self::next(&mut self.next_attempt);
+        let attempt_id = self.allocate_attempt()?;
         self.in_flight.insert(
             candidate.namespace.clone(),
             InFlight {
@@ -1042,7 +1095,7 @@ impl ValidatorCleanupManager {
         {
             return None;
         }
-        let attempt = Self::next(&mut self.next_attempt);
+        let attempt = self.allocate_attempt()?;
         self.claims_in_flight.insert(session.clone(), attempt);
         Some(attempt)
     }

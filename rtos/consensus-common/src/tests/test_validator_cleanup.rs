@@ -76,7 +76,7 @@ fn sample_records() -> Vec<PendingValidatorCleanup> {
 #[test]
 fn validator_cleanup_record_round_trips_for_every_layout() {
     for record in sample_records() {
-        let bytes = encode_record(&record);
+        let bytes = encode_record(&record).unwrap();
         assert!(bytes.len() <= MAX_RECORD_BYTES);
         assert_eq!(decode_record(&bytes), Some(record.clone()), "{record:?}");
         // Every truncation, a wrong version, a bad flag and a trailing byte
@@ -114,16 +114,16 @@ fn validator_cleanup_identity_must_fit_its_namespace() {
     // A forged identity on the wire is rejected the same way.
     let mut forged = base(NamespaceLayout::V2Validator);
     forged.identity = Some(wrong_cc);
-    assert!(decode_record(&encode_record(&forged)).is_none());
+    assert!(decode_record(&encode_record(&forged).unwrap()).is_none());
     let mut on_v1 = v1;
     on_v1.identity = Some(identity_for(&NamespaceLayout::V2Validator));
-    assert!(decode_record(&encode_record(&on_v1)).is_none());
+    assert!(decode_record(&encode_record(&on_v1).unwrap()).is_none());
 }
 
 #[test]
 fn validator_cleanup_wire_format_is_pinned() {
     let record = record(1, 100);
-    let bytes = encode_record(&record);
+    let bytes = encode_record(&record).unwrap();
     let name = format!("consensus.-1.8000000000000000.7.{}", session(1).to_hex_string());
     assert_eq!(bytes[0], 3);
     assert_eq!(&bytes[1..33], &[1u8; 32]);
@@ -328,7 +328,7 @@ struct Scan {
 impl Scan {
     fn new() -> Self {
         Self {
-            manager: ValidatorCleanupManager::default(),
+            manager: established(),
             store: BTreeMap::new(),
             live: BTreeSet::new(),
             vetoed: BTreeSet::new(),
@@ -737,10 +737,43 @@ fn validator_cleanup_namespaces_sharing_a_session_are_independent() {
     }
 }
 
+/// A manager whose process incarnation is established.
+fn established() -> ValidatorCleanupManager {
+    let mut manager = ValidatorCleanupManager::default();
+    assert!(manager.establish_incarnation(1));
+    manager
+}
+
+#[test]
+fn validator_cleanup_attempts_need_an_incarnation_and_stay_in_its_range() {
+    let sid = session(5);
+    let mut manager = ValidatorCleanupManager::default();
+    assert!(!manager.incarnation_established());
+    assert!(manager.begin_claim(&sid).is_none(), "no attempt before the incarnation");
+    assert!(!manager.establish_incarnation(u64::from(u32::MAX) + 1), "must fit 32 bits");
+    assert!(!manager.incarnation_established());
+    assert!(manager.establish_incarnation(7));
+    assert!(!manager.establish_incarnation(8), "established once, never reset");
+    let attempt = manager.begin_claim(&sid).unwrap();
+    assert_eq!(attempt, (7 << 32) | 1, "based on the incarnation");
+    manager.end_claim(&sid, attempt);
+    assert!(manager.begin_claim(&sid).unwrap() > attempt, "monotonic");
+    // The last id of the range is never handed out: no spill into the next
+    // incarnation's range.
+    let mut manager = ValidatorCleanupManager::default();
+    assert!(manager.establish_incarnation(7));
+    manager.set_attempt_low_for_test(u64::from(u32::MAX) - 1);
+    let last = manager.begin_claim(&sid).unwrap();
+    assert_eq!(last, (7 << 32) | u64::from(u32::MAX));
+    manager.end_claim(&sid, last);
+    assert!(manager.begin_claim(&sid).is_none(), "exhausted: refused, not wrapped");
+    assert!(manager.begin_claim(&session(6)).is_none());
+}
+
 #[test]
 fn validator_cleanup_candidate_claims_are_session_serialized() {
     let sid = session(5);
-    let mut manager = ValidatorCleanupManager::default();
+    let mut manager = established();
     assert_eq!(parse_candidate_claim_key(&candidate_claim_key(&sid)), Some(sid.clone()));
     assert_eq!(parse_candidate_claim_key("ValidatorCandidateCleanupV1.zz"), None);
     let attempt = manager.begin_claim(&sid).unwrap();
@@ -812,7 +845,7 @@ fn validator_cleanup_journal_round_trips_and_is_bounded() {
         CleanupJournal::Releasing(payload(MAX_JOURNAL_ASSOCIATIONS)),
     ] {
         let record = PendingValidatorCleanup { journal, ..base.clone() };
-        let bytes = encode_record(&record);
+        let bytes = encode_record(&record).unwrap();
         assert!(bytes.len() <= MAX_RECORD_BYTES);
         assert_eq!(decode_record(&bytes), Some(record.clone()));
         for length in [bytes.len() - 1, bytes.len() / 2] {
@@ -822,11 +855,25 @@ fn validator_cleanup_journal_round_trips_and_is_bounded() {
         tailed.push(0);
         assert!(decode_record(&tailed).is_none());
     }
+    // One association over the cap is refused in every state, never
+    // truncated to the cap.
+    for journal in [
+        CleanupJournal::Deleting(payload(MAX_JOURNAL_ASSOCIATIONS + 1)),
+        CleanupJournal::Deleted(payload(MAX_JOURNAL_ASSOCIATIONS + 1)),
+        CleanupJournal::Releasing(payload(MAX_JOURNAL_ASSOCIATIONS + 1)),
+    ] {
+        let record = PendingValidatorCleanup { journal, ..base.clone() };
+        assert!(encode_record(&record).is_err());
+    }
+    // So is an over-long namespace name.
+    let mut long = base.clone();
+    long.namespace = "v".repeat(MAX_NAMESPACE_BYTES + 1);
+    assert!(encode_record(&long).is_err());
     // An unknown state, an over-cap count and a count that disagrees with
     // the length are rejected before allocating.
     let record =
         PendingValidatorCleanup { journal: CleanupJournal::Deleted(payload(2)), ..base.clone() };
-    let bytes = encode_record(&record);
+    let bytes = encode_record(&record).unwrap();
     let tag = bytes.len() - 2 * 112 - 84 - 1;
     let mut unknown = bytes.clone();
     unknown[tag] = 9;
@@ -843,11 +890,11 @@ fn validator_cleanup_journal_round_trips_and_is_bounded() {
         .unwrap();
     let journaled_v1 =
         PendingValidatorCleanup { journal: CleanupJournal::Deleting(payload(1)), ..v1 };
-    assert!(decode_record(&encode_record(&journaled_v1)).is_none());
+    assert!(decode_record(&encode_record(&journaled_v1).unwrap()).is_none());
     let anonymous = PendingValidatorCleanup {
         identity: None,
         journal: CleanupJournal::Deleting(payload(1)),
         ..base
     };
-    assert!(decode_record(&encode_record(&anonymous)).is_none());
+    assert!(decode_record(&encode_record(&anonymous).unwrap()).is_none());
 }

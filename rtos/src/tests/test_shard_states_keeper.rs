@@ -691,7 +691,7 @@ async fn test_cleanup_sibling_scan_counts_oversized_records() -> Result<()> {
     let observer = make(NamespaceLayout::V2Observer(UInt256::from([0x01; 32])));
     let later = make(NamespaceLayout::V2Observer(UInt256::from([0xfe; 32])));
     engine.db.write_validator_state_batch_sync(
-        &[(record_key(&own.namespace), encode_record(&own))],
+        &[(record_key(&own.namespace), encode_record(&own).unwrap())],
         &[],
     )?;
     assert!(!session_has_other_records(&engine.db, &own.namespace, &session)?);
@@ -703,7 +703,7 @@ async fn test_cleanup_sibling_scan_counts_oversized_records() -> Result<()> {
     )?;
     assert!(session_has_other_records(&engine.db, &own.namespace, &session)?);
     engine.db.write_validator_state_batch_sync(
-        &[(record_key(&later.namespace), encode_record(&later))],
+        &[(record_key(&later.namespace), encode_record(&later).unwrap())],
         &[],
     )?;
     assert!(session_has_other_records(&engine.db, &own.namespace, &session)?);

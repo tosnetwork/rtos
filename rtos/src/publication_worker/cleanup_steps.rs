@@ -20,16 +20,19 @@ pub(crate) enum CleanupStep {
         expected: cleanup_projection::ExpectedIdentity,
         inventory: Vec<simplex::finality_delivery::source_retirement::RetirementItem>,
         budget: cleanup_projection::ProjectionBudget,
+        /// The record the attempt read; B0 writes only over exactly it.
+        durable: PendingValidatorCleanup,
         intended: PendingValidatorCleanup,
     },
     /// Resume: every journaled close is still present, Released and bound
     /// exactly as recorded, and its binding belongs to the runtime.
     Verify { expected: cleanup_projection::ExpectedIdentity, associations: Vec<CleanupAssociation> },
     /// B2: remove the journaled closes and write `intended` (Releasing) in
-    /// one synced batch.
-    ReleaseCloses { intended: PendingValidatorCleanup },
-    /// B3: release one journaled lease once no close references it.
-    ReleaseLease { association: CleanupAssociation },
+    /// one synced batch, only over exactly `durable` (Deleted, same token).
+    ReleaseCloses { durable: PendingValidatorCleanup, intended: PendingValidatorCleanup },
+    /// B3: release one journaled lease once no close references it and its
+    /// binding still belongs to the runtime.
+    ReleaseLease { expected: cleanup_projection::ExpectedIdentity, association: CleanupAssociation },
 }
 
 #[derive(Debug)]
@@ -47,6 +50,18 @@ pub(crate) enum CleanupStepOutcome {
     Uncertain(PendingValidatorCleanup, String),
 }
 
+/// Why the durable record is not exactly `expected`, if it is not.
+fn durable_differs(
+    engine: &crate::engine::Engine,
+    expected: &PendingValidatorCleanup,
+) -> Result<Option<String>> {
+    use crate::engine_traits::EngineOperations;
+    Ok(match engine.load_validator_cleanup_record(&expected.namespace)? {
+        Some(durable) if &durable == expected => None,
+        _ => Some("durable cleanup journal changed under the attempt".into()),
+    })
+}
+
 impl State {
     pub(super) fn cleanup_step(
         &self,
@@ -56,7 +71,15 @@ impl State {
         let engine = self.engine.upgrade().ok_or_else(|| error!("Engine unavailable"))?;
         let leases = engine.db().repair_leases().clone();
         match step {
-            CleanupStep::Commit { selection, expected, inventory, budget, intended } => {
+            CleanupStep::Commit { selection, expected, inventory, budget, durable, intended } => {
+                if durable.journal != CleanupJournal::Pending
+                    || durable.namespace != intended.namespace
+                {
+                    return Ok(CleanupStepOutcome::Vetoed("B0 must start from Pending".into()));
+                }
+                if let Some(reason) = durable_differs(&engine, &durable)? {
+                    return Ok(CleanupStepOutcome::Vetoed(reason));
+                }
                 let session = selection.session.clone();
                 let sources = cleanup_projection::JudgeSources {
                     outstanding: &|| self.outstanding.count(&session),
@@ -87,6 +110,11 @@ impl State {
                     journal: CleanupJournal::Deleting(payload),
                     ..intended
                 };
+                // Refused before anything is written, never truncated.
+                let encoded = match encode_record(&intended) {
+                    Ok(encoded) => encoded,
+                    Err(error) => return Ok(CleanupStepOutcome::Vetoed(error.to_string())),
+                };
                 #[cfg(test)]
                 if let Some(hook) = self.cleanup_commit_hook.lock().unwrap().clone() {
                     hook(store);
@@ -104,7 +132,22 @@ impl State {
                                 "projection raced a mutation before B0".into(),
                             ));
                         }
-                        let put = (record_key(&intended.namespace), encode_record(&intended));
+                        let put = (record_key(&intended.namespace), encoded);
+                        #[cfg(test)]
+                        if let Some(applied) =
+                            crate::validator::validator_cleanup_gc::take_write_fault(
+                                &intended.namespace,
+                                crate::validator::validator_cleanup_gc::CleanupPoint::AfterB0,
+                            )
+                        {
+                            if applied {
+                                engine.db().write_validator_state_batch_sync(&[put], &[])?;
+                            }
+                            return Ok(CleanupStepOutcome::Uncertain(
+                                intended.clone(),
+                                "injected journal write fault".into(),
+                            ));
+                        }
                         Ok(match engine.db().write_validator_state_batch_sync(&[put], &[]) {
                             Ok(()) => CleanupStepOutcome::Committed(intended.clone()),
                             Err(error) => {
@@ -143,20 +186,39 @@ impl State {
                     Ok(CleanupStepOutcome::Verified)
                 })
             }
-            CleanupStep::ReleaseCloses { intended } => {
+            CleanupStep::ReleaseCloses { durable, intended } => {
                 let CleanupJournal::Releasing(payload) = &intended.journal else {
                     return Ok(CleanupStepOutcome::Vetoed("B2 must journal Releasing".into()));
                 };
-                let put = (record_key(&intended.namespace), encode_record(&intended));
+                // Only from exactly the Deleted journal of the same attempt.
+                let same_record = PendingValidatorCleanup {
+                    journal: durable.journal.clone(),
+                    ..intended.clone()
+                };
+                if durable.journal != CleanupJournal::Deleted(payload.clone())
+                    || same_record != durable
+                {
+                    return Ok(CleanupStepOutcome::Vetoed(
+                        "B2 must follow the attempt's own Deleted journal".into(),
+                    ));
+                }
+                if let Some(reason) = durable_differs(&engine, &durable)? {
+                    return Ok(CleanupStepOutcome::Vetoed(reason));
+                }
+                let put = match encode_record(&intended) {
+                    Ok(encoded) => (record_key(&intended.namespace), encoded),
+                    Err(error) => return Ok(CleanupStepOutcome::Vetoed(error.to_string())),
+                };
                 match store.remove_cleanup_closes(&payload.associations, &[put]) {
                     Ok(Ok(())) => Ok(CleanupStepOutcome::ClosesReleased),
                     Ok(Err(reason)) => Ok(CleanupStepOutcome::Vetoed(reason)),
                     Err(error) => Ok(CleanupStepOutcome::Uncertain(intended, error.to_string())),
                 }
             }
-            CleanupStep::ReleaseLease { association } => {
+            CleanupStep::ReleaseLease { expected, association } => {
                 // Under the outbox lock (then the ledger's, the only order),
-                // so no close can come to reference the lease in between.
+                // so no close can come to reference the lease in between; the
+                // binding check and the release are one ledger operation.
                 store.with_cleanup_lock(|_, closing| {
                     if closing
                         .iter()
@@ -164,10 +226,11 @@ impl State {
                     {
                         return Ok(CleanupStepOutcome::Referenced);
                     }
-                    Ok(CleanupStepOutcome::Lease(leases.release_for(
+                    Ok(CleanupStepOutcome::Lease(leases.release_checked(
                         association.lease_generation,
                         &association.binding_digest,
                         &association.dependency_digest,
+                        |binding| cleanup_projection::binding_mismatch(binding, &expected),
                     )?))
                 })
             }

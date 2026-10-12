@@ -247,8 +247,11 @@ enum Submission {
         response: oneshot::Sender<Result<AcceptedSessionBlock>>,
     },
     /// One journaled deletion step, run as one owner transition.
+    /// `ownership` is the attempt's reservation share, dropped only once the
+    /// transition has returned (or the submission was rejected).
     Cleanup {
         step: cleanup_steps::CleanupStep,
+        ownership: Arc<dyn std::any::Any + Send + Sync>,
         response: oneshot::Sender<Result<cleanup_steps::CleanupStepOutcome>>,
     },
 }
@@ -622,6 +625,7 @@ impl PublicationWorker {
     pub(crate) async fn cleanup_step(
         &self,
         step: cleanup_steps::CleanupStep,
+        ownership: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Result<cleanup_steps::CleanupStepOutcome> {
         let (response, result) = oneshot::channel();
         {
@@ -633,7 +637,7 @@ impl PublicationWorker {
             sender
                 .as_ref()
                 .ok_or_else(|| error!("Publication owner stopped"))?
-                .try_send(Submission::Cleanup { step, response })
+                .try_send(Submission::Cleanup { step, ownership, response })
                 .map_err(|_| error!("Publication cleanup queue full"))?;
         }
         result.await.map_err(|e| error!("Publication cleanup owner: {e}"))?
@@ -831,8 +835,10 @@ impl State {
                 completion.finish(result);
                 self.wake.notify_one();
             }
-            Submission::Cleanup { step, response } => {
-                let _ = response.send(self.cleanup_step(store, step));
+            Submission::Cleanup { step, ownership, response } => {
+                let outcome = self.cleanup_step(store, step);
+                drop(ownership);
+                let _ = response.send(outcome);
             }
             Submission::Query { id, response } => {
                 // Caller cancellation only drops this response; acceptance and IO remain actor-owned.

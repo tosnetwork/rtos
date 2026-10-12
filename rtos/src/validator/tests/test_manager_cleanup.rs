@@ -2,6 +2,7 @@
 //! Validator consensus cleanup driven by the manager: the tick, the storage
 //! cleanup reservation, owned delete workers, the durable erase and its retry.
 use super::*;
+use crate::validator::validator_cleanup_gc::AttemptToken;
 use crate::{
     collator_test_bundle::{create_block_handle_storage, create_engine_allocated},
     shard_state::ShardStateStuff,
@@ -31,11 +32,16 @@ enum DeleteBehaviour {
 }
 
 /// What the fake journaled attempt returns; it defaults to Kept.
-#[derive(Clone)]
 enum V2Script {
     Retained,
     Gone,
-    Uncertain(PendingValidatorCleanup),
+    Uncertain {
+        intended: PendingValidatorCleanup,
+        previous: PendingValidatorCleanup,
+    },
+    /// Leaves a blocking child holding an ownership share until the
+    /// channel delivers, then panics.
+    PanicWithChild(Arc<Mutex<std::sync::mpsc::Receiver<()>>>),
 }
 
 struct CleanupEngine {
@@ -51,10 +57,13 @@ struct CleanupEngine {
     admitted: Mutex<HashSet<UInt256>>,
     registry: Arc<crate::validator::finality_recovery_owner::RecoveryRegistry>,
     v2_script: Mutex<std::collections::VecDeque<V2Script>>,
-    v2_seen: Mutex<Vec<PendingValidatorCleanup>>,
+    v2_seen: Mutex<Vec<(PendingValidatorCleanup, AttemptToken)>>,
+    children: Mutex<Vec<std::thread::JoinHandle<()>>>,
     rewrites: Mutex<Vec<PendingValidatorCleanup>>,
     rewrite_failures: AtomicUsize,
     erase_applied_failures: AtomicUsize,
+    incarnation: std::sync::atomic::AtomicU64,
+    incarnation_failures: AtomicUsize,
     v2_attempts: AtomicUsize,
     page_reads: AtomicUsize,
     stop: AtomicBool,
@@ -78,16 +87,19 @@ impl CleanupEngine {
             registry: Default::default(),
             v2_script: Mutex::new(Default::default()),
             v2_seen: Mutex::new(Vec::new()),
+            children: Mutex::new(Vec::new()),
             rewrites: Mutex::new(Vec::new()),
             rewrite_failures: AtomicUsize::new(0),
             erase_applied_failures: AtomicUsize::new(0),
+            incarnation: std::sync::atomic::AtomicU64::new(0),
+            incarnation_failures: AtomicUsize::new(0),
             v2_attempts: AtomicUsize::new(0),
             page_reads: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
         })
     }
-    fn script(&self, steps: &[V2Script]) {
-        self.v2_script.lock().unwrap().extend(steps.iter().cloned());
+    fn script(&self, steps: Vec<V2Script>) {
+        self.v2_script.lock().unwrap().extend(steps);
     }
     fn put(&self, record: &PendingValidatorCleanup) {
         self.records.lock().unwrap().insert(record_key(&record.namespace), record.clone());
@@ -258,28 +270,48 @@ impl EngineOperations for CleanupEngine {
     async fn execute_v2_cleanup(
         self: Arc<Self>,
         record: PendingValidatorCleanup,
-        held: crate::validator::validator_cleanup_gc::CleanupHeld,
-    ) -> Result<crate::validator::validator_cleanup_gc::V2Outcome> {
+        token: AttemptToken,
+        held: Arc<crate::validator::validator_cleanup_gc::CleanupHeld>,
+    ) -> crate::validator::validator_cleanup_gc::V2Outcome {
         use crate::validator::validator_cleanup_gc::V2Outcome;
         self.v2_attempts.fetch_add(1, Ordering::Relaxed);
-        // The attempt holds the namespace's storage reservation and admission.
+        // The attempt runs while the manager holds the namespace's storage
+        // reservation and admission.
         assert!(self
             .registry
-            .reserve_cleanup(&record.session_id, &NamespaceLayout::V2Validator)?
+            .reserve_cleanup(&record.session_id, &NamespaceLayout::V2Validator)
+            .unwrap()
             .is_none());
         assert!(held.storage.key().ends_with(record.session_id.to_hex_string()));
-        self.v2_seen.lock().unwrap().push(record);
+        self.v2_seen.lock().unwrap().push((record, token));
         let reason = "scripted".to_string();
         let step = self.v2_script.lock().unwrap().pop_front();
-        Ok(match step {
-            None => {
-                held.release();
-                V2Outcome::Kept(reason)
+        match step {
+            None => V2Outcome::Kept(reason),
+            Some(V2Script::Retained) => V2Outcome::Retained(reason),
+            Some(V2Script::Gone) => V2Outcome::Gone,
+            Some(V2Script::Uncertain { intended, previous }) => {
+                V2Outcome::Uncertain { intended, previous, reason }
             }
-            Some(V2Script::Retained) => V2Outcome::Retained { reason, held },
-            Some(V2Script::Gone) => V2Outcome::Gone { held },
-            Some(V2Script::Uncertain(intended)) => V2Outcome::Uncertain { intended, reason, held },
-        })
+            Some(V2Script::PanicWithChild(wait)) => {
+                let share = held.clone();
+                self.children.lock().unwrap().push(std::thread::spawn(move || {
+                    let _ = wait.lock().unwrap().recv();
+                    drop(share);
+                }));
+                panic!("injected attempt panic with a running child");
+            }
+        }
+    }
+    fn next_cleanup_incarnation(&self) -> Result<u64> {
+        if self
+            .incarnation_failures
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            fail!("injected incarnation write failure");
+        }
+        Ok(self.incarnation.fetch_add(1, Ordering::AcqRel) + 1)
     }
     fn rewrite_validator_cleanup_record(&self, record: &PendingValidatorCleanup) -> Result<()> {
         if self
@@ -845,13 +877,21 @@ fn with_journal(
     PendingValidatorCleanup { journal, ..record.clone() }
 }
 
+/// A journal payload written under `token`.
+fn payload_of(token: AttemptToken) -> consensus_common::validator_cleanup::JournalPayload {
+    consensus_common::validator_cleanup::JournalPayload {
+        attempt: token.attempt,
+        generation: token.generation,
+        manifest_digest: UInt256::from([7; 32]),
+        inventory_digest: UInt256::from([8; 32]),
+        associations: Vec::new(),
+    }
+}
+
 fn payload(byte: u8) -> consensus_common::validator_cleanup::JournalPayload {
     consensus_common::validator_cleanup::JournalPayload {
-        attempt: 0,
-        generation: 0,
         manifest_digest: UInt256::from([byte; 32]),
-        inventory_digest: UInt256::from([byte.wrapping_add(1); 32]),
-        associations: Vec::new(),
+        ..payload_of(AttemptToken { generation: 0, attempt: 0 })
     }
 }
 
@@ -879,6 +919,10 @@ fn v2_prepare(engine: &CleanupEngine, record: &PendingValidatorCleanup) {
         .unwrap();
 }
 
+fn outcome(manager: &ValidatorManagerImpl, record: &PendingValidatorCleanup) -> Option<String> {
+    manager.cleanup_v2_verdicts.get(&record.namespace).cloned()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v2_kept_attempt_releases_everything_and_keeps_the_record() {
     let engine = CleanupEngine::new();
@@ -891,15 +935,12 @@ async fn test_v2_kept_attempt_releases_everything_and_keeps_the_record() {
     manager.run_cleanup_tick().await;
     manager.drain_cleanup_workers().await;
     assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 1, "only the record with an identity");
-    assert_eq!(engine.v2_seen.lock().unwrap()[0], record);
-    assert_eq!(
-        manager.cleanup_v2_verdicts.get(&record.namespace).map(String::as_str),
-        Some("kept: scripted")
-    );
+    assert_eq!(engine.v2_seen.lock().unwrap()[0].0, record);
+    assert_eq!(outcome(&manager, &record).as_deref(), Some("kept: scripted"));
     assert!(engine.has_record(&record) && engine.has_record(&without_identity));
     assert!(engine.namespace_dir(&record).exists());
     assert!(!manager.cleanup.is_delete_in_flight(&record.session_id));
-    assert!(manager.cleanup_v2_parked.is_empty());
+    assert!(manager.cleanup_v2_parked.is_empty() && manager.cleanup_v2_held.is_empty());
     assert_eq!(v2_held(&engine, &record), (false, false), "a kept attempt releases both");
     // A namespace held by a session is never attempted.
     let live = engine
@@ -920,24 +961,23 @@ async fn test_v2_retained_attempt_keeps_its_reservations_and_resumes_from_the_du
     set_floor(&engine);
     let record = v2_record(1, true);
     v2_prepare(&engine, &record);
-    engine.script(&[V2Script::Retained, V2Script::Retained, V2Script::Gone]);
+    engine.script(vec![V2Script::Retained, V2Script::Retained, V2Script::Gone]);
     let mut manager = manager(engine.clone());
     manager.run_cleanup_tick().await;
     manager.drain_cleanup_workers().await;
-    assert_eq!(
-        manager.cleanup_v2_verdicts.get(&record.namespace).map(String::as_str),
-        Some("retained: scripted")
-    );
+    let token = engine.v2_seen.lock().unwrap()[0].1;
+    assert_eq!(outcome(&manager, &record).as_deref(), Some("retained: scripted"));
     assert!(manager.cleanup_v2_parked.contains_key(&record.namespace));
     assert!(manager.cleanup.is_delete_in_flight(&record.session_id));
     assert_eq!(v2_held(&engine, &record), (true, true), "parked keeps both reservations");
-    // The attempt progressed durably; the resume continues from there.
-    let deleted = with_journal(&record, CleanupJournal::Deleted(payload(7)));
+    // The attempt progressed durably; the resume continues from there under
+    // the same reservation.
+    let deleted = with_journal(&record, CleanupJournal::Deleted(payload_of(token)));
     engine.put(&deleted);
     manager.run_cleanup_tick().await;
     manager.drain_cleanup_workers().await;
     assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 2, "one resume per tick");
-    assert_eq!(engine.v2_seen.lock().unwrap()[1], deleted);
+    assert_eq!(engine.v2_seen.lock().unwrap()[1], (deleted, token));
     assert_eq!(v2_held(&engine, &record), (true, true));
     // An absent durable record is never resumed from.
     engine.records.lock().unwrap().remove(&record_key(&record.namespace));
@@ -945,21 +985,44 @@ async fn test_v2_retained_attempt_keeps_its_reservations_and_resumes_from_the_du
     manager.drain_cleanup_workers().await;
     assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 2, "absent record: stays parked");
     assert_eq!(v2_held(&engine, &record), (true, true));
-    let releasing = with_journal(&record, CleanupJournal::Releasing(payload(7)));
+    let releasing = with_journal(&record, CleanupJournal::Releasing(payload_of(token)));
     engine.put(&releasing);
     manager.run_cleanup_tick().await;
     manager.drain_cleanup_workers().await;
     assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 3);
-    assert_eq!(engine.v2_seen.lock().unwrap()[2], releasing);
-    assert_eq!(
-        manager.cleanup_v2_verdicts.get(&record.namespace).map(String::as_str),
-        Some("gone")
-    );
+    assert_eq!(engine.v2_seen.lock().unwrap()[2], (releasing, token));
+    assert_eq!(outcome(&manager, &record).as_deref(), Some("gone"));
     assert!(!engine.has_record(&record), "gone: the record is erased");
     assert!(engine.has_claim(&record.session_id), "the last holder wrote the claim");
-    assert!(manager.cleanup_v2_parked.is_empty() && manager.cleanup_v2_erasing.is_empty());
+    assert!(manager.cleanup_v2_parked.is_empty() && manager.cleanup_v2_held.is_empty());
     assert!(!manager.cleanup.is_delete_in_flight(&record.session_id));
     assert_eq!(v2_held(&engine, &record), (false, false), "released after the erase ack");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_resume_refuses_a_journal_of_another_attempt() {
+    use consensus_common::validator_cleanup::CleanupJournal;
+    let engine = CleanupEngine::new();
+    set_floor(&engine);
+    let record = v2_record(1, true);
+    v2_prepare(&engine, &record);
+    engine.script(vec![V2Script::Retained]);
+    let mut manager = manager(engine.clone());
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    let token = engine.v2_seen.lock().unwrap()[0].1;
+    for other in [
+        AttemptToken { attempt: token.attempt + 1, ..token },
+        AttemptToken { generation: token.generation + 1, ..token },
+    ] {
+        engine.put(&with_journal(&record, CleanupJournal::Deleted(payload_of(other))));
+        manager.run_cleanup_tick().await;
+        manager.drain_cleanup_workers().await;
+        assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 1, "never resumed");
+        assert_eq!(outcome(&manager, &record).as_deref(), Some("journal owned by another attempt"));
+        assert_eq!(v2_held(&engine, &record), (true, true));
+        assert!(manager.cleanup.is_delete_in_flight(&record.session_id));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -971,13 +1034,16 @@ async fn test_v2_uncertain_write_is_confirmed_by_a_synced_rewrite_before_resumin
     let deleting = with_journal(&record, CleanupJournal::Deleting(payload(7)));
     let deleted = with_journal(&record, CleanupJournal::Deleted(payload(7)));
     v2_prepare(&engine, &deleting);
-    engine.script(&[V2Script::Uncertain(deleted.clone()), V2Script::Retained]);
+    engine.script(vec![
+        V2Script::Uncertain { intended: deleted.clone(), previous: deleting.clone() },
+        V2Script::Retained,
+    ]);
     let mut manager = manager(engine.clone());
     manager.run_cleanup_tick().await;
     manager.drain_cleanup_workers().await;
     assert!(matches!(
         manager.cleanup_v2_parked.get(&record.namespace),
-        Some(V2Parked::Uncertain { .. })
+        Some(V2Parked { next: V2Next::Confirm { .. }, .. })
     ));
     assert_eq!(v2_held(&engine, &record), (true, true));
     // Neither the intended nor the previous state: never decided from it.
@@ -987,10 +1053,7 @@ async fn test_v2_uncertain_write_is_confirmed_by_a_synced_rewrite_before_resumin
     manager.drain_cleanup_workers().await;
     assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 1);
     assert!(engine.rewrites.lock().unwrap().is_empty());
-    assert_eq!(
-        manager.cleanup_v2_verdicts.get(&record.namespace).map(String::as_str),
-        Some("uncertain: unexpected durable state")
-    );
+    assert_eq!(outcome(&manager, &record).as_deref(), Some("uncertain: unexpected durable state"));
     // The previous state, but its re-write fails: still parked.
     engine.put(&deleting);
     engine.rewrite_failures.store(1, Ordering::Relaxed);
@@ -999,7 +1062,7 @@ async fn test_v2_uncertain_write_is_confirmed_by_a_synced_rewrite_before_resumin
     assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 1);
     assert!(matches!(
         manager.cleanup_v2_parked.get(&record.namespace),
-        Some(V2Parked::Uncertain { .. })
+        Some(V2Parked { next: V2Next::Confirm { .. }, .. })
     ));
     assert_eq!(v2_held(&engine, &record), (true, true));
     // Confirmed by a successful re-write, then resumed from exactly it.
@@ -1007,10 +1070,10 @@ async fn test_v2_uncertain_write_is_confirmed_by_a_synced_rewrite_before_resumin
     manager.drain_cleanup_workers().await;
     assert_eq!(*engine.rewrites.lock().unwrap(), vec![deleting.clone()]);
     assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 2);
-    assert_eq!(engine.v2_seen.lock().unwrap()[1], deleting);
+    assert_eq!(engine.v2_seen.lock().unwrap()[1].0, deleting);
     assert!(matches!(
         manager.cleanup_v2_parked.get(&record.namespace),
-        Some(V2Parked::Retained { .. })
+        Some(V2Parked { next: V2Next::Resume, .. })
     ));
 }
 
@@ -1023,7 +1086,10 @@ async fn test_v2_uncertain_write_that_applied_resumes_from_the_intended_state() 
     let deleted = with_journal(&record, CleanupJournal::Deleted(payload(7)));
     let releasing = with_journal(&record, CleanupJournal::Releasing(payload(7)));
     v2_prepare(&engine, &deleted);
-    engine.script(&[V2Script::Uncertain(releasing.clone()), V2Script::Retained]);
+    engine.script(vec![
+        V2Script::Uncertain { intended: releasing.clone(), previous: deleted.clone() },
+        V2Script::Retained,
+    ]);
     let mut manager = manager(engine.clone());
     manager.run_cleanup_tick().await;
     manager.drain_cleanup_workers().await;
@@ -1032,7 +1098,7 @@ async fn test_v2_uncertain_write_that_applied_resumes_from_the_intended_state() 
     manager.run_cleanup_tick().await;
     manager.drain_cleanup_workers().await;
     assert_eq!(*engine.rewrites.lock().unwrap(), vec![releasing.clone()]);
-    assert_eq!(engine.v2_seen.lock().unwrap()[1], releasing);
+    assert_eq!(engine.v2_seen.lock().unwrap()[1].0, releasing);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1041,7 +1107,7 @@ async fn test_v2_gone_erase_is_one_batch_decided_once_and_holds_until_acknowledg
     set_floor(&engine);
     let record = v2_record(1, true);
     v2_prepare(&engine, &record);
-    engine.script(&[V2Script::Gone]);
+    engine.script(vec![V2Script::Gone]);
     // The erase applies but its sync reports an error.
     engine.erase_applied_failures.store(1, Ordering::Relaxed);
     let mut manager = manager(engine.clone());
@@ -1069,7 +1135,72 @@ async fn test_v2_gone_erase_is_one_batch_decided_once_and_holds_until_acknowledg
     engine.claims.lock().unwrap().clear();
     manager.retry_cleanup_erases();
     assert!(engine.has_claim(&record.session_id), "the retry wrote the decided claim");
-    assert!(manager.cleanup_erase_claims.is_empty() && manager.cleanup_v2_erasing.is_empty());
+    assert!(manager.cleanup_erase_claims.is_empty() && manager.cleanup_v2_held.is_empty());
     assert_eq!(v2_held(&engine, &record), (false, false), "released on the ack");
     assert!(!manager.cleanup.is_delete_in_flight(&record.session_id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_aborted_attempt_with_a_running_child_drains_before_anything_else() {
+    let engine = CleanupEngine::new();
+    set_floor(&engine);
+    let record = v2_record(1, true);
+    v2_prepare(&engine, &record);
+    let (finish, wait) = std::sync::mpsc::channel::<()>();
+    engine.script(vec![V2Script::PanicWithChild(Arc::new(Mutex::new(wait)))]);
+    let mut manager = manager(engine.clone());
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    // The attempt panicked while its blocking child still runs: nothing is
+    // resumed or released, over several ticks.
+    for _ in 0..3 {
+        assert_eq!(outcome(&manager, &record).as_deref(), Some("draining"));
+        assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 1, "no overlapping attempt");
+        assert_eq!(v2_held(&engine, &record), (true, true));
+        assert!(manager.cleanup.is_delete_in_flight(&record.session_id));
+        manager.run_cleanup_tick().await;
+        manager.drain_cleanup_workers().await;
+    }
+    // The child finishes: the next tick resumes from the durable record.
+    finish.send(()).unwrap();
+    for child in std::mem::take(&mut *engine.children.lock().unwrap()) {
+        child.join().unwrap();
+    }
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 2);
+    assert_eq!(engine.v2_seen.lock().unwrap()[1].0, record, "resumed from the durable record");
+    assert_eq!(outcome(&manager, &record).as_deref(), Some("kept: scripted"));
+    assert_eq!(v2_held(&engine, &record), (false, false));
+    assert!(!manager.cleanup.is_delete_in_flight(&record.session_id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cleanup_runs_nothing_before_this_process_has_its_incarnation() {
+    let engine = CleanupEngine::new();
+    set_floor(&engine);
+    let v1 = v1_record(1, 5, &mc_id(40, 4));
+    engine.put(&v1);
+    engine.materialize(&v1);
+    let record = v2_record(2, true);
+    v2_prepare(&engine, &record);
+    engine.claims.lock().unwrap().insert(UInt256::from([9; 32]), "unknown".into());
+    engine.incarnation_failures.store(2, Ordering::Relaxed);
+    let mut manager = manager(engine.clone());
+    for _ in 0..2 {
+        manager.run_cleanup_tick().await;
+        manager.drain_cleanup_workers().await;
+        assert!(!manager.cleanup.incarnation_established());
+        assert_eq!(engine.page_reads.load(Ordering::Relaxed), 0, "no pass");
+        assert_eq!(engine.v2_attempts.load(Ordering::Relaxed), 0);
+        assert!(engine.has_record(&v1) && !engine.gone(&v1));
+        assert!(engine.has_claim(&UInt256::from([9; 32])), "no claim attempt either");
+    }
+    // Established: attempts carry this incarnation in their high half.
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    assert!(manager.cleanup.incarnation_established());
+    assert!(engine.gone(&v1));
+    let token = engine.v2_seen.lock().unwrap()[0].1;
+    assert_eq!(token.attempt >> 32, 1, "the first successful incarnation");
 }

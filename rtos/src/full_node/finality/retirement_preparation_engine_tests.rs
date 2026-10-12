@@ -562,7 +562,7 @@ async fn retirement_preparation_real_group_handoff_and_refusals() {
 /// Stores a synthetic masterchain state with its handle in the real engine.
 /// F0/F1 are synthetic: they exercise the real keeper, storage, oracles and
 /// deleter, not authenticated-chain coverage.
-async fn store_synthetic_mc_state(
+pub(super) async fn store_synthetic_mc_state(
     engine: &Arc<Engine>,
     id: &BlockIdExt,
     catchain_seqno: u32,
@@ -607,7 +607,7 @@ async fn store_synthetic_mc_state(
     engine.load_state(id).await.unwrap()
 }
 
-async fn pin_floor(engine: &Arc<Engine>, id: &BlockIdExt) {
+pub(super) async fn pin_floor(engine: &Arc<Engine>, id: &BlockIdExt) {
     let keeper = engine.shard_states_keeper();
     let guard = tokio::time::timeout(Duration::from_secs(20), async {
         loop {

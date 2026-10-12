@@ -345,6 +345,69 @@ async fn persistent_repair_ledger_release_is_counted_exact_and_deferred_while_re
 }
 
 #[test]
+fn persistent_repair_ledger_distinguishes_absent_from_mismatched_and_checks_in_one_lock(
+) -> Result<()> {
+    use crate::publication_dependency_leases::{LeaseBinding, LeaseRelease};
+    let dir = tempfile::tempdir()?;
+    let (_db, leases) = open(dir.path())?;
+    let budget = HistoryReadBudget::new(Default::default());
+    let digest = dependency_digest(&dependencies())?;
+    let first = binding();
+    let mut other = binding();
+    other.record_id = 2;
+    other.close_generation = 2;
+    let first_digest = UInt256::calc_file_hash(&first.encode()?);
+    let other_digest = UInt256::calc_file_hash(&other.encode()?);
+    let generation = leases.begin(&first, dependencies(), &budget)?;
+    // Present with the journaled digests.
+    match leases.binding_for(generation, &first_digest, &digest)? {
+        LeaseBinding::Matched(found) => assert_eq!(found, first),
+        other => panic!("expected Matched, got {other:?}"),
+    }
+    // Present with another binding or dependency digest: never Absent.
+    for (binding_digest, dependencies) in
+        [(&other_digest, &digest), (&first_digest, &UInt256::default())]
+    {
+        assert!(matches!(
+            leases.binding_for(generation, binding_digest, dependencies)?,
+            LeaseBinding::Mismatch
+        ));
+        assert_eq!(
+            leases.release_checked(generation, binding_digest, dependencies, |_| None)?,
+            LeaseRelease::Mismatch,
+            "a present mismatched lease is never counted released"
+        );
+    }
+    // A matched lease the caller's check refuses: nothing changes.
+    let epoch = leases.mutation_epoch()?;
+    let mut seen = None;
+    assert_eq!(
+        leases.release_checked(generation, &first_digest, &digest, |binding| {
+            seen = Some(binding.clone());
+            Some("another runtime".into())
+        })?,
+        LeaseRelease::Vetoed("another runtime".into())
+    );
+    assert_eq!(seen, Some(first.clone()), "the check sees the matched binding");
+    assert_eq!(leases.mutation_epoch()?, epoch);
+    assert!(leases.protection.state(&block(1)));
+    // Accepted: released; then Absent.
+    assert_eq!(
+        leases.release_checked(generation, &first_digest, &digest, |_| None)?,
+        LeaseRelease::Released
+    );
+    assert!(matches!(
+        leases.binding_for(generation, &first_digest, &digest)?,
+        LeaseBinding::Absent
+    ));
+    assert_eq!(
+        leases.release_checked(generation, &first_digest, &digest, |_| Some("never".into()))?,
+        LeaseRelease::AbsentAlreadyReleased
+    );
+    Ok(())
+}
+
+#[test]
 fn persistent_repair_ledger_release_fails_closed_when_protection_was_not_registered() -> Result<()> {
     use crate::publication_dependency_leases::LeaseRelease;
     let dir = tempfile::tempdir()?;

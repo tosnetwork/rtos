@@ -248,10 +248,13 @@ fn project_cleanup_inner(
             closes.len()
         ));
     }
+    // Each source item names its node close the way the node resolves it:
+    // by the node receipt in its offer, whose full offer must match.
     let mut seen = BTreeSet::new();
     for item in inventory {
-        let Some(close) = closes.get(&item.source_id) else {
-            return veto(format!("source item {:x} has no node close", item.source_id));
+        let node_id = &item.offer.request.canonical.node_receipt;
+        let Some(close) = closes.get(node_id) else {
+            return veto(format!("source item {:x} has no node close {node_id:x}", item.source_id));
         };
         if close.offer() != item.offer {
             return veto(format!("source item {:x} offer differs", item.source_id));
@@ -259,8 +262,8 @@ fn project_cleanup_inner(
         if budget.charge(map_insert::<UInt256, ()>()).is_err() {
             return veto("projection budget exhausted".into());
         }
-        if !seen.insert(item.source_id.clone()) {
-            return veto(format!("source item {:x} appears twice", item.source_id));
+        if !seen.insert(node_id.clone()) {
+            return veto(format!("node close {node_id:x} is claimed twice"));
         }
     }
     let mut associations = match reserved::<consensus_common::validator_cleanup::CleanupAssociation>(

@@ -253,27 +253,25 @@ impl DependencyLeases {
         f(memory.mutation_epoch)
     }
 
-    /// The binding of lease `generation` if its full encoded binding hashes
-    /// to `binding_digest` and its dependencies to `dependency_digest`.
+    /// Lease `generation` as journaled: absent, present with exactly the
+    /// full-binding digest and dependency digest, or present otherwise.
     pub(crate) fn binding_for(
         &self,
         generation: u64,
         binding_digest: &UInt256,
         dependency_digest: &UInt256,
-    ) -> Result<Option<RepairLeaseBinding>> {
+    ) -> Result<LeaseBinding> {
         let memory = self.memory.lock().map_err(|_| error!("Repair ledger poisoned"))?;
         if memory.poisoned {
             fail!("Repair ledger requires cold recovery");
         }
-        match memory.records.get(&generation) {
-            Some(record)
-                if &UInt256::calc_file_hash(&record.binding) == binding_digest
-                    && record.dependency_digest == format!("{dependency_digest:x}") =>
-            {
-                Ok(Some(record.binding()?))
-            }
-            _ => Ok(None),
+        let Some(record) = memory.records.get(&generation) else {
+            return Ok(LeaseBinding::Absent);
+        };
+        if !record_matches(record, binding_digest, dependency_digest) {
+            return Ok(LeaseBinding::Mismatch);
         }
+        Ok(LeaseBinding::Matched(record.binding()?))
     }
 
     /// The ledger epoch, read under its lock; None once exhausted.
@@ -294,6 +292,11 @@ impl DependencyLeases {
             fail!("Repair ledger requires cold recovery");
         }
         memory.records.get(&generation).cloned().ok_or_else(|| error!("Unknown repair lease"))
+    }
+    /// Observes (and may fail) the ledger's real WAL sync.
+    #[cfg(test)]
+    pub(crate) fn set_sync_observer(&self, observer: storage::durability::SyncObservation) {
+        *self.observer.lock().unwrap() = observer;
     }
     /// Instance-local observation after the actual WAL sync has succeeded.
     /// Production constructors and persistence semantics are unchanged.
@@ -417,6 +420,26 @@ impl DependencyLeases {
 #[path = "tests/test_persistent_repair_ledger.rs"]
 mod tests;
 
+/// A journaled lease generation as the ledger holds it.
+#[derive(Clone, Debug)]
+pub(crate) enum LeaseBinding {
+    /// No record of that generation.
+    Absent,
+    /// Present with exactly the journaled digests.
+    Matched(RepairLeaseBinding),
+    /// Present, but its binding or dependency digest differs.
+    Mismatch,
+}
+
+fn record_matches(
+    record: &LeaseRecord,
+    binding_digest: &UInt256,
+    dependency_digest: &UInt256,
+) -> bool {
+    &UInt256::calc_file_hash(&record.binding) == binding_digest
+        && record.dependency_digest == format!("{dependency_digest:x}")
+}
+
 /// Outcome of releasing one lease for cleanup.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LeaseRelease {
@@ -426,6 +449,9 @@ pub(crate) enum LeaseRelease {
     AbsentAlreadyReleased,
     /// The generation holds another binding or digest: nothing changed.
     Mismatch,
+    /// The binding matched its digests but the caller's check refused it:
+    /// nothing changed.
+    Vetoed(String),
     /// An authenticated reader or a GC deletion holds the gate: nothing
     /// changed; retry later.
     Busy,
@@ -452,11 +478,25 @@ impl DependencyLeases {
 
     /// `release` keyed by the digest of the full encoded binding recorded at
     /// B0: the lease must still hold a binding with exactly that digest.
+    #[cfg(test)]
     pub(crate) fn release_for(
         &self,
         generation: u64,
         binding_digest: &UInt256,
         expected_digest: &UInt256,
+    ) -> Result<LeaseRelease> {
+        self.release_checked(generation, binding_digest, expected_digest, |_| None)
+    }
+
+    /// `release_for` that also requires `check` to accept the matched
+    /// binding, all within one ledger lock acquisition: a present lease with
+    /// other digests is Mismatch and never counts as released.
+    pub(crate) fn release_checked(
+        &self,
+        generation: u64,
+        binding_digest: &UInt256,
+        expected_digest: &UInt256,
+        check: impl FnOnce(&RepairLeaseBinding) -> Option<String>,
     ) -> Result<LeaseRelease> {
         let Some(_gate) = self.protection.try_deletion() else {
             return Ok(LeaseRelease::Busy);
@@ -468,12 +508,13 @@ impl DependencyLeases {
         let Some(record) = memory.records.get(&generation) else {
             return Ok(LeaseRelease::AbsentAlreadyReleased);
         };
-        if &UInt256::calc_file_hash(&record.binding) != binding_digest
-            || record.dependency_digest != format!("{expected_digest:x}")
-        {
+        if !record_matches(record, binding_digest, expected_digest) {
             return Ok(LeaseRelease::Mismatch);
         }
         let binding = record.binding()?;
+        if let Some(reason) = check(&binding) {
+            return Ok(LeaseRelease::Vetoed(reason));
+        }
         let size = serde_json::to_vec(record)?.len();
         memory.mutation_epoch = memory.mutation_epoch.and_then(|epoch| epoch.checked_add(1));
         let result = (|| {

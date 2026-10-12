@@ -845,20 +845,30 @@ enum CleanupWork {
     },
 }
 
-/// An authenticated namespace whose attempt stopped after B0: it keeps its
-/// reservations and in-flight entry until resumed.
-enum V2Parked {
-    Retained {
-        generation: u64,
-        attempt: u64,
-        held: super::validator_cleanup_gc::CleanupHeld,
-    },
-    Uncertain {
-        generation: u64,
-        attempt: u64,
+/// What happens next to an authenticated namespace whose attempt is not
+/// running. Its reservations stay with the manager throughout.
+enum V2Next {
+    /// Refused before anything was journaled: release and complete.
+    Release,
+    /// Continue from the durable journal under the same reservation.
+    Resume,
+    /// Confirm the durable record as exactly one of these by a synced
+    /// re-write, then continue from it.
+    Confirm {
         intended: consensus_common::validator_cleanup::PendingValidatorCleanup,
-        held: super::validator_cleanup_gc::CleanupHeld,
+        previous: consensus_common::validator_cleanup::PendingValidatorCleanup,
     },
+    /// Gone: erase the record.
+    Erase,
+}
+
+/// An authenticated namespace between attempts, under reservation
+/// `(generation, attempt)`; its in-flight entry stays until released.
+struct V2Parked {
+    session: UInt256,
+    generation: u64,
+    attempt: u64,
+    next: V2Next,
 }
 
 fn journal_state(journal: &consensus_common::validator_cleanup::CleanupJournal) -> &'static str {
@@ -871,25 +881,10 @@ fn journal_state(journal: &consensus_common::validator_cleanup::CleanupJournal) 
     }
 }
 
-/// The durable state an uncertain journal write may have left instead of
-/// `intended`: the state it was written from.
-fn previous_journal(
-    intended: &consensus_common::validator_cleanup::PendingValidatorCleanup,
-) -> Option<consensus_common::validator_cleanup::PendingValidatorCleanup> {
-    use consensus_common::validator_cleanup::{CleanupJournal, PendingValidatorCleanup};
-    let journal = match &intended.journal {
-        CleanupJournal::Pending => return None,
-        CleanupJournal::Deleting(_) => CleanupJournal::Pending,
-        CleanupJournal::Deleted(payload) => CleanupJournal::Deleting(payload.clone()),
-        CleanupJournal::Releasing(payload) => CleanupJournal::Deleted(payload.clone()),
-    };
-    Some(PendingValidatorCleanup { journal, ..intended.clone() })
-}
-
 /// What a cleanup worker produced.
 enum CleanupOutcome {
     Gone(Result<bool>),
-    V2(Result<super::validator_cleanup_gc::V2Outcome>),
+    V2(super::validator_cleanup_gc::V2Outcome),
 }
 
 /// Dry verdicts kept for observability.
@@ -920,10 +915,12 @@ struct ValidatorManagerImpl {
     cleanup_workers: tokio::task::JoinSet<CleanupOutcome>,
     /// The last attempt outcome per authenticated namespace (bounded).
     cleanup_v2_verdicts: std::collections::BTreeMap<String, String>,
-    /// Authenticated namespaces parked after B0 with their reservations.
+    /// Authenticated namespaces between attempts.
     cleanup_v2_parked: HashMap<String, V2Parked>,
-    /// Reservations of authenticated namespaces kept until the erase ack.
-    cleanup_v2_erasing: HashMap<String, super::validator_cleanup_gc::CleanupHeld>,
+    /// The reservations of every authenticated namespace from its dispatch
+    /// until released or its erase is acknowledged; attempts and their
+    /// children hold shares.
+    cleanup_v2_held: HashMap<String, Arc<super::validator_cleanup_gc::CleanupHeld>>,
     /// The erase batch decided once per namespace (the claim to write, if
     /// any), reused by every retry until acknowledged.
     cleanup_erase_claims: HashMap<String, Option<UInt256>>,
@@ -980,6 +977,26 @@ impl ValidatorManagerImpl {
     async fn run_cleanup_tick(&mut self) {
         use super::validator_cleanup_gc as gc;
         use consensus_common::validator_cleanup::Oracles;
+        // No attempt of any kind before this process has its own durable
+        // incarnation; retried each tick.
+        if !self.cleanup.incarnation_established() {
+            match self.engine.next_cleanup_incarnation() {
+                Ok(incarnation) if self.cleanup.establish_incarnation(incarnation) => {
+                    log::info!(target: "validator_manager",
+                        "VALCLEANUP incarnation={incarnation}");
+                }
+                Ok(incarnation) => {
+                    log::warn!(target: "validator_manager",
+                        "VALCLEANUP incarnation {incarnation} refused");
+                    return;
+                }
+                Err(e) => {
+                    log::warn!(target: "validator_manager",
+                        "VALCLEANUP incarnation not established, retrying: {e}");
+                    return;
+                }
+            }
+        }
         self.retry_cleanup_erases();
         self.resume_parked_v2();
         if let Err(e) = self.engine.maintain_validator_cleanup_floor().await {
@@ -1114,7 +1131,7 @@ impl ValidatorManagerImpl {
                 for (item, storage, admission) in reserved {
                     match admission {
                         None => self.dispatch_cleanup_delete(item, storage),
-                        Some(admission) => self.dispatch_v2_dry(item, storage, admission),
+                        Some(admission) => self.dispatch_v2_reserved(item, storage, admission),
                     }
                 }
             }
@@ -1239,43 +1256,35 @@ impl ValidatorManagerImpl {
         };
         match self.cleanup_worker_ids.remove(&id) {
             None => {}
-            Some(CleanupWork::V2 { namespace, session, generation, attempt }) => match verdict {
-                Some(Ok(V2Outcome::Kept(reason))) => {
-                    self.note_v2(&namespace, format!("kept: {reason}"));
-                    self.cleanup.on_delete_completed(&namespace, generation, attempt, false);
-                }
-                Some(Ok(V2Outcome::Retained { reason, held })) => {
-                    self.note_v2(&namespace, format!("retained: {reason}"));
-                    self.cleanup_v2_parked
-                        .insert(namespace, V2Parked::Retained { generation, attempt, held });
-                }
-                Some(Ok(V2Outcome::Uncertain { intended, reason, held })) => {
-                    self.note_v2(&namespace, format!("uncertain: {reason}"));
-                    self.cleanup_v2_parked.insert(
-                        namespace,
-                        V2Parked::Uncertain { generation, attempt, intended, held },
-                    );
-                }
-                Some(Ok(V2Outcome::Gone { held })) => {
-                    self.note_v2(&namespace, "gone".into());
-                    if self.cleanup.on_delete_completed(&namespace, generation, attempt, true) {
-                        self.cleanup_v2_erasing.insert(namespace.clone(), held);
-                        self.erase_cleanup_record(&namespace, &session, generation, attempt);
-                    } else {
-                        held.release();
+            Some(CleanupWork::V2 { namespace, session, generation, attempt }) => {
+                let next = match verdict {
+                    Some(V2Outcome::Kept(reason)) => {
+                        self.note_v2(&namespace, format!("kept: {reason}"));
+                        V2Next::Release
                     }
-                }
-                // The attempt lost what it held: its admission stays occupied
-                // (fail closed) until restart; the durable journal remains.
-                Some(Err(error)) => {
-                    self.note_v2(&namespace, format!("failed: {error}"));
-                    self.cleanup.on_delete_completed(&namespace, generation, attempt, false);
-                }
-                None => {
-                    self.note_v2(&namespace, "attempt did not finish".into());
-                    self.cleanup.on_delete_completed(&namespace, generation, attempt, false);
-                }
-            },
+                    Some(V2Outcome::Retained(reason)) => {
+                        self.note_v2(&namespace, format!("retained: {reason}"));
+                        V2Next::Resume
+                    }
+                    Some(V2Outcome::Uncertain { intended, previous, reason }) => {
+                        self.note_v2(&namespace, format!("uncertain: {reason}"));
+                        V2Next::Confirm { intended, previous }
+                    }
+                    Some(V2Outcome::Gone) => {
+                        self.note_v2(&namespace, "gone".into());
+                        V2Next::Erase
+                    }
+                    // A panic or cancellation: whatever it journaled stays
+                    // durable; resume from it once its children are done.
+                    None => {
+                        self.note_v2(&namespace, "attempt did not finish".into());
+                        V2Next::Resume
+                    }
+                };
+                self.cleanup_v2_parked
+                    .insert(namespace.clone(), V2Parked { session, generation, attempt, next });
+                self.advance_v2(&namespace, false);
+            }
             Some(CleanupWork::Namespace { namespace, session, generation, attempt }) => {
                 if gone {
                     log::info!(target: "validator_manager",
@@ -1308,37 +1317,45 @@ impl ValidatorManagerImpl {
         }
     }
 
-    /// Hands one reserved authenticated namespace to an owned dry attempt.
-    /// The storage reservation moves into it; the Cleanup admission is
-    /// released after the attempt (a panic keeps it held, failing closed).
-    /// Hands a reserved authenticated namespace to its journaled attempt.
-    fn dispatch_v2_dry(
+    /// Hands a reserved authenticated namespace to its journaled attempt. The
+    /// manager keeps the reservations for the whole lifecycle; the attempt
+    /// and its children only hold shares.
+    fn dispatch_v2_reserved(
         &mut self,
         item: consensus_common::validator_cleanup::ReservedDelete,
         storage: consensus_common::StorageCleanupReservation,
         admission: super::finality_recovery_owner::RecoveryReservation,
     ) {
-        let held = super::validator_cleanup_gc::CleanupHeld { storage, admission };
-        self.dispatch_v2(item.record, item.generation, item.attempt_id, held);
+        let held = Arc::new(super::validator_cleanup_gc::CleanupHeld { storage, admission });
+        self.cleanup_v2_held.insert(item.record.namespace.clone(), held);
+        self.dispatch_v2(item.record, item.generation, item.attempt_id);
     }
 
-    /// Runs one journaled attempt as an owned task. Everything it holds
-    /// travels in and comes back in its outcome.
+    /// Runs one journaled attempt as an owned task under the reservation
+    /// `(generation, attempt)`, with a share of the namespace's ownership.
     fn dispatch_v2(
         &mut self,
         record: consensus_common::validator_cleanup::PendingValidatorCleanup,
         generation: u64,
         attempt: u64,
-        held: super::validator_cleanup_gc::CleanupHeld,
     ) {
         let namespace = record.namespace.clone();
         let session = record.session_id.clone();
+        let Some(held) = self.cleanup_v2_held.get(&namespace).cloned() else {
+            // Never dispatched without ownership; the attempt stays parked.
+            log::error!(target: "validator_manager",
+                "VALCLEANUP v2 dispatch without ownership dir={namespace}");
+            self.cleanup_v2_parked
+                .insert(namespace, V2Parked { session, generation, attempt, next: V2Next::Resume });
+            return;
+        };
         log::info!(target: "validator_manager",
             "VALCLEANUP v2_attempt dir={namespace} attempt={attempt} journal={:?}",
             journal_state(&record.journal));
         let engine = self.engine.clone();
+        let token = super::validator_cleanup_gc::AttemptToken { generation, attempt };
         let handle = self.cleanup_workers.spawn_on(
-            async move { CleanupOutcome::V2(engine.execute_v2_cleanup(record, held).await) },
+            async move { CleanupOutcome::V2(engine.execute_v2_cleanup(record, token, held).await) },
             &self.rt,
         );
         self.cleanup_worker_ids
@@ -1355,10 +1372,112 @@ impl ValidatorManagerImpl {
         self.cleanup_v2_verdicts.insert(namespace.to_owned(), outcome);
     }
 
-    /// Resumes parked authenticated namespaces, each at most once per tick
-    /// and never while its attempt runs: a retained one continues from its
-    /// durable journal; an uncertain one first confirms the exact state it
-    /// reads back with a synced re-write.
+    /// Whether a child of an earlier attempt (a blocking worker or an owner
+    /// request) still holds a share of the namespace's ownership.
+    fn v2_draining(&self, namespace: &str) -> bool {
+        self.cleanup_v2_held.get(namespace).is_some_and(|held| Arc::strong_count(held) > 1)
+    }
+
+    /// Releases the namespace's reservations; only the sole owner can.
+    fn release_v2(&mut self, namespace: &str) {
+        if let Some(held) = self.cleanup_v2_held.remove(namespace) {
+            match Arc::try_unwrap(held) {
+                Ok(held) => held.release(),
+                // Unreachable once drained; never released implicitly.
+                Err(_) => log::error!(target: "validator_manager",
+                    "VALCLEANUP v2 reservations still shared at release dir={namespace}"),
+            }
+        }
+    }
+
+    /// Acts on a parked authenticated namespace unless a child of its last
+    /// attempt is still running. A refusal releases and an erase proceeds at
+    /// once; a resume or confirmation runs only from the tick (`resume`),
+    /// at most once per tick. The in-flight entry stays until released.
+    fn advance_v2(&mut self, namespace: &str, resume: bool) {
+        if self.v2_draining(namespace) {
+            if self.cleanup_v2_parked.contains_key(namespace) {
+                self.note_v2(namespace, "draining".into());
+            }
+            return;
+        }
+        let Some(parked) = self.cleanup_v2_parked.remove(namespace) else {
+            return;
+        };
+        let V2Parked { session, generation, attempt, next } = parked;
+        match next {
+            V2Next::Release => {
+                self.release_v2(namespace);
+                self.cleanup.on_delete_completed(namespace, generation, attempt, false);
+            }
+            V2Next::Erase => {
+                if self.cleanup.on_delete_completed(namespace, generation, attempt, true) {
+                    self.erase_cleanup_record(namespace, &session, generation, attempt);
+                } else {
+                    self.release_v2(namespace);
+                }
+            }
+            next if !resume => {
+                self.cleanup_v2_parked
+                    .insert(namespace.to_owned(), V2Parked { session, generation, attempt, next });
+            }
+            V2Next::Resume => {
+                let token = super::validator_cleanup_gc::AttemptToken { generation, attempt };
+                match self.engine.load_validator_cleanup_record(namespace) {
+                    Ok(Some(record)) if token.owns(&record) => {
+                        self.dispatch_v2(record, generation, attempt)
+                    }
+                    Ok(Some(_)) => {
+                        self.note_v2(namespace, "journal owned by another attempt".into());
+                        self.cleanup_v2_parked.insert(
+                            namespace.to_owned(),
+                            V2Parked { session, generation, attempt, next: V2Next::Resume },
+                        );
+                    }
+                    // Absent, malformed or unreadable: never decided from it.
+                    Ok(None) | Err(_) => {
+                        self.cleanup_v2_parked.insert(
+                            namespace.to_owned(),
+                            V2Parked { session, generation, attempt, next: V2Next::Resume },
+                        );
+                    }
+                }
+            }
+            V2Next::Confirm { intended, previous } => {
+                let current = match self.engine.load_validator_cleanup_record(namespace) {
+                    Ok(Some(record)) => Some(record),
+                    Ok(None) | Err(_) => None,
+                };
+                let confirmed = match current {
+                    Some(current) if current == intended => Some(intended.clone()),
+                    Some(current) if current == previous => Some(previous.clone()),
+                    _ => None,
+                };
+                let next = V2Next::Confirm { intended, previous };
+                let Some(confirmed) = confirmed else {
+                    self.note_v2(namespace, "uncertain: unexpected durable state".into());
+                    self.cleanup_v2_parked.insert(
+                        namespace.to_owned(),
+                        V2Parked { session, generation, attempt, next },
+                    );
+                    return;
+                };
+                match self.engine.rewrite_validator_cleanup_record(&confirmed) {
+                    Ok(()) => self.dispatch_v2(confirmed, generation, attempt),
+                    Err(error) => {
+                        self.note_v2(namespace, format!("uncertain: re-write failed: {error}"));
+                        self.cleanup_v2_parked.insert(
+                            namespace.to_owned(),
+                            V2Parked { session, generation, attempt, next },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Advances every parked authenticated namespace whose attempt is not
+    /// running: each at most once per tick.
     fn resume_parked_v2(&mut self) {
         let running: HashSet<String> = self
             .cleanup_worker_ids
@@ -1375,53 +1494,7 @@ impl ValidatorManagerImpl {
             .cloned()
             .collect();
         for namespace in parked {
-            let Some(entry) = self.cleanup_v2_parked.remove(&namespace) else {
-                continue;
-            };
-            let current = match self.engine.load_validator_cleanup_record(&namespace) {
-                Ok(Some(record)) => record,
-                Ok(None) | Err(_) => {
-                    // Absent, malformed or unreadable: never decided from it.
-                    self.cleanup_v2_parked.insert(namespace, entry);
-                    continue;
-                }
-            };
-            match entry {
-                V2Parked::Retained { generation, attempt, held } => {
-                    self.dispatch_v2(current, generation, attempt, held);
-                }
-                V2Parked::Uncertain { generation, attempt, intended, held } => {
-                    let previous = previous_journal(&intended);
-                    let confirmed = if current == intended {
-                        Some(intended.clone())
-                    } else if previous.as_ref() == Some(&current) {
-                        previous
-                    } else {
-                        None
-                    };
-                    let Some(confirmed) = confirmed else {
-                        self.note_v2(&namespace, "uncertain: unexpected durable state".into());
-                        self.cleanup_v2_parked.insert(
-                            namespace,
-                            V2Parked::Uncertain { generation, attempt, intended, held },
-                        );
-                        continue;
-                    };
-                    match self.engine.rewrite_validator_cleanup_record(&confirmed) {
-                        Ok(()) => self.dispatch_v2(confirmed, generation, attempt, held),
-                        Err(error) => {
-                            self.note_v2(
-                                &namespace,
-                                format!("uncertain: re-write failed: {error}"),
-                            );
-                            self.cleanup_v2_parked.insert(
-                                namespace,
-                                V2Parked::Uncertain { generation, attempt, intended, held },
-                            );
-                        }
-                    }
-                }
-            }
+            self.advance_v2(&namespace, true);
         }
     }
 
@@ -1465,9 +1538,7 @@ impl ValidatorManagerImpl {
                 self.cleanup.on_erase_acknowledged(namespace, generation, attempt);
                 self.release_cleanup_storage(namespace, attempt);
                 self.cleanup_erase_claims.remove(namespace);
-                if let Some(held) = self.cleanup_v2_erasing.remove(namespace) {
-                    held.release();
-                }
+                self.release_v2(namespace);
                 log::info!(target: "validator_manager",
                     "VALCLEANUP erase_ack dir={namespace} generation={generation} \
                     attempt={attempt} claim={}", u8::from(last));
@@ -1583,7 +1654,7 @@ impl ValidatorManagerImpl {
             cleanup_claim_cursor: String::new(),
             cleanup_v2_verdicts: std::collections::BTreeMap::new(),
             cleanup_v2_parked: HashMap::new(),
-            cleanup_v2_erasing: HashMap::new(),
+            cleanup_v2_held: HashMap::new(),
             cleanup_erase_claims: HashMap::new(),
             retiring_observers: Vec::new(),
             lifecycle_errors: HashSet::new(),

@@ -564,15 +564,22 @@ pub trait EngineOperations: Sync + Send {
     ) -> Result<Option<crate::validator::finality_recovery_owner::RecoveryReservation>> {
         rtos_block::fail!("Cleanup admission is unavailable")
     }
-    /// The journaled cleanup attempt of a retired authenticated namespace,
-    /// holding its storage reservation and Cleanup admission.
+    /// The journaled cleanup attempt of a retired authenticated namespace
+    /// under reservation `token`, holding a share of its ownership.
     async fn execute_v2_cleanup(
         self: Arc<Self>,
         _record: consensus_common::validator_cleanup::PendingValidatorCleanup,
-        held: crate::validator::validator_cleanup_gc::CleanupHeld,
-    ) -> Result<crate::validator::validator_cleanup_gc::V2Outcome> {
-        held.release();
-        rtos_block::fail!("Authenticated namespace cleanup is unavailable")
+        _token: crate::validator::validator_cleanup_gc::AttemptToken,
+        _held: Arc<crate::validator::validator_cleanup_gc::CleanupHeld>,
+    ) -> crate::validator::validator_cleanup_gc::V2Outcome {
+        crate::validator::validator_cleanup_gc::V2Outcome::Kept(
+            "Authenticated namespace cleanup is unavailable".into(),
+        )
+    }
+    /// Advances the durable cleanup incarnation with a synced write and
+    /// returns it: each process bases its cleanup attempt ids on its own.
+    fn next_cleanup_incarnation(&self) -> Result<u64> {
+        rtos_block::fail!("Validator cleanup incarnation is unavailable")
     }
     /// Re-writes `record` synced, confirming an uncertain journal write.
     fn rewrite_validator_cleanup_record(

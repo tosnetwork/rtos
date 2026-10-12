@@ -94,8 +94,13 @@ fn close(id: u8, identity: &ExpectedIdentity, generation: u64, released: bool) -
 fn lease(generation: u64, close: &ClosingRecord) -> LeaseRecord {
     LeaseRecord::for_test(generation, &close.binding, &close.dependency_digest).unwrap()
 }
+/// A source item names its close by its own id, distinct from the node's
+/// delivery id; the node receipt in its offer names the close.
 fn item(close: &ClosingRecord) -> RetirementItem {
-    RetirementItem { source_id: close.binding.delivery_id.clone(), offer: close.offer() }
+    let source_id = UInt256::calc_file_hash(close.binding.delivery_id.as_slice());
+    assert_ne!(source_id, close.binding.delivery_id);
+    assert_eq!(close.offer().request.canonical.node_receipt, close.binding.delivery_id);
+    RetirementItem { source_id, offer: close.offer() }
 }
 
 struct World {

@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 mod chain;
 #[path = "retirement_preparation_engine_tests.rs"]
 mod retirement_preparation;
+#[path = "validator_cleanup_v2_engine_tests.rs"]
+mod validator_cleanup_v2;
 
 // Source circulation must begin with a chain whose catchain schedule agrees
 // with its authenticated recovery anchor. Legacy propagation fixtures use a

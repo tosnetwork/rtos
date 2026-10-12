@@ -1093,7 +1093,7 @@ impl EngineOperations for BootstrapTestEngine {
     ) -> Result<()> {
         use consensus_common::validator_cleanup::{encode_record, record_key};
         let puts: Vec<_> =
-            records.iter().map(|r| (record_key(&r.namespace), encode_record(r))).collect();
+            records.iter().map(|r| Ok((record_key(&r.namespace), encode_record(r)?))).collect::<Result<_>>()?;
         self.db.write_validator_state_batch_sync(&puts, &[])?;
         self.save_destroyed_session_ids(fence)
     }

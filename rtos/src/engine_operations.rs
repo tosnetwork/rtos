@@ -590,7 +590,7 @@ impl EngineOperations for Engine {
             ));
         }
         for record in records {
-            puts.push((record_key(&record.namespace), encode_record(record)));
+            puts.push((record_key(&record.namespace), encode_record(record)?));
         }
         self.db().write_validator_state_batch_sync(&puts, &deletes)
     }
@@ -700,9 +700,14 @@ impl EngineOperations for Engine {
     async fn execute_v2_cleanup(
         self: Arc<Self>,
         record: consensus_common::validator_cleanup::PendingValidatorCleanup,
-        held: crate::validator::validator_cleanup_gc::CleanupHeld,
-    ) -> Result<crate::validator::validator_cleanup_gc::V2Outcome> {
-        crate::validator::validator_cleanup_gc::execute_v2_cleanup(self, record, held).await
+        token: crate::validator::validator_cleanup_gc::AttemptToken,
+        held: Arc<crate::validator::validator_cleanup_gc::CleanupHeld>,
+    ) -> crate::validator::validator_cleanup_gc::V2Outcome {
+        crate::validator::validator_cleanup_gc::execute_v2_cleanup(self, record, token, held).await
+    }
+
+    fn next_cleanup_incarnation(&self) -> Result<u64> {
+        crate::validator::validator_cleanup_gc::next_cleanup_incarnation(self.db())
     }
 
     fn rewrite_validator_cleanup_record(
@@ -711,7 +716,7 @@ impl EngineOperations for Engine {
     ) -> Result<()> {
         use consensus_common::validator_cleanup::{encode_record, record_key};
         self.db().write_validator_state_batch_sync(
-            &[(record_key(&record.namespace), encode_record(record))],
+            &[(record_key(&record.namespace), encode_record(record)?)],
             &[],
         )
     }
