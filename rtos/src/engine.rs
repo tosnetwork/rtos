@@ -1709,6 +1709,14 @@ impl Engine {
         self.candidate_db.destroy_db(session_id)
     }
 
+    pub fn admit_candidate_session(&self, session_id: &SessionId) -> Result<()> {
+        self.candidate_db.admit(session_id)
+    }
+
+    pub fn revoke_and_destroy_candidate_table(&self, session_id: &SessionId) -> Result<bool> {
+        self.candidate_db.revoke_and_destroy(session_id)
+    }
+
     pub fn split_queues_cache(&self) -> &lockfree::map::Map<BlockIdExt, SplitQueues> {
         &self.split_queues_cache
     }

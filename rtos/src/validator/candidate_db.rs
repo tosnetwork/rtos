@@ -11,7 +11,7 @@
  */
 use super::consensus::{BlockHash, ConsensusFactory, ValidatorBlockCandidate};
 use rtos_api::{Deserializer, Serializer};
-use rtos_block::{error, Result, UInt256};
+use rtos_block::{error, fail, Result, UInt256};
 use std::{
     fmt::{Display, Formatter},
     io::Cursor,
@@ -87,28 +87,53 @@ impl ValidatorBlockCandidateWrapper {
     }
 }
 
-/// Database pool for storing validator block candidates by sessions
+/// Database pool for storing validator block candidates by sessions. A table
+/// is opened or created on disk only for an admitted session; admission is
+/// granted by the validator manager after the session's durable candidate
+/// cleanup claim is erased, and revoked under the same lock when the claim
+/// executor destroys the table.
 pub struct CandidateDbPool {
     path: String,
     map: lockfree::map::Map<UInt256, Arc<CandidateDb>>,
+    admitted: std::sync::Mutex<std::collections::HashSet<UInt256>>,
 }
 
 impl CandidateDbPool {
     /// Creates new candidate db pool
     pub fn with_path(path: impl ToString) -> Self {
-        Self { path: path.to_string(), map: lockfree::map::Map::new() }
+        Self {
+            path: path.to_string(),
+            map: lockfree::map::Map::new(),
+            admitted: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
     }
 
-    /// returns existing db or creates new one
+    fn admitted(&self) -> Result<std::sync::MutexGuard<'_, std::collections::HashSet<UInt256>>> {
+        self.admitted.lock().map_err(|_| error!("Candidate admission poisoned"))
+    }
+
+    /// Allows `session`'s table to be opened or created.
+    pub fn admit(&self, session_id: &UInt256) -> Result<()> {
+        self.admitted()?.insert(session_id.clone());
+        Ok(())
+    }
+
+    /// returns existing db, or opens one for an admitted session
     pub fn get_db(&self, session_id: &UInt256) -> Result<Arc<CandidateDb>> {
         if let Some(db) = self.map.get(session_id) {
-            Ok(db.val().clone())
-        } else {
-            let name = format!("catchains/candidates{:x}", session_id);
-            let db = Arc::new(CandidateDb::new(&self.path, &name)?);
-            self.map.insert(session_id.clone(), db.clone());
-            Ok(db)
+            return Ok(db.val().clone());
         }
+        let admitted = self.admitted()?;
+        if let Some(db) = self.map.get(session_id) {
+            return Ok(db.val().clone());
+        }
+        if !admitted.contains(session_id) {
+            fail!("Candidate table for session {:x} is not admitted", session_id);
+        }
+        let name = format!("catchains/candidates{:x}", session_id);
+        let db = Arc::new(CandidateDb::new(&self.path, &name)?);
+        self.map.insert(session_id.clone(), db.clone());
+        Ok(db)
     }
 
     /// destroys db for session
@@ -124,6 +149,15 @@ impl CandidateDbPool {
         } else {
             Ok(true)
         }
+    }
+
+    /// Session-level cleanup: revokes admission and destroys any open table
+    /// under the admission lock, so no open can race it. False while another
+    /// holder still shares the open table; admission stays revoked.
+    pub fn revoke_and_destroy(&self, session_id: &UInt256) -> Result<bool> {
+        let mut admitted = self.admitted()?;
+        admitted.remove(session_id);
+        self.destroy_db(session_id)
     }
 }
 

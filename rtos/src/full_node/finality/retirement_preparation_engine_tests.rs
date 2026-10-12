@@ -709,8 +709,17 @@ async fn validator_cleanup_real_engine_keeps_until_the_floor_passes_then_deletes
         // fence and an authenticated record, synced in the real DB.
         let mut manager = CleanupHarness::new(engine.clone());
         manager.retire(v2_session.clone(), group).await.unwrap();
-        let v2_record = engine.load_validator_cleanup_record(&v2_session).unwrap();
-        assert!(v2_record.is_some(), "retirement persisted the record");
+        let v2_namespace = |engine: &Arc<Engine>| {
+            engine
+                .load_validator_cleanup_page("", 256)
+                .unwrap()
+                .records
+                .into_iter()
+                .find(|record| record.session_id == v2_session)
+                .map(|record| record.namespace)
+        };
+        let v2_ns = v2_namespace(engine).expect("retirement persisted the record");
+        assert!(v2_ns.starts_with("v2/"), "an authenticated namespace record");
         assert!(engine.load_destroyed_session_ids().unwrap().contains(&v2_session));
 
         // (b) A retired V1 namespace on the same real DB: a real storage
@@ -747,6 +756,7 @@ async fn validator_cleanup_real_engine_keeps_until_the_floor_passes_then_deletes
             )
             .unwrap(),
         );
+        engine.admit_candidate_session(&v1_session).unwrap();
         drop(engine.get_candidate_table(&v1_session).unwrap());
         assert!(namespace.is_dir() && candidates.is_dir());
 
@@ -789,19 +799,28 @@ async fn validator_cleanup_real_engine_keeps_until_the_floor_passes_then_deletes
         pin_floor(engine, &f0).await;
         manager.tick().await;
         assert!(namespace.is_dir() && candidates.is_dir(), "kept before eligibility");
-        assert!(engine.load_validator_cleanup_record(&v1_session).unwrap().is_some());
+        assert!(engine.load_validator_cleanup_record(&v1.namespace).unwrap().is_some());
         assert!(!manager.delete_in_flight(&v1_session));
 
         // (f) Floor at F1: deleted through the real deleter, record erased,
         // fence untouched, the authenticated record still kept.
         pin_floor(engine, &f1).await;
         manager.tick().await;
-        assert!(!namespace.exists() && !candidates.exists(), "deleted after eligibility");
-        assert!(engine.load_validator_cleanup_record(&v1_session).unwrap().is_none());
+        assert!(!namespace.exists(), "deleted after eligibility");
+        assert!(engine.load_validator_cleanup_record(&v1.namespace).unwrap().is_none());
+        // The session's last namespace wrote the durable claim; the shared
+        // candidate table goes on the next tick, under its admission lock.
+        assert!(candidates.exists(), "the candidate table waits for the claim");
+        let claim_key = consensus_common::validator_cleanup::candidate_claim_key(&v1_session);
+        assert!(engine.db().load_validator_state_key_bounded(&claim_key, 512).unwrap().is_some());
+        manager.tick().await;
+        assert!(!candidates.exists(), "the claim deleted the candidate table");
+        assert!(engine.db().load_validator_state_key_bounded(&claim_key, 512).unwrap().is_none());
+        assert!(engine.get_candidate_table(&v1_session).is_err(), "admission was revoked");
         assert!(!manager.delete_in_flight(&v1_session));
         let fence_now = engine.load_destroyed_session_ids().unwrap();
         assert!(fence_now.contains(&v1_session) && fence_now.contains(&v2_session));
-        assert!(engine.load_validator_cleanup_record(&v2_session).unwrap().is_some());
+        assert!(engine.load_validator_cleanup_record(&v2_ns).unwrap().is_some());
     })
     .catch_unwind()
     .await;

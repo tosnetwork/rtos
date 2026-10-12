@@ -590,7 +590,7 @@ impl EngineOperations for Engine {
             ));
         }
         for record in records {
-            puts.push((record_key(&record.session_id), encode_record(record)));
+            puts.push((record_key(&record.namespace), encode_record(record)));
         }
         self.db().write_validator_state_batch_sync(&puts, &deletes)
     }
@@ -615,7 +615,7 @@ impl EngineOperations for Engine {
             .iter()
             .filter_map(|(key, value)| {
                 decode_record(value).filter(|record| {
-                    *key == consensus_common::validator_cleanup::record_key(&record.session_id)
+                    *key == consensus_common::validator_cleanup::record_key(&record.namespace)
                 })
             })
             .collect();
@@ -624,19 +624,87 @@ impl EngineOperations for Engine {
 
     fn load_validator_cleanup_record(
         &self,
-        session: &UInt256,
+        namespace: &str,
     ) -> Result<Option<consensus_common::validator_cleanup::PendingValidatorCleanup>> {
         use consensus_common::validator_cleanup::{decode_record, record_key, MAX_RECORD_BYTES};
         Ok(self
             .db()
-            .load_validator_state_key_bounded(&record_key(session), MAX_RECORD_BYTES)?
+            .load_validator_state_key_bounded(&record_key(namespace), MAX_RECORD_BYTES)?
             .and_then(|value| decode_record(&value))
-            .filter(|record| &record.session_id == session))
+            .filter(|record| record.namespace == namespace))
     }
 
-    fn erase_validator_cleanup_record(&self, session: &UInt256) -> Result<()> {
-        let key = consensus_common::validator_cleanup::record_key(session);
+    fn erase_validator_cleanup_record(
+        &self,
+        namespace: &str,
+        claim: Option<&UInt256>,
+    ) -> Result<()> {
+        use consensus_common::validator_cleanup::{candidate_claim_key, record_key};
+        // The claim names the last namespace so its executor can find any
+        // record the session gains again.
+        let puts: Vec<(String, Vec<u8>)> = claim
+            .map(|session| (candidate_claim_key(session), namespace.as_bytes().to_vec()))
+            .into_iter()
+            .collect();
+        self.db().write_validator_state_batch_sync(&puts, &[record_key(namespace)])
+    }
+
+    fn session_has_other_cleanup_records(&self, namespace: &str, session: &UInt256) -> Result<bool> {
+        use consensus_common::validator_cleanup::{
+            parse_canonical_namespace_name, record_key, session_record_prefixes, MAX_RECORD_BYTES,
+        };
+        let parsed = parse_canonical_namespace_name(namespace, session)
+            .ok_or_else(|| error!("Cleanup namespace is not canonical"))?;
+        let own = record_key(namespace);
+        for prefix in session_record_prefixes(&parsed.shard, parsed.catchain_seqno, session) {
+            // Two keys suffice to find one other than this namespace's own.
+            let (entries, _, _) =
+                self.db().scan_validator_state_prefix(&prefix, "", 2, MAX_RECORD_BYTES)?;
+            if entries.iter().any(|(key, _)| *key != own) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn load_candidate_claims_page(
+        &self,
+        after: &str,
+        max_keys: usize,
+    ) -> Result<(Vec<(UInt256, String)>, String, bool)> {
+        use consensus_common::validator_cleanup::{
+            parse_candidate_claim_key, parse_canonical_namespace_name, CANDIDATE_CLAIM_PREFIX,
+        };
+        let (entries, last_key, reached_end) =
+            self.db().scan_validator_state_prefix(CANDIDATE_CLAIM_PREFIX, after, max_keys, 512)?;
+        // A malformed claim never grants a deletion; the cursor still moves.
+        let claims = entries
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let session = parse_candidate_claim_key(&key)?;
+                let namespace = String::from_utf8(value).ok()?;
+                parse_canonical_namespace_name(&namespace, &session)?;
+                Some((session, namespace))
+            })
+            .collect();
+        Ok((claims, last_key, reached_end))
+    }
+
+    fn erase_candidate_claim(&self, session: &UInt256) -> Result<()> {
+        let key = consensus_common::validator_cleanup::candidate_claim_key(session);
         self.db().write_validator_state_batch_sync(&[], &[key])
+    }
+
+    fn admit_candidate_table(&self, session: &UInt256) -> Result<()> {
+        self.admit_candidate_session(session)
+    }
+
+    fn delete_candidate_table(&self, session: &UInt256) -> Result<bool> {
+        crate::validator::validator_cleanup_gc::delete_candidate_table(
+            self.db_root_dir()?,
+            session,
+            &|session| self.revoke_and_destroy_candidate_table(session),
+        )
     }
 
     async fn maintain_validator_cleanup_floor(&self) -> Result<()> {
@@ -651,11 +719,7 @@ impl EngineOperations for Engine {
         &self,
         record: &consensus_common::validator_cleanup::PendingValidatorCleanup,
     ) -> Result<bool> {
-        crate::validator::validator_cleanup_gc::delete_v1_namespace(
-            self.db_root_dir()?,
-            record,
-            &|session| self.destroy_candidate_table(session),
-        )
+        crate::validator::validator_cleanup_gc::delete_v1_namespace(self.db_root_dir()?, record)
     }
 
     fn save_block_candidate(

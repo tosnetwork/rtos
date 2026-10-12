@@ -74,8 +74,11 @@ fn validator_cleanup_wire_format_is_pinned() {
         format!("consensus.-1.8000000000000000.7.{}", session(1).to_hex_string())
     );
     assert_eq!(
-        record_key(&session(1)),
-        format!("ValidatorConsensusCleanupV1.{}", session(1).to_hex_string())
+        record_key(&record.namespace),
+        format!(
+            "ValidatorConsensusCleanupV2.consensus.-1.8000000000000000.7.{}",
+            session(1).to_hex_string()
+        )
     );
 }
 
@@ -270,7 +273,7 @@ impl Scan {
         }
     }
     fn put(&mut self, record: PendingValidatorCleanup) {
-        self.store.insert(record_key(&record.session_id), record);
+        self.store.insert(record_key(&record.namespace), record);
     }
     /// One full pass: page, gate, point reads. None when the tick is skipped.
     fn pass(&mut self) -> Option<Vec<ReservedDelete>> {
@@ -303,7 +306,7 @@ impl Scan {
         let candidates = self.manager.on_page(&request, &page, &oracles);
         let mut reserved = Vec::new();
         for candidate in candidates {
-            let current = Ok(self.store.get(&record_key(&candidate.session_id)).cloned());
+            let current = Ok(self.store.get(&record_key(&candidate.namespace)).cloned());
             if let Some(r) =
                 self.manager.on_point_read_result(request.token, &candidate, &current, &is_live)
             {
@@ -315,11 +318,15 @@ impl Scan {
         Some(reserved)
     }
     fn complete(&mut self, reserved: &ReservedDelete, gone: bool) {
-        let session = &reserved.record.session_id;
-        if self.manager.on_delete_completed(session, reserved.generation, reserved.attempt_id, gone)
-        {
-            self.store.remove(&record_key(session));
-            self.manager.on_erase_acknowledged(session, reserved.generation, reserved.attempt_id);
+        let namespace = &reserved.record.namespace;
+        if self.manager.on_delete_completed(
+            namespace,
+            reserved.generation,
+            reserved.attempt_id,
+            gone,
+        ) {
+            self.store.remove(&record_key(namespace));
+            self.manager.on_erase_acknowledged(namespace, reserved.generation, reserved.attempt_id);
         }
     }
 }
@@ -328,6 +335,7 @@ impl Scan {
 fn validator_cleanup_manager_enforces_driver_invariants() {
     let rec = record(1, 100);
     let sid = rec.session_id.clone();
+    let ns = rec.namespace.clone();
     {
         let mut scan = Scan::new();
         scan.put(rec.clone());
@@ -335,9 +343,9 @@ fn validator_cleanup_manager_enforces_driver_invariants() {
         assert_eq!(reserved.len(), 1);
         assert!(scan.manager.is_delete_in_flight(&sid));
         let r = &reserved[0];
-        assert!(scan.manager.on_delete_completed(&sid, r.generation, r.attempt_id, true));
+        assert!(scan.manager.on_delete_completed(&ns, r.generation, r.attempt_id, true));
         assert!(scan.manager.is_delete_in_flight(&sid), "held until the erase is acknowledged");
-        scan.manager.on_erase_acknowledged(&sid, r.generation, r.attempt_id);
+        scan.manager.on_erase_acknowledged(&ns, r.generation, r.attempt_id);
         assert!(!scan.manager.is_delete_in_flight(&sid));
     }
     {
@@ -346,9 +354,9 @@ fn validator_cleanup_manager_enforces_driver_invariants() {
         scan.put(rec.clone());
         scan.manager.on_group_created(&sid);
         let generation = scan.manager.on_group_retired(&rec);
-        scan.manager.on_close_confirmed(&sid, generation + 1);
+        scan.manager.on_close_confirmed(&ns, generation + 1);
         assert!(scan.pass().unwrap().is_empty());
-        scan.manager.on_close_confirmed(&sid, generation);
+        scan.manager.on_close_confirmed(&ns, generation);
         assert_eq!(scan.pass().unwrap().len(), 1);
     }
     {
@@ -357,7 +365,7 @@ fn validator_cleanup_manager_enforces_driver_invariants() {
         scan.put(rec.clone());
         scan.manager.on_group_created(&sid);
         let generation = scan.manager.on_group_retired(&rec);
-        scan.manager.on_close_confirmed(&sid, generation);
+        scan.manager.on_close_confirmed(&ns, generation);
         scan.manager.on_group_created(&sid);
         assert!(scan.pass().unwrap().is_empty());
     }
@@ -374,7 +382,7 @@ fn validator_cleanup_manager_enforces_driver_invariants() {
         let reserved = scan.pass().unwrap();
         scan.complete(&reserved[0], false);
         assert!(!scan.manager.is_delete_in_flight(&sid));
-        assert!(scan.store.contains_key(&record_key(&sid)));
+        assert!(scan.store.contains_key(&record_key(&ns)));
         assert_eq!(scan.pass().unwrap().len(), 1);
     }
     {
@@ -388,17 +396,17 @@ fn validator_cleanup_manager_enforces_driver_invariants() {
         let mut scan = Scan::new();
         scan.put(rec.clone());
         let r = scan.pass().unwrap().remove(0);
-        assert!(!scan.manager.on_delete_completed(&sid, r.generation + 1, r.attempt_id, true));
-        assert!(!scan.manager.on_delete_completed(&sid, r.generation, r.attempt_id + 1, true));
-        assert!(scan.manager.on_delete_completed(&sid, r.generation, r.attempt_id, true));
+        assert!(!scan.manager.on_delete_completed(&ns, r.generation + 1, r.attempt_id, true));
+        assert!(!scan.manager.on_delete_completed(&ns, r.generation, r.attempt_id + 1, true));
+        assert!(scan.manager.on_delete_completed(&ns, r.generation, r.attempt_id, true));
         assert!(
-            !scan.manager.on_delete_completed(&sid, r.generation, r.attempt_id, true),
+            !scan.manager.on_delete_completed(&ns, r.generation, r.attempt_id, true),
             "duplicate"
         );
-        scan.manager.on_erase_acknowledged(&sid, r.generation + 1, r.attempt_id);
-        scan.manager.on_erase_acknowledged(&sid, r.generation, r.attempt_id + 1);
+        scan.manager.on_erase_acknowledged(&ns, r.generation + 1, r.attempt_id);
+        scan.manager.on_erase_acknowledged(&ns, r.generation, r.attempt_id + 1);
         assert!(scan.manager.is_delete_in_flight(&sid));
-        scan.manager.on_erase_acknowledged(&sid, r.generation, r.attempt_id);
+        scan.manager.on_erase_acknowledged(&ns, r.generation, r.attempt_id);
         assert!(!scan.manager.is_delete_in_flight(&sid));
     }
 }
@@ -411,7 +419,7 @@ fn validator_cleanup_manager_point_read_rejects_changed_or_failed_records() {
     let request = scan.manager.begin_tick().unwrap();
     let page = Page {
         records: vec![rec.clone()],
-        last_key: record_key(&rec.session_id),
+        last_key: record_key(&rec.namespace),
         reached_end: true,
     };
     let ancestor = |q: &BlockIdExt| q.seq_no() <= 500;
@@ -469,7 +477,7 @@ fn validator_cleanup_manager_budget_stops_the_cursor() {
         let batch = scan.pass().unwrap();
         assert_eq!(batch.len(), expected.len());
         for (r, key) in batch.iter().zip(&expected) {
-            assert_eq!(&record_key(&r.record.session_id), key, "in key order, nothing skipped");
+            assert_eq!(&record_key(&r.record.namespace), key, "in key order, nothing skipped");
             assert!(reserved.insert(r.record.session_id.clone()), "never twice");
         }
         assert_eq!(scan.manager.cursor().is_empty(), reserved.len() == 40);
@@ -520,7 +528,7 @@ fn validator_cleanup_manager_reclaims_generation_state() {
         scan.put(rec.clone());
         scan.manager.on_group_created(&rec.session_id);
         let generation = scan.manager.on_group_retired(&rec);
-        scan.manager.on_close_confirmed(&rec.session_id, generation);
+        scan.manager.on_close_confirmed(&rec.namespace, generation);
     }
     for _ in 0..40 {
         if scan.store.is_empty() {
@@ -542,9 +550,9 @@ fn validator_cleanup_manager_reclaims_generation_state() {
     scan.manager.on_group_created(&rec.session_id);
     let second = scan.manager.on_group_retired(&rec);
     assert!(second > first);
-    scan.manager.on_close_confirmed(&rec.session_id, first);
+    scan.manager.on_close_confirmed(&rec.namespace, first);
     assert!(scan.pass().unwrap().is_empty(), "a stale ack cannot stand in");
-    scan.manager.on_close_confirmed(&rec.session_id, second);
+    scan.manager.on_close_confirmed(&rec.namespace, second);
     assert_eq!(scan.pass().unwrap().len(), 1);
 }
 
@@ -613,6 +621,7 @@ fn validator_cleanup_gc_floor_advances_only_behind_every_frontier() {
 fn validator_cleanup_manager_honours_the_custody_veto_and_lists_pending_erases() {
     let rec = record(1, 100);
     let sid = rec.session_id.clone();
+    let ns = rec.namespace.clone();
     let mut scan = Scan::new();
     scan.put(rec.clone());
     scan.vetoed.insert(sid.clone());
@@ -620,11 +629,71 @@ fn validator_cleanup_manager_honours_the_custody_veto_and_lists_pending_erases()
     scan.vetoed.clear();
     let r = scan.pass().unwrap().remove(0);
     assert!(scan.manager.erasing_entries().is_empty(), "deleting is not erasing");
-    assert!(scan.manager.on_delete_completed(&sid, r.generation, r.attempt_id, true));
+    assert!(scan.manager.on_delete_completed(&ns, r.generation, r.attempt_id, true));
     // A failed erase leaves the entry erasing and in flight for a retry.
-    assert_eq!(scan.manager.erasing_entries(), vec![(sid.clone(), r.generation, r.attempt_id)]);
+    assert_eq!(
+        scan.manager.erasing_entries(),
+        vec![(ns.clone(), sid.clone(), r.generation, r.attempt_id)]
+    );
     assert!(scan.manager.is_delete_in_flight(&sid));
-    scan.manager.on_erase_acknowledged(&sid, r.generation, r.attempt_id);
+    scan.manager.on_erase_acknowledged(&ns, r.generation, r.attempt_id);
     assert!(scan.manager.erasing_entries().is_empty());
     assert!(!scan.manager.is_delete_in_flight(&sid));
+}
+
+#[test]
+fn validator_cleanup_namespaces_sharing_a_session_are_independent() {
+    let sid = session(4);
+    let make = |layout: NamespaceLayout| {
+        make_record(&sid, &layout, &masterchain(), 7, &checkpoint(100)).unwrap()
+    };
+    let validator = make(NamespaceLayout::V2Validator);
+    let observer_a = make(NamespaceLayout::V2Observer(UInt256::from([0xa1; 32])));
+    let observer_b = make(NamespaceLayout::V2Observer(UInt256::from([0xb2; 32])));
+    let mut scan = Scan::new();
+    for record in [&validator, &observer_a, &observer_b] {
+        scan.put(record.clone());
+    }
+    assert_eq!(scan.store.len(), 3, "one key per physical namespace");
+    let reserved = scan.pass().unwrap();
+    assert_eq!(reserved.len(), 3);
+    let first = &reserved[0];
+    scan.complete(first, true);
+    assert!(!scan.manager.is_namespace_in_flight(&first.record.namespace));
+    assert!(scan.manager.is_delete_in_flight(&sid), "the session's other deletes are in flight");
+    assert!(scan.manager.session_has_other_holders(&sid, &reserved[1].record.namespace));
+    for r in &reserved[1..] {
+        scan.complete(r, true);
+    }
+    assert!(!scan.manager.is_delete_in_flight(&sid));
+    assert!(scan.store.is_empty());
+    // Session prefixes cover the V1 name and every authenticated namespace.
+    let [v1, v2] = session_record_prefixes(&masterchain(), 7, &sid);
+    assert!(record_key(&record(4, 100).namespace).starts_with(&v1));
+    for record in [&validator, &observer_a, &observer_b] {
+        assert!(record_key(&record.namespace).starts_with(&v2));
+    }
+}
+
+#[test]
+fn validator_cleanup_candidate_claims_are_session_serialized() {
+    let sid = session(5);
+    let mut manager = ValidatorCleanupManager::default();
+    assert_eq!(parse_candidate_claim_key(&candidate_claim_key(&sid)), Some(sid.clone()));
+    assert_eq!(parse_candidate_claim_key("ValidatorCandidateCleanupV1.zz"), None);
+    let attempt = manager.begin_claim(&sid).unwrap();
+    assert!(manager.begin_claim(&sid).is_none(), "one claim attempt per session");
+    assert!(manager.is_delete_in_flight(&sid), "creation defers while a claim runs");
+    manager.end_claim(&sid, attempt + 1);
+    assert!(manager.is_delete_in_flight(&sid), "a stale end is ignored");
+    manager.end_claim(&sid, attempt);
+    assert!(!manager.is_delete_in_flight(&sid));
+    // A live or retiring session never runs its claim.
+    manager.on_group_created(&sid);
+    assert!(manager.begin_claim(&sid).is_none());
+    let rec = make_record(&sid, &NamespaceLayout::V1, &masterchain(), 7, &checkpoint(100)).unwrap();
+    let generation = manager.on_group_retired(&rec);
+    assert!(manager.begin_claim(&sid).is_none(), "a retirement awaiting its close holds it");
+    manager.on_close_confirmed(&rec.namespace, generation);
+    assert!(manager.begin_claim(&sid).is_some());
 }

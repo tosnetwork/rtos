@@ -5,7 +5,7 @@ use super::*;
 use crate::{
     collator_test_bundle::{create_block_handle_storage, create_engine_allocated},
     shard_state::ShardStateStuff,
-    validator::validator_cleanup_gc::delete_v1_namespace,
+    validator::validator_cleanup_gc::{delete_candidate_table, delete_v1_namespace},
 };
 use consensus_common::validator_cleanup::{
     make_record, record_key, NamespaceLayout, Page, PendingValidatorCleanup,
@@ -38,6 +38,9 @@ struct CleanupEngine {
     records: Mutex<BTreeMap<String, PendingValidatorCleanup>>,
     behaviour: Mutex<HashMap<UInt256, DeleteBehaviour>>,
     erase_failures: AtomicUsize,
+    claims: Mutex<BTreeMap<UInt256, String>>,
+    claim_erase_failures: AtomicUsize,
+    admitted: Mutex<HashSet<UInt256>>,
     page_reads: AtomicUsize,
     stop: AtomicBool,
 }
@@ -54,15 +57,21 @@ impl CleanupEngine {
             records: Mutex::new(BTreeMap::new()),
             behaviour: Mutex::new(HashMap::new()),
             erase_failures: AtomicUsize::new(0),
+            claims: Mutex::new(BTreeMap::new()),
+            claim_erase_failures: AtomicUsize::new(0),
+            admitted: Mutex::new(HashSet::new()),
             page_reads: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
         })
     }
     fn put(&self, record: &PendingValidatorCleanup) {
-        self.records.lock().unwrap().insert(record_key(&record.session_id), record.clone());
+        self.records.lock().unwrap().insert(record_key(&record.namespace), record.clone());
     }
-    fn has_record(&self, session: &UInt256) -> bool {
-        self.records.lock().unwrap().contains_key(&record_key(session))
+    fn has_record(&self, record: &PendingValidatorCleanup) -> bool {
+        self.records.lock().unwrap().contains_key(&record_key(&record.namespace))
+    }
+    fn has_claim(&self, session: &UInt256) -> bool {
+        self.claims.lock().unwrap().contains_key(session)
     }
     fn namespace_dir(&self, record: &PendingValidatorCleanup) -> std::path::PathBuf {
         self.root.path().join("catchains/consensus").join(&record.namespace)
@@ -79,7 +88,10 @@ impl CleanupEngine {
         std::fs::create_dir_all(self.candidates_dir(&record.session_id)).unwrap();
     }
     fn gone(&self, record: &PendingValidatorCleanup) -> bool {
-        !self.namespace_dir(record).exists() && !self.candidates_dir(&record.session_id).exists()
+        !self.namespace_dir(record).exists()
+    }
+    fn table_gone(&self, session: &UInt256) -> bool {
+        !self.candidates_dir(session).exists()
     }
 }
 
@@ -135,11 +147,15 @@ impl EngineOperations for CleanupEngine {
     }
     fn load_validator_cleanup_record(
         &self,
-        session: &UInt256,
+        namespace: &str,
     ) -> Result<Option<PendingValidatorCleanup>> {
-        Ok(self.records.lock().unwrap().get(&record_key(session)).cloned())
+        Ok(self.records.lock().unwrap().get(&record_key(namespace)).cloned())
     }
-    fn erase_validator_cleanup_record(&self, session: &UInt256) -> Result<()> {
+    fn erase_validator_cleanup_record(
+        &self,
+        namespace: &str,
+        claim: Option<&UInt256>,
+    ) -> Result<()> {
         if self
             .erase_failures
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
@@ -147,8 +163,68 @@ impl EngineOperations for CleanupEngine {
         {
             fail!("injected erase failure");
         }
-        self.records.lock().unwrap().remove(&record_key(session));
+        self.records.lock().unwrap().remove(&record_key(namespace));
+        if let Some(session) = claim {
+            self.claims.lock().unwrap().insert(session.clone(), namespace.to_owned());
+        }
         Ok(())
+    }
+    fn session_has_other_cleanup_records(
+        &self,
+        namespace: &str,
+        session: &UInt256,
+    ) -> Result<bool> {
+        Ok(self
+            .records
+            .lock()
+            .unwrap()
+            .values()
+            .any(|record| &record.session_id == session && record.namespace != namespace))
+    }
+    fn load_candidate_claims_page(
+        &self,
+        after: &str,
+        max_keys: usize,
+    ) -> Result<(Vec<(UInt256, String)>, String, bool)> {
+        let claims = self.claims.lock().unwrap();
+        let mut page = Vec::new();
+        let mut last = String::new();
+        for (session, namespace) in claims.iter() {
+            let key = consensus_common::validator_cleanup::candidate_claim_key(session);
+            if key.as_str() <= after {
+                continue;
+            }
+            if page.len() == max_keys {
+                break;
+            }
+            page.push((session.clone(), namespace.clone()));
+            last = key;
+        }
+        let end = page.len() < max_keys;
+        Ok((page, last, end))
+    }
+    fn erase_candidate_claim(&self, session: &UInt256) -> Result<()> {
+        if self
+            .claim_erase_failures
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            // The delete applied but its sync reported an error.
+            self.claims.lock().unwrap().remove(session);
+            fail!("injected claim erase sync failure");
+        }
+        self.claims.lock().unwrap().remove(session);
+        Ok(())
+    }
+    fn admit_candidate_table(&self, session: &UInt256) -> Result<()> {
+        self.admitted.lock().unwrap().insert(session.clone());
+        Ok(())
+    }
+    fn delete_candidate_table(&self, session: &UInt256) -> Result<bool> {
+        delete_candidate_table(&self.root_str, session, &|session| {
+            self.admitted.lock().unwrap().remove(session);
+            Ok(true)
+        })
     }
     fn delete_validator_consensus_namespace(
         &self,
@@ -168,7 +244,7 @@ impl EngineOperations for CleanupEngine {
                 let _ = release.lock().unwrap().recv();
             }
         }
-        delete_v1_namespace(&self.root_str, record, &|_| Ok(true))
+        delete_v1_namespace(&self.root_str, record)
     }
 }
 
@@ -253,10 +329,18 @@ async fn test_cleanup_deletes_an_eligible_v1_namespace_once_and_erases_its_recor
     manager.run_cleanup_tick().await;
     assert!(manager.cleanup.is_delete_in_flight(&record.session_id));
     manager.drain_cleanup_workers().await;
-    assert!(engine.gone(&record), "namespace and candidate table removed");
-    assert!(!engine.has_record(&record.session_id), "record erased");
-    assert!(!manager.cleanup.is_delete_in_flight(&record.session_id));
+    assert!(engine.gone(&record), "namespace removed");
+    assert!(!engine.has_record(&record), "record erased");
+    assert!(engine.has_claim(&record.session_id), "the last namespace wrote the claim");
+    assert!(!engine.table_gone(&record.session_id), "the shared table waits for the claim");
     assert!(manager.cleanup_storage.is_empty(), "reservation released after the erase ack");
+    // The next tick executes the claim: the table goes, then the claim.
+    manager.run_cleanup_tick().await;
+    assert!(manager.cleanup.is_delete_in_flight(&record.session_id), "creation defers meanwhile");
+    manager.drain_cleanup_workers().await;
+    assert!(engine.table_gone(&record.session_id));
+    assert!(!engine.has_claim(&record.session_id));
+    assert!(!manager.cleanup.is_delete_in_flight(&record.session_id));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -284,7 +368,7 @@ async fn test_cleanup_keeps_records_the_gate_or_custody_refuses() {
     manager.run_cleanup_tick().await;
     assert!(manager.cleanup_workers.is_empty(), "nothing was dispatched");
     for record in [&fork, &same_cc, &v2] {
-        assert!(engine.has_record(&record.session_id));
+        assert!(engine.has_record(&record));
         assert!(!manager.cleanup.is_delete_in_flight(&record.session_id));
     }
     assert!(!engine.gone(&fork) && !engine.gone(&same_cc));
@@ -308,13 +392,13 @@ async fn test_cleanup_never_deletes_a_namespace_with_a_live_storage_instance() {
     manager.run_cleanup_tick().await;
     assert!(manager.cleanup_workers.is_empty(), "occupied storage is not deleted");
     assert!(!manager.cleanup.is_delete_in_flight(&record.session_id));
-    assert!(engine.has_record(&record.session_id));
+    assert!(engine.has_record(&record));
     // After a clean teardown the next tick deletes it.
     drop(open);
     manager.run_cleanup_tick().await;
     manager.drain_cleanup_workers().await;
     assert!(engine.gone(&record));
-    assert!(!engine.has_record(&record.session_id));
+    assert!(!engine.has_record(&record));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -329,13 +413,16 @@ async fn test_cleanup_failed_erase_stays_in_flight_and_is_retried() {
     manager.run_cleanup_tick().await;
     manager.drain_cleanup_workers().await;
     assert!(engine.gone(&record));
-    assert!(engine.has_record(&record.session_id), "the erase failed");
+    assert!(engine.has_record(&record), "the erase failed");
     assert!(manager.cleanup.is_delete_in_flight(&record.session_id), "creation stays deferred");
     assert_eq!(manager.cleanup_storage.len(), 1, "the reservation is still held");
     manager.run_cleanup_tick().await;
-    assert!(!engine.has_record(&record.session_id), "the next tick retried the erase");
-    assert!(!manager.cleanup.is_delete_in_flight(&record.session_id));
+    assert!(!engine.has_record(&record), "the next tick retried the erase");
     assert!(manager.cleanup_storage.is_empty());
+    // The same tick runs the session's claim; once it completes nothing of
+    // the session is in flight.
+    manager.drain_cleanup_workers().await;
+    assert!(!manager.cleanup.is_delete_in_flight(&record.session_id));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -350,7 +437,7 @@ async fn test_cleanup_disabled_reads_nothing() {
     manager.cleanup_tick_at = tokio::time::Instant::now();
     manager.run_cleanup_tick_if_due().await;
     assert_eq!(engine.page_reads.load(Ordering::Relaxed), 0);
-    assert!(engine.has_record(&record.session_id));
+    assert!(engine.has_record(&record));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -393,13 +480,13 @@ async fn test_cleanup_drain_tolerates_a_panicking_worker_and_waits_for_a_held_on
     }
     // The panic counted as not gone: record kept, nothing in flight, and its
     // storage is reservable again.
-    assert!(engine.has_record(&panicking.session_id));
+    assert!(engine.has_record(&panicking));
     assert!(!manager.cleanup.is_delete_in_flight(&panicking.session_id));
     let (parent, id) = key(&panicking);
     assert!(consensus_common::reserve_storage_cleanup(&parent, &id).unwrap().is_some());
     // The held worker completed normally after release.
     assert!(engine.gone(&held));
-    assert!(!engine.has_record(&held.session_id));
+    assert!(!engine.has_record(&held));
     assert!(manager.cleanup_storage.is_empty());
 }
 
@@ -432,7 +519,7 @@ async fn test_shutdown_waits_for_a_held_delete_worker_before_returning() {
         stop.await.unwrap();
     }
     assert!(engine.gone(&record));
-    assert!(!engine.has_record(&record.session_id), "the completion was fed through the erase");
+    assert!(!engine.has_record(&record), "the completion was fed through the erase");
     assert!(manager.cleanup_storage.is_empty());
 }
 
@@ -458,17 +545,17 @@ async fn test_cleanup_tick_deadline_survives_a_busy_masterchain() {
     // deadline reset per wait would never fire.
     for _ in 0..200 {
         let _ = manager.wait_next_mc_or_materialization_retry(&current, 0).await;
-        if !engine.has_record(&record.session_id) {
+        if !engine.has_record(&record) {
             break;
         }
     }
     manager.drain_cleanup_workers().await;
     assert!(engine.gone(&record), "cleanup progressed despite constant MC wakeups");
-    assert!(!engine.has_record(&record.session_id));
+    assert!(!engine.has_record(&record));
 }
 
 #[test]
-fn test_delete_v1_namespace_validates_every_path_before_destroying() {
+fn test_delete_v1_namespace_validates_its_path_before_destroying() {
     let checkpoint = mc_id(40, 4);
     let root = tempfile::tempdir().unwrap();
     let root_str = root.path().to_str().unwrap();
@@ -476,11 +563,9 @@ fn test_delete_v1_namespace_validates_every_path_before_destroying() {
     std::fs::create_dir_all(&consensus).unwrap();
     let candidates =
         |sid: &UInt256| root.path().join("catchains").join(format!("candidates{:x}", sid));
-    let ok = |_: &UInt256| Ok(true);
 
     // Already absent counts as gone.
-    let absent = v1_record(1, 5, &checkpoint);
-    assert!(delete_v1_namespace(root_str, &absent, &ok).unwrap());
+    assert!(delete_v1_namespace(root_str, &v1_record(1, 5, &checkpoint)).unwrap());
 
     // A symlinked namespace is refused, and its target is untouched.
     let linked = v1_record(2, 5, &checkpoint);
@@ -488,29 +573,8 @@ fn test_delete_v1_namespace_validates_every_path_before_destroying() {
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(target.join("keep"), b"x").unwrap();
     std::os::unix::fs::symlink(&target, consensus.join(&linked.namespace)).unwrap();
-    assert!(!delete_v1_namespace(root_str, &linked, &ok).unwrap());
+    assert!(!delete_v1_namespace(root_str, &linked).unwrap());
     assert!(target.join("keep").exists());
-
-    // A symlinked candidate table refuses before the namespace is touched.
-    let candidate_link = v1_record(3, 5, &checkpoint);
-    std::fs::create_dir_all(consensus.join(&candidate_link.namespace)).unwrap();
-    std::os::unix::fs::symlink(&target, candidates(&candidate_link.session_id)).unwrap();
-    let destroyed = std::sync::atomic::AtomicBool::new(false);
-    let watch = |_: &UInt256| {
-        destroyed.store(true, Ordering::Relaxed);
-        Ok(true)
-    };
-    assert!(!delete_v1_namespace(root_str, &candidate_link, &watch).unwrap());
-    assert!(consensus.join(&candidate_link.namespace).exists(), "nothing was destroyed");
-    assert!(!destroyed.load(Ordering::Relaxed));
-    assert!(target.join("keep").exists());
-
-    // A shared candidate handle refuses: not confirmed gone.
-    let shared = v1_record(4, 5, &checkpoint);
-    std::fs::create_dir_all(consensus.join(&shared.namespace)).unwrap();
-    std::fs::create_dir_all(candidates(&shared.session_id)).unwrap();
-    assert!(!delete_v1_namespace(root_str, &shared, &|_| Ok(false)).unwrap());
-    assert!(candidates(&shared.session_id).exists());
 
     // A v2 layout and a non-canonical name are never deleted here.
     let v2 = make_record(
@@ -521,19 +585,144 @@ fn test_delete_v1_namespace_validates_every_path_before_destroying() {
         &checkpoint,
     )
     .unwrap();
-    assert!(!delete_v1_namespace(root_str, &v2, &ok).unwrap());
+    assert!(!delete_v1_namespace(root_str, &v2).unwrap());
     let mut forged = v1_record(6, 5, &checkpoint);
     forged.namespace = format!("{}/../../elsewhere", forged.namespace);
-    assert!(!delete_v1_namespace(root_str, &forged, &ok).unwrap());
+    assert!(!delete_v1_namespace(root_str, &forged).unwrap());
     assert!(target.join("keep").exists());
 
-    // The real case: both directories removed and confirmed absent.
+    // The real case removes the namespace and never the shared table.
     let real = v1_record(7, 5, &checkpoint);
     let db = consensus.join(&real.namespace).join(real.session_id.to_hex_string());
     std::fs::create_dir_all(&db).unwrap();
     std::fs::write(db.join("CURRENT"), b"x").unwrap();
     std::fs::create_dir_all(candidates(&real.session_id)).unwrap();
-    assert!(delete_v1_namespace(root_str, &real, &ok).unwrap());
+    assert!(delete_v1_namespace(root_str, &real).unwrap());
     assert!(!consensus.join(&real.namespace).exists());
-    assert!(!candidates(&real.session_id).exists());
+    assert!(candidates(&real.session_id).exists(), "the candidate table is session-scoped");
+}
+
+#[test]
+fn test_delete_candidate_table_validates_its_path_before_destroying() {
+    let root = tempfile::tempdir().unwrap();
+    let root_str = root.path().to_str().unwrap();
+    let catchains = root.path().join("catchains");
+    std::fs::create_dir_all(&catchains).unwrap();
+    let candidates = |sid: &UInt256| catchains.join(format!("candidates{:x}", sid));
+    let ok = |_: &UInt256| Ok(true);
+
+    // Already absent counts as gone.
+    assert!(delete_candidate_table(root_str, &UInt256::from([1; 32]), &ok).unwrap());
+
+    // A symlinked table refuses before the pool is touched.
+    let linked = UInt256::from([2; 32]);
+    let target = root.path().join("elsewhere");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("keep"), b"x").unwrap();
+    std::os::unix::fs::symlink(&target, candidates(&linked)).unwrap();
+    let touched = std::sync::atomic::AtomicBool::new(false);
+    let watch = |_: &UInt256| {
+        touched.store(true, Ordering::Relaxed);
+        Ok(true)
+    };
+    assert!(!delete_candidate_table(root_str, &linked, &watch).unwrap());
+    assert!(!touched.load(Ordering::Relaxed));
+    assert!(target.join("keep").exists());
+
+    // A shared open table refuses: not confirmed gone.
+    let shared = UInt256::from([3; 32]);
+    std::fs::create_dir_all(candidates(&shared)).unwrap();
+    assert!(!delete_candidate_table(root_str, &shared, &|_| Ok(false)).unwrap());
+    assert!(candidates(&shared).exists());
+
+    // The real case.
+    let real = UInt256::from([4; 32]);
+    std::fs::create_dir_all(candidates(&real)).unwrap();
+    assert!(delete_candidate_table(root_str, &real, &ok).unwrap());
+    assert!(!candidates(&real).exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cleanup_claim_is_written_by_the_last_namespace_of_a_session() {
+    let engine = CleanupEngine::new();
+    set_floor(&engine);
+    let session = UInt256::from([7; 32]);
+    let make = |layout: NamespaceLayout| {
+        make_record(&session, &layout, &ShardIdent::masterchain(), 5, &mc_id(40, 4)).unwrap()
+    };
+    // Two V1-shaped namespaces of one session cannot exist, so the second is
+    // an authenticated namespace kept by the custody veto: it holds the table.
+    let v1 = make(NamespaceLayout::V1);
+    let v2 = make(NamespaceLayout::V2Validator);
+    engine.put(&v1);
+    engine.put(&v2);
+    engine.materialize(&v1);
+    let mut manager = manager(engine.clone());
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    assert!(engine.gone(&v1) && !engine.has_record(&v1));
+    assert!(!engine.has_claim(&session), "another durable namespace still holds the session");
+    assert!(engine.has_record(&v2));
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    assert!(!engine.table_gone(&session), "the shared table survives");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cleanup_claim_of_a_live_session_is_erased_without_deleting() {
+    let engine = CleanupEngine::new();
+    set_floor(&engine);
+    let record = v1_record(1, 5, &mc_id(40, 4));
+    engine.materialize(&record);
+    engine.claims.lock().unwrap().insert(record.session_id.clone(), record.namespace.clone());
+    // A durable record of the session means a newer incarnation holds it.
+    let newer = make_record(
+        &record.session_id,
+        &NamespaceLayout::V2Validator,
+        &ShardIdent::masterchain(),
+        5,
+        &mc_id(40, 4),
+    )
+    .unwrap();
+    engine.put(&newer);
+    let mut manager = manager(engine.clone());
+    manager.run_cleanup_tick().await;
+    manager.drain_cleanup_workers().await;
+    assert!(!engine.has_claim(&record.session_id), "the superseded claim is erased");
+    assert!(!engine.table_gone(&record.session_id), "and the table is kept");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_session_creation_requires_a_successful_synced_claim_erase() {
+    let engine = CleanupEngine::new();
+    let session = UInt256::from([9; 32]);
+    engine.claims.lock().unwrap().insert(session.clone(), "unused".to_owned());
+    // The delete applies but its sync errs: creation defers even though a
+    // later read would find the claim absent.
+    engine.claim_erase_failures.store(1, Ordering::Release);
+    let manager = manager(engine.clone());
+    assert!(!manager.admit_session_creation(&session));
+    assert!(!engine.has_claim(&session), "the key reads absent");
+    assert!(!engine.admitted.lock().unwrap().contains(&session), "but nothing was admitted");
+    // The next pass issues the synced delete again and only then admits.
+    assert!(manager.admit_session_creation(&session));
+    assert!(engine.admitted.lock().unwrap().contains(&session));
+}
+
+#[test]
+fn test_candidate_tables_open_only_for_admitted_sessions() {
+    use crate::validator::candidate_db::CandidateDbPool;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("catchains")).unwrap();
+    let pool = CandidateDbPool::with_path(root.path().to_str().unwrap());
+    let session = UInt256::from([0x5a; 32]);
+    let table = root.path().join("catchains").join(format!("candidates{:x}", session));
+    let refused = pool.get_db(&session).err().expect("not admitted").to_string();
+    assert!(refused.contains("not admitted"), "{refused}");
+    assert!(!table.exists(), "a refused open creates nothing");
+    pool.admit(&session).unwrap();
+    drop(pool.get_db(&session).unwrap());
+    assert!(table.exists());
+    assert!(pool.revoke_and_destroy(&session).unwrap());
+    assert!(pool.get_db(&session).is_err(), "revoked with the destroy");
 }

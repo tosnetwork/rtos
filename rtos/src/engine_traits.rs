@@ -509,16 +509,52 @@ pub trait EngineOperations: Sync + Send {
     ) -> Result<consensus_common::validator_cleanup::Page> {
         rtos_block::fail!("Validator cleanup records are unavailable")
     }
-    /// The durable cleanup record of one session, if any.
+    /// The durable cleanup record of one physical namespace, if any.
     fn load_validator_cleanup_record(
         &self,
-        _session: &UInt256,
+        _namespace: &str,
     ) -> Result<Option<consensus_common::validator_cleanup::PendingValidatorCleanup>> {
         rtos_block::fail!("Validator cleanup records are unavailable")
     }
-    /// Erases one session's cleanup record with a synced write.
-    fn erase_validator_cleanup_record(&self, _session: &UInt256) -> Result<()> {
+    /// Erases one namespace's cleanup record with a synced write; with
+    /// `claim`, the same batch writes that session's candidate cleanup claim.
+    fn erase_validator_cleanup_record(
+        &self,
+        _namespace: &str,
+        _claim: Option<&UInt256>,
+    ) -> Result<()> {
         rtos_block::fail!("Validator cleanup records are unavailable")
+    }
+    /// Whether any cleanup record of `session` other than `namespace` (a
+    /// canonical namespace of that session) is durable.
+    fn session_has_other_cleanup_records(&self, _namespace: &str, _session: &UInt256) -> Result<bool> {
+        rtos_block::fail!("Validator cleanup records are unavailable")
+    }
+    /// One bounded page of candidate cleanup claims strictly after `after`:
+    /// each session with the namespace whose erase wrote the claim, the last
+    /// key read and whether the range was exhausted.
+    #[allow(clippy::type_complexity)]
+    fn load_candidate_claims_page(
+        &self,
+        _after: &str,
+        _max_keys: usize,
+    ) -> Result<(Vec<(UInt256, String)>, String, bool)> {
+        rtos_block::fail!("Candidate cleanup claims are unavailable")
+    }
+    /// Synced delete of `session`'s candidate cleanup claim, idempotent.
+    /// Engines without candidate storage have nothing to invalidate.
+    fn erase_candidate_claim(&self, _session: &UInt256) -> Result<()> {
+        Ok(())
+    }
+    /// Allows `session`'s candidate table to be opened. Engines without
+    /// candidate storage have nothing to admit.
+    fn admit_candidate_table(&self, _session: &UInt256) -> Result<()> {
+        Ok(())
+    }
+    /// Blocking: deletes `session`'s candidate table for its claim; true only
+    /// when it is confirmed gone.
+    fn delete_candidate_table(&self, _session: &UInt256) -> Result<bool> {
+        rtos_block::fail!("Candidate table deletion is unavailable")
     }
     /// Bootstraps or advances the durable cleanup GC floor by at most one step.
     async fn maintain_validator_cleanup_floor(&self) -> Result<()> {

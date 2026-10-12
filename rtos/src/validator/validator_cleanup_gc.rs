@@ -263,32 +263,41 @@ fn confirmed_absent(path: &Path) -> bool {
     matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
-/// Deletes a retired V1 namespace and its candidate table. The caller already
-/// established eligibility under the gate and holds the storage cleanup
-/// reservation; this is only the blocking filesystem step. Every path check
-/// runs before anything is destroyed. Returns true only when both paths are
-/// confirmed absent; any refusal or error leaves the record for a later
-/// cycle.
-pub(crate) fn delete_v1_namespace(
-    db_root: &str,
-    record: &PendingValidatorCleanup,
-    destroy_candidates: &dyn Fn(&UInt256) -> Result<bool>,
-) -> Result<bool> {
+/// Deletes a retired V1 namespace directory. The caller already established
+/// eligibility under the gate and holds the storage cleanup reservation; this
+/// is only the blocking filesystem step. The path check runs before anything
+/// is destroyed. The session's candidate table is shared by its namespaces
+/// and is never touched here: only the session-level claim deletes it.
+/// Returns true only when the namespace is confirmed absent; any refusal or
+/// error leaves the record for a later cycle.
+pub(crate) fn delete_v1_namespace(db_root: &str, record: &PendingValidatorCleanup) -> Result<bool> {
     let Some((namespace, _)) = namespace_storage(db_root, record) else {
         return Ok(false);
     };
-    let catchains = Path::new(db_root).join("catchains");
-    let candidates = candidates_path(db_root, &record.session_id);
-    if !removable_under(&namespace, &consensus_root(db_root))?
-        || !removable_under(&candidates, &catchains)?
-    {
+    if !removable_under(&namespace, &consensus_root(db_root))? {
         return Ok(false);
     }
     remove_if_directory(&namespace)?;
-    // A shared handle (Ok(false)) means someone still uses the table.
-    if !destroy_candidates(&record.session_id)? {
+    Ok(confirmed_absent(&namespace))
+}
+
+/// Session-level candidate-table deletion for a durable claim. The path check
+/// runs first; `revoke_and_destroy` then revokes the session's admission and
+/// destroys any open table under the pool lock (false while still shared).
+/// Returns true only when the table directory is confirmed absent.
+pub(crate) fn delete_candidate_table(
+    db_root: &str,
+    session_id: &UInt256,
+    revoke_and_destroy: &dyn Fn(&UInt256) -> Result<bool>,
+) -> Result<bool> {
+    let catchains = Path::new(db_root).join("catchains");
+    let candidates = candidates_path(db_root, session_id);
+    if !removable_under(&candidates, &catchains)? {
+        return Ok(false);
+    }
+    if !revoke_and_destroy(session_id)? {
         return Ok(false);
     }
     remove_if_directory(&candidates)?;
-    Ok(confirmed_absent(&namespace) && confirmed_absent(&candidates))
+    Ok(confirmed_absent(&candidates))
 }

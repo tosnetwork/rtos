@@ -120,13 +120,41 @@ const FIXED_PREFIX: usize = 1 + 32 + 4 + 8 + 4 + 32 + 32;
 /// Upper bound for one encoded record; the longest layout is an observer name.
 pub const MAX_RECORD_BYTES: usize = FIXED_PREFIX + 512;
 
-/// Key prefix for records; each record lives under its own key so retirement
-/// and erase are single-key writes. The prefix ends in '.', and the lowercase
-/// session hex after it always sorts above '.'.
-pub const RECORD_KEY_PREFIX: &str = "ValidatorConsensusCleanupV1.";
+/// Key prefix for records. Each physical namespace has its own key (the
+/// prefix plus its canonical relative name), so retirement and erase are
+/// single-key writes and namespaces sharing a session never overwrite each
+/// other.
+pub const RECORD_KEY_PREFIX: &str = "ValidatorConsensusCleanupV2.";
 
-pub fn record_key(session_id: &UInt256) -> String {
-    format!("{RECORD_KEY_PREFIX}{}", session_id.to_hex_string())
+pub fn record_key(namespace: &str) -> String {
+    format!("{RECORD_KEY_PREFIX}{namespace}")
+}
+
+/// The key prefixes under which records of `session` can exist: its V1
+/// namespace name, and its authenticated namespaces (validator and every
+/// observer ADNL), for a bounded per-session scan.
+pub fn session_record_prefixes(
+    shard: &ShardIdent,
+    catchain_seqno: u32,
+    session: &UInt256,
+) -> [String; 2] {
+    let base = namespace_relative_name(&NamespaceLayout::V1, shard, catchain_seqno, session);
+    [record_key(&base), record_key(&format!("v2/{base}."))]
+}
+
+/// Durable session-level claim to delete the session's candidate table,
+/// written with the erase of the session's last namespace record.
+pub const CANDIDATE_CLAIM_PREFIX: &str = "ValidatorCandidateCleanupV1.";
+
+pub fn candidate_claim_key(session: &UInt256) -> String {
+    format!("{CANDIDATE_CLAIM_PREFIX}{}", session.to_hex_string())
+}
+
+/// The session of a claim key, if it is exactly a canonical claim key.
+pub fn parse_candidate_claim_key(key: &str) -> Option<UInt256> {
+    let hex = key.strip_prefix(CANDIDATE_CLAIM_PREFIX)?;
+    let session: UInt256 = hex.parse().ok()?;
+    (session.to_hex_string() == hex).then_some(session)
 }
 
 /// Builds the record for a retiring group. The name is rendered by the same
@@ -405,6 +433,7 @@ enum InFlightState {
 }
 
 struct InFlight {
+    session: UInt256,
     generation: u64,
     attempt_id: u64,
     state: InFlightState,
@@ -425,11 +454,18 @@ struct Pass {
 /// Driver of the cleanup. The durable store is the only backlog; in memory
 /// there are only open retirements awaiting their close, at most
 /// `MAX_IN_FLIGHT` operations, the live sessions' incarnation tokens, the scan
-/// cursor and the running pass. Confine it to one owner.
+/// cursor and the running pass. Records are per physical namespace: a
+/// validator directory and each observer directory of one session are judged
+/// and deleted independently, while group creation is deferred per session.
+/// Confine it to one owner.
 #[derive(Default)]
 pub struct ValidatorCleanupManager {
-    open_retirements: BTreeMap<UInt256, u64>,
-    in_flight: BTreeMap<UInt256, InFlight>,
+    /// Namespace -> (session, generation) awaiting its close confirmation.
+    open_retirements: BTreeMap<String, (UInt256, u64)>,
+    /// Namespace deletes from reservation to the acknowledged erase.
+    in_flight: BTreeMap<String, InFlight>,
+    /// Session-level candidate-table cleanups from dispatch to completion.
+    claims_in_flight: BTreeMap<UInt256, u64>,
     live_generation: BTreeMap<UInt256, u64>,
     next_generation: u64,
     next_attempt: u64,
@@ -454,41 +490,60 @@ impl ValidatorCleanupManager {
     }
 
     /// A group for `session` is about to be created. The caller must first
-    /// check `is_delete_in_flight` and defer creation while it is true. A
-    /// retirement still awaiting its close is superseded.
+    /// check `is_delete_in_flight` and defer creation while it is true. Any
+    /// retirement of the session still awaiting its close is superseded.
     pub fn on_group_created(&mut self, session: &UInt256) {
         let generation = Self::next(&mut self.next_generation);
         self.live_generation.insert(session.clone(), generation);
-        self.open_retirements.remove(session);
+        self.open_retirements.retain(|_, (owner, _)| owner != session);
     }
 
     /// The current incarnation retired; its durable record was persisted
     /// before the group may close. Returns the generation the close must
     /// report back.
     pub fn on_group_retired(&mut self, record: &PendingValidatorCleanup) -> u64 {
-        let session = &record.session_id;
-        if let Some(in_flight) = self.in_flight.get(session) {
+        if let Some(in_flight) = self.in_flight.get(&record.namespace) {
             return in_flight.generation;
         }
-        let generation = match self.live_generation.remove(session) {
+        let generation = match self.live_generation.remove(&record.session_id) {
             Some(generation) => generation,
             None => Self::next(&mut self.next_generation),
         };
-        self.open_retirements.insert(session.clone(), generation);
+        self.open_retirements
+            .insert(record.namespace.clone(), (record.session_id.clone(), generation));
         generation
     }
 
-    /// The retiring group confirmed close for `generation`; a stale ack from
-    /// an older incarnation is ignored.
-    pub fn on_close_confirmed(&mut self, session: &UInt256, generation: u64) {
-        if self.open_retirements.get(session) == Some(&generation) {
-            self.open_retirements.remove(session);
+    /// The retiring group confirmed close of `namespace` for `generation`; a
+    /// stale ack from an older incarnation is ignored.
+    pub fn on_close_confirmed(&mut self, namespace: &str, generation: u64) {
+        if self.open_retirements.get(namespace).is_some_and(|(_, open)| *open == generation) {
+            self.open_retirements.remove(namespace);
         }
     }
 
-    /// True from reservation until the durable erase is acknowledged.
+    /// True while any namespace of `session`, or its candidate-table cleanup,
+    /// is between reservation and its acknowledged completion.
     pub fn is_delete_in_flight(&self, session: &UInt256) -> bool {
-        self.in_flight.contains_key(session)
+        self.claims_in_flight.contains_key(session)
+            || self.in_flight.values().any(|entry| &entry.session == session)
+    }
+
+    /// True while this exact namespace is between reservation and its
+    /// acknowledged erase.
+    pub fn is_namespace_in_flight(&self, namespace: &str) -> bool {
+        self.in_flight.contains_key(namespace)
+    }
+
+    /// Whether `session` still has a retirement awaiting its close, or a
+    /// namespace delete in flight other than `except`.
+    pub fn session_has_other_holders(&self, session: &UInt256, except: &str) -> bool {
+        self.live_generation.contains_key(session)
+            || self.open_retirements.values().any(|(owner, _)| owner == session)
+            || self
+                .in_flight
+                .iter()
+                .any(|(namespace, entry)| &entry.session == session && namespace != except)
     }
 
     /// The page to read at this tick, or nothing when a pass is running or
@@ -532,7 +587,7 @@ impl ValidatorCleanupManager {
         let closed = |_: &UInt256| true; // open retirements are held below
         let mut stopped = false;
         for record in &page.records {
-            let held = self.held_in_memory(&record.session_id);
+            let held = self.held_in_memory(record);
             let eligible = !held
                 && !(oracles.custody_veto)(record)
                 && cleanup_eligible(
@@ -547,7 +602,7 @@ impl ValidatorCleanupManager {
                 stopped = true;
                 break;
             }
-            self.cursor = record_key(&record.session_id);
+            self.cursor = record_key(&record.namespace);
             self.pass.examined = self.pass.examined.saturating_add(1);
             if eligible {
                 candidates.push(record.clone());
@@ -566,7 +621,7 @@ impl ValidatorCleanupManager {
 
     /// The point read of one candidate: its durable record now (`Ok(None)` if
     /// gone) or a read error, which is not absence. Reserves the delete only if
-    /// the record is unchanged and the session is still not held.
+    /// the record is unchanged and the namespace is still not held.
     pub fn on_point_read_result(
         &mut self,
         token: u64,
@@ -592,17 +647,21 @@ impl ValidatorCleanupManager {
         if record.as_ref() != Some(candidate) {
             return None;
         }
-        let session = &candidate.session_id;
-        if self.held_in_memory(session)
-            || is_live(session)
+        if self.held_in_memory(candidate)
+            || is_live(&candidate.session_id)
             || self.in_flight.len() >= Self::MAX_IN_FLIGHT
         {
             return None;
         }
         let attempt_id = Self::next(&mut self.next_attempt);
         self.in_flight.insert(
-            session.clone(),
-            InFlight { generation: 0, attempt_id, state: InFlightState::Deleting },
+            candidate.namespace.clone(),
+            InFlight {
+                session: candidate.session_id.clone(),
+                generation: 0,
+                attempt_id,
+                state: InFlightState::Deleting,
+            },
         );
         self.pass.reserved = self.pass.reserved.saturating_add(1);
         Some(ReservedDelete { record: candidate.clone(), generation: 0, attempt_id })
@@ -635,12 +694,12 @@ impl ValidatorCleanupManager {
     /// whether the erase must now be dispatched.
     pub fn on_delete_completed(
         &mut self,
-        session: &UInt256,
+        namespace: &str,
         generation: u64,
         attempt_id: u64,
         confirmed_gone: bool,
     ) -> bool {
-        let matches = self.in_flight.get(session).is_some_and(|entry| {
+        let matches = self.in_flight.get(namespace).is_some_and(|entry| {
             entry.generation == generation
                 && entry.attempt_id == attempt_id
                 && entry.state == InFlightState::Deleting
@@ -649,36 +708,63 @@ impl ValidatorCleanupManager {
             return false;
         }
         if confirmed_gone {
-            if let Some(entry) = self.in_flight.get_mut(session) {
+            if let Some(entry) = self.in_flight.get_mut(namespace) {
                 entry.state = InFlightState::Erasing;
             }
             true
         } else {
-            self.in_flight.remove(session);
+            self.in_flight.remove(namespace);
             false
         }
     }
 
     /// The durable erase for the attempt committed: release the reservation.
-    pub fn on_erase_acknowledged(&mut self, session: &UInt256, generation: u64, attempt_id: u64) {
-        let matches = self.in_flight.get(session).is_some_and(|entry| {
+    pub fn on_erase_acknowledged(&mut self, namespace: &str, generation: u64, attempt_id: u64) {
+        let matches = self.in_flight.get(namespace).is_some_and(|entry| {
             entry.generation == generation
                 && entry.attempt_id == attempt_id
                 && entry.state == InFlightState::Erasing
         });
         if matches {
-            self.in_flight.remove(session);
+            self.in_flight.remove(namespace);
         }
     }
 
     /// Confirmed deletes whose durable erase has not been acknowledged yet,
-    /// as (session, generation, attempt), for an erase retry.
-    pub fn erasing_entries(&self) -> Vec<(UInt256, u64, u64)> {
+    /// as (namespace, session, generation, attempt), for an erase retry.
+    pub fn erasing_entries(&self) -> Vec<(String, UInt256, u64, u64)> {
         self.in_flight
             .iter()
             .filter(|(_, entry)| entry.state == InFlightState::Erasing)
-            .map(|(session, entry)| (session.clone(), entry.generation, entry.attempt_id))
+            .map(|(namespace, entry)| {
+                (namespace.clone(), entry.session.clone(), entry.generation, entry.attempt_id)
+            })
             .collect()
+    }
+
+    /// Reserves the session-level candidate-table cleanup of `session`; none
+    /// while the session is live, has a retirement awaiting its close, or has
+    /// any delete in flight.
+    pub fn begin_claim(&mut self, session: &UInt256) -> Option<u64> {
+        if self.live_generation.contains_key(session)
+            || self.open_retirements.values().any(|(owner, _)| owner == session)
+            || self.is_delete_in_flight(session)
+            || self.in_flight.len().saturating_add(self.claims_in_flight.len())
+                >= Self::MAX_IN_FLIGHT
+        {
+            return None;
+        }
+        let attempt = Self::next(&mut self.next_attempt);
+        self.claims_in_flight.insert(session.clone(), attempt);
+        Some(attempt)
+    }
+
+    /// The claim attempt ended (its table deleted and claim erased, or not);
+    /// a stale attempt is ignored.
+    pub fn end_claim(&mut self, session: &UInt256, attempt: u64) {
+        if self.claims_in_flight.get(session) == Some(&attempt) {
+            self.claims_in_flight.remove(session);
+        }
     }
 
     pub fn in_first_scan(&self) -> bool {
@@ -703,10 +789,10 @@ impl ValidatorCleanupManager {
         &self.cursor
     }
 
-    fn held_in_memory(&self, session: &UInt256) -> bool {
-        self.in_flight.contains_key(session)
-            || self.open_retirements.contains_key(session)
-            || self.live_generation.contains_key(session)
+    fn held_in_memory(&self, record: &PendingValidatorCleanup) -> bool {
+        self.in_flight.contains_key(&record.namespace)
+            || self.open_retirements.contains_key(&record.namespace)
+            || self.live_generation.contains_key(&record.session_id)
     }
 }
 
