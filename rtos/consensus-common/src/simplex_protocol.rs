@@ -128,11 +128,13 @@ impl SimplexNamespace<'_> {
             return Err(error!("Block-sync observers have no consensus database"));
         }
         Ok(format!(
-            "{root}/consensus/consensus.{}.{:016x}.{}.{}",
-            self.shard.workchain_id(),
-            self.shard.shard_prefix_with_tag(),
-            self.catchain_seqno,
-            self.session_id.to_hex_string()
+            "{root}/consensus/{}",
+            crate::validator_cleanup::namespace_relative_name(
+                &crate::validator_cleanup::NamespaceLayout::V1,
+                self.shard,
+                self.catchain_seqno,
+                self.session_id,
+            )
         ))
     }
 }

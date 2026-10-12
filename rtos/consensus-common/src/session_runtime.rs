@@ -194,17 +194,20 @@ impl AuthenticatedSessionRuntime {
             }
             .runtime_directory(root);
         }
-        let role = match self.local_role {
-            LocalRole::Validator(_) => "validator".to_owned(),
-            LocalRole::Observer => format!("observer.{}", hex::encode(self.local_adnl.data())),
+        let layout = match self.local_role {
+            LocalRole::Validator(_) => crate::validator_cleanup::NamespaceLayout::V2Validator,
+            LocalRole::Observer => crate::validator_cleanup::NamespaceLayout::V2Observer(
+                UInt256::from(*self.local_adnl.data()),
+            ),
         };
         Ok(format!(
-            "{root}/consensus/v2/consensus.{}.{:016x}.{}.{}.{}",
-            self.shard.workchain_id(),
-            self.shard.shard_prefix_with_tag(),
-            self.catchain_seqno,
-            self.session.to_hex_string(),
-            role
+            "{root}/consensus/{}",
+            crate::validator_cleanup::namespace_relative_name(
+                &layout,
+                &self.shard,
+                self.catchain_seqno,
+                &self.session,
+            )
         ))
     }
     pub fn committee_digest(&self) -> Result<UInt256> {

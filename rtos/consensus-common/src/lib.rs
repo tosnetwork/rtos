@@ -35,6 +35,7 @@ mod lossy_overlay;
 pub mod compression;
 pub mod profiling;
 pub mod utils;
+pub mod validator_cleanup;
 
 use adnl::{NetworkStack, PrivateOverlayShortId};
 use rtos_block::{
