@@ -54,7 +54,69 @@ const HISTORY_TIMEOUT: Duration = Duration::from_secs(60);
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 struct LegacySubmission {
     record: PublicationRecord,
-    response: oneshot::Sender<Result<AcceptedSessionBlock>>,
+    response: Responder<Result<AcceptedSessionBlock>>,
+}
+
+/// Accepted-but-uncompleted requests per session. A request counts from
+/// before it is enqueued until its callback or response has been delivered.
+#[derive(Default)]
+pub(crate) struct OutstandingRequests(Mutex<std::collections::HashMap<UInt256, usize>>);
+impl OutstandingRequests {
+    fn begin(self: &Arc<Self>, session: &UInt256) -> Outstanding {
+        let mut map = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let count = map.entry(session.clone()).or_insert(0);
+        *count = count.saturating_add(1);
+        Outstanding { map: self.clone(), session: session.clone() }
+    }
+    pub(crate) fn count(&self, session: &UInt256) -> usize {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).get(session).copied().unwrap_or(0)
+    }
+}
+/// One outstanding request; dropping it ends the count.
+pub(crate) struct Outstanding {
+    map: Arc<OutstandingRequests>,
+    session: UInt256,
+}
+impl Drop for Outstanding {
+    fn drop(&mut self) {
+        let mut map = self.map.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = map.get_mut(&self.session) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&self.session);
+            }
+        }
+    }
+}
+/// A oneshot response that ends its request's outstanding count only after
+/// the value was handed over.
+struct Responder<T> {
+    sender: oneshot::Sender<T>,
+    outstanding: Option<Outstanding>,
+}
+impl<T> Responder<T> {
+    fn new(sender: oneshot::Sender<T>) -> Self {
+        Self { sender, outstanding: None }
+    }
+    fn send(self, value: T) -> std::result::Result<(), T> {
+        let Self { sender, outstanding } = self;
+        let sent = sender.send(value);
+        drop(outstanding);
+        sent
+    }
+}
+/// Wraps a callback so the request stays outstanding until it has run,
+/// including while it unwinds.
+fn hold<T: 'static>(
+    callback: &mut Option<Box<dyn FnOnce(Result<T>) + Send>>,
+    token: Outstanding,
+) {
+    if let Some(inner) = callback.take() {
+        *callback = Some(Box::new(move |result| {
+            let _token = token;
+            inner(result);
+        }));
+    }
 }
 // The callback guard also completes rejected queued requests during an actor panic.
 struct Completion(Option<FinalizedDeliveryCompletion>);
@@ -115,7 +177,7 @@ enum Submission {
         request: CloseFinalityRequest,
         runtime: Arc<AuthenticatedSessionRuntime>,
         budget: Arc<crate::history_read_budget::HistoryReadBudget>,
-        response: oneshot::Sender<Result<NodeHistoryDebt>>,
+        response: Responder<Result<NodeHistoryDebt>>,
     },
     Terminal {
         request: CloseFinalityRequest,
@@ -150,6 +212,14 @@ enum Submission {
         id: UInt256,
         response: oneshot::Sender<Result<AcceptedSessionBlock>>,
     },
+    /// Read-only cleanup judgement of one retired namespace; not a session
+    /// request, so it never counts itself as outstanding.
+    CleanupProjection {
+        selection: cleanup_projection::NamespaceSelection,
+        expected: cleanup_projection::ExpectedIdentity,
+        inventory: Vec<simplex::finality_delivery::source_retirement::RetirementItem>,
+        response: oneshot::Sender<Result<cleanup_projection::CleanupDecision>>,
+    },
 }
 impl Submission {
     fn reject(self) {
@@ -174,6 +244,38 @@ impl Submission {
             Self::Query { response, .. } => {
                 let _ = response.send(Err(error!("Publication query shutdown")));
             }
+            Self::CleanupProjection { response, .. } => {
+                let _ = response.send(Err(error!("Publication cleanup projection shutdown")));
+            }
+        }
+    }
+    /// Counts this request as outstanding for its session before it is
+    /// enqueued. The count ends when its callback or response is delivered,
+    /// or when a rejected request is dropped.
+    fn track(&mut self, outstanding: &Arc<OutstandingRequests>) {
+        match self {
+            Self::Terminal { runtime, completion, .. } => {
+                hold(&mut completion.0, outstanding.begin(runtime.session_id()))
+            }
+            Self::OfferClose { runtime, completion, .. } => {
+                hold(&mut completion.0, outstanding.begin(runtime.session_id()))
+            }
+            Self::SourceDelivered { runtime, completion, .. } => {
+                hold(&mut completion.0, outstanding.begin(runtime.session_id()))
+            }
+            Self::Canonical { runtime, completion, .. } => {
+                hold(&mut completion.0, outstanding.begin(runtime.session_id()))
+            }
+            Self::Draft { record, completion, .. } => {
+                hold(&mut completion.0, outstanding.begin(&record.session_id))
+            }
+            Self::HistoryDebt { runtime, response, .. } => {
+                response.outstanding = Some(outstanding.begin(runtime.session_id()))
+            }
+            Self::Legacy(request) => {
+                request.response.outstanding = Some(outstanding.begin(&request.record.session_id))
+            }
+            Self::Query { .. } | Self::CleanupProjection { .. } => {}
         }
     }
 }
@@ -246,6 +348,7 @@ struct State {
     acceptance_cursor: Mutex<u64>,
     acceptance_retry: Mutex<std::collections::BTreeMap<u64, tokio::time::Instant>>,
     retry_after: Mutex<std::collections::BTreeMap<(u64, PublicationEffect), tokio::time::Instant>>,
+    outstanding: Arc<OutstandingRequests>,
 }
 pub(crate) struct PublicationWorker {
     sender: Mutex<Option<mpsc::Sender<Submission>>>,
@@ -270,6 +373,7 @@ impl PublicationWorker {
             acceptance_cursor: Mutex::new(0),
             acceptance_retry: Mutex::new(Default::default()),
             retry_after: Mutex::new(Default::default()),
+            outstanding: Default::default(),
         });
         let tasks = Arc::new(OwnedTasks::default());
         let result = Arc::new(Self {
@@ -334,10 +438,13 @@ impl PublicationWorker {
             if self.state.fatal.load(Ordering::Acquire) || self.state.stop.is_cancelled() {
                 fail!("Publication worker is stopped or failed");
             }
+            let mut request =
+                Submission::Legacy(LegacySubmission { record, response: Responder::new(response) });
+            request.track(&self.state.outstanding);
             sender
                 .as_ref()
                 .ok_or_else(|| error!("Publication admission closed"))?
-                .try_send(Submission::Legacy(LegacySubmission { record, response }))
+                .try_send(request)
                 .map_err(|error| error!("Publication queue admission: {error}"))?;
         }
         result.await.map_err(|error| error!("Publication actor completion: {error}"))?
@@ -365,7 +472,8 @@ impl PublicationWorker {
         Ok(Arc::new(SessionSink { worker: self.clone(), runtime, historical: true }))
     }
 
-    fn admit_draft(&self, request: Submission) -> Result<()> {
+    fn admit_draft(&self, mut request: Submission) -> Result<()> {
+        request.track(&self.state.outstanding);
         let result = (|| {
             let sender =
                 self.sender.lock().map_err(|_| error!("Publication admission poisoned"))?;
@@ -437,6 +545,33 @@ impl PublicationWorker {
                 .map_err(|_| error!("Publication query queue full"))?;
         }
         result.await.map_err(|e| error!("Publication query owner: {e}"))?
+    }
+    /// Judges one retired authenticated namespace in the owner's transition,
+    /// serialized with every other owner request. Read-only.
+    pub(crate) async fn project_cleanup(
+        &self,
+        selection: cleanup_projection::NamespaceSelection,
+        expected: cleanup_projection::ExpectedIdentity,
+        inventory: Vec<simplex::finality_delivery::source_retirement::RetirementItem>,
+    ) -> Result<cleanup_projection::CleanupDecision> {
+        let (response, result) = oneshot::channel();
+        {
+            let sender =
+                self.sender.lock().map_err(|_| error!("Publication projection admission poisoned"))?;
+            if self.state.stop.is_cancelled() || self.state.fatal.load(Ordering::Acquire) {
+                fail!("Publication owner stopped");
+            }
+            sender
+                .as_ref()
+                .ok_or_else(|| error!("Publication owner stopped"))?
+                .try_send(Submission::CleanupProjection { selection, expected, inventory, response })
+                .map_err(|_| error!("Publication projection queue full"))?;
+        }
+        result.await.map_err(|e| error!("Publication projection owner: {e}"))?
+    }
+    #[cfg(test)]
+    pub(crate) fn outstanding_for_test(&self, session: &UInt256) -> usize {
+        self.state.outstanding.count(session)
     }
     pub(crate) fn stop(&self) {
         self.sender.lock().unwrap_or_else(|p| p.into_inner()).take();
@@ -623,6 +758,29 @@ impl State {
                 .await;
                 completion.finish(result);
                 self.wake.notify_one();
+            }
+            Submission::CleanupProjection { selection, expected, inventory, response } => {
+                // One owner transition: no other request is handled meanwhile.
+                let result = (|| {
+                    let engine =
+                        self.engine.upgrade().ok_or_else(|| error!("Engine unavailable"))?;
+                    let (entries, deliveries, closing) = store.cleanup_view()?;
+                    let leases = engine.db().repair_leases().records_snapshot()?;
+                    let other_outstanding = self.outstanding.count(&selection.session);
+                    Ok(cleanup_projection::project_cleanup(
+                        &selection,
+                        &expected,
+                        &inventory,
+                        &cleanup_projection::ProjectionInput {
+                            entries: &entries,
+                            deliveries: &deliveries,
+                            closing: &closing,
+                            leases: &leases,
+                            other_outstanding,
+                        },
+                    ))
+                })();
+                let _ = response.send(result);
             }
             Submission::Query { id, response } => {
                 // Caller cancellation only drops this response; acceptance and IO remain actor-owned.
@@ -1456,6 +1614,7 @@ mod tests {
             acceptance_cursor: Mutex::new(0),
             acceptance_retry: Mutex::new(Default::default()),
             retry_after: Mutex::new(Default::default()),
+            outstanding: Default::default(),
         })
     }
     fn scheduling_entry(id: u64, expires: u64) -> UnverifiedRecord {
@@ -1550,6 +1709,85 @@ mod tests {
         })))
         .finish(Ok(()));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+
+    #[test]
+    fn outstanding_request_spans_its_callback_and_rolls_back_on_rejection() {
+        let session = UInt256::from([0x31; 32]);
+        let map: Arc<OutstandingRequests> = Default::default();
+        // A held request counts; its callback still sees it outstanding.
+        let observed = Arc::new(Mutex::new(None));
+        let (seen, probe) = (observed.clone(), map.clone());
+        let probe_session = session.clone();
+        let mut callback: Option<Box<dyn FnOnce(Result<()>) + Send>> =
+            Some(Box::new(move |_| {
+                *seen.lock().unwrap() = Some(probe.count(&probe_session));
+            }));
+        hold(&mut callback, map.begin(&session));
+        assert_eq!(map.count(&session), 1);
+        ClosingCompletion(callback).finish(Ok(()));
+        assert_eq!(*observed.lock().unwrap(), Some(1), "outstanding through the callback");
+        assert_eq!(map.count(&session), 0);
+        // A panicking callback still ends the count after unwinding.
+        let mut callback: Option<Box<dyn FnOnce(Result<()>) + Send>> =
+            Some(Box::new(|_| panic!("callback panicked")));
+        hold(&mut callback, map.begin(&session));
+        ClosingCompletion(callback).finish(Ok(()));
+        assert_eq!(map.count(&session), 0);
+        // A completion dropped by the owner runs its callback, then ends.
+        let mut callback: Option<Box<dyn FnOnce(Result<()>) + Send>> = Some(Box::new(|_| {}));
+        hold(&mut callback, map.begin(&session));
+        drop(ClosingCompletion(callback));
+        assert_eq!(map.count(&session), 0);
+        // A oneshot response ends the count after the value is handed over,
+        // and an unsent dropped response ends it too.
+        let (sender, mut receiver) = oneshot::channel::<u8>();
+        let mut responder = Responder::new(sender);
+        responder.outstanding = Some(map.begin(&session));
+        assert_eq!(map.count(&session), 1);
+        responder.send(7).unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), 7);
+        assert_eq!(map.count(&session), 0);
+        let (sender, _receiver) = oneshot::channel::<u8>();
+        let mut responder = Responder::new(sender);
+        responder.outstanding = Some(map.begin(&session));
+        drop(responder);
+        assert_eq!(map.count(&session), 0);
+        // Counts are per session and never underflow.
+        let other = UInt256::from([0x32; 32]);
+        let first = map.begin(&session);
+        let second = map.begin(&other);
+        assert_eq!((map.count(&session), map.count(&other)), (1, 1));
+        drop(first);
+        drop(second);
+        assert_eq!((map.count(&session), map.count(&other)), (0, 0));
+    }
+
+    #[test]
+    fn publication_worker_rejected_draft_rolls_back_its_outstanding_count() {
+        let worker = PublicationWorker {
+            sender: Mutex::new(None),
+            tasks: Arc::new(OwnedTasks::default()),
+            state: state(),
+        };
+        let record = scheduling_entry(1, 200).record;
+        let session = record.session_id.clone();
+        let request = Submission::Draft {
+            record,
+            last_mc: 0,
+            candidate_already_sent: false,
+            historical: false,
+            origin: RecoveryOrigin {
+                carrier_version: 1,
+                local_adnl: UInt256::default(),
+                source_validator: UInt256::default(),
+                local_validator_index: None,
+            },
+            completion: Completion(Some(Box::new(|_| {}))),
+        };
+        assert!(worker.admit_draft(request).is_err());
+        assert_eq!(worker.outstanding_for_test(&session), 0);
     }
 
     #[test]

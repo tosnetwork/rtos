@@ -203,6 +203,16 @@ impl DependencyLeases {
         }
         Ok(())
     }
+    /// Every lease record, read under the ledger lock, for a cleanup
+    /// projection.
+    pub(crate) fn records_snapshot(&self) -> Result<Vec<LeaseRecord>> {
+        let memory = self.memory.lock().map_err(|_| error!("Repair ledger poisoned"))?;
+        if memory.poisoned {
+            fail!("Repair ledger requires cold recovery");
+        }
+        Ok(memory.records.values().cloned().collect())
+    }
+
     pub(crate) fn lookup(
         &self,
         generation: u64,

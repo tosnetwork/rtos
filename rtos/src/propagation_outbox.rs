@@ -430,6 +430,19 @@ impl PropagationOutbox {
         Ok(delivery_id)
     }
 
+    /// The retained entries, deliveries and close history, read under the
+    /// writer lock for a cleanup projection in the owner's transition.
+    pub(crate) fn cleanup_view(
+        &self,
+    ) -> Result<(Vec<UnverifiedRecord>, Vec<Delivery>, Vec<closing::ClosingRecord>)> {
+        let state = self.lock()?;
+        Ok((
+            state.snapshot.entries.clone(),
+            state.snapshot.deliveries.clone(),
+            state.snapshot.closing.clone(),
+        ))
+    }
+
     /// Observe sticky writer health without cloning any retained entries.
     pub(crate) fn check_health(&self) -> Result<()> {
         drop(self.lock()?);

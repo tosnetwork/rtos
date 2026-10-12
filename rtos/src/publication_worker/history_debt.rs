@@ -38,7 +38,12 @@ impl PublicationWorker {
     ) -> Result<NodeHistoryDebt> {
         budget.step()?;
         let (response, receiver) = oneshot::channel();
-        self.admit_draft(Submission::HistoryDebt { request, runtime, budget, response })?;
+        self.admit_draft(Submission::HistoryDebt {
+            request,
+            runtime,
+            budget,
+            response: super::Responder::new(response),
+        })?;
         // Dropping the observer does not cancel the actor's real blocking work.
         receiver.await.map_err(|e| error!("Node history debt owner: {e}"))?
     }
