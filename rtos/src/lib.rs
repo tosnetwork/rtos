@@ -60,6 +60,10 @@ pub mod test_helper;
 mod disk_full_validator_state_tests;
 
 #[cfg(test)]
+#[path = "tests/test_sst_validator_lease.rs"]
+mod sst_validator_lease_tests;
+
+#[cfg(test)]
 #[path = "tests/test_disk_full_persistent_files.rs"]
 mod disk_full_persistent_files_tests;
 

@@ -2060,6 +2060,13 @@ impl InternalDb {
         self.block_handle_storage.flush_validator_state()
     }
 
+    /// Actual physical owners, retained until the SST fixture has drained every
+    /// producer and completed native close. Never used by production callers.
+    #[cfg(test)]
+    pub(crate) fn sst_databases_for_test(&self) -> (Arc<RocksDb>, Arc<RocksDb>) {
+        (self.recovery_node_db.clone(), self.catchain_db.clone())
+    }
+
     /// Refuses a truncation whose new head lies below the durable
     /// validator-cleanup GC floor, or when that key is malformed.
     pub(crate) fn check_truncation_above_cleanup_floor(&self, new_head_seqno: u32) -> Result<()> {

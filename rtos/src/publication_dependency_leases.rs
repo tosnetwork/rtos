@@ -423,6 +423,19 @@ mod tests;
 #[path = "tests/test_disk_full_ledger.rs"]
 pub(crate) mod disk_full_tests;
 
+#[cfg(test)]
+pub(crate) fn sst_fixture_for_test() -> (
+    crate::repair_lease_binding::RepairLeaseBinding,
+    Vec<crate::repair_provenance::Dependency>,
+    BlockIdExt,
+) {
+    (
+        tests::binding_for_disk_full(),
+        tests::dependencies_for_disk_full(),
+        tests::dependency_block_for_disk_full(),
+    )
+}
+
 /// A journaled lease generation as the ledger holds it.
 #[derive(Clone, Debug)]
 pub(crate) enum LeaseBinding {
