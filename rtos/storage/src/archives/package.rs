@@ -17,7 +17,7 @@ use rtos_block::{error, fail, Result};
 use std::{
     io::SeekFrom,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
@@ -26,6 +26,8 @@ pub struct Package {
     path: PathBuf,
     read_only: bool,
     size: AtomicU64,
+    // A partial tail or uncertain metadata requires fresh-owner recovery.
+    write_healthy: AtomicBool,
     write_mutex: tokio::sync::Mutex<Option<tokio::fs::File>>,
 }
 
@@ -75,6 +77,7 @@ impl Package {
             path,
             read_only,
             size: AtomicU64::new(size),
+            write_healthy: AtomicBool::new(true),
             write_mutex: tokio::sync::Mutex::new(file),
         })
     }
@@ -94,6 +97,7 @@ impl Package {
         file.seek(SeekFrom::End(0)).await?;
         Ok(Self {
             path, read_only, size: AtomicU64::new(size),
+            write_healthy: AtomicBool::new(true),
             write_mutex: tokio::sync::Mutex::new(if read_only { None } else { Some(file) }),
         })
     }
@@ -139,25 +143,28 @@ impl Package {
     }
 
     pub async fn truncate(&self, size: u64) -> Result<()> {
-        let new_size = PKG_HEADER_SIZE as u64 + size;
-        let Some(file) = &mut *self.write_mutex.lock().await else {
+        let new_size = (PKG_HEADER_SIZE as u64)
+            .checked_add(size)
+            .ok_or_else(|| error!("Package truncate size overflow"))?;
+        let mut guard = self.write_mutex.lock().await;
+        if !self.write_healthy.load(Ordering::SeqCst) {
+            fail!("Package write state is uncertain; reopen before mutation");
+        }
+        let Some(file) = &mut *guard else {
             fail!(
                 "Cannot truncate package file {}, because it was not opened",
                 self.path().display()
-            )
+            );
         };
+        self.write_healthy.store(false, Ordering::SeqCst);
         let old_raw = self.size.load(Ordering::SeqCst);
         let old_file_len = file.metadata().await?.len();
-        log::warn!(
-            target: TARGET,
-            "Truncating package {}: raw_size {old_raw} -> {new_size}, \
-            file_len {old_file_len} -> {new_size}",
-            self.path.display()
-        );
-        self.size.store(new_size, Ordering::SeqCst);
+        log::warn!(target: TARGET, "Truncating package {}: raw_size {old_raw} -> {new_size}, file_len {old_file_len} -> {new_size}", self.path.display());
         file.set_len(new_size).await?;
-        // ftruncate doesn't move the write cursor; reset to EOF to avoid sparse-gap writes.
+        // ftruncate does not move the cursor; publish only after both complete.
         file.seek(SeekFrom::Start(new_size)).await?;
+        self.size.store(new_size, Ordering::SeqCst);
+        self.write_healthy.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -225,45 +232,40 @@ impl Package {
     ) -> Result<()> {
         debug_assert!(entry.filename().len() <= u16::MAX as usize);
         debug_assert!(entry.data().len() <= u32::MAX as usize);
-        let Some(file) = &mut *self.write_mutex.lock().await else {
+        let mut guard = self.write_mutex.lock().await;
+        if !self.write_healthy.load(Ordering::SeqCst) {
+            fail!("Package write state is uncertain; reopen before mutation");
+        }
+        let Some(file) = &mut *guard else {
             fail!(
                 "Cannot append entry to package file {}, because it was not opened",
                 self.path().display()
-            )
+            );
         };
+        // Neither an error nor an abandoned future may reset this admission.
+        self.write_healthy.store(false, Ordering::SeqCst);
         let actual_before = file.metadata().await?.len();
         let raw_size = self.size.load(Ordering::SeqCst);
         let entry_offset = raw_size - PKG_HEADER_SIZE as u64;
         if raw_size != actual_before {
-            log::error!(
-                target: TARGET,
-                "Package {} entry {} offset mismatch BEFORE write: \
-                raw_size={raw_size}, file_len={actual_before}, \
-                diff={}, entry_data_len={}, entry_filename={}",
-                self.path.display(),
-                entry.filename(),
-                actual_before as i64 - raw_size as i64,
-                entry.data().len(),
-                entry.filename(),
-            )
+            fail!("Package {} physical/logical length mismatch before append: {actual_before} != {raw_size}", self.path.display());
         }
         let entry_size = entry.write_to(file).await?;
-        // Pack data must be durable before the offset gets committed in `after_append`.
+        // Pack data must be durable before the offset gets committed.
         file.sync_data().await?;
-        let total_size = self.size.fetch_add(entry_size, Ordering::SeqCst) + entry_size;
+        let total_size = raw_size
+            .checked_add(entry_size)
+            .ok_or_else(|| error!("Package append size overflow"))?;
         let actual_after = file.metadata().await?.len();
         if total_size != actual_after {
-            log::error!(
-                target: TARGET,
-                "Package {} entry {} size mismatch AFTER write: \
-                expected_total={total_size}, file_len={actual_after}, \
-                diff={}, entry_size={entry_size}, raw_size_before={raw_size}",
-                self.path.display(),
-                entry.filename(),
-                actual_after as i64 - total_size as i64,
-            )
+            fail!("Package {} physical/logical length mismatch after append: {actual_after} != {total_size}", self.path.display());
         }
-        after_append(entry_offset, entry_offset + entry_size)
+        self.size.store(total_size, Ordering::SeqCst);
+        let result = after_append(entry_offset, total_size - PKG_HEADER_SIZE as u64);
+        if result.is_ok() {
+            self.write_healthy.store(true, Ordering::SeqCst);
+        }
+        result
     }
 
     pub async fn open_file(&self) -> Result<tokio::fs::File> {
@@ -398,6 +400,89 @@ mod protected_open_tests {
         assert!(appended > size);
         drop(package);
         assert!(Package::open_existing_exact(path.clone(), true, appended).await.is_ok());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod write_health_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn metadata_error_fences_append_and_truncate_until_fresh_owner_recovery() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("write-health.pack");
+        let package = Package::open(path.clone(), false, true).await?;
+        let seed = PackageEntry::with_data("seed".into(), b"acknowledged bytes".to_vec());
+        package.append_entry(&seed, |_, _| Ok(())).await?;
+        let committed_end = package.size();
+        let original = std::fs::read(&path)?;
+        let target = PackageEntry::with_data("target".into(), b"uncommitted metadata".to_vec());
+        let error = package
+            .append_entry(&target, |_, _| Err(error!("metadata commit refused")))
+            .await
+            .expect_err("metadata callback failure must propagate");
+        assert!(error.to_string().contains("metadata commit refused"));
+        let uncertain = std::fs::read(&path)?;
+        assert!(uncertain.starts_with(&original));
+        assert!(uncertain.len() > original.len());
+        let read = package.read_entry(0).await?;
+        assert_eq!(read.filename(), seed.filename());
+        assert_eq!(read.data(), seed.data());
+        let calls = AtomicU64::new(0);
+        let error = package
+            .append_entry(&target, |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .expect_err("unhealthy append must be refused");
+        assert!(error.to_string().contains("write state is uncertain"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let error =
+            package.truncate(committed_end).await.expect_err("unhealthy truncate must be refused");
+        assert!(error.to_string().contains("write state is uncertain"));
+        assert_eq!(std::fs::read(&path)?, uncertain, "refusal must not repair or mutate bytes");
+        drop(package);
+        assert!(Package::open_existing_exact(path.clone(), false, committed_end).await.is_err());
+        assert_eq!(
+            std::fs::read(&path)?,
+            uncertain,
+            "protected reopen must preserve uncertain history"
+        );
+        // This models only the explicitly unprotected durable-end recovery policy.
+        let recovered = Package::open(path.clone(), false, false).await?;
+        recovered.truncate(committed_end).await?;
+        assert_eq!(std::fs::read(&path)?, original);
+        recovered.append_entry(&target, |_, _| Ok(())).await?;
+        let entry = recovered.read_entry(committed_end).await?;
+        assert_eq!(entry.filename(), target.filename());
+        assert_eq!(entry.data(), target.data());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prewrite_length_mismatch_is_refused_and_latches_write_health() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("length-mismatch.pack");
+        let package = Package::open(path.clone(), false, true).await?;
+        let seed = PackageEntry::with_data("seed".into(), b"seed".to_vec());
+        package.append_entry(&seed, |_, _| Ok(())).await?;
+        use std::io::Write;
+        std::fs::OpenOptions::new().append(true).open(&path)?.write_all(b"foreign tail")?;
+        let before = std::fs::read(&path)?;
+        let error = package
+            .append_entry(&seed, |_, _| panic!("mismatch must precede metadata"))
+            .await
+            .expect_err("length mismatch must fail closed");
+        assert!(error.to_string().contains("length mismatch before append"));
+        assert_eq!(std::fs::read(&path)?, before);
+        assert!(package
+            .truncate(0)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("write state is uncertain"));
         Ok(())
     }
 }
