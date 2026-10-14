@@ -973,6 +973,68 @@ impl RocksDbAsyncKeyValueStorage {
 
 impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
     #[cfg(any(test, feature = "test-utils"))]
+    fn sst_for_test(
+        &self,
+        action: crate::TestSstAction,
+    ) -> StorageAsyncResultPtr<crate::TestSstSnapshot> {
+        if self.is_closed.load(Ordering::SeqCst) {
+            return Self::closed_error_result();
+        }
+        let result = StorageAsyncResultImpl::new();
+        let completed = result.clone();
+        self.post_task(Box::new(move |db, _, _| {
+            use crate::{TestSstAction, TestSstFile, TestSstSnapshot};
+            use std::ops::Deref;
+            let operation = || -> Result<TestSstSnapshot> {
+                let raw = db.deref().deref();
+                match action {
+                    TestSstAction::Configure => raw.set_options(&[
+                        ("disable_auto_compactions", "true"),
+                        ("write_buffer_size", "16777216"),
+                    ])?,
+                    TestSstAction::Inspect => (),
+                    TestSstAction::Flush => raw.flush()?,
+                    TestSstAction::Compact { force } => {
+                        let mut opts = rocksdb::CompactOptions::default();
+                        opts.set_exclusive_manual_compaction(true);
+                        opts.set_change_level(true);
+                        opts.set_target_level(6);
+                        opts.set_bottommost_level_compaction(if force {
+                            rocksdb::BottommostLevelCompaction::Force
+                        } else {
+                            rocksdb::BottommostLevelCompaction::Skip
+                        });
+                        raw.compact_range_opt::<&[u8], &[u8]>(None, None, &opts);
+                    }
+                }
+                let mut files: Vec<_> = raw
+                    .live_files()?
+                    .into_iter()
+                    .map(|f| TestSstFile {
+                        name: f.name,
+                        cf: f.column_family_name,
+                        level: f.level,
+                        size: f.size,
+                        start: f.start_key.unwrap_or_default(),
+                        end: f.end_key.unwrap_or_default(),
+                    })
+                    .collect();
+                files.sort_by(|a, b| a.name.cmp(&b.name));
+                Ok(TestSstSnapshot {
+                    physical_path: raw.path().to_owned(),
+                    files,
+                    background_errors: raw.property_int_value("rocksdb.background-errors")?,
+                    running_flushes: raw.property_int_value("rocksdb.num-running-flushes")?,
+                    running_compactions: raw
+                        .property_int_value("rocksdb.num-running-compactions")?,
+                    compact_returned_unit: matches!(action, TestSstAction::Compact { .. }),
+                })
+            };
+            completed.set(operation());
+        }));
+        result
+    }
+    #[cfg(any(test, feature = "test-utils"))]
     fn flush_for_disk_full_test(&self) -> Result<()> {
         let result = StorageAsyncResultImpl::<()>::new();
         let completed = result.clone();
@@ -1453,3 +1515,14 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/test_disk_full_consensus.rs"]
 mod disk_full_tests;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) fn unsupported_sst_result() -> StorageAsyncResultPtr<crate::TestSstSnapshot> {
+    let result = StorageAsyncResultImpl::new();
+    result.set(Err(rtos_block::error!("SST test operations unsupported by this backend")));
+    result
+}
+
+#[cfg(test)]
+#[path = "tests/test_sst_consensus.rs"]
+mod sst_disk_full_tests;

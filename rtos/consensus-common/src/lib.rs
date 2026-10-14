@@ -433,7 +433,45 @@ impl Default for AsyncKeyValueStorageOptions {
 /// - **Creation**: Blocks until DB is opened, propagates open errors
 /// - **Drop**: Syncs pending ops, waits for threads to stop
 /// - **Destroy**: Call `mark_for_destroy()`, erases DB files on drop
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Copy, Debug)]
+pub enum TestSstAction {
+    Configure,
+    Inspect,
+    Flush,
+    Compact { force: bool },
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestSstFile {
+    pub name: String,
+    pub cf: String,
+    pub level: i32,
+    pub size: usize,
+    pub start: Vec<u8>,
+    pub end: Vec<u8>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Debug)]
+pub struct TestSstSnapshot {
+    pub physical_path: std::path::PathBuf,
+    pub files: Vec<TestSstFile>,
+    pub background_errors: Option<u64>,
+    pub running_flushes: Option<u64>,
+    pub running_compactions: Option<u64>,
+    pub compact_returned_unit: bool,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub mod sst_test_support;
 pub trait AsyncKeyValueStorage: Send + Sync {
+    /// Native maintenance on the owning FIFO queue, available only to tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    fn sst_for_test(&self, _action: TestSstAction) -> StorageAsyncResultPtr<TestSstSnapshot> {
+        async_key_value_storage::unsupported_sst_result()
+    }
     /// Rotate the WAL on the owning queue before a real disk-full probe.
     #[cfg(any(test, feature = "test-utils"))]
     fn flush_for_disk_full_test(&self) -> Result<()> {

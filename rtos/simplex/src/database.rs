@@ -1937,3 +1937,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/test_disk_full_database.rs"]
 mod disk_full_tests;
+
+#[cfg(test)]
+#[path = "tests/test_sst_database.rs"]
+mod sst_disk_full_tests;
