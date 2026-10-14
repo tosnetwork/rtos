@@ -110,7 +110,7 @@ async fn open(
     drop(storage);
     sole(&handles_db).await;
     let pack_root = Arc::new(path.join("pack_root"));
-    std::fs::create_dir_all(&pack_root).unwrap();
+    std::fs::create_dir_all(pack_root.as_path()).unwrap();
     let mode = if key { PackageType::KeyBlocks } else { PackageType::Blocks };
     let existed = provider.db().cf_handle(Kind::Status.cf(key)).is_some();
     let slice = if existed {
