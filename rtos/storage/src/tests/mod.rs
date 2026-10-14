@@ -96,3 +96,4 @@ pub mod utils {
         read_single_root_boc(data).unwrap()
     }
 }
+mod sst_state_tests;
