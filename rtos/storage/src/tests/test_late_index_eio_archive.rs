@@ -77,6 +77,7 @@ async fn exercise(update: bool) {
     })
     .await
     .unwrap();
+    eprintln!("LATE-INDEX SEEDS_SYNCED");
     let seeds = late::indices(&db, CF);
     let gates = Arc::new(AtomicUsize::new(0));
     *states.late_index_gate.lock().unwrap() =

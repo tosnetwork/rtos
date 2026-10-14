@@ -31,6 +31,11 @@ async fn close(db: Arc<RocksDb>, states: Arc<ShardStateDb>) {
     drop(states);
     late::close_db(db).await;
 }
+async fn barrier(states: &ShardStateDb) -> Result<()> {
+    tokio::time::timeout(TIMEOUT, states.sync_pending())
+        .await
+        .expect("barrier timed out; cold forbidden")
+}
 struct Receipt {
     count: AtomicUsize,
     notify: tokio::sync::Notify,
@@ -76,17 +81,19 @@ async fn ordinary_late_index_eio() {
         ordinary(&states, seq, receipt.clone()).await;
         receipt.success().await;
     }
-    states.sync_pending().await.unwrap();
+    barrier(&states).await.unwrap();
+    eprintln!("LATE-INDEX SEEDS_SYNCED");
     let seeds = late::indices(&db, CF);
     let gates = Arc::new(AtomicUsize::new(0));
     *states.late_index_gate.lock().unwrap() =
         Some(late::gate(db.clone(), CF, seeds.clone(), gates.clone()));
     let mut failure = states.write_failure.subscribe();
     let receipt = Receipt::new();
+    let attempts_before = states.ordinary_index_attempts.load(Ordering::SeqCst);
     ordinary(&states, 2, receipt.clone()).await;
     if control {
         receipt.success().await;
-        states.sync_pending().await.unwrap();
+        barrier(&states).await.unwrap();
     } else {
         tokio::time::timeout(TIMEOUT, async {
             while failure.borrow().is_none() {
@@ -97,9 +104,20 @@ async fn ordinary_late_index_eio() {
         .unwrap();
         late::check_eio(failure.borrow().as_ref().unwrap());
         assert_eq!(receipt.count.load(Ordering::SeqCst), 0);
-        assert!(states.sync_pending().await.is_err());
+        assert!(barrier(&states).await.is_err());
         assert!(states.with_absent_state(&support::graph(3).0, || Ok(())).is_err());
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        tokio::time::timeout(TIMEOUT, async {
+            while states.ordinary_index_attempts.load(Ordering::SeqCst) < attempts_before + 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("actual failed index retry not observed; cold forbidden");
+        assert_eq!(receipt.count.load(Ordering::SeqCst), 0);
+        eprintln!(
+            "LATE-INDEX REF_RETRY_OBSERVED attempts={}",
+            states.ordinary_index_attempts.load(Ordering::SeqCst) - attempts_before
+        );
     }
     assert_eq!(gates.load(Ordering::SeqCst), 1);
     late::inspect(&db, CF, &seeds, control, true);
@@ -117,7 +135,7 @@ async fn ordinary_late_index_eio() {
     let retry = Receipt::new();
     ordinary(&states, 2, retry.clone()).await;
     retry.success().await;
-    states.sync_pending().await.unwrap();
+    barrier(&states).await.unwrap();
     late::inspect(&db, CF, &seeds, true, true);
     let index = states.shardstate_db.get(&support::graph(2).0).unwrap().to_vec();
     close(db, states).await;

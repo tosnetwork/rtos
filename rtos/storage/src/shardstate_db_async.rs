@@ -202,6 +202,8 @@ pub struct ShardStateDb {
     write_failure: tokio::sync::watch::Sender<Option<String>>,
     #[cfg(test)]
     late_index_gate: std::sync::Mutex<Option<crate::durability::LateIndexGate>>,
+    #[cfg(test)]
+    ordinary_index_attempts: std::sync::atomic::AtomicUsize,
     bounded_read_gate: std::sync::RwLock<()>,
     in_queue: AtomicU32,
     stop: Arc<AtomicU8>,
@@ -251,6 +253,8 @@ impl ShardStateDb {
             write_failure: tokio::sync::watch::channel(None).0,
             #[cfg(test)]
             late_index_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            ordinary_index_attempts: std::sync::atomic::AtomicUsize::new(0),
             in_queue: AtomicU32::new(0),
             stop: Arc::new(AtomicU8::new(0)),
             task_owners: Default::default(),
@@ -968,7 +972,10 @@ impl ShardStateDb {
         }
         let save_utime = UnixTime::now();
         let db_entry = DbEntry::with_params(id.clone(), cell_id.clone(), save_utime);
-        self.shardstate_db.put(id, &db_entry.serialize())?;
+        let index_result = self.shardstate_db.put(id, &db_entry.serialize());
+        #[cfg(test)]
+        self.ordinary_index_attempts.fetch_add(1, Ordering::SeqCst);
+        index_result?;
 
         log::trace!(
             target: TARGET,
