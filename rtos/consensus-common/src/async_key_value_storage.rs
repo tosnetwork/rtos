@@ -972,7 +972,7 @@ impl RocksDbAsyncKeyValueStorage {
 }
 
 impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     fn flush_for_disk_full_test(&self) -> Result<()> {
         let result = StorageAsyncResultImpl::<()>::new();
         let completed = result.clone();

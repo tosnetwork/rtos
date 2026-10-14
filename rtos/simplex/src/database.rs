@@ -1933,3 +1933,7 @@ impl Drop for SimplexDb {
 #[cfg(test)]
 #[path = "tests/test_database.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/test_disk_full_database.rs"]
+mod disk_full_tests;

@@ -1287,3 +1287,7 @@ impl ArchiveSlice {
 #[cfg(test)]
 #[path = "../tests/test_archive_slice.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/test_disk_full_archive.rs"]
+mod disk_full_tests;
