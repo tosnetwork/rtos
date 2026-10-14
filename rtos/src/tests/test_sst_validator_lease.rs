@@ -10,6 +10,7 @@ use crate::{
     test_helper::TestEngine,
 };
 use rtos_block::{Result, UInt256};
+use storage::sst_native_test as rocksdb;
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 use storage::{db::rocksdb::RocksDb, shardstate_db_async::AllowStateGcResolver};
 
