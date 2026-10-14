@@ -972,6 +972,17 @@ impl RocksDbAsyncKeyValueStorage {
 }
 
 impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
+    #[cfg(test)]
+    fn flush_for_disk_full_test(&self) -> Result<()> {
+        let result = StorageAsyncResultImpl::<()>::new();
+        let completed = result.clone();
+        self.post_task(Box::new(move |db, _, _| {
+            use std::ops::Deref;
+            completed.set(db.deref().deref().flush().map_err(Into::into));
+        }));
+        result.wait_timeout(Duration::from_secs(10)).expect("disk-full flush timed out")
+    }
+
     fn get(
         &self,
         key: StorageKey,
@@ -1438,3 +1449,7 @@ impl Drop for RocksDbAsyncKeyValueStorage {
 #[cfg(test)]
 #[path = "tests/test_async_key_value_storage.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/test_disk_full_consensus.rs"]
+mod disk_full_tests;

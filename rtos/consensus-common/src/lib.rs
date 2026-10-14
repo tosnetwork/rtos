@@ -434,6 +434,11 @@ impl Default for AsyncKeyValueStorageOptions {
 /// - **Drop**: Syncs pending ops, waits for threads to stop
 /// - **Destroy**: Call `mark_for_destroy()`, erases DB files on drop
 pub trait AsyncKeyValueStorage: Send + Sync {
+    /// Rotate the WAL on the owning queue before a real disk-full probe.
+    #[cfg(test)]
+    fn flush_for_disk_full_test(&self) -> Result<()> {
+        rtos_block::fail!("disk-full flush is only supported by the RocksDB implementation")
+    }
     // =========================================================================
     // Read Operations (Async)
     // =========================================================================
