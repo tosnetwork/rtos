@@ -349,11 +349,11 @@ impl ArchiveSlice {
             let size = ret.package_status_db.get_value::<u64>(&PackageStatusKey::NonSlicedSize)?;
             // Live append persists the end under the non-sliced sentinel; imports
             // historically used index zero. Never infer a committed end from the file.
+            let meta = match ret.entry_db.try_get_value(&u32::MAX.into())? {
+                Some(meta) => Some(meta),
+                None => ret.entry_db.try_get_value(&0.into())?,
+            };
             let (size, version) = if matches!(mode, PackageOpenMode::PreserveExisting) {
-                let meta = match ret.entry_db.try_get_value(&u32::MAX.into())? {
-                    Some(meta) => Some(meta),
-                    None => ret.entry_db.try_get_value(&0.into())?,
-                };
                 match meta {
                     Some(meta) => {
                         // A legacy explicit truncation left only this status updated.
@@ -365,7 +365,12 @@ impl ArchiveSlice {
                     },
                     None => (size, 0),
                 }
-            } else { (size, 0) };
+            } else {
+                // Legacy explicit truncation updates only NonSlicedSize; keep
+                // that committed boundary, but never discard a stored version
+                // that enables recovery of an unacknowledged package tail.
+                (size, meta.map_or(0, |meta| meta.version()))
+            };
             let entry = ret.get_base_entry_info();
             ret.open_package(entry, None, size, version, mode).await?;
         }
