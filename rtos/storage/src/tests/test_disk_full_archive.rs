@@ -48,7 +48,11 @@ fn flush(db: &Arc<RocksDb>) {
     let names = rocksdb::DB::list_cf(&rocksdb::Options::default(), db.path()).unwrap();
     let raw = db.as_ref().deref();
     for name in names {
-        raw.flush_cf(&raw.cf_handle(&name).unwrap()).unwrap();
+        if name == "default" {
+            raw.flush().unwrap();
+        } else {
+            raw.flush_cf(&raw.cf_handle(&name).expect("named provider CF must be open")).unwrap();
+        }
     }
     db.sync_wal().unwrap();
 }
