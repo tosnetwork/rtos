@@ -532,3 +532,141 @@ normal!(archive_keys_entry_roundtrip, true, Entry);
 normal!(archive_keys_index_roundtrip, true, Index);
 normal!(archive_keys_offset_roundtrip, true, Offset);
 normal!(archive_keys_status_roundtrip, true, Status);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archive_key_cold_version_and_unacknowledged_tail_recovery() {
+    use std::io::Write;
+    let path = tempfile::tempdir().unwrap();
+    let (db, handles_db, slice, handles) = open(path.path(), true).await;
+    put(&slice, &handles[0]).await;
+    put(&slice, &handles[1]).await;
+    let acknowledged = inspect(&db, &slice, &handles[..2], true).await;
+    let package = acknowledged.packs.keys().next().unwrap().clone();
+    close(db, handles_db, slice, handles, 2).await;
+    let mut file = std::fs::OpenOptions::new().append(true).open(&package).unwrap();
+    file.write_all(b"private unacknowledged package tail").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let (db, handles_db, slice, handles) = open(path.path(), true).await;
+    assert_eq!(
+        inspect(&db, &slice, &handles[..2], true).await,
+        acknowledged,
+        "unprotected cold recovery retained an unACKed tail"
+    );
+    assert_eq!(infos(&slice, &handles[..1]).await[0].version(), DEFAULT_PKG_VERSION);
+    put(&slice, &handles[4]).await;
+    let meta = slice.entry_db.get_value(&u32::MAX.into()).unwrap();
+    assert_eq!(meta.version(), DEFAULT_PKG_VERSION, "cold append downgraded package version");
+    close(db, handles_db, slice, handles, 2).await;
+    let (db, handles_db, slice, handles) = open(path.path(), true).await;
+    assert_eq!(infos(&slice, &handles[..1]).await[0].version(), DEFAULT_PKG_VERSION);
+    let found = slice
+        .get_file(&handles[4], &PackageEntryId::Block(handles[4].id()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.data(), payload(&handles[4]));
+    close(db, handles_db, slice, handles, 2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archive_key_legacy_status_truncation_keeps_committed_boundary() {
+    let path = tempfile::tempdir().unwrap();
+    let (db, handles_db, slice, handles) = open(path.path(), true).await;
+    put(&slice, &handles[0]).await;
+    let first = inspect(&db, &slice, &handles[..1], true).await;
+    let package = first.packs.keys().next().unwrap().clone();
+    let size = first.packs[&package].len() as u64 - PKG_HEADER_SIZE as u64;
+    put(&slice, &handles[1]).await;
+    close(db, handles_db, slice, handles, 2).await;
+    let db = RocksDb::new(path.path(), "archive_provider", None, AccessType::ReadWrite).unwrap();
+    let status = PackageStatusDb::with_db(db.clone(), Kind::Status.cf(true), false).unwrap();
+    status.put_value(&PackageStatusKey::NonSlicedSize, &size).unwrap();
+    db.sync_wal().unwrap();
+    drop(status);
+    sole(&db).await;
+    joined(move || {
+        db.db().cancel_all_background_work(true);
+        drop(db);
+    })
+    .await;
+    let (db, handles_db, slice, handles) = open(path.path(), true).await;
+    assert_eq!(
+        std::fs::read(&package).unwrap(),
+        first.packs[&package],
+        "status-only committed truncation lost its boundary"
+    );
+    assert_eq!(infos(&slice, &handles[..1]).await[0].version(), DEFAULT_PKG_VERSION);
+    let found = slice
+        .get_file(&handles[0], &PackageEntryId::Block(handles[0].id()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.data(), payload(&handles[0]));
+    // The legacy truncation leaves stale second-entry indices; do not claim their cleanup.
+    close(db, handles_db, slice, handles, 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archive_key_protected_length_mismatch_refuses_without_file_mutation() {
+    let path = tempfile::tempdir().unwrap();
+    let (db, handles_db, slice, handles) = open(path.path(), true).await;
+    put(&slice, &handles[0]).await;
+    let first = inspect(&db, &slice, &handles[..1], true).await;
+    let size = first.packs.values().next().unwrap().len() as u64 - PKG_HEADER_SIZE as u64;
+    put(&slice, &handles[1]).await;
+    let acknowledged = inspect(&db, &slice, &handles[..2], true).await;
+    let packages = infos(&slice, &handles[..2]).await;
+    let protected = handles[0].id().clone();
+    drop(slice);
+    drop(handles);
+    assert!(packages.iter().all(|p| Arc::strong_count(p) == 1));
+    for info in &packages {
+        info.package().close_for_sst_test().await.unwrap();
+    }
+    drop(packages);
+    sole(&db).await;
+    sole(&handles_db).await;
+    let status = PackageStatusDb::with_db(db.clone(), Kind::Status.cf(true), false).unwrap();
+    status.put_value(&PackageStatusKey::NonSlicedSize, &size).unwrap();
+    db.sync_wal().unwrap();
+    drop(status);
+    db.repair_protection()
+        .register(
+            77,
+            crate::repair_protection::LeaseProtection {
+                artifacts: vec![protected],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let result = ArchiveSlice::with_data(
+        db.repair_protection().clone(),
+        db.clone(),
+        Arc::new(path.path().join("pack_root")),
+        0,
+        PackageType::KeyBlocks,
+        false,
+        false,
+        #[cfg(feature = "telemetry")]
+        Arc::new(StorageTelemetry::default()),
+        Arc::new(StorageAlloc::default()),
+    )
+    .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("protected ambiguous package accepted"),
+    };
+    assert!(error.to_string().contains("ambiguous durable length metadata"));
+    for (package, bytes) in acknowledged.packs {
+        assert_eq!(std::fs::read(package).unwrap(), bytes);
+    }
+    sole(&db).await;
+    joined(move || {
+        db.db().cancel_all_background_work(true);
+        handles_db.db().cancel_all_background_work(true);
+        drop(db);
+        drop(handles_db);
+    })
+    .await;
+}
