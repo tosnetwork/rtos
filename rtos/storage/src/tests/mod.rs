@@ -97,3 +97,4 @@ pub mod utils {
     }
 }
 mod sst_state_tests;
+mod sst_state_metadata_tests;
