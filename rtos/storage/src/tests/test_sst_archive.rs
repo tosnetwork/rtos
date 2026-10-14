@@ -249,7 +249,7 @@ async fn inspect(
             ARCHIVE_PACKAGE_SIZE
         );
         assert_eq!(
-            slice.package_status_db.get_value::<u32>(&PackageStatusKey::ShardSplitDepth).unwrap(),
+            slice.package_status_db.get_value::<u8>(&PackageStatusKey::ShardSplitDepth).unwrap(),
             0
         );
     }
@@ -257,11 +257,14 @@ async fn inspect(
     for info in packages {
         let meta = slice
             .entry_db
-            .get_value::<PackageEntryMeta>(&if key { u32::MAX.into() } else { info.index().into() })
+            .get_value(&if key { u32::MAX.into() } else { info.index().into() })
             .unwrap();
         assert_eq!(meta.entry_size(), info.package().size());
         assert_eq!(meta.version(), DEFAULT_PKG_VERSION);
-        assert_eq!(meta.get_info().unwrap(), if key { None } else { Some(info.entry().clone()) });
+        assert!(
+            meta.get_info().unwrap() == if key { None } else { Some(info.entry().clone()) },
+            "archive metadata package identity changed"
+        );
         let bytes = std::fs::read(info.package().path()).unwrap();
         assert_eq!(bytes.len() as u64, info.package().size() + PKG_HEADER_SIZE as u64);
         packs.insert(info.package().path().to_path_buf(), bytes);
