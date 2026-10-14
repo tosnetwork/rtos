@@ -1528,7 +1528,7 @@ mod test {
         }
 
         async fn stop(&self) {
-            self.db.stop_states_db().await
+            self.db.stop_states_db().await.expect("console test state owners failed to stop")
         }
     }
 
