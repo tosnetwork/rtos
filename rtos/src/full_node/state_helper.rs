@@ -14,6 +14,17 @@ use rtos_block::{fail, BlockIdExt, BocReader, Result};
 use std::io::{Cursor, Seek, SeekFrom, Write};
 use storage::types::PersistentStatePartId;
 
+/// A downloaded chunk is complete only after every byte reaches its writer.
+/// This boundary does not claim that the destination has been synced to disk.
+fn append_downloaded_chunk(dest: &mut impl Write, bytes: &[u8]) -> Result<usize> {
+    dest.write_all(bytes)?;
+    Ok(bytes.len())
+}
+
+#[cfg(test)]
+#[path = "../tests/test_state_chunk_write.rs"]
+mod chunk_write_tests;
+
 #[allow(clippy::too_many_arguments)]
 pub async fn download_pss_part<T: Write + Seek>(
     id: &PersistentStatePartId,
@@ -79,8 +90,7 @@ pub async fn download_pss_part<T: Write + Seek>(
                     }
                 }
                 part_attempt = 0;
-                let len = next_bytes.len();
-                dest.write(&next_bytes)?;
+                let len = append_downloaded_chunk(dest, &next_bytes)?;
                 if part % 10 == 0 {
                     if size > 0 {
                         log::info!(

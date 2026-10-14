@@ -1845,26 +1845,27 @@ impl Engine {
                 id
             );
 
-            let block_n_proof = loop {
-                // MC blocks require full proof verification (signatures + key-block chain).
-                // A proof link created from raw block data provides only shallow verification,
-                // so skip the candidates cache for masterchain blocks and download a real proof.
-                if !id.shard().is_masterchain() {
-                    if let Some(block_data) = self.try_get_cached_block_candidate(id) {
-                        let block = BlockStuff::deserialize_block(id.clone(), block_data.clone())?;
-                        let proof = create_new_proof_link(&block)?;
-                        log::trace!(
-                            "download_and_apply_block_worker {} loaded from candidates cache",
-                            id
-                        );
-                        break Some((block, proof));
-                    }
-                }
+            // MC blocks require full proof verification (signatures + key-block chain).
+            // A proof link from raw candidate data provides only shallow verification.
+            let cached = if id.shard().is_masterchain() {
+                None
+            } else {
+                self.try_get_cached_block_candidate(id)
+            };
+            let block_n_proof = if let Some(block_data) = cached {
+                let block = BlockStuff::deserialize_block(id.clone(), block_data.clone())?;
+                let proof = create_new_proof_link(&block)?;
+                log::trace!(
+                    "download_and_apply_block_worker {} loaded from candidates cache",
+                    id
+                );
+                Some((block, proof))
+            } else {
                 // for pre-apply only 10 attempts, for apply - infinity
                 let (attempts, timeout) =
                     if pre_apply { (Some(10), Some((50, 15, 500))) } else { (None, None) };
 
-                break self.download_block_with_policy(id, attempts, timeout).await?;
+                self.download_block_with_policy(id, attempts, timeout).await?
             };
 
             if let Some((block, proof)) = block_n_proof {
