@@ -1117,3 +1117,7 @@ mod bounded_read_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_disk_full_shardstate.rs"]
+mod disk_full_tests;

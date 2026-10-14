@@ -13,6 +13,7 @@ mod test_catchain_persistent_db;
 mod test_dynamic_boc_archive_db;
 mod test_dynamic_boc_rc_db;
 mod test_shardstate_db_async;
+pub(crate) mod disk_full_state_support;
 
 pub mod utils {
 

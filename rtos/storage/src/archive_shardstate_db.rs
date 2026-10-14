@@ -272,3 +272,7 @@ mod bounded_writer;
 #[cfg(test)]
 #[path = "tests/test_bounded_archive_writer.rs"]
 mod bounded_writer_tests;
+
+#[cfg(test)]
+#[path = "tests/test_disk_full_archive_state.rs"]
+mod disk_full_tests;
