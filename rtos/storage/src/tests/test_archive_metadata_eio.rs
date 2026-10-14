@@ -11,7 +11,7 @@ use crate::{
 use rtos_block::UInt256;
 use std::{collections::BTreeMap, sync::atomic::AtomicUsize, time::Duration};
 
-type Rows = BTreeMap<Vec<u8>, Vec<u8>>;
+pub(super) type Rows = BTreeMap<Vec<u8>, Vec<u8>>;
 fn stage() -> MetadataCut {
     match std::env::var("RTOS_ARCHIVE_META_STAGE").unwrap().as_str() {
         "entry" => MetadataCut::EntryMeta,
@@ -21,10 +21,10 @@ fn stage() -> MetadataCut {
         _ => panic!("invalid archive metadata stage"),
     }
 }
-fn cf(kind: &str, key: bool) -> String {
+pub(super) fn cf(kind: &str, key: bool) -> String {
     format!("{kind}_{}db_0", if key { "key_" } else { "" })
 }
-fn rows(db: &Arc<RocksDb>, name: &str) -> Rows {
+pub(super) fn rows(db: &Arc<RocksDb>, name: &str) -> Rows {
     let mut result = Rows::new();
     db.clone()
         .table::<String>(name, false)
@@ -36,7 +36,7 @@ fn rows(db: &Arc<RocksDb>, name: &str) -> Rows {
         .unwrap();
     result
 }
-fn old_rows(db: &Arc<RocksDb>, key: bool, old: &[Rows; 2]) {
+pub(super) fn old_rows(db: &Arc<RocksDb>, key: bool, old: &[Rows; 2]) {
     for (kind, old) in ["offsets", "block_index"].into_iter().zip(old) {
         let current = rows(db, &cf(kind, key));
         for (id, value) in old {
@@ -44,10 +44,10 @@ fn old_rows(db: &Arc<RocksDb>, key: bool, old: &[Rows; 2]) {
         }
     }
 }
-fn payload(handle: &BlockHandle) -> Vec<u8> {
+pub(super) fn payload(handle: &BlockHandle) -> Vec<u8> {
     format!("actual metadata EIO block {}", handle.id().seq_no()).into_bytes()
 }
-async fn native(path: &Path, key: bool) -> (Arc<RocksDb>, Arc<RocksDb>, Vec<Arc<BlockHandle>>) {
+pub(super) async fn native(path: &Path, key: bool) -> (Arc<RocksDb>, Arc<RocksDb>, Vec<Arc<BlockHandle>>) {
     let provider = RocksDb::new(path, "archive_provider", None, AccessType::ReadWrite).unwrap();
     let handles_db = RocksDb::new(path, "handle_db", None, AccessType::ReadWrite).unwrap();
     let (storage, table) = create_block_handle_storage(handles_db.clone());
@@ -74,12 +74,12 @@ async fn native(path: &Path, key: bool) -> (Arc<RocksDb>, Arc<RocksDb>, Vec<Arc<
     drop(table);
     (provider, handles_db, handles)
 }
-fn protect(db: &Arc<RocksDb>, id: &BlockIdExt) {
+pub(super) fn protect(db: &Arc<RocksDb>, id: &BlockIdExt) {
     db.repair_protection()
         .register(77, LeaseProtection { artifacts: vec![id.clone()], ..Default::default() })
         .unwrap();
 }
-async fn open(
+pub(super) async fn open(
     db: &Arc<RocksDb>,
     path: &Path,
     key: bool,
@@ -118,7 +118,7 @@ async fn open(
         .await
     }
 }
-async fn produce(slice: &ArchiveSlice, handle: &BlockHandle) -> Result<Vec<u8>> {
+pub(super) async fn produce(slice: &ArchiveSlice, handle: &BlockHandle) -> Result<Vec<u8>> {
     tokio::time::timeout(
         late::TIMEOUT,
         slice.add_file(handle, &PackageEntryId::Block(handle.id()), payload(handle)),
@@ -126,7 +126,7 @@ async fn produce(slice: &ArchiveSlice, handle: &BlockHandle) -> Result<Vec<u8>> 
     .await
     .expect("archive add_file owner timed out; no cold reopen")
 }
-async fn package(slice: &ArchiveSlice, handle: &BlockHandle) -> Arc<PackageInfo> {
+pub(super) async fn package(slice: &ArchiveSlice, handle: &BlockHandle) -> Arc<PackageInfo> {
     let ChosenPackage::Info(info) =
         slice.choose_package(handle.id().seq_no(), handle.id().shard()).await.unwrap()
     else {
@@ -134,7 +134,7 @@ async fn package(slice: &ArchiveSlice, handle: &BlockHandle) -> Arc<PackageInfo>
     };
     info
 }
-async fn reads(slice: &ArchiveSlice, handles: &[Arc<BlockHandle>]) {
+pub(super) async fn reads(slice: &ArchiveSlice, handles: &[Arc<BlockHandle>]) {
     let prefix = AccountIdPrefixFull { workchain_id: -1, prefix: 0 };
     for handle in handles {
         let entry = PackageEntryId::Block(handle.id());
@@ -165,7 +165,7 @@ async fn reads(slice: &ArchiveSlice, handles: &[Arc<BlockHandle>]) {
         assert_eq!(found, vec![(handle.id().clone(), payload(handle))]);
     }
 }
-fn target_rows(db: &Arc<RocksDb>, key: bool, handle: &BlockHandle, offset: bool, index: bool) {
+pub(super) fn target_rows(db: &Arc<RocksDb>, key: bool, handle: &BlockHandle, offset: bool, index: bool) {
     let offsets = PackageOffsetsDb::with_db(db.clone(), &cf("offsets", key), false).unwrap();
     assert_eq!(offsets.contains(&(&PackageEntryId::Block(handle.id())).into()).unwrap(), offset);
     let lookup = rows(db, &cf("block_index", key));
@@ -214,7 +214,7 @@ async fn close(
     late::close_db(handles_db).await;
     eprintln!("ARCHIVE-META NATIVE_ALL_CLOSED");
 }
-fn snapshot(db: &Arc<RocksDb>, key: bool, path: &Path) -> (Vec<Rows>, Vec<u8>) {
+pub(super) fn snapshot(db: &Arc<RocksDb>, key: bool, path: &Path) -> (Vec<Rows>, Vec<u8>) {
     (
         ["entry_meta", "status", "offsets", "block_index"]
             .map(|kind| rows(db, &cf(kind, key)))

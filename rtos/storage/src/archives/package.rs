@@ -138,6 +138,15 @@ impl Package {
         self.path.as_path()
     }
 
+    /// Borrow the actual writer identity; does not clone or transfer its fd.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) async fn writer_fd_for_io_test(&self) -> Result<std::ffi::c_int> {
+        use std::os::fd::AsRawFd;
+        let guard = self.write_mutex.lock().await;
+        let file = guard.as_ref().ok_or_else(|| error!("Package writer is closed"))?;
+        Ok(file.as_raw_fd())
+    }
+
     /// Complete pending package IO and observe the actual Linux fd close result.
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) async fn close_for_sst_test(&self) -> Result<()> {

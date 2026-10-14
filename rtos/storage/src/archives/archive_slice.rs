@@ -1334,3 +1334,7 @@ mod sst_disk_full_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../tests/test_archive_metadata_eio.rs"]
 mod metadata_eio_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/test_archive_package_io_eio.rs"]
+mod package_io_eio_tests;
