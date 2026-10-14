@@ -522,6 +522,15 @@ impl FullNodeOverlayService {
         &self,
         id: PersistentStatePartId,
     ) -> Result<TLObject> {
+        let published = self
+            .engine
+            .load_block_handle(id.block_id())?
+            .is_some_and(|handle| handle.has_persistent_state());
+        if !published {
+            return Ok(
+                ton_node::PersistentStateSize::TonNode_PersistentStateSizeNotFound.into_tl_object()
+            );
+        }
         if let Ok(size) = self.engine.load_persistent_state_size(&id).await {
             let answer = ton_node::persistentstatesize::PersistentStateSize { size: size as i64 }
                 .into_boxed();

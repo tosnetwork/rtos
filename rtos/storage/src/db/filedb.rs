@@ -14,8 +14,11 @@ use rtos_block::{error, Error, Result};
 use std::{
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+static FILE_WRITE_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub struct FileDb {
@@ -80,9 +83,45 @@ impl FileDb {
         let path = self.make_path(key.key(), false);
         let dir = path.parent().ok_or_else(|| error!("Unable to get parent path"))?;
         tokio::fs::create_dir_all(dir).await?;
-        tokio::fs::write(path, data).await?;
-
-        Ok(())
+        // Unique, same-directory temporary files keep failed or concurrent
+        // writes from truncating an acknowledged final file.
+        let mut selected = None;
+        for _ in 0..16 {
+            let attempt = FILE_WRITE_ATTEMPT
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
+                .map_err(|_| error!("File write attempt counter exhausted"))?;
+            let mut temporary = path.clone();
+            temporary.set_extension(format!("{}.{attempt}.tmp", std::process::id()));
+            match tokio::fs::OpenOptions::new().write(true).create_new(true).open(&temporary).await
+            {
+                Ok(file) => {
+                    selected = Some((temporary, file));
+                    break;
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let (temporary, mut file) =
+            selected.ok_or_else(|| error!("File temporary collision limit reached"))?;
+        let result: Result<()> = async {
+            file.write_all(data).await?;
+            // Drain Tokio buffered IO and propagate the actual write error
+            // before syncing or publishing the file.
+            file.flush().await?;
+            file.sync_all().await?;
+            tokio::fs::rename(&temporary, &path).await?;
+            crate::archives::package::sync_file_and_parents(&path).await?;
+            Ok(())
+        }
+        .await;
+        drop(file);
+        if result.is_err() {
+            // A rename may have completed. Only our temporary is disposable;
+            // never remove or roll back the final path on an uncertain sync.
+            let _ = tokio::fs::remove_file(&temporary).await;
+        }
+        result
     }
 
     pub async fn read_whole_file(&self, key: &(dyn DbKey + Send + Sync)) -> Result<Vec<u8>> {

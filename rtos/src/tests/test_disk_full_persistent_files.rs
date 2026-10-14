@@ -233,6 +233,13 @@ async fn exercise(mode: &str, inodes: bool) {
     if control {
         engine.db.sync_publication_metadata(&target).await.unwrap();
     }
+    if !control && mode == "raw" && target_path.exists() {
+        let bytes = std::fs::read(&target_path).unwrap();
+        let root = read_single_root_boc(&bytes)
+            .expect("atomic raw producer exposed incomplete final file");
+        assert_eq!(root.repr_hash(), target_root.repr_hash());
+        assert_eq!(bytes, write_boc(&target_root).unwrap());
+    }
     let server = service(&engine.db);
     if !control {
         assert_eq!(
@@ -294,3 +301,36 @@ case!(disk_full_persistent_whole_body, "whole", false);
 case!(disk_full_persistent_whole_inodes, "whole", true);
 case!(disk_full_persistent_raw_body, "raw", false);
 case!(disk_full_persistent_raw_inodes, "raw", true);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_unpublished_partial_file_is_not_advertised_or_served() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path()).await;
+    let id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        1,
+        UInt256::from([0x31; 32]),
+        UInt256::from([0x32; 32]),
+    );
+    let handle = engine.db.create_test_block_handle(&id).unwrap();
+    engine.db.sync_publication_metadata(&handle).await.unwrap();
+    let part = PersistentStatePartId::WholeState(id);
+    let path = file_path(directory.path(), &part, false);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"legacy-torn-file").unwrap();
+    let server = service(&engine.db);
+    assert_eq!(
+        server.test_persistent_size(part.clone()).await.unwrap(),
+        None,
+        "legacy unpublished partial file advertised"
+    );
+    assert!(server.test_persistent_slice(&part).await.is_err());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"legacy-torn-file",
+        "reader guard must not delete historical bytes"
+    );
+    drop(server);
+    drop(handle);
+    close(engine).await;
+}
