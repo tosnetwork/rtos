@@ -57,8 +57,16 @@ impl Receipt {
 }
 #[async_trait::async_trait]
 impl Callback for Receipt {
-    async fn invoke(&self, _: Job) {
+    async fn invoke(&self, job: Job) {
         self.count.fetch_add(1, Ordering::SeqCst);
+        if let Job::PutState(_, id) = job {
+            if id.seq_no() == 2 {
+                eprintln!(
+                    "LATE-INDEX TARGET_SUCCESS_CALLBACK count={}",
+                    self.count.load(Ordering::SeqCst)
+                );
+            }
+        }
         self.notify.notify_one();
     }
 }
@@ -96,8 +104,15 @@ async fn ordinary_late_index_eio() {
         barrier(&states).await.unwrap();
     } else {
         tokio::time::timeout(TIMEOUT, async {
-            while failure.borrow().is_none() {
-                failure.changed().await.unwrap();
+            loop {
+                assert_eq!(receipt.count.load(Ordering::SeqCst), 0, "late-index fault produced a success callback");
+                if failure.borrow().is_some() { break; }
+                tokio::select! {
+                    changed = failure.changed() => changed.unwrap(),
+                    _ = receipt.notify.notified() => {
+                        assert_eq!(receipt.count.load(Ordering::SeqCst), 0, "late-index fault produced a success callback");
+                    }
+                }
             }
         })
         .await

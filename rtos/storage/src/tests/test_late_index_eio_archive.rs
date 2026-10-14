@@ -84,7 +84,7 @@ async fn exercise(update: bool) {
         Some(late::gate(db.clone(), CF, seeds.clone(), gates.clone()));
     let result = produce(states.clone(), 2, update).await;
     eprintln!("LATE-INDEX ARCHIVE_RESULT update={update} result={result:?}");
-    assert_eq!(result.is_ok(), control);
+    assert_eq!(result.is_ok(), control, "late-index archive producer acknowledgement differs");
     if let Err(error) = result {
         late::check_eio(&error.to_string());
     }
