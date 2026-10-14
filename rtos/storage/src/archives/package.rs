@@ -138,6 +138,33 @@ impl Package {
         self.path.as_path()
     }
 
+    /// Complete pending package IO and observe the actual Linux fd close result.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) async fn close_for_sst_test(&self) -> Result<()> {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+        let mut guard = self.write_mutex.lock().await;
+        let Some(mut file) = guard.take() else {
+            fail!("SST package fd already closed or read-only: {}", self.path.display());
+        };
+        file.flush().await?;
+        let file = file.into_std().await;
+        eprintln!("SST-PACK-CLOSE fd={} path={}", file.as_raw_fd(), self.path.display());
+        tokio::task::spawn_blocking(move || {
+            unsafe extern "C" {
+                fn close(fd: std::ffi::c_int) -> std::ffi::c_int;
+            }
+            let fd = file.into_raw_fd();
+            // SAFETY: exclusive File ownership was transferred above; close the
+            // fd once, never retry EINTR (Linux may already have released it).
+            if unsafe { close(fd) } == -1 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| error!("SST package close owner failed: {e}"))?
+    }
+
     pub fn get_path(&self) -> String {
         self.path.display().to_string()
     }

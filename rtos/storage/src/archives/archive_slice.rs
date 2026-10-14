@@ -1291,3 +1291,7 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests/test_disk_full_archive.rs"]
 mod disk_full_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/test_sst_archive.rs"]
+mod sst_disk_full_tests;
