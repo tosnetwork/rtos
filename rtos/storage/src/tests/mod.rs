@@ -14,6 +14,8 @@ mod test_dynamic_boc_archive_db;
 mod test_dynamic_boc_rc_db;
 mod test_shardstate_db_async;
 pub(crate) mod disk_full_state_support;
+#[cfg(target_os = "linux")]
+pub(crate) mod late_index_eio_support;
 
 pub mod utils {
 

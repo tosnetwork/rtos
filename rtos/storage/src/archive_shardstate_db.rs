@@ -25,6 +25,8 @@ pub struct ArchiveShardStateDb {
     index: Arc<RocksDbTable<BlockIdExt>>,
     boc_db: Arc<DynamicBocArchiveDb>,
     write_gate: Arc<Mutex<Option<String>>>,
+    #[cfg(test)]
+    late_index_gate: Mutex<Option<crate::durability::LateIndexGate>>,
 }
 
 impl ArchiveShardStateDb {
@@ -46,7 +48,11 @@ impl ArchiveShardStateDb {
             allocated,
         )?);
         let index = Arc::new(RocksDbTable::with_db(db, index_cf, true)?);
-        Ok(Self { index, boc_db, write_gate: Arc::new(Mutex::new(None)) })
+        Ok(Self {
+            index, boc_db, write_gate: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            late_index_gate: Mutex::new(None),
+        })
     }
 
     pub fn contains_state_record(&self, id: &BlockIdExt) -> Result<bool> {
@@ -153,6 +159,11 @@ impl ArchiveShardStateDb {
         }
 
         let saved = self.boc_db.save_boc(state_root, &|| Ok(()))?;
+        #[cfg(test)]
+        {
+            let gate = self.late_index_gate.lock().unwrap().take();
+            if let Some(gate) = gate { gate()?; }
+        }
         let save_utime = UnixTime::now();
         let db_entry = DbEntry::with_params(id.clone(), cell_id, save_utime);
         self.index.put(id, &db_entry.serialize())?;
@@ -183,6 +194,11 @@ impl ArchiveShardStateDb {
         }
 
         self.boc_db.save_update(state_root)?;
+        #[cfg(test)]
+        {
+            let gate = self.late_index_gate.lock().unwrap().take();
+            if let Some(gate) = gate { gate()?; }
+        }
         let save_utime = UnixTime::now();
         let db_entry = DbEntry::with_params(id.clone(), cell_id, save_utime);
         self.index.put(id, &db_entry.serialize())?;
@@ -280,3 +296,7 @@ mod disk_full_tests;
 #[cfg(test)]
 #[path = "tests/test_disk_full_ordinary_archive.rs"]
 mod ordinary_disk_full_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "tests/test_late_index_eio_archive.rs"]
+mod late_index_eio_tests;

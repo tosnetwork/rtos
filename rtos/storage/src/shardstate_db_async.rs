@@ -200,6 +200,8 @@ pub struct ShardStateDb {
     dynamic_boc_db: Arc<DynamicBocDb>,
     storer: tokio::sync::mpsc::UnboundedSender<StateCommand>,
     write_failure: tokio::sync::watch::Sender<Option<String>>,
+    #[cfg(test)]
+    late_index_gate: std::sync::Mutex<Option<crate::durability::LateIndexGate>>,
     bounded_read_gate: std::sync::RwLock<()>,
     in_queue: AtomicU32,
     stop: Arc<AtomicU8>,
@@ -247,6 +249,8 @@ impl ShardStateDb {
             storer: sender,
             bounded_read_gate: std::sync::RwLock::new(()),
             write_failure: tokio::sync::watch::channel(None).0,
+            #[cfg(test)]
+            late_index_gate: std::sync::Mutex::new(None),
             in_queue: AtomicU32::new(0),
             stop: Arc::new(AtomicU8::new(0)),
             task_owners: Default::default(),
@@ -957,6 +961,11 @@ impl ShardStateDb {
             ss_db.dynamic_boc_db.save_boc(state_root, &check_stop)
         })?;
 
+        #[cfg(test)]
+        {
+            let gate = self.late_index_gate.lock().unwrap().take();
+            if let Some(gate) = gate { gate()?; }
+        }
         let save_utime = UnixTime::now();
         let db_entry = DbEntry::with_params(id.clone(), cell_id.clone(), save_utime);
         self.shardstate_db.put(id, &db_entry.serialize())?;
@@ -1121,3 +1130,7 @@ mod bounded_read_tests {
 #[cfg(test)]
 #[path = "tests/test_disk_full_shardstate.rs"]
 mod disk_full_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "tests/test_late_index_eio_ref.rs"]
+mod late_index_eio_tests;

@@ -11,6 +11,8 @@ pub enum SyncPoint {
 }
 pub type SyncObserver = dyn Fn(SyncPoint, &Path) -> Result<()> + Send + Sync;
 pub type SyncObservation = Option<Arc<SyncObserver>>;
+#[cfg(test)]
+pub(crate) type LateIndexGate = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 pub fn before(observer: Option<&SyncObserver>, point: SyncPoint, path: &Path) -> Result<()> {
     if let Some(observer) = observer {
         observer(point, path)?;
