@@ -70,6 +70,12 @@ enum ChosenPackage {
     MC package is indexed first, shard package indexes follow it
 */
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetadataCut { EntryMeta, NonSlicedStatus, Offset, BlockIndex }
+#[cfg(test)]
+type MetadataGate = Arc<dyn Fn(u64, u64) -> Result<()> + Send + Sync>;
+
 pub struct ArchiveSlice {
     archive_id: u32,
     db_root_path: Arc<PathBuf>,
@@ -99,6 +105,8 @@ pub struct ArchiveSlice {
     package_status_db: PackageStatusDb,
     #[cfg(feature = "telemetry")]
     telemetry: Arc<StorageTelemetry>,
+    #[cfg(test)]
+    metadata_gate: std::sync::Mutex<Option<(MetadataCut, MetadataGate)>>,
     allocated: Arc<StorageAlloc>,
 }
 
@@ -526,6 +534,18 @@ impl ArchiveSlice {
         }
     }
 
+    #[cfg(test)]
+    fn observe_metadata_cut(&self, stage: MetadataCut, offset: u64, size: u64) -> Result<()> {
+        let gate = {
+            let mut gate = self.metadata_gate.lock().unwrap();
+            if gate.as_ref().is_some_and(|(selected, _)| *selected == stage) {
+                gate.take().map(|(_, gate)| gate)
+            } else { None }
+        };
+        if let Some(gate) = gate { gate(offset, size)?; }
+        Ok(())
+    }
+
     pub async fn add_file<B: Borrow<BlockIdExt> + Hash>(
         &self,
         block_handle: &BlockHandle,
@@ -570,12 +590,20 @@ impl ArchiveSlice {
                     "Writing package entry metadata {}: {meta:?}, offset: {offset}",
                     index.map(|index| format!(" for slice #{index}")).unwrap_or("".to_string())
                 );
+                #[cfg(test)]
+                self.observe_metadata_cut(MetadataCut::EntryMeta, offset, size)?;
                 self.entry_db.put_value(&index.unwrap_or(u32::MAX).into(), &meta)?;
                 if !self.sliced_mode {
+                    #[cfg(test)]
+                    self.observe_metadata_cut(MetadataCut::NonSlicedStatus, offset, size)?;
                     self.package_status_db.put_value(&PackageStatusKey::NonSlicedSize, &size)?;
                 }
+                #[cfg(test)]
+                self.observe_metadata_cut(MetadataCut::Offset, offset, size)?;
                 self.offsets_db.put_value(&offset_key, &offset)?;
                 if let PackageEntryId::Block(_) = entry_id {
+                    #[cfg(test)]
+                    self.observe_metadata_cut(MetadataCut::BlockIndex, offset, size)?;
                     self.block_index_db.put(block_handle, offset as u32)?;
                 }
                 Ok(())
@@ -1134,6 +1162,8 @@ impl ArchiveSlice {
             )?,
             #[cfg(feature = "telemetry")]
             telemetry,
+            #[cfg(test)]
+            metadata_gate: std::sync::Mutex::new(None),
             allocated,
         };
         Ok(ret)
@@ -1300,3 +1330,7 @@ mod disk_full_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../tests/test_sst_archive.rs"]
 mod sst_disk_full_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/test_archive_metadata_eio.rs"]
+mod metadata_eio_tests;
