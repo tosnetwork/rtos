@@ -79,7 +79,7 @@ fn test_candidate_max_acceptable_slot_saturates() {
 fn test_first_too_new_vote_slot_is_window_aligned() {
     let spw = slots_per_window();
     let max_desync = crate::SessionOptions::default().max_leader_window_desync;
-    assert_eq!(first_too_new_vote_slot(0), ((0 / spw) + max_desync + 1) * spw);
+    assert_eq!(first_too_new_vote_slot(0), (max_desync + 1) * spw);
     assert_eq!(first_too_new_vote_slot(spw + 1), (((spw + 1) / spw) + max_desync + 1) * spw);
 }
 

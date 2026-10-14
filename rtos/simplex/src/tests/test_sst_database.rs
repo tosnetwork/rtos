@@ -60,6 +60,12 @@ fn check(db: &SimplexDbPtr) {
     assert_eq!(boot.candidate_payloads.len(), 2);
     assert_eq!(boot.finalized_blocks.len(), 2);
     for slot in [1, 2] {
+        let stored_cert = boot.final_certs.iter().find(|c| c.candidate_id == id(slot)).unwrap();
+        assert_eq!(
+            stored_cert.cert_bytes,
+            serialize_boxed(&cert(slot).to_tl().unwrap()).unwrap(),
+            "typed acknowledged certificate bytes must match intended subject and signatures"
+        );
         let stored = boot.votes.iter().find(|v| v.vote_hash == vote(slot).vote_hash).unwrap();
         assert_eq!(stored.seqno, i64::from(slot - 1));
         assert_eq!(stored.data, vote(slot).data);
