@@ -236,14 +236,14 @@ async fn test_get_write_object() -> Result<()> {
     let db = AutoDestroyableDb::new("filedb_test_get_write_object");
 
     let mut file = db.get_write_object(&KEY0)?;
-    file.write(&[0, 1, 2, 3, 4])?;
+    file.write_all(&[0, 1, 2, 3, 4])?;
     drop(file);
     assert!(db.read_whole_file(&KEY0).await.is_err());
     db.finalize_write_object(&KEY0)?;
     assert_eq!(vec![0, 1, 2, 3, 4], db.read_whole_file(&KEY0).await?);
 
     let mut file = db.get_write_object(&KEY0)?;
-    file.write(&[4, 5, 6, 7])?;
+    file.write_all(&[4, 5, 6, 7])?;
     drop(file);
     db.finalize_write_object(&KEY0)?;
     assert_eq!(vec![4, 5, 6, 7], db.read_whole_file(&KEY0).await?);
@@ -256,11 +256,11 @@ async fn test_cleanup_tmp() -> Result<()> {
     let db = AutoDestroyableDb::new("filedb_test_cleanup_tmp");
 
     let mut file1 = db.get_write_object(&KEY0)?;
-    file1.write(&[0, 1, 2, 3, 4])?;
+    file1.write_all(&[0, 1, 2, 3, 4])?;
     drop(file1);
 
     let mut file2 = db.get_write_object(&KEY1)?;
-    file2.write(&[5, 6, 7, 8, 9])?;
+    file2.write_all(&[5, 6, 7, 8, 9])?;
     drop(file2);
     db.finalize_write_object(&KEY1)?;
 
