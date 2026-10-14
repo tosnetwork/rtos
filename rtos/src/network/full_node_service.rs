@@ -531,6 +531,39 @@ impl FullNodeOverlayService {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn test_persistent_size(&self, id: PersistentStatePartId) -> Result<Option<u64>> {
+        let answer = self.get_persistent_state_size_internal(id).await?;
+        let answer = answer.downcast::<ton_node::PersistentStateSize>()
+            .map_err(|_| rtos_block::error!("Unexpected persistent-size reply type"))?;
+        Ok(match answer {
+            ton_node::PersistentStateSize::TonNode_PersistentStateSize(value) => Some(value.size as u64),
+            ton_node::PersistentStateSize::TonNode_PersistentStateSizeNotFound => None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_persistent_slice(&self, id: &PersistentStatePartId) -> Result<Vec<u8>> {
+        let query = DownloadPersistentStateSliceV2 {
+            state: PersistentStateIdV2 {
+                block: id.block_id().clone(),
+                masterchain_block: id.block_id().clone(),
+                effective_shard: id.part_prefix() as i64,
+            },
+            offset: 0,
+            max_size: PART_MAX_SIZE as i64,
+        };
+        let answer = self.download_persistent_state_slice_v2(query).await?;
+        if id.is_whole_state() {
+            let old = self.download_persistent_state_slice(DownloadPersistentStateSlice {
+                block: id.block_id().clone(), masterchain_block: id.block_id().clone(),
+                offset: 0, max_size: PART_MAX_SIZE as i64,
+            }).await?;
+            if old.object != answer.object { fail!("v1/v2 persistent slice mismatch"); }
+        }
+        Ok(answer.object)
+    }
+
     async fn download_block_proof_internal(
         &self,
         block_id: BlockIdExt,

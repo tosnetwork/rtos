@@ -59,6 +59,10 @@ pub mod test_helper;
 #[path = "tests/test_disk_full_validator_state.rs"]
 mod disk_full_validator_state_tests;
 
+#[cfg(test)]
+#[path = "tests/test_disk_full_persistent_files.rs"]
+mod disk_full_persistent_files_tests;
+
 pub(crate) mod history_read_budget;
 
 mod repair_lease_binding;
