@@ -413,7 +413,7 @@ fn inaccessible_provider_refuses_without_modification() {
     fixture(root, "db", true);
     let before = bytes(root);
     let permissions = fs::metadata(root.join("db")).unwrap().permissions();
-    fs::set_permissions(root.join("db"), fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(root.join("db"), fs::Permissions::from_mode(0o000)).unwrap();
     let status = wait(child(root, "check-refused"));
     fs::set_permissions(root.join("db"), permissions).unwrap();
     assert!(status.success());
