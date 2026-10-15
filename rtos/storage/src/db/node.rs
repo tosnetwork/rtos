@@ -2,7 +2,7 @@
 //! Physical node DB options independent of the state backend selected at startup.
 use super::rocksdb::{AccessType, RocksDb, NODE_DB_NAME};
 use crate::{dynamic_boc_rc_db::DynamicBocDb, shardstate_db_async::CellsDbConfig};
-use rtos_block::{fail, sha256_digest, Result};
+use rtos_block::{error, fail, sha256_digest, Result};
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 pub const CELLS_CF_NAME: &str = "cells_db_v6";
@@ -45,10 +45,12 @@ pub fn open_node_db_for_bootstrap(
 ) -> Result<NodeDbBootstrap> {
     use crate::archives::recovery_root::{FactoryMode, RootHeader, ROOT_KEY, PARTICIPANT_KEY};
     let writable = access == AccessType::ReadWrite;
-    let (db, deferred_cleanup) = open_physical(root.as_ref(), config, access, true)?;
+    let (mut db, deferred_cleanup) = open_physical(root.as_ref(), config, access, true)?;
     let pending = db.db().get_pinned(ROOT_KEY)?.map(|bytes| RootHeader::decode(&bytes)).transpose()?;
     if let Some(header) = &pending {
         if !writable { fail!("Pending archive root requires writable recovery bootstrap"); }
+        Arc::get_mut(&mut db).ok_or_else(|| error!("Main bootstrap provider shared before root inspection"))?
+            .require_strict_recovery_path()?;
         header.policy.check_environment(FactoryMode::Node, db.db().cf_handle("repair_dependency_leases_v1").is_some())?;
         let identity = db.db().get_db_identity()?;
         if header.database_identity_bytes != identity.len() as u64
@@ -72,7 +74,7 @@ fn open_physical(
     // Acquire the existing-only owner before CF inspection, so option selection
     // and native opening share the same managed provider reservation.
     let owner = if bootstrap && existing && access == AccessType::ReadWrite {
-        Some(super::provider_reservation::ProviderReservation::open_existing(&path)?)
+        Some(super::provider_reservation::ProviderReservation::inspect_existing(&path)?)
     } else { None };
     let families = if existing {
         rocksdb::DB::list_cf(&rocksdb::Options::default(), &path)?
@@ -91,7 +93,7 @@ fn open_physical(
     }
     let deferred_cleanup = owner.is_some();
     let db = if let Some(owner) = owner {
-        RocksDb::open_existing_for_recovery(owner, options)?
+        RocksDb::open_existing_for_bootstrap(owner, options)?
     } else { RocksDb::new(root, NODE_DB_NAME, options, access)? };
     for cache in caches { db.register_cache(cache); }
     Ok((db, deferred_cleanup))

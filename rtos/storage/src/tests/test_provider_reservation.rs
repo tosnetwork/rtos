@@ -278,3 +278,24 @@ fn existing_recovery_open_preserves_legacy_families_and_pending_controls() {
     assert!(db.db().cf_handle("status_db_0").is_some());
     assert!(crate::archives::recovery_guard::ensure_root_controls_clear(db.db()).is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_alias_owner_detects_retargeting_and_cannot_be_used_as_strict_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first"); let second = dir.path().join("second");
+    fs::create_dir(&first).unwrap(); fs::create_dir(&second).unwrap();
+    let alias = dir.path().join("alias"); std::os::unix::fs::symlink(&first, &alias).unwrap();
+    let mut owner = ProviderReservation::inspect_existing(&alias).unwrap().into_owner();
+    owner.verify().unwrap();
+    assert!(owner.verify_existing().is_err());
+    assert!(owner.require_strict_path().is_err());
+    fs::remove_file(&alias).unwrap(); std::os::unix::fs::symlink(&second, &alias).unwrap();
+    assert!(owner.verify().is_err());
+    assert!(ProviderReservation::open_existing(&first).is_err());
+    drop(owner);
+    ProviderReservation::open_existing(&first).unwrap();
+    let missing = dir.path().join("missing");
+    assert!(ProviderReservation::inspect_existing(&missing).is_err());
+    assert!(!missing.exists());
+}

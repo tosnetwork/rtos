@@ -244,6 +244,13 @@ impl Drop for PathIntent {
     }
 }
 
+/// Existing-directory ownership for initial bootstrap inspection. Unlike the
+/// recovery owner it retains ordinary configured aliases until root inspection.
+pub(crate) struct BootstrapReservation(ProviderReservation);
+impl BootstrapReservation {
+    pub(crate) fn into_owner(self) -> ProviderReservation { self.0 }
+}
+
 pub(crate) struct ProviderReservation {
     // Registry exclusion ends only after the caller has closed native resources.
     // The pinned directory stays alive until after exclusion is unregistered.
@@ -264,15 +271,23 @@ impl ProviderReservation {
     /// Reserve an existing directory without creating it or resolving through
     /// symlinks. The resulting owner must outlive native DB open/close.
     pub(crate) fn open_existing(path: &Path) -> Result<Self> {
-        let requested = if path.is_absolute() { path.to_path_buf() }
-            else { std::env::current_dir()?.join(path) };
-        Self::check_existing_path(&requested)?;
-        let canonical = fs::canonicalize(&requested)?;
-        let slot = PathIntent::reserve(canonical.clone(), Intent::Open)?;
-        let mut owner = Self::finish(slot, &requested, canonical)?;
-        owner.strict_existing = true;
-        owner.verify()?;
+        Self::check_existing_path(&if path.is_absolute() { path.to_path_buf() }
+            else { std::env::current_dir()?.join(path) })?;
+        let mut owner = Self::inspect_existing(path)?.into_owner();
+        owner.require_strict_path()?;
         Ok(owner)
+    }
+    /// No creation or cleanup. The requested alias remains part of verification
+    /// so changing its target cannot silently switch the owned provider.
+    pub(crate) fn inspect_existing(path: &Path) -> Result<BootstrapReservation> {
+        let canonical = fs::canonicalize(path)?;
+        let slot = PathIntent::reserve(canonical.clone(), Intent::Open)?;
+        Ok(BootstrapReservation(Self::finish(slot, path, canonical)?))
+    }
+    pub(crate) fn require_strict_path(&mut self) -> Result<()> {
+        Self::check_existing_path(&self.requested)?;
+        self.strict_existing = true;
+        self.verify()
     }
     fn check_existing_path(path: &Path) -> Result<()> {
         let mut prefix = PathBuf::new();

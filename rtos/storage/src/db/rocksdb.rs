@@ -110,6 +110,24 @@ impl RocksDb {
         Self::open_reserved(requested, spec_cf_opts.into(), AccessType::ReadWrite, Some(owner), true)
     }
 
+    /// Initial node inspection preserves ordinary configured aliases while
+    /// prohibiting creation and cleanup. Pending roots must upgrade the owned
+    /// path before rebuilding protection or issuing recovery mutations.
+    pub(crate) fn open_existing_for_bootstrap(
+        owner: super::provider_reservation::BootstrapReservation,
+        spec_cf_opts: impl Into<Option<HashMap<String, Options>>>,
+    ) -> Result<Arc<Self>> {
+        let owner = owner.into_owner();
+        owner.verify()?;
+        let requested = owner.path().to_path_buf();
+        Self::open_reserved(requested, spec_cf_opts.into(), AccessType::ReadWrite, Some(owner), true)
+    }
+    pub(crate) fn require_strict_recovery_path(&mut self) -> Result<()> {
+        self.reservation.as_mut().ok_or_else(|| error!("Missing recovery provider owner"))?
+            .require_strict_path()?;
+        Ok(())
+    }
+
     fn open_reserved(
         requested: std::path::PathBuf,
         spec_cf_opts: Option<HashMap<String, Options>>,
