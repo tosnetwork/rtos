@@ -23,10 +23,11 @@ pub(crate) fn ensure_root_controls_clear(db: &NativeDb) -> Result<()> {
         let _header = RootHeader::decode(&bytes)?;
         fail!("Pending archive root recovery");
     }
-    if db.get_pinned(PARTICIPANT_KEY)?.is_some() {
+    if let Some(bytes) = db.get_pinned(PARTICIPANT_KEY)? {
         // A backlink without independently checked root authority never
         // authorizes cleanup, including unknown future participant formats.
-        fail!("Pending or unsupported archive recovery participant");
+        let _backlink = super::recovery_participant::Backlink::decode(&bytes)?;
+        fail!("Pending archive recovery participant");
     }
     Ok(())
 }
