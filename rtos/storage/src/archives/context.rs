@@ -137,6 +137,7 @@ impl ArchiveView {
         // Registration and admission closure share the domain mutex.
         let ticket = state.owners.enter()?;
         Ok(ArchiveOperation {
+            epoch: self.epoch,
             custody: NativeCustody {
                 domain: self.binding.domain.clone(),
                 provider: Some(self.binding.provider.clone()),
@@ -146,9 +147,56 @@ impl ArchiveView {
     }
 }
 pub struct ArchiveOperation {
+    epoch: u64,
     custody: NativeCustody,
 }
 impl ArchiveOperation {
+    /// Inherit the admitted epoch while retaining the destination native DB.
+    /// Closing forbids new roots, but does not revoke an existing operation.
+    pub fn inherit(&self, destination: &ArchiveProvider) -> Result<Self> {
+        if !Arc::ptr_eq(&self.custody.domain, &destination.domain) {
+            return Err(ArchiveContextError::BindingConflict.into());
+        }
+        let state = self.custody.domain.lock()?;
+        ArchiveDomain::check_epoch(&state, self.epoch)?;
+        if state.phase == Phase::RecoveryRequired {
+            return Err(ArchiveContextError::RecoveryRequired(self.epoch).into());
+        }
+        Ok(Self {
+            epoch: self.epoch,
+            custody: NativeCustody {
+                domain: self.custody.domain.clone(),
+                provider: Some(destination.provider.clone()),
+                ticket: self.custody.ticket.clone(),
+            },
+        })
+    }
+
+    /// Capture this operation's binding without obtaining fresh root admission.
+    pub fn view(&self) -> ArchiveView {
+        ArchiveView {
+            binding: ArchiveProvider::bound(
+                self.custody.provider.as_ref().expect("operation retains provider").clone(),
+                self.custody.domain.clone(),
+            ),
+            epoch: self.epoch,
+        }
+    }
+
+    /// Call inside the native job immediately before opening its read file.
+    /// The mutex orders read start against failure latching. A read that wins
+    /// may finish after a later latch, retaining custody through file close.
+    pub fn start_read(self) -> Result<NativeCustody> {
+        {
+            let state = self.custody.domain.lock()?;
+            ArchiveDomain::check_epoch(&state, self.epoch)?;
+            if state.phase == Phase::RecoveryRequired {
+                return Err(ArchiveContextError::RecoveryRequired(self.epoch).into());
+            }
+        }
+        Ok(self.custody)
+    }
+
     pub fn child(&self) -> NativeCustody {
         NativeCustody {
             domain: self.custody.domain.clone(),

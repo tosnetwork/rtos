@@ -262,3 +262,55 @@ async fn cancelled_observer_does_not_release_held_native_owner() {
     assert_eq!(*observations.lock().unwrap(), vec![(1, true, true)]);
     assert_eq!(domain.outstanding(), 0);
 }
+
+
+#[tokio::test]
+async fn checked_inheritance_pins_destination_after_closing() {
+    let (dir, db, domain, view) = fixture();
+    let epoch_db = RocksDb::new(dir.path(), "inherited-epoch", None, AccessType::ReadWrite).unwrap();
+    let destination = epoch_db.bind_archive_domain(domain.clone()).unwrap();
+    let weak = Arc::downgrade(&epoch_db);
+    let parent = view.enter().unwrap();
+    let closed = domain.close(0).unwrap();
+    let inherited = parent.inherit(&destination).unwrap();
+    assert_eq!(inherited.view().epoch(), 0);
+    assert!(inherited.view().enter().is_err(), "inherited view reopened root admission");
+    let native = inherited.start_read().unwrap();
+    drop(destination);
+    drop(epoch_db);
+    drop(parent);
+    drop(view);
+    drop(db);
+    assert!(weak.upgrade().is_some(), "inherited owner lost destination provider");
+    assert_eq!(domain.outstanding(), 1);
+    let mut wait = Box::pin(closed.wait());
+    assert!(futures::poll!(&mut wait).is_pending());
+    drop(wait);
+    drop(native);
+    closed.wait().await;
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn checked_inheritance_rejects_other_domain_and_failure_before_read_start() {
+    let (_dir, db, domain, view) = fixture();
+    let (_other_dir, other_db, other_domain, _other_view) = fixture();
+    let parent = view.enter().unwrap();
+    let destination = db.bind_archive_domain(domain.clone()).unwrap();
+    let other = other_db.bind_archive_domain(other_domain.clone()).unwrap();
+    let error = parent.inherit(&other).err().expect("cross-domain inheritance admitted");
+    assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&ArchiveContextError::BindingConflict));
+    assert_eq!(other_domain.outstanding(), 0);
+    let queued = parent.inherit(&destination).unwrap();
+    let started = parent.inherit(&destination).unwrap().start_read().unwrap();
+    domain.latch_failure();
+    let error = queued.start_read().err().expect("read started after recovery latch");
+    assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&ArchiveContextError::RecoveryRequired(0)));
+    let error = parent.inherit(&destination).err().expect("inheritance ignored recovery latch");
+    assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&ArchiveContextError::RecoveryRequired(0)));
+    assert_eq!(domain.outstanding(), 2, "started read custody was revoked by failure");
+    drop(parent);
+    assert_eq!(domain.outstanding(), 1);
+    drop(started);
+    assert_eq!(domain.outstanding(), 0);
+}
