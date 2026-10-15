@@ -204,7 +204,8 @@ fn queued_native_read_checks_recovery_in_actual_blocking_owner() {
         assert!(pending);
         assert_eq!(
             error.downcast_ref::<ArchiveContextError>(),
-            Some(&ArchiveContextError::RecoveryRequired(0))
+            Some(&ArchiveContextError::RecoveryRequired(0)),
+            "queued native read ignored recovery latch"
         );
         assert!(!error.is::<ArchiveReadNotStarted>(), "context refusal became an open-only error");
         assert_eq!(domain.outstanding(), 0);

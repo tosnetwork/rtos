@@ -33,8 +33,11 @@ async fn epoch_read_resolution_does_not_create_and_pins_cached_destination_durin
     let config = config(dir.path());
     let router = Arc::new(EpochRouter::new(&config, &operation).await.unwrap());
     let provider = EpochDbProvider::new(router.clone());
-    assert!(provider.resolve_for_read(&operation, 0).await.unwrap().is_none());
-    assert_eq!(std::fs::read_dir(&config.new_epochs_path).unwrap().count(), 0);
+    let missing = provider.resolve_for_read(&operation, 0).await.unwrap();
+    assert_eq!(std::fs::read_dir(&config.new_epochs_path).unwrap().count(), 0,
+        "readonly epoch lookup created directory or DB");
+    assert!(missing.is_none());
+    drop(missing);
     let seeded = provider.db_for_archive(&operation, 0).await.unwrap();
     let weak = Arc::downgrade(seeded.provider.db());
     assert!(Arc::ptr_eq(seeded.provider.domain(), binding.domain()));
@@ -42,8 +45,11 @@ async fn epoch_read_resolution_does_not_create_and_pins_cached_destination_durin
     let closed = binding.domain().close(0).unwrap();
     let resolved = provider.resolve_for_read(&operation, 100).await.unwrap().unwrap();
     assert!(Arc::ptr_eq(resolved.provider.db(), router.resolve(0).unwrap().db()));
-    assert!(provider.resolve_for_read(&operation, 20000).await.unwrap().is_none());
-    assert!(!config.new_epochs_path.join("epoch_1").exists());
+    let missing = provider.resolve_for_read(&operation, 20000).await.unwrap();
+    assert!(!config.new_epochs_path.join("epoch_1").exists(),
+        "readonly epoch lookup created directory or DB");
+    assert!(missing.is_none());
+    drop(missing);
     assert_eq!(binding.domain().outstanding(), 2);
     drop(router);
     drop(provider);

@@ -163,17 +163,29 @@ async fn refusal_cases(late: bool) {
                     let result = tokio::time::timeout(Duration::from_secs(35), task.as_mut().unwrap())
                         .await.unwrap().unwrap();
                     drop(task.take());
-                    result.err().expect("late context refusal must fail")
+                    result
                 } else {
-                    repair_mc_final(engine.clone(), request.clone()).await.err().expect("early context refusal must fail")
+                    repair_mc_final(engine.clone(), request.clone()).await
                 };
+                let effects = engine.db().test_read_refusal_effects();
+                assert_eq!(effects[0], 0,
+                    "context refusal entered publication fallback: epoch={epoch} late={late} mode={mode} effects={effects:?}");
+                assert_eq!(effects[1], 0,
+                    "context refusal crossed authenticated repair admission: epoch={epoch} late={late} mode={mode} effects={effects:?}");
+                let publication = publication.err().expect(if late {
+                    "late context refusal must fail"
+                } else {
+                    "early context refusal must fail"
+                });
                 assert_refusal(&publication, &expected);
                 let budget = HistoryReadBudget::new(Default::default());
                 let history = crate::boot::load_history_proof_with_budget(
                     engine.as_ref(), target.id(), false, false, Some(&budget),
-                ).await.err().unwrap();
+                ).await;
+                assert_eq!(budget.local_proof_fallbacks(), 0,
+                    "context refusal entered boot history fallback: epoch={epoch} late={late} mode={mode}");
+                let history = history.err().unwrap();
                 assert_refusal(&history, &expected);
-                assert_eq!(budget.local_proof_fallbacks(), 0);
                 // Existing fullproof is present and exact: initial store is a no-op.
                 let proof_sync = engine.db().sync_repair_history_proof(
                     &proof, &HistoryReadBudget::new(Default::default()),
@@ -203,6 +215,7 @@ async fn refusal_cases(late: bool) {
             drop(dir);
             stopped.unwrap();
             assert!(released, "refusal fixture must release actual Engine owners");
+            eprintln!("context_refusal_cleanup epoch={epoch} late={late} mode={mode} stopped=true engine_released=true fixture_released=true");
             run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         }
     }
