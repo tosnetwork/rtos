@@ -12,6 +12,7 @@
 pub mod filedb;
 pub mod node;
 pub mod rocksdb;
+mod provider_reservation;
 
 #[cfg(test)]
 mod tests;

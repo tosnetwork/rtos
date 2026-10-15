@@ -49,6 +49,8 @@ pub struct RocksDb {
     repair_protection: Arc<crate::repair_protection::RepairProtection>,
     archive_domain: std::sync::OnceLock<Arc<crate::archives::context::ArchiveDomain>>,
     archive_binding_writable: bool,
+    // Declared after db: native close must precede reservation release.
+    reservation: Option<super::provider_reservation::ProviderReservation>,
 }
 
 impl RocksDb {
@@ -58,7 +60,7 @@ impl RocksDb {
         self: &Arc<Self>, domain: Arc<crate::archives::context::ArchiveDomain>,
     ) -> Result<crate::archives::context::ArchiveProvider> {
         use crate::archives::context::{ArchiveContextError, ArchiveProvider};
-        if !self.archive_binding_writable {
+        if !self.archive_binding_writable || self.db.is_none() {
             return Err(ArchiveContextError::ReadOnlyProvider.into());
         }
         let winner = self.archive_domain.get_or_init(|| domain.clone());
@@ -79,7 +81,11 @@ impl RocksDb {
         spec_cf_opts: impl Into<Option<HashMap<String, Options>>>,
         access_type: AccessType,
     ) -> Result<Arc<Self>> {
-        let path = path.as_ref().join(name);
+        let requested = path.as_ref().join(name);
+        let reservation = if matches!(access_type, AccessType::ReadWrite) {
+            Some(super::provider_reservation::ProviderReservation::open(&requested)?)
+        } else { None };
+        let path = reservation.as_ref().map_or_else(|| requested.clone(), |guard| guard.path().to_path_buf());
         let mut spec_cf_opts = spec_cf_opts.into().unwrap_or_default();
         let options = Self::build_db_options();
 
@@ -95,6 +101,7 @@ impl RocksDb {
             let opt = spec_cf_opts.remove(&cf).unwrap_or_default();
             rocksdb::ColumnFamilyDescriptor::new(cf, opt)
         });
+        if let Some(guard) = &reservation { guard.verify()?; }
         let db = match &access_type {
             AccessType::ReadWrite => {
                 DBWithThreadMode::<MultiThreaded>::open_cf_descriptors(&options, &path, cfs_opt)?
@@ -115,6 +122,10 @@ impl RocksDb {
         };
 
         // Clean up CFs from old archives in-place.
+        if let Some(guard) = &reservation {
+            if let Err(error) = guard.verify() { drop(db); return Err(error.into()); }
+        }
+
         if !matches!(access_type, AccessType::ReadOnly | AccessType::Secondary(_))
             && !cfs.iter().any(|cf| cf == "repair_dependency_leases_v1")
             && cfs.len() > 100
@@ -134,6 +145,7 @@ impl RocksDb {
             repair_protection: Arc::new(Default::default()),
             archive_domain: std::sync::OnceLock::new(),
             archive_binding_writable: matches!(access_type, AccessType::ReadWrite),
+            reservation,
             db: Some(db),
             locks: lockfree::map::Map::new(),
             caches: Mutex::new(Vec::new()),
@@ -310,24 +322,31 @@ impl RocksDb {
             .ok_or_else(|| error!("no handle for column family {} in rocksdb", name))
     }
 
+    fn destroy_reserved(guard: &super::provider_reservation::ProviderReservation) -> Result<bool> {
+        guard.verify()?;
+        DBWithThreadMode::<MultiThreaded>::destroy(&Options::default(), guard.path())?;
+        Ok(true)
+    }
+
     pub fn destroy_db(path: impl AsRef<Path>) -> Result<bool> {
-        let opts = Options::default();
-        log::info!(target: TARGET, "Destroying DB {}...", path.as_ref().display());
-        match DBWithThreadMode::<MultiThreaded>::destroy(&opts, path.as_ref()) {
-            Ok(_) => Ok(true),
-            Err(err) => fail!("cannot destroy database {:?} : {}", path.as_ref(), err),
-        }
+        let Some(guard) = super::provider_reservation::ProviderReservation::destroy(path.as_ref())? else {
+            return Ok(false);
+        };
+        Self::destroy_reserved(&guard)
     }
 
     pub fn destroy(&mut self) -> Result<bool> {
-        match self.db.take() {
-            Some(db) => {
-                let path = db.path().to_path_buf();
-                drop(db);
-                Self::destroy_db(path)
-            }
-            None => fail!("rocksdb already destroyed"),
-        }
+        let Some(guard) = self.reservation.as_ref() else {
+            fail!("Database has no writable destruction reservation");
+        };
+        guard.begin_destroy()?;
+        let db = self.db.take().ok_or_else(|| error!("rocksdb already destroyed"))?;
+        drop(db);
+        let result = Self::destroy_reserved(guard)?;
+        // Keep the reservation on errors; successful native destruction is the
+        // last operation before release. CF destruction does not use this path.
+        self.reservation.take();
+        Ok(result)
     }
 
     fn get_meta(&self) -> &str {
@@ -788,34 +807,46 @@ impl RocksDbTransaction {
 }
 
 pub async fn destroy_rocks_db(path: &str, name: &str) -> rtos_block::Result<()> {
-    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-    let mut path = std::path::Path::new(path);
-    let db_path = path.join(name);
-    // Clean up DB
-    if db_path.exists() {
-        let opts = rocksdb::Options::default();
-        while let Err(e) =
-            rocksdb::DBWithThreadMode::<rocksdb::MultiThreaded>::destroy(&opts, db_path.as_path())
-        {
-            println!("Can't destroy DB: {}", e);
-            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    let db_path = std::path::Path::new(path).join(name);
+    loop {
+        let attempt_path = db_path.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<()> {
+            #[cfg(test)]
+            let mut _cleanup_completion = None;
+            let Some(guard) = super::provider_reservation::ProviderReservation::destroy(&attempt_path)? else {
+                return Ok(());
+            };
+            #[cfg(test)]
+            { _cleanup_completion = super::provider_reservation::test_pause_cleanup(guard.path()); }
+            RocksDb::destroy_reserved(&guard)?;
+            guard.remove_directory_if_present()?;
+            // Ancestors may belong to another pending Open intent. Leave them.
+            Ok(())
+        }).await.map_err(|error| error!("Database cleanup owner failed: {error}"))?;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if retryable_destroy_error(&error) => {
+                log::warn!(target: TARGET, "Database cleanup waits for owner: {error}");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            Err(error) => return Err(error),
         }
     }
-    // Clean up DB folder
-    if db_path.exists() {
-        std::fs::remove_dir_all(&db_path)
-            .map_err(|e| rtos_block::error!("Can't clean DB folder {}: {}", db_path.display(), e))?
-    }
-    // Clean up upper folder if empty
-    while path.exists() {
-        if std::fs::read_dir(path)?.count() > 0 {
-            break;
+}
+
+fn retryable_destroy_error(error: &anyhow::Error) -> bool {
+    if matches!(error.downcast_ref::<super::provider_reservation::ReservationError>(),
+        Some(super::provider_reservation::ReservationError::Busy(_))) { return true; }
+    let Some(native) = error.downcast_ref::<rocksdb::Error>() else { return false; };
+    match native.kind() {
+        rocksdb::ErrorKind::Busy | rocksdb::ErrorKind::TryAgain | rocksdb::ErrorKind::TimedOut => true,
+        rocksdb::ErrorKind::IOError => {
+            // RocksDb 0.23 exposes native lock errno only in its message. Do not
+            // retry unrelated corruption, permission or disk errors forever.
+            let message = native.to_string();
+            message.contains("lock hold by current process")
+                || (message.contains("While lock file") && message.contains("Resource temporarily unavailable"))
         }
-        if let Err(e) = std::fs::remove_dir_all(path) {
-            println!("Ignored: can't clean DB enclosing folder {}: {}", path.display(), e);
-            break;
-        }
-        path = if let Some(path) = path.parent() { path } else { break }
+        _ => false,
     }
-    Ok(())
 }
