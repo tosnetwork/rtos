@@ -453,12 +453,15 @@ impl InternalDb {
         let can_create_db = access_type == AccessType::ReadWrite;
         // Existing dynamic counter CFs still need their merge operator when
         // this startup selects archival state storage.
-        let bootstrap = open_node_db_for_bootstrap(&config.db_directory, &config.cells_db_config, access_type.clone())?;
+        let mut bootstrap = open_node_db_for_bootstrap(&config.db_directory, &config.cells_db_config, access_type.clone())?;
         let db = bootstrap.database().clone();
         let repair_leases = crate::publication_dependency_leases::DependencyLeases::open(
             db.clone(),
             can_create_db && !bootstrap.requires_recovery(),
         )?;
+        if bootstrap.requires_recovery() {
+            bootstrap.inspect_recovery_providers(config.archival_mode.as_ref(), repair_leases.protection()).await?;
+        }
         // Keep this exact ledger/protection Arc for recovery and normal startup.
         // Pending recovery currently refuses here until the owned root worker
         // completes; no catchain, handle, archive or state constructor runs first.

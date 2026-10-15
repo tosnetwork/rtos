@@ -26,10 +26,28 @@ pub fn open_node_db(
 pub struct NodeDbBootstrap {
     db: Arc<RocksDb>,
     pending: Option<crate::archives::recovery_root::RootHeader>,
+    providers: Option<crate::archives::recovery_providers::RecoveryProviders>,
 }
 impl NodeDbBootstrap {
     pub fn database(&self) -> &Arc<RocksDb> { &self.db }
     pub fn requires_recovery(&self) -> bool { self.pending.is_some() }
+    /// Called after the node has loaded its existing durable protection. This
+    /// inspects and retains all managed providers; it performs no root replay.
+    pub async fn inspect_recovery_providers(
+        &mut self, config: Option<&crate::archives::epoch::ArchivalModeConfig>,
+        protection: &Arc<crate::repair_protection::RepairProtection>,
+    ) -> Result<()> {
+        let root = self.pending.as_ref().ok_or_else(|| error!("No pending node recovery"))?;
+        if self.providers.is_some() { fail!("Recovery providers already inspected"); }
+        let expected = root.encode()?;
+        if self.db.db().get_pinned(crate::archives::recovery_root::ROOT_KEY)?.as_deref() != Some(expected.as_slice()) {
+            fail!("Archive root changed during node bootstrap");
+        }
+        self.providers = Some(crate::archives::recovery_providers::RecoveryProviders::inspect(
+            self.db.clone(), root, config, protection,
+        ).await?);
+        Ok(())
+    }
     pub fn finish(self) -> Result<Arc<RocksDb>> {
         if self.pending.is_some() {
             crate::archives::recovery_guard::ensure_open_provider_clear(
@@ -63,7 +81,7 @@ pub fn open_node_db_for_bootstrap(
         }
         if deferred_cleanup { db.finish_ordinary_bootstrap()?; }
     }
-    Ok(NodeDbBootstrap { db, pending })
+    Ok(NodeDbBootstrap { db, pending, providers: None })
 }
 
 fn open_physical(

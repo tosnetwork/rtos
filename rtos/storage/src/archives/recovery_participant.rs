@@ -40,15 +40,7 @@ pub(crate) struct Provider {
     pub range: Option<(u32, u32)>,
     pub relative: PathBuf,
 }
-impl Provider {
-    /// Bind a trusted existing epoch path to its configured anchor and native
-    /// identity. This inspection does not replace an owned filesystem handle.
-    pub(crate) fn epoch(
-        path: &std::path::Path, anchor_root: &std::path::Path,
-        anchor: Anchor, range: (u32, u32), native_identity: &[u8],
-    ) -> Result<Self> {
-        if anchor == Anchor::Node { fail!("Epoch provider requires epoch anchor"); }
-        fn existing_directory(path: &std::path::Path) -> Result<PathBuf> {
+fn existing_directory(path: &std::path::Path) -> Result<PathBuf> {
             let absolute = if path.is_absolute() { path.to_path_buf() }
                 else { std::env::current_dir()?.join(path) };
             let mut prefix = PathBuf::new();
@@ -62,6 +54,29 @@ impl Provider {
             }
             Ok(std::fs::canonicalize(absolute)?)
         }
+impl Provider {
+    pub(crate) fn main(root: &std::path::Path, epochs: bool, native_identity: &[u8]) -> Result<Self> {
+        let root = existing_directory(root)?;
+        let mut digest = Sha256::new();
+        let raw = root.as_os_str().as_encoded_bytes();
+        digest.update(b"RTOS archive recovery anchor v1");
+        digest.update([Anchor::Node as u8]);
+        digest.update(u64::try_from(raw.len())?.to_le_bytes());
+        digest.update(raw);
+        let value = Self { roles: if epochs { MAIN | KEY } else { MAIN | KEY | ARCHIVE },
+            anchor: Anchor::Node, anchor_identity: digest.finalize(),
+            database: Identity::native(native_identity)?, range: None, relative: PathBuf::new() };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Bind a trusted existing epoch path to its configured anchor and native
+    /// identity. This inspection does not replace an owned filesystem handle.
+    pub(crate) fn epoch(
+        path: &std::path::Path, anchor_root: &std::path::Path,
+        anchor: Anchor, range: (u32, u32), native_identity: &[u8],
+    ) -> Result<Self> {
+        if anchor == Anchor::Node { fail!("Epoch provider requires epoch anchor"); }
         let path = existing_directory(path)?;
         let root = existing_directory(anchor_root)?;
         let relative = path.strip_prefix(&root)?.to_path_buf();

@@ -55,6 +55,7 @@ pub(crate) mod recovery_root;
 pub(crate) mod recovery_manifest;
 pub(crate) mod recovery_parent;
 pub(crate) mod recovery_participant;
+pub(crate) mod recovery_providers;
 pub mod truncation_selection;
 
 pub mod io_owners;

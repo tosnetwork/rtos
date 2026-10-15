@@ -353,8 +353,8 @@ async fn pending_archive_root_precedes_ledger_creation_and_other_node_services()
     Ok(())
 }
 
-#[test]
-fn pending_archive_bootstrap_rebuilds_real_lease_protection_on_same_provider() -> Result<()> {
+#[tokio::test]
+async fn pending_archive_bootstrap_rebuilds_real_lease_protection_on_same_provider() -> Result<()> {
     use crate::publication_dependency_leases::{DependencyLeases, sst_fixture_for_test};
     use crate::history_read_budget::HistoryReadBudget;
     use storage::db::node::open_node_db_for_bootstrap;
@@ -366,13 +366,14 @@ fn pending_archive_bootstrap_rebuilds_real_lease_protection_on_same_provider() -
     let root = pending_archive_root_bytes(&db)?;
     db.db().put(b"ArchiveTruncationRootV1", &root)?; db.sync_wal()?;
     drop(leases); drop(db);
-    let bootstrap = open_node_db_for_bootstrap(dir.path(), &small_config(), AccessType::ReadWrite)?;
+    let mut bootstrap = open_node_db_for_bootstrap(dir.path(), &small_config(), AccessType::ReadWrite)?;
     assert!(bootstrap.requires_recovery());
     let db = bootstrap.database().clone();
     assert!(!db.repair_protection().state(&id));
     let leases = DependencyLeases::open(db.clone(), false)?;
     assert!(Arc::ptr_eq(leases.protection(), db.repair_protection()));
     assert!(leases.protection().state(&id));
+    bootstrap.inspect_recovery_providers(None, leases.protection()).await?;
     assert!(bootstrap.finish().is_err());
     assert_eq!(db.db().get(b"ArchiveTruncationRootV1")?.as_deref(), Some(root.as_slice()));
     Ok(())
