@@ -48,3 +48,5 @@ fn get_mc_seq_no(handle: &BlockHandle) -> u32 {
 
 #[cfg(target_os = "linux")]
 pub mod recovery_check;
+
+pub mod recovery_guard;

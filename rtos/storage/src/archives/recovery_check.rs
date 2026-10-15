@@ -230,14 +230,7 @@ impl OpenProvider {
             let cf = self.db.cf_handle(name).ok_or_else(|| error!("Missing CF {name}"))?;
             for row in self.db.iterator_cf(&cf, IteratorMode::Start) {
                 let (key, _) = row?;
-                if ![
-                    b"ShardSplitDepth".as_slice(),
-                    b"SlicedMode",
-                    b"SliceSize",
-                    b"NonSlicedSize",
-                    b"TotalSlices",
-                ]
-                .contains(&key.as_ref())
+                if !super::recovery_guard::known_status_key(key.as_ref())
                 {
                     fail!(
                         "Pending or unsupported archive status in {} / {}",

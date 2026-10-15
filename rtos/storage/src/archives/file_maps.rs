@@ -304,6 +304,9 @@ impl FileMap {
             {
                 Ok(s) => s,
                 Err(e) => {
+                    if e.is::<super::recovery_guard::ArchiveRecoveryRequired>() {
+                        return Err(e);
+                    }
                     if protected {
                         return Err(e);
                     }

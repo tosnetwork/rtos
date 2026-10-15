@@ -101,8 +101,15 @@ impl RocksDb {
             && !cfs.iter().any(|cf| cf == "repair_dependency_leases_v1")
             && cfs.len() > 100
         {
-            Self::clean_up_old_cf(&db, &cfs)
-                .map_err(|e| error!("Error while clean_up_old_cf: {}", e))?;
+            match crate::archives::recovery_guard::ensure_provider_clear(
+                &db, path.parent().ok_or_else(|| error!("Missing database parent"))?, &cfs,
+            ) {
+                Ok(()) => {
+                    Self::clean_up_old_cf(&db, &cfs)
+                        .map_err(|e| error!("Error while clean_up_old_cf: {}", e))?;
+                }
+                Err(e) => log::warn!(target: TARGET, "Preserving archive CFs before recovery: {e}"),
+            }
         }
 
         Ok(Arc::new(Self {

@@ -120,6 +120,9 @@ impl ArchiveSlice {
         #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
         allocated: Arc<StorageAlloc>,
     ) -> Result<Self> {
+        super::recovery_guard::ensure_slice_clear(
+            db.db(), &db_root_path, archive_id, matches!(package_type, PackageType::KeyBlocks),
+        )?;
         let mut ret = Self::create(
             db,
             db_root_path,
@@ -185,6 +188,9 @@ impl ArchiveSlice {
         #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
         allocated: Arc<StorageAlloc>,
     ) -> Result<Self> {
+        super::recovery_guard::ensure_slice_clear(
+            db.db(), &db_root_path, archive_id, matches!(package_type, PackageType::KeyBlocks),
+        )?;
         let mut ret = Self::create(
             db,
             db_root_path,
@@ -281,6 +287,9 @@ impl ArchiveSlice {
         allocated: Arc<StorageAlloc>,
     ) -> Result<Self> {
         let _startup = protection.deletion().await;
+        super::recovery_guard::ensure_slice_clear(
+            db.db(), &db_root_path, archive_id, matches!(package_type, PackageType::KeyBlocks),
+        )?;
         let mode = if protection.archive_range(archive_id, None) {
             PackageOpenMode::PreserveExisting
         } else {
