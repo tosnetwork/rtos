@@ -48,7 +48,7 @@ impl TruncationSelection {
 
     /// Writes one predicate record's body; the containing manifest supplies
     /// framing/digest and its owned executor supplies mutation authority.
-    pub(crate) fn write_predicate(&self, writer: &mut impl Write) -> Result<()> {
+    pub(crate) fn write_predicate(&self, writer: &mut (impl Write + ?Sized)) -> Result<()> {
         self.encoded_len()?;
         writer.write_all(&PREDICATE_VERSION.to_le_bytes())?;
         writer.write_all(&self.cutoff.serialize())?;
@@ -69,7 +69,7 @@ fn predicate_len(count: u64) -> Result<u64> {
 /// Streams full IDs to the manifest validator/scratch index. It never allocates
 /// a collection from the on-disk count or consumes the next manifest record.
 pub(crate) fn read_predicate(
-    reader: &mut impl Read,
+    reader: &mut (impl Read + ?Sized),
     encoded_len: u64,
     mut visit: impl FnMut(BlockIdExt) -> Result<()>,
 ) -> Result<BlockIdExt> {
