@@ -9,6 +9,7 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+use super::context::{ArchiveOperation, ArchiveView};
 use crate::{
     archives::package_entry::{PackageEntry, PKG_ENTRY_HEADER_SIZE},
     TARGET,
@@ -23,6 +24,7 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 #[derive(Debug)]
 pub struct Package {
+    view: ArchiveView,
     path: PathBuf,
     read_only: bool,
     size: AtomicU64,
@@ -47,7 +49,8 @@ async fn read_header<R: tokio::io::AsyncReadExt + Unpin>(reader: &mut R) -> Resu
 }
 
 impl Package {
-    pub async fn open(path: PathBuf, read_only: bool, create: bool) -> Result<Self> {
+    pub async fn open(view: ArchiveView, parent: &ArchiveOperation, path: PathBuf, read_only: bool, create: bool) -> Result<Self> {
+        let _operation = view.inherit(parent)?;
         let (file, size) = if read_only {
             let size = tokio::fs::metadata(&path).await?.len();
             if size < PKG_HEADER_SIZE as u64 {
@@ -74,6 +77,7 @@ impl Package {
         };
 
         Ok(Self {
+            view,
             path,
             read_only,
             size: AtomicU64::new(size),
@@ -84,7 +88,8 @@ impl Package {
 
     /// Validate a leased existing package without any repair or creation. Use
     /// the same descriptor for validation and later append access.
-    pub(crate) async fn open_existing_exact(path: PathBuf, read_only: bool, logical_size: u64) -> Result<Self> {
+    pub(crate) async fn open_existing_exact(view: ArchiveView, parent: &ArchiveOperation, path: PathBuf, read_only: bool, logical_size: u64) -> Result<Self> {
+        let _operation = view.inherit(parent)?;
         let mut file = tokio::fs::OpenOptions::new().read(true).write(!read_only).open(&path).await
             .map_err(|error| error!("Protected package open failed for {}: {error}", path.display()))?;
         let expected = logical_size.checked_add(PKG_HEADER_SIZE as u64)
@@ -96,7 +101,7 @@ impl Package {
         read_header(&mut file).await?;
         file.seek(SeekFrom::End(0)).await?;
         Ok(Self {
-            path, read_only, size: AtomicU64::new(size),
+            view, path, read_only, size: AtomicU64::new(size),
             write_healthy: AtomicBool::new(true),
             write_mutex: tokio::sync::Mutex::new(if read_only { None } else { Some(file) }),
         })
@@ -246,19 +251,23 @@ impl Package {
         offset: u64,
         limits: super::bounded_read::ArchiveReadLimits,
     ) -> Result<PackageEntry> {
-        let mut file = tokio::fs::OpenOptions::new().read(true).write(!self.read_only)
-            .open(&self.path).await
-            .map_err(super::bounded_read::ArchiveReadNotStarted::from_open)?;
-        read_header(&mut file).await?;
-        let start = offset.checked_add(PKG_HEADER_SIZE as u64)
-            .ok_or_else(|| error!("Archive entry offset overflow"))?;
-        let end = start.checked_add(PKG_ENTRY_HEADER_SIZE as u64)
-            .ok_or_else(|| error!("Archive entry header offset overflow"))?;
-        if end > file.metadata().await?.len() { fail!("Truncated archive entry header"); }
-        file.seek(SeekFrom::Start(start)).await?;
-        // Preserve typed limit errors; formatting them into strings loses the
-        // upper resolver's ability to forbid fallback after budget exhaustion.
-        PackageEntry::read_from_bounded(&mut file, limits).await
+        let operation = self.view.enter()?;
+        self.read_entry_bounded_in(&operation, offset, limits).await
+    }
+
+    pub(super) async fn read_entry_bounded_in(
+        &self, parent: &ArchiveOperation, offset: u64,
+        limits: super::bounded_read::ArchiveReadLimits,
+    ) -> Result<PackageEntry> {
+        let operation = self.view.inherit(parent)?;
+        super::native_read::read_entry(operation, self.path.clone(), offset, limits).await
+    }
+
+    pub(super) async fn read_range_in(
+        &self, parent: &ArchiveOperation, offset: u64, limit: u32,
+    ) -> Result<Vec<u8>> {
+        let operation = self.view.inherit(parent)?;
+        super::native_read::read_range(operation, self.path.clone(), offset, limit).await
     }
 
     pub async fn append_entry(
@@ -350,6 +359,15 @@ pub async fn read_package_from<R: tokio::io::AsyncReadExt + Unpin>(
 }
 
 #[cfg(test)]
+pub(super) fn package_fixture_context() -> Result<(tempfile::TempDir, ArchiveView, ArchiveOperation)> {
+    let dir = tempfile::tempdir()?;
+    let db = crate::db::rocksdb::RocksDb::new(dir.path(), "provider", None, crate::db::rocksdb::AccessType::ReadWrite)?;
+    let view = db.bind_archive_domain(super::context::ArchiveDomain::new())?.view()?;
+    let operation = view.enter()?;
+    Ok((dir, view, operation))
+}
+
+#[cfg(test)]
 #[path = "../tests/test_package.rs"]
 mod tests;
 
@@ -384,6 +402,7 @@ mod bounded_tests {
     use crate::archives::bounded_read::{ArchiveReadLimitExceeded, ArchiveReadLimits};
     #[tokio::test]
     async fn bounded_archive_real_package_limit_offset_and_truncation() -> Result<()> {
+        let (_context_dir, view, operation) = package_fixture_context()?;
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("archive.pack");
         // Real fixed package/entry headers followed by an exact-sized payload.
@@ -393,7 +412,7 @@ mod bounded_tests {
         data.extend_from_slice(&4u32.to_le_bytes());
         data.extend_from_slice(b"xabcd");
         std::fs::write(&path, &data)?;
-        let package = Package::open(path.clone(), true, false).await?;
+        let package = Package::open(view.clone(), &operation, path.clone(), true, false).await?;
         let limits = ArchiveReadLimits { data_bytes: 4, filename_bytes: 1 };
         let entry = package.read_entry_bounded(0, limits).await?;
         assert_eq!(entry.filename(), "x"); assert_eq!(entry.data(), b"abcd");
@@ -416,9 +435,10 @@ mod protected_open_tests {
     use super::*;
     #[tokio::test]
     async fn protected_package_exact_open_checks_readonly_magic_and_allows_valid_append() -> Result<()> {
+        let (_context_dir, view, operation) = package_fixture_context()?;
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("protected.pack");
-        let package = Package::open(path.clone(), false, true).await?;
+        let package = Package::open(view.clone(), &operation, path.clone(), false, true).await?;
         let entry = PackageEntry::with_data("first".into(), b"first".to_vec());
         package.append_entry(&entry, |_, _| Ok(())).await?;
         let size = package.size();
@@ -427,15 +447,15 @@ mod protected_open_tests {
         let mut damaged = original.clone();
         damaged[0] ^= 0xff;
         std::fs::write(&path, &damaged)?;
-        assert!(Package::open_existing_exact(path.clone(), true, size).await.is_err());
+        assert!(Package::open_existing_exact(view.clone(), &operation, path.clone(), true, size).await.is_err());
         assert_eq!(std::fs::read(&path)?, damaged);
         std::fs::write(&path, &original)?;
-        let package = Package::open_existing_exact(path.clone(), false, size).await?;
+        let package = Package::open_existing_exact(view.clone(), &operation, path.clone(), false, size).await?;
         package.append_entry(&entry, |_, _| Ok(())).await?;
         let appended = package.size();
         assert!(appended > size);
         drop(package);
-        assert!(Package::open_existing_exact(path.clone(), true, appended).await.is_ok());
+        assert!(Package::open_existing_exact(view.clone(), &operation, path.clone(), true, appended).await.is_ok());
         Ok(())
     }
 }
@@ -446,9 +466,10 @@ mod write_health_tests {
 
     #[tokio::test]
     async fn metadata_error_fences_append_and_truncate_until_fresh_owner_recovery() -> Result<()> {
+        let (_context_dir, view, operation) = package_fixture_context()?;
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("write-health.pack");
-        let package = Package::open(path.clone(), false, true).await?;
+        let package = Package::open(view.clone(), &operation, path.clone(), false, true).await?;
         let seed = PackageEntry::with_data("seed".into(), b"acknowledged bytes".to_vec());
         package.append_entry(&seed, |_, _| Ok(())).await?;
         let committed_end = package.size();
@@ -480,14 +501,14 @@ mod write_health_tests {
         assert!(error.to_string().contains("write state is uncertain"));
         assert_eq!(std::fs::read(&path)?, uncertain, "refusal must not repair or mutate bytes");
         drop(package);
-        assert!(Package::open_existing_exact(path.clone(), false, committed_end).await.is_err());
+        assert!(Package::open_existing_exact(view.clone(), &operation, path.clone(), false, committed_end).await.is_err());
         assert_eq!(
             std::fs::read(&path)?,
             uncertain,
             "protected reopen must preserve uncertain history"
         );
         // This models only the explicitly unprotected durable-end recovery policy.
-        let recovered = Package::open(path.clone(), false, false).await?;
+        let recovered = Package::open(view.clone(), &operation, path.clone(), false, false).await?;
         recovered.truncate(committed_end).await?;
         assert_eq!(std::fs::read(&path)?, original);
         recovered.append_entry(&target, |_, _| Ok(())).await?;
@@ -499,9 +520,10 @@ mod write_health_tests {
 
     #[tokio::test]
     async fn prewrite_length_mismatch_is_refused_and_latches_write_health() -> Result<()> {
+        let (_context_dir, view, operation) = package_fixture_context()?;
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("length-mismatch.pack");
-        let package = Package::open(path.clone(), false, true).await?;
+        let package = Package::open(view.clone(), &operation, path.clone(), false, true).await?;
         let seed = PackageEntry::with_data("seed".into(), b"seed".to_vec());
         package.append_entry(&seed, |_, _| Ok(())).await?;
         use std::io::Write;

@@ -150,3 +150,64 @@ async fn failed_startup_refuses_router_before_directory_creation() {
     );
     assert!(!config.new_epochs_path.exists());
 }
+
+
+#[tokio::test]
+async fn file_map_context_refusal_never_deletes_unneeded_index() {
+    struct FailAfterResolve(SingleDbProvider);
+    #[async_trait::async_trait]
+    impl ArchiveDbProvider for FailAfterResolve {
+        fn main_binding(&self) -> &ArchiveProvider {
+            self.0.main_binding()
+        }
+        async fn resolve_for_read(
+            &self,
+            parent: &ArchiveOperation,
+            id: u32,
+        ) -> Result<Option<ResolvedArchive>> {
+            let resolved = self.0.resolve_for_read(parent, id).await?;
+            drop(parent.child().handoff(()));
+            Ok(resolved)
+        }
+        async fn db_for_archive(
+            &self,
+            parent: &ArchiveOperation,
+            id: u32,
+        ) -> Result<ResolvedArchive> {
+            self.0.db_for_archive(parent, id).await
+        }
+        fn memory_usage(&self) -> crate::RocksDbMemoryUsage {
+            Default::default()
+        }
+    }
+    let (dir, binding, operation) = factory();
+    let provider: Arc<dyn ArchiveDbProvider> = Arc::new(FailAfterResolve(SingleDbProvider::new(
+        binding.clone(),
+        Arc::new(dir.path().to_path_buf()),
+    )));
+    let db = binding.db();
+    db.db().create_cf("files", &rocksdb::Options::default()).unwrap();
+    let row = serde_cbor::to_vec(&PackageIndexEntry::new()).unwrap();
+    let cf = db.db().cf_handle("files").unwrap();
+    db.db().put_cf(&cf, 0u32.to_le_bytes(), &row).unwrap();
+    let error = FileMap::new(
+        db.clone(),
+        &operation,
+        &provider,
+        "files",
+        PackageType::Blocks,
+        100,
+        #[cfg(feature = "telemetry")]
+        &Arc::new(crate::StorageTelemetry::default()),
+        &Arc::new(StorageAlloc::default()),
+    )
+    .await
+    .err()
+    .expect("context refusal was swallowed by FileMap cleanup");
+    assert_eq!(
+        error.downcast_ref::<ArchiveContextError>(),
+        Some(&ArchiveContextError::RecoveryRequired(0))
+    );
+    assert_eq!(db.db().get_cf(&cf, 0u32.to_le_bytes()).unwrap().unwrap(), row);
+    assert!(!dir.path().join("archive").exists());
+}

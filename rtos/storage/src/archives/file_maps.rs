@@ -295,11 +295,11 @@ impl FileMap {
             );
             let resolved = db_provider.resolve_for_read(startup, key).await?
                 .ok_or_else(|| error!("Indexed archive {key} has no existing epoch provider"))?;
-            let slice_db = resolved.provider.db().clone();
             let slice_root_path = resolved.root_path.clone();
             let archive_slice = match ArchiveSlice::with_data(
                 protection.clone(),
-                slice_db,
+                resolved.provider.clone(),
+                &resolved.operation,
                 slice_root_path,
                 key,
                 package_type,

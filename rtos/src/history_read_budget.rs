@@ -60,6 +60,7 @@ pub fn stops_fallback(e: &anyhow::Error) -> bool {
         || e.downcast_ref::<crate::network::full_node_overlay_client::BoundedBocDecodeRejected>()
             .is_some()
         || e.downcast_ref::<storage::archives::bounded_read::ArchiveReadLimitExceeded>().is_some()
+        || e.downcast_ref::<storage::archives::context::ArchiveContextError>().is_some()
 }
 #[derive(Default)]
 struct Usage {
@@ -664,6 +665,11 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn history_budget_missing_local_refunds_only_verified_zero_read() -> Result<()> {
+        let package_context_dir = tempfile::tempdir()?;
+        let package_context_db = storage::db::rocksdb::RocksDb::new(package_context_dir.path(), "provider", None, storage::db::rocksdb::AccessType::ReadWrite)?;
+        let package_view = package_context_db.bind_archive_domain(storage::archives::context::ArchiveDomain::new())?.view()?;
+        let package_operation = package_view.enter()?;
+
         use storage::archives::{
             bounded_read::{ArchiveReadLimits, ArchiveReadNotStarted},
             package::Package,
@@ -672,7 +678,7 @@ mod tests {
         // callers cannot construct it from an unrelated NotFound after partial IO.
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("pack");
-        let package = Package::open(path.clone(), false, true).await?;
+        let package = Package::open(package_view.clone(), &package_operation, path.clone(), false, true).await?;
         std::fs::remove_file(&path)?;
         let error = package
             .read_entry_bounded(0, ArchiveReadLimits { data_bytes: 4, filename_bytes: 64 })
@@ -875,5 +881,18 @@ mod tests {
         assert!(budget.proof_bytes(b"efgh").is_err());
         assert_eq!(budget.usage.lock().unwrap().steps, 1);
         Ok(())
+    }
+}
+
+
+#[cfg(test)]
+#[test]
+fn archive_context_refusal_always_stops_history_fallback() {
+    use storage::archives::context::ArchiveContextError;
+    for refusal in [ArchiveContextError::Closed(0), ArchiveContextError::RecoveryRequired(0), ArchiveContextError::Stale { expected: 0, current: 1 }] {
+        let error = anyhow::Error::new(refusal).context("actual archive resolver boundary");
+        assert!(stops_fallback(&error));
+        assert!(!error.is::<storage::archives::bounded_read::ArchiveArtifactMissing>());
+        assert!(!error.is::<storage::archives::bounded_read::ArchiveReadNotStarted>());
     }
 }

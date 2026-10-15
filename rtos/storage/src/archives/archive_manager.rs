@@ -269,6 +269,7 @@ impl ArchiveManager {
         entry_id: &PackageEntryId<B>,
         limits: super::bounded_read::ArchiveReadLimits,
     ) -> Result<Vec<u8>> {
+        let operation = self.view.enter()?;
         let _lock = match entry_id {
             PackageEntryId::Block(_) => handle.block_file_lock().read().await,
             PackageEntryId::Proof(_) | PackageEntryId::ProofLink(_) => {
@@ -276,21 +277,23 @@ impl ArchiveManager {
             }
             _ => fail!("Unsupported bounded archive entry"),
         };
+        let _after_lock = self.view.inherit(&operation)?;
         if handle.is_archived() {
             let package_id = if handle.is_key_block()? {
                 PackageId::for_key_block(get_mc_seq_no(handle) / KEY_ARCHIVE_PACKAGE_SIZE)
             } else {
-                let id = self.file_maps.files().get_closest_id(get_mc_seq_no(handle)).await
-                    .ok_or_else(|| super::bounded_read::ArchiveArtifactMissing::new("package route"))?;
+                let found = self.file_maps.files().get_closest_id(get_mc_seq_no(handle)).await;
+                let _checked = self.view.inherit(&operation)?;
+                let id = found.ok_or_else(|| super::bounded_read::ArchiveArtifactMissing::new("package route"))?;
                 PackageId::for_block(id)
             };
             let fd = self
-                .get_file_desc(&package_id, false)
+                .get_file_desc_in(&operation, &package_id)
                 .await?
                 .ok_or_else(|| super::bounded_read::ArchiveArtifactMissing::new("descriptor"))?;
             let entry = fd
                 .archive_slice()
-                .get_file_bounded(handle, entry_id, limits)
+                .get_file_bounded_in(&operation, handle, entry_id, limits)
                 .await?
                 .ok_or_else(|| super::bounded_read::ArchiveArtifactMissing::new("entry offset"))?;
             return Ok(entry.take_data());
@@ -301,7 +304,7 @@ impl ArchiveManager {
             filename.len() as u64,
             limits.filename_bytes,
         )?;
-        super::bounded_read::read_loose(&self.unapplied_files_path.join(filename), limits).await
+        super::native_read::read_loose(self.view.inherit(&operation)?, self.unapplied_files_path.join(filename), limits).await
     }
 
     pub async fn get_file<B: Borrow<BlockIdExt> + Hash>(
@@ -512,13 +515,15 @@ impl ArchiveManager {
         offset: u64,
         limit: u32,
     ) -> Result<Vec<u8>> {
-        let fd = match self.get_file_desc(&PackageId::for_block(archive_id as u32), false).await? {
+        let operation = self.view.enter()?;
+        super::bounded_read::check_length("range", u64::from(limit), super::bounded_read::ARCHIVE_RANGE_MAX_BYTES)?;
+        let fd = match self.get_file_desc_in(&operation, &PackageId::for_block(archive_id as u32)).await? {
             Some(file_desc) => file_desc,
             None => {
                 match self
-                    .get_file_desc(
+                    .get_file_desc_in(
+                        &operation,
                         &PackageId::for_key_block(archive_id as u32 / KEY_ARCHIVE_PACKAGE_SIZE),
-                        false,
                     )
                     .await?
                 {
@@ -527,7 +532,7 @@ impl ArchiveManager {
                 }
             }
         };
-        fd.archive_slice().get_slice(archive_id, offset, limit).await
+        fd.archive_slice().get_slice_in(&operation, archive_id, offset, limit).await
     }
 
     /// Sums the main node DB (which always lives here regardless of mode)
@@ -688,6 +693,29 @@ impl ArchiveManager {
         Ok((temp_filename, data))
     }
 
+    /// Existing descriptor lookup for an already-admitted read; never creates.
+    async fn get_file_desc_in(
+        &self, parent: &ArchiveOperation, id: &PackageId,
+    ) -> Result<Option<Arc<FileDescription>>> {
+        let operation = self.view.inherit(parent)?;
+        let resolved = match id.package_type() {
+            PackageType::KeyBlocks => super::db_provider::ResolvedArchive {
+                provider: self.view.binding().clone(),
+                root_path: self.db_root_path.clone(),
+                operation: self.view.inherit(&operation)?,
+            },
+            PackageType::Blocks => {
+                let Some(resolved) = self.db_provider.resolve_for_read(&operation, id.id()).await? else {
+                    return Ok(None);
+                };
+                resolved
+            },
+        };
+        let found = self.file_maps.get(id.package_type()).get(id.id()).await;
+        let _checked = resolved.operation.view().inherit(&resolved.operation)?;
+        Ok(found.filter(|fd| !fd.deleted()))
+    }
+
     async fn get_file_desc(
         &self,
         id: &PackageId,
@@ -734,7 +762,8 @@ impl ArchiveManager {
         let dir = slice_root_path.join(id.path());
         tokio::fs::create_dir_all(&dir).await?;
         let archive_slice = ArchiveSlice::new_empty(
-            slice_db,
+            resolved.provider.clone(),
+            &resolved.operation,
             slice_root_path,
             id.id(),
             id.package_type(),
@@ -935,7 +964,8 @@ impl ArchiveManager {
         let dir = slice_root_path.join(id.path());
         tokio::fs::create_dir_all(&dir).await?;
         let archive_slice = ArchiveSlice::new_for_import(
-            slice_db,
+            resolved.provider.clone(),
+            &resolved.operation,
             slice_root_path,
             id.id(),
             id.package_type(),

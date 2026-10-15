@@ -63,7 +63,8 @@ fn typed(error: anyhow::Error) {
 async fn seed(db: &Arc<RocksDb>, root: &Arc<PathBuf>, kind: PackageType) {
     drop(
         ArchiveSlice::new_empty(
-            db.clone(),
+            db.test_archive_provider().unwrap(),
+        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
             root.clone(),
             0,
             kind,
@@ -93,6 +94,7 @@ async fn constructor_case(mode: &str) {
             let dir = tempfile::tempdir().unwrap();
             let root = Arc::new(dir.path().to_path_buf());
             let db = RocksDb::new(&*root, "db", None, AccessType::ReadWrite).unwrap();
+            db.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
             seed(&db, &root, kind).await;
             // An ordinary reopen could truncate this uncommitted tail.
             use std::io::Write;
@@ -117,7 +119,8 @@ async fn constructor_case(mode: &str) {
                         typed(
                             ArchiveSlice::with_data(
                                 db.repair_protection().clone(),
-                                db.clone(),
+                                db.test_archive_provider().unwrap(),
+        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
                                 root.clone(),
                                 0,
                                 kind,
@@ -137,7 +140,8 @@ async fn constructor_case(mode: &str) {
                 }
                 "new_empty" => typed(
                     ArchiveSlice::new_empty(
-                        db.clone(),
+                        db.test_archive_provider().unwrap(),
+        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
                         root.clone(),
                         0,
                         kind,
@@ -152,7 +156,8 @@ async fn constructor_case(mode: &str) {
                 ),
                 "new_for_import" => typed(
                     ArchiveSlice::new_for_import(
-                        db.clone(),
+                        db.test_archive_provider().unwrap(),
+        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
                         root.clone(),
                         0,
                         kind,
@@ -255,6 +260,7 @@ async fn legacy_cleanup_preserves_unresolved_inputs_and_clean_control_drops() {
         let dir = tempfile::tempdir().unwrap();
         let root = Arc::new(dir.path().to_path_buf());
         let db = RocksDb::new(&*root, "db", None, AccessType::ReadWrite).unwrap();
+        db.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
         seed(&db, &root, PackageType::Blocks).await;
         seed(&db, &root, PackageType::KeyBlocks).await;
         db.db().create_cf(NODE_STATE_DB_NAME, &Options::default()).unwrap();
@@ -286,6 +292,7 @@ async fn legacy_cleanup_preserves_unresolved_inputs_and_clean_control_drops() {
         db.sync_wal().unwrap();
         drop(db);
         let db = RocksDb::new(&*root, "db", None, AccessType::ReadWrite).unwrap();
+        db.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
         if mode == "clean" {
             assert!(db.db().cf_handle("status_db_0").is_none());
             assert!(db.db().cf_handle("entry_meta_db_0").is_none());
@@ -300,6 +307,7 @@ async fn legacy_cleanup_preserves_unresolved_inputs_and_clean_control_drops() {
 fn inspection_errors_are_typed_and_never_report_clear() {
     let dir = tempfile::tempdir().unwrap();
     let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite).unwrap();
+    db.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
     typed(ensure_provider_clear(db.db(), dir.path(), &["status_db_0".into()]).unwrap_err());
     fs::write(dir.path().join("archive"), b"not a directory").unwrap();
     typed(ensure_slice_clear(db.db(), dir.path(), 0, false).unwrap_err());
@@ -314,6 +322,7 @@ async fn dangling_package_ancestors_preserve_cleanup_inputs() {
         let dir = tempfile::tempdir().unwrap();
         let root = Arc::new(dir.path().to_path_buf());
         let db = RocksDb::new(&*root, "db", None, AccessType::ReadWrite).unwrap();
+        db.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
         for name in ["entry_meta_db_0", "offsets_db_0", "status_db_0", NODE_STATE_DB_NAME] {
             db.db().create_cf(name, &Options::default()).unwrap();
         }
@@ -343,8 +352,87 @@ async fn dangling_package_ancestors_preserve_cleanup_inputs() {
         let before = snapshot(&db);
         drop(db);
         let db = RocksDb::new(&*root, "db", None, AccessType::ReadWrite).unwrap();
+        db.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
         assert_eq!(snapshot(&db), before);
         typed(ensure_slice_clear(db.db(), &root, 0, false).unwrap_err());
         assert_eq!(fs::read_link(link).unwrap(), root.join("missing-target"));
+    }
+}
+
+
+#[tokio::test]
+async fn all_slice_constructors_refuse_failed_context_before_deletion_lock_or_changes() {
+    use crate::archives::context::{ArchiveContextError, ArchiveDomain};
+    let dir = tempfile::tempdir().unwrap();
+    let root = Arc::new(dir.path().to_path_buf());
+    let db = RocksDb::new(&*root, "db", None, AccessType::ReadWrite).unwrap();
+    let binding = db.bind_archive_domain(ArchiveDomain::new()).unwrap();
+    let parent = binding.view().unwrap().enter().unwrap();
+    seed(&db, &root, PackageType::Blocks).await;
+    let before = snapshot(&db);
+    let files = package_bytes(&root);
+    drop(parent.child().handoff(()));
+    for mode in ["with_data", "new_empty", "new_for_import"] {
+        let deletion = db.repair_protection().deletion().await;
+        let mut constructor = Box::pin(async {
+            match mode {
+                "with_data" => {
+                    ArchiveSlice::with_data(
+                        db.repair_protection().clone(),
+                        binding.clone(),
+                        &parent,
+                        root.clone(),
+                        0,
+                        PackageType::Blocks,
+                        false,
+                        true,
+                        #[cfg(feature = "telemetry")]
+                        Arc::new(crate::StorageTelemetry::default()),
+                        Arc::new(StorageAlloc::default()),
+                    )
+                    .await
+                }
+                "new_empty" => {
+                    ArchiveSlice::new_empty(
+                        binding.clone(),
+                        &parent,
+                        root.clone(),
+                        0,
+                        PackageType::Blocks,
+                        0,
+                        #[cfg(feature = "telemetry")]
+                        Arc::new(crate::StorageTelemetry::default()),
+                        Arc::new(StorageAlloc::default()),
+                    )
+                    .await
+                }
+                _ => {
+                    ArchiveSlice::new_for_import(
+                        binding.clone(),
+                        &parent,
+                        root.clone(),
+                        0,
+                        PackageType::Blocks,
+                        0,
+                        #[cfg(feature = "telemetry")]
+                        Arc::new(crate::StorageTelemetry::default()),
+                        Arc::new(StorageAlloc::default()),
+                    )
+                    .await
+                }
+            }
+        });
+        let observed = futures::poll!(&mut constructor);
+        drop(constructor);
+        drop(deletion);
+        match observed {
+            std::task::Poll::Ready(Err(error)) => assert_eq!(
+                error.downcast_ref::<ArchiveContextError>(),
+                Some(&ArchiveContextError::RecoveryRequired(0))
+            ),
+            _ => panic!("{mode} did not refuse before the deletion lock"),
+        }
+        assert_eq!(snapshot(&db), before);
+        assert_eq!(package_bytes(&root), files);
     }
 }

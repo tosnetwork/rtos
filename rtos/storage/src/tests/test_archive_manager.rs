@@ -779,7 +779,7 @@ async fn test_import_group_boundary_and_resume() -> Result<()> {
             );
             let data = format!("group={seq}, workchain={wc}").into_bytes();
             let path = Path::new(DB_PATH).join(NAME).join(format!("source-{seq}-{wc}.pack"));
-            let package = Package::open(path.clone(), false, true).await?;
+            let package = Package::open(db.test_archive_provider()?.view()?, &db.test_archive_provider()?.view()?.enter()?, path.clone(), false, true).await?;
             let mut offset = 0;
             package
                 .append_entry(
@@ -1013,7 +1013,8 @@ async fn archive_unleased_startup_still_recovers_uncommitted_tail_and_appends() 
     file.sync_all()?;
     drop(file);
     assert!(std::fs::metadata(&path)?.len() > original.len() as u64);
-    let slice = ArchiveSlice::with_data(db.repair_protection().clone(), db.clone(), root,
+    let slice = ArchiveSlice::with_data(db.repair_protection().clone(), db.test_archive_provider().unwrap(),
+        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(), root,
         0, PackageType::Blocks, false, false,
         #[cfg(feature = "telemetry")]
         Arc::new(StorageTelemetry::default()), Arc::new(StorageAlloc::default())).await?;
@@ -1047,12 +1048,111 @@ async fn archive_protected_key_package_append_metadata_cold_reopen() -> Result<(
     )?;
     let root = Arc::new(dir.path().join("key-reopen"));
     for bytes in [b"key-proof".as_slice(), b"appended-key-proof".as_slice()] {
-        let slice = ArchiveSlice::with_data(db.repair_protection().clone(), db.clone(), root.clone(),
+        let slice = ArchiveSlice::with_data(db.repair_protection().clone(), db.test_archive_provider().unwrap(),
+        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(), root.clone(),
             0, PackageType::KeyBlocks, false, false,
             #[cfg(feature = "telemetry")]
             Arc::new(StorageTelemetry::default()), Arc::new(StorageAlloc::default())).await?;
         assert_eq!(slice.get_file(&handle, &entry).await?.unwrap().data(), bytes);
         slice.add_file(&handle, &entry, b"appended-key-proof".to_vec()).await?;
+    }
+    Ok(())
+}
+
+
+#[tokio::test]
+async fn bounded_reads_keep_inherited_context_after_close_and_refuse_new_roots_before_locks(
+) -> Result<()> {
+    use crate::archives::{
+        bounded_read::{ArchiveReadLimitExceeded, ArchiveReadLimits, ARCHIVE_RANGE_MAX_BYTES},
+        context::ArchiveContextError,
+        package_id::PackageId,
+    };
+    for epoch in [false, true] {
+        for key in [false, true] {
+            for packed in [false, true] {
+                let dir = tempfile::tempdir()?;
+                let (manager, db) = if epoch {
+                    let (manager, db, _router) = create_epoch_manager(dir.path()).await?;
+                    (manager, db)
+                } else {
+                    create_manager(dir.path().to_str().unwrap(), "read-context", false).await?
+                };
+                let domain = manager.view.binding().domain().clone();
+                let (handles, _) = create_block_handle_storage(db);
+                let id = BlockIdExt::with_params(
+                    ShardIdent::masterchain(),
+                    1,
+                    UInt256::from([71; 32]),
+                    UInt256::from([72; 32]),
+                );
+                let flags = if key { FLAG_KEY_BLOCK } else { 0 };
+                let handle = handles
+                    .create_handle(id.clone(), BlockMeta::with_data(flags, 0, 0, 0, 0), None)?
+                    .unwrap();
+                let entry = PackageEntryId::Proof(&id);
+                manager.add_file(&entry, b"proof").await?;
+                handle.set_proof();
+                handle.set_block_applied();
+                if packed {
+                    manager.move_to_archive(&handle, || Ok(())).await?;
+                    handle.set_archived();
+                }
+                let limits = ArchiveReadLimits { data_bytes: 5, filename_bytes: 1024 };
+                // Populate descriptor/package cache before testing closure.
+                assert_eq!(manager.get_file_bounded(&handle, &entry, limits).await?, b"proof");
+                assert_eq!(manager.get_file_bounded(&handle, &entry, limits).await?, b"proof");
+                let error = manager
+                    .get_archive_slice(u64::MAX, 0, ARCHIVE_RANGE_MAX_BYTES as u32 + 1)
+                    .await
+                    .unwrap_err();
+                assert!(error.is::<ArchiveReadLimitExceeded>());
+                if packed {
+                    let package_id =
+                        if key { PackageId::for_key_block(0) } else { PackageId::for_block(0) };
+                    let descriptor = manager.get_file_desc(&package_id, false).await?.unwrap();
+                    assert_eq!(
+                        descriptor
+                            .archive_slice()
+                            .get_file_bounded(&handle, &entry, limits)
+                            .await?
+                            .unwrap()
+                            .data(),
+                        b"proof"
+                    );
+                    let archive_id =
+                        manager.get_archive_id(1, &ShardIdent::masterchain()).await.unwrap();
+                    assert!(!manager.get_archive_slice(archive_id, 0, 4).await?.is_empty());
+                }
+                let lock = handle.proof_file_lock().write().await;
+                let mut admitted = Box::pin(manager.get_file_bounded(&handle, &entry, limits));
+                let was_pending = futures::poll!(&mut admitted).is_pending();
+                let closed = domain.close(manager.view.epoch())?;
+                let mut refused = Box::pin(manager.get_file_bounded(&handle, &entry, limits));
+                let rejected_before_lock = match futures::poll!(&mut refused) {
+                    std::task::Poll::Ready(Err(error)) => {
+                        error.downcast_ref::<ArchiveContextError>()
+                            == Some(&ArchiveContextError::Closed(0))
+                    }
+                    _ => false,
+                };
+                drop(refused);
+                drop(lock);
+                let bytes =
+                    tokio::time::timeout(std::time::Duration::from_secs(20), admitted).await??;
+                tokio::time::timeout(std::time::Duration::from_secs(20), closed.wait()).await?;
+                assert!(was_pending && rejected_before_lock);
+                assert_eq!(bytes, b"proof");
+                assert_eq!(domain.outstanding(), 0);
+                let error = manager.get_archive_slice(0, 0, 4).await.unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<ArchiveContextError>(),
+                    Some(&ArchiveContextError::Closed(0))
+                );
+                assert!(handle.has_proof());
+                assert_eq!(handle.is_archived(), packed);
+            }
+        }
     }
     Ok(())
 }

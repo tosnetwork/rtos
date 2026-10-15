@@ -47,8 +47,10 @@ async fn prepare_test(
     let db_root = Path::new(DB_PATH).join(name);
     let _ = std::fs::remove_dir_all(&db_root);
     let db = RocksDb::new(DB_PATH, name, None, AccessType::ReadWrite)?;
+    db.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
     let archive_slice = ArchiveSlice::new_empty(
-        db.clone(),
+        db.test_archive_provider().unwrap(),
+        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
         Arc::new(db_root),
         archive_id,
         package_type,
@@ -251,9 +253,11 @@ async fn test_import_package_entries_refreshes_existing_size() -> Result<()> {
     let db_root = Path::new(DB_PATH).join(name);
     let _ = std::fs::remove_dir_all(&db_root);
     let db = RocksDb::new(DB_PATH, name, None, AccessType::ReadWrite)?;
+    db.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
     let archive_id = 0u32;
     let slice = ArchiveSlice::new_for_import(
-        db.clone(),
+        db.test_archive_provider().unwrap(),
+        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
         Arc::new(db_root),
         archive_id,
         PackageType::Blocks,
@@ -290,7 +294,59 @@ async fn test_import_package_entries_refreshes_existing_size() -> Result<()> {
         "persisted size must be refreshed on existing package (truncate-bug regression)",
     );
 
+    // Cached PackageInfo retains its bound provider until its last owner drops.
+    drop(pi);
     drop(slice);
     destroy_db(db, name).await;
+    Ok(())
+}
+
+
+#[tokio::test]
+async fn package_open_context_refusal_preserves_existing_input_and_slot_count() -> Result<()> {
+    use crate::archives::context::{ArchiveContextError, ArchiveDomain};
+    let dir = tempfile::tempdir()?;
+    let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite)?;
+    let binding = db.bind_archive_domain(ArchiveDomain::new())?;
+    let operation = binding.view()?.enter()?;
+    let root = Arc::new(dir.path().to_path_buf());
+    let slice = ArchiveSlice::new_empty(
+        binding,
+        &operation,
+        root.clone(),
+        0,
+        PackageType::Blocks,
+        0,
+        #[cfg(feature = "telemetry")]
+        Arc::new(StorageTelemetry::default()),
+        Arc::new(StorageAlloc::default()),
+    )
+    .await?;
+    let entry = super::PackageEntryInfo { seqno: 100, shard: ShardIdent::masterchain() };
+    let path = crate::archives::package_id::PackageId::for_block(100)
+        .full_path(root.as_path(), &entry.shard)?;
+    let original = crate::archives::package::PKG_HEADER_MAGIC.to_le_bytes();
+    std::fs::write(&path, original)?;
+    let count = slice.package_count.load(std::sync::atomic::Ordering::Relaxed);
+    let native = operation.child();
+    *slice.before_package_open.lock().unwrap() = Some(Box::new(move || drop(native.handoff(()))));
+    let error = slice
+        .open_package(
+            &operation,
+            entry.clone(),
+            None,
+            0,
+            super::DEFAULT_PKG_VERSION,
+            super::PackageOpenMode::RecoverOrCreate,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<ArchiveContextError>(),
+        Some(&ArchiveContextError::RecoveryRequired(0))
+    );
+    assert_eq!(std::fs::read(path)?, original);
+    assert_eq!(slice.package_count.load(std::sync::atomic::Ordering::Relaxed), count);
+    assert!(slice.package_store.get(&entry).is_none(), "failed opening left a spinning cache slot");
     Ok(())
 }

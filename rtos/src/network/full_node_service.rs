@@ -670,8 +670,8 @@ impl FullNodeOverlayService {
 
     // tonNode.getArchiveSlice archive_id:long offset:long max_size:int = tonNode.Data;
     async fn get_archive_slice(&self, query: GetArchiveSlice) -> Result<TaggedByteVec> {
-        if query.max_size as usize > PART_MAX_SIZE {
-            fail!("Part size {} is too big, max is {}", query.max_size, PART_MAX_SIZE);
+        if query.max_size as usize > storage::archives::bounded_read::ARCHIVE_RANGE_MAX_BYTES {
+            fail!("Part size {} is too big, max is {}", query.max_size, storage::archives::bounded_read::ARCHIVE_RANGE_MAX_BYTES);
         }
         let answer = TaggedByteVec {
             object: self

@@ -1,6 +1,9 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Explicit per-object limits; callers own cumulative request accounting.
-use rtos_block::{fail, Result};
+use rtos_block::Result;
+#[cfg(test)]
+use rtos_block::fail;
+#[cfg(test)]
 use tokio::io::AsyncReadExt;
 
 /// Shared storage/network cap for a single archive range response.
@@ -62,6 +65,7 @@ pub fn check_length(resource: &'static str, requested: u64, limit: usize) -> Res
     Ok(usize::try_from(requested)?)
 }
 
+#[cfg(test)]
 pub(super) async fn read_loose(
     path: &std::path::Path,
     limits: ArchiveReadLimits,
@@ -74,6 +78,7 @@ pub(super) async fn read_loose(
     read_opened(&mut file, metadata.len(), limits).await
 }
 
+#[cfg(test)]
 async fn read_opened(
     file: &mut tokio::fs::File,
     expected: u64,

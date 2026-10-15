@@ -88,6 +88,11 @@ impl Fixture {
         )
     }
     pub async fn prepare(&self, dir: &Path, archives: &Path) -> Result<()> {
+        let package_context_dir = tempfile::tempdir()?;
+        let package_context_db = storage::db::rocksdb::RocksDb::new(package_context_dir.path(), "provider", None, storage::db::rocksdb::AccessType::ReadWrite)?;
+        let package_view = package_context_db.bind_archive_domain(storage::archives::context::ArchiveDomain::new())?.view()?;
+        let package_operation = package_view.enter()?;
+
         std::fs::create_dir_all(archives)?;
         std::fs::write(dir.join("authenticated-mc-zero.boc"), self.bytes(0, false, false))?;
         std::fs::write(dir.join("authenticated-wc-zero.boc"), self.bytes(0, true, false))?;
@@ -103,7 +108,7 @@ impl Fixture {
                 } else {
                     format!("archive.{start:05}.pack")
                 });
-                let package = Package::open(path, false, true).await?;
+                let package = Package::open(package_view.clone(), &package_operation, path, false, true).await?;
                 for seq in start..=start + 1 {
                     let id = self.id(seq, wc);
                     let proof = self.proof(seq, wc)?;

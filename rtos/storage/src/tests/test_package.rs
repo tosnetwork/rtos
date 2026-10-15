@@ -27,6 +27,7 @@ const KEY_ARCHIVE_00000_PATH: &str = "src/tests/testdata/key.archive.000000.pack
 
 #[tokio::test]
 async fn test_creation() -> Result<()> {
+    let (_context_dir, view, operation) = super::package_fixture_context()?;
     const DB_NAME: &str = "test_package_creation";
 
     let dir = Path::new(DB_PATH).join(DB_NAME);
@@ -35,7 +36,7 @@ async fn test_creation() -> Result<()> {
     let filename = package_id.full_path(dir.as_path(), &ShardIdent::masterchain())?;
 
     fs::create_dir_all(filename.parent().unwrap())?;
-    let package = Package::open(filename, false, true).await?;
+    let package = Package::open(view.clone(), &operation, filename, false, true).await?;
 
     let block_id = BlockIdExt::default();
     let entry_id = PackageEntryId::Block(&block_id);
@@ -57,8 +58,9 @@ async fn test_creation() -> Result<()> {
 
 #[tokio::test]
 async fn test_reading() -> Result<()> {
+    let (_context_dir, view, operation) = super::package_fixture_context()?;
     let path = PathBuf::from_str(ARCHIVE_00001_GOLD_PATH)?;
-    let package = Package::open(path, true, false).await?;
+    let package = Package::open(view.clone(), &operation, path, true, false).await?;
     assert_eq!(package.size(), 342 - PKG_HEADER_SIZE as u64);
     let entry = package.read_entry(0).await?;
 

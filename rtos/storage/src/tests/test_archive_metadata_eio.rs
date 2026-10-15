@@ -49,6 +49,7 @@ pub(super) fn payload(handle: &BlockHandle) -> Vec<u8> {
 }
 pub(super) async fn native(path: &Path, key: bool) -> (Arc<RocksDb>, Arc<RocksDb>, Vec<Arc<BlockHandle>>) {
     let provider = RocksDb::new(path, "archive_provider", None, AccessType::ReadWrite).unwrap();
+    provider.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
     let handles_db = RocksDb::new(path, "handle_db", None, AccessType::ReadWrite).unwrap();
     let (storage, table) = create_block_handle_storage(handles_db.clone());
     let mut handles = Vec::new();
@@ -92,7 +93,8 @@ pub(super) async fn open(
     let mode = if key { PackageType::KeyBlocks } else { PackageType::Blocks };
     if db.db().cf_handle(&cf("status", key)).is_none() {
         ArchiveSlice::new_empty(
-            db.clone(),
+            db.test_archive_provider().unwrap(),
+        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
             root,
             0,
             mode,
@@ -105,7 +107,8 @@ pub(super) async fn open(
     } else {
         ArchiveSlice::with_data(
             db.repair_protection().clone(),
-            db.clone(),
+            db.test_archive_provider().unwrap(),
+        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
             root,
             0,
             mode,

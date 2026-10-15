@@ -318,3 +318,50 @@ fn checked_inheritance_rejects_other_domain_and_failure_before_read_start() {
     drop(started);
     assert_eq!(domain.outstanding(), 0);
 }
+
+
+#[tokio::test]
+async fn cached_package_and_slice_views_refuse_stale_read_authority() {
+    use crate::archives::{
+        archive_slice::ArchiveSlice, bounded_read::ArchiveReadLimits, package::Package,
+        package_id::PackageType,
+    };
+    let (dir, db, domain, view) = fixture();
+    let parent = view.enter().unwrap();
+    let path = dir.path().join("direct.pack");
+    let package = Package::open(view.clone(), &parent, path.clone(), false, true).await.unwrap();
+    let original = std::fs::read(&path).unwrap();
+    let slice = ArchiveSlice::new_empty(
+        view.binding().clone(),
+        &parent,
+        Arc::new(dir.path().to_path_buf()),
+        0,
+        PackageType::Blocks,
+        0,
+        #[cfg(feature = "telemetry")]
+        Arc::new(crate::StorageTelemetry::default()),
+        Arc::new(crate::StorageAlloc::default()),
+    )
+    .await
+    .unwrap();
+    drop(parent);
+    let closed = domain.close(0).unwrap();
+    closed.wait().await;
+    // Test-only publisher exercises immutable views, not production retirement.
+    domain.publish_next_epoch(0).unwrap();
+    let current = db.bind_archive_domain(domain.clone()).unwrap().view().unwrap().enter().unwrap();
+    let expected = ArchiveContextError::Stale { expected: 0, current: 1 };
+    let error = package
+        .read_entry_bounded(0, ArchiveReadLimits { data_bytes: 4, filename_bytes: 4 })
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&expected));
+    let error = package.read_range_in(&current, 0, 4).await.unwrap_err();
+    assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&expected));
+    let error = slice.get_slice(0, 0, 4).await.unwrap_err();
+    assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&expected));
+    let error = Package::open(view, &current, path.clone(), false, true).await.unwrap_err();
+    assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&expected));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+}

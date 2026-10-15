@@ -86,6 +86,7 @@ async fn open(
     key: bool,
 ) -> (Arc<RocksDb>, Arc<RocksDb>, ArchiveSlice, Vec<Arc<BlockHandle>>) {
     let provider = RocksDb::new(path, "archive_provider", None, AccessType::ReadWrite).unwrap();
+    provider.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
     let handles_db = RocksDb::new(path, "handle_db", None, AccessType::ReadWrite).unwrap();
     let (storage, table) = create_block_handle_storage(handles_db.clone());
     let mut handles = Vec::new();
@@ -116,7 +117,8 @@ async fn open(
     let slice = if existed {
         ArchiveSlice::with_data(
             provider.repair_protection().clone(),
-            provider.clone(),
+            provider.test_archive_provider().unwrap(),
+        &provider.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
             pack_root,
             0,
             mode,
@@ -129,7 +131,8 @@ async fn open(
         .await
     } else {
         ArchiveSlice::new_empty(
-            provider.clone(),
+            provider.test_archive_provider().unwrap(),
+        &provider.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
             pack_root,
             0,
             mode,
@@ -580,6 +583,7 @@ async fn archive_key_legacy_status_truncation_keeps_committed_boundary() {
     put(&slice, &handles[1]).await;
     close(db, handles_db, slice, handles, 2).await;
     let db = RocksDb::new(path.path(), "archive_provider", None, AccessType::ReadWrite).unwrap();
+    db.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
     let status = PackageStatusDb::with_db(db.clone(), Kind::Status.cf(true), false).unwrap();
     status.put_value(&PackageStatusKey::NonSlicedSize, &size).unwrap();
     db.sync_wal().unwrap();
@@ -642,7 +646,8 @@ async fn archive_key_protected_length_mismatch_refuses_without_file_mutation() {
         .unwrap();
     let result = ArchiveSlice::with_data(
         db.repair_protection().clone(),
-        db.clone(),
+        db.test_archive_provider().unwrap(),
+        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
         Arc::new(path.path().join("pack_root")),
         0,
         PackageType::KeyBlocks,

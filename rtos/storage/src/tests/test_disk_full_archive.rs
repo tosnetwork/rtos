@@ -59,7 +59,8 @@ fn flush(db: &Arc<RocksDb>) {
 async fn reopen(db: &Arc<RocksDb>, root: Arc<PathBuf>) -> ArchiveSlice {
     ArchiveSlice::with_data(
         db.repair_protection().clone(),
-        db.clone(),
+        db.test_archive_provider().unwrap(),
+        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
         root,
         0,
         PackageType::Blocks,
@@ -97,9 +98,11 @@ async fn exercise(cut: &str, live: bool) {
     std::fs::create_dir_all(&directory).unwrap();
     let control = std::env::var("RTOS_ENOSPC_CONTROL").as_deref() == Ok("1");
     let db = RocksDb::new(&directory, "db", None, AccessType::ReadWrite).unwrap();
+    db.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
     let handles = make_handles(&db);
     let slice = ArchiveSlice::new_empty(
-        db.clone(),
+        db.test_archive_provider().unwrap(),
+        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
         root.clone(),
         0,
         PackageType::Blocks,
@@ -167,6 +170,7 @@ async fn exercise(cut: &str, live: bool) {
     drop(handles);
     drop(db);
     let db = RocksDb::new(&directory, "db", None, AccessType::ReadWrite).unwrap();
+    db.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
     let handles = make_handles(&db);
     let slice = reopen(&db, root.clone()).await;
     assert_entry(&slice, &handles[0], seed).await;
@@ -195,6 +199,7 @@ async fn exercise(cut: &str, live: bool) {
     drop(handles);
     drop(db);
     let db = RocksDb::new(&directory, "db", None, AccessType::ReadWrite).unwrap();
+    db.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
     let handles = make_handles(&db);
     let slice = reopen(&db, root).await;
     assert_entry(&slice, &handles[0], seed).await;

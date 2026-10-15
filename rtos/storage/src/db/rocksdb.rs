@@ -70,6 +70,15 @@ impl RocksDb {
         Ok(ArchiveProvider::bound(self.clone(), winner.clone()))
     }
 
+    /// Test factories must establish a binding explicitly; retrieval never
+    /// allocates a domain or silently rebinds a provider.
+    #[cfg(test)]
+    pub(crate) fn test_archive_provider(self: &Arc<Self>) -> Result<crate::archives::context::ArchiveProvider> {
+        let domain = self.archive_domain.get()
+            .ok_or_else(|| error!("Archive fixture provider was not explicitly bound"))?;
+        self.bind_archive_domain(domain.clone())
+    }
+
     pub fn repair_protection(&self) -> &Arc<crate::repair_protection::RepairProtection> {
         &self.repair_protection
     }

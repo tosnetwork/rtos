@@ -129,6 +129,11 @@ pub struct ArchiveView {
     binding: ArchiveProvider,
     epoch: u64,
 }
+impl std::fmt::Debug for ArchiveView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArchiveView").field("epoch", &self.epoch).finish_non_exhaustive()
+    }
+}
 impl ArchiveView {
     pub fn binding(&self) -> &ArchiveProvider { &self.binding }
 

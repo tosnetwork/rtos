@@ -210,9 +210,13 @@ async fn archive_authority_native_import_and_resume() -> Result<()> {
         hex::decode(fixture()["zerostate"].as_str().unwrap())?,
     )?;
     std::fs::create_dir(dir.path().join("archives"))?;
+    let package_context_dir = tempfile::tempdir()?;
+    let package_context_db = storage::db::rocksdb::RocksDb::new(package_context_dir.path(), "provider", None, storage::db::rocksdb::AccessType::ReadWrite)?;
+    let package_view = package_context_db.bind_archive_domain(storage::archives::context::ArchiveDomain::new())?.view()?;
+    let package_operation = package_view.enter()?;
     for start in [1, 3] {
         let path = dir.path().join("archives").join(format!("archive.{start:05}.pack"));
-        let package = Package::open(path.clone(), false, true).await?;
+        let package = Package::open(package_view.clone(), &package_operation, path.clone(), false, true).await?;
         for (id, entry) in raw(start, start + 1, 0) {
             package
                 .append_entry(

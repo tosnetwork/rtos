@@ -40,14 +40,12 @@ use std::{
     borrow::Borrow,
     fs::create_dir_all,
     hash::Hash,
-    io::SeekFrom,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc, OnceLock,
     },
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 const DEFAULT_PKG_VERSION: u32 = 1;
 
@@ -76,7 +74,10 @@ enum MetadataCut { EntryMeta, NonSlicedStatus, Offset, BlockIndex }
 #[cfg(test)]
 type MetadataGate = Arc<dyn Fn(u64, u64) -> Result<()> + Send + Sync>;
 
+use super::context::{ArchiveContextError, ArchiveOperation, ArchiveProvider, ArchiveView};
+
 pub struct ArchiveSlice {
+    view: ArchiveView,
     archive_id: u32,
     db_root_path: Arc<PathBuf>,
     finalized: bool,
@@ -107,12 +108,15 @@ pub struct ArchiveSlice {
     telemetry: Arc<StorageTelemetry>,
     #[cfg(test)]
     metadata_gate: std::sync::Mutex<Option<(MetadataCut, MetadataGate)>>,
+    #[cfg(test)]
+    before_package_open: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     allocated: Arc<StorageAlloc>,
 }
 
 impl ArchiveSlice {
     pub async fn new_empty(
-        db: Arc<RocksDb>,
+        binding: ArchiveProvider,
+        parent: &ArchiveOperation,
         db_root_path: Arc<PathBuf>,
         archive_id: u32,
         package_type: PackageType,
@@ -120,10 +124,13 @@ impl ArchiveSlice {
         #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
         allocated: Arc<StorageAlloc>,
     ) -> Result<Self> {
+        let operation = parent.inherit(&binding)?;
+        let db = binding.db().clone();
         super::recovery_guard::ensure_slice_clear(
             db.db(), &db_root_path, archive_id, matches!(package_type, PackageType::KeyBlocks),
         )?;
         let mut ret = Self::create(
+            operation.view(),
             db,
             db_root_path,
             archive_id,
@@ -172,7 +179,7 @@ impl ArchiveSlice {
             )
         }
         let entry = ret.get_base_entry_info();
-        ret.new_package(entry, None, 0, DEFAULT_PKG_VERSION).await?;
+        ret.open_package(&operation, entry, None, 0, DEFAULT_PKG_VERSION, PackageOpenMode::RecoverOrCreate).await?;
         Ok(ret)
     }
 
@@ -180,7 +187,8 @@ impl ArchiveSlice {
     /// Unlike `new_empty()`, this does not create an initial package file.
     /// Packages are registered later via `import_package_entries()`.
     pub async fn new_for_import(
-        db: Arc<RocksDb>,
+        binding: ArchiveProvider,
+        parent: &ArchiveOperation,
         db_root_path: Arc<PathBuf>,
         archive_id: u32,
         package_type: PackageType,
@@ -188,10 +196,13 @@ impl ArchiveSlice {
         #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
         allocated: Arc<StorageAlloc>,
     ) -> Result<Self> {
+        let operation = parent.inherit(&binding)?;
+        let db = binding.db().clone();
         super::recovery_guard::ensure_slice_clear(
             db.db(), &db_root_path, archive_id, matches!(package_type, PackageType::KeyBlocks),
         )?;
         let mut ret = Self::create(
+            operation.view(),
             db,
             db_root_path,
             archive_id,
@@ -277,7 +288,8 @@ impl ArchiveSlice {
     #[allow(clippy::too_many_arguments)]
     pub async fn with_data(
         protection: Arc<crate::repair_protection::RepairProtection>,
-        db: Arc<RocksDb>,
+        binding: ArchiveProvider,
+        parent: &ArchiveOperation,
         db_root_path: Arc<PathBuf>,
         archive_id: u32,
         package_type: PackageType,
@@ -286,6 +298,8 @@ impl ArchiveSlice {
         #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
         allocated: Arc<StorageAlloc>,
     ) -> Result<Self> {
+        let operation = parent.inherit(&binding)?;
+        let db = binding.db().clone();
         let _startup = protection.deletion().await;
         super::recovery_guard::ensure_slice_clear(
             db.db(), &db_root_path, archive_id, matches!(package_type, PackageType::KeyBlocks),
@@ -296,6 +310,7 @@ impl ArchiveSlice {
             PackageOpenMode::RecoverOrCreate
         };
         let mut ret = Self::create(
+            operation.view(),
             db,
             db_root_path,
             archive_id,
@@ -346,9 +361,10 @@ impl ArchiveSlice {
                 } else {
                     fail!("No entry info for slice #{i}")
                 };
-                match ret.open_package(entry, None, meta.entry_size(), meta.version(), mode).await {
+                match ret.open_package(&operation, entry, None, meta.entry_size(), meta.version(), mode).await {
                     Ok(_) => (),
                     Err(e) => {
+                        if e.is::<ArchiveContextError>() { return Err(e); }
                         if cleanup_if_broken && matches!(mode, PackageOpenMode::RecoverOrCreate) {
                             match ret.destroy_broken().await {
                                 Ok(_) => (),
@@ -389,7 +405,7 @@ impl ArchiveSlice {
                 (size, meta.map_or(0, |meta| meta.version()))
             };
             let entry = ret.get_base_entry_info();
-            ret.open_package(entry, None, size, version, mode).await?;
+            ret.open_package(&operation, entry, None, size, version, mode).await?;
         }
         Ok(ret)
     }
@@ -705,11 +721,21 @@ impl ArchiveSlice {
         entry_id: &PackageEntryId<B>,
         limits: super::bounded_read::ArchiveReadLimits,
     ) -> Result<Option<PackageEntry>> {
-        self.get_file_raw_bounded(get_mc_seq_no(handle), handle.id().shard(), entry_id, limits).await
+        let operation = self.view.enter()?;
+        self.get_file_bounded_in(&operation, handle, entry_id, limits).await
+    }
+
+    pub(super) async fn get_file_bounded_in<B: Borrow<BlockIdExt> + Hash>(
+        &self, parent: &ArchiveOperation, handle: &BlockHandle,
+        entry_id: &PackageEntryId<B>, limits: super::bounded_read::ArchiveReadLimits,
+    ) -> Result<Option<PackageEntry>> {
+        let operation = self.view.inherit(parent)?;
+        self.get_file_raw_bounded(&operation, get_mc_seq_no(handle), handle.id().shard(), entry_id, limits).await
     }
 
     async fn get_file_raw_bounded<B: Borrow<BlockIdExt> + Hash>(
         &self,
+        operation: &ArchiveOperation,
         mc_seq_no: u32,
         shard: &ShardIdent,
         entry_id: &PackageEntryId<B>,
@@ -742,7 +768,7 @@ impl ArchiveSlice {
             "Reading package entry: {}, offset: {offset}",
             package_info.package().get_path()
         );
-        let entry = package_info.package().read_entry_bounded(offset, limits).await?;
+        let entry = package_info.package().read_entry_bounded_in(operation, offset, limits).await?;
         if entry.filename() != entry_id.filename() { fail!("Archive entry filename mismatch"); }
         if entry.data().is_empty() {
             fail!("Read entry ({}) is corrupted! It can't have zero length!", entry_id);
@@ -751,6 +777,13 @@ impl ArchiveSlice {
     }
 
     pub async fn get_slice(&self, archive_id: u64, offset: u64, limit: u32) -> Result<Vec<u8>> {
+        let operation = self.view.enter()?;
+        self.get_slice_in(&operation, archive_id, offset, limit).await
+    }
+
+    pub(super) async fn get_slice_in(&self, parent: &ArchiveOperation, archive_id: u64, offset: u64, limit: u32) -> Result<Vec<u8>> {
+        let operation = self.view.inherit(parent)?;
+        super::bounded_read::check_length("range", u64::from(limit), super::bounded_read::ARCHIVE_RANGE_MAX_BYTES)?;
         if archive_id as u32 != self.archive_id {
             fail!(
                 "Bad archive ID (archive_id = {}, expected {})!",
@@ -759,28 +792,16 @@ impl ArchiveSlice {
             )
         }
         let index = if self.shard_separated {
-            ((archive_id >> 32) as u32 - self.archive_id) / self.slice_size
+            ((archive_id >> 32) as u32).checked_sub(self.archive_id)
+                .and_then(|relative| relative.checked_div(self.slice_size))
+                .ok_or_else(|| error!("Invalid archive slice index"))?
         } else {
             (archive_id >> 32) as u32
         };
         let Some(package_info) = self.get_package_by_index(index).await else {
             fail!("index {index} is not found in archive")
         };
-        let mut file = tokio::fs::File::open(package_info.package().path()).await?;
-        let mut buffer = vec![0; limit as usize];
-        file.seek(SeekFrom::Start(offset)).await?;
-        let mut buf_offset = 0;
-        let mut actual_read = 0;
-        loop {
-            let read = file.read(&mut buffer[buf_offset..]).await?;
-            if read == 0 {
-                break;
-            }
-            actual_read += read;
-            buf_offset += read;
-        }
-        buffer.resize(actual_read, 0);
-        Ok(buffer)
+        package_info.package().read_range_in(&operation, offset, limit).await
     }
 
     pub async fn get_block_by_lookup_result(
@@ -1011,7 +1032,7 @@ impl ArchiveSlice {
             let new_name = old_package.get_path() + ".new";
             log::trace!(target: TARGET, "repack package {}", old_package.get_path());
             let _ = tokio::fs::remove_file(&new_name).await;
-            let new_package = Package::open(new_name.into(), false, true).await?;
+            let new_package = Package::open(self.view.clone(), &self.view.enter()?, new_name.into(), false, true).await?;
             let mut old_reader = read_package_from(old_package.open_file().await?).await?;
 
             let mut any_kept = false;
@@ -1100,7 +1121,7 @@ impl ArchiveSlice {
             crate::archives::package::sync_file_and_parents(old_package.path()).await?;
             self.block_index_db.commit_repack_offsets(index_batch)?;
             let name = old_package.get_path().into();
-            *package_info.package_mut() = Package::open(name, false, true).await?;
+            *package_info.package_mut() = Package::open(self.view.clone(), &self.view.enter()?, name, false, true).await?;
             log::trace!(
                 target: TARGET,
                 "package repacked {}",
@@ -1146,6 +1167,7 @@ impl ArchiveSlice {
 
     #[allow(clippy::too_many_arguments)]
     async fn create(
+        view: ArchiveView,
         db: Arc<RocksDb>,
         db_root_path: Arc<PathBuf>,
         archive_id: u32,
@@ -1167,6 +1189,7 @@ impl ArchiveSlice {
             ("", ARCHIVE_PACKAGE_SIZE, true)
         };
         let ret = Self {
+            view,
             archive_id,
             db_root_path,
             finalized,
@@ -1202,6 +1225,8 @@ impl ArchiveSlice {
             telemetry,
             #[cfg(test)]
             metadata_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            before_package_open: std::sync::Mutex::new(None),
             allocated,
         };
         Ok(ret)
@@ -1257,13 +1282,15 @@ impl ArchiveSlice {
         size: u64,
         version: u32,
     ) -> Result<bool> {
-        self.open_package(entry, index, size, version, PackageOpenMode::RecoverOrCreate).await
+        let operation = self.view.enter()?;
+        self.open_package(&operation, entry, index, size, version, PackageOpenMode::RecoverOrCreate).await
     }
 
     async fn open_package(
-        &self, entry: PackageEntryInfo, index: Option<u32>, size: u64,
+        &self, parent: &ArchiveOperation, entry: PackageEntryInfo, index: Option<u32>, size: u64,
         version: u32, mode: PackageOpenMode,
     ) -> Result<bool> {
+        let operation = self.view.inherit(parent)?;
         let package_str = format!("{} {}", entry.seqno, entry.shard);
         log::debug!(
             target: TARGET,
@@ -1280,11 +1307,17 @@ impl ArchiveSlice {
         }
         if add_unbound_object_to_map(&self.package_store, entry.clone(), || Ok(OnceLock::new()))? {
             let create_package = async || {
-                if matches!(mode, PackageOpenMode::PreserveExisting) {
-                    return Package::open_existing_exact(path.clone(), self.finalized, size).await;
+                #[cfg(test)]
+                {
+                    let gate = self.before_package_open.lock().unwrap().take();
+                    if let Some(gate) = gate { gate(); }
                 }
-                let package = match Package::open(path.clone(), self.finalized, true).await {
+                if matches!(mode, PackageOpenMode::PreserveExisting) {
+                    return Package::open_existing_exact(self.view.clone(), &operation, path.clone(), self.finalized, size).await;
+                }
+                let package = match Package::open(self.view.clone(), &operation, path.clone(), self.finalized, true).await {
                     Ok(p) => p,
+                    Err(e) if e.is::<ArchiveContextError>() => return Err(e),
                     Err(e) => match tokio::fs::remove_file(path.as_path()).await {
                         Ok(_) => fail!(
                             "Failed to open or create archive {}: {e}. \

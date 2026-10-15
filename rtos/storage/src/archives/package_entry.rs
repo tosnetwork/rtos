@@ -81,6 +81,7 @@ impl PackageEntry {
         Ok(Some(Self::with_data(filename, data)))
     }
 
+    #[cfg(test)]
     pub(super) async fn read_from_bounded<R: tokio::io::AsyncReadExt + Unpin>(
         reader: &mut R,
         limits: super::bounded_read::ArchiveReadLimits,
