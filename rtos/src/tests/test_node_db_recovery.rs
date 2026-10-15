@@ -305,3 +305,75 @@ async fn node_db_counter_wal_legacy_open_negative_control() -> Result<()> {
     }
     Ok(())
 }
+
+fn pending_archive_root_bytes(db: &RocksDb) -> Result<Vec<u8>> {
+    // Independent fixed-format fixture, including the checksum over all flags.
+    let identity = db.db().get_db_identity()?;
+    let mut bytes = vec![0u8; 316];
+    bytes[..8].copy_from_slice(b"RTOSATR1");
+    bytes[8..12].copy_from_slice(&[1, 0, 1, 2]);
+    bytes[12..28].fill(4);
+    bytes[28..36].copy_from_slice(&(identity.len() as u64).to_le_bytes());
+    bytes[36..68].copy_from_slice(&rtos_block::sha256_digest(identity));
+    bytes[68..76].copy_from_slice(&100u64.to_le_bytes());
+    bytes[76..84].copy_from_slice(&1u64.to_le_bytes());
+    bytes[84..116].fill(8);
+    let checksum = rtos_block::sha256_digest(&bytes[..284]);
+    bytes[284..].copy_from_slice(&checksum);
+    Ok(bytes)
+}
+
+#[tokio::test]
+async fn pending_archive_root_precedes_ledger_creation_and_other_node_services() -> Result<()> {
+    for ledger in ["missing", "corrupt", "valid"] {
+        let dir = tempfile::tempdir()?;
+        let db = open_node_db(dir.path(), &small_config(), AccessType::ReadWrite)?;
+        let root = pending_archive_root_bytes(&db)?;
+        if ledger != "missing" {
+            db.db().create_cf("repair_dependency_leases_v1", &storage::sst_native_test::Options::default())?;
+            let cf = db.db().cf_handle("repair_dependency_leases_v1").unwrap();
+            db.db().put_cf(&cf, b"next", if ledger == "corrupt" { b"bad".as_slice() } else { &[0; 8] })?;
+        }
+        db.db().put(b"ArchiveTruncationRootV1", &root)?; db.sync_wal()?; drop(db);
+        let outcome = InternalDb::construct(
+            InternalDbConfig { db_directory: dir.path().to_string_lossy().into_owned(), cells_db_config: small_config(), ..Default::default() },
+            false, Arc::new(AtomicU8::new(0)), None,
+            #[cfg(feature = "telemetry")] create_engine_telemetry(),
+            create_engine_allocated(),
+        ).await;
+        let error = outcome.err().expect("pending root started ordinary services");
+        let message = format!("{error:#}");
+        assert!(message.contains(match ledger { "missing" => "ledger presence", "corrupt" => "generation length", _ => "Pending archive root" }), "{message}");
+        assert!(!dir.path().join("catchains").exists());
+        assert!(!dir.path().join("archive").exists());
+        let db = open_node_db(dir.path(), &small_config(), AccessType::ReadWrite)?;
+        assert_eq!(db.db().get(b"ArchiveTruncationRootV1")?.as_deref(), Some(root.as_slice()));
+        assert_eq!(db.db().cf_handle("repair_dependency_leases_v1").is_some(), ledger != "missing");
+    }
+    Ok(())
+}
+
+#[test]
+fn pending_archive_bootstrap_rebuilds_real_lease_protection_on_same_provider() -> Result<()> {
+    use crate::publication_dependency_leases::{DependencyLeases, sst_fixture_for_test};
+    use crate::history_read_budget::HistoryReadBudget;
+    use storage::db::node::open_node_db_for_bootstrap;
+    let dir = tempfile::tempdir()?;
+    let db = open_node_db(dir.path(), &small_config(), AccessType::ReadWrite)?;
+    let leases = DependencyLeases::open(db.clone(), true)?;
+    let (binding, dependencies, id) = sst_fixture_for_test();
+    leases.begin(&binding, dependencies, &HistoryReadBudget::new(Default::default()))?;
+    let root = pending_archive_root_bytes(&db)?;
+    db.db().put(b"ArchiveTruncationRootV1", &root)?; db.sync_wal()?;
+    drop(leases); drop(db);
+    let bootstrap = open_node_db_for_bootstrap(dir.path(), &small_config(), AccessType::ReadWrite)?;
+    assert!(bootstrap.requires_recovery());
+    let db = bootstrap.database().clone();
+    assert!(!db.repair_protection().state(&id));
+    let leases = DependencyLeases::open(db.clone(), false)?;
+    assert!(Arc::ptr_eq(leases.protection(), db.repair_protection()));
+    assert!(leases.protection().state(&id));
+    assert!(bootstrap.finish().is_err());
+    assert_eq!(db.db().get(b"ArchiveTruncationRootV1")?.as_deref(), Some(root.as_slice()));
+    Ok(())
+}

@@ -191,6 +191,25 @@ impl RocksDb {
         }))
     }
 
+    /// Resume the ordinary legacy-cleanup policy after bootstrap has established
+    /// there is no pending root. Recovery opens themselves never call this.
+    pub(crate) fn finish_ordinary_bootstrap(&self) -> Result<()> {
+        if !self.archive_binding_writable { return Ok(()); }
+        if let Some(owner) = &self.reservation { owner.verify()?; }
+        crate::archives::recovery_guard::ensure_root_controls_clear(self.db())?;
+        let path = self.db().path();
+        let cfs = DBWithThreadMode::<MultiThreaded>::list_cf(&Options::default(), path)?;
+        if cfs.len() > 100 && !cfs.iter().any(|cf| cf == "repair_dependency_leases_v1") {
+            match crate::archives::recovery_guard::ensure_provider_clear(
+                self.db(), path.parent().ok_or_else(|| error!("Missing database parent"))?, &cfs,
+            ) {
+                Ok(()) => { Self::clean_up_old_cf(self.db(), &cfs)?; }
+                Err(error) => log::warn!(target: TARGET, "Preserving archive CFs before recovery: {error}"),
+            }
+        }
+        Ok(())
+    }
+
     fn build_db_options() -> Options {
         let mut options = Options::default();
 

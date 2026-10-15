@@ -57,7 +57,7 @@ use storage::{
     },
     db::{
         filedb::FileDb,
-        node::{open_node_db, CELLSCOUNTERS_CF_NAME, CELLS_CF_NAME},
+        node::{open_node_db_for_bootstrap, CELLSCOUNTERS_CF_NAME, CELLS_CF_NAME},
         rocksdb::{AccessType, RocksDb, CATCHAINS_DB_NAME},
     },
     dynamic_boc_rc_db::AsyncCellsStorageAdapter,
@@ -453,11 +453,16 @@ impl InternalDb {
         let can_create_db = access_type == AccessType::ReadWrite;
         // Existing dynamic counter CFs still need their merge operator when
         // this startup selects archival state storage.
-        let db = open_node_db(&config.db_directory, &config.cells_db_config, access_type.clone())?;
+        let bootstrap = open_node_db_for_bootstrap(&config.db_directory, &config.cells_db_config, access_type.clone())?;
+        let db = bootstrap.database().clone();
         let repair_leases = crate::publication_dependency_leases::DependencyLeases::open(
             db.clone(),
-            can_create_db,
+            can_create_db && !bootstrap.requires_recovery(),
         )?;
+        // Keep this exact ledger/protection Arc for recovery and normal startup.
+        // Pending recovery currently refuses here until the owned root worker
+        // completes; no catchain, handle, archive or state constructor runs first.
+        let db = bootstrap.finish()?;
         let db_catchain = RocksDb::new(
             config.db_directory.as_str(),
             CATCHAINS_DB_NAME,

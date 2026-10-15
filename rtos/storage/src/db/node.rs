@@ -2,7 +2,7 @@
 //! Physical node DB options independent of the state backend selected at startup.
 use super::rocksdb::{AccessType, RocksDb, NODE_DB_NAME};
 use crate::{dynamic_boc_rc_db::DynamicBocDb, shardstate_db_async::CellsDbConfig};
-use rtos_block::Result;
+use rtos_block::{fail, sha256_digest, Result};
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 pub const CELLS_CF_NAME: &str = "cells_db_v6";
@@ -17,14 +17,66 @@ pub fn open_node_db(
     config: &CellsDbConfig,
     access: AccessType,
 ) -> Result<Arc<RocksDb>> {
-    let path = root.as_ref().join(NODE_DB_NAME);
-    // A listing failure on an existing DB must never silently remove the
-    // counter merge operator. Only a missing or empty directory is a new DB.
-    let families = if !path.try_exists()? || std::fs::read_dir(&path)?.next().is_none() {
-        Vec::new()
+    Ok(open_physical(root.as_ref(), config, access, false)?.0)
+}
+
+/// Holds the opened main provider while the caller validates and reconstructs
+/// its durable dependency protection. No ordinary service may start before
+/// finish succeeds; a pending root must first be reconciled by its worker.
+pub struct NodeDbBootstrap {
+    db: Arc<RocksDb>,
+    pending: Option<crate::archives::recovery_root::RootHeader>,
+}
+impl NodeDbBootstrap {
+    pub fn database(&self) -> &Arc<RocksDb> { &self.db }
+    pub fn requires_recovery(&self) -> bool { self.pending.is_some() }
+    pub fn finish(self) -> Result<Arc<RocksDb>> {
+        if self.pending.is_some() {
+            crate::archives::recovery_guard::ensure_open_provider_clear(
+                self.db.db(), self.db.db().path().parent().expect("node DB has a parent"),
+            )?;
+        }
+        Ok(self.db)
+    }
+}
+
+pub fn open_node_db_for_bootstrap(
+    root: impl AsRef<Path>, config: &CellsDbConfig, access: AccessType,
+) -> Result<NodeDbBootstrap> {
+    use crate::archives::recovery_root::{FactoryMode, RootHeader, ROOT_KEY, PARTICIPANT_KEY};
+    let writable = access == AccessType::ReadWrite;
+    let (db, deferred_cleanup) = open_physical(root.as_ref(), config, access, true)?;
+    let pending = db.db().get_pinned(ROOT_KEY)?.map(|bytes| RootHeader::decode(&bytes)).transpose()?;
+    if let Some(header) = &pending {
+        if !writable { fail!("Pending archive root requires writable recovery bootstrap"); }
+        header.policy.check_environment(FactoryMode::Node, db.db().cf_handle("repair_dependency_leases_v1").is_some())?;
+        let identity = db.db().get_db_identity()?;
+        if header.database_identity_bytes != identity.len() as u64
+            || header.database_identity_digest != sha256_digest(&identity) {
+            fail!("Archive root belongs to another native main database");
+        }
     } else {
+        if db.db().get_pinned(PARTICIPANT_KEY)?.is_some() {
+            fail!("Orphan archive recovery participant on main database");
+        }
+        if deferred_cleanup { db.finish_ordinary_bootstrap()?; }
+    }
+    Ok(NodeDbBootstrap { db, pending })
+}
+
+fn open_physical(
+    root: &Path, config: &CellsDbConfig, access: AccessType, bootstrap: bool,
+) -> Result<(Arc<RocksDb>, bool)> {
+    let path = root.join(NODE_DB_NAME);
+    let existing = path.try_exists()? && std::fs::read_dir(&path)?.next().is_some();
+    // Acquire the existing-only owner before CF inspection, so option selection
+    // and native opening share the same managed provider reservation.
+    let owner = if bootstrap && existing && access == AccessType::ReadWrite {
+        Some(super::provider_reservation::ProviderReservation::open_existing(&path)?)
+    } else { None };
+    let families = if existing {
         rocksdb::DB::list_cf(&rocksdb::Options::default(), &path)?
-    };
+    } else { Vec::new() };
     let mut options = HashMap::new();
     let mut caches = Vec::new();
     if families.iter().any(|name| name == CELLS_CF_NAME) {
@@ -37,9 +89,14 @@ pub fn open_node_db(
         options.insert(CELLSCOUNTERS_CF_NAME.to_owned(), opts);
         caches.push(cache);
     }
-    let db = RocksDb::new(root, NODE_DB_NAME, options, access)?;
-    for cache in caches {
-        db.register_cache(cache);
-    }
-    Ok(db)
+    let deferred_cleanup = owner.is_some();
+    let db = if let Some(owner) = owner {
+        RocksDb::open_existing_for_recovery(owner, options)?
+    } else { RocksDb::new(root, NODE_DB_NAME, options, access)? };
+    for cache in caches { db.register_cache(cache); }
+    Ok((db, deferred_cleanup))
 }
+
+#[cfg(test)]
+#[path = "../tests/test_node_bootstrap.rs"]
+mod tests;
