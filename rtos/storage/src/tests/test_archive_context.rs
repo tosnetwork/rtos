@@ -139,7 +139,7 @@ async fn immutable_views_refuse_stale_epochs_and_preserve_typed_errors() {
     assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&ArchiveContextError::Closed(0)));
     assert!(domain.publish_next_epoch(1).is_err());
     domain.publish_next_epoch(0).unwrap();
-    let error = old.enter().err().unwrap();
+    let error = old.enter().err().expect("stale archive view unexpectedly regained admission");
     assert_eq!(
         error.downcast_ref::<ArchiveContextError>(),
         Some(&ArchiveContextError::Stale { expected: 0, current: 1 })
