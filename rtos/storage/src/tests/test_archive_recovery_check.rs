@@ -6,6 +6,12 @@ use std::{
     time::{Duration, Instant},
 };
 const CHILD: &str = "archives::recovery_check::tests::native_child";
+fn observed(config: &CheckConfig) -> Result<CheckReport> {
+    eprintln!("RECOVERY_CHECK_BEGIN root={}", config.node_root.display());
+    let result = inspect(config);
+    eprintln!("RECOVERY_CHECK_END ok={}", result.is_ok());
+    result
+}
 fn fixture(root: &Path, name: &str, main: bool) {
     fs::create_dir_all(root).unwrap();
     let mut options = Options::default();
@@ -65,7 +71,7 @@ fn single_clear_and_pending_are_read_only() {
     fixture(root, "db", true);
     archive(root, "db", 0, false, false, true);
     let before = bytes(root);
-    assert_eq!(inspect(&config(root)).unwrap().live_archives, 1);
+    assert_eq!(observed(&config(root)).unwrap().live_archives, 1);
     assert_eq!(bytes(root), before);
     let options = Options::default();
     let families = NativeDb::list_cf(&options, root.join("db")).unwrap();
@@ -73,7 +79,7 @@ fn single_clear_and_pending_are_read_only() {
     db.put_cf(&db.cf_handle("status_db_0").unwrap(), b"UnknownRecoveryVersion", b"x").unwrap();
     drop(db);
     let before = bytes(root);
-    assert!(inspect(&config(root)).unwrap_err().to_string().contains("Pending or unsupported"));
+    assert!(observed(&config(root)).unwrap_err().to_string().contains("Pending or unsupported"));
     assert_eq!(bytes(root), before);
 }
 #[test]
@@ -82,7 +88,7 @@ fn orphan_marker_and_legacy_staging_refuse() {
     let root = dir.path();
     fixture(root, "db", true);
     archive(root, "db", 0, false, true, false);
-    assert!(inspect(&config(root)).is_err());
+    assert!(observed(&config(root)).is_err());
     let other = tempfile::tempdir().unwrap();
     fixture(other.path(), "db", true);
     let path = other.path().join("archive/packages/arch0000");
@@ -91,7 +97,7 @@ fn orphan_marker_and_legacy_staging_refuse() {
         let marker = path.join(name);
         fs::write(&marker, b"preserve").unwrap();
         let before = bytes(other.path());
-        assert!(inspect(&config(other.path()))
+        assert!(observed(&config(other.path()))
             .unwrap_err()
             .to_string()
             .contains("Unresolved archive staging"));
@@ -126,39 +132,39 @@ fn epoch_routes_key_archives_to_main_and_checks_all_providers() {
         let epoch = dir.path().join("epochs/epoch_0");
         archive(&epoch, "archive_db", 0, false, false, false);
         let before = bytes(dir.path());
-        let result = inspect(&cfg);
+        let result = observed(&cfg);
         assert_eq!(result.is_ok(), !pending);
         assert_eq!(before, bytes(dir.path()));
     }
     let dir = tempfile::tempdir().unwrap();
     let cfg = epoch_setup(dir.path());
     archive(&dir.path().join("epochs/epoch_0"), "archive_db", 0, false, true, false);
-    assert!(inspect(&cfg).unwrap_err().to_string().contains("Pending or unsupported"));
+    assert!(observed(&cfg).unwrap_err().to_string().contains("Pending or unsupported"));
 }
 #[test]
 fn epoch_inventory_refuses_missing_duplicate_and_malformed_candidates() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = epoch_setup(dir.path());
-    assert_eq!(inspect(&cfg).unwrap().providers.len(), 2);
+    assert_eq!(observed(&cfg).unwrap().providers.len(), 2);
     cfg.archival_mode
         .as_mut()
         .unwrap()
         .existing_epochs
         .push(EpochEntry { path: PathBuf::from("epochs/epoch_0") });
-    assert_eq!(inspect(&cfg).unwrap().providers.len(), 2);
+    assert_eq!(observed(&cfg).unwrap().providers.len(), 2);
     let duplicate = dir.path().join("epochs/epoch_duplicate");
     fixture(&duplicate, "archive_db", false);
     fs::copy(dir.path().join("epochs/epoch_0/epoch_meta.json"), duplicate.join("epoch_meta.json"))
         .unwrap();
-    assert!(inspect(&cfg).unwrap_err().to_string().contains("duplicate"));
+    assert!(observed(&cfg).unwrap_err().to_string().contains("duplicate"));
     fs::remove_dir_all(&duplicate).unwrap();
     fs::create_dir(&duplicate).unwrap();
-    assert!(inspect(&cfg).is_err());
+    assert!(observed(&cfg).is_err());
     fs::write(duplicate.join("epoch_meta.json"), b"invalid").unwrap();
-    assert!(inspect(&cfg).is_err());
+    assert!(observed(&cfg).is_err());
     fs::remove_dir_all(&duplicate).unwrap();
     cfg.archival_mode.as_mut().unwrap().new_epochs_path = PathBuf::from("missing");
-    assert!(inspect(&cfg).is_err());
+    assert!(observed(&cfg).is_err());
 }
 #[test]
 fn missing_live_target_and_corrupt_database_refuse() {
@@ -173,11 +179,11 @@ fn missing_live_target_and_corrupt_database_refuse() {
     )
     .unwrap();
     drop(db);
-    assert!(inspect(&config(dir.path())).unwrap_err().to_string().contains("Missing archive CF"));
+    assert!(observed(&config(dir.path())).unwrap_err().to_string().contains("Missing archive CF"));
     let other = tempfile::tempdir().unwrap();
     fs::create_dir(other.path().join("db")).unwrap();
     fs::write(other.path().join("db/LOCK"), b"").unwrap();
-    assert!(inspect(&config(other.path())).is_err());
+    assert!(observed(&config(other.path())).is_err());
 }
 fn child(root: &Path, mode: &str) -> std::process::Child {
     Command::new(std::env::current_exe().unwrap())
@@ -213,7 +219,7 @@ fn native_writer_lock_conflicts_in_both_directions() {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(inspect(&config(dir.path())).unwrap_err().to_string().contains("not offline"));
+    assert!(observed(&config(dir.path())).unwrap_err().to_string().contains("not offline"));
     fs::write(dir.path().join("writer-release"), b"x").unwrap();
     assert!(wait(process).success());
     let provider = OpenProvider::open(dir.path().to_path_buf(), "db", None).unwrap();
@@ -249,7 +255,7 @@ fn unflushed_counter_merge_and_pending_marker_survive_readonly_replay() {
         );
         assert_eq!(provider.statuses().is_err(), pending);
         drop(provider);
-        assert_eq!(inspect(&config(dir.path())).is_err(), pending);
+        assert_eq!(observed(&config(dir.path())).is_err(), pending);
         assert_eq!(bytes(dir.path()), before);
     }
 }
