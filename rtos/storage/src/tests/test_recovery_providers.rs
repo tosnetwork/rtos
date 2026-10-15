@@ -5,10 +5,13 @@ use crate::db::rocksdb::AccessType;
 use std::path::Path;
 fn root(db: &RocksDb) -> RootHeader {
     let identity = db.db().get_db_identity().unwrap();
-    RootHeader { state: State::Building, policy: Policy::Node, aborted: false, operation: [1;16],
+    let header = RootHeader { state: State::Building, policy: Policy::Node, aborted: false, operation: [1;16],
         database_identity_bytes: identity.len() as u64, database_identity_digest: rtos_block::sha256_digest(identity),
         selection: Sidecar { bytes: 100, records: 1, digest: [2;32] }, ready: Sidecar::default(),
-        providers: Inventory::default(), maps: Inventory::default(), data: Inventory::default() }
+        providers: Inventory::default(), maps: Inventory::default(), data: Inventory::default() };
+    db.db().put(ROOT_KEY, header.encode().unwrap()).unwrap();
+    db.sync_wal().unwrap();
+    header
 }
 async fn seed(path: &Path, start: u32) {
     std::fs::create_dir_all(path).unwrap();
@@ -102,5 +105,102 @@ async fn copied_native_provider_refuses_and_releases_partial_owners() -> Result<
         let db = RocksDb::new(path, "archive_db", None, AccessType::ReadWrite)?;
         assert_eq!(db.db().get(b"unchanged")?.as_deref(), Some(b"data".as_slice()));
     }
+    Ok(())
+}
+
+
+fn enroll(set: &RecoveryProviders, root: &RootHeader) -> Result<()> {
+    for participant in &set.participants {
+        let link = Backlink { operation: root.operation,
+            main: super::super::recovery_participant::Identity {
+                bytes: root.database_identity_bytes, digest: root.database_identity_digest },
+            selection: root.selection.digest, provider: participant.descriptor.digest()? };
+        participant.database.db().put(PARTICIPANT_KEY, link.encode()?)?;
+        participant.database.sync_wal()?;
+    }
+    Ok(())
+}
+#[tokio::test]
+async fn participant_requirements_follow_root_phase_and_preserve_mismatches() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let main = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite)?;
+    let config = ArchivalModeConfig { epoch_size: 20_000, new_epochs_path: dir.path().join("epochs"), existing_epochs: vec![] };
+    seed(&config.new_epochs_path.join("epoch_0"), 0).await;
+    let mut header = root(&main);
+    let set = RecoveryProviders::inspect(main.clone(), &header, Some(&config), main.repair_protection()).await?;
+    set.validate_controls(&header)?; // Building: enrollment may be incomplete.
+    header.state = State::Ready;
+    header.ready = Sidecar { bytes: 200, records: 2, digest: [7;32] };
+    main.db().put(ROOT_KEY, header.encode()?)?;
+    assert!(set.validate_controls(&header).is_err());
+    enroll(&set, &header)?; set.validate_controls(&header)?;
+    let epoch = &set.participants[1].database;
+    let good = epoch.db().get(PARTICIPANT_KEY)?.unwrap();
+    epoch.db().delete(PARTICIPANT_KEY)?;
+    assert!(set.validate_controls(&header).is_err());
+    let mut other_operation = Backlink::decode(&good)?;
+    other_operation.operation[0] ^= 1;
+    let mismatch = other_operation.encode()?;
+    epoch.db().put(PARTICIPANT_KEY, mismatch)?;
+    assert!(set.validate_controls(&header).is_err());
+    assert_eq!(epoch.db().get(PARTICIPANT_KEY)?.as_deref(), Some(mismatch.as_slice()));
+    epoch.db().put(PARTICIPANT_KEY, b"unknown backlink")?;
+    assert!(set.validate_controls(&header).is_err());
+    assert_eq!(epoch.db().get(PARTICIPANT_KEY)?.as_deref(), Some(b"unknown backlink".as_slice()));
+    epoch.db().put(PARTICIPANT_KEY, &good)?;
+    epoch.db().put(ROOT_KEY, b"foreign root")?;
+    assert!(set.validate_controls(&header).is_err());
+    assert_eq!(epoch.db().get(ROOT_KEY)?.as_deref(), Some(b"foreign root".as_slice()));
+    epoch.db().delete(ROOT_KEY)?;
+    main.db().put(ROOT_KEY, b"changed root")?;
+    assert!(set.validate_controls(&header).is_err());
+    main.db().put(ROOT_KEY, header.encode()?)?;
+    set.validate_controls(&header)?;
+    Ok(())
+}
+#[tokio::test]
+async fn committed_and_cleaned_inventories_detect_missing_extra_and_changed_rows() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let main = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite)?;
+    for name in ["files", "key_files"] { main.db().create_cf(name, &rocksdb::Options::default())?; }
+    let files = main.db().cf_handle("files").unwrap();
+    let original = serde_cbor::to_vec(&crate::archives::package_index_db::PackageIndexEntry::new())?;
+    main.db().put_cf(&files, 0u32.to_le_bytes(), &original)?;
+    let mut header = root(&main);
+    let set = RecoveryProviders::inspect(main.clone(), &header, None, main.repair_protection()).await?;
+    header.state = State::Committed;
+    header.ready = Sidecar { bytes: 200, records: 2, digest: [7;32] };
+    header.maps = super::super::recovery_parent::native_inventory(main.db())?;
+    main.db().put(ROOT_KEY, header.encode()?)?;
+    enroll(&set, &header)?;
+    set.validate_controls(&header)?; set.verify_provider_and_map_inventories(&header)?;
+    for action in 0..3 {
+        match action {
+            0 => main.db().put_cf(&files, 1u32.to_le_bytes(), b"extra")?,
+            1 => main.db().delete_cf(&files, 0u32.to_le_bytes())?,
+            _ => main.db().put_cf(&files, 0u32.to_le_bytes(), b"changed")?,
+        }
+        assert!(set.verify_provider_and_map_inventories(&header).is_err());
+        main.db().delete_cf(&files, 1u32.to_le_bytes())?;
+        main.db().put_cf(&files, 0u32.to_le_bytes(), &original)?;
+    }
+    header.state = State::Cleaned;
+    header.providers = set.inventory()?;
+    header.data = Inventory { count: 0, digest: rtos_block::sha256_digest([]) };
+    main.db().put(ROOT_KEY, header.encode()?)?;
+    // Cleaned may have already removed backlinks and both sidecar files.
+    main.db().delete(PARTICIPANT_KEY)?;
+    set.validate_controls(&header)?; set.verify_provider_and_map_inventories(&header)?;
+    assert!(!dir.path().join("archive/recovery").exists());
+    let mut changed = header.clone(); changed.providers.digest[0] ^= 1;
+    assert!(set.verify_provider_and_map_inventories(&changed).is_err());
+    changed = header.clone(); changed.providers.count += 1;
+    assert!(set.verify_provider_and_map_inventories(&changed).is_err());
+    // Aborted Cleaned verifies OLD maps using the same complete inventory path.
+    header.aborted = true; header.ready = Sidecar::default();
+    main.db().put(ROOT_KEY, header.encode()?)?;
+    set.validate_controls(&header)?; set.verify_provider_and_map_inventories(&header)?;
+    main.db().drop_cf("key_files")?;
+    assert!(set.verify_provider_and_map_inventories(&header).is_err());
     Ok(())
 }
