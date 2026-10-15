@@ -23,16 +23,17 @@ async fn invalid_append_preserves_file_then_maximum_filename_roundtrips() -> Res
     let before = std::fs::read(&path)?;
     let mut callbacks = 0;
     let invalid = PackageEntry::with_data("x".repeat(usize::from(u16::MAX) + 1), vec![1]);
-    assert!(package.append_entry(&invalid, |_, _| { callbacks += 1; Ok(()) }).await.is_err());
+    assert!(package.append_entry(invalid, |_, _| { callbacks += 1; Ok(()) }).await.is_err());
     assert_eq!(callbacks, 0);
     assert_eq!(package.size(), 0);
     assert_eq!(std::fs::read(&path)?, before);
     assert!(package.write_healthy.load(Ordering::SeqCst));
     let valid = PackageEntry::with_data("x".repeat(usize::from(u16::MAX)), vec![7, 8]);
-    package.append_entry(&valid, |offset, size| {
+    let encoded_size = valid.serialized_size()?;
+    let valid = package.append_entry(valid, |offset, size| {
         callbacks += 1;
         assert_eq!(offset, 0);
-        assert_eq!(size, valid.serialized_size()?);
+        assert_eq!(size, encoded_size);
         Ok(())
     }).await?;
     let read = package.read_entry_bounded(0, ArchiveReadLimits {
@@ -57,8 +58,8 @@ async fn damaged_length_and_cursor_latch_before_append() -> Result<()> {
         }
         let before = std::fs::read(&path)?;
         let entry = PackageEntry::with_data("entry".into(), vec![1]);
-        let error = package.append_entry(&entry, |_, _| panic!("damaged writer reached metadata"))
-            .await.unwrap_err();
+        let error = package.append_entry(entry, |_, _| panic!("damaged writer reached metadata"))
+            .await.err().expect("damaged writer must be refused");
         assert!(error.to_string().contains(if bad_length { "smaller than its header" } else { "cursor mismatch" }));
         assert!(!package.write_healthy.load(Ordering::SeqCst));
         assert_eq!(std::fs::read(&path)?, before);
@@ -84,20 +85,23 @@ async fn sparse_indexed_append_checks_start_before_effects() -> Result<()> {
         assert!(before.blocks() * 512 < 1024 * 1024,
             "sparse fixture unsupported: indexed offset boundary remains unverified");
         let package = Package::open(view, &operation, path.clone(), false, false).await?;
-        let entry = PackageEntry::with_data("block".into(), vec![1, 2, 3]);
+        let make_entry = || PackageEntry::with_data("block".into(), vec![1, 2, 3]);
+        let entry = make_entry();
+        let encoded_size = entry.serialized_size()?;
         let mut callbacks = 0;
-        let result = package.append_indexed_entry(&entry, |actual, size| {
+        let result = package.append_indexed_entry(entry, |actual, size| {
             callbacks += 1;
             assert_eq!(u64::from(actual), offset);
-            assert_eq!(size, offset + entry.serialized_size()?);
+            assert_eq!(size, offset + encoded_size);
             Ok(())
         }).await;
-        if offset == u64::from(u32::MAX) {
-            result?;
+        let entry = if offset == u64::from(u32::MAX) {
+            let entry = result?;
             assert_eq!(callbacks, 1);
             assert_eq!(std::fs::metadata(&path)?.len(), raw_size + entry.serialized_size()?);
+            entry
         } else {
-            assert!(result.unwrap_err().to_string().contains("BlockIndex offset exceeds u32"));
+            assert!(result.err().expect("oversized Block offset must fail").to_string().contains("BlockIndex offset exceeds u32"));
             assert_eq!(callbacks, 0);
             let after = std::fs::metadata(&path)?;
             assert_eq!((after.len(), after.blocks()), (before.len(), before.blocks()));
@@ -108,8 +112,8 @@ async fn sparse_indexed_append_checks_start_before_effects() -> Result<()> {
             let mut tail = [1; 8]; file.read_exact_at(&mut tail, raw_size - 8)?;
             assert_eq!(tail, [0; 8]);
             // A wide non-Block entry remains legal at this offset after refusal.
-            package.append_entry(&entry, |actual, _| { assert_eq!(actual, offset); Ok(()) }).await?;
-        }
+            package.append_entry(make_entry(), |actual, _| { assert_eq!(actual, offset); Ok(()) }).await?
+        };
         let read = package.read_entry_bounded(offset, ArchiveReadLimits { filename_bytes: 5, data_bytes: 3 }).await?;
         assert_eq!(read.filename(), entry.filename());
         assert_eq!(read.data(), entry.data());

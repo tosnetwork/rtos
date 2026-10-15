@@ -631,15 +631,15 @@ impl ArchiveSlice {
             }
             Ok(())
         };
-        if matches!(entry_id, PackageEntryId::Block(_)) {
-            package_info.package().append_indexed_entry(&entry, |offset, size| {
+        let entry = if matches!(entry_id, PackageEntryId::Block(_)) {
+            package_info.package().append_indexed_entry(entry, |offset, size| {
                 after_append(u64::from(offset), size, Some(offset))
-            }).await?;
+            }).await?
         } else {
-            package_info.package().append_entry(&entry, |offset, size| {
+            package_info.package().append_entry(entry, |offset, size| {
                 after_append(offset, size, None)
-            }).await?;
-        }
+            }).await?
+        };
         // Relocation may delete the loose copy immediately after this returns.
         // Commit package directory entries and the provider's index WAL first.
         self.sync_block_package(block_handle, None).await?;
@@ -1095,11 +1095,11 @@ impl ArchiveSlice {
                         Ok(())
                     };
                     if block_offset.is_some() {
-                        new_package.append_indexed_entry(&entry, |offset, size| {
+                        new_package.append_indexed_entry(entry, |offset, size| {
                             after_append(u64::from(offset), size)
                         }).await?;
                     } else {
-                        new_package.append_entry(&entry, after_append).await?;
+                        new_package.append_entry(entry, after_append).await?;
                     }
                     any_kept = true;
                 }

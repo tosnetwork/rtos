@@ -220,7 +220,7 @@ async fn archive_authority_native_import_and_resume() -> Result<()> {
         for (id, entry) in raw(start, start + 1, 0) {
             package
                 .append_entry(
-                    &PackageEntry::with_data(
+                    PackageEntry::with_data(
                         PackageEntryId::Block(id.clone()).filename(),
                         entry.block_data,
                     ),
@@ -229,7 +229,7 @@ async fn archive_authority_native_import_and_resume() -> Result<()> {
                 .await?;
             package
                 .append_entry(
-                    &PackageEntry::with_data(
+                    PackageEntry::with_data(
                         PackageEntryId::Proof(id).filename(),
                         entry.proof_data,
                     ),

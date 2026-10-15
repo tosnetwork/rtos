@@ -114,7 +114,7 @@ impl Fixture {
                     let proof = self.proof(seq, wc)?;
                     package
                         .append_entry(
-                            &PackageEntry::with_data(
+                            PackageEntry::with_data(
                                 PackageEntryId::Block(id.clone()).filename(),
                                 self.bytes(seq, wc, false),
                             ),
@@ -125,7 +125,7 @@ impl Fixture {
                         if wc { PackageEntryId::ProofLink(id) } else { PackageEntryId::Proof(id) };
                     package
                         .append_entry(
-                            &PackageEntry::with_data(proofid.filename(), proof.data().to_vec()),
+                            PackageEntry::with_data(proofid.filename(), proof.data().to_vec()),
                             |_, _| Ok(()),
                         )
                         .await?;

@@ -41,11 +41,11 @@ async fn test_creation() -> Result<()> {
     let block_id = BlockIdExt::default();
     let entry_id = PackageEntryId::Block(&block_id);
     let entry = PackageEntry::with_data(entry_id.filename(), vec![1, 2, 3]);
-    package.append_entry(&entry, |_offset, _size| Ok(())).await?;
+    package.append_entry(entry, |_offset, _size| Ok(())).await?;
 
     let entry_id = PackageEntryId::Proof(&block_id);
     let entry = PackageEntry::with_data(entry_id.filename(), vec![3, 2, 1]);
-    package.append_entry(&entry, |_offset, _size| Ok(())).await?;
+    package.append_entry(entry, |_offset, _size| Ok(())).await?;
 
     assert_eq!(
         tokio::fs::read(package.path()).await.unwrap(),

@@ -783,7 +783,7 @@ async fn test_import_group_boundary_and_resume() -> Result<()> {
             let mut offset = 0;
             package
                 .append_entry(
-                    &PackageEntry::with_data(PackageEntryId::Block(&id).filename(), data.clone()),
+                    PackageEntry::with_data(PackageEntryId::Block(&id).filename(), data.clone()),
                     |pos, _| {
                         offset = pos;
                         Ok(())

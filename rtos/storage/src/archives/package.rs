@@ -298,26 +298,26 @@ impl Package {
 
     pub async fn append_entry(
         &self,
-        entry: &PackageEntry,
+        entry: PackageEntry,
         after_append: impl FnOnce(u64, u64) -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<PackageEntry> {
         self.append_entry_checked(entry, Ok, after_append).await
     }
 
     pub(super) async fn append_indexed_entry(
         &self,
-        entry: &PackageEntry,
+        entry: PackageEntry,
         after_append: impl FnOnce(u32, u64) -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<PackageEntry> {
         self.append_entry_checked(entry, block_index_offset, after_append).await
     }
 
     async fn append_entry_checked<O>(
         &self,
-        entry: &PackageEntry,
+        entry: PackageEntry,
         checked_offset: impl FnOnce(u64) -> Result<O>,
         after_append: impl FnOnce(O, u64) -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<PackageEntry> {
         let entry_size = entry.serialized_size()?;
         let mut guard = self.write_mutex.lock().await;
         if !self.write_healthy.load(Ordering::SeqCst) {
@@ -365,11 +365,11 @@ impl Package {
             fail!("Package {} physical/logical length mismatch after append: {actual_after} != {}", self.path.display(), layout.total_size);
         }
         self.size.store(layout.total_size, Ordering::SeqCst);
-        let result = after_append(offset, layout.logical_size);
-        if result.is_ok() {
-            self.write_healthy.store(true, Ordering::SeqCst);
-        }
-        result
+        after_append(offset, layout.logical_size)?;
+        self.write_healthy.store(true, Ordering::SeqCst);
+        // Only the original entry escapes. Later sync reacquires this mutex.
+        drop(guard);
+        Ok(entry)
     }
 
     pub async fn open_file(&self) -> Result<tokio::fs::File> {
@@ -499,7 +499,7 @@ mod protected_open_tests {
         let path = dir.path().join("protected.pack");
         let package = Package::open(view.clone(), &operation, path.clone(), false, true).await?;
         let entry = PackageEntry::with_data("first".into(), b"first".to_vec());
-        package.append_entry(&entry, |_, _| Ok(())).await?;
+        let entry = package.append_entry(entry, |_, _| Ok(())).await?;
         let size = package.size();
         drop(package);
         let original = std::fs::read(&path)?;
@@ -510,7 +510,7 @@ mod protected_open_tests {
         assert_eq!(std::fs::read(&path)?, damaged);
         std::fs::write(&path, &original)?;
         let package = Package::open_existing_exact(view.clone(), &operation, path.clone(), false, size).await?;
-        package.append_entry(&entry, |_, _| Ok(())).await?;
+        package.append_entry(entry, |_, _| Ok(())).await?;
         let appended = package.size();
         assert!(appended > size);
         drop(package);
@@ -530,14 +530,14 @@ mod write_health_tests {
         let path = directory.path().join("write-health.pack");
         let package = Package::open(view.clone(), &operation, path.clone(), false, true).await?;
         let seed = PackageEntry::with_data("seed".into(), b"acknowledged bytes".to_vec());
-        package.append_entry(&seed, |_, _| Ok(())).await?;
+        let seed = package.append_entry(seed, |_, _| Ok(())).await?;
         let committed_end = package.size();
         let original = std::fs::read(&path)?;
-        let target = PackageEntry::with_data("target".into(), b"uncommitted metadata".to_vec());
+        let target = || PackageEntry::with_data("target".into(), b"uncommitted metadata".to_vec());
         let error = package
-            .append_entry(&target, |_, _| Err(error!("metadata commit refused")))
+            .append_entry(target(), |_, _| Err(error!("metadata commit refused")))
             .await
-            .expect_err("metadata callback failure must propagate");
+            .err().expect("metadata callback failure must propagate");
         assert!(error.to_string().contains("metadata commit refused"));
         let uncertain = std::fs::read(&path)?;
         assert!(uncertain.starts_with(&original));
@@ -547,12 +547,12 @@ mod write_health_tests {
         assert_eq!(read.data(), seed.data());
         let calls = AtomicU64::new(0);
         let error = package
-            .append_entry(&target, |_, _| {
+            .append_entry(target(), |_, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
             .await
-            .expect_err("unhealthy append must be refused");
+            .err().expect("unhealthy append must be refused");
         assert!(error.to_string().contains("write state is uncertain"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let error =
@@ -570,7 +570,7 @@ mod write_health_tests {
         let recovered = Package::open(view.clone(), &operation, path.clone(), false, false).await?;
         recovered.truncate(committed_end).await?;
         assert_eq!(std::fs::read(&path)?, original);
-        recovered.append_entry(&target, |_, _| Ok(())).await?;
+        let target = recovered.append_entry(target(), |_, _| Ok(())).await?;
         let entry = recovered.read_entry(committed_end).await?;
         assert_eq!(entry.filename(), target.filename());
         assert_eq!(entry.data(), target.data());
@@ -584,14 +584,14 @@ mod write_health_tests {
         let path = directory.path().join("length-mismatch.pack");
         let package = Package::open(view.clone(), &operation, path.clone(), false, true).await?;
         let seed = PackageEntry::with_data("seed".into(), b"seed".to_vec());
-        package.append_entry(&seed, |_, _| Ok(())).await?;
+        let seed = package.append_entry(seed, |_, _| Ok(())).await?;
         use std::io::Write;
         std::fs::OpenOptions::new().append(true).open(&path)?.write_all(b"foreign tail")?;
         let before = std::fs::read(&path)?;
         let error = package
-            .append_entry(&seed, |_, _| panic!("mismatch must precede metadata"))
+            .append_entry(seed, |_, _| panic!("mismatch must precede metadata"))
             .await
-            .expect_err("length mismatch must fail closed");
+            .err().expect("length mismatch must fail closed");
         assert!(error.to_string().contains("length mismatch before append"));
         assert_eq!(std::fs::read(&path)?, before);
         assert!(package
@@ -601,5 +601,75 @@ mod write_health_tests {
             .to_string()
             .contains("write state is uncertain"));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod consuming_tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn check_owned_append(indexed: bool) -> Result<()> {
+        let (_context_dir, view, operation) = package_fixture_context()?;
+        let directory = tempfile::tempdir()?;
+        let package = Package::open(
+            view, &operation, directory.path().join("owned.pack"), false, true,
+        ).await?;
+        let entry = PackageEntry::with_data("owned".into(), b"owned payload".to_vec());
+        let data_pointer = entry.data().as_ptr();
+        let name_pointer = entry.filename().as_ptr();
+        let encoded_size = entry.serialized_size()?;
+        let calls = AtomicU64::new(0);
+        let callback = |offset: u64, size: u64| {
+            assert!(package.write_mutex.try_lock().is_err(), "metadata callback lost writer guard");
+            assert_eq!(offset, 0);
+            assert_eq!(size, encoded_size);
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        let entry = if indexed {
+            package.append_indexed_entry(entry, |offset, size| callback(u64::from(offset), size)).await?
+        } else {
+            package.append_entry(entry, callback).await?
+        };
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(entry.data().as_ptr(), data_pointer, "append replaced owned payload allocation");
+        assert_eq!(entry.filename().as_ptr(), name_pointer);
+        assert_eq!(entry.data(), b"owned payload");
+        assert_eq!(entry.filename(), "owned");
+        assert!(package.write_mutex.try_lock().is_ok(), "append returned while writer guard remained locked");
+        tokio::time::timeout(Duration::from_secs(5), package.sync_durable(None)).await??;
+        let next = package.size();
+        let entry = tokio::time::timeout(Duration::from_secs(5), async {
+            if indexed {
+                package.append_indexed_entry(entry, |offset, _| {
+                    assert_eq!(u64::from(offset), next);
+                    Ok(())
+                }).await
+            } else {
+                package.append_entry(entry, |offset, _| {
+                    assert_eq!(offset, next);
+                    Ok(())
+                }).await
+            }
+        }).await??;
+        assert_eq!(entry.data().as_ptr(), data_pointer, "append replaced owned payload allocation");
+        tokio::time::timeout(Duration::from_secs(5), package.sync_durable(None)).await??;
+        for offset in [0, next] {
+            let stored = package.read_entry(offset).await?;
+            assert_eq!(stored.filename(), entry.filename());
+            assert_eq!(stored.data(), entry.data());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordinary_append_returns_owned_buffer_after_unlock() -> Result<()> {
+        check_owned_append(false).await
+    }
+
+    #[tokio::test]
+    async fn indexed_append_returns_owned_buffer_after_unlock() -> Result<()> {
+        check_owned_append(true).await
     }
 }
