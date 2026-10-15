@@ -121,6 +121,7 @@ async fn exercise(shifted: bool, proof: bool, reader: usize) {
     close(slice, db, handles_db, handles).await;
 
     let db = RocksDb::new(path.path(), "archive_provider", None, AccessType::ReadWrite).unwrap();
+    db.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
     let handles_db = RocksDb::new(path.path(), "handle_db", None, AccessType::ReadWrite).unwrap();
     let slice = base::open(&db, path.path(), false, None).await.unwrap();
     let cold = observations(&slice, &retained, "cold").await;
@@ -233,6 +234,7 @@ async fn multiple_retained_shifts_with_interleaved_proofs() {
     let retained = vec![handles[0].clone(), handles[3].clone(), handles[4].clone()];
     close(slice, db, handles_db, handles).await;
     let db = RocksDb::new(path.path(), "archive_provider", None, AccessType::ReadWrite).unwrap();
+    db.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
     let handles_db = RocksDb::new(path.path(), "handle_db", None, AccessType::ReadWrite).unwrap();
     let slice = base::open(&db, path.path(), false, None).await.unwrap();
     let mut cold = Vec::new();

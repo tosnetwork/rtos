@@ -185,6 +185,7 @@ async fn cold() {
     let multiple = std::env::var("RTOS_RENAME_LAYOUT").as_deref() == Ok("multiple");
     let pack = PathBuf::from(std::fs::read_to_string(root.join("package-path")).unwrap());
     let db = RocksDb::new(&root, "archive_provider", None, AccessType::ReadWrite).unwrap();
+    db.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
     let handles_db = RocksDb::new(&root, "handle_db", None, AccessType::ReadWrite).unwrap();
     let (storage, table) = create_block_handle_storage(handles_db.clone());
     let mut handles = Vec::new();
