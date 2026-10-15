@@ -207,6 +207,9 @@ fn child(root: &Path, mode: &str) -> std::process::Child {
         .env("RTOS_RECOVERY_CHECK_CHILD_MODE", mode)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if mode.starts_with("wal-") {
+        command.stderr(Stdio::inherit());
+    }
     if mode == "check-refused" && unsafe { libc::geteuid() } == 0 {
         use std::os::unix::process::CommandExt;
         command.uid(65534);
@@ -254,9 +257,9 @@ fn native_writer_lock_conflicts_in_both_directions() {
 fn unflushed_counter_merge_and_pending_marker_survive_readonly_replay() {
     for pending in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        assert!(
-            wait(child(dir.path(), if pending { "wal-pending" } else { "wal-clear" })).success()
-        );
+        let mode = if pending { "wal-pending" } else { "wal-clear" };
+        let status = wait(child(dir.path(), mode));
+        assert!(status.success(), "native WAL seed {mode} exited {status}");
         assert!(!fs::read_dir(dir.path().join("db")).unwrap().any(|e| e
             .unwrap()
             .path()
@@ -332,8 +335,10 @@ fn native_child() {
                 .unwrap();
         }
         db.flush_wal(true).unwrap();
-        std::hint::black_box(cache);
-        std::process::exit(0);
+        // Preserve the WAL-only seed without DB/SST teardown or native global
+        // exit handlers running while this intentionally live DB owns threads.
+        std::hint::black_box((&db, &cache));
+        unsafe { libc::_exit(0) };
     }
     let families = NativeDb::list_cf(&Options::default(), root.join("db")).unwrap();
     let db = match NativeDb::open_cf(&Options::default(), root.join("db"), families) {
