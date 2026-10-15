@@ -271,6 +271,13 @@ pub(crate) enum OutboxSyncBoundary {
 #[cfg(test)]
 type OutboxSyncObserver = dyn Fn(OutboxSyncBoundary, &[u8]) -> Result<()> + Send + Sync;
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArchiveQueueDrainEvent {
+    WaitPending,
+    StateStopBoundary(usize),
+}
+
 pub struct InternalDb {
     #[cfg(test)]
     recovery_node_db: Arc<RocksDb>,
@@ -301,7 +308,9 @@ pub struct InternalDb {
     archive_enqueue_test_gate:
         std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     #[cfg(test)]
-    archive_queue_drain_started: std::sync::atomic::AtomicBool,
+    archive_queue_drain_events: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<ArchiveQueueDrainEvent>>>,
+    #[cfg(test)]
+    archive_queue_boundary_count: std::sync::atomic::AtomicUsize,
     shard_top_blocks_db: ShardTopBlocksDb,
     full_node_state_db: Arc<NodeStateDb>,
 
@@ -533,7 +542,9 @@ impl InternalDb {
             #[cfg(test)]
             archive_enqueue_test_gate: Default::default(),
             #[cfg(test)]
-            archive_queue_drain_started: Default::default(),
+            archive_queue_drain_events: Default::default(),
+            #[cfg(test)]
+            archive_queue_boundary_count: std::sync::atomic::AtomicUsize::new(usize::MAX),
             repair_leases,
             #[cfg(test)]
             recovery_node_db: db.clone(),
@@ -651,9 +662,27 @@ impl InternalDb {
         self.archive_admission.close();
         self.archive_io_owners.close();
         let archived = self.archive_tasks.wait().await;
+        let drain = self.archive_io_owners.wait();
         #[cfg(test)]
-        self.archive_queue_drain_started.store(true, Ordering::SeqCst);
-        self.archive_io_owners.wait().await;
+        let drain = {
+            let mut drain = Box::pin(drain);
+            let mut pending_reported = false;
+            std::future::poll_fn(move |cx| {
+                let result = std::future::Future::poll(drain.as_mut(), cx);
+                if result.is_pending() && !pending_reported {
+                    pending_reported = true;
+                    self.test_report_archive_drain(ArchiveQueueDrainEvent::WaitPending);
+                }
+                result
+            })
+        };
+        drain.await;
+        #[cfg(test)]
+        {
+            let remaining = self.archive_io_owners.outstanding();
+            self.archive_queue_boundary_count.store(remaining, Ordering::SeqCst);
+            self.test_report_archive_drain(ArchiveQueueDrainEvent::StateStopBoundary(remaining));
+        }
         debug_assert_eq!(self.archive_io_owners.outstanding(), 0, "Archive queue owners remain at state shutdown");
         let states = match &self.state_db {
             StateDb::Dynamic(db) => db.stop().await,
@@ -691,8 +720,21 @@ impl InternalDb {
     #[cfg(test)]
     pub(crate) fn test_archive_io_outstanding(&self) -> usize { self.archive_io_owners.outstanding() }
     #[cfg(test)]
-    pub(crate) fn test_archive_queue_drain_started(&self) -> bool {
-        self.archive_queue_drain_started.load(Ordering::SeqCst)
+    pub(crate) fn test_observe_archive_queue_drain(&self) -> tokio::sync::mpsc::UnboundedReceiver<ArchiveQueueDrainEvent> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        *self.archive_queue_drain_events.lock().unwrap() = Some(sender);
+        self.archive_queue_boundary_count.store(usize::MAX, Ordering::SeqCst);
+        receiver
+    }
+    #[cfg(test)]
+    fn test_report_archive_drain(&self, event: ArchiveQueueDrainEvent) {
+        if let Some(sender) = self.archive_queue_drain_events.lock().unwrap().as_ref() {
+            let _ = sender.send(event);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn test_archive_queue_boundary_count(&self) -> usize {
+        self.archive_queue_boundary_count.load(Ordering::SeqCst)
     }
     #[cfg(test)]
     pub(crate) async fn test_join_archive_tasks(&self) -> Result<()> { self.archive_tasks.wait().await }

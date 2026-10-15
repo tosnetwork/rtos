@@ -195,3 +195,91 @@ async fn no_cache_and_enqueue_failure_release_supplied_ticket() {
         .is_err());
     owners.wait().await;
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the explicitly armed private WAL sync harness"]
+async fn barrier_native_wal_failure_retains_custody_after_cancel() {
+    let db_path = std::path::PathBuf::from(std::env::var_os("RTOS_QUEUE_DB").unwrap());
+    let arm = std::path::PathBuf::from(std::env::var_os("RTOS_QUEUE_ARM").unwrap());
+    let case = std::env::var("RTOS_QUEUE_CASE").unwrap();
+    assert!(matches!(case.as_str(), "fault" | "control" | "wrong-path" | "no-arm"));
+    assert!(!arm.exists());
+    assert!(!db_path.exists());
+    let db = RocksDb::new(
+        db_path.parent().unwrap(),
+        db_path.file_name().unwrap().to_str().unwrap(),
+        None,
+        AccessType::ReadWrite,
+    )
+    .unwrap();
+    let (storage, handle_db) = create_block_handle_storage(db);
+    let storage = Arc::new(storage);
+    let handle =
+        storage.create_handle(BlockIdExt::default(), BlockMeta::default(), None).unwrap().unwrap();
+    storage.sync_pending().await.unwrap();
+    handle.set_archived();
+    let callback = Arc::new(HeldCallback {
+        entered: Default::default(),
+        release: Default::default(),
+        completed: AtomicBool::new(false),
+        panic_after_release: false,
+    });
+    storage.save_handle(&handle, Some(callback.clone())).unwrap();
+    entered(&callback).await;
+    callback.release.notify_one();
+    assert_eq!(
+        handle_db.try_get_raw(handle.id().root_hash().as_slice()).unwrap().unwrap().as_ref(),
+        handle.serialize().as_slice()
+    );
+    let owners = ArchiveIoOwners::default();
+    let ticket = owners.enter().unwrap();
+    let (entered_send, entered_receive) = std::sync::mpsc::channel();
+    let (release_send, release_receive) = std::sync::mpsc::channel();
+    let release_receive = std::sync::Mutex::new(release_receive);
+    let visits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = visits.clone();
+    let observer: crate::durability::SyncObservation = Some(Arc::new(move |point, path| {
+        assert_eq!(point, crate::durability::SyncPoint::Wal);
+        assert_eq!(path, db_path.as_path());
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            entered_send.send(()).unwrap();
+            release_receive.lock().unwrap().recv_timeout(Duration::from_secs(30)).unwrap();
+        }
+        // All failures in this test come from the actual native sync call.
+        Ok(())
+    }));
+    let caller_storage = storage.clone();
+    let caller = tokio::spawn(async move {
+        caller_storage.sync_pending_observed_with_archive_custody(observer, ticket).await
+    });
+    entered_receive.recv_timeout(Duration::from_secs(30)).unwrap();
+    caller.abort();
+    let cancelled = caller.await.unwrap_err().is_cancelled();
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(cancelled);
+        owners.close();
+        assert_eq!(
+            owners.outstanding(),
+            1,
+            "native Barrier lost custody after observer cancellation"
+        );
+        assert!(callback.completed.load(Ordering::SeqCst));
+        if case != "no-arm" {
+            std::fs::write(&arm, b"private WAL sync test").unwrap();
+        }
+    }));
+    eprintln!("QUEUE_BARRIER_RELEASE");
+    release_send.send(()).unwrap();
+    let drained = tokio::time::timeout(Duration::from_secs(30), owners.wait()).await;
+    if arm.exists() {
+        std::fs::remove_file(&arm).unwrap();
+    }
+    eprintln!("QUEUE_BARRIER_DRAINED");
+    drained.unwrap();
+    let sticky = storage.sync_pending().await;
+    assert_eq!(owners.outstanding(), 0);
+    run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    assert_eq!(sticky.is_err(), case == "fault", "native WAL failure must remain sticky");
+    assert_eq!(visits.load(Ordering::SeqCst), if case == "fault" { 1 } else { 3 });
+}

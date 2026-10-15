@@ -400,6 +400,8 @@ async fn persistent_repair_archive_owner_panic_still_drains_queued_handle() {
     let owner_engine = engine.clone(); let id = target.id().clone(); let queued_callback = callback.clone();
     let mut caller = Some(tokio::spawn(async move { owner_engine.db().archive_block(&id, Some(queued_callback)).await }));
     let mut stopping = None;
+    let mut drain_events = engine.db().test_observe_archive_queue_drain();
+    let mut first_drain_event = None;
     let run = std::panic::AssertUnwindSafe(async {
         tokio::time::timeout(Duration::from_secs(30), enqueue_entered.notified()).await.expect("archive owner did not enqueue");
         tokio::time::timeout(Duration::from_secs(30), callback.entered.notified()).await.expect("actual handle writer did not enter");
@@ -409,11 +411,10 @@ async fn persistent_repair_archive_owner_panic_still_drains_queued_handle() {
         assert_eq!(engine.db().test_archive_io_outstanding(), 1, "real queued command must outlive failed archive owner");
         let stopping_engine = engine.clone();
         stopping = Some(tokio::spawn(async move { stopping_engine.wait_stop().await }));
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while !engine.db().test_archive_queue_drain_started() { tokio::task::yield_now().await; }
-        }).await.expect("shutdown did not reach actual queue drain");
+        first_drain_event = Some(tokio::time::timeout(Duration::from_secs(30), drain_events.recv())
+            .await.expect("shutdown drain event missing")
+            .expect("shutdown drain event channel closed"));
         assert_eq!(engine.db().test_archive_io_outstanding(), 1);
-        assert!(!stopping.as_ref().unwrap().is_finished(), "shutdown passed a held queue owner");
         assert!(!callback.completed.load(std::sync::atomic::Ordering::SeqCst));
     }).catch_unwind().await;
     // Release the actual queue owner even when an assertion failed.
@@ -423,8 +424,12 @@ async fn persistent_repair_archive_owner_panic_still_drains_queued_handle() {
     let repeated = engine.clone().wait_stop().await;
     assert_eq!(engine.db().test_archive_io_outstanding(), 0);
     assert!(callback.completed.load(std::sync::atomic::Ordering::SeqCst));
+    let boundary_count = engine.db().test_archive_queue_boundary_count();
     let weak = Arc::downgrade(&engine); drop(engine);
     run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    assert_eq!(first_drain_event, Some(crate::internal_db::ArchiveQueueDrainEvent::WaitPending),
+        "shutdown crossed state-stop boundary before held queue drain");
+    assert_eq!(boundary_count, 0, "state shutdown observed a live archive queue owner");
     assert!(stopped.is_err()); assert!(repeated.is_err()); assert!(weak.upgrade().is_none());
     drop(dir);
 }
