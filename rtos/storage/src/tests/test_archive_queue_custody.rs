@@ -289,6 +289,7 @@ async fn verify_writer_close_releases_provider(panic_after_release: bool) {
     let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite).unwrap();
     let provider = Arc::downgrade(&db);
     let (storage, handle_db) = create_block_handle_storage(db);
+    let completion = storage.writer_completion_for_test();
     let handle = storage
         .create_handle(BlockIdExt::default(), BlockMeta::default(), None)
         .unwrap()
@@ -302,28 +303,36 @@ async fn verify_writer_close_releases_provider(panic_after_release: bool) {
     });
     handle.set_archived();
     storage.save_handle(&handle, Some(callback.clone())).unwrap();
-    entered(&callback).await;
+    let arrived = tokio::time::timeout(Duration::from_secs(20), callback.entered.notified()).await;
     drop(handle_db);
     let mut closing = Box::pin(storage.close_and_wait());
-    std::future::poll_fn(|cx| {
-        assert!(
-            std::future::Future::poll(closing.as_mut(), cx).is_pending(),
-            "close returned before the actual writer callback exited"
-        );
-        std::task::Poll::Ready(())
+    let observation = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(closing.as_mut(), cx))
     })
     .await;
-    assert!(provider.upgrade().is_some());
-    assert!(RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite).is_err());
+    let pending = observation.is_pending();
+    let held = provider.upgrade().is_some();
+    let excluded = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite).is_err();
+    // Always release the callback and observe actual task completion before assertions.
     callback.release.notify_one();
-    let closed = tokio::time::timeout(Duration::from_secs(20), closing).await.unwrap();
+    let closed = match observation {
+        std::task::Poll::Ready(result) => Ok(result),
+        std::task::Poll::Pending => tokio::time::timeout(Duration::from_secs(20), closing).await,
+    };
+    let joined = tokio::time::timeout(Duration::from_secs(20), completion).await;
+    let gone = provider.upgrade().is_none();
+    assert!(arrived.is_ok(), "callback did not enter");
+    assert_eq!(joined.unwrap().is_err(), panic_after_release);
+    assert!(gone, "joined writer retained its provider");
+    assert!(pending, "close returned before the actual writer callback exited");
+    assert!(held && excluded, "held writer callback lost provider exclusion");
+    let closed = closed.unwrap();
     assert_eq!(closed.is_err(), panic_after_release);
     if panic_after_release {
         let diagnostic = format!("{:#}", closed.unwrap_err());
         assert!(diagnostic.contains("Handle writer failed during durability barrier"));
         assert!(diagnostic.contains("Handle writer failed while closing"));
     }
-    assert!(provider.upgrade().is_none(), "joined writer retained its provider");
     let reopened = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite).unwrap();
     let stored = BlockHandleDb::with_db(reopened, "block_handles", false).unwrap();
     assert_eq!(
