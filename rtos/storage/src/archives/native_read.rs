@@ -20,7 +20,27 @@ use std::{
 /// releasing the provider and then its operation ticket, including on unwind.
 struct OwnedReader {
     file: File,
+    #[cfg(all(test, target_os = "linux"))]
+    _receipt: Option<ReadReceipt>,
     _custody: NativeCustody,
+}
+
+// Instance-local test instrumentation. The receipt field is destroyed after the
+// actual File and before custody; callbacks never replace production close.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct ReadProbe {
+    pub opened: Box<dyn FnOnce(&File) + Send>,
+    pub closed: Box<dyn FnOnce() + Send>,
+}
+#[cfg(all(test, target_os = "linux"))]
+struct ReadReceipt(Option<Box<dyn FnOnce() + Send>>);
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for ReadReceipt {
+    fn drop(&mut self) {
+        if let Some(receipt) = self.0.take() {
+            receipt();
+        }
+    }
 }
 
 async fn read_owned<T: Send + 'static>(
@@ -32,7 +52,23 @@ async fn read_owned<T: Send + 'static>(
         // This check runs in the actual native owner, not its async observer.
         let custody = operation.start_read()?;
         let file = File::open(path).map_err(ArchiveReadNotStarted::from_open)?;
-        let mut owner = OwnedReader { file, _custody: custody };
+        #[cfg(all(test, target_os = "linux"))]
+        let probe = custody.take_read_probe();
+        #[cfg(all(test, target_os = "linux"))]
+        let (opened, receipt) = match probe {
+            Some(probe) => (Some(probe.opened), Some(ReadReceipt(Some(probe.closed)))),
+            None => (None, None),
+        };
+        let mut owner = OwnedReader {
+            file,
+            #[cfg(all(test, target_os = "linux"))]
+            _receipt: receipt,
+            _custody: custody,
+        };
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(opened) = opened {
+            opened(&owner.file);
+        }
         read(&mut owner.file)
     })
     .await

@@ -1156,3 +1156,119 @@ async fn bounded_reads_keep_inherited_context_after_close_and_refuse_new_roots_b
     }
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_manager_reads_close_actual_file_before_domain_drain() -> Result<()> {
+    use crate::archives::{bounded_read::ArchiveReadLimits, native_read::ReadProbe};
+    use std::{
+        os::fd::AsRawFd,
+        sync::atomic::{AtomicBool, AtomicI32, Ordering},
+        time::Duration,
+    };
+    let deadline = Duration::from_secs(20);
+    for epoch in [false, true] {
+        for key in [false, true] {
+            // 0: loose body; 1: packed entry; 2: packed range.
+            for route in 0..3 {
+                let dir = tempfile::tempdir()?;
+                let (manager, db) = if epoch {
+                    let (manager, db, _router) = create_epoch_manager(dir.path()).await?;
+                    (manager, db)
+                } else {
+                    create_manager(dir.path().to_str().unwrap(), "native-read-owner", false).await?
+                };
+                let manager = Arc::new(manager);
+                let domain = manager.view.binding().domain().clone();
+                let (handles, _) = create_block_handle_storage(db);
+                let id = BlockIdExt::with_params(
+                    ShardIdent::masterchain(), 1,
+                    UInt256::from([81; 32]), UInt256::from([82; 32]),
+                );
+                let flags = if key { FLAG_KEY_BLOCK } else { 0 };
+                let handle = handles.create_handle(
+                    id.clone(), BlockMeta::with_data(flags, 0, 0, 0, 0), None,
+                )?.unwrap();
+                manager.add_file(&PackageEntryId::Proof(&id), b"proof").await?;
+                handle.set_proof();
+                handle.set_block_applied();
+                if route != 0 {
+                    manager.move_to_archive(&handle, || Ok(())).await?;
+                    handle.set_archived();
+                }
+                let limits = ArchiveReadLimits { data_bytes: 5, filename_bytes: 1024 };
+                assert_eq!(manager.get_file_bounded(
+                    &handle, &PackageEntryId::Proof(&id), limits,
+                ).await?, b"proof");
+                let archive_id = if route == 2 {
+                    let archive_id = manager.get_archive_id(1, &ShardIdent::masterchain()).await.unwrap();
+                    assert_eq!(manager.get_archive_slice(archive_id, 0, 4).await?.len(), 4);
+                    archive_id
+                } else { 0 };
+                let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
+                let (read_release_tx, read_release_rx) = std::sync::mpsc::channel();
+                let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+                let (close_release_tx, close_release_rx) = std::sync::mpsc::channel();
+                let (released_tx, released_rx) = tokio::sync::oneshot::channel();
+                let fd = Arc::new(AtomicI32::new(-1));
+                let read_gate = Arc::new(AtomicBool::new(false));
+                let open_fd = fd.clone();
+                let open_gate = read_gate.clone();
+                let weak_domain = Arc::downgrade(&domain);
+                domain.install_read_probe(ReadProbe {
+                    opened: Box::new(move |file| {
+                        open_fd.store(file.as_raw_fd(), Ordering::SeqCst);
+                        let _ = opened_tx.send(file.as_raw_fd());
+                        open_gate.store(read_release_rx.recv_timeout(deadline).is_ok(), Ordering::SeqCst);
+                    }),
+                    closed: Box::new(move || {
+                        // Observe only; never acquire ownership or close this number.
+                        let rc = unsafe { libc::fcntl(fd.load(Ordering::SeqCst), libc::F_GETFD) };
+                        let errno = std::io::Error::last_os_error().raw_os_error();
+                        let outstanding = weak_domain.upgrade().map(|d| d.outstanding());
+                        let _ = closed_tx.send((rc, errno, outstanding, read_gate.load(Ordering::SeqCst)));
+                        let released = close_release_rx.recv_timeout(deadline).is_ok();
+                        let _ = released_tx.send(released);
+                    }),
+                });
+                let reader_manager = manager.clone();
+                let reader_handle = handle.clone();
+                let observer = tokio::spawn(async move {
+                    if route == 2 {
+                        reader_manager.get_archive_slice(archive_id, 0, 4).await
+                    } else {
+                        reader_manager.get_file_bounded(
+                            &reader_handle, &PackageEntryId::Proof(&id), limits,
+                        ).await
+                    }
+                });
+                let opened_fd = tokio::time::timeout(deadline, opened_rx).await??;
+                let valid_while_held = unsafe { libc::fcntl(opened_fd, libc::F_GETFD) } >= 0;
+                observer.abort();
+                let cancelled = observer.await.is_err_and(|e| e.is_cancelled());
+                let closed = domain.close(manager.view.epoch())?;
+                let before_close = domain.outstanding();
+                let mut drain = Box::pin(closed.wait());
+                let pending_open = futures::poll!(&mut drain).is_pending();
+                let read_released = read_release_tx.send(()).is_ok();
+                let receipt = tokio::time::timeout(deadline, closed_rx).await;
+                let pending_closed = futures::poll!(&mut drain).is_pending();
+                let close_released = close_release_tx.send(()).is_ok();
+                let release_result = tokio::time::timeout(deadline, released_rx).await;
+                // Finish the actual owner before propagating observation failures.
+                tokio::time::timeout(deadline, &mut drain).await?;
+                let (rc, errno, retained, read_gate_ok) = receipt??;
+                let close_gate_ok = release_result??;
+                eprintln!("native_read_receipt epoch={epoch} key={key} route={route} fcntl={rc} errno={errno:?} retained={retained:?} before_close={before_close} valid_open={valid_while_held} cancelled={cancelled} pending_open={pending_open} pending_closed={pending_closed} read_gate={read_gate_ok} close_gate={close_gate_ok} read_release={read_released} close_release={close_released}");
+                assert!(cancelled && valid_while_held && pending_open && pending_closed);
+                assert!(read_released && close_released && read_gate_ok && close_gate_ok);
+                assert_eq!(rc, -1, "actual descriptor must be closed before custody release");
+                assert_eq!(errno, Some(libc::EBADF));
+                assert!(before_close > 0 && retained.is_some_and(|n| n > 0));
+                assert_eq!(domain.outstanding(), 0);
+                assert!(!closed.recovery_required());
+            }
+        }
+    }
+    Ok(())
+}

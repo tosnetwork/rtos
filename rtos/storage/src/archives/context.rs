@@ -38,13 +38,26 @@ struct State {
 }
 pub struct ArchiveDomain {
     state: Mutex<State>,
+    #[cfg(all(test, target_os = "linux"))]
+    read_probe: Mutex<Option<super::native_read::ReadProbe>>,
 }
 impl Default for ArchiveDomain {
     fn default() -> Self {
-        Self { state: Mutex::new(State { epoch: 0, phase: Phase::Open, owners: Arc::default() }) }
+        Self {
+            state: Mutex::new(State { epoch: 0, phase: Phase::Open, owners: Arc::default() }),
+            #[cfg(all(test, target_os = "linux"))]
+            read_probe: Mutex::new(None),
+        }
     }
 }
 impl ArchiveDomain {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn install_read_probe(&self, probe: super::native_read::ReadProbe) {
+        let mut slot = self.read_probe.lock().unwrap();
+        assert!(slot.is_none(), "unconsumed native read probe");
+        *slot = Some(probe);
+    }
+
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -252,6 +265,11 @@ pub struct NativeCustody {
     ticket: Option<ArchiveIoTicket>,
 }
 impl NativeCustody {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn take_read_probe(&self) -> Option<super::native_read::ReadProbe> {
+        self.domain.read_probe.lock().unwrap().take()
+    }
+
     /// The result remains an owner after the native closure returns. This is
     /// specifically a mutation-to-metadata handoff, not a plain read result.
     pub fn handoff<T: Send + 'static>(self, value: T) -> NativeHandoff<T> {
