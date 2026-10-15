@@ -287,6 +287,23 @@ fn native_child() {
         assert!(observed(&config(&root)).is_err());
         return;
     }
+    if mode == "epoch-clear" || mode == "epoch-missing" {
+        epoch_setup(&root);
+        archive(&root, "db", 0, true, false, true);
+        archive(&root.join("epochs/epoch_0"), "archive_db", 0, false, false, false);
+        let options = Options::default();
+        let families = NativeDb::list_cf(&options, root.join("db")).unwrap();
+        let db = NativeDb::open_cf(&options, root.join("db"), families).unwrap();
+        let id = if mode == "epoch-clear" { 0u32 } else { 20000u32 };
+        db.put_cf(
+            &db.cf_handle("files").unwrap(),
+            id.to_le_bytes(),
+            serde_cbor::to_vec(&PackageIndexEntry::new()).unwrap(),
+        )
+        .unwrap();
+        drop(db);
+        return;
+    }
     if mode.starts_with("wal-") {
         let mut options = Options::default();
         options.create_if_missing(true);
