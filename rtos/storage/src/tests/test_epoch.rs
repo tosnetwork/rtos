@@ -11,25 +11,31 @@ use super::*;
 #[tokio::test]
 async fn test_epoch_router_validation() {
     let dir = tempfile::tempdir().unwrap();
+    let main = RocksDb::new(dir.path(), "main", None, AccessType::ReadWrite).unwrap();
+    let binding = main.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
+    let startup = binding.view().unwrap().enter().unwrap();
 
     let config = ArchivalModeConfig {
         epoch_size: 0,
         new_epochs_path: dir.path().to_path_buf(),
         existing_epochs: vec![],
     };
-    assert!(EpochRouter::new(&config).await.is_err());
+    assert!(EpochRouter::new(&config, &startup).await.is_err());
 
     let config = ArchivalModeConfig {
         epoch_size: 10_000, // not a multiple of ARCHIVE_SLICE_SIZE
         new_epochs_path: dir.path().to_path_buf(),
         existing_epochs: vec![],
     };
-    assert!(EpochRouter::new(&config).await.is_err());
+    assert!(EpochRouter::new(&config, &startup).await.is_err());
 }
 
 #[tokio::test]
 async fn test_epoch_router_resolve_and_create() {
     let dir = tempfile::tempdir().unwrap();
+    let main = RocksDb::new(dir.path(), "main", None, AccessType::ReadWrite).unwrap();
+    let binding = main.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
+    let startup = binding.view().unwrap().enter().unwrap();
     let new_epochs_path = dir.path().join("new_epochs");
 
     let config = ArchivalModeConfig {
@@ -38,7 +44,7 @@ async fn test_epoch_router_resolve_and_create() {
         existing_epochs: vec![],
     };
 
-    let router = EpochRouter::new(&config).await.unwrap();
+    let router = EpochRouter::new(&config, &startup).await.unwrap();
 
     // No epochs exist yet
     assert!(router.resolve(0).is_none());
@@ -68,6 +74,9 @@ async fn test_epoch_router_resolve_and_create() {
 #[tokio::test]
 async fn test_epoch_router_with_existing_epochs() {
     let dir = tempfile::tempdir().unwrap();
+    let main = RocksDb::new(dir.path(), "main", None, AccessType::ReadWrite).unwrap();
+    let binding = main.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
+    let startup = binding.view().unwrap().enter().unwrap();
     let epoch0_path = dir.path().join("epoch_0");
     let epoch1_path = dir.path().join("epoch_1");
     let new_epochs_path = dir.path().join("new_epochs");
@@ -87,7 +96,7 @@ async fn test_epoch_router_with_existing_epochs() {
         existing_epochs: vec![EpochEntry { path: epoch0_path }, EpochEntry { path: epoch1_path }],
     };
 
-    let router = EpochRouter::new(&config).await.unwrap();
+    let router = EpochRouter::new(&config, &startup).await.unwrap();
 
     let e0 = router.resolve(0).unwrap();
     assert_eq!(e0.mc_seq_no_start(), 0);
@@ -103,6 +112,9 @@ async fn test_epoch_router_with_existing_epochs() {
 #[tokio::test]
 async fn test_epoch_router_rejects_misaligned_existing() {
     let dir = tempfile::tempdir().unwrap();
+    let main = RocksDb::new(dir.path(), "main", None, AccessType::ReadWrite).unwrap();
+    let binding = main.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
+    let startup = binding.view().unwrap().enter().unwrap();
     let epoch_path = dir.path().join("bad_epoch");
     std::fs::create_dir_all(&epoch_path).unwrap();
 
@@ -116,12 +128,15 @@ async fn test_epoch_router_rejects_misaligned_existing() {
         existing_epochs: vec![EpochEntry { path: epoch_path }],
     };
 
-    assert!(EpochRouter::new(&config).await.is_err());
+    assert!(EpochRouter::new(&config, &startup).await.is_err());
 }
 
 #[tokio::test]
 async fn test_epoch_router_discovers_on_restart() {
     let dir = tempfile::tempdir().unwrap();
+    let main = RocksDb::new(dir.path(), "main", None, AccessType::ReadWrite).unwrap();
+    let binding = main.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
+    let startup = binding.view().unwrap().enter().unwrap();
     let new_epochs_path = dir.path().join("new_epochs");
 
     // First "run": create epochs dynamically
@@ -130,7 +145,7 @@ async fn test_epoch_router_discovers_on_restart() {
         new_epochs_path: new_epochs_path.clone(),
         existing_epochs: vec![],
     };
-    let router = EpochRouter::new(&config).await.unwrap();
+    let router = EpochRouter::new(&config, &startup).await.unwrap();
     router.resolve_or_create(0).await.unwrap();
     router.resolve_or_create(50_000).await.unwrap();
     assert!(router.resolve(0).is_some());
@@ -143,7 +158,7 @@ async fn test_epoch_router_discovers_on_restart() {
         new_epochs_path: new_epochs_path.clone(),
         existing_epochs: vec![],
     };
-    let router2 = EpochRouter::new(&config2).await.unwrap();
+    let router2 = EpochRouter::new(&config2, &startup).await.unwrap();
     let e0 = router2.resolve(0).unwrap();
     assert_eq!(e0.mc_seq_no_start(), 0);
     assert_eq!(e0.mc_seq_no_end(), 39_999);

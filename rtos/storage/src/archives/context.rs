@@ -115,6 +115,9 @@ impl ArchiveProvider {
     pub(crate) fn bound(provider: Arc<RocksDb>, domain: Arc<ArchiveDomain>) -> Self {
         Self { provider, domain }
     }
+    pub fn db(&self) -> &Arc<RocksDb> { &self.provider }
+    pub fn domain(&self) -> &Arc<ArchiveDomain> { &self.domain }
+
     pub fn view(&self) -> Result<ArchiveView> {
         let state = self.domain.lock()?;
         ArchiveDomain::check_open(&state)?;
@@ -127,6 +130,19 @@ pub struct ArchiveView {
     epoch: u64,
 }
 impl ArchiveView {
+    pub fn binding(&self) -> &ArchiveProvider { &self.binding }
+
+    /// Inherit into this captured view without reopening root admission.
+    pub fn inherit(&self, parent: &ArchiveOperation) -> Result<ArchiveOperation> {
+        let operation = parent.inherit(&self.binding)?;
+        if self.epoch != operation.epoch {
+            return Err(ArchiveContextError::Stale {
+                expected: self.epoch, current: operation.epoch,
+            }.into());
+        }
+        Ok(operation)
+    }
+
     pub fn epoch(&self) -> u64 {
         self.epoch
     }

@@ -193,20 +193,24 @@ async fn file_map_preserves_live_index_for_main_and_epoch_providers() {
                 let dir = tempfile::tempdir().unwrap();
                 let root = Arc::new(dir.path().to_path_buf());
                 let main = RocksDb::new(&*root, "db", None, AccessType::ReadWrite).unwrap();
+                let binding = main.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
+                let startup = binding.view().unwrap().enter().unwrap();
                 let provider: Arc<dyn ArchiveDbProvider> =
                     if epoch_mode && matches!(kind, PackageType::Blocks) {
                         let router = EpochRouter::new(&ArchivalModeConfig {
                             epoch_size: 20000,
                             new_epochs_path: root.join("epochs"),
                             existing_epochs: vec![],
-                        })
+                        }, &startup)
                         .await
                         .unwrap();
                         Arc::new(EpochDbProvider::new(Arc::new(router)))
                     } else {
-                        Arc::new(SingleDbProvider::new(main.clone(), root.clone()))
+                        Arc::new(SingleDbProvider::new(binding.clone(), root.clone()))
                     };
-                let (db, slice_root) = provider.db_for_archive(0).await.unwrap();
+                let resolved = provider.db_for_archive(&startup, 0).await.unwrap();
+                let db = resolved.provider.db().clone();
+                let slice_root = resolved.root_path.clone();
                 seed(&db, &slice_root, kind).await;
                 marker(&db, kind, b"FutureRecoveryVersion");
                 let name =
@@ -224,6 +228,7 @@ async fn file_map_preserves_live_index_for_main_and_epoch_providers() {
                 let files = package_bytes(&slice_root);
                 let error = FileMap::new(
                     main.clone(),
+                    &startup,
                     &provider,
                     name,
                     kind,

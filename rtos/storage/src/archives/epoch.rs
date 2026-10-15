@@ -7,6 +7,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+use super::context::{ArchiveOperation, ArchiveProvider, ArchiveView};
 use crate::{
     archives::ARCHIVE_SLICE_SIZE,
     db::rocksdb::{AccessType, RocksDb},
@@ -65,6 +66,7 @@ pub struct ArchivalModeConfig {
 
 /// Runtime state for a single epoch
 pub struct Epoch {
+    binding: ArchiveProvider,
     mc_seq_no_start: u32,
     mc_seq_no_end: u32,
     path: Arc<PathBuf>,
@@ -72,6 +74,8 @@ pub struct Epoch {
 }
 
 impl Epoch {
+    pub fn binding(&self) -> &ArchiveProvider { &self.binding }
+
     pub fn mc_seq_no_start(&self) -> u32 {
         self.mc_seq_no_start
     }
@@ -94,6 +98,7 @@ impl Epoch {
 /// All epochs must have the same size (`epoch_size`), which allows O(1) arithmetic lookup
 /// without any map search.
 pub struct EpochRouter {
+    view: ArchiveView,
     epochs: lockfree::map::Map<u32, Arc<Epoch>>,
     epoch_size: u32,
     new_epochs_path: PathBuf,
@@ -101,7 +106,9 @@ pub struct EpochRouter {
 }
 
 impl EpochRouter {
-    pub async fn new(config: &ArchivalModeConfig) -> Result<Self> {
+    pub async fn new(config: &ArchivalModeConfig, startup: &ArchiveOperation) -> Result<Self> {
+        let startup = startup.view().inherit(startup)?;
+        let view = startup.view();
         if config.epoch_size == 0 || config.epoch_size % ARCHIVE_SLICE_SIZE != 0 {
             fail!(
                 "epoch_size must be a positive multiple of ARCHIVE_SLICE_SIZE ({}), got {}",
@@ -121,6 +128,7 @@ impl EpochRouter {
             Self::validate_epoch_meta(&meta, config.epoch_size, &entry.path)?;
 
             let db = RocksDb::new(&entry.path, "archive_db", None, AccessType::ReadWrite)?;
+            let binding = db.bind_archive_domain(view.binding().domain().clone())?;
 
             log::info!(
                 target: TARGET,
@@ -131,6 +139,7 @@ impl EpochRouter {
             epochs.insert(
                 meta.mc_seq_no_start,
                 Arc::new(Epoch {
+                    binding,
                     mc_seq_no_start: meta.mc_seq_no_start,
                     mc_seq_no_end: meta.mc_seq_no_end,
                     path: Arc::new(entry.path.clone()),
@@ -169,6 +178,7 @@ impl EpochRouter {
             }
 
             let db = RocksDb::new(&epoch_path, "archive_db", None, AccessType::ReadWrite)?;
+            let binding = db.bind_archive_domain(view.binding().domain().clone())?;
 
             log::info!(
                 target: TARGET,
@@ -179,6 +189,7 @@ impl EpochRouter {
             epochs.insert(
                 meta.mc_seq_no_start,
                 Arc::new(Epoch {
+                    binding,
                     mc_seq_no_start: meta.mc_seq_no_start,
                     mc_seq_no_end: meta.mc_seq_no_end,
                     path: Arc::new(epoch_path),
@@ -188,12 +199,15 @@ impl EpochRouter {
         }
 
         Ok(Self {
+            view,
             epochs,
             epoch_size: config.epoch_size,
             new_epochs_path: config.new_epochs_path.clone(),
             creation_mutex: tokio::sync::Mutex::new(()),
         })
     }
+
+    pub fn view(&self) -> &ArchiveView { &self.view }
 
     pub fn resolve(&self, mc_seq_no: u32) -> Option<Arc<Epoch>> {
         let start = (mc_seq_no / self.epoch_size) * self.epoch_size;
@@ -202,6 +216,12 @@ impl EpochRouter {
 
     /// Resolve the epoch for a given mc_seq_no, creating a new one if needed.
     pub async fn resolve_or_create(&self, mc_seq_no: u32) -> Result<Arc<Epoch>> {
+        let operation = self.view.enter()?;
+        self.resolve_or_create_in(&operation, mc_seq_no).await
+    }
+
+    pub async fn resolve_or_create_in(&self, parent: &ArchiveOperation, mc_seq_no: u32) -> Result<Arc<Epoch>> {
+        let operation = self.view.inherit(parent)?;
         if let Some(epoch) = self.resolve(mc_seq_no) {
             return Ok(epoch);
         }
@@ -214,6 +234,8 @@ impl EpochRouter {
             return Ok(epoch);
         }
 
+        // Recheck after waiting for another creator, before any new path effect.
+        let _before_create = self.view.inherit(&operation)?;
         let epoch_index = mc_seq_no / self.epoch_size;
         let start = epoch_index * self.epoch_size;
         let end = start + self.epoch_size - 1;
@@ -227,6 +249,7 @@ impl EpochRouter {
         write_epoch_meta(&epoch_dir, &meta).await?;
 
         let db = RocksDb::new(&epoch_dir, "archive_db", None, AccessType::ReadWrite)?;
+        let binding = db.bind_archive_domain(self.view.binding().domain().clone())?;
 
         log::info!(
             target: TARGET,
@@ -235,6 +258,7 @@ impl EpochRouter {
         );
 
         let epoch = Arc::new(Epoch {
+            binding,
             mc_seq_no_start: start,
             mc_seq_no_end: end,
             path: Arc::new(epoch_dir),

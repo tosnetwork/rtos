@@ -262,8 +262,6 @@ pub async fn run_import(config: ImportConfig) -> Result<Arc<RocksDb>> {
         new_epochs_path: config.epochs_path.clone(),
         existing_epochs: vec![],
     };
-    let router = Arc::new(EpochRouter::new(&epoch_config).await?);
-    let db_provider = Arc::new(EpochDbProvider::new(router));
 
     std::fs::create_dir_all(&config.node_db_path).map_err(|e| {
         error!("Cannot create node_db_path {}: {}", config.node_db_path.display(), e)
@@ -271,6 +269,12 @@ pub async fn run_import(config: ImportConfig) -> Result<Arc<RocksDb>> {
     // Import can resume in a database previously opened in dynamic mode.
     let cells_db_config = CellsDbConfig::default();
     let node_db = open_node_db(&config.node_db_path, &cells_db_config, AccessType::ReadWrite)?;
+    let archive_domain = storage::archives::context::ArchiveDomain::new();
+    let archive_binding = node_db.bind_archive_domain(archive_domain)?;
+    let archive_startup = archive_binding.view()?.enter()?;
+    let router = Arc::new(EpochRouter::new(&epoch_config, &archive_startup).await?);
+    let db_provider = Arc::new(EpochDbProvider::new(router));
+
 
     let handle_db = Arc::new(BlockHandleDb::with_db(node_db.clone(), BLOCK_HANDLE_DB_NAME, true)?);
     let full_node_state_db = Arc::new(NodeStateDb::with_db(
@@ -307,7 +311,8 @@ pub async fn run_import(config: ImportConfig) -> Result<Arc<RocksDb>> {
 
     let archive_manager = Arc::new(
         ArchiveManager::with_data(
-            node_db.clone(),
+            archive_binding,
+            &archive_startup,
             db_root_path,
             db_provider,
             0, // last_unneeded_key_block
@@ -318,6 +323,8 @@ pub async fn run_import(config: ImportConfig) -> Result<Arc<RocksDb>> {
         )
         .await?,
     );
+
+    drop(archive_startup);
 
     let (archive_cells_opts, archive_cells_cache) =
         storage::cell_db::CellDb::build_cf_options(cells_db_config.cells_cache_size_bytes);

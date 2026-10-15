@@ -469,16 +469,20 @@ impl InternalDb {
         let last_unneeded_key_block_id =
             block_handle_storage.load_full_node_state(LAST_UNNEEDED_KEY_BLOCK)?.unwrap_or_default();
         let db_root_path = Arc::new(PathBuf::from(&config.db_directory));
+        let archive_domain = storage::archives::context::ArchiveDomain::new();
+        let archive_binding = db.bind_archive_domain(archive_domain)?;
+        let archive_startup = archive_binding.view()?.enter()?;
         let db_provider: Arc<dyn ArchiveDbProvider> =
             if let Some(ref archival_config) = config.archival_mode {
-                let router = Arc::new(EpochRouter::new(archival_config).await?);
+                let router = Arc::new(EpochRouter::new(archival_config, &archive_startup).await?);
                 Arc::new(EpochDbProvider::new(router))
             } else {
-                Arc::new(SingleDbProvider::new(db.clone(), db_root_path.clone()))
+                Arc::new(SingleDbProvider::new(archive_binding.clone(), db_root_path.clone()))
             };
         let archive_manager = Arc::new(
             ArchiveManager::with_data(
-                db.clone(),
+                archive_binding,
+                &archive_startup,
                 db_root_path,
                 db_provider,
                 last_unneeded_key_block_id.seq_no(),

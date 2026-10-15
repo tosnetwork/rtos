@@ -1,0 +1,152 @@
+// Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
+use super::*;
+use crate::{
+    archives::{
+        context::{ArchiveContextError, ArchiveDomain},
+        epoch::ArchivalModeConfig,
+        file_maps::FileMap,
+        package_id::PackageType,
+        package_index_db::PackageIndexEntry,
+    },
+    db::rocksdb::{AccessType, RocksDb},
+    StorageAlloc,
+};
+
+fn factory() -> (tempfile::TempDir, ArchiveProvider, ArchiveOperation) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = RocksDb::new(dir.path(), "main", None, AccessType::ReadWrite).unwrap();
+    let binding = db.bind_archive_domain(ArchiveDomain::new()).unwrap();
+    let operation = binding.view().unwrap().enter().unwrap();
+    (dir, binding, operation)
+}
+fn config(root: &std::path::Path) -> ArchivalModeConfig {
+    ArchivalModeConfig {
+        epoch_size: 20000,
+        new_epochs_path: root.join("epochs"),
+        existing_epochs: vec![],
+    }
+}
+
+#[tokio::test]
+async fn epoch_read_resolution_does_not_create_and_pins_cached_destination_during_close() {
+    let (dir, binding, operation) = factory();
+    let config = config(dir.path());
+    let router = Arc::new(EpochRouter::new(&config, &operation).await.unwrap());
+    let provider = EpochDbProvider::new(router.clone());
+    assert!(provider.resolve_for_read(&operation, 0).await.unwrap().is_none());
+    assert_eq!(std::fs::read_dir(&config.new_epochs_path).unwrap().count(), 0);
+    let seeded = provider.db_for_archive(&operation, 0).await.unwrap();
+    let weak = Arc::downgrade(seeded.provider.db());
+    assert!(Arc::ptr_eq(seeded.provider.domain(), binding.domain()));
+    drop(seeded);
+    let closed = binding.domain().close(0).unwrap();
+    let resolved = provider.resolve_for_read(&operation, 100).await.unwrap().unwrap();
+    assert!(Arc::ptr_eq(resolved.provider.db(), router.resolve(0).unwrap().db()));
+    assert!(provider.resolve_for_read(&operation, 20000).await.unwrap().is_none());
+    assert!(!config.new_epochs_path.join("epoch_1").exists());
+    assert_eq!(binding.domain().outstanding(), 2);
+    drop(router);
+    drop(provider);
+    drop(operation);
+    let ResolvedArchive { provider, root_path: _, operation } = resolved;
+    drop(provider);
+    assert!(weak.upgrade().is_some(), "destination DB must be held by inherited operation");
+    let mut wait = Box::pin(closed.wait());
+    assert!(futures::poll!(&mut wait).is_pending());
+    drop(wait);
+    drop(operation);
+    closed.wait().await;
+    assert!(weak.upgrade().is_none());
+}
+
+#[tokio::test]
+async fn providers_refuse_wrong_domain_and_recovery_on_cache_hit_and_miss() {
+    let (dir, binding, operation) = factory();
+    let (_other_dir, _other_binding, other) = factory();
+    let router = Arc::new(EpochRouter::new(&config(dir.path()), &operation).await.unwrap());
+    let epoch: Arc<dyn ArchiveDbProvider> = Arc::new(EpochDbProvider::new(router));
+    let single: Arc<dyn ArchiveDbProvider> =
+        Arc::new(SingleDbProvider::new(binding.clone(), Arc::new(dir.path().to_path_buf())));
+    drop(epoch.db_for_archive(&operation, 0).await.unwrap());
+    for provider in [&epoch, &single] {
+        for id in [0, 20000] {
+            let error = provider
+                .resolve_for_read(&other, id)
+                .await
+                .err()
+                .expect("cross-domain lookup admitted");
+            assert_eq!(
+                error.downcast_ref::<ArchiveContextError>(),
+                Some(&ArchiveContextError::BindingConflict)
+            );
+        }
+    }
+    drop(operation.child().handoff(()));
+    for provider in [&epoch, &single] {
+        for id in [0, 20000] {
+            let error = provider
+                .resolve_for_read(&operation, id)
+                .await
+                .err()
+                .expect("recovery-latched read admitted");
+            assert_eq!(
+                error.downcast_ref::<ArchiveContextError>(),
+                Some(&ArchiveContextError::RecoveryRequired(0))
+            );
+            let error = provider
+                .db_for_archive(&operation, id)
+                .await
+                .err()
+                .expect("recovery-latched creation admitted");
+            assert_eq!(
+                error.downcast_ref::<ArchiveContextError>(),
+                Some(&ArchiveContextError::RecoveryRequired(0))
+            );
+        }
+    }
+    assert!(!dir.path().join("epochs/epoch_1").exists());
+}
+
+#[tokio::test]
+async fn file_map_missing_epoch_preserves_index_without_creation() {
+    let (dir, binding, operation) = factory();
+    let config = config(dir.path());
+    let router = Arc::new(EpochRouter::new(&config, &operation).await.unwrap());
+    let provider: Arc<dyn ArchiveDbProvider> = Arc::new(EpochDbProvider::new(router));
+    let db = binding.db();
+    db.db().create_cf("files", &rocksdb::Options::default()).unwrap();
+    let row = serde_cbor::to_vec(&PackageIndexEntry::new()).unwrap();
+    let cf = db.db().cf_handle("files").unwrap();
+    db.db().put_cf(&cf, 0u32.to_le_bytes(), &row).unwrap();
+    let error = FileMap::new(
+        db.clone(),
+        &operation,
+        &provider,
+        "files",
+        PackageType::Blocks,
+        100,
+        #[cfg(feature = "telemetry")]
+        &Arc::new(crate::StorageTelemetry::default()),
+        &Arc::new(StorageAlloc::default()),
+    )
+    .await
+    .err()
+    .expect("missing indexed epoch must refuse startup");
+    assert!(error.to_string().contains("no existing epoch provider"));
+    assert_eq!(db.db().get_cf(&cf, 0u32.to_le_bytes()).unwrap().unwrap(), row);
+    assert_eq!(std::fs::read_dir(&config.new_epochs_path).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn failed_startup_refuses_router_before_directory_creation() {
+    let (dir, _binding, operation) = factory();
+    drop(operation.child().handoff(()));
+    let config = config(dir.path());
+    let error =
+        EpochRouter::new(&config, &operation).await.err().expect("failed context admitted startup");
+    assert_eq!(
+        error.downcast_ref::<ArchiveContextError>(),
+        Some(&ArchiveContextError::RecoveryRequired(0))
+    );
+    assert!(!config.new_epochs_path.exists());
+}

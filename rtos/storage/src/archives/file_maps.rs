@@ -9,6 +9,7 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+use super::context::{ArchiveContextError, ArchiveOperation};
 use super::ARCHIVE_SLICE_SIZE;
 #[cfg(feature = "telemetry")]
 use crate::StorageTelemetry;
@@ -258,6 +259,7 @@ pub struct FileMap {
 impl FileMap {
     pub async fn new(
         index_db: Arc<RocksDb>,
+        startup: &ArchiveOperation,
         db_provider: &Arc<dyn ArchiveDbProvider>,
         path: impl ToString,
         package_type: PackageType,
@@ -265,6 +267,10 @@ impl FileMap {
         #[cfg(feature = "telemetry")] telemetry: &Arc<StorageTelemetry>,
         allocated: &Arc<StorageAlloc>,
     ) -> Result<Self> {
+        let _startup = startup.inherit(db_provider.main_binding())?;
+        if !Arc::ptr_eq(&index_db, db_provider.main_binding().db()) {
+            return Err(ArchiveContextError::BindingConflict.into());
+        }
         let protection = index_db.repair_protection().clone();
         let storage = PackageIndexDb::with_db(index_db, path, true)?;
         let mut index_pairs = Vec::new();
@@ -287,7 +293,10 @@ impl FileMap {
                 "Opening archive slice {}, finalized {}, unneeded {}",
                 key, finalized, unneeded
             );
-            let (slice_db, slice_root_path) = db_provider.db_for_archive(key).await?;
+            let resolved = db_provider.resolve_for_read(startup, key).await?
+                .ok_or_else(|| error!("Indexed archive {key} has no existing epoch provider"))?;
+            let slice_db = resolved.provider.db().clone();
+            let slice_root_path = resolved.root_path.clone();
             let archive_slice = match ArchiveSlice::with_data(
                 protection.clone(),
                 slice_db,
@@ -304,7 +313,7 @@ impl FileMap {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    if e.is::<super::recovery_guard::ArchiveRecoveryRequired>() {
+                    if e.is::<super::recovery_guard::ArchiveRecoveryRequired>() || e.is::<ArchiveContextError>() {
                         return Err(e);
                     }
                     if protected {
@@ -587,6 +596,7 @@ pub struct FileMaps {
 impl FileMaps {
     pub async fn new(
         db: Arc<RocksDb>,
+        startup: &ArchiveOperation,
         db_root_path: &Arc<PathBuf>,
         db_provider: &Arc<dyn ArchiveDbProvider>,
         last_unneeded_key_block: u32,
@@ -594,10 +604,11 @@ impl FileMaps {
         allocated: &Arc<StorageAlloc>,
     ) -> Result<Self> {
         let key_db_provider: Arc<dyn ArchiveDbProvider> =
-            Arc::new(SingleDbProvider::new(db.clone(), db_root_path.clone()));
+            Arc::new(SingleDbProvider::new(db_provider.main_binding().clone(), db_root_path.clone()));
         Ok(Self {
             files: FileMap::new(
                 db.clone(),
+                startup,
                 db_provider,
                 FILES_DB_NAME,
                 PackageType::Blocks,
@@ -609,6 +620,7 @@ impl FileMaps {
             .await?,
             key_files: FileMap::new(
                 db.clone(),
+                startup,
                 &key_db_provider,
                 KEY_FILES_DB_NAME,
                 PackageType::KeyBlocks,

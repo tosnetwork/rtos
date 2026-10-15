@@ -57,10 +57,13 @@ fn tree(root: &Path) -> BTreeMap<PathBuf, Entry> {
     result
 }
 async fn manager(db: &Arc<RocksDb>, root: &Arc<PathBuf>) -> Result<ArchiveManager> {
+    let binding = db.bind_archive_domain(crate::archives::context::ArchiveDomain::new())?;
+    let startup = binding.view()?.enter()?;
     ArchiveManager::with_data(
-        db.clone(),
+        binding.clone(),
+        &startup,
         root.clone(),
-        Arc::new(SingleDbProvider::new(db.clone(), root.clone())),
+        Arc::new(SingleDbProvider::new(binding, root.clone())),
         0,
         Arc::new(AtomicU8::new(0)),
         #[cfg(feature = "telemetry")]

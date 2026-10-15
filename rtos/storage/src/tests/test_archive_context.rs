@@ -146,6 +146,10 @@ async fn immutable_views_refuse_stale_epochs_and_preserve_typed_errors() {
     );
     let current = db.bind_archive_domain(domain.clone()).unwrap().view().unwrap();
     assert_eq!(current.epoch(), 1);
+    let current_operation = current.enter().unwrap();
+    let error = old.inherit(&current_operation).err().expect("stale target view inherited current authority");
+    assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&ArchiveContextError::Stale { expected: 0, current: 1 }));
+    drop(current_operation);
     assert!(current.enter().is_ok());
     assert!(domain.close(0).is_err());
     assert!(domain.publish_next_epoch(1).is_err());

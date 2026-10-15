@@ -9,6 +9,7 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+use super::context::{ArchiveOperation, ArchiveProvider, ArchiveView};
 #[cfg(feature = "telemetry")]
 use crate::StorageTelemetry;
 use crate::{
@@ -62,6 +63,7 @@ pub struct ImportEntry {
 }
 
 pub struct ArchiveManager {
+    view: ArchiveView,
     db: Arc<RocksDb>,
     db_root_path: Arc<PathBuf>,
     db_provider: Arc<dyn ArchiveDbProvider>,
@@ -78,7 +80,8 @@ impl ArchiveManager {
     pub const ARCHIVE_DIR: &'static str = "archive";
 
     pub async fn with_data(
-        db: Arc<RocksDb>,
+        binding: ArchiveProvider,
+        startup: &ArchiveOperation,
         db_root_path: Arc<PathBuf>,
         db_provider: Arc<dyn ArchiveDbProvider>,
         last_unneeded_key_block: u32,
@@ -86,9 +89,18 @@ impl ArchiveManager {
         #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
         allocated: Arc<StorageAlloc>,
     ) -> Result<Self> {
+        let startup = startup.inherit(&binding)?;
+        let view = startup.view();
+        // The main/key provider must be the same actual DB as the factory binding.
+        if !Arc::ptr_eq(binding.db(), db_provider.main_binding().db()) {
+            return Err(super::context::ArchiveContextError::BindingConflict.into());
+        }
+        let _provider_check = startup.inherit(db_provider.main_binding())?;
+        let db = binding.db().clone();
         super::recovery_guard::ensure_open_provider_clear(db.db(), &db_root_path)?;
         let file_maps = FileMaps::new(
             db.clone(),
+            &startup,
             &db_root_path,
             &db_provider,
             last_unneeded_key_block,
@@ -102,6 +114,7 @@ impl ArchiveManager {
             error!("Cannot create unapplied files directory {:?}: {}", unapplied_files_path, e)
         })?;
         let ret = Self {
+            view,
             db,
             db_root_path,
             db_provider,
@@ -701,12 +714,19 @@ impl ArchiveManager {
     }
 
     async fn add_file_desc(&self, id: &PackageId) -> Result<Arc<FileDescription>> {
+        let operation = self.view.enter()?;
         let file_map = self.file_maps.get(id.package_type());
         assert!(file_map.get(id.id()).await.is_none());
-        let (slice_db, slice_root_path) = match id.package_type() {
-            PackageType::KeyBlocks => (self.db.clone(), Arc::clone(&self.db_root_path)),
-            PackageType::Blocks => self.db_provider.db_for_archive(id.id()).await?,
+        let resolved = match id.package_type() {
+            PackageType::KeyBlocks => super::db_provider::ResolvedArchive {
+                provider: self.view.binding().clone(),
+                root_path: self.db_root_path.clone(),
+                operation: self.view.inherit(&operation)?,
+            },
+            PackageType::Blocks => self.db_provider.db_for_archive(&operation, id.id()).await?,
         };
+        let slice_db = resolved.provider.db().clone();
+        let slice_root_path = resolved.root_path.clone();
         super::recovery_guard::ensure_slice_clear(
             slice_db.db(), &slice_root_path, id.id(),
             matches!(id.package_type(), PackageType::KeyBlocks),
@@ -896,11 +916,18 @@ impl ArchiveManager {
         id: &PackageId,
         shard_split_depth: u8,
     ) -> Result<Arc<FileDescription>> {
+        let operation = self.view.enter()?;
         let file_map = self.file_maps.get(id.package_type());
-        let (slice_db, slice_root_path) = match id.package_type() {
-            PackageType::KeyBlocks => (self.db.clone(), Arc::clone(&self.db_root_path)),
-            PackageType::Blocks => self.db_provider.db_for_archive(id.id()).await?,
+        let resolved = match id.package_type() {
+            PackageType::KeyBlocks => super::db_provider::ResolvedArchive {
+                provider: self.view.binding().clone(),
+                root_path: self.db_root_path.clone(),
+                operation: self.view.inherit(&operation)?,
+            },
+            PackageType::Blocks => self.db_provider.db_for_archive(&operation, id.id()).await?,
         };
+        let slice_db = resolved.provider.db().clone();
+        let slice_root_path = resolved.root_path.clone();
         super::recovery_guard::ensure_slice_clear(
             slice_db.db(), &slice_root_path, id.id(),
             matches!(id.package_type(), PackageType::KeyBlocks),
