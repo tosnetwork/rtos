@@ -3,6 +3,9 @@
 use rtos_block::{fail, Result};
 use tokio::io::AsyncReadExt;
 
+/// Shared storage/network cap for a single archive range response.
+pub const ARCHIVE_RANGE_MAX_BYTES: usize = 1 << 21;
+
 #[derive(Clone, Copy, Debug)]
 pub struct ArchiveReadLimits {
     pub data_bytes: usize,

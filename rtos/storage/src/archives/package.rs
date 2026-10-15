@@ -32,7 +32,7 @@ pub struct Package {
 }
 
 pub(crate) const PKG_HEADER_SIZE: usize = 4;
-const PKG_HEADER_MAGIC: u32 = 0xAE8F_DD01;
+pub(super) const PKG_HEADER_MAGIC: u32 = 0xAE8F_DD01;
 
 async fn read_header<R: tokio::io::AsyncReadExt + Unpin>(reader: &mut R) -> Result<()> {
     let mut buf = [0; PKG_HEADER_SIZE];

@@ -99,6 +99,29 @@ impl PackageEntry {
         Ok(Self::with_data(filename, data))
     }
 
+    /// Native counterpart of bounded decoding, used by owned blocking readers.
+    pub(super) fn read_from_bounded_sync<R: std::io::Read>(
+        reader: &mut R,
+        limits: super::bounded_read::ArchiveReadLimits,
+    ) -> Result<Self> {
+        let mut header = [0; PKG_ENTRY_HEADER_SIZE];
+        reader.read_exact(&mut header)?;
+        let header = PackageEntryHeader::deserialize(&header)?;
+        // Validate both advertised lengths before allocating either payload.
+        let filename_size = super::bounded_read::check_length(
+            "filename", u64::from(header.filename_size), limits.filename_bytes,
+        )?;
+        let data_size = super::bounded_read::check_length(
+            "data", u64::from(header.data_size), limits.data_bytes,
+        )?;
+        let mut filename = vec![0; filename_size];
+        reader.read_exact(&mut filename)?;
+        let filename = String::from_utf8(filename)?;
+        let mut data = vec![0; data_size];
+        reader.read_exact(&mut data)?;
+        Ok(Self::with_data(filename, data))
+    }
+
     pub(super) async fn write_to<W: tokio::io::AsyncWriteExt + Unpin>(
         &self,
         writer: &mut W,
