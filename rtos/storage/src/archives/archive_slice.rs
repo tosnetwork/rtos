@@ -14,7 +14,7 @@ use crate::StorageTelemetry;
 use crate::{
     archives::{
         archive_manager::{ArchiveManager, ImportEntry},
-        block_index_db::{BlockIndexDb, LookupResult},
+        block_index_db::{BlockIndexDb, LookupResult, RepackOffsets},
         get_mc_seq_no,
         package::{read_package_from, Package},
         package_entry::PackageEntry,
@@ -1006,8 +1006,17 @@ impl ArchiveSlice {
             let mut old_reader = read_package_from(old_package.open_file().await?).await?;
 
             let mut any_kept = false;
+            let mut source_offset = 0u64;
+            let mut index_offsets = RepackOffsets::new();
             while let Some(entry) = old_reader.next().await? {
                 let entry_id = PackageEntryId::from_filename(entry.filename())?;
+                let block_offset = if matches!(&entry_id, PackageEntryId::Block(_)) {
+                    Some(source_offset)
+                } else {
+                    None
+                };
+                source_offset = source_offset.checked_add(entry.serialized_size())
+                    .ok_or_else(|| error!("Archive source offset overflow"))?;
                 let id = match &entry_id {
                     PackageEntryId::Block(id) => id,
                     PackageEntryId::Proof(id) => id,
@@ -1016,6 +1025,9 @@ impl ArchiveSlice {
                 };
                 if delete_condition(id) {
                     log::trace!(target: TARGET, "repack package: delete {entry_id}");
+                    if let Some(offset) = block_offset {
+                        index_offsets.insert((id.shard().clone(), offset), None);
+                    }
                     if let Err(e) = self.offsets_db.delete(&(&entry_id).into()) {
                         log::warn!(
                             target: TARGET,
@@ -1041,7 +1053,11 @@ impl ArchiveSlice {
                                 #{index}: {meta:?}, offset: {offset}"
                             );
                             self.entry_db.put_value(&index.into(), &meta)?;
-                            self.offsets_db.put_value(&(&entry_id).into(), &offset)
+                            self.offsets_db.put_value(&(&entry_id).into(), &offset)?;
+                            if let Some(old) = block_offset {
+                                index_offsets.insert((id.shard().clone(), old), Some(offset));
+                            }
+                            Ok(())
                         })
                         .await?;
                     any_kept = true;
@@ -1065,7 +1081,15 @@ impl ArchiveSlice {
                 }
             }
 
+            let index_batch = self.block_index_db.prepare_repack_offsets(
+                &index_offsets,
+                |shard, mc_ref| {
+                    Ok(self.package_entry_info(mc_ref, shard)? == *package_info.entry())
+                },
+            )?;
             tokio::fs::rename(new_package.get_path(), old_package.get_path()).await?;
+            crate::archives::package::sync_file_and_parents(old_package.path()).await?;
+            self.block_index_db.commit_repack_offsets(index_batch)?;
             let name = old_package.get_path().into();
             *package_info.package_mut() = Package::open(name, false, true).await?;
             log::trace!(
@@ -1085,6 +1109,15 @@ impl ArchiveSlice {
     }
 
     async fn choose_package(&self, mc_seq_no: u32, shard: &ShardIdent) -> Result<ChosenPackage> {
+        let entry_info = self.package_entry_info(mc_seq_no, shard)?;
+        let ret = match self.get_package_by_entry(&entry_info).await {
+            Some(info) => ChosenPackage::Info(info),
+            None => ChosenPackage::Slot(entry_info),
+        };
+        Ok(ret)
+    }
+
+    fn package_entry_info(&self, mc_seq_no: u32, shard: &ShardIdent) -> Result<PackageEntryInfo> {
         let entry_info = if !self.sliced_mode || (self.package_type == PackageType::KeyBlocks) {
             self.get_base_entry_info()
         } else if let Some(seqno) = mc_seq_no.checked_sub(self.archive_id) {
@@ -1099,11 +1132,7 @@ impl ArchiveSlice {
         } else {
             fail!("Wrong mc_seq_no {mc_seq_no} < {}", self.archive_id)
         };
-        let ret = match self.get_package_by_entry(&entry_info).await {
-            Some(info) => ChosenPackage::Info(info),
-            None => ChosenPackage::Slot(entry_info),
-        };
-        Ok(ret)
+        Ok(entry_info)
     }
 
     #[allow(clippy::too_many_arguments)]

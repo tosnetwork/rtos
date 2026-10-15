@@ -9,7 +9,9 @@
  */
 use crate::{block_handle_db::BlockHandle, db::rocksdb::RocksDb};
 use rtos_block::{error, fail, AccountIdPrefixFull, ByteOrderRead, Result, ShardIdent};
-use std::{fmt::Display, ops::Sub, sync::Arc};
+use std::{collections::HashMap, fmt::Display, ops::Sub, sync::Arc};
+
+pub(super) type RepackOffsets = HashMap<(ShardIdent, u64), Option<u64>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BlocksIndexKey {
@@ -207,6 +209,56 @@ impl BlockIndexDb {
         self.db.write(transaction)?;
 
         Ok(())
+    }
+
+    /// Prepare all lookup changes before the replacement package is published.
+    /// Offsets are meaningful only within the package selected by shard and mc_ref.
+    pub(super) fn prepare_repack_offsets(
+        &self,
+        offsets: &RepackOffsets,
+        selects_package: impl Fn(&ShardIdent, u32) -> Result<bool>,
+    ) -> Result<rocksdb::WriteBatch> {
+        let offsets = offsets
+            .iter()
+            .map(|((shard, old), new)| {
+                Ok(((shard.clone(), u32::try_from(*old)?), new.map(u32::try_from).transpose()?))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let cf = self.cf()?;
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek_to_first();
+        while let Some(key) = iter.key() {
+            let shard = match BlocksIndexKey::parse_bytes(key)? {
+                BlocksIndexKey::Seqno { shard, .. }
+                | BlocksIndexKey::Lt { shard, .. }
+                | BlocksIndexKey::Utime { shard, .. } => shard,
+            };
+            let value = iter.value().ok_or_else(|| error!("Block index value is missing"))?;
+            if value.len() != 8 {
+                fail!("Invalid block index value length {}", value.len());
+            }
+            let (mc_ref, old_offset) = Self::deserialize_value(Some(value))?;
+            if selects_package(&shard, mc_ref)? {
+                match offsets.get(&(shard.clone(), old_offset)) {
+                    Some(Some(offset)) => {
+                        batch.put_cf(&cf, key, Self::serialize_value(mc_ref, *offset));
+                    }
+                    Some(None) => batch.delete_cf(&cf, key),
+                    None => fail!(
+                        "Block index offset {old_offset} for {shard} is absent from source package"
+                    ),
+                }
+            }
+            iter.next();
+        }
+        iter.status()?;
+        Ok(batch)
+    }
+
+    pub(super) fn commit_repack_offsets(&self, batch: rocksdb::WriteBatch) -> Result<()> {
+        self.db.write(batch)?;
+        self.db.sync_wal()
     }
 
     pub fn lookup_by_lt(

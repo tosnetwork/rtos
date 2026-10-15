@@ -160,3 +160,163 @@ async fn missing_proof_control() {
 async fn ordered_layout_control() {
     exercise(false, true, 0).await;
 }
+
+#[tokio::test]
+async fn multiple_retained_shifts_with_interleaved_proofs() {
+    use crate::{tests::utils::create_block_handle_storage, types::BlockMeta};
+    use rtos_block::UInt256;
+    let path = tempfile::tempdir().unwrap();
+    let (db, handles_db, mut handles) = base::native(path.path(), false).await;
+    let (storage, table) = create_block_handle_storage(handles_db.clone());
+    for seq in [8u32, 9] {
+        let id = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            seq,
+            UInt256::from([seq as u8; 32]),
+            UInt256::from([seq as u8 + 3; 32]),
+        );
+        let handle = storage
+            .create_handle(id, BlockMeta::with_data(0, seq, u64::from(seq), 0, 0), None)
+            .unwrap()
+            .unwrap();
+        storage.save_handle(&handle, None).unwrap();
+        handles.push(handle);
+    }
+    tokio::time::timeout(late::TIMEOUT, storage.sync_pending()).await.unwrap().unwrap();
+    drop(storage);
+    drop(table);
+    let mut slice = base::open(&db, path.path(), false, None).await.unwrap();
+    for (index, block) in
+        [(1, true), (0, false), (0, true), (2, false), (3, true), (2, true), (4, false), (4, true)]
+    {
+        let handle = &handles[index];
+        let id = if block {
+            PackageEntryId::Block(handle.id())
+        } else {
+            PackageEntryId::Proof(handle.id())
+        };
+        let data = if block {
+            base::payload(handle)
+        } else {
+            format!("proof {}", handle.id().seq_no()).into_bytes()
+        };
+        assert_eq!(slice.add_file(handle, &id, data.clone()).await.unwrap(), data);
+    }
+    base::reads(&slice, &handles).await;
+    let mut offsets = Vec::new();
+    for index in [0, 3, 4] {
+        offsets.push(
+            slice
+                .offsets_db
+                .get_value(&(&PackageEntryId::Block(handles[index].id())).into())
+                .unwrap(),
+        );
+    }
+    slice.trunc(handles[2].id(), &|id| id.seq_no() >= 11).await.unwrap();
+    let mut shifts = Vec::new();
+    let mut live = Vec::new();
+    for (position, index) in [0, 3, 4].into_iter().enumerate() {
+        let offset = slice
+            .offsets_db
+            .get_value(&(&PackageEntryId::Block(handles[index].id())).into())
+            .unwrap();
+        assert!(offset > 0, "retained Proof precedes each retained Block");
+        shifts.push(offsets[position].checked_sub(offset).unwrap());
+        live.push(observations(&slice, &handles[index], "multi-live").await);
+    }
+    assert!(shifts[0] > 0 && shifts[0] < shifts[1] && shifts[1] < shifts[2]);
+    let prefix = AccountIdPrefixFull { workchain_id: -1, prefix: 0 };
+    let deleted_live = [
+        slice.lookup_block_by_seqno(&prefix, 11).await.unwrap().is_none(),
+        slice.lookup_block_by_seqno(&prefix, 12).await.unwrap().is_none(),
+    ];
+    let retained = vec![handles[0].clone(), handles[3].clone(), handles[4].clone()];
+    close(slice, db, handles_db, handles).await;
+    let db = RocksDb::new(path.path(), "archive_provider", None, AccessType::ReadWrite).unwrap();
+    let handles_db = RocksDb::new(path.path(), "handle_db", None, AccessType::ReadWrite).unwrap();
+    let slice = base::open(&db, path.path(), false, None).await.unwrap();
+    let mut cold = Vec::new();
+    for handle in &retained {
+        cold.push(observations(&slice, handle, "multi-cold").await);
+    }
+    let deleted_cold = [
+        slice.lookup_block_by_seqno(&prefix, 11).await.unwrap().is_none(),
+        slice.lookup_block_by_seqno(&prefix, 12).await.unwrap().is_none(),
+    ];
+    close(slice, db, handles_db, retained).await;
+    assert!(live.into_iter().chain(cold).flatten().all(|ok| ok));
+    assert!(deleted_live.into_iter().chain(deleted_cold).all(|absent| absent));
+}
+
+#[tokio::test]
+async fn repack_index_isolates_package_and_shard_aliases() {
+    let path = tempfile::tempdir().unwrap();
+    let db = RocksDb::new(path.path(), "index", None, AccessType::ReadWrite).unwrap();
+    let index = BlockIndexDb::with_db(db.clone(), base::cf("block_index", false), true).unwrap();
+    let master = ShardIdent::masterchain();
+    let shard = ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap();
+    for (seq, offset) in [(9u32, 500u32), (10, 196), (12, 0), (110, 196)] {
+        index.put_raw(&master, seq, seq.into(), seq, seq, offset).unwrap();
+    }
+    index.put_raw(&shard, 10, 10, 10, 10, 196).unwrap();
+    let offsets = RepackOffsets::from([
+        ((master.clone(), 500), Some(170)),
+        ((master.clone(), 196), Some(0)),
+        ((master.clone(), 0), None),
+    ]);
+    let batch = index
+        .prepare_repack_offsets(
+            &offsets,
+            |shard, mc_ref| Ok(shard.is_masterchain() && mc_ref < 100),
+        )
+        .unwrap();
+    index.commit_repack_offsets(batch).unwrap();
+    for (shard, seq, expected) in
+        [(&master, 9u32, 170u32), (&master, 10, 0), (&master, 110, 196), (&shard, 10, 196)]
+    {
+        let prefix = AccountIdPrefixFull { workchain_id: shard.workchain_id(), prefix: 0 };
+        assert_eq!(index.lookup_by_seqno(&prefix, seq).unwrap().unwrap().offset, expected);
+        assert_eq!(index.lookup_by_lt(&prefix, seq.into()).unwrap().unwrap().offset, expected);
+        let mut found = Vec::new();
+        index
+            .lookup_by_utime(&prefix, seq, &mut |entry| {
+                found.push((entry.mc_ref, entry.offset));
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(found, vec![(seq, expected)]);
+    }
+    let rows = base::rows(&db, &base::cf("block_index", false));
+    use crate::archives::block_index_db::BlocksIndexKey;
+    for key in [
+        BlocksIndexKey::key_with_seqno(&master, 12),
+        BlocksIndexKey::key_with_lt(&master, 12),
+        BlocksIndexKey::key_with_utime(&master, 12, 12),
+    ] {
+        assert!(!rows.contains_key(key.as_bytes()));
+    }
+    drop(index);
+    late::close_db(db).await;
+}
+
+#[tokio::test]
+async fn repack_index_rejects_unmapped_and_overflow_without_mutation() {
+    let path = tempfile::tempdir().unwrap();
+    let db = RocksDb::new(path.path(), "index", None, AccessType::ReadWrite).unwrap();
+    let index = BlockIndexDb::with_db(db.clone(), base::cf("block_index", false), true).unwrap();
+    let shard = ShardIdent::masterchain();
+    index.put_raw(&shard, 10, 10, 10, 10, 196).unwrap();
+    index.put_raw(&shard, 11, 11, 11, 11, 400).unwrap();
+    let before = base::rows(&db, &base::cf("block_index", false));
+    let missing = RepackOffsets::from([((shard.clone(), 196), Some(0))]);
+    let error = index.prepare_repack_offsets(&missing, |_, _| Ok(true)).err().unwrap();
+    assert!(error.to_string().contains("absent from source package"));
+    assert_eq!(base::rows(&db, &base::cf("block_index", false)), before);
+    for (old, new) in [(u64::from(u32::MAX) + 1, Some(0)), (196, Some(u64::from(u32::MAX) + 1))] {
+        let offsets = RepackOffsets::from([((shard.clone(), old), new)]);
+        assert!(index.prepare_repack_offsets(&offsets, |_, _| Ok(true)).is_err());
+        assert_eq!(base::rows(&db, &base::cf("block_index", false)), before);
+    }
+    drop(index);
+    late::close_db(db).await;
+}
