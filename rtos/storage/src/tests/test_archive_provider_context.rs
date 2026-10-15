@@ -196,7 +196,7 @@ async fn file_map_context_refusal_never_deletes_unneeded_index() {
     let row = serde_cbor::to_vec(&PackageIndexEntry::new()).unwrap();
     let cf = db.db().cf_handle("files").unwrap();
     db.db().put_cf(&cf, 0u32.to_le_bytes(), &row).unwrap();
-    let error = FileMap::new(
+    let opened = FileMap::new(
         db.clone(),
         &operation,
         &provider,
@@ -207,9 +207,10 @@ async fn file_map_context_refusal_never_deletes_unneeded_index() {
         &Arc::new(crate::StorageTelemetry::default()),
         &Arc::new(StorageAlloc::default()),
     )
-    .await
-    .err()
-    .expect("context refusal was swallowed by FileMap cleanup");
+    .await;
+    assert_eq!(db.db().get_cf(&cf, 0u32.to_le_bytes()).unwrap(), Some(row.clone()),
+        "context refusal deleted indexed slice");
+    let error = opened.err().expect("context refusal was swallowed by FileMap cleanup");
     assert_eq!(
         error.downcast_ref::<ArchiveContextError>(),
         Some(&ArchiveContextError::RecoveryRequired(0))

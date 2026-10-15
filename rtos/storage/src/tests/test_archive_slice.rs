@@ -341,6 +341,7 @@ async fn package_open_context_refusal_preserves_existing_input_and_slot_count() 
         )
         .await
         .unwrap_err();
+    assert!(path.is_file(), "context refusal deleted package input");
     assert_eq!(
         error.downcast_ref::<ArchiveContextError>(),
         Some(&ArchiveContextError::RecoveryRequired(0))

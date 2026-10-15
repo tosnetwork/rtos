@@ -357,7 +357,8 @@ async fn cached_package_and_slice_views_refuse_stale_read_authority() {
         .err()
         .unwrap();
     assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&expected));
-    let error = package.read_range_in(&current, 0, 4).await.unwrap_err();
+    let error = package.read_range_in(&current, 0, 4).await.err()
+        .expect("stale cached package read admitted");
     assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&expected));
     let error = slice.get_slice(0, 0, 4).await.unwrap_err();
     assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&expected));
