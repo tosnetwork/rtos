@@ -100,6 +100,15 @@ pub(crate) fn ensure_provider_clear(db: &NativeDb, root: &Path, names: &[String]
     .map_err(|e| ArchiveRecoveryRequired(e).into())
 }
 
+pub(crate) fn ensure_open_provider_clear(db: &NativeDb, root: &Path) -> Result<()> {
+    (|| {
+        let names = NativeDb::list_cf(&rocksdb::Options::default(), db.path())?;
+        statuses(db, names)?;
+        packages(root)
+    })()
+    .map_err(|e| ArchiveRecoveryRequired(e).into())
+}
+
 pub(crate) fn ensure_slice_clear(db: &NativeDb, root: &Path, id: u32, key: bool) -> Result<()> {
     let name = format!("status_{}db_{id}", if key { "key_" } else { "" });
     (|| {

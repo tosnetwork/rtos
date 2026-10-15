@@ -86,6 +86,7 @@ impl ArchiveManager {
         #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
         allocated: Arc<StorageAlloc>,
     ) -> Result<Self> {
+        super::recovery_guard::ensure_open_provider_clear(db.db(), &db_root_path)?;
         let file_maps = FileMaps::new(
             db.clone(),
             &db_root_path,
@@ -706,6 +707,10 @@ impl ArchiveManager {
             PackageType::KeyBlocks => (self.db.clone(), Arc::clone(&self.db_root_path)),
             PackageType::Blocks => self.db_provider.db_for_archive(id.id()).await?,
         };
+        super::recovery_guard::ensure_slice_clear(
+            slice_db.db(), &slice_root_path, id.id(),
+            matches!(id.package_type(), PackageType::KeyBlocks),
+        )?;
         let dir = slice_root_path.join(id.path());
         tokio::fs::create_dir_all(&dir).await?;
         let archive_slice = ArchiveSlice::new_empty(
@@ -896,6 +901,10 @@ impl ArchiveManager {
             PackageType::KeyBlocks => (self.db.clone(), Arc::clone(&self.db_root_path)),
             PackageType::Blocks => self.db_provider.db_for_archive(id.id()).await?,
         };
+        super::recovery_guard::ensure_slice_clear(
+            slice_db.db(), &slice_root_path, id.id(),
+            matches!(id.package_type(), PackageType::KeyBlocks),
+        )?;
         let dir = slice_root_path.join(id.path());
         tokio::fs::create_dir_all(&dir).await?;
         let archive_slice = ArchiveSlice::new_for_import(
@@ -1044,3 +1053,7 @@ impl ArchiveManager {
 #[cfg(test)]
 #[path = "../tests/test_archive_manager.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/test_archive_recovery_guard_manager.rs"]
+mod recovery_guard_tests;
