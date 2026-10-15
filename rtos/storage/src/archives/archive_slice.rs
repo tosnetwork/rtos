@@ -1338,3 +1338,7 @@ mod metadata_eio_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../tests/test_archive_package_io_eio.rs"]
 mod package_io_eio_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/test_archive_repack_readers.rs"]
+mod repack_reader_tests;
