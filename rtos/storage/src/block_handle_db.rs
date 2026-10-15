@@ -18,6 +18,7 @@ use adnl::{
     },
     declare_counted,
 };
+use futures::FutureExt;
 use rtos_block::{error, fail, BlockIdExt, Result, ShardIdent, UInt256};
 #[cfg(feature = "telemetry")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -489,6 +490,16 @@ enum HandleCommand {
 /// read, and whether the prefix range was exhausted.
 pub type ValidatorStatePage = (Vec<(String, Vec<u8>)>, String, bool);
 
+type WriterCompletion = futures::future::Shared<
+    futures::future::BoxFuture<'static, std::result::Result<(), Arc<tokio::task::JoinError>>>,
+>;
+
+#[cfg(test)]
+struct WriterExitHook {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
 pub struct BlockHandleStorage {
     handle_db: Arc<BlockHandleDb>,
     handle_cache: Arc<BlockHandleCache>,
@@ -497,7 +508,9 @@ pub struct BlockHandleStorage {
     validator_state_db: Arc<NodeStateDb>,
     state_cache: lockfree::map::Map<String, Arc<BlockIdExt>>,
     storer: tokio::sync::mpsc::UnboundedSender<HandleCommand>,
-    writer: Option<tokio::task::JoinHandle<()>>,
+    writer: Option<WriterCompletion>,
+    #[cfg(test)]
+    writer_exit_hook: Arc<std::sync::Mutex<Option<WriterExitHook>>>,
     #[cfg(feature = "telemetry")]
     telemetry: Arc<StorageTelemetry>,
     allocated: Arc<StorageAlloc>,
@@ -521,11 +534,15 @@ impl BlockHandleStorage {
             state_cache: lockfree::map::Map::new(),
             storer: sender,
             writer: None,
+            #[cfg(test)]
+            writer_exit_hook: Default::default(),
             #[cfg(feature = "telemetry")]
             telemetry,
             allocated,
         };
-        ret.writer = Some(tokio::spawn(async move {
+        #[cfg(test)]
+        let writer_exit_hook = ret.writer_exit_hook.clone();
+        let writer = tokio::spawn(async move {
             fn save_state(key: &str, id: &Arc<BlockIdExt>, db: &Arc<NodeStateDb>) -> bool {
                 if let Err(e) = db.put_raw(key.as_bytes(), &id.serialize()) {
                     log::error!(target: TARGET, "ERROR: {e} while saving state {id}");
@@ -630,7 +647,18 @@ impl BlockHandleStorage {
             // Graceful close
             reader.close();
             while reader.recv().await.is_some() {}
-        }));
+            #[cfg(test)]
+            {
+                let hook = writer_exit_hook.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    let _ = hook.entered.send(());
+                    let _ = hook.release.await;
+                }
+            }
+            // Keep all native provider captures alive through the exit boundary.
+            drop((handle_db, full_node_state_db, validator_state_db));
+        });
+        ret.writer = Some(async move { writer.await.map_err(Arc::new) }.boxed().shared());
         ret
     }
 
@@ -641,8 +669,31 @@ impl BlockHandleStorage {
         let flushed = self.sync_pending().await;
         let writer = self.writer.take().expect("handle writer is installed by constructor");
         drop(self);
-        writer.await.map_err(|error| error!("Handle writer failed while closing: {error}"))?;
-        flushed
+        match (flushed, writer.await) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(flush), Ok(())) => Err(flush),
+            (Ok(()), Err(join)) => Err(error!("Handle writer failed while closing: {join}")),
+            (Err(flush), Err(join)) => Err(error!(
+                "Handle writer flush failed: {flush:#}; Handle writer failed while closing: {join}"
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    fn writer_completion_for_test(&self) -> WriterCompletion {
+        self.writer.as_ref().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    fn hold_writer_exit_for_test(
+        &self,
+    ) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+        let (entered, arrived) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let mut slot = self.writer_exit_hook.lock().unwrap();
+        assert!(slot.is_none());
+        *slot = Some(WriterExitHook { entered, release: released });
+        (arrived, release)
     }
 
     pub fn set_no_cache(&mut self) {

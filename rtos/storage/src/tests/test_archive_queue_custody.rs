@@ -318,6 +318,11 @@ async fn verify_writer_close_releases_provider(panic_after_release: bool) {
     callback.release.notify_one();
     let closed = tokio::time::timeout(Duration::from_secs(20), closing).await.unwrap();
     assert_eq!(closed.is_err(), panic_after_release);
+    if panic_after_release {
+        let diagnostic = format!("{:#}", closed.unwrap_err());
+        assert!(diagnostic.contains("Handle writer failed during durability barrier"));
+        assert!(diagnostic.contains("Handle writer failed while closing"));
+    }
     assert!(provider.upgrade().is_none(), "joined writer retained its provider");
     let reopened = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite).unwrap();
     let stored = BlockHandleDb::with_db(reopened, "block_handles", false).unwrap();
@@ -335,4 +340,81 @@ async fn close_joins_actual_writer_before_provider_reopen() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_reports_writer_panic_after_provider_release() {
     verify_writer_close_releases_provider(true).await;
+}
+
+async fn verify_close_at_actual_writer_exit(cancel_observer: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite).unwrap();
+    let provider = Arc::downgrade(&db);
+    let (storage, handle_db) = create_block_handle_storage(db);
+    let completion = storage.writer_completion_for_test();
+    let (mut entered, release) = storage.hold_writer_exit_for_test();
+    drop(handle_db);
+    let mut closing = Box::pin(storage.close_and_wait());
+    let mut early = None;
+    let arrival = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            tokio::select! {
+                result = &mut closing, if early.is_none() => early = Some(result),
+                arrived = &mut entered => break arrived,
+            }
+        }
+    })
+    .await;
+    let arrived = matches!(arrival, Ok(Ok(())));
+    let pending = if arrived && early.is_none() {
+        std::future::poll_fn(|cx| {
+            let pending = match std::future::Future::poll(closing.as_mut(), cx) {
+                std::task::Poll::Pending => true,
+                std::task::Poll::Ready(result) => {
+                    early = Some(result);
+                    false
+                }
+            };
+            std::task::Poll::Ready(pending)
+        })
+        .await
+    } else {
+        false
+    };
+    let closing = if cancel_observer {
+        drop(closing);
+        None
+    } else {
+        Some(closing)
+    };
+    let held = provider.upgrade().is_some();
+    let excluded = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite).is_err();
+    // Release and join independently before propagating any observation failure.
+    let released = release.send(()).is_ok();
+    let completed = tokio::time::timeout(Duration::from_secs(20), completion).await;
+    let gone = provider.upgrade().is_none();
+    let closed = if let Some(closing) = closing {
+        match early {
+            Some(result) => Some(Ok(result)),
+            None => Some(tokio::time::timeout(Duration::from_secs(20), closing).await),
+        }
+    } else {
+        None
+    };
+    assert!(arrived, "actual writer did not reach post-drain exit hook");
+    assert!(released);
+    assert!(matches!(completed, Ok(Ok(()))), "independent writer join failed");
+    assert!(gone, "actual joined writer retained its provider");
+    assert!(pending, "close returned before actual writer exit");
+    assert!(held && excluded, "writer exit boundary lost provider exclusion");
+    if let Some(closed) = closed {
+        closed.unwrap().unwrap();
+    }
+    RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_waits_at_actual_post_drain_writer_exit() {
+    verify_close_at_actual_writer_exit(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_close_observer_retains_writer_until_actual_exit() {
+    verify_close_at_actual_writer_exit(true).await;
 }
