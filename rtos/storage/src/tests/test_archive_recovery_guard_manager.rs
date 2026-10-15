@@ -79,62 +79,61 @@ fn pending(db: &RocksDb, id: &PackageId) {
     db.db().put_cf(&db.db().cf_handle(&name).unwrap(), b"RepackRecovery", b"pending").unwrap();
 }
 
-#[tokio::test]
-async fn manager_creation_and_import_preserve_inputs() {
+async fn manager_entry_case(import: bool) {
     for key in [false, true] {
-        for import in [false, true] {
-            for mode in ["pending", "packages-link", "archive-link"] {
-                if !cfg!(unix) && mode != "pending" {
-                    continue;
-                }
-                let dir = tempfile::tempdir().unwrap();
-                let external = tempfile::tempdir().unwrap();
-                let root = Arc::new(dir.path().to_path_buf());
-                let db = RocksDb::new(&*root, "db", None, AccessType::ReadWrite).unwrap();
-                let manager = manager(&db, &root).await.unwrap();
-                let id = if key {
-                    PackageId::for_key_block(10000000)
-                } else {
-                    PackageId::for_block(100000)
-                };
-                match mode {
-                    "pending" => pending(&db, &id),
-                    #[cfg(unix)]
-                    "packages-link" => {
-                        std::os::unix::fs::symlink(external.path(), root.join("archive/packages"))
-                            .unwrap()
-                    }
-                    #[cfg(unix)]
-                    "archive-link" => {
-                        fs::remove_dir_all(root.join("archive")).unwrap();
-                        std::os::unix::fs::symlink(external.path(), root.join("archive")).unwrap();
-                    }
-                    _ => unreachable!(),
-                }
-                let before = rows(&db);
-                let files = tree(&root.join("archive"));
-                let outside = tree(external.path());
-                let error = if import {
-                    manager.get_or_create_import_desc(&id, 0).await.err()
-                } else {
-                    manager.get_file_desc(&id, true).await.err()
-                }
-                .expect("manager must refuse");
-                assert!(error.is::<ArchiveRecoveryRequired>(), "{error:#}");
-                assert_eq!(
-                    tree(&root.join("archive")),
-                    files,
-                    "manager changed package directory inventory"
-                );
-                assert_eq!(
-                    tree(external.path()),
-                    outside,
-                    "manager changed symlink target inventory"
-                );
-                assert_eq!(rows(&db), before, "manager changed CF or index contents");
+        for mode in ["pending", "packages-link", "archive-link"] {
+            if !cfg!(unix) && mode != "pending" {
+                continue;
             }
+            let dir = tempfile::tempdir().unwrap();
+            let external = tempfile::tempdir().unwrap();
+            let root = Arc::new(dir.path().to_path_buf());
+            let db = RocksDb::new(&*root, "db", None, AccessType::ReadWrite).unwrap();
+            let manager = manager(&db, &root).await.unwrap();
+            let id =
+                if key { PackageId::for_key_block(10000000) } else { PackageId::for_block(100000) };
+            match mode {
+                "pending" => pending(&db, &id),
+                #[cfg(unix)]
+                "packages-link" => {
+                    std::os::unix::fs::symlink(external.path(), root.join("archive/packages"))
+                        .unwrap()
+                }
+                #[cfg(unix)]
+                "archive-link" => {
+                    fs::remove_dir_all(root.join("archive")).unwrap();
+                    std::os::unix::fs::symlink(external.path(), root.join("archive")).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = rows(&db);
+            let files = tree(&root.join("archive"));
+            let outside = tree(external.path());
+            let error = if import {
+                manager.get_or_create_import_desc(&id, 0).await.err()
+            } else {
+                manager.get_file_desc(&id, true).await.err()
+            }
+            .expect("manager must refuse");
+            assert!(error.is::<ArchiveRecoveryRequired>(), "{error:#}");
+            assert_eq!(
+                tree(&root.join("archive")),
+                files,
+                "manager changed package directory inventory"
+            );
+            assert_eq!(tree(external.path()), outside, "manager changed symlink target inventory");
+            assert_eq!(rows(&db), before, "manager changed CF or index contents");
         }
     }
+}
+
+#[tokio::test]
+async fn manager_creation_preserves_inputs() {
+    manager_entry_case(false).await;
+}
+#[tokio::test]
+async fn manager_import_preserves_inputs() {
+    manager_entry_case(true).await;
 }
 
 #[tokio::test]

@@ -54,7 +54,10 @@ fn package_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     result
 }
 fn typed(error: anyhow::Error) {
-    assert!(error.is::<ArchiveRecoveryRequired>(), "{error:#}");
+    assert!(
+        error.is::<ArchiveRecoveryRequired>(),
+        "constructor recovery error type lost: {error:#}"
+    );
     assert!(error.context("actual startup caller context").is::<ArchiveRecoveryRequired>());
 }
 async fn seed(db: &Arc<RocksDb>, root: &Arc<PathBuf>, kind: PackageType) {
@@ -84,8 +87,7 @@ fn staging(root: &Path) {
     fs::write(dir.join("archive.00000.pack.new"), b"retain staged bytes").unwrap();
 }
 
-#[tokio::test]
-async fn constructors_refuse_before_package_or_metadata_changes() {
+async fn constructor_case(mode: &str) {
     for kind in [PackageType::Blocks, PackageType::KeyBlocks] {
         for pending in [true, false] {
             let dir = tempfile::tempdir().unwrap();
@@ -109,62 +111,78 @@ async fn constructors_refuse_before_package_or_metadata_changes() {
             }
             let before = snapshot(&db);
             let files = package_bytes(&root);
-            for cleanup in [false, true] {
-                let error = ArchiveSlice::with_data(
-                    db.repair_protection().clone(),
-                    db.clone(),
-                    root.clone(),
-                    0,
-                    kind,
-                    false,
-                    cleanup,
-                    #[cfg(feature = "telemetry")]
-                    Arc::new(crate::StorageTelemetry::default()),
-                    Arc::new(StorageAlloc::default()),
-                )
-                .await
-                .err()
-                .expect("startup must refuse");
-                typed(error);
-                assert_eq!(snapshot(&db), before);
-                assert_eq!(package_bytes(&root), files);
+            match mode {
+                "with_data" => {
+                    for cleanup in [false, true] {
+                        typed(
+                            ArchiveSlice::with_data(
+                                db.repair_protection().clone(),
+                                db.clone(),
+                                root.clone(),
+                                0,
+                                kind,
+                                false,
+                                cleanup,
+                                #[cfg(feature = "telemetry")]
+                                Arc::new(crate::StorageTelemetry::default()),
+                                Arc::new(StorageAlloc::default()),
+                            )
+                            .await
+                            .err()
+                            .expect("startup must refuse"),
+                        );
+                        assert_eq!(snapshot(&db), before);
+                        assert_eq!(package_bytes(&root), files);
+                    }
+                }
+                "new_empty" => typed(
+                    ArchiveSlice::new_empty(
+                        db.clone(),
+                        root.clone(),
+                        0,
+                        kind,
+                        0,
+                        #[cfg(feature = "telemetry")]
+                        Arc::new(crate::StorageTelemetry::default()),
+                        Arc::new(StorageAlloc::default()),
+                    )
+                    .await
+                    .err()
+                    .expect("new must refuse"),
+                ),
+                "new_for_import" => typed(
+                    ArchiveSlice::new_for_import(
+                        db.clone(),
+                        root.clone(),
+                        0,
+                        kind,
+                        0,
+                        #[cfg(feature = "telemetry")]
+                        Arc::new(crate::StorageTelemetry::default()),
+                        Arc::new(StorageAlloc::default()),
+                    )
+                    .await
+                    .err()
+                    .expect("import must refuse"),
+                ),
+                _ => unreachable!(),
             }
-            typed(
-                ArchiveSlice::new_empty(
-                    db.clone(),
-                    root.clone(),
-                    0,
-                    kind,
-                    0,
-                    #[cfg(feature = "telemetry")]
-                    Arc::new(crate::StorageTelemetry::default()),
-                    Arc::new(StorageAlloc::default()),
-                )
-                .await
-                .err()
-                .expect("new must refuse"),
-            );
-            assert_eq!(snapshot(&db), before);
-            assert_eq!(package_bytes(&root), files);
-            typed(
-                ArchiveSlice::new_for_import(
-                    db.clone(),
-                    root.clone(),
-                    0,
-                    kind,
-                    0,
-                    #[cfg(feature = "telemetry")]
-                    Arc::new(crate::StorageTelemetry::default()),
-                    Arc::new(StorageAlloc::default()),
-                )
-                .await
-                .err()
-                .expect("import must refuse"),
-            );
             assert_eq!(snapshot(&db), before);
             assert_eq!(package_bytes(&root), files);
         }
     }
+}
+#[tokio::test]
+async fn constructors_with_data_preserve_inputs() {
+    constructor_case("with_data").await;
+}
+#[tokio::test]
+async fn constructors_new_empty_preserve_inputs() {
+    constructor_case("new_empty").await;
+}
+#[tokio::test]
+async fn constructors_new_for_import_preserve_inputs() {
+    constructor_case("new_for_import").await;
 }
 
 #[tokio::test]
@@ -267,7 +285,7 @@ async fn legacy_cleanup_preserves_unresolved_inputs_and_clean_control_drops() {
             assert!(db.db().cf_handle("status_db_0").is_none());
             assert!(db.db().cf_handle("entry_meta_db_0").is_none());
         } else {
-            assert_eq!(snapshot(&db), before);
+            assert_eq!(snapshot(&db), before, "unresolved cleanup changed archive CF contents");
         }
         assert_eq!(package_bytes(&root), files);
     }
