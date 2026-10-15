@@ -410,6 +410,10 @@ fn inspect_with_completion(config: &CheckConfig, complete: impl FnOnce()) -> Res
             fail!("Epoch inventory changed during offline check");
         }
     }
+    complete();
+    for provider in &providers {
+        provider.verify_identity()?;
+    }
     Ok(CheckReport{providers:reports,live_archives:live,scope:"Offline advisory-lock precheck only; no recovery, integrity or old-binary enforcement claim"})
 }
 
