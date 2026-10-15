@@ -252,6 +252,7 @@ pub(crate) struct ProviderReservation {
     requested: PathBuf,
     path: PathBuf,
     identity: Identity,
+    strict_existing: bool,
 }
 impl ProviderReservation {
     pub(crate) fn open(path: &Path) -> Result<Self> {
@@ -259,6 +260,37 @@ impl ProviderReservation {
         let slot = PathIntent::reserve(canonical.clone(), Intent::Open)?;
         fs::create_dir_all(&canonical)?;
         Self::finish(slot, path, canonical)
+    }
+    /// Reserve an existing directory without creating it or resolving through
+    /// symlinks. The resulting owner must outlive native DB open/close.
+    pub(crate) fn open_existing(path: &Path) -> Result<Self> {
+        let requested = if path.is_absolute() { path.to_path_buf() }
+            else { std::env::current_dir()?.join(path) };
+        Self::check_existing_path(&requested)?;
+        let canonical = fs::canonicalize(&requested)?;
+        let slot = PathIntent::reserve(canonical.clone(), Intent::Open)?;
+        let mut owner = Self::finish(slot, &requested, canonical)?;
+        owner.strict_existing = true;
+        owner.verify()?;
+        Ok(owner)
+    }
+    fn check_existing_path(path: &Path) -> Result<()> {
+        let mut prefix = PathBuf::new();
+        for component in path.components() {
+            if matches!(component, std::path::Component::ParentDir) {
+                return Err(ReservationError::InvalidPath(path.to_path_buf()));
+            }
+            prefix.push(component.as_os_str());
+            let metadata = fs::symlink_metadata(&prefix)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(ReservationError::InvalidPath(prefix));
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn verify_existing(&self) -> Result<()> {
+        if !self.strict_existing { return Err(ReservationError::InvalidPath(self.requested.clone())); }
+        self.verify()
     }
     pub(crate) fn destroy(path: &Path) -> Result<Option<Self>> {
         let canonical = normalize(path)?;
@@ -303,7 +335,7 @@ impl ProviderReservation {
                 .ok_or(ReservationError::Poisoned)?
                 .identity = Some(id);
         }
-        let result = Self { slot, directory, requested, path, identity: id };
+        let result = Self { slot, directory, requested, path, identity: id, strict_existing: false };
         result.verify()?;
         Ok(result)
     }
@@ -311,6 +343,7 @@ impl ProviderReservation {
         &self.path
     }
     pub(crate) fn verify(&self) -> Result<()> {
+        if self.strict_existing { Self::check_existing_path(&self.requested)?; }
         let actual = fs::canonicalize(&self.requested)
             .map_err(|_| ReservationError::IdentityChanged(self.requested.clone()))?;
         if !same_path(&actual, &self.path) || identity(&self.directory)? != self.identity {

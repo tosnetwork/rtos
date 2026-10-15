@@ -94,16 +94,46 @@ impl RocksDb {
         let reservation = if matches!(access_type, AccessType::ReadWrite) {
             Some(super::provider_reservation::ProviderReservation::open(&requested)?)
         } else { None };
-        let path = reservation.as_ref().map_or_else(|| requested.clone(), |guard| guard.path().to_path_buf());
-        let mut spec_cf_opts = spec_cf_opts.into().unwrap_or_default();
-        let options = Self::build_db_options();
+        Self::open_reserved(requested, spec_cf_opts.into(), access_type, reservation, false)
+    }
 
-        let cfs = DBWithThreadMode::<MultiThreaded>::list_cf(&options, &path).unwrap_or_default();
+    /// Private recovery-opening primitive. Its physical owner spans native
+    /// open and close; no DB/CF creation or legacy cleanup is allowed. The
+    /// caller still needs ledger protection and full root authority before
+    /// any canonical mutation. Native WAL replay/logging can occur at open.
+    pub(crate) fn open_existing_for_recovery(
+        owner: super::provider_reservation::ProviderReservation,
+        spec_cf_opts: impl Into<Option<HashMap<String, Options>>>,
+    ) -> Result<Arc<Self>> {
+        owner.verify_existing()?;
+        let requested = owner.path().to_path_buf();
+        Self::open_reserved(requested, spec_cf_opts.into(), AccessType::ReadWrite, Some(owner), true)
+    }
+
+    fn open_reserved(
+        requested: std::path::PathBuf,
+        spec_cf_opts: Option<HashMap<String, Options>>,
+        access_type: AccessType,
+        reservation: Option<super::provider_reservation::ProviderReservation>,
+        existing_only: bool,
+    ) -> Result<Arc<Self>> {
+        let path = reservation.as_ref().map_or_else(|| requested.clone(), |guard| guard.path().to_path_buf());
+        let mut spec_cf_opts = spec_cf_opts.unwrap_or_default();
+        let mut options = Self::build_db_options();
+        if existing_only {
+            options.create_if_missing(false);
+            options.create_missing_column_families(false);
+        }
+        let cfs = if existing_only {
+            DBWithThreadMode::<MultiThreaded>::list_cf(&options, &path)?
+        } else {
+            DBWithThreadMode::<MultiThreaded>::list_cf(&options, &path).unwrap_or_default()
+        };
 
         log::info!(
             target: TARGET,
             "Opening DB {} (mode: {:?}) with {} cfs",
-            name, access_type, cfs.len()
+            path.display(), access_type, cfs.len()
         );
 
         let cfs_opt = cfs.clone().into_iter().map(|cf| {
@@ -135,7 +165,7 @@ impl RocksDb {
             if let Err(error) = guard.verify() { drop(db); return Err(error.into()); }
         }
 
-        if !matches!(access_type, AccessType::ReadOnly | AccessType::Secondary(_))
+        if !existing_only && !matches!(access_type, AccessType::ReadOnly | AccessType::Secondary(_))
             && !cfs.iter().any(|cf| cf == "repair_dependency_leases_v1")
             && cfs.len() > 100
         {

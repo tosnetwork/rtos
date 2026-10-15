@@ -200,3 +200,81 @@ async fn missing_cleanup_preserves_empty_parent_and_creates_nothing() {
     assert!(dir.path().exists());
     assert!(!dir.path().join("missing").exists());
 }
+
+
+#[test]
+fn existing_reservation_and_native_open_never_create_missing_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing/db");
+    assert!(ProviderReservation::open_existing(&missing).is_err());
+    assert!(!dir.path().join("missing").exists());
+    let empty = dir.path().join("empty"); fs::create_dir(&empty).unwrap();
+    let owner = ProviderReservation::open_existing(&empty).unwrap();
+    assert!(RocksDb::open_existing_for_recovery(owner, None).is_err());
+    assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
+    // Failure releases the reservation without leaving a fabricated DB.
+    ProviderReservation::open_existing(&empty).unwrap().verify_existing().unwrap();
+    let ordinary = ProviderReservation::open(&empty).unwrap();
+    assert!(RocksDb::open_existing_for_recovery(ordinary, None).is_err());
+    assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_reservation_rejects_symlinks_and_retains_exclusion() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    drop(writable(&path).unwrap());
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&path, &alias).unwrap();
+    assert!(ProviderReservation::open_existing(&alias).is_err());
+    let owner = ProviderReservation::open_existing(&path).unwrap();
+    assert!(busy(writable(&path)));
+    assert!(ProviderReservation::open_existing(&path).is_err());
+    let db = RocksDb::open_existing_for_recovery(owner, None).unwrap();
+    let retained = db.clone(); drop(db);
+    assert!(busy(writable(&path)));
+    drop(retained);
+    let owner = ProviderReservation::open_existing(&path).unwrap();
+    owner.verify_existing().unwrap();
+    fs::rename(&path, dir.path().join("moved")).unwrap();
+    fs::create_dir(&path).unwrap();
+    assert!(owner.verify_existing().is_err());
+}
+
+#[test]
+fn existing_recovery_open_preserves_legacy_families_and_pending_controls() {
+    use crate::{db::rocksdb::{NODE_STATE_DB_NAME, LAST_UNNEEDED_KEY_BLOCK}, traits::Serializable};
+    use crate::archives::recovery_root::{ROOT_KEY, PARTICIPANT_KEY};
+    use rtos_block::{BlockIdExt, ShardIdent};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut options = rocksdb::Options::default();
+    options.create_if_missing(true); options.create_missing_column_families(true);
+    let mut names: Vec<_> = (0..100).map(|n| format!("untouched_{n}")).collect();
+    names.extend([NODE_STATE_DB_NAME.to_string(), "status_db_0".to_string()]);
+    let native = rocksdb::DBWithThreadMode::<rocksdb::MultiThreaded>::open_cf(&options, &path, &names).unwrap();
+    let cutoff = BlockIdExt::with_params(ShardIdent::masterchain(), 100, [1;32].into(), [2;32].into());
+    native.put_cf(&native.cf_handle(NODE_STATE_DB_NAME).unwrap(), LAST_UNNEEDED_KEY_BLOCK, cutoff.serialize()).unwrap();
+    // Clean status row permits normal legacy cleanup, so preservation here
+    // proves the existing-only policy independently of pending-root refusal.
+    native.put_cf(&native.cf_handle("status_db_0").unwrap(), b"SlicedMode", b"original").unwrap();
+    native.flush_wal(true).unwrap();
+    let identity = native.get_db_identity().unwrap(); drop(native);
+    let owner = ProviderReservation::open_existing(&path).unwrap();
+    let mut cf_options = std::collections::HashMap::new();
+    cf_options.insert("must_not_create".to_string(), rocksdb::Options::default());
+    let db = RocksDb::open_existing_for_recovery(owner, cf_options).unwrap();
+    assert_eq!(db.db().get_db_identity().unwrap(), identity);
+    assert!(db.db().cf_handle("must_not_create").is_none());
+    assert_eq!(db.db().get_cf(&db.db().cf_handle("status_db_0").unwrap(), b"SlicedMode").unwrap().as_deref(), Some(b"original".as_slice()));
+    db.db().put(ROOT_KEY, b"future-root-format").unwrap();
+    db.db().put(PARTICIPANT_KEY, b"future-participant-format").unwrap(); db.sync_wal().unwrap();
+    drop(db);
+    let owner = ProviderReservation::open_existing(&path).unwrap();
+    let db = RocksDb::open_existing_for_recovery(owner, None).unwrap();
+    assert_eq!(db.db().get(ROOT_KEY).unwrap().as_deref(), Some(b"future-root-format".as_slice()));
+    assert_eq!(db.db().get(PARTICIPANT_KEY).unwrap().as_deref(), Some(b"future-participant-format".as_slice()));
+    assert!(db.db().cf_handle("status_db_0").is_some());
+    assert!(crate::archives::recovery_guard::ensure_root_controls_clear(db.db()).is_err());
+}
