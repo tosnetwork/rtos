@@ -100,9 +100,15 @@ impl ArchiveDomain {
     pub fn outstanding(&self) -> usize {
         self.state.lock().unwrap_or_else(|error| error.into_inner()).owners.outstanding()
     }
+    /// Test fixtures only: exercise stale captured views through the same
+    /// checked closed/drained transition. Not a durable recovery publisher.
+    #[cfg(any(test, feature = "integration-test-support"))]
+    pub fn test_publish_next_epoch(&self, expected: u64) -> Result<()> {
+        self.publish_next_epoch(expected)
+    }
     // No production publication API: durable recovery and idle-writer retirement
     // have not been implemented. Tests only exercise immutable epoch identities.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-support"))]
     fn publish_next_epoch(&self, expected: u64) -> Result<()> {
         let mut state = self.lock()?;
         Self::check_epoch(&state, expected)?;

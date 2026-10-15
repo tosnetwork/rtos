@@ -163,6 +163,18 @@ pub(crate) async fn repair_mc_final(
         .map_err(|e| error!("MC repair worker failed: {e}"))?
 }
 
+// Calibration uses the actual admitted worker with an explicitly bounded budget.
+// The test awaits the whole owner; no mocked context errors or fallback shortcut.
+#[cfg(test)]
+pub(crate) async fn repair_with_budget_for_test(
+    engine: Arc<Engine>,
+    request: McFinalRepairRequest,
+    budget: Arc<crate::history_read_budget::HistoryReadBudget>,
+) -> Result<McFinalRepairCustody> {
+    let admission = admit(&engine, &request)?;
+    repair_owned(engine, request, admission, budget).await
+}
+
 async fn load_pinned_bounded(
     engine: &Engine,
     id: &BlockIdExt,
@@ -261,6 +273,8 @@ async fn repair_owned(
             let (block, proof) = match local.take() {
                 Some(pair) => pair,
                 None => {
+                    #[cfg(test)]
+                    engine.db().test_note_read_refusal_effect(0);
                     let body = budget
                         .reserve(crate::history_read_budget::ReadKind::State, MAX_ARTIFACT_BYTES)?;
                     let proof_bytes = budget
@@ -473,6 +487,10 @@ pub(crate) fn install_test_gate(engine: &Arc<Engine>) -> Arc<RepairTestGate> {
         .insert(Arc::as_ptr(engine) as usize, gate.clone())
         .is_none());
     gate
+}
+#[cfg(test)]
+pub(crate) fn remove_test_gate(engine: &Arc<Engine>) {
+    drop(take_test_gate(engine));
 }
 #[cfg(test)]
 fn take_test_gate(engine: &Arc<Engine>) -> Option<Arc<RepairTestGate>> {

@@ -544,6 +544,11 @@ impl ArchiveManager {
     }
 
     #[cfg(any(test, feature = "integration-test-support"))]
+    pub fn test_archive_view(&self) -> ArchiveView {
+        self.view.clone()
+    }
+
+    #[cfg(any(test, feature = "integration-test-support"))]
     pub fn test_pause_gc_selection(&self) -> (tokio::sync::oneshot::Receiver<Vec<u32>>, Arc<tokio::sync::Notify>) {
         self.file_maps.files().test_pause_gc_selection()
     }

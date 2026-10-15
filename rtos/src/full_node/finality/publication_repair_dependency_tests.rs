@@ -676,3 +676,6 @@ mod persistent_custody_tests;
 
 #[path = "source_closing_drain_tests.rs"]
 mod source_closing_drain_tests;
+
+#[path = "archive_read_refusal_tests.rs"]
+mod archive_read_refusal_tests;

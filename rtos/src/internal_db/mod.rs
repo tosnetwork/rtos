@@ -298,6 +298,8 @@ pub struct InternalDb {
     state_db: StateDb,
     repair_leases: Arc<crate::publication_dependency_leases::DependencyLeases>,
     archive_manager: Arc<ArchiveManager>,
+    #[cfg(test)]
+    read_refusal_effects: [std::sync::atomic::AtomicUsize; 2],
     archive_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
     archive_admission: Arc<tokio::sync::Semaphore>,
     archive_io_owners: Arc<storage::archives::io_owners::ArchiveIoOwners>,
@@ -333,6 +335,23 @@ impl Drop for PropagationOutboxWriterLease {
 }
 
 impl InternalDb {
+    #[cfg(test)]
+    pub(crate) fn test_archive_view(&self) -> storage::archives::context::ArchiveView {
+        self.archive_manager.test_archive_view()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_note_read_refusal_effect(&self, index: usize) {
+        self.read_refusal_effects[index].fetch_add(1, Ordering::SeqCst);
+    }
+    #[cfg(test)]
+    pub(crate) fn test_read_refusal_effects(&self) -> [usize; 2] {
+        std::array::from_fn(|i| self.read_refusal_effects[i].load(Ordering::SeqCst))
+    }
+    #[cfg(test)]
+    pub(crate) fn test_reset_read_refusal_effects(&self) {
+        for counter in &self.read_refusal_effects { counter.store(0, Ordering::SeqCst); }
+    }
+
     pub(crate) fn repair_leases(
         &self,
     ) -> &Arc<crate::publication_dependency_leases::DependencyLeases> {
@@ -570,6 +589,8 @@ impl InternalDb {
             )),
             state_db,
             archive_manager,
+            #[cfg(test)]
+            read_refusal_effects: Default::default(),
             shard_top_blocks_db,
             full_node_state_db,
             cells_gc_interval: Arc::new(AtomicU32::new(config.cells_gc_interval_sec)),
@@ -1016,6 +1037,8 @@ impl InternalDb {
                 }
             }
         }
+        #[cfg(test)]
+        self.test_note_read_refusal_effect(1);
         {
             let _body = handle.block_file_lock().write().await;
             let _proof = handle.proof_file_lock().write().await;
