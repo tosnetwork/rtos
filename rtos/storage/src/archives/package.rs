@@ -36,6 +36,32 @@ pub struct Package {
 pub(crate) const PKG_HEADER_SIZE: usize = 4;
 pub(super) const PKG_HEADER_MAGIC: u32 = 0xAE8F_DD01;
 
+struct AppendLayout {
+    entry_offset: u64,
+    total_size: u64,
+    logical_size: u64,
+}
+
+impl AppendLayout {
+    fn checked(raw_size: u64, entry_size: u64) -> Result<Self> {
+        let entry_offset = raw_size.checked_sub(PKG_HEADER_SIZE as u64)
+            .ok_or_else(|| error!("Package length is smaller than its header"))?;
+        let total_size = raw_size.checked_add(entry_size)
+            .ok_or_else(|| error!("Package append size overflow"))?;
+        let logical_size = total_size.checked_sub(PKG_HEADER_SIZE as u64)
+            .ok_or_else(|| error!("Package logical size underflow"))?;
+        Ok(Self { entry_offset, total_size, logical_size })
+    }
+}
+
+fn block_index_offset(offset: u64) -> Result<u32> {
+    u32::try_from(offset).map_err(|_| error!("Package BlockIndex offset exceeds u32"))
+}
+
+#[cfg(test)]
+#[path = "../tests/test_package_preflight.rs"]
+mod preflight_tests;
+
 async fn read_header<R: tokio::io::AsyncReadExt + Unpin>(reader: &mut R) -> Result<()> {
     let mut buf = [0; PKG_HEADER_SIZE];
     if reader.read_exact(&mut buf).await? != PKG_HEADER_SIZE {
@@ -275,8 +301,24 @@ impl Package {
         entry: &PackageEntry,
         after_append: impl FnOnce(u64, u64) -> Result<()>,
     ) -> Result<()> {
-        debug_assert!(entry.filename().len() <= u16::MAX as usize);
-        debug_assert!(entry.data().len() <= u32::MAX as usize);
+        self.append_entry_checked(entry, Ok, after_append).await
+    }
+
+    pub(super) async fn append_indexed_entry(
+        &self,
+        entry: &PackageEntry,
+        after_append: impl FnOnce(u32, u64) -> Result<()>,
+    ) -> Result<()> {
+        self.append_entry_checked(entry, block_index_offset, after_append).await
+    }
+
+    async fn append_entry_checked<O>(
+        &self,
+        entry: &PackageEntry,
+        checked_offset: impl FnOnce(u64) -> Result<O>,
+        after_append: impl FnOnce(O, u64) -> Result<()>,
+    ) -> Result<()> {
+        let entry_size = entry.serialized_size()?;
         let mut guard = self.write_mutex.lock().await;
         if !self.write_healthy.load(Ordering::SeqCst) {
             fail!("Package write state is uncertain; reopen before mutation");
@@ -289,24 +331,41 @@ impl Package {
         };
         // Neither an error nor an abandoned future may reset this admission.
         self.write_healthy.store(false, Ordering::SeqCst);
-        let actual_before = file.metadata().await?.len();
         let raw_size = self.size.load(Ordering::SeqCst);
-        let entry_offset = raw_size - PKG_HEADER_SIZE as u64;
+        if raw_size < PKG_HEADER_SIZE as u64 {
+            fail!("Package length is smaller than its header");
+        }
+        let actual_before = file.metadata().await?.len();
         if raw_size != actual_before {
             fail!("Package {} physical/logical length mismatch before append: {actual_before} != {raw_size}", self.path.display());
         }
-        let entry_size = entry.write_to(file).await?;
+        let cursor = file.stream_position().await?;
+        if cursor != raw_size {
+            fail!("Package {} writer cursor mismatch before append: {cursor} != {raw_size}", self.path.display());
+        }
+        let prepared = AppendLayout::checked(raw_size, entry_size)
+            .and_then(|layout| Ok((checked_offset(layout.entry_offset)?, layout)));
+        let (offset, layout) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // Only checked arithmetic/input refusal can reach this branch.
+                // Actual length/cursor were verified; no mutation has begun.
+                self.write_healthy.store(true, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        let written = entry.write_to(file).await?;
+        if written != entry_size {
+            fail!("Package entry encoded size changed during append");
+        }
         // Pack data must be durable before the offset gets committed.
         file.sync_data().await?;
-        let total_size = raw_size
-            .checked_add(entry_size)
-            .ok_or_else(|| error!("Package append size overflow"))?;
         let actual_after = file.metadata().await?.len();
-        if total_size != actual_after {
-            fail!("Package {} physical/logical length mismatch after append: {actual_after} != {total_size}", self.path.display());
+        if layout.total_size != actual_after {
+            fail!("Package {} physical/logical length mismatch after append: {actual_after} != {}", self.path.display(), layout.total_size);
         }
-        self.size.store(total_size, Ordering::SeqCst);
-        let result = after_append(entry_offset, total_size - PKG_HEADER_SIZE as u64);
+        self.size.store(layout.total_size, Ordering::SeqCst);
+        let result = after_append(offset, layout.logical_size);
         if result.is_ok() {
             self.write_healthy.store(true, Ordering::SeqCst);
         }

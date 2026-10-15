@@ -10,7 +10,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{traits::Serializable, TARGET};
-use rtos_block::{fail, Result};
+use rtos_block::{error, fail, Result};
 
 pub(crate) const PKG_ENTRY_HEADER_SIZE: usize = 8;
 const PKG_ENTRY_HEADER_MAGIC: u16 = 0x1E8B;
@@ -19,6 +19,27 @@ const PKG_ENTRY_HEADER_MAGIC: u16 = 0x1E8B;
 struct PackageEntryHeader {
     filename_size: u16,
     data_size: u32,
+}
+
+struct PackageEntryLayout {
+    header: PackageEntryHeader,
+    size: u64,
+}
+
+impl PackageEntryLayout {
+    fn checked(filename_size: u64, data_size: u64) -> Result<Self> {
+        let header = PackageEntryHeader {
+            filename_size: u16::try_from(filename_size)
+                .map_err(|_| error!("Package entry filename exceeds u16 length"))?,
+            data_size: u32::try_from(data_size)
+                .map_err(|_| error!("Package entry data exceeds u32 length"))?,
+        };
+        let size = (PKG_ENTRY_HEADER_SIZE as u64)
+            .checked_add(filename_size)
+            .and_then(|size| size.checked_add(data_size))
+            .ok_or_else(|| error!("Package entry encoded size overflow"))?;
+        Ok(Self { header, size })
+    }
 }
 
 impl Serializable for PackageEntryHeader {
@@ -127,18 +148,12 @@ impl PackageEntry {
         &self,
         writer: &mut W,
     ) -> Result<u64> {
-        let entry_header = PackageEntryHeader {
-            filename_size: self.filename.len() as u16,
-            data_size: self.data.len() as u32,
-        };
-        writer.write_all(&entry_header.serialize()).await?;
+        let layout = self.layout()?;
+        writer.write_all(&layout.header.serialize()).await?;
         writer.write_all(self.filename.as_bytes()).await?;
         writer.write_all(&self.data).await?;
         writer.flush().await?;
-        let size = PKG_ENTRY_HEADER_SIZE as u64
-            + entry_header.filename_size as u64
-            + entry_header.data_size as u64;
-        Ok(size)
+        Ok(layout.size)
     }
 
     pub fn filename(&self) -> &str {
@@ -154,10 +169,15 @@ impl PackageEntry {
     }
 
     /// Returns the serialized size of this entry (header + filename + data).
-    pub fn serialized_size(&self) -> u64 {
-        PKG_ENTRY_HEADER_SIZE as u64
-            + self.filename.as_bytes().len() as u64
-            + self.data.len() as u64
+    pub fn serialized_size(&self) -> Result<u64> {
+        Ok(self.layout()?.size)
+    }
+
+    fn layout(&self) -> Result<PackageEntryLayout> {
+        PackageEntryLayout::checked(
+            u64::try_from(self.filename.len())?,
+            u64::try_from(self.data.len())?,
+        )
     }
 }
 
@@ -184,5 +204,50 @@ mod bounded_tests {
         let mut invalid = header; invalid[0] ^= 1;
         assert!(PackageEntry::read_from_bounded(&mut invalid.as_slice(), limits).await.is_err());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+    use std::{pin::Pin, task::{Context, Poll}};
+
+    #[test]
+    fn checked_encoding_lengths_preserve_wire_limits() -> Result<()> {
+        let layout = PackageEntryLayout::checked(u16::MAX.into(), u32::MAX.into())?;
+        assert_eq!(layout.header.filename_size, u16::MAX);
+        assert_eq!(layout.header.data_size, u32::MAX);
+        assert_eq!(layout.size, 8 + u64::from(u16::MAX) + u64::from(u32::MAX));
+        assert!(PackageEntryLayout::checked(u64::from(u16::MAX) + 1, 0).is_err());
+        assert!(PackageEntryLayout::checked(0, u64::from(u32::MAX) + 1).is_err());
+        assert!(PackageEntryLayout::checked(u64::MAX, u64::MAX).is_err());
+        // UTF-8 byte length, not the character count, controls the wire field.
+        let entry = PackageEntry::with_data("é".repeat(32768), vec![]);
+        assert!(entry.serialized_size().is_err());
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct CountingWriter { writes: usize, flushes: usize }
+    impl tokio::io::AsyncWrite for CountingWriter {
+        fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, bytes: &[u8]) -> Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_encoding_never_calls_writer() {
+        let entry = PackageEntry::with_data("x".repeat(usize::from(u16::MAX) + 1), vec![1]);
+        let mut writer = CountingWriter::default();
+        assert!(entry.write_to(&mut writer).await.is_err());
+        assert_eq!((writer.writes, writer.flushes), (0, 0));
     }
 }

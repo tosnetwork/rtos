@@ -54,7 +54,9 @@ async fn read_raw_package(path: &Path) -> Result<HashMap<BlockIdExt, RawEntry>> 
     let mut entries = HashMap::<BlockIdExt, RawEntry>::new();
     let mut offset: u64 = 0;
     while let Some(entry) = reader.next().await? {
-        let entry_size = entry.serialized_size();
+        let entry_size = entry.serialized_size()?;
+        let next_offset = offset.checked_add(entry_size)
+            .ok_or_else(|| error!("Imported package entry offset overflow"))?;
         let entry_id = PackageEntryId::<BlockIdExt>::from_filename(entry.filename())?;
         let (block_id, is_proof) = match entry_id {
             PackageEntryId::Block(id) => (id, false),
@@ -62,7 +64,7 @@ async fn read_raw_package(path: &Path) -> Result<HashMap<BlockIdExt, RawEntry>> 
             PackageEntryId::ProofLink(id) if !id.is_masterchain() => (id, true),
             entry_id => {
                 log::warn!("Unexpected entry type {} in {}", entry_id, path.display());
-                offset += entry_size;
+                offset = next_offset;
                 continue;
             }
         };
@@ -95,7 +97,7 @@ async fn read_raw_package(path: &Path) -> Result<HashMap<BlockIdExt, RawEntry>> 
                     }
                 }
             });
-        offset += entry_size;
+        offset = next_offset;
     }
     Ok(entries)
 }

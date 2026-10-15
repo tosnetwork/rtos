@@ -128,7 +128,7 @@ async fn exercise(cut: &str, live: bool) {
             target.clone(),
         );
         assert!(
-            original.len() as u64 + entry.serialized_size() <= 4096,
+            original.len() as u64 + entry.serialized_size().unwrap() <= 4096,
             "index cut must fit package writes inside the allocated first page"
         );
     }

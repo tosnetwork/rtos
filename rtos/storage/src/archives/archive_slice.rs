@@ -604,36 +604,42 @@ impl ArchiveSlice {
             }
         };
         let entry = PackageEntry::with_data(entry_id.filename(), data);
-        package_info
-            .package()
-            .append_entry(&entry, |offset, size| {
-                let info = if self.shard_separated { Some(package_info.entry()) } else { None };
-                let index = if self.sliced_mode { Some(package_info.index()) } else { None };
-                let meta = PackageEntryMeta::with_data(size, package_info.version(), info);
-                log::debug!(
-                    target: TARGET,
-                    "Writing package entry metadata {}: {meta:?}, offset: {offset}",
-                    index.map(|index| format!(" for slice #{index}")).unwrap_or("".to_string())
-                );
+        let after_append = |offset: u64, size: u64, indexed_offset: Option<u32>| {
+            let info = if self.shard_separated { Some(package_info.entry()) } else { None };
+            let index = if self.sliced_mode { Some(package_info.index()) } else { None };
+            let meta = PackageEntryMeta::with_data(size, package_info.version(), info);
+            log::debug!(
+                target: TARGET,
+                "Writing package entry metadata {}: {meta:?}, offset: {offset}",
+                index.map(|index| format!(" for slice #{index}")).unwrap_or("".to_string())
+            );
+            #[cfg(test)]
+            self.observe_metadata_cut(MetadataCut::EntryMeta, offset, size)?;
+            self.entry_db.put_value(&index.unwrap_or(u32::MAX).into(), &meta)?;
+            if !self.sliced_mode {
                 #[cfg(test)]
-                self.observe_metadata_cut(MetadataCut::EntryMeta, offset, size)?;
-                self.entry_db.put_value(&index.unwrap_or(u32::MAX).into(), &meta)?;
-                if !self.sliced_mode {
-                    #[cfg(test)]
-                    self.observe_metadata_cut(MetadataCut::NonSlicedStatus, offset, size)?;
-                    self.package_status_db.put_value(&PackageStatusKey::NonSlicedSize, &size)?;
-                }
+                self.observe_metadata_cut(MetadataCut::NonSlicedStatus, offset, size)?;
+                self.package_status_db.put_value(&PackageStatusKey::NonSlicedSize, &size)?;
+            }
+            #[cfg(test)]
+            self.observe_metadata_cut(MetadataCut::Offset, offset, size)?;
+            self.offsets_db.put_value(&offset_key, &offset)?;
+            if let Some(indexed_offset) = indexed_offset {
                 #[cfg(test)]
-                self.observe_metadata_cut(MetadataCut::Offset, offset, size)?;
-                self.offsets_db.put_value(&offset_key, &offset)?;
-                if let PackageEntryId::Block(_) = entry_id {
-                    #[cfg(test)]
-                    self.observe_metadata_cut(MetadataCut::BlockIndex, offset, size)?;
-                    self.block_index_db.put(block_handle, offset as u32)?;
-                }
-                Ok(())
-            })
-            .await?;
+                self.observe_metadata_cut(MetadataCut::BlockIndex, offset, size)?;
+                self.block_index_db.put(block_handle, indexed_offset)?;
+            }
+            Ok(())
+        };
+        if matches!(entry_id, PackageEntryId::Block(_)) {
+            package_info.package().append_indexed_entry(&entry, |offset, size| {
+                after_append(u64::from(offset), size, Some(offset))
+            }).await?;
+        } else {
+            package_info.package().append_entry(&entry, |offset, size| {
+                after_append(offset, size, None)
+            }).await?;
+        }
         // Relocation may delete the loose copy immediately after this returns.
         // Commit package directory entries and the provider's index WAL first.
         self.sync_block_package(block_handle, None).await?;
@@ -1045,7 +1051,7 @@ impl ArchiveSlice {
                 } else {
                     None
                 };
-                source_offset = source_offset.checked_add(entry.serialized_size())
+                source_offset = source_offset.checked_add(entry.serialized_size()?)
                     .ok_or_else(|| error!("Archive source offset overflow"))?;
                 let id = match &entry_id {
                     PackageEntryId::Block(id) => id,
@@ -1067,29 +1073,34 @@ impl ArchiveSlice {
                     }
                 } else {
                     log::trace!(target: TARGET, "repack package: repack {entry_id}");
-                    new_package
-                        .append_entry(&entry, |offset, size| {
-                            let info = if self.shard_separated {
-                                Some(package_info.entry())
-                            } else {
-                                None
-                            };
-                            let meta =
-                                PackageEntryMeta::with_data(size, package_info.version(), info);
-                            let index = package_info.index();
-                            log::debug!(
-                                target: TARGET,
-                                "Writing package entry metadata for slice \
-                                #{index}: {meta:?}, offset: {offset}"
-                            );
-                            self.entry_db.put_value(&index.into(), &meta)?;
-                            self.offsets_db.put_value(&(&entry_id).into(), &offset)?;
-                            if let Some(old) = block_offset {
-                                index_offsets.insert((id.shard().clone(), old), Some(offset));
-                            }
-                            Ok(())
-                        })
-                        .await?;
+                    let mut after_append = |offset: u64, size: u64| {
+                        let info = if self.shard_separated {
+                            Some(package_info.entry())
+                        } else {
+                            None
+                        };
+                        let meta =
+                            PackageEntryMeta::with_data(size, package_info.version(), info);
+                        let index = package_info.index();
+                        log::debug!(
+                            target: TARGET,
+                            "Writing package entry metadata for slice \
+                            #{index}: {meta:?}, offset: {offset}"
+                        );
+                        self.entry_db.put_value(&index.into(), &meta)?;
+                        self.offsets_db.put_value(&(&entry_id).into(), &offset)?;
+                        if let Some(old) = block_offset {
+                            index_offsets.insert((id.shard().clone(), old), Some(offset));
+                        }
+                        Ok(())
+                    };
+                    if block_offset.is_some() {
+                        new_package.append_indexed_entry(&entry, |offset, size| {
+                            after_append(u64::from(offset), size)
+                        }).await?;
+                    } else {
+                        new_package.append_entry(&entry, after_append).await?;
+                    }
                     any_kept = true;
                 }
             }
