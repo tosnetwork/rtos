@@ -22,10 +22,13 @@ fn snapshot(db: &RocksDb) -> BTreeMap<String, Vec<(Vec<u8>, Vec<u8>)>> {
         .unwrap()
         .into_iter()
         .map(|name| {
-            let cf = db.db().cf_handle(&name).unwrap();
-            let rows = db
-                .db()
-                .iterator_cf(&cf, IteratorMode::Start)
+            let iter = if name == "default" {
+                db.db().iterator(IteratorMode::Start)
+            } else {
+                let cf = db.db().cf_handle(&name).unwrap();
+                db.db().iterator_cf(&cf, IteratorMode::Start)
+            };
+            let rows = iter
                 .map(|row| {
                     let (k, v) = row.unwrap();
                     (k.to_vec(), v.to_vec())
