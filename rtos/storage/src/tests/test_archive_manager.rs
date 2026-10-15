@@ -1193,7 +1193,15 @@ async fn cancelled_manager_reads_close_actual_file_before_domain_drain() -> Resu
                 handle.set_proof();
                 handle.set_block_applied();
                 if route != 0 {
-                    manager.move_to_archive(&handle, || Ok(())).await?;
+                    if key && route == 2 {
+                        // Seed only the key route: ordinary-first range lookup must miss.
+                        manager.add_block_data_to_package(
+                            b"proof".to_vec(), &handle, &PackageEntryId::Proof(&id), true,
+                        ).await?;
+                        assert!(manager.file_maps.files().get(0).await.is_none());
+                    } else {
+                        manager.move_to_archive(&handle, || Ok(())).await?;
+                    }
                     handle.set_archived();
                 }
                 let limits = ArchiveReadLimits { data_bytes: 5, filename_bytes: 1024 };
@@ -1205,6 +1213,22 @@ async fn cancelled_manager_reads_close_actual_file_before_domain_drain() -> Resu
                     assert_eq!(manager.get_archive_slice(archive_id, 0, 4).await?.len(), 4);
                     archive_id
                 } else { 0 };
+                let expected_path = if route == 0 {
+                    manager.unapplied_files_path.join(PackageEntryId::Proof(&id).filename_short())
+                } else {
+                    let root = if epoch && !key {
+                        dir.path().join("new_epochs/epoch_0")
+                    } else {
+                        manager.db_root_path.as_ref().clone()
+                    };
+                    let package = if key {
+                        crate::archives::package_id::PackageId::for_key_block(0)
+                    } else {
+                        crate::archives::package_id::PackageId::for_block(0)
+                    };
+                    package.full_path(root, &ShardIdent::masterchain())?
+                };
+                let expected_path = std::fs::canonicalize(expected_path)?;
                 let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
                 let (read_release_tx, read_release_rx) = std::sync::mpsc::channel();
                 let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
@@ -1218,7 +1242,9 @@ async fn cancelled_manager_reads_close_actual_file_before_domain_drain() -> Resu
                 domain.install_read_probe(ReadProbe {
                     opened: Box::new(move |file| {
                         open_fd.store(file.as_raw_fd(), Ordering::SeqCst);
-                        let _ = opened_tx.send(file.as_raw_fd());
+                        let actual_path = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+                            .map_err(|error| error.to_string());
+                        let _ = opened_tx.send((file.as_raw_fd(), actual_path));
                         open_gate.store(read_release_rx.recv_timeout(deadline).is_ok(), Ordering::SeqCst);
                     }),
                     closed: Box::new(move || {
@@ -1242,7 +1268,7 @@ async fn cancelled_manager_reads_close_actual_file_before_domain_drain() -> Resu
                         ).await
                     }
                 });
-                let opened_fd = tokio::time::timeout(deadline, opened_rx).await??;
+                let (opened_fd, actual_path) = tokio::time::timeout(deadline, opened_rx).await??;
                 let valid_while_held = unsafe { libc::fcntl(opened_fd, libc::F_GETFD) } >= 0;
                 observer.abort();
                 let cancelled = observer.await.is_err_and(|e| e.is_cancelled());
@@ -1259,7 +1285,8 @@ async fn cancelled_manager_reads_close_actual_file_before_domain_drain() -> Resu
                 tokio::time::timeout(deadline, &mut drain).await?;
                 let (rc, errno, retained, read_gate_ok) = receipt??;
                 let close_gate_ok = release_result??;
-                eprintln!("native_read_receipt epoch={epoch} key={key} route={route} fcntl={rc} errno={errno:?} retained={retained:?} before_close={before_close} valid_open={valid_while_held} cancelled={cancelled} pending_open={pending_open} pending_closed={pending_closed} read_gate={read_gate_ok} close_gate={close_gate_ok} read_release={read_released} close_release={close_released}");
+                eprintln!("native_read_receipt epoch={epoch} key={key} route={route} fcntl={rc} errno={errno:?} retained={retained:?} before_close={before_close} valid_open={valid_while_held} cancelled={cancelled} pending_open={pending_open} pending_closed={pending_closed} read_gate={read_gate_ok} close_gate={close_gate_ok} read_release={read_released} close_release={close_released} actual_path={actual_path:?} expected_path={expected_path:?}");
+                assert_eq!(actual_path, Ok(expected_path), "actual native reader must use the intended route");
                 assert!(cancelled && valid_while_held && pending_open && pending_closed);
                 assert!(read_released && close_released && read_gate_ok && close_gate_ok);
                 assert_eq!(rc, -1, "actual descriptor must be closed before custody release");
