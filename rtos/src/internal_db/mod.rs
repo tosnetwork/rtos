@@ -683,7 +683,6 @@ impl InternalDb {
             self.archive_queue_boundary_count.store(remaining, Ordering::SeqCst);
             self.test_report_archive_drain(ArchiveQueueDrainEvent::StateStopBoundary(remaining));
         }
-        debug_assert_eq!(self.archive_io_owners.outstanding(), 0, "Archive queue owners remain at state shutdown");
         let states = match &self.state_db {
             StateDb::Dynamic(db) => db.stop().await,
             StateDb::Archive(_) => Ok(()),

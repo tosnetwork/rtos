@@ -427,9 +427,19 @@ async fn persistent_repair_archive_owner_panic_still_drains_queued_handle() {
     let boundary_count = engine.db().test_archive_queue_boundary_count();
     let weak = Arc::downgrade(&engine); drop(engine);
     run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let stopped_error = format!("{:#}", stopped.unwrap_err());
+    let repeated_error = format!("{:#}", repeated.unwrap_err());
+    assert_eq!(stopped_error, repeated_error, "shutdown observers lost the terminal error");
+    assert!(stopped_error.contains("node shutdown failed; unreleased service mask 0x0000"),
+        "shutdown did not finish its actual service joins: {stopped_error}");
+    assert!(stopped_error.contains("DB archive/state drain:"), "archive failure was lost: {stopped_error}");
+    for unexpected in ["state shutdown failed:", "top shard persistence:", "node network shutdown:"] {
+        assert!(!stopped_error.contains(unexpected), "additional cleanup failure: {stopped_error}");
+    }
+    assert!(weak.upgrade().is_none());
+    eprintln!("ARCHIVE_QUEUE_SHUTDOWN_CLEANUP_COMPLETE boundary={boundary_count} first={first_drain_event:?}");
     assert_eq!(first_drain_event, Some(crate::internal_db::ArchiveQueueDrainEvent::WaitPending),
         "shutdown crossed state-stop boundary before held queue drain");
     assert_eq!(boundary_count, 0, "state shutdown observed a live archive queue owner");
-    assert!(stopped.is_err()); assert!(repeated.is_err()); assert!(weak.upgrade().is_none());
     drop(dir);
 }
