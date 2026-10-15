@@ -142,3 +142,7 @@ telemetry = ['adnl/telemetry', 'storage/telemetry']
 trace_alloc = []
 trace_alloc_detail = ['trace_alloc']
 xp25 = ['rtos_block/xp25', 'adnl/xp25']
+
+[[bin]]
+name = 'archive_recovery_check'
+path = 'bin/archive_recovery_check.rs'

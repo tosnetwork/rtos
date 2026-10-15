@@ -5295,6 +5295,7 @@ dependencies = [
  "fnv",
  "futures",
  "hex",
+ "libc",
  "lockfree",
  "log",
  "log4rs",

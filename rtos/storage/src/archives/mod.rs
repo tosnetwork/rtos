@@ -45,3 +45,6 @@ fn get_mc_seq_no(handle: &BlockHandle) -> u32 {
         handle.masterchain_ref_seq_no()
     }
 }
+
+#[cfg(target_os = "linux")]
+pub mod recovery_check;
