@@ -366,3 +366,65 @@ async fn protected_pack_cold_damage_checks(
         stopped.unwrap();
     }
 }
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_repair_archive_owner_panic_still_drains_queued_handle() {
+    struct HeldQueueCallback {
+        id: BlockIdExt,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        completed: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl storage::block_handle_db::Callback for HeldQueueCallback {
+        async fn invoke(&self, job: storage::block_handle_db::StoreJob, ok: bool) {
+            assert!(ok, "actual archive handle write failed");
+            match job {
+                storage::block_handle_db::StoreJob::SaveHandle(handle) => assert_eq!(handle.id(), &self.id),
+                _ => panic!("unexpected queue command"),
+            }
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.completed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let Fixture { dir, engine, target, .. } = fixture(false).await;
+    let enqueue_entered = Arc::new(tokio::sync::Notify::new());
+    let enqueue_release = Arc::new(tokio::sync::Notify::new());
+    let callback = Arc::new(HeldQueueCallback {
+        id: target.id().clone(), entered: Default::default(), release: Default::default(),
+        completed: std::sync::atomic::AtomicBool::new(false),
+    });
+    engine.db().test_panic_archive_after_handle_enqueue(enqueue_entered.clone(), enqueue_release.clone());
+    let owner_engine = engine.clone(); let id = target.id().clone(); let queued_callback = callback.clone();
+    let mut caller = Some(tokio::spawn(async move { owner_engine.db().archive_block(&id, Some(queued_callback)).await }));
+    let mut stopping = None;
+    let run = std::panic::AssertUnwindSafe(async {
+        tokio::time::timeout(Duration::from_secs(30), enqueue_entered.notified()).await.expect("archive owner did not enqueue");
+        tokio::time::timeout(Duration::from_secs(30), callback.entered.notified()).await.expect("actual handle writer did not enter");
+        enqueue_release.notify_one();
+        assert!(caller.take().unwrap().await.unwrap().is_err());
+        assert!(engine.db().test_join_archive_tasks().await.is_err());
+        assert_eq!(engine.db().test_archive_io_outstanding(), 1, "real queued command must outlive failed archive owner");
+        let stopping_engine = engine.clone();
+        stopping = Some(tokio::spawn(async move { stopping_engine.wait_stop().await }));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !engine.db().test_archive_queue_drain_started() { tokio::task::yield_now().await; }
+        }).await.expect("shutdown did not reach actual queue drain");
+        assert_eq!(engine.db().test_archive_io_outstanding(), 1);
+        assert!(!stopping.as_ref().unwrap().is_finished(), "shutdown passed a held queue owner");
+        assert!(!callback.completed.load(std::sync::atomic::Ordering::SeqCst));
+    }).catch_unwind().await;
+    // Release the actual queue owner even when an assertion failed.
+    enqueue_release.notify_one(); callback.release.notify_one();
+    if let Some(caller) = caller { let _ = caller.await; }
+    let stopped = if let Some(stopping) = stopping { stopping.await.unwrap() } else { engine.clone().wait_stop().await };
+    let repeated = engine.clone().wait_stop().await;
+    assert_eq!(engine.db().test_archive_io_outstanding(), 0);
+    assert!(callback.completed.load(std::sync::atomic::Ordering::SeqCst));
+    let weak = Arc::downgrade(&engine); drop(engine);
+    run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    assert!(stopped.is_err()); assert!(repeated.is_err()); assert!(weak.upgrade().is_none());
+    drop(dir);
+}

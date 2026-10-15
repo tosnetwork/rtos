@@ -293,9 +293,15 @@ pub struct InternalDb {
     archive_manager: Arc<ArchiveManager>,
     archive_tasks: Arc<crate::types::owned_tasks::OwnedTasks>,
     archive_admission: Arc<tokio::sync::Semaphore>,
+    archive_io_owners: Arc<storage::archives::io_owners::ArchiveIoOwners>,
     #[cfg(test)]
     archive_test_gate:
         std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    #[cfg(test)]
+    archive_enqueue_test_gate:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    #[cfg(test)]
+    archive_queue_drain_started: std::sync::atomic::AtomicBool,
     shard_top_blocks_db: ShardTopBlocksDb,
     full_node_state_db: Arc<NodeStateDb>,
 
@@ -521,8 +527,13 @@ impl InternalDb {
         let result = Self {
             archive_tasks: Arc::default(),
             archive_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+            archive_io_owners: Arc::default(),
             #[cfg(test)]
             archive_test_gate: Default::default(),
+            #[cfg(test)]
+            archive_enqueue_test_gate: Default::default(),
+            #[cfg(test)]
+            archive_queue_drain_started: Default::default(),
             repair_leases,
             #[cfg(test)]
             recovery_node_db: db.clone(),
@@ -638,7 +649,12 @@ impl InternalDb {
         // owner even if its caller has disappeared. A failed owner must not skip
         // shutdown of the state worker, nor disappear from the shutdown result.
         self.archive_admission.close();
+        self.archive_io_owners.close();
         let archived = self.archive_tasks.wait().await;
+        #[cfg(test)]
+        self.archive_queue_drain_started.store(true, Ordering::SeqCst);
+        self.archive_io_owners.wait().await;
+        debug_assert_eq!(self.archive_io_owners.outstanding(), 0, "Archive queue owners remain at state shutdown");
         let states = match &self.state_db {
             StateDb::Dynamic(db) => db.stop().await,
             StateDb::Archive(_) => Ok(()),
@@ -665,6 +681,21 @@ impl InternalDb {
     ) {
         *self.archive_test_gate.lock().unwrap() = Some((entered, release));
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_panic_archive_after_handle_enqueue(
+        &self, entered: Arc<tokio::sync::Notify>, release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.archive_enqueue_test_gate.lock().unwrap() = Some((entered, release));
+    }
+    #[cfg(test)]
+    pub(crate) fn test_archive_io_outstanding(&self) -> usize { self.archive_io_owners.outstanding() }
+    #[cfg(test)]
+    pub(crate) fn test_archive_queue_drain_started(&self) -> bool {
+        self.archive_queue_drain_started.load(Ordering::SeqCst)
+    }
+    #[cfg(test)]
+    pub(crate) async fn test_join_archive_tasks(&self) -> Result<()> { self.archive_tasks.wait().await }
 
     fn store_block_handle(
         &self,
@@ -1989,6 +2020,7 @@ impl InternalDb {
             .acquire_owned()
             .await
             .map_err(|_| error!("Archive migration admission stopped"))?;
+        let io_custody = self.archive_io_owners.enter()?;
         let manager = self.archive_manager.clone();
         let handles = self.block_handle_storage.clone();
         let tasks = self.archive_tasks.clone();
@@ -1997,9 +2029,12 @@ impl InternalDb {
         let block_id = id.clone();
         #[cfg(test)]
         let gate = self.archive_test_gate.lock().unwrap().take();
+        #[cfg(test)]
+        let enqueue_test_gate = self.archive_enqueue_test_gate.lock().unwrap().take();
         let (sent, received) = tokio::sync::oneshot::channel();
         self.archive_tasks.spawn("archive migration IO", async move {
             let _permit = permit;
+            let owner_custody = io_custody;
             #[cfg(test)]
             if let Some((entered, release)) = gate {
                 entered.notify_one();
@@ -2015,11 +2050,20 @@ impl InternalDb {
                     let handle = handle.clone();
                     let callback = callback.clone();
                     let observer = observer.clone();
+                    let queue_custody = owner_custody.clone();
+                    #[cfg(test)]
+                    let enqueue_test_gate = enqueue_test_gate.clone();
                     async move {
                         if handle.set_archived() {
-                            handles.save_handle(&handle, callback)?;
+                            handles.save_handle_with_archive_custody(&handle, callback, queue_custody.clone())?;
                         }
-                        handles.sync_pending_observed(observer).await
+                        #[cfg(test)]
+                        if let Some((entered, release)) = enqueue_test_gate {
+                            entered.notify_one();
+                            release.notified().await;
+                            panic!("controlled archive owner panic after handle enqueue");
+                        }
+                        handles.sync_pending_observed_with_archive_custody(observer, queue_custody).await
                     }
                 },
             ))
@@ -2027,7 +2071,7 @@ impl InternalDb {
             .await
             .map_err(|_| error!("Archive migration panicked for {block_id}"))
             .and_then(|result| result)
-            .map_err(|err| error!("Failed to move block to archive: {block_id}. Error: {err}"));
+            .map_err(|err| err.context(format!("Failed to move block to archive: {block_id}")));
             if let Err(error) = &result {
                 admission.close();
                 tasks.record_error(format!("archive migration {block_id}: {error}"));

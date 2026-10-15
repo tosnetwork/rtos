@@ -33,7 +33,7 @@ strum = '0.18'
 strum_macros = '0.18'
 thiserror = '1.0'
 tokio = { features = ['fs', 'rt-multi-thread'], version = '1.4' }
-tokio-util = '0.7'
+tokio-util = { version = '0.7', features = ['rt'] }
 adnl = { path = '../../adnl' }
 rtos_block = { path = '../../block' }
 lockfree = { path = '../../lockfree' }

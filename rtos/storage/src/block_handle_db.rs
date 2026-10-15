@@ -480,8 +480,9 @@ pub trait Callback: Sync + Send {
 }
 
 enum HandleCommand {
-    Work(StoreJob, Option<Arc<dyn Callback>>),
-    Barrier(tokio::sync::oneshot::Sender<Result<()>>, crate::durability::SyncObservation),
+    Work(StoreJob, Option<Arc<dyn Callback>>, Option<crate::archives::io_owners::ArchiveIoTicket>),
+    Barrier(tokio::sync::oneshot::Sender<Result<()>>, crate::durability::SyncObservation,
+        Option<crate::archives::io_owners::ArchiveIoTicket>),
 }
 
 /// One page of a validator-state prefix scan: the entries read, the last key
@@ -538,9 +539,9 @@ impl BlockHandleStorage {
 
             let mut failed = false;
             while let Some(command) = reader.recv().await {
-                let (job, callback) = match command {
-                    HandleCommand::Work(job, callback) => (job, callback),
-                    HandleCommand::Barrier(reply, observer) => {
+                let (job, callback, _archive_custody) = match command {
+                    HandleCommand::Work(job, callback, custody) => (job, callback, custody),
+                    HandleCommand::Barrier(reply, observer, _archive_custody) => {
                         let result = if failed {
                             Err(error!("Handle storage has an unacknowledged write failure"))
                         } else {
@@ -648,14 +649,14 @@ impl BlockHandleStorage {
     pub fn drop_validator_state(&self, key: String) -> Result<()> {
         self.delete_state(&key)?;
         self.storer
-            .send(HandleCommand::Work(StoreJob::DropValidatorState(key), None))
+            .send(HandleCommand::Work(StoreJob::DropValidatorState(key), None, None))
             .map_err(|_| error!("Cannot drop validator state: storer thread dropped"))
     }
 
     pub fn drop_full_node_state(&self, key: String) -> Result<()> {
         self.delete_state(&key)?;
         self.storer
-            .send(HandleCommand::Work(StoreJob::DropFullNodeState(key), None))
+            .send(HandleCommand::Work(StoreJob::DropFullNodeState(key), None, None))
             .map_err(|_| error!("Cannot drop fullnode state: storer thread dropped"))
     }
 
@@ -707,9 +708,25 @@ impl BlockHandleStorage {
         &self,
         observer: crate::durability::SyncObservation,
     ) -> Result<()> {
+        self.sync_pending_with_custody(observer, None).await
+    }
+
+    pub async fn sync_pending_observed_with_archive_custody(
+        &self,
+        observer: crate::durability::SyncObservation,
+        custody: crate::archives::io_owners::ArchiveIoTicket,
+    ) -> Result<()> {
+        self.sync_pending_with_custody(observer, Some(custody)).await
+    }
+
+    async fn sync_pending_with_custody(
+        &self,
+        observer: crate::durability::SyncObservation,
+        custody: Option<crate::archives::io_owners::ArchiveIoTicket>,
+    ) -> Result<()> {
         let (send, receive) = tokio::sync::oneshot::channel();
         self.storer
-            .send(HandleCommand::Barrier(send, observer))
+            .send(HandleCommand::Barrier(send, observer, custody))
             .map_err(|_| error!("Handle writer stopped"))?;
         receive.await.map_err(|_| error!("Handle writer failed during durability barrier"))?
     }
@@ -719,25 +736,44 @@ impl BlockHandleStorage {
         handle: &Arc<BlockHandle>,
         callback: Option<Arc<dyn Callback>>, // not invoked in no-cache mode
     ) -> Result<()> {
+        self.save_handle_with_custody(handle, callback, None)
+    }
+
+    pub fn save_handle_with_archive_custody(
+        &self,
+        handle: &Arc<BlockHandle>,
+        callback: Option<Arc<dyn Callback>>,
+        custody: crate::archives::io_owners::ArchiveIoTicket,
+    ) -> Result<()> {
+        self.save_handle_with_custody(handle, callback, Some(custody))
+    }
+
+    fn save_handle_with_custody(
+        &self,
+        handle: &Arc<BlockHandle>,
+        callback: Option<Arc<dyn Callback>>,
+        custody: Option<crate::archives::io_owners::ArchiveIoTicket>,
+    ) -> Result<()> {
         if self.no_cache {
+            let _custody = custody;
             return self.handle_db.put_raw(handle.id().root_hash().as_slice(), &handle.serialize());
         }
         self.storer
-            .send(HandleCommand::Work(StoreJob::SaveHandle(handle.clone()), callback))
+            .send(HandleCommand::Work(StoreJob::SaveHandle(handle.clone()), callback, custody))
             .map_err(|_| error!("Cannot store handle {}: storer thread dropped", handle.id()))
     }
 
     pub fn save_full_node_state(&self, key: String, id: &BlockIdExt) -> Result<()> {
         let refid = self.create_state(key.clone(), id)?;
         self.storer
-            .send(HandleCommand::Work(StoreJob::SaveFullNodeState((key, refid)), None))
+            .send(HandleCommand::Work(StoreJob::SaveFullNodeState((key, refid)), None, None))
             .map_err(|_| error!("Cannot store full node state {}: storer thread dropped", id))
     }
 
     pub fn save_validator_state(&self, key: String, id: &BlockIdExt) -> Result<()> {
         let refid = self.create_state(key.clone(), id)?;
         self.storer
-            .send(HandleCommand::Work(StoreJob::SaveValidatorState((key, refid)), None))
+            .send(HandleCommand::Work(StoreJob::SaveValidatorState((key, refid)), None, None))
             .map_err(|_| error!("Cannot store validator state {}: storer thread dropped", id))
     }
 
@@ -865,7 +901,7 @@ impl BlockHandleStorage {
     pub fn drop_handle(&self, id: BlockIdExt, callback: Option<Arc<dyn Callback>>) -> Result<()> {
         let _ = self.handle_cache.remove(id.root_hash());
         self.storer
-            .send(HandleCommand::Work(StoreJob::DropHandle(id.clone()), callback))
+            .send(HandleCommand::Work(StoreJob::DropHandle(id.clone()), callback, None))
             .map_err(|_| error!("Cannot drop handle {}: storer thread dropped", id))?;
         Ok(())
     }
@@ -1000,3 +1036,7 @@ impl BlockHandleStorage {
 
 #[cfg(test)]
 impl BlockHandleStorage {}
+
+#[cfg(test)]
+#[path = "tests/test_archive_queue_custody.rs"]
+mod archive_queue_custody_tests;
