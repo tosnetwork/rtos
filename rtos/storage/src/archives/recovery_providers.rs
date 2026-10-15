@@ -57,6 +57,14 @@ impl RecoveryProviders {
         let providers = Self { participants, protection: protection.clone() };
         providers.validate_controls(root)?;
         providers.verify_provider_and_map_inventories(root)?;
+        if root.state == State::Cleaned {
+            #[cfg(target_os = "linux")]
+            if super::recovery_data::inventory(&providers)? != root.data {
+                fail!("Cleaned recovery archive data inventory mismatch");
+            }
+            #[cfg(not(target_os = "linux"))]
+            fail!("Archive data inventory is not implemented on this platform");
+        }
         Ok(providers)
     }
     /// Building can have partially enrolled providers; Cleaned can have
