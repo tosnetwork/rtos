@@ -11,7 +11,7 @@ const MAIN: u8 = 1;
 const KEY: u8 = 2;
 const ARCHIVE: u8 = 4;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Identity { pub bytes: u64, pub digest: [u8; 32] }
 impl Identity {
     pub(crate) fn native(bytes: &[u8]) -> Result<Self> {
@@ -41,6 +41,47 @@ pub(crate) struct Provider {
     pub relative: PathBuf,
 }
 impl Provider {
+    /// Bind a trusted existing epoch path to its configured anchor and native
+    /// identity. This inspection does not replace an owned filesystem handle.
+    pub(crate) fn epoch(
+        path: &std::path::Path, anchor_root: &std::path::Path,
+        anchor: Anchor, range: (u32, u32), native_identity: &[u8],
+    ) -> Result<Self> {
+        if anchor == Anchor::Node { fail!("Epoch provider requires epoch anchor"); }
+        fn existing_directory(path: &std::path::Path) -> Result<PathBuf> {
+            let absolute = if path.is_absolute() { path.to_path_buf() }
+                else { std::env::current_dir()?.join(path) };
+            let mut prefix = PathBuf::new();
+            for part in absolute.components() {
+                if matches!(part, Component::ParentDir) { fail!("Parent traversal in recovery anchor"); }
+                prefix.push(part.as_os_str());
+                let metadata = std::fs::symlink_metadata(&prefix)?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    fail!("Invalid recovery anchor directory");
+                }
+            }
+            Ok(std::fs::canonicalize(absolute)?)
+        }
+        let path = existing_directory(path)?;
+        let root = existing_directory(anchor_root)?;
+        let relative = path.strip_prefix(&root)?.to_path_buf();
+        if anchor == Anchor::ExplicitEpoch && !relative.as_os_str().is_empty() {
+            fail!("Explicit epoch anchor must be the configured directory");
+        }
+        let mut digest = Sha256::new();
+        let raw = root.as_os_str().as_encoded_bytes();
+        digest.update(b"RTOS archive recovery anchor v1");
+        digest.update([anchor as u8]);
+        digest.update(u64::try_from(raw.len())?.to_le_bytes());
+        digest.update(raw);
+        let value = Self {
+            roles: ARCHIVE, anchor, anchor_identity: digest.finalize(),
+            database: Identity::native(native_identity)?, range: Some(range), relative,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
     fn validate(&self) -> Result<()> {
         self.database.validate()?;
         if self.anchor_identity == [0; 32] { fail!("Missing recovery anchor identity"); }

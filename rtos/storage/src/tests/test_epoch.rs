@@ -272,3 +272,79 @@ async fn missing_discovery_ancestor_does_not_hide_parent_traversal() {
     assert!(scan_existing(&config, true).await.is_err());
     assert!(!dir.path().join("missing").exists());
 }
+
+#[tokio::test]
+async fn copied_native_identity_refuses_router_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = RocksDb::new(dir.path(), "main", None, AccessType::ReadWrite).unwrap();
+    let binding = main.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
+    let startup = binding.view().unwrap().enter().unwrap();
+    let paths = [dir.path().join("first"), dir.path().join("second")];
+    for (i, path) in paths.iter().enumerate() {
+        std::fs::create_dir_all(path).unwrap();
+        let start = i as u32 * 40_000;
+        write_epoch_meta(path, &EpochMeta { mc_seq_no_start: start, mc_seq_no_end: start+39_999 }).await.unwrap();
+        let db = RocksDb::new(path, "archive_db", None, AccessType::ReadWrite).unwrap();
+        db.db().put(b"preserve", b"old bytes").unwrap(); db.sync_wal().unwrap();
+    }
+    // Modern RocksDB restores identity from its manifest. Copy an actual
+    // checkpoint, not just the legacy IDENTITY file.
+    std::fs::remove_dir_all(paths[1].join("archive_db")).unwrap();
+    {
+        let source = RocksDb::new(&paths[0], "archive_db", None, AccessType::ReadWrite).unwrap();
+        rocksdb::checkpoint::Checkpoint::new(source.db()).unwrap()
+            .create_checkpoint(paths[1].join("archive_db")).unwrap();
+        let copied = RocksDb::new(&paths[1], "archive_db", None, AccessType::ReadWrite).unwrap();
+        assert_eq!(source.db().get_db_identity().unwrap(), copied.db().get_db_identity().unwrap());
+    }
+    let config = ArchivalModeConfig { epoch_size: 40_000, new_epochs_path: dir.path().join("absent"),
+        existing_epochs: paths.iter().map(|path| EpochEntry { path: path.clone() }).collect() };
+    let error = EpochRouter::new(&config, &startup).await.err().unwrap();
+    assert!(error.to_string().contains("Duplicate native identity"), "{error}");
+    assert!(!config.new_epochs_path.exists());
+    for path in paths {
+        let db = RocksDb::new(path, "archive_db", None, AccessType::ReadWrite).unwrap();
+        assert_eq!(db.db().get(b"preserve").unwrap().as_deref(), Some(b"old bytes".as_slice()));
+    }
+}
+
+#[tokio::test]
+async fn discovered_provider_binding_survives_actual_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = RocksDb::new(dir.path(), "main", None, AccessType::ReadWrite).unwrap();
+    let binding = main.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
+    let startup = binding.view().unwrap().enter().unwrap();
+    let config = ArchivalModeConfig { epoch_size: 40_000, new_epochs_path: dir.path().join("epochs"), existing_epochs: vec![] };
+    let router = EpochRouter::new(&config, &startup).await.unwrap();
+    let before = {
+        let epoch = router.resolve_or_create(45_000).await.unwrap();
+        let provider = epoch.recovery_provider();
+        assert_eq!(provider.anchor, Anchor::Discovery);
+        assert_eq!(provider.range, Some((40_000, 79_999)));
+        assert_eq!(provider.relative, PathBuf::from("epoch_1"));
+        assert_eq!(provider.database, Identity::native(&epoch.db().db().get_db_identity().unwrap()).unwrap());
+        provider.digest().unwrap()
+    };
+    drop(router);
+    let router = EpochRouter::new(&config, &startup).await.unwrap();
+    assert_eq!(router.resolve(45_000).unwrap().recovery_provider().digest().unwrap(), before);
+}
+
+#[tokio::test]
+async fn epoch_cannot_reuse_main_native_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = RocksDb::new(dir.path(), "main", None, AccessType::ReadWrite).unwrap();
+    let binding = main.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
+    let startup = binding.view().unwrap().enter().unwrap();
+    let epoch_path = dir.path().join("epoch"); std::fs::create_dir(&epoch_path).unwrap();
+    write_epoch_meta(&epoch_path, &EpochMeta { mc_seq_no_start: 0, mc_seq_no_end: 39_999 }).await.unwrap();
+    rocksdb::checkpoint::Checkpoint::new(main.db()).unwrap()
+        .create_checkpoint(epoch_path.join("archive_db")).unwrap();
+    {
+        let copied = RocksDb::new(&epoch_path, "archive_db", None, AccessType::ReadWrite).unwrap();
+        assert_eq!(main.db().get_db_identity().unwrap(), copied.db().get_db_identity().unwrap());
+    }
+    let config = ArchivalModeConfig { epoch_size: 40_000, new_epochs_path: dir.path().join("absent"), existing_epochs: vec![EpochEntry { path: epoch_path }] };
+    let error = EpochRouter::new(&config, &startup).await.err().unwrap();
+    assert!(error.to_string().contains("Duplicate native identity"), "{error}");
+}

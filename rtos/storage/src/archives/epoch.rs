@@ -7,7 +7,8 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use super::context::{ArchiveOperation, ArchiveProvider, ArchiveView};
+use super::{context::{ArchiveOperation, ArchiveProvider, ArchiveView},
+    recovery_participant::{Anchor, Identity, Provider}};
 use crate::{
     archives::ARCHIVE_SLICE_SIZE,
     db::rocksdb::{AccessType, RocksDb},
@@ -149,6 +150,7 @@ pub(crate) async fn scan_existing(config: &ArchivalModeConfig, complete: bool) -
 
 /// Runtime state for a single epoch
 pub struct Epoch {
+    recovery: Provider,
     binding: ArchiveProvider,
     mc_seq_no_start: u32,
     mc_seq_no_end: u32,
@@ -157,6 +159,8 @@ pub struct Epoch {
 }
 
 impl Epoch {
+    pub(crate) fn recovery_provider(&self) -> &Provider { &self.recovery }
+
     pub fn binding(&self) -> &ArchiveProvider { &self.binding }
 
     pub fn mc_seq_no_start(&self) -> u32 {
@@ -194,11 +198,21 @@ impl EpochRouter {
         let view = startup.view();
         let existing = scan_existing(config, false).await?;
         let epochs = lockfree::map::Map::new();
+        let mut identities = std::collections::HashSet::new();
+        identities.insert(Identity::native(&view.binding().db().db().get_db_identity()?)?);
         for entry in existing {
             let db = RocksDb::new(&entry.path, "archive_db", None, AccessType::ReadWrite)?;
+            let native = db.db().get_db_identity()?;
+            let recovery = Provider::epoch(&entry.path,
+                if entry.explicit { &entry.path } else { &config.new_epochs_path },
+                if entry.explicit { Anchor::ExplicitEpoch } else { Anchor::Discovery },
+                (entry.meta.mc_seq_no_start, entry.meta.mc_seq_no_end), &native)?;
+            if !identities.insert(recovery.database) {
+                fail!("Duplicate native identity among archive providers");
+            }
             let binding = db.bind_archive_domain(view.binding().domain().clone())?;
             epochs.insert(entry.meta.mc_seq_no_start, Arc::new(Epoch {
-                binding, mc_seq_no_start: entry.meta.mc_seq_no_start,
+                recovery, binding, mc_seq_no_start: entry.meta.mc_seq_no_start,
                 mc_seq_no_end: entry.meta.mc_seq_no_end,
                 path: Arc::new(entry.path), db,
             }));
@@ -259,6 +273,12 @@ impl EpochRouter {
         write_epoch_meta(&epoch_dir, &meta).await?;
 
         let db = RocksDb::new(&epoch_dir, "archive_db", None, AccessType::ReadWrite)?;
+        let recovery = Provider::epoch(&epoch_dir, &self.new_epochs_path, Anchor::Discovery,
+            (start, end), &db.db().get_db_identity()?)?;
+        if recovery.database == Identity::native(&self.view.binding().db().db().get_db_identity()?)?
+            || self.epochs.iter().any(|entry| entry.val().recovery.database == recovery.database) {
+            fail!("Duplicate native identity among archive providers");
+        }
         let binding = db.bind_archive_domain(self.view.binding().domain().clone())?;
 
         log::info!(
@@ -268,7 +288,7 @@ impl EpochRouter {
         );
 
         let epoch = Arc::new(Epoch {
-            binding,
+            recovery, binding,
             mc_seq_no_start: start,
             mc_seq_no_end: end,
             path: Arc::new(epoch_dir),
