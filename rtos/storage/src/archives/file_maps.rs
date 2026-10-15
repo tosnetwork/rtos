@@ -11,6 +11,7 @@
  */
 use super::context::{ArchiveContextError, ArchiveOperation};
 use super::ARCHIVE_SLICE_SIZE;
+use super::truncation_selection::TruncationSelection;
 #[cfg(feature = "telemetry")]
 use crate::StorageTelemetry;
 use crate::{
@@ -220,12 +221,8 @@ impl FileDescription {
         self.archive_slice.destroy().await
     }
 
-    async fn trunc<F: Fn(&BlockIdExt) -> bool>(
-        &mut self,
-        block_id: &BlockIdExt,
-        delete_condition: &F,
-    ) -> Result<()> {
-        self.archive_slice.trunc(block_id, delete_condition).await
+    async fn trunc(&mut self, selection: Arc<TruncationSelection>) -> Result<()> {
+        self.archive_slice.trunc(selection).await
     }
 
     pub fn blocks_ranges(&self) -> &lockfree::map::Map<ShardIdent, BlockRanges> {
@@ -545,11 +542,8 @@ impl FileMap {
         }
     }
 
-    pub async fn trunc<F: Fn(&BlockIdExt) -> bool>(
-        &self,
-        block_id: &BlockIdExt,
-        delete_condition: &F,
-    ) -> Result<()> {
+    pub async fn trunc(&self, selection: Arc<TruncationSelection>) -> Result<()> {
+        let block_id = selection.cutoff();
         let _deletion = self.protection.deletion().await;
         if self.protection.archive_range(0, None) {
             fail!("Archive truncation conflicts with repair custody");
@@ -584,7 +578,7 @@ impl FileMap {
             .ok_or_else(|| error!("unable to get FileDescription as mutable"))?;
         // clear finalized flag
         self.storage.put_value(&entry.key.into(), &PackageIndexEntry::new())?;
-        fd.trunc(block_id, delete_condition).await
+        fd.trunc(selection).await
     }
 }
 
@@ -649,12 +643,8 @@ impl FileMaps {
         }
     }
 
-    pub async fn trunc<F: Fn(&BlockIdExt) -> bool>(
-        &self,
-        block_id: &BlockIdExt,
-        delete_condition: &F,
-    ) -> Result<()> {
-        self.files.trunc(block_id, delete_condition).await?;
-        self.key_files.trunc(block_id, delete_condition).await
+    pub async fn trunc(&self, selection: Arc<TruncationSelection>) -> Result<()> {
+        self.files.trunc(selection.clone()).await?;
+        self.key_files.trunc(selection).await
     }
 }

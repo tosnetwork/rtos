@@ -10,6 +10,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::context::{ArchiveOperation, ArchiveProvider, ArchiveView};
+use super::truncation_selection::TruncationSelection;
 #[cfg(feature = "telemetry")]
 use crate::StorageTelemetry;
 use crate::{
@@ -998,12 +999,8 @@ impl ArchiveManager {
         Ok(fd)
     }
 
-    pub async fn trunc<F: Fn(&BlockIdExt) -> bool>(
-        &self,
-        block_id: &BlockIdExt,
-        delete_condition: &F,
-    ) -> Result<()> {
-        self.file_maps.trunc(block_id, delete_condition).await
+    pub async fn trunc(&self, selection: Arc<TruncationSelection>) -> Result<()> {
+        self.file_maps.trunc(selection).await
     }
 
     pub async fn lookup_block_by_seqno(

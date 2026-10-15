@@ -9,6 +9,7 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+use super::truncation_selection::TruncationSelection;
 #[cfg(feature = "telemetry")]
 use crate::StorageTelemetry;
 use crate::{
@@ -924,11 +925,8 @@ impl ArchiveSlice {
     }
 
     /// truncs slice starting from master block_id
-    pub async fn trunc(
-        &mut self,
-        block_id: &BlockIdExt,
-        delete_condition: &impl Fn(&BlockIdExt) -> bool,
-    ) -> Result<()> {
+    pub async fn trunc(&mut self, selection: Arc<TruncationSelection>) -> Result<()> {
+        let block_id = selection.cutoff();
         log::info!(
             target: TARGET,
             "truncating by mc_seq_no: {}, sliced_mode: {}",
@@ -1059,7 +1057,7 @@ impl ArchiveSlice {
                     PackageEntryId::ProofLink(id) => id,
                     _ => fail!("Unsupported entry: {entry_id:?}"),
                 };
-                if delete_condition(id) {
+                if selection.should_delete(id) {
                     log::trace!(target: TARGET, "repack package: delete {entry_id}");
                     if let Some(offset) = block_offset {
                         index_offsets.insert((id.shard().clone(), offset), None);

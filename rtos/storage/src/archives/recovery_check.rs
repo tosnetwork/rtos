@@ -213,6 +213,7 @@ impl OpenProvider {
         Ok(())
     }
     fn statuses(&self) -> Result<usize> {
+        super::recovery_guard::ensure_root_controls_clear(&self.db)?;
         let mut count = 0;
         for name in &self.families {
             let parsed = name

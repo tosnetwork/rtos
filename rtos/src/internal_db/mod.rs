@@ -2474,23 +2474,13 @@ impl InternalDb {
             .load_block_handle(&prev_id)?
             .ok_or_else(|| error!("there is no handle for block {}", prev_id))?;
         let prev_block = self.load_block_data(&prev_handle).await?;
-        let top_blocks = prev_block.shard_hashes()?.top_blocks_all()?;
+        let top_blocks: Arc<[BlockIdExt]> = prev_block.shard_hashes()?.top_blocks_all()?.into();
 
         // truncate archives
-        self.archive_manager
-            .trunc(mc_block_id, &|id: &BlockIdExt| {
-                if id.shard().is_masterchain() {
-                    return id.seq_no() >= mc_block_id.seq_no();
-                } else {
-                    for tb in &top_blocks {
-                        if id.shard().intersect_with(tb.shard()) && id.seq_no() > tb.seq_no() {
-                            return true;
-                        }
-                    }
-                }
-                false
-            })
-            .await?;
+        let selection = Arc::new(storage::archives::truncation_selection::TruncationSelection::new(
+            mc_block_id.clone(), top_blocks.clone(),
+        )?);
+        self.archive_manager.trunc(selection).await?;
 
         // truncate handles and prev/next links
         fn clear_dbs(db: &InternalDb, id: BlockIdExt) {
@@ -2514,7 +2504,7 @@ impl InternalDb {
             if id.shard().is_masterchain() && id.seq_no() >= mc_block_id.seq_no() {
                 clear_dbs(self, id);
             } else {
-                for tb in &top_blocks {
+                for tb in top_blocks.iter() {
                     if id.shard().intersect_with(tb.shard()) && id.seq_no() > tb.seq_no() {
                         clear_dbs(self, id);
                         break;
@@ -2525,7 +2515,7 @@ impl InternalDb {
         })?;
         self.next2_block_db.for_each(&mut |_key, val| {
             let id = BlockIdExt::deserialize(&val)?;
-            for tb in &top_blocks {
+            for tb in top_blocks.iter() {
                 if id.shard().intersect_with(tb.shard()) && id.seq_no() > tb.seq_no() {
                     clear_dbs(self, id);
                     break;
@@ -2553,7 +2543,7 @@ impl InternalDb {
         }
 
         clear_last_handle(self, &prev_id);
-        for id in &top_blocks {
+        for id in top_blocks.iter() {
             clear_last_handle(self, id);
         }
 

@@ -51,6 +51,9 @@ pub mod recovery_check;
 
 pub mod recovery_guard;
 
+pub(crate) mod recovery_root;
+pub mod truncation_selection;
+
 pub mod io_owners;
 
 pub mod context;

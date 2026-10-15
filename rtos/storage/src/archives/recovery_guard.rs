@@ -15,6 +15,22 @@ pub(crate) fn known_status_key(key: &[u8]) -> bool {
 
 type NativeDb = DBWithThreadMode<MultiThreaded>;
 
+/// Ordinary startup/inspection must not interpret pending root work as an
+/// absent slice. The exclusive recovery bootstrap uses a separate authority.
+pub(crate) fn ensure_root_controls_clear(db: &NativeDb) -> Result<()> {
+    use super::recovery_root::{RootHeader, PARTICIPANT_KEY, ROOT_KEY};
+    if let Some(bytes) = db.get_pinned(ROOT_KEY)? {
+        let _header = RootHeader::decode(&bytes)?;
+        fail!("Pending archive root recovery");
+    }
+    if db.get_pinned(PARTICIPANT_KEY)?.is_some() {
+        // A backlink without independently checked root authority never
+        // authorizes cleanup, including unknown future participant formats.
+        fail!("Pending or unsupported archive recovery participant");
+    }
+    Ok(())
+}
+
 fn statuses(db: &NativeDb, names: impl IntoIterator<Item = String>) -> Result<()> {
     for name in names {
         let Some(id) =
@@ -94,6 +110,7 @@ fn packages(root: &Path) -> Result<()> {
 
 pub(crate) fn ensure_provider_clear(db: &NativeDb, root: &Path, names: &[String]) -> Result<()> {
     (|| {
+        ensure_root_controls_clear(db)?;
         statuses(db, names.iter().cloned())?;
         packages(root)
     })()
@@ -102,6 +119,7 @@ pub(crate) fn ensure_provider_clear(db: &NativeDb, root: &Path, names: &[String]
 
 pub(crate) fn ensure_open_provider_clear(db: &NativeDb, root: &Path) -> Result<()> {
     (|| {
+        ensure_root_controls_clear(db)?;
         let names = NativeDb::list_cf(&rocksdb::Options::default(), db.path())?;
         statuses(db, names)?;
         packages(root)
@@ -112,6 +130,7 @@ pub(crate) fn ensure_open_provider_clear(db: &NativeDb, root: &Path) -> Result<(
 pub(crate) fn ensure_slice_clear(db: &NativeDb, root: &Path, id: u32, key: bool) -> Result<()> {
     let name = format!("status_{}db_{id}", if key { "key_" } else { "" });
     (|| {
+        ensure_root_controls_clear(db)?;
         if db.cf_handle(&name).is_some() {
             statuses(db, [name])?;
         }

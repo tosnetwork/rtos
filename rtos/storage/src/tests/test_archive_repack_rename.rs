@@ -145,7 +145,7 @@ async fn producer() {
         std::fs::write(root.join("armed"), b"seed-synced").unwrap();
     }
     eprintln!("RENAME SEEDS_SYNCED pack={}", pack.display());
-    let result = slice.trunc(handles[2].id(), &|id| id.seq_no() >= 11).await;
+    let result = slice.trunc(Arc::new(TruncationSelection::new(handles[2].id().clone(), Vec::new()).unwrap())).await;
     let api_ok = result.is_ok();
     let api_error = result.err().map(|error| error.to_string());
     let indexed = slice.package_index.get(&0).is_some();

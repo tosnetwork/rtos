@@ -97,7 +97,7 @@ async fn exercise(shifted: bool, proof: bool, reader: usize) {
         "REPACK BEFORE pack={} old_offset={old_offset} shifted={shifted} proof={proof}",
         pack.display()
     );
-    slice.trunc(handles[2].id(), &|id| id.seq_no() >= 11).await.unwrap();
+    slice.trunc(Arc::new(TruncationSelection::new(handles[2].id().clone(), Vec::new()).unwrap())).await.unwrap();
     db.sync_wal().unwrap();
     assert!(!PathBuf::from(format!("{}.new", pack.display())).exists());
     if proof {
@@ -213,7 +213,7 @@ async fn multiple_retained_shifts_with_interleaved_proofs() {
                 .unwrap(),
         );
     }
-    slice.trunc(handles[2].id(), &|id| id.seq_no() >= 11).await.unwrap();
+    slice.trunc(Arc::new(TruncationSelection::new(handles[2].id().clone(), Vec::new()).unwrap())).await.unwrap();
     let mut shifts = Vec::new();
     let mut live = Vec::new();
     for (position, index) in [0, 3, 4].into_iter().enumerate() {

@@ -301,7 +301,7 @@ impl TestArchiveManager {
         let trunc_block_id = Self::master_block_id(mc_seq_no, version);
         println!("trunc on {}", trunc_block_id);
         self.archive_manager
-            .trunc(&trunc_block_id, &|id: &BlockIdExt| id.seq_no() >= trunc_block_id.seq_no())
+            .trunc(Arc::new(crate::archives::truncation_selection::TruncationSelection::new(trunc_block_id.clone(), Vec::new()).unwrap()))
             .await
             .unwrap();
 
