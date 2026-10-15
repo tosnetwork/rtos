@@ -50,7 +50,7 @@ pub struct CheckReport {
 struct OpenProvider {
     db: NativeDb,
     _caches: Vec<rocksdb::Cache>,
-    _lock: File,
+    _lock: std::sync::Arc<File>,
     root: PathBuf,
     database: PathBuf,
     families: BTreeSet<String>,
@@ -77,14 +77,7 @@ fn file_identity(metadata: &fs::Metadata) -> (u64, u64) {
     (metadata.dev(), metadata.ino())
 }
 
-fn shared_lock(database: &Path) -> Result<File> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(database.join("LOCK"))?;
-    if !file.metadata()?.is_file() {
-        fail!("Database LOCK is not a regular file");
-    }
+fn shared_lock(file: &File, database: &Path) -> Result<()> {
     // SAFETY: flock is a native Linux structure, and fcntl receives its valid pointer.
     let mut lock: libc::flock = unsafe { std::mem::zeroed() };
     lock.l_type = libc::F_RDLCK as _;
@@ -96,17 +89,64 @@ fn shared_lock(database: &Path) -> Result<File> {
             std::io::Error::last_os_error()
         ));
     }
-    Ok(file)
+    Ok(())
+}
+#[derive(Default)]
+struct ProviderLocks {
+    held: BTreeMap<(u64, u64), std::sync::Arc<File>>,
+    // If a pathname changes to an already-held inode during open, keep the new
+    // descriptor until every provider DB has dropped. Closing it early would
+    // release this process's existing POSIX lock on that inode.
+    deferred: Vec<File>,
+}
+impl ProviderLocks {
+    fn acquire(&mut self, database: &Path) -> Result<std::sync::Arc<File>> {
+        let path = database.join("LOCK");
+        let before = fs::symlink_metadata(&path)?;
+        if !before.is_file() || before.file_type().is_symlink() {
+            fail!("Invalid database LOCK file");
+        }
+        let expected = file_identity(&before);
+        if self.held.contains_key(&expected) {
+            fail!("Provider LOCK inode alias refused before open");
+        }
+        self.deferred
+            .push(fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path)?);
+        let file = self.deferred.last().ok_or_else(|| error!("Missing inspection descriptor"))?;
+        let opened = file.metadata()?;
+        let actual = file_identity(&opened);
+        if self.held.contains_key(&actual) {
+            fail!("Provider LOCK changed to an already-held inode");
+        }
+        if !opened.is_file() || actual != expected {
+            fail!("Provider LOCK changed during open");
+        }
+        shared_lock(file, database)?;
+        let file = std::sync::Arc::new(
+            self.deferred.pop().ok_or_else(|| error!("Missing inspection descriptor"))?,
+        );
+        self.held.insert(actual, file.clone());
+        Ok(file)
+    }
 }
 impl OpenProvider {
+    #[cfg(test)]
     fn open(root: PathBuf, name: &str, range: Option<(u32, u32)>) -> Result<Self> {
+        Self::open_with_locks(root, name, range, &mut ProviderLocks::default())
+    }
+    fn open_with_locks(
+        root: PathBuf,
+        name: &str,
+        range: Option<(u32, u32)>,
+        locks: &mut ProviderLocks,
+    ) -> Result<Self> {
         let database = resolve_checked(&root, Path::new(name))?;
         let directory = fs::symlink_metadata(&database)?;
         if !directory.is_dir() {
             fail!("Provider is not a directory");
         }
         let directory_identity = file_identity(&directory);
-        let lock = shared_lock(&database)?;
+        let lock = locks.acquire(&database)?;
         let lock_identity = file_identity(&lock.metadata()?);
         let initial_inventory = inventory(&database, false)?;
         let mut options = Options::default();
@@ -323,6 +363,25 @@ fn inventory(root: &Path, reject_staging: bool) -> Result<Inventory> {
     Ok(result)
 }
 
+fn package_inventory(root: &Path) -> Result<Option<Inventory>> {
+    let archive = root.join("archive");
+    if !entry_exists(&archive)? {
+        return Ok(None);
+    }
+    let archive = resolve_checked(root, &archive)?;
+    if !fs::symlink_metadata(&archive)?.is_dir() {
+        fail!("Archive path is not a directory");
+    }
+    let packages = archive.join("packages");
+    if !entry_exists(&packages)? {
+        return Ok(None);
+    }
+    let packages = resolve_checked(root, &packages)?;
+    if !fs::symlink_metadata(&packages)?.is_dir() {
+        fail!("Package path is not a directory");
+    }
+    Ok(Some(inventory(&packages, true)?))
+}
 pub fn inspect(config: &CheckConfig) -> Result<CheckReport> {
     inspect_with_completion(config, || {})
 }
@@ -336,7 +395,9 @@ fn inspect_with_completion(config: &CheckConfig, complete: impl FnOnce()) -> Res
         fail!("Node working directory is not a directory");
     }
     let main_root = resolve_checked(&working, &config.node_root)?;
-    let mut providers = vec![OpenProvider::open(main_root, "db", None)?];
+    // Declared before providers so every DB drops before any registry LOCK fd.
+    let mut locks = ProviderLocks::default();
+    let mut providers = vec![OpenProvider::open_with_locks(main_root, "db", None, &mut locks)?];
     let epoch_inventory = match &config.archival_mode {
         Some(c) => epochs(c, &working)?,
         None => vec![],
@@ -348,13 +409,15 @@ fn inspect_with_completion(config: &CheckConfig, complete: impl FnOnce()) -> Res
         if !physical.insert(database) {
             fail!("Database path is used by multiple providers");
         }
-        providers.push(OpenProvider::open(path.clone(), "archive_db", Some(*range))?);
+        providers.push(OpenProvider::open_with_locks(
+            path.clone(),
+            "archive_db",
+            Some(*range),
+            &mut locks,
+        )?);
     }
-    let mut package_before = Vec::new();
-    for p in &providers {
-        let path = p.root.join("archive/packages");
-        package_before.push(if path.try_exists()? { Some(inventory(&path, true)?) } else { None });
-    }
+    let package_before: Vec<_> =
+        providers.iter().map(|p| package_inventory(&p.root)).collect::<Result<_>>()?;
     let mut live = 0;
     for (name, key) in [("files", false), ("key_files", true)] {
         let cf = providers[0]
@@ -370,16 +433,17 @@ fn inspect_with_completion(config: &CheckConfig, complete: impl FnOnce()) -> Res
             if entry.deleted() {
                 continue;
             }
-            let provider = if key || config.archival_mode.is_none() {
-                &providers[0]
+            let provider_index = if key || config.archival_mode.is_none() {
+                0
             } else {
                 providers
                     .iter()
-                    .find(|p| p.range.is_some_and(|(start, end)| id >= start && id <= end))
+                    .position(|p| p.range.is_some_and(|(start, end)| id >= start && id <= end))
                     .ok_or_else(|| error!("Live archive {id} has no epoch provider"))?
             };
+            let provider = &providers[provider_index];
             provider.require_families(id, key)?;
-            if !provider.root.join("archive/packages").is_dir() {
+            if package_before[provider_index].is_none() {
                 fail!("Live archive {id} has no package root");
             }
             live += 1;
@@ -392,9 +456,7 @@ fn inspect_with_completion(config: &CheckConfig, complete: impl FnOnce()) -> Res
         if inventory(&p.database, false)? != p.initial_inventory {
             fail!("Provider changed during offline check");
         }
-        let path = p.root.join("archive/packages");
-        let after = if path.try_exists()? { Some(inventory(&path, true)?) } else { None };
-        if after != package_before[i] {
+        if package_inventory(&p.root)? != package_before[i] {
             fail!("Package inventory changed during offline check");
         }
         reports.push(ProviderReport {

@@ -131,9 +131,23 @@ fn epoch_routes_key_archives_to_main_and_checks_all_providers() {
         archive(dir.path(), "db", 0, true, pending, true);
         let epoch = dir.path().join("epochs/epoch_0");
         archive(&epoch, "archive_db", 0, false, false, false);
+        let options = Options::default();
+        let families = NativeDb::list_cf(&options, dir.path().join("db")).unwrap();
+        let db = NativeDb::open_cf(&options, dir.path().join("db"), families).unwrap();
+        db.put_cf(
+            &db.cf_handle("files").unwrap(),
+            0u32.to_le_bytes(),
+            serde_cbor::to_vec(&PackageIndexEntry::new()).unwrap(),
+        )
+        .unwrap();
+        drop(db);
         let before = bytes(dir.path());
         let result = observed(&cfg);
         assert_eq!(result.is_ok(), !pending);
+        if let Ok(report) = result {
+            assert_eq!(report.live_archives, 2);
+            assert_eq!(report.providers.len(), 2);
+        }
         assert_eq!(before, bytes(dir.path()));
     }
     let dir = tempfile::tempdir().unwrap();
@@ -457,4 +471,90 @@ fn concurrent_inspections_keep_all_provider_lifetimes_serialized() {
     assert!(finished_rx.recv_timeout(Duration::from_secs(20)).unwrap());
     second.join().unwrap().unwrap();
     assert!(wait(child(root, "try-writer")).success());
+}
+
+#[test]
+fn package_ancestor_and_dangling_links_refuse() {
+    use std::os::unix::fs::symlink;
+    for ancestor in [true, false] {
+        for dangling in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let external = tempfile::tempdir().unwrap();
+            fixture(dir.path(), "db", true);
+            let target = external.path().join("target");
+            if !dangling {
+                fs::create_dir_all(target.join("packages")).unwrap();
+            }
+            let link = if ancestor {
+                dir.path().join("archive")
+            } else {
+                fs::create_dir(dir.path().join("archive")).unwrap();
+                dir.path().join("archive/packages")
+            };
+            symlink(&target, &link).unwrap();
+            let before = bytes(&dir.path().join("db"));
+            let external_before = bytes(external.path());
+            assert!(observed(&config(dir.path())).unwrap_err().to_string().contains("Symlink"));
+            assert_eq!(fs::read_link(&link).unwrap(), target);
+            assert_eq!(bytes(&dir.path().join("db")), before);
+            assert_eq!(bytes(external.path()), external_before);
+        }
+    }
+}
+
+#[test]
+fn provider_lock_alias_refuses_without_releasing_original_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = epoch_setup(dir.path());
+    let epoch = dir.path().join("epochs/epoch_0");
+    fs::remove_file(epoch.join("archive_db/LOCK")).unwrap();
+    fs::hard_link(dir.path().join("db/LOCK"), epoch.join("archive_db/LOCK")).unwrap();
+    let before = bytes(dir.path());
+    assert!(observed(&cfg).unwrap_err().to_string().contains("LOCK inode alias"));
+    assert_eq!(bytes(dir.path()), before);
+    let mut locks = ProviderLocks::default();
+    let provider =
+        OpenProvider::open_with_locks(dir.path().to_path_buf(), "db", None, &mut locks).unwrap();
+    let error = OpenProvider::open_with_locks(epoch, "archive_db", Some((0, 19999)), &mut locks)
+        .err()
+        .expect("LOCK alias must be refused");
+    assert!(error.to_string().contains("LOCK inode alias"));
+    assert_eq!(wait(child(dir.path(), "try-writer")).code(), Some(7));
+    drop(provider);
+    assert_eq!(wait(child(dir.path(), "try-writer")).code(), Some(7));
+    drop(locks);
+    assert!(wait(child(dir.path(), "try-writer")).success());
+}
+
+#[test]
+fn live_epoch_index_and_invalid_ranges_refuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = epoch_setup(dir.path());
+    let db = NativeDb::open_cf(&Options::default(), dir.path().join("db"), ["files", "key_files"])
+        .unwrap();
+    db.put_cf(
+        &db.cf_handle("files").unwrap(),
+        20000u32.to_le_bytes(),
+        serde_cbor::to_vec(&PackageIndexEntry::new()).unwrap(),
+    )
+    .unwrap();
+    drop(db);
+    let before = bytes(dir.path());
+    assert!(observed(&cfg).unwrap_err().to_string().contains("has no epoch provider"));
+    assert_eq!(bytes(dir.path()), before);
+    for (start, end, expected) in [
+        (1u32, 20000u32, "Invalid epoch range"),
+        (0, 19998, "Invalid epoch range"),
+        (u32::MAX, u32::MAX, "Epoch range overflow"),
+    ] {
+        fs::write(
+            dir.path().join("epochs/epoch_0/epoch_meta.json"),
+            serde_json::to_vec(&serde_json::json!({"mc_seq_no_start":start,"mc_seq_no_end":end}))
+                .unwrap(),
+        )
+        .unwrap();
+        let before = bytes(dir.path());
+        assert!(observed(&cfg).unwrap_err().to_string().contains(expected));
+        assert_eq!(bytes(dir.path()), before);
+    }
 }
