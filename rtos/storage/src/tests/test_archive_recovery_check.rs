@@ -186,15 +186,20 @@ fn missing_live_target_and_corrupt_database_refuse() {
     assert!(observed(&config(other.path())).is_err());
 }
 fn child(root: &Path, mode: &str) -> std::process::Child {
-    Command::new(std::env::current_exe().unwrap())
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
         .args(["--ignored", "--exact", CHILD, "--nocapture"])
         .env("RTOS_RECOVERY_CHECK_CHILD_ROOT", root)
         .env("RTOS_RECOVERY_CHECK_CHILD_MODE", mode)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap()
+        .stderr(Stdio::null());
+    if mode == "check-refused" && unsafe { libc::geteuid() } == 0 {
+        use std::os::unix::process::CommandExt;
+        command.uid(65534);
+    }
+    command.spawn().unwrap()
 }
+
 fn wait(mut process: std::process::Child) -> std::process::ExitStatus {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -264,6 +269,10 @@ fn unflushed_counter_merge_and_pending_marker_survive_readonly_replay() {
 fn native_child() {
     let root = PathBuf::from(std::env::var_os("RTOS_RECOVERY_CHECK_CHILD_ROOT").unwrap());
     let mode = std::env::var("RTOS_RECOVERY_CHECK_CHILD_MODE").unwrap();
+    if mode == "check-refused" {
+        assert!(observed(&config(&root)).is_err());
+        return;
+    }
     if mode.starts_with("wal-") {
         let mut options = Options::default();
         options.create_if_missing(true);
@@ -309,4 +318,143 @@ fn native_child() {
         }
     }
     drop(db);
+}
+
+#[test]
+fn many_families_do_not_trigger_legacy_cleanup() {
+    use crate::db::rocksdb::{LAST_UNNEEDED_KEY_BLOCK, NODE_STATE_DB_NAME};
+    use crate::traits::Serializable;
+    for pending in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fixture(root, "db", true);
+        archive(root, "db", 0, false, pending, true);
+        let options = Options::default();
+        let families = NativeDb::list_cf(&options, root.join("db")).unwrap();
+        let db = NativeDb::open_cf(&options, root.join("db"), families).unwrap();
+        db.create_cf(NODE_STATE_DB_NAME, &options).unwrap();
+        for index in 0..101 {
+            db.create_cf(&format!("padding_{index}"), &options).unwrap();
+        }
+        let boundary = rtos_block::BlockIdExt::with_params(
+            rtos_block::ShardIdent::masterchain(),
+            100,
+            rtos_block::UInt256::default(),
+            rtos_block::UInt256::default(),
+        );
+        db.put_cf(
+            &db.cf_handle(NODE_STATE_DB_NAME).unwrap(),
+            LAST_UNNEEDED_KEY_BLOCK.as_bytes(),
+            boundary.serialize(),
+        )
+        .unwrap();
+        drop(db);
+        let families = NativeDb::list_cf(&options, root.join("db")).unwrap();
+        assert!(
+            families.len() > 100
+                && !families.iter().any(|name| name == "repair_dependency_leases_v1")
+        );
+        let before = bytes(root);
+        assert_eq!(observed(&config(root)).is_err(), pending);
+        assert_eq!(bytes(root), before);
+        assert_eq!(NativeDb::list_cf(&options, root.join("db")).unwrap(), families);
+    }
+}
+
+#[test]
+fn lock_and_database_path_replacement_are_detected() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    fixture(root, "db", true);
+    let provider = OpenProvider::open(root.to_path_buf(), "db", None).unwrap();
+    fs::rename(root.join("db/LOCK"), root.join("db/LOCK.old")).unwrap();
+    fs::write(root.join("db/LOCK"), b"").unwrap();
+    assert!(provider.verify_identity().unwrap_err().to_string().contains("identity changed"));
+    drop(provider);
+    let provider = OpenProvider::open(root.to_path_buf(), "db", None).unwrap();
+    fs::rename(root.join("db"), root.join("db.old")).unwrap();
+    fixture(root, "db", true);
+    assert!(provider.verify_identity().unwrap_err().to_string().contains("identity changed"));
+    drop(provider);
+}
+
+#[test]
+fn symlinked_inputs_and_unrecognized_epoch_directories_refuse() {
+    use std::os::unix::fs::symlink;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let cfg = epoch_setup(root);
+    symlink(root, root.join("alias")).unwrap();
+    let mut linked = cfg.clone();
+    linked.node_root = root.join("alias");
+    assert!(observed(&linked).unwrap_err().to_string().contains("Symlink"));
+    fs::remove_file(root.join("alias")).unwrap();
+    let metadata = root.join("epochs/epoch_0/epoch_meta.json");
+    fs::rename(&metadata, root.join("metadata.json")).unwrap();
+    symlink(root.join("metadata.json"), &metadata).unwrap();
+    assert!(observed(&cfg).is_err());
+    fs::remove_file(&metadata).unwrap();
+    fs::rename(root.join("metadata.json"), &metadata).unwrap();
+    fixture(&root.join("epochs/custom-directory"), "archive_db", false);
+    assert!(observed(&cfg).is_err());
+    fs::remove_dir_all(root.join("epochs/custom-directory")).unwrap();
+    assert_eq!(observed(&cfg).unwrap().providers.len(), 2);
+    let invalid = root.join("epochs/dangling-directory");
+    fs::create_dir(&invalid).unwrap();
+    symlink(root.join("absent-meta"), invalid.join("epoch_meta.json")).unwrap();
+    assert!(observed(&cfg).is_err());
+}
+
+#[test]
+fn inaccessible_provider_refuses_without_modification() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    fixture(root, "db", true);
+    let before = bytes(root);
+    let permissions = fs::metadata(root.join("db")).unwrap().permissions();
+    fs::set_permissions(root.join("db"), fs::Permissions::from_mode(0)).unwrap();
+    let status = wait(child(root, "check-refused"));
+    fs::set_permissions(root.join("db"), permissions).unwrap();
+    assert!(status.success());
+    assert_eq!(bytes(root), before);
+}
+
+#[test]
+fn concurrent_inspections_keep_all_provider_lifetimes_serialized() {
+    use std::sync::mpsc;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    fixture(root, "db", true);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let first_config = config(root);
+    let first = std::thread::spawn(move || {
+        inspect_with_completion(&first_config, || {
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        })
+    });
+    ready_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let second_config = config(root);
+    let second = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let result = inspect(&second_config);
+        finished_tx.send(result.is_ok()).unwrap();
+        result
+    });
+    started_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+    assert!(matches!(
+        finished_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    // A real independent native writer must still see the first inspection's lock.
+    assert!(!wait(child(root, "try-writer")).success());
+    release_tx.send(()).unwrap();
+    first.join().unwrap().unwrap();
+    assert!(finished_rx.recv_timeout(Duration::from_secs(20)).unwrap());
+    second.join().unwrap().unwrap();
+    assert!(wait(child(root, "try-writer")).success());
 }

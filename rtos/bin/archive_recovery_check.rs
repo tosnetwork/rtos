@@ -4,7 +4,7 @@ fn check() -> anyhow::Result<()> {
     use std::{collections::BTreeMap, path::PathBuf};
     use storage::archives::{
         epoch::ArchivalModeConfig,
-        recovery_check::{inspect, CheckConfig},
+        recovery_check::{inspect, resolve_checked, CheckConfig},
     };
     #[derive(serde::Deserialize)]
     struct Projection {
@@ -22,19 +22,17 @@ fn check() -> anyhow::Result<()> {
         let value = args.next().ok_or_else(|| anyhow::anyhow!("argument value missing"))?;
         anyhow::ensure!(values.insert(key, value).is_none(), "duplicate argument");
     }
-    let working = std::fs::canonicalize(
+    let working_arg = PathBuf::from(
         values
             .remove("--node-working-directory")
             .ok_or_else(|| anyhow::anyhow!("--node-working-directory required"))?,
-    )?;
-    let config_path = PathBuf::from(
+    );
+    let working = resolve_checked(&std::env::current_dir()?, &working_arg)?;
+    anyhow::ensure!(working.is_dir(), "node working directory must be a directory");
+    let config_arg = PathBuf::from(
         values.remove("--node-config").ok_or_else(|| anyhow::anyhow!("--node-config required"))?,
     );
-    let config_path = std::fs::canonicalize(if config_path.is_absolute() {
-        config_path
-    } else {
-        working.join(config_path)
-    })?;
+    let config_path = resolve_checked(&working, &config_arg)?;
     let bytes = std::fs::read(&config_path)?;
     let projection: Projection = serde_json::from_slice(&bytes)?;
     let override_root = values.remove("--db-root-override");
@@ -47,6 +45,11 @@ fn check() -> anyhow::Result<()> {
         working_directory: working.clone(),
         archival_mode: projection.archival_mode,
     })?;
+    anyhow::ensure!(
+        resolve_checked(&working, &config_arg)? == config_path
+            && std::fs::read(&config_path)? == bytes,
+        "node configuration changed during inspection"
+    );
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({

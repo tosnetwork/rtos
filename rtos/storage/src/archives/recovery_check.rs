@@ -55,10 +55,28 @@ struct OpenProvider {
     database: PathBuf,
     families: BTreeSet<String>,
     range: Option<(u32, u32)>,
+    directory_identity: (u64, u64),
+    lock_identity: (u64, u64),
+    initial_inventory: Inventory,
 }
-fn resolve(base: &Path, path: &Path) -> Result<PathBuf> {
-    Ok(fs::canonicalize(if path.is_absolute() { path.to_path_buf() } else { base.join(path) })?)
+static INSPECTION_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Resolve an inspection input without following symlinks in any path component.
+pub fn resolve_checked(base: &Path, path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() { path.to_path_buf() } else { base.join(path) };
+    let mut prefix = PathBuf::new();
+    for component in absolute.components() {
+        prefix.push(component.as_os_str());
+        if fs::symlink_metadata(&prefix)?.file_type().is_symlink() {
+            fail!("Symlink in inspection path: {}", prefix.display());
+        }
+    }
+    Ok(fs::canonicalize(absolute)?)
 }
+fn file_identity(metadata: &fs::Metadata) -> (u64, u64) {
+    (metadata.dev(), metadata.ino())
+}
+
 fn shared_lock(database: &Path) -> Result<File> {
     let file = fs::OpenOptions::new()
         .read(true)
@@ -82,8 +100,15 @@ fn shared_lock(database: &Path) -> Result<File> {
 }
 impl OpenProvider {
     fn open(root: PathBuf, name: &str, range: Option<(u32, u32)>) -> Result<Self> {
-        let database = root.join(name);
+        let database = resolve_checked(&root, Path::new(name))?;
+        let directory = fs::symlink_metadata(&database)?;
+        if !directory.is_dir() {
+            fail!("Provider is not a directory");
+        }
+        let directory_identity = file_identity(&directory);
         let lock = shared_lock(&database)?;
+        let lock_identity = file_identity(&lock.metadata()?);
+        let initial_inventory = inventory(&database, false)?;
         let mut options = Options::default();
         options.create_if_missing(false);
         options.create_missing_column_families(false);
@@ -113,7 +138,39 @@ impl OpenProvider {
             })
             .collect();
         let db = NativeDb::open_cf_descriptors_read_only(&options, &database, descriptors, false)?;
-        Ok(Self { db, _caches: caches, _lock: lock, root, database, families, range })
+        let provider = Self {
+            db,
+            _caches: caches,
+            _lock: lock,
+            root,
+            database,
+            families,
+            range,
+            directory_identity,
+            lock_identity,
+            initial_inventory,
+        };
+        provider.verify_identity()?;
+        if inventory(&provider.database, false)? != provider.initial_inventory {
+            fail!("Provider changed during native read-only open");
+        }
+        Ok(provider)
+    }
+    fn verify_identity(&self) -> Result<()> {
+        let current = resolve_checked(&self.root, &self.database)?;
+        let directory = fs::symlink_metadata(&current)?;
+        let lock = fs::symlink_metadata(self.database.join("LOCK"))?;
+        if current != self.database
+            || !directory.is_dir()
+            || !lock.is_file()
+            || lock.file_type().is_symlink()
+            || file_identity(&directory) != self.directory_identity
+            || file_identity(&lock) != self.lock_identity
+            || file_identity(&self._lock.metadata()?) != self.lock_identity
+        {
+            fail!("Database or LOCK path identity changed during inspection");
+        }
+        Ok(())
     }
     fn statuses(&self) -> Result<usize> {
         let mut count = 0;
@@ -176,14 +233,21 @@ impl OpenProvider {
     }
 }
 
+fn entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
 fn epochs(config: &ArchivalModeConfig, working: &Path) -> Result<Vec<(PathBuf, (u32, u32))>> {
     if config.epoch_size == 0 || config.epoch_size % ARCHIVE_SLICE_SIZE != 0 {
         fail!("Invalid epoch_size");
     }
-    let parent = resolve(working, &config.new_epochs_path)?;
+    let parent = resolve_checked(working, &config.new_epochs_path)?;
     let mut paths = BTreeSet::new();
     for entry in &config.existing_epochs {
-        paths.insert(resolve(working, &entry.path)?);
+        paths.insert(resolve_checked(working, &entry.path)?);
     }
     for entry in fs::read_dir(&parent)? {
         let entry = entry?;
@@ -192,7 +256,8 @@ fn epochs(config: &ArchivalModeConfig, working: &Path) -> Result<Vec<(PathBuf, (
             fail!("Symlink in epoch discovery: {}", entry.path().display());
         }
         let candidate = entry.file_name().to_string_lossy().starts_with("epoch_")
-            || entry.path().join("epoch_meta.json").try_exists()?;
+            || entry_exists(&entry.path().join("epoch_meta.json"))?
+            || entry_exists(&entry.path().join("archive_db"))?;
         if candidate {
             if !kind.is_dir() {
                 fail!("Invalid epoch candidate: {}", entry.path().display());
@@ -202,7 +267,12 @@ fn epochs(config: &ArchivalModeConfig, working: &Path) -> Result<Vec<(PathBuf, (
     }
     let mut ranges = BTreeMap::new();
     for path in paths {
-        let meta: EpochMeta = serde_json::from_reader(File::open(path.join("epoch_meta.json"))?)?;
+        let meta: EpochMeta = serde_json::from_reader(
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path.join("epoch_meta.json"))?,
+        )?;
         let end = meta
             .mc_seq_no_start
             .checked_add(config.epoch_size - 1)
@@ -254,8 +324,18 @@ fn inventory(root: &Path, reject_staging: bool) -> Result<Inventory> {
 }
 
 pub fn inspect(config: &CheckConfig) -> Result<CheckReport> {
-    let working = fs::canonicalize(&config.working_directory)?;
-    let main_root = resolve(&working, &config.node_root)?;
+    inspect_with_completion(config, || {})
+}
+fn inspect_with_completion(config: &CheckConfig, complete: impl FnOnce()) -> Result<CheckReport> {
+    // POSIX locks belong to the process: a second LOCK close could release an
+    // earlier lock. Serialize all provider lifetimes, including error cleanup.
+    let _serial =
+        INSPECTION_SERIAL.lock().map_err(|_| error!("Inspection coordinator poisoned"))?;
+    let working = resolve_checked(&std::env::current_dir()?, &config.working_directory)?;
+    if !working.is_dir() {
+        fail!("Node working directory is not a directory");
+    }
+    let main_root = resolve_checked(&working, &config.node_root)?;
     let mut providers = vec![OpenProvider::open(main_root, "db", None)?];
     let epoch_inventory = match &config.archival_mode {
         Some(c) => epochs(c, &working)?,
@@ -270,8 +350,6 @@ pub fn inspect(config: &CheckConfig) -> Result<CheckReport> {
         }
         providers.push(OpenProvider::open(path.clone(), "archive_db", Some(*range))?);
     }
-    let before: Vec<_> =
-        providers.iter().map(|p| inventory(&p.database, false)).collect::<Result<_>>()?;
     let mut package_before = Vec::new();
     for p in &providers {
         let path = p.root.join("archive/packages");
@@ -310,7 +388,8 @@ pub fn inspect(config: &CheckConfig) -> Result<CheckReport> {
     let mut reports = Vec::new();
     for (i, p) in providers.iter().enumerate() {
         let count = p.statuses()?;
-        if inventory(&p.database, false)? != before[i] {
+        p.verify_identity()?;
+        if inventory(&p.database, false)? != p.initial_inventory {
             fail!("Provider changed during offline check");
         }
         let path = p.root.join("archive/packages");
