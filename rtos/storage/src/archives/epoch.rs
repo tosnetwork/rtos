@@ -64,6 +64,89 @@ pub struct ArchivalModeConfig {
     pub existing_epochs: Vec<EpochEntry>,
 }
 
+/// Read-only configuration/discovery result. No native DB has been opened yet.
+pub(crate) struct ExistingEpoch {
+    pub path: PathBuf,
+    pub meta: EpochMeta,
+    pub explicit: bool,
+}
+
+/// Discover every configured epoch before opening any provider. Recovery callers
+/// request complete enumeration, which also refuses unrecognized directories.
+/// Native identity, physical-alias and owned-open checks follow this path scan.
+pub(crate) async fn scan_existing(config: &ArchivalModeConfig, complete: bool) -> Result<Vec<ExistingEpoch>> {
+    if config.epoch_size == 0 || config.epoch_size % ARCHIVE_SLICE_SIZE != 0 {
+        fail!("epoch_size must be a positive multiple of ARCHIVE_SLICE_SIZE ({})", ARCHIVE_SLICE_SIZE);
+    }
+    let mut selected = std::collections::BTreeMap::<u32, ExistingEpoch>::new();
+    async fn inspect(path: &Path, size: u32, explicit: bool) -> Result<ExistingEpoch> {
+        // Reject symlinks in every component rather than canonicalizing through
+        // them. This is inspection, not an owned open against external renames.
+        let absolute = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+        let mut prefix = PathBuf::new();
+        for component in absolute.components() {
+            if matches!(component, std::path::Component::ParentDir) { fail!("Parent traversal in epoch path"); }
+            prefix.push(component.as_os_str());
+            let meta = tokio::fs::symlink_metadata(&prefix).await?;
+            if meta.file_type().is_symlink() || !meta.is_dir() { fail!("Invalid epoch directory component"); }
+        }
+        let meta_path = absolute.join(EPOCH_META_FILENAME);
+        let file = tokio::fs::symlink_metadata(&meta_path).await?;
+        if !file.is_file() || file.file_type().is_symlink() { fail!("Invalid epoch metadata file"); }
+        let meta = read_epoch_meta(&absolute).await?;
+        EpochRouter::validate_epoch_meta(&meta, size, &absolute)?;
+        Ok(ExistingEpoch { path: tokio::fs::canonicalize(absolute).await?, meta, explicit })
+    }
+    fn insert(selected: &mut std::collections::BTreeMap<u32, ExistingEpoch>, value: ExistingEpoch) -> Result<()> {
+        if let Some(old) = selected.get(&value.meta.mc_seq_no_start) {
+            if old.path != value.path || old.meta.mc_seq_no_end != value.meta.mc_seq_no_end {
+                fail!("Conflicting epoch providers for range starting {}", value.meta.mc_seq_no_start);
+            }
+            // One physical path configured explicitly and found by discovery is
+            // one provider; keep its stable explicit anchor, not vector position.
+            return Ok(());
+        }
+        selected.insert(value.meta.mc_seq_no_start, value);
+        Ok(())
+    }
+    for entry in &config.existing_epochs {
+        insert(&mut selected, inspect(&entry.path, config.epoch_size, true).await?)?;
+    }
+    // Absence is read-only: normal construction may create this directory later.
+    // A pending recovery still has to match its recorded provider inventory.
+    let mut prefix = PathBuf::new();
+    let absolute = if config.new_epochs_path.is_absolute() { config.new_epochs_path.clone() }
+        else { std::env::current_dir()?.join(&config.new_epochs_path) };
+    if absolute.components().any(|component| matches!(component, std::path::Component::ParentDir)) {
+        fail!("Parent traversal in discovery path");
+    }
+    for component in absolute.components() {
+        prefix.push(component.as_os_str());
+        match tokio::fs::symlink_metadata(&prefix).await {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {},
+            Ok(_) => fail!("Invalid discovery directory component"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(selected.into_values().collect()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut entries = tokio::fs::read_dir(&absolute).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let file_type = entry.file_type().await?;
+        if file_type.is_symlink() { fail!("Symlink in epoch discovery directory"); }
+        if !file_type.is_dir() {
+            if complete { fail!("Unrecognized file in epoch discovery directory"); }
+            continue;
+        }
+        let path = entry.path();
+        match tokio::fs::symlink_metadata(path.join(EPOCH_META_FILENAME)).await {
+            Ok(_) => insert(&mut selected, inspect(&path, config.epoch_size, false).await?)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !complete => {},
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(selected.into_values().collect())
+}
+
 /// Runtime state for a single epoch
 pub struct Epoch {
     binding: ArchiveProvider,
@@ -109,94 +192,20 @@ impl EpochRouter {
     pub async fn new(config: &ArchivalModeConfig, startup: &ArchiveOperation) -> Result<Self> {
         let startup = startup.view().inherit(startup)?;
         let view = startup.view();
-        if config.epoch_size == 0 || config.epoch_size % ARCHIVE_SLICE_SIZE != 0 {
-            fail!(
-                "epoch_size must be a positive multiple of ARCHIVE_SLICE_SIZE ({}), got {}",
-                ARCHIVE_SLICE_SIZE,
-                config.epoch_size
-            );
-        }
-
+        let existing = scan_existing(config, false).await?;
         let epochs = lockfree::map::Map::new();
-
-        for (i, entry) in config.existing_epochs.iter().enumerate() {
-            if !entry.path.exists() {
-                fail!("Epoch {} path does not exist: {}", i, entry.path.display());
-            }
-
-            let meta = read_epoch_meta(&entry.path).await?;
-            Self::validate_epoch_meta(&meta, config.epoch_size, &entry.path)?;
-
+        for entry in existing {
             let db = RocksDb::new(&entry.path, "archive_db", None, AccessType::ReadWrite)?;
             let binding = db.bind_archive_domain(view.binding().domain().clone())?;
-
-            log::info!(
-                target: TARGET,
-                "Opened epoch {}: mc_seq_no [{}, {}], path: {}",
-                i, meta.mc_seq_no_start, meta.mc_seq_no_end, entry.path.display()
-            );
-
-            epochs.insert(
-                meta.mc_seq_no_start,
-                Arc::new(Epoch {
-                    binding,
-                    mc_seq_no_start: meta.mc_seq_no_start,
-                    mc_seq_no_end: meta.mc_seq_no_end,
-                    path: Arc::new(entry.path.clone()),
-                    db,
-                }),
-            );
+            epochs.insert(entry.meta.mc_seq_no_start, Arc::new(Epoch {
+                binding, mc_seq_no_start: entry.meta.mc_seq_no_start,
+                mc_seq_no_end: entry.meta.mc_seq_no_end,
+                path: Arc::new(entry.path), db,
+            }));
         }
-
         tokio::fs::create_dir_all(&config.new_epochs_path).await.map_err(|e| {
             error!("Cannot create new_epochs_path {}: {}", config.new_epochs_path.display(), e)
         })?;
-
-        // Discover epochs previously created in new_epochs_path (survive restarts)
-        let mut read_dir = tokio::fs::read_dir(&config.new_epochs_path).await.map_err(|e| {
-            error!("Cannot read new_epochs_path {}: {}", config.new_epochs_path.display(), e)
-        })?;
-        let mut discovered = Vec::new();
-        while let Some(entry) = read_dir
-            .next_entry()
-            .await
-            .map_err(|e| error!("Error reading new_epochs_path: {}", e))?
-        {
-            let epoch_path = entry.path();
-            if epoch_path.is_dir() && epoch_path.join(EPOCH_META_FILENAME).exists() {
-                discovered.push(epoch_path);
-            }
-        }
-
-        for epoch_path in discovered {
-            let meta = read_epoch_meta(&epoch_path).await?;
-            Self::validate_epoch_meta(&meta, config.epoch_size, &epoch_path)?;
-
-            // Skip if already loaded from existing_epochs
-            if epochs.get(&meta.mc_seq_no_start).is_some() {
-                continue;
-            }
-
-            let db = RocksDb::new(&epoch_path, "archive_db", None, AccessType::ReadWrite)?;
-            let binding = db.bind_archive_domain(view.binding().domain().clone())?;
-
-            log::info!(
-                target: TARGET,
-                "Discovered epoch: mc_seq_no [{}, {}], path: {}",
-                meta.mc_seq_no_start, meta.mc_seq_no_end, epoch_path.display()
-            );
-
-            epochs.insert(
-                meta.mc_seq_no_start,
-                Arc::new(Epoch {
-                    binding,
-                    mc_seq_no_start: meta.mc_seq_no_start,
-                    mc_seq_no_end: meta.mc_seq_no_end,
-                    path: Arc::new(epoch_path),
-                    db,
-                }),
-            );
-        }
 
         Ok(Self {
             view,
@@ -238,7 +247,8 @@ impl EpochRouter {
         let _before_create = self.view.inherit(&operation)?;
         let epoch_index = mc_seq_no / self.epoch_size;
         let start = epoch_index * self.epoch_size;
-        let end = start + self.epoch_size - 1;
+        let end = start.checked_add(self.epoch_size - 1)
+            .ok_or_else(|| error!("Epoch range exceeds u32 sequence space"))?;
 
         let epoch_dir = self.new_epochs_path.join(format!("epoch_{}", epoch_index));
         tokio::fs::create_dir_all(&epoch_dir)
@@ -291,7 +301,8 @@ impl EpochRouter {
                 epoch_size
             );
         }
-        let expected_end = meta.mc_seq_no_start + epoch_size - 1;
+        let expected_end = meta.mc_seq_no_start.checked_add(epoch_size - 1)
+            .ok_or_else(|| error!("Epoch range exceeds u32 sequence space"))?;
         if meta.mc_seq_no_end != expected_end {
             fail!(
                 "Epoch at {} has mc_seq_no_end={} but expected {} for epoch_size={}",

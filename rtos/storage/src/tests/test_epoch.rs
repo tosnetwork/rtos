@@ -169,3 +169,106 @@ async fn test_epoch_router_discovers_on_restart() {
 
     assert!(router2.resolve(80_000).is_none());
 }
+
+#[tokio::test]
+async fn scan_rejects_conflicting_ranges_before_native_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let discovery = dir.path().join("discovery");
+    let configured = dir.path().join("configured");
+    let duplicate = discovery.join("duplicate");
+    for path in [&configured, &duplicate] {
+        std::fs::create_dir_all(path).unwrap();
+        write_epoch_meta(path, &EpochMeta { mc_seq_no_start: 0, mc_seq_no_end: 39_999 }).await.unwrap();
+    }
+    let config = ArchivalModeConfig { epoch_size: 40_000, new_epochs_path: discovery,
+        existing_epochs: vec![EpochEntry { path: configured.clone() }] };
+    assert!(scan_existing(&config, true).await.is_err());
+    let main = RocksDb::new(dir.path(), "main", None, AccessType::ReadWrite).unwrap();
+    let binding = main.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
+    let startup = binding.view().unwrap().enter().unwrap();
+    assert!(EpochRouter::new(&config, &startup).await.is_err());
+    assert!(!configured.join("archive_db").exists());
+    assert!(!duplicate.join("archive_db").exists());
+}
+
+#[tokio::test]
+async fn scan_deduplicates_same_path_and_preserves_external_explicit_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let discovery = dir.path().join("discovery");
+    let shared = discovery.join("epoch_0");
+    std::fs::create_dir_all(&shared).unwrap();
+    write_epoch_meta(&shared, &EpochMeta { mc_seq_no_start: 0, mc_seq_no_end: 39_999 }).await.unwrap();
+    write_epoch_meta(external.path(), &EpochMeta { mc_seq_no_start: 40_000, mc_seq_no_end: 79_999 }).await.unwrap();
+    let mut config = ArchivalModeConfig { epoch_size: 40_000, new_epochs_path: discovery,
+        existing_epochs: vec![EpochEntry { path: external.path().into() }, EpochEntry { path: shared.clone() }] };
+    let first = scan_existing(&config, true).await.unwrap();
+    config.existing_epochs.reverse();
+    let second = scan_existing(&config, true).await.unwrap();
+    assert_eq!(first.len(), 2);
+    for (a, b) in first.iter().zip(&second) {
+        assert_eq!(a.path, b.path); assert_eq!(a.meta.mc_seq_no_start, b.meta.mc_seq_no_start);
+        assert!(a.explicit && b.explicit);
+        assert!(!a.path.join("archive_db").exists());
+    }
+    assert_eq!(first[0].path, shared);
+    assert_eq!(first[1].path, external.path());
+}
+
+#[tokio::test]
+async fn complete_scan_refuses_unknown_entries_and_does_not_create_missing_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let discovery = dir.path().join("discovery");
+    let config = ArchivalModeConfig { epoch_size: 40_000, new_epochs_path: discovery.clone(), existing_epochs: vec![] };
+    assert!(scan_existing(&config, true).await.unwrap().is_empty());
+    assert!(!discovery.exists());
+    std::fs::create_dir_all(discovery.join("unknown")).unwrap();
+    assert!(scan_existing(&config, true).await.is_err());
+    assert!(scan_existing(&config, false).await.unwrap().is_empty());
+    std::fs::remove_dir(discovery.join("unknown")).unwrap();
+    std::fs::write(discovery.join("unknown"), b"preserve").unwrap();
+    assert!(scan_existing(&config, true).await.is_err());
+    assert_eq!(std::fs::read(discovery.join("unknown")).unwrap(), b"preserve");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scan_refuses_symlink_ancestors_and_metadata() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    write_epoch_meta(&real, &EpochMeta { mc_seq_no_start: 0, mc_seq_no_end: 39_999 }).await.unwrap();
+    symlink(&real, dir.path().join("alias")).unwrap();
+    let mut config = ArchivalModeConfig { epoch_size: 40_000, new_epochs_path: dir.path().join("absent"),
+        existing_epochs: vec![EpochEntry { path: dir.path().join("alias") }] };
+    assert!(scan_existing(&config, true).await.is_err());
+    config.existing_epochs[0].path = real.clone();
+    std::fs::rename(real.join(EPOCH_META_FILENAME), dir.path().join("saved_meta")).unwrap();
+    symlink(dir.path().join("saved_meta"), real.join(EPOCH_META_FILENAME)).unwrap();
+    assert!(scan_existing(&config, true).await.is_err());
+    assert!(!real.join("archive_db").exists());
+}
+
+#[tokio::test]
+async fn terminal_epoch_overflow_refuses_before_directory_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = RocksDb::new(dir.path(), "main", None, AccessType::ReadWrite).unwrap();
+    let binding = main.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
+    let startup = binding.view().unwrap().enter().unwrap();
+    let config = ArchivalModeConfig { epoch_size: 40_000, new_epochs_path: dir.path().join("epochs"), existing_epochs: vec![] };
+    let router = EpochRouter::new(&config, &startup).await.unwrap();
+    assert!(router.resolve_or_create(u32::MAX).await.is_err());
+    assert_eq!(std::fs::read_dir(&config.new_epochs_path).unwrap().count(), 0);
+    let start = (u32::MAX / 40_000) * 40_000;
+    assert!(EpochRouter::validate_epoch_meta(&EpochMeta { mc_seq_no_start: start, mc_seq_no_end: u32::MAX }, 40_000, dir.path()).is_err());
+}
+
+#[tokio::test]
+async fn missing_discovery_ancestor_does_not_hide_parent_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = ArchivalModeConfig { epoch_size: 40_000,
+        new_epochs_path: dir.path().join("missing/../existing"), existing_epochs: vec![] };
+    assert!(scan_existing(&config, true).await.is_err());
+    assert!(!dir.path().join("missing").exists());
+}
