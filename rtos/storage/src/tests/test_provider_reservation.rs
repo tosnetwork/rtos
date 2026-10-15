@@ -44,7 +44,7 @@ fn simultaneous_alias_opens_have_one_owner_and_reopen_after_close() {
         .filter_map(|r| r.as_ref().err())
         .all(|e| matches!(e.downcast_ref::<ReservationError>(), Some(ReservationError::Busy(_))));
     if let Some(owner) = results.iter().find_map(|r| r.as_ref().ok()) {
-        owner.put_raw(b"kept", b"value").unwrap();
+        owner.db().put(b"kept", b"value").unwrap();
         owner.sync_wal().unwrap();
     }
     drop(results);
@@ -59,7 +59,7 @@ fn failed_native_open_releases_identity_for_repaired_retry() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let db = writable(&path).unwrap();
-    db.put_raw(b"kept", b"value").unwrap();
+    db.db().put(b"kept", b"value").unwrap();
     db.sync_wal().unwrap();
     drop(db);
     let current = path.join("CURRENT");
@@ -81,7 +81,7 @@ fn static_destroy_refuses_live_provider_and_instance_destroy_releases_afterward(
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let db = writable(&path).unwrap();
-    db.put_raw(b"kept", b"value").unwrap();
+    db.db().put(b"kept", b"value").unwrap();
     db.sync_wal().unwrap();
     assert!(
         busy(RocksDb::destroy_db(&path)),
@@ -102,7 +102,7 @@ fn instance_destroy_preserves_native_owner_when_nested_provider_is_active() {
     let dir = tempfile::tempdir().unwrap();
     let parent_path = dir.path().join("db");
     let parent = writable(&parent_path).unwrap();
-    parent.put_raw(b"kept", b"value").unwrap();
+    parent.db().put(b"kept", b"value").unwrap();
     let child = writable(&parent_path.join("child")).unwrap();
     let mut parent = Arc::try_unwrap(parent).ok().unwrap();
     assert!(busy(parent.destroy()), "parent destruction ignored a live nested provider");
