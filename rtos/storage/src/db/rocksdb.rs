@@ -47,9 +47,27 @@ pub struct RocksDb {
     // Block caches attached to this DB's column families.
     caches: Mutex<Vec<Cache>>,
     repair_protection: Arc<crate::repair_protection::RepairProtection>,
+    archive_domain: std::sync::OnceLock<Arc<crate::archives::context::ArchiveDomain>>,
+    archive_binding_writable: bool,
 }
 
 impl RocksDb {
+    /// Binds this opened writable provider once; cached/epoch callers must pass
+    /// the same explicit domain. This does not migrate existing archive IO.
+    pub fn bind_archive_domain(
+        self: &Arc<Self>, domain: Arc<crate::archives::context::ArchiveDomain>,
+    ) -> Result<crate::archives::context::ArchiveProvider> {
+        use crate::archives::context::{ArchiveContextError, ArchiveProvider};
+        if !self.archive_binding_writable {
+            return Err(ArchiveContextError::ReadOnlyProvider.into());
+        }
+        let winner = self.archive_domain.get_or_init(|| domain.clone());
+        if !Arc::ptr_eq(winner, &domain) {
+            return Err(ArchiveContextError::BindingConflict.into());
+        }
+        Ok(ArchiveProvider::bound(self.clone(), winner.clone()))
+    }
+
     pub fn repair_protection(&self) -> &Arc<crate::repair_protection::RepairProtection> {
         &self.repair_protection
     }
@@ -114,6 +132,8 @@ impl RocksDb {
 
         Ok(Arc::new(Self {
             repair_protection: Arc::new(Default::default()),
+            archive_domain: std::sync::OnceLock::new(),
+            archive_binding_writable: matches!(access_type, AccessType::ReadWrite),
             db: Some(db),
             locks: lockfree::map::Map::new(),
             caches: Mutex::new(Vec::new()),
