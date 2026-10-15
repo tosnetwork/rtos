@@ -497,6 +497,7 @@ pub struct BlockHandleStorage {
     validator_state_db: Arc<NodeStateDb>,
     state_cache: lockfree::map::Map<String, Arc<BlockIdExt>>,
     storer: tokio::sync::mpsc::UnboundedSender<HandleCommand>,
+    writer: Option<tokio::task::JoinHandle<()>>,
     #[cfg(feature = "telemetry")]
     telemetry: Arc<StorageTelemetry>,
     allocated: Arc<StorageAlloc>,
@@ -511,7 +512,7 @@ impl BlockHandleStorage {
         allocated: Arc<StorageAlloc>,
     ) -> Self {
         let (sender, mut reader) = tokio::sync::mpsc::unbounded_channel();
-        let ret = Self {
+        let mut ret = Self {
             handle_db: handle_db.clone(),
             handle_cache: Arc::new(lockfree::map::Map::new()),
             no_cache: false,
@@ -519,11 +520,12 @@ impl BlockHandleStorage {
             validator_state_db: validator_state_db.clone(),
             state_cache: lockfree::map::Map::new(),
             storer: sender,
+            writer: None,
             #[cfg(feature = "telemetry")]
             telemetry,
             allocated,
         };
-        tokio::spawn(async move {
+        ret.writer = Some(tokio::spawn(async move {
             fn save_state(key: &str, id: &Arc<BlockIdExt>, db: &Arc<NodeStateDb>) -> bool {
                 if let Err(e) = db.put_raw(key.as_bytes(), &id.serialize()) {
                     log::error!(target: TARGET, "ERROR: {e} while saving state {id}");
@@ -628,8 +630,19 @@ impl BlockHandleStorage {
             // Graceful close
             reader.close();
             while reader.recv().await.is_some() {}
-        });
+        }));
         ret
+    }
+
+    /// Flush queued writes and wait for the writer to release its database references.
+    /// Other provider owners must also be dropped before reopening the database.
+    /// Cancelling this wait does not abort the writer or imply that it has exited.
+    pub async fn close_and_wait(mut self) -> Result<()> {
+        let flushed = self.sync_pending().await;
+        let writer = self.writer.take().expect("handle writer is installed by constructor");
+        drop(self);
+        writer.await.map_err(|error| error!("Handle writer failed while closing: {error}"))?;
+        flushed
     }
 
     pub fn set_no_cache(&mut self) {

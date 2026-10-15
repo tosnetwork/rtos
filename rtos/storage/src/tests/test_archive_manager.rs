@@ -838,7 +838,7 @@ async fn test_import_group_boundary_and_resume() -> Result<()> {
         import(1).await?;
     }
     drop(manager);
-    drop(handles);
+    handles.close_and_wait().await?;
     drop(db);
     let (manager, reopened_db) = create_manager(DB_PATH, NAME, false).await?;
     for (handle, id, data) in expected {

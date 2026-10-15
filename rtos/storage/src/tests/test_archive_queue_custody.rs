@@ -283,3 +283,56 @@ async fn barrier_native_wal_failure_retains_custody_after_cancel() {
     assert_eq!(sticky.is_err(), case == "fault", "native WAL failure must remain sticky");
     assert_eq!(visits.load(Ordering::SeqCst), if case == "fault" { 1 } else { 3 });
 }
+
+async fn verify_writer_close_releases_provider(panic_after_release: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite).unwrap();
+    let provider = Arc::downgrade(&db);
+    let (storage, handle_db) = create_block_handle_storage(db);
+    let handle = storage
+        .create_handle(BlockIdExt::default(), BlockMeta::default(), None)
+        .unwrap()
+        .unwrap();
+    storage.sync_pending().await.unwrap();
+    let callback = Arc::new(HeldCallback {
+        entered: Default::default(),
+        release: Default::default(),
+        completed: AtomicBool::new(false),
+        panic_after_release,
+    });
+    handle.set_archived();
+    storage.save_handle(&handle, Some(callback.clone())).unwrap();
+    entered(&callback).await;
+    drop(handle_db);
+    let mut closing = Box::pin(storage.close_and_wait());
+    std::future::poll_fn(|cx| {
+        assert!(
+            std::future::Future::poll(closing.as_mut(), cx).is_pending(),
+            "close returned before the actual writer callback exited"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert!(provider.upgrade().is_some());
+    assert!(RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite).is_err());
+    callback.release.notify_one();
+    let closed = tokio::time::timeout(Duration::from_secs(20), closing).await.unwrap();
+    assert_eq!(closed.is_err(), panic_after_release);
+    assert!(provider.upgrade().is_none(), "joined writer retained its provider");
+    let reopened = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite).unwrap();
+    let stored = BlockHandleDb::with_db(reopened, "block_handles", false).unwrap();
+    assert_eq!(
+        stored.try_get_raw(handle.id().root_hash().as_slice()).unwrap().unwrap().as_ref(),
+        handle.serialize().as_slice()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_joins_actual_writer_before_provider_reopen() {
+    verify_writer_close_releases_provider(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_reports_writer_panic_after_provider_release() {
+    verify_writer_close_releases_provider(true).await;
+}
