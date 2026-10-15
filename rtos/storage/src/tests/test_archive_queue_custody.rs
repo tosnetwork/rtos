@@ -5,7 +5,10 @@ use crate::{
     db::rocksdb::{AccessType, RocksDb},
     tests::utils::create_block_handle_storage,
 };
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 struct HeldCallback {
     entered: tokio::sync::Notify,

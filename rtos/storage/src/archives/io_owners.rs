@@ -2,7 +2,7 @@
 //! Tracks actual archive operation and queued metadata owners through shutdown.
 use rtos_block::{error, Result};
 use std::sync::Mutex;
-use tokio_util::task::{TaskTracker, TaskTrackerToken};
+use tokio_util::task::{task_tracker::TaskTrackerToken, TaskTracker};
 
 pub struct ArchiveIoOwners {
     open: Mutex<bool>,
