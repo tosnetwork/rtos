@@ -1371,3 +1371,7 @@ mod package_io_eio_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../tests/test_archive_repack_readers.rs"]
 mod repack_reader_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/test_archive_repack_rename.rs"]
+mod repack_rename_tests;
