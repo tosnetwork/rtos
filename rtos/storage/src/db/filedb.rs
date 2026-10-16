@@ -61,8 +61,11 @@ impl FileDb {
     pub fn finalize_write_object(&self, key: &(dyn DbKey + Send + Sync)) -> Result<()> {
         let tmp_path = self.make_path(key.key(), true);
         let final_path = self.make_path(key.key(), false);
-        std::fs::rename(tmp_path, final_path)?;
-        Ok(())
+        // A successful publication must survive loss of the filesystem cache.
+        // Keep the old final path intact until the new contents are durable.
+        std::fs::OpenOptions::new().read(true).write(true).open(&tmp_path)?.sync_all()?;
+        std::fs::rename(&tmp_path, &final_path)?;
+        crate::archives::package::sync_file_and_parents_native(&final_path, None)
     }
 
     pub fn cleanup_tmp(&self) -> Result<()> {

@@ -545,7 +545,7 @@ pub(crate) async fn sync_file_and_parents_observed(
         .await.map_err(|e| error!("Native file sync task failed: {e}"))?
 }
 
-fn sync_file_and_parents_native(
+pub(crate) fn sync_file_and_parents_native(
     path: &Path,
     observer: Option<&crate::durability::SyncObserver>,
 ) -> Result<()> {
