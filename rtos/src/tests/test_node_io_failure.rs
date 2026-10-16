@@ -2,16 +2,19 @@
 //! Scoped syscall error simulation, not physical disk exhaustion or power loss.
 use super::*;
 
-pub(super) async fn selection_fault(binary: &Path, root: &Path, zero: &Path, mode: &str) -> Result<()> {
+pub(super) async fn recovery_fault(binary: &Path, root: &Path, zero: &Path, mode: &str) -> Result<()> {
     let (proof, error) = match mode {
         "selection-enospc" => ("write selection.v1 after 28-byte header: ENOSPC\n", "No space left on device"),
         "selection-sync-eio" => ("fsync selection.v1 after complete manifest: EIO\n", "Input/output error"),
-        _ => rtos_block::fail!("Unknown Selection fault mode"),
+        "ready-enospc" => ("write ready.v1 after 28-byte header: ENOSPC\n", "No space left on device"),
+        "ready-sync-eio" => ("fsync ready.v1 after complete manifest: EIO\n", "Input/output error"),
+        "operation-sync-eio" => ("fsync operation directory after Selection: EIO\n", "Input/output error"),
+        _ => rtos_block::fail!("Unknown recovery fault mode"),
     };
-    let source = root.join("selection-fault.c");
-    let library = root.join("selection-fault.so");
+    let source = root.join("recovery-fault.c");
+    let library = root.join("recovery-fault.so");
     let marker = root.join(format!("{mode}.reached"));
-    fs::write(&source, include_str!("node_selection_fault.c"))?;
+    fs::write(&source, include_str!("node_recovery_fault.c"))?;
     let compile = Command::new("cc").args(["-shared", "-fPIC", "-O2", "-Wall", "-Wextra", "-Werror"])
         .arg(&source).arg("-o").arg(&library).output()?;
     assert!(compile.status.success(), "fault shim compile: {}", String::from_utf8_lossy(&compile.stderr));
@@ -20,9 +23,9 @@ pub(super) async fn selection_fault(binary: &Path, root: &Path, zero: &Path, mod
     let mut node = Process(Command::new(binary)
         .env("TOKIO_WORKER_THREADS", "2")
         .env("LD_PRELOAD", &library)
-        .env("RTOS_TEST_SELECTION_PREFIX", format!("{}/", root.join("node_db/archive/recovery").display()))
-        .env("RTOS_TEST_SELECTION_FAULT_MARKER", &marker)
-        .env("RTOS_TEST_SELECTION_FAULT_MODE", mode)
+        .env("RTOS_TEST_RECOVERY_PREFIX", format!("{}/", root.join("node_db/archive/recovery").display()))
+        .env("RTOS_TEST_RECOVERY_FAULT_MARKER", &marker)
+        .env("RTOS_TEST_RECOVERY_FAULT_MODE", mode)
         .arg("--configs").arg(root).arg("--zerostate").arg(zero)
         .arg("--initial-sync-disabled").current_dir(root)
         .stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log)).spawn()?);
@@ -49,9 +52,21 @@ pub(super) async fn selection_fault(binary: &Path, root: &Path, zero: &Path, mod
     let controls = root.join("node_db/archive/recovery");
     let operations = fs::read_dir(&controls)?.collect::<std::io::Result<Vec<_>>>()?;
     assert_eq!(operations.len(), 1);
-    let selection = operations[0].path().join("selection.v1");
+    let ready_fault = mode.starts_with("ready-");
+    let selection = operations[0].path().join(if ready_fault { "ready.v1" } else { "selection.v1" });
+    let mut ready = Vec::new();
+    let mut stages = 0;
+    find_ready_staging(root, &mut ready, &mut stages)?;
+    if ready_fault {
+        assert_eq!(ready.len(), 1);
+        assert!(stages > 0, "Ready fault must follow production stage creation");
+        keep_evidence(root, &operations[0].path().join("selection.v1"))?;
+    } else {
+        assert!(ready.is_empty());
+        assert_eq!(stages, 0, "Selection failure must precede package staging");
+    }
     let bytes = fs::read(&selection)?;
-    if mode == "selection-enospc" {
+    if mode.ends_with("-enospc") {
         assert_eq!(bytes.len(), 28, "fault must stop the first body write");
     } else {
         // Independently verify complete framing, record count and body hash.
@@ -61,7 +76,7 @@ pub(super) async fn selection_fault(binary: &Path, root: &Path, zero: &Path, mod
             assert!(bytes.len().saturating_sub(position) >= 9, "short record header");
             let length = u64::from_le_bytes(bytes[position + 1..position + 9].try_into()?);
             position = position.checked_add(9).and_then(|n| n.checked_add(usize::try_from(length).ok()?))
-                .ok_or_else(|| rtos_block::error!("Selection framing overflow"))?;
+                .ok_or_else(|| rtos_block::error!("Manifest framing overflow"))?;
             assert!(position <= bytes.len(), "short record payload");
             records += 1;
         }
@@ -72,6 +87,6 @@ pub(super) async fn selection_fault(binary: &Path, root: &Path, zero: &Path, mod
     }
     assert_eq!(&bytes[..8], b"RTOSAMF1");
     keep_evidence(root, &selection)?;
-    eprintln!("Actual node refused startup after scoped {mode}; Selection retained for automatic recovery");
+    eprintln!("Actual node refused startup after scoped {mode}; recovery artifacts retained for automatic recovery");
     Ok(())
 }
