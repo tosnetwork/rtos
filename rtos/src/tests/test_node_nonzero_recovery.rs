@@ -334,6 +334,18 @@ async fn exercise_nonzero_recovery_case(
 #[path = "test_node_sparse_packages.rs"]
 mod sparse_packages;
 
+#[path = "test_node_cache_loss.rs"]
+mod cache_loss;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated LazyFS mount, production node binary, fixture signer and GDB"]
+async fn actual_node_sparse_packages_cache_loss() -> Result<()> {
+    std::env::var("RTOS_NODE_RECOVERY_FIXTURE_DIR")?;
+    std::env::var("RTOS_TEST_LAZYFS_COMMAND")?;
+    std::env::var("RTOS_TEST_LAZYFS_COMPLETED")?;
+    exercise_nonzero_recovery_layout(false, None, Some((3, Some("forward-after-row-sync-cache-loss"))), true).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires production node binary and public fixture signer"]
 async fn actual_node_sparse_packages_restart() -> Result<()> {
@@ -353,7 +365,10 @@ async fn exercise_nonzero_recovery_layout(
     sparse: bool,
 ) -> Result<()> {
     let binary = fs::canonicalize(std::env::var("RTOS_NODE_RECOVERY_BINARY")?)?;
-    let dir = tempfile::tempdir()?;
+    let dir = match std::env::var_os("RTOS_NODE_RECOVERY_FIXTURE_DIR") {
+        Some(parent) => tempfile::tempdir_in(parent)?,
+        None => tempfile::tempdir()?,
+    };
     let root = dir.path();
     let fixture = Fixture::node_recovery();
     let archives = root.join("archives");
