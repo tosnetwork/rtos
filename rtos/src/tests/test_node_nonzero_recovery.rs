@@ -393,6 +393,9 @@ async fn exercise_nonzero_recovery_layout(
     fixture.prepare(root, &archives).await?;
     let physical = run_import(fixture.config(root, archives)).await?;
     tokio::time::timeout(Duration::from_secs(60), wait_for_db_release(physical)).await?;
+    if truncation == Some((3, Some("state-cache-loss"))) {
+        truncation_recovery::state_cache_loss::prepare_dynamic(root, &fixture).await?;
+    }
     if sparse { sparse_packages::prepare(root).await?; }
     let db = open_db(root).await?;
     fixture.assert_imported(&db, 4).await?;
@@ -406,7 +409,9 @@ async fn exercise_nonzero_recovery_layout(
     db.stop_states_db().await?;
     drop(db);
     tokio::time::timeout(Duration::from_secs(30), wait_for_db_release(physical)).await?;
-    interrupt_cleaned_writer(root, building).await?;
+    if !root.join("dynamic-state-fixture").exists() {
+        interrupt_cleaned_writer(root, building).await?;
+    }
     let before = package_inventory(root)?;
     let controls_before = recovery_file_inventory(root)?;
     assert!(!before.is_empty(), "node fixture must contain canonical archive packages");
@@ -436,7 +441,7 @@ async fn exercise_nonzero_recovery_layout(
             "ip_address_quic": quic.local_addr()?.to_string(),
             "boot_from_zerostate": true,
             "restore_db": true,
-            "archival_mode": {"epoch_size": 20000, "new_epochs_path": root.join("epochs"), "existing_epochs": []}
+            "archival_mode": if root.join("dynamic-state-fixture").exists() { serde_json::Value::Null } else { serde_json::json!({"epoch_size": 20000, "new_epochs_path": root.join("epochs"), "existing_epochs": []}) }
         }))?,
     )?;
     drop((adnl, quic));
@@ -1101,4 +1106,10 @@ async fn actual_node_persistent_whole_published_eio() -> Result<()> {
 async fn actual_node_persistent_raw_published_eio() -> Result<()> {
     exercise_nonzero_recovery_layout(false, None,
         Some((3, Some("persistent-raw-published-eio"))), false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires actual node executable, signer and cache-loss fixture"]
+async fn actual_node_state_cache_loss() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-cache-loss"))), false).await
 }

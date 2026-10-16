@@ -123,7 +123,7 @@ def run(binary, output, node=None):
             result["after_clear"] = {name: (mount / name).read_bytes().hex()
                                      for name in ["synced", "overwrite", "unsynced"]}
             if node is not None:
-                omitted_manifest = "validator-wal" if node.omit_validator_wal_sync else "lease-wal" if node.omit_lease_wal_sync else "root-wal" if node.omit_root_wal_sync else "cleaned-wal" if node.omit_cleaned_wal_sync else "committed-wal" if node.omit_committed_wal_sync else "ready-wal" if node.omit_ready_wal_sync else "stage" if node.omit_stage_sync else "selection" if node.omit_selection_sync else "ready" if node.omit_ready_sync else None
+                omitted_manifest = "state-wal" if node.omit_state_wal_sync else "validator-wal" if node.omit_validator_wal_sync else "lease-wal" if node.omit_lease_wal_sync else "root-wal" if node.omit_root_wal_sync else "cleaned-wal" if node.omit_cleaned_wal_sync else "committed-wal" if node.omit_committed_wal_sync else "ready-wal" if node.omit_ready_wal_sync else "stage" if node.omit_stage_sync else "selection" if node.omit_selection_sync else "ready" if node.omit_ready_sync else None
                 fixture_dir = mount / "fixtures"
                 fixture_dir.mkdir()
                 environment = dict(os.environ)
@@ -148,10 +148,10 @@ def run(binary, output, node=None):
                     environment.update({
                         "LD_PRELOAD": str(library),
                         "RTOS_TEST_OMIT_MANIFEST_SYNC_ROOT": str(fixture_dir) + "/",
-                        "RTOS_TEST_OMIT_MANIFEST_SYNC_FILE": (omitted_manifest if omitted_manifest in ["stage", "ready-wal", "committed-wal", "cleaned-wal", "root-wal", "lease-wal", "validator-wal"] else omitted_manifest + ".v1"),
+                        "RTOS_TEST_OMIT_MANIFEST_SYNC_FILE": (omitted_manifest if omitted_manifest in ["stage", "ready-wal", "committed-wal", "cleaned-wal", "root-wal", "lease-wal", "state-wal", "validator-wal"] else omitted_manifest + ".v1"),
                         "RTOS_TEST_OMIT_MANIFEST_SYNC_MARKER": str(output / "manifest-sync-omitted.log"),
                     })
-                    if omitted_manifest in ["committed-wal", "cleaned-wal", "root-wal", "lease-wal", "validator-wal"]:
+                    if omitted_manifest in ["committed-wal", "cleaned-wal", "root-wal", "lease-wal", "state-wal", "validator-wal"]:
                         environment["RTOS_TEST_ROOT_WAL_ARM"] = str(output / "root-wal.arm")
                     result["sync_mutation"] = {"kind": f"omit {omitted_manifest} file sync only",
                                                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
@@ -188,6 +188,8 @@ def run(binary, output, node=None):
                         case = "actual_node_validator_outbox_cache_loss"
                     if node.cut in ["validator-prune", "validator-prune-empty"]:
                         case = "actual_node_" + node.cut.replace("-", "_") + "_cache_loss"
+                    if node.cut == "state":
+                        case = "actual_node_state_cache_loss"
                     if node.cut.startswith("persistent-"):
                         case = "actual_node_" + node.cut.replace("-", "_") + ("" if node.cut.endswith("-eio") else "_cache_loss")
                     result["node_cut"] = node.cut
@@ -232,6 +234,8 @@ def run(binary, output, node=None):
                 if node.cut in ["lease", "lease-acquire", "lease-custody"]:
                     operation = "custody" if node.cut == "lease-custody" else "acquire" if node.cut == "lease-acquire" else "release"
                     required_evidence = [f"Acknowledged lease {operation} writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true")]
+                if node.cut == "state":
+                    required_evidence = ["Acknowledged state publication writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true"), "State publication graph, counters and index preserved after two-boots"]
                 if node.cut == "validator-floor":
                     required_evidence = ["Acknowledged validator floor writer killed with physical pin and native owner alive; cache-loss=" + ("false" if node.no_cache_loss else "true")]
                 if node.cut in ["validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty"]:
@@ -280,6 +284,22 @@ def run(binary, output, node=None):
                     if report["ready_files"] or report["selection_files"]:
                         raise RuntimeError("Validator floor cut overlaps archive recovery")
                     result["changed_validator_wal"] = target[0]
+                    result["sensitivity_detected"] = True
+                elif expected_failure and omitted_manifest == "state-wal":
+                    if executed.returncode != 101:
+                        raise RuntimeError("State WAL omission did not fail the recovery assertions")
+                    required_evidence = ["Acknowledged state publication writer killed without native close; cache-loss=true", "0 passed; 1 failed", "Key not found: BlockId((-1:8000000000000000, 3,", "(shardstate_db))"]
+                    reports = list((output / "node").rglob("cache-loss.json"))
+                    if len(reports) != 1:
+                        raise RuntimeError("Missing state WAL cache-loss report")
+                    report = json.loads(reports[0].read_text())
+                    lost = [r for r in report["wal_files"] if marker[0].endswith("/" + r["path"])]
+                    if len(lost) != 1 or lost[0]["bytes_before"] <= lost[0]["bytes_after"]:
+                        raise RuntimeError("Target state WAL did not lose acknowledged bytes")
+                    refused = list((output / "node").rglob("truncation-refused.log"))
+                    if len(refused) != 1 or "Archive truncation conflicts with repair custody" not in refused[0].read_text():
+                        raise RuntimeError("State sensitivity did not reach actual node startup protection")
+                    result["changed_state_wal"] = lost[0]
                     result["sensitivity_detected"] = True
                 elif expected_failure and omitted_manifest == "lease-wal":
                     if executed.returncode != 101:
@@ -503,9 +523,10 @@ if __name__ == "__main__":
     mutation.add_argument("--omit-committed-wal-sync", action="store_true", help="omit main WAL sync at verified Committed publication")
     mutation.add_argument("--omit-cleaned-wal-sync", action="store_true", help="omit main WAL sync at verified Cleaned publication")
     mutation.add_argument("--omit-root-wal-sync", action="store_true", help="omit main WAL sync at verified final root deletion")
+    mutation.add_argument("--omit-state-wal-sync", action="store_true", help="omit one scoped dynamic state publication WAL sync")
     mutation.add_argument("--omit-lease-wal-sync", action="store_true", help="omit one scoped repair lease mutation WAL sync")
     mutation.add_argument("--omit-validator-wal-sync", action="store_true", help="omit one scoped validator-state WAL sync")
-    parser.add_argument("--cut", choices=["rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire", "lease-custody", "validator-floor", "validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty", "persistent-fast", "persistent-head", "persistent-whole", "persistent-raw", "persistent-fast-file-eio", "persistent-fast-directory-eio", "persistent-head-file-eio", "persistent-head-directory-eio", "persistent-whole-file-eio", "persistent-whole-directory-eio", "persistent-raw-file-eio", "persistent-raw-directory-eio", "persistent-fast-rename-eio", "persistent-head-rename-eio", "persistent-whole-rename-eio", "persistent-raw-rename-eio", "persistent-fast-published-eio", "persistent-head-published-eio", "persistent-whole-published-eio", "persistent-raw-published-eio"], default="rows")
+    parser.add_argument("--cut", choices=["state", "rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire", "lease-custody", "validator-floor", "validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty", "persistent-fast", "persistent-head", "persistent-whole", "persistent-raw", "persistent-fast-file-eio", "persistent-fast-directory-eio", "persistent-head-file-eio", "persistent-head-directory-eio", "persistent-whole-file-eio", "persistent-whole-directory-eio", "persistent-raw-file-eio", "persistent-raw-directory-eio", "persistent-fast-rename-eio", "persistent-head-rename-eio", "persistent-whole-rename-eio", "persistent-raw-rename-eio", "persistent-fast-published-eio", "persistent-head-published-eio", "persistent-whole-published-eio", "persistent-raw-published-eio"], default="rows")
     parser.add_argument("--no-cache-loss", action="store_true", help="run the same node cut without cache loss as a control")
     parser.add_argument("--node-test-binary", type=Path)
     parser.add_argument("--node-binary", type=Path)
@@ -524,6 +545,8 @@ if __name__ == "__main__":
         parser.error("Cleaned WAL control requires all node arguments and --cut cleaned")
     if args.omit_root_wal_sync and (not all(node_args) or args.cut != "root-last"):
         parser.error("Root WAL control requires all node arguments and --cut root-last")
+    if args.omit_state_wal_sync and (not all(node_args) or args.cut != "state"):
+        parser.error("--omit-state-wal-sync requires the state node cut")
     if args.omit_lease_wal_sync and (not all(node_args) or args.cut not in ["lease", "lease-acquire", "lease-custody"]):
         parser.error("Lease WAL control requires all node arguments and a lease cut")
     if args.omit_validator_wal_sync and (not all(node_args) or args.cut not in ["validator-floor", "validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty"]):

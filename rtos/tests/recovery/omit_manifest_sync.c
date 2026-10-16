@@ -101,7 +101,7 @@ static int selected_lease_wal(int fd, char path[PATH_MAX]) {
 static int sync_or_omit(int fd, long operation, const char *name) {
     char path[PATH_MAX];
     const char *mode = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE");
-    if (mode && (!strcmp(mode, "lease-wal") || !strcmp(mode, "validator-wal"))) {
+    if (mode && (!strcmp(mode, "lease-wal") || !strcmp(mode, "state-wal") || !strcmp(mode, "validator-wal"))) {
         if (!selected_lease_wal(fd, path)) return syscall(operation, fd);
     } else if (mode && (!strcmp(mode, "ready-wal") || !strcmp(mode, "committed-wal") || !strcmp(mode, "cleaned-wal") || !strcmp(mode, "root-wal"))) {
         if (!atomic_load_explicit(&wal_armed, memory_order_acquire) && selected(fd, path)) {

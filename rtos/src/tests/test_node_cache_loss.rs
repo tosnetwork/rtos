@@ -18,7 +18,9 @@ pub(super) fn sync_fixture(path: &Path) -> Result<()> {
 
 fn selection_paths(root: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
-    for entry in fs::read_dir(root.join("node_db/archive/recovery"))? {
+    let directory = root.join("node_db/archive/recovery");
+    if !directory.try_exists()? { return Ok(paths); }
+    for entry in fs::read_dir(directory)? {
         let entry = entry?;
         assert!(entry.file_type()?.is_dir());
         let path = entry.path().join("selection.v1");
