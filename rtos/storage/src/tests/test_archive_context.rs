@@ -366,3 +366,26 @@ async fn cached_package_and_slice_views_refuse_stale_read_authority() {
     assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&expected));
     assert_eq!(std::fs::read(&path).unwrap(), original);
 }
+
+#[tokio::test]
+async fn acquisition_releases_resource_before_custody_without_mutation_failure() {
+    for fail_registration in [false, true] {
+        let (_dir, db, domain, view) = fixture();
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let value = payload(domain.clone(), &db, observations.clone()).await;
+        let acquisition = view.enter().unwrap().start_read().unwrap().acquisition(value);
+        let weak = Arc::downgrade(&db);
+        drop(view);
+        drop(db);
+        assert!(weak.upgrade().is_some());
+        if fail_registration {
+            assert!(acquisition.consume(|_| Err(anyhow::anyhow!("registration refused"))).is_err());
+        } else {
+            drop(acquisition);
+        }
+        assert_eq!(*observations.lock().unwrap(), vec![(1, false, true)]);
+        assert_eq!(domain.outstanding(), 0);
+        assert!(!domain.recovery_required());
+        assert!(weak.upgrade().is_none());
+    }
+}

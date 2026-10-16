@@ -104,6 +104,13 @@ async fn read_header<R: tokio::io::AsyncReadExt + Unpin>(reader: &mut R) -> Resu
     Ok(())
 }
 
+fn read_header_sync(reader: &mut impl std::io::Read) -> Result<()> {
+    let mut bytes = [0; PKG_HEADER_SIZE];
+    reader.read_exact(&mut bytes)?;
+    if u32::from_le_bytes(bytes) != PKG_HEADER_MAGIC { fail!("Package file header mismatch"); }
+    Ok(())
+}
+
 impl Package {
     async fn lock_writer(&self) -> PackageWriter {
         let state = self.state.clone();
@@ -111,66 +118,92 @@ impl Package {
         PackageWriter { guard, _state: state }
     }
 
-    pub async fn open(view: ArchiveView, parent: &ArchiveOperation, path: PathBuf, read_only: bool, create: bool) -> Result<Self> {
-        let _operation = view.inherit(parent)?;
-        let (file, size) = if read_only {
-            let size = tokio::fs::metadata(&path).await?.len();
-            if size < PKG_HEADER_SIZE as u64 {
-                fail!("Package file is too short")
-            }
-            (None, size)
-        } else {
-            let mut file = Self::open_file_ext(read_only, create, path.as_path()).await?;
-            let mut size = file.metadata().await?.len();
-
-            file.seek(SeekFrom::Start(0)).await?;
-            if size < PKG_HEADER_SIZE as u64 {
-                if !create {
-                    fail!("Package file is too short")
-                }
-                file.write_all(&PKG_HEADER_MAGIC.to_le_bytes()).await?;
-                file.flush().await?;
-                size = PKG_HEADER_SIZE as u64;
-            } else {
-                read_header(&mut file).await?;
-                file.seek(SeekFrom::End(0)).await?;
-            }
-            (Some(file.into_std().await), size)
-        };
-
-        Ok(Self { state: Arc::new(PackageState {
-            view,
-            path,
-            read_only,
-            size: AtomicU64::new(size),
-            write_healthy: AtomicBool::new(true),
+    fn from_opened(view: ArchiveView, path: PathBuf, read_only: bool, file: Option<std::fs::File>, size: u64) -> Self {
+        Self { state: Arc::new(PackageState {
+            view, path, read_only, size: AtomicU64::new(size), write_healthy: AtomicBool::new(true),
             write_mutex: Arc::new(tokio::sync::Mutex::new(file)),
             #[cfg(test)]
             append_probe: std::sync::Mutex::new(None),
-        }) })
+        }) }
+    }
+
+    pub async fn open(view: ArchiveView, parent: &ArchiveOperation, path: PathBuf, read_only: bool, create: bool) -> Result<Self> {
+        if read_only || !create {
+            return Self::open_native_existing(view, parent, path, read_only, None).await;
+        }
+        let operation = view.inherit(parent)?;
+        let (phase, mut job) = operation.mutation_phase();
+        let native_path = path.clone();
+        let handoff = tokio::task::spawn_blocking(move || {
+            // O_CREAT may create the file, so cancellation must be ordered before
+            // the open itself, not merely before a later header write.
+            job.start()?;
+            let mut file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&native_path)?;
+            let mut size = file.metadata()?.len();
+            std::io::Seek::seek(&mut file, SeekFrom::Start(0))?;
+            if size < PKG_HEADER_SIZE as u64 {
+                std::io::Write::write_all(&mut file, &PKG_HEADER_MAGIC.to_le_bytes())?;
+                std::io::Write::flush(&mut file)?;
+                size = PKG_HEADER_SIZE as u64;
+            } else {
+                read_header_sync(&mut file)?;
+                std::io::Seek::seek(&mut file, SeekFrom::End(0))?;
+            }
+            Ok::<_, anyhow::Error>(job.handoff((Some(file), size)))
+        }).await.map_err(|e| error!("Native package create task failed: {e}"))??;
+        phase.check_completion()?;
+        let mut package = None;
+        handoff.consume(|opened| {
+            package = Some(Self::from_opened(view, path, false, opened.0.take(), opened.1));
+            Ok(())
+        })?;
+        phase.complete();
+        Ok(package.expect("registered native package"))
     }
 
     /// Validate a leased existing package without any repair or creation. Use
-    /// the same descriptor for validation and later append access.
+    /// the same native descriptor for validation and subsequent append access.
     pub(crate) async fn open_existing_exact(view: ArchiveView, parent: &ArchiveOperation, path: PathBuf, read_only: bool, logical_size: u64) -> Result<Self> {
-        let _operation = view.inherit(parent)?;
-        let mut file = tokio::fs::OpenOptions::new().read(true).write(!read_only).open(&path).await
-            .map_err(|error| error!("Protected package open failed for {}: {error}", path.display()))?;
         let expected = logical_size.checked_add(PKG_HEADER_SIZE as u64)
             .ok_or_else(|| error!("Protected package size overflow"))?;
-        let size = file.metadata().await?.len();
-        if size != expected || size < PKG_HEADER_SIZE as u64 {
-            fail!("Protected package physical length differs from durable metadata");
-        }
-        read_header(&mut file).await?;
-        file.seek(SeekFrom::End(0)).await?;
-        Ok(Self { state: Arc::new(PackageState {
-            view, path, read_only, size: AtomicU64::new(size),
-            write_healthy: AtomicBool::new(true),
-            write_mutex: Arc::new(tokio::sync::Mutex::new(if read_only { None } else { Some(file.into_std().await) })),
-            #[cfg(test)]
-            append_probe: std::sync::Mutex::new(None),
-        }) })
+        Self::open_native_existing(view, parent, path, read_only, Some(expected)).await
+    }
+
+    async fn open_native_existing(
+        view: ArchiveView, parent: &ArchiveOperation, path: PathBuf,
+        read_only: bool, expected: Option<u64>,
+    ) -> Result<Self> {
+        let operation = view.inherit(parent)?;
+        let native_path = path.clone();
+        let acquisition = tokio::task::spawn_blocking(move || {
+            let custody = operation.start_read()?;
+            // Preserve ordinary read-only open semantics: the legacy path only
+            // inspects length; protected exact opens also validate the header.
+            if read_only && expected.is_none() {
+                let size = std::fs::metadata(&native_path)?.len();
+                if size < PKG_HEADER_SIZE as u64 { fail!("Package file is too short"); }
+                return Ok::<_, anyhow::Error>(custody.acquisition((None, size)));
+            }
+            let mut file = std::fs::OpenOptions::new().read(true).write(!read_only).open(&native_path)
+                .map_err(|error| error!("Existing package open failed for {}: {error}", native_path.display()))?;
+            let size = file.metadata()?.len();
+            if expected.is_some_and(|expected| expected != size) || size < PKG_HEADER_SIZE as u64 {
+                fail!("Package physical length differs from durable metadata or header minimum");
+            }
+            read_header_sync(&mut file)?;
+            std::io::Seek::seek(&mut file, SeekFrom::End(0))?;
+            let file = if read_only { drop(file); None } else { Some(file) };
+            Ok(custody.acquisition((file, size)))
+        }).await.map_err(|e| error!("Native package existing-open task failed: {e}"))??;
+        // Recheck the epoch and failure state after native acquisition, before
+        // publishing a writer. The acquisition still owns its resource here.
+        let _registration = view.inherit(parent)?;
+        let mut package = None;
+        acquisition.consume(|opened| {
+            package = Some(Self::from_opened(view, path, read_only, opened.0.take(), opened.1));
+            Ok(())
+        })?;
+        Ok(package.expect("registered existing native package"))
     }
 
     pub fn size(&self) -> u64 {

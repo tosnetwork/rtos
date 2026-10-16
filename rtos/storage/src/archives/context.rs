@@ -288,11 +288,33 @@ impl NativeCustody {
     pub fn handoff<T: Send + 'static>(self, value: T) -> NativeHandoff<T> {
         NativeHandoff { value: Some(value), custody: Some(self), consumed: false }
     }
+    /// Transfer a resource acquired without canonical mutation. Cancellation
+    /// closes/drops the resource before releasing provider and epoch custody.
+    pub(crate) fn acquisition<T: Send + 'static>(self, value: T) -> NativeAcquisition<T> {
+        NativeAcquisition { value: Some(value), custody: Some(self) }
+    }
 }
 impl Drop for NativeCustody {
     fn drop(&mut self) {
         drop(self.provider.take());
         drop(self.ticket.take());
+    }
+}
+
+#[must_use = "the acquired resource remains owned until consumed or dropped"]
+pub(crate) struct NativeAcquisition<T: Send + 'static> {
+    value: Option<T>, custody: Option<NativeCustody>,
+}
+impl<T: Send + 'static> NativeAcquisition<T> {
+    /// Registration only: this callback must not perform canonical mutations.
+    pub(crate) fn consume(mut self, register: impl FnOnce(&mut T) -> Result<()>) -> Result<()> {
+        register(self.value.as_mut().expect("native acquisition payload"))
+    }
+}
+impl<T: Send + 'static> Drop for NativeAcquisition<T> {
+    fn drop(&mut self) {
+        drop(self.value.take());
+        drop(self.custody.take());
     }
 }
 

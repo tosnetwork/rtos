@@ -171,3 +171,90 @@ async fn actual_native_syscall_errors_preserve_bytes_and_fence_domain() -> Resul
     }
     Ok(())
 }
+
+#[test]
+fn cancelled_queued_opens_drain_actual_custody_and_preserve_files() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1).max_blocking_threads(1).enable_all().build()?;
+    runtime.block_on(async {
+        for mode in 0..5 {
+            let (dir, view, operation) = package_fixture_context()?;
+            let path = dir.path().join("open.pack");
+            let original = if mode != 0 {
+                let package = Package::open(view.clone(), &operation, path.clone(), false, true).await?;
+                drop(package);
+                Some(std::fs::read(&path)?)
+            } else { None };
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(10))?;
+            let mut opening = Box::pin(async {
+                match mode {
+                    0 => Package::open(view.clone(), &operation, path.clone(), false, true).await,
+                    1 => Package::open(view.clone(), &operation, path.clone(), false, false).await,
+                    2 => Package::open(view.clone(), &operation, path.clone(), true, false).await,
+                    _ => Package::open_existing_exact(view.clone(), &operation, path.clone(), mode == 4, 0).await,
+                }
+            });
+            assert!(futures::poll!(&mut opening).is_pending());
+            drop(opening);
+            let closed = view.binding().domain().close(view.epoch())?;
+            drop(operation);
+            assert!(view.binding().domain().outstanding() > 0);
+            release_tx.send(())?;
+            blocker.await?;
+            tokio::time::timeout(Duration::from_secs(10), closed.wait()).await?;
+            assert!(!view.binding().domain().recovery_required());
+            match original {
+                Some(bytes) => assert_eq!(std::fs::read(&path)?, bytes),
+                None => assert!(!path.exists()),
+            }
+        }
+        Ok(())
+    })
+}
+
+#[tokio::test]
+async fn native_open_preserves_short_file_and_invalid_header_policy() -> Result<()> {
+    for create in [false, true] {
+        for len in [0, 3, 4] {
+            let (dir, view, operation) = package_fixture_context()?;
+            let path = dir.path().join("invalid.pack");
+            let original = vec![0xff; len];
+            std::fs::write(&path, &original)?;
+            let result = Package::open(view.clone(), &operation, path.clone(), false, create).await;
+            if create && len < PKG_HEADER_SIZE {
+                let package = result?;
+                assert_eq!(package.size(), 0);
+                assert_eq!(std::fs::read(&path)?, PKG_HEADER_MAGIC.to_le_bytes());
+                package.append_entry(PackageEntry::with_data("after-header".into(), vec![9]), |_,_| Ok(())).await?;
+                assert_eq!(package.read_entry(0).await?.data(), &[9]);
+            } else {
+                assert!(result.is_err());
+                assert_eq!(std::fs::read(&path)?, original);
+            }
+            assert_eq!(view.binding().domain().recovery_required(), create && len == PKG_HEADER_SIZE);
+        }
+    }
+    // Ordinary readonly opens historically inspect length only. Exact opens
+    // additionally validate the magic, but neither path can repair the file.
+    for exact in [false, true] {
+        let (dir, view, operation) = package_fixture_context()?;
+        let path = dir.path().join("readonly.pack");
+        let original = [0xff; PKG_HEADER_SIZE];
+        std::fs::write(&path, original)?;
+        let result = if exact {
+            Package::open_existing_exact(view.clone(), &operation, path.clone(), true, 0).await
+        } else {
+            Package::open(view.clone(), &operation, path.clone(), true, true).await
+        };
+        assert_eq!(result.is_err(), exact);
+        assert_eq!(std::fs::read(&path)?, original);
+        assert!(!view.binding().domain().recovery_required());
+    }
+    Ok(())
+}
