@@ -18,19 +18,41 @@ use rtos_block::{error, fail, Result};
 use std::{
     io::SeekFrom,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
 };
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 #[derive(Debug)]
 pub struct Package {
-    view: ArchiveView,
+    state: Arc<PackageState>,
+}
+
+/// One identity for cached length/health, captured view and actual writer. Native
+/// migration can retain this state independently of the caller's Package handle.
+#[derive(Debug)]
+struct PackageState {
+    // Writer ownership is released before the captured provider/view.
+    write_mutex: Arc<tokio::sync::Mutex<Option<tokio::fs::File>>>,
     path: PathBuf,
     read_only: bool,
     size: AtomicU64,
     // A partial tail or uncertain metadata requires fresh-owner recovery.
     write_healthy: AtomicBool,
-    write_mutex: tokio::sync::Mutex<Option<tokio::fs::File>>,
+    view: ArchiveView,
+}
+
+/// A transferable writer guard always pins the shared state and its provider.
+/// Declaration order releases serialization before the final state reference.
+struct PackageWriter {
+    guard: tokio::sync::OwnedMutexGuard<Option<tokio::fs::File>>,
+    _state: Arc<PackageState>,
+}
+impl std::ops::Deref for PackageWriter {
+    type Target = Option<tokio::fs::File>;
+    fn deref(&self) -> &Self::Target { &self.guard }
+}
+impl std::ops::DerefMut for PackageWriter {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.guard }
 }
 
 pub(crate) const PKG_HEADER_SIZE: usize = 4;
@@ -75,6 +97,12 @@ async fn read_header<R: tokio::io::AsyncReadExt + Unpin>(reader: &mut R) -> Resu
 }
 
 impl Package {
+    async fn lock_writer(&self) -> PackageWriter {
+        let state = self.state.clone();
+        let guard = state.write_mutex.clone().lock_owned().await;
+        PackageWriter { guard, _state: state }
+    }
+
     pub async fn open(view: ArchiveView, parent: &ArchiveOperation, path: PathBuf, read_only: bool, create: bool) -> Result<Self> {
         let _operation = view.inherit(parent)?;
         let (file, size) = if read_only {
@@ -102,14 +130,14 @@ impl Package {
             (Some(file), size)
         };
 
-        Ok(Self {
+        Ok(Self { state: Arc::new(PackageState {
             view,
             path,
             read_only,
             size: AtomicU64::new(size),
             write_healthy: AtomicBool::new(true),
-            write_mutex: tokio::sync::Mutex::new(file),
-        })
+            write_mutex: Arc::new(tokio::sync::Mutex::new(file)),
+        }) })
     }
 
     /// Validate a leased existing package without any repair or creation. Use
@@ -126,20 +154,20 @@ impl Package {
         }
         read_header(&mut file).await?;
         file.seek(SeekFrom::End(0)).await?;
-        Ok(Self {
+        Ok(Self { state: Arc::new(PackageState {
             view, path, read_only, size: AtomicU64::new(size),
             write_healthy: AtomicBool::new(true),
-            write_mutex: tokio::sync::Mutex::new(if read_only { None } else { Some(file) }),
-        })
+            write_mutex: Arc::new(tokio::sync::Mutex::new(if read_only { None } else { Some(file) })),
+        }) })
     }
 
     pub fn size(&self) -> u64 {
-        self.size.load(Ordering::SeqCst) - PKG_HEADER_SIZE as u64
+        self.state.size.load(Ordering::SeqCst) - PKG_HEADER_SIZE as u64
     }
 
     pub async fn remove(&self) -> Result<()> {
-        debug_assert!(!self.read_only);
-        let mut file = self.write_mutex.lock().await;
+        debug_assert!(!self.state.read_only);
+        let mut file = self.lock_writer().await;
         if file.take().is_none() {
             Ok(())
         } else {
@@ -161,19 +189,19 @@ impl Package {
         &self,
         observer: Option<&crate::durability::SyncObserver>,
     ) -> Result<()> {
-        let _guard = self.write_mutex.lock().await;
+        let _guard = self.lock_writer().await;
         sync_file_and_parents_observed(self.path(), observer).await
     }
 
     pub fn path(&self) -> &Path {
-        self.path.as_path()
+        self.state.path.as_path()
     }
 
     /// Borrow the actual writer identity; does not clone or transfer its fd.
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) async fn writer_fd_for_io_test(&self) -> Result<std::ffi::c_int> {
         use std::os::fd::AsRawFd;
-        let guard = self.write_mutex.lock().await;
+        let guard = self.lock_writer().await;
         let file = guard.as_ref().ok_or_else(|| error!("Package writer is closed"))?;
         Ok(file.as_raw_fd())
     }
@@ -182,13 +210,13 @@ impl Package {
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) async fn close_for_sst_test(&self) -> Result<()> {
         use std::os::fd::{AsRawFd, IntoRawFd};
-        let mut guard = self.write_mutex.lock().await;
+        let mut guard = self.lock_writer().await;
         let Some(mut file) = guard.take() else {
-            fail!("SST package fd already closed or read-only: {}", self.path.display());
+            fail!("SST package fd already closed or read-only: {}", self.state.path.display());
         };
         file.flush().await?;
         let file = file.into_std().await;
-        eprintln!("SST-PACK-CLOSE fd={} path={}", file.as_raw_fd(), self.path.display());
+        eprintln!("SST-PACK-CLOSE fd={} path={}", file.as_raw_fd(), self.state.path.display());
         tokio::task::spawn_blocking(move || {
             unsafe extern "C" {
                 fn close(fd: std::ffi::c_int) -> std::ffi::c_int;
@@ -206,15 +234,15 @@ impl Package {
     }
 
     pub fn get_path(&self) -> String {
-        self.path.display().to_string()
+        self.state.path.display().to_string()
     }
 
     pub async fn truncate(&self, size: u64) -> Result<()> {
         let new_size = (PKG_HEADER_SIZE as u64)
             .checked_add(size)
             .ok_or_else(|| error!("Package truncate size overflow"))?;
-        let mut guard = self.write_mutex.lock().await;
-        if !self.write_healthy.load(Ordering::SeqCst) {
+        let mut guard = self.lock_writer().await;
+        if !self.state.write_healthy.load(Ordering::SeqCst) {
             fail!("Package write state is uncertain; reopen before mutation");
         }
         let Some(file) = &mut *guard else {
@@ -223,15 +251,15 @@ impl Package {
                 self.path().display()
             );
         };
-        self.write_healthy.store(false, Ordering::SeqCst);
-        let old_raw = self.size.load(Ordering::SeqCst);
+        self.state.write_healthy.store(false, Ordering::SeqCst);
+        let old_raw = self.state.size.load(Ordering::SeqCst);
         let old_file_len = file.metadata().await?.len();
-        log::warn!(target: TARGET, "Truncating package {}: raw_size {old_raw} -> {new_size}, file_len {old_file_len} -> {new_size}", self.path.display());
+        log::warn!(target: TARGET, "Truncating package {}: raw_size {old_raw} -> {new_size}, file_len {old_file_len} -> {new_size}", self.state.path.display());
         file.set_len(new_size).await?;
         // ftruncate does not move the cursor; publish only after both complete.
         file.seek(SeekFrom::Start(new_size)).await?;
-        self.size.store(new_size, Ordering::SeqCst);
-        self.write_healthy.store(true, Ordering::SeqCst);
+        self.state.size.store(new_size, Ordering::SeqCst);
+        self.state.write_healthy.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -247,14 +275,14 @@ impl Package {
             if actual_size <= required_size {
                 fail!(
                     "Unexpected end of file when reading package {} entry with offset {offset}",
-                    self.path.display()
+                    self.state.path.display()
                 );
             } else {
                 log::warn!(
                     target: TARGET,
                     "Not actualized package {} size {actual_size} \
                     when reading entry with offset {offset}",
-                    self.path.display()
+                    self.state.path.display()
                 )
             }
         }
@@ -262,12 +290,12 @@ impl Package {
         PackageEntry::read_from(&mut file)
             .await
             .map_err(|e| {
-                error!("Package::read_entry {} at offset {offset}: {e}", self.path.display())
+                error!("Package::read_entry {} at offset {offset}: {e}", self.state.path.display())
             })?
             .ok_or_else(|| {
                 error!(
                     "Package::read_entry {} at offset {offset}: Unexpected end of file",
-                    self.path.display()
+                    self.state.path.display()
                 )
             })
     }
@@ -277,7 +305,7 @@ impl Package {
         offset: u64,
         limits: super::bounded_read::ArchiveReadLimits,
     ) -> Result<PackageEntry> {
-        let operation = self.view.enter()?;
+        let operation = self.state.view.enter()?;
         self.read_entry_bounded_in(&operation, offset, limits).await
     }
 
@@ -285,15 +313,15 @@ impl Package {
         &self, parent: &ArchiveOperation, offset: u64,
         limits: super::bounded_read::ArchiveReadLimits,
     ) -> Result<PackageEntry> {
-        let operation = self.view.inherit(parent)?;
-        super::native_read::read_entry(operation, self.path.clone(), offset, limits).await
+        let operation = self.state.view.inherit(parent)?;
+        super::native_read::read_entry(operation, self.state.path.clone(), offset, limits).await
     }
 
     pub(super) async fn read_range_in(
         &self, parent: &ArchiveOperation, offset: u64, limit: u32,
     ) -> Result<Vec<u8>> {
-        let operation = self.view.inherit(parent)?;
-        super::native_read::read_range(operation, self.path.clone(), offset, limit).await
+        let operation = self.state.view.inherit(parent)?;
+        super::native_read::read_range(operation, self.state.path.clone(), offset, limit).await
     }
 
     pub async fn append_entry(
@@ -319,8 +347,8 @@ impl Package {
         after_append: impl FnOnce(O, u64) -> Result<()>,
     ) -> Result<PackageEntry> {
         let entry_size = entry.serialized_size()?;
-        let mut guard = self.write_mutex.lock().await;
-        if !self.write_healthy.load(Ordering::SeqCst) {
+        let mut guard = self.lock_writer().await;
+        if !self.state.write_healthy.load(Ordering::SeqCst) {
             fail!("Package write state is uncertain; reopen before mutation");
         }
         let Some(file) = &mut *guard else {
@@ -330,18 +358,18 @@ impl Package {
             );
         };
         // Neither an error nor an abandoned future may reset this admission.
-        self.write_healthy.store(false, Ordering::SeqCst);
-        let raw_size = self.size.load(Ordering::SeqCst);
+        self.state.write_healthy.store(false, Ordering::SeqCst);
+        let raw_size = self.state.size.load(Ordering::SeqCst);
         if raw_size < PKG_HEADER_SIZE as u64 {
             fail!("Package length is smaller than its header");
         }
         let actual_before = file.metadata().await?.len();
         if raw_size != actual_before {
-            fail!("Package {} physical/logical length mismatch before append: {actual_before} != {raw_size}", self.path.display());
+            fail!("Package {} physical/logical length mismatch before append: {actual_before} != {raw_size}", self.state.path.display());
         }
         let cursor = file.stream_position().await?;
         if cursor != raw_size {
-            fail!("Package {} writer cursor mismatch before append: {cursor} != {raw_size}", self.path.display());
+            fail!("Package {} writer cursor mismatch before append: {cursor} != {raw_size}", self.state.path.display());
         }
         let prepared = AppendLayout::checked(raw_size, entry_size)
             .and_then(|layout| Ok((checked_offset(layout.entry_offset)?, layout)));
@@ -350,7 +378,7 @@ impl Package {
             Err(error) => {
                 // Only checked arithmetic/input refusal can reach this branch.
                 // Actual length/cursor were verified; no mutation has begun.
-                self.write_healthy.store(true, Ordering::SeqCst);
+                self.state.write_healthy.store(true, Ordering::SeqCst);
                 return Err(error);
             }
         };
@@ -362,18 +390,18 @@ impl Package {
         file.sync_data().await?;
         let actual_after = file.metadata().await?.len();
         if layout.total_size != actual_after {
-            fail!("Package {} physical/logical length mismatch after append: {actual_after} != {}", self.path.display(), layout.total_size);
+            fail!("Package {} physical/logical length mismatch after append: {actual_after} != {}", self.state.path.display(), layout.total_size);
         }
-        self.size.store(layout.total_size, Ordering::SeqCst);
+        self.state.size.store(layout.total_size, Ordering::SeqCst);
         after_append(offset, layout.logical_size)?;
-        self.write_healthy.store(true, Ordering::SeqCst);
+        self.state.write_healthy.store(true, Ordering::SeqCst);
         // Only the original entry escapes. Later sync reacquires this mutex.
         drop(guard);
         Ok(entry)
     }
 
     pub async fn open_file(&self) -> Result<tokio::fs::File> {
-        Self::open_file_ext(self.read_only, false, self.path.as_path()).await
+        Self::open_file_ext(self.state.read_only, false, self.state.path.as_path()).await
     }
 
     async fn open_file_ext(
@@ -621,7 +649,7 @@ mod consuming_tests {
         let encoded_size = entry.serialized_size()?;
         let calls = AtomicU64::new(0);
         let callback = |offset: u64, size: u64| {
-            assert!(package.write_mutex.try_lock().is_err(), "metadata callback lost writer guard");
+            assert!(package.state.write_mutex.try_lock().is_err(), "metadata callback lost writer guard");
             assert_eq!(offset, 0);
             assert_eq!(size, encoded_size);
             calls.fetch_add(1, Ordering::SeqCst);
@@ -637,7 +665,7 @@ mod consuming_tests {
         assert_eq!(entry.filename().as_ptr(), name_pointer);
         assert_eq!(entry.data(), b"owned payload");
         assert_eq!(entry.filename(), "owned");
-        assert!(package.write_mutex.try_lock().is_ok(), "append returned while writer guard remained locked");
+        assert!(package.state.write_mutex.try_lock().is_ok(), "append returned while writer guard remained locked");
         tokio::time::timeout(Duration::from_secs(5), package.sync_durable(None)).await??;
         let next = package.size();
         let entry = tokio::time::timeout(Duration::from_secs(5), async {
@@ -671,5 +699,47 @@ mod consuming_tests {
     #[tokio::test]
     async fn indexed_append_returns_owned_buffer_after_unlock() -> Result<()> {
         check_owned_append(true).await
+    }
+}
+
+#[cfg(test)]
+mod state_ownership_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn shared_state_and_owned_writer_outlive_dropped_package_handle() -> Result<()> {
+        let (_context_dir, view, operation) = package_fixture_context()?;
+        let dir = tempfile::tempdir()?;
+        let package = Package::open(view.clone(), &operation, dir.path().join("owned.pack"), false, true).await?;
+        let state = package.state.clone();
+        let weak_state = Arc::downgrade(&state);
+        let weak_provider = Arc::downgrade(view.binding().db());
+        let mut guard = package.lock_writer().await;
+        let worker_state = weak_state.clone();
+        drop(state);
+        fn assert_send<T: Send>(_: &T) {}
+        assert_send(&guard);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let observer = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            release_rx.await.unwrap();
+            let state = worker_state.upgrade().expect("writer guard must pin shared package state");
+            assert!(state.write_mutex.try_lock().is_err());
+            assert_eq!(guard.as_mut().unwrap().metadata().await.unwrap().len(), PKG_HEADER_SIZE as u64);
+            drop(guard);
+            assert!(state.write_mutex.try_lock().is_ok());
+            drop(state);
+            let _ = done_tx.send(());
+        });
+        started_rx.await?;
+        drop(package); drop(operation); drop(view); drop(observer);
+        assert!(weak_state.upgrade().is_some()); assert!(weak_provider.upgrade().is_some());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), done_rx).await??;
+        assert!(weak_state.upgrade().is_none()); assert!(weak_provider.upgrade().is_none());
+        Ok(())
     }
 }

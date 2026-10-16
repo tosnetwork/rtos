@@ -27,7 +27,7 @@ async fn invalid_append_preserves_file_then_maximum_filename_roundtrips() -> Res
     assert_eq!(callbacks, 0);
     assert_eq!(package.size(), 0);
     assert_eq!(std::fs::read(&path)?, before);
-    assert!(package.write_healthy.load(Ordering::SeqCst));
+    assert!(package.state.write_healthy.load(Ordering::SeqCst));
     let valid = PackageEntry::with_data("x".repeat(usize::from(u16::MAX)), vec![7, 8]);
     let encoded_size = valid.serialized_size()?;
     let valid = package.append_entry(valid, |offset, size| {
@@ -52,16 +52,16 @@ async fn damaged_length_and_cursor_latch_before_append() -> Result<()> {
         let path = directory.path().join("damaged.pack");
         let package = Package::open(view, &operation, path.clone(), false, true).await?;
         if bad_length {
-            package.size.store(3, Ordering::SeqCst);
+            package.state.size.store(3, Ordering::SeqCst);
         } else {
-            package.write_mutex.lock().await.as_mut().unwrap().seek(SeekFrom::Start(0)).await?;
+            package.state.write_mutex.lock().await.as_mut().unwrap().seek(SeekFrom::Start(0)).await?;
         }
         let before = std::fs::read(&path)?;
         let entry = PackageEntry::with_data("entry".into(), vec![1]);
         let error = package.append_entry(entry, |_, _| panic!("damaged writer reached metadata"))
             .await.err().expect("damaged writer must be refused");
         assert!(error.to_string().contains(if bad_length { "smaller than its header" } else { "cursor mismatch" }));
-        assert!(!package.write_healthy.load(Ordering::SeqCst));
+        assert!(!package.state.write_healthy.load(Ordering::SeqCst));
         assert_eq!(std::fs::read(&path)?, before);
         assert!(package.truncate(0).await.unwrap_err().to_string().contains("write state is uncertain"));
     }
