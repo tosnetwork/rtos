@@ -295,6 +295,30 @@ async fn actual_node_recovers_publish_directory_sync_eio_retaining_height_three(
     exercise_nonzero_recovery_case(false, None, Some((3, Some("publish-directory-sync-eio")))).await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node binary, public fixture signer, and C compiler"]
+async fn actual_node_recovers_stage_enospc_retaining_height_two() -> Result<()> {
+    exercise_nonzero_recovery_case(false, None, Some((2, Some("stage-enospc")))).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node binary, public fixture signer, and C compiler"]
+async fn actual_node_recovers_stage_enospc_retaining_height_three() -> Result<()> {
+    exercise_nonzero_recovery_case(false, None, Some((3, Some("stage-enospc")))).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node binary, public fixture signer, and C compiler"]
+async fn actual_node_recovers_stage_sync_eio_retaining_height_two() -> Result<()> {
+    exercise_nonzero_recovery_case(false, None, Some((2, Some("stage-sync-eio")))).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node binary, public fixture signer, and C compiler"]
+async fn actual_node_recovers_stage_sync_eio_retaining_height_three() -> Result<()> {
+    exercise_nonzero_recovery_case(false, None, Some((3, Some("stage-sync-eio")))).await
+}
+
 async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&str>) -> Result<()> {
     exercise_nonzero_recovery_case(interrupt_recovery, building, None).await
 }

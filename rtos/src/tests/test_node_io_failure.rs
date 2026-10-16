@@ -15,6 +15,8 @@ pub(super) async fn recovery_fault(binary: &Path, root: &Path, zero: &Path, mode
         "wal-publish-sync-eio" => ("main WAL sync after canonical replacement: EIO\n", "Input/output error"),
         "wal-epoch-enrollment-eio" => ("epoch WAL sync after Selection fsync: EIO\n", "Input/output error"),
         "publish-directory-sync-eio" => ("fsync canonical directory after replacement: EIO\n", "Input/output error"),
+        "stage-enospc" => ("write staged package after 4-byte header: ENOSPC\n", "No space left on device"),
+        "stage-sync-eio" => ("fsync staged package: EIO\n", "Input/output error"),
         _ => rtos_block::fail!("Unknown recovery fault mode"),
     };
     let source = root.join("recovery-fault.c");
@@ -75,12 +77,47 @@ pub(super) async fn recovery_fault(binary: &Path, root: &Path, zero: &Path, mode
             assert!(stages > 0, "failure must leave staged replacements");
         }
         keep_evidence(root, &operations[0].path().join("selection.v1"))?;
+    } else if mode.starts_with("stage-") {
+        assert!(ready.is_empty(), "stage failure must precede Ready creation");
+        assert!(stages > 0);
+        fn collect(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() { collect(&entry.path(), files)?; }
+                else if entry.file_name().to_string_lossy().starts_with("stage-")
+                    && entry.path().extension().is_some_and(|ext| ext == "pack") { files.push(entry.path()); }
+            }
+            Ok(())
+        }
+        let mut files = Vec::new();
+        collect(root, &mut files)?;
+        assert_eq!(files.len(), stages);
+        let mut header_only = false;
+        for file in files {
+            let bytes = fs::read(&file)?;
+            assert!(bytes.len() >= 4);
+            assert_eq!(&bytes[..4], &0xAE8F_DD01u32.to_le_bytes());
+            header_only |= bytes.len() == 4;
+            // Independent framing check of all entries present at fsync.
+            let mut pos = 4usize;
+            while pos < bytes.len() {
+                assert!(bytes.len() - pos >= 8);
+                assert_eq!(u16::from_le_bytes(bytes[pos..pos + 2].try_into()?), 0x1E8B);
+                let name = u16::from_le_bytes(bytes[pos + 2..pos + 4].try_into()?) as usize;
+                let body = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into()?) as usize;
+                pos = pos.checked_add(8).and_then(|n| n.checked_add(name)).and_then(|n| n.checked_add(body))
+                    .ok_or_else(|| rtos_block::error!("Stage framing overflow"))?;
+                assert!(pos <= bytes.len(), "incomplete staged package entry");
+            }
+            keep_evidence(root, &file)?;
+        }
+        if mode == "stage-enospc" { assert!(header_only, "write fault must leave an unfinished header-only stage"); }
     } else {
         assert!(ready.is_empty());
         assert_eq!(stages, 0, "Selection failure must precede package staging");
     }
     let bytes = fs::read(&selection)?;
-    if mode.ends_with("-enospc") {
+    if matches!(mode, "selection-enospc" | "ready-enospc") {
         assert_eq!(bytes.len(), 28, "fault must stop the first body write");
     } else {
         // Independently verify complete framing, record count and body hash.

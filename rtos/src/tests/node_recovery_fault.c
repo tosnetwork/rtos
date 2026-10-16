@@ -35,6 +35,32 @@ static int selected(int fd, const char *mode, const char *suffix) {
         && S_ISREG(info.st_mode) && info.st_size > 28;
 }
 
+static int selected_stage(int fd, const char *mode) {
+    const char *root = getenv("RTOS_TEST_FIXTURE_ROOT");
+    const char *configured = getenv("RTOS_TEST_RECOVERY_FAULT_MODE");
+    if (!root || !configured || strcmp(mode, configured)
+        || !getenv("RTOS_TEST_RECOVERY_FAULT_MARKER")) return 0;
+    char link[64], path[PATH_MAX];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, path, sizeof(path) - 1);
+    if (n <= 0) return 0;
+    path[n] = 0;
+    size_t length = strlen(root);
+    if (strncmp(path, root, length) || path[length] != '/') return 0;
+    char *file = strrchr(path, '/');
+    if (!file || strlen(file + 1) != 75 || strncmp(file + 1, "stage-", 6)
+        || strspn(file + 7, "0123456789abcdef") != 64 || strcmp(file + 71, ".pack")) return 0;
+    *file = 0;
+    const char *operation = strrchr(path, '/');
+    const char parent[] = "/archive/recovery/";
+    if (!operation || strlen(operation + 1) != 32
+        || strspn(operation + 1, "0123456789abcdef") != 32
+        || (size_t)(operation + 1 - path) < sizeof(parent) - 1
+        || strncmp(operation + 1 - (sizeof(parent) - 1), parent, sizeof(parent) - 1)) return 0;
+    struct stat info;
+    return !fstat(fd, &info) && S_ISREG(info.st_mode) && info.st_size >= 4;
+}
+
 static void record_fault(const char *message) {
     int proof = open(getenv("RTOS_TEST_RECOVERY_FAULT_MARKER"),
         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
@@ -47,6 +73,11 @@ static void record_fault(const char *message) {
 }
 
 ssize_t write(int fd, const void *buffer, size_t count) {
+    if (count && selected_stage(fd, "stage-enospc")) {
+        record_fault("write staged package after 4-byte header: ENOSPC\n");
+        errno = ENOSPC;
+        return -1;
+    }
     if (count && selected(fd, "selection-enospc", "/selection.v1")) {
         record_fault("write selection.v1 after 28-byte header: ENOSPC\n");
         errno = ENOSPC;
@@ -160,6 +191,11 @@ int renameat(int olddir, const char *old, int newdir, const char *new) {
 }
 
 int fsync(int fd) {
+    if (selected_stage(fd, "stage-sync-eio")) {
+        record_fault("fsync staged package: EIO\n");
+        errno = EIO;
+        return -1;
+    }
     if (fail_wal_sync(fd)) return -1;
     if (selected(fd, "wal-ready-sync-eio", "/ready.v1")
         || selected(fd, "wal-epoch-enrollment-eio", "/selection.v1")) {
