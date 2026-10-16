@@ -155,13 +155,16 @@ impl MapInventory {
         Self { last: None, count: 0, digest: Sha256::new() }
     }
     pub(crate) fn row(&mut self, key: Key, value: &[u8]) -> Result<()> {
+        self.begin_row(key, u64::try_from(value.len())?)?;
+        self.digest.update(value);
+        Ok(())
+    }
+    fn begin_row(&mut self, key: Key, length: u64) -> Result<()> {
         if self.last.is_some_and(|last| last >= key) { fail!("Unordered archive inventory row"); }
         let count = self.count.checked_add(1).ok_or_else(|| error!("Archive inventory count overflow"))?;
-        let length = u64::try_from(value.len())?;
         self.digest.update([key.map as u8]);
         self.digest.update(key.bytes);
         self.digest.update(length.to_le_bytes());
-        self.digest.update(value);
         self.count = count;
         self.last = Some(key);
         Ok(())
@@ -191,6 +194,120 @@ pub(crate) fn native_inventory(
         rows.status()?;
     }
     Ok(inventory.finish())
+}
+
+/// Expectations must come from the fully validated, immutable operation
+/// selection/Ready records, never from the current (possibly partly replayed)
+/// database. This preflight performs no writes and grants no execution custody.
+pub(crate) struct ReplayMaps {
+    pub operation: [u8; 16],
+    pub ready: super::recovery_root::Sidecar,
+    pub selection_digest: [u8; 32],
+    pub original: super::recovery_root::Inventory,
+    pub final_maps: super::recovery_root::Inventory,
+}
+
+type NativeDb = rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>;
+struct NativeRows<'a> {
+    rows: [rocksdb::DBRawIteratorWithThreadMode<'a, NativeDb>; 2],
+}
+impl<'a> NativeRows<'a> {
+    fn new(db: &'a NativeDb) -> Result<Self> {
+        let files = db.cf_handle(Map::Files.name()).ok_or_else(|| error!("Missing recovery files map"))?;
+        let keys = db.cf_handle(Map::KeyFiles.name()).ok_or_else(|| error!("Missing recovery key map"))?;
+        let mut rows = [db.raw_iterator_cf(&files), db.raw_iterator_cf(&keys)];
+        for row in &mut rows { row.seek_to_first(); }
+        Ok(Self { rows })
+    }
+    fn peek(&self) -> Result<Option<(Key, &[u8])>> {
+        for (index, map) in [Map::Files, Map::KeyFiles].into_iter().enumerate() {
+            let row = &self.rows[index];
+            if row.valid() {
+                return Ok(Some((Key { map, bytes: row.key().ok_or_else(|| error!("Missing native key"))?.try_into()? },
+                    row.value().ok_or_else(|| error!("Missing native value"))?)));
+            }
+            row.status()?;
+        }
+        Ok(None)
+    }
+    fn next(&mut self) {
+        if self.rows[0].valid() { self.rows[0].next(); } else { self.rows[1].next(); }
+    }
+}
+
+/// Validate the whole Ready stream and both complete maps before replay starts.
+/// A selected row may contain exactly its old bytes or its specified new bytes
+/// (absence for a delete). Unselected rows must agree with both inventories.
+/// Reconstructing original/final digests catches extra, missing and altered rows
+/// even after any prefix of commands has already been applied.
+///
+/// The caller validates all non-parent records with `visit_other`, then finishes
+/// its own provider/child completeness checks. It must keep admission closed
+/// across this scan and replay. Native iterator values remain borrowed resources
+/// that the operation must budget; old manifest payloads use a 64 KiB buffer,
+/// never a collection of all rows. This is not a concurrent database snapshot.
+pub(crate) fn validate_replay_maps(
+    db: &NativeDb, ready: impl Read, expected: &ReplayMaps,
+    mut visit_other: impl FnMut(Record, u64, &mut dyn Read) -> Result<()>,
+) -> Result<()> {
+    use super::recovery_manifest::{read_manifest, Kind};
+    let mut native = NativeRows::new(db)?;
+    let mut original = MapInventory::new();
+    let mut final_maps = MapInventory::new();
+    let mut last_command = None;
+    read_manifest(ready, Kind::Ready, expected.operation, expected.ready, |record, length, input| {
+        if record == Record::SelectionDigest {
+            if length != 32 { fail!("Invalid Ready selection digest length"); }
+            let mut digest = [0; 32]; input.read_exact(&mut digest)?;
+            if digest != expected.selection_digest { fail!("Ready selection digest mismatch"); }
+        } else if record == Record::ParentMutation {
+            let mut old_matches = false;
+            let command = read_command(input, length, |key, _, old_len, old| {
+                if last_command.is_some_and(|last| last >= key) {
+                    fail!("Duplicate or unordered recovery parent command");
+                }
+                last_command = Some(key);
+                while let Some((current_key, value)) = native.peek()? {
+                    if current_key >= key { break; }
+                    original.row(current_key, value)?;
+                    final_maps.row(current_key, value)?;
+                    native.next();
+                }
+                let current = native.peek()?.filter(|(current_key, _)| *current_key == key).map(|(_, value)| value);
+                old_matches = current.is_some_and(|value| value.len() as u64 == old_len);
+                // Stream the original row using exactly MapInventory's encoding.
+                original.begin_row(key, old_len)?;
+                let mut remaining = old_len;
+                let mut offset = 0usize;
+                let mut buffer = [0; 64 * 1024];
+                while remaining != 0 {
+                    let n = remaining.min(buffer.len() as u64) as usize;
+                    old.read_exact(&mut buffer[..n])?;
+                    original.digest.update(&buffer[..n]);
+                    if old_matches {
+                        let value = current.expect("matching native value");
+                        if value.get(offset..offset + n) != Some(&buffer[..n]) { old_matches = false; }
+                        offset += n;
+                    }
+                    remaining -= n as u64;
+                }
+                Ok(())
+            })?;
+            let current = native.peek()?.filter(|(key, _)| *key == command.key).map(|(_, value)| value);
+            if !old_matches && current != command.new.as_deref() {
+                fail!("Recovery parent row is neither its old nor new value");
+            }
+            if let Some(value) = &command.new { final_maps.row(command.key, value)?; }
+            if current.is_some() { native.next(); }
+        } else { visit_other(record, length, input)?; }
+        Ok(())
+    })?;
+    while let Some((key, value)) = native.peek()? {
+        original.row(key, value)?; final_maps.row(key, value)?; native.next();
+    }
+    if original.finish() != expected.original { fail!("Recovery original parent inventory mismatch"); }
+    if final_maps.finish() != expected.final_maps { fail!("Recovery final parent inventory mismatch"); }
+    Ok(())
 }
 
 /// Streaming ordering/budget state. Batches are only data; emitting them does
