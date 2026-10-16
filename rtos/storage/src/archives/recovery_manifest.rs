@@ -32,7 +32,7 @@ impl Record {
         Ok(match (kind, self) {
             (Kind::Selection, Self::Predicate) | (Kind::Ready, Self::SelectionDigest) => 0,
             (_, Self::Provider) => 1,
-            (Kind::Selection, Self::MapInventory) => 2,
+            (_, Self::MapInventory) => 2,
             (_, Self::Child) => 3,
             (Kind::Ready, Self::ParentMutation) => 4,
             (_, Self::Tail) => 5,

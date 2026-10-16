@@ -9,6 +9,11 @@ fn ready() -> ManifestWriter<Vec<u8>> {
     writer.record(Record::SelectionDigest, 32, &mut &[8; 32][..]).unwrap();
     writer
 }
+fn ready_with_inventory(inventory: super::super::recovery_root::Inventory) -> ManifestWriter<Vec<u8>> {
+    let mut writer = ready();
+    write_inventory(&mut writer, InventoryRole::Final, inventory).unwrap();
+    writer
+}
 fn command_body(old: &[u8], reset: Option<&ResetValue>) -> Vec<u8> {
     let mut writer = ready();
     write_command(&mut writer, key(Map::Files, 7), old, reset).unwrap();
@@ -36,7 +41,9 @@ fn parent_commands_match_native_rows_and_replay_both_maps() -> Result<()> {
     let reset = ResetValue::capture()?;
     // Actual PackageIndexEntry serialization, preserving the exact old bytes.
     let old = serde_cbor::to_vec(&PackageIndexEntry::with_data(true, true, &lockfree::map::Map::new()))?;
-    let mut writer = ready();
+    let mut final_inventory = MapInventory::new();
+    for map in [Map::Files, Map::KeyFiles] { final_inventory.row(key(map, 0), &reset.0)?; }
+    let mut writer = ready_with_inventory(final_inventory.finish());
     for map in [Map::Files, Map::KeyFiles] {
         let cf = db.cf_handle(map.name()).unwrap();
         for n in [0, 1] {
@@ -50,10 +57,8 @@ fn parent_commands_match_native_rows_and_replay_both_maps() -> Result<()> {
     let original_inventory = native_inventory(&db)?;
     assert_eq!(original_inventory.count, 4);
     let (bytes, descriptor) = writer.finish()?;
-    let mut final_maps = MapInventory::new();
-    for map in [Map::Files, Map::KeyFiles] { final_maps.row(key(map, 0), &reset.0)?; }
     let expected = ReplayMaps { operation: [9;16], ready: descriptor, selection_digest: [8;32],
-        original: original_inventory, final_maps: final_maps.finish() };
+        original: original_inventory };
     // The same preflight accepts original state before any native write and
     // the durable final state after the fixture's replay and cold reopen.
     validate_replay_maps(&db, &bytes[..], &expected, |_,_,_| fail!("unexpected record"))?;
@@ -178,22 +183,29 @@ fn replay_preflight_accepts_every_old_new_combination_and_rejects_unexpected_row
     let db = NativeDb::open_cf(&options, directory.path(), ["files", "key_files"])?;
     let old = serde_cbor::to_vec(&PackageIndexEntry::with_data(true, true, &lockfree::map::Map::new()))?;
     let reset = ResetValue::capture()?;
-    let mut writer = ready();
-    let mut original = MapInventory::new(); let mut final_maps = MapInventory::new();
+    let mut final_maps = MapInventory::new();
+    for map in [Map::Files, Map::KeyFiles] {
+        final_maps.row(key(map, 0), &old)?;
+        final_maps.row(key(map, 1), &reset.0)?;
+        final_maps.row(key(map, 3), &old)?;
+    }
+    let final_maps = final_maps.finish();
+    let mut writer = ready_with_inventory(final_maps);
+    let mut original = MapInventory::new();
     for map in [Map::Files, Map::KeyFiles] {
         for n in 0..4 {
             let k = key(map, n);
             original.row(k, &old)?;
             match n {
-                1 => { write_command(&mut writer, k, &old, Some(&reset))?; final_maps.row(k, &reset.0)?; },
+                1 => write_command(&mut writer, k, &old, Some(&reset))?,
                 2 => write_command(&mut writer, k, &old, None)?,
-                _ => final_maps.row(k, &old)?,
+                _ => {},
             }
         }
     }
     let (bytes, descriptor) = writer.finish()?;
     let expected = ReplayMaps { operation: [9;16], ready: descriptor, selection_digest: [8;32],
-        original: original.finish(), final_maps: final_maps.finish() };
+        original: original.finish() };
     let validate = || validate_replay_maps(&db, &bytes[..], &expected, |_, _, _| panic!("unexpected record"));
     for mask in 0..16 {
         for (index, map) in [Map::Files, Map::KeyFiles].into_iter().enumerate() {
@@ -225,7 +237,7 @@ fn replay_preflight_accepts_every_old_new_combination_and_rejects_unexpected_row
     assert!(validate_replay_maps(&db, &corrupt[..], &expected, |_,_,_| Ok(())).is_err());
     let mut wrong_selection = ReplayMaps { selection_digest: [7;32], ..expected };
     assert!(validate_replay_maps(&db, &bytes[..], &wrong_selection, |_,_,_| Ok(())).is_err());
-    wrong_selection.selection_digest = [8;32]; wrong_selection.final_maps.count += 1;
+    wrong_selection.selection_digest = [8;32]; wrong_selection.original.count += 1;
     assert!(validate_replay_maps(&db, &bytes[..], &wrong_selection, |_,_,_| Ok(())).is_err());
     Ok(())
 }
@@ -238,10 +250,10 @@ fn replay_preflight_streams_large_old_rows_and_checks_original_bytes_after_repla
     let db = NativeDb::open_cf(&options, directory.path(), ["files", "key_files"])?;
     let k = key(Map::Files, 7); let old = vec![42; 8 * 1024 * 1024 + 9];
     let mut original = MapInventory::new(); original.row(k, &old)?;
-    let mut writer = ready(); write_command(&mut writer, k, &old, None)?;
+    let mut writer = ready_with_inventory(MapInventory::new().finish()); write_command(&mut writer, k, &old, None)?;
     let (bytes, descriptor) = writer.finish()?;
     let expected = ReplayMaps { operation: [9;16], ready: descriptor, selection_digest: [8;32],
-        original: original.finish(), final_maps: MapInventory::new().finish() };
+        original: original.finish() };
     // Current absence is the already-applied delete; the old inventory still
     // has to be reconstructed from the complete original stream.
     validate_replay_maps(&db, &bytes[..], &expected, |_,_,_| Ok(()))?;
@@ -249,7 +261,7 @@ fn replay_preflight_streams_large_old_rows_and_checks_original_bytes_after_repla
     validate_replay_maps(&db, &bytes[..], &expected, |_,_,_| Ok(()))?;
     db.delete_cf(&cf, k.bytes)?;
     let mut wrong_old = old; *wrong_old.last_mut().unwrap() ^= 1;
-    let mut writer = ready(); write_command(&mut writer, k, &wrong_old, None)?;
+    let mut writer = ready_with_inventory(MapInventory::new().finish()); write_command(&mut writer, k, &wrong_old, None)?;
     let (wrong, descriptor) = writer.finish()?;
     let wrong_expected = ReplayMaps { ready: descriptor, ..expected };
     assert!(validate_replay_maps(&db, &wrong[..], &wrong_expected, |_,_,_| Ok(())).is_err());
@@ -263,23 +275,118 @@ fn replay_preflight_checks_noop_maps_command_order_and_other_records() -> Result
     options.create_if_missing(true); options.create_missing_column_families(true);
     let db = NativeDb::open_cf(&options, directory.path(), ["files", "key_files"])?;
     let empty = MapInventory::new().finish();
-    let (bytes, descriptor) = ready().finish()?;
+    let (bytes, descriptor) = ready_with_inventory(empty).finish()?;
     let mut expected = ReplayMaps { operation: [9;16], ready: descriptor, selection_digest: [8;32],
-        original: empty, final_maps: empty };
+        original: empty };
     validate_replay_maps(&db, &bytes[..], &expected, |_,_,_| Ok(()))?;
     for keys in [[2, 1], [1, 1]] {
-        let mut writer = ready();
+        let mut writer = ready_with_inventory(MapInventory::new().finish());
         for n in keys { write_command(&mut writer, key(Map::Files, n), b"old", None)?; }
         let (bytes, descriptor) = writer.finish()?; expected.ready = descriptor;
         let error = validate_replay_maps(&db, &bytes[..], &expected, |_,_,_| Ok(())).unwrap_err();
         assert!(error.to_string().contains("unordered"), "{error}");
     }
-    let mut writer = ready(); writer.record(Record::Tail, 4, &mut &b"tail"[..])?;
+    let mut writer = ready_with_inventory(MapInventory::new().finish()); writer.record(Record::Tail, 4, &mut &b"tail"[..])?;
     let (bytes, descriptor) = writer.finish()?; expected.ready = descriptor;
     let mut visited = false;
     assert!(validate_replay_maps(&db, &bytes[..], &expected, |tag, _, _| {
         assert_eq!(tag, Record::Tail); visited = true; fail!("invalid tail")
     }).is_err());
     assert!(visited);
+    Ok(())
+}
+
+#[test]
+fn inventory_records_reject_wrong_role_version_length_and_empty_digest() -> Result<()> {
+    let inventory = MapInventory::new().finish();
+    let mut writer = ready_with_inventory(inventory);
+    write_command(&mut writer, key(Map::Files, 7), b"old", None)?;
+    let (bytes, descriptor) = writer.finish()?;
+    let mut body = Vec::new();
+    read_manifest(&bytes[..], Kind::Ready, [9;16], descriptor, |tag, _, input| {
+        if tag == Record::MapInventory { input.read_to_end(&mut body)?; }
+        else { io::copy(input, &mut io::sink())?; }
+        Ok(())
+    })?;
+    assert_eq!(read_inventory(&mut &body[..], body.len() as u64, InventoryRole::Final)?, inventory);
+    assert!(read_inventory(&mut &body[..], body.len() as u64, InventoryRole::Original).is_err());
+    for index in [0, 2, 11] {
+        let mut bad = body.clone(); bad[index] ^= 1;
+        assert!(read_inventory(&mut &bad[..], bad.len() as u64, InventoryRole::Final).is_err());
+    }
+    for n in 0..body.len() {
+        assert!(read_inventory(&mut &body[..n], body.len() as u64, InventoryRole::Final).is_err());
+    }
+    assert!(read_inventory(&mut &body[..], body.len() as u64 + 1, InventoryRole::Final).is_err());
+    assert!(write_inventory(&mut ready(), InventoryRole::Final, Default::default()).is_err());
+    let directory = tempfile::tempdir()?;
+    let mut options = rocksdb::Options::default(); options.create_if_missing(true); options.create_missing_column_families(true);
+    let db = NativeDb::open_cf(&options, directory.path(), ["files", "key_files"])?;
+    for count in [0, 2] {
+        let mut writer = ready();
+        for _ in 0..count { write_inventory(&mut writer, InventoryRole::Final, inventory)?; }
+        let (bytes, ready) = writer.finish()?;
+        let expected = ReplayMaps { operation: [9;16], ready, selection_digest: [8;32], original: inventory };
+        assert!(validate_replay_maps(&db, &bytes[..], &expected, |_,_,_| Ok(())).is_err());
+    }
+    let mut incorrect_final = inventory; incorrect_final.count = 1;
+    let (bytes, ready) = ready_with_inventory(incorrect_final).finish()?;
+    let expected = ReplayMaps { operation: [9;16], ready, selection_digest: [8;32], original: inventory };
+    let error = validate_replay_maps(&db, &bytes[..], &expected, |_,_,_| Ok(())).unwrap_err();
+    assert!(error.to_string().contains("final parent inventory mismatch"), "{error}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn selection_persisted_maps_bind_predicate_complete_providers_and_ready_replay() -> Result<()> {
+    use crate::{archives::{recovery_participant::Provider, recovery_providers::RecoveryProviders,
+        recovery_root::{RootHeader, State, Policy, Sidecar, Inventory, ROOT_KEY}, truncation_selection::TruncationSelection},
+        db::rocksdb::{RocksDb, AccessType}};
+    use rtos_block::{BlockIdExt, ShardIdent};
+    let directory = tempfile::tempdir()?;
+    let db = RocksDb::new(directory.path(), "db", None, AccessType::ReadWrite)?;
+    for map in [Map::Files, Map::KeyFiles] { db.db().create_cf(map.name(), &rocksdb::Options::default())?; }
+    let identity = db.db().get_db_identity()?;
+    let provider = Provider::main(directory.path(), false, &identity)?;
+    let cutoff = BlockIdExt::with_params(ShardIdent::masterchain(), 100, [1;32].into(), [2;32].into());
+    let top = BlockIdExt::with_params(ShardIdent::full(0), 88, [3;32].into(), [4;32].into());
+    let selection = TruncationSelection::new(cutoff.clone(), vec![top.clone()])?;
+    let inventory = native_inventory(db.db())?;
+    let build = |provider_count, inventory_count| -> Result<_> {
+        let mut writer = ManifestWriter::new(Vec::new(), Kind::Selection, [9;16])?;
+        writer.record_with(Record::Predicate, selection.encoded_len()?, |out| selection.write_predicate(out))?;
+        for _ in 0..provider_count { writer.record_with(Record::Provider, provider.encoded_len()?, |out| provider.write(out))?; }
+        for _ in 0..inventory_count { write_inventory(&mut writer, InventoryRole::Original, inventory)?; }
+        writer.finish()
+    };
+    let (bytes, descriptor) = build(1, 1)?;
+    let mut root = RootHeader { state: State::Building, policy: Policy::Node, aborted: false, operation: [9;16],
+        database_identity_bytes: identity.len() as u64, database_identity_digest: rtos_block::sha256_digest(identity),
+        selection: descriptor, ready: Sidecar::default(), providers: Inventory::default(), maps: Inventory::default(), data: Inventory::default() };
+    db.db().put(ROOT_KEY, root.encode()?)?;
+    let providers = RecoveryProviders::inspect(db.clone(), &root, None, db.repair_protection()).await?;
+    let mut tops = Vec::new();
+    let parsed = read_selection_maps(&providers, &root, &bytes[..], |id| { tops.push(id); Ok(()) }, |_,_,_| fail!("unexpected disposition"))?;
+    assert_eq!(parsed.cutoff, cutoff); assert_eq!(tops, vec![top]); assert_eq!(parsed.original, inventory);
+    let mut writer = ManifestWriter::new(Vec::new(), Kind::Ready, root.operation)?;
+    writer.record(Record::SelectionDigest, 32, &mut descriptor.digest.as_slice())?;
+    writer.record_with(Record::Provider, provider.encoded_len()?, |out| provider.write(out))?;
+    write_inventory(&mut writer, InventoryRole::Final, inventory)?;
+    let (ready_bytes, ready) = writer.finish()?;
+    let expected = ReplayMaps { operation: root.operation, ready, selection_digest: descriptor.digest,
+        original: parsed.original };
+    let mut checker = providers.checker();
+    let checked_final = validate_replay_maps(db.db(), &ready_bytes[..], &expected, |tag, len, input| {
+        assert_eq!(tag, Record::Provider); checker.record(input, len)
+    })?;
+    assert_eq!(checked_final, inventory);
+    checker.finish()?;
+    for (provider_count, inventory_count) in [(0,1), (2,1), (1,0), (1,2)] {
+        let (bytes, descriptor) = build(provider_count, inventory_count)?;
+        root.selection = descriptor; db.db().put(ROOT_KEY, root.encode()?)?;
+        assert!(read_selection_maps(&providers, &root, &bytes[..], |_| Ok(()), |_,_,_| Ok(())).is_err());
+        assert_eq!(native_inventory(db.db())?, inventory);
+        assert_eq!(db.db().get(ROOT_KEY)?.as_deref(), Some(root.encode()?.as_slice()));
+    }
     Ok(())
 }

@@ -196,6 +196,85 @@ pub(crate) fn native_inventory(
     Ok(inventory.finish())
 }
 
+/// One complete two-map inventory, using MapInventory's canonical map/key
+/// encoding. Role 1 is Selection's original state; role 2 is Ready's final state.
+/// Both empty maps still require an explicit count-zero/SHA256(empty) record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InventoryRole { Original = 1, Final = 2 }
+const INVENTORY_BYTES: u64 = 43;
+
+pub(crate) fn write_inventory<W: Write>(
+    writer: &mut ManifestWriter<W>, role: InventoryRole, inventory: super::recovery_root::Inventory,
+) -> Result<()> {
+    validate_inventory(inventory)?;
+    writer.record_with(Record::MapInventory, INVENTORY_BYTES, |out| {
+        out.write_all(&1u16.to_le_bytes())?;
+        out.write_all(&[role as u8])?;
+        out.write_all(&inventory.count.to_le_bytes())?;
+        out.write_all(&inventory.digest)?;
+        Ok(())
+    })
+}
+fn validate_inventory(inventory: super::recovery_root::Inventory) -> Result<()> {
+    if inventory.digest == [0;32]
+        || (inventory.count == 0 && inventory.digest != Sha256::new().finalize()) {
+        fail!("Invalid complete recovery map inventory");
+    }
+    Ok(())
+}
+pub(crate) fn read_inventory(
+    input: &mut dyn Read, length: u64, role: InventoryRole,
+) -> Result<super::recovery_root::Inventory> {
+    if length != INVENTORY_BYTES { fail!("Recovery map inventory length mismatch"); }
+    let mut bytes = [0; INVENTORY_BYTES as usize]; input.read_exact(&mut bytes)?;
+    if bytes[..2] != [1,0] || bytes[2] != role as u8 {
+        fail!("Recovery map inventory version or role mismatch");
+    }
+    let inventory = super::recovery_root::Inventory {
+        count: u64::from_le_bytes(bytes[3..11].try_into()?), digest: bytes[11..].try_into()?,
+    };
+    validate_inventory(inventory)?;
+    Ok(inventory)
+}
+
+/// Validated Selection inputs for the parent-map part of recovery. Child/tail
+/// records are delegated to the operation validator, which must also finish
+/// their completeness checks before granting any execution authority.
+pub(crate) struct SelectionMaps {
+    pub cutoff: rtos_block::BlockIdExt,
+    pub original: super::recovery_root::Inventory,
+}
+pub(crate) fn read_selection_maps(
+    providers: &super::recovery_providers::RecoveryProviders,
+    root: &super::recovery_root::RootHeader, input: impl Read,
+    mut visit_top: impl FnMut(rtos_block::BlockIdExt) -> Result<()>,
+    mut visit_disposition: impl FnMut(Record, u64, &mut dyn Read) -> Result<()>,
+) -> Result<SelectionMaps> {
+    use super::recovery_manifest::{read_manifest, Kind};
+    providers.validate_controls(root)?;
+    let mut participants = providers.checker();
+    let mut cutoff = None;
+    let mut inventory = None;
+    read_manifest(input, Kind::Selection, root.operation, root.selection, |tag, length, payload| {
+        match tag {
+            Record::Predicate => cutoff = Some(super::truncation_selection::read_predicate(payload, length, &mut visit_top)?),
+            Record::Provider => participants.record(payload, length)?,
+            Record::MapInventory => {
+                if inventory.is_some() { fail!("Duplicate Selection map inventory"); }
+                inventory = Some(read_inventory(payload, length, InventoryRole::Original)?);
+            }
+            Record::Child | Record::Tail => visit_disposition(tag, length, payload)?,
+            _ => fail!("Unexpected Selection record"),
+        }
+        Ok(())
+    })?;
+    participants.finish()?;
+    Ok(SelectionMaps {
+        cutoff: cutoff.ok_or_else(|| error!("Missing Selection predicate"))?,
+        original: inventory.ok_or_else(|| error!("Missing Selection map inventory"))?,
+    })
+}
+
 /// Expectations must come from the fully validated, immutable operation
 /// selection/Ready records, never from the current (possibly partly replayed)
 /// database. This preflight performs no writes and grants no execution custody.
@@ -204,7 +283,6 @@ pub(crate) struct ReplayMaps {
     pub ready: super::recovery_root::Sidecar,
     pub selection_digest: [u8; 32],
     pub original: super::recovery_root::Inventory,
-    pub final_maps: super::recovery_root::Inventory,
 }
 
 type NativeDb = rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>;
@@ -239,7 +317,9 @@ impl<'a> NativeRows<'a> {
 /// A selected row may contain exactly its old bytes or its specified new bytes
 /// (absence for a delete). Unselected rows must agree with both inventories.
 /// Reconstructing original/final digests catches extra, missing and altered rows
-/// even after any prefix of commands has already been applied.
+/// even after any prefix of commands has already been applied. The final digest
+/// is read from the root-bound Ready stream and returned only after verification;
+/// the caller never substitutes a final inventory derived from partial DB state.
 ///
 /// The caller validates all non-parent records with `visit_other`, then finishes
 /// its own provider/child completeness checks. It must keep admission closed
@@ -249,18 +329,23 @@ impl<'a> NativeRows<'a> {
 pub(crate) fn validate_replay_maps(
     db: &NativeDb, ready: impl Read, expected: &ReplayMaps,
     mut visit_other: impl FnMut(Record, u64, &mut dyn Read) -> Result<()>,
-) -> Result<()> {
+) -> Result<super::recovery_root::Inventory> {
     use super::recovery_manifest::{read_manifest, Kind};
     let mut native = NativeRows::new(db)?;
     let mut original = MapInventory::new();
     let mut final_maps = MapInventory::new();
     let mut last_command = None;
+    let mut declared_final = None;
     read_manifest(ready, Kind::Ready, expected.operation, expected.ready, |record, length, input| {
         if record == Record::SelectionDigest {
             if length != 32 { fail!("Invalid Ready selection digest length"); }
             let mut digest = [0; 32]; input.read_exact(&mut digest)?;
             if digest != expected.selection_digest { fail!("Ready selection digest mismatch"); }
+        } else if record == Record::MapInventory {
+            if declared_final.is_some() { fail!("Duplicate Ready map inventory"); }
+            declared_final = Some(read_inventory(input, length, InventoryRole::Final)?);
         } else if record == Record::ParentMutation {
+            if declared_final.is_none() { fail!("Missing Ready map inventory before commands"); }
             let mut old_matches = false;
             let command = read_command(input, length, |key, _, old_len, old| {
                 if last_command.is_some_and(|last| last >= key) {
@@ -302,12 +387,13 @@ pub(crate) fn validate_replay_maps(
         } else { visit_other(record, length, input)?; }
         Ok(())
     })?;
+    let declared_final = declared_final.ok_or_else(|| error!("Missing Ready map inventory"))?;
     while let Some((key, value)) = native.peek()? {
         original.row(key, value)?; final_maps.row(key, value)?; native.next();
     }
     if original.finish() != expected.original { fail!("Recovery original parent inventory mismatch"); }
-    if final_maps.finish() != expected.final_maps { fail!("Recovery final parent inventory mismatch"); }
-    Ok(())
+    if final_maps.finish() != declared_final { fail!("Recovery final parent inventory mismatch"); }
+    Ok(declared_final)
 }
 
 /// Streaming ordering/budget state. Batches are only data; emitting them does
