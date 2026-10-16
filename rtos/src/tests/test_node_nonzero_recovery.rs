@@ -376,11 +376,36 @@ async fn actual_node_sparse_packages_interrupted_metadata() -> Result<()> {
     exercise_nonzero_recovery_layout(false, None, Some((3, Some("forward-after-row-sync"))), true).await
 }
 
+#[path = "test_node_finality_recovery.rs"]
+mod finality_recovery;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node binary and public fixture signer"]
+async fn actual_node_recovers_retained_finality_without_validator_keys() -> Result<()> {
+    exercise_nonzero_recovery_with_finality(false, None, None, false, 1).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node binary and GDB"]
+async fn actual_node_retries_finality_after_interrupted_source_acknowledgement() -> Result<()> {
+    exercise_nonzero_recovery_with_finality(false, None, None, false, 2).await
+}
+
 async fn exercise_nonzero_recovery_layout(
     interrupt_recovery: bool,
     building: Option<&str>,
     truncation: Option<(u32, Option<&str>)>,
     sparse: bool,
+) -> Result<()> {
+    exercise_nonzero_recovery_with_finality(interrupt_recovery, building, truncation, sparse, 0).await
+}
+
+async fn exercise_nonzero_recovery_with_finality(
+    interrupt_recovery: bool,
+    building: Option<&str>,
+    truncation: Option<(u32, Option<&str>)>,
+    sparse: bool,
+    retained_finality: u8,
 ) -> Result<()> {
     let binary = fs::canonicalize(std::env::var("RTOS_NODE_RECOVERY_BINARY")?)?;
     let dir = match std::env::var_os("RTOS_NODE_RECOVERY_FIXTURE_DIR") {
@@ -388,7 +413,7 @@ async fn exercise_nonzero_recovery_layout(
         None => tempfile::tempdir()?,
     };
     let root = dir.path();
-    let fixture = Fixture::node_recovery();
+    let fixture = if retained_finality > 0 { Fixture::node_finality() } else { Fixture::node_recovery() };
     let archives = root.join("archives");
     fixture.prepare(root, &archives).await?;
     let physical = run_import(fixture.config(root, archives)).await?;
@@ -412,6 +437,9 @@ async fn exercise_nonzero_recovery_layout(
     if !root.join("dynamic-state-fixture").exists() {
         interrupt_cleaned_writer(root, building).await?;
     }
+    let finality = if retained_finality > 0 {
+        Some(finality_recovery::prepare(root, &fixture).await?)
+    } else { None };
     let before = package_inventory(root)?;
     let controls_before = recovery_file_inventory(root)?;
     assert!(!before.is_empty(), "node fixture must contain canonical archive packages");
@@ -577,6 +605,14 @@ async fn exercise_nonzero_recovery_layout(
             assert_eq!(package_inventory(root)?, before, "interrupted recovery changed packages");
         }
     }
+    if retained_finality == 2 {
+        interrupt_actual_recovery(&binary, root, &zero, "finality-before-source-ack",
+            "source.acknowledge(receipt)").await?;
+        let pending = simplex::finality_delivery::scan_pending_finality(&root.join("node_db/catchains"))?;
+        assert_eq!(pending.len(), 1, "interrupted source acknowledgement lost retained evidence");
+        assert_eq!(pending[0].record().data, finality.as_ref().unwrap().block_data);
+        drop(pending);
+    }
     for attempt in 0..2 {
         let path = root.join(format!("node-{attempt}.log"));
         let log = fs::File::create(&path)?;
@@ -616,8 +652,11 @@ async fn exercise_nonzero_recovery_layout(
         // The next actual process must itself open and recover the database.
     }
     assert_eq!(package_inventory(root)?, before, "restart changed canonical package bytes");
-    let db = open_db(root).await?;
+    let db = Arc::new(open_db(root).await?);
     fixture.assert_imported(&db, 4).await?;
+    if let Some(expected) = &finality {
+        finality_recovery::verify(root, &db, expected)?;
+    }
     let (physical, catchain) = db.sst_databases_for_test();
     assert!(physical.db().get(b"ArchiveTruncationRootV1")?.is_none());
     assert!(physical.db().get(b"ArchiveTruncationParticipantV1")?.is_none());
@@ -701,6 +740,8 @@ async fn interrupt_actual_recovery(
         (include_str!("../../storage/src/archives/recovery_forward.rs"), "recovery_forward.rs")
     } else if cut.starts_with("producer-") {
         (include_str!("../../storage/src/archives/recovery_producer.rs"), "recovery_producer.rs")
+    } else if cut == "finality-before-source-ack" {
+        (include_str!("../validator/session_publication.rs"), "session_publication.rs")
     } else if cut == "truncation-before-progress" {
         (include_str!("../internal_db/restore.rs"), "restore.rs")
     } else {
@@ -716,6 +757,8 @@ async fn interrupt_actual_recovery(
         "storage::archives::recovery_forward::recover"
     } else if cut.starts_with("producer-") {
         "storage::archives::recovery_producer::"
+    } else if cut == "finality-before-source-ack" {
+        "session_publication::recover_retained_finality"
     } else if cut == "truncation-before-progress" {
         "internal_db::restore::restore"
     } else if cut == "stage-after-unlink" {

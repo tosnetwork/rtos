@@ -14,6 +14,9 @@ pub struct Fixture {
     data: serde_json::Value,
 }
 impl Fixture {
+    pub fn node_finality() -> Self {
+        Self { data: serde_json::from_str(include_str!("static/node-finality-history.json")).unwrap() }
+    }
     pub fn node_recovery() -> Self {
         Self {
             data: serde_json::from_str(include_str!("static/node-recovery-history.json")).unwrap(),

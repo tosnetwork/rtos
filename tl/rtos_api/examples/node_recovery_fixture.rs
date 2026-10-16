@@ -26,6 +26,7 @@ fn reference(id: &BlockIdExt) -> ExtBlkRef {
     }
 }
 fn main() {
+    let finality = std::env::args().any(|arg| arg == "--retained-finality");
     let shard = ShardIdent::with_tagged_prefix(0, SHARD_FULL).unwrap();
     let mut wcstate = ShardStateUnsplit::default();
     wcstate.set_global_id(-239);
@@ -36,6 +37,12 @@ fn main() {
     let wcboc = write_boc(&wcroot).unwrap();
     let mut wcprevious = wczero.clone();
     let mut config = fixture::config();
+    if finality {
+        let simplex = SimplexConfig { protocol_version: 2, ..Default::default() };
+        config.set_config(ConfigParamEnum::ConfigParam30(NewConsensusConfigAll {
+            mc: Some(simplex.clone()), shard: Some(simplex),
+        })).unwrap();
+    }
     let template = ShardStateUnsplit::construct_from_bytes(include_bytes!(
         "../../../rtos/src/tests/static/zerostate.boc"
     ))
@@ -176,8 +183,15 @@ fn main() {
         info.set_gen_utime(1_700_000_000 + seq);
         info.set_prev_key_block_seqno(epoch);
         info.set_vertical_stuff(0, 1, None).unwrap();
+        if finality {
+            info.set_gen_catchain_seqno(7);
+            let (_, hash) = governing.validator_set().unwrap().calc_subset(
+                &governing.catchain_config().unwrap(), SHARD_FULL, -1, 7).unwrap();
+            info.set_gen_validator_list_hash_short(hash);
+        }
         info.set_prev_stuff(false, &BlkPrevInfo::Block { prev: reference(&previous) }).unwrap();
         let mut extra = BlockExtra::default();
+        if finality { *extra.created_by_mut() = UInt256::from([1; 32]); }
         let mut mc = McBlockExtra::default();
         *mc.shards_mut() = shards;
         if key {
@@ -211,6 +225,18 @@ fn main() {
         candidate.extend_from_slice(blockid.file_hash.as_slice());
         candidate.extend_from_slice(&98u32.to_le_bytes());
         candidate.extend_from_slice(&[5; 32]);
+        if finality {
+            candidate = 0x3f6431f8u32.to_le_bytes().to_vec();
+            candidate.extend_from_slice(&(-1i32).to_le_bytes());
+            candidate.extend_from_slice(&SHARD_FULL.to_le_bytes());
+            candidate.extend_from_slice(&seq.to_le_bytes());
+            candidate.extend_from_slice(blockid.root_hash.as_slice());
+            candidate.extend_from_slice(blockid.file_hash.as_slice());
+            candidate.extend_from_slice(UInt256::calc_file_hash(&[]).as_slice());
+            candidate.extend(rtos_api::WireProfile::T0.serialize(
+                &rtos_api::ton::consensus::CandidateParent::Consensus_CandidateWithoutParents
+            ).unwrap());
+        }
         let carrier = BlockSignaturesSimplexPq {
             validator_info: ValidatorBaseInfo::with_params(ctx.subset_hash(), 7),
             session_id: ctx.expected_session_id().clone(),
