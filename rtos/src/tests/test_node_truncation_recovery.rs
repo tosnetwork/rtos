@@ -119,9 +119,9 @@ pub(super) async fn run(
     drop(db);
     tokio::time::timeout(Duration::from_secs(30), wait_for_db_release(physical)).await?;
     eprintln!("Failed actual truncation preserved four cursors, full history and restoring beacon; exact synthetic lease released");
-    if let Some(mode @ ("selection-enospc" | "selection-sync-eio" | "ready-enospc" | "ready-sync-eio" | "operation-sync-eio" | "publish-rename-eio" | "publish-sync-eio")) = interrupt {
+    if let Some(mode @ ("selection-enospc" | "selection-sync-eio" | "ready-enospc" | "ready-sync-eio" | "operation-sync-eio" | "publish-rename-eio" | "publish-sync-eio" | "wal-ready-sync-eio" | "wal-publish-sync-eio")) = interrupt {
         io_failure::recovery_fault(binary, root, zero, mode).await?;
-        if mode == "publish-sync-eio" {
+        if matches!(mode, "publish-sync-eio" | "wal-publish-sync-eio") {
             assert_ne!(package_inventory(root)?, before, "sync fault must follow actual canonical replacement");
         } else {
             assert_eq!(package_inventory(root)?, before, "failed recovery IO changed canonical packages");

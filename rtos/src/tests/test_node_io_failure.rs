@@ -11,6 +11,8 @@ pub(super) async fn recovery_fault(binary: &Path, root: &Path, zero: &Path, mode
         "operation-sync-eio" => ("fsync operation directory after Selection: EIO\n", "Input/output error"),
         "publish-rename-eio" => ("renameat staged package before replacement: EIO\n", "Input/output error"),
         "publish-sync-eio" => ("fsync replaced canonical package: EIO\n", "Input/output error"),
+        "wal-ready-sync-eio" => ("main WAL sync after Ready fsync: EIO\n", "Input/output error"),
+        "wal-publish-sync-eio" => ("main WAL sync after canonical replacement: EIO\n", "Input/output error"),
         _ => rtos_block::fail!("Unknown recovery fault mode"),
     };
     let source = root.join("recovery-fault.c");
@@ -60,14 +62,14 @@ pub(super) async fn recovery_fault(binary: &Path, root: &Path, zero: &Path, mode
     let controls = root.join("node_db/archive/recovery");
     let operations = fs::read_dir(&controls)?.collect::<std::io::Result<Vec<_>>>()?;
     assert_eq!(operations.len(), 1);
-    let ready_fault = mode.starts_with("ready-") || mode.starts_with("publish-");
+    let ready_fault = mode.starts_with("ready-") || mode.starts_with("publish-") || mode.starts_with("wal-");
     let selection = operations[0].path().join(if ready_fault { "ready.v1" } else { "selection.v1" });
     let mut ready = Vec::new();
     let mut stages = 0;
     find_ready_staging(root, &mut ready, &mut stages)?;
     if ready_fault {
         assert_eq!(ready.len(), 1);
-        if mode != "publish-sync-eio" {
+        if !matches!(mode, "publish-sync-eio" | "wal-publish-sync-eio") {
             assert!(stages > 0, "failure must leave staged replacements");
         }
         keep_evidence(root, &operations[0].path().join("selection.v1"))?;

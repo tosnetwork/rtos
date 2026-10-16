@@ -60,6 +60,40 @@ ssize_t write(int fd, const void *buffer, size_t count) {
     return syscall(SYS_write, fd, buffer, count);
 }
 
+static atomic_int wal_armed = 0;
+
+static int fail_wal_sync(int fd) {
+    if (!atomic_load_explicit(&wal_armed, memory_order_acquire)) return 0;
+    const char *root = getenv("RTOS_TEST_FIXTURE_ROOT");
+    const char *mode = getenv("RTOS_TEST_RECOVERY_FAULT_MODE");
+    if (!root || !mode) return 0;
+    char link[64], path[PATH_MAX], prefix[PATH_MAX];
+    int size = snprintf(prefix, sizeof(prefix), "%s/node_db/db/", root);
+    if (size <= 0 || (size_t)size >= sizeof(prefix)) return 0;
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, path, sizeof(path) - 1);
+    if (n <= 0) return 0;
+    path[n] = 0;
+    if (strncmp(path, prefix, size)) return 0;
+    const char *name = path + size;
+    size_t digits = strspn(name, "0123456789");
+    if (!digits || strcmp(name + digits, ".log")) return 0;
+    struct stat info;
+    if (fstat(fd, &info) || !S_ISREG(info.st_mode)) return 0;
+    if (!strcmp(mode, "wal-ready-sync-eio"))
+        record_fault("main WAL sync after Ready fsync: EIO\n");
+    else if (!strcmp(mode, "wal-publish-sync-eio"))
+        record_fault("main WAL sync after canonical replacement: EIO\n");
+    else return 0;
+    errno = EIO;
+    return 1;
+}
+
+int fdatasync(int fd) {
+    if (fail_wal_sync(fd)) return -1;
+    return syscall(SYS_fdatasync, fd);
+}
+
 // Publish the exact renamed pathname once; readers never observe a partial path.
 static atomic_int renamed_state = 0;
 static char renamed_path[PATH_MAX];
@@ -95,6 +129,7 @@ int renameat(int olddir, const char *old, int newdir, const char *new) {
         return -1;
     }
     int arm = stage && stage_directory(olddir, "publish-sync-eio");
+    int arm_wal = stage && stage_directory(olddir, "wal-publish-sync-eio");
     char target[PATH_MAX];
     if (arm) {
         char link[64];
@@ -104,6 +139,7 @@ int renameat(int olddir, const char *old, int newdir, const char *new) {
         else { target[n] = '/'; strcpy(target + n + 1, new); }
     }
     int result = syscall(SYS_renameat, olddir, old, newdir, new);
+    if (!result && arm_wal) atomic_store_explicit(&wal_armed, 1, memory_order_release);
     int expected = 0;
     if (!result && arm && atomic_compare_exchange_strong(&renamed_state, &expected, 1)) {
         strcpy(renamed_path, target);
@@ -113,6 +149,12 @@ int renameat(int olddir, const char *old, int newdir, const char *new) {
 }
 
 int fsync(int fd) {
+    if (fail_wal_sync(fd)) return -1;
+    if (selected(fd, "wal-ready-sync-eio", "/ready.v1")) {
+        int result = syscall(SYS_fsync, fd);
+        if (!result) atomic_store_explicit(&wal_armed, 1, memory_order_release);
+        return result;
+    }
     if (atomic_load_explicit(&renamed_state, memory_order_acquire) == 2) {
         char link[64], path[PATH_MAX];
         snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
