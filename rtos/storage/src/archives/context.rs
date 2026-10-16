@@ -7,6 +7,10 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ArchiveContextError {
+    #[error("Archive package permanently retired at epoch {0}")]
+    Retired(u64),
+    #[error("Archive native close is uncertain or quarantine is full; process restart required")]
+    RestartRequired,
     #[error("Archive view epoch {expected} is stale; current epoch is {current}")]
     Stale { expected: u64, current: u64 },
     #[error("Archive admission is closed at epoch {0}")]
@@ -73,12 +77,14 @@ impl ArchiveDomain {
         self.state.lock().map_err(|_| ArchiveContextError::Poisoned.into())
     }
     fn check_epoch(state: &State, expected: u64) -> Result<()> {
+        if super::package::retirement_restart_required() { return Err(ArchiveContextError::RestartRequired.into()); }
         if state.epoch != expected {
             return Err(ArchiveContextError::Stale { expected, current: state.epoch }.into());
         }
         Ok(())
     }
     fn check_open(state: &State) -> Result<()> {
+        if super::package::retirement_restart_required() { return Err(ArchiveContextError::RestartRequired.into()); }
         match state.phase {
             Phase::Open => Ok(()),
             Phase::Closing => Err(ArchiveContextError::Closed(state.epoch).into()),

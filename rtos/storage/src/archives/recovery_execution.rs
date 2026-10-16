@@ -1,7 +1,7 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Exclusive recovery execution lane, separate from old-view IO tickets.
-//! This retains providers and actual jobs; it does not certify idle-writer
-//! retirement, protection reservations, quarantine or durable root completion.
+//! Retains providers and actual jobs, including registered idle-writer close
+//! receipts. Protection reservations and durable root completion remain separate.
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -59,6 +59,13 @@ impl ArchiveDomain {
         }) })
     }
 }
+static NEXT_RETIREMENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+#[derive(Debug)]
+pub(crate) struct PackageRetirement {
+    pub(crate) identity: u64,
+    pub(crate) packages: usize,
+    pub(crate) closed_files: usize,
+}
 impl RecoveryExecution {
     pub(crate) async fn wait_for_old_io(&self) -> Result<()> {
         self.state.owners.wait().await;
@@ -97,6 +104,19 @@ impl RecoveryExecution {
             return Err(ArchiveContextError::InvalidRecoveryProviders.into());
         }
         Ok(packages)
+    }
+
+    /// Close idle descriptors under this execution's unique claim. The returned
+    /// receipt must be consumed before any following recovery phase is allowed.
+    pub(crate) fn retire_packages(&self) -> Result<tokio::task::JoinHandle<Result<RecoveryReceipt<PackageRetirement>>>> {
+        let packages = self.snapshot_packages()?;
+        self.spawn_phase(move || {
+            let identity = NEXT_RETIREMENT.fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+                .map_err(|_| anyhow::anyhow!("Package retirement identity exhausted"))?;
+            let mut report = PackageRetirement { identity, packages: packages.len(), closed_files: 0 };
+            for package in packages { report.closed_files += usize::from(package.retire_native()?); }
+            Ok(report)
+        })
     }
 
     /// The closure starts only after old IO has drained. The worker must first

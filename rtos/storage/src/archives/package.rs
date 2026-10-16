@@ -17,8 +17,6 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
 };
-#[cfg(test)]
-use tokio::io::AsyncWriteExt;
 
 #[derive(Debug)]
 pub struct Package {
@@ -36,6 +34,11 @@ pub(super) struct PackageState {
     size: AtomicU64,
     // A partial tail or uncertain metadata requires fresh-owner recovery.
     write_healthy: AtomicBool,
+    retired: AtomicBool,
+    #[cfg(test)]
+    fail_retirement_close: AtomicBool,
+    #[cfg(test)]
+    retirement_probe: std::sync::Mutex<Option<AppendProbe>>,
     view: ArchiveView,
     #[cfg(test)]
     append_probe: std::sync::Mutex<Option<AppendProbe>>,
@@ -113,6 +116,21 @@ fn read_header_sync(reader: &mut impl std::io::Read) -> Result<()> {
 }
 
 impl Package {
+    fn ensure_active(&self) -> Result<()> {
+        if self.state.retired.load(Ordering::Acquire) {
+            return Err(super::context::ArchiveContextError::Retired(self.state.view.epoch()).into());
+        }
+        Ok(())
+    }
+    fn enter_operation(&self) -> Result<ArchiveOperation> {
+        self.ensure_active()?;
+        self.state.view.enter()
+    }
+    fn inherit_operation(&self, parent: &ArchiveOperation) -> Result<ArchiveOperation> {
+        self.ensure_active()?;
+        self.state.view.inherit(parent)
+    }
+
     async fn lock_writer(&self) -> PackageWriter {
         let state = self.state.clone();
         let guard = state.write_mutex.clone().lock_owned().await;
@@ -121,7 +139,11 @@ impl Package {
 
     fn from_opened(view: ArchiveView, parent: &ArchiveOperation, path: PathBuf, read_only: bool, file: Option<std::fs::File>, size: u64) -> Result<Self> {
         let state = Arc::new(PackageState {
-            view, path, read_only, size: AtomicU64::new(size), write_healthy: AtomicBool::new(true),
+            view, path, read_only, size: AtomicU64::new(size), write_healthy: AtomicBool::new(true), retired: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_retirement_close: AtomicBool::new(false),
+            #[cfg(test)]
+            retirement_probe: std::sync::Mutex::new(None),
             write_mutex: Arc::new(tokio::sync::Mutex::new(file)),
             #[cfg(test)]
             append_probe: std::sync::Mutex::new(None),
@@ -215,7 +237,7 @@ impl Package {
 
     pub async fn remove(&self) -> Result<()> {
         if self.state.read_only { fail!("Cannot remove a read-only package"); }
-        let operation = self.state.view.enter()?;
+        let operation = self.enter_operation()?;
         let mut guard = self.lock_writer().await;
         if guard.is_none() { return Ok(()); }
         let (phase, mut job) = operation.mutation_phase();
@@ -254,7 +276,7 @@ impl Package {
         &self,
         observer: crate::durability::SyncObservation,
     ) -> Result<()> {
-        let operation = self.state.view.enter()?;
+        let operation = self.enter_operation()?;
         let guard = self.lock_writer().await;
         let (phase, mut job) = operation.mutation_phase();
         let handoff = tokio::task::spawn_blocking(move || {
@@ -315,7 +337,7 @@ impl Package {
     pub async fn truncate(&self, size: u64) -> Result<()> {
         let new_size = (PKG_HEADER_SIZE as u64).checked_add(size)
             .ok_or_else(|| error!("Package truncate size overflow"))?;
-        let operation = self.state.view.enter()?;
+        let operation = self.enter_operation()?;
         let guard = self.lock_writer().await;
         if !self.state.write_healthy.load(Ordering::SeqCst) {
             fail!("Package write state is uncertain; reopen before mutation");
@@ -344,7 +366,7 @@ impl Package {
     }
 
     pub(super) async fn open_reader(&self) -> Result<super::native_read::NativePackageReader> {
-        let operation = self.state.view.enter()?;
+        let operation = self.enter_operation()?;
         super::native_read::NativePackageReader::open(operation, self.state.path.clone(), wire_read_limits()).await
     }
 
@@ -353,7 +375,7 @@ impl Package {
         offset: u64,
         limits: super::bounded_read::ArchiveReadLimits,
     ) -> Result<PackageEntry> {
-        let operation = self.state.view.enter()?;
+        let operation = self.enter_operation()?;
         self.read_entry_bounded_in(&operation, offset, limits).await
     }
 
@@ -361,14 +383,14 @@ impl Package {
         &self, parent: &ArchiveOperation, offset: u64,
         limits: super::bounded_read::ArchiveReadLimits,
     ) -> Result<PackageEntry> {
-        let operation = self.state.view.inherit(parent)?;
+        let operation = self.inherit_operation(parent)?;
         super::native_read::read_entry(operation, self.state.path.clone(), offset, limits).await
     }
 
     pub(super) async fn read_range_in(
         &self, parent: &ArchiveOperation, offset: u64, limit: u32,
     ) -> Result<Vec<u8>> {
-        let operation = self.state.view.inherit(parent)?;
+        let operation = self.inherit_operation(parent)?;
         super::native_read::read_range(operation, self.state.path.clone(), offset, limit).await
     }
 
@@ -394,7 +416,7 @@ impl Package {
         after_append: impl FnOnce(O, u64) -> Result<()>,
     ) -> Result<PackageEntry> {
         let entry_size = entry.serialized_size()?;
-        let operation = self.state.view.enter()?;
+        let operation = self.enter_operation()?;
         let guard = self.lock_writer().await;
         if !self.state.write_healthy.load(Ordering::SeqCst) {
             fail!("Package write state is uncertain; reopen before mutation");
@@ -812,3 +834,7 @@ mod state_ownership_tests {
 #[cfg(test)]
 #[path = "../tests/test_package_native_writer.rs"]
 mod native_writer_tests;
+
+#[path = "package_retirement.rs"]
+mod retirement;
+pub(super) fn retirement_restart_required() -> bool { retirement::restart_required() }
