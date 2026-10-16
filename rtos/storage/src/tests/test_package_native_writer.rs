@@ -258,3 +258,70 @@ async fn native_open_preserves_short_file_and_invalid_header_policy() -> Result<
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn started_sync_cancellation_retains_writer_and_observer_until_native_end() -> Result<()> {
+    let (dir, view, operation) = package_fixture_context()?;
+    let package = Arc::new(Package::open(view.clone(), &operation, dir.path().join("sync.pack"), false, true).await?);
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let observer: Arc<crate::durability::SyncObserver> = Arc::new(move |point, _| {
+        if point == crate::durability::SyncPoint::File {
+            started_tx.send(())?;
+            release_rx.lock().unwrap().recv_timeout(Duration::from_secs(10))?;
+        }
+        Ok(())
+    });
+    let weak_observer = Arc::downgrade(&observer);
+    let worker = package.clone();
+    let task = tokio::spawn(async move { worker.sync_durable(Some(observer)).await });
+    started_rx.recv_timeout(Duration::from_secs(10))?;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(view.binding().domain().recovery_required());
+    assert!(weak_observer.upgrade().is_some());
+    assert!(package.state.write_mutex.try_lock().is_err());
+    let closed = view.binding().domain().close(view.epoch())?;
+    drop(operation);
+    assert!(view.binding().domain().outstanding() > 0);
+    release_tx.send(())?;
+    tokio::time::timeout(Duration::from_secs(10), closed.wait()).await?;
+    assert!(weak_observer.upgrade().is_none());
+    assert!(package.state.write_mutex.try_lock().is_ok());
+    Ok(())
+}
+
+#[test]
+fn cancelled_queued_sync_has_no_effect_and_allows_retry() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1)
+        .max_blocking_threads(1).enable_all().build()?;
+    runtime.block_on(async {
+        let (dir, view, operation) = package_fixture_context()?;
+        let package = Package::open(view.clone(), &operation, dir.path().join("queued-sync.pack"), false, true).await?;
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(10))?;
+        let calls = Arc::new(AtomicU64::new(0));
+        let observed = calls.clone();
+        let mut sync = Box::pin(package.sync_durable(Some(Arc::new(move |_, _| {
+            observed.fetch_add(1, Ordering::SeqCst); Ok(())
+        }))));
+        assert!(futures::poll!(&mut sync).is_pending());
+        drop(sync);
+        release_tx.send(())?;
+        blocker.await?;
+        drop(tokio::time::timeout(Duration::from_secs(10), package.lock_writer()).await?);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!view.binding().domain().recovery_required());
+        package.sync_durable(None).await?;
+        // A failure at the actual synchronization boundary must fence the domain.
+        assert!(package.sync_durable(Some(Arc::new(|_, _| Err(anyhow::anyhow!("sync observer failure"))))).await.is_err());
+        assert!(view.binding().domain().recovery_required());
+        Ok(())
+    })
+}

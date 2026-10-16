@@ -232,10 +232,20 @@ impl Package {
     /// File and directory entries are separate durability obligations.
     pub async fn sync_durable(
         &self,
-        observer: Option<&crate::durability::SyncObserver>,
+        observer: crate::durability::SyncObservation,
     ) -> Result<()> {
-        let _guard = self.lock_writer().await;
-        sync_file_and_parents_observed(self.path(), observer).await
+        let operation = self.state.view.enter()?;
+        let guard = self.lock_writer().await;
+        let (phase, mut job) = operation.mutation_phase();
+        let handoff = tokio::task::spawn_blocking(move || {
+            job.start()?;
+            sync_file_and_parents_native(&guard._state.path, observer.as_deref())?;
+            Ok::<_, anyhow::Error>(job.handoff(guard))
+        }).await.map_err(|e| error!("Native package sync task failed: {e}"))??;
+        phase.check_completion()?;
+        handoff.consume(|_| Ok(()))?;
+        phase.complete();
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -509,19 +519,28 @@ pub(crate) async fn sync_file_and_parents(path: &Path) -> Result<()> {
 }
 pub(crate) async fn sync_file_and_parents_observed(
     path: &Path,
+    observer: crate::durability::SyncObservation,
+) -> Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || sync_file_and_parents_native(&path, observer.as_deref()))
+        .await.map_err(|e| error!("Native file sync task failed: {e}"))?
+}
+
+fn sync_file_and_parents_native(
+    path: &Path,
     observer: Option<&crate::durability::SyncObserver>,
 ) -> Result<()> {
-    let file = tokio::fs::OpenOptions::new().read(true).write(true).open(path).await?;
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
     crate::durability::before(observer, crate::durability::SyncPoint::File, path)?;
-    file.sync_all().await?;
+    file.sync_all()?;
     let mut parent = path.parent();
     while let Some(directory) = parent {
         if directory.as_os_str().is_empty() {
             break;
         }
-        let file = tokio::fs::File::open(directory).await?;
+        let file = std::fs::File::open(directory)?;
         crate::durability::before(observer, crate::durability::SyncPoint::Directory, directory)?;
-        file.sync_all().await?;
+        file.sync_all()?;
         parent = directory.parent();
     }
     Ok(())

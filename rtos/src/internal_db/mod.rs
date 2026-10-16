@@ -1063,11 +1063,11 @@ impl InternalDb {
             handle.set_proof();
         }
         self.archive_manager
-            .sync_file(&handle, &body_id, self.publication_sync_observer().as_deref())
+            .sync_file(&handle, &body_id, self.publication_sync_observer())
             .await
             .map_err(publication_durability_failure)?;
         self.archive_manager
-            .sync_file(&handle, &proof_id, self.publication_sync_observer().as_deref())
+            .sync_file(&handle, &proof_id, self.publication_sync_observer())
             .await
             .map_err(publication_durability_failure)?;
         let body =
@@ -1181,7 +1181,7 @@ impl InternalDb {
             }
         }
         self.archive_manager
-            .sync_file(&handle, &entry, self.publication_sync_observer().as_deref())
+            .sync_file(&handle, &entry, self.publication_sync_observer())
             .await?;
         self.sync_publication_metadata(&handle).await
     }
@@ -1307,11 +1307,11 @@ impl InternalDb {
             }
         }
         self.archive_manager
-            .sync_file(&handle, &body_id, self.publication_sync_observer().as_deref())
+            .sync_file(&handle, &body_id, self.publication_sync_observer())
             .await
             .map_err(publication_durability_failure)?;
         self.archive_manager
-            .sync_file(&handle, &proof_id, self.publication_sync_observer().as_deref())
+            .sync_file(&handle, &proof_id, self.publication_sync_observer())
             .await
             .map_err(publication_durability_failure)?;
         Ok((handle, selected))

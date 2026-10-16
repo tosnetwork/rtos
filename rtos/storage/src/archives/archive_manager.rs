@@ -224,7 +224,7 @@ impl ArchiveManager {
         &self,
         handle: &BlockHandle,
         entry_id: &PackageEntryId<B>,
-        observer: Option<&crate::durability::SyncObserver>,
+        observer: crate::durability::SyncObservation,
     ) -> Result<()> {
         let _guard = match entry_id {
             PackageEntryId::Block(_) => handle.block_file_lock().write().await,
@@ -239,15 +239,15 @@ impl ArchiveManager {
                 .get_file_desc(&id, false)
                 .await?
                 .ok_or_else(|| error!("Required archive descriptor is absent"))?;
-            descriptor.archive_slice().sync_block_package(handle, observer).await?;
+            descriptor.archive_slice().sync_block_package(handle, observer.clone()).await?;
         } else {
             super::package::sync_file_and_parents_observed(
                 &self.unapplied_files_path.join(entry_id.filename_short()),
-                observer,
+                observer.clone(),
             )
             .await?;
         }
-        self.db.sync_wal_observed(observer)?;
+        self.db.sync_wal_observed(observer.as_deref())?;
         Ok(())
     }
 
