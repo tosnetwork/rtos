@@ -50,9 +50,9 @@ def reserve_port(kind, used):
             return port
 
 
-async def child_checked(command, log_path):
+async def child_checked(command, log_path, cwd=None):
     with log_path.open('w') as log:
-        process = await asyncio.create_subprocess_exec(*map(str, command), stdout=log, stderr=log)
+        process = await asyncio.create_subprocess_exec(*map(str, command), stdout=log, stderr=log, cwd=cwd)
         try:
             code = await asyncio.wait_for(process.wait(), 60)
         finally:
@@ -81,12 +81,75 @@ async def stop_rust(node):
     return process.returncode
 
 
+def block_text(block_id):
+    return (f"({block_id['workchain']},{int(block_id['shard']) & ((1 << 64) - 1):016x},"
+            f"{block_id['seqno']}):{base64.b64decode(block_id['root_hash']).hex()}:"
+            f"{base64.b64decode(block_id['file_hash']).hex()}")
+
+
+async def cpp_block(snapshot, node, block_id, directory):
+    """Read native bytes without adding a Rust participant to the C++ control."""
+    config = directory / 'lite-client.json'
+    config.write_text(node.liteserver_config.to_json())
+    data = directory / 'lite-data'
+    data.mkdir()
+    await child_checked([snapshot / 'build/lite-client/lite-client', '-C', config,
+        '-r', '-D', data, '-t', '15', '-c', 'getblock ' + block_text(block_id)], directory / 'lite-client.log')
+    expected = base64.b64decode(block_id['file_hash']).hex()
+    matches = [p for p in data.rglob('*') if p.is_file() and digest(p) == expected]
+    if len(matches) != 1:
+        raise RuntimeError('Native LiteServer did not retain exactly one matching block body')
+    return dict(id=block_id, boc=base64.b64encode(matches[0].read_bytes()).decode())
+
+
+async def cpp_certificate(snapshot, node, zero, target, directory):
+    config = directory / 'proof-client.json'
+    config.write_text(node.liteserver_config.to_json())
+    command = 'saveblkproofchain finality ' + block_text(zero) + ' ' + block_text(target)
+    await child_checked([snapshot / 'build/lite-client/lite-client', '-C', config, '-r',
+        '-t', '20', '-c', command], directory / 'proof-client.log', cwd=directory)
+    responses = sorted(directory.glob('finality-*.response.tl'))
+    if not responses:
+        raise RuntimeError('Native C++ LiteServer did not export finality proof responses')
+    return dict(kind='cpp_lite', name='cpp-0',
+        responses=[base64.b64encode(path.read_bytes()).decode() for path in responses])
+
+
+async def prepare_rust(args, directory, i, network, global_config, tcp_used, udp_used):
+    directory.mkdir()
+    (directory / 'zero').mkdir()
+    for state in [network.zerostate.masterchain, network.zerostate.shardchain]:
+        shutil.copyfile(state.file, directory / 'zero' / (state.file_hash.hex() + '.boc'))
+    shutil.copyfile(global_config, directory / 'global.json')
+    address = f'127.0.0.1:{reserve_port(socket.SOCK_STREAM, tcp_used)}'
+    config = dict(log_config_name='node-log.yml', ton_global_config_name='global.json',
+        internal_db_path=str(directory / 'node_db'),
+        ip_address=f'127.0.0.1:{reserve_port(socket.SOCK_DGRAM, udp_used)}',
+        ip_address_quic=f'127.0.0.1:{reserve_port(socket.SOCK_DGRAM, udp_used)}',
+        boot_from_zerostate=True, restore_db=True, archival_mode=None,
+        validation_countdown_mode='except-zerostate', json_rpc_server={'address': address})
+    write(directory / 'default_config.json', config)
+    (directory / 'node-log.yml').write_text(
+        "appenders:\n  console:\n    kind: console\n    encoder:\n      pattern: '{m}{n}'\n"
+        "root:\n  level: info\n  appenders: [console]\n")
+    await child_checked([args.validator_preparer, '--configs', directory,
+        '--global-config', directory / 'global.json', '--zerostate', directory / 'zero' /
+        (network.zerostate.masterchain.file_hash.hex() + '.boc'), '--member', i],
+        directory.parent / f'prepare-{directory.name}.log')
+    prepared = json.loads((directory / 'validator-prepared.json').read_text())
+    if prepared['public_test_member'] != i or prepared['validator_id'] != hashlib.sha256(
+            f'n6-validator-id-{i}'.encode()).hexdigest():
+        raise RuntimeError('Prepared Rust identity differs from the reserved member')
+    return address, prepared
+
+
 async def run(args, root, snapshot, artifacts):
     sys.path.insert(0, str(snapshot / 'source/test/tostester/src'))
     from nacl.signing import SigningKey
     from tostester.install import Install
     from tostester.key import Key
-    from tostester.network import Network, StartOptions
+    from tostester.network import Network, StartOptions, _write_model
+    from tosapi import tos_api
 
     tcp_used, udp_used = set(), set()
     network_dir = root / 'network'
@@ -145,7 +208,10 @@ async def run(args, root, snapshot, artifacts):
             cpp_nodes.append(node)
             endpoint_names.append(f'cpp-{i}')
             endpoints.append('http://' + address + '/jsonRPC')
-        global_config = members[0].directory / 'config.global.json'
+        global_config = root / 'config.global.json'
+        _write_model(global_config, tos_api.Config_global(
+            dht=tos_api.Dht_config_global(static_nodes=tos_api.Dht_nodes(nodes=[dht.signed_address]), k=3, a=3),
+            validator=network.zerostate.as_validator_config()))
         if identity(json.loads(global_config.read_text())['validator']['zero_state']) != identity(zero):
             raise RuntimeError('Generated C++ global configuration differs from the frozen Genesis')
         expected_creators = {
@@ -156,30 +222,7 @@ async def run(args, root, snapshot, artifacts):
         try:
             for i in range(args.cpp_count, 4):
                 directory = root / f'rust-{i}'
-                directory.mkdir()
-                (directory / 'zero').mkdir()
-                for state in [network.zerostate.masterchain, network.zerostate.shardchain]:
-                    shutil.copyfile(state.file, directory / 'zero' / (state.file_hash.hex() + '.boc'))
-                shutil.copyfile(global_config, directory / 'global.json')
-                address = f'127.0.0.1:{reserve_port(socket.SOCK_STREAM, tcp_used)}'
-                config = dict(log_config_name='node-log.yml', ton_global_config_name='global.json',
-                    internal_db_path=str(directory / 'node_db'),
-                    ip_address=f'127.0.0.1:{reserve_port(socket.SOCK_DGRAM, udp_used)}',
-                    ip_address_quic=f'127.0.0.1:{reserve_port(socket.SOCK_DGRAM, udp_used)}',
-                    boot_from_zerostate=True, restore_db=True, archival_mode=None,
-                    validation_countdown_mode='except-zerostate', json_rpc_server={'address': address})
-                write(directory / 'default_config.json', config)
-                (directory / 'node-log.yml').write_text(
-                    "appenders:\n  console:\n    kind: console\n    encoder:\n      pattern: '{m}{n}'\n"
-                    "root:\n  level: info\n  appenders: [console]\n")
-                await child_checked([args.validator_preparer, '--configs', directory,
-                    '--global-config', directory / 'global.json', '--zerostate', directory / 'zero' /
-                    (network.zerostate.masterchain.file_hash.hex() + '.boc'), '--member', i],
-                    root / f'prepare-{i}.log')
-                prepared = json.loads((directory / 'validator-prepared.json').read_text())
-                if prepared['public_test_member'] != i or prepared['validator_id'] != hashlib.sha256(
-                        f'n6-validator-id-{i}'.encode()).hexdigest():
-                    raise RuntimeError('Prepared Rust identity differs from the reserved member')
+                address, prepared = await prepare_rust(args, directory, i, network, global_config, tcp_used, udp_used)
                 log = (directory / 'node.log').open('w')
                 try:
                     process = await asyncio.create_subprocess_exec(str(args.rust_node), '--configs',
@@ -196,7 +239,19 @@ async def run(args, root, snapshot, artifacts):
                         start_ticks=Path(f"/proc/{node['process'].pid}/stat").read_text().split()[21])
                         for node in rust_nodes}))
             write(root / 'rpc-endpoints.json', dict(zip(endpoint_names, endpoints)))
-            first_prepared = json.loads((rust_nodes[0]['directory'] / 'validator-prepared.json').read_text())
+            if rust_nodes:
+                first_prepared = json.loads((rust_nodes[0]['directory'] / 'validator-prepared.json').read_text())
+            else:
+                # This offline decoder validates the frozen committee; no Rust
+                # validator process or network participant starts in this mode.
+                _, first_prepared = await prepare_rust(args, root / 'committee-probe', 0,
+                    network, global_config, tcp_used, udp_used)
+            write(root / 'processes.json', dict(cpp={node.name: node.process_id for node in cpp_nodes},
+                rust={str(node['index']): dict(pid=node['process'].pid,
+                    start_ticks=Path(f"/proc/{node['process'].pid}/stat").read_text().split()[21])
+                    for node in rust_nodes}))
+            comparison_index = args.cpp_count if 0 < args.cpp_count < 4 else 1
+            body_index = args.cpp_count if rust_nodes else 0
             master = next(s for s in first_prepared['sessions'] if s['masterchain'] and s['catchain_seqno'] == 0)
             weights = {m['validator_id']: m['weight'] for m in master['committee']}
             if len(weights) != 4 or set(weights) != {base64.b64decode(c).hex() for c in expected_creators}:
@@ -237,10 +292,27 @@ async def run(args, root, snapshot, artifacts):
                         raise RuntimeError(f'Applied state roots differ at MC{key[2]}')
                     directory = root / 'checks' / str(key[2])
                     directory.mkdir(parents=True)
-                    block = await asyncio.to_thread(rpc, endpoints[args.cpp_count], 'getBlock',
-                        {k: infos[0]['last'][k] for k in ['workchain', 'shard', 'seqno', 'root_hash', 'file_hash']})
-                    write(directory / 'sample.json', dict(zerostate=zero, reference=infos[0],
-                        references=dict(zip(endpoint_names, infos)), rust=infos[args.cpp_count], block=block))
+                    if rust_nodes:
+                        block = await asyncio.to_thread(rpc, endpoints[body_index], 'getBlock',
+                            {k: infos[0]['last'][k] for k in ['workchain', 'shard', 'seqno', 'root_hash', 'file_hash']})
+                    else:
+                        block = await cpp_block(snapshot, cpp_nodes[0], infos[0]['last'], directory)
+                    sample = dict(zerostate=zero, reference=infos[0],
+                        references=dict(zip(endpoint_names, infos)), comparison=infos[comparison_index],
+                        comparison_endpoint=endpoint_names[comparison_index], block=block,
+                        body_transport='native_rust_rpc' if rust_nodes else 'native_cpp_liteserver')
+                    if args.verify_certificates:
+                        sample['governing_zerostate_boc'] = base64.b64encode(generated.file.read_bytes()).decode()
+                        if rust_nodes:
+                            certs = await asyncio.gather(*(asyncio.to_thread(rpc, url,
+                                'getMasterchainBlockSignatures', {'seqno': key[2]})
+                                for url in endpoints[args.cpp_count:]))
+                            sample['certificates'] = [dict(kind='rpc', name=name, value=cert)
+                                for name, cert in zip(endpoint_names[args.cpp_count:], certs)]
+                        else:
+                            sample['certificates'] = [await cpp_certificate(snapshot, cpp_nodes[0], zero,
+                                infos[0]['last'], directory)]
+                    write(directory / 'sample.json', sample)
                     await child_checked([args.block_checker, directory / 'sample.json',
                         directory / 'checked.json'], directory / 'checker.log')
                     checked = json.loads((directory / 'checked.json').read_text())
@@ -268,7 +340,9 @@ async def run(args, root, snapshot, artifacts):
                                 raise RuntimeError('An executable changed during matrix validation')
                         return dict(status='all_four_creators_accepted_with_matching_states',
                             cpp_count=args.cpp_count, rust_count=4 - args.cpp_count,
+                            control_kind=('all_cpp' if args.cpp_count == 4 else 'all_rust' if args.cpp_count == 0 else 'mixed'),
                             creators=creators, common_state_checkpoints=len(checked_keys),
+                            final_certificates_required=args.verify_certificates,
                             mixed_validator_qualified=False)
                 await asyncio.sleep(0.1)
             raise TimeoutError(f'Not all four creators were accepted within {args.timeout} seconds')
@@ -287,7 +361,7 @@ def main():
     parser.add_argument('--validator-preparer', type=Path, required=True)
     parser.add_argument('--block-checker', type=Path, required=True)
     parser.add_argument('--rust-revision', required=True)
-    parser.add_argument('--cpp-count', type=int, choices=[1, 2, 3], required=True)
+    parser.add_argument('--cpp-count', type=int, choices=[0, 1, 2, 3, 4], required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--base-port', type=int, default=55700)
     parser.add_argument('--timeout', type=float, default=180)
@@ -295,6 +369,7 @@ def main():
     parser.add_argument('--genesis-profile', type=Path,
                         default=Path(__file__).with_name('testnet-v16.json'))
     parser.add_argument('--prepare-genesis-only', action='store_true')
+    parser.add_argument('--verify-certificates', action='store_true')
     args = parser.parse_args()
     args.snapshot = args.snapshot.resolve()
     for name in ['rust_node', 'validator_preparer', 'block_checker']:

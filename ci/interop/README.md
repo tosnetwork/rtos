@@ -151,7 +151,12 @@ revision.
 ```
 
 Use `--cpp-count 1`, `2`, or `3` for the reverse, symmetric and forward
-four-member topologies. Run them sequentially: these deliberately public test
+four-member topologies; `0` and `4` run all-Rust and all-C++ validator controls.
+The bootstrap DHT and Genesis generator remain C++ harness services in both
+controls. An all-C++ run uses only an offline Rust committee decoder and BOC
+checker, with no Rust validator process. It downloads native block bytes through
+the pinned C++ LiteServer/client, since the baseline has no `getBlock` JSON-RPC.
+Run them sequentially: these deliberately public test
 identities must not be active in concurrent duplicate networks. The checked-in
 `testnet-v16.json` fixes time, public wallet-seed derivation, initial-set lifetime,
 version, equal membership, test economics, Simplex parameters and complete MC/WC
@@ -169,3 +174,19 @@ The long initial-set lifetime is solely for reproducible isolated fixtures.
 This profile does not qualify deployment fee schedules, version 17–19,
 workchain leadership, elections or validator-set rotation. Do not use its public
 identities or wallet for a shared deployment.
+
+Add `--verify-certificates` to require independent finality checks at every
+sampled checkpoint. Rust validators expose their stored PQ proof through native
+RPC. The C++ baseline's JSON-RPC does not export PQ signature sets, so its
+existing `saveblkproofchain` command retains raw LiteServer responses instead.
+The checker authenticates the supplied governing Genesis body against the
+frozen root/file identity, derives the expected committee/session from its
+configuration and the signed block header, and verifies the native ML-DSA-44
+FinalCert and strict quorum. This is currently limited to the Genesis key-block
+epoch; later governing epochs are refused. It checks the target certificate,
+not every intermediate proof-link in an exported chain.
+
+Requests use `reference` and `comparison` for two named native endpoints; the
+older `rust` comparison field remains accepted for archived samples. Even in
+single-language controls, the independent checker compares distinct endpoints,
+and the runner requires matching applied states at all four endpoints.
