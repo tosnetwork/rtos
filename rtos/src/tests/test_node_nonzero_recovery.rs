@@ -453,6 +453,27 @@ async fn actual_network_recovers_after_source_sync_eio_and_interruption() -> Res
     exercise_nonzero_recovery_with_finality(false, None, None, false, 10).await
 }
 
+#[cfg(feature = "isolated-consensus-signing")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires actual isolated node binary and public network fixture"]
+async fn actual_network_recovers_after_signer_expiry_and_interruption() -> Result<()> {
+    exercise_nonzero_recovery_with_finality(false, None, None, false, 11).await
+}
+
+#[cfg(feature = "isolated-consensus-signing")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires actual isolated node binary, public network fixture and cc"]
+async fn actual_network_recovers_after_signer_expiry_write_enospc_and_interruption() -> Result<()> {
+    exercise_nonzero_recovery_with_finality(false, None, None, false, 12).await
+}
+
+#[cfg(feature = "isolated-consensus-signing")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires actual isolated node binary, public network fixture and cc"]
+async fn actual_network_recovers_after_signer_expiry_sync_eio_and_interruption() -> Result<()> {
+    exercise_nonzero_recovery_with_finality(false, None, None, false, 13).await
+}
+
 async fn exercise_nonzero_recovery_layout(
     interrupt_recovery: bool,
     building: Option<&str>,
@@ -476,7 +497,7 @@ async fn exercise_nonzero_recovery_with_finality(
     };
     let root = dir.path();
     #[cfg(feature = "isolated-consensus-signing")]
-    let active_fixture = match retained_finality { 7 => Some(Fixture::active_validator()?), 8..=10 => Some(Fixture::active_network()?), _ => None };
+    let active_fixture = match retained_finality { 7 => Some(Fixture::active_validator()?), 8..=13 => Some(Fixture::active_network()?), _ => None };
     #[cfg(not(feature = "isolated-consensus-signing"))]
     let active_fixture: Option<Fixture> = None;
     let fixture = active_fixture.unwrap_or_else(|| if retained_finality > 0 { Fixture::node_finality() } else { Fixture::node_recovery() });
@@ -484,7 +505,7 @@ async fn exercise_nonzero_recovery_with_finality(
     fixture.prepare(root, &archives).await?;
     let physical = run_import(fixture.config(root, archives)).await?;
     tokio::time::timeout(Duration::from_secs(60), wait_for_db_release(physical)).await?;
-    if matches!(retained_finality, 7..=10) || matches!(truncation, Some((3, Some(cut))) if cut == "state-cache-loss" || cut.starts_with("state-auto-")) {
+    if matches!(retained_finality, 7..=13) || matches!(truncation, Some((3, Some(cut))) if cut == "state-cache-loss" || cut.starts_with("state-auto-")) {
         truncation_recovery::state_cache_loss::prepare_dynamic(root, &fixture).await?;
     }
     if sparse { sparse_packages::prepare(root).await?; }
@@ -541,15 +562,22 @@ async fn exercise_nonzero_recovery_with_finality(
     drop((adnl, quic));
     fs::write(root.join("node-log.yml"), "appenders:\n  console:\n    kind: console\n    encoder:\n      pattern: '{m}{n}'\nroot:\n  level: info\n  appenders: [console]\n")?;
     #[cfg(feature = "isolated-consensus-signing")]
-    if matches!(retained_finality, 7..=10) {
+    if matches!(retained_finality, 7..=13) {
+        // Keep owned public fixtures through assertion panics as well as Err;
+        // only remove them after the actual process and cold checks succeed.
+        let kept = dir.keep();
+        let root = kept.as_path();
+        eprintln!("Actual active-validator fixture: {}", root.display());
         let result = if retained_finality >= 8 {
-            let fault = match retained_finality { 9 => Some("write-enospc"), 10 => Some("sync-eio"), _ => None };
+            let fault = match retained_finality {
+                9 => Some("write-enospc"), 10 => Some("sync-eio"), 11 => Some("signer-expiry"),
+                12 => Some("signer-expiry-write-enospc"), 13 => Some("signer-expiry-sync-eio"), _ => None,
+            };
             active_network::run(&binary, root, &fixture, fault).await
         } else { active_validator::run(&binary, root, &zero, &fixture).await };
         if result.is_err() {
-            let kept = dir.keep();
             eprintln!("Retained public active-validator fixture for diagnosis: {}", kept.display());
-        }
+        } else { fs::remove_dir_all(&kept)?; }
         return result;
     }
     if let Some(lease) = lease {

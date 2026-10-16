@@ -80,6 +80,13 @@ pub(super) async fn run(binary: &Path, root: &Path, fixture: &Fixture, fault_mod
     let mut sockets = Vec::new();
     let mut peers = Vec::new();
     let mut fault = None;
+    let mut expiry = None;
+    let expiring = fault_mode.is_some_and(|m| m.starts_with("signer-expiry"));
+    let io_mode = match fault_mode {
+        Some("signer-expiry-write-enospc") => Some("write-enospc"),
+        Some("signer-expiry-sync-eio") => Some("sync-eio"),
+        Some("signer-expiry") => None, other => other,
+    };
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i32;
     for i in 0..4u8 {
         let node = network.join(format!("node-{i}")); fs::create_dir(&node)?;
@@ -92,13 +99,13 @@ pub(super) async fn run(binary: &Path, root: &Path, fixture: &Fixture, fault_mod
         config["ip_address"] = adnl.local_addr()?.to_string().into();
         config["ip_address_quic"] = quic.local_addr()?.to_string().into();
         fs::write(node.join("default_config.json"), serde_json::to_vec(&config)?)?;
-        let runtime = active_validator::provision(&node, fixture, 0xa0 + i, 0x61 + i).await?;
+        let expire_at = if i == 0 && expiring { unix_now()?.checked_add(45).unwrap() } else { u32::MAX };
+        let runtime = active_validator::provision_with_expiry(&node, fixture, 0xa0 + i, 0x61 + i, expire_at).await?;
         assert_eq!(runtime.catchain_seqno(), 7, "MC4 must hand off from historical session 6");
         if i == 0 {
-            if let Some(mode) = fault_mode {
-                let namespace = runtime.runtime_directory(node.join("node_db/catchains").to_str().unwrap())?;
-                fault = Some(Fault::prepare(root, Path::new(&namespace), mode)?);
-            }
+            let namespace = PathBuf::from(runtime.runtime_directory(node.join("node_db/catchains").to_str().unwrap())?);
+            if expiring { expiry = Some(Expiry::prepare(&node, &namespace, runtime.session_id(), expire_at)?); }
+            if let Some(mode) = io_mode { fault = Some(Fault::prepare(root, &namespace, mode)?); }
         }
         let (dht_json, key) = Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[0x71 + i; 32])?;
         let addr_list = rtos_api::ton::adnl::addresslist::AddressList {
@@ -127,6 +134,24 @@ pub(super) async fn run(binary: &Path, root: &Path, fixture: &Fixture, fault_mod
     drop(sockets);
     let mut nodes = roots.iter().enumerate().map(|(i, root)| launch(binary, root, 0, if i == 0 { fault.as_ref() } else { None }).map(Some)).collect::<Result<Vec<_>>>()?;
     let initial = wait_for(&mut nodes, &roots, 5).await?;
+    let mut expiry_report = if let Some(expiry) = &expiry {
+        assert!(unix_now()? < expiry.deadline, "expiry occurred before authenticated active participation");
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let refused_heights = loop {
+            let heights = nodes.iter_mut().zip(&roots).map(|(node, root)| {
+                let (process, path) = node.as_mut().unwrap(); observe(root, process, path)
+            }).collect::<Result<Vec<_>>>()?;
+            let output = fs::read_to_string(&nodes[0].as_ref().unwrap().1)?;
+            if unix_now()? >= expiry.deadline && output.contains("signing generation expired and retired") { break heights; }
+            if Instant::now() >= deadline { rtos_block::fail!("Actual signer did not reach expiry retirement"); }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        let live_survivors = wait_for(&mut nodes[1..], &roots[1..], refused_heights.iter().max().unwrap() + 2).await?;
+        eprintln!("Actual signer expired at {}; refused at {refused_heights:?}; live quorum advanced to {live_survivors:?}", expiry.deadline);
+        Some(serde_json::json!({"expire_at":expiry.deadline,"expiry_refusal_observed":true,
+            "refused_heights":refused_heights,"live_surviving_heights":live_survivors,
+            "real_system_clock":true,"expiry_profile_extended":false}))
+    } else { None };
     let failed_source = if let Some(fault) = &fault {
         fs::write(&fault.arm, b"armed after all four actual nodes applied MC5\n")?;
         let deadline = Instant::now() + Duration::from_secs(90);
@@ -169,8 +194,21 @@ pub(super) async fn run(binary: &Path, root: &Path, fixture: &Fixture, fault_mod
     eprintln!("Four actual nodes reached {initial:?}; node 0 SIGKILL; surviving quorum advanced to {surviving:?}");
     nodes[0] = Some(launch(binary, &roots[0], 1, None)?);
     let recovered = wait_for(&mut nodes, &roots, survivor_floor + 1).await?;
+    if let Some(report) = &mut expiry_report {
+        let output = fs::read_to_string(&nodes[0].as_ref().unwrap().1)?;
+        // History recovery may still own this namespace while public block
+        // synchronization has already caught up. The authoritative retirement
+        // and fresh-certificate checks below do not depend on retry log timing.
+        report["expired_profile_refusal_logged"] = output.contains(
+            "Isolated custody key differs from authenticated descriptor or has expired").into();
+    }
     for (node, root) in nodes.iter_mut().zip(&roots) { interrupt(node, root)?; }
     let common_height = *recovered.iter().min().unwrap();
+    let retirement = expiry.as_ref().map(Expiry::verify_retired).transpose()?;
+    if let Some(report) = &mut expiry_report {
+        report["retirement"] = retirement.as_ref().unwrap().clone();
+        report["old_signing_generation_stayed_retired"] = true.into();
+    }
     let mut common: Option<(rtos_block::BlockIdExt, UInt256)> = None;
     let mut reports = Vec::new();
     for node in &roots {
@@ -192,6 +230,11 @@ pub(super) async fn run(binary: &Path, root: &Path, fixture: &Fixture, fault_mod
             assert_eq!(carrier.validator_info.catchain_seqno, 7);
             assert!(carrier.sig_count >= 3 && carrier.sig_weight >= 3);
             if current.seq_no() == common_height {
+                if let Some(retirement) = &retirement {
+                    assert!(u64::from(carrier.slot) > retirement["max_signed_finalize_slot"].as_u64().unwrap());
+                    assert!(carrier.signatures.iter().all(|s| s.validator_id != UInt256::from([1; 32])),
+                        "fresh final certificate contains expired validator");
+                }
                 let identity = (current.clone(), state.root_cell().repr_hash().clone());
                 if let Some(expected) = &common { assert_eq!(&identity, expected); } else { common = Some(identity); }
             }
@@ -212,7 +255,7 @@ pub(super) async fn run(binary: &Path, root: &Path, fixture: &Fixture, fault_mod
     let (id, state) = common.unwrap();
     let report = root.join("active-network-recovery.json");
     fs::write(&report, serde_json::to_vec_pretty(&serde_json::json!({
-        "source_io_fault":fault_mode,"node_count":4,"total_weight":4,"interrupted_weight":1,"surviving_weight":3,
+        "scenario":fault_mode,"source_io_fault":io_mode,"signer_expiry":expiry_report,"node_count":4,"total_weight":4,"interrupted_weight":1,"surviving_weight":3,
         "initial_heights":initial,"interruption_heights":cut_heights,"surviving_heights":surviving,"recovered_heights":recovered,
         "common_height":common_height,"common_block":id.to_string(),"common_state_root":state.to_hex_string(),
         "native_reopen_between_boots":false,"nodes":reports,
@@ -240,5 +283,61 @@ impl Fault {
         for path in [&source, &library] { keep_evidence(root, path)?; }
         Ok(Self { mode: mode.into(), library, directory: namespace.join("finality-pending"),
             arm: root.join("network-source-io.arm"), marker: root.join("network-source-io.reached") })
+    }
+}
+
+fn unix_now() -> Result<u32> {
+    Ok(u32::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())?)
+}
+
+struct Expiry {
+    deadline: u32,
+    journal: PathBuf,
+    originals: Vec<(PathBuf, Vec<u8>)>,
+}
+impl Expiry {
+    fn prepare(node: &Path, namespace: &Path, session: &UInt256, deadline: u32) -> Result<Self> {
+        let owners = fs::read_dir(node.join("isolated-owner"))?.map(|e| e.map(|e| e.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(owners.len(), 1);
+        let mut paths = vec![namespace.join(simplex::isolated_signing::PROFILE_FILE),
+            node.join("isolated-custody/public-test-seed")];
+        paths.extend(owners);
+        let originals = paths.into_iter().map(|p| fs::read(&p).map(|b| (p, b))).collect::<std::io::Result<_>>()?;
+        Ok(Self { deadline, journal: namespace.join(session.to_hex_string()), originals })
+    }
+    fn verify_retired(&self) -> Result<serde_json::Value> {
+        for (path, original) in &self.originals { assert_eq!(&fs::read(path)?, original, "expired custody/profile/owner was changed"); }
+        // Only after all actual processes stopped. No native DB is reopened
+        // between the interruption and the executable restart.
+        let db = storage::db::rocksdb::RocksDb::new(self.journal.parent().unwrap(),
+            self.journal.file_name().unwrap().to_str().unwrap(), None,
+            storage::db::rocksdb::AccessType::ReadOnly)?;
+        let bytes = db.db().get(b"RSJ1H")?.unwrap();
+        let header: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(header["retired"], true);
+        assert_eq!(header["binding"]["expire_at"], self.deadline);
+        assert_eq!(header["binding"]["generation"], 1);
+        assert_eq!(header["binding"]["validator"], serde_json::json!(vec![1u8; 32]));
+        let mut iterator = db.db().raw_iterator(); iterator.seek(b"RSJ1D");
+        let mut signed = 0; let mut candidates = 0; let mut max_finalize = None;
+        while iterator.valid() && iterator.key().unwrap().starts_with(b"RSJ1D") {
+            let record: serde_json::Value = serde_json::from_slice(iterator.value().unwrap())?;
+            if !record["signed"].is_null() {
+                signed += 1;
+                if record["decision"]["kind"] == 3 { candidates += 1; }
+                if record["decision"]["kind"] == 1 {
+                    let slot = record["decision"]["slot"].as_u64().unwrap();
+                    max_finalize = Some(max_finalize.map_or(slot, |old: u64| old.max(slot)));
+                }
+            }
+            iterator.next();
+        }
+        iterator.status()?;
+        assert!(signed > 0 && candidates > 0, "expired validator never actively signed");
+        let max_finalize = max_finalize.expect("expired validator never signed finality before expiry");
+        Ok(serde_json::json!({"persisted_retired":true,"generation":1,"own_signed_decisions":signed,
+            "own_signed_candidates":candidates,"max_signed_finalize_slot":max_finalize,
+            "profile_key_owner_unchanged":true,"journal_header_sha256":UInt256::calc_file_hash(&bytes).to_hex_string()}))
     }
 }

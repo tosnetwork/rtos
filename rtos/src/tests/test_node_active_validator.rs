@@ -75,6 +75,11 @@ pub(super) async fn run(binary: &Path, root: &Path, zero: &Path, fixture: &Fixtu
 
 pub(super) async fn provision(root: &Path, fixture: &Fixture, custody_seed: u8, transport_seed: u8)
     -> Result<AuthenticatedSessionRuntime> {
+    provision_with_expiry(root, fixture, custody_seed, transport_seed, u32::MAX).await
+}
+
+pub(super) async fn provision_with_expiry(root: &Path, fixture: &Fixture, custody_seed: u8,
+    transport_seed: u8, expire_at: u32) -> Result<AuthenticatedSessionRuntime> {
     // Public deterministic test identities; no configured/production keys are read.
     let custody = root.join("isolated-custody"); fs::create_dir(&custody)?;
     let key_file = custody.join("public-test-seed");
@@ -104,7 +109,7 @@ pub(super) async fn provision(root: &Path, fixture: &Fixture, custody_seed: u8, 
         committee, transport.id().clone(),
     )?.bind_recovery_anchor(fixture.id(4, false))?;
     let namespace = PathBuf::from(runtime.runtime_directory(root.join("node_db/catchains").to_str().unwrap())?);
-    simplex::isolated_signing::provision(&runtime, &namespace, &owner, &key_file, 1, u32::MAX)?;
+    simplex::isolated_signing::provision(&runtime, &namespace, &owner, &key_file, 1, expire_at)?;
     let (physical, _) = db.sst_databases_for_test();
     drop(state); db.stop_states_db().await?; drop(db);
     tokio::time::timeout(Duration::from_secs(30), wait_for_db_release(physical)).await?;
