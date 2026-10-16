@@ -153,8 +153,9 @@ revision.
 Use `--cpp-count 1`, `2`, or `3` for the reverse, symmetric and forward
 four-member topologies; `0` and `4` run all-Rust and all-C++ validator controls.
 The bootstrap DHT and Genesis generator remain C++ harness services in both
-controls. An all-C++ run uses only an offline Rust committee decoder and BOC
-checker, with no Rust validator process. It downloads native block bytes through
+controls. An all-C++ run uses the offline Rust test-identity preparer to inspect its
+committee, plus the offline BOC checker. The resulting unused journal is never
+started as a Rust validator process. It downloads native block bytes through
 the pinned C++ LiteServer/client, since the baseline has no `getBlock` JSON-RPC.
 Run them sequentially: these deliberately public test
 identities must not be active in concurrent duplicate networks. The checked-in
