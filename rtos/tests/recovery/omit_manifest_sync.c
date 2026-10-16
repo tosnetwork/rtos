@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -15,6 +16,7 @@ static int selected(int fd, char path[PATH_MAX]) {
     const char *root = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_ROOT");
     const char *marker = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_MARKER");
     const char *file = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE");
+    if (file && !strcmp(file, "ready-wal")) file = "ready.v1";
     if (!root || !marker || !*root || !file
         || (strcmp(file, "ready.v1") && strcmp(file, "selection.v1") && strcmp(file, "stage"))) return 0;
     size_t prefix = strlen(root);
@@ -51,9 +53,45 @@ static int selected(int fd, char path[PATH_MAX]) {
     return !fstat(fd, &info) && S_ISREG(info.st_mode) && info.st_size > 28;
 }
 
+static atomic_int wal_armed = 0;
+static char wal_prefix[PATH_MAX];
+
+static int selected_wal(int fd, char path[PATH_MAX]) {
+    if (atomic_load_explicit(&wal_armed, memory_order_acquire) != 1) return 0;
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t length = readlink(link, path, PATH_MAX - 1);
+    if (length <= 0) return 0;
+    path[length] = 0;
+    size_t prefix = strlen(wal_prefix);
+    if (strncmp(path, wal_prefix, prefix)) return 0;
+    const char *leaf = path + prefix;
+    size_t digits = strspn(leaf, "0123456789");
+    struct stat info;
+    return digits && !strcmp(leaf + digits, ".log") && !fstat(fd, &info)
+        && S_ISREG(info.st_mode) && info.st_size > 0;
+}
+
 static int sync_or_omit(int fd, long operation, const char *name) {
     char path[PATH_MAX];
-    if (!selected(fd, path)) return syscall(operation, fd);
+    const char *mode = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE");
+    if (mode && !strcmp(mode, "ready-wal")) {
+        if (!atomic_load_explicit(&wal_armed, memory_order_acquire) && selected(fd, path)) {
+            int result = syscall(operation, fd);
+            if (result) return result;
+            int idle = 0;
+            if (!atomic_compare_exchange_strong_explicit(&wal_armed, &idle, -1,
+                    memory_order_acq_rel, memory_order_acquire)) return 0;
+            char *parent = strstr(path, "/node_db/archive/recovery/");
+            if (!parent) { errno = EINVAL; return -1; }
+            *parent = 0;
+            int length = snprintf(wal_prefix, sizeof(wal_prefix), "%s/node_db/db/", path);
+            if (length <= 0 || (size_t)length >= sizeof(wal_prefix)) { errno = ENAMETOOLONG; return -1; }
+            atomic_store_explicit(&wal_armed, 1, memory_order_release);
+            return 0;
+        }
+        if (!selected_wal(fd, path)) return syscall(operation, fd);
+    } else if (!selected(fd, path)) return syscall(operation, fd);
     int proof = open(getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_MARKER"),
         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (proof < 0) {

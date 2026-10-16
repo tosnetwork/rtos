@@ -33,6 +33,18 @@ pub(super) async fn clear(root: &Path) -> Result<()> {
     truncation_recovery::find_ready_staging(root, &mut ready, &mut stages)?;
     let mut manifests: Vec<_> = ready.into_iter().map(|path| ("ready", path)).collect();
     manifests.extend(selection_paths(root)?.into_iter().map(|path| ("selection", path)));
+    // Snapshot the physical main WAL without opening a native database.
+    for entry in fs::read_dir(root.join("node_db/db"))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(number) = name.strip_suffix(".log") {
+            if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) {
+                assert!(entry.file_type()?.is_file());
+                manifests.push(("wal", entry.path()));
+            }
+        }
+    }
     let mut manifest_before = Vec::new();
     for (_, path) in &manifests {
         let bytes = fs::read(path)?;
@@ -75,9 +87,10 @@ pub(super) async fn clear(root: &Path) -> Result<()> {
     assert_eq!(fs::read(&control)?, old, "cache loss did not discard unsynced overwrite");
     let mut ready_files = Vec::new();
     let mut selection_files = Vec::new();
+    let mut wal_files = Vec::new();
     for ((kind, path), (length, digest)) in manifests.iter().zip(manifest_before) {
         let bytes = fs::read(path)?;
-        let files = if *kind == "ready" { &mut ready_files } else { &mut selection_files };
+        let files = match *kind { "ready" => &mut ready_files, "selection" => &mut selection_files, _ => &mut wal_files };
         files.push(serde_json::json!({
             "path": path.strip_prefix(root)?, "bytes_before": length,
             "sha256_before": digest, "bytes_after": bytes.len(),
@@ -90,6 +103,7 @@ pub(super) async fn clear(root: &Path) -> Result<()> {
         "unsynced_overwrite_discarded": true,
         "ready_files": ready_files,
         "selection_files": selection_files,
+        "wal_files": wal_files,
         "scope": "LazyFS file-data cache loss; directory metadata loss unproven"
     }))?)?;
     keep_evidence(root, &report)?;

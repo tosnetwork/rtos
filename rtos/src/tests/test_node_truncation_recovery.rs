@@ -164,6 +164,18 @@ pub(super) async fn run(
             assert_eq!(package_inventory(root)?, before, "preflight cut changed canonical packages");
             cache_loss::staged_packages(root).await?;
             assert_eq!(package_inventory(root)?, before, "staging cache loss changed canonical packages");
+            if std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE").as_deref() == Ok("ready-wal")
+                && std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED").as_deref() == Ok("1") {
+                interrupt_actual_recovery(binary, root, zero, "building-before-cleaned",
+                    "main.database.db().put(ROOT_KEY, cleaned.encode()?)?;").await?;
+                let mut ready = Vec::new();
+                let mut stages = 0;
+                find_ready_staging(root, &mut ready, &mut stages)?;
+                assert!(ready.is_empty(), "Building abort left Ready intent");
+                assert_eq!(stages, 0, "Building abort left replacement stages");
+                assert_eq!(package_inventory(root)?, before, "Building abort changed canonical packages");
+                eprintln!("Lost Ready WAL publication recovered through Building abort; second actual interruption preserved canonical packages");
+            }
         } else if cut.ends_with("-cache-loss") { cache_loss::clear(root).await?; }
         assert!(root.join("node_db/ton_node.restoring").is_file());
         if cut == "forward-before-cleanup" {

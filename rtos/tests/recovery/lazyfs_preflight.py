@@ -123,7 +123,7 @@ def run(binary, output, node=None):
             result["after_clear"] = {name: (mount / name).read_bytes().hex()
                                      for name in ["synced", "overwrite", "unsynced"]}
             if node is not None:
-                omitted_manifest = "stage" if node.omit_stage_sync else "selection" if node.omit_selection_sync else "ready" if node.omit_ready_sync else None
+                omitted_manifest = "ready-wal" if node.omit_ready_wal_sync else "stage" if node.omit_stage_sync else "selection" if node.omit_selection_sync else "ready" if node.omit_ready_sync else None
                 fixture_dir = mount / "fixtures"
                 fixture_dir.mkdir()
                 environment = dict(os.environ)
@@ -148,7 +148,7 @@ def run(binary, output, node=None):
                     environment.update({
                         "LD_PRELOAD": str(library),
                         "RTOS_TEST_OMIT_MANIFEST_SYNC_ROOT": str(fixture_dir) + "/",
-                        "RTOS_TEST_OMIT_MANIFEST_SYNC_FILE": ("stage" if omitted_manifest == "stage" else omitted_manifest + ".v1"),
+                        "RTOS_TEST_OMIT_MANIFEST_SYNC_FILE": (omitted_manifest if omitted_manifest in ["stage", "ready-wal"] else omitted_manifest + ".v1"),
                         "RTOS_TEST_OMIT_MANIFEST_SYNC_MARKER": str(output / "manifest-sync-omitted.log"),
                     })
                     result["sync_mutation"] = {"kind": f"omit {omitted_manifest} file sync only",
@@ -188,12 +188,14 @@ def run(binary, output, node=None):
                     raise RuntimeError("Node test left owned processes running")
                 result["node_test_exit"] = executed.returncode
                 transcript = (output / "node-test.log").read_text()
-                expected_failure = bool(omitted_manifest) and not node.no_cache_loss
+                expected_failure = bool(omitted_manifest) and omitted_manifest != "ready-wal" and not node.no_cache_loss
                 result["node_failure_expected"] = expected_failure
                 if omitted_manifest:
                     marker = (output / "manifest-sync-omitted.log").read_text().splitlines()
-                    if len(marker) != 1 or not marker[0].startswith("fsync omitted: " + str(fixture_dir) + "/") or not (marker[0].endswith(".pack") if omitted_manifest == "stage" else marker[0].endswith(f"/{omitted_manifest}.v1")):
-                        raise RuntimeError("Manifest sync mutation did not hit exactly one scoped file")
+                    prefix = tuple(name + " omitted: " + str(fixture_dir) + "/" for name in (["fsync", "fdatasync"] if omitted_manifest == "ready-wal" else ["fsync"]))
+                    suffix = ".log" if omitted_manifest == "ready-wal" else ".pack" if omitted_manifest == "stage" else f"/{omitted_manifest}.v1"
+                    if len(marker) != 1 or not marker[0].startswith(prefix) or not marker[0].endswith(suffix):
+                        raise RuntimeError("Sync mutation did not hit exactly one scoped file")
                     result["sync_mutation"]["hits"] = marker
                 required_evidence = ["Actual node recovery interrupted at " + (
                     f"producer-{node.cut}-cache-loss" if node.cut in ["ready", "selection"] else "forward-before-prepare-cache-loss" if node.cut == "stages" else "forward-after-row-sync")]
@@ -244,6 +246,21 @@ def run(binary, output, node=None):
                     if executed.returncode != 0:
                         raise RuntimeError(f"Actual node cache-loss test failed: {executed.returncode}")
                     required_evidence.extend(["1 passed; 0 failed", "Actual node retried real truncation"])
+                if omitted_manifest == "ready-wal" and not node.no_cache_loss:
+                    required_evidence.append("Lost Ready WAL publication recovered through Building abort")
+                    reports = list((output / "node").rglob("cache-loss.json"))
+                    if len(reports) != 1:
+                        raise RuntimeError("Missing WAL cache-loss report")
+                    report = json.loads(reports[0].read_text())
+                    target = [f for f in report["wal_files"] if marker[0].endswith("/" + f["path"])]
+                    if len(target) != 1 or target[0]["sha256_before"] == target[0]["sha256_after"]:
+                        raise RuntimeError("Ready WAL sync omission did not lose target WAL bytes")
+                    preserved = report["ready_files"] + report["selection_files"]
+                    if len(preserved) != 2 or any(f["bytes_before"] != f["bytes_after"] or f["sha256_before"] != f["sha256_after"] for f in preserved):
+                        raise RuntimeError("WAL omission changed a durable manifest")
+                    result["changed_wal"] = target[0]
+                    result["preserved_manifests"] = preserved
+                    result["building_fallback_verified"] = True
                 if node.cut in ["ready", "selection"]:
                     required_evidence.append(f"Unfinished {node.cut.title()} cache-loss=" + ("false" if node.no_cache_loss else "true"))
                 if node.cut == "stages":
@@ -310,6 +327,7 @@ if __name__ == "__main__":
     mutation.add_argument("--omit-ready-sync", action="store_true", help="scoped Ready sync omission sensitivity control")
     mutation.add_argument("--omit-selection-sync", action="store_true", help="scoped Selection sync omission sensitivity control")
     mutation.add_argument("--omit-stage-sync", action="store_true", help="scoped replacement stage sync omission control")
+    mutation.add_argument("--omit-ready-wal-sync", action="store_true", help="omit one main WAL sync after durable Ready")
     parser.add_argument("--cut", choices=["rows", "ready", "selection", "stages"], default="rows")
     parser.add_argument("--no-cache-loss", action="store_true", help="run the same node cut without cache loss as a control")
     parser.add_argument("--node-test-binary", type=Path)
@@ -321,6 +339,6 @@ if __name__ == "__main__":
         parser.error("all three node binary/signer arguments are required together")
     if (args.omit_ready_sync or args.omit_selection_sync) and (not all(node_args) or args.cut != "rows"):
         parser.error("Manifest sync sensitivity requires all node arguments and --cut rows")
-    if args.omit_stage_sync and (not all(node_args) or args.cut != "stages"):
+    if (args.omit_stage_sync or args.omit_ready_wal_sync) and (not all(node_args) or args.cut != "stages"):
         parser.error("Stage sync sensitivity requires all node arguments and --cut stages")
     run(args.lazyfs.resolve(strict=True), args.output.resolve(), args if all(node_args) else None)
