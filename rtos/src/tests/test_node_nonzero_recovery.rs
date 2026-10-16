@@ -718,12 +718,16 @@ async fn interrupt_actual_recovery(
     } else {
         "recovery_worker::recover_cleaned"
     };
-    let start = if cut == "forward-committed-cache-loss"
-        && std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE").as_deref() == Ok("committed-wal") {
+    let mode = std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE");
+    let start = if (cut == "forward-committed-cache-loss" && mode.as_deref() == Ok("committed-wal"))
+        || (cut == "forward-cleaned-cache-loss" && mode.as_deref() == Ok("cleaned-wal")) {
         let arm = std::env::var("RTOS_TEST_COMMITTED_WAL_ARM")?;
+        let arm_statement = if cut == "forward-cleaned-cache-loss" {
+            "store_successor(providers, &committed, &cleaned)?;"
+        } else { "store_successor(providers, root, &committed)?;" };
         let matches: Vec<_> = source.lines().enumerate().filter(|(_, line)|
-            line.trim() == "store_successor(providers, root, &committed)?;").collect();
-        assert_eq!(matches.len(), 1, "Committed arm must identify one production statement");
+            line.trim() == arm_statement).collect();
+        assert_eq!(matches.len(), 1, "root publication arm must identify one production statement");
         let arm_line = matches[0].0 + 1;
         format!(r#"delete breakpoints
 break {source_file}:{arm_line}
@@ -731,17 +735,20 @@ run
 python
 import gdb
 frame = gdb.newest_frame()
-assert frame is not None and '{function}' in frame.name(), 'wrong Committed arm frame'
-assert frame.find_sal().line == {arm_line}, 'wrong Committed arm statement'
-assert gdb.selected_inferior().pid > 0, 'missing actual node at Committed arm'
+assert frame is not None and '{function}' in frame.name(), 'wrong root publication arm frame'
+assert frame.find_sal().line == {arm_line}, 'wrong root publication arm statement'
+assert gdb.selected_inferior().pid > 0, 'missing actual node at root publication arm'
 with open({arm:?}, 'x') as output:
-    output.write('armed before Committed root publication\n')
-print('Committed WAL omission armed at verified production statement')
+    output.write('armed before root publication\n')
+print('Root WAL omission armed at verified production statement')
 end
 delete breakpoints
 break {source_file}:{line}
 continue"#)
     } else { "run".to_owned() };
+    let state_check = if cut == "forward-verify-committed" {
+        "state = str(gdb.parse_and_eval('root.state'))\nassert state.endswith('::Committed'), 'unexpected persisted root state: ' + state\nprint('Persisted Committed root verified before replay')"
+    } else { "" };
     let marker = root.join(format!("cut-{cut}.reached"));
     let script = root.join(format!("cut-{cut}.gdb"));
     fs::write(
@@ -759,6 +766,7 @@ frame = gdb.newest_frame()
 assert frame is not None and '{function}' in frame.name(), 'wrong recovery frame'
 assert frame.find_sal().line == {line}, 'wrong recovery statement'
 assert gdb.selected_inferior().pid > 0, 'missing actual node'
+{state_check}
 with open({marker:?}, 'w') as output:
     output.write('actual recovery stopped at line {line} before {statement}\n')
 end
@@ -857,4 +865,11 @@ async fn actual_node_staged_packages_cache_loss() -> Result<()> {
 async fn actual_node_committed_cache_loss() -> Result<()> {
     exercise_nonzero_recovery_layout(false, None,
         Some((3, Some("forward-committed-cache-loss"))), false).await
+}
+
+#[tokio::test]
+#[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
+async fn actual_node_cleaned_cache_loss() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None,
+        Some((3, Some("forward-cleaned-cache-loss"))), false).await
 }
