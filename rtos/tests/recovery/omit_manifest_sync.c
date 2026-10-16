@@ -1,5 +1,5 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
-// Test-only causal control: omit sync only for one isolated fixture's Ready.
+// Test-only causal control: omit sync only for one isolated fixture's selected manifest.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -12,9 +12,11 @@
 #include <unistd.h>
 
 static int selected(int fd, char path[PATH_MAX]) {
-    const char *root = getenv("RTOS_TEST_OMIT_READY_SYNC_ROOT");
-    const char *marker = getenv("RTOS_TEST_OMIT_READY_SYNC_MARKER");
-    if (!root || !marker || !*root) return 0;
+    const char *root = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_ROOT");
+    const char *marker = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_MARKER");
+    const char *file = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE");
+    if (!root || !marker || !*root || !file
+        || (strcmp(file, "ready.v1") && strcmp(file, "selection.v1"))) return 0;
     size_t prefix = strlen(root);
     if (root[prefix - 1] != '/') return 0;
     char link[64];
@@ -29,9 +31,9 @@ static int selected(int fd, char path[PATH_MAX]) {
     const char parent[] = "/node_db/archive/recovery/";
     if (strncmp(end, parent, sizeof(parent) - 1)) return 0;
     const char *operation = end + sizeof(parent) - 1;
-    if (strlen(operation) != 32 + strlen("/ready.v1")
+    if (strlen(operation) != 33 + strlen(file)
         || strspn(operation, "0123456789abcdef") != 32
-        || strcmp(operation + 32, "/ready.v1")) return 0;
+        || operation[32] != '/' || strcmp(operation + 33, file)) return 0;
     struct stat info;
     return !fstat(fd, &info) && S_ISREG(info.st_mode) && info.st_size > 28;
 }
@@ -39,7 +41,7 @@ static int selected(int fd, char path[PATH_MAX]) {
 static int sync_or_omit(int fd, long operation, const char *name) {
     char path[PATH_MAX];
     if (!selected(fd, path)) return syscall(operation, fd);
-    int proof = open(getenv("RTOS_TEST_OMIT_READY_SYNC_MARKER"),
+    int proof = open(getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_MARKER"),
         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (proof < 0) {
         // Atomic, cross-process one-shot claim; subsequent recovery attempts

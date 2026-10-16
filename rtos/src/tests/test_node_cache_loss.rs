@@ -16,15 +16,28 @@ pub(super) fn sync_fixture(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn selection_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(root.join("node_db/archive/recovery"))? {
+        let entry = entry?;
+        assert!(entry.file_type()?.is_dir());
+        let path = entry.path().join("selection.v1");
+        if path.try_exists()? { paths.push(path); }
+    }
+    Ok(paths)
+}
+
 pub(super) async fn clear(root: &Path) -> Result<()> {
     let mut ready = Vec::new();
     let mut stages = 0;
     truncation_recovery::find_ready_staging(root, &mut ready, &mut stages)?;
-    let mut ready_before = Vec::new();
-    for path in &ready {
+    let mut manifests: Vec<_> = ready.into_iter().map(|path| ("ready", path)).collect();
+    manifests.extend(selection_paths(root)?.into_iter().map(|path| ("selection", path)));
+    let mut manifest_before = Vec::new();
+    for (_, path) in &manifests {
         let bytes = fs::read(path)?;
         keep_evidence(root, path)?;
-        ready_before.push((bytes.len(), hex::encode(rtos_block::sha256_digest(&bytes))));
+        manifest_before.push((bytes.len(), hex::encode(rtos_block::sha256_digest(&bytes))));
     }
     let control = root.join("cache-loss-control");
     let old = b"old durable data";
@@ -61,9 +74,11 @@ pub(super) async fn clear(root: &Path) -> Result<()> {
     }).await??;
     assert_eq!(fs::read(&control)?, old, "cache loss did not discard unsynced overwrite");
     let mut ready_files = Vec::new();
-    for (path, (length, digest)) in ready.iter().zip(ready_before) {
+    let mut selection_files = Vec::new();
+    for ((kind, path), (length, digest)) in manifests.iter().zip(manifest_before) {
         let bytes = fs::read(path)?;
-        ready_files.push(serde_json::json!({
+        let files = if *kind == "ready" { &mut ready_files } else { &mut selection_files };
+        files.push(serde_json::json!({
             "path": path.strip_prefix(root)?, "bytes_before": length,
             "sha256_before": digest, "bytes_after": bytes.len(),
             "sha256_after": hex::encode(rtos_block::sha256_digest(&bytes)),
@@ -74,6 +89,7 @@ pub(super) async fn clear(root: &Path) -> Result<()> {
         "acknowledgement": std::str::from_utf8(&acknowledgement)?,
         "unsynced_overwrite_discarded": true,
         "ready_files": ready_files,
+        "selection_files": selection_files,
         "scope": "LazyFS file-data cache loss; directory metadata loss unproven"
     }))?)?;
     keep_evidence(root, &report)?;
@@ -120,13 +136,7 @@ pub(super) async fn unfinished_selection(root: &Path) -> Result<PathBuf> {
     truncation_recovery::find_ready_staging(root, &mut ready, &mut stages)?;
     assert!(ready.is_empty(), "Ready exists before Selection completion");
     assert_eq!(stages, 0, "stages exist before Selection completion");
-    let mut selections = Vec::new();
-    for entry in fs::read_dir(root.join("node_db/archive/recovery"))? {
-        let entry = entry?;
-        assert!(entry.file_type()?.is_dir());
-        let path = entry.path().join("selection.v1");
-        if path.try_exists()? { selections.push(path); }
-    }
+    let mut selections = selection_paths(root)?;
     assert_eq!(selections.len(), 1);
     let selection = selections.remove(0);
     let before = fs::read(&selection)?;

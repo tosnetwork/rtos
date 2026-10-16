@@ -70,7 +70,7 @@ def clear_cache(command, completion):
 
 def run(binary, output, node=None):
     output.mkdir(parents=True, exist_ok=False)
-    root = Path(tempfile.mkdtemp(prefix="rtos-lazyfs-preflight-"))
+    root = Path(tempfile.mkdtemp(prefix="rtos-lazyfs-preflight-owned-"))
     mount = root / "mount"
     backing = root / "backing"
     mount.mkdir()
@@ -90,9 +90,12 @@ def run(binary, output, node=None):
     try:
         with (output / "lazyfs.log").open("wb") as log:
             process = subprocess.Popen(
-                [str(binary), str(mount), "--config-path", str(config),
+                # Upstream mistakes any "-o" substring in a config argument
+                # for an option. Keep the argument relative; the owned root
+                # deliberately contains "-o" so every run covers this case.
+                [str(binary), str(mount), "--config-path", config.name,
                  "-o", "modules=subdir", "-o", f"subdir={backing}", "-f"],
-                stdout=log, stderr=subprocess.STDOUT,
+                stdout=log, stderr=subprocess.STDOUT, cwd=root,
             )
             wait_until(lambda: is_mounted(mount) and command.exists() and completion.exists(), process)
             directory = os.open(mount, os.O_RDONLY | os.O_DIRECTORY)
@@ -120,6 +123,7 @@ def run(binary, output, node=None):
             result["after_clear"] = {name: (mount / name).read_bytes().hex()
                                      for name in ["synced", "overwrite", "unsynced"]}
             if node is not None:
+                omitted_manifest = "selection" if node.omit_selection_sync else "ready" if node.omit_ready_sync else None
                 fixture_dir = mount / "fixtures"
                 fixture_dir.mkdir()
                 environment = dict(os.environ)
@@ -132,21 +136,22 @@ def run(binary, output, node=None):
                     "RTOS_PUBLIC_FIXTURE_SIGNER": str(node.fixture_signer.resolve(strict=True)),
                     "RTOS_NODE_RECOVERY_EVIDENCE_DIR": str(output / "node"),
                 })
-                if node.omit_ready_sync:
+                if omitted_manifest:
                     if environment.get("LD_PRELOAD"):
                         raise RuntimeError("Sync sensitivity requires an otherwise clean preload environment")
-                    source = Path(__file__).with_name("omit_ready_sync.c")
-                    library = output / "omit-ready-sync.so"
+                    source = Path(__file__).with_name("omit_manifest_sync.c")
+                    library = output / "omit-manifest-sync.so"
                     shutil.copyfile(source, output / source.name)
                     subprocess.run(["cc", "-shared", "-fPIC", "-O2", "-Wall", "-Wextra", "-Werror",
                                     str(source), "-o", str(library)], check=True, timeout=30,
                                    capture_output=True)
                     environment.update({
                         "LD_PRELOAD": str(library),
-                        "RTOS_TEST_OMIT_READY_SYNC_ROOT": str(fixture_dir) + "/",
-                        "RTOS_TEST_OMIT_READY_SYNC_MARKER": str(output / "ready-sync-omitted.log"),
+                        "RTOS_TEST_OMIT_MANIFEST_SYNC_ROOT": str(fixture_dir) + "/",
+                        "RTOS_TEST_OMIT_MANIFEST_SYNC_FILE": omitted_manifest + ".v1",
+                        "RTOS_TEST_OMIT_MANIFEST_SYNC_MARKER": str(output / "manifest-sync-omitted.log"),
                     })
-                    result["sync_mutation"] = {"kind": "omit Ready file sync only",
+                    result["sync_mutation"] = {"kind": f"omit {omitted_manifest} file sync only",
                                                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
                                                "library_sha256": hashlib.sha256(library.read_bytes()).hexdigest()}
                 with (output / "node-test.log").open("wb") as log:
@@ -181,12 +186,12 @@ def run(binary, output, node=None):
                     raise RuntimeError("Node test left owned processes running")
                 result["node_test_exit"] = executed.returncode
                 transcript = (output / "node-test.log").read_text()
-                expected_failure = node.omit_ready_sync and not node.no_cache_loss
+                expected_failure = bool(omitted_manifest) and not node.no_cache_loss
                 result["node_failure_expected"] = expected_failure
-                if node.omit_ready_sync:
-                    marker = (output / "ready-sync-omitted.log").read_text().splitlines()
-                    if len(marker) != 1 or not marker[0].startswith("fsync omitted: " + str(fixture_dir) + "/") or not marker[0].endswith("/ready.v1"):
-                        raise RuntimeError("Ready sync mutation did not hit exactly one scoped file")
+                if omitted_manifest:
+                    marker = (output / "manifest-sync-omitted.log").read_text().splitlines()
+                    if len(marker) != 1 or not marker[0].startswith("fsync omitted: " + str(fixture_dir) + "/") or not marker[0].endswith(f"/{omitted_manifest}.v1"):
+                        raise RuntimeError("Manifest sync mutation did not hit exactly one scoped file")
                     result["sync_mutation"]["hits"] = marker
                 required_evidence = ["Actual node recovery interrupted at " + (
                     f"producer-{node.cut}-cache-loss" if node.cut in ["ready", "selection"] else "forward-after-row-sync")]
@@ -198,10 +203,18 @@ def run(binary, output, node=None):
                     reports = list((output / "node").rglob("cache-loss.json"))
                     if len(reports) != 1:
                         raise RuntimeError("Missing unique cache-loss report")
-                    ready = json.loads(reports[0].read_text())["ready_files"]
-                    if len(ready) != 1 or ready[0]["bytes_before"] <= 28 or ready[0]["bytes_after"] != 0:
-                        raise RuntimeError("Sync omission did not lose the published Ready contents")
-                    result["lost_ready"] = ready[0]
+                    report = json.loads(reports[0].read_text())
+                    lost = report[omitted_manifest + "_files"]
+                    if len(lost) != 1 or lost[0]["bytes_before"] <= 28 or lost[0]["bytes_after"] != 0:
+                        raise RuntimeError("Sync omission did not lose the selected manifest contents")
+                    if not marker[0].endswith("/" + lost[0]["path"]):
+                        raise RuntimeError("Lost manifest differs from the exact sync omission target")
+                    other = "ready" if omitted_manifest == "selection" else "selection"
+                    preserved = report[other + "_files"]
+                    if len(preserved) != 1 or preserved[0]["bytes_before"] != preserved[0]["bytes_after"] or preserved[0]["sha256_before"] != preserved[0]["sha256_after"]:
+                        raise RuntimeError("Non-target manifest changed during cache loss")
+                    result["lost_" + omitted_manifest] = lost[0]
+                    result["preserved_" + other] = preserved[0]
                     result["sensitivity_detected"] = True
                 else:
                     if executed.returncode != 0:
@@ -267,7 +280,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lazyfs", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--omit-ready-sync", action="store_true", help="scoped Ready sync omission sensitivity control")
+    mutation = parser.add_mutually_exclusive_group()
+    mutation.add_argument("--omit-ready-sync", action="store_true", help="scoped Ready sync omission sensitivity control")
+    mutation.add_argument("--omit-selection-sync", action="store_true", help="scoped Selection sync omission sensitivity control")
     parser.add_argument("--cut", choices=["rows", "ready", "selection"], default="rows")
     parser.add_argument("--no-cache-loss", action="store_true", help="run the same node cut without cache loss as a control")
     parser.add_argument("--node-test-binary", type=Path)
@@ -277,6 +292,6 @@ if __name__ == "__main__":
     node_args = [args.node_test_binary, args.node_binary, args.fixture_signer]
     if any(node_args) and not all(node_args):
         parser.error("all three node binary/signer arguments are required together")
-    if args.omit_ready_sync and (not all(node_args) or args.cut != "rows"):
-        parser.error("Ready sync sensitivity requires all node arguments and --cut rows")
+    if (args.omit_ready_sync or args.omit_selection_sync) and (not all(node_args) or args.cut != "rows"):
+        parser.error("Manifest sync sensitivity requires all node arguments and --cut rows")
     run(args.lazyfs.resolve(strict=True), args.output.resolve(), args if all(node_args) else None)
