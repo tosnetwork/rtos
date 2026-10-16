@@ -27,7 +27,7 @@ Genesis states and public deterministic PQ test identities through the existing
 C++ harness. They do not load an existing validator identity or reset an
 existing node. The bootstrap stage runs three C++ validators, reserves the
 fourth identity without starting its C++ process, and starts Rust with signing
-disabled. It records whether Rust applies MC4 from that network. Its result does
+disabled. It records whether Rust logs processing MC4 from that network. Its result does
 not prove Rust signed, validated a candidate, produced a block, or has the same
 state root. Those are subsequent acceptance requirements; a bootstrap result
 must not close the mixed-validator gate.
@@ -54,8 +54,8 @@ provisioning is not an operator custody or committee-rotation implementation.
 The native Param29 carrier version 5 is admitted with T0 wire format; it remains
 distinct from the Param30 Simplex protocol version 2.
 
-An active result requires both C++ nodes to agree at MC4 and Rust to apply at
-least MC4. This measures required Rust participation in chain progress. It does
+An active result requires both C++ nodes to agree at MC4 and Rust to log
+processing at least MC4. This log is not an independent applied-state check. This measures required Rust participation in chain progress. It does
 not close the full mixed-validator gate or prove every transaction/state profile
 and every Rust leadership case.
 
