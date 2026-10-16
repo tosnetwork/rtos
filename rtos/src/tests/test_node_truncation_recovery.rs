@@ -139,6 +139,7 @@ pub(super) async fn run(
                 "sync_child(destination.last().unwrap(), &new)"
             }
             "forward-before-cleanup" => "scan(providers, &committed, Pass::Cleanup)?;",
+            "forward-after-row-sync" => "let applied = scan(providers, root, Pass::Committed)?;",
             "producer-selection-before-finish" => "let (file, selection) = writer.finish()?;",
             "producer-ready-before-finish" => "let (file, ready) = writer.finish()?;",
             _ => rtos_block::fail!("Unknown truncation cut {cut}"),

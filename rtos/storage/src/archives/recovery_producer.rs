@@ -206,6 +206,23 @@ impl<'a> Plan<'a> {
     }
 
     fn decision(&self, member: &Member) -> Result<PackageDecision> {
+        let mut decision = self.content_decision(member)?;
+        // Legacy package filenames are derived from their metadata ordinal.
+        // Keep empty interior slots so later retained packages keep that identity.
+        if !decision.retained && member.archive.disposition == Disposition::Filter
+            && member.archive.sliced && !member.archive.separated
+        {
+            self.members(member.archive.provider, member.archive.key, member.archive.id, |later| {
+                if later.index > member.index && self.content_decision(&later)?.retained {
+                    decision.retained = true;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(decision)
+    }
+
+    fn content_decision(&self, member: &Member) -> Result<PackageDecision> {
         let mut kept = 0u64;
         let mut removed = false;
         let mut total = 0u64;
@@ -442,6 +459,27 @@ impl Plan<'_> {
                 answer.ok_or_else(|| error!("Offset metadata does not identify a package entry"))
             }
             "entry_meta" => {
+                if archive.sliced && archive.separated {
+                    // Separated packages carry their physical identity in the
+                    // value, so project retained members onto dense ordinals.
+                    let target = u32::from_le_bytes(key.try_into()?);
+                    let mut ordinal = 0u32;
+                    let mut projected = None;
+                    self.members(archive.provider, archive.key, archive.id, |member| {
+                        let decision = self.decision(&member)?;
+                        if decision.retained {
+                            if ordinal == target {
+                                projected = Some(serde_cbor::to_vec(&PackageEntryMeta::with_data(
+                                    decision.size, member.meta.version(), Some(&member.info),
+                                ))?);
+                            }
+                            ordinal = ordinal.checked_add(1)
+                                .ok_or_else(|| error!("Package count overflow"))?;
+                        }
+                        Ok(())
+                    })?;
+                    return Ok(projected);
+                }
                 if !archive.sliced && key == 0u32.to_le_bytes() {
                     let db = self.providers.participants[archive.provider].database.db();
                     let cf = db
@@ -475,11 +513,6 @@ impl Plan<'_> {
                 let mut count = 0u32;
                 self.members(archive.provider, archive.key, archive.id, |member| {
                     if self.decision(&member)?.retained {
-                        // Entries must remain dense: a missing shard package in
-                        // the middle cannot be hidden by a high TotalSlices.
-                        if member.index != count {
-                            fail!("Filtered package indices require compaction");
-                        }
                         count =
                             count.checked_add(1).ok_or_else(|| error!("Package count overflow"))?;
                     }
@@ -977,3 +1010,7 @@ fn write_blob(out: &mut dyn Write, bytes: &[u8]) -> Result<()> {
     out.write_all(bytes)?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/test_recovery_producer_indices.rs"]
+mod index_tests;

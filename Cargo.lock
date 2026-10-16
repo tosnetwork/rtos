@@ -4407,6 +4407,7 @@ dependencies = [
  "rtos_vm",
  "secrets-vault",
  "serde",
+ "serde_cbor",
  "serde_derive",
  "serde_json",
  "shell-words",

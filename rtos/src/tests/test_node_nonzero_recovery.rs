@@ -328,6 +328,30 @@ async fn exercise_nonzero_recovery_case(
     building: Option<&str>,
     truncation: Option<(u32, Option<&str>)>,
 ) -> Result<()> {
+    exercise_nonzero_recovery_layout(interrupt_recovery, building, truncation, false).await
+}
+
+#[path = "test_node_sparse_packages.rs"]
+mod sparse_packages;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node binary and public fixture signer"]
+async fn actual_node_sparse_packages_restart() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None, Some((3, None)), true).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node binary, public fixture signer and GDB"]
+async fn actual_node_sparse_packages_interrupted_metadata() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None, Some((3, Some("forward-after-row-sync"))), true).await
+}
+
+async fn exercise_nonzero_recovery_layout(
+    interrupt_recovery: bool,
+    building: Option<&str>,
+    truncation: Option<(u32, Option<&str>)>,
+    sparse: bool,
+) -> Result<()> {
     let binary = fs::canonicalize(std::env::var("RTOS_NODE_RECOVERY_BINARY")?)?;
     let dir = tempfile::tempdir()?;
     let root = dir.path();
@@ -336,6 +360,7 @@ async fn exercise_nonzero_recovery_case(
     fixture.prepare(root, &archives).await?;
     let physical = run_import(fixture.config(root, archives)).await?;
     tokio::time::timeout(Duration::from_secs(60), wait_for_db_release(physical)).await?;
+    if sparse { sparse_packages::prepare(root).await?; }
     let db = open_db(root).await?;
     fixture.assert_imported(&db, 4).await?;
     let lease = if let Some((retained, _)) = truncation {
