@@ -17,8 +17,9 @@ pub(super) struct Lease {
     generation: u64,
     digest: UInt256,
     retained: u32,
+    dependencies: Vec<Dependency>,
 }
-pub(super) async fn prepare(db: &InternalDb, fixture: &Fixture, retained: u32) -> Result<Lease> {
+pub(super) async fn prepare(db: &InternalDb, fixture: &Fixture, retained: u32, defer_begin: bool) -> Result<Lease> {
     let (mut binding, _, _) = sst_fixture_for_test();
     binding.domain.zerostate = fixture.id(0, false);
     binding.domain.history_init = fixture.id(0, false);
@@ -34,16 +35,14 @@ pub(super) async fn prepare(db: &InternalDb, fixture: &Fixture, retained: u32) -
         root: None,
     }];
     let digest = dependency_digest(&dependencies)?;
-    let generation = db.repair_leases().begin(
-        &binding,
-        dependencies,
-        &HistoryReadBudget::new(Default::default()),
-    )?;
+    let generation = if defer_begin { 0 } else {
+        db.repair_leases().begin(&binding, dependencies.clone(), &HistoryReadBudget::new(Default::default()))?
+    };
     db.save_full_node_state(SHARD_CLIENT_MC_BLOCK, &fixture.id(retained, false))?;
     let (physical, catchain) = db.sst_databases_for_test();
     drop(catchain);
     physical.sync_wal()?;
-    Ok(Lease { binding, generation, digest, retained })
+    Ok(Lease { binding, generation, digest, retained, dependencies })
 }
 fn spawn(binary: &Path, root: &Path, zero: &Path, path: &Path) -> Result<Process> {
     let log = fs::File::create(path)?;
@@ -67,10 +66,15 @@ pub(super) async fn run(
     zero: &Path,
     fixture: &Fixture,
     before: BTreeMap<PathBuf, [u8; 32]>,
-    lease: Lease,
+    mut lease: Lease,
     interrupt: Option<&str>,
 ) -> Result<()> {
     let retained = lease.retained;
+    let acquire_cut = interrupt == Some("lease-acquire-cache-loss");
+    if acquire_cut {
+        lease_cache_loss::acquire_and_interrupt(root, &mut lease).await?;
+        assert_eq!(package_inventory(root)?, before, "lease acquisition changed canonical packages");
+    }
     let path = root.join("truncation-refused.log");
     let mut node = spawn(binary, root, zero, &path)?;
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -124,7 +128,7 @@ pub(super) async fn run(
         assert_eq!(package_inventory(root)?, before, "lease release cache loss changed canonical packages");
     }
     eprintln!("Failed actual truncation preserved four cursors, full history and restoring beacon; exact synthetic lease release acknowledged");
-    let interrupt = if lease_cut { None } else { interrupt };
+    let interrupt = if lease_cut || acquire_cut { None } else { interrupt };
     if let Some(mode @ ("selection-enospc" | "selection-sync-eio" | "ready-enospc" | "ready-sync-eio" | "operation-sync-eio" | "publish-rename-eio" | "publish-sync-eio" | "wal-ready-sync-eio" | "wal-publish-sync-eio" | "wal-epoch-enrollment-eio" | "publish-directory-sync-eio" | "stage-enospc" | "stage-sync-eio")) = interrupt {
         io_failure::recovery_fault(binary, root, zero, mode).await?;
         if matches!(mode, "publish-sync-eio" | "wal-publish-sync-eio" | "publish-directory-sync-eio") {

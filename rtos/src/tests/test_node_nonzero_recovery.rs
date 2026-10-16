@@ -396,8 +396,8 @@ async fn exercise_nonzero_recovery_layout(
     if sparse { sparse_packages::prepare(root).await?; }
     let db = open_db(root).await?;
     fixture.assert_imported(&db, 4).await?;
-    let lease = if let Some((retained, _)) = truncation {
-        Some(truncation_recovery::prepare(&db, &fixture, retained).await?)
+    let lease = if let Some((retained, cut)) = truncation {
+        Some(truncation_recovery::prepare(&db, &fixture, retained, cut == Some("lease-acquire-cache-loss")).await?)
     } else {
         None
     };
@@ -891,4 +891,11 @@ async fn actual_node_root_last_cache_loss() -> Result<()> {
 async fn actual_node_lease_release_cache_loss() -> Result<()> {
     exercise_nonzero_recovery_layout(false, None,
         Some((3, Some("lease-release-cache-loss"))), false).await
+}
+
+#[tokio::test]
+#[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
+async fn actual_node_lease_acquire_cache_loss() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None,
+        Some((3, Some("lease-acquire-cache-loss"))), false).await
 }
