@@ -2492,30 +2492,31 @@ impl InternalDb {
         self.archive_manager.trunc(selection).await?;
 
         // truncate handles and prev/next links
-        fn clear_dbs(db: &InternalDb, id: BlockIdExt) {
+        fn clear_dbs(db: &InternalDb, id: BlockIdExt) -> Result<()> {
             let protection = db.repair_leases.protection();
             let Some(_deletion) = protection.try_deletion() else {
-                return;
+                fail!("Truncation handle cleanup conflicts with repair custody for {}", id);
             };
             if protection.artifact(&id) || protection.state(&id) {
-                return;
+                fail!("Truncation handle cleanup conflicts with repair custody for {}", id);
             }
             log::trace!("truncate_database: trying to drop handle {}", id);
-            let _ = db.block_handle_storage.drop_handle(id.clone(), None);
-            let _ = db.prev2_block_db.delete(&id);
-            let _ = db.prev1_block_db.delete(&id);
-            let _ = db.next2_block_db.delete(&id);
-            let _ = db.next1_block_db.delete(&id);
+            db.block_handle_storage.drop_handle(id.clone(), None)?;
+            db.prev2_block_db.delete(&id)?;
+            db.prev1_block_db.delete(&id)?;
+            db.next2_block_db.delete(&id)?;
+            db.next1_block_db.delete(&id)?;
+            Ok(())
         }
 
         self.next1_block_db.for_each(&mut |_key, val| {
             let id = BlockIdExt::deserialize(&val)?;
             if id.shard().is_masterchain() && id.seq_no() >= mc_block_id.seq_no() {
-                clear_dbs(self, id);
+                clear_dbs(self, id)?;
             } else {
                 for tb in top_blocks.iter() {
                     if id.shard().intersect_with(tb.shard()) && id.seq_no() > tb.seq_no() {
-                        clear_dbs(self, id);
+                        clear_dbs(self, id)?;
                         break;
                     }
                 }
@@ -2526,7 +2527,7 @@ impl InternalDb {
             let id = BlockIdExt::deserialize(&val)?;
             for tb in top_blocks.iter() {
                 if id.shard().intersect_with(tb.shard()) && id.seq_no() > tb.seq_no() {
-                    clear_dbs(self, id);
+                    clear_dbs(self, id)?;
                     break;
                 }
             }
@@ -2534,28 +2535,33 @@ impl InternalDb {
         })?;
 
         // truncate info related with last handles
-        fn clear_last_handle(db: &InternalDb, id: &BlockIdExt) {
+        fn clear_last_handle(db: &InternalDb, id: &BlockIdExt) -> Result<()> {
             let protection = db.repair_leases.protection();
             let Some(_deletion) = protection.try_deletion() else {
-                return;
+                fail!("Truncation handle cleanup conflicts with repair custody for {}", id);
             };
             if protection.artifact(id) || protection.state(id) {
-                return;
+                fail!("Truncation handle cleanup conflicts with repair custody for {}", id);
             }
             log::trace!("truncate_database: clear_last_handle {}", id);
-            let _ = db.next1_block_db.delete(id);
-            if let Ok(Some(handle)) = db.load_block_handle(id) {
+            db.next1_block_db.delete(id)?;
+            db.next2_block_db.delete(id)?;
+            if let Some(handle) = db.load_block_handle(id)? {
                 handle.reset_next1();
                 handle.reset_next2();
-                let _ = db.store_block_handle(&handle, None);
+                db.store_block_handle(&handle, None)?;
             }
+            Ok(())
         }
 
-        clear_last_handle(self, &prev_id);
+        clear_last_handle(self, &prev_id)?;
         for id in top_blocks.iter() {
-            clear_last_handle(self, id);
+            clear_last_handle(self, id)?;
         }
 
+        // Queue admission does not persist the reset successor flags. Recovery
+        // may publish its cursors only after the ordered writer and WAL barrier.
+        self.block_handle_storage.sync_pending().await?;
         Ok(())
     }
 

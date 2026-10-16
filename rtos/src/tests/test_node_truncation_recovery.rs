@@ -65,6 +65,7 @@ pub(super) async fn run(
     fixture: &Fixture,
     before: BTreeMap<PathBuf, [u8; 32]>,
     lease: Lease,
+    interrupt: bool,
 ) -> Result<()> {
     let retained = lease.retained;
     let path = root.join("truncation-refused.log");
@@ -115,6 +116,26 @@ pub(super) async fn run(
     drop(db);
     tokio::time::timeout(Duration::from_secs(30), wait_for_db_release(physical)).await?;
     eprintln!("Failed actual truncation preserved four cursors, full history and restoring beacon; exact synthetic lease released");
+    if interrupt {
+        interrupt_actual_recovery(
+            binary,
+            root,
+            zero,
+            "truncation-before-progress",
+            "db.save_full_node_state(SHARD_CLIENT_MC_BLOCK, last_mc_block.id())?;",
+        )
+        .await?;
+        assert!(root.join("node_db/ton_node.restoring").is_file());
+        assert_ne!(package_inventory(root)?, before, "cut preceded actual archive mutation");
+        let output = fs::read_to_string(root.join("cut-truncation-before-progress.log"))?;
+        assert!(
+            output.contains(&format!(
+                "Database was truncated at {}",
+                fixture.id(retained + 1, false)
+            )),
+            "{output}"
+        );
+    }
     for attempt in 0..2 {
         let path = root.join(format!("truncation-retry-{attempt}.log"));
         let mut node = spawn(binary, root, zero, &path)?;
@@ -126,7 +147,7 @@ pub(super) async fn run(
                 rtos_block::fail!("Truncation retry {status}: {output}");
             }
             if output.contains("Node services started.") {
-                if attempt == 0 {
+                if attempt == 0 && !interrupt {
                     assert!(
                         output.contains(&format!(
                             "Database was truncated at {}",

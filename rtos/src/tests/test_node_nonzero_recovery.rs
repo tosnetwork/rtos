@@ -95,6 +95,15 @@ async fn actual_node_retries_truncation_without_publishing_failed_progress() -> 
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires gdb and RTOS_NODE_RECOVERY_BINARY with current debug symbols"]
+async fn actual_node_resumes_after_truncation_before_progress_publication() -> Result<()> {
+    for retained in [2, 3] {
+        exercise_nonzero_recovery_case(true, None, Some(retained)).await?;
+    }
+    Ok(())
+}
+
 async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&str>) -> Result<()> {
     exercise_nonzero_recovery_case(interrupt_recovery, building, None).await
 }
@@ -160,7 +169,16 @@ async fn exercise_nonzero_recovery_case(
     drop((adnl, quic));
     fs::write(root.join("node-log.yml"), "appenders:\n  console:\n    kind: console\n    encoder:\n      pattern: '{m}{n}'\nroot:\n  level: info\n  appenders: [console]\n")?;
     if let Some(lease) = lease {
-        return truncation_recovery::run(&binary, root, &zero, &fixture, before, lease).await;
+        return truncation_recovery::run(
+            &binary,
+            root,
+            &zero,
+            &fixture,
+            before,
+            lease,
+            interrupt_recovery,
+        )
+        .await;
     }
     if building.is_some_and(|case| !matches!(case, "valid" | "staged")) {
         let path = root.join("building-refused.log");
@@ -401,12 +419,18 @@ async fn interrupt_actual_recovery(
     statement: &str,
 ) -> Result<()> {
     use std::os::unix::process::CommandExt;
-    let source = include_str!("../../storage/src/archives/recovery_worker.rs");
+    let (source, source_file) = if cut == "truncation-before-progress" {
+        (include_str!("../internal_db/restore.rs"), "restore.rs")
+    } else {
+        (include_str!("../../storage/src/archives/recovery_worker.rs"), "recovery_worker.rs")
+    };
     let matches: Vec<_> =
         source.lines().enumerate().filter(|(_, line)| line.trim() == statement).collect();
     assert_eq!(matches.len(), 1, "crash cut must identify one production statement");
     let line = matches[0].0 + 1;
-    let function = if cut == "stage-after-unlink" {
+    let function = if cut == "truncation-before-progress" {
+        "internal_db::restore::restore"
+    } else if cut == "stage-after-unlink" {
         "recovery_worker::clean_stage"
     } else {
         "recovery_worker::recover_cleaned"
@@ -420,7 +444,7 @@ async fn interrupt_actual_recovery(
 set confirm off
 set breakpoint pending off
 set debuginfod enabled off
-break recovery_worker.rs:{line}
+break {source_file}:{line}
 run
 python
 import gdb
