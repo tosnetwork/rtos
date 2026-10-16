@@ -1012,3 +1012,35 @@ async fn explicit_consensus_transport_rejects_duplicate_missing_and_wrong_keys()
     }
     Ok(())
 }
+
+#[test]
+fn durable_config_replacement_preserves_old_file_on_failure() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("config.json");
+    write_config_durable(&path, br#"{"version":1}"#)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
+    }
+    write_config_durable(&path, br#"{"version":2}"#)?;
+    assert_eq!(std::fs::read(&path)?, br#"{"version":2}"#);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o640);
+        let link = dir.path().join("linked.json");
+        std::os::unix::fs::symlink(&path, &link)?;
+        write_config_durable(&link, br#"{"version":3}"#)?;
+        assert!(std::fs::symlink_metadata(&link)?.file_type().is_symlink());
+        assert_eq!(std::fs::read(&path)?, br#"{"version":3}"#);
+    }
+    // Native rename refusal must leave the existing directory and its data intact.
+    let blocked = dir.path().join("directory.json");
+    std::fs::create_dir(&blocked)?;
+    std::fs::write(blocked.join("sentinel"), b"retained")?;
+    assert!(write_config_durable(&blocked, br#"{"version":4}"#).is_err());
+    assert_eq!(std::fs::read(blocked.join("sentinel"))?, b"retained");
+    assert!(std::fs::read_dir(dir.path())?.all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+    Ok(())
+}

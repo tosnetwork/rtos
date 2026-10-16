@@ -395,6 +395,20 @@ def run(binary, output, node=None):
                             raise RuntimeError("Unexpected automatic recovery contract")
                         if list((output / "node").rglob("truncation-refused.log")):
                             raise RuntimeError("Automatic recovery used the synthetic refusal path")
+                        configs = list((output / "node").rglob("state-generated-config.json"))
+                        if len(configs) != 1:
+                            raise RuntimeError("Missing generated config durability report")
+                        config = json.loads(configs[0].read_text())
+                        if config["bytes_before"] <= 0 or config["bytes_before"] != config["bytes_after"] or config["sha256_before"] != config["sha256_after"]:
+                            raise RuntimeError("Generated node configuration changed after interruption")
+                        if not node.no_cache_loss:
+                            for filename in ["state-publication-cache-loss.json", "cache-loss.json"]:
+                                losses = list((output / "node").rglob(filename))
+                                if len(losses) != 1 or not json.loads(losses[0].read_text())["unsynced_overwrite_discarded"]:
+                                    raise RuntimeError("Missing independent control for both interruptions")
+                            if transcript.count("independent overwrite control reverted to durable bytes") != 2:
+                                raise RuntimeError("Expected two verified cache-loss interruptions")
+                        result["generated_config_preserved"] = config
                         result["automatic_dynamic_recovery"] = report
                     if node.cut in ["validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty"]:
                         required_evidence.append(f"Validator {batch_kind} batch preserved together after two-boots")

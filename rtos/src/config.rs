@@ -9,6 +9,53 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+// Publish a complete configuration only after its contents are durable. The
+// temporary file lives beside the destination so replacement stays atomic.
+fn write_config_durable(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Keep configured symlinks pointing at the same target when replacing it.
+    let path = match std::fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => path.to_owned(),
+        Err(error) => return Err(error.into()),
+    };
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path.file_name().ok_or_else(|| error!("Configuration path has no filename"))?;
+    let permissions = match std::fs::metadata(&path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let (temporary, mut file) = loop {
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut temporary_name = name.to_os_string();
+        temporary_name.push(format!(".{}.{}.tmp", std::process::id(), sequence));
+        let temporary = parent.join(temporary_name);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+        match options.open(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let result = (|| -> Result<()> {
+        file.write_all(bytes)?;
+        if let Some(permissions) = permissions { file.set_permissions(permissions)?; }
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    // Never remove the published destination after an uncertain directory sync.
+    if result.is_err() { let _ = std::fs::remove_file(&temporary); }
+    result
+}
+
 use crate::network::{
     liteserver::{LiteServerConfig, LiteServerConfigJson},
     node_network::NodeNetwork,
@@ -711,7 +758,7 @@ impl TonNodeConfig {
                 }
                 config
             }
-            Err(_) => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // generate new config from default_config
                 let path = TonNodeConfig::build_path(configs_dir, default_config_name);
                 let default_config_file =
@@ -740,9 +787,10 @@ impl TonNodeConfig {
                 config.create_and_save_console_configs(configs_dir, client_console_key).await?;
                 config.create_and_save_lite_configs(configs_dir).await?;
                 config.ip_address = None;
-                std::fs::write(config_file_path, serde_json::to_string_pretty(&config)?)?;
+                write_config_durable(&config_file_path, &serde_json::to_vec_pretty(&config)?)?;
                 config
             }
+            Err(error) => return Err(error.into()),
         };
 
         let custom_overlays_config_path =
@@ -996,7 +1044,7 @@ impl TonNodeConfig {
             None,
             None,
         );
-        std::fs::write(client_config_file_path, serde_json::to_string_pretty(&client_config)?)
+        write_config_durable(&client_config_file_path, &serde_json::to_vec_pretty(&client_config)?)
             .map_err(|err| error!("Can`t create {client_config_name}: {}", err))?;
 
         // generate and save server config
@@ -1104,7 +1152,7 @@ impl TonNodeConfig {
 
     async fn save_to_file(&self, file_name: &str) -> Result<()> {
         let config_file_path = self.build_config_path(file_name);
-        std::fs::write(config_file_path, serde_json::to_string_pretty(&self)?)?;
+        write_config_durable(&config_file_path, &serde_json::to_vec_pretty(&self)?)?;
         Ok(())
     }
 
@@ -1155,7 +1203,7 @@ impl TonNodeConfig {
         }
         let mut map = serde_json::Map::new();
         map.insert("overlays".to_string(), serde_json::Value::Array(list));
-        std::fs::write(path, serde_json::to_string_pretty(&map)?)?;
+        write_config_durable(Path::new(path), &serde_json::to_vec_pretty(&map)?)?;
         Ok(())
     }
 

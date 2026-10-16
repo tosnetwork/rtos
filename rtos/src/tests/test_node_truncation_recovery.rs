@@ -256,6 +256,12 @@ pub(super) async fn run(
             _ => rtos_block::fail!("Unknown truncation cut {cut}"),
         };
         interrupt_actual_recovery(binary, root, zero, cut, statement).await?;
+        let generated_config = if automatic {
+            let bytes = fs::read(root.join("config.json"))?;
+            serde_json::from_slice::<serde_json::Value>(&bytes)?;
+            assert!(!bytes.is_empty());
+            Some(bytes)
+        } else { None };
         if cut == "producer-selection-cache-loss" {
             assert_eq!(package_inventory(root)?, before, "Selection production changed canonical packages");
             let selection = cache_loss::unfinished_selection(root).await?;
@@ -345,6 +351,17 @@ pub(super) async fn run(
                 eprintln!("Lost root deletion reopened Cleaned; second actual interruption preserved final packages");
             }
         } else if cut.ends_with("-cache-loss") { cache_loss::clear(root).await?; }
+        if let Some(expected) = generated_config {
+            let actual = fs::read(root.join("config.json"))?;
+            let report = root.join("state-generated-config.json");
+            fs::write(&report, serde_json::to_vec(&serde_json::json!({
+                "bytes_before": expected.len(), "bytes_after": actual.len(),
+                "sha256_before": hex::encode(rtos_block::sha256_digest(&expected)),
+                "sha256_after": hex::encode(rtos_block::sha256_digest(&actual)),
+            }))?)?;
+            keep_evidence(root, &report)?;
+            assert!(actual == expected, "Generated node configuration lost after recovery interruption");
+        }
         assert!(root.join("node_db/ton_node.restoring").is_file());
         if cut == "forward-before-cleanup" {
             assert_ne!(package_inventory(root)?, before, "Committed cut preceded canonical replacement");
