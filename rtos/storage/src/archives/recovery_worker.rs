@@ -49,6 +49,21 @@ fn clean_controls(path: &Path, main: bool, root: &RootHeader) -> Result<()> {
     }
     sync_close(base)
 }
+pub(super) fn clean_stage(path: &Path, root: &RootHeader, name: &CStr) -> Result<()> {
+    let base = File::options().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(path)?;
+    if let Some(archive) = child_directory(&base, c"archive")? {
+        if let Some(controls) = child_directory(&archive, c"recovery")? {
+            let operation = CString::new(hex::encode(root.operation))?;
+            if let Some(directory) = child_directory(&controls, &operation)? {
+                unlink(&directory, name, false)?;
+                sync_close(directory)?; // Stage removal durable before advancing Building.
+            }
+            sync_close(controls)?;
+        }
+        sync_close(archive)?;
+    }
+    sync_close(base)
+}
 fn verify(providers: &RecoveryProviders, root: &RootHeader) -> Result<()> {
     providers.validate_controls(root)?;
     providers.verify_provider_and_map_inventories(root)?;
@@ -65,6 +80,10 @@ pub(crate) fn recover_cleaned(providers: RecoveryProviders, root: RootHeader) ->
     let providers = Arc::new(providers);
     let custody = super::package::retirement::reserve_resources(&providers)?;
     let root = if let Some(cleaned) = aborted {
+        super::recovery_building::discard_stages(&providers, &root)?;
+        if super::recovery_building::prepare_abort(&providers, &root)? != cleaned {
+            fail!("Building data changed during stage cleanup");
+        }
         let main = providers.participants.iter().find(|p| p.descriptor.anchor == Anchor::Node)
             .ok_or_else(|| error!("Missing Building main provider"))?;
         main.database.db().put(ROOT_KEY, cleaned.encode()?)?;

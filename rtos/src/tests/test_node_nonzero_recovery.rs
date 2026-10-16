@@ -33,7 +33,19 @@ fn package_inventory(root: &Path) -> Result<BTreeMap<PathBuf, [u8; 32]>> {
     }
     let mut rows = BTreeMap::new();
     for directory in [root.join("node_db"), root.join("epochs")] {
-        visit(root, &directory, &mut rows)?;
+        if directory == root.join("node_db") {
+            let packages = directory.join("archive/packages");
+            if packages.try_exists()? {
+                visit(root, &packages, &mut rows)?;
+            }
+        } else {
+            for entry in fs::read_dir(directory)? {
+                let packages = entry?.path().join("archive/packages");
+                if packages.try_exists()? {
+                    visit(root, &packages, &mut rows)?;
+                }
+            }
+        }
     }
     Ok(rows)
 }
@@ -57,9 +69,15 @@ async fn actual_node_aborts_unstaged_building_with_nonzero_history() -> Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires gdb and RTOS_NODE_RECOVERY_BINARY built from this revision"]
+async fn actual_node_aborts_declared_building_stages_after_interruption() -> Result<()> {
+    exercise_nonzero_recovery(true, Some("staged")).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires RTOS_NODE_RECOVERY_BINARY built from this revision"]
 async fn actual_node_preserves_building_with_unverified_inputs() -> Result<()> {
-    for case in ["bad-data", "unexpected-stage"] {
+    for case in ["bad-data", "unexpected-stage", "staged-bad-data", "staged-unknown"] {
         exercise_nonzero_recovery(false, Some(case)).await?;
     }
     Ok(())
@@ -83,6 +101,7 @@ async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&s
     tokio::time::timeout(Duration::from_secs(30), wait_for_db_release(physical)).await?;
     interrupt_cleaned_writer(root, building).await?;
     let before = package_inventory(root)?;
+    let controls_before = recovery_file_inventory(root)?;
     assert!(!before.is_empty(), "node fixture must contain canonical archive packages");
 
     let global_path = root.join("authenticated-global.json");
@@ -115,7 +134,7 @@ async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&s
     )?;
     drop((adnl, quic));
     fs::write(root.join("node-log.yml"), "appenders:\n  console:\n    kind: console\n    encoder:\n      pattern: '{m}{n}'\nroot:\n  level: info\n  appenders: [console]\n")?;
-    if building.is_some_and(|case| case != "valid") {
+    if building.is_some_and(|case| !matches!(case, "valid" | "staged")) {
         let path = root.join("building-refused.log");
         let log = fs::File::create(&path)?;
         let mut node = Process(
@@ -142,15 +161,23 @@ async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&s
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let output = fs::read_to_string(path)?;
-        let expected = if building == Some("bad-data") {
+        keep_evidence(root, &path)?;
+        let output = fs::read_to_string(&path)?;
+        let expected = if building.is_some_and(|case| case.ends_with("bad-data")) {
             "Building original archive data changed"
+        } else if building == Some("staged-unknown") {
+            "Undeclared Building stage file"
         } else {
             "Unrecognized remaining recovery artifact"
         };
         assert!(output.contains(expected), "{output}");
         assert!(!output.contains("Node services started."));
         assert_eq!(package_inventory(root)?, before);
+        assert_eq!(
+            recovery_file_inventory(root)?,
+            controls_before,
+            "rejected recovery changed control/stage files"
+        );
         let bootstrap = storage::db::node::open_node_db_for_bootstrap(
             root.join("node_db"),
             &Default::default(),
@@ -187,6 +214,26 @@ async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&s
         return Ok(());
     }
     if interrupt_recovery {
+        if building == Some("staged") {
+            interrupt_actual_recovery(
+                &binary,
+                root,
+                &zero,
+                "stage-after-unlink",
+                "sync_close(directory)?; // Stage removal durable before advancing Building.",
+            )
+            .await?;
+            assert_eq!(package_inventory(root)?, before);
+            let controls = recovery_file_inventory(root)?;
+            assert_eq!(
+                controls
+                    .keys()
+                    .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("stage-"))
+                    .count(),
+                1,
+                "cut must remove exactly the first of two present declared stages"
+            );
+        }
         if building.is_some() {
             interrupt_actual_recovery(
                 &binary,
@@ -238,6 +285,7 @@ async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&s
         }
         node.0.kill()?;
         assert!(!node.0.wait()?.success());
+        keep_evidence(root, &path)?;
         eprintln!(
             "Nonzero node attempt {attempt}: services started at imported height 4, then SIGKILL"
         );
@@ -330,6 +378,11 @@ async fn interrupt_actual_recovery(
         source.lines().enumerate().filter(|(_, line)| line.trim() == statement).collect();
     assert_eq!(matches.len(), 1, "crash cut must identify one production statement");
     let line = matches[0].0 + 1;
+    let function = if cut == "stage-after-unlink" {
+        "recovery_worker::clean_stage"
+    } else {
+        "recovery_worker::recover_cleaned"
+    };
     let marker = root.join(format!("cut-{cut}.reached"));
     let script = root.join(format!("cut-{cut}.gdb"));
     fs::write(
@@ -344,7 +397,7 @@ run
 python
 import gdb
 frame = gdb.newest_frame()
-assert frame is not None and 'recovery_worker::recover_cleaned' in frame.name(), 'wrong recovery frame'
+assert frame is not None and '{function}' in frame.name(), 'wrong recovery frame'
 assert frame.find_sal().line == {line}, 'wrong recovery statement'
 assert gdb.selected_inferior().pid > 0, 'missing actual node'
 with open({marker:?}, 'w') as output:
@@ -386,12 +439,8 @@ quit
     loop {
         if let Some(status) = debugger.0 .0.try_wait()? {
             let output = fs::read_to_string(&path)?;
-            if let Some(evidence) = std::env::var_os("RTOS_NODE_RECOVERY_EVIDENCE_DIR") {
-                let evidence = PathBuf::from(evidence);
-                fs::create_dir_all(&evidence)?;
-                fs::copy(&path, evidence.join(format!("cut-{cut}.log")))?;
-                fs::copy(&script, evidence.join(format!("cut-{cut}.gdb")))?;
-            }
+            keep_evidence(root, &path)?;
+            keep_evidence(root, &script)?;
             assert!(status.success(), "debugger failed at {cut}: {output}");
             assert!(marker.is_file(), "recovery cut not reached: {output}");
             assert!(output.contains("killed"), "node was not killed: {output}");
@@ -407,6 +456,32 @@ quit
             rtos_block::fail!("Recovery cut {cut} timeout: {}", fs::read_to_string(&path)?);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+fn recovery_file_inventory(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
+    let mut files = BTreeMap::new();
+    let providers = std::iter::once(root.join("node_db"))
+        .chain(fs::read_dir(root.join("epochs"))?.map(|entry| entry.unwrap().path()));
+    for provider in providers {
+        let directory = provider.join("archive/recovery").join(hex::encode([0x35u8; 16]));
+        if !directory.try_exists()? {
+            continue;
+        }
+        for entry in fs::read_dir(directory)? {
+            let path = entry?.path();
+            files.insert(path.strip_prefix(root)?.to_owned(), fs::read(path)?);
+        }
+    }
+    Ok(files)
+}
+
+fn keep_evidence(root: &Path, path: &Path) -> Result<()> {
+    if let Some(evidence) = std::env::var_os("RTOS_NODE_RECOVERY_EVIDENCE_DIR") {
+        let evidence = PathBuf::from(evidence).join(root.file_name().expect("fixture root"));
+        fs::create_dir_all(&evidence)?;
+        fs::copy(path, evidence.join(path.file_name().expect("evidence filename")))?;
     }
     Ok(())
 }

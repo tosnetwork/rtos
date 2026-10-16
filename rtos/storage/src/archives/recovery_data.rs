@@ -20,7 +20,7 @@ impl Digest {
 
 /// Bounded batches of directory names, independent of the number of files.
 /// Rescans once per 512 entries; callers must not mutate the tree during a scan.
-fn sorted_entries(path: &Path, mut visit: impl FnMut(PathBuf) -> Result<()>) -> Result<()> {
+pub(super) fn sorted_entries(path: &Path, mut visit: impl FnMut(PathBuf) -> Result<()>) -> Result<()> {
     let mut last: Option<OsString> = None;
     loop {
         let mut names = BinaryHeap::new();

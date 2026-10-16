@@ -183,7 +183,10 @@ pub(super) fn write_and_hold(root: &Path) -> Result<()> {
     header[244..252].copy_from_slice(&data_count.to_le_bytes());
     header[252..284].copy_from_slice(&data_hash.finalize());
     let building_mode = std::env::var("RTOS_NONZERO_BUILDING_FIXTURE").unwrap_or_default();
-    let building = matches!(building_mode.as_str(), "valid" | "bad-data" | "unexpected-stage");
+    let building = matches!(
+        building_mode.as_str(),
+        "valid" | "bad-data" | "unexpected-stage" | "staged" | "staged-bad-data" | "staged-unknown"
+    );
     if building {
         use storage::traits::Serializable;
         let mut selection = b"RTOSAMF1".to_vec();
@@ -210,10 +213,38 @@ pub(super) fn write_and_hold(root: &Path) -> Result<()> {
         record(3, &maps);
         let mut data = vec![1, 0, 2];
         data.extend_from_slice(&header[244..284]);
-        if building_mode == "bad-data" {
+        if building_mode.ends_with("bad-data") {
             data[11] ^= 1;
         }
         record(8, &data);
+        if building_mode.starts_with("staged") {
+            let mut stages = Vec::new();
+            for (provider, key, id, present) in
+                [(0usize, true, 0u32, true), (1, false, 0, true), (1, false, 1, false)]
+            {
+                let mut payload = vec![1, 0, 1, u8::from(key)];
+                payload.extend_from_slice(&id.to_le_bytes());
+                payload.extend_from_slice(&(-1i32).to_le_bytes());
+                payload.extend_from_slice(&0x8000000000000000u64.to_le_bytes());
+                payload.extend_from_slice(&sha256_digest(&providers[provider].descriptor));
+                let identity = sha256_digest(&payload);
+                stages.push((provider, identity, payload, present));
+            }
+            stages.sort_by_key(|(provider, identity, _, _)| (*provider, *identity));
+            for (provider, identity, payload, present) in stages {
+                record(4, &payload);
+                if present {
+                    let directory = providers[provider]
+                        .root
+                        .join("archive/recovery")
+                        .join(hex::encode(OPERATION));
+                    fs::create_dir_all(&directory)?;
+                    let path = directory.join(format!("stage-{}.pack", hex::encode(identity)));
+                    fs::write(&path, b"partial staged package bytes")?;
+                    fs::File::open(path)?.sync_all()?;
+                }
+            }
+        }
         selection.push(0);
         let body_hash = sha256_digest(&selection);
         selection.extend_from_slice(&count.to_le_bytes());
@@ -225,6 +256,11 @@ pub(super) fn write_and_hold(root: &Path) -> Result<()> {
         header[164..284].fill(0);
         let directory = node.join("archive/recovery").join(hex::encode(OPERATION));
         fs::create_dir_all(&directory)?;
+        if building_mode == "staged-unknown" {
+            let stage = directory.join(format!("stage-{}.pack", "ff".repeat(32)));
+            fs::write(&stage, b"undeclared stage")?;
+            fs::File::open(stage)?.sync_all()?;
+        }
         if building_mode == "unexpected-stage" {
             let stage = directory.join("stage.pack");
             fs::write(&stage, b"preserve")?;
@@ -247,7 +283,7 @@ pub(super) fn write_and_hold(root: &Path) -> Result<()> {
         let checksum = sha256_digest(&backlink[..132]);
         backlink[132..].copy_from_slice(&checksum);
         // Building may be interrupted before every provider was enrolled.
-        if !building || index == 0 {
+        if !building || index == 0 || building_mode.starts_with("staged") {
             if index == 0 {
                 fs::write(root.join("expected-backlink.bin"), &backlink)?;
             }

@@ -6,7 +6,7 @@ use super::{recovery_manifest::{read_manifest, Kind}, recovery_participant::Anch
 use rtos_block::{fail, Result};
 use std::{fs, io, os::{fd::IntoRawFd, unix::fs::{MetadataExt, OpenOptionsExt}}, path::Path};
 
-fn directory(path: &Path) -> Result<bool> {
+pub(super) fn directory(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => Ok(true),
         Ok(_) => fail!("Invalid recovery control directory {}", path.display()),
