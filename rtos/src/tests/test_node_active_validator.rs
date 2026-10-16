@@ -6,52 +6,8 @@ use consensus_common::session_runtime::{AuthenticatedSessionRuntime, SessionNetw
 use rtos_block::{Ed25519KeyOption, ZeroizingBytes};
 
 pub(super) async fn run(binary: &Path, root: &Path, zero: &Path, fixture: &Fixture) -> Result<()> {
-    // Public deterministic test identities; no configured/production keys are read.
-    let custody = root.join("isolated-custody"); fs::create_dir(&custody)?;
-    let key_file = custody.join("public-test-seed");
-    fs::write(&key_file, [0xa1; 32])?;
-    #[cfg(unix)] {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&custody, fs::Permissions::from_mode(0o700))?;
-        fs::set_permissions(&key_file, fs::Permissions::from_mode(0o600))?;
-    }
-    let owner = root.join("isolated-owner"); fs::create_dir(&owner)?;
-    #[cfg(unix)] {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&owner, fs::Permissions::from_mode(0o700))?;
-    }
-    let db = open_db(root).await?;
-    let state = db.load_shard_state_dynamic(&fixture.id(4, false))?;
-    let config = state.config_params()?;
-    let extra = state.shard_state_extra()?;
-    let cc = extra.validator_info.catchain_seqno;
-    let key_seqno = extra.last_key_block.as_ref().unwrap().seq_no;
-    let (committee, _) = config.validator_set()?.calc_subset(&config.catchain_config()?, rtos_block::SHARD_FULL, -1, cc)?;
-    let (transport_json, transport) = Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[0x61; 32])?;
-    let runtime = AuthenticatedSessionRuntime::from_authenticated_config(
-        SessionNetworkPin { global_id: state.state()?.global_id(), zerostate: fixture.id(0, false) },
-        config, rtos_api::session_identity::SessionCoordinates { shard: fixture.id(4, false).shard(),
-            catchain_seqno: cc, vertical_seqno: 0, last_key_block_seqno: key_seqno, new_catchain_ids: false },
-        committee, transport.id().clone(),
-    )?.bind_recovery_anchor(fixture.id(4, false))?;
-    let namespace = PathBuf::from(runtime.runtime_directory(root.join("node_db/catchains").to_str().unwrap())?);
-    simplex::isolated_signing::provision(&runtime, &namespace, &owner, &key_file, 1, u32::MAX)?;
-    let (physical, _) = db.sst_databases_for_test();
-    drop(state); db.stop_states_db().await?; drop(db);
-    tokio::time::timeout(Duration::from_secs(30), wait_for_db_release(physical)).await?;
-    let generated = TonNodeConfig::from_file(root.to_str().unwrap(), "config.json", None, "default_config.json", None).await?;
-    drop(generated);
-    let mut node_config: serde_json::Value = serde_json::from_slice(&fs::read(root.join("config.json"))?)?;
-    for key in node_config["adnl_node"]["keys"].as_array_mut().unwrap() {
-        if key["tag"] == NodeNetwork::TAG_OVERLAY_KEY { key["data"] = serde_json::to_value(&transport_json)?; }
-    }
+    let runtime = provision(root, fixture, 0xa1, 0x61).await?;
     let local_id = runtime.committee()[0].validator_id()?;
-    node_config["validator_key_ring"][rtos_block::base64_encode(transport.id().data())] = serde_json::to_value(&transport_json)?;
-    node_config["consensus_transport_bindings"] = serde_json::json!([{
-        "validator_id":rtos_block::base64_encode(local_id.as_slice()),
-        "adnl_key_id":rtos_block::base64_encode(transport.id().data()),
-    }]);
-    fs::write(root.join("config.json"), serde_json::to_vec(&node_config)?)?;
     let mut previous = 4;
     for attempt in 0..2 {
         let path = root.join(format!("active-node-{attempt}.log"));
@@ -115,4 +71,55 @@ pub(super) async fn run(binary: &Path, root: &Path, zero: &Path, fixture: &Fixtu
     keep_evidence(root, &report)?;
     db.stop_states_db().await?;
     Ok(())
+}
+
+pub(super) async fn provision(root: &Path, fixture: &Fixture, custody_seed: u8, transport_seed: u8)
+    -> Result<AuthenticatedSessionRuntime> {
+    // Public deterministic test identities; no configured/production keys are read.
+    let custody = root.join("isolated-custody"); fs::create_dir(&custody)?;
+    let key_file = custody.join("public-test-seed");
+    fs::write(&key_file, [custody_seed; 32])?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&custody, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&key_file, fs::Permissions::from_mode(0o600))?;
+    }
+    let owner = root.join("isolated-owner"); fs::create_dir(&owner)?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&owner, fs::Permissions::from_mode(0o700))?;
+    }
+    let db = open_db(root).await?;
+    let state = db.load_shard_state_dynamic(&fixture.id(4, false))?;
+    let config = state.config_params()?;
+    let extra = state.shard_state_extra()?;
+    let cc = extra.validator_info.catchain_seqno;
+    let key_seqno = extra.last_key_block.as_ref().unwrap().seq_no;
+    let (committee, _) = config.validator_set()?.calc_subset(&config.catchain_config()?, rtos_block::SHARD_FULL, -1, cc)?;
+    let (transport_json, transport) = Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[transport_seed; 32])?;
+    let runtime = AuthenticatedSessionRuntime::from_authenticated_config(
+        SessionNetworkPin { global_id: state.state()?.global_id(), zerostate: fixture.id(0, false) },
+        config, rtos_api::session_identity::SessionCoordinates { shard: fixture.id(4, false).shard(),
+            catchain_seqno: cc, vertical_seqno: 0, last_key_block_seqno: key_seqno, new_catchain_ids: false },
+        committee, transport.id().clone(),
+    )?.bind_recovery_anchor(fixture.id(4, false))?;
+    let namespace = PathBuf::from(runtime.runtime_directory(root.join("node_db/catchains").to_str().unwrap())?);
+    simplex::isolated_signing::provision(&runtime, &namespace, &owner, &key_file, 1, u32::MAX)?;
+    let (physical, _) = db.sst_databases_for_test();
+    drop(state); db.stop_states_db().await?; drop(db);
+    tokio::time::timeout(Duration::from_secs(30), wait_for_db_release(physical)).await?;
+    let generated = TonNodeConfig::from_file(root.to_str().unwrap(), "config.json", None, "default_config.json", None).await?;
+    drop(generated);
+    let mut node_config: serde_json::Value = serde_json::from_slice(&fs::read(root.join("config.json"))?)?;
+    for key in node_config["adnl_node"]["keys"].as_array_mut().unwrap() {
+        if key["tag"] == NodeNetwork::TAG_OVERLAY_KEY { key["data"] = serde_json::to_value(&transport_json)?; }
+    }
+    let local_id = runtime.committee()[match runtime.local_role() { consensus_common::session_runtime::LocalRole::Validator(i) => i as usize, _ => unreachable!() }].validator_id()?;
+    node_config["validator_key_ring"][rtos_block::base64_encode(transport.id().data())] = serde_json::to_value(&transport_json)?;
+    node_config["consensus_transport_bindings"] = serde_json::json!([{
+        "validator_id":rtos_block::base64_encode(local_id.as_slice()),
+        "adnl_key_id":rtos_block::base64_encode(transport.id().data()),
+    }]);
+    fs::write(root.join("config.json"), serde_json::to_vec(&node_config)?)?;
+    Ok(runtime)
 }

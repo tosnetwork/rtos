@@ -428,6 +428,31 @@ async fn actual_node_active_validator_resumes_after_interruption() -> Result<()>
     exercise_nonzero_recovery_with_finality(false, None, None, false, 7).await
 }
 
+#[cfg(feature = "isolated-consensus-signing")]
+#[path = "test_node_active_network.rs"]
+mod active_network;
+
+#[cfg(feature = "isolated-consensus-signing")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires actual isolated node binary and public four-validator fixture generator"]
+async fn actual_network_validator_catches_up_after_interruption() -> Result<()> {
+    exercise_nonzero_recovery_with_finality(false, None, None, false, 8).await
+}
+
+#[cfg(feature = "isolated-consensus-signing")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires actual isolated node binary, public network fixture and cc"]
+async fn actual_network_recovers_after_source_write_enospc_and_interruption() -> Result<()> {
+    exercise_nonzero_recovery_with_finality(false, None, None, false, 9).await
+}
+
+#[cfg(feature = "isolated-consensus-signing")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires actual isolated node binary, public network fixture and cc"]
+async fn actual_network_recovers_after_source_sync_eio_and_interruption() -> Result<()> {
+    exercise_nonzero_recovery_with_finality(false, None, None, false, 10).await
+}
+
 async fn exercise_nonzero_recovery_layout(
     interrupt_recovery: bool,
     building: Option<&str>,
@@ -451,7 +476,7 @@ async fn exercise_nonzero_recovery_with_finality(
     };
     let root = dir.path();
     #[cfg(feature = "isolated-consensus-signing")]
-    let active_fixture = if retained_finality == 7 { Some(Fixture::active_validator()?) } else { None };
+    let active_fixture = match retained_finality { 7 => Some(Fixture::active_validator()?), 8..=10 => Some(Fixture::active_network()?), _ => None };
     #[cfg(not(feature = "isolated-consensus-signing"))]
     let active_fixture: Option<Fixture> = None;
     let fixture = active_fixture.unwrap_or_else(|| if retained_finality > 0 { Fixture::node_finality() } else { Fixture::node_recovery() });
@@ -459,7 +484,7 @@ async fn exercise_nonzero_recovery_with_finality(
     fixture.prepare(root, &archives).await?;
     let physical = run_import(fixture.config(root, archives)).await?;
     tokio::time::timeout(Duration::from_secs(60), wait_for_db_release(physical)).await?;
-    if retained_finality == 7 || matches!(truncation, Some((3, Some(cut))) if cut == "state-cache-loss" || cut.starts_with("state-auto-")) {
+    if matches!(retained_finality, 7..=10) || matches!(truncation, Some((3, Some(cut))) if cut == "state-cache-loss" || cut.starts_with("state-auto-")) {
         truncation_recovery::state_cache_loss::prepare_dynamic(root, &fixture).await?;
     }
     if sparse { sparse_packages::prepare(root).await?; }
@@ -516,8 +541,11 @@ async fn exercise_nonzero_recovery_with_finality(
     drop((adnl, quic));
     fs::write(root.join("node-log.yml"), "appenders:\n  console:\n    kind: console\n    encoder:\n      pattern: '{m}{n}'\nroot:\n  level: info\n  appenders: [console]\n")?;
     #[cfg(feature = "isolated-consensus-signing")]
-    if retained_finality == 7 {
-        let result = active_validator::run(&binary, root, &zero, &fixture).await;
+    if matches!(retained_finality, 7..=10) {
+        let result = if retained_finality >= 8 {
+            let fault = match retained_finality { 9 => Some("write-enospc"), 10 => Some("sync-eio"), _ => None };
+            active_network::run(&binary, root, &fixture, fault).await
+        } else { active_validator::run(&binary, root, &zero, &fixture).await };
         if result.is_err() {
             let kept = dir.keep();
             eprintln!("Retained public active-validator fixture for diagnosis: {}", kept.display());

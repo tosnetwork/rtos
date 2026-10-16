@@ -35,6 +35,26 @@ impl Fixture {
         }
         Ok(Self { data })
     }
+    #[cfg(feature = "isolated-consensus-signing")]
+    pub fn active_network() -> Result<Self> {
+        let stores = (0..4).map(|i| rtos_pq_consensus::ConsensusKeyStore::from_seed(&[0xa0 + i; 32], u32::MAX))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let keys = tempfile::NamedTempFile::new()?;
+        std::fs::write(keys.path(), serde_json::to_vec(&stores.iter().map(|k| hex::encode(&k.consensus_key().public_key)).collect::<Vec<_>>())?)?;
+        let generated = std::process::Command::new(std::env::var("RTOS_ACTIVE_FIXTURE_GENERATOR")?)
+            .arg("--active-network-keys").arg(keys.path()).output()?;
+        assert!(generated.status.success(), "four-validator history generator failed");
+        let mut data: serde_json::Value = serde_json::from_slice(&generated.stdout)?;
+        for row in data["cases"].as_array_mut().unwrap() {
+            let preimage = hex::decode(row["preimage"].as_str().unwrap())?;
+            let signatures = stores.iter().enumerate().map(|(i, store)| Ok(serde_json::json!({
+                "validator_id":hex::encode([i as u8 + 1; 32]),
+                "signature":hex::encode(store.sign_consensus(&preimage)?.bytes),
+            }))).collect::<Result<Vec<_>>>()?;
+            row["signatures"] = signatures.into();
+        }
+        Ok(Self { data })
+    }
     pub fn node_finality() -> Self {
         Self { data: serde_json::from_str(include_str!("static/node-finality-history.json")).unwrap() }
     }
@@ -91,20 +111,25 @@ impl Fixture {
             Some(BlockSignaturesVariant::SimplexPq(BlockSignaturesSimplexPq {
                 validator_info: ValidatorBaseInfo::with_params(
                     row["subset_hash"].as_u64().unwrap() as u32,
-                    7,
+                    row["catchain_seqno"].as_u64().unwrap_or(7) as u32,
                 ),
                 session_id: UInt256::from_slice(&hex::decode(row["session"].as_str().unwrap())?),
                 slot: row["slot"].as_u64().unwrap() as u32,
                 candidate_data: BlockSignaturesSimplex::bytes_to_cell_tree(&hex::decode(
                     row["candidate"].as_str().unwrap(),
                 )?)?,
-                sig_count: 1,
-                sig_weight: 2,
-                signatures: vec![PqBlockSignaturePair {
+                sig_count: if self.data["active_network"] == true { 4 } else { 1 },
+                sig_weight: if self.data["active_network"] == true { 4 } else { 2 },
+                signatures: if self.data["active_network"] == true {
+                    row["signatures"].as_array().unwrap().iter().map(|s| Ok(PqBlockSignaturePair {
+                        validator_id: UInt256::from_slice(&hex::decode(s["validator_id"].as_str().unwrap())?),
+                        algorithm_id: 1, signature: hex::decode(s["signature"].as_str().unwrap())?,
+                    })).collect::<Result<Vec<_>>>()?
+                } else { vec![PqBlockSignaturePair {
                     validator_id: UInt256::from([2; 32]),
                     algorithm_id: 1,
                     signature: hex::decode(row["signature"].as_str().unwrap())?,
-                }],
+                }] },
             }))
         };
         BlockProofStuff::new(

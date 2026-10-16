@@ -118,6 +118,7 @@ name = "liteserver_pipeline"
 harness = false
 
 [dev-dependencies]
+rtos_pq_consensus = { path = "../pq-consensus" }
 serde_cbor = "0.11"
 storage = { path = "storage", features = ["integration-test-support"] }
 simplex = { path = "simplex", features = ["integration-test-support"] }

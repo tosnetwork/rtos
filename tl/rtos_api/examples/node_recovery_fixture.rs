@@ -36,7 +36,12 @@ fn install_config_account(state: &mut ShardStateUnsplit, config: &ConfigParams) 
 }
 
 fn main() {
-    let active = std::env::args().any(|arg| arg == "--active-validator");
+    let args: Vec<_> = std::env::args().collect();
+    let network_keys: Option<Vec<String>> = args.windows(2).find(|a| a[0] == "--active-network-keys")
+        .map(|a| serde_json::from_slice(&std::fs::read(&a[1]).unwrap()).unwrap());
+    if let Some(keys) = &network_keys { assert_eq!(keys.len(), 4, "network fixture requires four independent validators"); }
+    let active = network_keys.is_some() || args.iter().any(|arg| arg == "--active-validator");
+    let history_cc = if network_keys.is_some() { 6 } else { 7 };
     let finality = active || std::env::args().any(|arg| arg == "--retained-finality");
     let genesis_time = if active { u32::try_from(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()).unwrap() - 4 } else { 1_700_000_000 };
@@ -82,7 +87,15 @@ fn main() {
             Ok(true)
         })
         .unwrap();
-    let validators = if active {
+    let validators = if let Some(keys) = &network_keys {
+        keys.iter().enumerate().map(|(i, public)| {
+            let public_key = hex::decode(public).unwrap();
+            let transport = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x61 + i as u8; 32]).unwrap();
+            ValidatorDescr::with_pq_params(UInt256::from([i as u8 + 1; 32]),
+                PqConsensusKey { algorithm_id: 1, key_id: derive_consensus_key_id(1, &public_key), public_key },
+                1, UInt256::from(*transport.id().data()))
+        }).collect()
+    } else if active {
         let member = config.validator_set().unwrap().list()[1].clone();
         let transport = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x61; 32]).unwrap();
         vec![ValidatorDescr::with_pq_params(member.validator_id().unwrap(), member.pq_key().unwrap().clone(),
@@ -90,7 +103,7 @@ fn main() {
     } else { config.validator_set().unwrap().list().to_vec() };
     config
         .set_config(ConfigParamEnum::ConfigParam34(ConfigParam34 {
-            cur_validators: ValidatorSet::new(1_600_000_000, u32::MAX, if active { 1 } else { 2 }, validators).unwrap(),
+            cur_validators: ValidatorSet::new(1_600_000_000, u32::MAX, validators.len() as u16, validators).unwrap(),
         }))
         .unwrap();
     let mut workchains = ConfigParam12::default();
@@ -120,7 +133,7 @@ fn main() {
     custom.config = config.clone();
     custom.after_key_block = true;
     if active {
-        custom.validator_info.catchain_seqno = 7;
+        custom.validator_info.catchain_seqno = history_cc;
         custom.validator_info.validator_list_hash_short = ValidatorSet::calc_subset_hash_short(
             config.validator_set().unwrap().list(), 0).unwrap();
     }
@@ -203,6 +216,10 @@ fn main() {
         custom.config = config.clone();
         custom.after_key_block = key;
         custom.last_key_block = last_key.clone();
+        if network_keys.is_some() {
+            custom.validator_info.catchain_seqno = if seq == 4 { 7 } else { history_cc };
+            custom.validator_info.nx_cc_updated = seq == 4;
+        }
         state.set_seq_no(seq);
         state.set_gen_lt(mc_end_lt);
         state.set_gen_time(genesis_time + seq);
@@ -219,14 +236,19 @@ fn main() {
         info.set_prev_key_block_seqno(epoch);
         info.set_vertical_stuff(0, if active { 0 } else { 1 }, None).unwrap();
         if finality {
-            info.set_gen_catchain_seqno(7);
+            info.set_gen_catchain_seqno(history_cc);
             let (_, hash) = governing.validator_set().unwrap().calc_subset(
-                &governing.catchain_config().unwrap(), SHARD_FULL, -1, 7).unwrap();
+                &governing.catchain_config().unwrap(), SHARD_FULL, -1, history_cc).unwrap();
             info.set_gen_validator_list_hash_short(hash);
         }
         info.set_prev_stuff(false, &BlkPrevInfo::Block { prev: reference(&previous) }).unwrap();
         let mut extra = BlockExtra::default();
-        if finality { *extra.created_by_mut() = UInt256::from([if active { 2 } else { 1 }; 32]); }
+        if finality {
+            let creator = if network_keys.is_some() {
+                (99 / SimplexConfig::default().slots_per_leader_window % 4 + 1) as u8
+            } else if active { 2 } else { 1 };
+            *extra.created_by_mut() = UInt256::from([creator; 32]);
+        }
         let mut mc = McBlockExtra::default();
         *mc.shards_mut() = shards;
         if key {
@@ -249,7 +271,7 @@ fn main() {
             blockid.clone(),
             if active { 0 } else { 1 },
             epoch,
-            7,
+            history_cc,
         )
         .unwrap();
         let mut candidate = 0x8354642du32.to_le_bytes().to_vec();
@@ -273,7 +295,7 @@ fn main() {
             ).unwrap());
         }
         let carrier = BlockSignaturesSimplexPq {
-            validator_info: ValidatorBaseInfo::with_params(ctx.subset_hash(), 7),
+            validator_info: ValidatorBaseInfo::with_params(ctx.subset_hash(), history_cc),
             session_id: ctx.expected_session_id().clone(),
             slot: 99,
             candidate_data: BlockSignaturesSimplex::bytes_to_cell_tree(&candidate).unwrap(),
@@ -282,6 +304,7 @@ fn main() {
             signatures: vec![],
         };
         rows.push(serde_json::json!({"block_boc":hex::encode(write_boc(&root).unwrap()),"state_boc":hex::encode(write_boc(&next_state).unwrap()),"wc_block_boc":hex::encode(write_boc(&wcblockroot).unwrap()),"wc_state_boc":hex::encode(write_boc(&nextwc).unwrap()),"candidate":hex::encode(candidate),"session":hex::encode(carrier.session_id.as_slice()),"subset_hash":ctx.subset_hash(),"slot":99,"preimage":hex::encode(final_vote_preimage(&blockid,&carrier).unwrap())}));
+        if network_keys.is_some() { rows.last_mut().unwrap()["catchain_seqno"] = history_cc.into(); }
         if key {
             epoch = seq;
             last_key = Some(reference(&blockid));
@@ -293,5 +316,6 @@ fn main() {
     }
     let mut output = serde_json::json!({"zerostate":hex::encode(zero_boc),"wc_zerostate":hex::encode(wcboc),"zero_root":zero.root_hash.as_hex_string(),"zero_file":zero.file_hash.as_hex_string(),"cases":rows});
     if active { output["masterchain_only"] = true.into(); }
+    if network_keys.is_some() { output["active_network"] = true.into(); }
     println!("{}", output);
 }

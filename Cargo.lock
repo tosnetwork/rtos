@@ -4401,6 +4401,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rtos_api",
+ "rtos_pq_consensus",
  "rtos_block",
  "rtos_block_json",
  "rtos_executor",
