@@ -76,7 +76,7 @@ fn decode_comment_from_body(body: &SliceData) -> Option<String> {
 
 pub(crate) fn serialize_block_id(block_id: &BlockIdExt) -> serde_json::Value {
     serde_json::json!({
-        "@type": "ton.blockIdExt",
+        "@type": "tos.blockIdExt",
         "workchain": block_id.shard().workchain_id(),
         "shard": (block_id.shard().shard_prefix_with_tag() as i64).to_string(),
         "seqno": block_id.seq_no(),

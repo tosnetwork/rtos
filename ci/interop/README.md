@@ -37,3 +37,41 @@ the two wire fixtures in `adnl/src/overlay/testdata/`. The adjacent JSON pins
 the reference revision. Run it against that revision's generated TL headers,
 `tl-utils`, `tl_api`, and `tdutils` libraries when updating the fixtures; retain
 the exact compiler command and library hashes with the run evidence.
+
+## Compare existing local nodes
+
+`local_compare.py` uses a public global network configuration and at least two
+existing C++ observer RPC endpoints. It creates a fresh Rust directory and
+enables its RPC server on an allocated loopback port. It starts and stops only
+that Rust process. Node initialization remains the operator's responsibility.
+
+Build the node and the independent BOC checker first:
+
+```sh
+cargo +1.91.1 build -p rtos --bin rtos --locked
+cargo +1.91.1 build -p rtos_api --example interop_block_check --locked
+python3 ci/interop/local_compare.py \
+  --global-config /data/tos-global.json \
+  --cpp-rpc http://127.0.0.1:8015/jsonRPC \
+  --cpp-rpc http://127.0.0.1:8016/jsonRPC \
+  --rust-node "$RUST_NODE" --block-checker "$BLOCK_CHECKER" \
+  --output "$COMPARISON_OUTPUT"
+```
+
+Use `--prepare-only` to validate the reference chain and write configuration
+without starting Rust. Every invocation needs a new output directory. A change
+to the source global configuration invalidates a running comparison.
+
+The actual run captures matching C++ block/state observations, requires Rust to
+advance at least two blocks beyond the initial checkpoint, and finds a common
+height. It obtains Rust's applied state root and full block through RPC. The
+independent checker verifies the full BOC file hash, cell hash, block header,
+canonical block ID labels and the state update's new root against both clients'
+reported applied states. The C++ observers must still agree on the matched block
+ID after Rust stops. Logs and `status.json` preserve terminal success or failure;
+`sample.json` retains the exact public sample locally.
+
+This establishes a block/state checkpoint comparison. It does not qualify
+active Rust voting, candidate production, quorum behavior, transactions across
+all profiles or the complete mixed-validator gate. The public synchronization
+configuration contains fresh transport identities and no signing profile.

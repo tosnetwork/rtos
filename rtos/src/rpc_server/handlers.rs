@@ -393,12 +393,7 @@ async fn get_masterchain_info(_: NoParams, ctx: Ctx) -> JsonResult {
     let mc_state = ctx.engine.load_state(&mc_block_id).await?;
     let state_root_hash = mc_state.root_cell().repr_hash();
     let zerostate_block: BlockIdExt = ctx.engine.zerostate_id()?.clone();
-    // toncenter renders the zerostate's shard as the literal "0" rather than the
-    // shard-prefix-with-tag form. Match that for parity.
-    let mut init = serialize_block_id(&zerostate_block);
-    if let Some(obj) = init.as_object_mut() {
-        obj.insert("shard".to_string(), serde_json::Value::String("0".to_string()));
-    }
+    let init = serialize_block_id(&zerostate_block);
     Ok(serde_json::json!({
         "@type": "blocks.masterchainInfo",
         "last": serialize_block_id(&mc_block_id),

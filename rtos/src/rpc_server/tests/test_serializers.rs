@@ -250,7 +250,7 @@ fn test_json_serde_block_id_ext() {
         format!("{json:#}"),
         r#"{
   "block_id": {
-    "@type": "ton.blockIdExt",
+    "@type": "tos.blockIdExt",
     "workchain": -1,
     "shard": "-9223372036854775808",
     "seqno": 199473,

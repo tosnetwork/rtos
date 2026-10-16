@@ -236,13 +236,9 @@ async fn get_masterchain_info_returns_state_metadata() {
 
     pretty_assertions::assert_eq!(response["@type"], "blocks.masterchainInfo");
     pretty_assertions::assert_eq!(response["last"], serialize_block_id(master_state.block_id()));
-    // init mirrors zerostate id but with shard rendered as the literal "0" (toncenter parity)
-    let mut expected_init = serialize_block_id(master_state.block_id());
-    expected_init
-        .as_object_mut()
-        .unwrap()
-        .insert("shard".to_string(), serde_json::Value::String("0".to_string()));
-    pretty_assertions::assert_eq!(response["init"], expected_init);
+    pretty_assertions::assert_eq!(response["init"], serialize_block_id(master_state.block_id()));
+    pretty_assertions::assert_eq!(response["init"]["@type"], "tos.blockIdExt");
+    pretty_assertions::assert_eq!(response["init"]["shard"], i64::MIN.to_string());
     pretty_assertions::assert_eq!(
         response["state_root_hash"],
         serialize_uint256(&master_state.root_cell().repr_hash())
