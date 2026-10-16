@@ -54,7 +54,7 @@ async fn damaged_length_and_cursor_latch_before_append() -> Result<()> {
         if bad_length {
             package.state.size.store(3, Ordering::SeqCst);
         } else {
-            package.state.write_mutex.lock().await.as_mut().unwrap().seek(SeekFrom::Start(0)).await?;
+            std::io::Seek::seek(package.state.write_mutex.lock().await.as_mut().unwrap(), SeekFrom::Start(0))?;
         }
         let before = std::fs::read(&path)?;
         let entry = PackageEntry::with_data("entry".into(), vec![1]);

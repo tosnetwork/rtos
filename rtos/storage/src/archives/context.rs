@@ -1,5 +1,5 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
-//! Archive context primitives. Canonical IO migration is not yet integrated.
+//! Archive admission and native phase ownership. Full operation recovery remains incomplete.
 use super::io_owners::{ArchiveIoOwners, ArchiveIoTicket};
 use crate::db::rocksdb::RocksDb;
 use rtos_block::Result;
@@ -331,3 +331,6 @@ mod tests;
 
 #[path = "recovery_execution.rs"]
 pub(crate) mod recovery_execution;
+
+#[path = "mutation_phase.rs"]
+mod mutation_phase;
