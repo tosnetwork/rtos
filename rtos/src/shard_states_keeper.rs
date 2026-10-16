@@ -480,6 +480,10 @@ impl ShardStatesKeeper {
     ) -> Result<()> {
         log::trace!("start");
         self.restore_states(last_applied_mc_block, shard_client_mc_block.clone()).await?;
+        // Restoring may have queued forced state writes even when their handles
+        // already say saved. Drain the native owner and make the recovered graph
+        // durable before workers and node services can observe completed startup.
+        self.db.sync_publication_state().await?;
         self.start_workers(engine, shard_client_mc_block, ss_keeper_block)
     }
 
