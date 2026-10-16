@@ -72,10 +72,36 @@ static int selected_wal(int fd, char path[PATH_MAX]) {
         && S_ISREG(info.st_mode) && info.st_size > 0;
 }
 
+static int selected_lease_wal(int fd, char path[PATH_MAX]) {
+    const char *root = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_ROOT");
+    const char *arm = getenv("RTOS_TEST_ROOT_WAL_ARM");
+    if (!root || !*root || !arm || access(arm, F_OK)
+        || !getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_MARKER")) return 0;
+    size_t prefix = strlen(root);
+    if (root[prefix - 1] != '/') return 0;
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t length = readlink(link, path, PATH_MAX - 1);
+    if (length <= 0) return 0;
+    path[length] = 0;
+    if (strncmp(path, root, prefix)) return 0;
+    const char *fixture = path + prefix;
+    const char *end = strchr(fixture, '/');
+    const char parent[] = "/node_db/db/";
+    if (!end || strncmp(fixture, ".tmp", 4) || strncmp(end, parent, sizeof(parent) - 1)) return 0;
+    const char *leaf = end + sizeof(parent) - 1;
+    size_t digits = strspn(leaf, "0123456789");
+    struct stat info;
+    return digits && !strcmp(leaf + digits, ".log") && !fstat(fd, &info)
+        && S_ISREG(info.st_mode) && info.st_size > 0;
+}
+
 static int sync_or_omit(int fd, long operation, const char *name) {
     char path[PATH_MAX];
     const char *mode = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE");
-    if (mode && (!strcmp(mode, "ready-wal") || !strcmp(mode, "committed-wal") || !strcmp(mode, "cleaned-wal") || !strcmp(mode, "root-wal"))) {
+    if (mode && !strcmp(mode, "lease-wal")) {
+        if (!selected_lease_wal(fd, path)) return syscall(operation, fd);
+    } else if (mode && (!strcmp(mode, "ready-wal") || !strcmp(mode, "committed-wal") || !strcmp(mode, "cleaned-wal") || !strcmp(mode, "root-wal"))) {
         if (!atomic_load_explicit(&wal_armed, memory_order_acquire) && selected(fd, path)) {
             int result = syscall(operation, fd);
             if (result) return result;

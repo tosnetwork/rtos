@@ -885,3 +885,10 @@ async fn actual_node_root_last_cache_loss() -> Result<()> {
     exercise_nonzero_recovery_layout(false, None,
         Some((3, Some("root-last-cache-loss"))), false).await
 }
+
+#[tokio::test]
+#[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
+async fn actual_node_lease_release_cache_loss() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None,
+        Some((3, Some("lease-release-cache-loss"))), false).await
+}

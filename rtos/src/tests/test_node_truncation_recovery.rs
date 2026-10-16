@@ -109,16 +109,22 @@ pub(super) async fn run(
     );
     fixture.assert_history(&db, 4).await?;
     assert!(db.repair_leases().protection().artifact(&fixture.id(4, false)));
-    assert_eq!(
-        db.repair_leases().release(lease.generation, &lease.binding, &lease.digest)?,
-        LeaseRelease::Released
-    );
+    let lease_cut = interrupt == Some("lease-release-cache-loss");
+    if !lease_cut {
+        assert_eq!(db.repair_leases().release(lease.generation, &lease.binding, &lease.digest)?,
+            LeaseRelease::Released);
+    }
     let (physical, catchain) = db.sst_databases_for_test();
     drop(catchain);
     db.stop_states_db().await?;
     drop(db);
     tokio::time::timeout(Duration::from_secs(30), wait_for_db_release(physical)).await?;
-    eprintln!("Failed actual truncation preserved four cursors, full history and restoring beacon; exact synthetic lease released");
+    if lease_cut {
+        lease_cache_loss::release_and_interrupt(root, &lease).await?;
+        assert_eq!(package_inventory(root)?, before, "lease release cache loss changed canonical packages");
+    }
+    eprintln!("Failed actual truncation preserved four cursors, full history and restoring beacon; exact synthetic lease release acknowledged");
+    let interrupt = if lease_cut { None } else { interrupt };
     if let Some(mode @ ("selection-enospc" | "selection-sync-eio" | "ready-enospc" | "ready-sync-eio" | "operation-sync-eio" | "publish-rename-eio" | "publish-sync-eio" | "wal-ready-sync-eio" | "wal-publish-sync-eio" | "wal-epoch-enrollment-eio" | "publish-directory-sync-eio" | "stage-enospc" | "stage-sync-eio")) = interrupt {
         io_failure::recovery_fault(binary, root, zero, mode).await?;
         if matches!(mode, "publish-sync-eio" | "wal-publish-sync-eio" | "publish-directory-sync-eio") {
@@ -475,3 +481,6 @@ pub(super) fn find_ready_staging(path: &Path, ready: &mut Vec<PathBuf>, stages: 
     }
     Ok(())
 }
+
+#[path = "test_node_lease_cache_loss.rs"]
+mod lease_cache_loss;
