@@ -141,12 +141,21 @@ pub(super) async fn run(
             }
             "forward-before-cleanup" => "scan(providers, &committed, Pass::Cleanup)?;",
             "forward-after-row-sync" | "forward-after-row-sync-cache-loss" => "let applied = scan(providers, root, Pass::Committed)?;",
-            "producer-selection-before-finish" => "let (file, selection) = writer.finish()?;",
+            "producer-selection-before-finish" | "producer-selection-cache-loss" => "let (file, selection) = writer.finish()?;",
             "producer-ready-before-finish" | "producer-ready-cache-loss" => "let (file, ready) = writer.finish()?;",
             _ => rtos_block::fail!("Unknown truncation cut {cut}"),
         };
         interrupt_actual_recovery(binary, root, zero, cut, statement).await?;
-        if cut == "producer-ready-cache-loss" {
+        if cut == "producer-selection-cache-loss" {
+            assert_eq!(package_inventory(root)?, before, "Selection production changed canonical packages");
+            let selection = cache_loss::unfinished_selection(root).await?;
+            assert_eq!(package_inventory(root)?, before, "Selection cache loss changed canonical packages");
+            interrupt_actual_recovery(binary, root, zero, "building-before-cleaned",
+                "main.database.db().put(ROOT_KEY, cleaned.encode()?)?;").await?;
+            assert!(!selection.exists(), "Preparing abort did not remove Selection");
+            assert_eq!(package_inventory(root)?, before, "Preparing abort changed canonical packages");
+            eprintln!("Preparing abort removed Selection before Cleaned publication; second actual interruption preserved canonical packages");
+        } else if cut == "producer-ready-cache-loss" {
             assert_eq!(package_inventory(root)?, before, "producer cut changed canonical packages");
             cache_loss::unfinished_ready(root).await?;
             assert_eq!(package_inventory(root)?, before, "cache loss changed canonical packages");

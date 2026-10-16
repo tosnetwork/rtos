@@ -339,6 +339,15 @@ mod cache_loss;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires isolated LazyFS mount, production node binary, fixture signer and GDB"]
+async fn actual_node_unfinished_selection_cache_loss() -> Result<()> {
+    std::env::var("RTOS_NODE_RECOVERY_FIXTURE_DIR")?;
+    std::env::var("RTOS_TEST_LAZYFS_COMMAND")?;
+    std::env::var("RTOS_TEST_LAZYFS_COMPLETED")?;
+    exercise_nonzero_recovery_layout(false, None, Some((3, Some("producer-selection-cache-loss"))), false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated LazyFS mount, production node binary, fixture signer and GDB"]
 async fn actual_node_unfinished_ready_cache_loss() -> Result<()> {
     std::env::var("RTOS_NODE_RECOVERY_FIXTURE_DIR")?;
     std::env::var("RTOS_TEST_LAZYFS_COMMAND")?;

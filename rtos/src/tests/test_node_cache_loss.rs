@@ -113,3 +113,42 @@ pub(super) async fn unfinished_ready(root: &Path) -> Result<()> {
     eprintln!("Unfinished Ready cache-loss={loss}: {} bytes before, {} bytes after; durable stages present", before.len(), after.len());
     Ok(())
 }
+
+pub(super) async fn unfinished_selection(root: &Path) -> Result<PathBuf> {
+    let mut ready = Vec::new();
+    let mut stages = 0;
+    truncation_recovery::find_ready_staging(root, &mut ready, &mut stages)?;
+    assert!(ready.is_empty(), "Ready exists before Selection completion");
+    assert_eq!(stages, 0, "stages exist before Selection completion");
+    let mut selections = Vec::new();
+    for entry in fs::read_dir(root.join("node_db/archive/recovery"))? {
+        let entry = entry?;
+        assert!(entry.file_type()?.is_dir());
+        let path = entry.path().join("selection.v1");
+        if path.try_exists()? { selections.push(path); }
+    }
+    assert_eq!(selections.len(), 1);
+    let selection = selections.remove(0);
+    let before = fs::read(&selection)?;
+    assert!(before.len() > 28 && &before[..8] == b"RTOSAMF1");
+    keep_evidence(root, &selection)?;
+    let loss = match std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")?.as_str() {
+        "1" => true,
+        "0" => false,
+        _ => rtos_block::fail!("Invalid cache-loss test mode"),
+    };
+    if loss { clear(root).await?; }
+    let after = fs::read(&selection)?;
+    if loss { assert!(after.is_empty(), "unsynced Selection bytes survived cache loss"); }
+    else { assert_eq!(after, before, "no-loss control changed Selection bytes"); }
+    let report = root.join("selection-cache-loss.json");
+    fs::write(&report, serde_json::to_vec(&serde_json::json!({
+        "cache_loss": loss, "selection_bytes_before": before.len(),
+        "selection_bytes_after": after.len(), "ready_count": ready.len(), "stage_count": stages,
+        "sha256_before": hex::encode(rtos_block::sha256_digest(&before)),
+        "sha256_after": hex::encode(rtos_block::sha256_digest(&after)),
+    }))?)?;
+    keep_evidence(root, &report)?;
+    eprintln!("Unfinished Selection cache-loss={loss}: {} bytes before, {} bytes after; no Ready or stages", before.len(), after.len());
+    Ok(selection)
+}
