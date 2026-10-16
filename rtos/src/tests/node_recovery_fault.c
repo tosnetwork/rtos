@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -59,7 +60,73 @@ ssize_t write(int fd, const void *buffer, size_t count) {
     return syscall(SYS_write, fd, buffer, count);
 }
 
+// Publish the exact renamed pathname once; readers never observe a partial path.
+static atomic_int renamed_state = 0;
+static char renamed_path[PATH_MAX];
+
+static int stage_directory(int fd, const char *mode) {
+    const char *root = getenv("RTOS_TEST_FIXTURE_ROOT");
+    const char *configured = getenv("RTOS_TEST_RECOVERY_FAULT_MODE");
+    if (!root || !configured || strcmp(mode, configured)
+        || !getenv("RTOS_TEST_RECOVERY_FAULT_MARKER")) return 0;
+    char link[64], path[PATH_MAX];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, path, sizeof(path) - 1);
+    if (n <= 0) return 0;
+    path[n] = 0;
+    size_t length = strlen(root);
+    if (strncmp(path, root, length) || path[length] != '/') return 0;
+    const char *operation = strrchr(path, '/');
+    const char parent[] = "/archive/recovery/";
+    if (!operation || strlen(operation + 1) != 32
+        || strspn(operation + 1, "0123456789abcdef") != 32
+        || (size_t)(operation + 1 - path) < sizeof(parent) - 1
+        || strncmp(operation + 1 - (sizeof(parent) - 1), parent, sizeof(parent) - 1)) return 0;
+    struct stat info;
+    return !fstat(fd, &info) && S_ISDIR(info.st_mode);
+}
+
+int renameat(int olddir, const char *old, int newdir, const char *new) {
+    int stage = strlen(old) == 75 && !strncmp(old, "stage-", 6)
+        && strspn(old + 6, "0123456789abcdef") == 64 && !strcmp(old + 70, ".pack");
+    if (stage && stage_directory(olddir, "publish-rename-eio")) {
+        record_fault("renameat staged package before replacement: EIO\n");
+        errno = EIO;
+        return -1;
+    }
+    int arm = stage && stage_directory(olddir, "publish-sync-eio");
+    char target[PATH_MAX];
+    if (arm) {
+        char link[64];
+        snprintf(link, sizeof(link), "/proc/self/fd/%d", newdir);
+        ssize_t n = readlink(link, target, sizeof(target) - 1);
+        if (n <= 0 || strchr(new, '/') || (size_t)n + 1 + strlen(new) >= sizeof(target)) arm = 0;
+        else { target[n] = '/'; strcpy(target + n + 1, new); }
+    }
+    int result = syscall(SYS_renameat, olddir, old, newdir, new);
+    int expected = 0;
+    if (!result && arm && atomic_compare_exchange_strong(&renamed_state, &expected, 1)) {
+        strcpy(renamed_path, target);
+        atomic_store_explicit(&renamed_state, 2, memory_order_release);
+    }
+    return result;
+}
+
 int fsync(int fd) {
+    if (atomic_load_explicit(&renamed_state, memory_order_acquire) == 2) {
+        char link[64], path[PATH_MAX];
+        snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+        ssize_t n = readlink(link, path, sizeof(path) - 1);
+        if (n > 0) {
+            path[n] = 0;
+            if (!strcmp(path, renamed_path)) {
+                record_fault("fsync replaced canonical package: EIO\n");
+                errno = EIO;
+                return -1;
+            }
+        }
+    }
+
     if (selected(fd, "selection-sync-eio", "/selection.v1")) {
         record_fault("fsync selection.v1 after complete manifest: EIO\n");
         errno = EIO;

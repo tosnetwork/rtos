@@ -9,6 +9,8 @@ pub(super) async fn recovery_fault(binary: &Path, root: &Path, zero: &Path, mode
         "ready-enospc" => ("write ready.v1 after 28-byte header: ENOSPC\n", "No space left on device"),
         "ready-sync-eio" => ("fsync ready.v1 after complete manifest: EIO\n", "Input/output error"),
         "operation-sync-eio" => ("fsync operation directory after Selection: EIO\n", "Input/output error"),
+        "publish-rename-eio" => ("renameat staged package before replacement: EIO\n", "Input/output error"),
+        "publish-sync-eio" => ("fsync replaced canonical package: EIO\n", "Input/output error"),
         _ => rtos_block::fail!("Unknown recovery fault mode"),
     };
     let source = root.join("recovery-fault.c");
@@ -26,11 +28,17 @@ pub(super) async fn recovery_fault(binary: &Path, root: &Path, zero: &Path, mode
         .env("RTOS_TEST_RECOVERY_PREFIX", format!("{}/", root.join("node_db/archive/recovery").display()))
         .env("RTOS_TEST_RECOVERY_FAULT_MARKER", &marker)
         .env("RTOS_TEST_RECOVERY_FAULT_MODE", mode)
+        .env("RTOS_TEST_FIXTURE_ROOT", root)
         .arg("--configs").arg(root).arg("--zerostate").arg(zero)
         .arg("--initial-sync-disabled").current_dir(root)
         .stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log)).spawn()?);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
+        let output = fs::read_to_string(&path)?;
+        if output.contains("Node services started.") {
+            keep_evidence(root, &path)?;
+            rtos_block::fail!("Fault did not prevent node startup: {output}");
+        }
         if let Some(status) = node.0.try_wait()? {
             assert!(!status.success(), "faulted node unexpectedly succeeded");
             break;
@@ -52,14 +60,16 @@ pub(super) async fn recovery_fault(binary: &Path, root: &Path, zero: &Path, mode
     let controls = root.join("node_db/archive/recovery");
     let operations = fs::read_dir(&controls)?.collect::<std::io::Result<Vec<_>>>()?;
     assert_eq!(operations.len(), 1);
-    let ready_fault = mode.starts_with("ready-");
+    let ready_fault = mode.starts_with("ready-") || mode.starts_with("publish-");
     let selection = operations[0].path().join(if ready_fault { "ready.v1" } else { "selection.v1" });
     let mut ready = Vec::new();
     let mut stages = 0;
     find_ready_staging(root, &mut ready, &mut stages)?;
     if ready_fault {
         assert_eq!(ready.len(), 1);
-        assert!(stages > 0, "Ready fault must follow production stage creation");
+        if mode != "publish-sync-eio" {
+            assert!(stages > 0, "failure must leave staged replacements");
+        }
         keep_evidence(root, &operations[0].path().join("selection.v1"))?;
     } else {
         assert!(ready.is_empty());
