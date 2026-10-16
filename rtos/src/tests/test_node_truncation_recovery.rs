@@ -140,7 +140,7 @@ pub(super) async fn run(
                 "sync_child(destination.last().unwrap(), &new)"
             }
             "forward-before-prepare-cache-loss" => "let expected = prepare(providers, root)?;",
-            "forward-before-cleanup" => "scan(providers, &committed, Pass::Cleanup)?;",
+            "forward-before-cleanup" | "forward-committed-cache-loss" => "scan(providers, &committed, Pass::Cleanup)?;",
             "forward-after-row-sync" | "forward-after-row-sync-cache-loss" => "let applied = scan(providers, root, Pass::Committed)?;",
             "producer-selection-before-finish" | "producer-selection-cache-loss" => "let (file, selection) = writer.finish()?;",
             "producer-ready-before-finish" | "producer-ready-cache-loss" => "let (file, ready) = writer.finish()?;",
@@ -175,6 +175,23 @@ pub(super) async fn run(
                 assert_eq!(stages, 0, "Building abort left replacement stages");
                 assert_eq!(package_inventory(root)?, before, "Building abort changed canonical packages");
                 eprintln!("Lost Ready WAL publication recovered through Building abort; second actual interruption preserved canonical packages");
+            }
+        } else if cut == "forward-committed-cache-loss" {
+            let published = package_inventory(root)?;
+            assert_ne!(published, before, "Committed cut preceded package publication");
+            let loss = match std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")?.as_str() {
+                "1" => true, "0" => false,
+                _ => rtos_block::fail!("Invalid cache-loss mode"),
+            };
+            if loss { cache_loss::clear(root).await?; }
+            assert_eq!(package_inventory(root)?, published, "cache loss changed published packages");
+            eprintln!("Committed cut cache-loss={loss}: published canonical packages preserved");
+            if loss && std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE").as_deref() == Ok("committed-wal") {
+                // Reaching this branch requires replay of Ready, not Committed.
+                interrupt_actual_recovery(binary, root, zero, "forward-after-row-sync",
+                    "let applied = scan(providers, root, Pass::Committed)?;").await?;
+                assert_eq!(package_inventory(root)?, published, "Ready replay changed final packages");
+                eprintln!("Lost Committed WAL publication replayed Ready; second actual interruption preserved final packages");
             }
         } else if cut.ends_with("-cache-loss") { cache_loss::clear(root).await?; }
         assert!(root.join("node_db/ton_node.restoring").is_file());

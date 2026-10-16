@@ -123,7 +123,7 @@ def run(binary, output, node=None):
             result["after_clear"] = {name: (mount / name).read_bytes().hex()
                                      for name in ["synced", "overwrite", "unsynced"]}
             if node is not None:
-                omitted_manifest = "ready-wal" if node.omit_ready_wal_sync else "stage" if node.omit_stage_sync else "selection" if node.omit_selection_sync else "ready" if node.omit_ready_sync else None
+                omitted_manifest = "committed-wal" if node.omit_committed_wal_sync else "ready-wal" if node.omit_ready_wal_sync else "stage" if node.omit_stage_sync else "selection" if node.omit_selection_sync else "ready" if node.omit_ready_sync else None
                 fixture_dir = mount / "fixtures"
                 fixture_dir.mkdir()
                 environment = dict(os.environ)
@@ -148,9 +148,11 @@ def run(binary, output, node=None):
                     environment.update({
                         "LD_PRELOAD": str(library),
                         "RTOS_TEST_OMIT_MANIFEST_SYNC_ROOT": str(fixture_dir) + "/",
-                        "RTOS_TEST_OMIT_MANIFEST_SYNC_FILE": (omitted_manifest if omitted_manifest in ["stage", "ready-wal"] else omitted_manifest + ".v1"),
+                        "RTOS_TEST_OMIT_MANIFEST_SYNC_FILE": (omitted_manifest if omitted_manifest in ["stage", "ready-wal", "committed-wal"] else omitted_manifest + ".v1"),
                         "RTOS_TEST_OMIT_MANIFEST_SYNC_MARKER": str(output / "manifest-sync-omitted.log"),
                     })
+                    if omitted_manifest == "committed-wal":
+                        environment["RTOS_TEST_COMMITTED_WAL_ARM"] = str(output / "committed-wal.arm")
                     result["sync_mutation"] = {"kind": f"omit {omitted_manifest} file sync only",
                                                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
                                                "library_sha256": hashlib.sha256(library.read_bytes()).hexdigest()}
@@ -160,6 +162,8 @@ def run(binary, output, node=None):
                         case = f"actual_node_unfinished_{node.cut}_cache_loss"
                     if node.cut == "stages":
                         case = "actual_node_staged_packages_cache_loss"
+                    if node.cut == "committed":
+                        case = "actual_node_committed_cache_loss"
                     result["node_cut"] = node.cut
                     result["node_cache_loss_enabled"] = not node.no_cache_loss
                     executed = subprocess.Popen(
@@ -188,17 +192,17 @@ def run(binary, output, node=None):
                     raise RuntimeError("Node test left owned processes running")
                 result["node_test_exit"] = executed.returncode
                 transcript = (output / "node-test.log").read_text()
-                expected_failure = bool(omitted_manifest) and omitted_manifest != "ready-wal" and not node.no_cache_loss
+                expected_failure = bool(omitted_manifest) and omitted_manifest not in ["ready-wal", "committed-wal"] and not node.no_cache_loss
                 result["node_failure_expected"] = expected_failure
                 if omitted_manifest:
                     marker = (output / "manifest-sync-omitted.log").read_text().splitlines()
-                    prefix = tuple(name + " omitted: " + str(fixture_dir) + "/" for name in (["fsync", "fdatasync"] if omitted_manifest == "ready-wal" else ["fsync"]))
-                    suffix = ".log" if omitted_manifest == "ready-wal" else ".pack" if omitted_manifest == "stage" else f"/{omitted_manifest}.v1"
+                    prefix = tuple(name + " omitted: " + str(fixture_dir) + "/" for name in (["fsync", "fdatasync"] if omitted_manifest in ["ready-wal", "committed-wal"] else ["fsync"]))
+                    suffix = ".log" if omitted_manifest in ["ready-wal", "committed-wal"] else ".pack" if omitted_manifest == "stage" else f"/{omitted_manifest}.v1"
                     if len(marker) != 1 or not marker[0].startswith(prefix) or not marker[0].endswith(suffix):
                         raise RuntimeError("Sync mutation did not hit exactly one scoped file")
                     result["sync_mutation"]["hits"] = marker
                 required_evidence = ["Actual node recovery interrupted at " + (
-                    f"producer-{node.cut}-cache-loss" if node.cut in ["ready", "selection"] else "forward-before-prepare-cache-loss" if node.cut == "stages" else "forward-after-row-sync")]
+                    f"producer-{node.cut}-cache-loss" if node.cut in ["ready", "selection"] else "forward-before-prepare-cache-loss" if node.cut == "stages" else "forward-committed-cache-loss" if node.cut == "committed" else "forward-after-row-sync")]
                 if expected_failure and omitted_manifest == "stage":
                     if executed.returncode != 101:
                         raise RuntimeError("Stage sync omission did not fail the actual restart")
@@ -246,8 +250,8 @@ def run(binary, output, node=None):
                     if executed.returncode != 0:
                         raise RuntimeError(f"Actual node cache-loss test failed: {executed.returncode}")
                     required_evidence.extend(["1 passed; 0 failed", "Actual node retried real truncation"])
-                if omitted_manifest == "ready-wal" and not node.no_cache_loss:
-                    required_evidence.append("Lost Ready WAL publication recovered through Building abort")
+                if omitted_manifest in ["ready-wal", "committed-wal"] and not node.no_cache_loss:
+                    required_evidence.append("Lost Ready WAL publication recovered through Building abort" if omitted_manifest == "ready-wal" else "Lost Committed WAL publication replayed Ready")
                     reports = list((output / "node").rglob("cache-loss.json"))
                     if len(reports) != 1:
                         raise RuntimeError("Missing WAL cache-loss report")
@@ -260,9 +264,15 @@ def run(binary, output, node=None):
                         raise RuntimeError("WAL omission changed a durable manifest")
                     result["changed_wal"] = target[0]
                     result["preserved_manifests"] = preserved
-                    result["building_fallback_verified"] = True
+                    result["building_fallback_verified" if omitted_manifest == "ready-wal" else "ready_replay_verified"] = True
                 if node.cut in ["ready", "selection"]:
                     required_evidence.append(f"Unfinished {node.cut.title()} cache-loss=" + ("false" if node.no_cache_loss else "true"))
+                if node.cut == "committed":
+                    required_evidence.append("Committed cut cache-loss=" + ("false" if node.no_cache_loss else "true"))
+                    if omitted_manifest == "committed-wal":
+                        arms = list((output / "node").rglob("cut-forward-committed-cache-loss.log"))
+                        if len(arms) != 1 or "Committed WAL omission armed at verified production statement" not in arms[0].read_text():
+                            raise RuntimeError("Committed WAL omission lacks verified production arm")
                 if node.cut == "stages":
                     required_evidence.append("Published Ready staging cache-loss=" + ("false" if node.no_cache_loss else "true"))
                 if node.cut == "selection":
@@ -328,7 +338,8 @@ if __name__ == "__main__":
     mutation.add_argument("--omit-selection-sync", action="store_true", help="scoped Selection sync omission sensitivity control")
     mutation.add_argument("--omit-stage-sync", action="store_true", help="scoped replacement stage sync omission control")
     mutation.add_argument("--omit-ready-wal-sync", action="store_true", help="omit one main WAL sync after durable Ready")
-    parser.add_argument("--cut", choices=["rows", "ready", "selection", "stages"], default="rows")
+    mutation.add_argument("--omit-committed-wal-sync", action="store_true", help="omit main WAL sync at verified Committed publication")
+    parser.add_argument("--cut", choices=["rows", "ready", "selection", "stages", "committed"], default="rows")
     parser.add_argument("--no-cache-loss", action="store_true", help="run the same node cut without cache loss as a control")
     parser.add_argument("--node-test-binary", type=Path)
     parser.add_argument("--node-binary", type=Path)
@@ -341,4 +352,6 @@ if __name__ == "__main__":
         parser.error("Manifest sync sensitivity requires all node arguments and --cut rows")
     if (args.omit_stage_sync or args.omit_ready_wal_sync) and (not all(node_args) or args.cut != "stages"):
         parser.error("Stage sync sensitivity requires all node arguments and --cut stages")
+    if args.omit_committed_wal_sync and (not all(node_args) or args.cut != "committed"):
+        parser.error("Committed WAL control requires all node arguments and --cut committed")
     run(args.lazyfs.resolve(strict=True), args.output.resolve(), args if all(node_args) else None)

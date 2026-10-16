@@ -16,7 +16,7 @@ static int selected(int fd, char path[PATH_MAX]) {
     const char *root = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_ROOT");
     const char *marker = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_MARKER");
     const char *file = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE");
-    if (file && !strcmp(file, "ready-wal")) file = "ready.v1";
+    if (file && (!strcmp(file, "ready-wal") || !strcmp(file, "committed-wal"))) file = "ready.v1";
     if (!root || !marker || !*root || !file
         || (strcmp(file, "ready.v1") && strcmp(file, "selection.v1") && strcmp(file, "stage"))) return 0;
     size_t prefix = strlen(root);
@@ -75,7 +75,7 @@ static int selected_wal(int fd, char path[PATH_MAX]) {
 static int sync_or_omit(int fd, long operation, const char *name) {
     char path[PATH_MAX];
     const char *mode = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE");
-    if (mode && !strcmp(mode, "ready-wal")) {
+    if (mode && (!strcmp(mode, "ready-wal") || !strcmp(mode, "committed-wal"))) {
         if (!atomic_load_explicit(&wal_armed, memory_order_acquire) && selected(fd, path)) {
             int result = syscall(operation, fd);
             if (result) return result;
@@ -91,6 +91,10 @@ static int sync_or_omit(int fd, long operation, const char *name) {
             return 0;
         }
         if (!selected_wal(fd, path)) return syscall(operation, fd);
+        if (!strcmp(mode, "committed-wal")) {
+            const char *armed = getenv("RTOS_TEST_COMMITTED_WAL_ARM");
+            if (!armed || access(armed, F_OK)) return syscall(operation, fd);
+        }
     } else if (!selected(fd, path)) return syscall(operation, fd);
     int proof = open(getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_MARKER"),
         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);

@@ -718,6 +718,30 @@ async fn interrupt_actual_recovery(
     } else {
         "recovery_worker::recover_cleaned"
     };
+    let start = if cut == "forward-committed-cache-loss"
+        && std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE").as_deref() == Ok("committed-wal") {
+        let arm = std::env::var("RTOS_TEST_COMMITTED_WAL_ARM")?;
+        let matches: Vec<_> = source.lines().enumerate().filter(|(_, line)|
+            line.trim() == "store_successor(providers, root, &committed)?;").collect();
+        assert_eq!(matches.len(), 1, "Committed arm must identify one production statement");
+        let arm_line = matches[0].0 + 1;
+        format!(r#"delete breakpoints
+break {source_file}:{arm_line}
+run
+python
+import gdb
+frame = gdb.newest_frame()
+assert frame is not None and '{function}' in frame.name(), 'wrong Committed arm frame'
+assert frame.find_sal().line == {arm_line}, 'wrong Committed arm statement'
+assert gdb.selected_inferior().pid > 0, 'missing actual node at Committed arm'
+with open({arm:?}, 'x') as output:
+    output.write('armed before Committed root publication\n')
+print('Committed WAL omission armed at verified production statement')
+end
+delete breakpoints
+break {source_file}:{line}
+continue"#)
+    } else { "run".to_owned() };
     let marker = root.join(format!("cut-{cut}.reached"));
     let script = root.join(format!("cut-{cut}.gdb"));
     fs::write(
@@ -728,7 +752,7 @@ set confirm off
 set breakpoint pending off
 set debuginfod enabled off
 break {source_file}:{line}
-run
+{start}
 python
 import gdb
 frame = gdb.newest_frame()
@@ -826,4 +850,11 @@ fn keep_evidence(root: &Path, path: &Path) -> Result<()> {
 async fn actual_node_staged_packages_cache_loss() -> Result<()> {
     exercise_nonzero_recovery_layout(false, None,
         Some((3, Some("forward-before-prepare-cache-loss"))), false).await
+}
+
+#[tokio::test]
+#[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
+async fn actual_node_committed_cache_loss() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None,
+        Some((3, Some("forward-committed-cache-loss"))), false).await
 }
