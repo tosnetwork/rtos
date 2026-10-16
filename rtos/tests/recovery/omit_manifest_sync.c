@@ -87,9 +87,11 @@ static int selected_lease_wal(int fd, char path[PATH_MAX]) {
     if (strncmp(path, root, prefix)) return 0;
     const char *fixture = path + prefix;
     const char *end = strchr(fixture, '/');
-    const char parent[] = "/node_db/db/";
-    if (!end || strncmp(fixture, ".tmp", 4) || strncmp(end, parent, sizeof(parent) - 1)) return 0;
-    const char *leaf = end + sizeof(parent) - 1;
+    const char *mode = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE");
+    const char *parent = mode && !strcmp(mode, "validator-wal") ? "/node_db/catchains/" : "/node_db/db/";
+    size_t parent_length = strlen(parent);
+    if (!end || strncmp(fixture, ".tmp", 4) || strncmp(end, parent, parent_length)) return 0;
+    const char *leaf = end + parent_length;
     size_t digits = strspn(leaf, "0123456789");
     struct stat info;
     return digits && !strcmp(leaf + digits, ".log") && !fstat(fd, &info)
@@ -99,7 +101,7 @@ static int selected_lease_wal(int fd, char path[PATH_MAX]) {
 static int sync_or_omit(int fd, long operation, const char *name) {
     char path[PATH_MAX];
     const char *mode = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE");
-    if (mode && !strcmp(mode, "lease-wal")) {
+    if (mode && (!strcmp(mode, "lease-wal") || !strcmp(mode, "validator-wal"))) {
         if (!selected_lease_wal(fd, path)) return syscall(operation, fd);
     } else if (mode && (!strcmp(mode, "ready-wal") || !strcmp(mode, "committed-wal") || !strcmp(mode, "cleaned-wal") || !strcmp(mode, "root-wal"))) {
         if (!atomic_load_explicit(&wal_armed, memory_order_acquire) && selected(fd, path)) {
