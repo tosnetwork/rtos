@@ -128,7 +128,31 @@ impl PackageEntry {
     ) -> Result<Self> {
         let mut header = [0; PKG_ENTRY_HEADER_SIZE];
         reader.read_exact(&mut header)?;
-        let header = PackageEntryHeader::deserialize(&header)?;
+        Self::read_payload_sync(reader, PackageEntryHeader::deserialize(&header)?, limits)
+    }
+
+    /// Sequential native scan: only EOF before the first header byte ends the
+    /// stream. A partial header/body remains corruption, never a clean boundary.
+    pub(super) fn read_next_bounded_sync<R: std::io::Read>(
+        reader: &mut R, limits: super::bounded_read::ArchiveReadLimits,
+    ) -> Result<Option<Self>> {
+        let mut header = [0; PKG_ENTRY_HEADER_SIZE];
+        loop {
+            match reader.read(&mut header[..1]) {
+                Ok(0) => return Ok(None),
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        reader.read_exact(&mut header[1..])?;
+        Self::read_payload_sync(reader, PackageEntryHeader::deserialize(&header)?, limits).map(Some)
+    }
+
+    fn read_payload_sync<R: std::io::Read>(
+        reader: &mut R, header: PackageEntryHeader,
+        limits: super::bounded_read::ArchiveReadLimits,
+    ) -> Result<Self> {
         // Validate both advertised lengths before allocating either payload.
         let filename_size = super::bounded_read::check_length(
             "filename", u64::from(header.filename_size), limits.filename_bytes,
@@ -153,6 +177,18 @@ impl PackageEntry {
         writer.write_all(self.filename.as_bytes()).await?;
         writer.write_all(&self.data).await?;
         writer.flush().await?;
+        Ok(layout.size)
+    }
+
+    /// Encode directly into an owned native writer without a body copy or an
+    /// async filesystem child. Flush errors propagate; file durability and actual
+    /// close receipts are separate obligations of the execution owner.
+    pub(super) fn write_to_sync<W: std::io::Write>(&self, writer: &mut W) -> Result<u64> {
+        let layout = self.layout()?;
+        writer.write_all(&layout.header.serialize())?;
+        writer.write_all(self.filename.as_bytes())?;
+        writer.write_all(&self.data)?;
+        writer.flush()?;
         Ok(layout.size)
     }
 
@@ -251,3 +287,7 @@ mod encoding_tests {
         assert_eq!((writer.writes, writer.flushes), (0, 0));
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/test_package_entry_native.rs"]
+mod native_encoding_tests;
