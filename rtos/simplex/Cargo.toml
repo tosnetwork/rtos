@@ -37,3 +37,4 @@ consensus-common = { path = '../consensus-common', features = ['test-utils'] }
 [features]
 default = []
 integration-test-support = []
+isolated-consensus-signing = ["integration-test-support"]

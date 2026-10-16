@@ -14,6 +14,27 @@ pub struct Fixture {
     data: serde_json::Value,
 }
 impl Fixture {
+    pub fn chains(&self) -> Vec<bool> {
+        if self.data["masterchain_only"].as_bool() == Some(true) { vec![false] } else { vec![false, true] }
+    }
+    #[cfg(feature = "isolated-consensus-signing")]
+    pub fn active_validator() -> Result<Self> {
+        let generated = std::process::Command::new(std::env::var("RTOS_ACTIVE_FIXTURE_GENERATOR")?)
+            .arg("--active-validator").output()?;
+        assert!(generated.status.success(), "active history generator failed");
+        let mut data: serde_json::Value = serde_json::from_slice(&generated.stdout)?;
+        for row in data["cases"].as_array_mut().unwrap() {
+            let signed = std::process::Command::new(std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER")?)
+                .args(["1", row["preimage"].as_str().unwrap(), &hex::encode(b"TOS-CONSENSUS-SIMPLEX-v1")])
+                .output()?;
+            assert!(signed.status.success(), "public fixture signing failed");
+            let text = std::str::from_utf8(&signed.stdout)?;
+            let signature = text.lines().nth(1).unwrap();
+            assert_eq!(hex::decode(signature)?.len(), 2420);
+            row["signature"] = signature.into();
+        }
+        Ok(Self { data })
+    }
     pub fn node_finality() -> Self {
         Self { data: serde_json::from_str(include_str!("static/node-finality-history.json")).unwrap() }
     }
@@ -117,7 +138,7 @@ impl Fixture {
         global["validator"] = serde_json::json!({"zero_state":{"workchain":-1,"shard":i64::MIN,"seqno":0,"root_hash":pin.root_hash.as_base64(false),"file_hash":pin.file_hash.as_base64(false)}});
         std::fs::write(dir.join("authenticated-global.json"), serde_json::to_vec(&global)?)?;
         for start in [1, 3] {
-            for wc in [false, true] {
+            for wc in self.chains() {
                 let path = archives.join(if wc {
                     format!("archive.{start:05}.0:8000000000000000.pack")
                 } else {
@@ -175,7 +196,7 @@ impl Fixture {
     }
     pub async fn assert_history(&self, db: &InternalDb, through: u32) -> Result<()> {
         for seq in 0..=through {
-            for wc in [false, true] {
+            for wc in self.chains() {
                 let id = self.id(seq, wc);
                 let block = check_imported_block(db, &id).await?;
                 let loaded = db.load_shard_state_dynamic(&id)?;
@@ -207,13 +228,14 @@ impl Fixture {
                         assert_eq!(master.file_hash, prevmc.file_hash);
                         assert_eq!(loaded.state()?.master_ref().unwrap().master, master);
                     } else {
-                        assert_eq!(block.top_blocks_all()?, vec![self.id(seq, true)]);
+                        let expected_shards = if self.chains().len() == 1 { vec![] } else { vec![self.id(seq, true)] };
+                        assert_eq!(block.top_blocks_all()?, expected_shards);
                         assert_eq!(
                             crate::shard_state::ShardHashesStuff::from(
                                 loaded.shard_state_extra()?.shards.clone()
                             )
                             .top_blocks_all()?,
-                            vec![self.id(seq, true)]
+                            expected_shards
                         );
                     }
                 }

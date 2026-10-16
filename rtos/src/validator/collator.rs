@@ -2472,6 +2472,9 @@ impl Collator {
         let prev_now = prev_data.prev_state_utime();
         let ccvc = collator_data.config.raw_config().catchain_config()?;
         let lifetime = ccvc.mc_catchain_lifetime;
+        if self.shard.is_masterchain() && lifetime == 0 {
+            fail!("masterchain catchain lifetime must be nonzero");
+        }
         if self.shard.is_masterchain()
             && now / lifetime > prev_now / lifetime
             && now > (prev_now / lifetime + 1) * lifetime + 20

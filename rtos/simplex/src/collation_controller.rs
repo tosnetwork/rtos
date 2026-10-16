@@ -3622,19 +3622,13 @@ impl CollationController {
         //
         // Falls back to raw bytes if canonicalization fails (e.g., in unit tests with
         // mock data that's not valid BOC). In production, all data is valid BOC.
-        let file_hash =
-            match consensus_common::compression::canonicalize_boc(data.data(), BocFlags::all()) {
-                Ok(canonical) => UInt256::from_slice(&sha256_digest(&canonical)),
-                Err(_) => UInt256::from_slice(&sha256_digest(data.data())),
-            };
-
-        let collated_file_hash = match consensus_common::compression::canonicalize_boc(
-            collated_data.data(),
-            BocFlags::Crc32,
-        ) {
-            Ok(canonical) => UInt256::from_slice(&sha256_digest(&canonical)),
-            Err(_) => UInt256::from_slice(&sha256_digest(collated_data.data())),
-        };
+        let canonical_data = consensus_common::compression::canonicalize_boc(data.data(), BocFlags::all())
+            .unwrap_or_else(|_| data.data().to_vec());
+        let canonical_collated_data = consensus_common::compression::canonicalize_boc(
+            collated_data.data(), BocFlags::Crc32,
+        ).unwrap_or_else(|_| collated_data.data().to_vec());
+        let file_hash = UInt256::from_slice(&sha256_digest(&canonical_data));
+        let collated_file_hash = UInt256::from_slice(&sha256_digest(&canonical_collated_data));
         log::trace!(
             "Session {} create_normal_block_desc: slot={}, root_hash={:x}",
             self.session_id().to_hex_string(),
@@ -3761,25 +3755,24 @@ impl CollationController {
             signature: signature.clone(),
         });
 
-        // Compute actual file hashes for FSM
-        let computed_file_hash = consensus_common::utils::get_hash_from_block_payload(data);
-        let computed_collated_file_hash =
-            consensus_common::utils::get_hash_from_block_payload(collated_data);
+        // The FSM, durable metadata and broadcast must describe the same bytes.
+        // Compression reconstructs the canonical BOCs, so retaining the original
+        // input hashes here would make our own candidate fail restart verification.
         let gen_utime_ms = crate::utils::extract_consensus_gen_utime_ms(collated_data.data());
 
         let block_id_ext = BlockIdExt {
             shard_id: self.description.get_shard().clone(),
             seq_no: expected_seqno,
             root_hash: root_hash.clone(),
-            file_hash: computed_file_hash,
+            file_hash,
         };
 
         // Create block candidate for FSM
         let block_candidate = crate::block::BlockCandidate {
             id: block_id_ext.clone(),
-            collated_file_hash: computed_collated_file_hash,
-            data: data.data().to_vec(),
-            collated_data: collated_data.data().to_vec(),
+            collated_file_hash,
+            data: canonical_data,
+            collated_data: canonical_collated_data,
             creator: self
                 .description
                 .get_source_public_key(self.description.require_validator_index()?)

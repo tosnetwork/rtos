@@ -1045,7 +1045,7 @@ impl SessionFactory {
             Some(runtime.clone()),
             delivery_sink,
             false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "isolated-consensus-signing"))]
             None,
         )
     }
@@ -1095,7 +1095,7 @@ impl SessionFactory {
             delivery_sink,
             Some(delivered_completion),
             false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "isolated-consensus-signing"))]
             None,
         )
     }
@@ -1173,7 +1173,7 @@ impl SessionFactory {
             Some(runtime.clone()),
             Some(delivery_sink),
             true,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "isolated-consensus-signing"))]
             None,
         )?;
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1239,7 +1239,7 @@ impl SessionFactory {
             Some(delivery_sink),
             Some(delivered_completion),
             true,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "isolated-consensus-signing"))]
             None,
         )?;
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1283,3 +1283,7 @@ mod signing_coordinator;
 #[cfg(test)]
 #[path = "tests/authenticated_fixture.rs"]
 pub(crate) mod authenticated_fixture;
+
+/// Explicit offline provisioning and recovery for isolated consensus builds.
+#[cfg(feature = "isolated-consensus-signing")]
+pub mod isolated_signing;

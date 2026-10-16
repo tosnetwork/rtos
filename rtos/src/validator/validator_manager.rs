@@ -3083,7 +3083,7 @@ impl ValidatorManagerImpl {
                         );
                         Arc::new(match &authenticated {
                             Some((_, runtime)) => {
-                                group.with_authenticated_runtime(runtime.clone())?
+                                group.with_recovered_authenticated_runtime(runtime.clone()).await?
                             }
                             None => group,
                         })
@@ -3618,7 +3618,7 @@ impl ValidatorManagerImpl {
                         block_sync_overlay_params.clone(),
                     );
                     let group = Arc::new(match &authenticated {
-                        Some((_, runtime)) => group.with_authenticated_runtime(runtime.clone())?,
+                        Some((_, runtime)) => group.with_recovered_authenticated_runtime(runtime.clone()).await?,
                         None => group,
                     });
                     self.future_sessions.insert(session_id.clone(), group.clone());

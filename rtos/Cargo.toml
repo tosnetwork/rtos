@@ -136,6 +136,7 @@ default = ['telemetry', 'rtos_block/export_key', 'validator_session/export_key',
 jemalloc = ['tikv-jemallocator', 'tikv-jemalloc-ctl']
 cell_counter = ['rtos_block/cell_counter']
 ci_run = []
+isolated-consensus-signing = ["simplex/isolated-consensus-signing"]
 export_key = ['catchain/export_key', 'rtos_block/export_key']
 mirrornet = ['rtos_block/mirrornet']
 only_sorted_clean = []

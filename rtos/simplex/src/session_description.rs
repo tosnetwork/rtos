@@ -368,7 +368,7 @@ impl SessionDescription {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "isolated-consensus-signing"))]
     pub fn install_test_coordinator(
         &self,
         coordinator: std::sync::Arc<crate::signing_coordinator::SigningCoordinator>,

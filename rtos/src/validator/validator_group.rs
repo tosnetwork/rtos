@@ -600,8 +600,9 @@ impl ValidatorGroupImpl {
                 self.shard,
                 self.cc_seqno
             );
-            session
-                .start(self.prev_block_ids.get_prevs().to_vec(), min_masterchain_block_id.clone());
+            let (session_prevs, session_mc) = g.recovered_session_start.clone()
+                .unwrap_or_else(|| (self.prev_block_ids.get_prevs().to_vec(), min_masterchain_block_id.clone()));
+            session.start(session_prevs, session_mc);
         }
 
         log::info!(target: "validator",
@@ -1071,6 +1072,7 @@ pub struct ValidatorGroup {
     pq_session: std::result::Result<Option<rtos_api::pq_finality::PqSessionContext>, String>,
     authenticated_runtime:
         Option<Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>>,
+    recovered_session_start: Option<(Vec<BlockIdExt>, BlockIdExt)>,
     namespace_admission: Mutex<NormalNamespaceAdmission>,
     durable_finality_sink:
         tokio::sync::OnceCell<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
@@ -1164,6 +1166,35 @@ impl ResolverBackend for ValidatorGroup {
 }
 
 impl ValidatorGroup {
+    /// Reauthenticate persisted session floors before publishing a restarted group.
+    /// Current admission must still match; disk metadata grants no signing rights.
+    pub async fn with_recovered_authenticated_runtime(
+        mut self,
+        current: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+    ) -> Result<Self> {
+        let root = std::path::PathBuf::from(self.engine.db_root_dir()?).join("catchains");
+        let namespace = current.runtime_directory(
+            root.to_str().ok_or_else(|| error!("Invalid consensus DB root"))?,
+        )?;
+        let record = simplex::finality_recovery::locate_session_start(
+            std::path::Path::new(&namespace),
+        )?;
+        let Some(record) = record else {
+            return self.with_authenticated_runtime(current);
+        };
+        let authenticated = super::retired_session_auth::authenticate_retired_session(
+            self.engine.as_ref(), &record,
+        ).await?;
+        if !current.same_admission(authenticated.runtime()) {
+            fail!("Recovered session admission differs from current authenticated admission");
+        }
+        self.recovered_session_start = Some((
+            authenticated.record().prev_blocks.clone(),
+            authenticated.record().start_masterchain.clone(),
+        ));
+        self.with_authenticated_runtime(authenticated.runtime().clone())
+    }
+
     /// Frozen membership and role used to decide whether a live group can be reused.
     pub fn authenticated_runtime(
         &self,
@@ -1307,6 +1338,7 @@ impl ValidatorGroup {
             validator_set,
             pq_session,
             authenticated_runtime: None,
+            recovered_session_start: None,
             durable_finality_sink: tokio::sync::OnceCell::new(),
             delivered_finality_sink: tokio::sync::OnceCell::new(),
             namespace_admission: Mutex::new(NormalNamespaceAdmission::default()),
@@ -2471,7 +2503,15 @@ impl ValidatorGroup {
 
         let shard = self.shard().clone();
         let engine = self.engine.clone();
-        let local_key = self.local_key.clone();
+        let collator_transport = self.local_key.clone();
+        let collator_identity = match self.local_identity.clone() {
+            Some(identity) => identity,
+            None => {
+                self.is_collating.store(false, Ordering::Release);
+                callback(Err(error!("Observer cannot generate a validator block")));
+                return;
+            }
+        };
         let validator_set = self.validator_set.clone(); //TODO: optimize
         let group_impl = self.group_impl.clone();
         let state_resolver_cache = self.state_resolver_cache.clone();
@@ -2545,7 +2585,8 @@ impl ValidatorGroup {
                                 mc.seq_no,
                                 &prev_block_ids,
                                 state_resolver_cache.clone(),
-                                local_key,
+                                collator_identity,
+                                collator_transport,
                                 validator_set.clone(),
                                 engine.clone(),
                                 is_simplex,

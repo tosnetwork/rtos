@@ -743,6 +743,36 @@ pub fn scan_finality_recovery(root: &std::path::Path) -> Result<Vec<SessionRecov
     Ok(sessions)
 }
 
+/// Locate the original live-session context, including already delivered intents.
+/// This is untrusted input: the node must authenticate both historical anchors
+/// and the ordered parents before using it to resume a signing session.
+pub fn locate_session_start(namespace: &std::path::Path) -> Result<Option<SessionRecoveryRecord>> {
+    let store = FinalityIntentStore::new(namespace);
+    let mut found: Option<SessionRecoveryRecord> = None;
+    for path in store.paths()? {
+        let (record, _) = read_intent(&path, namespace)?;
+        if let Some(existing) = &found {
+            if existing.binding != record.binding
+                || existing.pin != record.pin
+                || existing.protocol != record.protocol
+                || existing.carrier_version != record.carrier_version
+                || existing.wire_profile != record.wire_profile
+                || existing.profile != record.profile
+                || existing.session_id != record.session_id
+                || existing.local_adnl != record.local_adnl
+                || existing.local_validator_index != record.local_validator_index
+                || existing.prev_blocks != record.prev_blocks
+                || existing.start_masterchain != record.start_masterchain
+            {
+                fail!("Conflicting live session start contexts within namespace");
+            }
+        } else {
+            found = Some(record);
+        }
+    }
+    Ok(found)
+}
+
 /// Scan one namespace so Engine can isolate malformed/legacy records and fairly
 /// revisit other sessions. None means no idle unresolved work, not authentication.
 pub fn scan_finality_recovery_namespace(
@@ -1079,6 +1109,10 @@ mod tests {
         );
         assert_eq!(reopened.legacy_output_count().unwrap(), 0);
         assert!(scan_finality_recovery(directory.path()).unwrap().is_empty());
+        let start = locate_session_start(&namespace).unwrap().expect("completed intent preserves live session floor");
+        start.validate_runtime(&runtime).unwrap();
+        assert_eq!(start.prev_blocks, records[0].prev_blocks);
+        assert_eq!(start.start_masterchain, records[0].start_masterchain);
         assert_eq!(reopened.paths().unwrap().len(), 1, "canonical resolved evidence retained");
         std::fs::write(&reopened.paths().unwrap()[0], b"{broken").unwrap();
         assert!(

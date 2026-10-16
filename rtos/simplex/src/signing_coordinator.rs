@@ -282,7 +282,7 @@ impl Signer {
         }
         Ok(())
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "isolated-consensus-signing"))]
     pub(crate) fn from_test_custody(
         custody: &rtos_pq_consensus::PqConsensusCustody,
         validator: &UInt256,
@@ -301,14 +301,14 @@ impl Signer {
 }
 /// Isolated test capability: compiled out of production and never sourced from
 /// node configuration. It exercises the actual session worker/journal/custody path.
-#[cfg(test)]
+#[cfg(any(test, feature = "isolated-consensus-signing"))]
 pub(crate) struct TestSessionSigner {
     pub store: std::sync::Arc<rtos_pq_consensus::ConsensusKeyStore>,
     pub owner_root: std::path::PathBuf,
     pub generation: u64,
     pub initialize: bool,
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "isolated-consensus-signing"))]
 impl TestSessionSigner {
     pub(crate) fn open(self, runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
         db: SimplexDbPtr) -> Result<std::sync::Arc<SigningCoordinator>> {

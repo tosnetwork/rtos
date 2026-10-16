@@ -2024,7 +2024,9 @@ impl ValidateQuery {
             })
             .map_err(|err| error!("new shard configuration is invalid : {:?}", err))?;
 
-        base.prev_state_extra.config.workchains()?.iterate_keys(|wc_id: i32| {
+        // Retain actual prior shard records. A configured inactive workchain
+        // has no shards until activation, matching the collator's admission.
+        base.prev_state_extra.shards().iterate_keys(|wc_id: i32| {
             if base.mc_extra.shards().get(&wc_id)?.is_none() {
                 reject_query!(
                     "shards of workchain {} existed in previous \
@@ -2098,6 +2100,9 @@ impl ValidateQuery {
         let ccvc = base.next_state_extra.config.catchain_config()?;
         let cur_validators = base.next_state_extra.config.validator_set()?;
         let lifetime = ccvc.mc_catchain_lifetime;
+        if lifetime == 0 {
+            reject_query!("masterchain catchain lifetime must be nonzero");
+        }
         let is_key_block = base.info.key_block();
         let mut cc_updated = false;
         let catchain_seqno = new_info.catchain_seqno;

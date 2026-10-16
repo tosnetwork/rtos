@@ -15,7 +15,7 @@ pub(crate) async fn prepare_dynamic(root: &Path, fixture: &Fixture) -> Result<()
     fixture.assert_imported(&source, 4).await?;
     let mut history = Vec::new();
     for seq in 0..=4 {
-        for wc in [false, true] {
+        for wc in if seq == 0 { vec![false, true] } else { fixture.chains() } {
             let id = fixture.id(seq, wc);
             let handle = source.load_block_handle(&id)?.unwrap();
             let state = source.load_shard_state_dynamic(&id)?;

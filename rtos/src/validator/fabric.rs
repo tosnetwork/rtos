@@ -282,7 +282,8 @@ pub async fn run_collate_query(
     min_mc_seqno: u32,
     prev: &PrevBlockHistory,
     state_resolver_cache: Arc<tokio::sync::Mutex<StateResolverCache>>,
-    collator_id: PublicKey,
+    collator_id: consensus_common::ValidatorIdentity,
+    collator_transport: PublicKey,
     set: ValidatorSet,
     engine: Arc<dyn EngineOperations>,
     is_simplex: bool,
@@ -302,7 +303,7 @@ pub async fn run_collate_query(
         prev,
         state_resolver_cache,
         set,
-        UInt256::from(collator_id.pub_key()?),
+        collator_id.block_creator()?,
         engine.clone(),
         None,
         CollatorSettings {
@@ -355,7 +356,7 @@ pub async fn run_collate_query(
             }
 
             return Ok((
-                validator_query_candidate_to_validator_block_candidate(collator_id, candidate),
+                validator_query_candidate_to_validator_block_candidate(collator_transport, candidate),
                 new_state,
                 new_block,
                 block_root,

@@ -25,13 +25,26 @@ fn reference(id: &BlockIdExt) -> ExtBlkRef {
         file_hash: id.file_hash.clone(),
     }
 }
+fn install_config_account(state: &mut ShardStateUnsplit, config: &ConfigParams) {
+    let mut data = BuilderData::new();
+    data.checked_append_reference(config.config_params.data().unwrap().clone()).unwrap();
+    let mut init = StateInit::default();
+    init.set_code(BuilderData::with_raw(vec![0], 8).unwrap().into_cell().unwrap());
+    init.set_data(data.into_cell().unwrap());
+    let account = Account::active_standard(config.config_addr.clone(), 0, 0, state.gen_time(), init);
+    state.insert_account(&config.config_addr, &ShardAccount::with_params(&account, UInt256::default(), 0).unwrap()).unwrap();
+}
+
 fn main() {
-    let finality = std::env::args().any(|arg| arg == "--retained-finality");
+    let active = std::env::args().any(|arg| arg == "--active-validator");
+    let finality = active || std::env::args().any(|arg| arg == "--retained-finality");
+    let genesis_time = if active { u32::try_from(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()).unwrap() - 4 } else { 1_700_000_000 };
     let shard = ShardIdent::with_tagged_prefix(0, SHARD_FULL).unwrap();
     let mut wcstate = ShardStateUnsplit::default();
     wcstate.set_global_id(-239);
     wcstate.set_shard(shard.clone());
-    wcstate.set_gen_time(1_700_000_000);
+    wcstate.set_gen_time(genesis_time);
     let mut wcroot = wcstate.serialize().unwrap();
     let wczero = id(&wcroot, 0, shard.clone());
     let wcboc = write_boc(&wcroot).unwrap();
@@ -41,6 +54,14 @@ fn main() {
         let simplex = SimplexConfig { protocol_version: 2, ..Default::default() };
         config.set_config(ConfigParamEnum::ConfigParam30(NewConsensusConfigAll {
             mc: Some(simplex.clone()), shard: Some(simplex),
+        })).unwrap();
+    }
+    if active {
+        config.set_config(ConfigParamEnum::ConfigParam31(ConfigParam31::default())).unwrap();
+        config.set_config(ConfigParamEnum::ConfigParam28(CatchainConfig {
+            mc_catchain_lifetime: 86_400, shard_catchain_lifetime: 600,
+            shard_validators_lifetime: 3_600, shard_validators_num: 1,
+            shuffle_mc_validators: false, ..Default::default()
         })).unwrap();
     }
     let template = ShardStateUnsplit::construct_from_bytes(include_bytes!(
@@ -61,10 +82,15 @@ fn main() {
             Ok(true)
         })
         .unwrap();
-    let validators = config.validator_set().unwrap().list().to_vec();
+    let validators = if active {
+        let member = config.validator_set().unwrap().list()[1].clone();
+        let transport = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x61; 32]).unwrap();
+        vec![ValidatorDescr::with_pq_params(member.validator_id().unwrap(), member.pq_key().unwrap().clone(),
+            member.weight, UInt256::from(*transport.id().data()))]
+    } else { config.validator_set().unwrap().list().to_vec() };
     config
         .set_config(ConfigParamEnum::ConfigParam34(ConfigParam34 {
-            cur_validators: ValidatorSet::new(1_600_000_000, u32::MAX, 2, validators).unwrap(),
+            cur_validators: ValidatorSet::new(1_600_000_000, u32::MAX, if active { 1 } else { 2 }, validators).unwrap(),
         }))
         .unwrap();
     let mut workchains = ConfigParam12::default();
@@ -72,8 +98,8 @@ fn main() {
         .insert(
             0,
             &WorkchainDescr {
-                active: true,
-                accept_msgs: true,
+                active: !active,
+                accept_msgs: !active,
                 zerostate_root_hash: wczero.root_hash.clone(),
                 zerostate_file_hash: wczero.file_hash.clone(),
                 format: WorkchainFormat::Basic(WorkchainFormat1::with_params(0, 0)),
@@ -89,11 +115,17 @@ fn main() {
     let mut state = ShardStateUnsplit::default();
     state.set_global_id(-239);
     state.set_shard(ShardIdent::masterchain());
-    state.set_gen_time(1_700_000_000);
+    state.set_gen_time(genesis_time);
     let mut custom = McStateExtra::default();
     custom.config = config.clone();
     custom.after_key_block = true;
+    if active {
+        custom.validator_info.catchain_seqno = 7;
+        custom.validator_info.validator_list_hash_short = ValidatorSet::calc_subset_hash_short(
+            config.validator_set().unwrap().list(), 0).unwrap();
+    }
     state.write_custom(Some(&custom)).unwrap();
+    if active { install_config_account(&mut state, &config); }
     let mut state_root = state.serialize().unwrap();
     let zero = id(&state_root, 0, ShardIdent::masterchain());
     let zero_boc = write_boc(&state_root).unwrap();
@@ -108,7 +140,7 @@ fn main() {
         let mc_end_lt = mc_start_lt + 1_000;
         wcstate.set_seq_no(seq);
         wcstate.set_gen_lt(wc_end_lt);
-        wcstate.set_gen_time(1_700_000_000 + seq);
+        wcstate.set_gen_time(genesis_time + seq);
         wcstate.set_master_ref(Some(BlkMasterInfo { master: reference(&previous) }));
         let nextwc = wcstate.serialize().unwrap();
         let mut wcinfo = BlockInfo::default();
@@ -116,7 +148,7 @@ fn main() {
         wcinfo.set_start_lt(wc_start_lt);
         wcinfo.set_end_lt(wc_end_lt);
         wcinfo.set_shard(shard.clone());
-        wcinfo.set_gen_utime(1_700_000_000 + seq);
+        wcinfo.set_gen_utime(genesis_time + seq);
         wcinfo.set_prev_stuff(false, &BlkPrevInfo::Block { prev: reference(&wcprevious) }).unwrap();
         wcinfo.write_master_ref(Some(&BlkMasterInfo { master: reference(&previous) })).unwrap();
         let wcblock = Block::with_params(
@@ -141,7 +173,7 @@ fn main() {
             reg_mc_seqno: seq,
             root_hash: wcid.root_hash.clone(),
             file_hash: wcid.file_hash.clone(),
-            gen_utime: 1_700_000_000 + seq,
+            gen_utime: genesis_time + seq,
             start_lt: wc_start_lt,
             end_lt: wc_end_lt,
             next_validator_shard: SHARD_FULL,
@@ -149,8 +181,10 @@ fn main() {
             ..Default::default()
         };
         let mut shards = ShardHashes::default();
-        shards.add_workchain(0, 0, wczero.root_hash.clone(), wczero.file_hash.clone()).unwrap();
-        shards.update_shard(&shard, |_| Ok(descr)).unwrap();
+        if !active {
+            shards.add_workchain(0, 0, wczero.root_hash.clone(), wczero.file_hash.clone()).unwrap();
+            shards.update_shard(&shard, |_| Ok(descr)).unwrap();
+        }
         custom
             .prev_blocks
             .set(
@@ -171,8 +205,9 @@ fn main() {
         custom.last_key_block = last_key.clone();
         state.set_seq_no(seq);
         state.set_gen_lt(mc_end_lt);
-        state.set_gen_time(1_700_000_000 + seq);
+        state.set_gen_time(genesis_time + seq);
         state.write_custom(Some(&custom)).unwrap();
+        if active { install_config_account(&mut state, &config); }
         let next_state = state.serialize().unwrap();
         let mut info = BlockInfo::default();
         info.set_seq_no(seq).unwrap();
@@ -180,9 +215,9 @@ fn main() {
         info.set_end_lt(mc_end_lt);
         info.set_shard(ShardIdent::masterchain());
         info.set_key_block(key);
-        info.set_gen_utime(1_700_000_000 + seq);
+        info.set_gen_utime(genesis_time + seq);
         info.set_prev_key_block_seqno(epoch);
-        info.set_vertical_stuff(0, 1, None).unwrap();
+        info.set_vertical_stuff(0, if active { 0 } else { 1 }, None).unwrap();
         if finality {
             info.set_gen_catchain_seqno(7);
             let (_, hash) = governing.validator_set().unwrap().calc_subset(
@@ -191,7 +226,7 @@ fn main() {
         }
         info.set_prev_stuff(false, &BlkPrevInfo::Block { prev: reference(&previous) }).unwrap();
         let mut extra = BlockExtra::default();
-        if finality { *extra.created_by_mut() = UInt256::from([1; 32]); }
+        if finality { *extra.created_by_mut() = UInt256::from([if active { 2 } else { 1 }; 32]); }
         let mut mc = McBlockExtra::default();
         *mc.shards_mut() = shards;
         if key {
@@ -212,7 +247,7 @@ fn main() {
             -239,
             &governing,
             blockid.clone(),
-            1,
+            if active { 0 } else { 1 },
             epoch,
             7,
         )
@@ -256,8 +291,7 @@ fn main() {
         wcprevious = wcid;
         wcroot = nextwc;
     }
-    println!(
-        "{}",
-        serde_json::json!({"zerostate":hex::encode(zero_boc),"wc_zerostate":hex::encode(wcboc),"zero_root":zero.root_hash.as_hex_string(),"zero_file":zero.file_hash.as_hex_string(),"cases":rows})
-    );
+    let mut output = serde_json::json!({"zerostate":hex::encode(zero_boc),"wc_zerostate":hex::encode(wcboc),"zero_root":zero.root_hash.as_hex_string(),"zero_file":zero.file_hash.as_hex_string(),"cases":rows});
+    if active { output["masterchain_only"] = true.into(); }
+    println!("{}", output);
 }

@@ -589,10 +589,14 @@ impl SessionStartupRecoveryProcessor {
                 rtos_block::fail!("PQ recovery wrong candidate leader");
             }
             let bytes = serialize_boxed(&info.candidate_hash_data)?;
-            if UInt256::calc_file_hash(&bytes) != info.candidate_id.hash
-                || info.candidate_hash_data.block().shard() != self.description.get_shard()
-            {
-                rtos_block::fail!("PQ recovery candidate identity mismatch");
+            let computed = UInt256::calc_file_hash(&bytes);
+            if computed != info.candidate_id.hash {
+                rtos_block::fail!("PQ recovery candidate hash mismatch at slot {}: stored {}, computed {}",
+                    info.candidate_id.slot.value(), info.candidate_id.hash, computed);
+            }
+            if info.candidate_hash_data.block().shard() != self.description.get_shard() {
+                rtos_block::fail!("PQ recovery candidate shard mismatch at slot {}: stored {}, expected {}",
+                    info.candidate_id.slot.value(), info.candidate_hash_data.block().shard(), self.description.get_shard());
             }
             if !crate::utils::check_candidate_signature(
                 &self.session_id,
