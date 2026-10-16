@@ -610,6 +610,15 @@ impl Default for SessionOptions {
 }
 
 impl SessionOptions {
+    pub(crate) fn validate_carrier(wire: rtos_api::WireProfile, version: u32) -> Result<()> {
+        // Param29 is independent of the Param30 Simplex protocol. The native
+        // T0 candidate carrier uses version 5, including CRC32 collated data.
+        if version <= 1 || (wire == rtos_api::WireProfile::T0 && version == 5) {
+            Ok(())
+        } else {
+            fail!("Unsupported Simplex carrier version {version} for {wire:?}")
+        }
+    }
     /// Validate options and return error if invalid
     pub fn validate(&self) -> Result<()> {
         self.protocol.admits_runtime()?;
@@ -631,9 +640,7 @@ impl SessionOptions {
     }
 
     fn validate_fields(&self) -> Result<()> {
-        if self.proto_version > 1 {
-            fail!("Simplex supports protocol versions 0 and 1 only");
-        }
+        Self::validate_carrier(self.wire_profile, self.proto_version)?;
         if self.slots_per_leader_window == 0 {
             fail!("slots_per_leader_window must be >= 1")
         }

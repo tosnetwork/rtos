@@ -32,6 +32,41 @@ not prove Rust signed, validated a candidate, produced a block, or has the same
 state root. Those are subsequent acceptance requirements; a bootstrap result
 must not close the mixed-validator gate.
 
+To exercise active signing, build both programs with the explicit isolated
+signing feature and use the frozen `8f083dc` C++ snapshot:
+
+```sh
+cargo +1.91.1 build -p rtos --bin rtos --bin interop_validator_prepare \
+  --features isolated-consensus-signing --locked
+"$CPP_PYTHON" ci/interop/mixed_bootstrap.py \
+  --snapshot "$CPP_SNAPSHOT" --rust-node "$RUST_NODE" \
+  --validator-preparer "$VALIDATOR_PREPARER" \
+  --output "$ACTIVE_OUTPUT" --base-port 55600 --timeout 180
+```
+
+This mode starts two C++ validators and Rust in a four-member committee. The
+remaining C++ identities never start, so C++ alone cannot form a quorum. Fresh
+public deterministic transport/PQ identities are bound to the generated
+Genesis; offline preparation creates the matching MC and shard session journals
+before Rust starts. Existing configurations/databases are refused. Independent
+test shards use separate explicit journal owner directories. This isolated
+provisioning is not an operator custody or committee-rotation implementation.
+The native Param29 carrier version 5 is admitted with T0 wire format; it remains
+distinct from the Param30 Simplex protocol version 2.
+
+An active result requires both C++ nodes to agree at MC4 and Rust to apply at
+least MC4. This measures required Rust participation in chain progress. It does
+not close the full mixed-validator gate or prove every transaction/state profile
+and every Rust leadership case.
+
+The initial `8f083dc` active run reached MC4 with C++ weight 34 and Rust weight
+17 against quorum 46 (total 68). Native QUIC uses ALPN `tos` in both directions.
+This bounded result demonstrates required Rust voting participation. The initial
+fixture provisions the Genesis masterchain session only when Genesis has no
+shard descriptors; subsequent workchain and future-session provisioning remains
+unfinished. Preserve shutdown receipts: a forced test-process stop is not an
+orderly-shutdown or recovery qualification.
+
 `overlay-node-vector.cpp` uses the production C++ TL serializer to generate
 the two wire fixtures in `adnl/src/overlay/testdata/`. The adjacent JSON pins
 the reference revision. Run it against that revision's generated TL headers,

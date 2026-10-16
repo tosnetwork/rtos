@@ -8,6 +8,41 @@ use std::{
         Arc,
     },
 };
+
+#[test]
+fn native_carrier5_signing_and_recovery_preserve_exact_vote() {
+    let root = crate::authenticated_fixture::TestDirectory::new();
+    let store = Arc::new(rtos_pq_consensus::ConsensusKeyStore::from_seed(&[0x95; 32], 0).unwrap());
+    let (mut nodes, keys) = f::members();
+    nodes[1] = crate::SimplexSessionNode::from_descriptor(&custody_descriptor(&store)).unwrap();
+    let options = SessionOptions { wire_profile: rtos_api::WireProfile::T0, proto_version: 5,
+        ..Default::default() };
+    options.validate().unwrap();
+    for (wire_profile, proto_version) in [(rtos_api::WireProfile::Legacy, 5),
+        (rtos_api::WireProfile::T0, 6), (rtos_api::WireProfile::T0, u32::MAX)] {
+        assert!(SessionOptions { wire_profile, proto_version, ..Default::default() }.validate().is_err());
+    }
+    let description = Arc::new(SessionDescription::new(&options, f::session(), 42, &nodes,
+        keys[1].clone(), &ShardIdent::masterchain(), SystemTime::now(), None)
+        .unwrap().bind_pq_session(7).unwrap());
+    let mut binding = binding(&description);
+    binding.protocol = options.proto_version;
+    assert_eq!(binding.protocol, 5);
+    let db = crate::database::SimplexDb::open(root.path().join("db"), "carrier5").unwrap();
+    let open = |initialize| SigningCoordinator::open(db.clone(), binding.clone(),
+        description.get_source_public_key(description.get_self_idx()).clone(), root.path(),
+        initialize, custody_backend(&description, store.clone()));
+    let signer = open(true).unwrap();
+    let signed = signer.vote(&vote("notarize")).unwrap();
+    assert_eq!(store.consensus_signatures_produced(), 1);
+    drop(signer);
+    let recovered = open(false).unwrap();
+    recovered.check_session(&description).unwrap();
+    assert_eq!(recovered.vote(&vote("notarize")).unwrap(), signed);
+    assert_eq!(store.consensus_signatures_produced(), 1);
+    drop(recovered);
+    db.close(None).unwrap();
+}
 pub(crate) fn description() -> Arc<SessionDescription> {
     description_with_profile(rtos_api::WireProfile::Legacy)
 }

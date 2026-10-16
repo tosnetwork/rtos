@@ -359,8 +359,8 @@ impl SigningCoordinator {
     ) -> Result<Self> {
         let pq = identity.pq_key().ok_or_else(|| error!("journal requires PQ identity"))?;
         binding.validate_schema()?;
-        if binding.protocol > 1
-            || binding.generation == 0
+        crate::SessionOptions::validate_carrier(binding.wire()?, binding.protocol)?;
+        if binding.generation == 0
             || binding.slots_per_window == 0
             || binding.validator_count == 0
             || binding.local_index >= binding.validator_count

@@ -14,14 +14,14 @@ const MAGIC: &[u8] = b"RTOS-NETWORK-DB-v1\n";
 
 /// Held for the engine lifetime. The OS releases the advisory lock on exit.
 /// It serializes participating RTOS starts, not unrelated database utilities.
-pub(crate) struct DbNetworkBinding {
+pub struct DbNetworkBinding {
     _lock: File,
 }
 
 impl DbNetworkBinding {
     /// Must finish before any network startup, database creation, upgrade,
     /// truncation or recovery. An unbound nonempty directory is never adopted.
-    pub(crate) fn acquire(directory: &Path, anchor: &BlockIdExt) -> Result<Self> {
+    pub fn acquire(directory: &Path, anchor: &BlockIdExt) -> Result<Self> {
         if !anchor.shard().is_masterchain_ext()
             || anchor.seq_no != 0
             || anchor.root_hash == UInt256::default()

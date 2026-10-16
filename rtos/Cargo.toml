@@ -149,3 +149,8 @@ xp25 = ['rtos_block/xp25', 'adnl/xp25']
 [[bin]]
 name = 'archive_recovery_check'
 path = 'bin/archive_recovery_check.rs'
+
+[[bin]]
+name = 'interop_validator_prepare'
+path = 'bin/interop_validator_prepare.rs'
+required-features = ['isolated-consensus-signing']
