@@ -4,16 +4,16 @@ use super::*;
 use std::sync::Arc;
 use storage::{db::DbKey, types::{PersistentStatePartId, PersistentStatePartKey}};
 
-fn part(mode: &str) -> PersistentStatePartId {
+pub(super) fn part(mode: &str) -> PersistentStatePartId {
     let id = Fixture::node_recovery().id(3, false);
     if mode == "head" { PersistentStatePartId::Head(id) } else { PersistentStatePartId::WholeState(id) }
 }
-fn path(root: &Path, mode: &str) -> PathBuf {
+pub(super) fn path(root: &Path, mode: &str) -> PathBuf {
     let key = PersistentStatePartKey::from(&part(mode));
     let name = hex::encode(key.key());
     root.join("node_db/shard_state_persistent_db").join(&name[..4]).join(&name[4..])
 }
-fn ack_path(root: &Path, mode: &str) -> PathBuf { root.join(format!("persistent-{mode}-ack.json")) }
+pub(super) fn ack_path(root: &Path, mode: &str) -> PathBuf { root.join(format!("persistent-{mode}-ack.json")) }
 
 #[tokio::test]
 #[ignore = "internal child; requires owned persistent snapshot fixture"]

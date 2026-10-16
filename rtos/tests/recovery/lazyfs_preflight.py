@@ -189,7 +189,7 @@ def run(binary, output, node=None):
                     if node.cut in ["validator-prune", "validator-prune-empty"]:
                         case = "actual_node_" + node.cut.replace("-", "_") + "_cache_loss"
                     if node.cut.startswith("persistent-"):
-                        case = "actual_node_" + node.cut.replace("-", "_") + "_cache_loss"
+                        case = "actual_node_" + node.cut.replace("-", "_") + ("" if node.cut.endswith("-eio") else "_cache_loss")
                     result["node_cut"] = node.cut
                     result["node_cache_loss_enabled"] = not node.no_cache_loss
                     executed = subprocess.Popen(
@@ -239,7 +239,11 @@ def run(binary, output, node=None):
                     required_evidence = [f"Acknowledged validator {batch_kind} batch writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true")]
                 if node.cut.startswith("persistent-"):
                     persistent_mode = node.cut.removeprefix("persistent-")
-                    required_evidence = [f"Acknowledged persistent {persistent_mode} writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true")]
+                    if node.cut.endswith("-eio"):
+                        persistent_mode = persistent_mode.removesuffix("-eio")
+                        required_evidence = [f"Failed persistent {persistent_mode} writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true")]
+                    else:
+                        required_evidence = [f"Acknowledged persistent {persistent_mode} writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true")]
                 if expected_failure and omitted_manifest == "validator-wal":
                     if executed.returncode != 101:
                         raise RuntimeError("Missing validator-state sync omission failure")
@@ -361,7 +365,20 @@ def run(binary, output, node=None):
                     required_evidence.extend(["1 passed; 0 failed", "Actual node retried real truncation"])
                     if node.cut in ["validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty"]:
                         required_evidence.append(f"Validator {batch_kind} batch preserved together after two-boots")
-                    if node.cut.startswith("persistent-"):
+                    if node.cut.startswith("persistent-") and node.cut.endswith("-eio"):
+                        required_evidence.extend([f"Persistent {persistent_mode} EIO refused publication; cold retry acknowledged",
+                            f"Persistent {persistent_mode} failure recovered after two-boots"])
+                        failed = list((output / "node").rglob("persistent-failure.json"))
+                        cold = list((output / "node").rglob("persistent-failure-guarded-startup.json"))
+                        if len(failed) != 1 or len(cold) != 1:
+                            raise RuntimeError("Missing persistent failure/refusal reports")
+                        failure, reopened = json.loads(failed[0].read_text()), json.loads(cold[0].read_text())
+                        if failure["acknowledged"] or failure["persistent_flag"] or reopened["persistent_flag"] or failure["snapshot"] != reopened["snapshot"]:
+                            raise RuntimeError("Failed persistent sync changed publication after restart")
+                        if (failure["snapshot"] is None) != (failure["phase"] == "file"):
+                            raise RuntimeError("Unexpected failed publication state")
+                        result["persistent_failure_recovered"] = {"mode":failure["mode"], "phase":failure["phase"], "acknowledged":False, "persistent_flag_before_retry":False}
+                    if node.cut.startswith("persistent-") and not node.cut.endswith("-eio"):
                         required_evidence.append(f"Persistent {persistent_mode} snapshot bytes, root, metadata and reads preserved after two-boots")
                         reports = list((output / "node").rglob(f"persistent-{persistent_mode}-cache-loss.json"))
                         if len(reports) != 1:
@@ -488,7 +505,7 @@ if __name__ == "__main__":
     mutation.add_argument("--omit-root-wal-sync", action="store_true", help="omit main WAL sync at verified final root deletion")
     mutation.add_argument("--omit-lease-wal-sync", action="store_true", help="omit one scoped repair lease mutation WAL sync")
     mutation.add_argument("--omit-validator-wal-sync", action="store_true", help="omit one scoped validator-state WAL sync")
-    parser.add_argument("--cut", choices=["rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire", "lease-custody", "validator-floor", "validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty", "persistent-fast", "persistent-head", "persistent-whole", "persistent-raw"], default="rows")
+    parser.add_argument("--cut", choices=["rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire", "lease-custody", "validator-floor", "validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty", "persistent-fast", "persistent-head", "persistent-whole", "persistent-raw", "persistent-fast-file-eio", "persistent-fast-directory-eio", "persistent-head-file-eio", "persistent-head-directory-eio", "persistent-whole-file-eio", "persistent-whole-directory-eio", "persistent-raw-file-eio", "persistent-raw-directory-eio"], default="rows")
     parser.add_argument("--no-cache-loss", action="store_true", help="run the same node cut without cache loss as a control")
     parser.add_argument("--node-test-binary", type=Path)
     parser.add_argument("--node-binary", type=Path)

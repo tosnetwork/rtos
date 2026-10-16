@@ -86,6 +86,11 @@ pub(super) async fn run(
         outbox_cache_loss::write_and_interrupt(root).await?;
         assert_eq!(package_inventory(root)?, before, "outbox update changed canonical packages");
     }
+    let persistent_failure_mode = interrupt.and_then(|v| v.strip_prefix("persistent-")?.strip_suffix("-eio")?.rsplit_once('-'));
+    if let Some((mode, phase)) = persistent_failure_mode {
+        persistent_failure::write_and_interrupt(root, mode, phase).await?;
+        assert_eq!(package_inventory(root)?, before, "failed persistent write changed canonical packages");
+    }
     let persistent_mode = match interrupt {
         Some("persistent-fast-cache-loss") => Some("fast"), Some("persistent-head-cache-loss") => Some("head"),
         Some("persistent-whole-cache-loss") => Some("whole"), Some("persistent-raw-cache-loss") => Some("raw"),
@@ -165,6 +170,9 @@ pub(super) async fn run(
         eprintln!("Actual node preserved protected history and progress after validator floor cut");
         validator_cache_loss::verify(root, &db, &fixture.id(retained, false), "guarded-startup")?;
     }
+    if let Some((mode, phase)) = persistent_failure_mode {
+        persistent_failure::verify_and_retry(root, &db, mode, phase).await?;
+    }
     if let Some(mode) = persistent_mode {
         eprintln!("Actual node preserved protected history and progress after persistent cut");
         persistent_cache_loss::verify(root, &db, mode, "guarded-startup").await?;
@@ -192,7 +200,7 @@ pub(super) async fn run(
         assert_eq!(package_inventory(root)?, before, "lease release cache loss changed canonical packages");
     }
     eprintln!("Failed actual truncation preserved four cursors, full history and restoring beacon; exact synthetic lease release acknowledged");
-    let interrupt = if lease_cut || acquire_cut || custody_cut || floor_cut || outbox_cut || persistent_mode.is_some() || validator_batch.is_some() { None } else { interrupt };
+    let interrupt = if lease_cut || acquire_cut || custody_cut || floor_cut || outbox_cut || persistent_mode.is_some() || persistent_failure_mode.is_some() || validator_batch.is_some() { None } else { interrupt };
     if let Some(mode @ ("selection-enospc" | "selection-sync-eio" | "ready-enospc" | "ready-sync-eio" | "operation-sync-eio" | "publish-rename-eio" | "publish-sync-eio" | "wal-ready-sync-eio" | "wal-publish-sync-eio" | "wal-epoch-enrollment-eio" | "publish-directory-sync-eio" | "stage-enospc" | "stage-sync-eio")) = interrupt {
         io_failure::recovery_fault(binary, root, zero, mode).await?;
         if matches!(mode, "publish-sync-eio" | "wal-publish-sync-eio" | "publish-directory-sync-eio") {
@@ -483,6 +491,10 @@ pub(super) async fn run(
     );
     let db = open_db(root).await?;
     fixture.assert_imported(&db, retained).await?;
+    if let Some((mode, phase)) = persistent_failure_mode {
+        persistent_cache_loss::verify(root, &db, mode, "two-boots").await?;
+        eprintln!("Persistent {mode}-{phase} failure recovered after two-boots");
+    }
     if let Some(mode) = persistent_mode { persistent_cache_loss::verify(root, &db, mode, "two-boots").await?; }
     if outbox_cut { outbox_cache_loss::verify(root, &db, "two-boots")?; }
     if let Some(kind) = validator_batch {
@@ -572,3 +584,6 @@ mod outbox_cache_loss;
 
 #[path = "test_node_persistent_cache_loss.rs"]
 mod persistent_cache_loss;
+
+#[path = "test_node_persistent_failure.rs"]
+mod persistent_failure;
