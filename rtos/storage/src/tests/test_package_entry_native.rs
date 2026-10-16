@@ -113,7 +113,8 @@ async fn owned_native_phase_encodes_and_syncs_real_file_then_scans_after_reopen(
     let path = dir.path().join("native-entries"); let output = path.clone();
     let entry = PackageEntry::with_data("retained-entry".into(), vec![7; 1024 * 1024 + 1]);
     let pointer = entry.data().as_ptr() as usize;
-    execution.spawn_phase(move || {
+    execution.retire_packages()?.await??.consume(|_| Ok(()))?;
+    execution.spawn_recovery_phase(move || {
         let mut file = std::fs::File::create(output)?;
         entry.write_to_sync(&mut file)?; entry.write_to_sync(&mut file)?; file.sync_all()?;
         Ok(entry)

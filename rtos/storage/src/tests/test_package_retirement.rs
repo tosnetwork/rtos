@@ -18,7 +18,7 @@ async fn actual_idle_close_has_consumable_receipt_and_permanently_retires_old_pa
     assert!(std::fs::read_link(fd_path).map_or(true, |target| target != path));
     assert!(package.state.retired.load(Ordering::Acquire));
     assert!(package.lock_writer().await.is_none());
-    assert!(owner.spawn_phase(|| Ok(())).is_err(), "unconsumed close receipt must keep the phase busy");
+    assert!(owner.spawn_recovery_phase(|| Ok(())).is_err(), "unconsumed close receipt must keep the phase busy");
     receipt.consume(|report| {
         assert!(report.identity > 0);
         assert_eq!(report.packages, 1);
@@ -29,7 +29,7 @@ async fn actual_idle_close_has_consumable_receipt_and_permanently_retires_old_pa
         Some(&crate::archives::context::ArchiveContextError::Retired(0)));
     assert!(package.sync_durable(None).await.unwrap_err().to_string().contains("permanently retired"));
     assert!(package.remove().await.unwrap_err().to_string().contains("permanently retired"));
-    owner.spawn_phase(|| Ok(()))?.await??.consume(|_| Ok(()))?;
+    owner.spawn_recovery_phase(|| Ok(()))?.await??.consume(|_| Ok(()))?;
     assert!(path.exists());
     Ok(())
 }

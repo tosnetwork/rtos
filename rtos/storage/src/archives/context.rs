@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ArchiveContextError {
+    #[error("Archive recovery requires a consumed package retirement receipt")]
+    RetirementRequired,
     #[error("Archive package permanently retired at epoch {0}")]
     Retired(u64),
     #[error("Archive native close is uncertain or quarantine is full; process restart required")]

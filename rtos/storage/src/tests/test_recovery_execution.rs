@@ -257,3 +257,50 @@ async fn retirement_snapshot_refuses_missing_live_package_provider() -> Result<(
     assert!(!domain.recovery_required());
     Ok(())
 }
+
+#[tokio::test]
+async fn recovery_mutation_gate_requires_its_own_successfully_consumed_close_receipt() -> Result<()> {
+    let (dir, _db, domain, provider) = fixture();
+    let owner = domain.begin_recovery(0, &[provider])?;
+    let output = dir.path().join("recovery-effect");
+    let work_output = output.clone();
+    let error = owner.spawn_recovery_phase(move || {
+        std::fs::write(work_output, b"must not run before retirement")?; Ok(())
+    }).err().unwrap();
+    assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&ArchiveContextError::RetirementRequired));
+    assert!(!output.exists());
+    let receipt = owner.retire_packages()?.await??;
+    assert!(owner.spawn_recovery_phase(|| Ok(())).is_err());
+    receipt.consume(|_| {
+        assert!(owner.spawn_recovery_phase(|| Ok(())).is_err(), "callback is still inside retirement consumption");
+        Ok(())
+    })?;
+    let work_output = output.clone();
+    owner.spawn_recovery_phase(move || {
+        std::fs::write(work_output, b"after retirement")?; Ok(())
+    })?.await??.consume(|_| Ok(()))?;
+    assert_eq!(std::fs::read(output)?, b"after retirement");
+    // Even another fully drained domain cannot use this execution's receipt.
+    let (_other_dir, _other_db, other_domain, other_provider) = fixture();
+    let other = other_domain.begin_recovery(0, &[other_provider])?;
+    assert!(other.spawn_recovery_phase(|| Ok(())).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn retirement_callback_failure_or_domain_failure_never_opens_mutation_gate() -> Result<()> {
+    for latch_in_callback in [false, true] {
+        let (_dir, _db, domain, provider) = fixture();
+        let owner = domain.begin_recovery(0, &[provider])?;
+        let receipt = owner.retire_packages()?.await??;
+        let result = receipt.consume(|_| {
+            if latch_in_callback { domain.latch_failure(); Ok(()) }
+            else { Err(anyhow::anyhow!("retirement registration refused")) }
+        });
+        assert!(result.is_err());
+        assert!(!owner.state.packages_retired.load(Ordering::Acquire));
+        assert!(domain.recovery_required());
+        assert!(owner.spawn_recovery_phase(|| -> Result<()> { panic!("must not run") }).is_err());
+    }
+    Ok(())
+}

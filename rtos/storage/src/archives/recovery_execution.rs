@@ -13,6 +13,7 @@ struct ExecutionState {
     effects_started: AtomicBool,
     owner_alive: AtomicBool,
     busy: AtomicBool,
+    packages_retired: AtomicBool,
 }
 impl Drop for ExecutionState {
     fn drop(&mut self) {
@@ -55,7 +56,7 @@ impl ArchiveDomain {
         Ok(RecoveryExecution { state: Arc::new(ExecutionState {
             domain: self.clone(), epoch, owners: state.owners.clone(), providers,
             effects_started: AtomicBool::new(false), owner_alive: AtomicBool::new(true),
-            busy: AtomicBool::new(false),
+            busy: AtomicBool::new(false), packages_retired: AtomicBool::new(false),
         }) })
     }
 }
@@ -110,7 +111,7 @@ impl RecoveryExecution {
     /// receipt must be consumed before any following recovery phase is allowed.
     pub(crate) fn retire_packages(&self) -> Result<tokio::task::JoinHandle<Result<RecoveryReceipt<PackageRetirement>>>> {
         let packages = self.snapshot_packages()?;
-        self.spawn_phase(move || {
+        self.spawn_phase_kind(true, move || {
             let identity = NEXT_RETIREMENT.fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
                 .map_err(|_| anyhow::anyhow!("Package retirement identity exhausted"))?;
             let mut report = PackageRetirement { identity, packages: packages.len(), closed_files: 0 };
@@ -119,17 +120,32 @@ impl RecoveryExecution {
         })
     }
 
-    /// The closure starts only after old IO has drained. The worker must first
-    /// establish phase-specific retirement/protection/manifest preconditions.
-    /// Queued closures and returned receipts retain this claim independently of
-    /// the observer. Only one phase may be queued or awaiting consumption.
-    pub(crate) fn spawn_phase<T: Send + 'static>(
+    /// Recovery mutations require this execution's consumed close receipt.
+    /// Phase-specific protection and manifest preconditions remain mandatory.
+    pub(crate) fn spawn_recovery_phase<T: Send + 'static>(
         &self, work: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<tokio::task::JoinHandle<Result<RecoveryReceipt<T>>>> {
+        self.check_drained()?;
+        if !self.state.packages_retired.load(Ordering::Acquire) {
+            return Err(ArchiveContextError::RetirementRequired.into());
+        }
+        self.spawn_phase(work)
+    }
+
+    // The raw scheduler is private: external recovery code cannot bypass the
+    // retirement gate. Its unit tests exercise the scheduling primitive itself.
+    fn spawn_phase<T: Send + 'static>(
+        &self, work: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<tokio::task::JoinHandle<Result<RecoveryReceipt<T>>>> {
+        self.spawn_phase_kind(false, work)
+    }
+    fn spawn_phase_kind<T: Send + 'static>(
+        &self, retirement: bool, work: impl FnOnce() -> Result<T> + Send + 'static,
     ) -> Result<tokio::task::JoinHandle<Result<RecoveryReceipt<T>>>> {
         self.check_drained()?;
         self.state.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| ArchiveContextError::RecoveryBusy)?;
-        let mut job = RecoveryJob { state: self.state.clone(), started: false, consumed: false };
+        let mut job = RecoveryJob { state: self.state.clone(), started: false, consumed: false, retirement };
         Ok(tokio::task::spawn_blocking(move || {
             {
                 let state = job.state.domain.lock()?;
@@ -171,7 +187,7 @@ impl Drop for RecoveryExecution {
     }
 }
 
-struct RecoveryJob { state: Arc<ExecutionState>, started: bool, consumed: bool }
+struct RecoveryJob { state: Arc<ExecutionState>, started: bool, consumed: bool, retirement: bool }
 impl Drop for RecoveryJob {
     fn drop(&mut self) {
         if self.started && !self.consumed { self.state.domain.latch_failure(); }
@@ -193,7 +209,17 @@ impl<T> RecoveryReceipt<T> {
         finish(self.value.as_mut().expect("recovery phase payload"))?;
         // Payload/resource destruction also precedes phase acknowledgement.
         drop(self.value.take());
-        self.job.as_mut().expect("recovery phase job").consumed = true;
+        let job = self.job.as_mut().expect("recovery phase job");
+        let state = job.state.domain.lock()?;
+        ArchiveDomain::check_epoch(&state, job.state.epoch)?;
+        if state.phase == Phase::RecoveryRequired {
+            return Err(ArchiveContextError::RecoveryRequired(state.epoch).into());
+        }
+        if !job.state.owner_alive.load(Ordering::Acquire) {
+            return Err(ArchiveContextError::RecoveryCancelled.into());
+        }
+        if job.retirement { job.state.packages_retired.store(true, Ordering::Release); }
+        job.consumed = true;
         Ok(())
     }
 }
