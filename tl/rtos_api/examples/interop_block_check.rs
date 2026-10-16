@@ -144,11 +144,67 @@ fn main() -> Result<()> {
                 "final_certificate_checked":true}));
         }
     }
+    let mut shard_tops = Vec::new();
+    if let Some(extra) = block.read_extra()?.read_custom()? {
+        extra.shards().iterate_shards(|shard, descr| {
+            shard_tops.push(json!({"@type":"tos.blockIdExt", "workchain":shard.workchain_id(),
+                "shard":(shard.shard_prefix_with_tag() as i64).to_string(), "seqno":descr.seq_no,
+                "root_hash":base64_encode(descr.root_hash.as_slice()),
+                "file_hash":base64_encode(descr.file_hash.as_slice())}));
+            Ok(true)
+        })?;
+    }
+    let mut workchain_check = Value::Null;
+    if let Some(workchain) = value.get("workchain") {
+        let wc_id = identity(&workchain["block"]["id"])?;
+        ensure!(wc_id.0 == 0 && wc_id.1 == i64::MIN && wc_id.2 > 0,
+            "fixture needs a produced full workchain-0 block");
+        ensure!(shard_tops.iter().any(|id| identity(id).ok().as_ref() == Some(&wc_id)),
+            "workchain block is not anchored by the checked masterchain block");
+        let bytes = base64_decode(workchain["block"]["boc"].as_str().context("workchain block BOC required")?)?;
+        ensure!(UInt256::calc_file_hash(&bytes) == wc_id.4, "workchain block file hash differs");
+        let cell = read_single_root_boc(&bytes)?;
+        ensure!(cell.repr_hash() == &wc_id.3, "workchain block cell hash differs");
+        let wc_block = Block::construct_from_cell(cell)?;
+        let wc_info = wc_block.read_info()?;
+        ensure!(u64::from(wc_info.seq_no()) == wc_id.2
+            && wc_info.shard().workchain_id() == 0
+            && wc_info.shard().shard_prefix_with_tag() == 1_u64 << 63
+            && wc_block.global_id() == block.global_id(), "workchain block header differs");
+        let wc_root = wc_block.read_state_update()?.new_hash;
+        let states = workchain["states"].as_array().context("workchain state evidence required")?;
+        let names: std::collections::BTreeSet<_> = states.iter().map(|s| s["name"].as_str()
+            .context("state endpoint name required")).collect::<Result<_>>()?;
+        let required: std::collections::BTreeSet<_> = value["references"].as_object()
+            .context("all endpoint references required")?.keys().map(String::as_str).collect();
+        ensure!(names == required && names.len() == states.len() && names.len() == 4,
+            "exactly one workchain state from every fixture endpoint required");
+        let mut checked_states = Vec::new();
+        for source in states {
+            ensure!(identity(&source["id"])? == wc_id, "workchain state identity differs");
+            let bytes = base64_decode(source["boc"].as_str().context("workchain state BOC required")?)?;
+            let file_hash = UInt256::calc_file_hash(&bytes);
+            ensure!(file_hash == hash(&source["file_hash"])?, "workchain state file hash differs");
+            let cell = read_single_root_boc(&bytes)?;
+            ensure!(cell.repr_hash() == &wc_root, "workchain state differs from block state update");
+            let state = ShardStateUnsplit::construct_from_cell(cell)?;
+            ensure!(u64::from(state.seq_no()) == wc_id.2
+                && state.shard() == wc_info.shard() && state.global_id() == block.global_id(),
+                "workchain state header differs");
+            checked_states.push(json!({"name":source["name"], "file_hash":base64_encode(file_hash.as_slice())}));
+        }
+        workchain_check = json!({"block":workchain["block"]["id"],
+            "created_by":base64_encode(wc_block.read_extra()?.created_by().as_slice()),
+            "state_root_hash":base64_encode(wc_root.as_slice()), "states":checked_states,
+            "masterchain_anchor_checked":true, "block_file_cell_and_header_checked":true,
+            "all_four_states_match_block_update":true});
+    }
     let result = json!({"status":"block_and_state_match", "block":reference["last"],
         "created_by":base64_encode(block.read_extra()?.created_by().as_slice()),
         "state_root_hash":base64_encode(state.as_slice()), "global_id":block.global_id(),
         "file_hash_checked":true, "cell_hash_checked":true, "header_identity_checked":true,
         "state_update_matches_both":true, "verified_final_certificates":certificates,
+        "shard_tops":shard_tops, "workchain_check":workchain_check,
         "active_signing_qualified":false});
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(output)?;
     file.write_all(&serde_json::to_vec_pretty(&result)?)?;

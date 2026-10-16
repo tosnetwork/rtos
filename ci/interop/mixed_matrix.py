@@ -115,6 +115,23 @@ async def cpp_certificate(snapshot, node, zero, target, directory):
         responses=[base64.b64encode(path.read_bytes()).decode() for path in responses])
 
 
+async def native_state(snapshot, config, name, block_id, directory):
+    """Use the same pinned native client for C++ and Rust full-state responses."""
+    directory.mkdir()
+    config_path = directory / 'lite-client.json'
+    config_path.write_text(config.to_json())
+    data = directory / 'data'
+    data.mkdir()
+    await child_checked([snapshot / 'build/lite-client/lite-client', '-C', config_path,
+        '-r', '-D', data, '-t', '15', '-c', 'getstate ' + block_text(block_id)],
+        directory / 'client.log')
+    files = [path for path in data.rglob('*') if path.is_file()]
+    if len(files) != 1:
+        raise RuntimeError(f'{name} did not return exactly one native full-state body')
+    return dict(name=name, id=block_id, file_hash=base64.b64encode(
+        bytes.fromhex(digest(files[0]))).decode(), boc=base64.b64encode(files[0].read_bytes()).decode())
+
+
 async def prepare_rust(args, directory, i, network, global_config, tcp_used, udp_used):
     directory.mkdir()
     (directory / 'zero').mkdir()
@@ -128,6 +145,8 @@ async def prepare_rust(args, directory, i, network, global_config, tcp_used, udp
         ip_address_quic=f'127.0.0.1:{reserve_port(socket.SOCK_DGRAM, udp_used)}',
         boot_from_zerostate=True, restore_db=True, archival_mode=None,
         validation_countdown_mode='except-zerostate', json_rpc_server={'address': address})
+    if args.verify_workchain:
+        config['lite_server_port'] = reserve_port(socket.SOCK_STREAM, tcp_used)
     write(directory / 'default_config.json', config)
     (directory / 'node-log.yml').write_text(
         "appenders:\n  console:\n    kind: console\n    encoder:\n      pattern: '{m}{n}'\n"
@@ -157,6 +176,7 @@ async def run(args, root, snapshot, artifacts):
     rust_nodes = []
     cpp_nodes = []
     endpoint_names, endpoints = [], []
+    lite_configs = []
     async with Network(Install(snapshot / 'build', snapshot / 'source'), network_dir,
                        base_port=args.base_port) as network:
         profile = json.loads(args.genesis_profile.read_text())
@@ -208,6 +228,7 @@ async def run(args, root, snapshot, artifacts):
             cpp_nodes.append(node)
             endpoint_names.append(f'cpp-{i}')
             endpoints.append('http://' + address + '/jsonRPC')
+            lite_configs.append(node.liteserver_config)
         global_config = root / 'config.global.json'
         _write_model(global_config, tos_api.Config_global(
             dht=tos_api.Dht_config_global(static_nodes=tos_api.Dht_nodes(nodes=[dht.signed_address]), k=3, a=3),
@@ -234,6 +255,13 @@ async def run(args, root, snapshot, artifacts):
                 rust_nodes.append(dict(index=i, directory=directory, process=process))
                 endpoint_names.append(f'rust-{i}')
                 endpoints.append('http://' + address + '/jsonRPC')
+                if args.verify_workchain:
+                    client = json.loads((directory / 'lite_client_config.json').read_text())
+                    lite_configs.append(tos_api.Liteclient_config_global(
+                        liteservers=[tos_api.Liteserver_desc(id=tos_api.Pub_ed25519(
+                            key=base64.b64decode(client['server_key']['pub_key'])),
+                            ip=2130706433, port=int(client['server_address'].rsplit(':', 1)[1]))],
+                        validator=network.zerostate.as_validator_config()))
                 write(root / 'processes.json', dict(cpp={node.name: node.process_id for node in cpp_nodes},
                     rust={str(node['index']): dict(pid=node['process'].pid,
                         start_ticks=Path(f"/proc/{node['process'].pid}/stat").read_text().split()[21])
@@ -264,6 +292,7 @@ async def run(args, root, snapshot, artifacts):
                 cpp_alone_can_finalize=cpp_weight >= total * 2 // 3 + 1))
             observations = [{} for _ in endpoints]
             checked_keys, creators = set(), {}
+            workchain_keys, workchain_creators = set(), {}
             deadline = time.monotonic() + args.timeout
             while time.monotonic() < deadline:
                 for node in rust_nodes:
@@ -285,7 +314,8 @@ async def run(args, root, snapshot, artifacts):
                 write(root / 'status.json', dict(status='waiting_for_all_creators',
                     heights={name: (reply['last']['seqno'] if not isinstance(reply, BaseException) else None)
                              for name, reply in zip(endpoint_names, replies)},
-                    creators=list(creators), common_checkpoints=len(common)))
+                    creators=list(creators), workchain_creators=list(workchain_creators),
+                    common_checkpoints=len(common)))
                 for key in common:
                     infos = [items[key] for items in observations]
                     if any(info['state_root_hash'] != infos[0]['state_root_hash'] for info in infos):
@@ -316,6 +346,47 @@ async def run(args, root, snapshot, artifacts):
                     await child_checked([args.block_checker, directory / 'sample.json',
                         directory / 'checked.json'], directory / 'checker.log')
                     checked = json.loads((directory / 'checked.json').read_text())
+                    if args.verify_workchain:
+                        tops = [top for top in checked['shard_tops']
+                            if int(top['workchain']) == 0 and int(top['shard']) == -(1 << 63)
+                            and int(top['seqno']) > 0 and identity(top) not in workchain_keys]
+                        if len(tops) > 1:
+                            raise RuntimeError('Multiple full workchain-0 anchors in one masterchain block')
+                        if tops:
+                            top = tops[0]
+                            wc_dir = directory / 'workchain'
+                            wc_dir.mkdir()
+                            if rust_nodes:
+                                wc_block = await asyncio.to_thread(rpc, endpoints[body_index], 'getBlock',
+                                    {k: top[k] for k in ['workchain', 'shard', 'seqno', 'root_hash', 'file_hash']})
+                            else:
+                                wc_block = await cpp_block(snapshot, cpp_nodes[0], top, wc_dir)
+                            states = await asyncio.gather(*(native_state(snapshot, config, name, top,
+                                wc_dir / name) for name, config in zip(endpoint_names, lite_configs)))
+                            sample['workchain'] = dict(block=wc_block, states=states)
+                            write(directory / 'sample.json', sample)
+                            await child_checked([args.block_checker, directory / 'sample.json',
+                                directory / 'workchain-checked.json'], directory / 'workchain-checker.log')
+                            checked = json.loads((directory / 'workchain-checked.json').read_text())
+                            wc_check = checked['workchain_check']
+                            wc_creator = wc_check['created_by']
+                            if wc_creator not in expected_creators:
+                                raise RuntimeError('Anchored workchain block has an unexpected creator')
+                            wc_language, wc_member = expected_creators[wc_creator]
+                            wc_evidence = dict(member=wc_member, language=wc_language,
+                                block_check=wc_check, masterchain_anchor=infos[0]['last'],
+                                sample_directory=str(directory))
+                            if wc_language == 'rust':
+                                node = next(node for node in rust_nodes if node['index'] == wc_member)
+                                text = (node['directory'] / 'node.log').read_text(errors='replace')
+                                match = re.search(r'^\(0:8000000000000000, ' + str(top['seqno']) +
+                                    r'\): ValidatorGroup::on_generate_slot: .*Collation successful$', text, re.M)
+                                if not match:
+                                    raise RuntimeError('Rust workchain creator lacks successful local collation evidence')
+                                wc_evidence['local_collation'] = match.group(0)
+                            workchain_keys.add(identity(top))
+                            workchain_creators.setdefault(wc_creator, wc_evidence)
+                            write(root / 'workchain-creators.json', workchain_creators)
                     checked_keys.add(key)
                     creator = checked['created_by']
                     if creator not in expected_creators:
@@ -334,7 +405,8 @@ async def run(args, root, snapshot, artifacts):
                         evidence['local_collation'] = match.group(0)
                     creators.setdefault(creator, evidence)
                     write(root / 'creators.json', creators)
-                    if set(creators) == set(expected_creators):
+                    if set(creators) == set(expected_creators) and (not args.verify_workchain
+                            or set(workchain_creators) == set(expected_creators)):
                         for path, expected in artifacts.items():
                             if digest(Path(path)) != expected:
                                 raise RuntimeError('An executable changed during matrix validation')
@@ -343,6 +415,9 @@ async def run(args, root, snapshot, artifacts):
                             control_kind=('all_cpp' if args.cpp_count == 4 else 'all_rust' if args.cpp_count == 0 else 'mixed'),
                             creators=creators, common_state_checkpoints=len(checked_keys),
                             final_certificates_required=args.verify_certificates,
+                            workchain_states_required=args.verify_workchain,
+                            workchain_creators=workchain_creators,
+                            workchain_state_checkpoints=len(workchain_keys),
                             mixed_validator_qualified=False)
                 await asyncio.sleep(0.1)
             raise TimeoutError(f'Not all four creators were accepted within {args.timeout} seconds')
@@ -370,6 +445,7 @@ def main():
                         default=Path(__file__).with_name('testnet-v16.json'))
     parser.add_argument('--prepare-genesis-only', action='store_true')
     parser.add_argument('--verify-certificates', action='store_true')
+    parser.add_argument('--verify-workchain', action='store_true')
     args = parser.parse_args()
     args.snapshot = args.snapshot.resolve()
     for name in ['rust_node', 'validator_preparer', 'block_checker']:

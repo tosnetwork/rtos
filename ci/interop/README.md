@@ -173,7 +173,7 @@ without running validator processes; it is not consensus acceptance.
 
 The long initial-set lifetime is solely for reproducible isolated fixtures.
 This profile does not qualify deployment fee schedules, version 17–19,
-workchain leadership, elections or validator-set rotation. Do not use its public
+elections or validator-set rotation. Do not use its public
 identities or wallet for a shared deployment.
 
 Add `--verify-certificates` to require independent finality checks at every
@@ -191,3 +191,19 @@ Requests use `reference` and `comparison` for two named native endpoints; the
 older `rust` comparison field remains accepted for archived samples. Even in
 single-language controls, the independent checker compares distinct endpoints,
 and the runner requires matching applied states at all four endpoints.
+
+Add `--verify-workchain --verify-certificates` to extend the same deployment
+to workchain production and full-state comparison. The checker extracts shard
+top block identities from the authenticated masterchain block body. For each
+new workchain-0 anchor the runner obtains the full block and downloads full
+states from all four validators through the pinned C++ LiteServer client,
+including when the server is Rust. The checker verifies the block file/cell
+hashes and header, its exact inclusion in the checked masterchain shard table,
+and all four state cell roots and headers against the workchain block's state
+update. State BOC serialization may differ; equality is required for cell roots.
+Every member must create an anchored workchain block as well as a masterchain
+block, and Rust creators need the matching local collation log. Each sample
+retains native client logs and state bodies. This proves state availability and
+masterchain inclusion in the initial frozen epoch, with the containing
+masterchain FinalCert checked. It does not independently export a workchain
+FinalCert, prove a workchain database applied cursor, or qualify set rotation.
