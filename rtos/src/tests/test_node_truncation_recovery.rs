@@ -92,6 +92,8 @@ pub(super) async fn run(
         assert_eq!(package_inventory(root)?, before, "validator floor write changed canonical packages");
     }
     let validator_batch = match interrupt {
+        Some("validator-prune-cache-loss") => Some(validator_retirement_loss::BatchKind::Prune),
+        Some("validator-prune-empty-cache-loss") => Some(validator_retirement_loss::BatchKind::PruneEmpty),
         Some("validator-retirement-cache-loss") => Some(validator_retirement_loss::BatchKind::Retirement),
         Some("validator-claim-cache-loss") => Some(validator_retirement_loss::BatchKind::Claim),
         Some("validator-journal-cache-loss") => Some(validator_retirement_loss::BatchKind::Journal),

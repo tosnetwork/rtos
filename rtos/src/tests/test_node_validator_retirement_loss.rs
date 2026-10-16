@@ -6,10 +6,10 @@ use crate::{internal_db::DESTROYED_VALIDATOR_SESSIONS, validator::validator_clea
 use std::collections::HashSet;
 
 #[derive(Clone, Copy)]
-pub(super) enum BatchKind { Retirement, Claim, Incarnation, Journal }
+pub(super) enum BatchKind { Retirement, Claim, Incarnation, Journal, Prune, PruneEmpty }
 impl BatchKind {
     pub(super) fn name(self) -> &'static str {
-        match self { Self::Retirement => "retirement", Self::Claim => "claim", Self::Incarnation => "incarnation", Self::Journal => "journal" }
+        match self { Self::Retirement => "retirement", Self::Claim => "claim", Self::Incarnation => "incarnation", Self::Journal => "journal", Self::Prune => "prune", Self::PruneEmpty => "prune-empty" }
     }
 }
 
@@ -41,6 +41,9 @@ fn intended(id: &rtos_block::BlockIdExt, kind: BatchKind) -> Result<Vec<Option<V
     let (fence, record) = fixture(id)?;
     let fence = Some(crate::engine_operations::serialize_destroyed_session_ids(&fence));
     Ok(match kind {
+        BatchKind::Prune => vec![Some(crate::engine_operations::serialize_destroyed_session_ids(
+            &HashSet::from([UInt256::from([0x11; 32])]))), Some(encode_record(&record)?)],
+        BatchKind::PruneEmpty => vec![None, Some(encode_record(&record)?)],
         BatchKind::Retirement => vec![fence, Some(encode_record(&record)?)],
         BatchKind::Claim => vec![None, Some(record.namespace.into_bytes()), fence],
         BatchKind::Incarnation => vec![Some(2u64.to_le_bytes().to_vec())],
@@ -49,6 +52,10 @@ fn intended(id: &rtos_block::BlockIdExt, kind: BatchKind) -> Result<Vec<Option<V
 }
 fn previous(id: &rtos_block::BlockIdExt, kind: BatchKind) -> Result<Vec<Option<Vec<u8>>>> {
     Ok(match kind {
+        BatchKind::Prune | BatchKind::PruneEmpty => {
+            let (fence, record) = fixture(id)?;
+            vec![Some(crate::engine_operations::serialize_destroyed_session_ids(&fence)), Some(encode_record(&record)?)]
+        }
         BatchKind::Incarnation => vec![Some(1u64.to_le_bytes().to_vec())],
         BatchKind::Journal => vec![Some(encode_record(&journal_pair(id)?.0)?),
             Some(crate::engine_operations::serialize_destroyed_session_ids(&fixture(id)?.0))],
@@ -66,7 +73,7 @@ fn read(db: &InternalDb, id: &rtos_block::BlockIdExt, kind: BatchKind) -> Result
     let keys = match kind {
         BatchKind::Journal => vec![record_key(&journal_pair(id)?.0.namespace), DESTROYED_VALIDATOR_SESSIONS.to_owned()],
         BatchKind::Incarnation => vec!["ValidatorCleanupIncarnationV1".to_owned()],
-        BatchKind::Retirement => vec![DESTROYED_VALIDATOR_SESSIONS.to_owned(), record_key(&record.namespace)],
+        BatchKind::Retirement | BatchKind::Prune | BatchKind::PruneEmpty => vec![DESTROYED_VALIDATOR_SESSIONS.to_owned(), record_key(&record.namespace)],
         BatchKind::Claim => vec![record_key(&record.namespace), candidate_claim_key(&record.session_id),
             DESTROYED_VALIDATOR_SESSIONS.to_owned()],
     };
@@ -84,6 +91,7 @@ async fn batch_child() -> Result<()> {
     let kind = match std::env::var("RTOS_TEST_VALIDATOR_BATCH")?.as_str() {
         "retirement" => BatchKind::Retirement, "claim" => BatchKind::Claim,
         "incarnation" => BatchKind::Incarnation, "journal" => BatchKind::Journal,
+        "prune" => BatchKind::Prune, "prune-empty" => BatchKind::PruneEmpty,
         _ => rtos_block::fail!("Unknown validator batch"),
     };
     let db = open_db(&root).await?;
@@ -92,13 +100,15 @@ async fn batch_child() -> Result<()> {
         BatchKind::Incarnation => assert_eq!(next_cleanup_incarnation(&db)?, 1),
         BatchKind::Journal => persist_retirement(&db, &fence, &[journal_pair(&id)?.0])?,
         BatchKind::Retirement => persist_retirement(&db, &HashSet::from([UInt256::from([0x11; 32])]), &[])?,
-        BatchKind::Claim => persist_retirement(&db, &fence, std::slice::from_ref(&record))?,
+        BatchKind::Claim | BatchKind::Prune | BatchKind::PruneEmpty => persist_retirement(&db, &fence, std::slice::from_ref(&record))?,
     }
     assert_eq!(read(&db, &id, kind)?, previous(&id, kind)?);
     if let Ok(arm) = std::env::var("RTOS_TEST_ROOT_WAL_ARM") {
         fs::write(arm, b"validator mutation armed after durable baseline\n")?;
     }
     match kind {
+        BatchKind::Prune => persist_retirement(&db, &HashSet::from([UInt256::from([0x11; 32])]), &[])?,
+        BatchKind::PruneEmpty => persist_retirement(&db, &HashSet::new(), &[])?,
         BatchKind::Retirement => persist_retirement(&db, &fence, &[record])?,
         BatchKind::Claim => erase_record(&db, &record.namespace, Some(&record.session_id))?,
         BatchKind::Incarnation => assert_eq!(next_cleanup_incarnation(&db)?, 2),
