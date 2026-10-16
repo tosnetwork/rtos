@@ -1,5 +1,5 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
-//! Exact native sync EIO, interruption and retry across actual node recovery.
+//! Exact native sync/rename EIO, interruption and retry across actual node recovery.
 use super::*;
 use std::sync::Arc;
 use super::persistent_cache_loss::{part, path, ack_path};
@@ -36,12 +36,13 @@ async fn failure_child() -> Result<()> {
     assert_eq!(proof.lines().count(),1);
     let expected_target=path(&root,&mode);
     if phase=="file" { assert!(proof.starts_with(&format!("file sync EIO: {}.",expected_target.display()))); }
-    else { assert_eq!(proof,format!("directory sync EIO: {}\n",expected_target.parent().unwrap().display())); }
+    else if phase=="directory" { assert_eq!(proof,format!("directory sync EIO: {}\n",expected_target.parent().unwrap().display())); }
+    else { assert_eq!(phase,"rename"); assert_eq!(proof,format!("rename EIO: {}\n",expected_target.display())); }
     let error=result.expect_err("Persistent producer acknowledged failed native sync");
     assert!(format!("{error:#}").contains("Input/output error"));
     assert!(!handle.has_persistent_state(),"Failed sync published persistent flag");
     let actual=snapshot(&root,&mode)?;
-    if phase=="file" { assert!(actual.is_none(),"File published before successful contents sync"); }
+    if phase!="directory" { assert!(actual.is_none(),"Failed pre-publication operation exposed a final file"); }
     else {
         let bytes=hex::decode(actual.as_ref().unwrap())?;
         assert_eq!(rtos_block::read_single_root_boc(&bytes)?.repr_hash(),db.load_shard_state_dynamic(&id)?.root_cell().repr_hash());

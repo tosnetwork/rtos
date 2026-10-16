@@ -54,3 +54,30 @@ static int sync_or_fail(int fd, long syscall_number) {
 }
 int fsync(int fd) { return sync_or_fail(fd,SYS_fsync); }
 int fdatasync(int fd) { return sync_or_fail(fd,SYS_fdatasync); }
+
+static int fail_rename(const char *from, const char *to) {
+    const char *target=getenv("RTOS_TEST_PERSISTENT_TARGET");
+    const char *phase=getenv("RTOS_TEST_PERSISTENT_PHASE");
+    const char *marker=getenv("RTOS_TEST_PERSISTENT_MARKER");
+    if (!target || !phase || !marker || strcmp(phase,"rename") || target[0]!='/' || strcmp(to,target)) return 0;
+    size_t n=strlen(target), length=strlen(from);
+    if (length < n+4 || strncmp(from,target,n) || from[n]!='.' || strcmp(from+length-4,".tmp")) return 0;
+    struct stat info;
+    if (stat(from,&info) || !S_ISREG(info.st_mode) || info.st_size<=0 || !access(target,F_OK)) return 0;
+    int proof=open(marker,O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
+    if (proof<0) { if (errno==EEXIST) return 0; return 1; }
+    char message[PATH_MAX+64];
+    int size=snprintf(message,sizeof(message),"rename EIO: %s\n",target);
+    ssize_t written=syscall(SYS_write,proof,message,(size_t)size);
+    int synced=syscall(SYS_fsync,proof);int closed=close(proof);
+    if (written!=size || synced || closed) { errno=EIO;return 1; }
+    errno=EIO;return 1;
+}
+int rename(const char *from, const char *to) {
+    if (fail_rename(from,to)) return -1;
+    return syscall(SYS_renameat,AT_FDCWD,from,AT_FDCWD,to);
+}
+int renameat(int from_fd, const char *from, int to_fd, const char *to) {
+    if (from[0]=='/' && to[0]=='/' && fail_rename(from,to)) return -1;
+    return syscall(SYS_renameat,from_fd,from,to_fd,to);
+}

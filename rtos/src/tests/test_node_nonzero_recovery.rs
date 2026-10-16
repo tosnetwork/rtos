@@ -1046,3 +1046,31 @@ async fn actual_node_persistent_raw_directory_eio() -> Result<()> {
     exercise_nonzero_recovery_layout(false, None,
         Some((3, Some("persistent-raw-directory-eio"))), false).await
 }
+
+#[tokio::test]
+#[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
+async fn actual_node_persistent_fast_rename_eio() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None,
+        Some((3, Some("persistent-fast-rename-eio"))), false).await
+}
+
+#[tokio::test]
+#[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
+async fn actual_node_persistent_head_rename_eio() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None,
+        Some((3, Some("persistent-head-rename-eio"))), false).await
+}
+
+#[tokio::test]
+#[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
+async fn actual_node_persistent_whole_rename_eio() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None,
+        Some((3, Some("persistent-whole-rename-eio"))), false).await
+}
+
+#[tokio::test]
+#[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
+async fn actual_node_persistent_raw_rename_eio() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None,
+        Some((3, Some("persistent-raw-rename-eio"))), false).await
+}
