@@ -172,6 +172,8 @@ def run(binary, output, node=None):
                         case = "actual_node_lease_release_cache_loss"
                     if node.cut == "lease-acquire":
                         case = "actual_node_lease_acquire_cache_loss"
+                    if node.cut == "lease-custody":
+                        case = "actual_node_lease_custody_cache_loss"
                     result["node_cut"] = node.cut
                     result["node_cache_loss_enabled"] = not node.no_cache_loss
                     executed = subprocess.Popen(
@@ -211,8 +213,8 @@ def run(binary, output, node=None):
                     result["sync_mutation"]["hits"] = marker
                 required_evidence = ["Actual node recovery interrupted at " + (
                     f"producer-{node.cut}-cache-loss" if node.cut in ["ready", "selection"] else "forward-before-prepare-cache-loss" if node.cut == "stages" else "forward-committed-cache-loss" if node.cut == "committed" else "forward-cleaned-cache-loss" if node.cut == "cleaned" else "root-last-cache-loss" if node.cut == "root-last" else "forward-after-row-sync")]
-                if node.cut in ["lease", "lease-acquire"]:
-                    operation = "acquire" if node.cut == "lease-acquire" else "release"
+                if node.cut in ["lease", "lease-acquire", "lease-custody"]:
+                    operation = "custody" if node.cut == "lease-custody" else "acquire" if node.cut == "lease-acquire" else "release"
                     required_evidence = [f"Acknowledged lease {operation} writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true")]
                 if expected_failure and omitted_manifest == "lease-wal":
                     if executed.returncode != 101:
@@ -220,6 +222,22 @@ def run(binary, output, node=None):
                     required_evidence.append("0 passed; 1 failed")
                     if node.cut == "lease-acquire":
                         required_evidence.extend(["Actual node started despite failed archive truncation", "Node services started."])
+                    elif node.cut == "lease-custody":
+                        required_evidence.extend(["Acknowledged custody record lost after actual node restart",
+                            "Actual node lease protection preserved full history and progress after custody cut"])
+                        cold_files = list((output / "node").rglob("lease-custody-cold.json"))
+                        ack_files = list((output / "node").rglob("lease-mutation-ack.json"))
+                        refused = list((output / "node").rglob("truncation-refused.log"))
+                        if len(cold_files) != 1 or len(ack_files) != 1 or len(refused) != 1:
+                            raise RuntimeError("Missing custody downgrade evidence")
+                        cold = json.loads(cold_files[0].read_text())
+                        acknowledged = json.loads(ack_files[0].read_text())["record"]
+                        if cold["state"] != "Protecting" or acknowledged["state"] != "DurableCustody":
+                            raise RuntimeError("Unexpected custody state transition")
+                        cold["state"] = "DurableCustody"
+                        if cold != acknowledged or "Archive truncation conflicts with repair custody" not in refused[0].read_text():
+                            raise RuntimeError("Custody downgrade changed identity or lost startup protection")
+                        result["custody_downgrade_detected"] = True
                     else:
                         required_evidence.extend(["Truncation retry", "Archive truncation conflicts with repair custody"])
                     reports = list((output / "node").rglob("cache-loss.json"))
@@ -280,6 +298,8 @@ def run(binary, output, node=None):
                     if executed.returncode != 0:
                         raise RuntimeError(f"Actual node cache-loss test failed: {executed.returncode}")
                     required_evidence.extend(["1 passed; 0 failed", "Actual node retried real truncation"])
+                    if node.cut == "lease-custody":
+                        required_evidence.append("Acknowledged DurableCustody record survived actual node restart")
                 if omitted_manifest in ["ready-wal", "committed-wal", "cleaned-wal", "root-wal"] and not node.no_cache_loss:
                     required_evidence.append("Lost Ready WAL publication recovered through Building abort" if omitted_manifest == "ready-wal" else "Lost Cleaned WAL publication reopened Committed" if omitted_manifest == "cleaned-wal" else "Lost root deletion reopened Cleaned" if omitted_manifest == "root-wal" else "Lost Committed WAL publication replayed Ready")
                     reports = list((output / "node").rglob("cache-loss.json"))
@@ -386,7 +406,7 @@ if __name__ == "__main__":
     mutation.add_argument("--omit-cleaned-wal-sync", action="store_true", help="omit main WAL sync at verified Cleaned publication")
     mutation.add_argument("--omit-root-wal-sync", action="store_true", help="omit main WAL sync at verified final root deletion")
     mutation.add_argument("--omit-lease-wal-sync", action="store_true", help="omit one scoped repair lease mutation WAL sync")
-    parser.add_argument("--cut", choices=["rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire"], default="rows")
+    parser.add_argument("--cut", choices=["rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire", "lease-custody"], default="rows")
     parser.add_argument("--no-cache-loss", action="store_true", help="run the same node cut without cache loss as a control")
     parser.add_argument("--node-test-binary", type=Path)
     parser.add_argument("--node-binary", type=Path)
@@ -405,6 +425,6 @@ if __name__ == "__main__":
         parser.error("Cleaned WAL control requires all node arguments and --cut cleaned")
     if args.omit_root_wal_sync and (not all(node_args) or args.cut != "root-last"):
         parser.error("Root WAL control requires all node arguments and --cut root-last")
-    if args.omit_lease_wal_sync and (not all(node_args) or args.cut not in ["lease", "lease-acquire"]):
+    if args.omit_lease_wal_sync and (not all(node_args) or args.cut not in ["lease", "lease-acquire", "lease-custody"]):
         parser.error("Lease WAL control requires all node arguments and a lease cut")
     run(args.lazyfs.resolve(strict=True), args.output.resolve(), args if all(node_args) else None)

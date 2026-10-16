@@ -75,6 +75,12 @@ pub(super) async fn run(
         lease_cache_loss::acquire_and_interrupt(root, &mut lease).await?;
         assert_eq!(package_inventory(root)?, before, "lease acquisition changed canonical packages");
     }
+    let custody_cut = interrupt == Some("lease-custody-cache-loss");
+    let expected_custody = if custody_cut {
+        let record = lease_cache_loss::durable_and_interrupt(root, &lease).await?;
+        assert_eq!(package_inventory(root)?, before, "custody transition changed canonical packages");
+        Some(record)
+    } else { None };
     let path = root.join("truncation-refused.log");
     let mut node = spawn(binary, root, zero, &path)?;
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -113,6 +119,16 @@ pub(super) async fn run(
     );
     fixture.assert_history(&db, 4).await?;
     assert!(db.repair_leases().protection().artifact(&fixture.id(4, false)));
+    if let Some(expected) = expected_custody {
+        eprintln!("Actual node lease protection preserved full history and progress after custody cut");
+        let cold = serde_json::to_value(db.repair_leases().lookup(lease.generation,
+            &HistoryReadBudget::new(Default::default()))?)?;
+        let report = root.join("lease-custody-cold.json");
+        fs::write(&report, serde_json::to_vec(&cold)?)?;
+        keep_evidence(root, &report)?;
+        assert_eq!(cold, expected, "Acknowledged custody record lost after actual node restart");
+        eprintln!("Acknowledged DurableCustody record survived actual node restart byte-for-byte in canonical JSON");
+    }
     let lease_cut = interrupt == Some("lease-release-cache-loss");
     if !lease_cut {
         assert_eq!(db.repair_leases().release(lease.generation, &lease.binding, &lease.digest)?,
@@ -128,7 +144,7 @@ pub(super) async fn run(
         assert_eq!(package_inventory(root)?, before, "lease release cache loss changed canonical packages");
     }
     eprintln!("Failed actual truncation preserved four cursors, full history and restoring beacon; exact synthetic lease release acknowledged");
-    let interrupt = if lease_cut || acquire_cut { None } else { interrupt };
+    let interrupt = if lease_cut || acquire_cut || custody_cut { None } else { interrupt };
     if let Some(mode @ ("selection-enospc" | "selection-sync-eio" | "ready-enospc" | "ready-sync-eio" | "operation-sync-eio" | "publish-rename-eio" | "publish-sync-eio" | "wal-ready-sync-eio" | "wal-publish-sync-eio" | "wal-epoch-enrollment-eio" | "publish-directory-sync-eio" | "stage-enospc" | "stage-sync-eio")) = interrupt {
         io_failure::recovery_fault(binary, root, zero, mode).await?;
         if matches!(mode, "publish-sync-eio" | "wal-publish-sync-eio" | "publish-directory-sync-eio") {
