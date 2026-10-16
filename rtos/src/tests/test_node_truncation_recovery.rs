@@ -70,7 +70,8 @@ pub(super) async fn run(
     interrupt: Option<&str>,
 ) -> Result<()> {
     let retained = lease.retained;
-    let state_cut = interrupt == Some("state-cache-loss");
+    let automatic = interrupt == Some("state-auto-cache-loss");
+    let state_cut = automatic || interrupt == Some("state-cache-loss");
     if state_cut {
         state_cache_loss::write_and_interrupt(root).await?;
         assert_eq!(package_inventory(root)?, before, "state restoration changed canonical packages");
@@ -123,90 +124,108 @@ pub(super) async fn run(
         validator_retirement_loss::write_and_interrupt(root, &fixture.id(retained, false), kind).await?;
         assert_eq!(package_inventory(root)?, before, "retirement batch changed canonical packages");
     }
-    let path = root.join("truncation-refused.log");
-    let mut node = spawn(binary, root, zero, &path)?;
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let output = fs::read_to_string(&path)?;
-        if output.contains("Node services started.") {
-            keep_evidence(root, &path)?;
-            rtos_block::fail!("Actual node started despite failed archive truncation: {output}");
-        }
-        if let Some(status) = node.0.try_wait()? {
-            assert!(!status.success(), "{output}");
-            break;
-        }
-        if Instant::now() >= deadline {
-            keep_evidence(root, &path)?;
-            rtos_block::fail!("Truncation refusal timeout: {output}");
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    keep_evidence(root, &path)?;
-    let output = fs::read_to_string(path)?;
-    assert!(output.contains("Archive truncation conflicts with repair custody"), "{output}");
-    assert!(root.join("node_db/ton_node.restoring").is_file(), "failed restore cleared its beacon");
-    assert_eq!(package_inventory(root)?, before, "failed truncation changed archives");
-    let db = open_db(root).await?;
-    for key in [LAST_APPLIED_MC_BLOCK, PSS_KEEPER_MC_BLOCK, ARCHIVES_GC_BLOCK] {
-        assert_eq!(
-            db.load_full_node_state(key)?.as_deref(),
-            Some(&fixture.id(4, false)),
-            "failed restore rewrote {key}"
-        );
-    }
-    assert_eq!(
-        db.load_full_node_state(SHARD_CLIENT_MC_BLOCK)?.as_deref(),
-        Some(&fixture.id(retained, false))
-    );
-    fixture.assert_history(&db, 4).await?;
-    assert!(db.repair_leases().protection().artifact(&fixture.id(4, false)));
-    if let Some(expected) = expected_custody {
-        eprintln!("Actual node lease protection preserved full history and progress after custody cut");
-        let cold = serde_json::to_value(db.repair_leases().lookup(lease.generation,
-            &HistoryReadBudget::new(Default::default()))?)?;
-        let report = root.join("lease-custody-cold.json");
-        fs::write(&report, serde_json::to_vec(&cold)?)?;
-        keep_evidence(root, &report)?;
-        assert_eq!(cold, expected, "Acknowledged custody record lost after actual node restart");
-        eprintln!("Acknowledged DurableCustody record survived actual node restart byte-for-byte in canonical JSON");
-    }
-    if state_cut { state_cache_loss::verify(root, &db, "guarded-startup")?; }
-    if floor_cut {
-        eprintln!("Actual node preserved protected history and progress after validator floor cut");
-        validator_cache_loss::verify(root, &db, &fixture.id(retained, false), "guarded-startup")?;
-    }
-    if let Some((mode, phase)) = persistent_failure_mode {
-        persistent_failure::verify_and_retry(root, &db, mode, phase).await?;
-    }
-    if let Some(mode) = persistent_mode {
-        eprintln!("Actual node preserved protected history and progress after persistent cut");
-        persistent_cache_loss::verify(root, &db, mode, "guarded-startup").await?;
-    }
-    if outbox_cut {
-        eprintln!("Actual node preserved protected history and progress after outbox cut");
-        outbox_cache_loss::verify(root, &db, "guarded-startup")?;
-    }
-    if let Some(kind) = validator_batch {
-        eprintln!("Actual node preserved protected history and progress after {} cut", kind.name());
-        validator_retirement_loss::verify(root, &db, &fixture.id(retained, false), "guarded-startup", kind)?;
-    }
     let lease_cut = interrupt == Some("lease-release-cache-loss");
-    if !lease_cut {
-        assert_eq!(db.repair_leases().release(lease.generation, &lease.binding, &lease.digest)?,
-            LeaseRelease::Released);
+    if automatic {
+        assert_eq!(lease.generation, 0, "automatic recovery must not acquire a fixture lease");
+        // Preserve the first loss report; the second cut will record recovery WALs.
+        let first = root.join("cache-loss.json");
+        if first.try_exists()? {
+            let saved = root.join("state-publication-cache-loss.json");
+            fs::copy(first, &saved)?;
+            keep_evidence(root, &saved)?;
+        }
+        eprintln!("Automatic dynamic recovery begins with no fixture lease or manual repair");
+    } else {
+        let path = root.join("truncation-refused.log");
+        let mut node = spawn(binary, root, zero, &path)?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let output = fs::read_to_string(&path)?;
+            if output.contains("Node services started.") {
+                keep_evidence(root, &path)?;
+                rtos_block::fail!("Actual node started despite failed archive truncation: {output}");
+            }
+            if let Some(status) = node.0.try_wait()? {
+                assert!(!status.success(), "{output}");
+                break;
+            }
+            if Instant::now() >= deadline {
+                keep_evidence(root, &path)?;
+                rtos_block::fail!("Truncation refusal timeout: {output}");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        keep_evidence(root, &path)?;
+        let output = fs::read_to_string(path)?;
+        assert!(output.contains("Archive truncation conflicts with repair custody"), "{output}");
+        assert!(root.join("node_db/ton_node.restoring").is_file(), "failed restore cleared its beacon");
+        assert_eq!(package_inventory(root)?, before, "failed truncation changed archives");
+        let db = open_db(root).await?;
+        for key in [LAST_APPLIED_MC_BLOCK, PSS_KEEPER_MC_BLOCK, ARCHIVES_GC_BLOCK] {
+            assert_eq!(
+                db.load_full_node_state(key)?.as_deref(),
+                Some(&fixture.id(4, false)),
+                "failed restore rewrote {key}"
+            );
+        }
+        assert_eq!(
+            db.load_full_node_state(SHARD_CLIENT_MC_BLOCK)?.as_deref(),
+            Some(&fixture.id(retained, false))
+        );
+        fixture.assert_history(&db, 4).await?;
+        assert!(db.repair_leases().protection().artifact(&fixture.id(4, false)));
+        if let Some(expected) = expected_custody {
+            eprintln!("Actual node lease protection preserved full history and progress after custody cut");
+            let cold = serde_json::to_value(db.repair_leases().lookup(lease.generation,
+                &HistoryReadBudget::new(Default::default()))?)?;
+            let report = root.join("lease-custody-cold.json");
+            fs::write(&report, serde_json::to_vec(&cold)?)?;
+            keep_evidence(root, &report)?;
+            assert_eq!(cold, expected, "Acknowledged custody record lost after actual node restart");
+            eprintln!("Acknowledged DurableCustody record survived actual node restart byte-for-byte in canonical JSON");
+        }
+        if state_cut { state_cache_loss::verify(root, &db, "guarded-startup")?; }
+        if floor_cut {
+            eprintln!("Actual node preserved protected history and progress after validator floor cut");
+            validator_cache_loss::verify(root, &db, &fixture.id(retained, false), "guarded-startup")?;
+        }
+        if let Some((mode, phase)) = persistent_failure_mode {
+            persistent_failure::verify_and_retry(root, &db, mode, phase).await?;
+        }
+        if let Some(mode) = persistent_mode {
+            eprintln!("Actual node preserved protected history and progress after persistent cut");
+            persistent_cache_loss::verify(root, &db, mode, "guarded-startup").await?;
+        }
+        if outbox_cut {
+            eprintln!("Actual node preserved protected history and progress after outbox cut");
+            outbox_cache_loss::verify(root, &db, "guarded-startup")?;
+        }
+        if let Some(kind) = validator_batch {
+            eprintln!("Actual node preserved protected history and progress after {} cut", kind.name());
+            validator_retirement_loss::verify(root, &db, &fixture.id(retained, false), "guarded-startup", kind)?;
+        }
+        if !lease_cut {
+            assert_eq!(db.repair_leases().release(lease.generation, &lease.binding, &lease.digest)?,
+                LeaseRelease::Released);
+        }
+        let (physical, catchain) = db.sst_databases_for_test();
+        drop(catchain);
+        db.stop_states_db().await?;
+        drop(db);
+        tokio::time::timeout(Duration::from_secs(30), wait_for_db_release(physical)).await?;
+        if lease_cut {
+            lease_cache_loss::release_and_interrupt(root, &lease).await?;
+            assert_eq!(package_inventory(root)?, before, "lease release cache loss changed canonical packages");
+        }
+        eprintln!("Failed actual truncation preserved four cursors, full history and restoring beacon; exact synthetic lease release acknowledged");
     }
-    let (physical, catchain) = db.sst_databases_for_test();
-    drop(catchain);
-    db.stop_states_db().await?;
-    drop(db);
-    tokio::time::timeout(Duration::from_secs(30), wait_for_db_release(physical)).await?;
-    if lease_cut {
-        lease_cache_loss::release_and_interrupt(root, &lease).await?;
-        assert_eq!(package_inventory(root)?, before, "lease release cache loss changed canonical packages");
-    }
-    eprintln!("Failed actual truncation preserved four cursors, full history and restoring beacon; exact synthetic lease release acknowledged");
-    let interrupt = if state_cut || lease_cut || acquire_cut || custody_cut || floor_cut || outbox_cut || persistent_mode.is_some() || persistent_failure_mode.is_some() || validator_batch.is_some() { None } else { interrupt };
+    let interrupt = if automatic {
+        Some(match std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")?.as_str() {
+            "1" => "forward-after-row-sync-cache-loss",
+            "0" => "forward-after-row-sync",
+            _ => rtos_block::fail!("Invalid automatic recovery cache-loss mode"),
+        })
+    } else if state_cut || lease_cut || acquire_cut || custody_cut || floor_cut || outbox_cut || persistent_mode.is_some() || persistent_failure_mode.is_some() || validator_batch.is_some() { None } else { interrupt };
     if let Some(mode @ ("selection-enospc" | "selection-sync-eio" | "ready-enospc" | "ready-sync-eio" | "operation-sync-eio" | "publish-rename-eio" | "publish-sync-eio" | "wal-ready-sync-eio" | "wal-publish-sync-eio" | "wal-epoch-enrollment-eio" | "publish-directory-sync-eio" | "stage-enospc" | "stage-sync-eio")) = interrupt {
         io_failure::recovery_fault(binary, root, zero, mode).await?;
         if matches!(mode, "publish-sync-eio" | "wal-publish-sync-eio" | "publish-directory-sync-eio") {
@@ -555,6 +574,19 @@ pub(super) async fn run(
                 "truncated block still indexed"
             );
         }
+    }
+    if automatic {
+        assert!(!db.repair_leases().protection().artifact(&fixture.id(4, false)));
+        assert!(!db.repair_leases().protection().state(&fixture.id(3, false)));
+        let report = root.join("state-automatic-recovery.json");
+        fs::write(&report, serde_json::to_vec(&serde_json::json!({
+            "fixture_lease_acquired": false, "manual_lease_release": false,
+            "native_reopen_between_recovery_kill_and_boot": false,
+            "actual_recovery_interrupted": true, "complete_boots": 2,
+            "retained_height": retained, "exact_state_graph": true,
+        }))?)?;
+        keep_evidence(root, &report)?;
+        eprintln!("Actual dynamic node recovered automatically after recovery interruption; no manual lease release or data repair");
     }
     db.stop_states_db().await?;
     eprintln!("Actual node retried real truncation to height {retained}, restarted twice, retained MC/WC data consistent and tail indexes removed");

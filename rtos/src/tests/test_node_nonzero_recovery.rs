@@ -393,14 +393,14 @@ async fn exercise_nonzero_recovery_layout(
     fixture.prepare(root, &archives).await?;
     let physical = run_import(fixture.config(root, archives)).await?;
     tokio::time::timeout(Duration::from_secs(60), wait_for_db_release(physical)).await?;
-    if truncation == Some((3, Some("state-cache-loss"))) {
+    if matches!(truncation, Some((3, Some("state-cache-loss" | "state-auto-cache-loss")))) {
         truncation_recovery::state_cache_loss::prepare_dynamic(root, &fixture).await?;
     }
     if sparse { sparse_packages::prepare(root).await?; }
     let db = open_db(root).await?;
     fixture.assert_imported(&db, 4).await?;
     let lease = if let Some((retained, cut)) = truncation {
-        Some(truncation_recovery::prepare(&db, &fixture, retained, cut == Some("lease-acquire-cache-loss")).await?)
+        Some(truncation_recovery::prepare(&db, &fixture, retained, matches!(cut, Some("lease-acquire-cache-loss" | "state-auto-cache-loss"))).await?)
     } else {
         None
     };
@@ -1112,4 +1112,10 @@ async fn actual_node_persistent_raw_published_eio() -> Result<()> {
 #[ignore = "requires actual node executable, signer and cache-loss fixture"]
 async fn actual_node_state_cache_loss() -> Result<()> {
     exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-cache-loss"))), false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires actual node executable, gdb, signer and cache-loss fixture"]
+async fn actual_node_state_auto_cache_loss() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-cache-loss"))), false).await
 }
