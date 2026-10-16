@@ -343,7 +343,14 @@ async fn pending_archive_root_precedes_ledger_creation_and_other_node_services()
         ).await;
         let error = outcome.err().expect("pending root started ordinary services");
         let message = format!("{error:#}");
-        assert!(message.contains(match ledger { "missing" => "ledger presence", "corrupt" => "generation length", _ => "Archive recovery state is not implemented yet: Building" }), "{message}");
+        match ledger {
+            "missing" => assert!(message.contains("ledger presence"), "{message}"),
+            "corrupt" => assert!(message.contains("generation length"), "{message}"),
+            // Building is now supported before staging, but this fixture has
+            // no selection sidecar. Its absence must preserve the pending root.
+            _ => assert!(error.downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound), "{message}"),
+        }
         assert!(!dir.path().join("catchains").exists());
         assert!(!dir.path().join("archive").exists());
         let db = open_node_db(dir.path(), &small_config(), AccessType::ReadWrite)?;

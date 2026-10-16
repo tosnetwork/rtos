@@ -54,7 +54,7 @@ impl NodeDbBootstrap {
     pub async fn recover_pending(&mut self) -> Result<()> {
         if self.recovery_started { fail!("Bootstrap recovery already started; reopen after failure or cancellation"); }
         let root = self.pending.clone().ok_or_else(|| error!("No pending node recovery"))?;
-        if root.state != crate::archives::recovery_root::State::Cleaned {
+        if !matches!(root.state, crate::archives::recovery_root::State::Building | crate::archives::recovery_root::State::Cleaned) {
             fail!("Archive recovery state is not implemented yet: {:?}", root.state);
         }
         #[cfg(not(target_os = "linux"))]

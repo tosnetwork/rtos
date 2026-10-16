@@ -16,7 +16,7 @@ pub(crate) enum Kind { Selection = 1, Ready = 2 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Record {
     Predicate = 1, Provider = 2, MapInventory = 3, Child = 4,
-    Tail = 5, ParentMutation = 6, SelectionDigest = 7,
+    Tail = 5, ParentMutation = 6, SelectionDigest = 7, ArchiveInventory = 8,
 }
 
 impl Record {
@@ -24,7 +24,7 @@ impl Record {
         Ok(match tag {
             1 => Self::Predicate, 2 => Self::Provider, 3 => Self::MapInventory,
             4 => Self::Child, 5 => Self::Tail, 6 => Self::ParentMutation,
-            7 => Self::SelectionDigest, _ => fail!("Unknown archive manifest record"),
+            7 => Self::SelectionDigest, 8 => Self::ArchiveInventory, _ => fail!("Unknown archive manifest record"),
         })
     }
 
@@ -32,7 +32,7 @@ impl Record {
         Ok(match (kind, self) {
             (Kind::Selection, Self::Predicate) | (Kind::Ready, Self::SelectionDigest) => 0,
             (_, Self::Provider) => 1,
-            (_, Self::MapInventory) => 2,
+            (_, Self::MapInventory) | (Kind::Selection, Self::ArchiveInventory) => 2,
             (_, Self::Child) => 3,
             (Kind::Ready, Self::ParentMutation) => 4,
             (_, Self::Tail) => 5,

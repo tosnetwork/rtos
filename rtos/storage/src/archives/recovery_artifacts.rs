@@ -17,7 +17,10 @@ fn directory(path: &Path) -> Result<bool> {
 fn identity(meta: &fs::Metadata) -> (u64,u64,u64,i64,i64,i64,i64) {
     (meta.dev(), meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec(), meta.ctime(), meta.ctime_nsec())
 }
-fn sidecar(path: &Path, kind: Kind, root: &RootHeader, expected: Sidecar) -> Result<()> {
+pub(crate) fn read_sidecar(
+    path: &Path, kind: Kind, root: &RootHeader, expected: Sidecar,
+    visit: impl FnMut(super::recovery_manifest::Record, u64, &mut dyn io::Read) -> Result<()>,
+) -> Result<()> {
     let before = fs::symlink_metadata(path)?;
     if !before.is_file() || before.file_type().is_symlink() || before.len() != expected.bytes {
         fail!("Recovery sidecar type or length mismatch");
@@ -28,9 +31,7 @@ fn sidecar(path: &Path, kind: Kind, root: &RootHeader, expected: Sidecar) -> Res
         // Root-bound whole-file digest, framing, operation, counts and EOF are
         // checked. Cleaned inventories supply canonical-state evidence; this is
         // not a replacement for the earlier full selection/Ready semantics.
-        read_manifest(&mut file, kind, root.operation, expected, |_, _, payload| {
-            io::copy(payload, &mut io::sink())?; Ok(())
-        })?;
+        read_manifest(&mut file, kind, root.operation, expected, visit)?;
         if identity(&file.metadata()?) != identity(&before)
             || identity(&fs::symlink_metadata(path)?) != identity(&before) {
             fail!("Recovery sidecar changed during inspection");
@@ -44,9 +45,24 @@ fn sidecar(path: &Path, kind: Kind, root: &RootHeader, expected: Sidecar) -> Res
     outcome
 }
 
+fn sidecar(path: &Path, kind: Kind, root: &RootHeader, expected: Sidecar) -> Result<()> {
+    read_sidecar(path, kind, root, expected, |_, _, payload| {
+        io::copy(payload, &mut io::sink())?; Ok(())
+    })
+}
+
+pub(crate) fn validate_unstaged_building(providers: &RecoveryProviders, root: &RootHeader) -> Result<()> {
+    if root.state != State::Building { fail!("Expected Building root"); }
+    validate_remaining(providers, root)
+}
+
 pub(crate) fn validate_cleaned(providers: &RecoveryProviders, root: &RootHeader) -> Result<()> {
-    root.validate()?;
     if root.state != State::Cleaned { fail!("Control cleanup inspection requires Cleaned root"); }
+    validate_remaining(providers, root)
+}
+
+fn validate_remaining(providers: &RecoveryProviders, root: &RootHeader) -> Result<()> {
+    root.validate()?;
     let operation = hex::encode(root.operation);
     for participant in &providers.participants {
         let archive = participant.database.db().path().parent().expect("provider root").join("archive");
@@ -67,7 +83,7 @@ pub(crate) fn validate_cleaned(providers: &RecoveryProviders, root: &RootHeader)
                 }
                 match artifact.file_name().to_str() {
                     Some("selection.v1") => sidecar(&artifact.path(), Kind::Selection, root, root.selection)?,
-                    Some("ready.v1") if !root.aborted => sidecar(&artifact.path(), Kind::Ready, root, root.ready)?,
+                    Some("ready.v1") if root.state == State::Cleaned && !root.aborted => sidecar(&artifact.path(), Kind::Ready, root, root.ready)?,
                     _ => fail!("Unrecognized remaining recovery artifact"),
                 }
             }

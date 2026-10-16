@@ -182,9 +182,62 @@ pub(super) fn write_and_hold(root: &Path) -> Result<()> {
     header[212..244].copy_from_slice(&map_hash.finalize());
     header[244..252].copy_from_slice(&data_count.to_le_bytes());
     header[252..284].copy_from_slice(&data_hash.finalize());
+    let building_mode = std::env::var("RTOS_NONZERO_BUILDING_FIXTURE").unwrap_or_default();
+    let building = matches!(building_mode.as_str(), "valid" | "bad-data" | "unexpected-stage");
+    if building {
+        use storage::traits::Serializable;
+        let mut selection = b"RTOSAMF1".to_vec();
+        selection.extend_from_slice(&[1, 0, 1, 0]);
+        selection.extend_from_slice(&OPERATION);
+        let mut count = 0u64;
+        let mut record = |tag: u8, payload: &[u8]| {
+            selection.push(tag);
+            selection.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            selection.extend_from_slice(payload);
+            count += 1;
+        };
+        let fixture = Fixture::node_recovery();
+        let mut predicate = 1u16.to_le_bytes().to_vec();
+        predicate.extend_from_slice(&fixture.id(4, false).serialize());
+        predicate.extend_from_slice(&1u64.to_le_bytes());
+        predicate.extend_from_slice(&fixture.id(4, true).serialize());
+        record(1, &predicate);
+        for provider in &providers {
+            record(2, &provider.descriptor);
+        }
+        let mut maps = vec![1, 0, 1];
+        maps.extend_from_slice(&header[204..244]);
+        record(3, &maps);
+        let mut data = vec![1, 0, 2];
+        data.extend_from_slice(&header[244..284]);
+        if building_mode == "bad-data" {
+            data[11] ^= 1;
+        }
+        record(8, &data);
+        selection.push(0);
+        let body_hash = sha256_digest(&selection);
+        selection.extend_from_slice(&count.to_le_bytes());
+        selection.extend_from_slice(&body_hash);
+        header[10..12].copy_from_slice(&[1, 2]);
+        header[68..76].copy_from_slice(&(selection.len() as u64).to_le_bytes());
+        header[76..84].copy_from_slice(&count.to_le_bytes());
+        header[84..116].copy_from_slice(&sha256_digest(&selection));
+        header[164..284].fill(0);
+        let directory = node.join("archive/recovery").join(hex::encode(OPERATION));
+        fs::create_dir_all(&directory)?;
+        if building_mode == "unexpected-stage" {
+            let stage = directory.join("stage.pack");
+            fs::write(&stage, b"preserve")?;
+            fs::File::open(stage)?.sync_all()?;
+        }
+        let path = directory.join("selection.v1");
+        fs::write(root.join("expected-selection.bin"), &selection)?;
+        fs::write(&path, selection)?;
+        fs::File::open(path)?.sync_all()?;
+    }
     let checksum = sha256_digest(&header[..284]);
     header[284..].copy_from_slice(&checksum);
-    for provider in &providers {
+    for (index, provider) in providers.iter().enumerate() {
         let mut backlink = vec![0u8; 164];
         backlink[..8].copy_from_slice(b"RTOSATP1");
         backlink[8] = 1;
@@ -193,8 +246,14 @@ pub(super) fn write_and_hold(root: &Path) -> Result<()> {
         backlink[100..132].copy_from_slice(&sha256_digest(&provider.descriptor));
         let checksum = sha256_digest(&backlink[..132]);
         backlink[132..].copy_from_slice(&checksum);
-        provider.db.db().put(b"ArchiveTruncationParticipantV1", backlink)?;
-        provider.db.sync_wal()?;
+        // Building may be interrupted before every provider was enrolled.
+        if !building || index == 0 {
+            if index == 0 {
+                fs::write(root.join("expected-backlink.bin"), &backlink)?;
+            }
+            provider.db.db().put(b"ArchiveTruncationParticipantV1", backlink)?;
+            provider.db.sync_wal()?;
+        }
         let operation = provider.root.join("archive/recovery").join(hex::encode(OPERATION));
         fs::create_dir_all(&operation)?;
         for dir in [
@@ -206,6 +265,7 @@ pub(super) fn write_and_hold(root: &Path) -> Result<()> {
             fs::File::open(dir)?.sync_all()?;
         }
     }
+    fs::write(root.join("expected-root.bin"), &header)?;
     main.db().put(b"ArchiveTruncationRootV1", header)?;
     main.sync_wal()?;
     fs::write(root.join("cleaned-ready"), b"durable")?;

@@ -57,10 +57,21 @@ fn verify(providers: &RecoveryProviders, root: &RootHeader) -> Result<()> {
 }
 
 pub(crate) fn recover_cleaned(providers: RecoveryProviders, root: RootHeader) -> Result<()> {
-    if root.state != State::Cleaned { fail!("Archive recovery state is not implemented yet: {:?}", root.state); }
-    verify(&providers, &root)?;
+    let aborted = match root.state {
+        State::Building => Some(super::recovery_building::prepare_abort(&providers, &root)?),
+        State::Cleaned => { verify(&providers, &root)?; None },
+        _ => fail!("Archive recovery state is not implemented yet: {:?}", root.state),
+    };
     let providers = Arc::new(providers);
     let custody = super::package::retirement::reserve_resources(&providers)?;
+    let root = if let Some(cleaned) = aborted {
+        let main = providers.participants.iter().find(|p| p.descriptor.anchor == Anchor::Node)
+            .ok_or_else(|| error!("Missing Building main provider"))?;
+        main.database.db().put(ROOT_KEY, cleaned.encode()?)?;
+        main.database.sync_wal()?;
+        cleaned
+    } else { root };
+    verify(&providers, &root)?;
     for participant in &providers.participants {
         clean_controls(participant.database.db().path().parent().ok_or_else(|| error!("Missing provider root"))?,
             participant.descriptor.anchor == Anchor::Node, &root)?;

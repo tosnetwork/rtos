@@ -41,16 +41,31 @@ fn package_inventory(root: &Path) -> Result<BTreeMap<PathBuf, [u8; 32]>> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires RTOS_NODE_RECOVERY_BINARY built from this revision"]
 async fn actual_node_restarts_with_nonzero_authenticated_history() -> Result<()> {
-    exercise_nonzero_recovery(false).await
+    exercise_nonzero_recovery(false, None).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires gdb and RTOS_NODE_RECOVERY_BINARY with current debug symbols"]
 async fn actual_node_resumes_after_interrupting_recovery() -> Result<()> {
-    exercise_nonzero_recovery(true).await
+    exercise_nonzero_recovery(true, None).await
 }
 
-async fn exercise_nonzero_recovery(interrupt_recovery: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RTOS_NODE_RECOVERY_BINARY built from this revision"]
+async fn actual_node_aborts_unstaged_building_with_nonzero_history() -> Result<()> {
+    exercise_nonzero_recovery(true, Some("valid")).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RTOS_NODE_RECOVERY_BINARY built from this revision"]
+async fn actual_node_preserves_building_with_unverified_inputs() -> Result<()> {
+    for case in ["bad-data", "unexpected-stage"] {
+        exercise_nonzero_recovery(false, Some(case)).await?;
+    }
+    Ok(())
+}
+
+async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&str>) -> Result<()> {
     let binary = fs::canonicalize(std::env::var("RTOS_NODE_RECOVERY_BINARY")?)?;
     let dir = tempfile::tempdir()?;
     let root = dir.path();
@@ -66,7 +81,7 @@ async fn exercise_nonzero_recovery(interrupt_recovery: bool) -> Result<()> {
     db.stop_states_db().await?;
     drop(db);
     tokio::time::timeout(Duration::from_secs(30), wait_for_db_release(physical)).await?;
-    interrupt_cleaned_writer(root).await?;
+    interrupt_cleaned_writer(root, building).await?;
     let before = package_inventory(root)?;
     assert!(!before.is_empty(), "node fixture must contain canonical archive packages");
 
@@ -100,7 +115,89 @@ async fn exercise_nonzero_recovery(interrupt_recovery: bool) -> Result<()> {
     )?;
     drop((adnl, quic));
     fs::write(root.join("node-log.yml"), "appenders:\n  console:\n    kind: console\n    encoder:\n      pattern: '{m}{n}'\nroot:\n  level: info\n  appenders: [console]\n")?;
+    if building.is_some_and(|case| case != "valid") {
+        let path = root.join("building-refused.log");
+        let log = fs::File::create(&path)?;
+        let mut node = Process(
+            Command::new(&binary)
+                .env("TOKIO_WORKER_THREADS", "2")
+                .arg("--configs")
+                .arg(root)
+                .arg("--zerostate")
+                .arg(&zero)
+                .arg("--initial-sync-disabled")
+                .current_dir(root)
+                .stdout(Stdio::from(log.try_clone()?))
+                .stderr(Stdio::from(log))
+                .spawn()?,
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(status) = node.0.try_wait()? {
+                assert!(!status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                rtos_block::fail!("Building rejection timeout: {}", fs::read_to_string(&path)?);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let output = fs::read_to_string(path)?;
+        let expected = if building == Some("bad-data") {
+            "Building original archive data changed"
+        } else {
+            "Unrecognized remaining recovery artifact"
+        };
+        assert!(output.contains(expected), "{output}");
+        assert!(!output.contains("Node services started."));
+        assert_eq!(package_inventory(root)?, before);
+        let bootstrap = storage::db::node::open_node_db_for_bootstrap(
+            root.join("node_db"),
+            &Default::default(),
+            storage::db::rocksdb::AccessType::ReadWrite,
+        )?;
+        assert!(bootstrap.requires_recovery());
+        assert_eq!(
+            bootstrap.database().db().get(b"ArchiveTruncationRootV1")?.unwrap(),
+            fs::read(root.join("expected-root.bin"))?
+        );
+        assert_eq!(
+            bootstrap.database().db().get(b"ArchiveTruncationParticipantV1")?.unwrap(),
+            fs::read(root.join("expected-backlink.bin"))?
+        );
+        assert_eq!(
+            fs::read(
+                root.join("node_db/archive/recovery")
+                    .join(hex::encode([0x35u8; 16]))
+                    .join("selection.v1")
+            )?,
+            fs::read(root.join("expected-selection.bin"))?
+        );
+        if building == Some("unexpected-stage") {
+            assert_eq!(
+                fs::read(
+                    root.join("node_db/archive/recovery")
+                        .join(hex::encode([0x35u8; 16]))
+                        .join("stage.pack")
+                )?,
+                b"preserve"
+            );
+        }
+        eprintln!("Actual node rejected Building {building:?}; packages, root, backlink, selection and any unknown stage unchanged");
+        return Ok(());
+    }
     if interrupt_recovery {
+        if building.is_some() {
+            interrupt_actual_recovery(
+                &binary,
+                root,
+                &zero,
+                "building-before-cleaned",
+                "main.database.db().put(ROOT_KEY, cleaned.encode()?)?;",
+            )
+            .await?;
+            assert_eq!(package_inventory(root)?, before);
+        }
         for (cut, statement) in [
             ("backlink-before-sync", "participant.database.sync_wal()?;"),
             ("root-before-delete", "main.database.db().delete(ROOT_KEY)?;"),
@@ -172,7 +269,7 @@ fn nonzero_cleaned_crash_writer() -> Result<()> {
     pending_root::write_and_hold(Path::new(&std::env::var("RTOS_NONZERO_CLEANED_FIXTURE")?))
 }
 
-async fn interrupt_cleaned_writer(root: &Path) -> Result<()> {
+async fn interrupt_cleaned_writer(root: &Path, building: Option<&str>) -> Result<()> {
     let log_path = root.join("cleaned-writer.log");
     let log = fs::File::create(&log_path)?;
     let mut writer = Process(
@@ -184,6 +281,7 @@ async fn interrupt_cleaned_writer(root: &Path) -> Result<()> {
                 "--nocapture",
             ])
             .env("RTOS_NONZERO_CLEANED_FIXTURE", root)
+            .env("RTOS_NONZERO_BUILDING_FIXTURE", building.unwrap_or("0"))
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log))
             .spawn()?,
