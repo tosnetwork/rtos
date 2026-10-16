@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "cpp_revision": "8f083dc06bff16705710a01de15eb3123d5d696b",
+  "global_id": 3,
+  "global_version": 16,
+  "genesis_time": 1792180800,
+  "genesis_wallet_seed_label": "rtos-interop-v16-public-genesis-wallet",
+  "bootstrap_validator_set_valid_for": 2000000000,
+  "shard_validators": 4,
+  "economics": "cpp-local-test-default",
+  "consensus": {
+    "target_block_rate_ms": 400,
+    "slots_per_leader_window": 4,
+    "first_block_timeout_ms": 1000,
+    "max_leader_window_desync": 250,
+    "protocol_version": 2,
+    "use_quic": true
+  },
+  "expected_zerostate": {
+    "workchain": -1,
+    "shard": "-9223372036854775808",
+    "seqno": 0,
+    "root_hash": "BtlGvhDPk8Tpq4G2cBi6XWpiuq/L7E6QT4xPxTb7gO0=",
+    "file_hash": "kNcYS2WlR5CzvvbMxc4VMeFUx0mrlr8ZCSMXdYURUWM=",
+    "@type": "tosNode.blockIdExt"
+  },
+  "expected_workchain_zerostate": {
+    "@type": "tosNode.blockIdExt",
+    "workchain": 0,
+    "shard": "-9223372036854775808",
+    "seqno": 0,
+    "root_hash": "8biqDnQdr1iiwlnkrD33BDxNKZYWUSptWgPwnMkdBEs=",
+    "file_hash": "xzDVh4DUX3RLsOWGAnkIbd3fWtf7VpiXxiJ1T7R3Ofo="
+  }
+}

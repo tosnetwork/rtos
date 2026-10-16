@@ -131,3 +131,37 @@ This establishes a block/state checkpoint comparison. It does not qualify
 active Rust voting, candidate production, quorum behavior, transactions across
 all profiles or the complete mixed-validator gate. The public synchronization
 configuration contains fresh transport identities and no signing profile.
+
+## Frozen four-member matrix
+
+`mixed_matrix.py` starts all four validators and requires each one's own
+masterchain block to be accepted with matching native applied-state checkpoints
+at every endpoint. Rust creators additionally require the corresponding local
+collation success log. Every owned Rust process must exit normally. The node,
+preparer, checker, C++ snapshot and Genesis profile hashes remain pinned during
+the run. Supply the exact Rust executable revision, independently of the runner
+revision.
+
+```sh
+"$CPP_PYTHON" ci/interop/mixed_matrix.py \
+  --snapshot "$CPP_SNAPSHOT" --rust-node "$RUST_NODE" \
+  --validator-preparer "$VALIDATOR_PREPARER" --block-checker "$BLOCK_CHECKER" \
+  --rust-revision "$RUST_REVISION" --cpp-count 1 \
+  --output "$MATRIX_OUTPUT" --base-port 55700
+```
+
+Use `--cpp-count 1`, `2`, or `3` for the reverse, symmetric and forward
+four-member topologies. Run them sequentially: these deliberately public test
+identities must not be active in concurrent duplicate networks. The checked-in
+`testnet-v16.json` fixes time, public wallet-seed derivation, initial-set lifetime,
+version, equal membership, test economics, Simplex parameters and complete MC/WC
+Genesis identities. The transport, validator-ID and PQ seeds use the fixed public
+`n6-validator-{transport,id,seed}-{index}` SHA-256 derivations. Each deployment
+regenerates Genesis with the frozen C++ programs and rejects a different full
+identity before starting validators. `--prepare-genesis-only` performs generation
+without running validator processes; it is not consensus acceptance.
+
+The long initial-set lifetime is solely for reproducible isolated fixtures.
+This profile does not qualify deployment fee schedules, version 17–19,
+workchain leadership, elections or validator-set rotation. Do not use its public
+identities or wallet for a shared deployment.
