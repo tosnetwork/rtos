@@ -711,6 +711,12 @@ impl<K: DbKey + Send + Sync> RocksDbTable<K> {
         self.delete_raw(key.key())
     }
 
+    /// Append a put without publishing it. The caller owns the matching DB batch.
+    pub fn add_put_to_batch(&self, batch: &mut WriteBatch, key: &K, value: &[u8]) -> Result<()> {
+        batch.put_cf(&self.cf()?, key.key(), value);
+        Ok(())
+    }
+
     /// Append a delete operation for `key` into `batch`. Caller commits.
     pub fn add_delete_to_batch(&self, batch: &mut WriteBatch, key: &K) -> Result<()> {
         batch.delete_cf(&self.cf()?, key.key());

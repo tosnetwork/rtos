@@ -6,7 +6,7 @@ use std::{fs, path::Path};
 
 #[derive(Debug, thiserror::Error)]
 #[error("Archive recovery required: {0}")]
-pub struct ArchiveRecoveryRequired(#[source] anyhow::Error);
+pub struct ArchiveRecoveryRequired(#[source] pub(crate) anyhow::Error);
 
 pub(crate) fn known_status_key(key: &[u8]) -> bool {
     [b"ShardSplitDepth".as_slice(), b"SlicedMode", b"SliceSize", b"NonSlicedSize", b"TotalSlices"]

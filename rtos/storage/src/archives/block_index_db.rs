@@ -252,9 +252,19 @@ impl BlockIndexDb {
 
     /// Prepare all lookup changes before the replacement package is published.
     /// Offsets are meaningful only within the package selected by shard and mc_ref.
+    #[cfg(test)]
     pub(super) fn prepare_repack_offsets(
         &self,
         offsets: &RepackOffsets,
+        selects_package: impl Fn(&ShardIdent, u32) -> Result<bool>,
+    ) -> Result<rocksdb::WriteBatch> {
+        self.prepare_repack_changes(offsets, rocksdb::WriteBatch::default(), selects_package)
+    }
+
+    pub(super) fn prepare_repack_changes(
+        &self,
+        offsets: &RepackOffsets,
+        mut batch: rocksdb::WriteBatch,
         selects_package: impl Fn(&ShardIdent, u32) -> Result<bool>,
     ) -> Result<rocksdb::WriteBatch> {
         let offsets = offsets
@@ -264,7 +274,6 @@ impl BlockIndexDb {
             })
             .collect::<Result<HashMap<_, _>>>()?;
         let cf = self.cf()?;
-        let mut batch = rocksdb::WriteBatch::default();
         let mut iter = self.db.raw_iterator_cf(&cf);
         iter.seek_to_first();
         while let Some(key) = iter.key() {

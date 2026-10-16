@@ -124,10 +124,36 @@ pub(super) async fn run(
             "repack-before-rename" => {
                 "tokio::fs::rename(new_package.get_path(), old_package.get_path()).await?;"
             }
+            "repack-after-rename" => {
+                "crate::archives::package::sync_file_and_parents(old_package.path()).await?;"
+            }
             _ => rtos_block::fail!("Unknown truncation cut {cut}"),
         };
         interrupt_actual_recovery(binary, root, zero, cut, statement).await?;
         assert!(root.join("node_db/ton_node.restoring").is_file());
+        if cut == "repack-after-rename" {
+            assert_ne!(
+                package_inventory(root)?,
+                before,
+                "after-rename cut did not replace canonical bytes"
+            );
+            fn no_stage(path: &Path) -> Result<()> {
+                for entry in fs::read_dir(path)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_dir() {
+                        no_stage(&entry.path())?;
+                    } else {
+                        assert!(
+                            !entry.file_name().to_string_lossy().ends_with(".pack.new"),
+                            "after-rename cut still has a stage: {}",
+                            entry.path().display()
+                        );
+                    }
+                }
+                Ok(())
+            }
+            no_stage(root)?;
+        }
         if cut == "truncation-before-progress" {
             assert_ne!(package_inventory(root)?, before, "cut preceded actual archive mutation");
             let output = fs::read_to_string(root.join(format!("cut-{cut}.log")))?;

@@ -18,6 +18,8 @@ pub enum PackageStatusKey {
     SliceSize,
     NonSlicedSize,
     TotalSlices,
+    // Not a normal-open key: the startup guard must preserve pending publication.
+    RepackPending,
 }
 
 impl DbKey for PackageStatusKey {

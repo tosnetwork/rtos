@@ -121,6 +121,18 @@ async fn actual_node_resumes_repack_before_rename_retaining_height_three() -> Re
     exercise_nonzero_recovery_case(false, None, Some((3, Some("repack-before-rename")))).await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires gdb; known incomplete archive transaction recovery"]
+async fn actual_node_resumes_repack_after_rename_retaining_height_two() -> Result<()> {
+    exercise_nonzero_recovery_case(false, None, Some((2, Some("repack-after-rename")))).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires gdb; known incomplete archive transaction recovery"]
+async fn actual_node_resumes_repack_after_rename_retaining_height_three() -> Result<()> {
+    exercise_nonzero_recovery_case(false, None, Some((3, Some("repack-after-rename")))).await
+}
+
 async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&str>) -> Result<()> {
     exercise_nonzero_recovery_case(interrupt_recovery, building, None).await
 }
@@ -436,7 +448,7 @@ async fn interrupt_actual_recovery(
     statement: &str,
 ) -> Result<()> {
     use std::os::unix::process::CommandExt;
-    let (source, source_file) = if cut == "repack-before-rename" {
+    let (source, source_file) = if cut.starts_with("repack-") {
         (include_str!("../../storage/src/archives/archive_slice.rs"), "archive_slice.rs")
     } else if cut == "truncation-before-progress" {
         (include_str!("../internal_db/restore.rs"), "restore.rs")
@@ -447,7 +459,7 @@ async fn interrupt_actual_recovery(
         source.lines().enumerate().filter(|(_, line)| line.trim() == statement).collect();
     assert_eq!(matches.len(), 1, "crash cut must identify one production statement");
     let line = matches[0].0 + 1;
-    let function = if cut == "repack-before-rename" {
+    let function = if cut.starts_with("repack-") {
         "storage::archives::archive_slice::{impl#0}::trunc::"
     } else if cut == "truncation-before-progress" {
         "internal_db::restore::restore"

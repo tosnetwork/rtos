@@ -934,6 +934,11 @@ impl ArchiveSlice {
 
     /// truncs slice starting from master block_id
     pub async fn trunc(&mut self, selection: Arc<TruncationSelection>) -> Result<()> {
+        if self.package_status_db.contains(&PackageStatusKey::RepackPending)? {
+            return Err(super::recovery_guard::ArchiveRecoveryRequired(
+                error!("Pending package publication requires archive recovery"),
+            ).into());
+        }
         let block_id = selection.cutoff();
         log::info!(
             target: TARGET,
@@ -1025,12 +1030,10 @@ impl ArchiveSlice {
         }
 
         // Delete unneeded entries from package by repack.
-        // 1) read all items from package and write it (with condition) into "new" package
-        //      write new offsets and indexes into correspond dbs by the way
-        // 2) rename new package
-        // while old package is not deleted repack might be replay many times
-        // (it doesn't use offsets db), but read form package will fail
-        // (offsets db points new package)
+        // Prepare replacement bytes and a single child-metadata batch without
+        // changing canonical offsets or lengths while the old package is live.
+        // Publish that batch only after the replacement file is synchronized.
+        // Root-owned durable staging/replay is still required across that boundary.
 
         // TotalSlices is written after the loop because the effective count may be less than
         // upto if all entries in the boundary package(s) are deleted.
@@ -1047,6 +1050,7 @@ impl ArchiveSlice {
             let new_package = Package::open(self.view.clone(), &self.view.enter()?, new_name.into(), false, true).await?;
             let mut old_reader = old_package.open_reader().await?;
 
+            let mut metadata_batch = rocksdb::WriteBatch::default();
             let mut any_kept = false;
             let mut source_offset = 0u64;
             let mut index_offsets = RepackOffsets::new();
@@ -1070,31 +1074,13 @@ impl ArchiveSlice {
                     if let Some(offset) = block_offset {
                         index_offsets.insert((id.shard().clone(), offset), None);
                     }
-                    if let Err(e) = self.offsets_db.delete(&(&entry_id).into()) {
-                        log::warn!(
-                            target: TARGET,
-                            "Can't delete {entry_id} from offsets db (slice: {}): {e}",
-                            self.archive_id
-                        )
-                    }
+                    self.offsets_db.add_delete_to_batch(&mut metadata_batch, &(&entry_id).into())?;
                 } else {
                     log::trace!(target: TARGET, "repack package: repack {entry_id}");
-                    let mut after_append = |offset: u64, size: u64| {
-                        let info = if self.shard_separated {
-                            Some(package_info.entry())
-                        } else {
-                            None
-                        };
-                        let meta =
-                            PackageEntryMeta::with_data(size, package_info.version(), info);
-                        let index = package_info.index();
-                        log::debug!(
-                            target: TARGET,
-                            "Writing package entry metadata for slice \
-                            #{index}: {meta:?}, offset: {offset}"
-                        );
-                        self.entry_db.put_value(&index.into(), &meta)?;
-                        self.offsets_db.put_value(&(&entry_id).into(), &offset)?;
+                    let mut after_append = |offset: u64, _size: u64| {
+                        self.offsets_db.add_put_to_batch(
+                            &mut metadata_batch, &(&entry_id).into(), &serde_cbor::to_vec(&offset)?,
+                        )?;
                         if let Some(old) = block_offset {
                             index_offsets.insert((id.shard().clone(), old), Some(offset));
                         }
@@ -1112,6 +1098,11 @@ impl ArchiveSlice {
             }
             if any_kept {
                 effective_total = i + 1;
+                let info = self.shard_separated.then(|| package_info.entry());
+                let meta = PackageEntryMeta::with_data(new_package.size(), package_info.version(), info);
+                self.entry_db.add_put_to_batch(
+                    &mut metadata_batch, &i.into(), &serde_cbor::to_vec(&meta)?,
+                )?;
             } else {
                 log::debug!(
                     target: TARGET,
@@ -1119,21 +1110,22 @@ impl ArchiveSlice {
                     not counting it towards TotalSlices",
                     self.archive_id
                 );
-                if let Err(e) = self.entry_db.delete(&i.into()) {
-                    log::warn!(
-                        target: TARGET,
-                        "Can't delete #{i} from entry_db (slice: {}): {e}",
-                        self.archive_id
-                    );
-                }
+                self.entry_db.add_delete_to_batch(&mut metadata_batch, &i.into())?;
             }
 
-            let index_batch = self.block_index_db.prepare_repack_offsets(
+            let mut index_batch = self.block_index_db.prepare_repack_changes(
                 &index_offsets,
+                metadata_batch,
                 |shard, mc_ref| {
                     Ok(self.package_entry_info(mc_ref, shard)? == *package_info.entry())
                 },
             )?;
+            // Persist a refusal marker before the file/DB publication window.
+            // It grants no replay authority. Clear it atomically with all child
+            // metadata; ordinary startup must never truncate using stale sizes.
+            self.package_status_db.put_value(&PackageStatusKey::RepackPending, &i)?;
+            self.package_status_db.sync_wal()?;
+            self.package_status_db.add_delete_to_batch(&mut index_batch, &PackageStatusKey::RepackPending)?;
             tokio::fs::rename(new_package.get_path(), old_package.get_path()).await?;
             crate::archives::package::sync_file_and_parents(old_package.path()).await?;
             self.block_index_db.commit_repack_offsets(index_batch)?;
