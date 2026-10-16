@@ -28,7 +28,7 @@ pub struct Package {
 /// One identity for cached length/health, captured view and actual writer. Native
 /// migration can retain this state independently of the caller's Package handle.
 #[derive(Debug)]
-struct PackageState {
+pub(super) struct PackageState {
     // Writer ownership is released before the captured provider/view.
     write_mutex: Arc<tokio::sync::Mutex<Option<std::fs::File>>>,
     path: PathBuf,
@@ -39,6 +39,9 @@ struct PackageState {
     view: ArchiveView,
     #[cfg(test)]
     append_probe: std::sync::Mutex<Option<AppendProbe>>,
+}
+impl PackageState {
+    pub(super) fn view(&self) -> &ArchiveView { &self.view }
 }
 #[cfg(test)]
 #[derive(Debug)]
@@ -116,13 +119,15 @@ impl Package {
         PackageWriter { guard, _state: state }
     }
 
-    fn from_opened(view: ArchiveView, path: PathBuf, read_only: bool, file: Option<std::fs::File>, size: u64) -> Self {
-        Self { state: Arc::new(PackageState {
+    fn from_opened(view: ArchiveView, parent: &ArchiveOperation, path: PathBuf, read_only: bool, file: Option<std::fs::File>, size: u64) -> Result<Self> {
+        let state = Arc::new(PackageState {
             view, path, read_only, size: AtomicU64::new(size), write_healthy: AtomicBool::new(true),
             write_mutex: Arc::new(tokio::sync::Mutex::new(file)),
             #[cfg(test)]
             append_probe: std::sync::Mutex::new(None),
-        }) }
+        });
+        state.view.register_package(parent, &state)?;
+        Ok(Self { state })
     }
 
     pub async fn open(view: ArchiveView, parent: &ArchiveOperation, path: PathBuf, read_only: bool, create: bool) -> Result<Self> {
@@ -152,7 +157,7 @@ impl Package {
         phase.check_completion()?;
         let mut package = None;
         handoff.consume(|opened| {
-            package = Some(Self::from_opened(view, path, false, opened.0.take(), opened.1));
+            package = Some(Self::from_opened(view, &operation, path, false, opened.0.take(), opened.1)?);
             Ok(())
         })?;
         phase.complete();
@@ -198,7 +203,7 @@ impl Package {
         let _registration = view.inherit(parent)?;
         let mut package = None;
         acquisition.consume(|opened| {
-            package = Some(Self::from_opened(view, path, read_only, opened.0.take(), opened.1));
+            package = Some(Self::from_opened(view, &_registration, path, read_only, opened.0.take(), opened.1)?);
             Ok(())
         })?;
         Ok(package.expect("registered existing native package"))

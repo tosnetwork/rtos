@@ -175,3 +175,85 @@ fn competing_claims_retain_every_native_participant_until_last_owner() -> Result
     assert!(!domain.state.lock().unwrap().recovery_claimed);
     Ok(())
 }
+
+#[tokio::test]
+async fn idle_package_registry_is_weak_and_carries_no_io_ticket() -> Result<()> {
+    use crate::archives::package::Package;
+    let (dir, _db, domain, provider) = fixture();
+    let view = provider.view()?;
+    let operation = view.enter()?;
+    let package = Package::open(view.clone(), &operation, dir.path().join("idle.pack"), false, true).await?;
+    drop(operation);
+    assert_eq!(domain.outstanding(), 0);
+    let owner = domain.begin_recovery(view.epoch(), &[provider])?;
+    owner.wait_for_old_io().await?;
+    let snapshot = owner.snapshot_packages()?;
+    assert_eq!(snapshot.len(), 1);
+    let weak = Arc::downgrade(&snapshot[0]);
+    drop(snapshot);
+    assert!(weak.upgrade().is_some());
+    drop(package);
+    assert!(weak.upgrade().is_none(), "weak registry must not keep idle files alive");
+    assert!(owner.snapshot_packages()?.is_empty());
+    assert_eq!(domain.lock()?.packages.len(), 0);
+    Ok(())
+}
+
+#[test]
+fn retirement_snapshot_includes_constructor_that_finishes_while_closing() -> Result<()> {
+    use crate::archives::package::Package;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all()
+        .max_blocking_threads(1).build()?;
+    runtime.block_on(async {
+        let (dir, _db, domain, provider) = fixture();
+        let view = provider.view()?;
+        let operation = view.enter()?;
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(10))?;
+        let path = dir.path().join("late.pack");
+        let mut opening = Box::pin(Package::open(view.clone(), &operation, path.clone(), false, true));
+        assert!(futures::poll!(&mut opening).is_pending());
+        let owner = domain.begin_recovery(view.epoch(), &[provider])?;
+        assert_eq!(owner.snapshot_packages().err().unwrap().downcast_ref::<ArchiveContextError>(),
+            Some(&ArchiveContextError::NotDrained));
+        assert!(domain.lock()?.packages.is_empty());
+        release_tx.send(())?;
+        blocker.await?;
+        let package = opening.await?;
+        drop(operation);
+        owner.wait_for_old_io().await?;
+        let snapshot = owner.snapshot_packages()?;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(std::fs::metadata(&path)?.len(), 4);
+        assert_eq!(domain.outstanding(), 0);
+        drop(snapshot); drop(package);
+        assert!(!domain.recovery_required());
+        Ok(())
+    })
+}
+
+#[tokio::test]
+async fn retirement_snapshot_refuses_missing_live_package_provider() -> Result<()> {
+    use crate::archives::package::Package;
+    let (dir, _db, domain, provider) = fixture();
+    let epoch_db = RocksDb::new(dir.path(), "epoch", None, AccessType::ReadWrite)?;
+    let epoch_provider = epoch_db.bind_archive_domain(domain.clone())?;
+    let view = epoch_provider.view()?;
+    let operation = view.enter()?;
+    let _package = Package::open(view.clone(), &operation, dir.path().join("epoch.pack"), false, true).await?;
+    drop(operation);
+    let incomplete = domain.begin_recovery(0, &[provider.clone()])?;
+    incomplete.wait_for_old_io().await?;
+    let error = incomplete.snapshot_packages().err().unwrap();
+    assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&ArchiveContextError::InvalidRecoveryProviders));
+    drop(incomplete);
+    let complete = domain.begin_recovery(0, &[provider, epoch_provider])?;
+    assert_eq!(complete.snapshot_packages()?.len(), 1);
+    assert!(!domain.recovery_required());
+    Ok(())
+}

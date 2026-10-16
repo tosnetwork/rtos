@@ -75,6 +75,30 @@ impl RecoveryExecution {
         }
         Ok(())
     }
+    /// Capture idle packages only after all admitted constructors and IO have
+    /// really drained. No package lock is taken under the registry mutex.
+    /// This is resource discovery, not proof that descriptors have closed.
+    pub(in crate::archives) fn snapshot_packages(&self) -> Result<Vec<Arc<super::super::package::PackageState>>> {
+        let mut state = self.state.domain.lock()?;
+        ArchiveDomain::check_epoch(&state, self.state.epoch)?;
+        if state.phase == Phase::RecoveryRequired {
+            return Err(ArchiveContextError::RecoveryRequired(state.epoch).into());
+        }
+        if state.phase != Phase::Closing || state.owners.outstanding() != 0 {
+            return Err(ArchiveContextError::NotDrained.into());
+        }
+        let packages: Vec<_> = state.packages.iter().filter_map(std::sync::Weak::upgrade).collect();
+        state.packages.retain(|package| package.strong_count() != 0);
+        // Releasing a rejected snapshot may close the final idle file. Never
+        // let that destruction happen while holding the registry/domain lock.
+        drop(state);
+        if packages.iter().any(|package| !self.state.providers.iter()
+            .any(|provider| Arc::ptr_eq(provider, package.view().binding().db()))) {
+            return Err(ArchiveContextError::InvalidRecoveryProviders.into());
+        }
+        Ok(packages)
+    }
+
     /// The closure starts only after old IO has drained. The worker must first
     /// establish phase-specific retirement/protection/manifest preconditions.
     /// Queued closures and returned receipts retain this claim independently of

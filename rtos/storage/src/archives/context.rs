@@ -3,7 +3,7 @@
 use super::io_owners::{ArchiveIoOwners, ArchiveIoTicket};
 use crate::db::rocksdb::RocksDb;
 use rtos_block::Result;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ArchiveContextError {
@@ -42,6 +42,7 @@ struct State {
     phase: Phase,
     owners: Arc<ArchiveIoOwners>,
     recovery_claimed: bool,
+    packages: Vec<Weak<super::package::PackageState>>,
 }
 pub struct ArchiveDomain {
     state: Mutex<State>,
@@ -51,7 +52,7 @@ pub struct ArchiveDomain {
 impl Default for ArchiveDomain {
     fn default() -> Self {
         Self {
-            state: Mutex::new(State { epoch: 0, phase: Phase::Open, owners: Arc::default(), recovery_claimed: false }),
+            state: Mutex::new(State { epoch: 0, phase: Phase::Open, owners: Arc::default(), recovery_claimed: false, packages: Vec::new() }),
             #[cfg(all(test, target_os = "linux"))]
             read_probe: Mutex::new(None),
         }
@@ -177,6 +178,22 @@ impl ArchiveView {
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
+    /// Called while constructor admission is still held. Closing permits that
+    /// constructor to finish; a recovery snapshot must wait for its ticket.
+    pub(super) fn register_package(
+        &self, parent: &ArchiveOperation, package: &Arc<super::package::PackageState>,
+    ) -> Result<()> {
+        let _registration = self.inherit(parent)?;
+        let mut state = self.binding.domain.lock()?;
+        ArchiveDomain::check_epoch(&state, self.epoch)?;
+        if state.phase == Phase::RecoveryRequired {
+            return Err(ArchiveContextError::RecoveryRequired(self.epoch).into());
+        }
+        state.packages.retain(|package| package.strong_count() != 0);
+        state.packages.push(Arc::downgrade(package));
+        Ok(())
+    }
+
     pub fn enter(&self) -> Result<ArchiveOperation> {
         let state = self.binding.domain.lock()?;
         ArchiveDomain::check_epoch(&state, self.epoch)?;
