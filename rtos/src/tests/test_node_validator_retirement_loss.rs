@@ -1,9 +1,17 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
-//! Synced validator retirement batch followed by executable recovery.
+//! Synced validator retirement and claim batches followed by executable recovery.
 use super::*;
-use consensus_common::validator_cleanup::{encode_record, make_record, record_key, NamespaceLayout, PendingValidatorCleanup};
-use crate::{internal_db::DESTROYED_VALIDATOR_SESSIONS, validator::validator_cleanup_gc::persist_retirement};
+use consensus_common::validator_cleanup::{candidate_claim_key, encode_record, make_record, record_key, NamespaceLayout, PendingValidatorCleanup};
+use crate::{internal_db::DESTROYED_VALIDATOR_SESSIONS, validator::validator_cleanup_gc::{erase_record, persist_retirement}};
 use std::collections::HashSet;
+
+#[derive(Clone, Copy)]
+pub(super) enum BatchKind { Retirement, Claim }
+impl BatchKind {
+    pub(super) fn name(self) -> &'static str {
+        match self { Self::Retirement => "retirement", Self::Claim => "claim" }
+    }
+}
 
 fn fixture(id: &rtos_block::BlockIdExt) -> Result<(HashSet<UInt256>, PendingValidatorCleanup)> {
     let session = UInt256::from([0x22; 32]);
@@ -11,17 +19,33 @@ fn fixture(id: &rtos_block::BlockIdExt) -> Result<(HashSet<UInt256>, PendingVali
     let record = make_record(&session, &NamespaceLayout::V1, &rtos_block::ShardIdent::masterchain(), 5, id)?;
     Ok((fence, record))
 }
-fn intended(id: &rtos_block::BlockIdExt) -> Result<Vec<Option<Vec<u8>>>> {
+fn intended(id: &rtos_block::BlockIdExt, kind: BatchKind) -> Result<Vec<Option<Vec<u8>>>> {
     let (fence, record) = fixture(id)?;
-    Ok(vec![Some(crate::engine_operations::serialize_destroyed_session_ids(&fence)), Some(encode_record(&record)?)])
+    let fence = Some(crate::engine_operations::serialize_destroyed_session_ids(&fence));
+    Ok(match kind {
+        BatchKind::Retirement => vec![fence, Some(encode_record(&record)?)],
+        BatchKind::Claim => vec![None, Some(record.namespace.into_bytes()), fence],
+    })
 }
-fn previous() -> Vec<Option<Vec<u8>>> {
-    vec![Some(crate::engine_operations::serialize_destroyed_session_ids(&HashSet::from([UInt256::from([0x11; 32])]))), None]
+fn previous(id: &rtos_block::BlockIdExt, kind: BatchKind) -> Result<Vec<Option<Vec<u8>>>> {
+    Ok(match kind {
+        BatchKind::Retirement => vec![Some(crate::engine_operations::serialize_destroyed_session_ids(
+            &HashSet::from([UInt256::from([0x11; 32])]))), None],
+        BatchKind::Claim => {
+            let (fence, record) = fixture(id)?;
+            vec![Some(encode_record(&record)?), None,
+                Some(crate::engine_operations::serialize_destroyed_session_ids(&fence))]
+        }
+    })
 }
-fn read(db: &InternalDb, id: &rtos_block::BlockIdExt) -> Result<Vec<Option<Vec<u8>>>> {
+fn read(db: &InternalDb, id: &rtos_block::BlockIdExt, kind: BatchKind) -> Result<Vec<Option<Vec<u8>>>> {
     let (_, record) = fixture(id)?;
-    Ok(vec![db.load_validator_state_key_bounded(DESTROYED_VALIDATOR_SESSIONS, 1 << 20)?,
-        db.load_validator_state_key_bounded(&record_key(&record.namespace), 1 << 20)?])
+    let keys = match kind {
+        BatchKind::Retirement => vec![DESTROYED_VALIDATOR_SESSIONS.to_owned(), record_key(&record.namespace)],
+        BatchKind::Claim => vec![record_key(&record.namespace), candidate_claim_key(&record.session_id),
+            DESTROYED_VALIDATOR_SESSIONS.to_owned()],
+    };
+    keys.iter().map(|key| db.load_validator_state_key_bounded(key, 1 << 20)).collect()
 }
 fn encoded(rows: &[Option<Vec<u8>>]) -> Vec<Option<String>> {
     rows.iter().map(|bytes| bytes.as_ref().map(hex::encode)).collect()
@@ -29,51 +53,63 @@ fn encoded(rows: &[Option<Vec<u8>>]) -> Vec<Option<String>> {
 
 #[tokio::test]
 #[ignore = "internal child; requires owned validator retirement fixture"]
-async fn retirement_child() -> Result<()> {
+async fn batch_child() -> Result<()> {
     let root = PathBuf::from(std::env::var("RTOS_TEST_VALIDATOR_CHILD_ROOT")?);
     let id: rtos_block::BlockIdExt = fs::read_to_string(root.join("retirement-input.txt"))?.parse()?;
+    let kind = match std::env::var("RTOS_TEST_VALIDATOR_BATCH")?.as_str() {
+        "retirement" => BatchKind::Retirement, "claim" => BatchKind::Claim,
+        _ => rtos_block::fail!("Unknown validator batch"),
+    };
     let db = open_db(&root).await?;
-    persist_retirement(&db, &HashSet::from([UInt256::from([0x11; 32])]), &[])?;
-    assert_eq!(read(&db, &id)?, previous());
+    let (fence, record) = fixture(&id)?;
+    match kind {
+        BatchKind::Retirement => persist_retirement(&db, &HashSet::from([UInt256::from([0x11; 32])]), &[])?,
+        BatchKind::Claim => persist_retirement(&db, &fence, std::slice::from_ref(&record))?,
+    }
+    assert_eq!(read(&db, &id, kind)?, previous(&id, kind)?);
     if let Ok(arm) = std::env::var("RTOS_TEST_ROOT_WAL_ARM") {
         fs::write(arm, b"retirement armed after durable previous fence\n")?;
     }
-    let (fence, record) = fixture(&id)?;
-    persist_retirement(&db, &fence, &[record])?;
-    assert_eq!(read(&db, &id)?, intended(&id)?);
+    match kind {
+        BatchKind::Retirement => persist_retirement(&db, &fence, &[record])?,
+        BatchKind::Claim => erase_record(&db, &record.namespace, Some(&record.session_id))?,
+    }
+    assert_eq!(read(&db, &id, kind)?, intended(&id, kind)?);
     let omitted = std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE").as_deref() == Ok("validator-wal");
     if omitted {
         let proof = fs::read_to_string(std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_MARKER")?)?;
         assert_eq!(proof.lines().count(), 1);
         assert!(proof.contains(&format!("{}/node_db/catchains/", root.display())));
     }
-    let ack = root.join("validator-retirement-ack.json");
+    let ack = root.join(format!("validator-{}-ack.json", kind.name()));
     fs::write(&ack, serde_json::to_vec(&serde_json::json!({
-        "checkpoint": id.to_string(), "previous": encoded(&previous()),
-        "expected": encoded(&intended(&id)?), "sync_omission_before_ack": omitted,
+        "checkpoint": id.to_string(), "kind": kind.name(), "previous": encoded(&previous(&id, kind)?),
+        "expected": encoded(&intended(&id, kind)?), "sync_omission_before_ack": omitted,
     }))?)?;
     fs::File::open(&ack)?.sync_all()?;
     loop { tokio::time::sleep(Duration::from_secs(1)).await; }
 }
 
-pub(super) async fn write_and_interrupt(root: &Path, id: &rtos_block::BlockIdExt) -> Result<()> {
+pub(super) async fn write_and_interrupt(root: &Path, id: &rtos_block::BlockIdExt, kind: BatchKind) -> Result<()> {
     fs::write(root.join("retirement-input.txt"), id.to_string())?;
     cache_loss::sync_fixture(root)?;
-    let path = root.join("validator-retirement-child.log");
+    let path = root.join(format!("validator-{}-child.log", kind.name()));
     let log = fs::File::create(&path)?;
     let mut child = Process(Command::new(std::env::current_exe()?)
         .args(["--exact", "--ignored", "--nocapture", "--test-threads=1",
-            "archive_import::tests::node_process_recovery::truncation_recovery::validator_retirement_loss::retirement_child"])
+            "archive_import::tests::node_process_recovery::truncation_recovery::validator_retirement_loss::batch_child"])
         .env("RTOS_TEST_VALIDATOR_CHILD_ROOT", root)
+        .env("RTOS_TEST_VALIDATOR_BATCH", kind.name())
         .stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log)).spawn()?);
-    let ack = root.join("validator-retirement-ack.json");
+    let ack = root.join(format!("validator-{}-ack.json", kind.name()));
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Ok(bytes) = fs::read(&ack) {
             if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 assert_eq!(value["checkpoint"], id.to_string());
-                assert_eq!(value["expected"], serde_json::json!(encoded(&intended(id)?)));
-                assert_eq!(value["previous"], serde_json::json!(encoded(&previous())));
+                assert_eq!(value["kind"], kind.name());
+                assert_eq!(value["expected"], serde_json::json!(encoded(&intended(id, kind)?)));
+                assert_eq!(value["previous"], serde_json::json!(encoded(&previous(id, kind)?)));
                 assert_eq!(value["sync_omission_before_ack"],
                     std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE").as_deref() == Ok("validator-wal"));
                 break;
@@ -100,19 +136,19 @@ pub(super) async fn write_and_interrupt(root: &Path, id: &rtos_block::BlockIdExt
         _ => rtos_block::fail!("Invalid cache-loss mode"),
     };
     if loss { cache_loss::clear(root).await?; }
-    eprintln!("Acknowledged validator retirement batch writer killed without native close; cache-loss={loss}");
+    eprintln!("Acknowledged validator {} batch writer killed without native close; cache-loss={loss}", kind.name());
     Ok(())
 }
 
-pub(super) fn verify(root: &Path, db: &InternalDb, id: &rtos_block::BlockIdExt, phase: &str) -> Result<()> {
-    let actual = read(db, id)?;
-    let expected = intended(id)?;
-    let report = root.join(format!("validator-retirement-{phase}.json"));
+pub(super) fn verify(root: &Path, db: &InternalDb, id: &rtos_block::BlockIdExt, phase: &str, kind: BatchKind) -> Result<()> {
+    let actual = read(db, id, kind)?;
+    let expected = intended(id, kind)?;
+    let report = root.join(format!("validator-{}-{phase}.json", kind.name()));
     fs::write(&report, serde_json::to_vec(&serde_json::json!({
-        "previous": encoded(&previous()), "expected": encoded(&expected), "actual": encoded(&actual),
+        "previous": encoded(&previous(id, kind)?), "expected": encoded(&expected), "actual": encoded(&actual),
     }))?)?;
     keep_evidence(root, &report)?;
-    assert_eq!(actual, expected, "Acknowledged validator retirement batch lost after actual node restart");
-    eprintln!("Validator retirement fence and record preserved together after {phase}");
+    assert_eq!(actual, expected, "Acknowledged validator {} batch lost after actual node restart", kind.name());
+    eprintln!("Validator {} batch preserved together after {phase}", kind.name());
     Ok(())
 }

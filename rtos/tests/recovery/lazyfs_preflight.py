@@ -178,6 +178,8 @@ def run(binary, output, node=None):
                         case = "actual_node_validator_floor_cache_loss"
                     if node.cut == "validator-retirement":
                         case = "actual_node_validator_retirement_cache_loss"
+                    if node.cut == "validator-claim":
+                        case = "actual_node_validator_claim_cache_loss"
                     result["node_cut"] = node.cut
                     result["node_cache_loss_enabled"] = not node.no_cache_loss
                     executed = subprocess.Popen(
@@ -222,8 +224,9 @@ def run(binary, output, node=None):
                     required_evidence = [f"Acknowledged lease {operation} writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true")]
                 if node.cut == "validator-floor":
                     required_evidence = ["Acknowledged validator floor writer killed with physical pin and native owner alive; cache-loss=" + ("false" if node.no_cache_loss else "true")]
-                if node.cut == "validator-retirement":
-                    required_evidence = ["Acknowledged validator retirement batch writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true")]
+                if node.cut in ["validator-retirement", "validator-claim"]:
+                    batch_kind = node.cut.removeprefix("validator-")
+                    required_evidence = [f"Acknowledged validator {batch_kind} batch writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true")]
                 if expected_failure and omitted_manifest == "validator-wal":
                     if executed.returncode != 101:
                         raise RuntimeError("Missing validator-floor sync omission failure")
@@ -231,16 +234,18 @@ def run(binary, output, node=None):
                     reports = list((output / "node").rglob("cache-loss.json"))
                     if len(reports) != 1:
                         raise RuntimeError("Missing validator WAL report")
-                    if node.cut == "validator-retirement":
-                        required_evidence.extend(["Actual node preserved protected history and progress after retirement cut",
-                            "Acknowledged validator retirement batch lost after actual node restart"])
-                        cold = list((output / "node").rglob("validator-retirement-guarded-startup.json"))
+                    if node.cut in ["validator-retirement", "validator-claim"]:
+                        required_evidence.extend([f"Actual node preserved protected history and progress after {batch_kind} cut",
+                            f"Acknowledged validator {batch_kind} batch lost after actual node restart"])
+                        cold = list((output / "node").rglob(f"validator-{batch_kind}-guarded-startup.json"))
                         if len(cold) != 1:
                             raise RuntimeError("Missing retirement batch report")
                         batch = json.loads(cold[0].read_text())
                         if batch["actual"] != batch["previous"] or batch["actual"] == batch["expected"]:
                             raise RuntimeError("Retirement omission did not revert the whole batch")
-                        result["whole_retirement_batch_lost"] = True
+                        if batch_kind == "claim" and (len(batch["actual"]) != 3 or batch["actual"][2] != batch["expected"][2]):
+                            raise RuntimeError("Claim rollback changed unrelated fence")
+                        result[f"whole_{batch_kind}_batch_lost"] = True
                     else:
                         required_evidence.extend(["Actual node preserved protected history and progress after validator floor cut",
                             "Acknowledged validator cleanup floor lost after actual node restart"])
@@ -337,8 +342,8 @@ def run(binary, output, node=None):
                     if executed.returncode != 0:
                         raise RuntimeError(f"Actual node cache-loss test failed: {executed.returncode}")
                     required_evidence.extend(["1 passed; 0 failed", "Actual node retried real truncation"])
-                    if node.cut == "validator-retirement":
-                        required_evidence.append("Validator retirement fence and record preserved together after two-boots")
+                    if node.cut in ["validator-retirement", "validator-claim"]:
+                        required_evidence.append(f"Validator {batch_kind} batch preserved together after two-boots")
                     if node.cut == "validator-floor":
                         required_evidence.append("Validator cleanup floor bytes and truncation boundary preserved after two-boots")
                     if node.cut == "lease-custody":
@@ -450,7 +455,7 @@ if __name__ == "__main__":
     mutation.add_argument("--omit-root-wal-sync", action="store_true", help="omit main WAL sync at verified final root deletion")
     mutation.add_argument("--omit-lease-wal-sync", action="store_true", help="omit one scoped repair lease mutation WAL sync")
     mutation.add_argument("--omit-validator-wal-sync", action="store_true", help="omit one scoped validator floor WAL sync")
-    parser.add_argument("--cut", choices=["rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire", "lease-custody", "validator-floor", "validator-retirement"], default="rows")
+    parser.add_argument("--cut", choices=["rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire", "lease-custody", "validator-floor", "validator-retirement", "validator-claim"], default="rows")
     parser.add_argument("--no-cache-loss", action="store_true", help="run the same node cut without cache loss as a control")
     parser.add_argument("--node-test-binary", type=Path)
     parser.add_argument("--node-binary", type=Path)
@@ -471,6 +476,6 @@ if __name__ == "__main__":
         parser.error("Root WAL control requires all node arguments and --cut root-last")
     if args.omit_lease_wal_sync and (not all(node_args) or args.cut not in ["lease", "lease-acquire", "lease-custody"]):
         parser.error("Lease WAL control requires all node arguments and a lease cut")
-    if args.omit_validator_wal_sync and (not all(node_args) or args.cut not in ["validator-floor", "validator-retirement"]):
+    if args.omit_validator_wal_sync and (not all(node_args) or args.cut not in ["validator-floor", "validator-retirement", "validator-claim"]):
         parser.error("Validator WAL control requires all node arguments and --cut validator-floor")
     run(args.lazyfs.resolve(strict=True), args.output.resolve(), args if all(node_args) else None)

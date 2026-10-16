@@ -86,9 +86,13 @@ pub(super) async fn run(
         validator_cache_loss::write_and_interrupt(root, &fixture.id(retained, false)).await?;
         assert_eq!(package_inventory(root)?, before, "validator floor write changed canonical packages");
     }
-    let retirement_cut = interrupt == Some("validator-retirement-cache-loss");
-    if retirement_cut {
-        validator_retirement_loss::write_and_interrupt(root, &fixture.id(retained, false)).await?;
+    let validator_batch = match interrupt {
+        Some("validator-retirement-cache-loss") => Some(validator_retirement_loss::BatchKind::Retirement),
+        Some("validator-claim-cache-loss") => Some(validator_retirement_loss::BatchKind::Claim),
+        _ => None,
+    };
+    if let Some(kind) = validator_batch {
+        validator_retirement_loss::write_and_interrupt(root, &fixture.id(retained, false), kind).await?;
         assert_eq!(package_inventory(root)?, before, "retirement batch changed canonical packages");
     }
     let path = root.join("truncation-refused.log");
@@ -143,9 +147,9 @@ pub(super) async fn run(
         eprintln!("Actual node preserved protected history and progress after validator floor cut");
         validator_cache_loss::verify(root, &db, &fixture.id(retained, false), "guarded-startup")?;
     }
-    if retirement_cut {
-        eprintln!("Actual node preserved protected history and progress after retirement cut");
-        validator_retirement_loss::verify(root, &db, &fixture.id(retained, false), "guarded-startup")?;
+    if let Some(kind) = validator_batch {
+        eprintln!("Actual node preserved protected history and progress after {} cut", kind.name());
+        validator_retirement_loss::verify(root, &db, &fixture.id(retained, false), "guarded-startup", kind)?;
     }
     let lease_cut = interrupt == Some("lease-release-cache-loss");
     if !lease_cut {
@@ -162,7 +166,7 @@ pub(super) async fn run(
         assert_eq!(package_inventory(root)?, before, "lease release cache loss changed canonical packages");
     }
     eprintln!("Failed actual truncation preserved four cursors, full history and restoring beacon; exact synthetic lease release acknowledged");
-    let interrupt = if lease_cut || acquire_cut || custody_cut || floor_cut || retirement_cut { None } else { interrupt };
+    let interrupt = if lease_cut || acquire_cut || custody_cut || floor_cut || validator_batch.is_some() { None } else { interrupt };
     if let Some(mode @ ("selection-enospc" | "selection-sync-eio" | "ready-enospc" | "ready-sync-eio" | "operation-sync-eio" | "publish-rename-eio" | "publish-sync-eio" | "wal-ready-sync-eio" | "wal-publish-sync-eio" | "wal-epoch-enrollment-eio" | "publish-directory-sync-eio" | "stage-enospc" | "stage-sync-eio")) = interrupt {
         io_failure::recovery_fault(binary, root, zero, mode).await?;
         if matches!(mode, "publish-sync-eio" | "wal-publish-sync-eio" | "publish-directory-sync-eio") {
@@ -453,8 +457,8 @@ pub(super) async fn run(
     );
     let db = open_db(root).await?;
     fixture.assert_imported(&db, retained).await?;
-    if retirement_cut {
-        validator_retirement_loss::verify(root, &db, &fixture.id(retained, false), "two-boots")?;
+    if let Some(kind) = validator_batch {
+        validator_retirement_loss::verify(root, &db, &fixture.id(retained, false), "two-boots", kind)?;
     }
     if floor_cut {
         validator_cache_loss::verify(root, &db, &fixture.id(retained, false), "two-boots")?;
