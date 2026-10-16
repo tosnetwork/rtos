@@ -257,3 +257,64 @@ async fn started_native_read_finishes_after_recovery_latch() {
     assert_eq!(domain.outstanding(), 0);
     assert!(weak.upgrade().is_none());
 }
+
+#[tokio::test]
+async fn native_stream_keeps_admitted_owner_through_entries_and_rejects_partial_tail() {
+    for partial in [false, true] {
+        let (dir, _db, domain, view) = fixture();
+        let path = dir.path().join("stream.pack");
+        let mut bytes = package_bytes();
+        if partial { bytes.push(0x8b); }
+        std::fs::write(&path, bytes).unwrap();
+        let mut reader = NativePackageReader::open(view.enter().unwrap(), path, LIMITS).await.unwrap();
+        let closed = domain.close(view.epoch()).unwrap();
+        assert_eq!(domain.outstanding(), 1);
+        let entry = reader.next().await.unwrap().unwrap();
+        assert_eq!(entry.filename(), "x");
+        assert_eq!(entry.data(), b"abcd");
+        let end = reader.next().await;
+        if partial {
+            assert!(end.is_err());
+            assert!(reader.next().await.is_err());
+            assert_eq!(domain.outstanding(), 0);
+        } else {
+            assert!(end.unwrap().is_none());
+        }
+        drop(reader);
+        tokio::time::timeout(Duration::from_secs(10), closed.wait()).await.unwrap();
+        assert!(!domain.recovery_required());
+    }
+}
+
+#[test]
+fn cancelled_native_stream_next_retains_provider_until_job_retires() {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all()
+        .max_blocking_threads(1).build().unwrap();
+    runtime.block_on(async {
+        let (dir, db, domain, view) = fixture();
+        let path = dir.path().join("cancel-stream.pack");
+        std::fs::write(&path, package_bytes()).unwrap();
+        let weak = Arc::downgrade(&db);
+        let mut reader = NativePackageReader::open(view.enter().unwrap(), path, LIMITS).await.unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut next = Box::pin(reader.next());
+        assert!(futures::poll!(&mut next).is_pending());
+        drop(next);
+        assert!(reader.next().await.is_err());
+        drop(reader); drop(view); drop(db);
+        let closed = domain.close(0).unwrap();
+        assert_eq!(domain.outstanding(), 1);
+        assert!(weak.upgrade().is_some());
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), closed.wait()).await.unwrap();
+        assert!(weak.upgrade().is_none());
+        assert!(!domain.recovery_required());
+    });
+}

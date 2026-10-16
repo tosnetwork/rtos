@@ -10,17 +10,15 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::context::{ArchiveOperation, ArchiveView};
-use crate::{
-    archives::package_entry::{PackageEntry, PKG_ENTRY_HEADER_SIZE},
-    TARGET,
-};
+use crate::archives::package_entry::PackageEntry;
 use rtos_block::{error, fail, Result};
 use std::{
     io::SeekFrom,
     path::{Path, PathBuf},
     sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
 };
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+#[cfg(test)]
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug)]
 pub struct Package {
@@ -337,40 +335,12 @@ impl Package {
     }
 
     pub async fn read_entry(&self, offset: u64) -> Result<PackageEntry> {
-        let mut file = self.open_file().await?;
-        let required_size = offset + PKG_ENTRY_HEADER_SIZE as u64;
-        // Fast path: use cached atomic size for bounds check.
-        let mut actual_size = self.size();
-        if actual_size <= required_size {
-            // Slow path: cached size may be stale when another thread just finished
-            // appending; confirm with actual file metadata before returning EOF.
-            actual_size = file.metadata().await?.len().saturating_sub(PKG_HEADER_SIZE as u64);
-            if actual_size <= required_size {
-                fail!(
-                    "Unexpected end of file when reading package {} entry with offset {offset}",
-                    self.state.path.display()
-                );
-            } else {
-                log::warn!(
-                    target: TARGET,
-                    "Not actualized package {} size {actual_size} \
-                    when reading entry with offset {offset}",
-                    self.state.path.display()
-                )
-            }
-        }
-        file.seek(SeekFrom::Start(PKG_HEADER_SIZE as u64 + offset)).await?;
-        PackageEntry::read_from(&mut file)
-            .await
-            .map_err(|e| {
-                error!("Package::read_entry {} at offset {offset}: {e}", self.state.path.display())
-            })?
-            .ok_or_else(|| {
-                error!(
-                    "Package::read_entry {} at offset {offset}: Unexpected end of file",
-                    self.state.path.display()
-                )
-            })
+        self.read_entry_bounded(offset, wire_read_limits()).await
+    }
+
+    pub(super) async fn open_reader(&self) -> Result<super::native_read::NativePackageReader> {
+        let operation = self.state.view.enter()?;
+        super::native_read::NativePackageReader::open(operation, self.state.path.clone(), wire_read_limits()).await
     }
 
     pub async fn read_entry_bounded(
@@ -471,22 +441,12 @@ impl Package {
         Ok(entry.expect("consumed package entry"))
     }
 
-    pub async fn open_file(&self) -> Result<tokio::fs::File> {
-        Self::open_file_ext(self.state.read_only, false, self.state.path.as_path()).await
-    }
+}
 
-    async fn open_file_ext(
-        read_only: bool,
-        create: bool,
-        path: impl AsRef<Path>,
-    ) -> Result<tokio::fs::File> {
-        Ok(tokio::fs::OpenOptions::new()
-            .read(true)
-            .write(!read_only || create)
-            .create(create)
-            .open(&path)
-            .await?)
-    }
+// Preserve the legacy API's full wire-format range. Callers requiring a
+// resource budget must continue using read_entry_bounded with explicit limits.
+fn wire_read_limits() -> super::bounded_read::ArchiveReadLimits {
+    super::bounded_read::ArchiveReadLimits { data_bytes: u32::MAX as usize, filename_bytes: u16::MAX as usize }
 }
 
 pub struct PackageReader<R: tokio::io::AsyncReadExt + Unpin> {
@@ -660,9 +620,8 @@ mod write_health_tests {
         let uncertain = std::fs::read(&path)?;
         assert!(uncertain.starts_with(&original));
         assert!(uncertain.len() > original.len());
-        let read = package.read_entry(0).await?;
-        assert_eq!(read.filename(), seed.filename());
-        assert_eq!(read.data(), seed.data());
+        let error = package.read_entry(0).await.err().expect("failed domain must refuse new reads");
+        assert!(error.is::<crate::archives::context::ArchiveContextError>());
         let calls = AtomicU64::new(0);
         let error = package
             .append_entry(target(), |_, _| {
@@ -696,6 +655,9 @@ mod write_health_tests {
         let recovered = Package::open(view.clone(), &operation, path.clone(), false, false).await?;
         recovered.truncate(committed_end).await?;
         assert_eq!(std::fs::read(&path)?, original);
+        let read = recovered.read_entry(0).await?;
+        assert_eq!(read.filename(), seed.filename());
+        assert_eq!(read.data(), seed.data());
         let target = recovered.append_entry(target(), |_, _| Ok(())).await?;
         let entry = recovered.read_entry(committed_end).await?;
         assert_eq!(entry.filename(), target.filename());

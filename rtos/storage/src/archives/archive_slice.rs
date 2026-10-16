@@ -17,7 +17,7 @@ use crate::{
         archive_manager::{ArchiveManager, ImportEntry},
         block_index_db::{BlockIndexDb, LookupResult, RepackOffsets},
         get_mc_seq_no,
-        package::{read_package_from, Package},
+        package::Package,
         package_entry::PackageEntry,
         package_entry_id::{GetFileName, PackageEntryId},
         package_entry_meta_db::{PackageEntryInfo, PackageEntryMeta, PackageEntryMetaDb},
@@ -1041,7 +1041,7 @@ impl ArchiveSlice {
             log::trace!(target: TARGET, "repack package {}", old_package.get_path());
             let _ = tokio::fs::remove_file(&new_name).await;
             let new_package = Package::open(self.view.clone(), &self.view.enter()?, new_name.into(), false, true).await?;
-            let mut old_reader = read_package_from(old_package.open_file().await?).await?;
+            let mut old_reader = old_package.open_reader().await?;
 
             let mut any_kept = false;
             let mut source_offset = 0u64;

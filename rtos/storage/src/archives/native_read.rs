@@ -12,7 +12,7 @@ use super::{
 use rtos_block::{error, fail, Result};
 use std::{
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{BufReader, Read, Seek, SeekFrom},
     path::PathBuf,
 };
 
@@ -43,36 +43,73 @@ impl Drop for ReadReceipt {
     }
 }
 
+fn open_owned(operation: ArchiveOperation, path: PathBuf) -> Result<OwnedReader> {
+    let custody = operation.start_read()?;
+    let file = File::open(path).map_err(ArchiveReadNotStarted::from_open)?;
+    #[cfg(all(test, target_os = "linux"))]
+    let probe = custody.take_read_probe();
+    #[cfg(all(test, target_os = "linux"))]
+    let (opened, receipt) = match probe {
+        Some(probe) => (Some(probe.opened), Some(ReadReceipt(Some(probe.closed)))),
+        None => (None, None),
+    };
+    let owner = OwnedReader {
+        file,
+        #[cfg(all(test, target_os = "linux"))]
+        _receipt: receipt,
+        _custody: custody,
+    };
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(opened) = opened {
+        opened(&owner.file);
+    }
+    Ok(owner)
+}
+
 async fn read_owned<T: Send + 'static>(
     operation: ArchiveOperation,
     path: PathBuf,
     read: impl FnOnce(&mut File) -> Result<T> + Send + 'static,
 ) -> Result<T> {
     tokio::task::spawn_blocking(move || {
-        // This check runs in the actual native owner, not its async observer.
-        let custody = operation.start_read()?;
-        let file = File::open(path).map_err(ArchiveReadNotStarted::from_open)?;
-        #[cfg(all(test, target_os = "linux"))]
-        let probe = custody.take_read_probe();
-        #[cfg(all(test, target_os = "linux"))]
-        let (opened, receipt) = match probe {
-            Some(probe) => (Some(probe.opened), Some(ReadReceipt(Some(probe.closed)))),
-            None => (None, None),
-        };
-        let mut owner = OwnedReader {
-            file,
-            #[cfg(all(test, target_os = "linux"))]
-            _receipt: receipt,
-            _custody: custody,
-        };
-        #[cfg(all(test, target_os = "linux"))]
-        if let Some(opened) = opened {
-            opened(&owner.file);
-        }
+        let mut owner = open_owned(operation, path)?;
         read(&mut owner.file)
-    })
-    .await
-    .map_err(|error| error!("Archive native read owner failed: {error}"))?
+    }).await.map_err(|error| error!("Archive native read owner failed: {error}"))?
+}
+
+impl Read for OwnedReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> { self.file.read(bytes) }
+}
+
+/// The stream retains its actual descriptor and admission between entries.
+/// Each next call transfers that whole owner to the native job. Cancelling a
+/// next call leaves this handle unusable while the job retires its resources.
+pub(super) struct NativePackageReader {
+    reader: Option<BufReader<OwnedReader>>,
+    limits: ArchiveReadLimits,
+}
+impl NativePackageReader {
+    pub(super) async fn open(operation: ArchiveOperation, path: PathBuf, limits: ArchiveReadLimits) -> Result<Self> {
+        let reader = tokio::task::spawn_blocking(move || {
+            let mut reader = BufReader::with_capacity(1 << 19, open_owned(operation, path)?);
+            let mut header = [0; PKG_HEADER_SIZE];
+            reader.read_exact(&mut header)?;
+            if u32::from_le_bytes(header) != PKG_HEADER_MAGIC { fail!("Package file header mismatch"); }
+            Ok::<_, anyhow::Error>(reader)
+        }).await.map_err(|e| error!("Native package stream open failed: {e}"))??;
+        Ok(Self { reader: Some(reader), limits })
+    }
+
+    pub(super) async fn next(&mut self) -> Result<Option<PackageEntry>> {
+        let mut reader = self.reader.take().ok_or_else(|| error!("Package stream is closed after cancellation or read failure"))?;
+        let limits = self.limits;
+        let (reader, entry) = tokio::task::spawn_blocking(move || {
+            let entry = PackageEntry::read_next_bounded_sync(&mut reader, limits);
+            (reader, entry)
+        }).await.map_err(|e| error!("Native package stream read failed: {e}"))?;
+        if entry.is_ok() { self.reader = Some(reader); }
+        entry
+    }
 }
 
 pub(super) async fn read_entry(
