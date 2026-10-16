@@ -86,6 +86,11 @@ pub(super) async fn run(
         validator_cache_loss::write_and_interrupt(root, &fixture.id(retained, false)).await?;
         assert_eq!(package_inventory(root)?, before, "validator floor write changed canonical packages");
     }
+    let retirement_cut = interrupt == Some("validator-retirement-cache-loss");
+    if retirement_cut {
+        validator_retirement_loss::write_and_interrupt(root, &fixture.id(retained, false)).await?;
+        assert_eq!(package_inventory(root)?, before, "retirement batch changed canonical packages");
+    }
     let path = root.join("truncation-refused.log");
     let mut node = spawn(binary, root, zero, &path)?;
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -138,6 +143,10 @@ pub(super) async fn run(
         eprintln!("Actual node preserved protected history and progress after validator floor cut");
         validator_cache_loss::verify(root, &db, &fixture.id(retained, false), "guarded-startup")?;
     }
+    if retirement_cut {
+        eprintln!("Actual node preserved protected history and progress after retirement cut");
+        validator_retirement_loss::verify(root, &db, &fixture.id(retained, false), "guarded-startup")?;
+    }
     let lease_cut = interrupt == Some("lease-release-cache-loss");
     if !lease_cut {
         assert_eq!(db.repair_leases().release(lease.generation, &lease.binding, &lease.digest)?,
@@ -153,7 +162,7 @@ pub(super) async fn run(
         assert_eq!(package_inventory(root)?, before, "lease release cache loss changed canonical packages");
     }
     eprintln!("Failed actual truncation preserved four cursors, full history and restoring beacon; exact synthetic lease release acknowledged");
-    let interrupt = if lease_cut || acquire_cut || custody_cut || floor_cut { None } else { interrupt };
+    let interrupt = if lease_cut || acquire_cut || custody_cut || floor_cut || retirement_cut { None } else { interrupt };
     if let Some(mode @ ("selection-enospc" | "selection-sync-eio" | "ready-enospc" | "ready-sync-eio" | "operation-sync-eio" | "publish-rename-eio" | "publish-sync-eio" | "wal-ready-sync-eio" | "wal-publish-sync-eio" | "wal-epoch-enrollment-eio" | "publish-directory-sync-eio" | "stage-enospc" | "stage-sync-eio")) = interrupt {
         io_failure::recovery_fault(binary, root, zero, mode).await?;
         if matches!(mode, "publish-sync-eio" | "wal-publish-sync-eio" | "publish-directory-sync-eio") {
@@ -444,6 +453,9 @@ pub(super) async fn run(
     );
     let db = open_db(root).await?;
     fixture.assert_imported(&db, retained).await?;
+    if retirement_cut {
+        validator_retirement_loss::verify(root, &db, &fixture.id(retained, false), "two-boots")?;
+    }
     if floor_cut {
         validator_cache_loss::verify(root, &db, &fixture.id(retained, false), "two-boots")?;
     }
@@ -519,3 +531,6 @@ mod lease_cache_loss;
 
 #[path = "test_node_validator_cache_loss.rs"]
 mod validator_cache_loss;
+
+#[path = "test_node_validator_retirement_loss.rs"]
+mod validator_retirement_loss;
