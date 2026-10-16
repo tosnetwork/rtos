@@ -454,6 +454,20 @@ pub(super) fn decode_closing(
     Ok((next_close_generation, snapshot.closing))
 }
 
+/// Seeds synthetic Released bookkeeping for crash tests; bypasses authentication
+/// and private custody only while constructing the durable test baseline.
+#[cfg(test)]
+pub(crate) fn seed_released_pair_for_recovery(
+    store: &PropagationOutbox, ids: [BlockIdExt; 3],
+) -> Result<(ClosingRecord, ClosingRecord)> {
+    let (d, e, c) = tests::setup_with_ids(store, ids[1].clone(), ids[0].clone())?;
+    store.begin_close_offer_inner(c.clone(), &d, &e)?;
+    let first = store.confirm_close_inner(c)?;
+    let (d, e, c) = tests::setup_with_ids(store, ids[2].clone(), ids[1].clone())?;
+    store.begin_close_offer_inner(c.clone(), &d, &e)?;
+    Ok((first, store.confirm_close_inner(c)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,15 +536,20 @@ mod tests {
         store: &PropagationOutbox,
         seq: u32,
     ) -> Result<(Delivery, UnverifiedRecord, ClosingRecord)> {
+        setup_with_ids(store, id(seq), id(seq - 1))
+    }
+    pub(super) fn setup_with_ids(
+        store: &PropagationOutbox, block_id: BlockIdExt, previous: BlockIdExt,
+    ) -> Result<(Delivery, UnverifiedRecord, ClosingRecord)> {
         let record = PublicationRecord {
-            domain: domain(),
+            domain: store.domain().clone(),
             protocol: SimplexProtocol::PrivateObserversPlumtree,
             profile: UInt256::from([3; 32]),
             session_id: UInt256::from([4; 32]),
-            block_id: id(seq),
+            block_id,
             block_data: vec![1, 2],
             proof_data: None,
-            prev: vec![id(seq - 1)],
+            prev: vec![previous],
             carrier: StoredCarrier::Final(vec![9]),
             locally_generated: false,
             created_at_unix_secs: 10,
@@ -561,10 +580,10 @@ mod tests {
                 local_validator_index: None,
             },
             domain: RepairLeaseDomain {
-                zerostate: id(0),
-                global_id: -1,
-                history_init: id(0),
-                source_recovery_anchor: id(0),
+                zerostate: store.domain().zerostate.clone(),
+                global_id: store.domain().global_id,
+                history_init: store.domain().zerostate.clone(),
+                source_recovery_anchor: store.domain().zerostate.clone(),
                 source_recovery_coordinates:
                     consensus_common::session_runtime::SessionRecoveryCoordinates {
                         shard: ShardIdent::masterchain(),

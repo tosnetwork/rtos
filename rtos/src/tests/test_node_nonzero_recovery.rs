@@ -941,3 +941,10 @@ async fn actual_node_validator_journal_cache_loss() -> Result<()> {
     exercise_nonzero_recovery_layout(false, None,
         Some((3, Some("validator-journal-cache-loss"))), false).await
 }
+
+#[tokio::test]
+#[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
+async fn actual_node_validator_outbox_cache_loss() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None,
+        Some((3, Some("validator-outbox-cache-loss"))), false).await
+}

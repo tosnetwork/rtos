@@ -20,7 +20,7 @@ fn fixture(id: &rtos_block::BlockIdExt) -> Result<(HashSet<UInt256>, PendingVali
     Ok((fence, record))
 }
 // Identity and digests are synthetic journal metadata, not authentication evidence.
-fn journal_pair(id: &rtos_block::BlockIdExt) -> Result<(PendingValidatorCleanup, PendingValidatorCleanup)> {
+pub(super) fn journal_pair(id: &rtos_block::BlockIdExt) -> Result<(PendingValidatorCleanup, PendingValidatorCleanup)> {
     use consensus_common::session_runtime::{SessionNetworkPin, SessionRecoveryBinding, SessionRecoveryCoordinates};
     let base = make_record(&UInt256::from([0x22; 32]), &NamespaceLayout::V2Validator,
         &rtos_block::ShardIdent::masterchain(), 5, id)?.with_identity(CleanupIdentity {

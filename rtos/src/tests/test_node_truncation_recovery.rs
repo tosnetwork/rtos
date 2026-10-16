@@ -81,6 +81,11 @@ pub(super) async fn run(
         assert_eq!(package_inventory(root)?, before, "custody transition changed canonical packages");
         Some(record)
     } else { None };
+    let outbox_cut = interrupt == Some("validator-outbox-cache-loss");
+    if outbox_cut {
+        outbox_cache_loss::write_and_interrupt(root).await?;
+        assert_eq!(package_inventory(root)?, before, "outbox update changed canonical packages");
+    }
     let floor_cut = interrupt == Some("validator-floor-cache-loss");
     if floor_cut {
         validator_cache_loss::write_and_interrupt(root, &fixture.id(retained, false)).await?;
@@ -149,6 +154,10 @@ pub(super) async fn run(
         eprintln!("Actual node preserved protected history and progress after validator floor cut");
         validator_cache_loss::verify(root, &db, &fixture.id(retained, false), "guarded-startup")?;
     }
+    if outbox_cut {
+        eprintln!("Actual node preserved protected history and progress after outbox cut");
+        outbox_cache_loss::verify(root, &db, "guarded-startup")?;
+    }
     if let Some(kind) = validator_batch {
         eprintln!("Actual node preserved protected history and progress after {} cut", kind.name());
         validator_retirement_loss::verify(root, &db, &fixture.id(retained, false), "guarded-startup", kind)?;
@@ -168,7 +177,7 @@ pub(super) async fn run(
         assert_eq!(package_inventory(root)?, before, "lease release cache loss changed canonical packages");
     }
     eprintln!("Failed actual truncation preserved four cursors, full history and restoring beacon; exact synthetic lease release acknowledged");
-    let interrupt = if lease_cut || acquire_cut || custody_cut || floor_cut || validator_batch.is_some() { None } else { interrupt };
+    let interrupt = if lease_cut || acquire_cut || custody_cut || floor_cut || outbox_cut || validator_batch.is_some() { None } else { interrupt };
     if let Some(mode @ ("selection-enospc" | "selection-sync-eio" | "ready-enospc" | "ready-sync-eio" | "operation-sync-eio" | "publish-rename-eio" | "publish-sync-eio" | "wal-ready-sync-eio" | "wal-publish-sync-eio" | "wal-epoch-enrollment-eio" | "publish-directory-sync-eio" | "stage-enospc" | "stage-sync-eio")) = interrupt {
         io_failure::recovery_fault(binary, root, zero, mode).await?;
         if matches!(mode, "publish-sync-eio" | "wal-publish-sync-eio" | "publish-directory-sync-eio") {
@@ -459,6 +468,7 @@ pub(super) async fn run(
     );
     let db = open_db(root).await?;
     fixture.assert_imported(&db, retained).await?;
+    if outbox_cut { outbox_cache_loss::verify(root, &db, "two-boots")?; }
     if let Some(kind) = validator_batch {
         validator_retirement_loss::verify(root, &db, &fixture.id(retained, false), "two-boots", kind)?;
     }
@@ -540,3 +550,6 @@ mod validator_cache_loss;
 
 #[path = "test_node_validator_retirement_loss.rs"]
 mod validator_retirement_loss;
+
+#[path = "test_node_outbox_cache_loss.rs"]
+mod outbox_cache_loss;
