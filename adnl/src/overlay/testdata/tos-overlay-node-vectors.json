@@ -1,0 +1,6 @@
+{
+  "cpp_commit": "d2b73fb1f5ab18461d6d544b5dad5fc9f54387c2",
+  "generator": "ci/interop/overlay-node-vector.cpp",
+  "serializer": "tos::serialize_tl_object",
+  "vectors": "tos-overlay-node-vectors.txt"
+}

@@ -9,10 +9,8 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::adnl::tasks::AdnlTasks;
-#[cfg(feature = "telemetry")]
-use crate::{common::add_unbound_object_to_map, telemetry::Metric};
 use crate::{
+    adnl::tasks::AdnlTasks,
     common::{
         add_counted_object_to_map, add_counted_object_to_map_with_update,
         add_unbound_object_to_map_with_update, hash, hash_boxed, AdnlPeers, AsyncReceiver,
@@ -24,6 +22,8 @@ use crate::{
     quic::QuicNode,
     rldp::{Constraints, RldpNode},
 };
+#[cfg(feature = "telemetry")]
+use crate::{common::add_unbound_object_to_map, telemetry::Metric};
 use num_traits::pow::Pow;
 use rtos_api::{
     deserialize_boxed, deserialize_boxed_with_suffix, serialize_boxed, serialize_boxed_append,
@@ -43,10 +43,7 @@ use rtos_api::{
             membercertificateid::MemberCertificateId,
             message::{Message as OverlayMessage, MessageWithExtra as OverlayMessageWithExtra},
             messageextra::MessageExtra,
-            node::{
-                tosign::{ToSign as NodeToSign, ToSignEx as NodeToSignEx},
-                Node as NodeV1, ToSign as NodeToSignBoxed,
-            },
+            node::{tosign::ToSign as NodeToSign, Node as NodeV1, ToSign as NodeToSignBoxed},
             nodes::Nodes as NodesV1,
             nodesv2::NodesV2,
             nodev2::NodeV2,
@@ -315,6 +312,9 @@ impl OverlayUtils {
         overlay_id: &Arc<OverlayShortId>,
         node: &T,
     ) -> Result<()> {
+        if (node.flags() as u32) & !3 != 0 {
+            fail!("Unsupported overlay member flags {}", node.flags())
+        }
         let key: Arc<dyn KeyOption> = node.get_key()?;
         if node.overlay().as_slice() != overlay_id.data() {
             fail!(
@@ -343,11 +343,7 @@ impl OverlayUtils {
         version: i32,
     ) -> NodeToSignBoxed {
         let id = AdnlShortId { id: UInt256::with_array(*key.id().data()) };
-        if flags != 0 {
-            NodeToSignEx { flags, id, overlay: overlay_id.clone(), version }.into_boxed()
-        } else {
-            NodeToSign { id, overlay: overlay_id.clone(), version }.into_boxed()
-        }
+        NodeToSign { flags, id, overlay: overlay_id.clone(), version }.into_boxed()
     }
 }
 
@@ -363,7 +359,7 @@ pub(crate) trait NodeData {
 
 impl NodeData for NodeV1 {
     fn flags(&self) -> i32 {
-        0
+        self.flags
     }
     fn get_key(&self) -> Result<Arc<dyn KeyOption>> {
         (&self.id).try_into()
@@ -403,6 +399,16 @@ declare_counted!(
         v2: Option<Arc<NodeV2>>,
     }
 );
+
+impl NodeObject {
+    fn advertisement(&self) -> Option<(i32, i32, &MemberCertificateBoxed)> {
+        self.v1
+            .iter()
+            .map(|node| (node.flags, node.version, &node.certificate))
+            .chain(self.v2.iter().map(|node| (node.flags, node.version, &node.certificate)))
+            .max_by_key(|(_, version, _)| *version)
+    }
+}
 
 enum Nodes {
     V1(NodesV1),
@@ -745,9 +751,8 @@ impl Overlay {
                 // Bcasts are sent without a certificate, hoping the target already knows
                 // the sender's one.
                 if let Some(guard) = self.nodes.get(peer) {
-                    if let Some(node) = &guard.val().v2 {
-                        let MemberCertificateBoxed::Overlay_MemberCertificate(cert) =
-                            &node.certificate
+                    if let Some((_, _, certificate)) = guard.val().advertisement() {
+                        let MemberCertificateBoxed::Overlay_MemberCertificate(cert) = certificate
                         else {
                             fail!(
                                 "Empty certificate for known peer {peer} in overlay {}",
@@ -911,8 +916,7 @@ impl Overlay {
     ) -> Result<OverlayNodeInfo<NodeV1, NodeV2>> {
         let key = self.overlay_key().unwrap_or(default_key);
         let overlay_id = UInt256::with_array(*self.overlay_id.data());
-        let flags =
-            if !v2 || self.plumtree.get().is_some_and(|p| !p.original_sender) { 0 } else { 2 };
+        let flags = if self.plumtree.get().is_some_and(|p| !p.original_sender) { 0 } else { 2 };
         let version = Version::get();
         let local_node = OverlayUtils::get_node_to_sign(key, &overlay_id, flags, version);
         let node = if v2 {
@@ -932,6 +936,12 @@ impl Overlay {
         } else {
             let node = NodeV1 {
                 id: key.try_into()?,
+                flags,
+                certificate: self
+                    .overlay_type
+                    .certificate()
+                    .map(|cert| cert.clone().into_boxed())
+                    .unwrap_or_default(),
                 overlay: overlay_id,
                 signature: key.sign(&serialize_boxed(&local_node)?)?.into(),
                 version,
@@ -1682,15 +1692,16 @@ impl OverlayNode {
         }
         let (key, verify) = match peer {
             OverlayNodeInfo::V1(peer) => {
+                let peer = peer.borrow();
+                let key = peer.get_key()?;
                 if overlay.overlay_type.has_certified_members() {
-                    fail!(
-                        "Trying to add peer without certificate \
-                        to semiprivate overlay {overlay_id}"
-                    )
-                } else {
-                    let peer = peer.borrow();
-                    (peer.get_key()?, OverlayUtils::verify_node(overlay_id, peer))
+                    let cert = match &peer.certificate {
+                        MemberCertificateBoxed::Overlay_MemberCertificate(cert) => Some(cert),
+                        _ => None,
+                    };
+                    overlay.check_peer(key.id(), cert)?;
                 }
+                (key, OverlayUtils::verify_node(overlay_id, peer))
             }
             OverlayNodeInfo::V2(peer) => {
                 let peer = peer.borrow();
@@ -3165,17 +3176,12 @@ impl Overlay {
 
     fn plumtree_neighbours(&self) -> Vec<[u8; 32]> {
         // Public peers must have a fresh authenticated node advertisement.
-        // V1 peers imply flags zero in the fixed wire protocol.
         let now = Version::get();
         let mut peers = Vec::new();
         let mut iter = None;
         while let Some(peer) = self.known_peers.next(&mut iter) {
             let eligible = if let Some(node) = self.nodes.get(&peer) {
-                let pair = if let Some(v2) = &node.val().v2 {
-                    Some((v2.flags, v2.version))
-                } else {
-                    node.val().v1.as_ref().map(|v1| (0, v1.version))
-                };
+                let pair = node.val().advertisement().map(|(flags, version, _)| (flags, version));
                 pair.is_some_and(|(flags, version)| {
                     flags == 0
                         && (!self.overlay_type.is_public()
@@ -3417,6 +3423,10 @@ impl OverlayNode {
 #[cfg(test)]
 #[path = "wire_profile_tests.rs"]
 mod wire_profile_tests;
+
+#[cfg(test)]
+#[path = "tos_node_tests.rs"]
+mod tos_node_tests;
 
 #[cfg(test)]
 mod owned_shutdown_tests;

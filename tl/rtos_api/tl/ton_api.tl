@@ -228,9 +228,9 @@ dht.query node:dht.node = True;
 
 ---types---
 
-overlay.node.toSign id:adnl.id.short overlay:int256 version:int = overlay.node.ToSign;
+overlay.node.toSign id:adnl.id.short overlay:int256 flags:int version:int = overlay.node.ToSign;
 overlay.node.toSignEx id:adnl.id.short overlay:int256 flags:int version:int = overlay.node.ToSign;
-overlay.node id:PublicKey overlay:int256 version:int signature:bytes = overlay.Node;
+overlay.node id:PublicKey overlay:int256 flags:int version:int signature:bytes certificate:overlay.MemberCertificate = overlay.Node;
 overlay.nodeV2 id:PublicKey overlay:int256 flags:int version:int signature:bytes certificate:overlay.MemberCertificate = overlay.NodeV2;
 overlay.nodes nodes:(vector overlay.node) = overlay.Nodes;
 overlay.nodesV2 nodes:(vector overlay.nodeV2) = overlay.NodesV2;
