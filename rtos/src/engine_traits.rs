@@ -1251,7 +1251,7 @@ pub trait EngineOperations: Sync + Send {
         _tbd: Arc<TopBlockDescrStuff>,
         _cc_seqno: u32,
     ) -> Result<()> {
-        fail!("Local shard description registration is unavailable")
+        rtos_block::fail!("Local shard description registration is unavailable")
     }
 
     async fn send_top_shard_block_description(
