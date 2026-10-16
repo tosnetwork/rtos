@@ -87,28 +87,42 @@ async fn failed_unconsumed_and_panicking_phases_latch_immediately() -> Result<()
     Ok(())
 }
 #[test]
-fn queued_abort_releases_only_after_actual_queue_retirement() -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).enable_all().build()?;
-    let (_dir, _db, domain, provider) = fixture();
-    runtime.block_on(async {
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let blocker = tokio::task::spawn_blocking(move || {
-            started_tx.send(()).unwrap(); release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        });
-        started_rx.recv_timeout(Duration::from_secs(10))?;
-        let owner = domain.begin_recovery(0, &[provider.clone()])?;
-        let ran = Arc::new(AtomicBool::new(false)); let work_ran = ran.clone();
-        let queued = owner.spawn_phase(move || { work_ran.store(true, Ordering::Release); Ok(()) })?;
-        queued.abort(); drop(owner);
-        assert!(domain.begin_recovery(0, &[provider.clone()]).is_err());
-        assert!(!domain.recovery_required());
-        release_tx.send(())?; blocker.await?;
-        assert!(queued.await.err().expect("cancelled queued phase").is_cancelled());
-        assert!(!ran.load(Ordering::Acquire)); assert!(!domain.recovery_required());
-        drop(domain.begin_recovery(0, &[provider])?);
-        Ok(())
-    })
+fn queued_owner_cancellation_prevents_effects_with_or_without_handle_abort() -> Result<()> {
+    for abort_handle in [false, true] {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).enable_all().build()?;
+        let (dir, _db, domain, provider) = fixture();
+        runtime.block_on(async {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap(); release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(10))?;
+            let owner = domain.begin_recovery(0, &[provider.clone()])?;
+            let ran = Arc::new(AtomicBool::new(false)); let work_ran = ran.clone();
+            let output = dir.path().join("cancelled-before-first-write"); let work_output = output.clone();
+            let queued = owner.spawn_phase(move || {
+                std::fs::write(work_output, b"must never be written")?;
+                work_ran.store(true, Ordering::Release); Ok(())
+            })?;
+            if abort_handle { queued.abort(); }
+            drop(owner);
+            assert!(domain.begin_recovery(0, &[provider.clone()]).is_err());
+            assert!(!domain.recovery_required());
+            release_tx.send(())?; blocker.await?;
+            if abort_handle {
+                assert!(queued.await.err().expect("cancelled queued phase").is_cancelled());
+            } else {
+                let error = queued.await?.err().expect("cancelled owner must prevent native work");
+                assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&ArchiveContextError::RecoveryCancelled));
+            }
+            assert!(!ran.load(Ordering::Acquire)); assert!(!output.exists());
+            assert!(!domain.recovery_required());
+            drop(domain.begin_recovery(0, &[provider])?);
+            Ok::<_, anyhow::Error>(())
+        })?;
+    }
+    Ok(())
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_running_observer_preserves_provider_until_job_and_receipt_drop() -> Result<()> {
@@ -127,6 +141,7 @@ async fn cancelled_running_observer_preserves_provider_until_job_and_receipt_dro
     })?;
     started_rx.await?; task.abort(); drop(task); drop(owner); drop(provider); drop(db);
     assert!(weak.upgrade().is_some());
+    assert!(domain.recovery_required(), "owner cancellation after native start latches immediately");
     assert!(domain.state.lock().unwrap().recovery_claimed);
     release_tx.send(())?; done_rx.await?;
     tokio::time::timeout(Duration::from_secs(10), async {

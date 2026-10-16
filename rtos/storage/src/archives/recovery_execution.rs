@@ -11,6 +11,7 @@ struct ExecutionState {
     owners: Arc<ArchiveIoOwners>,
     providers: Vec<Arc<RocksDb>>,
     effects_started: AtomicBool,
+    owner_alive: AtomicBool,
     busy: AtomicBool,
 }
 impl Drop for ExecutionState {
@@ -53,7 +54,8 @@ impl ArchiveDomain {
         state.owners.close();
         Ok(RecoveryExecution { state: Arc::new(ExecutionState {
             domain: self.clone(), epoch, owners: state.owners.clone(), providers,
-            effects_started: AtomicBool::new(false), busy: AtomicBool::new(false),
+            effects_started: AtomicBool::new(false), owner_alive: AtomicBool::new(true),
+            busy: AtomicBool::new(false),
         }) })
     }
 }
@@ -94,7 +96,10 @@ impl RecoveryExecution {
                 if state.phase != Phase::Closing || state.owners.outstanding() != 0 {
                     return Err(ArchiveContextError::NotDrained.into());
                 }
-                // Ordered against failure latching; mark before invoking code
+                if !job.state.owner_alive.load(Ordering::Acquire) {
+                    return Err(ArchiveContextError::RecoveryCancelled.into());
+                }
+                // Ordered against owner cancellation and failure latching; mark before invoking code
                 // that can perform IO. Consuming a phase never resets this bit.
                 job.started = true;
                 job.state.effects_started.store(true, Ordering::Release);
@@ -105,6 +110,21 @@ impl RecoveryExecution {
     }
     // No completion/publication API yet: full durable root cleanup and actual
     // resource receipts must be integrated before any owner can certify success.
+}
+
+impl Drop for RecoveryExecution {
+    fn drop(&mut self) {
+        // This mutex is also held by the native phase when it checks owner
+        // liveness and records its first possible effect. Exactly one wins:
+        // cancellation first prevents queued work; native start first requires
+        // recovery while the real job continues to retain all provider pins.
+        let mut state = self.state.domain.state.lock().unwrap_or_else(|error| error.into_inner());
+        self.state.owner_alive.store(false, Ordering::Release);
+        if self.state.effects_started.load(Ordering::Acquire) {
+            state.phase = Phase::RecoveryRequired;
+            state.owners.close();
+        }
+    }
 }
 
 struct RecoveryJob { state: Arc<ExecutionState>, started: bool, consumed: bool }

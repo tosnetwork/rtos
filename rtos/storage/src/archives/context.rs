@@ -27,6 +27,8 @@ pub enum ArchiveContextError {
     RecoveryBusy,
     #[error("Archive recovery requires a nonempty, distinct provider set")]
     InvalidRecoveryProviders,
+    #[error("Archive recovery execution was cancelled before this phase began")]
+    RecoveryCancelled,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
