@@ -163,6 +163,18 @@ async fn actual_node_resumes_committed_cleanup_retaining_height_three() -> Resul
     exercise_nonzero_recovery_case(false, None, Some((3, Some("forward-before-cleanup")))).await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node binary, public fixture signer, and C compiler"]
+async fn actual_node_recovers_selection_enospc_retaining_height_two() -> Result<()> {
+    exercise_nonzero_recovery_case(false, None, Some((2, Some("selection-enospc")))).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node binary, public fixture signer, and C compiler"]
+async fn actual_node_recovers_selection_enospc_retaining_height_three() -> Result<()> {
+    exercise_nonzero_recovery_case(false, None, Some((3, Some("selection-enospc")))).await
+}
+
 async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&str>) -> Result<()> {
     exercise_nonzero_recovery_case(interrupt_recovery, building, None).await
 }

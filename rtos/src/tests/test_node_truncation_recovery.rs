@@ -9,6 +9,9 @@ use crate::{
 };
 use rtos_block::UInt256;
 
+#[path = "test_node_io_failure.rs"]
+mod io_failure;
+
 pub(super) struct Lease {
     binding: RepairLeaseBinding,
     generation: u64,
@@ -116,7 +119,11 @@ pub(super) async fn run(
     drop(db);
     tokio::time::timeout(Duration::from_secs(30), wait_for_db_release(physical)).await?;
     eprintln!("Failed actual truncation preserved four cursors, full history and restoring beacon; exact synthetic lease released");
-    if let Some(cut) = interrupt {
+    if interrupt == Some("selection-enospc") {
+        io_failure::selection_enospc(binary, root, zero).await?;
+        assert_eq!(package_inventory(root)?, before, "failed Selection write changed canonical packages");
+        assert!(root.join("node_db/ton_node.restoring").is_file());
+    } else if let Some(cut) = interrupt {
         let statement = match cut {
             "truncation-before-progress" => {
                 "db.save_full_node_state(SHARD_CLIENT_MC_BLOCK, last_mc_block.id())?;"
