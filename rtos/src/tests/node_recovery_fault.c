@@ -68,7 +68,8 @@ static int fail_wal_sync(int fd) {
     const char *mode = getenv("RTOS_TEST_RECOVERY_FAULT_MODE");
     if (!root || !mode) return 0;
     char link[64], path[PATH_MAX], prefix[PATH_MAX];
-    int size = snprintf(prefix, sizeof(prefix), "%s/node_db/db/", root);
+    int epoch = !strcmp(mode, "wal-epoch-enrollment-eio");
+    int size = snprintf(prefix, sizeof(prefix), epoch ? "%s/epochs/epoch_" : "%s/node_db/db/", root);
     if (size <= 0 || (size_t)size >= sizeof(prefix)) return 0;
     snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
     ssize_t n = readlink(link, path, sizeof(path) - 1);
@@ -76,6 +77,12 @@ static int fail_wal_sync(int fd) {
     path[n] = 0;
     if (strncmp(path, prefix, size)) return 0;
     const char *name = path + size;
+    if (epoch) {
+        size_t number = strspn(name, "0123456789");
+        const char database[] = "/archive_db/";
+        if (!number || strncmp(name + number, database, sizeof(database) - 1)) return 0;
+        name += number + sizeof(database) - 1;
+    }
     size_t digits = strspn(name, "0123456789");
     if (!digits || strcmp(name + digits, ".log")) return 0;
     struct stat info;
@@ -84,6 +91,8 @@ static int fail_wal_sync(int fd) {
         record_fault("main WAL sync after Ready fsync: EIO\n");
     else if (!strcmp(mode, "wal-publish-sync-eio"))
         record_fault("main WAL sync after canonical replacement: EIO\n");
+    else if (epoch)
+        record_fault("epoch WAL sync after Selection fsync: EIO\n");
     else return 0;
     errno = EIO;
     return 1;
@@ -128,7 +137,8 @@ int renameat(int olddir, const char *old, int newdir, const char *new) {
         errno = EIO;
         return -1;
     }
-    int arm = stage && stage_directory(olddir, "publish-sync-eio");
+    int arm_directory = stage && stage_directory(olddir, "publish-directory-sync-eio");
+    int arm = arm_directory || (stage && stage_directory(olddir, "publish-sync-eio"));
     int arm_wal = stage && stage_directory(olddir, "wal-publish-sync-eio");
     char target[PATH_MAX];
     if (arm) {
@@ -136,6 +146,7 @@ int renameat(int olddir, const char *old, int newdir, const char *new) {
         snprintf(link, sizeof(link), "/proc/self/fd/%d", newdir);
         ssize_t n = readlink(link, target, sizeof(target) - 1);
         if (n <= 0 || strchr(new, '/') || (size_t)n + 1 + strlen(new) >= sizeof(target)) arm = 0;
+        else if (arm_directory) target[n] = 0;
         else { target[n] = '/'; strcpy(target + n + 1, new); }
     }
     int result = syscall(SYS_renameat, olddir, old, newdir, new);
@@ -150,7 +161,8 @@ int renameat(int olddir, const char *old, int newdir, const char *new) {
 
 int fsync(int fd) {
     if (fail_wal_sync(fd)) return -1;
-    if (selected(fd, "wal-ready-sync-eio", "/ready.v1")) {
+    if (selected(fd, "wal-ready-sync-eio", "/ready.v1")
+        || selected(fd, "wal-epoch-enrollment-eio", "/selection.v1")) {
         int result = syscall(SYS_fsync, fd);
         if (!result) atomic_store_explicit(&wal_armed, 1, memory_order_release);
         return result;
@@ -162,7 +174,10 @@ int fsync(int fd) {
         if (n > 0) {
             path[n] = 0;
             if (!strcmp(path, renamed_path)) {
-                record_fault("fsync replaced canonical package: EIO\n");
+                const char *mode = getenv("RTOS_TEST_RECOVERY_FAULT_MODE");
+                if (mode && !strcmp(mode, "publish-directory-sync-eio"))
+                    record_fault("fsync canonical directory after replacement: EIO\n");
+                else record_fault("fsync replaced canonical package: EIO\n");
                 errno = EIO;
                 return -1;
             }
