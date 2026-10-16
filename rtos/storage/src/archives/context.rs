@@ -23,6 +23,10 @@ pub enum ArchiveContextError {
     NotDrained,
     #[error("Archive epoch overflow")]
     EpochOverflow,
+    #[error("Archive recovery already has an execution owner or pending phase")]
+    RecoveryBusy,
+    #[error("Archive recovery requires a nonempty, distinct provider set")]
+    InvalidRecoveryProviders,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -35,6 +39,7 @@ struct State {
     epoch: u64,
     phase: Phase,
     owners: Arc<ArchiveIoOwners>,
+    recovery_claimed: bool,
 }
 pub struct ArchiveDomain {
     state: Mutex<State>,
@@ -44,7 +49,7 @@ pub struct ArchiveDomain {
 impl Default for ArchiveDomain {
     fn default() -> Self {
         Self {
-            state: Mutex::new(State { epoch: 0, phase: Phase::Open, owners: Arc::default() }),
+            state: Mutex::new(State { epoch: 0, phase: Phase::Open, owners: Arc::default(), recovery_claimed: false }),
             #[cfg(all(test, target_os = "linux"))]
             read_probe: Mutex::new(None),
         }
@@ -115,7 +120,7 @@ impl ArchiveDomain {
         if state.phase == Phase::RecoveryRequired {
             return Err(ArchiveContextError::RecoveryRequired(state.epoch).into());
         }
-        if state.phase != Phase::Closing || state.owners.outstanding() != 0 {
+        if state.phase != Phase::Closing || state.owners.outstanding() != 0 || state.recovery_claimed {
             return Err(ArchiveContextError::NotDrained.into());
         }
         state.epoch = state.epoch.checked_add(1).ok_or(ArchiveContextError::EpochOverflow)?;
@@ -321,3 +326,6 @@ impl<T: Send + 'static> Drop for NativeHandoff<T> {
 #[cfg(test)]
 #[path = "../tests/test_archive_context.rs"]
 mod tests;
+
+#[path = "recovery_execution.rs"]
+pub(crate) mod recovery_execution;

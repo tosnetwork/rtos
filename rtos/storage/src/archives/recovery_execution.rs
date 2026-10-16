@@ -1,0 +1,148 @@
+// Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
+//! Exclusive recovery execution lane, separate from old-view IO tickets.
+//! This retains providers and actual jobs; it does not certify idle-writer
+//! retirement, protection reservations, quarantine or durable root completion.
+use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+struct ExecutionState {
+    domain: Arc<ArchiveDomain>,
+    epoch: u64,
+    owners: Arc<ArchiveIoOwners>,
+    providers: Vec<Arc<RocksDb>>,
+    effects_started: AtomicBool,
+    busy: AtomicBool,
+}
+impl Drop for ExecutionState {
+    fn drop(&mut self) {
+        if self.effects_started.load(Ordering::Acquire) { self.domain.latch_failure(); }
+        // Last native job/handoff has released its reference before this drop.
+        // Release native provider pins before making the logical claim available.
+        self.providers.clear();
+        let mut state = self.domain.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.recovery_claimed = false;
+        // Never reopen admission implicitly, even for cancellation before IO.
+    }
+}
+
+pub(crate) struct RecoveryExecution { state: Arc<ExecutionState> }
+impl ArchiveDomain {
+    /// Acquire the logical claim before closing/draining the old epoch. No old
+    /// IO ticket is held by this owner, so it cannot itself prevent the drain.
+    pub(crate) fn begin_recovery(
+        self: &Arc<Self>, epoch: u64, participants: &[ArchiveProvider],
+    ) -> Result<RecoveryExecution> {
+        let mut state = self.lock()?;
+        Self::check_epoch(&state, epoch)?;
+        if state.phase == Phase::RecoveryRequired {
+            return Err(ArchiveContextError::RecoveryRequired(epoch).into());
+        }
+        if state.recovery_claimed { return Err(ArchiveContextError::RecoveryBusy.into()); }
+        if participants.is_empty() { return Err(ArchiveContextError::InvalidRecoveryProviders.into()); }
+        for (index, provider) in participants.iter().enumerate() {
+            if !Arc::ptr_eq(&provider.domain, self) {
+                return Err(ArchiveContextError::BindingConflict.into());
+            }
+            if participants[..index].iter().any(|earlier| Arc::ptr_eq(&earlier.provider, &provider.provider)) {
+                return Err(ArchiveContextError::InvalidRecoveryProviders.into());
+            }
+        }
+        let providers = participants.iter().map(|p| p.provider.clone()).collect();
+        state.recovery_claimed = true;
+        state.phase = Phase::Closing;
+        state.owners.close();
+        Ok(RecoveryExecution { state: Arc::new(ExecutionState {
+            domain: self.clone(), epoch, owners: state.owners.clone(), providers,
+            effects_started: AtomicBool::new(false), busy: AtomicBool::new(false),
+        }) })
+    }
+}
+impl RecoveryExecution {
+    pub(crate) async fn wait_for_old_io(&self) -> Result<()> {
+        self.state.owners.wait().await;
+        self.check_drained()
+    }
+    fn check_drained(&self) -> Result<()> {
+        let state = self.state.domain.lock()?;
+        ArchiveDomain::check_epoch(&state, self.state.epoch)?;
+        if state.phase == Phase::RecoveryRequired {
+            return Err(ArchiveContextError::RecoveryRequired(state.epoch).into());
+        }
+        if state.phase != Phase::Closing || state.owners.outstanding() != 0 {
+            return Err(ArchiveContextError::NotDrained.into());
+        }
+        Ok(())
+    }
+    /// The closure starts only after old IO has drained. The worker must first
+    /// establish phase-specific retirement/protection/manifest preconditions.
+    /// Queued closures and returned receipts retain this claim independently of
+    /// the observer. Only one phase may be queued or awaiting consumption.
+    pub(crate) fn spawn_phase<T: Send + 'static>(
+        &self, work: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<tokio::task::JoinHandle<Result<RecoveryReceipt<T>>>> {
+        self.check_drained()?;
+        self.state.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| ArchiveContextError::RecoveryBusy)?;
+        let mut job = RecoveryJob { state: self.state.clone(), started: false, consumed: false };
+        Ok(tokio::task::spawn_blocking(move || {
+            {
+                let state = job.state.domain.lock()?;
+                ArchiveDomain::check_epoch(&state, job.state.epoch)?;
+                if state.phase == Phase::RecoveryRequired {
+                    return Err(ArchiveContextError::RecoveryRequired(state.epoch).into());
+                }
+                if state.phase != Phase::Closing || state.owners.outstanding() != 0 {
+                    return Err(ArchiveContextError::NotDrained.into());
+                }
+                // Ordered against failure latching; mark before invoking code
+                // that can perform IO. Consuming a phase never resets this bit.
+                job.started = true;
+                job.state.effects_started.store(true, Ordering::Release);
+            }
+            let value = work()?;
+            Ok(RecoveryReceipt { value: Some(value), job: Some(job) })
+        }))
+    }
+    // No completion/publication API yet: full durable root cleanup and actual
+    // resource receipts must be integrated before any owner can certify success.
+}
+
+struct RecoveryJob { state: Arc<ExecutionState>, started: bool, consumed: bool }
+impl Drop for RecoveryJob {
+    fn drop(&mut self) {
+        if self.started && !self.consumed { self.state.domain.latch_failure(); }
+        self.state.busy.store(false, Ordering::Release);
+    }
+}
+#[must_use = "unconsumed recovery phase results retain the claim and require recovery"]
+pub(crate) struct RecoveryReceipt<T> { value: Option<T>, job: Option<RecoveryJob> }
+impl<T> RecoveryReceipt<T> {
+    pub(crate) fn consume(mut self, finish: impl FnOnce(&mut T) -> Result<()>) -> Result<()> {
+        {
+            let job = self.job.as_ref().expect("recovery phase job");
+            let state = job.state.domain.lock()?;
+            ArchiveDomain::check_epoch(&state, job.state.epoch)?;
+            if state.phase == Phase::RecoveryRequired {
+                return Err(ArchiveContextError::RecoveryRequired(state.epoch).into());
+            }
+        }
+        finish(self.value.as_mut().expect("recovery phase payload"))?;
+        // Payload/resource destruction also precedes phase acknowledgement.
+        drop(self.value.take());
+        self.job.as_mut().expect("recovery phase job").consumed = true;
+        Ok(())
+    }
+}
+impl<T> Drop for RecoveryReceipt<T> {
+    fn drop(&mut self) {
+        if self.job.as_ref().is_some_and(|job| !job.consumed) {
+            self.job.as_ref().expect("recovery job").state.domain.latch_failure();
+        }
+        drop(self.value.take());
+        drop(self.job.take());
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/test_recovery_execution.rs"]
+mod tests;
