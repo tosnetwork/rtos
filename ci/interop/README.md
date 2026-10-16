@@ -157,6 +157,10 @@ identities must not be active in concurrent duplicate networks. The checked-in
 version, equal membership, test economics, Simplex parameters and complete MC/WC
 Genesis identities. The transport, validator-ID and PQ seeds use the fixed public
 `n6-validator-{transport,id,seed}-{index}` SHA-256 derivations. Each deployment
+uses ML-DSA-44 consensus keys (algorithm ID 1), Ed25519 transport keys, the T0
+wire profile, Param29 carrier 5 and Param30 Simplex protocol 2. The immutable
+Genesis body pins the full public key descriptors as well as their identities.
+Each deployment
 regenerates Genesis with the frozen C++ programs and rejects a different full
 identity before starting validators. `--prepare-genesis-only` performs generation
 without running validator processes; it is not consensus acceptance.
