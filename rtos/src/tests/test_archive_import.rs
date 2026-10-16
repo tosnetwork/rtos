@@ -259,3 +259,6 @@ async fn test_import_rejects_skip_validation() -> Result<()> {
     assert!(!dir.path().join("epochs").exists(), "rejected import must not move archives");
     Ok(())
 }
+
+#[path = "test_node_nonzero_recovery.rs"]
+mod node_process_recovery;
