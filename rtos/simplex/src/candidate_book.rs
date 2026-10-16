@@ -169,7 +169,7 @@ impl CandidateBook {
     pub(crate) fn has_real_body(&self, id: &RawCandidateId) -> bool {
         self.received_candidates
             .get(id)
-            .map(|r| !r.candidate_hash_data_bytes.is_empty())
+            .map(ReceivedCandidate::has_real_body)
             .unwrap_or(false)
     }
 
@@ -448,3 +448,12 @@ impl CandidateBook {
 #[cfg(test)]
 #[path = "tests/test_candidate_book.rs"]
 mod tests;
+
+impl ReceivedCandidate {
+    /// Restart may restore authenticated hash metadata before the block bytes.
+    /// Empty candidates are complete with metadata; ordinary candidates also
+    /// require their body before suppressing retrieval or publishing finality.
+    pub(crate) fn has_real_body(&self) -> bool {
+        !self.candidate_hash_data_bytes.is_empty() && (self.is_empty || !self.data.data().is_empty())
+    }
+}

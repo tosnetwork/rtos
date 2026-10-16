@@ -576,7 +576,7 @@ impl CandidateController {
         let is_finalized_stub = self
             .book
             .received(&candidate_id)
-            .map(|r| r.candidate_hash_data_bytes.is_empty())
+            .map(|r| !r.has_real_body())
             .unwrap_or(false);
         if !is_finalized_stub
             && (b.candidate_known_in_validation(&candidate_id)

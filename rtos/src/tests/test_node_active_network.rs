@@ -33,8 +33,18 @@ fn launch(binary: &Path, root: &Path, boot: usize, fault: Option<&Fault>) -> Res
     Ok((Process(child), path))
 }
 
+fn keep_node_evidence(node: &Path, path: &Path) -> Result<()> {
+    if let Some(evidence) = std::env::var_os("RTOS_NODE_RECOVERY_EVIDENCE_DIR") {
+        let fixture = node.parent().unwrap().parent().unwrap();
+        let destination = PathBuf::from(evidence).join(fixture.file_name().unwrap()).join(node.file_name().unwrap());
+        fs::create_dir_all(&destination)?;
+        fs::copy(path, destination.join(path.file_name().unwrap()))?;
+    }
+    Ok(())
+}
+
 fn observe(root: &Path, process: &mut Process, log: &Path) -> Result<u32> {
-    keep_evidence(root, log)?;
+    keep_node_evidence(root, log)?;
     if let Some(status) = process.0.try_wait()? { rtos_block::fail!("Network node exited {status}: {}", log.display()); }
     let output = fs::read_to_string(log)?;
     if !output.contains("Node services started.") { return Ok(0); }
@@ -57,7 +67,7 @@ fn interrupt(node: &mut Option<(Process, PathBuf)>, root: &Path) -> Result<()> {
     let (mut process, log) = node.take().unwrap();
     process.0.kill()?;
     assert!(!process.0.wait()?.success());
-    keep_evidence(root, &log)?;
+    keep_node_evidence(root, &log)?;
     Ok(())
 }
 

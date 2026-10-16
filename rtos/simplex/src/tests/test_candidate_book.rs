@@ -77,7 +77,7 @@ fn make_received_real(
         block_id,
         root_hash: UInt256::from([2u8; 32]),
         file_hash: UInt256::from([3u8; 32]),
-        data: ConsensusCommonFactory::create_block_payload(vec![]),
+        data: ConsensusCommonFactory::create_block_payload(vec![0x01]),
         collated_data: ConsensusCommonFactory::create_block_payload(vec![]),
         gen_utime_ms: Some(1_700_000_000_000),
         receive_time: SystemTime::now(),
@@ -254,7 +254,7 @@ fn has_real_body_distinguishes_stub_from_real() {
     book.insert_received(real_id.clone(), make_received_real(1, 1, make_block_id(11, 0x01), None));
     book.insert_received(stub_id.clone(), make_received_stub(2, make_block_id(22, 0x02)));
 
-    assert!(book.has_real_body(&real_id), "non-empty candidate_hash_data_bytes is a real body");
+    assert!(book.has_real_body(&real_id), "ordinary candidate metadata and body are present");
     assert!(!book.has_real_body(&stub_id), "empty candidate_hash_data_bytes is a stub");
     assert!(!book.has_real_body(&missing_id), "absent id is not a real body");
 }
@@ -534,4 +534,20 @@ fn debug_impl_includes_field_counts() {
         dbg.contains("seen_broadcast_count: 1"),
         "Debug must expose seen_broadcast_count: {dbg}",
     );
+}
+
+#[test]
+fn restored_metadata_does_not_suppress_body_hydration() {
+    let mut book = CandidateBook::new();
+    let id = make_candidate_id(4, 0xDD);
+    let mut restored = make_received_real(4, 0, make_block_id(44, 0x04), None);
+    restored.data = ConsensusCommonFactory::create_block_payload(vec![]);
+    book.insert_received(id.clone(), restored);
+    assert!(!book.has_real_body(&id), "authenticated hash metadata still needs ordinary block bytes");
+    book.received_mut(&id).unwrap().data = ConsensusCommonFactory::create_block_payload(vec![1, 2, 3]);
+    assert!(book.has_real_body(&id));
+    let restored = book.received_mut(&id).unwrap();
+    restored.data = ConsensusCommonFactory::create_block_payload(vec![]);
+    restored.is_empty = true;
+    assert!(book.has_real_body(&id), "an empty candidate carries no ordinary block body");
 }

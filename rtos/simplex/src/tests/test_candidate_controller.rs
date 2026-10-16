@@ -537,7 +537,7 @@ fn make_real_body(slot: SlotIndex, block_id: BlockIdExt) -> ReceivedCandidate {
         block_id,
         root_hash: UInt256::from([2u8; 32]),
         file_hash: UInt256::from([3u8; 32]),
-        data: ConsensusCommonFactory::create_block_payload(vec![]),
+        data: ConsensusCommonFactory::create_block_payload(vec![0x01]),
         collated_data: ConsensusCommonFactory::create_block_payload(vec![]),
         gen_utime_ms: Some(1_700_000_000_000),
         receive_time: SystemTime::now(),

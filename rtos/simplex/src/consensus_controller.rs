@@ -1771,7 +1771,7 @@ impl ConsensusController {
             // recursive finalization in C++ has no applied-floor guard.
             let block_below_applied_floor =
                 !has_final_cert && received.block_id.seq_no() < applied_floor;
-            let body_available = !received.candidate_hash_data_bytes.is_empty();
+            let body_available = received.has_real_body();
 
             if body_available {
                 // Step 3: persist/apply local finalized state before listener callback emission.
