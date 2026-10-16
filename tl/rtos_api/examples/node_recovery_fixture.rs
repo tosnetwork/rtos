@@ -14,7 +14,12 @@ fn id(root: &Cell, seq: u32, shard: ShardIdent) -> BlockIdExt {
 }
 fn reference(id: &BlockIdExt) -> ExtBlkRef {
     ExtBlkRef {
-        end_lt: 0,
+        end_lt: if id.seq_no == 0 {
+            0
+        } else {
+            u64::from(id.seq_no) * 1_000_000
+                + if id.shard().is_masterchain() { 3_000 } else { 1_000 }
+        },
         seq_no: id.seq_no,
         root_hash: id.root_hash.clone(),
         file_hash: id.file_hash.clone(),
@@ -90,12 +95,19 @@ fn main() {
     let mut last_key = None;
     let mut rows = vec![];
     for seq in 1..=4 {
+        let wc_start_lt = u64::from(seq) * 1_000_000;
+        let wc_end_lt = wc_start_lt + 1_000;
+        let mc_start_lt = wc_end_lt + 1_000;
+        let mc_end_lt = mc_start_lt + 1_000;
         wcstate.set_seq_no(seq);
+        wcstate.set_gen_lt(wc_end_lt);
         wcstate.set_gen_time(1_700_000_000 + seq);
         wcstate.set_master_ref(Some(BlkMasterInfo { master: reference(&previous) }));
         let nextwc = wcstate.serialize().unwrap();
         let mut wcinfo = BlockInfo::default();
         wcinfo.set_seq_no(seq).unwrap();
+        wcinfo.set_start_lt(wc_start_lt);
+        wcinfo.set_end_lt(wc_end_lt);
         wcinfo.set_shard(shard.clone());
         wcinfo.set_gen_utime(1_700_000_000 + seq);
         wcinfo.set_prev_stuff(false, &BlkPrevInfo::Block { prev: reference(&wcprevious) }).unwrap();
@@ -123,6 +135,8 @@ fn main() {
             root_hash: wcid.root_hash.clone(),
             file_hash: wcid.file_hash.clone(),
             gen_utime: 1_700_000_000 + seq,
+            start_lt: wc_start_lt,
+            end_lt: wc_end_lt,
             next_validator_shard: SHARD_FULL,
             min_ref_mc_seqno: seq - 1,
             ..Default::default()
@@ -138,7 +152,10 @@ fn main() {
                     key: previous.seq_no == 0 || previous.seq_no % 2 == 1,
                     blk_ref: reference(&previous),
                 },
-                &KeyMaxLt { key: previous.seq_no == 0 || previous.seq_no % 2 == 1, max_end_lt: 0 },
+                &KeyMaxLt {
+                    key: previous.seq_no == 0 || previous.seq_no % 2 == 1,
+                    max_end_lt: reference(&previous).end_lt,
+                },
             )
             .unwrap();
         custom.shards = shards.clone();
@@ -146,11 +163,14 @@ fn main() {
         custom.after_key_block = key;
         custom.last_key_block = last_key.clone();
         state.set_seq_no(seq);
+        state.set_gen_lt(mc_end_lt);
         state.set_gen_time(1_700_000_000 + seq);
         state.write_custom(Some(&custom)).unwrap();
         let next_state = state.serialize().unwrap();
         let mut info = BlockInfo::default();
         info.set_seq_no(seq).unwrap();
+        info.set_start_lt(mc_start_lt);
+        info.set_end_lt(mc_end_lt);
         info.set_shard(ShardIdent::masterchain());
         info.set_key_block(key);
         info.set_gen_utime(1_700_000_000 + seq);

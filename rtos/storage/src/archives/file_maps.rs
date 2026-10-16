@@ -333,11 +333,18 @@ impl FileMap {
                     continue;
                 }
             };
+            let deleted = value.deleted();
+            let ranges = value.blocks_ranges()?;
+            // A truncation boundary resets the parent cache. Rebuild retained
+            // ranges from the actual indexes before deciding the slice is empty.
+            let ranges = if ranges.iter().next().is_none() {
+                archive_slice.rebuild_block_ranges()?
+            } else { ranges };
             let value = Arc::new(FileDescription::with_data(
                 PackageId::with_values(key, package_type),
                 archive_slice,
-                value.deleted(),
-                value.blocks_ranges()?,
+                deleted,
+                ranges,
             ));
             elements.push(FileMapEntry {
                 key,
@@ -498,7 +505,7 @@ impl FileMap {
 
     pub async fn get_closest_by(
         &self,
-        f: impl FnMut(&FileMapEntry) -> std::cmp::Ordering,
+        mut f: impl FnMut(&FileMapEntry) -> std::cmp::Ordering,
     ) -> Option<Arc<FileDescription>> {
         let guard = self.elements.read().await;
         log::trace!(
@@ -506,13 +513,11 @@ impl FileMap {
             "Searching for file description (elements count = {})",
             guard.len()
         );
-        if guard.is_empty() {
-            return None;
-        }
-        let index = match guard.binary_search_by(f) {
-            Ok(index) => index,
-            Err(index) => (guard.len() - 1).min(index),
-        };
+        let index = closest_nonempty_range(
+            guard.len(),
+            |index| guard[index].value.blocks_ranges().iter().next().is_some(),
+            |index| f(&guard[index]),
+        )?;
         Some(Arc::clone(&guard[index].value))
     }
 
@@ -646,5 +651,50 @@ impl FileMaps {
     pub async fn trunc(&self, selection: Arc<TruncationSelection>) -> Result<()> {
         self.files.trunc(selection.clone()).await?;
         self.key_files.trunc(selection).await
+    }
+}
+
+// Empty boundary rows remain valid append destinations after truncation, but
+// they cannot answer seqno/LT/time queries. Resolve each binary-search probe to
+// the preceding nonempty row (or the first), preserving comparator ordering
+// across gaps without allocating a second index or dropping persisted rows.
+fn closest_nonempty_range(
+    len: usize,
+    nonempty: impl Fn(usize) -> bool,
+    mut compare: impl FnMut(usize) -> std::cmp::Ordering,
+) -> Option<usize> {
+    let first = (0..len).find(|&index| nonempty(index))?;
+    let resolve = |index: usize| {
+        (first..=index.max(first)).rev().find(|&candidate| nonempty(candidate)).unwrap()
+    };
+    let (mut low, mut high) = (0, len);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let index = resolve(middle);
+        match compare(index) {
+            std::cmp::Ordering::Equal => return Some(index),
+            std::cmp::Ordering::Less => low = middle + 1,
+            std::cmp::Ordering::Greater => high = middle,
+        }
+    }
+    Some(resolve(low.min(len - 1)))
+}
+
+#[cfg(test)]
+mod empty_range_tests {
+    use super::closest_nonempty_range;
+    #[test]
+    fn every_empty_range_layout_matches_linear_lookup() {
+        for len in 0..=6 {
+            for mask in 0..(1usize << len) {
+                let present: Vec<_> = (0..len).filter(|&i| mask & (1 << i) != 0).collect();
+                for query in 0..=70 {
+                    let expected = present.iter().copied().find(|&i| (i + 1) * 10 >= query)
+                        .or_else(|| present.last().copied());
+                    assert_eq!(closest_nonempty_range(len, |i| mask & (1 << i) != 0,
+                        |i| ((i + 1) * 10).cmp(&query)), expected, "len={len} mask={mask} query={query}");
+                }
+            }
+        }
     }
 }

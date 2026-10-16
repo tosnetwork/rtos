@@ -83,7 +83,27 @@ async fn actual_node_preserves_building_with_unverified_inputs() -> Result<()> {
     Ok(())
 }
 
+#[path = "test_node_truncation_recovery.rs"]
+mod truncation_recovery;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RTOS_NODE_RECOVERY_BINARY built from this revision"]
+async fn actual_node_retries_truncation_without_publishing_failed_progress() -> Result<()> {
+    for retained in [2, 3] {
+        exercise_nonzero_recovery_case(false, None, Some(retained)).await?;
+    }
+    Ok(())
+}
+
 async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&str>) -> Result<()> {
+    exercise_nonzero_recovery_case(interrupt_recovery, building, None).await
+}
+
+async fn exercise_nonzero_recovery_case(
+    interrupt_recovery: bool,
+    building: Option<&str>,
+    truncation: Option<u32>,
+) -> Result<()> {
     let binary = fs::canonicalize(std::env::var("RTOS_NODE_RECOVERY_BINARY")?)?;
     let dir = tempfile::tempdir()?;
     let root = dir.path();
@@ -94,6 +114,11 @@ async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&s
     tokio::time::timeout(Duration::from_secs(60), wait_for_db_release(physical)).await?;
     let db = open_db(root).await?;
     fixture.assert_imported(&db, 4).await?;
+    let lease = if let Some(retained) = truncation {
+        Some(truncation_recovery::prepare(&db, &fixture, retained).await?)
+    } else {
+        None
+    };
     let (physical, catchain) = db.sst_databases_for_test();
     drop(catchain);
     db.stop_states_db().await?;
@@ -134,6 +159,9 @@ async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&s
     )?;
     drop((adnl, quic));
     fs::write(root.join("node-log.yml"), "appenders:\n  console:\n    kind: console\n    encoder:\n      pattern: '{m}{n}'\nroot:\n  level: info\n  appenders: [console]\n")?;
+    if let Some(lease) = lease {
+        return truncation_recovery::run(&binary, root, &zero, &fixture, before, lease).await;
+    }
     if building.is_some_and(|case| !matches!(case, "valid" | "staged")) {
         let path = root.join("building-refused.log");
         let log = fs::File::create(&path)?;

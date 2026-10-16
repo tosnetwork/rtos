@@ -211,6 +211,45 @@ impl BlockIndexDb {
         Ok(())
     }
 
+    /// Reconstruct an empty boundary's query cache after a durable parent reset.
+    /// Only one bounds record per shard is retained; block bodies are not read.
+    pub(super) fn rebuild_ranges(&self) -> Result<lockfree::map::Map<ShardIdent, super::file_maps::BlockRanges>> {
+        #[derive(Default)]
+        struct Bounds { seq: Option<(u32,u32)>, time: Option<(u32,u32)>, lt: Option<(u64,u64)> }
+        fn include<T: Ord + Copy>(bounds: &mut Option<(T,T)>, value: T) {
+            *bounds = Some(match *bounds { Some((low, high)) => (low.min(value), high.max(value)), None => (value, value) });
+        }
+        let cf = self.cf()?;
+        let mut shards: HashMap<ShardIdent, Bounds> = HashMap::new();
+        let mut rows = self.db.raw_iterator_cf(&cf);
+        rows.seek_to_first();
+        while rows.valid() {
+            let key = BlocksIndexKey::parse_bytes(rows.key().ok_or_else(|| error!("Missing block index key"))?)?;
+            let value = rows.value().ok_or_else(|| error!("Missing boundary index value"))?;
+            if value.len() != 8 { fail!("Invalid boundary index value length"); }
+            Self::deserialize_value(Some(value))?;
+            match key {
+                BlocksIndexKey::Seqno { shard, seqno } => include(&mut shards.entry(shard).or_default().seq, seqno),
+                BlocksIndexKey::Utime { shard, utime, .. } => include(&mut shards.entry(shard).or_default().time, utime),
+                BlocksIndexKey::Lt { shard, lt } => include(&mut shards.entry(shard).or_default().lt, lt),
+            }
+            rows.next();
+        }
+        rows.status()?;
+        let ranges = lockfree::map::Map::new();
+        for (shard, bounds) in shards {
+            let (min_seqno, max_seqno) = bounds.seq.ok_or_else(|| error!("Incomplete boundary seqno index"))?;
+            let (min_utime, max_utime) = bounds.time.ok_or_else(|| error!("Incomplete boundary time index"))?;
+            let (min_lt, max_lt) = bounds.lt.ok_or_else(|| error!("Incomplete boundary LT index"))?;
+            ranges.insert(shard, super::file_maps::BlockRanges {
+                min_seqno: min_seqno.into(), max_seqno: max_seqno.into(),
+                min_utime: min_utime.into(), max_utime: max_utime.into(),
+                min_lt: (min_lt - min_lt % rtos_block::LT_ALIGN).into(), max_lt: max_lt.into(),
+            });
+        }
+        Ok(ranges)
+    }
+
     /// Prepare all lookup changes before the replacement package is published.
     /// Offsets are meaningful only within the package selected by shard and mc_ref.
     pub(super) fn prepare_repack_offsets(

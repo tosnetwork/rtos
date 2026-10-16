@@ -44,7 +44,7 @@ pub async fn check_db(
         if let Some(is_broken) = is_broken {
             is_broken.store(true, Ordering::Relaxed);
         }
-        log::error!("Error while restoring database: {err}. Need to clear db and re-sync node.");
+        log::error!("Error while restoring database: {err}. Recovery remains pending; node startup stopped.");
         // Let the owning constructor drain storage tasks before reporting failure.
         err
     }
@@ -329,10 +329,11 @@ async fn restore(
                 last_mc_block.id()
             );
         }
-        Ok(next_id) => match db.truncate_database(&next_id).await {
-            Err(e) => log::warn!("Error while db truncation at block {}: {}", next_id, e),
-            Ok(_) => log::info!("Database was truncated at {}", next_id),
-        },
+        Ok(next_id) => {
+            db.truncate_database(&next_id).await
+                .map_err(|err| error!("Database recovery truncation failed at {}: {}", next_id, err))?;
+            log::info!("Database was truncated at {}", next_id);
+        }
     }
     db.save_full_node_state(SHARD_CLIENT_MC_BLOCK, last_mc_block.id())?;
     db.save_full_node_state(LAST_APPLIED_MC_BLOCK, last_mc_block.id())?;

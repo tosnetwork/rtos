@@ -15,7 +15,9 @@ pub struct Fixture {
 }
 impl Fixture {
     pub fn node_recovery() -> Self {
-        Self { data: serde_json::from_str(include_str!("static/node-recovery-history.json")).unwrap() }
+        Self {
+            data: serde_json::from_str(include_str!("static/node-recovery-history.json")).unwrap(),
+        }
     }
     pub fn new() -> Self {
         Self { data: serde_json::from_str(include_str!("static/archive-mc-wc.json")).unwrap() }
@@ -92,8 +94,15 @@ impl Fixture {
     }
     pub async fn prepare(&self, dir: &Path, archives: &Path) -> Result<()> {
         let package_context_dir = tempfile::tempdir()?;
-        let package_context_db = storage::db::rocksdb::RocksDb::new(package_context_dir.path(), "provider", None, storage::db::rocksdb::AccessType::ReadWrite)?;
-        let package_view = package_context_db.bind_archive_domain(storage::archives::context::ArchiveDomain::new())?.view()?;
+        let package_context_db = storage::db::rocksdb::RocksDb::new(
+            package_context_dir.path(),
+            "provider",
+            None,
+            storage::db::rocksdb::AccessType::ReadWrite,
+        )?;
+        let package_view = package_context_db
+            .bind_archive_domain(storage::archives::context::ArchiveDomain::new())?
+            .view()?;
         let package_operation = package_view.enter()?;
 
         std::fs::create_dir_all(archives)?;
@@ -111,7 +120,9 @@ impl Fixture {
                 } else {
                     format!("archive.{start:05}.pack")
                 });
-                let package = Package::open(package_view.clone(), &package_operation, path, false, true).await?;
+                let package =
+                    Package::open(package_view.clone(), &package_operation, path, false, true)
+                        .await?;
                 for seq in start..=start + 1 {
                     let id = self.id(seq, wc);
                     let proof = self.proof(seq, wc)?;
@@ -157,6 +168,9 @@ impl Fixture {
         {
             assert_eq!(db.load_full_node_state(key)?.as_deref(), Some(&expected), "cursor {key}");
         }
+        self.assert_history(db, through).await
+    }
+    pub async fn assert_history(&self, db: &InternalDb, through: u32) -> Result<()> {
         for seq in 0..=through {
             for wc in [false, true] {
                 let id = self.id(seq, wc);
@@ -178,7 +192,7 @@ impl Fixture {
                             seq,
                         )
                         .await?
-                        .expect("indexed imported block");
+                        .unwrap_or_else(|| panic!("missing index for imported block {id}"));
                     assert_eq!(indexed.0, id);
                     let block = block.unwrap();
                     assert_eq!(block.construct_prev_id()?.0, self.id(seq - 1, wc));

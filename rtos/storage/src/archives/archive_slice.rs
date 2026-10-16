@@ -860,6 +860,10 @@ impl ArchiveSlice {
         Ok(Some((block_id.clone(), entry.take_data())))
     }
 
+    pub(super) fn rebuild_block_ranges(&self) -> Result<lockfree::map::Map<ShardIdent, super::file_maps::BlockRanges>> {
+        self.block_index_db.rebuild_ranges()
+    }
+
     pub async fn lookup_block_by_seqno(
         &self,
         prefix: &AccountIdPrefixFull,
