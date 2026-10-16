@@ -1,15 +1,15 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
-//! Synced validator retirement and claim batches followed by executable recovery.
+//! Synced validator-state mutations followed by executable recovery.
 use super::*;
 use consensus_common::validator_cleanup::{candidate_claim_key, encode_record, make_record, record_key, NamespaceLayout, PendingValidatorCleanup};
-use crate::{internal_db::DESTROYED_VALIDATOR_SESSIONS, validator::validator_cleanup_gc::{erase_record, persist_retirement}};
+use crate::{internal_db::DESTROYED_VALIDATOR_SESSIONS, validator::validator_cleanup_gc::{erase_record, next_cleanup_incarnation, persist_retirement}};
 use std::collections::HashSet;
 
 #[derive(Clone, Copy)]
-pub(super) enum BatchKind { Retirement, Claim }
+pub(super) enum BatchKind { Retirement, Claim, Incarnation }
 impl BatchKind {
     pub(super) fn name(self) -> &'static str {
-        match self { Self::Retirement => "retirement", Self::Claim => "claim" }
+        match self { Self::Retirement => "retirement", Self::Claim => "claim", Self::Incarnation => "incarnation" }
     }
 }
 
@@ -25,10 +25,12 @@ fn intended(id: &rtos_block::BlockIdExt, kind: BatchKind) -> Result<Vec<Option<V
     Ok(match kind {
         BatchKind::Retirement => vec![fence, Some(encode_record(&record)?)],
         BatchKind::Claim => vec![None, Some(record.namespace.into_bytes()), fence],
+        BatchKind::Incarnation => vec![Some(2u64.to_le_bytes().to_vec())],
     })
 }
 fn previous(id: &rtos_block::BlockIdExt, kind: BatchKind) -> Result<Vec<Option<Vec<u8>>>> {
     Ok(match kind {
+        BatchKind::Incarnation => vec![Some(1u64.to_le_bytes().to_vec())],
         BatchKind::Retirement => vec![Some(crate::engine_operations::serialize_destroyed_session_ids(
             &HashSet::from([UInt256::from([0x11; 32])]))), None],
         BatchKind::Claim => {
@@ -41,6 +43,7 @@ fn previous(id: &rtos_block::BlockIdExt, kind: BatchKind) -> Result<Vec<Option<V
 fn read(db: &InternalDb, id: &rtos_block::BlockIdExt, kind: BatchKind) -> Result<Vec<Option<Vec<u8>>>> {
     let (_, record) = fixture(id)?;
     let keys = match kind {
+        BatchKind::Incarnation => vec!["ValidatorCleanupIncarnationV1".to_owned()],
         BatchKind::Retirement => vec![DESTROYED_VALIDATOR_SESSIONS.to_owned(), record_key(&record.namespace)],
         BatchKind::Claim => vec![record_key(&record.namespace), candidate_claim_key(&record.session_id),
             DESTROYED_VALIDATOR_SESSIONS.to_owned()],
@@ -52,27 +55,30 @@ fn encoded(rows: &[Option<Vec<u8>>]) -> Vec<Option<String>> {
 }
 
 #[tokio::test]
-#[ignore = "internal child; requires owned validator retirement fixture"]
+#[ignore = "internal child; requires owned validator batch fixture"]
 async fn batch_child() -> Result<()> {
     let root = PathBuf::from(std::env::var("RTOS_TEST_VALIDATOR_CHILD_ROOT")?);
     let id: rtos_block::BlockIdExt = fs::read_to_string(root.join("retirement-input.txt"))?.parse()?;
     let kind = match std::env::var("RTOS_TEST_VALIDATOR_BATCH")?.as_str() {
         "retirement" => BatchKind::Retirement, "claim" => BatchKind::Claim,
+        "incarnation" => BatchKind::Incarnation,
         _ => rtos_block::fail!("Unknown validator batch"),
     };
     let db = open_db(&root).await?;
     let (fence, record) = fixture(&id)?;
     match kind {
+        BatchKind::Incarnation => assert_eq!(next_cleanup_incarnation(&db)?, 1),
         BatchKind::Retirement => persist_retirement(&db, &HashSet::from([UInt256::from([0x11; 32])]), &[])?,
         BatchKind::Claim => persist_retirement(&db, &fence, std::slice::from_ref(&record))?,
     }
     assert_eq!(read(&db, &id, kind)?, previous(&id, kind)?);
     if let Ok(arm) = std::env::var("RTOS_TEST_ROOT_WAL_ARM") {
-        fs::write(arm, b"retirement armed after durable previous fence\n")?;
+        fs::write(arm, b"validator mutation armed after durable baseline\n")?;
     }
     match kind {
         BatchKind::Retirement => persist_retirement(&db, &fence, &[record])?,
         BatchKind::Claim => erase_record(&db, &record.namespace, Some(&record.session_id))?,
+        BatchKind::Incarnation => assert_eq!(next_cleanup_incarnation(&db)?, 2),
     }
     assert_eq!(read(&db, &id, kind)?, intended(&id, kind)?);
     let omitted = std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE").as_deref() == Ok("validator-wal");
@@ -117,11 +123,11 @@ pub(super) async fn write_and_interrupt(root: &Path, id: &rtos_block::BlockIdExt
         }
         if let Some(status) = child.0.try_wait()? {
             keep_evidence(root, &path)?;
-            rtos_block::fail!("Retirement child exited before acknowledgement: {status}");
+            rtos_block::fail!("Validator batch child exited before acknowledgement: {status}");
         }
         if Instant::now() >= deadline {
             keep_evidence(root, &path)?;
-            rtos_block::fail!("Retirement acknowledgement timeout");
+            rtos_block::fail!("Validator batch acknowledgement timeout");
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -149,6 +155,17 @@ pub(super) fn verify(root: &Path, db: &InternalDb, id: &rtos_block::BlockIdExt, 
     }))?)?;
     keep_evidence(root, &report)?;
     assert_eq!(actual, expected, "Acknowledged validator {} batch lost after actual node restart", kind.name());
+    if matches!(kind, BatchKind::Incarnation) && phase == "two-boots" {
+        let next = next_cleanup_incarnation(db)?;
+        let report = root.join("validator-incarnation-next.json");
+        fs::write(&report, serde_json::to_vec(&serde_json::json!({
+            "acknowledged_before_crash": 2, "next_after_recovery": next,
+        }))?)?;
+        keep_evidence(root, &report)?;
+        assert_eq!(next, 3, "Recovery reused an acknowledged cleanup incarnation");
+        assert_eq!(read(db, id, kind)?, vec![Some(3u64.to_le_bytes().to_vec())]);
+        eprintln!("Next cleanup incarnation advances beyond acknowledged pre-crash value");
+    }
     eprintln!("Validator {} batch preserved together after {phase}", kind.name());
     Ok(())
 }
