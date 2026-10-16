@@ -63,12 +63,19 @@ pub struct ImportEntry {
     pub block_meta: Option<ImportBlockMeta>,
 }
 
-pub struct ArchiveManager {
+struct PublishedArchive {
     view: ArchiveView,
+    file_maps: FileMaps,
+    db_provider: Arc<dyn ArchiveDbProvider>,
+}
+
+pub struct ArchiveManager {
+    published: std::sync::RwLock<Arc<PublishedArchive>>,
     db: Arc<RocksDb>,
     db_root_path: Arc<PathBuf>,
-    db_provider: Arc<dyn ArchiveDbProvider>,
-    file_maps: FileMaps,
+    factory: super::recovery_root::FactoryMode,
+    last_unneeded_key_block: u32,
+    recovery_mutex: tokio::sync::Mutex<()>,
     shard_split_depth: Arc<AtomicU8>,
     unapplied_files_path: PathBuf,
     create_slice_mutex: tokio::sync::Mutex<()>,
@@ -78,7 +85,31 @@ pub struct ArchiveManager {
 }
 
 impl ArchiveManager {
+    // Readers capture one immutable generation without holding a lock across IO.
+    // The recovery coordinator replaces the view and both maps together.
+    fn snapshot(&self) -> Arc<PublishedArchive> {
+        self.published.read().unwrap_or_else(|error| error.into_inner()).clone()
+    }
+
     pub const ARCHIVE_DIR: &'static str = "archive";
+
+    pub async fn with_node_data(
+        binding: ArchiveProvider,
+        startup: &ArchiveOperation,
+        db_root_path: Arc<PathBuf>,
+        db_provider: Arc<dyn ArchiveDbProvider>,
+        last_unneeded_key_block: u32,
+        shard_split_depth: Arc<AtomicU8>,
+        #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
+        allocated: Arc<StorageAlloc>,
+    ) -> Result<Self> {
+        let mut manager = Self::with_data(binding, startup, db_root_path, db_provider,
+            last_unneeded_key_block, shard_split_depth,
+            #[cfg(feature = "telemetry")] telemetry,
+            allocated).await?;
+        manager.factory = super::recovery_root::FactoryMode::Node;
+        Ok(manager)
+    }
 
     pub async fn with_data(
         binding: ArchiveProvider,
@@ -115,11 +146,12 @@ impl ArchiveManager {
             error!("Cannot create unapplied files directory {:?}: {}", unapplied_files_path, e)
         })?;
         let ret = Self {
-            view,
+            published: std::sync::RwLock::new(Arc::new(PublishedArchive { view, file_maps, db_provider })),
             db,
             db_root_path,
-            db_provider,
-            file_maps,
+            factory: super::recovery_root::FactoryMode::Standalone,
+            last_unneeded_key_block,
+            recovery_mutex: tokio::sync::Mutex::new(()),
             shard_split_depth,
             unapplied_files_path,
             create_slice_mutex: tokio::sync::Mutex::new(()),
@@ -270,7 +302,8 @@ impl ArchiveManager {
         entry_id: &PackageEntryId<B>,
         limits: super::bounded_read::ArchiveReadLimits,
     ) -> Result<Vec<u8>> {
-        let operation = self.view.enter()?;
+        let current = self.snapshot();
+        let operation = current.view.enter()?;
         let _lock = match entry_id {
             PackageEntryId::Block(_) => handle.block_file_lock().read().await,
             PackageEntryId::Proof(_) | PackageEntryId::ProofLink(_) => {
@@ -278,13 +311,13 @@ impl ArchiveManager {
             }
             _ => fail!("Unsupported bounded archive entry"),
         };
-        let _after_lock = self.view.inherit(&operation)?;
+        let _after_lock = current.view.inherit(&operation)?;
         if handle.is_archived() {
             let package_id = if handle.is_key_block()? {
                 PackageId::for_key_block(get_mc_seq_no(handle) / KEY_ARCHIVE_PACKAGE_SIZE)
             } else {
-                let found = self.file_maps.files().get_closest_id(get_mc_seq_no(handle)).await;
-                let _checked = self.view.inherit(&operation)?;
+                let found = current.file_maps.files().get_closest_id(get_mc_seq_no(handle)).await;
+                let _checked = current.view.inherit(&operation)?;
                 let id = found.ok_or_else(|| super::bounded_read::ArchiveArtifactMissing::new("package route"))?;
                 PackageId::for_block(id)
             };
@@ -305,7 +338,7 @@ impl ArchiveManager {
             filename.len() as u64,
             limits.filename_bytes,
         )?;
-        super::native_read::read_loose(self.view.inherit(&operation)?, self.unapplied_files_path.join(filename), limits).await
+        super::native_read::read_loose(current.view.inherit(&operation)?, self.unapplied_files_path.join(filename), limits).await
     }
 
     pub async fn get_file<B: Borrow<BlockIdExt> + Hash>(
@@ -501,10 +534,11 @@ impl ArchiveManager {
     }
 
     pub async fn get_archive_id(&self, mc_seq_no: u32, shard: &ShardIdent) -> Option<u64> {
-        if let Some(id) = self.file_maps.files().get_closest_archive_id(mc_seq_no, shard).await {
+        let current = self.snapshot();
+        if let Some(id) = current.file_maps.files().get_closest_archive_id(mc_seq_no, shard).await {
             Some(id)
         } else if shard.is_masterchain() {
-            self.file_maps.key_files().get_closest_archive_id(mc_seq_no, shard).await
+            current.file_maps.key_files().get_closest_archive_id(mc_seq_no, shard).await
         } else {
             None
         }
@@ -516,7 +550,8 @@ impl ArchiveManager {
         offset: u64,
         limit: u32,
     ) -> Result<Vec<u8>> {
-        let operation = self.view.enter()?;
+        let current = self.snapshot();
+        let operation = current.view.enter()?;
         super::bounded_read::check_length("range", u64::from(limit), super::bounded_read::ARCHIVE_RANGE_MAX_BYTES)?;
         let fd = match self.get_file_desc_in(&operation, &PackageId::for_block(archive_id as u32)).await? {
             Some(file_desc) => file_desc,
@@ -539,23 +574,28 @@ impl ArchiveManager {
     /// Sums the main node DB (which always lives here regardless of mode)
     /// and any extra DBs known to the provider (epoch DBs in archival mode).
     pub fn rocksdb_memory_usage(&self) -> crate::RocksDbMemoryUsage {
+        let current = self.snapshot();
         let mut usage = self.db.memory_usage();
-        usage += self.db_provider.memory_usage();
+        usage += current.db_provider.memory_usage();
         usage
     }
 
     #[cfg(any(test, feature = "integration-test-support"))]
     pub fn test_archive_view(&self) -> ArchiveView {
-        self.view.clone()
+        let current = self.snapshot();
+        current.view.clone()
     }
 
     #[cfg(any(test, feature = "integration-test-support"))]
     pub fn test_pause_gc_selection(&self) -> (tokio::sync::oneshot::Receiver<Vec<u32>>, Arc<tokio::sync::Notify>) {
-        self.file_maps.files().test_pause_gc_selection()
+        let current = self.snapshot();
+        current.file_maps.files().test_pause_gc_selection()
     }
 
     pub async fn gc(&self, last_unneeded_key_block: &BlockIdExt) {
-        if let Err(e) = self.file_maps.files().gc(last_unneeded_key_block).await {
+        let current = self.snapshot();
+        let Ok(_admission) = current.view.enter() else { return; };
+        if let Err(e) = current.file_maps.files().gc(last_unneeded_key_block).await {
             log::info!(target: TARGET, "archive_manager gc is error: {:?}", e);
         }
     }
@@ -638,6 +678,8 @@ impl ArchiveManager {
         entry_id: &PackageEntryId<B>,
         key_archive: bool,
     ) -> Result<Vec<u8>> {
+        let current = self.snapshot();
+        let _admission = current.view.enter()?;
         let _mutation = self.db.repair_protection().artifact_mutation().await;
         self.check_repair_write(entry_id, &data)?;
         let mc_seq_no = get_mc_seq_no(handle);
@@ -668,7 +710,7 @@ impl ArchiveManager {
         if fd.update_block_ranges(handle) {
             let _t = time_checker!(|| format!("file_map.update {package_id:?}"), 30);
             let file_map =
-                if key_archive { self.file_maps.key_files() } else { self.file_maps.files() };
+                if key_archive { current.file_maps.key_files() } else { current.file_maps.files() };
             file_map.update(fd.id().id(), &fd).await?;
         }
         let _t = time_checker!(
@@ -703,21 +745,22 @@ impl ArchiveManager {
     async fn get_file_desc_in(
         &self, parent: &ArchiveOperation, id: &PackageId,
     ) -> Result<Option<Arc<FileDescription>>> {
-        let operation = self.view.inherit(parent)?;
+        let current = self.snapshot();
+        let operation = current.view.inherit(parent)?;
         let resolved = match id.package_type() {
             PackageType::KeyBlocks => super::db_provider::ResolvedArchive {
-                provider: self.view.binding().clone(),
+                provider: current.view.binding().clone(),
                 root_path: self.db_root_path.clone(),
-                operation: self.view.inherit(&operation)?,
+                operation: current.view.inherit(&operation)?,
             },
             PackageType::Blocks => {
-                let Some(resolved) = self.db_provider.resolve_for_read(&operation, id.id()).await? else {
+                let Some(resolved) = current.db_provider.resolve_for_read(&operation, id.id()).await? else {
                     return Ok(None);
                 };
                 resolved
             },
         };
-        let found = self.file_maps.get(id.package_type()).get(id.id()).await;
+        let found = current.file_maps.get(id.package_type()).get(id.id()).await;
         let _checked = resolved.operation.view().inherit(&resolved.operation)?;
         Ok(found.filter(|fd| !fd.deleted()))
     }
@@ -727,7 +770,8 @@ impl ArchiveManager {
         id: &PackageId,
         force_create: bool,
     ) -> Result<Option<Arc<FileDescription>>> {
-        if let Some(fd) = self.file_maps.get(id.package_type()).get(id.id()).await {
+        let current = self.snapshot();
+        if let Some(fd) = current.file_maps.get(id.package_type()).get(id.id()).await {
             if fd.deleted() {
                 return Ok(None);
             }
@@ -735,7 +779,7 @@ impl ArchiveManager {
         }
         if force_create {
             let _guard = self.create_slice_mutex.lock().await;
-            if let Some(fd) = self.file_maps.get(id.package_type()).get(id.id()).await {
+            if let Some(fd) = current.file_maps.get(id.package_type()).get(id.id()).await {
                 if fd.deleted() {
                     return Ok(None);
                 }
@@ -748,16 +792,17 @@ impl ArchiveManager {
     }
 
     async fn add_file_desc(&self, id: &PackageId) -> Result<Arc<FileDescription>> {
-        let operation = self.view.enter()?;
-        let file_map = self.file_maps.get(id.package_type());
+        let current = self.snapshot();
+        let operation = current.view.enter()?;
+        let file_map = current.file_maps.get(id.package_type());
         assert!(file_map.get(id.id()).await.is_none());
         let resolved = match id.package_type() {
             PackageType::KeyBlocks => super::db_provider::ResolvedArchive {
-                provider: self.view.binding().clone(),
+                provider: current.view.binding().clone(),
                 root_path: self.db_root_path.clone(),
-                operation: self.view.inherit(&operation)?,
+                operation: current.view.inherit(&operation)?,
             },
-            PackageType::Blocks => self.db_provider.db_for_archive(&operation, id.id()).await?,
+            PackageType::Blocks => current.db_provider.db_for_archive(&operation, id.id()).await?,
         };
         let slice_db = resolved.provider.db().clone();
         let slice_root_path = resolved.root_path.clone();
@@ -798,10 +843,11 @@ impl ArchiveManager {
     }
 
     async fn get_package_id(&self, mc_seq_no: u32, is_key: bool) -> Result<PackageId> {
+        let current = self.snapshot();
         if is_key {
             Ok(PackageId::for_key_block(mc_seq_no / KEY_ARCHIVE_PACKAGE_SIZE))
         } else {
-            let package_id = self
+            let package_id = current
                 .file_maps
                 .files()
                 .get_closest_id(mc_seq_no)
@@ -817,6 +863,7 @@ impl ArchiveManager {
         key_archive: bool,
         is_key: bool,
     ) -> PackageId {
+        let current = self.snapshot();
         if is_key {
             if key_archive {
                 PackageId::for_key_block(mc_seq_no / KEY_ARCHIVE_PACKAGE_SIZE)
@@ -825,7 +872,7 @@ impl ArchiveManager {
             }
         } else {
             let mut package_id = mc_seq_no - (mc_seq_no % ARCHIVE_SLICE_SIZE);
-            if let Some(found_package_id) = self.file_maps.files().get_closest_id(mc_seq_no).await {
+            if let Some(found_package_id) = current.file_maps.files().get_closest_id(mc_seq_no).await {
                 if package_id < found_package_id {
                     package_id = found_package_id;
                 }
@@ -843,6 +890,8 @@ impl ArchiveManager {
         archive_id: u32,
         starts_with_key_block: bool,
     ) -> Result<()> {
+        let current = self.snapshot();
+        let _admission = current.view.enter()?;
         let _registration = self.db.repair_protection().deletion().await;
         if self.db.repair_protection().archive_range(0, None) {
             fail!("Archive regrouping conflicts with repair custody");
@@ -861,6 +910,8 @@ impl ArchiveManager {
         move_file: bool,
         contains_key_block: bool,
     ) -> Result<()> {
+        let current = self.snapshot();
+        let _admission = current.view.enter()?;
         let _replacement = self.db.repair_protection().deletion().await;
         if self.db.repair_protection().archive_range(0, None) {
             fail!("Archive package replacement conflicts with persistent repair custody");
@@ -908,7 +959,7 @@ impl ArchiveManager {
 
         fd.archive_slice().import_package_entries(archive_id, &shard, file_size, entries).await?;
 
-        let file_map = self.file_maps.get(PackageType::Blocks);
+        let file_map = current.file_maps.get(PackageType::Blocks);
         let mut ranges_updated = false;
         for entry in entries {
             if let Some(meta) = &entry.block_meta {
@@ -932,13 +983,14 @@ impl ArchiveManager {
         id: &PackageId,
         shard_split_depth: u8,
     ) -> Result<Arc<FileDescription>> {
-        if let Some(fd) = self.file_maps.get(id.package_type()).get(id.id()).await {
+        let current = self.snapshot();
+        if let Some(fd) = current.file_maps.get(id.package_type()).get(id.id()).await {
             if !fd.deleted() {
                 return Ok(fd);
             }
         }
         let _guard = self.create_slice_mutex.lock().await;
-        if let Some(fd) = self.file_maps.get(id.package_type()).get(id.id()).await {
+        if let Some(fd) = current.file_maps.get(id.package_type()).get(id.id()).await {
             if !fd.deleted() {
                 return Ok(fd);
             }
@@ -951,15 +1003,16 @@ impl ArchiveManager {
         id: &PackageId,
         shard_split_depth: u8,
     ) -> Result<Arc<FileDescription>> {
-        let operation = self.view.enter()?;
-        let file_map = self.file_maps.get(id.package_type());
+        let current = self.snapshot();
+        let operation = current.view.enter()?;
+        let file_map = current.file_maps.get(id.package_type());
         let resolved = match id.package_type() {
             PackageType::KeyBlocks => super::db_provider::ResolvedArchive {
-                provider: self.view.binding().clone(),
+                provider: current.view.binding().clone(),
                 root_path: self.db_root_path.clone(),
-                operation: self.view.inherit(&operation)?,
+                operation: current.view.inherit(&operation)?,
             },
-            PackageType::Blocks => self.db_provider.db_for_archive(&operation, id.id()).await?,
+            PackageType::Blocks => current.db_provider.db_for_archive(&operation, id.id()).await?,
         };
         let slice_db = resolved.provider.db().clone();
         let slice_root_path = resolved.root_path.clone();
@@ -1000,7 +1053,53 @@ impl ArchiveManager {
     }
 
     pub async fn trunc(&self, selection: Arc<TruncationSelection>) -> Result<()> {
-        self.file_maps.trunc(selection).await
+        #[cfg(not(target_os = "linux"))]
+        { let _ = selection; fail!("Durable archive truncation requires Linux"); }
+        #[cfg(target_os = "linux")]
+        {
+            let _serial = self.recovery_mutex.lock().await;
+            let current = self.snapshot();
+            let protection = self.db.repair_protection().clone();
+            {
+                let _check = protection.deletion().await;
+                if protection.archive_range(0, None) { fail!("Archive truncation conflicts with repair custody"); }
+            }
+            let domain = current.view.binding().domain().clone();
+            let closed = domain.close(current.view.epoch())?;
+            closed.wait().await;
+            let participants = current.db_provider.recovery_participants()?;
+            let execution = domain.begin_recovery(current.view.epoch(), &participants.bindings)?;
+            execution.wait_for_old_io().await?;
+            execution.retire_packages()?.await.map_err(|e| error!("Archive retirement failed: {e}"))??
+                .consume(|_| Ok(()))?;
+            let ledger = self.db.db().cf_handle("repair_dependency_leases_v1").is_some();
+            use super::recovery_root::{FactoryMode, Policy};
+            let policy = match (self.factory, ledger) {
+                (FactoryMode::Node, _) => Policy::Node,
+                (FactoryMode::Standalone, true) => Policy::StandaloneWithLedger,
+                (FactoryMode::Standalone, false) => Policy::StandaloneWithoutLedger,
+            };
+            policy.check_environment(self.factory, ledger)?;
+            let deletion = protection.deletion().await;
+            let mutation = protection.artifact_mutation().await;
+            let receipt = execution.spawn_recovery_phase(move || {
+                let _guards = (mutation, deletion);
+                let plan = super::recovery_producer::Plan::new(&participants.providers, &selection)?;
+                let root = plan.produce(policy)?;
+                Ok(Some(super::recovery_worker::recover_live(participants.providers, root)?))
+            })?.await.map_err(|e| error!("Native archive truncation failed: {e}"))??;
+            let mut completion = None;
+            receipt.consume(|value| { completion = value.take(); Ok(()) })?;
+            let startup = execution.begin_rebuild(completion.ok_or_else(|| error!("Missing recovery completion"))?, current.view.binding())?;
+            let db_provider = current.db_provider.rebuilt(&startup)?;
+            let file_maps = FileMaps::new(self.db.clone(), &startup, &self.db_root_path, &db_provider,
+                self.last_unneeded_key_block,
+                #[cfg(feature = "telemetry")] &self.telemetry,
+                &self.allocated).await?;
+            let published = Arc::new(PublishedArchive { view: startup.view(), file_maps, db_provider });
+            drop(startup);
+            execution.publish(|| { *self.published.write().unwrap_or_else(|error| error.into_inner()) = published; })
+        }
     }
 
     pub async fn lookup_block_by_seqno(
@@ -1042,13 +1141,15 @@ impl ArchiveManager {
     }
 
     pub async fn get_max_mc_seqno(&self) -> Option<u32> {
-        let fd = self.file_maps.files().get_closest(u32::MAX).await?;
+        let current = self.snapshot();
+        let fd = current.file_maps.files().get_closest(u32::MAX).await?;
         let guard = fd.blocks_ranges().get(&ShardIdent::masterchain())?;
         Some(guard.val().max_seqno.load(Ordering::Relaxed))
     }
 
     pub async fn get_max_key_block_seqno(&self) -> Option<u32> {
-        let fd = self.file_maps.key_files().get_closest(u32::MAX).await?;
+        let current = self.snapshot();
+        let fd = current.file_maps.key_files().get_closest(u32::MAX).await?;
         let guard = fd.blocks_ranges().get(&ShardIdent::masterchain())?;
         Some(guard.val().max_seqno.load(Ordering::Relaxed))
     }
@@ -1074,7 +1175,8 @@ impl ArchiveManager {
     where
         F: FnMut(&BlockRanges) -> std::cmp::Ordering + Send,
     {
-        self.file_maps
+        let current = self.snapshot();
+        current.file_maps
             .files()
             .get_closest_by(|entry| {
                 let blocks_ranges = entry.value().blocks_ranges();

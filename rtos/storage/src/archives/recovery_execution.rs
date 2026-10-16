@@ -14,10 +14,12 @@ struct ExecutionState {
     owner_alive: AtomicBool,
     busy: AtomicBool,
     packages_retired: AtomicBool,
+    completed: AtomicBool,
+    rebuilding: AtomicBool,
 }
 impl Drop for ExecutionState {
     fn drop(&mut self) {
-        if self.effects_started.load(Ordering::Acquire) { self.domain.latch_failure(); }
+        if self.effects_started.load(Ordering::Acquire) && !self.completed.load(Ordering::Acquire) { self.domain.latch_failure(); }
         // Last native job/handoff has released its reference before this drop.
         // Release native provider pins before making the logical claim available.
         self.providers.clear();
@@ -57,6 +59,7 @@ impl ArchiveDomain {
             domain: self.clone(), epoch, owners: state.owners.clone(), providers,
             effects_started: AtomicBool::new(false), owner_alive: AtomicBool::new(true),
             busy: AtomicBool::new(false), packages_retired: AtomicBool::new(false),
+            completed: AtomicBool::new(false), rebuilding: AtomicBool::new(false),
         }) })
     }
 }
@@ -180,7 +183,7 @@ impl Drop for RecoveryExecution {
         // recovery while the real job continues to retain all provider pins.
         let mut state = self.state.domain.state.lock().unwrap_or_else(|error| error.into_inner());
         self.state.owner_alive.store(false, Ordering::Release);
-        if self.state.effects_started.load(Ordering::Acquire) {
+        if self.state.effects_started.load(Ordering::Acquire) && !self.state.completed.load(Ordering::Acquire) {
             state.phase = Phase::RecoveryRequired;
             state.owners.close();
         }
@@ -236,3 +239,45 @@ impl<T> Drop for RecoveryReceipt<T> {
 #[cfg(test)]
 #[path = "../tests/test_recovery_execution.rs"]
 mod tests;
+
+
+#[cfg(target_os = "linux")]
+impl RecoveryExecution {
+    /// Root-last completion grants one exclusive constructor ticket for a new
+    /// generation. Ordinary admission remains closed until its maps are ready.
+    pub(in crate::archives) fn begin_rebuild(
+        &self, completion: super::super::recovery_worker::RecoveryCompletion,
+        binding: &ArchiveProvider,
+    ) -> Result<ArchiveOperation> {
+        self.check_drained()?;
+        if self.state.busy.load(Ordering::Acquire) || !self.state.packages_retired.load(Ordering::Acquire)
+            || !completion.matches(&self.state.providers)
+            || !Arc::ptr_eq(binding.domain(), &self.state.domain)
+            || !self.state.providers.iter().any(|db| Arc::ptr_eq(db, binding.db())) {
+            return Err(ArchiveContextError::NotDrained.into());
+        }
+        let mut state = self.state.domain.lock()?;
+        ArchiveDomain::check_epoch(&state, self.state.epoch)?;
+        let epoch = state.epoch.checked_add(1).ok_or(ArchiveContextError::EpochOverflow)?;
+        let owners = Arc::new(ArchiveIoOwners::default());
+        let ticket = owners.enter()?;
+        state.epoch = epoch; state.owners = owners;
+        self.state.rebuilding.store(true, Ordering::Release);
+        Ok(ArchiveOperation { epoch, custody: NativeCustody {
+            domain: self.state.domain.clone(), provider: Some(binding.db().clone()), ticket: Some(ticket),
+        } })
+    }
+    pub(in crate::archives) fn publish(self, install: impl FnOnce()) -> Result<()> {
+        let mut state = self.state.domain.lock()?;
+        let epoch = self.state.epoch.checked_add(1).ok_or(ArchiveContextError::EpochOverflow)?;
+        ArchiveDomain::check_epoch(&state, epoch)?;
+        if !self.state.rebuilding.load(Ordering::Acquire) || self.state.busy.load(Ordering::Acquire)
+            || state.phase != Phase::Closing || state.owners.outstanding() != 0 {
+            return Err(ArchiveContextError::NotDrained.into());
+        }
+        install();
+        self.state.completed.store(true, Ordering::Release);
+        state.phase = Phase::Open;
+        Ok(())
+    }
+}

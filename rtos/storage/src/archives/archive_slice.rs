@@ -1341,7 +1341,7 @@ impl ArchiveSlice {
                     },
                 };
                 if !self.finalized && (version >= DEFAULT_PKG_VERSION) {
-                    package.truncate(size).await?;
+                    package.truncate_in(&operation, size).await?;
                 }
                 Ok(package)
             };

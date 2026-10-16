@@ -22,7 +22,7 @@ fn unlink(parent: &File, name: &CStr, directory: bool) -> Result<()> {
     }
     Ok(())
 }
-fn sync_close(file: File) -> Result<()> {
+pub(super) fn sync_close(file: File) -> Result<()> {
     let synced = file.sync_all();
     let fd = file.into_raw_fd();
     // A failed close is never retried; the caller's quarantine owns providers.
@@ -75,12 +75,17 @@ pub(crate) fn recover_cleaned(providers: RecoveryProviders, root: RootHeader) ->
     let aborted = match root.state {
         State::Building => Some(super::recovery_building::prepare_abort(&providers, &root)?),
         State::Cleaned => { verify(&providers, &root)?; None },
-        _ => fail!("Archive recovery state is not implemented yet: {:?}", root.state),
+        State::Ready | State::Committed => { super::recovery_forward::validate(&providers, &root)?; None },
     };
     let providers = Arc::new(providers);
     let custody = super::package::retirement::reserve_resources(&providers)?;
     let root = if let Some(cleaned) = aborted {
         super::recovery_building::discard_stages(&providers, &root)?;
+        if super::recovery_producer::has_ready_intent(&providers, &root)? {
+            let main = providers.participants.iter().find(|p| p.descriptor.anchor == Anchor::Node)
+                .ok_or_else(|| error!("Missing Building main provider"))?;
+            clean_stage(main.archive_root.as_path(), &root, c"ready.v1")?;
+        }
         if super::recovery_building::prepare_abort(&providers, &root)? != cleaned {
             fail!("Building data changed during stage cleanup");
         }
@@ -89,10 +94,12 @@ pub(crate) fn recover_cleaned(providers: RecoveryProviders, root: RootHeader) ->
         main.database.db().put(ROOT_KEY, cleaned.encode()?)?;
         main.database.sync_wal()?;
         cleaned
+    } else if matches!(root.state, State::Ready | State::Committed) {
+        super::recovery_forward::recover(&providers, &root)?
     } else { root };
     verify(&providers, &root)?;
     for participant in &providers.participants {
-        clean_controls(participant.database.db().path().parent().ok_or_else(|| error!("Missing provider root"))?,
+        clean_controls(participant.archive_root.as_path(),
             participant.descriptor.anchor == Anchor::Node, &root)?;
     }
     for participant in &providers.participants {
@@ -110,4 +117,22 @@ pub(crate) fn recover_cleaned(providers: RecoveryProviders, root: RootHeader) ->
     main.database.sync_wal()?;
     custody.complete();
     Ok(())
+}
+
+
+/// Constructed only after the shared worker has removed the root durably.
+/// Retains the exact native set so another domain cannot use this receipt.
+pub(in crate::archives) struct RecoveryCompletion {
+    providers: Vec<Arc<crate::db::rocksdb::RocksDb>>,
+}
+impl RecoveryCompletion {
+    pub(in crate::archives) fn matches(&self, providers: &[Arc<crate::db::rocksdb::RocksDb>]) -> bool {
+        self.providers.len() == providers.len() && self.providers.iter().all(|actual|
+            providers.iter().any(|expected| Arc::ptr_eq(actual, expected)))
+    }
+}
+pub(in crate::archives) fn recover_live(providers: RecoveryProviders, root: RootHeader) -> Result<RecoveryCompletion> {
+    let retained = providers.participants.iter().map(|p| p.database.clone()).collect();
+    recover_cleaned(providers, root)?;
+    Ok(RecoveryCompletion { providers: retained })
 }

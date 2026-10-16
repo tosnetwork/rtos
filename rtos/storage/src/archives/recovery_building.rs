@@ -30,11 +30,7 @@ pub(crate) fn prepare_abort(
         .find(|p| p.descriptor.anchor == Anchor::Node)
         .ok_or_else(|| error!("Missing Building main provider"))?;
     let path = main
-        .database
-        .db()
-        .path()
-        .parent()
-        .ok_or_else(|| error!("Missing provider root"))?
+        .archive_root
         .join("archive/recovery")
         .join(hex::encode(root.operation))
         .join("selection.v1");
@@ -83,6 +79,12 @@ pub(crate) fn prepare_abort(
                         fail!("Invalid original archive inventory digest");
                     }
                     data = Some(inventory);
+                }
+                Record::ReadyIntent => {
+                    let mut version = [0;2];
+                    if length != 2 { fail!("Invalid Ready staging intent"); }
+                    input.read_exact(&mut version)?;
+                    if version != [1,0] { fail!("Unknown Ready staging version"); }
                 }
                 Record::Child => {
                     let stage = super::recovery_stages::Stage::decode(providers, input, length)?;
@@ -139,12 +141,7 @@ pub(crate) fn discard_stages(providers: &RecoveryProviders, root: &RootHeader) -
         |tag, length, input| {
             if tag == Record::Child {
                 let stage = super::recovery_stages::Stage::decode(providers, input, length)?;
-                let provider = providers.participants[stage.provider]
-                    .database
-                    .db()
-                    .path()
-                    .parent()
-                    .ok_or_else(|| error!("Missing stage provider root"))?;
+                let provider = providers.participants[stage.provider].archive_root.as_path();
                 let name = std::ffi::CString::new(stage.name())?;
                 super::recovery_worker::clean_stage(provider, root, &name)?;
             } else {

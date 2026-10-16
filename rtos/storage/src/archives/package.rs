@@ -335,9 +335,14 @@ impl Package {
     }
 
     pub async fn truncate(&self, size: u64) -> Result<()> {
+        let operation = self.enter_operation()?;
+        self.truncate_in(&operation, size).await
+    }
+
+    pub(super) async fn truncate_in(&self, parent: &ArchiveOperation, size: u64) -> Result<()> {
+        let operation = self.state.view.inherit(parent)?;
         let new_size = (PKG_HEADER_SIZE as u64).checked_add(size)
             .ok_or_else(|| error!("Package truncate size overflow"))?;
-        let operation = self.enter_operation()?;
         let guard = self.lock_writer().await;
         if !self.state.write_healthy.load(Ordering::SeqCst) {
             fail!("Package write state is uncertain; reopen before mutation");

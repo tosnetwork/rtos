@@ -232,6 +232,20 @@ impl EpochRouter {
 
     pub fn view(&self) -> &ArchiveView { &self.view }
 
+    pub(crate) fn rebuilt(&self, startup: &ArchiveOperation) -> Result<Self> {
+        let operation = startup.inherit(self.view.binding())?;
+        let epochs = lockfree::map::Map::new();
+        for entry in self.epochs.iter() { epochs.insert(*entry.key(), entry.val().clone()); }
+        Ok(Self { view: operation.view(), epochs, epoch_size: self.epoch_size,
+            new_epochs_path: self.new_epochs_path.clone(), creation_mutex: tokio::sync::Mutex::new(()) })
+    }
+
+    /// The coordinator calls this only after closing and draining admission.
+    /// Keep the actual open owners, including epochs with no affected packages.
+    pub(crate) fn recovery_epochs(&self) -> Vec<Arc<Epoch>> {
+        self.epochs.iter().map(|entry| entry.val().clone()).collect()
+    }
+
     pub fn resolve(&self, mc_seq_no: u32) -> Option<Arc<Epoch>> {
         let start = (mc_seq_no / self.epoch_size) * self.epoch_size;
         self.epochs.get(&start).map(|g| Arc::clone(g.val()))

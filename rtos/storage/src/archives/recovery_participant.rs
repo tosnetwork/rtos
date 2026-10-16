@@ -32,6 +32,7 @@ pub(crate) enum Anchor { Node = 1, ExplicitEpoch = 2, Discovery = 3 }
 /// existing providers. Anchor identity includes the configured anchor, not its
 /// position in a mutable configuration vector. Physical path and native identity
 /// uniqueness are separate full-enumeration obligations.
+#[derive(Clone)]
 pub(crate) struct Provider {
     pub roles: u8,
     pub anchor: Anchor,

@@ -277,7 +277,9 @@ impl TestArchiveManager {
         for mc_seq_no in range {
             let block_id = Self::master_block_id(mc_seq_no, version);
             let flags = if key_blocks.contains(&mc_seq_no) { FLAG_KEY_BLOCK } else { 0 };
-            let meta = BlockMeta::with_data(flags, 0, 0, 0, 0);
+            // Masterchain LT increases with height. Equal zero LTs overwrite
+            // one native index key and cannot support a cold range rebuild.
+            let meta = BlockMeta::with_data(flags, mc_seq_no, u64::from(mc_seq_no) * 100, mc_seq_no, 0);
             let handle = self
                 .block_handle_storage
                 .create_handle(block_id.clone(), meta, None)
@@ -831,7 +833,7 @@ async fn test_import_group_boundary_and_resume() -> Result<()> {
             mc?;
         }
         let expected_slice = if seq < 150 { 1 } else { 150 };
-        assert_eq!(manager.file_maps.files().get_closest_id(seq).await, Some(expected_slice));
+        assert_eq!(manager.snapshot().file_maps.files().get_closest_id(seq).await, Some(expected_slice));
         for (handle, id, data) in &expected {
             assert_eq!(
                 &manager.get_file(handle, &PackageEntryId::Block(id)).await?,
@@ -1078,7 +1080,7 @@ async fn bounded_reads_keep_inherited_context_after_close_and_refuse_new_roots_b
                 } else {
                     create_manager(dir.path().to_str().unwrap(), "read-context", false).await?
                 };
-                let domain = manager.view.binding().domain().clone();
+                let domain = manager.snapshot().view.binding().domain().clone();
                 let (handles, _) = create_block_handle_storage(db);
                 let id = BlockIdExt::with_params(
                     ShardIdent::masterchain(),
@@ -1127,7 +1129,7 @@ async fn bounded_reads_keep_inherited_context_after_close_and_refuse_new_roots_b
                 let lock = handle.proof_file_lock().write().await;
                 let mut admitted = Box::pin(manager.get_file_bounded(&handle, &entry, limits));
                 let was_pending = futures::poll!(&mut admitted).is_pending();
-                let closed = domain.close(manager.view.epoch())?;
+                let closed = domain.close(manager.snapshot().view.epoch())?;
                 let mut refused = Box::pin(manager.get_file_bounded(&handle, &entry, limits));
                 let rejected_before_lock = match futures::poll!(&mut refused) {
                     std::task::Poll::Ready(Err(error)) => {
@@ -1179,7 +1181,7 @@ async fn cancelled_manager_reads_close_actual_file_before_domain_drain() -> Resu
                     create_manager(dir.path().to_str().unwrap(), "native-read-owner", false).await?
                 };
                 let manager = Arc::new(manager);
-                let domain = manager.view.binding().domain().clone();
+                let domain = manager.snapshot().view.binding().domain().clone();
                 let (handles, _) = create_block_handle_storage(db);
                 let id = BlockIdExt::with_params(
                     ShardIdent::masterchain(), 1,
@@ -1198,7 +1200,7 @@ async fn cancelled_manager_reads_close_actual_file_before_domain_drain() -> Resu
                         manager.add_block_data_to_package(
                             b"proof".to_vec(), &handle, &PackageEntryId::Proof(&id), true,
                         ).await?;
-                        assert!(manager.file_maps.files().get(0).await.is_none());
+                        assert!(manager.snapshot().file_maps.files().get(0).await.is_none());
                     } else {
                         manager.move_to_archive(&handle, || Ok(())).await?;
                     }
@@ -1272,7 +1274,7 @@ async fn cancelled_manager_reads_close_actual_file_before_domain_drain() -> Resu
                 let valid_while_held = unsafe { libc::fcntl(opened_fd, libc::F_GETFD) } >= 0;
                 observer.abort();
                 let cancelled = observer.await.is_err_and(|e| e.is_cancelled());
-                let closed = domain.close(manager.view.epoch())?;
+                let closed = domain.close(manager.snapshot().view.epoch())?;
                 let before_close = domain.outstanding();
                 let mut drain = Box::pin(closed.wait());
                 let pending_open = futures::poll!(&mut drain).is_pending();

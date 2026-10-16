@@ -23,6 +23,14 @@ pub struct ResolvedArchive {
 
 #[async_trait::async_trait]
 pub trait ArchiveDbProvider: Send + Sync {
+    /// Capture existing native owners after admission has closed and drained.
+    /// Custom routers must supply their complete managed set explicitly.
+    fn recovery_participants(&self) -> Result<ArchiveRecoverySet> {
+        rtos_block::fail!("Archive router does not expose its recovery participants")
+    }
+    fn rebuilt(&self, _startup: &ArchiveOperation) -> Result<Arc<dyn ArchiveDbProvider>> {
+        rtos_block::fail!("Archive router does not support generation rebuild")
+    }
     fn main_binding(&self) -> &ArchiveProvider;
 
     /// Existing destination only. This route must not create directories/DBs.
@@ -43,6 +51,12 @@ pub trait ArchiveDbProvider: Send + Sync {
     fn memory_usage(&self) -> crate::RocksDbMemoryUsage;
 }
 
+/// Opaque because provider descriptors are internal recovery authority.
+pub struct ArchiveRecoverySet {
+    pub(crate) providers: super::recovery_providers::RecoveryProviders,
+    pub(crate) bindings: Vec<ArchiveProvider>,
+}
+
 pub struct SingleDbProvider {
     binding: ArchiveProvider,
     db_root_path: Arc<PathBuf>,
@@ -61,6 +75,14 @@ impl SingleDbProvider {
 }
 #[async_trait::async_trait]
 impl ArchiveDbProvider for SingleDbProvider {
+    fn rebuilt(&self, startup: &ArchiveOperation) -> Result<Arc<dyn ArchiveDbProvider>> {
+        let _operation = startup.inherit(&self.binding)?;
+        Ok(Arc::new(Self::new(self.binding.clone(), self.db_root_path.clone())))
+    }
+    fn recovery_participants(&self) -> Result<ArchiveRecoverySet> {
+        let root = std::fs::canonicalize(&*self.db_root_path)?;
+        super::recovery_providers::RecoveryProviders::from_live(&self.binding, &root, None)
+    }
     fn main_binding(&self) -> &ArchiveProvider {
         &self.binding
     }
@@ -96,6 +118,15 @@ impl EpochDbProvider {
 }
 #[async_trait::async_trait]
 impl ArchiveDbProvider for EpochDbProvider {
+    fn rebuilt(&self, startup: &ArchiveOperation) -> Result<Arc<dyn ArchiveDbProvider>> {
+        Ok(Arc::new(Self::new(Arc::new(self.router.rebuilt(startup)?))))
+    }
+    fn recovery_participants(&self) -> Result<ArchiveRecoverySet> {
+        let binding = self.main_binding();
+        let root = binding.db().db().path().parent()
+            .ok_or_else(|| rtos_block::error!("Missing live main database root"))?;
+        super::recovery_providers::RecoveryProviders::from_live(binding, root, Some(self.router.recovery_epochs()))
+    }
     fn main_binding(&self) -> &ArchiveProvider {
         self.router.view().binding()
     }

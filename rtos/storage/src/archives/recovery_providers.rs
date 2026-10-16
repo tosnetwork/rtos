@@ -10,6 +10,7 @@ use std::{collections::HashSet, io::Read, sync::Arc};
 pub(crate) struct Participant {
     pub descriptor: Provider,
     pub database: Arc<RocksDb>,
+    pub archive_root: std::path::PathBuf,
 }
 pub(crate) struct RecoveryProviders {
     pub participants: Vec<Participant>,
@@ -18,6 +19,38 @@ pub(crate) struct RecoveryProviders {
     pub protection: Arc<RepairProtection>,
 }
 impl RecoveryProviders {
+    pub(crate) fn from_live(
+        main: &super::context::ArchiveProvider,
+        root: &std::path::Path,
+        epochs: Option<Vec<Arc<super::epoch::Epoch>>>,
+    ) -> Result<super::db_provider::ArchiveRecoverySet> {
+        let descriptor = Provider::main(root, epochs.is_some(), &main.db().db().get_db_identity()?)?;
+        let mut identities = HashSet::new();
+        identities.insert(descriptor.database);
+        let mut participants = vec![Participant { descriptor, database: main.db().clone(), archive_root: std::fs::canonicalize(root)? }];
+        let mut bindings = vec![main.clone()];
+        for epoch in epochs.into_iter().flatten() {
+            if !Arc::ptr_eq(main.domain(), epoch.binding().domain()) {
+                fail!("Live recovery participant belongs to another archive domain");
+            }
+            let descriptor = epoch.recovery_provider().clone();
+            if descriptor.database != super::recovery_participant::Identity::native(&epoch.db().db().get_db_identity()?)?
+                || !identities.insert(descriptor.database) {
+                fail!("Invalid or duplicate live recovery provider identity");
+            }
+            participants.push(Participant { descriptor, database: epoch.db().clone(), archive_root: std::fs::canonicalize(&**epoch.path())? });
+            bindings.push(epoch.binding().clone());
+        }
+        participants.sort_by(|a, b| {
+            let a = &a.descriptor; let b = &b.descriptor;
+            (a.roles, a.anchor as u8, a.anchor_identity, &a.relative)
+                .cmp(&(b.roles, b.anchor as u8, b.anchor_identity, &b.relative))
+        });
+        Ok(super::db_provider::ArchiveRecoverySet {
+            providers: Self { participants, protection: main.db().repair_protection().clone() }, bindings,
+        })
+    }
+
     pub(crate) async fn inspect(
         main: Arc<RocksDb>, root: &RootHeader, config: Option<&ArchivalModeConfig>,
         protection: &Arc<RepairProtection>,
@@ -34,7 +67,8 @@ impl RecoveryProviders {
         }
         let mut identities = HashSet::new();
         identities.insert(descriptor.database);
-        let mut participants = vec![Participant { descriptor, database: main }];
+        let archive_root = node_root.to_path_buf();
+        let mut participants = vec![Participant { descriptor, database: main, archive_root }];
         if let Some(config) = config {
             for entry in scan_existing(config, true).await? {
                 let owner = ProviderReservation::open_existing(&entry.path.join("archive_db"))?;
@@ -44,7 +78,7 @@ impl RecoveryProviders {
                     if entry.explicit { Anchor::ExplicitEpoch } else { Anchor::Discovery },
                     (entry.meta.mc_seq_no_start, entry.meta.mc_seq_no_end), &database.db().get_db_identity()?)?;
                 if !identities.insert(descriptor.database) { fail!("Duplicate recovery provider native identity"); }
-                participants.push(Participant { descriptor, database });
+                participants.push(Participant { descriptor, database, archive_root: std::fs::canonicalize(&entry.path)? });
             }
         }
         // Same ordering used by Provider records: routing roles, anchor kind,

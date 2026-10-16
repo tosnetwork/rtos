@@ -449,7 +449,7 @@ async fn interrupt_actual_recovery(
 ) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let (source, source_file) = if cut.starts_with("repack-") {
-        (include_str!("../../storage/src/archives/archive_slice.rs"), "archive_slice.rs")
+        (include_str!("../../storage/src/archives/recovery_forward.rs"), "recovery_forward.rs")
     } else if cut == "truncation-before-progress" {
         (include_str!("../internal_db/restore.rs"), "restore.rs")
     } else {
@@ -460,7 +460,7 @@ async fn interrupt_actual_recovery(
     assert_eq!(matches.len(), 1, "crash cut must identify one production statement");
     let line = matches[0].0 + 1;
     let function = if cut.starts_with("repack-") {
-        "storage::archives::archive_slice::{impl#0}::trunc::"
+        "storage::archives::recovery_forward::publish_package"
     } else if cut == "truncation-before-progress" {
         "internal_db::restore::restore"
     } else if cut == "stage-after-unlink" {

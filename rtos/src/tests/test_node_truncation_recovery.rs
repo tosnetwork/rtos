@@ -122,10 +122,10 @@ pub(super) async fn run(
                 "db.save_full_node_state(SHARD_CLIENT_MC_BLOCK, last_mc_block.id())?;"
             }
             "repack-before-rename" => {
-                "tokio::fs::rename(new_package.get_path(), old_package.get_path()).await?;"
+                "sync_child(source.last().unwrap(), &old)?;"
             }
             "repack-after-rename" => {
-                "crate::archives::package::sync_file_and_parents(old_package.path()).await?;"
+                "sync_child(destination.last().unwrap(), &new)"
             }
             _ => rtos_block::fail!("Unknown truncation cut {cut}"),
         };
@@ -145,7 +145,7 @@ pub(super) async fn run(
                     } else {
                         assert!(
                             !entry.file_name().to_string_lossy().ends_with(".pack.new"),
-                            "after-rename cut still has a stage: {}",
+                            "after-rename cut has an undeclared legacy stage: {}",
                             entry.path().display()
                         );
                     }

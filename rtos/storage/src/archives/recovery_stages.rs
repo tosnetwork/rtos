@@ -75,11 +75,7 @@ pub(super) fn operation(
     index: usize,
 ) -> Result<PathBuf> {
     Ok(providers.participants[index]
-        .database
-        .db()
-        .path()
-        .parent()
-        .ok_or_else(|| error!("Missing stage provider root"))?
+        .archive_root
         .join("archive/recovery")
         .join(hex::encode(root.operation)))
 }
@@ -125,6 +121,7 @@ pub(super) fn inventory(providers: &RecoveryProviders, root: &RootHeader) -> Res
     if root.state != State::Building {
         fail!("Stage inspection requires Building");
     }
+    let ready_intent = super::recovery_producer::has_ready_intent(providers, root)?;
     let mut inventory = StageInventory::new();
     for (index, participant) in providers.participants.iter().enumerate() {
         let operation = operation(providers, root, index)?;
@@ -147,6 +144,10 @@ pub(super) fn inventory(providers: &RecoveryProviders, root: &RootHeader) -> Res
                 .and_then(|n| n.to_str())
                 .ok_or_else(|| error!("Invalid stage filename"))?;
             if name == "selection.v1" && participant.descriptor.anchor == Anchor::Node {
+                return Ok(());
+            }
+            if name == "ready.v1" && ready_intent && participant.descriptor.anchor == Anchor::Node {
+                if !present(&path)? { fail!("Missing declared Ready staging file"); }
                 return Ok(());
             }
             let hex = name

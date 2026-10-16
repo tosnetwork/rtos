@@ -21,6 +21,17 @@ pub(crate) fn read_sidecar(
     path: &Path, kind: Kind, root: &RootHeader, expected: Sidecar,
     visit: impl FnMut(super::recovery_manifest::Record, u64, &mut dyn io::Read) -> Result<()>,
 ) -> Result<()> {
+    inspect_sidecar(path, expected, |file| {
+        read_manifest(file, kind, root.operation, expected, visit)
+    })
+}
+
+/// Hold and verify the same native sidecar descriptor through a full semantic
+/// scan, including close errors. A successful callback alone is not a receipt.
+pub(super) fn inspect_sidecar<T>(
+    path: &Path, expected: Sidecar,
+    inspect: impl FnOnce(&mut fs::File) -> Result<T>,
+) -> Result<T> {
     let before = fs::symlink_metadata(path)?;
     if !before.is_file() || before.file_type().is_symlink() || before.len() != expected.bytes {
         fail!("Recovery sidecar type or length mismatch");
@@ -31,12 +42,12 @@ pub(crate) fn read_sidecar(
         // Root-bound whole-file digest, framing, operation, counts and EOF are
         // checked. Cleaned inventories supply canonical-state evidence; this is
         // not a replacement for the earlier full selection/Ready semantics.
-        read_manifest(&mut file, kind, root.operation, expected, visit)?;
+        let result = inspect(&mut file)?;
         if identity(&file.metadata()?) != identity(&before)
             || identity(&fs::symlink_metadata(path)?) != identity(&before) {
             fail!("Recovery sidecar changed during inspection");
         }
-        Ok(())
+        Ok(result)
     })();
     let fd = file.into_raw_fd();
     // SAFETY: this uniquely owned descriptor is consumed once; never retry a
@@ -65,7 +76,7 @@ fn validate_remaining(providers: &RecoveryProviders, root: &RootHeader) -> Resul
     root.validate()?;
     let operation = hex::encode(root.operation);
     for participant in &providers.participants {
-        let archive = participant.database.db().path().parent().expect("provider root").join("archive");
+        let archive = participant.archive_root.join("archive");
         if !directory(&archive)? { continue; }
         let controls = archive.join("recovery");
         if !directory(&controls)? { continue; }

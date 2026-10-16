@@ -508,7 +508,7 @@ impl InternalDb {
                 Arc::new(SingleDbProvider::new(archive_binding.clone(), db_root_path.clone()))
             };
         let archive_manager = Arc::new(
-            ArchiveManager::with_data(
+            ArchiveManager::with_node_data(
                 archive_binding,
                 &archive_startup,
                 db_root_path,
@@ -521,6 +521,10 @@ impl InternalDb {
             )
             .await?,
         );
+
+        // Constructors have completed; recovery must be able to drain this
+        // admission epoch before restore starts a real archive truncation.
+        drop(archive_startup);
 
         // Complete every fallible passive constructor before starting the
         // self-owned dynamic state worker. A rejected archive must release the

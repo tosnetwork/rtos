@@ -6,9 +6,11 @@ use rtos_block::{error, fail, Result, Sha256, ShardIdent};
 use std::{collections::BinaryHeap, ffi::OsString, fs, io::Read,
     os::{fd::IntoRawFd, unix::{fs::{MetadataExt, OpenOptionsExt}}}, path::{Path, PathBuf}};
 
-struct Digest { hash: Sha256, count: u64 }
+pub(super) struct Digest { hash: Sha256, count: u64 }
 impl Digest {
-    fn record(&mut self, tag: u8, provider: [u8;32], parts: &[&[u8]]) -> Result<()> {
+    pub(super) fn new() -> Self { Self { hash: Sha256::new(), count: 0 } }
+    pub(super) fn finish(self) -> Inventory { Inventory { count: self.count, digest: self.hash.finalize() } }
+    pub(super) fn record(&mut self, tag: u8, provider: [u8;32], parts: &[&[u8]]) -> Result<()> {
         self.count = self.count.checked_add(1).ok_or_else(|| error!("Archive data inventory overflow"))?;
         self.hash.update([tag]); self.hash.update(provider);
         for part in parts {
@@ -49,7 +51,7 @@ fn directory(path: &Path) -> Result<bool> {
 fn identity(meta: &fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
     (meta.dev(), meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec(), meta.ctime(), meta.ctime_nsec())
 }
-fn file_digest(path: &Path) -> Result<(u64, [u8;32])> {
+pub(super) fn file_digest(path: &Path) -> Result<(u64, [u8;32])> {
     let before = fs::symlink_metadata(path)?;
     if !before.is_file() || before.file_type().is_symlink() { fail!("Invalid canonical package file"); }
     let mut file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
@@ -97,6 +99,15 @@ fn routed(roles: u8, range: Option<(u32,u32)>, key: bool, id: u32) -> Result<()>
 }
 
 pub(crate) fn inventory(providers: &RecoveryProviders) -> Result<Inventory> {
+    inventory_with_families(providers, true)
+}
+
+/// Only a fully validated Committed manifest may account for a partially
+/// removed tail family set. The resulting digest must match that projection.
+pub(super) fn inventory_during_cleanup(providers: &RecoveryProviders) -> Result<Inventory> {
+    inventory_with_families(providers, false)
+}
+fn inventory_with_families(providers: &RecoveryProviders, require_complete: bool) -> Result<Inventory> {
     let mut digest = Digest { hash: Sha256::new(), count: 0 };
     for participant in &providers.participants {
         let descriptor = &participant.descriptor;
@@ -125,7 +136,7 @@ pub(crate) fn inventory(providers: &RecoveryProviders) -> Result<Inventory> {
             routed(descriptor.roles, descriptor.range, key, id)?;
             for required in ["block_index", "entry_meta", "offsets", "status"] {
                 let required = format!("{required}_{}db_{id}", if key { "key_" } else { "" });
-                if names.binary_search(&required).is_err() { fail!("Incomplete archive metadata family set"); }
+                if require_complete && names.binary_search(&required).is_err() { fail!("Incomplete archive metadata family set"); }
             }
             digest.record(1, provider, &[name.as_bytes()])?; // Empty CF presence is significant.
             let cf = db.cf_handle(name).ok_or_else(|| error!("Missing archive metadata CF"))?;
@@ -141,7 +152,7 @@ pub(crate) fn inventory(providers: &RecoveryProviders) -> Result<Inventory> {
             }
             rows.status()?;
         }
-        let root = db.path().parent().ok_or_else(|| error!("Missing archive provider root"))?;
+        let root = participant.archive_root.as_path();
         let archive = root.join("archive");
         if !directory(&archive)? { continue; }
         let packages = archive.join("packages");
