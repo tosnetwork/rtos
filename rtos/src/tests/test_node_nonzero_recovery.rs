@@ -378,6 +378,8 @@ async fn actual_node_sparse_packages_interrupted_metadata() -> Result<()> {
 
 #[path = "test_node_finality_recovery.rs"]
 mod finality_recovery;
+#[path = "test_node_finality_io.rs"]
+mod finality_io;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires production node binary and public fixture signer"]
@@ -401,6 +403,18 @@ async fn actual_node_finality_cache_loss() -> Result<()> {
 #[ignore = "requires production node, GDB and isolated LazyFS"]
 async fn actual_node_finality_ack_cache_loss() -> Result<()> {
     exercise_nonzero_recovery_with_finality(false, None, None, false, 4).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node, GDB and isolated LazyFS"]
+async fn actual_node_finality_write_enospc_cache_loss() -> Result<()> {
+    exercise_nonzero_recovery_with_finality(false, None, None, false, 5).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node, GDB and isolated LazyFS"]
+async fn actual_node_finality_sync_eio_cache_loss() -> Result<()> {
+    exercise_nonzero_recovery_with_finality(false, None, None, false, 6).await
 }
 
 async fn exercise_nonzero_recovery_layout(
@@ -618,7 +632,11 @@ async fn exercise_nonzero_recovery_with_finality(
         }
     }
     if retained_finality >= 3 { cache_loss::sync_fixture(root)?; }
-    if retained_finality >= 2 {
+    if retained_finality >= 5 {
+        let mode = if retained_finality == 5 { "write-enospc" } else { "sync-eio" };
+        finality_io::refuse(&binary, root, &zero, mode).await?;
+        finality_recovery::discard(root, "refusal", false).await?;
+    } else if retained_finality >= 2 {
         let (cut, statement) = if retained_finality == 4 {
             ("finality-ack-committed", "match std::fs::remove_file(&path) {")
         } else { ("finality-before-source-ack", "source.acknowledge(receipt)") };

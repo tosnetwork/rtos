@@ -192,7 +192,7 @@ def run(binary, output, node=None):
                         case = "actual_node_" + node.cut.replace("-", "_") + ("_cache_loss" if node.cut in ["state", "state-auto"] else "")
                     if node.cut.startswith("persistent-"):
                         case = "actual_node_" + node.cut.replace("-", "_") + ("" if node.cut.endswith("-eio") else "_cache_loss")
-                    if node.cut in ["finality", "finality-ack"]:
+                    if node.cut.startswith("finality"):
                         case = "actual_node_" + node.cut.replace("-", "_") + "_cache_loss"
                     result["node_cut"] = node.cut
                     result["node_cache_loss_enabled"] = not node.no_cache_loss
@@ -233,8 +233,9 @@ def run(binary, output, node=None):
                     result["sync_mutation"]["hits"] = marker
                 required_evidence = ["Actual node recovery interrupted at " + (
                     f"producer-{node.cut}-cache-loss" if node.cut in ["ready", "selection"] else "forward-before-prepare-cache-loss" if node.cut == "stages" else "forward-committed-cache-loss" if node.cut == "committed" else "forward-cleaned-cache-loss" if node.cut == "cleaned" else "root-last-cache-loss" if node.cut == "root-last" else "forward-after-row-sync")]
-                if node.cut in ["finality", "finality-ack"]:
-                    required_evidence = ["Actual node recovery interrupted at " + ("finality-ack-committed" if node.cut == "finality-ack" else "finality-before-source-ack"), "Actual node retained finality recovery: two boots, source acknowledged, exact block and certificate durable"]
+                if node.cut.startswith("finality"):
+                    finality_fault = node.cut in ["finality-write-enospc", "finality-sync-eio"]
+                    required_evidence = ["Actual node refused startup after source " + node.cut.removeprefix("finality-") if finality_fault else "Actual node recovery interrupted at " + ("finality-ack-committed" if node.cut == "finality-ack" else "finality-before-source-ack"), "Actual node retained finality recovery: two boots, source acknowledged, exact block and certificate durable"]
                 if node.cut in ["lease", "lease-acquire", "lease-custody"]:
                     operation = "custody" if node.cut == "lease-custody" else "acquire" if node.cut == "lease-acquire" else "release"
                     required_evidence = [f"Acknowledged lease {operation} writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true")]
@@ -389,18 +390,35 @@ def run(binary, output, node=None):
                     if executed.returncode != 0:
                         raise RuntimeError(f"Actual node cache-loss test failed: {executed.returncode}")
                     required_evidence.append("1 passed; 0 failed")
-                    if node.cut not in ["finality", "finality-ack"]:
+                    if not node.cut.startswith("finality"):
                         required_evidence.append("Actual node retried real truncation")
                     else:
-                        for phase in ["takeover", "started"]:
+                        if finality_fault:
+                            reports = list((output / "node").rglob("source-io-refusal.json"))
+                            if len(reports) != 1:
+                                raise RuntimeError("Missing finality source IO refusal")
+                            refusal = json.loads(reports[0].read_text())
+                            if refusal["node_exit"] <= 0 or refusal["native_hits"] != 1 or refusal["services_started"] or refusal["source_acknowledged"] or not refusal["source_preserved"] or refusal["mode"] != node.cut.removeprefix("finality-"):
+                                raise RuntimeError("Unqualified finality source IO refusal")
+                            if (refusal["temporary_bytes"] > 0) != (node.cut == "finality-sync-eio"):
+                                raise RuntimeError("Source IO failure missed expected temporary-file boundary")
+                            result["finality_io_refusal"] = refusal
+                        for phase in ["refusal" if finality_fault else "takeover", "started"]:
                             reports = list((output / "node").rglob(f"finality-{phase}-source.json"))
                             if len(reports) != 1:
                                 raise RuntimeError("Missing finality source observation")
                             source = json.loads(reports[0].read_text())
                             if source["cache_loss"] != (not node.no_cache_loss) or not source["exact_source_bytes"] or source["native_database_reopened"] or not source["source_files"] or source["config_bytes"] <= 0:
                                 raise RuntimeError("Unqualified finality source/config persistence")
-                            if source["source_pending"] != int(phase == "takeover") or source["source_acknowledged"] != int(phase == "started" or node.cut == "finality-ack"):
+                            if source["source_pending"] != int(phase != "started") or source["source_acknowledged"] != int(phase == "started" or node.cut == "finality-ack"):
                                 raise RuntimeError("Incorrect finality source ACK boundary")
+                            if phase == "refusal":
+                                before = list(source["temporary_before"].values())
+                                after = list(source["temporary_after"].values())
+                                if len(before) != 1 or len(after) != 1 or before[0][0] != refusal["temporary_bytes"]:
+                                    raise RuntimeError("Missing failed temporary-file observation")
+                                if not node.no_cache_loss and after[0][0] != 0:
+                                    raise RuntimeError("Unsynced failed source temporary survived cache loss")
                             if not node.no_cache_loss:
                                 losses = list((output / "node").rglob(f"finality-{phase}-cache-loss.json"))
                                 if len(losses) != 1:
@@ -409,8 +427,11 @@ def run(binary, output, node=None):
                                 if not loss["unsynced_overwrite_discarded"] or "finished::clear-cache" not in loss["acknowledgement"]:
                                     raise RuntimeError("Unqualified finality cache loss")
                                 wal = loss["validator_wal_files"]
-                                if not wal or not any(f["bytes_before"] > 0 for f in wal) or any(f["bytes_before"] != f["bytes_after"] or f["sha256_before"] != f["sha256_after"] for f in wal):
+                                if not wal or any(f["bytes_before"] != f["bytes_after"] or f["sha256_before"] != f["sha256_after"] for f in wal):
                                     raise RuntimeError("Finality takeover WAL did not survive cache loss exactly")
+                                if not any(f["bytes_before"] > 0 for f in wal):
+                                    if not (finality_fault and phase == "started" and source["exact_native_tables"] and source["native_tables"] and all(v[0] > 0 for v in source["native_tables"].values())):
+                                        raise RuntimeError("Empty takeover WAL requires observed durable native SSTs")
                         if transcript.count("independent overwrite control reverted to durable bytes") != (0 if node.no_cache_loss else 2):
                             raise RuntimeError("Unexpected finality cache-loss count")
                         reports = list((output / "node").rglob("finality-recovery.json"))
@@ -623,7 +644,7 @@ if __name__ == "__main__":
     mutation.add_argument("--omit-state-wal-sync", action="store_true", help="omit one scoped dynamic state publication WAL sync")
     mutation.add_argument("--omit-lease-wal-sync", action="store_true", help="omit one scoped repair lease mutation WAL sync")
     mutation.add_argument("--omit-validator-wal-sync", action="store_true", help="omit one scoped validator-state WAL sync")
-    parser.add_argument("--cut", choices=["finality", "finality-ack", "state-auto-rebuild-startup-sync-eio", "state-auto-startup-sync-eio", "state-auto-state-sync-eio", "state-auto-selection-enospc", "state-auto-stage-enospc", "state-auto-publish-rename-eio", "state-auto-publish-sync-eio", "state-auto-publish-directory-sync-eio", "state-auto-wal-publish-sync-eio", "state-auto", "state", "rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire", "lease-custody", "validator-floor", "validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty", "persistent-fast", "persistent-head", "persistent-whole", "persistent-raw", "persistent-fast-file-eio", "persistent-fast-directory-eio", "persistent-head-file-eio", "persistent-head-directory-eio", "persistent-whole-file-eio", "persistent-whole-directory-eio", "persistent-raw-file-eio", "persistent-raw-directory-eio", "persistent-fast-rename-eio", "persistent-head-rename-eio", "persistent-whole-rename-eio", "persistent-raw-rename-eio", "persistent-fast-published-eio", "persistent-head-published-eio", "persistent-whole-published-eio", "persistent-raw-published-eio"], default="rows")
+    parser.add_argument("--cut", choices=["finality-write-enospc", "finality-sync-eio", "finality", "finality-ack", "state-auto-rebuild-startup-sync-eio", "state-auto-startup-sync-eio", "state-auto-state-sync-eio", "state-auto-selection-enospc", "state-auto-stage-enospc", "state-auto-publish-rename-eio", "state-auto-publish-sync-eio", "state-auto-publish-directory-sync-eio", "state-auto-wal-publish-sync-eio", "state-auto", "state", "rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire", "lease-custody", "validator-floor", "validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty", "persistent-fast", "persistent-head", "persistent-whole", "persistent-raw", "persistent-fast-file-eio", "persistent-fast-directory-eio", "persistent-head-file-eio", "persistent-head-directory-eio", "persistent-whole-file-eio", "persistent-whole-directory-eio", "persistent-raw-file-eio", "persistent-raw-directory-eio", "persistent-fast-rename-eio", "persistent-head-rename-eio", "persistent-whole-rename-eio", "persistent-raw-rename-eio", "persistent-fast-published-eio", "persistent-head-published-eio", "persistent-whole-published-eio", "persistent-raw-published-eio"], default="rows")
     parser.add_argument("--no-cache-loss", action="store_true", help="run the same node cut without cache loss as a control")
     parser.add_argument("--node-test-binary", type=Path)
     parser.add_argument("--node-binary", type=Path)

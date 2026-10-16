@@ -123,7 +123,7 @@ pub(super) async fn verify(root: &Path, db: &Arc<InternalDb>, expected: &Publica
 
 /// Observe only regular source files after the actual process has been reaped.
 /// This never opens a native DB or runs the source scanner before the loss cut.
-fn source_inventory(root: &Path) -> Result<BTreeMap<PathBuf, (usize, String)>> {
+pub(super) fn source_inventory(root: &Path) -> Result<BTreeMap<PathBuf, (usize, String)>> {
     fn visit(root: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, (usize, String)>) -> Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
@@ -142,13 +142,30 @@ fn source_inventory(root: &Path) -> Result<BTreeMap<PathBuf, (usize, String)>> {
     Ok(files)
 }
 
+fn native_tables(root: &Path) -> Result<BTreeMap<PathBuf, (usize, String)>> {
+    let mut files = BTreeMap::new();
+    for entry in fs::read_dir(root.join("node_db/catchains"))? {
+        let entry = entry?;
+        if entry.path().extension().is_some_and(|e| e == "sst") {
+            assert!(entry.file_type()?.is_file());
+            let bytes = fs::read(entry.path())?;
+            files.insert(entry.path().strip_prefix(root)?.to_owned(),
+                (bytes.len(), hex::encode(rtos_block::sha256_digest(&bytes))));
+        }
+    }
+    Ok(files)
+}
+
 pub(super) async fn discard(root: &Path, phase: &str, acknowledged: bool) -> Result<()> {
     let enabled = std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")? == "1";
-    let before = source_inventory(root)?;
+    let (temporary_before, before): (BTreeMap<_, _>, BTreeMap<_, _>) = source_inventory(root)?
+        .into_iter().partition(|(path, _)| path.extension().is_some_and(|e| e == "tmp"));
+    assert_eq!(temporary_before.len(), usize::from(phase == "refusal"));
     let pending = before.keys().filter(|p| p.extension().is_some_and(|e| e == "json")).count();
     let ack = before.keys().filter(|p| p.extension().is_some_and(|e| e == "acked")).count();
-    assert_eq!(pending, usize::from(phase == "takeover"), "unexpected source retention at cut");
+    assert_eq!(pending, usize::from(phase != "started"), "unexpected source retention at cut");
     assert_eq!(ack, usize::from(acknowledged), "source ACK cut was not observed");
+    let tables = native_tables(root)?;
     let config = fs::read(root.join("config.json"))?;
     let _: serde_json::Value = serde_json::from_slice(&config)?;
     if enabled {
@@ -157,12 +174,17 @@ pub(super) async fn discard(root: &Path, phase: &str, acknowledged: bool) -> Res
         fs::copy(root.join("cache-loss.json"), &report)?;
         keep_evidence(root, &report)?;
     }
-    let after = source_inventory(root)?;
+    let (temporary_after, after): (BTreeMap<_, _>, BTreeMap<_, _>) = source_inventory(root)?
+        .into_iter().partition(|(path, _)| path.extension().is_some_and(|e| e == "tmp"));
+    assert_eq!(temporary_before.keys().collect::<Vec<_>>(), temporary_after.keys().collect::<Vec<_>>());
     assert_eq!(before, after, "durable source files changed after cache loss");
+    assert_eq!(tables, native_tables(root)?, "node takeover SST changed after cache loss");
     assert_eq!(config, fs::read(root.join("config.json"))?, "node configuration lost during finality recovery");
     let report = root.join(format!("finality-{phase}-source.json"));
     fs::write(&report, serde_json::to_vec_pretty(&serde_json::json!({
         "phase": phase, "cache_loss": enabled, "source_files": before,
+        "temporary_before": temporary_before, "temporary_after": temporary_after,
+        "native_tables": tables, "exact_native_tables": true,
         "source_pending": pending, "source_acknowledged": ack,
         "exact_source_bytes": true, "config_bytes": config.len(),
         "config_sha256": hex::encode(rtos_block::sha256_digest(&config)),
