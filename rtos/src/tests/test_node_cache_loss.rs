@@ -61,3 +61,36 @@ pub(super) async fn clear(root: &Path) -> Result<()> {
     eprintln!("LazyFS discarded unsynced file data after actual node interruption; independent overwrite control reverted to durable bytes");
     Ok(())
 }
+
+pub(super) async fn unfinished_ready(root: &Path) -> Result<()> {
+    let mut ready = Vec::new();
+    let mut stages = 0;
+    truncation_recovery::find_ready_staging(root, &mut ready, &mut stages)?;
+    assert_eq!(ready.len(), 1);
+    assert!(stages > 0, "Ready cut must follow durable replacement staging");
+    let before = fs::read(&ready[0])?;
+    assert!(before.len() > 28 && &before[..8] == b"RTOSAMF1");
+    keep_evidence(root, &ready[0])?;
+    let loss = match std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")?.as_str() {
+        "1" => true,
+        "0" => false,
+        _ => rtos_block::fail!("Invalid cache-loss test mode"),
+    };
+    if loss { clear(root).await?; }
+    let after = fs::read(&ready[0])?;
+    if loss { assert!(after.is_empty(), "unsynced Ready bytes survived cache loss"); }
+    else { assert_eq!(after, before, "no-loss control changed Ready bytes"); }
+    let mut remaining = Vec::new();
+    let mut remaining_stages = 0;
+    truncation_recovery::find_ready_staging(root, &mut remaining, &mut remaining_stages)?;
+    assert_eq!(remaining, ready);
+    assert_eq!(remaining_stages, stages, "durable staged files disappeared");
+    let report = root.join("ready-cache-loss.json");
+    fs::write(&report, serde_json::to_vec(&serde_json::json!({
+        "cache_loss": loss, "ready_bytes_before": before.len(),
+        "ready_bytes_after": after.len(), "durable_stage_count": stages
+    }))?)?;
+    keep_evidence(root, &report)?;
+    eprintln!("Unfinished Ready cache-loss={loss}: {} bytes before, {} bytes after; durable stages present", before.len(), after.len());
+    Ok(())
+}

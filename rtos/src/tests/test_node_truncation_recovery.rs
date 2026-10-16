@@ -142,11 +142,15 @@ pub(super) async fn run(
             "forward-before-cleanup" => "scan(providers, &committed, Pass::Cleanup)?;",
             "forward-after-row-sync" | "forward-after-row-sync-cache-loss" => "let applied = scan(providers, root, Pass::Committed)?;",
             "producer-selection-before-finish" => "let (file, selection) = writer.finish()?;",
-            "producer-ready-before-finish" => "let (file, ready) = writer.finish()?;",
+            "producer-ready-before-finish" | "producer-ready-cache-loss" => "let (file, ready) = writer.finish()?;",
             _ => rtos_block::fail!("Unknown truncation cut {cut}"),
         };
         interrupt_actual_recovery(binary, root, zero, cut, statement).await?;
-        if cut.ends_with("-cache-loss") { cache_loss::clear(root).await?; }
+        if cut == "producer-ready-cache-loss" {
+            assert_eq!(package_inventory(root)?, before, "producer cut changed canonical packages");
+            cache_loss::unfinished_ready(root).await?;
+            assert_eq!(package_inventory(root)?, before, "cache loss changed canonical packages");
+        } else if cut.ends_with("-cache-loss") { cache_loss::clear(root).await?; }
         assert!(root.join("node_db/ton_node.restoring").is_file());
         if cut == "forward-before-cleanup" {
             assert_ne!(package_inventory(root)?, before, "Committed cut preceded canonical replacement");
@@ -370,7 +374,7 @@ pub(super) async fn run(
 }
 
 
-fn find_ready_staging(path: &Path, ready: &mut Vec<PathBuf>, stages: &mut usize) -> Result<()> {
+pub(super) fn find_ready_staging(path: &Path, ready: &mut Vec<PathBuf>, stages: &mut usize) -> Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {

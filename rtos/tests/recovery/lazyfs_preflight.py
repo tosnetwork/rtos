@@ -125,6 +125,7 @@ def run(binary, output, node=None):
                 environment = dict(os.environ)
                 environment.update({
                     "RTOS_NODE_RECOVERY_FIXTURE_DIR": str(fixture_dir),
+                    "RTOS_TEST_CACHE_LOSS_ENABLED": "0" if node.no_cache_loss else "1",
                     "RTOS_TEST_LAZYFS_COMMAND": str(command),
                     "RTOS_TEST_LAZYFS_COMPLETED": str(completion),
                     "RTOS_NODE_RECOVERY_BINARY": str(node.node_binary.resolve(strict=True)),
@@ -133,6 +134,9 @@ def run(binary, output, node=None):
                 })
                 with (output / "node-test.log").open("wb") as log:
                     case = "actual_node_sparse_packages_interrupted_metadata" if node.no_cache_loss else "actual_node_sparse_packages_cache_loss"
+                    if node.cut == "ready":
+                        case = "actual_node_unfinished_ready_cache_loss"
+                    result["node_cut"] = node.cut
                     result["node_cache_loss_enabled"] = not node.no_cache_loss
                     executed = subprocess.Popen(
                         [str(node.node_test_binary.resolve(strict=True)),
@@ -163,7 +167,10 @@ def run(binary, output, node=None):
                     raise RuntimeError(f"Actual node cache-loss test failed: {executed.returncode}")
                 transcript = (output / "node-test.log").read_text()
                 required_evidence = ["1 passed; 0 failed", "Actual node retried real truncation",
-                                     "Actual node recovery interrupted at forward-after-row-sync"]
+                                     "Actual node recovery interrupted at " + (
+                                         "producer-ready-cache-loss" if node.cut == "ready" else "forward-after-row-sync")]
+                if node.cut == "ready":
+                    required_evidence.append("Unfinished Ready cache-loss=" + ("false" if node.no_cache_loss else "true"))
                 if not node.no_cache_loss:
                     required_evidence.append("LazyFS discarded unsynced file data")
                 elif "LazyFS discarded unsynced file data" in transcript:
@@ -220,6 +227,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lazyfs", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--cut", choices=["rows", "ready"], default="rows")
     parser.add_argument("--no-cache-loss", action="store_true", help="run the same node cut without cache loss as a control")
     parser.add_argument("--node-test-binary", type=Path)
     parser.add_argument("--node-binary", type=Path)
