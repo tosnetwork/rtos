@@ -41,6 +41,16 @@ fn package_inventory(root: &Path) -> Result<BTreeMap<PathBuf, [u8; 32]>> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires RTOS_NODE_RECOVERY_BINARY built from this revision"]
 async fn actual_node_restarts_with_nonzero_authenticated_history() -> Result<()> {
+    exercise_nonzero_recovery(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires gdb and RTOS_NODE_RECOVERY_BINARY with current debug symbols"]
+async fn actual_node_resumes_after_interrupting_recovery() -> Result<()> {
+    exercise_nonzero_recovery(true).await
+}
+
+async fn exercise_nonzero_recovery(interrupt_recovery: bool) -> Result<()> {
     let binary = fs::canonicalize(std::env::var("RTOS_NODE_RECOVERY_BINARY")?)?;
     let dir = tempfile::tempdir()?;
     let root = dir.path();
@@ -90,6 +100,15 @@ async fn actual_node_restarts_with_nonzero_authenticated_history() -> Result<()>
     )?;
     drop((adnl, quic));
     fs::write(root.join("node-log.yml"), "appenders:\n  console:\n    kind: console\n    encoder:\n      pattern: '{m}{n}'\nroot:\n  level: info\n  appenders: [console]\n")?;
+    if interrupt_recovery {
+        for (cut, statement) in [
+            ("backlink-before-sync", "participant.database.sync_wal()?;"),
+            ("root-before-delete", "main.database.db().delete(ROOT_KEY)?;"),
+        ] {
+            interrupt_actual_recovery(&binary, root, &zero, cut, statement).await?;
+            assert_eq!(package_inventory(root)?, before, "interrupted recovery changed packages");
+        }
+    }
     for attempt in 0..2 {
         let path = root.join(format!("node-{attempt}.log"));
         let log = fs::File::create(&path)?;
@@ -181,5 +200,115 @@ async fn interrupt_cleaned_writer(root: &Path) -> Result<()> {
     }
     writer.0.kill()?;
     assert!(!writer.0.wait()?.success());
+    Ok(())
+}
+
+// Debugger-owned cuts leave the production executable and recovery logic unchanged.
+// Every child has a private process group so a timeout also kills the inferior.
+struct Debugger(Process, bool);
+impl Drop for Debugger {
+    fn drop(&mut self) {
+        if !self.1 {
+            return;
+        }
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", self.0 .0.id())])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+async fn interrupt_actual_recovery(
+    binary: &Path,
+    root: &Path,
+    zero: &Path,
+    cut: &str,
+    statement: &str,
+) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let source = include_str!("../../storage/src/archives/recovery_worker.rs");
+    let matches: Vec<_> =
+        source.lines().enumerate().filter(|(_, line)| line.trim() == statement).collect();
+    assert_eq!(matches.len(), 1, "crash cut must identify one production statement");
+    let line = matches[0].0 + 1;
+    let marker = root.join(format!("cut-{cut}.reached"));
+    let script = root.join(format!("cut-{cut}.gdb"));
+    fs::write(
+        &script,
+        format!(
+            r#"set pagination off
+set confirm off
+set breakpoint pending off
+set debuginfod enabled off
+break recovery_worker.rs:{line}
+run
+python
+import gdb
+frame = gdb.newest_frame()
+assert frame is not None and 'recovery_worker::recover_cleaned' in frame.name(), 'wrong recovery frame'
+assert frame.find_sal().line == {line}, 'wrong recovery statement'
+assert gdb.selected_inferior().pid > 0, 'missing actual node'
+with open({marker:?}, 'w') as output:
+    output.write('actual recovery stopped at line {line} before {statement}\n')
+end
+kill
+python
+assert gdb.selected_inferior().pid == 0, 'node did not terminate'
+end
+quit
+"#,
+            marker = marker.to_string_lossy()
+        ),
+    )?;
+    let path = root.join(format!("cut-{cut}.log"));
+    let log = fs::File::create(&path)?;
+    let mut debugger = Debugger(
+        Process(
+            Command::new("gdb")
+                .args(["--batch", "-nx", "-x"])
+                .arg(&script)
+                .arg("--args")
+                .arg(binary)
+                .arg("--configs")
+                .arg(root)
+                .arg("--zerostate")
+                .arg(zero)
+                .arg("--initial-sync-disabled")
+                .env("TOKIO_WORKER_THREADS", "2")
+                .current_dir(root)
+                .process_group(0)
+                .stdout(Stdio::from(log.try_clone()?))
+                .stderr(Stdio::from(log))
+                .spawn()?,
+        ),
+        true,
+    );
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if let Some(status) = debugger.0 .0.try_wait()? {
+            let output = fs::read_to_string(&path)?;
+            if let Some(evidence) = std::env::var_os("RTOS_NODE_RECOVERY_EVIDENCE_DIR") {
+                let evidence = PathBuf::from(evidence);
+                fs::create_dir_all(&evidence)?;
+                fs::copy(&path, evidence.join(format!("cut-{cut}.log")))?;
+                fs::copy(&script, evidence.join(format!("cut-{cut}.gdb")))?;
+            }
+            assert!(status.success(), "debugger failed at {cut}: {output}");
+            assert!(marker.is_file(), "recovery cut not reached: {output}");
+            assert!(output.contains("killed"), "node was not killed: {output}");
+            assert!(!output.contains("Node services started."), "cut happened after startup");
+            debugger.1 = false;
+            eprintln!(
+                "Actual node recovery interrupted at {cut}: {}",
+                fs::read_to_string(&marker)?.trim()
+            );
+            break;
+        }
+        if Instant::now() >= deadline {
+            rtos_block::fail!("Recovery cut {cut} timeout: {}", fs::read_to_string(&path)?);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     Ok(())
 }
