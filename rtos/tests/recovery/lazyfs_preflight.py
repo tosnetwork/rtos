@@ -188,6 +188,8 @@ def run(binary, output, node=None):
                         case = "actual_node_validator_outbox_cache_loss"
                     if node.cut in ["validator-prune", "validator-prune-empty"]:
                         case = "actual_node_" + node.cut.replace("-", "_") + "_cache_loss"
+                    if node.cut.startswith("persistent-"):
+                        case = "actual_node_" + node.cut.replace("-", "_") + "_cache_loss"
                     result["node_cut"] = node.cut
                     result["node_cache_loss_enabled"] = not node.no_cache_loss
                     executed = subprocess.Popen(
@@ -235,6 +237,9 @@ def run(binary, output, node=None):
                 if node.cut in ["validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty"]:
                     batch_kind = node.cut.removeprefix("validator-")
                     required_evidence = [f"Acknowledged validator {batch_kind} batch writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true")]
+                if node.cut.startswith("persistent-"):
+                    persistent_mode = node.cut.removeprefix("persistent-")
+                    required_evidence = [f"Acknowledged persistent {persistent_mode} writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true")]
                 if expected_failure and omitted_manifest == "validator-wal":
                     if executed.returncode != 101:
                         raise RuntimeError("Missing validator-state sync omission failure")
@@ -356,6 +361,15 @@ def run(binary, output, node=None):
                     required_evidence.extend(["1 passed; 0 failed", "Actual node retried real truncation"])
                     if node.cut in ["validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty"]:
                         required_evidence.append(f"Validator {batch_kind} batch preserved together after two-boots")
+                    if node.cut.startswith("persistent-"):
+                        required_evidence.append(f"Persistent {persistent_mode} snapshot bytes, root, metadata and reads preserved after two-boots")
+                        reports = list((output / "node").rglob(f"persistent-{persistent_mode}-cache-loss.json"))
+                        if len(reports) != 1:
+                            raise RuntimeError("Missing persistent snapshot cache-loss report")
+                        report = json.loads(reports[0].read_text())
+                        if report["bytes_before"] <= 0 or report["bytes_before"] != report["bytes_after"] or report["sha256_before"] != report["sha256_after"]:
+                            raise RuntimeError("Acknowledged persistent snapshot changed")
+                        result["persistent_snapshot"] = report
                     if node.cut == "validator-journal":
                         required_evidence.append("Recovered Deleted journal refuses stale Deleting writer without changing bytes")
                     if node.cut == "validator-incarnation":
@@ -474,7 +488,7 @@ if __name__ == "__main__":
     mutation.add_argument("--omit-root-wal-sync", action="store_true", help="omit main WAL sync at verified final root deletion")
     mutation.add_argument("--omit-lease-wal-sync", action="store_true", help="omit one scoped repair lease mutation WAL sync")
     mutation.add_argument("--omit-validator-wal-sync", action="store_true", help="omit one scoped validator-state WAL sync")
-    parser.add_argument("--cut", choices=["rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire", "lease-custody", "validator-floor", "validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty"], default="rows")
+    parser.add_argument("--cut", choices=["rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire", "lease-custody", "validator-floor", "validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty", "persistent-fast", "persistent-head", "persistent-whole", "persistent-raw"], default="rows")
     parser.add_argument("--no-cache-loss", action="store_true", help="run the same node cut without cache loss as a control")
     parser.add_argument("--node-test-binary", type=Path)
     parser.add_argument("--node-binary", type=Path)

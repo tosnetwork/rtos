@@ -962,3 +962,31 @@ async fn actual_node_validator_prune_empty_cache_loss() -> Result<()> {
     exercise_nonzero_recovery_layout(false, None,
         Some((3, Some("validator-prune-empty-cache-loss"))), false).await
 }
+
+#[tokio::test]
+#[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
+async fn actual_node_persistent_fast_cache_loss() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None,
+        Some((3, Some("persistent-fast-cache-loss"))), false).await
+}
+
+#[tokio::test]
+#[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
+async fn actual_node_persistent_head_cache_loss() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None,
+        Some((3, Some("persistent-head-cache-loss"))), false).await
+}
+
+#[tokio::test]
+#[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
+async fn actual_node_persistent_whole_cache_loss() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None,
+        Some((3, Some("persistent-whole-cache-loss"))), false).await
+}
+
+#[tokio::test]
+#[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
+async fn actual_node_persistent_raw_cache_loss() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None,
+        Some((3, Some("persistent-raw-cache-loss"))), false).await
+}
