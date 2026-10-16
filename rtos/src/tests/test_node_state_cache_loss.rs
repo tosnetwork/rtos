@@ -210,3 +210,23 @@ pub(super) fn verify(root: &Path, db: &InternalDb, phase: &str) -> Result<()> {
     eprintln!("State publication graph, counters and index preserved after {phase}");
     Ok(())
 }
+
+pub(super) fn generated_config(root: &Path) -> Result<Vec<u8>> {
+    let bytes = fs::read(root.join("config.json"))?;
+    serde_json::from_slice::<serde_json::Value>(&bytes)?;
+    assert!(!bytes.is_empty());
+    Ok(bytes)
+}
+
+pub(super) fn verify_generated_config(root: &Path, expected: &[u8]) -> Result<()> {
+    let actual = fs::read(root.join("config.json"))?;
+    let report = root.join("state-generated-config.json");
+    fs::write(&report, serde_json::to_vec(&serde_json::json!({
+        "bytes_before": expected.len(), "bytes_after": actual.len(),
+        "sha256_before": hex::encode(rtos_block::sha256_digest(expected)),
+        "sha256_after": hex::encode(rtos_block::sha256_digest(&actual)),
+    }))?)?;
+    keep_evidence(root, &report)?;
+    assert!(actual == expected, "Generated node configuration lost after recovery interruption");
+    Ok(())
+}

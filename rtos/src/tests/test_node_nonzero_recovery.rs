@@ -393,14 +393,14 @@ async fn exercise_nonzero_recovery_layout(
     fixture.prepare(root, &archives).await?;
     let physical = run_import(fixture.config(root, archives)).await?;
     tokio::time::timeout(Duration::from_secs(60), wait_for_db_release(physical)).await?;
-    if matches!(truncation, Some((3, Some("state-cache-loss" | "state-auto-cache-loss")))) {
+    if matches!(truncation, Some((3, Some(cut))) if cut == "state-cache-loss" || cut.starts_with("state-auto-")) {
         truncation_recovery::state_cache_loss::prepare_dynamic(root, &fixture).await?;
     }
     if sparse { sparse_packages::prepare(root).await?; }
     let db = open_db(root).await?;
     fixture.assert_imported(&db, 4).await?;
     let lease = if let Some((retained, cut)) = truncation {
-        Some(truncation_recovery::prepare(&db, &fixture, retained, matches!(cut, Some("lease-acquire-cache-loss" | "state-auto-cache-loss"))).await?)
+        Some(truncation_recovery::prepare(&db, &fixture, retained, cut.is_some_and(|cut| cut == "lease-acquire-cache-loss" || cut.starts_with("state-auto-"))).await?)
     } else {
         None
     };
@@ -1118,4 +1118,40 @@ async fn actual_node_state_cache_loss() -> Result<()> {
 #[ignore = "requires actual node executable, gdb, signer and cache-loss fixture"]
 async fn actual_node_state_auto_cache_loss() -> Result<()> {
     exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-cache-loss"))), false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires actual node executable, signer and isolated fault fixture"]
+async fn actual_node_state_auto_selection_enospc() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-selection-enospc"))), false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires actual node executable, signer and isolated fault fixture"]
+async fn actual_node_state_auto_stage_enospc() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-stage-enospc"))), false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires actual node executable, signer and isolated fault fixture"]
+async fn actual_node_state_auto_publish_rename_eio() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-publish-rename-eio"))), false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires actual node executable, signer and isolated fault fixture"]
+async fn actual_node_state_auto_publish_sync_eio() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-publish-sync-eio"))), false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires actual node executable, signer and isolated fault fixture"]
+async fn actual_node_state_auto_publish_directory_sync_eio() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-publish-directory-sync-eio"))), false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires actual node executable, signer and isolated fault fixture"]
+async fn actual_node_state_auto_wal_publish_sync_eio() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-wal-publish-sync-eio"))), false).await
 }

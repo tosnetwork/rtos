@@ -70,7 +70,9 @@ pub(super) async fn run(
     interrupt: Option<&str>,
 ) -> Result<()> {
     let retained = lease.retained;
-    let automatic = interrupt == Some("state-auto-cache-loss");
+    let automatic = interrupt.is_some_and(|cut| cut.starts_with("state-auto-"));
+    let automatic_fault = interrupt.and_then(|cut| cut.strip_prefix("state-auto-"))
+        .filter(|mode| *mode != "cache-loss");
     let state_cut = automatic || interrupt == Some("state-cache-loss");
     if state_cut {
         state_cache_loss::write_and_interrupt(root).await?;
@@ -219,7 +221,9 @@ pub(super) async fn run(
         }
         eprintln!("Failed actual truncation preserved four cursors, full history and restoring beacon; exact synthetic lease release acknowledged");
     }
-    let interrupt = if automatic {
+    let interrupt = if let Some(mode) = automatic_fault {
+        Some(mode)
+    } else if automatic {
         Some(match std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")?.as_str() {
             "1" => "forward-after-row-sync-cache-loss",
             "0" => "forward-after-row-sync",
@@ -234,6 +238,15 @@ pub(super) async fn run(
             assert_eq!(package_inventory(root)?, before, "failed recovery IO changed canonical packages");
         }
         assert!(root.join("node_db/ton_node.restoring").is_file());
+        if automatic {
+            let config = state_cache_loss::generated_config(root)?;
+            match std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")?.as_str() {
+                "1" => cache_loss::clear(root).await?,
+                "0" => (),
+                _ => rtos_block::fail!("Invalid automatic recovery cache-loss mode"),
+            }
+            state_cache_loss::verify_generated_config(root, &config)?;
+        }
     } else if let Some(cut) = interrupt {
         if cut.ends_with("-cache-loss") { cache_loss::sync_fixture(root)?; }
         let statement = match cut {
@@ -257,10 +270,7 @@ pub(super) async fn run(
         };
         interrupt_actual_recovery(binary, root, zero, cut, statement).await?;
         let generated_config = if automatic {
-            let bytes = fs::read(root.join("config.json"))?;
-            serde_json::from_slice::<serde_json::Value>(&bytes)?;
-            assert!(!bytes.is_empty());
-            Some(bytes)
+            Some(state_cache_loss::generated_config(root)?)
         } else { None };
         if cut == "producer-selection-cache-loss" {
             assert_eq!(package_inventory(root)?, before, "Selection production changed canonical packages");
@@ -352,15 +362,7 @@ pub(super) async fn run(
             }
         } else if cut.ends_with("-cache-loss") { cache_loss::clear(root).await?; }
         if let Some(expected) = generated_config {
-            let actual = fs::read(root.join("config.json"))?;
-            let report = root.join("state-generated-config.json");
-            fs::write(&report, serde_json::to_vec(&serde_json::json!({
-                "bytes_before": expected.len(), "bytes_after": actual.len(),
-                "sha256_before": hex::encode(rtos_block::sha256_digest(&expected)),
-                "sha256_after": hex::encode(rtos_block::sha256_digest(&actual)),
-            }))?)?;
-            keep_evidence(root, &report)?;
-            assert!(actual == expected, "Generated node configuration lost after recovery interruption");
+            state_cache_loss::verify_generated_config(root, &expected)?;
         }
         assert!(root.join("node_db/ton_node.restoring").is_file());
         if cut == "forward-before-cleanup" {

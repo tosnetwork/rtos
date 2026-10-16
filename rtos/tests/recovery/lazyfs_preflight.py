@@ -188,8 +188,8 @@ def run(binary, output, node=None):
                         case = "actual_node_validator_outbox_cache_loss"
                     if node.cut in ["validator-prune", "validator-prune-empty"]:
                         case = "actual_node_" + node.cut.replace("-", "_") + "_cache_loss"
-                    if node.cut in ["state", "state-auto"]:
-                        case = "actual_node_" + node.cut.replace("-", "_") + "_cache_loss"
+                    if node.cut == "state" or node.cut.startswith("state-auto"):
+                        case = "actual_node_" + node.cut.replace("-", "_") + ("_cache_loss" if node.cut in ["state", "state-auto"] else "")
                     if node.cut.startswith("persistent-"):
                         case = "actual_node_" + node.cut.replace("-", "_") + ("" if node.cut.endswith("-eio") else "_cache_loss")
                     result["node_cut"] = node.cut
@@ -234,7 +234,7 @@ def run(binary, output, node=None):
                 if node.cut in ["lease", "lease-acquire", "lease-custody"]:
                     operation = "custody" if node.cut == "lease-custody" else "acquire" if node.cut == "lease-acquire" else "release"
                     required_evidence = [f"Acknowledged lease {operation} writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true")]
-                if node.cut in ["state", "state-auto"]:
+                if node.cut == "state" or node.cut.startswith("state-auto"):
                     required_evidence = ["Acknowledged state publication writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true"), "State publication graph, counters and index preserved after two-boots"]
                 if node.cut == "validator-floor":
                     required_evidence = ["Acknowledged validator floor writer killed with physical pin and native owner alive; cache-loss=" + ("false" if node.no_cache_loss else "true")]
@@ -383,8 +383,9 @@ def run(binary, output, node=None):
                     if executed.returncode != 0:
                         raise RuntimeError(f"Actual node cache-loss test failed: {executed.returncode}")
                     required_evidence.extend(["1 passed; 0 failed", "Actual node retried real truncation"])
-                    if node.cut == "state-auto":
-                        required_evidence.extend(["Actual node recovery interrupted at forward-after-row-sync", "Actual dynamic node recovered automatically after recovery interruption; no manual lease release or data repair"])
+                    if node.cut.startswith("state-auto"):
+                        recovery_stop = "Actual node recovery interrupted at forward-after-row-sync" if node.cut == "state-auto" else "Actual node refused startup after scoped " + node.cut.removeprefix("state-auto-")
+                        required_evidence.extend([recovery_stop, "Actual dynamic node recovered automatically after recovery interruption; no manual lease release or data repair"])
                         reports = list((output / "node").rglob("state-automatic-recovery.json"))
                         if len(reports) != 1:
                             raise RuntimeError("Missing automatic state recovery report")
@@ -553,7 +554,7 @@ if __name__ == "__main__":
     mutation.add_argument("--omit-state-wal-sync", action="store_true", help="omit one scoped dynamic state publication WAL sync")
     mutation.add_argument("--omit-lease-wal-sync", action="store_true", help="omit one scoped repair lease mutation WAL sync")
     mutation.add_argument("--omit-validator-wal-sync", action="store_true", help="omit one scoped validator-state WAL sync")
-    parser.add_argument("--cut", choices=["state-auto", "state", "rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire", "lease-custody", "validator-floor", "validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty", "persistent-fast", "persistent-head", "persistent-whole", "persistent-raw", "persistent-fast-file-eio", "persistent-fast-directory-eio", "persistent-head-file-eio", "persistent-head-directory-eio", "persistent-whole-file-eio", "persistent-whole-directory-eio", "persistent-raw-file-eio", "persistent-raw-directory-eio", "persistent-fast-rename-eio", "persistent-head-rename-eio", "persistent-whole-rename-eio", "persistent-raw-rename-eio", "persistent-fast-published-eio", "persistent-head-published-eio", "persistent-whole-published-eio", "persistent-raw-published-eio"], default="rows")
+    parser.add_argument("--cut", choices=["state-auto-selection-enospc", "state-auto-stage-enospc", "state-auto-publish-rename-eio", "state-auto-publish-sync-eio", "state-auto-publish-directory-sync-eio", "state-auto-wal-publish-sync-eio", "state-auto", "state", "rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire", "lease-custody", "validator-floor", "validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty", "persistent-fast", "persistent-head", "persistent-whole", "persistent-raw", "persistent-fast-file-eio", "persistent-fast-directory-eio", "persistent-head-file-eio", "persistent-head-directory-eio", "persistent-whole-file-eio", "persistent-whole-directory-eio", "persistent-raw-file-eio", "persistent-raw-directory-eio", "persistent-fast-rename-eio", "persistent-head-rename-eio", "persistent-whole-rename-eio", "persistent-raw-rename-eio", "persistent-fast-published-eio", "persistent-head-published-eio", "persistent-whole-published-eio", "persistent-raw-published-eio"], default="rows")
     parser.add_argument("--no-cache-loss", action="store_true", help="run the same node cut without cache loss as a control")
     parser.add_argument("--node-test-binary", type=Path)
     parser.add_argument("--node-binary", type=Path)
