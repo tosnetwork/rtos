@@ -58,6 +58,8 @@ pub(crate) mod recovery_participant;
 pub(crate) mod recovery_providers;
 #[cfg(target_os = "linux")]
 pub(crate) mod recovery_data;
+#[cfg(target_os = "linux")]
+pub(crate) mod recovery_artifacts;
 pub mod truncation_selection;
 
 pub mod io_owners;
