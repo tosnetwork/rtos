@@ -127,10 +127,48 @@ pub(super) async fn run(
             "repack-after-rename" => {
                 "sync_child(destination.last().unwrap(), &new)"
             }
+            "producer-ready-before-finish" => "let (file, ready) = writer.finish()?;",
             _ => rtos_block::fail!("Unknown truncation cut {cut}"),
         };
         interrupt_actual_recovery(binary, root, zero, cut, statement).await?;
         assert!(root.join("node_db/ton_node.restoring").is_file());
+        if cut == "producer-ready-before-finish" {
+            assert_eq!(package_inventory(root)?, before, "Building changed canonical packages");
+            let mut ready = Vec::new();
+            let mut stages = 0;
+            find_ready_staging(root, &mut ready, &mut stages)?;
+            assert_eq!(ready.len(), 1, "expected one production Ready staging file");
+            assert!(stages > 0, "producer cut preceded replacement staging");
+            let bytes = fs::read(&ready[0])?;
+            assert!(bytes.len() > 28 && &bytes[..8] == b"RTOSAMF1");
+            // Independent framing check: body records are complete, but the
+            // terminating tag/count/checksum trailer has not been written.
+            let mut position = 28usize;
+            let mut records = 0;
+            while position < bytes.len() {
+                assert_ne!(bytes[position], 0, "Ready already has a completion trailer");
+                assert!(bytes.len() - position >= 9, "short Ready record header");
+                let length = u64::from_le_bytes(bytes[position + 1..position + 9].try_into()?);
+                position = position.checked_add(9).and_then(|value| value.checked_add(usize::try_from(length).ok()?))
+                    .ok_or_else(|| rtos_block::error!("Ready framing overflow"))?;
+                assert!(position <= bytes.len(), "short Ready record payload");
+                records += 1;
+            }
+            assert!(records > 0);
+            keep_evidence(root, &ready[0])?;
+            // Interrupt the real bootstrap abort too, after stage/partial-Ready
+            // disposal but before durable Cleaned publication. No test DB open
+            // or native-data edits occur between either kill and restart.
+            interrupt_actual_recovery(binary, root, zero, "building-before-cleaned",
+                "main.database.db().put(ROOT_KEY, cleaned.encode()?)?;").await?;
+            assert_eq!(package_inventory(root)?, before, "Building abort changed canonical packages");
+            let mut remaining = Vec::new();
+            let mut remaining_stages = 0;
+            find_ready_staging(root, &mut remaining, &mut remaining_stages)?;
+            assert!(remaining.is_empty(), "partial Ready survived abort cleanup");
+            assert_eq!(remaining_stages, 0, "owned stages survived abort cleanup");
+            eprintln!("Actual producer left a trailer-less Ready; real bootstrap discarded it and stages before a second interruption; canonical packages stayed unchanged");
+        }
         if cut == "repack-after-rename" {
             assert_ne!(
                 package_inventory(root)?,
@@ -254,5 +292,21 @@ pub(super) async fn run(
     }
     db.stop_states_db().await?;
     eprintln!("Actual node retried real truncation to height {retained}, restarted twice, retained MC/WC data consistent and tail indexes removed");
+    Ok(())
+}
+
+
+fn find_ready_staging(path: &Path, ready: &mut Vec<PathBuf>, stages: &mut usize) -> Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            find_ready_staging(&entry.path(), ready, stages)?;
+        } else if entry.file_type()?.is_file() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == "ready.v1" { ready.push(entry.path()); }
+            if name.starts_with("stage-") && name.ends_with(".pack") { *stages += 1; }
+        }
+    }
     Ok(())
 }

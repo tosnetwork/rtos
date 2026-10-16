@@ -110,27 +110,39 @@ async fn actual_node_resumes_after_truncation_before_progress_publication() -> R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires gdb; known incomplete archive transaction recovery"]
+#[ignore = "requires production node binary, public fixture signer, and gdb"]
 async fn actual_node_resumes_repack_before_rename_retaining_height_two() -> Result<()> {
     exercise_nonzero_recovery_case(false, None, Some((2, Some("repack-before-rename")))).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires gdb; known incomplete archive transaction recovery"]
+#[ignore = "requires production node binary, public fixture signer, and gdb"]
 async fn actual_node_resumes_repack_before_rename_retaining_height_three() -> Result<()> {
     exercise_nonzero_recovery_case(false, None, Some((3, Some("repack-before-rename")))).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires gdb; known incomplete archive transaction recovery"]
+#[ignore = "requires production node binary, public fixture signer, and gdb"]
 async fn actual_node_resumes_repack_after_rename_retaining_height_two() -> Result<()> {
     exercise_nonzero_recovery_case(false, None, Some((2, Some("repack-after-rename")))).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires gdb; known incomplete archive transaction recovery"]
+#[ignore = "requires production node binary, public fixture signer, and gdb"]
 async fn actual_node_resumes_repack_after_rename_retaining_height_three() -> Result<()> {
     exercise_nonzero_recovery_case(false, None, Some((3, Some("repack-after-rename")))).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node binary, public fixture signer, and gdb"]
+async fn actual_node_resumes_partial_ready_retaining_height_two() -> Result<()> {
+    exercise_nonzero_recovery_case(false, None, Some((2, Some("producer-ready-before-finish")))).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node binary, public fixture signer, and gdb"]
+async fn actual_node_resumes_partial_ready_retaining_height_three() -> Result<()> {
+    exercise_nonzero_recovery_case(false, None, Some((3, Some("producer-ready-before-finish")))).await
 }
 
 async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&str>) -> Result<()> {
@@ -450,6 +462,8 @@ async fn interrupt_actual_recovery(
     use std::os::unix::process::CommandExt;
     let (source, source_file) = if cut.starts_with("repack-") {
         (include_str!("../../storage/src/archives/recovery_forward.rs"), "recovery_forward.rs")
+    } else if cut == "producer-ready-before-finish" {
+        (include_str!("../../storage/src/archives/recovery_producer.rs"), "recovery_producer.rs")
     } else if cut == "truncation-before-progress" {
         (include_str!("../internal_db/restore.rs"), "restore.rs")
     } else {
@@ -461,6 +475,8 @@ async fn interrupt_actual_recovery(
     let line = matches[0].0 + 1;
     let function = if cut.starts_with("repack-") {
         "storage::archives::recovery_forward::publish_package"
+    } else if cut == "producer-ready-before-finish" {
+        "storage::archives::recovery_producer::"
     } else if cut == "truncation-before-progress" {
         "internal_db::restore::restore"
     } else if cut == "stage-after-unlink" {
