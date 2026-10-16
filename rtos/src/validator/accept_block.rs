@@ -1085,8 +1085,32 @@ impl AcceptedSessionBlock {
         engine: Arc<dyn EngineOperations>,
         locally_generated: bool,
     ) -> Result<()> {
+        if let Some((tbd, cc_seqno)) = self.shard_description(engine.clone(), locally_generated).await? {
+            engine.send_top_shard_block_description(tbd, cc_seqno, false).await?;
+        }
+        Ok(())
+    }
+
+    /// Admit finalized shard data to the local MC collator independently of
+    /// whether this protocol broadcasts legacy shard descriptions.
+    pub(crate) async fn register_shard_description(
+        &self,
+        engine: Arc<dyn EngineOperations>,
+        locally_generated: bool,
+    ) -> Result<()> {
+        if let Some((tbd, cc_seqno)) = self.shard_description(engine.clone(), locally_generated).await? {
+            engine.register_top_shard_block_description(tbd, cc_seqno).await?;
+        }
+        Ok(())
+    }
+
+    async fn shard_description(
+        &self,
+        engine: Arc<dyn EngineOperations>,
+        locally_generated: bool,
+    ) -> Result<Option<(Arc<TopBlockDescrStuff>, u32)>> {
         if self.block.id().shard().is_masterchain() {
-            return Ok(());
+            return Ok(None);
         }
         let carrier = self.final_carrier()?;
         let cc_seqno = self.network_signatures()?.validator_info().catchain_seqno;
@@ -1103,9 +1127,9 @@ impl AcceptedSessionBlock {
             let tbd =
                 Arc::new(TopBlockDescrStuff::new(tbd, self.block.id(), false, locally_generated)?);
             tbd.validate(&state)?;
-            engine.send_top_shard_block_description(tbd, cc_seqno, false).await?;
+            return Ok(Some((tbd, cc_seqno)));
         }
-        Ok(())
+        Ok(None)
     }
 }
 

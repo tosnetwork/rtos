@@ -1601,6 +1601,17 @@ impl EngineOperations for Engine {
         Ok(())
     }
 
+    async fn register_top_shard_block_description(
+        &self,
+        tbd: Arc<TopBlockDescrStuff>,
+        cc_seqno: u32,
+    ) -> Result<()> {
+        self.shard_blocks()
+            .process_shard_block(tbd.proof_for(), cc_seqno, || Ok(tbd.clone()), false, self)
+            .await?;
+        Ok(())
+    }
+
     async fn send_top_shard_block_description(
         &self,
         tbd: Arc<TopBlockDescrStuff>,
@@ -1609,11 +1620,7 @@ impl EngineOperations for Engine {
     ) -> Result<()> {
         if !is_resend {
             let id = tbd.proof_for();
-            if let Err(e) = self
-                .shard_blocks()
-                .process_shard_block(id, cc_seqno, || Ok(tbd.clone()), false, self)
-                .await
-            {
+            if let Err(e) = self.register_top_shard_block_description(tbd.clone(), cc_seqno).await {
                 log::error!("Can't add own shard top block {}: {}", id, e);
             }
         }

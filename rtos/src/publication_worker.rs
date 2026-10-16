@@ -34,6 +34,7 @@ use consensus_common::{
         FinalizedDeliveryDraft,
     },
     session_runtime::{AuthenticatedSessionRuntime, LocalRole},
+    simplex_protocol::SimplexProtocol,
     SessionFinality,
 };
 use futures::FutureExt;
@@ -994,7 +995,7 @@ impl State {
         let id = entry.id;
         let needs_verification = !self.acceptance_verified.lock().unwrap().contains(&id.0);
         if needs_verification {
-            if let Err(error) = engine.ensure_publication_acceptance_durable(&accepted).await {
+            if let Err(error) = engine.clone().ensure_publication_acceptance_durable(&accepted).await {
                 if error
                     .downcast_ref::<crate::internal_db::PublicationDurabilityFailure>()
                     .is_some()
@@ -1002,6 +1003,16 @@ impl State {
                     self.fatal(error.to_string());
                 }
                 return Err(error);
+            }
+            // Private-v2 suppresses legacy shard-description broadcasts, but
+            // finalized WC data must still enter the local MC collator's pool.
+            // Do this only after the block/proof/state durability barrier; a
+            // failure keeps the handoff retryable and cannot admit an approval.
+            if accepted.is_final()
+                && !accepted.block().id().shard().is_masterchain()
+                && entry.record.protocol == SimplexProtocol::PrivateObserversPlumtree
+            {
+                accepted.register_shard_description(engine.clone(), entry.record.locally_generated).await?;
             }
         }
         self.write(store, move |store| store.mark_accepted(id)).await?;

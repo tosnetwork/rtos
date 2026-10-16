@@ -1246,6 +1246,14 @@ pub trait EngineOperations: Sync + Send {
         unimplemented!()
     }
 
+    async fn register_top_shard_block_description(
+        &self,
+        _tbd: Arc<TopBlockDescrStuff>,
+        _cc_seqno: u32,
+    ) -> Result<()> {
+        fail!("Local shard description registration is unavailable")
+    }
+
     async fn send_top_shard_block_description(
         &self,
         tbd: Arc<TopBlockDescrStuff>,
