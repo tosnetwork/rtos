@@ -1943,9 +1943,6 @@ impl LiteServerQuerySubscriber {
         if block_id.root_hash.is_zero() || block_id.file_hash.is_zero() {
             fail!("invalid BlockIdExt: {block_id}");
         }
-        if !block_id.is_masterchain() {
-            fail!("getState works only for masterchain blocks: {block_id}");
-        }
         if block_id.seq_no > 1000 {
             fail!("cannot request total state: possibly too large");
         }

@@ -1233,6 +1233,37 @@ async fn test_get_state_returns_expected_boc_and_hashes() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_get_state_supports_shardchain_with_existing_limits() -> Result<()> {
+    struct StateEngine(Arc<ShardStateStuff>);
+    #[async_trait::async_trait]
+    impl EngineOperations for StateEngine {
+        async fn load_state(&self, id: &BlockIdExt) -> Result<Arc<ShardStateStuff>> {
+            if id != self.0.block_id() { fail!("Unexpected state lookup") }
+            Ok(self.0.clone())
+        }
+    }
+    let id = BlockIdExt::with_params(ShardIdent::full(0), 1,
+        UInt256::from([1; 32]), UInt256::from([2; 32]));
+    let (_, state) = gen_shard_state(Some(id.clone()), &[],
+        #[cfg(feature = "telemetry")] None, None, None);
+    let engine: Arc<dyn EngineOperations> = Arc::new(StateEngine(state.clone()));
+    let got = LiteServerQuerySubscriber::get_state(&engine, id.clone()).await?;
+    assert_eq!(got.id, id);
+    assert_eq!(got.root_hash, *state.root_cell().repr_hash());
+    assert_eq!(got.file_hash, UInt256::calc_file_hash(&got.data));
+    let decoded = ShardStateUnsplit::construct_from_cell(read_single_root_boc(&got.data)?)?;
+    assert_eq!(decoded.shard(), id.shard());
+    assert_eq!(decoded.seq_no(), 1);
+    let mut oversized = id.clone(); oversized.seq_no = 1001;
+    let error = LiteServerQuerySubscriber::get_state(&engine, oversized).await.unwrap_err();
+    assert!(error.to_string().contains("cannot request total state"));
+    let mut invalid = id; invalid.root_hash = UInt256::default();
+    let error = LiteServerQuerySubscriber::get_state(&engine, invalid).await.unwrap_err();
+    assert!(error.to_string().contains("invalid BlockIdExt"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_get_libraries_empty() -> Result<()> {
     struct TestEngine {
         state_id: BlockIdExt,
