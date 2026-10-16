@@ -125,11 +125,20 @@ async def native_state(snapshot, config, name, block_id, directory):
     await child_checked([snapshot / 'build/lite-client/lite-client', '-C', config_path,
         '-r', '-D', data, '-t', '15', '-c', 'getstate ' + block_text(block_id)],
         directory / 'client.log')
-    files = [path for path in data.rglob('*') if path.is_file()]
-    if len(files) != 1:
-        raise RuntimeError(f'{name} did not return exactly one native full-state body')
+    # The native client also saves its startup masterchain block. Select the
+    # state receipt for the requested full identity instead of counting files.
+    log = re.sub(r'\x1b\[[0-9;]*m', '', (directory / 'client.log').read_text())
+    receipts = re.findall(r'obtained (\d+) state bytes for block ' + re.escape(block_text(block_id))
+        + r'.*?(\d+) bytes saved into file ([^\r\n]+)', log, re.I | re.S)
+    if len(receipts) != 1:
+        raise RuntimeError(f'{name} did not retain exactly one requested native full-state receipt')
+    obtained, saved, filename = receipts[0]
+    body = Path(filename)
+    if not body.resolve().is_relative_to(data.resolve()) or obtained != saved \
+            or body.stat().st_size != int(saved) or digest(body).upper() != body.stem.upper():
+        raise RuntimeError(f'{name} native full-state receipt does not match its saved body')
     return dict(name=name, id=block_id, file_hash=base64.b64encode(
-        bytes.fromhex(digest(files[0]))).decode(), boc=base64.b64encode(files[0].read_bytes()).decode())
+        bytes.fromhex(digest(body))).decode(), boc=base64.b64encode(body.read_bytes()).decode())
 
 
 async def prepare_rust(args, directory, i, network, global_config, tcp_used, udp_used):
