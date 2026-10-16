@@ -78,30 +78,80 @@ pub async fn check_db(
         }
 
         set_restoring(&db.config.db_directory)?;
-        match restore_last_applied_mc_block(db, check_stop).await {
-            Ok(Some(last_applied_mc_block)) => {
-                let shard_client_mc_block = restore_shard_client_mc_block(
-                    db,
-                    &last_applied_mc_block,
-                    processed_wc,
-                    check_stop,
-                )
-                .await?;
-                restore(db, &last_applied_mc_block, &shard_client_mc_block).await
-                    .map_err(|err| restore_failure(err, is_broken))?;
+        if check_genesis_checkpoint(db, check_stop)
+            .map_err(|err| restore_failure(err, is_broken))? {
+            log::info!("Genesis checkpoint and workchain states are consistent after interruption");
+        } else {
+            match restore_last_applied_mc_block(db, check_stop).await {
+                Ok(Some(last_applied_mc_block)) => {
+                    let shard_client_mc_block = restore_shard_client_mc_block(
+                        db,
+                        &last_applied_mc_block,
+                        processed_wc,
+                        check_stop,
+                    )
+                    .await?;
+                    restore(db, &last_applied_mc_block, &shard_client_mc_block).await
+                        .map_err(|err| restore_failure(err, is_broken))?;
+                }
+                Ok(None) => {
+                    log::info!(
+                        "End of check & restore: looks like node hasn't \
+                        ever booted in blockchain."
+                    );
+                }
+                Err(err) => return Err(restore_failure(err, is_broken)),
             }
-            Ok(None) => {
-                log::info!(
-                    "End of check & restore: looks like node hasn't \
-                    ever booted in blockchain."
-                );
-            }
-            Err(err) => return Err(restore_failure(err, is_broken)),
         }
         reset_restoring(&db.config.db_directory)?;
     }
     set_unexpected_termination(&db.config.db_directory)?;
     Ok(())
+}
+
+// Zerostates have state BOCs but no corresponding block/proof files. A fully
+// persisted genesis checkpoint must therefore be checked through its states,
+// not searched for in the nonzero block successor index. This is consistency
+// checking only; normal warm boot still authenticates the configured anchor.
+fn check_genesis_checkpoint(
+    db: &InternalDb,
+    check_stop: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<bool> {
+    let id = match db.load_full_node_state(LAST_APPLIED_MC_BLOCK) {
+        Ok(Some(id)) if id.seq_no() == 0 => id,
+        _ => return Ok(false),
+    };
+    if !id.shard().is_masterchain_ext() { fail!("Invalid genesis masterchain checkpoint"); }
+    for key in [SHARD_CLIENT_MC_BLOCK, PSS_KEEPER_MC_BLOCK, ARCHIVES_GC_BLOCK] {
+        match db.load_full_node_state(key)? {
+            Some(other) if other.as_ref() == id.as_ref() => {},
+            Some(_) => fail!("Genesis checkpoint conflicts with {key}"),
+            None => return Ok(false), // Partial boot still requires its recovery path.
+        }
+    }
+    db.next1_block_db.for_each(&mut |_key, value| {
+        check_stop()?;
+        if BlockIdExt::deserialize(&value)?.shard().is_masterchain_ext() {
+            fail!("Genesis checkpoint has a masterchain successor; preserve for recovery");
+        }
+        Ok(true)
+    })?;
+    let verify = |id: &BlockIdExt| -> Result<()> {
+        check_stop()?;
+        if !db.load_block_handle(id)?.is_some_and(|handle| handle.is_applied()) {
+            fail!("Genesis checkpoint has no applied handle for {id}");
+        }
+        db.load_shard_state_dynamic(id)?.verify_zerostate(id)
+    };
+    verify(&id)?;
+    let state = db.load_shard_state_dynamic(&id)?;
+    for (workchain, descriptor) in state.workchains()? {
+        verify(&BlockIdExt::with_params(
+            rtos_block::ShardIdent::with_tagged_prefix(workchain, rtos_block::SHARD_FULL)?,
+            0, descriptor.zerostate_root_hash, descriptor.zerostate_file_hash,
+        ))?;
+    }
+    Ok(true)
 }
 
 pub fn set_graceful_termination(db_dir: &str) {

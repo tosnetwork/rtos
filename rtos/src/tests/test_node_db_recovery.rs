@@ -464,17 +464,7 @@ async fn node_cleaned_recovery_crash_writer() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_node_restart_finishes_cleaned_recovery_and_preserves_data() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let mut child = KillOnDrop(Command::new(std::env::current_exe()?)
-        .args(["--exact", CLEANED_CHILD, "--ignored", "--nocapture"])
-        .env(CLEANED_ENV, dir.path()).stdout(Stdio::null())
-        .stderr(Stdio::from(fs::File::create(dir.path().join("child.log"))?)).spawn()?);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !dir.path().join("child-ready").exists() {
-        if let Some(status) = child.0.try_wait()? { fail!("Recovery fixture exited {status}: {}", fs::read_to_string(dir.path().join("child.log"))?); }
-        if Instant::now() >= deadline { child.0.kill()?; child.0.wait()?; fail!("Recovery fixture readiness timeout"); }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    child.0.kill()?; assert!(!child.0.wait()?.success());
+    crash_cleaned_writer(dir.path()).await?;
     let db = InternalDb::with_update(
         InternalDbConfig { db_directory: dir.path().to_string_lossy().into_owned(), cells_db_config: small_config(), ..Default::default() },
         false, false, false, None, &|| Ok(()), None, Arc::new(AtomicU8::new(0)), None,
@@ -491,5 +481,166 @@ async fn actual_node_restart_finishes_cleaned_recovery_and_preserves_data() -> R
     verify(&reopened, dir.path())?;
     assert!(reopened.db().get(b"ArchiveTruncationRootV1")?.is_none());
     assert_eq!(reopened.db().get(b"recovery-sentinel")?.as_deref(), Some(b"acknowledged-before-interruption".as_slice()));
+    Ok(())
+}
+
+async fn crash_cleaned_writer(root: &Path) -> Result<()> {
+    let mut child = KillOnDrop(Command::new(std::env::current_exe()?)
+        .args(["--exact", CLEANED_CHILD, "--ignored", "--nocapture"])
+        .env(CLEANED_ENV, root).stdout(Stdio::null())
+        .stderr(Stdio::from(fs::File::create(root.join("child.log"))?)).spawn()?);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !root.join("child-ready").exists() {
+        if let Some(status) = child.0.try_wait()? { fail!("Recovery fixture exited {status}: {}", fs::read_to_string(root.join("child.log"))?); }
+        if Instant::now() >= deadline { child.0.kill()?; child.0.wait()?; fail!("Recovery fixture readiness timeout"); }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    child.0.kill()?; assert!(!child.0.wait()?.success());
+    Ok(())
+}
+
+/// Runs the actual node executable, not another test function. The binary must
+/// be built from the same source revision and supplied explicitly by the runner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RTOS_NODE_RECOVERY_BINARY built from this revision"]
+async fn node_executable_restarts_after_cleaned_recovery_with_consistent_data() -> Result<()> {
+    let binary = fs::canonicalize(std::env::var("RTOS_NODE_RECOVERY_BINARY")?)?;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    prepare(root)?;
+    // The archive-import fixture omits the genesis key-block marker used by
+    // the node's overlay startup. Match the node zerostate template and repin
+    // the resulting bytes before creating any network-bound database.
+    use rtos_block::{Deserializable, HashmapType, Serializable, ShardStateUnsplit};
+    let mut genesis = ShardStateUnsplit::construct_from_bytes(&fs::read(root.join("mc-zero.boc"))?)?;
+    let mut extra = genesis.read_custom()?.expect("masterchain genesis extra");
+    extra.after_key_block = true;
+    let template = ShardStateUnsplit::construct_from_bytes(include_bytes!("static/zerostate.boc"))?;
+    let template = template.read_custom()?.expect("node genesis configuration");
+    template.config.config_params.iterate_slices(|key, value| {
+        if extra.config.config_params.get(key.clone())?.is_none() {
+            extra.config.config_params.set(key, &value)?;
+        }
+        Ok(true)
+    })?;
+    genesis.write_custom(Some(&extra))?;
+    fs::write(root.join("mc-zero.boc"), rtos_block::write_boc(&genesis.serialize()?)?)?;
+    let pin = anchor(root)?;
+    let mut global: serde_json::Value = serde_json::from_slice(&fs::read(root.join("global.json"))?)?;
+    global["validator"]["zero_state"]["root_hash"] = serde_json::json!(pin.root_hash.as_base64(false));
+    global["validator"]["zero_state"]["file_hash"] = serde_json::json!(pin.file_hash.as_base64(false));
+    fs::write(root.join("global.json"), serde_json::to_vec(&global)?)?;
+    let node_root = root.join("node_db");
+    fs::create_dir(&node_root)?;
+    drop(DbNetworkBinding::acquire(&node_root, &anchor(root)?)?);
+    crash_cleaned_writer(&node_root).await?;
+
+    // Keep the process entirely on the local fixture network, without remote
+    // bootstrap peers, public servers, validator signing keys or external RPC.
+    let mut global: serde_json::Value = serde_json::from_slice(&fs::read(root.join("global.json"))?)?;
+    global["dht"]["static_nodes"]["nodes"] = serde_json::json!([]);
+    global["liteservers"] = serde_json::json!([]);
+    fs::write(root.join("global.json"), serde_json::to_vec(&global)?)?;
+    let zero = root.join("zero");
+    fs::create_dir(&zero)?;
+    for name in ["mc-zero.boc", "wc-zero.boc"] {
+        let bytes = fs::read(root.join(name))?;
+        fs::write(zero.join(format!("{}.boc", hex::encode(rtos_block::sha256_digest(&bytes)))), bytes)?;
+    }
+    fs::write(root.join("default_config.json"), serde_json::to_vec(&serde_json::json!({
+        "log_config_name": "node-log.yml",
+        "ton_global_config_name": "global.json",
+        "internal_db_path": node_root,
+        "ip_address": "127.0.0.1:0",
+        "ip_address_quic": "127.0.0.1:0",
+        "boot_from_zerostate": true,
+        "restore_db": true,
+        "workchain": 0,
+        "cells_db_config": small_config()
+    }))?)?;
+    fs::write(root.join("node-log.yml"),
+        "appenders:\n  console:\n    kind: console\n    encoder:\n      pattern: '{m}{n}'\nroot:\n  level: info\n  appenders: [console]\n".replace("\\n", "\n"))?;
+
+    for attempt in 0..2 {
+        let log_path = root.join(format!("node-{attempt}.log"));
+        let log = fs::File::create(&log_path)?;
+        let mut node = KillOnDrop(Command::new(&binary)
+            .env("TOKIO_WORKER_THREADS", "2")
+            .arg("--configs").arg(root)
+            .arg("--zerostate").arg(&zero)
+            .arg("--initial-sync-disabled")
+            .current_dir(root)
+            .stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log)).spawn()?);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let output = fs::read_to_string(&log_path)?;
+            if let Some(status) = node.0.try_wait()? {
+                fail!("Actual node exited before boot, attempt {attempt}, {status}: {output}");
+            }
+            if output.contains("Node services started.") { break; }
+            if Instant::now() >= deadline { fail!("Actual node boot timeout, attempt {attempt}: {output}"); }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        node.0.kill()?;
+        assert!(!node.0.wait()?.success());
+        eprintln!("Actual node attempt {attempt}: services started, then SIGKILL");
+    }
+    // No inspection opens the DB between the two node processes: the second
+    // node itself must replay the WAL and handle its unclean-shutdown beacon.
+    let db = open_node_db(&node_root, &small_config(), AccessType::ReadWrite)?;
+    let expected: Vec<Row> = serde_json::from_slice(&fs::read(node_root.join("manifest.json"))?)?;
+    let actual = snapshot(&db)?;
+    eprintln!("Checking {} acknowledged rows after two node process restarts", expected.len());
+    for row in expected {
+        assert!(actual.contains(&row), "acknowledged row changed after node restarts: {row:?}");
+    }
+    // Additional rows are legitimate: the actual node persists its configured
+    // masterchain and workchain zerostates during its first full boot.
+        assert!(db.db().get(b"ArchiveTruncationRootV1")?.is_none());
+        assert!(db.db().get(b"ArchiveTruncationParticipantV1")?.is_none());
+        assert_eq!(db.db().get(b"recovery-sentinel")?.as_deref(), Some(b"acknowledged-before-interruption".as_slice()));
+        assert!(!node_root.join("archive/recovery").join(hex::encode([4u8; 16])).exists());
+    drop(db);
+    let db = InternalDb::with_update(
+        InternalDbConfig { db_directory: node_root.to_string_lossy().into_owned(), cells_db_config: small_config(), ..Default::default() },
+        false, false, false, None, &|| Ok(()), None, Arc::new(AtomicU8::new(0)), None,
+        #[cfg(feature = "telemetry")] create_engine_telemetry(), create_engine_allocated(),
+    ).await?;
+    let id = anchor(root)?;
+    assert_eq!(db.load_full_node_state(LAST_APPLIED_MC_BLOCK)?.as_deref(), Some(&id));
+    assert_eq!(db.load_full_node_state(SHARD_CLIENT_MC_BLOCK)?.as_deref(), Some(&id));
+    assert!(db.load_block_handle(&id)?.expect("applied zerostate handle").is_applied());
+    db.load_shard_state_dynamic(&id)?.verify_zerostate(&id)?;
+    eprintln!("Recovered node head, applied handle and zerostate root match the independent fixture");
+    // Negative control follows the successful restarts: contradictory durable
+    // progress must refuse startup, preserve data and retain the restore marker.
+    let mut conflicting = id.clone();
+    conflicting.seq_no = 1;
+    db.save_full_node_state(SHARD_CLIENT_MC_BLOCK, &conflicting)?;
+    let physical = db.recovery_node_db.clone();
+    physical.sync_wal()?;
+    db.stop_states_db().await?;
+    drop(db);
+    release(physical).await?;
+    let log_path = root.join("conflicting-progress.log");
+    let log = fs::File::create(&log_path)?;
+    let mut node = KillOnDrop(Command::new(&binary)
+        .env("TOKIO_WORKER_THREADS", "2")
+        .arg("--configs").arg(root).arg("--zerostate").arg(&zero)
+        .arg("--initial-sync-disabled").current_dir(root)
+        .stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log)).spawn()?);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = node.0.try_wait()? { assert!(!status.success()); break; }
+        if Instant::now() >= deadline { fail!("Conflicting checkpoint was not rejected: {}", fs::read_to_string(&log_path)?); }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let output = fs::read_to_string(log_path)?;
+    assert!(output.contains("Genesis checkpoint conflicts with ShardsClientMcBlockId"), "{output}");
+    assert!(!output.contains("Node services started."));
+    assert!(node_root.join("ton_node.restoring").exists());
+    let db = open_node_db(&node_root, &small_config(), AccessType::ReadWrite)?;
+    assert_eq!(snapshot(&db)?, actual, "rejected restart changed state rows");
+    eprintln!("Conflicting progress rejected by actual node; state rows and recovery marker preserved");
     Ok(())
 }

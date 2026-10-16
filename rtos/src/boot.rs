@@ -290,6 +290,13 @@ async fn choose_masterchain_state(
     pss_period_bits: u32,
 ) -> Result<Arc<BlockHandle>> {
     while let Some(handle) = key_blocks.pop() {
+        // The configured zerostate is a permanent trust anchor, not a rotating
+        // persistent snapshot. Its timestamp may be zero, outside the TTL
+        // formula's domain. run_cold has already authenticated this handle.
+        if handle.id().seq_no() == 0 {
+            log::info!(target: "boot", "using zerostate handle {}", handle.id());
+            return Ok(handle);
+        }
         let utime = handle.gen_utime();
         let ptime = if let Some(handle) = key_blocks.last() { handle.gen_utime() } else { 0 };
         log::info!(target: "boot", "key block candidate: seqno={} \

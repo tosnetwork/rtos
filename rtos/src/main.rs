@@ -558,6 +558,7 @@ fn main() {
                 false
             }
             Ok((engine, join_handle)) => {
+                log::info!("Node services started.");
                 if let Err(error) = join_handle.await {
                     stopper.report_service_failure(
                         0,
