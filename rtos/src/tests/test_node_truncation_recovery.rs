@@ -70,12 +70,14 @@ pub(super) async fn run(
     interrupt: Option<&str>,
 ) -> Result<()> {
     let retained = lease.retained;
+    let unconfirmed = interrupt == Some("state-auto-state-sync-eio");
     let automatic = interrupt.is_some_and(|cut| cut.starts_with("state-auto-"));
     let automatic_fault = interrupt.and_then(|cut| cut.strip_prefix("state-auto-"))
-        .filter(|mode| *mode != "cache-loss");
+        .filter(|mode| *mode != "cache-loss" && *mode != "state-sync-eio");
     let state_cut = automatic || interrupt == Some("state-cache-loss");
     if state_cut {
-        state_cache_loss::write_and_interrupt(root).await?;
+        if unconfirmed { state_cache_loss::refuse_and_interrupt(root).await?; }
+        else { state_cache_loss::write_and_interrupt(root).await?; }
         assert_eq!(package_inventory(root)?, before, "state restoration changed canonical packages");
     }
     let acquire_cut = interrupt == Some("lease-acquire-cache-loss");
@@ -221,7 +223,7 @@ pub(super) async fn run(
         }
         eprintln!("Failed actual truncation preserved four cursors, full history and restoring beacon; exact synthetic lease release acknowledged");
     }
-    let interrupt = if let Some(mode) = automatic_fault {
+    let interrupt = if unconfirmed { None } else if let Some(mode) = automatic_fault {
         Some(mode)
     } else if automatic {
         Some(match std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")?.as_str() {
@@ -506,6 +508,15 @@ pub(super) async fn run(
                 rtos_block::fail!("Truncation retry {status}: {output}");
             }
             if output.contains("Node services started.") {
+                if unconfirmed && std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")?.as_str() == "1" {
+                    keep_evidence(root, &path)?;
+                    let missing = output.contains(&format!("Can't load state for {} from DB, but handle.has_saved_state() == true", fixture.id(3, false)));
+                    if attempt == 0 {
+                        assert!(missing, "Actual node did not encounter the lost unconfirmed state: {output}");
+                    } else {
+                        assert!(!missing, "Recovered state was not durable before services started");
+                    }
+                }
                 if attempt == 0 && interrupt != Some("truncation-before-progress") {
                     assert!(
                         output.contains(&format!(
@@ -526,6 +537,11 @@ pub(super) async fn run(
         node.0.kill()?;
         assert!(!node.0.wait()?.success());
         keep_evidence(root, &path)?;
+        if unconfirmed && attempt == 0 {
+            let config = state_cache_loss::generated_config(root)?;
+            if std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")?.as_str() == "1" { cache_loss::clear(root).await?; }
+            state_cache_loss::verify_generated_config(root, &config)?;
+        }
     }
     assert!(!root.join("node_db/ton_node.restoring").exists());
     assert_ne!(
@@ -535,7 +551,8 @@ pub(super) async fn run(
     );
     let db = open_db(root).await?;
     fixture.assert_imported(&db, retained).await?;
-    if state_cut { state_cache_loss::verify(root, &db, "two-boots")?; }
+    if unconfirmed { state_cache_loss::verify_reconstructed(root, &db, "two-boots")?; }
+    else if state_cut { state_cache_loss::verify(root, &db, "two-boots")?; }
     if let Some((mode, phase)) = persistent_failure_mode {
         persistent_cache_loss::verify(root, &db, mode, "two-boots").await?;
         eprintln!("Persistent {mode}-{phase} failure recovered after two-boots");
@@ -601,11 +618,15 @@ pub(super) async fn run(
         fs::write(&report, serde_json::to_vec(&serde_json::json!({
             "fixture_lease_acquired": false, "manual_lease_release": false,
             "native_reopen_between_recovery_kill_and_boot": false,
-            "actual_recovery_interrupted": true, "complete_boots": 2,
+            "actual_recovery_interrupted": !unconfirmed, "complete_boots": 2,
             "retained_height": retained, "exact_state_graph": true,
         }))?)?;
         keep_evidence(root, &report)?;
-        eprintln!("Actual dynamic node recovered automatically after recovery interruption; no manual lease release or data repair");
+        if unconfirmed {
+            eprintln!("Actual dynamic node recovered unconfirmed state; no manual lease release or data repair");
+        } else {
+            eprintln!("Actual dynamic node recovered automatically after recovery interruption; no manual lease release or data repair");
+        }
     }
     db.stop_states_db().await?;
     eprintln!("Actual node retried real truncation to height {retained}, restarted twice, retained MC/WC data consistent and tail indexes removed");

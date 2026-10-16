@@ -1155,3 +1155,9 @@ async fn actual_node_state_auto_publish_directory_sync_eio() -> Result<()> {
 async fn actual_node_state_auto_wal_publish_sync_eio() -> Result<()> {
     exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-wal-publish-sync-eio"))), false).await
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires actual node executable, signer and isolated state WAL fault fixture"]
+async fn actual_node_state_auto_state_sync_eio() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-state-sync-eio"))), false).await
+}

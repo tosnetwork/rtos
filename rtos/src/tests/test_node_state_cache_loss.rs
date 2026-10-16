@@ -100,6 +100,7 @@ fn rows(db: &InternalDb) -> Result<BTreeMap<String, String>> {
 #[ignore = "internal child; requires owned history fixture"]
 async fn state_child() -> Result<()> {
     let root = PathBuf::from(std::env::var("RTOS_TEST_STATE_CHILD_ROOT")?);
+    let unconfirmed = std::env::var("RTOS_TEST_STATE_SYNC_FAILURE").as_deref() == Ok("1");
     let id = Fixture::node_recovery().id(3, false);
     let db = open_db(&root).await?;
     let bytes = rtos_block::write_boc(db.load_shard_state_dynamic(&id)?.root_cell())?;
@@ -138,7 +139,15 @@ async fn state_child() -> Result<()> {
     assert!(queued);
     tokio::time::timeout(Duration::from_secs(30), callback.wait()).await?;
     // Completion of put alone is not the publication durability contract.
-    db.sync_publication_state().await?;
+    let sync = db.sync_publication_state().await;
+    if unconfirmed {
+        let proof = fs::read_to_string(root.join("state-sync-fault.reached"))?;
+        assert_eq!(proof.lines().count(), 1);
+        assert!(proof.starts_with(&format!("state WAL sync EIO: {}/node_db/db/", root.display())));
+        assert!(proof.trim_end().ends_with(".log"));
+        let error = sync.expect_err("State publication acknowledged a failed WAL sync");
+        assert!(format!("{error:#}").contains("Input/output error"));
+    } else { sync?; }
     if std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE").as_deref() == Ok("state-wal") {
         let marker = fs::read_to_string(std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_MARKER")?)?;
         assert_eq!(marker.lines().count(), 1, "exact WAL omission must precede state acknowledgement");
@@ -153,27 +162,46 @@ async fn state_child() -> Result<()> {
         assert_eq!(original.iter().filter(|(k, _)| k.starts_with(&prefix)).collect::<Vec<_>>(),
             restored.iter().filter(|(k, _)| k.starts_with(&prefix)).collect::<Vec<_>>());
     }
-    let ack = root.join("state-ack.json");
+    let ack = root.join(if unconfirmed { "state-refusal.json" } else { "state-ack.json" });
     fs::write(&ack, serde_json::to_vec(&serde_json::json!({"bytes":hex::encode(bytes),
-        "rows":restored,"state_barrier_completed":true,"gc_baseline_rows":absent.len()}))?)?;
+        "rows":restored,"state_barrier_completed":!unconfirmed,"publication_acknowledged":!unconfirmed,"gc_baseline_rows":absent.len()}))?)?;
     fs::File::open(ack)?.sync_all()?;
     loop { tokio::time::sleep(Duration::from_secs(1)).await; }
 }
 
 pub(super) async fn write_and_interrupt(root: &Path) -> Result<()> {
+    write_and_interrupt_inner(root, false).await
+}
+pub(super) async fn refuse_and_interrupt(root: &Path) -> Result<()> {
+    write_and_interrupt_inner(root, true).await
+}
+async fn write_and_interrupt_inner(root: &Path, unconfirmed: bool) -> Result<()> {
     let log_path = root.join("state-child.log");
     let log = fs::File::create(&log_path)?;
-    let mut child = Process(Command::new(std::env::current_exe()?)
+    let mut command = Command::new(std::env::current_exe()?);
+    if unconfirmed {
+        let source = root.join("state-sync-fault.c");
+        let library = root.join("state-sync-fault.so");
+        fs::write(&source, include_str!("state_sync_fault.c"))?;
+        let result = Command::new("cc").args(["-shared", "-fPIC", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(&source).arg("-o").arg(&library).output()?;
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        command.env("LD_PRELOAD", library).env("RTOS_TEST_STATE_SYNC_FAILURE", "1")
+            .env("RTOS_TEST_STATE_FAULT_PREFIX", format!("{}/node_db/db/", root.display()))
+            .env("RTOS_TEST_ROOT_WAL_ARM", root.join("state-sync-fault.arm"))
+            .env("RTOS_TEST_STATE_FAULT_MARKER", root.join("state-sync-fault.reached"));
+    }
+    let mut child = Process(command
         .args(["--exact", "--ignored", "--nocapture", "--test-threads=1",
             "archive_import::tests::node_process_recovery::truncation_recovery::state_cache_loss::state_child"])
         .env("RTOS_TEST_STATE_CHILD_ROOT", root)
         .stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log)).spawn()?);
-    let ack = root.join("state-ack.json");
+    let ack = root.join(if unconfirmed { "state-refusal.json" } else { "state-ack.json" });
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         if let Ok(bytes) = fs::read(&ack) {
             if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                assert_eq!(value["state_barrier_completed"], true);
+                assert_eq!(value["state_barrier_completed"], !unconfirmed);
                 break;
             }
         }
@@ -188,24 +216,55 @@ pub(super) async fn write_and_interrupt(root: &Path) -> Result<()> {
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(child.0.wait()?.signal(), Some(9));
     keep_evidence(root, &log_path)?; keep_evidence(root, &ack)?;
+    if unconfirmed {
+        assert!(!root.join("state-ack.json").exists());
+        for name in ["state-sync-fault.c", "state-sync-fault.so", "state-sync-fault.reached"] {
+            keep_evidence(root, &root.join(name))?;
+        }
+    }
     let loss = match std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")?.as_str() {
         "1" => true, "0" => false, _ => rtos_block::fail!("Invalid cache-loss mode"),
     };
     if loss { cache_loss::clear(root).await?; }
-    eprintln!("Acknowledged state publication writer killed without native close; cache-loss={loss}");
+    if unconfirmed {
+        eprintln!("Unconfirmed state writer killed after WAL sync refusal; cache-loss={loss}");
+    } else {
+        eprintln!("Acknowledged state publication writer killed without native close; cache-loss={loss}");
+    }
     Ok(())
 }
 
 pub(super) fn verify(root: &Path, db: &InternalDb, phase: &str) -> Result<()> {
-    let ack: serde_json::Value = serde_json::from_slice(&fs::read(root.join("state-ack.json"))?)?;
-    let expected: BTreeMap<String, String> = serde_json::from_value(ack["rows"].clone())?;
-    assert_eq!(rows(db)?, expected, "Acknowledged cells, counters or state index changed after restart");
+    verify_inner(root, db, phase, false)
+}
+pub(super) fn verify_reconstructed(root: &Path, db: &InternalDb, phase: &str) -> Result<()> {
+    verify_inner(root, db, phase, true)
+}
+fn verify_inner(root: &Path, db: &InternalDb, phase: &str, unconfirmed: bool) -> Result<()> {
+    let receipt = if unconfirmed { "state-refusal.json" } else { "state-ack.json" };
+    let ack: serde_json::Value = serde_json::from_slice(&fs::read(root.join(receipt))?)?;
+    let mut expected: BTreeMap<String, String> = serde_json::from_value(ack["rows"].clone())?;
+    let mut actual = rows(db)?;
+    if unconfirmed {
+        use storage::db::DbKey;
+        assert_eq!(ack["publication_acknowledged"], false);
+        // A genuine re-save has a new save timestamp. Every other index byte,
+        // every cell, and every shared-reference counter must remain exact.
+        let id = Fixture::node_recovery().id(3, false);
+        let key = format!("{SHARDSTATE_DB_NAME}/{}", hex::encode(id.key()));
+        for snapshot in [&mut actual, &mut expected] {
+            let row = snapshot.get_mut(&key).expect("reconstructed MC3 index missing");
+            assert!(row.len() >= 16);
+            row.truncate(row.len() - 16);
+        }
+    }
+    assert_eq!(actual, expected, "Cells, counters or state index changed after restart");
     let id = Fixture::node_recovery().id(3, false);
     let state = db.load_shard_state_dynamic(&id)?;
     assert_eq!(rtos_block::write_boc(state.root_cell())?, hex::decode(ack["bytes"].as_str().unwrap())?);
     let report = root.join(format!("state-{phase}.json"));
     fs::write(&report, serde_json::to_vec(&serde_json::json!({"rows":expected.len(),
-        "state_root":format!("{:x}",state.root_cell().repr_hash()),"exact_rows":true,"exact_boc":true}))?)?;
+        "state_root":format!("{:x}",state.root_cell().repr_hash()),"exact_rows":!unconfirmed,"exact_rows_except_target_timestamp":unconfirmed,"exact_boc":true}))?)?;
     keep_evidence(root, &report)?;
     eprintln!("State publication graph, counters and index preserved after {phase}");
     Ok(())
