@@ -139,6 +139,7 @@ pub(super) async fn run(
             "repack-after-rename" => {
                 "sync_child(destination.last().unwrap(), &new)"
             }
+            "root-last-cache-loss" => "custody.complete();",
             "forward-cleaned-cache-loss" => "Ok(cleaned)",
             "forward-before-prepare-cache-loss" => "let expected = prepare(providers, root)?;",
             "forward-before-cleanup" | "forward-committed-cache-loss" => "scan(providers, &committed, Pass::Cleanup)?;",
@@ -214,6 +215,27 @@ pub(super) async fn run(
                     "let expected = prepare(providers, root)?;").await?;
                 assert_eq!(package_inventory(root)?, published, "Committed reopen changed final packages");
                 eprintln!("Lost Cleaned WAL publication reopened Committed; second actual interruption preserved final packages");
+            }
+        } else if cut == "root-last-cache-loss" {
+            let published = package_inventory(root)?;
+            assert_ne!(published, before, "root deletion preceded package publication");
+            let mut ready = Vec::new();
+            let mut stages = 0;
+            find_ready_staging(root, &mut ready, &mut stages)?;
+            assert!(ready.is_empty(), "root deletion preceded Ready cleanup");
+            assert_eq!(stages, 0, "root deletion preceded stage cleanup");
+            let loss = match std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")?.as_str() {
+                "1" => true, "0" => false,
+                _ => rtos_block::fail!("Invalid cache-loss mode"),
+            };
+            if loss { cache_loss::clear(root).await?; }
+            assert_eq!(package_inventory(root)?, published, "cache loss changed final packages");
+            eprintln!("Root-last cut cache-loss={loss}: final packages preserved and controls removed");
+            if loss && std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE").as_deref() == Ok("root-wal") {
+                interrupt_actual_recovery(binary, root, zero, "root-verify-cleaned",
+                    "let providers = Arc::new(providers);").await?;
+                assert_eq!(package_inventory(root)?, published, "Cleaned reopen changed final packages");
+                eprintln!("Lost root deletion reopened Cleaned; second actual interruption preserved final packages");
             }
         } else if cut.ends_with("-cache-loss") { cache_loss::clear(root).await?; }
         assert!(root.join("node_db/ton_node.restoring").is_file());

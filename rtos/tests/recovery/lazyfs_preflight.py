@@ -123,7 +123,7 @@ def run(binary, output, node=None):
             result["after_clear"] = {name: (mount / name).read_bytes().hex()
                                      for name in ["synced", "overwrite", "unsynced"]}
             if node is not None:
-                omitted_manifest = "cleaned-wal" if node.omit_cleaned_wal_sync else "committed-wal" if node.omit_committed_wal_sync else "ready-wal" if node.omit_ready_wal_sync else "stage" if node.omit_stage_sync else "selection" if node.omit_selection_sync else "ready" if node.omit_ready_sync else None
+                omitted_manifest = "root-wal" if node.omit_root_wal_sync else "cleaned-wal" if node.omit_cleaned_wal_sync else "committed-wal" if node.omit_committed_wal_sync else "ready-wal" if node.omit_ready_wal_sync else "stage" if node.omit_stage_sync else "selection" if node.omit_selection_sync else "ready" if node.omit_ready_sync else None
                 fixture_dir = mount / "fixtures"
                 fixture_dir.mkdir()
                 environment = dict(os.environ)
@@ -148,11 +148,11 @@ def run(binary, output, node=None):
                     environment.update({
                         "LD_PRELOAD": str(library),
                         "RTOS_TEST_OMIT_MANIFEST_SYNC_ROOT": str(fixture_dir) + "/",
-                        "RTOS_TEST_OMIT_MANIFEST_SYNC_FILE": (omitted_manifest if omitted_manifest in ["stage", "ready-wal", "committed-wal", "cleaned-wal"] else omitted_manifest + ".v1"),
+                        "RTOS_TEST_OMIT_MANIFEST_SYNC_FILE": (omitted_manifest if omitted_manifest in ["stage", "ready-wal", "committed-wal", "cleaned-wal", "root-wal"] else omitted_manifest + ".v1"),
                         "RTOS_TEST_OMIT_MANIFEST_SYNC_MARKER": str(output / "manifest-sync-omitted.log"),
                     })
-                    if omitted_manifest in ["committed-wal", "cleaned-wal"]:
-                        environment["RTOS_TEST_COMMITTED_WAL_ARM"] = str(output / "committed-wal.arm")
+                    if omitted_manifest in ["committed-wal", "cleaned-wal", "root-wal"]:
+                        environment["RTOS_TEST_ROOT_WAL_ARM"] = str(output / "root-wal.arm")
                     result["sync_mutation"] = {"kind": f"omit {omitted_manifest} file sync only",
                                                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
                                                "library_sha256": hashlib.sha256(library.read_bytes()).hexdigest()}
@@ -166,6 +166,8 @@ def run(binary, output, node=None):
                         case = "actual_node_committed_cache_loss"
                     if node.cut == "cleaned":
                         case = "actual_node_cleaned_cache_loss"
+                    if node.cut == "root-last":
+                        case = "actual_node_root_last_cache_loss"
                     result["node_cut"] = node.cut
                     result["node_cache_loss_enabled"] = not node.no_cache_loss
                     executed = subprocess.Popen(
@@ -194,17 +196,17 @@ def run(binary, output, node=None):
                     raise RuntimeError("Node test left owned processes running")
                 result["node_test_exit"] = executed.returncode
                 transcript = (output / "node-test.log").read_text()
-                expected_failure = bool(omitted_manifest) and omitted_manifest not in ["ready-wal", "committed-wal", "cleaned-wal"] and not node.no_cache_loss
+                expected_failure = bool(omitted_manifest) and omitted_manifest not in ["ready-wal", "committed-wal", "cleaned-wal", "root-wal"] and not node.no_cache_loss
                 result["node_failure_expected"] = expected_failure
                 if omitted_manifest:
                     marker = (output / "manifest-sync-omitted.log").read_text().splitlines()
-                    prefix = tuple(name + " omitted: " + str(fixture_dir) + "/" for name in (["fsync", "fdatasync"] if omitted_manifest in ["ready-wal", "committed-wal", "cleaned-wal"] else ["fsync"]))
-                    suffix = ".log" if omitted_manifest in ["ready-wal", "committed-wal", "cleaned-wal"] else ".pack" if omitted_manifest == "stage" else f"/{omitted_manifest}.v1"
+                    prefix = tuple(name + " omitted: " + str(fixture_dir) + "/" for name in (["fsync", "fdatasync"] if omitted_manifest in ["ready-wal", "committed-wal", "cleaned-wal", "root-wal"] else ["fsync"]))
+                    suffix = ".log" if omitted_manifest in ["ready-wal", "committed-wal", "cleaned-wal", "root-wal"] else ".pack" if omitted_manifest == "stage" else f"/{omitted_manifest}.v1"
                     if len(marker) != 1 or not marker[0].startswith(prefix) or not marker[0].endswith(suffix):
                         raise RuntimeError("Sync mutation did not hit exactly one scoped file")
                     result["sync_mutation"]["hits"] = marker
                 required_evidence = ["Actual node recovery interrupted at " + (
-                    f"producer-{node.cut}-cache-loss" if node.cut in ["ready", "selection"] else "forward-before-prepare-cache-loss" if node.cut == "stages" else "forward-committed-cache-loss" if node.cut == "committed" else "forward-cleaned-cache-loss" if node.cut == "cleaned" else "forward-after-row-sync")]
+                    f"producer-{node.cut}-cache-loss" if node.cut in ["ready", "selection"] else "forward-before-prepare-cache-loss" if node.cut == "stages" else "forward-committed-cache-loss" if node.cut == "committed" else "forward-cleaned-cache-loss" if node.cut == "cleaned" else "root-last-cache-loss" if node.cut == "root-last" else "forward-after-row-sync")]
                 if expected_failure and omitted_manifest == "stage":
                     if executed.returncode != 101:
                         raise RuntimeError("Stage sync omission did not fail the actual restart")
@@ -252,8 +254,8 @@ def run(binary, output, node=None):
                     if executed.returncode != 0:
                         raise RuntimeError(f"Actual node cache-loss test failed: {executed.returncode}")
                     required_evidence.extend(["1 passed; 0 failed", "Actual node retried real truncation"])
-                if omitted_manifest in ["ready-wal", "committed-wal", "cleaned-wal"] and not node.no_cache_loss:
-                    required_evidence.append("Lost Ready WAL publication recovered through Building abort" if omitted_manifest == "ready-wal" else "Lost Cleaned WAL publication reopened Committed" if omitted_manifest == "cleaned-wal" else "Lost Committed WAL publication replayed Ready")
+                if omitted_manifest in ["ready-wal", "committed-wal", "cleaned-wal", "root-wal"] and not node.no_cache_loss:
+                    required_evidence.append("Lost Ready WAL publication recovered through Building abort" if omitted_manifest == "ready-wal" else "Lost Cleaned WAL publication reopened Committed" if omitted_manifest == "cleaned-wal" else "Lost root deletion reopened Cleaned" if omitted_manifest == "root-wal" else "Lost Committed WAL publication replayed Ready")
                     reports = list((output / "node").rglob("cache-loss.json"))
                     if len(reports) != 1:
                         raise RuntimeError("Missing WAL cache-loss report")
@@ -262,16 +264,16 @@ def run(binary, output, node=None):
                     if len(target) != 1 or target[0]["sha256_before"] == target[0]["sha256_after"]:
                         raise RuntimeError("Ready WAL sync omission did not lose target WAL bytes")
                     preserved = report["ready_files"] + report["selection_files"]
-                    if len(preserved) != 2 or any(f["bytes_before"] != f["bytes_after"] or f["sha256_before"] != f["sha256_after"] for f in preserved):
+                    if len(preserved) != (0 if omitted_manifest == "root-wal" else 2) or any(f["bytes_before"] != f["bytes_after"] or f["sha256_before"] != f["sha256_after"] for f in preserved):
                         raise RuntimeError("WAL omission changed a durable manifest")
                     result["changed_wal"] = target[0]
                     result["preserved_manifests"] = preserved
-                    result["building_fallback_verified" if omitted_manifest == "ready-wal" else "committed_reopen_verified" if omitted_manifest == "cleaned-wal" else "ready_replay_verified"] = True
+                    result["building_fallback_verified" if omitted_manifest == "ready-wal" else "committed_reopen_verified" if omitted_manifest == "cleaned-wal" else "cleaned_reopen_verified" if omitted_manifest == "root-wal" else "ready_replay_verified"] = True
                 if node.cut in ["ready", "selection"]:
                     required_evidence.append(f"Unfinished {node.cut.title()} cache-loss=" + ("false" if node.no_cache_loss else "true"))
                 if node.cut in ["committed", "cleaned"]:
                     required_evidence.append(node.cut.title() + " cut cache-loss=" + ("false" if node.no_cache_loss else "true"))
-                    if omitted_manifest in ["committed-wal", "cleaned-wal"]:
+                    if omitted_manifest in ["committed-wal", "cleaned-wal", "root-wal"]:
                         arms = list((output / "node").rglob(f"cut-forward-{node.cut}-cache-loss.log"))
                         if len(arms) != 1 or "Root WAL omission armed at verified production statement" not in arms[0].read_text():
                             raise RuntimeError("Committed WAL omission lacks verified production arm")
@@ -279,6 +281,16 @@ def run(binary, output, node=None):
                     states = list((output / "node").rglob("cut-forward-verify-committed.log"))
                     if len(states) != 1 or "Persisted Committed root verified before replay" not in states[0].read_text():
                         raise RuntimeError("Missing actual persisted Committed state verification")
+                if node.cut == "root-last":
+                    required_evidence.append("Root-last cut cache-loss=" + ("false" if node.no_cache_loss else "true"))
+                    if omitted_manifest == "root-wal":
+                        arms = list((output / "node").rglob("cut-root-last-cache-loss.log"))
+                        if len(arms) != 1 or "Root WAL omission armed at verified production statement" not in arms[0].read_text():
+                            raise RuntimeError("Root deletion omission lacks verified production arm")
+                        if not node.no_cache_loss:
+                            states = list((output / "node").rglob("cut-root-verify-cleaned.log"))
+                            if len(states) != 1 or "Persisted Cleaned root verified before cleanup" not in states[0].read_text():
+                                raise RuntimeError("Missing actual persisted Cleaned state verification")
                 if node.cut == "stages":
                     required_evidence.append("Published Ready staging cache-loss=" + ("false" if node.no_cache_loss else "true"))
                 if node.cut == "selection":
@@ -346,7 +358,8 @@ if __name__ == "__main__":
     mutation.add_argument("--omit-ready-wal-sync", action="store_true", help="omit one main WAL sync after durable Ready")
     mutation.add_argument("--omit-committed-wal-sync", action="store_true", help="omit main WAL sync at verified Committed publication")
     mutation.add_argument("--omit-cleaned-wal-sync", action="store_true", help="omit main WAL sync at verified Cleaned publication")
-    parser.add_argument("--cut", choices=["rows", "ready", "selection", "stages", "committed", "cleaned"], default="rows")
+    mutation.add_argument("--omit-root-wal-sync", action="store_true", help="omit main WAL sync at verified final root deletion")
+    parser.add_argument("--cut", choices=["rows", "ready", "selection", "stages", "committed", "cleaned", "root-last"], default="rows")
     parser.add_argument("--no-cache-loss", action="store_true", help="run the same node cut without cache loss as a control")
     parser.add_argument("--node-test-binary", type=Path)
     parser.add_argument("--node-binary", type=Path)
@@ -363,4 +376,6 @@ if __name__ == "__main__":
         parser.error("Committed WAL control requires all node arguments and --cut committed")
     if args.omit_cleaned_wal_sync and (not all(node_args) or args.cut != "cleaned"):
         parser.error("Cleaned WAL control requires all node arguments and --cut cleaned")
+    if args.omit_root_wal_sync and (not all(node_args) or args.cut != "root-last"):
+        parser.error("Root WAL control requires all node arguments and --cut root-last")
     run(args.lazyfs.resolve(strict=True), args.output.resolve(), args if all(node_args) else None)

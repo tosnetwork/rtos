@@ -720,9 +720,12 @@ async fn interrupt_actual_recovery(
     };
     let mode = std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE");
     let start = if (cut == "forward-committed-cache-loss" && mode.as_deref() == Ok("committed-wal"))
-        || (cut == "forward-cleaned-cache-loss" && mode.as_deref() == Ok("cleaned-wal")) {
-        let arm = std::env::var("RTOS_TEST_COMMITTED_WAL_ARM")?;
-        let arm_statement = if cut == "forward-cleaned-cache-loss" {
+        || (cut == "forward-cleaned-cache-loss" && mode.as_deref() == Ok("cleaned-wal"))
+        || (cut == "root-last-cache-loss" && mode.as_deref() == Ok("root-wal")) {
+        let arm = std::env::var("RTOS_TEST_ROOT_WAL_ARM")?;
+        let arm_statement = if cut == "root-last-cache-loss" {
+            "main.database.db().delete(ROOT_KEY)?;"
+        } else if cut == "forward-cleaned-cache-loss" {
             "store_successor(providers, &committed, &cleaned)?;"
         } else { "store_successor(providers, root, &committed)?;" };
         let matches: Vec<_> = source.lines().enumerate().filter(|(_, line)|
@@ -748,6 +751,8 @@ continue"#)
     } else { "run".to_owned() };
     let state_check = if cut == "forward-verify-committed" {
         "state = str(gdb.parse_and_eval('root.state'))\nassert state.endswith('::Committed'), 'unexpected persisted root state: ' + state\nprint('Persisted Committed root verified before replay')"
+    } else if cut == "root-verify-cleaned" {
+        "state = str(gdb.parse_and_eval('root.state'))\nassert state.endswith('::Cleaned'), 'unexpected persisted root state: ' + state\nprint('Persisted Cleaned root verified before cleanup')"
     } else { "" };
     let marker = root.join(format!("cut-{cut}.reached"));
     let script = root.join(format!("cut-{cut}.gdb"));
@@ -872,4 +877,11 @@ async fn actual_node_committed_cache_loss() -> Result<()> {
 async fn actual_node_cleaned_cache_loss() -> Result<()> {
     exercise_nonzero_recovery_layout(false, None,
         Some((3, Some("forward-cleaned-cache-loss"))), false).await
+}
+
+#[tokio::test]
+#[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
+async fn actual_node_root_last_cache_loss() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None,
+        Some((3, Some("root-last-cache-loss"))), false).await
 }
