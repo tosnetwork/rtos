@@ -158,6 +158,8 @@ def run(binary, output, node=None):
                     case = "actual_node_sparse_packages_interrupted_metadata" if node.no_cache_loss else "actual_node_sparse_packages_cache_loss"
                     if node.cut in ["ready", "selection"]:
                         case = f"actual_node_unfinished_{node.cut}_cache_loss"
+                    if node.cut == "stages":
+                        case = "actual_node_staged_packages_cache_loss"
                     result["node_cut"] = node.cut
                     result["node_cache_loss_enabled"] = not node.no_cache_loss
                     executed = subprocess.Popen(
@@ -194,7 +196,7 @@ def run(binary, output, node=None):
                         raise RuntimeError("Manifest sync mutation did not hit exactly one scoped file")
                     result["sync_mutation"]["hits"] = marker
                 required_evidence = ["Actual node recovery interrupted at " + (
-                    f"producer-{node.cut}-cache-loss" if node.cut in ["ready", "selection"] else "forward-after-row-sync")]
+                    f"producer-{node.cut}-cache-loss" if node.cut in ["ready", "selection"] else "forward-before-prepare-cache-loss" if node.cut == "stages" else "forward-after-row-sync")]
                 if expected_failure:
                     if executed.returncode != 101:
                         raise RuntimeError("Sync omission did not produce the expected Rust test failure")
@@ -222,6 +224,8 @@ def run(binary, output, node=None):
                     required_evidence.extend(["1 passed; 0 failed", "Actual node retried real truncation"])
                 if node.cut in ["ready", "selection"]:
                     required_evidence.append(f"Unfinished {node.cut.title()} cache-loss=" + ("false" if node.no_cache_loss else "true"))
+                if node.cut == "stages":
+                    required_evidence.append("Published Ready staging cache-loss=" + ("false" if node.no_cache_loss else "true"))
                 if node.cut == "selection":
                     required_evidence.append("Preparing abort removed Selection before Cleaned publication")
                 if not node.no_cache_loss:
@@ -283,7 +287,7 @@ if __name__ == "__main__":
     mutation = parser.add_mutually_exclusive_group()
     mutation.add_argument("--omit-ready-sync", action="store_true", help="scoped Ready sync omission sensitivity control")
     mutation.add_argument("--omit-selection-sync", action="store_true", help="scoped Selection sync omission sensitivity control")
-    parser.add_argument("--cut", choices=["rows", "ready", "selection"], default="rows")
+    parser.add_argument("--cut", choices=["rows", "ready", "selection", "stages"], default="rows")
     parser.add_argument("--no-cache-loss", action="store_true", help="run the same node cut without cache loss as a control")
     parser.add_argument("--node-test-binary", type=Path)
     parser.add_argument("--node-binary", type=Path)

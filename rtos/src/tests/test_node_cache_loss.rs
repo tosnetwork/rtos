@@ -162,3 +162,55 @@ pub(super) async fn unfinished_selection(root: &Path) -> Result<PathBuf> {
     eprintln!("Unfinished Selection cache-loss={loss}: {} bytes before, {} bytes after; no Ready or stages", before.len(), after.len());
     Ok(selection)
 }
+
+// Observe staging without opening native databases between interruption and restart.
+pub(super) async fn staged_packages(root: &Path) -> Result<()> {
+    fn collect(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() { collect(&entry.path(), files)?; }
+            else if entry.file_name().to_string_lossy().starts_with("stage-")
+                && entry.file_name().to_string_lossy().ends_with(".pack") {
+                assert!(entry.file_type()?.is_file());
+                files.push(entry.path());
+            }
+        }
+        Ok(())
+    }
+    let mut stages = Vec::new();
+    collect(root, &mut stages)?;
+    stages.sort();
+    assert!(!stages.is_empty(), "published Ready must own replacement packages");
+    let mut before = Vec::new();
+    for path in &stages {
+        let bytes = fs::read(path)?;
+        assert!(!bytes.is_empty(), "empty staged package before cache loss");
+        before.push((bytes.len(), rtos_block::sha256_digest(&bytes)));
+        keep_evidence(root, path)?;
+    }
+    let loss = match std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")?.as_str() {
+        "1" => true,
+        "0" => false,
+        _ => rtos_block::fail!("Invalid cache-loss test mode"),
+    };
+    if loss { clear(root).await?; }
+    let mut reports = Vec::new();
+    for (path, (length, digest)) in stages.iter().zip(before) {
+        let bytes = fs::read(path)?;
+        let after = rtos_block::sha256_digest(&bytes);
+        reports.push(serde_json::json!({
+            "path": path.strip_prefix(root)?, "bytes_before": length,
+            "bytes_after": bytes.len(), "sha256_before": hex::encode(digest),
+            "sha256_after": hex::encode(after),
+        }));
+        assert_eq!(bytes.len(), length, "staged package length changed");
+        assert_eq!(after, digest, "staged package contents changed");
+    }
+    let report = root.join("stages-cache-loss.json");
+    fs::write(&report, serde_json::to_vec(&serde_json::json!({
+        "cache_loss": loss, "stage_files": reports,
+    }))?)?;
+    keep_evidence(root, &report)?;
+    eprintln!("Published Ready staging cache-loss={loss}: {} replacement packages preserved byte-exactly", stages.len());
+    Ok(())
+}

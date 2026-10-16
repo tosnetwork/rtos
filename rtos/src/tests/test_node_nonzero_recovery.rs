@@ -820,3 +820,10 @@ fn keep_evidence(root: &Path, path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
+async fn actual_node_staged_packages_cache_loss() -> Result<()> {
+    exercise_nonzero_recovery_layout(false, None,
+        Some((3, Some("forward-before-prepare-cache-loss"))), false).await
+}

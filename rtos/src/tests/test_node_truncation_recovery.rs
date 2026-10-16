@@ -139,6 +139,7 @@ pub(super) async fn run(
             "repack-after-rename" => {
                 "sync_child(destination.last().unwrap(), &new)"
             }
+            "forward-before-prepare-cache-loss" => "let expected = prepare(providers, root)?;",
             "forward-before-cleanup" => "scan(providers, &committed, Pass::Cleanup)?;",
             "forward-after-row-sync" | "forward-after-row-sync-cache-loss" => "let applied = scan(providers, root, Pass::Committed)?;",
             "producer-selection-before-finish" | "producer-selection-cache-loss" => "let (file, selection) = writer.finish()?;",
@@ -159,6 +160,10 @@ pub(super) async fn run(
             assert_eq!(package_inventory(root)?, before, "producer cut changed canonical packages");
             cache_loss::unfinished_ready(root).await?;
             assert_eq!(package_inventory(root)?, before, "cache loss changed canonical packages");
+        } else if cut == "forward-before-prepare-cache-loss" {
+            assert_eq!(package_inventory(root)?, before, "preflight cut changed canonical packages");
+            cache_loss::staged_packages(root).await?;
+            assert_eq!(package_inventory(root)?, before, "staging cache loss changed canonical packages");
         } else if cut.ends_with("-cache-loss") { cache_loss::clear(root).await?; }
         assert!(root.join("node_db/ton_node.restoring").is_file());
         if cut == "forward-before-cleanup" {
