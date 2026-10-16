@@ -79,7 +79,7 @@ pub(super) async fn prepare(root: &Path, fixture: &Fixture) -> Result<Publicatio
     Ok(expected)
 }
 
-pub(super) fn verify(root: &Path, db: &Arc<InternalDb>, expected: &PublicationRecord) -> Result<()> {
+pub(super) async fn verify(root: &Path, db: &Arc<InternalDb>, expected: &PublicationRecord) -> Result<()> {
     assert!(scan_pending_finality(&root.join("node_db/catchains"))?.is_empty(),
         "actual startup did not acknowledge retained source finality");
     let id = delivery_id(expected)?;
@@ -92,15 +92,29 @@ pub(super) fn verify(root: &Path, db: &Arc<InternalDb>, expected: &PublicationRe
     assert_eq!(entry.record.carrier, expected.carrier);
     assert_eq!(entry.record.session_id, expected.session_id);
     assert_eq!(entry.record.profile, expected.profile);
+    assert_eq!(entry.record.protocol, expected.protocol);
+    assert_eq!(entry.record.locally_generated, expected.locally_generated);
+    assert_eq!(entry.record.expires_at_unix_secs, expected.expires_at_unix_secs);
     assert_eq!(entry.record.prev, expected.prev);
     assert_eq!(entry.record.created_at_unix_secs, expected.created_at_unix_secs);
     let origin = delivery.origin.expect("source recovery lost its authenticated origin");
     assert_eq!(origin.local_validator_index, Some(0));
+    let handle = db.load_block_handle(&expected.block_id)?.unwrap();
+    let proof = db.load_block_proof(&handle, false).await?;
+    proof.check_trusted_checkpoint(&expected.block_id)?;
+    let recovered_config = proof.get_config_params()?;
+    let block = db.load_block_data(&handle).await?;
+    let extra = block.block()?.read_extra()?.read_custom()?.unwrap();
+    let full_config = extra.config().unwrap();
+    for parameter in [19, 28, 29, 30] {
+        assert_eq!(recovered_config.config(parameter)?, full_config.config(parameter)?,
+            "recovered key proof lost governing configuration {parameter}");
+    }
     let path = root.join("finality-recovery.json");
     fs::write(&path, serde_json::to_vec_pretty(&serde_json::json!({
         "delivery_id": id.to_hex_string(), "pending_sources": 0,
         "complete_boots": 2, "exact_block_and_certificate": true,
-        "validator_keys_configured": false,
+        "validator_keys_configured": false, "governing_parameters": [19, 28, 29, 30],
     }))?)?;
     keep_evidence(root, &path)?;
     eprintln!("Actual node retained finality recovery: two boots, source acknowledged, exact block and certificate durable");

@@ -737,7 +737,12 @@ pub fn visit_block_for_proof(block: &Block, id: &BlockIdExt) -> Result<()> {
         for i_config in 32..=38 {
             let _val_set = config.config(i_config)?;
         }
-        let _catchain_config = config.config(28)?;
+        // Restart trust and PQ session reconstruction also consume the network
+        // domain and consensus policies. Keep these leaves in the usage tree;
+        // otherwise accepting a key block produces a proof that cannot boot.
+        for parameter in [19, 28, 29, 30] {
+            let _governing_config = config.config(parameter)?;
+        }
     }
 
     Ok(())

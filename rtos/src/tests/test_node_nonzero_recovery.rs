@@ -655,7 +655,7 @@ async fn exercise_nonzero_recovery_with_finality(
     let db = Arc::new(open_db(root).await?);
     fixture.assert_imported(&db, 4).await?;
     if let Some(expected) = &finality {
-        finality_recovery::verify(root, &db, expected)?;
+        finality_recovery::verify(root, &db, expected).await?;
     }
     let (physical, catchain) = db.sst_databases_for_test();
     assert!(physical.db().get(b"ArchiveTruncationRootV1")?.is_none());
