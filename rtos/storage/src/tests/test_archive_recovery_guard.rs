@@ -256,7 +256,7 @@ async fn file_map_preserves_live_index_for_main_and_epoch_providers() {
 
 #[tokio::test]
 async fn legacy_cleanup_preserves_unresolved_inputs_and_clean_control_drops() {
-    for mode in ["ordinary", "key", "unknown", "staging", "clean"] {
+    for mode in ["ordinary", "key", "unknown", "staging", "orphan", "clean"] {
         let dir = tempfile::tempdir().unwrap();
         let root = Arc::new(dir.path().to_path_buf());
         let db = RocksDb::new(&*root, "db", None, AccessType::ReadWrite).unwrap();
@@ -285,6 +285,11 @@ async fn legacy_cleanup_preserves_unresolved_inputs_and_clean_control_drops() {
             "key" => marker(&db, PackageType::KeyBlocks, b"RepackRecovery"),
             "unknown" => marker(&db, PackageType::Blocks, b"UnknownRecoveryVersion"),
             "staging" => staging(&root),
+            "orphan" => {
+                let operation = root.join("archive/recovery").join(hex::encode([5;16]));
+                fs::create_dir_all(&operation).unwrap();
+                fs::write(operation.join("selection.v1"), b"retain before Building").unwrap();
+            }
             _ => {}
         }
         let before = snapshot(&db);
@@ -435,4 +440,52 @@ async fn all_slice_constructors_refuse_failed_context_before_deletion_lock_or_ch
         assert_eq!(snapshot(&db), before);
         assert_eq!(package_bytes(&root), files);
     }
+}
+
+#[test]
+fn orphan_operation_controls_refuse_all_guards_without_changing_bytes() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite)?;
+    let controls = dir.path().join("archive/recovery");
+    ensure_root_controls_clear(db.db())?;
+    assert!(!dir.path().join("archive").exists());
+    fs::create_dir_all(&controls)?;
+    ensure_root_controls_clear(db.db())?;
+    let names = db.cfs().expect("open database column families");
+    let operation = controls.join(hex::encode([1;16])); fs::create_dir(&operation)?;
+    let before = snapshot(&db);
+    for populated in [false, true] {
+        if populated { fs::write(operation.join("selection.v1"), b"selection before root")?; }
+        let files = package_bytes(dir.path());
+        typed(ensure_root_controls_clear(db.db()).unwrap_err());
+        typed(ensure_provider_clear(db.db(), dir.path(), &names).unwrap_err());
+        typed(ensure_open_provider_clear(db.db(), dir.path()).unwrap_err());
+        typed(ensure_slice_clear(db.db(), dir.path(), 0, false).unwrap_err());
+        assert_eq!(snapshot(&db), before); assert_eq!(package_bytes(dir.path()), files);
+        assert!(operation.is_dir());
+    }
+    fs::remove_file(operation.join("selection.v1"))?; fs::remove_dir(operation)?;
+    fs::write(controls.join("unknown-control"), b"preserved")?;
+    typed(ensure_root_controls_clear(db.db()).unwrap_err());
+    assert_eq!(fs::read(controls.join("unknown-control"))?, b"preserved");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn orphan_control_aliases_and_wrong_types_are_preserved() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite)?;
+    let archive = dir.path().join("archive"); fs::create_dir(&archive)?;
+    let controls = archive.join("recovery");
+    fs::write(&controls, b"unexpected file")?;
+    typed(ensure_root_controls_clear(db.db()).unwrap_err());
+    assert_eq!(fs::read(&controls)?, b"unexpected file"); fs::remove_file(&controls)?;
+    let target = dir.path().join("saved-controls"); fs::create_dir(&target)?;
+    fs::write(target.join("selection.v1"), b"keep target")?;
+    std::os::unix::fs::symlink(&target, &controls)?;
+    typed(ensure_root_controls_clear(db.db()).unwrap_err());
+    assert!(fs::symlink_metadata(&controls)?.file_type().is_symlink());
+    assert_eq!(fs::read(target.join("selection.v1"))?, b"keep target");
+    Ok(())
 }

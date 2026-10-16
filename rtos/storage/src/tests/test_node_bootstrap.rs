@@ -92,3 +92,48 @@ fn ordinary_parent_components_remain_compatible_without_pending_root() {
     assert!(open_node_db_for_bootstrap(&ordinary, &config, AccessType::ReadWrite).is_err());
     assert!(open_node_db_for_bootstrap(&real, &config, AccessType::ReadWrite).unwrap().requires_recovery());
 }
+
+#[test]
+fn orphan_selection_refuses_bootstrap_before_ledger_or_service_initialization() -> Result<()> {
+    let dir = tempfile::tempdir()?; let config = CellsDbConfig::default();
+    let db = open_node_db(dir.path(), &config, AccessType::ReadWrite)?;
+    db.db().put(b"keep", b"native value")?; db.sync_wal()?;
+    let names = db.cfs().expect("open database column families"); drop(db);
+    let operation = dir.path().join("archive/recovery").join(hex::encode([4;16]));
+    std::fs::create_dir_all(&operation)?;
+    for populated in [false, true] {
+        if populated { std::fs::write(operation.join("selection.v1"), b"durable selection before Building")?; }
+        for access in [AccessType::ReadWrite, AccessType::ReadOnly] {
+            let error = open_node_db_for_bootstrap(dir.path(), &config, access).err().expect("orphan must refuse bootstrap");
+            assert!(error.is::<crate::archives::recovery_guard::ArchiveRecoveryRequired>(), "{error:#}");
+        }
+        let db = open_node_db(dir.path(), &config, AccessType::ReadWrite)?;
+        assert_eq!(db.cfs().expect("open database column families"), names);
+        assert!(db.db().cf_handle("repair_dependency_leases_v1").is_none());
+        assert!(db.db().get(ROOT_KEY)?.is_none());
+        assert_eq!(db.db().get(b"keep")?.as_deref(), Some(b"native value".as_slice()));
+        assert!(operation.is_dir());
+    }
+    assert_eq!(std::fs::read(operation.join("selection.v1"))?, b"durable selection before Building");
+    std::fs::remove_file(operation.join("selection.v1"))?; std::fs::remove_dir(&operation)?;
+    let bootstrap = open_node_db_for_bootstrap(dir.path(), &config, AccessType::ReadWrite)?;
+    assert!(!bootstrap.requires_recovery()); drop(bootstrap.finish()?);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_readonly_alias_allows_empty_control_directory() -> Result<()> {
+    let dir = tempfile::tempdir()?; let config = CellsDbConfig::default();
+    let real = dir.path().join("real"); let alias = dir.path().join("alias");
+    drop(open_node_db(&real, &config, AccessType::ReadWrite)?);
+    let controls = real.join("archive/recovery"); std::fs::create_dir_all(&controls)?;
+    std::os::unix::fs::symlink(&real, &alias)?;
+    let bootstrap = open_node_db_for_bootstrap(&alias, &config, AccessType::ReadOnly)?;
+    assert!(!bootstrap.requires_recovery()); drop(bootstrap.finish()?);
+    let artifact = controls.join("orphan"); std::fs::write(&artifact, b"keep")?;
+    let error = open_node_db_for_bootstrap(&alias, &config, AccessType::ReadOnly).err().expect("orphan through alias");
+    assert!(error.is::<crate::archives::recovery_guard::ArchiveRecoveryRequired>());
+    assert_eq!(std::fs::read(artifact)?, b"keep");
+    Ok(())
+}

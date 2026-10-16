@@ -29,7 +29,8 @@ pub(crate) fn ensure_root_controls_clear(db: &NativeDb) -> Result<()> {
         let _backlink = super::recovery_participant::Backlink::decode(&bytes)?;
         fail!("Pending archive recovery participant");
     }
-    Ok(())
+    let root = db.path().parent().ok_or_else(|| error!("Missing archive provider root"))?;
+    orphan_controls(root).map_err(|error| ArchiveRecoveryRequired(error).into())
 }
 
 fn statuses(db: &NativeDb, names: impl IntoIterator<Item = String>) -> Result<()> {
@@ -66,6 +67,25 @@ fn checked_exists(path: &Path) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+/// With neither root nor backlink, no operation directory has cleanup authority.
+/// Even an empty operation directory is preserved: it may precede Building.
+/// An empty shared recovery directory is harmless after root-last cleanup.
+fn orphan_controls(root: &Path) -> Result<()> {
+    // Ordinary provider aliases remain compatible when no root work exists.
+    // Resolve the provider root, then reject aliases in the control area itself.
+    let archive = fs::canonicalize(root)?.join("archive");
+    if !checked_exists(&archive)? { return Ok(()); }
+    if !fs::symlink_metadata(&archive)?.is_dir() { fail!("Archive path is not a directory"); }
+    let controls = archive.join("recovery");
+    if !checked_exists(&controls)? { return Ok(()); }
+    if !fs::symlink_metadata(&controls)?.is_dir() { fail!("Recovery control path is not a directory"); }
+    if let Some(entry) = fs::read_dir(&controls)?.next() {
+        let entry = entry?;
+        fail!("Orphan archive recovery artifact: {}", entry.path().display());
+    }
+    Ok(())
 }
 
 fn packages(root: &Path) -> Result<()> {

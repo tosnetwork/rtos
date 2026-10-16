@@ -79,6 +79,7 @@ pub fn open_node_db_for_bootstrap(
         if db.db().get_pinned(PARTICIPANT_KEY)?.is_some() {
             fail!("Orphan archive recovery participant on main database");
         }
+        crate::archives::recovery_guard::ensure_root_controls_clear(db.db())?;
         if deferred_cleanup { db.finish_ordinary_bootstrap()?; }
     }
     Ok(NodeDbBootstrap { db, pending, providers: None })
