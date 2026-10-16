@@ -119,9 +119,9 @@ pub(super) async fn run(
     drop(db);
     tokio::time::timeout(Duration::from_secs(30), wait_for_db_release(physical)).await?;
     eprintln!("Failed actual truncation preserved four cursors, full history and restoring beacon; exact synthetic lease released");
-    if interrupt == Some("selection-enospc") {
-        io_failure::selection_enospc(binary, root, zero).await?;
-        assert_eq!(package_inventory(root)?, before, "failed Selection write changed canonical packages");
+    if let Some(mode @ ("selection-enospc" | "selection-sync-eio")) = interrupt {
+        io_failure::selection_fault(binary, root, zero, mode).await?;
+        assert_eq!(package_inventory(root)?, before, "failed Selection IO changed canonical packages");
         assert!(root.join("node_db/ton_node.restoring").is_file());
     } else if let Some(cut) = interrupt {
         let statement = match cut {
