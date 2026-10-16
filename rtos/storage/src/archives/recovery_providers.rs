@@ -121,6 +121,7 @@ impl RecoveryProviders {
                 }
             } else if current.is_some() { fail!("Unexpected recovery root on epoch provider"); }
             match db.get_pinned(PARTICIPANT_KEY)? {
+                Some(_) if root.state == State::Preparing => fail!("Unexpected Preparing participant backlink"),
                 Some(bytes) => Backlink::decode(&bytes)?.check(root, &participant.descriptor)?,
                 None if matches!(root.state, State::Ready | State::Committed) => {
                     fail!("Missing required recovery participant backlink");
@@ -137,10 +138,10 @@ impl RecoveryProviders {
     /// before the worker may clear a root or publish a new view.
     pub(crate) fn verify_provider_and_map_inventories(&self, root: &RootHeader) -> Result<()> {
         root.validate()?;
-        if root.state == State::Cleaned && self.inventory()? != root.providers {
+        if matches!(root.state, State::Preparing | State::Cleaned) && self.inventory()? != root.providers {
             fail!("Cleaned recovery provider inventory mismatch");
         }
-        if matches!(root.state, State::Committed | State::Cleaned) {
+        if matches!(root.state, State::Preparing | State::Committed | State::Cleaned) {
             let main = self.participants.iter().find(|p| p.descriptor.anchor == Anchor::Node)
                 .ok_or_else(|| error!("Missing main recovery provider"))?;
             if super::recovery_parent::native_inventory(main.database.db())? != root.maps {

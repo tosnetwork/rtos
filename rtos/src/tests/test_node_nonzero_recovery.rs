@@ -145,6 +145,12 @@ async fn actual_node_resumes_partial_ready_retaining_height_three() -> Result<()
     exercise_nonzero_recovery_case(false, None, Some((3, Some("producer-ready-before-finish")))).await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node binary, public fixture signer, and gdb"]
+async fn actual_node_resumes_partial_selection_before_building() -> Result<()> {
+    exercise_nonzero_recovery_case(false, None, Some((2, Some("producer-selection-before-finish")))).await
+}
+
 async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&str>) -> Result<()> {
     exercise_nonzero_recovery_case(interrupt_recovery, building, None).await
 }
@@ -462,7 +468,7 @@ async fn interrupt_actual_recovery(
     use std::os::unix::process::CommandExt;
     let (source, source_file) = if cut.starts_with("repack-") {
         (include_str!("../../storage/src/archives/recovery_forward.rs"), "recovery_forward.rs")
-    } else if cut == "producer-ready-before-finish" {
+    } else if cut.starts_with("producer-") {
         (include_str!("../../storage/src/archives/recovery_producer.rs"), "recovery_producer.rs")
     } else if cut == "truncation-before-progress" {
         (include_str!("../internal_db/restore.rs"), "restore.rs")
@@ -475,7 +481,7 @@ async fn interrupt_actual_recovery(
     let line = matches[0].0 + 1;
     let function = if cut.starts_with("repack-") {
         "storage::archives::recovery_forward::publish_package"
-    } else if cut == "producer-ready-before-finish" {
+    } else if cut.starts_with("producer-") {
         "storage::archives::recovery_producer::"
     } else if cut == "truncation-before-progress" {
         "internal_db::restore::restore"

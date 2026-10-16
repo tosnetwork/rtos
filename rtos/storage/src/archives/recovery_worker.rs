@@ -73,6 +73,7 @@ fn verify(providers: &RecoveryProviders, root: &RootHeader) -> Result<()> {
 
 pub(crate) fn recover_cleaned(providers: RecoveryProviders, root: RootHeader) -> Result<()> {
     let aborted = match root.state {
+        State::Preparing => Some(super::recovery_preparing::prepare_abort(&providers, &root)?),
         State::Building => Some(super::recovery_building::prepare_abort(&providers, &root)?),
         State::Cleaned => { verify(&providers, &root)?; None },
         State::Ready | State::Committed => { super::recovery_forward::validate(&providers, &root)?; None },
@@ -80,14 +81,21 @@ pub(crate) fn recover_cleaned(providers: RecoveryProviders, root: RootHeader) ->
     let providers = Arc::new(providers);
     let custody = super::package::retirement::reserve_resources(&providers)?;
     let root = if let Some(cleaned) = aborted {
-        super::recovery_building::discard_stages(&providers, &root)?;
-        if super::recovery_producer::has_ready_intent(&providers, &root)? {
-            let main = providers.participants.iter().find(|p| p.descriptor.anchor == Anchor::Node)
-                .ok_or_else(|| error!("Missing Building main provider"))?;
-            clean_stage(main.archive_root.as_path(), &root, c"ready.v1")?;
-        }
-        if super::recovery_building::prepare_abort(&providers, &root)? != cleaned {
-            fail!("Building data changed during stage cleanup");
+        if root.state == State::Preparing {
+            super::recovery_preparing::discard_selection(&providers, &root)?;
+            if super::recovery_preparing::prepare_abort(&providers, &root)? != cleaned {
+                fail!("Preparing data changed during selection cleanup");
+            }
+        } else {
+            super::recovery_building::discard_stages(&providers, &root)?;
+            if super::recovery_producer::has_ready_intent(&providers, &root)? {
+                let main = providers.participants.iter().find(|p| p.descriptor.anchor == Anchor::Node)
+                    .ok_or_else(|| error!("Missing Building main provider"))?;
+                clean_stage(main.archive_root.as_path(), &root, c"ready.v1")?;
+            }
+            if super::recovery_building::prepare_abort(&providers, &root)? != cleaned {
+                fail!("Building data changed during stage cleanup");
+            }
         }
         let main = providers.participants.iter().find(|p| p.descriptor.anchor == Anchor::Node)
             .ok_or_else(|| error!("Missing Building main provider"))?;

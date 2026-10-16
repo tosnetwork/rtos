@@ -742,7 +742,7 @@ impl Plan<'_> {
         let original_maps = recovery_parent::native_inventory(self.main()?.db())?;
         let native = self.main()?.db().get_db_identity()?;
         let mut root = RootHeader {
-            state: State::Building,
+            state: State::Preparing,
             policy,
             aborted: false,
             operation: rand::random(),
@@ -750,9 +750,9 @@ impl Plan<'_> {
             database_identity_digest: rtos_block::sha256_digest(native),
             selection: Sidecar::default(),
             ready: Sidecar::default(),
-            providers: Inventory::default(),
-            maps: Inventory::default(),
-            data: Inventory::default(),
+            providers: self.providers.inventory()?,
+            maps: original_maps,
+            data: original_data,
         };
         let main = self
             .providers
@@ -760,6 +760,9 @@ impl Plan<'_> {
             .iter()
             .position(|p| p.descriptor.anchor == Anchor::Node)
             .ok_or_else(|| error!("Missing main provider"))?;
+        self.main()?.db().put(ROOT_KEY, root.encode()?)?;
+        self.main()?.sync_wal()?; // Preparing durable before creating any artifacts.
+        let preparing = root.clone();
         for index in 0..self.providers.participants.len() {
             let operation = super::recovery_stages::operation(self.providers, &root, index)?;
             fs::create_dir_all(
@@ -793,7 +796,17 @@ impl Plan<'_> {
         let (file, selection) = writer.finish()?;
         super::recovery_worker::sync_close(file)?;
         root.selection = selection;
+        root.state = State::Building;
+        root.providers = Inventory::default();
+        root.maps = Inventory::default();
+        root.data = Inventory::default();
         self.sync_operation_directories(&root)?;
+        if super::recovery_data::inventory(self.providers)? != preparing.data
+            || recovery_parent::native_inventory(self.main()?.db())? != preparing.maps
+            || self.providers.inventory()? != preparing.providers {
+            fail!("Canonical archive changed during Selection construction");
+        }
+        preparing.check_successor(&root)?;
         self.main()?.db().put(ROOT_KEY, root.encode()?)?;
         self.main()?.sync_wal()?;
         for participant in &self.providers.participants {

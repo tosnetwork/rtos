@@ -127,11 +127,50 @@ pub(super) async fn run(
             "repack-after-rename" => {
                 "sync_child(destination.last().unwrap(), &new)"
             }
+            "producer-selection-before-finish" => "let (file, selection) = writer.finish()?;",
             "producer-ready-before-finish" => "let (file, ready) = writer.finish()?;",
             _ => rtos_block::fail!("Unknown truncation cut {cut}"),
         };
         interrupt_actual_recovery(binary, root, zero, cut, statement).await?;
         assert!(root.join("node_db/ton_node.restoring").is_file());
+        if cut == "producer-selection-before-finish" {
+            assert_eq!(package_inventory(root)?, before, "Selection production changed canonical packages");
+            let mut ready = Vec::new();
+            let mut stages = 0;
+            find_ready_staging(root, &mut ready, &mut stages)?;
+            assert!(ready.is_empty(), "Ready existed before Selection completed");
+            assert_eq!(stages, 0, "package stages existed before Selection completed");
+            fn selections(path: &Path, found: &mut Vec<std::path::PathBuf>) -> Result<()> {
+                for entry in fs::read_dir(path)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_dir() { selections(&entry.path(), found)?; }
+                    else if entry.file_name() == "selection.v1" { found.push(entry.path()); }
+                }
+                Ok(())
+            }
+            let mut partial = Vec::new();
+            selections(&root.join("node_db/archive/recovery"), &mut partial)?;
+            assert_eq!(partial.len(), 1);
+            let bytes = fs::read(&partial[0])?;
+            assert!(bytes.len() > 28 && &bytes[..8] == b"RTOSAMF1");
+            let mut position = 28usize;
+            let mut records = 0;
+            while position < bytes.len() {
+                assert_ne!(bytes[position], 0, "Selection already has a completion trailer");
+                assert!(bytes.len() - position >= 9);
+                let length = u64::from_le_bytes(bytes[position + 1..position + 9].try_into()?);
+                position = position.checked_add(9).and_then(|value| value.checked_add(usize::try_from(length).ok()?))
+                    .ok_or_else(|| rtos_block::error!("Selection framing overflow"))?;
+                assert!(position <= bytes.len());
+                records += 1;
+            }
+            assert!(records > 0);
+            keep_evidence(root, &partial[0])?;
+            interrupt_actual_recovery(binary, root, zero, "building-before-cleaned",
+                "main.database.db().put(ROOT_KEY, cleaned.encode()?)?;").await?;
+            assert!(!partial[0].exists(), "partial Selection survived abort cleanup");
+            assert_eq!(package_inventory(root)?, before, "Preparing abort changed canonical packages");
+        }
         if cut == "producer-ready-before-finish" {
             assert_eq!(package_inventory(root)?, before, "Building changed canonical packages");
             let mut ready = Vec::new();

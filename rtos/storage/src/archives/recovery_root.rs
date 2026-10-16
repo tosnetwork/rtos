@@ -14,6 +14,7 @@ pub(crate) enum State {
     Ready = 2,
     Committed = 3,
     Cleaned = 4,
+    Preparing = 5,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,11 +110,15 @@ impl RootHeader {
         if self.aborted && self.state != State::Cleaned {
             fail!("Archive abort disposition requires Cleaned state");
         }
-        self.selection.require(true)?;
-        self.ready.require(self.state != State::Building && !self.aborted)?;
-        self.providers.require(self.state == State::Cleaned)?;
-        self.maps.require(matches!(self.state, State::Committed | State::Cleaned))?;
-        self.data.require(self.state == State::Cleaned)?;
+        // Preparing is durable before any control directory or sidecar exists.
+        // Its inventories describe the complete original canonical state.
+        let unselected_abort = self.state == State::Cleaned && self.aborted
+            && self.selection == Sidecar::default();
+        self.selection.require(self.state != State::Preparing && !unselected_abort)?;
+        self.ready.require(!matches!(self.state, State::Preparing | State::Building) && !self.aborted)?;
+        self.providers.require(matches!(self.state, State::Preparing | State::Cleaned))?;
+        self.maps.require(matches!(self.state, State::Preparing | State::Committed | State::Cleaned))?;
+        self.data.require(matches!(self.state, State::Preparing | State::Cleaned))?;
         Ok(())
     }
 
@@ -162,6 +167,7 @@ impl RootHeader {
             2 => State::Ready,
             3 => State::Committed,
             4 => State::Cleaned,
+            5 => State::Preparing,
             _ => fail!("Unknown archive root state"),
         };
         let flags = reader.take::<1>()?[0];
@@ -203,11 +209,15 @@ impl RootHeader {
             || self.policy != next.policy
             || self.database_identity_bytes != next.database_identity_bytes
             || self.database_identity_digest != next.database_identity_digest
-            || self.selection != next.selection
+            || (self.state != State::Preparing && self.selection != next.selection)
         {
             fail!("Archive root immutable identity changed");
         }
         let legal = match (self.state, next.state) {
+            (State::Preparing, State::Building) => true,
+            (State::Preparing, State::Cleaned) => next.aborted
+                && next.selection == self.selection && next.providers == self.providers
+                && next.maps == self.maps && next.data == self.data,
             (State::Building, State::Ready) => true,
             (State::Building, State::Cleaned) => next.aborted,
             (State::Ready, State::Committed) => self.ready == next.ready,

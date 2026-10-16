@@ -9,15 +9,15 @@ fn fixture(state: State, aborted: bool, policy: Policy) -> RootHeader {
         operation: [7; 16],
         database_identity_bytes: 36,
         database_identity_digest: [8; 32],
-        selection: Sidecar { bytes: 1024, records: 5, digest: [9; 32] },
-        ready: if state == State::Building || aborted {
+        selection: if state == State::Preparing { Sidecar::default() } else { Sidecar { bytes: 1024, records: 5, digest: [9; 32] } },
+        ready: if matches!(state, State::Preparing | State::Building) || aborted {
             Sidecar::default()
         } else {
             Sidecar { bytes: 2048, records: 7, digest: [10; 32] }
         },
-        providers: if state == State::Cleaned { empty } else { Inventory::default() },
-        maps: if matches!(state, State::Committed | State::Cleaned) { empty } else { Inventory::default() },
-        data: if state == State::Cleaned { empty } else { Inventory::default() },
+        providers: if matches!(state, State::Preparing | State::Cleaned) { empty } else { Inventory::default() },
+        maps: if matches!(state, State::Preparing | State::Committed | State::Cleaned) { empty } else { Inventory::default() },
+        data: if matches!(state, State::Preparing | State::Cleaned) { empty } else { Inventory::default() },
     }
 }
 
@@ -28,7 +28,7 @@ fn rechecksum(bytes: &mut [u8; HEADER_SIZE]) {
 
 #[test]
 fn root_header_checks_every_policy_state_combination() -> Result<()> {
-    for state in [State::Building, State::Ready, State::Committed, State::Cleaned] {
+    for state in [State::Preparing, State::Building, State::Ready, State::Committed, State::Cleaned] {
         for flags in 0u8..=u8::MAX {
             let aborted = state == State::Cleaned && flags & 1 != 0;
             let mut bytes = fixture(state, aborted, Policy::Node).encode()?;
@@ -124,7 +124,7 @@ fn root_transitions_bind_identity_and_committed_map_inventory() -> Result<()> {
 fn root_inventory_and_descriptor_presence_follow_durable_states() -> Result<()> {
     let ready_descriptor = fixture(State::Ready, false, Policy::Node).ready;
     let inventory = Inventory { count: 0, digest: sha256_digest([]) };
-    for state in [State::Building, State::Ready, State::Committed, State::Cleaned] {
+    for state in [State::Preparing, State::Building, State::Ready, State::Committed, State::Cleaned] {
         for aborted in [false, true] {
             let header = fixture(state, aborted, Policy::Node);
             if aborted && state != State::Cleaned {
@@ -153,7 +153,7 @@ fn pending_root_and_orphan_participant_preserve_native_records() -> Result<()> {
     };
     let directory = tempfile::tempdir()?;
     let db = RocksDb::new(directory.path(), "db", None, AccessType::ReadWrite)?;
-    for state in [State::Building, State::Ready, State::Committed, State::Cleaned] {
+    for state in [State::Preparing, State::Building, State::Ready, State::Committed, State::Cleaned] {
         let bytes = fixture(state, false, Policy::Node).encode()?;
         db.db().put(ROOT_KEY, bytes)?;
         db.sync_wal()?;
@@ -172,5 +172,23 @@ fn pending_root_and_orphan_participant_preserve_native_records() -> Result<()> {
     assert_eq!(db.db().get(PARTICIPANT_KEY)?.as_deref(), Some(b"orphan participant".as_slice()));
     db.db().delete(PARTICIPANT_KEY)?;
     recovery_guard::ensure_open_provider_clear(db.db(), directory.path())?;
+    Ok(())
+}
+
+#[test]
+fn preparing_transitions_preserve_original_inventories() -> Result<()> {
+    let preparing = fixture(State::Preparing, false, Policy::Node);
+    preparing.check_successor(&fixture(State::Building, false, Policy::Node))?;
+    assert!(preparing.check_successor(&fixture(State::Ready, false, Policy::Node)).is_err());
+    let mut aborted = preparing.clone();
+    aborted.state = State::Cleaned;
+    aborted.aborted = true;
+    preparing.check_successor(&aborted)?;
+    assert_eq!(RootHeader::decode(&aborted.encode()?)?, aborted);
+    for field in 0..3 {
+        let mut changed = aborted.clone();
+        match field { 0 => changed.providers.digest[0] ^= 1, 1 => changed.maps.digest[0] ^= 1, _ => changed.data.digest[0] ^= 1 }
+        assert!(preparing.check_successor(&changed).is_err());
+    }
     Ok(())
 }
