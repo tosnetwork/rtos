@@ -70,10 +70,11 @@ pub(super) async fn run(
     interrupt: Option<&str>,
 ) -> Result<()> {
     let retained = lease.retained;
-    let unconfirmed = interrupt == Some("state-auto-state-sync-eio");
+    let unconfirmed = matches!(interrupt, Some("state-auto-state-sync-eio" | "state-auto-rebuild-startup-sync-eio"));
+    let startup_sync_fault = matches!(interrupt, Some("state-auto-startup-sync-eio" | "state-auto-rebuild-startup-sync-eio"));
     let automatic = interrupt.is_some_and(|cut| cut.starts_with("state-auto-"));
     let automatic_fault = interrupt.and_then(|cut| cut.strip_prefix("state-auto-"))
-        .filter(|mode| *mode != "cache-loss" && *mode != "state-sync-eio");
+        .filter(|mode| *mode != "cache-loss" && *mode != "state-sync-eio" && *mode != "startup-sync-eio" && *mode != "rebuild-startup-sync-eio");
     let state_cut = automatic || interrupt == Some("state-cache-loss");
     if state_cut {
         if unconfirmed { state_cache_loss::refuse_and_interrupt(root).await?; }
@@ -223,7 +224,22 @@ pub(super) async fn run(
         }
         eprintln!("Failed actual truncation preserved four cursors, full history and restoring beacon; exact synthetic lease release acknowledged");
     }
-    let interrupt = if unconfirmed { None } else if let Some(mode) = automatic_fault {
+    if startup_sync_fault {
+        startup_sync::refuse(binary, root, zero, unconfirmed).await?;
+        let config = state_cache_loss::generated_config(root)?;
+        match std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")?.as_str() {
+            "1" => cache_loss::clear(root).await?,
+            "0" => (),
+            _ => rtos_block::fail!("Invalid startup sync cache-loss mode"),
+        }
+        state_cache_loss::verify_generated_config(root, &config)?;
+        if unconfirmed && root.join("cache-loss.json").try_exists()? {
+            let saved = root.join("startup-failure-cache-loss.json");
+            fs::copy(root.join("cache-loss.json"), &saved)?;
+            keep_evidence(root, &saved)?;
+        }
+    }
+    let interrupt = if unconfirmed || startup_sync_fault { None } else if let Some(mode) = automatic_fault {
         Some(mode)
     } else if automatic {
         Some(match std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")?.as_str() {
@@ -511,13 +527,13 @@ pub(super) async fn run(
                 if unconfirmed && std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")?.as_str() == "1" {
                     keep_evidence(root, &path)?;
                     let missing = output.contains(&format!("Can't load state for {} from DB, but handle.has_saved_state() == true", fixture.id(3, false)));
-                    if attempt == 0 {
+                    if attempt == 0 && !startup_sync_fault {
                         assert!(missing, "Actual node did not encounter the lost unconfirmed state: {output}");
-                    } else {
+                    } else if attempt != 0 {
                         assert!(!missing, "Recovered state was not durable before services started");
                     }
                 }
-                if attempt == 0 && interrupt != Some("truncation-before-progress") {
+                if attempt == 0 && !startup_sync_fault && interrupt != Some("truncation-before-progress") {
                     assert!(
                         output.contains(&format!(
                             "Database was truncated at {}",
@@ -618,7 +634,7 @@ pub(super) async fn run(
         fs::write(&report, serde_json::to_vec(&serde_json::json!({
             "fixture_lease_acquired": false, "manual_lease_release": false,
             "native_reopen_between_recovery_kill_and_boot": false,
-            "actual_recovery_interrupted": !unconfirmed, "complete_boots": 2,
+            "actual_recovery_interrupted": !unconfirmed || startup_sync_fault, "complete_boots": 2,
             "retained_height": retained, "exact_state_graph": true,
         }))?)?;
         keep_evidence(root, &report)?;
@@ -669,3 +685,6 @@ mod persistent_failure;
 
 #[path = "test_node_state_cache_loss.rs"]
 pub(super) mod state_cache_loss;
+
+#[path = "test_node_startup_sync.rs"]
+mod startup_sync;

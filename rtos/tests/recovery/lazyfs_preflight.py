@@ -236,7 +236,7 @@ def run(binary, output, node=None):
                     required_evidence = [f"Acknowledged lease {operation} writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true")]
                 if node.cut == "state" or node.cut.startswith("state-auto"):
                     required_evidence = ["Acknowledged state publication writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true"), "State publication graph, counters and index preserved after two-boots"]
-                if node.cut == "state-auto-state-sync-eio":
+                if node.cut in ["state-auto-state-sync-eio", "state-auto-rebuild-startup-sync-eio"]:
                     required_evidence = ["Unconfirmed state writer killed after WAL sync refusal; cache-loss=" + ("false" if node.no_cache_loss else "true"), "State publication graph, counters and index preserved after two-boots"]
                 if node.cut == "validator-floor":
                     required_evidence = ["Acknowledged validator floor writer killed with physical pin and native owner alive; cache-loss=" + ("false" if node.no_cache_loss else "true")]
@@ -386,8 +386,8 @@ def run(binary, output, node=None):
                         raise RuntimeError(f"Actual node cache-loss test failed: {executed.returncode}")
                     required_evidence.extend(["1 passed; 0 failed", "Actual node retried real truncation"])
                     if node.cut.startswith("state-auto"):
-                        recovery_stop = "Unconfirmed state writer killed after WAL sync refusal" if node.cut == "state-auto-state-sync-eio" else "Actual node recovery interrupted at forward-after-row-sync" if node.cut == "state-auto" else "Actual node refused startup after scoped " + node.cut.removeprefix("state-auto-")
-                        recovery_complete = "Actual dynamic node recovered unconfirmed state; no manual lease release or data repair" if node.cut == "state-auto-state-sync-eio" else "Actual dynamic node recovered automatically after recovery interruption; no manual lease release or data repair"
+                        recovery_stop = "Actual node refused services after exact startup state WAL sync EIO" if node.cut in ["state-auto-startup-sync-eio", "state-auto-rebuild-startup-sync-eio"] else "Unconfirmed state writer killed after WAL sync refusal" if node.cut in ["state-auto-state-sync-eio", "state-auto-rebuild-startup-sync-eio"] else "Actual node recovery interrupted at forward-after-row-sync" if node.cut == "state-auto" else "Actual node refused startup after scoped " + node.cut.removeprefix("state-auto-")
+                        recovery_complete = "Actual dynamic node recovered unconfirmed state; no manual lease release or data repair" if node.cut in ["state-auto-state-sync-eio", "state-auto-rebuild-startup-sync-eio"] else "Actual dynamic node recovered automatically after recovery interruption; no manual lease release or data repair"
                         required_evidence.extend([recovery_stop, recovery_complete])
                         reports = list((output / "node").rglob("state-automatic-recovery.json"))
                         if len(reports) != 1:
@@ -406,14 +406,14 @@ def run(binary, output, node=None):
                         if config["bytes_before"] <= 0 or config["bytes_before"] != config["bytes_after"] or config["sha256_before"] != config["sha256_after"]:
                             raise RuntimeError("Generated node configuration changed after interruption")
                         if not node.no_cache_loss:
-                            for filename in ["state-publication-cache-loss.json", "cache-loss.json"]:
+                            for filename in (["state-publication-cache-loss.json", "startup-failure-cache-loss.json", "cache-loss.json"] if node.cut == "state-auto-rebuild-startup-sync-eio" else ["state-publication-cache-loss.json", "cache-loss.json"]):
                                 losses = list((output / "node").rglob(filename))
                                 if len(losses) != 1 or not json.loads(losses[0].read_text())["unsynced_overwrite_discarded"]:
                                     raise RuntimeError("Missing independent control for both interruptions")
-                            if transcript.count("independent overwrite control reverted to durable bytes") != 2:
-                                raise RuntimeError("Expected two verified cache-loss interruptions")
+                            if transcript.count("independent overwrite control reverted to durable bytes") != (3 if node.cut == "state-auto-rebuild-startup-sync-eio" else 2):
+                                raise RuntimeError("Missing verified cache-loss interruption")
                         result["generated_config_preserved"] = config
-                        if node.cut == "state-auto-state-sync-eio":
+                        if node.cut in ["state-auto-state-sync-eio", "state-auto-rebuild-startup-sync-eio"]:
                             refusals = list((output / "node").rglob("state-refusal.json"))
                             proofs = list((output / "node").rglob("state-sync-fault.reached"))
                             if len(refusals) != 1 or len(proofs) != 1 or list((output / "node").rglob("state-ack.json")):
@@ -434,6 +434,16 @@ def run(binary, output, node=None):
                                 result["unconfirmed_state_wal"] = lost[0]
                             result["unconfirmed_state_recovered"] = state
                             result["state_reconstruction_required"] = not node.no_cache_loss
+                        if node.cut in ["state-auto-startup-sync-eio", "state-auto-rebuild-startup-sync-eio"]:
+                            refusals = list((output / "node").rglob("startup-sync-refusal.json"))
+                            if len(refusals) != 1:
+                                raise RuntimeError("Missing exact startup barrier refusal")
+                            refusal = json.loads(refusals[0].read_text())
+                            if refusal["node_exit"] <= 0 or refusal["native_hits"] != 1 or refusal["services_started"]:
+                                raise RuntimeError("Startup state barrier error was not propagated")
+                            if refusal["state_reconstructed_before_fault"] != (node.cut == "state-auto-rebuild-startup-sync-eio" and not node.no_cache_loss):
+                                raise RuntimeError("Startup sync error did not exercise the intended state recovery")
+                            result["startup_sync_refusal"] = refusal
                         result["automatic_dynamic_recovery"] = report
                     if node.cut in ["validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty"]:
                         required_evidence.append(f"Validator {batch_kind} batch preserved together after two-boots")
@@ -578,7 +588,7 @@ if __name__ == "__main__":
     mutation.add_argument("--omit-state-wal-sync", action="store_true", help="omit one scoped dynamic state publication WAL sync")
     mutation.add_argument("--omit-lease-wal-sync", action="store_true", help="omit one scoped repair lease mutation WAL sync")
     mutation.add_argument("--omit-validator-wal-sync", action="store_true", help="omit one scoped validator-state WAL sync")
-    parser.add_argument("--cut", choices=["state-auto-state-sync-eio", "state-auto-selection-enospc", "state-auto-stage-enospc", "state-auto-publish-rename-eio", "state-auto-publish-sync-eio", "state-auto-publish-directory-sync-eio", "state-auto-wal-publish-sync-eio", "state-auto", "state", "rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire", "lease-custody", "validator-floor", "validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty", "persistent-fast", "persistent-head", "persistent-whole", "persistent-raw", "persistent-fast-file-eio", "persistent-fast-directory-eio", "persistent-head-file-eio", "persistent-head-directory-eio", "persistent-whole-file-eio", "persistent-whole-directory-eio", "persistent-raw-file-eio", "persistent-raw-directory-eio", "persistent-fast-rename-eio", "persistent-head-rename-eio", "persistent-whole-rename-eio", "persistent-raw-rename-eio", "persistent-fast-published-eio", "persistent-head-published-eio", "persistent-whole-published-eio", "persistent-raw-published-eio"], default="rows")
+    parser.add_argument("--cut", choices=["state-auto-rebuild-startup-sync-eio", "state-auto-startup-sync-eio", "state-auto-state-sync-eio", "state-auto-selection-enospc", "state-auto-stage-enospc", "state-auto-publish-rename-eio", "state-auto-publish-sync-eio", "state-auto-publish-directory-sync-eio", "state-auto-wal-publish-sync-eio", "state-auto", "state", "rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire", "lease-custody", "validator-floor", "validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty", "persistent-fast", "persistent-head", "persistent-whole", "persistent-raw", "persistent-fast-file-eio", "persistent-fast-directory-eio", "persistent-head-file-eio", "persistent-head-directory-eio", "persistent-whole-file-eio", "persistent-whole-directory-eio", "persistent-raw-file-eio", "persistent-raw-directory-eio", "persistent-fast-rename-eio", "persistent-head-rename-eio", "persistent-whole-rename-eio", "persistent-raw-rename-eio", "persistent-fast-published-eio", "persistent-head-published-eio", "persistent-whole-published-eio", "persistent-raw-published-eio"], default="rows")
     parser.add_argument("--no-cache-loss", action="store_true", help="run the same node cut without cache loss as a control")
     parser.add_argument("--node-test-binary", type=Path)
     parser.add_argument("--node-binary", type=Path)
