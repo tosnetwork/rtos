@@ -423,6 +423,7 @@ impl ArchiveSlice {
     }
 
     pub async fn destroy_broken(&mut self) -> Result<()> {
+        let operation = self.view.enter()?;
         if self.sliced_mode {
             let mut count =
                 self.package_status_db.get_value::<u32>(&PackageStatusKey::TotalSlices)?;
@@ -433,7 +434,8 @@ impl ArchiveSlice {
                     let shard = ShardIdent::with_prefix_len(
                         self.shard_split_depth,
                         BASE_WORKCHAIN_ID,
-                        (shard as u64) << (64 - self.shard_split_depth),
+                        if self.shard_split_depth == 0 { 0 }
+                        else { (shard as u64) << (64 - self.shard_split_depth) },
                     )?;
                     shards.push(shard)
                 }
@@ -447,7 +449,7 @@ impl ArchiveSlice {
                         break;
                     }
                     let path = package_id.full_path(self.db_root_path.as_path(), shard)?;
-                    match Package::remove_by_path(&path).await {
+                    match Package::remove_by_path(&self.view, &operation, &path).await {
                         Ok(_) => {
                             log::info!(
                                 target: TARGET,
@@ -455,10 +457,12 @@ impl ArchiveSlice {
                             );
                             count -= 1;
                         }
-                        Err(e) => log::info!(
-                            target: TARGET,
-                            "destroy_packages: can't remove package {seq_no} {shard}: {e}"
-                        ),
+                        Err(e) => {
+                            // Preserve remaining packages and tables once a
+                            // deletion fails; retrying indefinitely cannot heal
+                            // the now-failed archive domain.
+                            return Err(e.context(format!("Cannot remove package {seq_no} {shard}")));
+                        }
                     }
                 }
             }

@@ -351,3 +351,30 @@ async fn package_open_context_refusal_preserves_existing_input_and_slot_count() 
     assert!(slice.package_store.get(&entry).is_none(), "failed opening left a spinning cache slot");
     Ok(())
 }
+
+#[tokio::test]
+async fn broken_slice_deletion_error_preserves_tables_and_returns() -> Result<()> {
+    let name = "broken_slice_deletion_error";
+    let (db, mut context) = prepare_test(name, PackageType::Blocks, 0, 0).await?;
+    let root = Path::new(DB_PATH).join(name);
+    let path = crate::archives::package_id::PackageId::for_block(0)
+        .full_path(&root, &ShardIdent::masterchain())?;
+    let saved = path.with_extension("saved");
+    std::fs::rename(&path, &saved)?;
+    std::fs::create_dir(&path)?;
+    std::fs::write(path.join("retained"), b"keep")?;
+    let before = context.archive_slice.package_status_db
+        .get_value::<u32>(&super::PackageStatusKey::TotalSlices)?;
+    assert!(before > 0);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5),
+        context.archive_slice.destroy_broken()).await?;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(path.join("retained"))?, b"keep");
+    assert!(saved.is_file());
+    assert_eq!(context.archive_slice.package_status_db
+        .get_value::<u32>(&super::PackageStatusKey::TotalSlices)?, before);
+    assert!(context.archive_slice.view.binding().domain().recovery_required());
+    drop(context);
+    destroy_db(db, name).await;
+    Ok(())
+}

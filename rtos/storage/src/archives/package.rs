@@ -211,21 +211,38 @@ impl Package {
     }
 
     pub async fn remove(&self) -> Result<()> {
-        debug_assert!(!self.state.read_only);
-        let mut file = self.lock_writer().await;
-        if file.take().is_none() {
-            Ok(())
-        } else {
-            Self::remove_by_path(self.path()).await
-        }
+        if self.state.read_only { fail!("Cannot remove a read-only package"); }
+        let operation = self.state.view.enter()?;
+        let mut guard = self.lock_writer().await;
+        if guard.is_none() { return Ok(()); }
+        let (phase, mut job) = operation.mutation_phase();
+        let handoff = tokio::task::spawn_blocking(move || {
+            // Keep the live writer intact when cancellation wins before start.
+            job.start()?;
+            drop(guard.take());
+            remove_file_native(&guard._state.path)?;
+            Ok::<_, anyhow::Error>(job.handoff(guard))
+        }).await.map_err(|e| error!("Native package remove task failed: {e}"))??;
+        phase.check_completion()?;
+        handoff.consume(|_| Ok(()))?;
+        phase.complete();
+        Ok(())
     }
 
-    pub async fn remove_by_path(path: &Path) -> Result<()> {
-        if path.try_exists()? {
-            tokio::fs::remove_file(path)
-                .await
-                .map_err(|err| error!("destroy package error {}", err))?;
-        }
+    pub(crate) async fn remove_by_path(
+        view: &ArchiveView, parent: &ArchiveOperation, path: &Path,
+    ) -> Result<()> {
+        let operation = view.inherit(parent)?;
+        let (phase, mut job) = operation.mutation_phase();
+        let path = path.to_path_buf();
+        let handoff = tokio::task::spawn_blocking(move || {
+            job.start()?;
+            remove_file_native(&path)?;
+            Ok::<_, anyhow::Error>(job.handoff(()))
+        }).await.map_err(|e| error!("Native package path remove task failed: {e}"))??;
+        phase.check_completion()?;
+        handoff.consume(|_| Ok(()))?;
+        phase.complete();
         Ok(())
     }
 
@@ -511,6 +528,16 @@ pub(super) fn package_fixture_context() -> Result<(tempfile::TempDir, ArchiveVie
 #[cfg(test)]
 #[path = "../tests/test_package.rs"]
 mod tests;
+
+// Missing files are already removed. Other errors must reach the mutation
+// owner; a failed existence probe must never turn into apparent success.
+fn remove_file_native(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
 
 /// Called by an owned storage operation. Synchronize the directory chain as
 /// archive packages may have created more than one new ancestor directory.

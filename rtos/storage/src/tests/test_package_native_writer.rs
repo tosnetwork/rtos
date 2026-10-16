@@ -325,3 +325,76 @@ fn cancelled_queued_sync_has_no_effect_and_allows_retry() -> Result<()> {
         Ok(())
     })
 }
+
+#[test]
+fn queued_remove_cancellation_preserves_writer_and_path_through_drain() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1)
+        .max_blocking_threads(1).enable_all().build()?;
+    runtime.block_on(async {
+        for path_only in [false, true] {
+            let (dir, view, operation) = package_fixture_context()?;
+            let path = dir.path().join("remove.pack");
+            let package = Package::open(view.clone(), &operation, path.clone(), false, true).await?;
+            let original = std::fs::read(&path)?;
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(10))?;
+            let mut removal = Box::pin(async {
+                if path_only { Package::remove_by_path(&view, &operation, &path).await }
+                else { package.remove().await }
+            });
+            assert!(futures::poll!(&mut removal).is_pending());
+            drop(removal);
+            let closed = view.binding().domain().close(view.epoch())?;
+            drop(operation);
+            release_tx.send(())?;
+            blocker.await?;
+            tokio::time::timeout(Duration::from_secs(10), closed.wait()).await?;
+            assert_eq!(std::fs::read(&path)?, original);
+            assert!(package.lock_writer().await.is_some());
+            assert!(!view.binding().domain().recovery_required());
+        }
+        Ok(())
+    })
+}
+
+#[tokio::test]
+async fn native_remove_success_missing_and_filesystem_error() -> Result<()> {
+    let (dir, view, operation) = package_fixture_context()?;
+    let path = dir.path().join("removed.pack");
+    let package = Package::open(view.clone(), &operation, path.clone(), false, true).await?;
+    package.remove().await?;
+    assert!(!path.exists());
+    assert!(package.lock_writer().await.is_none());
+    package.remove().await?;
+    Package::remove_by_path(&view, &operation, &path).await?;
+    assert!(!view.binding().domain().recovery_required());
+    let directory = dir.path().join("not-a-package");
+    std::fs::create_dir(&directory)?;
+    std::fs::write(directory.join("retained"), b"keep")?;
+    assert!(Package::remove_by_path(&view, &operation, &directory).await.is_err());
+    assert_eq!(std::fs::read(directory.join("retained"))?, b"keep");
+    assert!(view.binding().domain().recovery_required());
+    Ok(())
+}
+
+#[tokio::test]
+async fn remove_refuses_closed_admission_before_writer_lock_and_readonly_input() -> Result<()> {
+    let (dir, view, operation) = package_fixture_context()?;
+    let path = dir.path().join("preserved.pack");
+    let package = Package::open(view.clone(), &operation, path.clone(), false, true).await?;
+    let readonly = Package::open(view.clone(), &operation, path.clone(), true, false).await?;
+    let original = std::fs::read(&path)?;
+    assert!(readonly.remove().await.is_err());
+    assert!(!view.binding().domain().recovery_required());
+    let _guard = package.lock_writer().await;
+    let _closed = view.binding().domain().close(view.epoch())?;
+    let mut removal = Box::pin(package.remove());
+    assert!(matches!(futures::poll!(&mut removal), std::task::Poll::Ready(Err(_))));
+    assert_eq!(std::fs::read(&path)?, original);
+    Ok(())
+}
