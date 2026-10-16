@@ -391,6 +391,18 @@ async fn actual_node_retries_finality_after_interrupted_source_acknowledgement()
     exercise_nonzero_recovery_with_finality(false, None, None, false, 2).await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node, GDB and isolated LazyFS"]
+async fn actual_node_finality_cache_loss() -> Result<()> {
+    exercise_nonzero_recovery_with_finality(false, None, None, false, 3).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node, GDB and isolated LazyFS"]
+async fn actual_node_finality_ack_cache_loss() -> Result<()> {
+    exercise_nonzero_recovery_with_finality(false, None, None, false, 4).await
+}
+
 async fn exercise_nonzero_recovery_layout(
     interrupt_recovery: bool,
     building: Option<&str>,
@@ -605,13 +617,20 @@ async fn exercise_nonzero_recovery_with_finality(
             assert_eq!(package_inventory(root)?, before, "interrupted recovery changed packages");
         }
     }
-    if retained_finality == 2 {
-        interrupt_actual_recovery(&binary, root, &zero, "finality-before-source-ack",
-            "source.acknowledge(receipt)").await?;
-        let pending = simplex::finality_delivery::scan_pending_finality(&root.join("node_db/catchains"))?;
-        assert_eq!(pending.len(), 1, "interrupted source acknowledgement lost retained evidence");
-        assert_eq!(pending[0].record().data, finality.as_ref().unwrap().block_data);
-        drop(pending);
+    if retained_finality >= 3 { cache_loss::sync_fixture(root)?; }
+    if retained_finality >= 2 {
+        let (cut, statement) = if retained_finality == 4 {
+            ("finality-ack-committed", "match std::fs::remove_file(&path) {")
+        } else { ("finality-before-source-ack", "source.acknowledge(receipt)") };
+        interrupt_actual_recovery(&binary, root, &zero, cut, statement).await?;
+        if retained_finality >= 3 {
+            finality_recovery::discard(root, "takeover", retained_finality == 4).await?;
+        } else {
+            let pending = simplex::finality_delivery::scan_pending_finality(&root.join("node_db/catchains"))?;
+            assert_eq!(pending.len(), 1, "interrupted source acknowledgement lost retained evidence");
+            assert_eq!(pending[0].record().data, finality.as_ref().unwrap().block_data);
+            drop(pending);
+        }
     }
     for attempt in 0..2 {
         let path = root.join(format!("node-{attempt}.log"));
@@ -649,6 +668,9 @@ async fn exercise_nonzero_recovery_with_finality(
         eprintln!(
             "Nonzero node attempt {attempt}: services started at imported height 4, then SIGKILL"
         );
+        if retained_finality >= 3 && attempt == 0 {
+            finality_recovery::discard(root, "started", true).await?;
+        }
         // The next actual process must itself open and recover the database.
     }
     assert_eq!(package_inventory(root)?, before, "restart changed canonical package bytes");
@@ -740,6 +762,8 @@ async fn interrupt_actual_recovery(
         (include_str!("../../storage/src/archives/recovery_forward.rs"), "recovery_forward.rs")
     } else if cut.starts_with("producer-") {
         (include_str!("../../storage/src/archives/recovery_producer.rs"), "recovery_producer.rs")
+    } else if cut == "finality-ack-committed" {
+        (include_str!("../../simplex/src/finality_delivery.rs"), "finality_delivery.rs")
     } else if cut == "finality-before-source-ack" {
         (include_str!("../validator/session_publication.rs"), "session_publication.rs")
     } else if cut == "truncation-before-progress" {
@@ -757,6 +781,8 @@ async fn interrupt_actual_recovery(
         "storage::archives::recovery_forward::recover"
     } else if cut.starts_with("producer-") {
         "storage::archives::recovery_producer::"
+    } else if cut == "finality-ack-committed" {
+        "finality_delivery::PendingFinalityStore::acknowledge"
     } else if cut == "finality-before-source-ack" {
         "session_publication::recover_retained_finality"
     } else if cut == "truncation-before-progress" {

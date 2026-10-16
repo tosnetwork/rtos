@@ -192,6 +192,8 @@ def run(binary, output, node=None):
                         case = "actual_node_" + node.cut.replace("-", "_") + ("_cache_loss" if node.cut in ["state", "state-auto"] else "")
                     if node.cut.startswith("persistent-"):
                         case = "actual_node_" + node.cut.replace("-", "_") + ("" if node.cut.endswith("-eio") else "_cache_loss")
+                    if node.cut in ["finality", "finality-ack"]:
+                        case = "actual_node_" + node.cut.replace("-", "_") + "_cache_loss"
                     result["node_cut"] = node.cut
                     result["node_cache_loss_enabled"] = not node.no_cache_loss
                     executed = subprocess.Popen(
@@ -231,6 +233,8 @@ def run(binary, output, node=None):
                     result["sync_mutation"]["hits"] = marker
                 required_evidence = ["Actual node recovery interrupted at " + (
                     f"producer-{node.cut}-cache-loss" if node.cut in ["ready", "selection"] else "forward-before-prepare-cache-loss" if node.cut == "stages" else "forward-committed-cache-loss" if node.cut == "committed" else "forward-cleaned-cache-loss" if node.cut == "cleaned" else "root-last-cache-loss" if node.cut == "root-last" else "forward-after-row-sync")]
+                if node.cut in ["finality", "finality-ack"]:
+                    required_evidence = ["Actual node recovery interrupted at " + ("finality-ack-committed" if node.cut == "finality-ack" else "finality-before-source-ack"), "Actual node retained finality recovery: two boots, source acknowledged, exact block and certificate durable"]
                 if node.cut in ["lease", "lease-acquire", "lease-custody"]:
                     operation = "custody" if node.cut == "lease-custody" else "acquire" if node.cut == "lease-acquire" else "release"
                     required_evidence = [f"Acknowledged lease {operation} writer killed without native close; cache-loss=" + ("false" if node.no_cache_loss else "true")]
@@ -384,7 +388,38 @@ def run(binary, output, node=None):
                 else:
                     if executed.returncode != 0:
                         raise RuntimeError(f"Actual node cache-loss test failed: {executed.returncode}")
-                    required_evidence.extend(["1 passed; 0 failed", "Actual node retried real truncation"])
+                    required_evidence.append("1 passed; 0 failed")
+                    if node.cut not in ["finality", "finality-ack"]:
+                        required_evidence.append("Actual node retried real truncation")
+                    else:
+                        for phase in ["takeover", "started"]:
+                            reports = list((output / "node").rglob(f"finality-{phase}-source.json"))
+                            if len(reports) != 1:
+                                raise RuntimeError("Missing finality source observation")
+                            source = json.loads(reports[0].read_text())
+                            if source["cache_loss"] != (not node.no_cache_loss) or not source["exact_source_bytes"] or source["native_database_reopened"] or not source["source_files"] or source["config_bytes"] <= 0:
+                                raise RuntimeError("Unqualified finality source/config persistence")
+                            if source["source_pending"] != int(phase == "takeover") or source["source_acknowledged"] != int(phase == "started" or node.cut == "finality-ack"):
+                                raise RuntimeError("Incorrect finality source ACK boundary")
+                            if not node.no_cache_loss:
+                                losses = list((output / "node").rglob(f"finality-{phase}-cache-loss.json"))
+                                if len(losses) != 1:
+                                    raise RuntimeError("Missing finality loss completion")
+                                loss = json.loads(losses[0].read_text())
+                                if not loss["unsynced_overwrite_discarded"] or "finished::clear-cache" not in loss["acknowledgement"]:
+                                    raise RuntimeError("Unqualified finality cache loss")
+                                wal = loss["validator_wal_files"]
+                                if not wal or not any(f["bytes_before"] > 0 for f in wal) or any(f["bytes_before"] != f["bytes_after"] or f["sha256_before"] != f["sha256_after"] for f in wal):
+                                    raise RuntimeError("Finality takeover WAL did not survive cache loss exactly")
+                        if transcript.count("independent overwrite control reverted to durable bytes") != (0 if node.no_cache_loss else 2):
+                            raise RuntimeError("Unexpected finality cache-loss count")
+                        reports = list((output / "node").rglob("finality-recovery.json"))
+                        if len(reports) != 1:
+                            raise RuntimeError("Missing finality cold consistency check")
+                        recovery = json.loads(reports[0].read_text())
+                        if recovery["complete_boots"] != 2 or recovery["pending_sources"] != 0 or not recovery["exact_block_and_certificate"] or recovery["governing_parameters"] != [19, 28, 29, 30]:
+                            raise RuntimeError("Finality cold consistency failed")
+                        result["finality_recovery"] = recovery
                     if node.cut.startswith("state-auto"):
                         recovery_stop = "Actual node refused services after exact startup state WAL sync EIO" if node.cut in ["state-auto-startup-sync-eio", "state-auto-rebuild-startup-sync-eio"] else "Unconfirmed state writer killed after WAL sync refusal" if node.cut in ["state-auto-state-sync-eio", "state-auto-rebuild-startup-sync-eio"] else "Actual node recovery interrupted at forward-after-row-sync" if node.cut == "state-auto" else "Actual node refused startup after scoped " + node.cut.removeprefix("state-auto-")
                         recovery_complete = "Actual dynamic node recovered unconfirmed state; no manual lease release or data repair" if node.cut in ["state-auto-state-sync-eio", "state-auto-rebuild-startup-sync-eio"] else "Actual dynamic node recovered automatically after recovery interruption; no manual lease release or data repair"
@@ -588,7 +623,7 @@ if __name__ == "__main__":
     mutation.add_argument("--omit-state-wal-sync", action="store_true", help="omit one scoped dynamic state publication WAL sync")
     mutation.add_argument("--omit-lease-wal-sync", action="store_true", help="omit one scoped repair lease mutation WAL sync")
     mutation.add_argument("--omit-validator-wal-sync", action="store_true", help="omit one scoped validator-state WAL sync")
-    parser.add_argument("--cut", choices=["state-auto-rebuild-startup-sync-eio", "state-auto-startup-sync-eio", "state-auto-state-sync-eio", "state-auto-selection-enospc", "state-auto-stage-enospc", "state-auto-publish-rename-eio", "state-auto-publish-sync-eio", "state-auto-publish-directory-sync-eio", "state-auto-wal-publish-sync-eio", "state-auto", "state", "rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire", "lease-custody", "validator-floor", "validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty", "persistent-fast", "persistent-head", "persistent-whole", "persistent-raw", "persistent-fast-file-eio", "persistent-fast-directory-eio", "persistent-head-file-eio", "persistent-head-directory-eio", "persistent-whole-file-eio", "persistent-whole-directory-eio", "persistent-raw-file-eio", "persistent-raw-directory-eio", "persistent-fast-rename-eio", "persistent-head-rename-eio", "persistent-whole-rename-eio", "persistent-raw-rename-eio", "persistent-fast-published-eio", "persistent-head-published-eio", "persistent-whole-published-eio", "persistent-raw-published-eio"], default="rows")
+    parser.add_argument("--cut", choices=["finality", "finality-ack", "state-auto-rebuild-startup-sync-eio", "state-auto-startup-sync-eio", "state-auto-state-sync-eio", "state-auto-selection-enospc", "state-auto-stage-enospc", "state-auto-publish-rename-eio", "state-auto-publish-sync-eio", "state-auto-publish-directory-sync-eio", "state-auto-wal-publish-sync-eio", "state-auto", "state", "rows", "ready", "selection", "stages", "committed", "cleaned", "root-last", "lease", "lease-acquire", "lease-custody", "validator-floor", "validator-retirement", "validator-claim", "validator-incarnation", "validator-journal", "validator-outbox", "validator-prune", "validator-prune-empty", "persistent-fast", "persistent-head", "persistent-whole", "persistent-raw", "persistent-fast-file-eio", "persistent-fast-directory-eio", "persistent-head-file-eio", "persistent-head-directory-eio", "persistent-whole-file-eio", "persistent-whole-directory-eio", "persistent-raw-file-eio", "persistent-raw-directory-eio", "persistent-fast-rename-eio", "persistent-head-rename-eio", "persistent-whole-rename-eio", "persistent-raw-rename-eio", "persistent-fast-published-eio", "persistent-head-published-eio", "persistent-whole-published-eio", "persistent-raw-published-eio"], default="rows")
     parser.add_argument("--no-cache-loss", action="store_true", help="run the same node cut without cache loss as a control")
     parser.add_argument("--node-test-binary", type=Path)
     parser.add_argument("--node-binary", type=Path)

@@ -120,3 +120,55 @@ pub(super) async fn verify(root: &Path, db: &Arc<InternalDb>, expected: &Publica
     eprintln!("Actual node retained finality recovery: two boots, source acknowledged, exact block and certificate durable");
     Ok(())
 }
+
+/// Observe only regular source files after the actual process has been reaped.
+/// This never opens a native DB or runs the source scanner before the loss cut.
+fn source_inventory(root: &Path) -> Result<BTreeMap<PathBuf, (usize, String)>> {
+    fn visit(root: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, (usize, String)>) -> Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() { visit(root, &entry.path(), files)?; }
+            else {
+                assert!(entry.file_type()?.is_file());
+                let bytes = fs::read(entry.path())?;
+                files.insert(entry.path().strip_prefix(root)?.to_owned(),
+                    (bytes.len(), hex::encode(rtos_block::sha256_digest(&bytes))));
+            }
+        }
+        Ok(())
+    }
+    let mut files = BTreeMap::new();
+    visit(root, &root.join("node_db/catchains/consensus/v2"), &mut files)?;
+    Ok(files)
+}
+
+pub(super) async fn discard(root: &Path, phase: &str, acknowledged: bool) -> Result<()> {
+    let enabled = std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")? == "1";
+    let before = source_inventory(root)?;
+    let pending = before.keys().filter(|p| p.extension().is_some_and(|e| e == "json")).count();
+    let ack = before.keys().filter(|p| p.extension().is_some_and(|e| e == "acked")).count();
+    assert_eq!(pending, usize::from(phase == "takeover"), "unexpected source retention at cut");
+    assert_eq!(ack, usize::from(acknowledged), "source ACK cut was not observed");
+    let config = fs::read(root.join("config.json"))?;
+    let _: serde_json::Value = serde_json::from_slice(&config)?;
+    if enabled {
+        cache_loss::clear(root).await?;
+        let report = root.join(format!("finality-{phase}-cache-loss.json"));
+        fs::copy(root.join("cache-loss.json"), &report)?;
+        keep_evidence(root, &report)?;
+    }
+    let after = source_inventory(root)?;
+    assert_eq!(before, after, "durable source files changed after cache loss");
+    assert_eq!(config, fs::read(root.join("config.json"))?, "node configuration lost during finality recovery");
+    let report = root.join(format!("finality-{phase}-source.json"));
+    fs::write(&report, serde_json::to_vec_pretty(&serde_json::json!({
+        "phase": phase, "cache_loss": enabled, "source_files": before,
+        "source_pending": pending, "source_acknowledged": ack,
+        "exact_source_bytes": true, "config_bytes": config.len(),
+        "config_sha256": hex::encode(rtos_block::sha256_digest(&config)),
+        "native_database_reopened": false,
+    }))?)?;
+    keep_evidence(root, &report)?;
+    eprintln!("Finality {phase} source files and config preserved; cache-loss={enabled}");
+    Ok(())
+}
