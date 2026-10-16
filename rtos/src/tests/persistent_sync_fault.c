@@ -35,6 +35,8 @@ static int sync_or_fail(int fd, long syscall_number) {
             selected = digits && s[digits]=='.';
             if (selected) { s += digits+1; digits=strspn(s,"0123456789"); selected=digits && !strcmp(s+digits,".tmp"); }
         }
+    } else if (!strcmp(phase, "published")) {
+        selected = S_ISREG(info.st_mode) && info.st_size > 0 && !strcmp(path,target);
     } else if (!strcmp(phase, "directory")) {
         const char *slash = strrchr(target,'/');
         struct stat published;
