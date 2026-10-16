@@ -1,5 +1,5 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
-// Test-only causal control: omit sync only for one isolated fixture's selected manifest.
+// Test-only causal control: omit sync only for one isolated fixture's selected recovery file.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -16,7 +16,7 @@ static int selected(int fd, char path[PATH_MAX]) {
     const char *marker = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_MARKER");
     const char *file = getenv("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE");
     if (!root || !marker || !*root || !file
-        || (strcmp(file, "ready.v1") && strcmp(file, "selection.v1"))) return 0;
+        || (strcmp(file, "ready.v1") && strcmp(file, "selection.v1") && strcmp(file, "stage"))) return 0;
     size_t prefix = strlen(root);
     if (root[prefix - 1] != '/') return 0;
     char link[64];
@@ -28,12 +28,25 @@ static int selected(int fd, char path[PATH_MAX]) {
     const char *fixture = path + prefix;
     const char *end = strchr(fixture, '/');
     if (!end || end == fixture || strncmp(fixture, ".tmp", 4)) return 0;
+    const char *operation;
     const char parent[] = "/node_db/archive/recovery/";
-    if (strncmp(end, parent, sizeof(parent) - 1)) return 0;
-    const char *operation = end + sizeof(parent) - 1;
-    if (strlen(operation) != 33 + strlen(file)
-        || strspn(operation, "0123456789abcdef") != 32
-        || operation[32] != '/' || strcmp(operation + 33, file)) return 0;
+    if (!strncmp(end, parent, sizeof(parent) - 1)) {
+        operation = end + sizeof(parent) - 1;
+    } else if (!strcmp(file, "stage") && !strncmp(end, "/epochs/epoch_", 14)) {
+        const char *number = end + 14;
+        size_t digits = strspn(number, "0123456789");
+        const char suffix[] = "/archive/recovery/";
+        if (!digits || strncmp(number + digits, suffix, sizeof(suffix) - 1)) return 0;
+        operation = number + digits + sizeof(suffix) - 1;
+    } else return 0;
+    if (strlen(operation) < 34 || strspn(operation, "0123456789abcdef") != 32
+        || operation[32] != '/') return 0;
+    const char *leaf = operation + 33;
+    if (!strcmp(file, "stage")) {
+        if (strlen(leaf) != 75 || strncmp(leaf, "stage-", 6)
+            || strspn(leaf + 6, "0123456789abcdef") != 64
+            || strcmp(leaf + 70, ".pack")) return 0;
+    } else if (strcmp(leaf, file)) return 0;
     struct stat info;
     return !fstat(fd, &info) && S_ISREG(info.st_mode) && info.st_size > 28;
 }
