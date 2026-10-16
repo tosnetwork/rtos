@@ -26,6 +26,8 @@ pub fn open_node_db(
 pub struct NodeDbBootstrap {
     db: Arc<RocksDb>,
     pending: Option<crate::archives::recovery_root::RootHeader>,
+    recovery_started: bool,
+    recovery_complete: bool,
     providers: Option<crate::archives::recovery_providers::RecoveryProviders>,
 }
 impl NodeDbBootstrap {
@@ -48,7 +50,35 @@ impl NodeDbBootstrap {
         ).await?);
         Ok(())
     }
+    /// Existing durable protection must have been rebuilt before this call.
+    pub async fn recover_pending(&mut self) -> Result<()> {
+        if self.recovery_started { fail!("Bootstrap recovery already started; reopen after failure or cancellation"); }
+        let root = self.pending.clone().ok_or_else(|| error!("No pending node recovery"))?;
+        if root.state != crate::archives::recovery_root::State::Cleaned {
+            fail!("Archive recovery state is not implemented yet: {:?}", root.state);
+        }
+        #[cfg(not(target_os = "linux"))]
+        { fail!("Archive bootstrap recovery requires Linux"); }
+        #[cfg(target_os = "linux")]
+        {
+            let providers = self.providers.take().ok_or_else(|| error!("Recovery providers have not been validated"))?;
+            self.recovery_started = true;
+            let protection = providers.protection.clone();
+            let deletion = protection.deletion().await;
+            let mutation = protection.artifact_mutation().await;
+            tokio::task::spawn_blocking(move || {
+                let _guards = (mutation, deletion);
+                crate::archives::recovery_worker::recover_cleaned(providers, root)
+            }).await.map_err(|e| error!("Native bootstrap recovery failed: {e}"))??;
+            self.recovery_complete = true;
+            self.pending = None;
+            Ok(())
+        }
+    }
     pub fn finish(self) -> Result<Arc<RocksDb>> {
+        if self.recovery_started && !self.recovery_complete {
+            fail!("Bootstrap recovery has no successful completion receipt");
+        }
         if self.pending.is_some() {
             crate::archives::recovery_guard::ensure_open_provider_clear(
                 self.db.db(), self.db.db().path().parent().expect("node DB has a parent"),
@@ -82,7 +112,7 @@ pub fn open_node_db_for_bootstrap(
         crate::archives::recovery_guard::ensure_root_controls_clear(db.db())?;
         if deferred_cleanup { db.finish_ordinary_bootstrap()?; }
     }
-    Ok(NodeDbBootstrap { db, pending, providers: None })
+    Ok(NodeDbBootstrap { db, pending, providers: None, recovery_started: false, recovery_complete: false })
 }
 
 fn open_physical(

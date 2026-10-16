@@ -343,7 +343,7 @@ async fn pending_archive_root_precedes_ledger_creation_and_other_node_services()
         ).await;
         let error = outcome.err().expect("pending root started ordinary services");
         let message = format!("{error:#}");
-        assert!(message.contains(match ledger { "missing" => "ledger presence", "corrupt" => "generation length", _ => "Pending archive root" }), "{message}");
+        assert!(message.contains(match ledger { "missing" => "ledger presence", "corrupt" => "generation length", _ => "Archive recovery state is not implemented yet: Building" }), "{message}");
         assert!(!dir.path().join("catchains").exists());
         assert!(!dir.path().join("archive").exists());
         let db = open_node_db(dir.path(), &small_config(), AccessType::ReadWrite)?;
@@ -376,5 +376,120 @@ async fn pending_archive_bootstrap_rebuilds_real_lease_protection_on_same_provid
     bootstrap.inspect_recovery_providers(None, leases.protection()).await?;
     assert!(bootstrap.finish().is_err());
     assert_eq!(db.db().get(b"ArchiveTruncationRootV1")?.as_deref(), Some(root.as_slice()));
+    Ok(())
+}
+
+const CLEANED_CHILD: &str = "internal_db::node_db_recovery_tests::node_cleaned_recovery_crash_writer";
+const CLEANED_ENV: &str = "RTOS_CLEANED_RECOVERY_FIXTURE";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "child process fixture"]
+async fn node_cleaned_recovery_crash_writer() -> Result<()> {
+    use crate::publication_dependency_leases::DependencyLeases;
+    let root = std::path::PathBuf::from(std::env::var(CLEANED_ENV)?);
+    let db = open_node_db(&root, &small_config(), AccessType::ReadWrite)?;
+    let _leases = DependencyLeases::open(db.clone(), true)?;
+    let states = ShardStateDb::new(
+        db.clone(),
+        STATE_TABLE,
+        CELLS_CF_NAME,
+        CELLSCOUNTERS_CF_NAME,
+        small_config(),
+        #[cfg(feature = "telemetry")]
+        Arc::new(StorageTelemetry::default()),
+        Arc::new(StorageAlloc::default()),
+    )?;
+    let sentinel = db.clone().table::<UInt256>(SENTINEL_TABLE, true)?;
+    // Two independent root references to one child produce a real counter Merge.
+    let child = BuilderData::with_raw(vec![0x31], 8)?.into_cell()?;
+    for seq in [1, 2] {
+        let mut builder = BuilderData::with_raw(vec![seq as u8], 8)?;
+        builder.checked_append_reference(child.clone())?;
+        let cell = builder.into_cell()?;
+        let id = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            seq,
+            cell.repr_hash().clone(),
+            UInt256::default(),
+        );
+        states.put(&id, cell, None).await?;
+        states.sync_pending().await?;
+    }
+    sentinel.put_raw(SENTINEL_KEY, SENTINEL_VALUE)?;
+    db.sync_wal()?;
+    let counters = db.clone().table::<UInt256>(CELLSCOUNTERS_CF_NAME, false)?;
+    assert_eq!(
+        counters.try_get_raw(child.repr_hash().as_slice())?.unwrap().as_ref(),
+        &2u32.to_le_bytes()
+    );
+    assert!(db.db().live_files()?.is_empty(), "fixture must recover cells from WAL, not SST files");
+    let manifest = snapshot(&db)?;
+    assert_eq!(manifest.iter().filter(|row| row.family == CELLS_CF_NAME).count(), 3);
+    assert_eq!(manifest.iter().filter(|row| row.family == CELLSCOUNTERS_CF_NAME).count(), 3);
+    fs::write(root.join("manifest.json"), serde_json::to_vec(&manifest)?)?;
+    for name in ["files", "key_files"] { db.db().create_cf(name, &Default::default())?; }
+    // Independent wire fixture for the final durable state, with sidecars
+    // already removed by a prior cleanup attempt. No archive rows are present.
+    let mut header = pending_archive_root_bytes(&db)?;
+    header[10] = 4; header[11] = 3; // Cleaned, node policy, aborted Building.
+    let identity = db.db().get_db_identity()?;
+    let absolute = fs::canonicalize(&root)?;
+    let raw = absolute.as_os_str().as_encoded_bytes();
+    let mut anchor = b"RTOS archive recovery anchor v1".to_vec();
+    anchor.push(1); anchor.extend_from_slice(&(raw.len() as u64).to_le_bytes()); anchor.extend_from_slice(raw);
+    let mut descriptor = vec![0u8; 93];
+    descriptor[..4].copy_from_slice(&[1, 0, 7, 1]);
+    descriptor[4..36].copy_from_slice(&rtos_block::sha256_digest(anchor));
+    descriptor[36..44].copy_from_slice(&(identity.len() as u64).to_le_bytes());
+    descriptor[44..76].copy_from_slice(&rtos_block::sha256_digest(identity));
+    let mut providers = 93u64.to_le_bytes().to_vec();
+    providers.extend_from_slice(&rtos_block::sha256_digest(descriptor));
+    header[164..172].copy_from_slice(&1u64.to_le_bytes());
+    header[172..204].copy_from_slice(&rtos_block::sha256_digest(providers));
+    let empty = rtos_block::sha256_digest([]);
+    header[212..244].copy_from_slice(&empty); header[252..284].copy_from_slice(&empty);
+    let checksum = rtos_block::sha256_digest(&header[..284]); header[284..].copy_from_slice(&checksum);
+    let controls = root.join("archive/recovery").join(hex::encode([4u8;16]));
+    fs::create_dir_all(&controls)?;
+    for directory in [&controls, controls.parent().unwrap(), controls.parent().unwrap().parent().unwrap(), root.as_path()] {
+        fs::File::open(directory)?.sync_all()?;
+    }
+    db.db().put(b"recovery-sentinel", b"acknowledged-before-interruption")?;
+    db.db().put(b"ArchiveTruncationRootV1", header)?;
+    db.sync_wal()?;
+    fs::write(root.join("child-ready"), b"ready")?;
+    loop { tokio::time::sleep(Duration::from_secs(1)).await; }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_node_restart_finishes_cleaned_recovery_and_preserves_data() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut child = KillOnDrop(Command::new(std::env::current_exe()?)
+        .args(["--exact", CLEANED_CHILD, "--ignored", "--nocapture"])
+        .env(CLEANED_ENV, dir.path()).stdout(Stdio::null())
+        .stderr(Stdio::from(fs::File::create(dir.path().join("child.log"))?)).spawn()?);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !dir.path().join("child-ready").exists() {
+        if let Some(status) = child.0.try_wait()? { fail!("Recovery fixture exited {status}: {}", fs::read_to_string(dir.path().join("child.log"))?); }
+        if Instant::now() >= deadline { child.0.kill()?; child.0.wait()?; fail!("Recovery fixture readiness timeout"); }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    child.0.kill()?; assert!(!child.0.wait()?.success());
+    let db = InternalDb::with_update(
+        InternalDbConfig { db_directory: dir.path().to_string_lossy().into_owned(), cells_db_config: small_config(), ..Default::default() },
+        false, false, false, None, &|| Ok(()), None, Arc::new(AtomicU8::new(0)), None,
+        #[cfg(feature = "telemetry")] create_engine_telemetry(), create_engine_allocated(),
+    ).await?;
+    let physical = db.recovery_node_db.clone();
+    verify(&physical, dir.path())?;
+    assert!(physical.db().get(b"ArchiveTruncationRootV1")?.is_none());
+    assert!(physical.db().get(b"ArchiveTruncationParticipantV1")?.is_none());
+    assert_eq!(physical.db().get(b"recovery-sentinel")?.as_deref(), Some(b"acknowledged-before-interruption".as_slice()));
+    assert!(!dir.path().join("archive/recovery").join(hex::encode([4u8;16])).exists());
+    db.stop_states_db().await?; drop(db); release(physical).await?;
+    let reopened = open_node_db(dir.path(), &small_config(), AccessType::ReadWrite)?;
+    verify(&reopened, dir.path())?;
+    assert!(reopened.db().get(b"ArchiveTruncationRootV1")?.is_none());
+    assert_eq!(reopened.db().get(b"recovery-sentinel")?.as_deref(), Some(b"acknowledged-before-interruption".as_slice()));
     Ok(())
 }

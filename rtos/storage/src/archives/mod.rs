@@ -67,3 +67,6 @@ pub mod io_owners;
 pub mod context;
 
 mod native_read;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod recovery_worker;

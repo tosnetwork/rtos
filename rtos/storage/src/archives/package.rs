@@ -836,5 +836,5 @@ mod state_ownership_tests {
 mod native_writer_tests;
 
 #[path = "package_retirement.rs"]
-mod retirement;
+pub(super) mod retirement;
 pub(super) fn retirement_restart_required() -> bool { retirement::restart_required() }

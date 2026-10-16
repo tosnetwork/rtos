@@ -5,14 +5,14 @@ use std::sync::Mutex;
 
 const QUARANTINE_CAPACITY: usize = 64;
 struct Quarantine {
-    slots: Mutex<[Option<Arc<PackageState>>; QUARANTINE_CAPACITY]>,
+    slots: Mutex<[Option<Arc<dyn Send + Sync>>; QUARANTINE_CAPACITY]>,
     restart: AtomicBool,
 }
 impl Quarantine {
     const fn new() -> Self {
         Self { slots: Mutex::new([const { None }; QUARANTINE_CAPACITY]), restart: AtomicBool::new(false) }
     }
-    fn reserve(&self, state: &Arc<PackageState>) -> Result<Reservation<'_>> {
+    fn reserve<T: Send + Sync + 'static>(&self, state: &Arc<T>) -> Result<Reservation<'_>> {
         if self.restart.load(Ordering::Acquire) { fail!("Package close requires process restart"); }
         let mut slots = self.slots.lock().map_err(|_| {
             self.restart.store(true, Ordering::Release);
@@ -33,9 +33,9 @@ pub(super) fn restart_required() -> bool { QUARANTINE.restart.load(Ordering::Acq
 // Reservation precedes taking the actual file. An error or unwind leaves a
 // strong provider pin in a preallocated process slot; there is no retry/drop of
 // an ambiguous raw descriptor. The global slots never drain during shutdown.
-struct Reservation<'a> { quarantine: &'a Quarantine, index: usize, complete: bool }
+pub(in crate::archives) struct Reservation<'a> { quarantine: &'a Quarantine, index: usize, complete: bool }
 impl Reservation<'_> {
-    fn complete(mut self) {
+    pub(in crate::archives) fn complete(mut self) {
         let retained = self.quarantine.slots.lock().unwrap_or_else(|e| e.into_inner())[self.index].take();
         self.complete = true;
         drop(retained);
@@ -93,3 +93,7 @@ fn close_once(file: std::fs::File) -> Result<()> {
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../tests/test_package_retirement.rs"]
 mod tests;
+
+pub(in crate::archives) fn reserve_resources<T: Send + Sync + 'static>(owner: &Arc<T>) -> Result<Reservation<'static>> {
+    QUARANTINE.reserve(owner)
+}

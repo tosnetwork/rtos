@@ -461,10 +461,11 @@ impl InternalDb {
         )?;
         if bootstrap.requires_recovery() {
             bootstrap.inspect_recovery_providers(config.archival_mode.as_ref(), repair_leases.protection()).await?;
+            bootstrap.recover_pending().await?;
         }
         // Keep this exact ledger/protection Arc for recovery and normal startup.
-        // Pending recovery currently refuses here until the owned root worker
-        // completes; no catchain, handle, archive or state constructor runs first.
+        // Recovery must complete before catchain, handle, archive or state
+        // construction. Unsupported recovery states continue to refuse startup.
         let db = bootstrap.finish()?;
         let db_catchain = RocksDb::new(
             config.db_directory.as_str(),
