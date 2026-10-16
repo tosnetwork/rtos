@@ -90,7 +90,7 @@ mod truncation_recovery;
 #[ignore = "requires RTOS_NODE_RECOVERY_BINARY built from this revision"]
 async fn actual_node_retries_truncation_without_publishing_failed_progress() -> Result<()> {
     for retained in [2, 3] {
-        exercise_nonzero_recovery_case(false, None, Some(retained)).await?;
+        exercise_nonzero_recovery_case(false, None, Some((retained, None))).await?;
     }
     Ok(())
 }
@@ -99,9 +99,26 @@ async fn actual_node_retries_truncation_without_publishing_failed_progress() -> 
 #[ignore = "requires gdb and RTOS_NODE_RECOVERY_BINARY with current debug symbols"]
 async fn actual_node_resumes_after_truncation_before_progress_publication() -> Result<()> {
     for retained in [2, 3] {
-        exercise_nonzero_recovery_case(true, None, Some(retained)).await?;
+        exercise_nonzero_recovery_case(
+            true,
+            None,
+            Some((retained, Some("truncation-before-progress"))),
+        )
+        .await?;
     }
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires gdb; known incomplete archive transaction recovery"]
+async fn actual_node_resumes_repack_before_rename_retaining_height_two() -> Result<()> {
+    exercise_nonzero_recovery_case(false, None, Some((2, Some("repack-before-rename")))).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires gdb; known incomplete archive transaction recovery"]
+async fn actual_node_resumes_repack_before_rename_retaining_height_three() -> Result<()> {
+    exercise_nonzero_recovery_case(false, None, Some((3, Some("repack-before-rename")))).await
 }
 
 async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&str>) -> Result<()> {
@@ -111,7 +128,7 @@ async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&s
 async fn exercise_nonzero_recovery_case(
     interrupt_recovery: bool,
     building: Option<&str>,
-    truncation: Option<u32>,
+    truncation: Option<(u32, Option<&str>)>,
 ) -> Result<()> {
     let binary = fs::canonicalize(std::env::var("RTOS_NODE_RECOVERY_BINARY")?)?;
     let dir = tempfile::tempdir()?;
@@ -123,7 +140,7 @@ async fn exercise_nonzero_recovery_case(
     tokio::time::timeout(Duration::from_secs(60), wait_for_db_release(physical)).await?;
     let db = open_db(root).await?;
     fixture.assert_imported(&db, 4).await?;
-    let lease = if let Some(retained) = truncation {
+    let lease = if let Some((retained, _)) = truncation {
         Some(truncation_recovery::prepare(&db, &fixture, retained).await?)
     } else {
         None
@@ -176,7 +193,7 @@ async fn exercise_nonzero_recovery_case(
             &fixture,
             before,
             lease,
-            interrupt_recovery,
+            truncation.and_then(|(_, cut)| cut),
         )
         .await;
     }
@@ -419,7 +436,9 @@ async fn interrupt_actual_recovery(
     statement: &str,
 ) -> Result<()> {
     use std::os::unix::process::CommandExt;
-    let (source, source_file) = if cut == "truncation-before-progress" {
+    let (source, source_file) = if cut == "repack-before-rename" {
+        (include_str!("../../storage/src/archives/archive_slice.rs"), "archive_slice.rs")
+    } else if cut == "truncation-before-progress" {
         (include_str!("../internal_db/restore.rs"), "restore.rs")
     } else {
         (include_str!("../../storage/src/archives/recovery_worker.rs"), "recovery_worker.rs")
@@ -428,7 +447,9 @@ async fn interrupt_actual_recovery(
         source.lines().enumerate().filter(|(_, line)| line.trim() == statement).collect();
     assert_eq!(matches.len(), 1, "crash cut must identify one production statement");
     let line = matches[0].0 + 1;
-    let function = if cut == "truncation-before-progress" {
+    let function = if cut == "repack-before-rename" {
+        "storage::archives::archive_slice::{impl#0}::trunc::"
+    } else if cut == "truncation-before-progress" {
         "internal_db::restore::restore"
     } else if cut == "stage-after-unlink" {
         "recovery_worker::clean_stage"
