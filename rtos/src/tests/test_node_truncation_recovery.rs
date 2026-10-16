@@ -89,6 +89,7 @@ pub(super) async fn run(
     let validator_batch = match interrupt {
         Some("validator-retirement-cache-loss") => Some(validator_retirement_loss::BatchKind::Retirement),
         Some("validator-claim-cache-loss") => Some(validator_retirement_loss::BatchKind::Claim),
+        Some("validator-journal-cache-loss") => Some(validator_retirement_loss::BatchKind::Journal),
         Some("validator-incarnation-cache-loss") => Some(validator_retirement_loss::BatchKind::Incarnation),
         _ => None,
     };
