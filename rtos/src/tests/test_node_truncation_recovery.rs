@@ -127,12 +127,33 @@ pub(super) async fn run(
             "repack-after-rename" => {
                 "sync_child(destination.last().unwrap(), &new)"
             }
+            "forward-before-cleanup" => "scan(providers, &committed, Pass::Cleanup)?;",
             "producer-selection-before-finish" => "let (file, selection) = writer.finish()?;",
             "producer-ready-before-finish" => "let (file, ready) = writer.finish()?;",
             _ => rtos_block::fail!("Unknown truncation cut {cut}"),
         };
         interrupt_actual_recovery(binary, root, zero, cut, statement).await?;
         assert!(root.join("node_db/ton_node.restoring").is_file());
+        if cut == "forward-before-cleanup" {
+            assert_ne!(package_inventory(root)?, before, "Committed cut preceded canonical replacement");
+            let mut ready = Vec::new();
+            let mut stages = 0;
+            find_ready_staging(root, &mut ready, &mut stages)?;
+            assert_eq!(ready.len(), 1, "Committed recovery must retain its Ready manifest");
+            let ready_before = fs::read(&ready[0])?;
+            keep_evidence(root, &ready[0])?;
+            // Restart through the real Committed replay and interrupt after
+            // cleanup, before publishing Cleaned. No native test edits intervene.
+            interrupt_actual_recovery(binary, root, zero, "forward-before-cleaned",
+                "store_successor(providers, &committed, &cleaned)?;").await?;
+            let mut remaining = Vec::new();
+            let mut remaining_stages = 0;
+            find_ready_staging(root, &mut remaining, &mut remaining_stages)?;
+            assert_eq!(remaining.len(), 1, "Ready must remain until Cleaned publication");
+            assert_eq!(remaining_stages, 0, "owned stages survived Committed cleanup");
+            assert_eq!(ready_before, fs::read(&remaining[0])?);
+            eprintln!("Actual node interrupted before Committed cleanup and again before Cleaned publication");
+        }
         if cut == "producer-selection-before-finish" {
             assert_eq!(package_inventory(root)?, before, "Selection production changed canonical packages");
             let mut ready = Vec::new();

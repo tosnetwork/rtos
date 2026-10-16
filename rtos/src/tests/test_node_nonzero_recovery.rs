@@ -151,6 +151,18 @@ async fn actual_node_resumes_partial_selection_before_building() -> Result<()> {
     exercise_nonzero_recovery_case(false, None, Some((2, Some("producer-selection-before-finish")))).await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node binary, public fixture signer, and gdb"]
+async fn actual_node_resumes_committed_cleanup_retaining_height_two() -> Result<()> {
+    exercise_nonzero_recovery_case(false, None, Some((2, Some("forward-before-cleanup")))).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires production node binary, public fixture signer, and gdb"]
+async fn actual_node_resumes_committed_cleanup_retaining_height_three() -> Result<()> {
+    exercise_nonzero_recovery_case(false, None, Some((3, Some("forward-before-cleanup")))).await
+}
+
 async fn exercise_nonzero_recovery(interrupt_recovery: bool, building: Option<&str>) -> Result<()> {
     exercise_nonzero_recovery_case(interrupt_recovery, building, None).await
 }
@@ -466,7 +478,7 @@ async fn interrupt_actual_recovery(
     statement: &str,
 ) -> Result<()> {
     use std::os::unix::process::CommandExt;
-    let (source, source_file) = if cut.starts_with("repack-") {
+    let (source, source_file) = if cut.starts_with("repack-") || cut.starts_with("forward-") {
         (include_str!("../../storage/src/archives/recovery_forward.rs"), "recovery_forward.rs")
     } else if cut.starts_with("producer-") {
         (include_str!("../../storage/src/archives/recovery_producer.rs"), "recovery_producer.rs")
@@ -481,6 +493,8 @@ async fn interrupt_actual_recovery(
     let line = matches[0].0 + 1;
     let function = if cut.starts_with("repack-") {
         "storage::archives::recovery_forward::publish_package"
+    } else if cut.starts_with("forward-") {
+        "storage::archives::recovery_forward::recover"
     } else if cut.starts_with("producer-") {
         "storage::archives::recovery_producer::"
     } else if cut == "truncation-before-progress" {
