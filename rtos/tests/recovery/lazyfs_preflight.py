@@ -132,6 +132,23 @@ def run(binary, output, node=None):
                     "RTOS_PUBLIC_FIXTURE_SIGNER": str(node.fixture_signer.resolve(strict=True)),
                     "RTOS_NODE_RECOVERY_EVIDENCE_DIR": str(output / "node"),
                 })
+                if node.omit_ready_sync:
+                    if environment.get("LD_PRELOAD"):
+                        raise RuntimeError("Sync sensitivity requires an otherwise clean preload environment")
+                    source = Path(__file__).with_name("omit_ready_sync.c")
+                    library = output / "omit-ready-sync.so"
+                    shutil.copyfile(source, output / source.name)
+                    subprocess.run(["cc", "-shared", "-fPIC", "-O2", "-Wall", "-Wextra", "-Werror",
+                                    str(source), "-o", str(library)], check=True, timeout=30,
+                                   capture_output=True)
+                    environment.update({
+                        "LD_PRELOAD": str(library),
+                        "RTOS_TEST_OMIT_READY_SYNC_ROOT": str(fixture_dir) + "/",
+                        "RTOS_TEST_OMIT_READY_SYNC_MARKER": str(output / "ready-sync-omitted.log"),
+                    })
+                    result["sync_mutation"] = {"kind": "omit Ready file sync only",
+                                               "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                                               "library_sha256": hashlib.sha256(library.read_bytes()).hexdigest()}
                 with (output / "node-test.log").open("wb") as log:
                     case = "actual_node_sparse_packages_interrupted_metadata" if node.no_cache_loss else "actual_node_sparse_packages_cache_loss"
                     if node.cut == "ready":
@@ -163,12 +180,33 @@ def run(binary, output, node=None):
                 if remaining:
                     raise RuntimeError("Node test left owned processes running")
                 result["node_test_exit"] = executed.returncode
-                if executed.returncode != 0:
-                    raise RuntimeError(f"Actual node cache-loss test failed: {executed.returncode}")
                 transcript = (output / "node-test.log").read_text()
-                required_evidence = ["1 passed; 0 failed", "Actual node retried real truncation",
-                                     "Actual node recovery interrupted at " + (
-                                         "producer-ready-cache-loss" if node.cut == "ready" else "forward-after-row-sync")]
+                expected_failure = node.omit_ready_sync and not node.no_cache_loss
+                result["node_failure_expected"] = expected_failure
+                if node.omit_ready_sync:
+                    marker = (output / "ready-sync-omitted.log").read_text().splitlines()
+                    if len(marker) != 1 or not marker[0].startswith("fsync omitted: " + str(fixture_dir) + "/") or not marker[0].endswith("/ready.v1"):
+                        raise RuntimeError("Ready sync mutation did not hit exactly one scoped file")
+                    result["sync_mutation"]["hits"] = marker
+                required_evidence = ["Actual node recovery interrupted at " + (
+                    "producer-ready-cache-loss" if node.cut == "ready" else "forward-after-row-sync")]
+                if expected_failure:
+                    if executed.returncode != 101:
+                        raise RuntimeError("Sync omission did not produce the expected Rust test failure")
+                    required_evidence.extend(["0 passed; 1 failed", "Truncation retry",
+                                              "Recovery sidecar type or length mismatch"])
+                    reports = list((output / "node").rglob("cache-loss.json"))
+                    if len(reports) != 1:
+                        raise RuntimeError("Missing unique cache-loss report")
+                    ready = json.loads(reports[0].read_text())["ready_files"]
+                    if len(ready) != 1 or ready[0]["bytes_before"] <= 28 or ready[0]["bytes_after"] != 0:
+                        raise RuntimeError("Sync omission did not lose the published Ready contents")
+                    result["lost_ready"] = ready[0]
+                    result["sensitivity_detected"] = True
+                else:
+                    if executed.returncode != 0:
+                        raise RuntimeError(f"Actual node cache-loss test failed: {executed.returncode}")
+                    required_evidence.extend(["1 passed; 0 failed", "Actual node retried real truncation"])
                 if node.cut == "ready":
                     required_evidence.append("Unfinished Ready cache-loss=" + ("false" if node.no_cache_loss else "true"))
                 if not node.no_cache_loss:
@@ -227,6 +265,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lazyfs", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--omit-ready-sync", action="store_true", help="scoped Ready sync omission sensitivity control")
     parser.add_argument("--cut", choices=["rows", "ready"], default="rows")
     parser.add_argument("--no-cache-loss", action="store_true", help="run the same node cut without cache loss as a control")
     parser.add_argument("--node-test-binary", type=Path)
@@ -236,4 +275,6 @@ if __name__ == "__main__":
     node_args = [args.node_test_binary, args.node_binary, args.fixture_signer]
     if any(node_args) and not all(node_args):
         parser.error("all three node binary/signer arguments are required together")
+    if args.omit_ready_sync and (not all(node_args) or args.cut != "rows"):
+        parser.error("Ready sync sensitivity requires all node arguments and --cut rows")
     run(args.lazyfs.resolve(strict=True), args.output.resolve(), args if all(node_args) else None)

@@ -17,6 +17,15 @@ pub(super) fn sync_fixture(path: &Path) -> Result<()> {
 }
 
 pub(super) async fn clear(root: &Path) -> Result<()> {
+    let mut ready = Vec::new();
+    let mut stages = 0;
+    truncation_recovery::find_ready_staging(root, &mut ready, &mut stages)?;
+    let mut ready_before = Vec::new();
+    for path in &ready {
+        let bytes = fs::read(path)?;
+        keep_evidence(root, path)?;
+        ready_before.push((bytes.len(), hex::encode(rtos_block::sha256_digest(&bytes))));
+    }
     let control = root.join("cache-loss-control");
     let old = b"old durable data";
     let new = b"new volatile txt";
@@ -51,10 +60,20 @@ pub(super) async fn clear(root: &Path) -> Result<()> {
         }
     }).await??;
     assert_eq!(fs::read(&control)?, old, "cache loss did not discard unsynced overwrite");
+    let mut ready_files = Vec::new();
+    for (path, (length, digest)) in ready.iter().zip(ready_before) {
+        let bytes = fs::read(path)?;
+        ready_files.push(serde_json::json!({
+            "path": path.strip_prefix(root)?, "bytes_before": length,
+            "sha256_before": digest, "bytes_after": bytes.len(),
+            "sha256_after": hex::encode(rtos_block::sha256_digest(&bytes)),
+        }));
+    }
     let report = root.join("cache-loss.json");
     fs::write(&report, serde_json::to_vec(&serde_json::json!({
         "acknowledgement": std::str::from_utf8(&acknowledgement)?,
         "unsynced_overwrite_discarded": true,
+        "ready_files": ready_files,
         "scope": "LazyFS file-data cache loss; directory metadata loss unproven"
     }))?)?;
     keep_evidence(root, &report)?;
