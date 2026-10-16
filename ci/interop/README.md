@@ -59,13 +59,34 @@ processing at least MC4. This log is not an independent applied-state check. Thi
 not close the full mixed-validator gate or prove every transaction/state profile
 and every Rust leadership case.
 
-The initial `8f083dc` active run reached MC4 with C++ weight 34 and Rust weight
-17 against quorum 46 (total 68). Native QUIC uses ALPN `tos` in both directions.
-This bounded result demonstrates required Rust voting participation. The initial
-fixture provisions the Genesis masterchain session only when Genesis has no
-shard descriptors; subsequent workchain and future-session provisioning remains
-unfinished. Preserve shutdown receipts: a forced test-process stop is not an
-orderly-shutdown or recovery qualification.
+The original bounded MC4 result demonstrated required Rust voting participation.
+The preparer now includes enabled workchains whose first shard descriptor is
+not yet in Genesis, and explicitly provisions current and immediate-successor
+sessions of the initial set. It refuses a separate next validator set; this is
+not live key rotation. The node advertises global-version support through 16,
+matching the active fixture. The C++ baseline advertises a higher ceiling (19);
+full later-version node qualification remains outstanding.
+
+To require a Rust-created block with matching applied-state checkpoints:
+
+```sh
+"$CPP_PYTHON" ci/interop/mixed_bootstrap.py \
+  --snapshot "$CPP_SNAPSHOT" --rust-node "$RUST_NODE" \
+  --validator-preparer "$VALIDATOR_PREPARER" --block-checker "$BLOCK_CHECKER" \
+  --require-leadership --min-height 4 --cpp-count 3 \
+  --output "$LEADERSHIP_OUTPUT" --base-port 55600 --timeout 180
+```
+
+All three native RPCs must report the same produced masterchain block and
+applied state. The independent BOC checker authenticates file/cell/header/state
+update hashes and reads `BlockExtra.created_by` from the body. Acceptance also
+requires the creator to equal Rust's authenticated validator ID and the
+corresponding local collation success log. With `--cpp-count 3`, C++ alone has
+quorum, so height progress is insufficient; leadership verification is mandatory.
+With the default two C++ nodes, Rust is also necessary for quorum. Complete
+transaction profiles, both mixed directions, workchain leadership and rotation
+remain separate acceptance requirements. Preserve shutdown receipts: a forced
+process stop is not an orderly-shutdown or recovery qualification.
 
 `overlay-node-vector.cpp` uses the production C++ TL serializer to generate
 the two wire fixtures in `adnl/src/overlay/testdata/`. The adjacent JSON pins

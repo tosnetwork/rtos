@@ -78,45 +78,59 @@ async fn main() -> anyhow::Result<()> {
         Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(transport_seed.as_slice())?;
     let stable_id = public_seed("id", args.member);
     let key_seqno = extra.last_key_block.as_ref().map_or(0, |block| block.seq_no);
-    let mut shards = vec![ShardIdent::masterchain()];
+    if config.next_validator_set_present()? {
+        fail!("Interop Genesis preparation requires one initial validator set");
+    }
+    let mut shards = vec![(ShardIdent::masterchain(), extra.validator_info.catchain_seqno)];
     extra.shards().iterate_shards(|shard, _| {
-        shards.push(shard);
+        let cc = extra.shards().calc_shard_cc_seqno(&shard)?;
+        shards.push((shard, cc));
+        Ok(true)
+    })?;
+    // Genesis can describe an enabled workchain before its first shard entry
+    // appears. That first full-shard session starts with catchain sequence zero.
+    config.workchains()?.iterate_with_keys(|workchain: i32, descr| {
+        if descr.active() && !shards.iter().any(|(shard, _)| shard.workchain_id() == workchain) {
+            shards.push((ShardIdent::with_workchain_id(workchain)?, 0));
+        }
         Ok(true)
     })?;
     let mut runtimes = Vec::new();
-    for shard in shards {
-        let cc = if shard.is_masterchain() {
-            extra.validator_info.catchain_seqno
-        } else {
-            extra.shards().calc_shard_cc_seqno(&shard)?
-        };
-        let (committee, _) = config.validator_set()?.calc_subset(
-            &config.catchain_config()?,
-            shard.shard_prefix_with_tag(),
-            shard.workchain_id(),
-            cc,
-        )?;
-        let runtime = AuthenticatedSessionRuntime::from_authenticated_config(
-            SessionNetworkPin { global_id: state.global_id(), zerostate: zero.clone() },
-            config,
-            rtos_api::session_identity::SessionCoordinates {
-                shard: &shard,
-                catchain_seqno: cc,
-                vertical_seqno: 0,
-                last_key_block_seqno: key_seqno,
-                new_catchain_ids: false,
-            },
-            committee,
-            transport.id().clone(),
-        )?
-        .bind_recovery_anchor(zero.clone())?;
-        if let LocalRole::Validator(index) = runtime.local_role() {
-            if runtime.committee()[index as usize].validator_id()? != stable_id {
-                fail!("Public test transport belongs to an unexpected validator");
+    for (shard, current_cc) in shards {
+        // The node eagerly prepares the immediate successor from this same
+        // initial set. This is explicit fixture provisioning, not live rotation.
+        for offset in 0..=1 {
+            let cc = current_cc
+                .checked_add(offset)
+                .ok_or_else(|| error!("Catchain sequence overflow"))?;
+            let (committee, _) = config.validator_set()?.calc_subset(
+                &config.catchain_config()?,
+                shard.shard_prefix_with_tag(),
+                shard.workchain_id(),
+                cc,
+            )?;
+            let runtime = AuthenticatedSessionRuntime::from_authenticated_config(
+                SessionNetworkPin { global_id: state.global_id(), zerostate: zero.clone() },
+                config,
+                rtos_api::session_identity::SessionCoordinates {
+                    shard: &shard,
+                    catchain_seqno: cc,
+                    vertical_seqno: 0,
+                    last_key_block_seqno: key_seqno,
+                    new_catchain_ids: false,
+                },
+                committee,
+                transport.id().clone(),
+            )?
+            .bind_recovery_anchor(zero.clone())?;
+            if let LocalRole::Validator(index) = runtime.local_role() {
+                if runtime.committee()[index as usize].validator_id()? != stable_id {
+                    fail!("Public test transport belongs to an unexpected validator");
+                }
+                runtimes.push(runtime);
+            } else if shard.is_masterchain() && offset == 0 {
+                fail!("Public test member is absent from the masterchain committee");
             }
-            runtimes.push(runtime);
-        } else if shard.is_masterchain() {
-            fail!("Public test member is absent from the masterchain committee");
         }
     }
     // Bind the fresh database before creating any session namespaces. Hold the
@@ -149,9 +163,10 @@ async fn main() -> anyhow::Result<()> {
         // Each independent test shard has its own explicit journal owner. Never
         // reuse one single-session ownership record for MC and WC journals.
         let shard_owner = owner.join(format!(
-            "{}-{}",
+            "{}-{}-{}",
             runtime.shard().workchain_id(),
-            runtime.shard().shard_prefix_with_tag()
+            runtime.shard().shard_prefix_with_tag(),
+            runtime.catchain_seqno()
         ));
         create_private_directory(&shard_owner)?;
         simplex::isolated_signing::provision(
@@ -164,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
         )?;
         sessions.push(serde_json::json!({"shard":runtime.shard().to_string(),
             "masterchain":runtime.shard().is_masterchain(),
+            "catchain_seqno":runtime.catchain_seqno(),
             "session":runtime.session_id().to_hex_string(), "namespace":namespace,
             "carrier_version":runtime.carrier_version(),
             "simplex_protocol":runtime.protocol().version(),

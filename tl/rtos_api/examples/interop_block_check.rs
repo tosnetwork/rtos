@@ -77,6 +77,7 @@ fn main() -> Result<()> {
         "block state update differs from applied states"
     );
     let result = json!({"status":"block_and_state_match", "block":reference["last"],
+        "created_by":base64_encode(block.read_extra()?.created_by().as_slice()),
         "state_root_hash":base64_encode(state.as_slice()), "global_id":block.global_id(),
         "file_hash_checked":true, "cell_hash_checked":true, "header_identity_checked":true,
         "state_update_matches_both":true, "active_signing_qualified":false});
