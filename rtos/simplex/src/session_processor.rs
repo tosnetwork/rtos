@@ -2214,7 +2214,7 @@ impl ConsensusBackend for ConsensusBackendAdapter<'_> {
         });
     }
 
-    fn persist_notar_cert_then_relay(&mut self, event: &NotarizationReachedEvent) {
+    fn persist_notar_cert(&mut self, event: &NotarizationReachedEvent, relay: bool) {
         // Save notarization certificate to DB (store async result for write ordering)
         // Reference: C++ candidate-resolver.cpp NotarizationObserved handler:
         //   store_to_db(event->id, state).start().detach()
@@ -2356,8 +2356,10 @@ impl ConsensusBackend for ConsensusBackendAdapter<'_> {
                 );
                 // C++ parity (pool.cpp handle_saved_certificate): relay every newly
                 // accepted certificate to all validators. Dedup is in SimplexState.
-                processor.telemetry.certs_relayed_counter.increment(1);
-                processor.receiver.send_certificate(tl_cert);
+                if relay {
+                    processor.telemetry.certs_relayed_counter.increment(1);
+                    processor.receiver.send_certificate(tl_cert);
+                }
                 // Cache for standstill re-broadcast
                 processor.receiver.cache_standstill_certificate(
                     slot.value(),
@@ -2368,7 +2370,7 @@ impl ConsensusBackend for ConsensusBackendAdapter<'_> {
         );
     }
 
-    fn persist_skip_cert_then_relay(&mut self, event: &SkipCertificateReachedEvent) {
+    fn persist_skip_cert(&mut self, event: &SkipCertificateReachedEvent, relay: bool) {
         let skip_store_result =
             if let Some(existing) = self.database.skip_cert_store_result(event.slot) {
                 existing.clone()
@@ -2467,8 +2469,10 @@ impl ConsensusBackend for ConsensusBackendAdapter<'_> {
                     cert_bytes.len(),
                 );
                 // Send certificate to all validators.
-                processor.telemetry.certs_relayed_counter.increment(1);
-                processor.receiver.send_certificate(tl_cert);
+                if relay {
+                    processor.telemetry.certs_relayed_counter.increment(1);
+                    processor.receiver.send_certificate(tl_cert);
+                }
                 // Cache for standstill re-broadcast.
                 processor.receiver.cache_standstill_certificate(
                     slot.value(),
@@ -4324,6 +4328,15 @@ impl StartupRecoveryBackend for SessionProcessor {
 
     fn increment_error(&self) {
         self.telemetry.increment_error();
+    }
+
+    fn persist_reconstructed_certificate(&mut self, event: SimplexEvent) {
+        self.with_consensus_backend(|_, backend| match event {
+            SimplexEvent::NotarizationReached(event) => backend.persist_notar_cert(&event, false),
+            SimplexEvent::SkipCertificateReached(event) => backend.persist_skip_cert(&event, false),
+            SimplexEvent::FinalizationReached(event) => backend.persist_final_cert(&event, false),
+            _ => unreachable!("startup certificate persistence requires a certificate event"),
+        });
     }
 
     fn sync_standstill_after_restore(&mut self) {

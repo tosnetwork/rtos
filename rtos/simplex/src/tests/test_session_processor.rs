@@ -5421,6 +5421,59 @@ fn test_foreign_vote_is_not_rebroadcast() {
 }
 
 #[test]
+fn test_recovery_reconstructed_pq_certificates_survive_repeated_bootstrap_without_relay() {
+    use crate::pq_fixture as f;
+    for (kind, role) in [("empty", "notarize"), ("empty", "finalize"), ("skip", "skip")] {
+        let directory = crate::authenticated_fixture::TestDirectory::new();
+        let path = directory.path().join("db");
+        let description = f::description(ShardIdent::masterchain(), 0);
+        let db = crate::database::SimplexDb::open(&path, "replayed-cert").unwrap();
+        // A process can stop after storing the individual votes but before its
+        // quorum certificate is saved. Use real fixture PQ signatures.
+        for index in 0..2 {
+            let vote = f::vote(kind, role, index, f::CONTEXT);
+            let data = serialize_boxed(&vote).unwrap();
+            db.save_vote_async(&crate::database::VoteRecord {
+                vote_hash: UInt256::calc_file_hash(&data),
+                data,
+                node_idx: ValidatorIndex::new(index as u32),
+                seqno: index as i64,
+            }).unwrap();
+        }
+        db.sync(Some(Duration::from_secs(10))).unwrap();
+        let mut bootstrap = db.load_bootstrap().unwrap();
+        assert!(bootstrap.notar_certs.is_empty() && bootstrap.final_certs.is_empty()
+            && bootstrap.skip_certs.is_empty());
+        for restart in 0..2 {
+            let receiver = MockReceiver::new();
+            let mut processor = make_pq_processor_with_description_for_test(db.clone(), description.clone());
+            processor.receiver = receiver.clone();
+            crate::startup_recovery::SessionStartupRecoveryProcessor::new(
+                f::session(), description.clone(), bootstrap,
+            ).apply_bootstrap(&mut processor).unwrap();
+            db.sync(Some(Duration::from_secs(10))).unwrap();
+            processor.process_pending_async_db_results();
+            assert!(!receiver.drain_actions().iter().any(|action| matches!(action,
+                ReceiverAction::SendCertificate { .. }
+            )), "historical certificates must not be relayed on restart {restart}");
+            bootstrap = db.load_bootstrap().unwrap();
+            let records = match role {
+                "notarize" => bootstrap.notar_certs.len(),
+                "finalize" => bootstrap.final_certs.len(),
+                _ => bootstrap.skip_certs.len(),
+            };
+            assert_eq!(records, 1, "reconstructed {role} certificate must be durable on restart {restart}");
+            // A second reader independently checks membership, quorum, session
+            // and signatures in the newly stored bootstrap.
+            crate::startup_recovery::SessionStartupRecoveryProcessor::new(
+                f::session(), description.clone(), bootstrap.clone(),
+            ).authenticate_pq_input().unwrap();
+        }
+        db.close(Some(Duration::from_secs(10))).unwrap();
+    }
+}
+
+#[test]
 fn test_recovery_drain_startup_events_drops_certificate_relay_events() {
     let mut fixture = TestFixture::new(4);
 
@@ -5441,7 +5494,7 @@ fn test_recovery_drain_startup_events_drops_certificate_relay_events() {
     assert!(stored, "notar cert should be stored before startup drain");
 
     // Run startup recovery with a minimal non-empty bootstrap so the drain step
-    // (step 5: keep BroadcastVote only) executes and drops the pre-seeded
+    // preserves the reconstructed certificate save but suppresses its historical
     // NotarizationReached relay event. The finalized block sits at slot 0 so it
     // does not interfere with the notar cert at slot 3.
     let mut bootstrap = empty_bootstrap();
@@ -10596,7 +10649,7 @@ fn pq_live_recovery_authenticates_finalized_parent_chains_and_role_flags() {
             candidate_id: child.candidate_id.clone(),
             cert_bytes: final_cert(kind, &child.candidate_id, 2),
         });
-        for alteration in 0..10 {
+        for alteration in 0..13 {
             let mut bootstrap = valid.clone();
             match alteration {
                 0 => {}
@@ -10613,6 +10666,26 @@ fn pq_live_recovery_authenticates_finalized_parent_chains_and_role_flags() {
                 8 => {
                     bootstrap.finalized_blocks.remove(0);
                     bootstrap.notar_certs.clear();
+                }
+                10..=12 => {
+                    bootstrap.finalized_blocks.remove(0);
+                    bootstrap.notar_certs.clear();
+                    // Reconstruct a missing ancestor NotarCert from the real
+                    // stored PQ votes; duplicate low-weight votes cannot add weight.
+                    for index in if alteration == 11 { vec![0, 0] } else { vec![0, 1] } {
+                        let signed = TlVote {
+                            vote: rtos_api::ton::consensus::simplex::unsignedvote::NotarizeVote {
+                                id: TlCandidateId { slot: 98, hash: parent.candidate_id.hash.clone() }.into_boxed(),
+                            }.into_boxed(),
+                            signature: f::bytes(row("parent", "notarize", index), "signature"),
+                        }.into_boxed();
+                        let mut data = serialize_boxed(&signed).unwrap();
+                        if alteration == 12 { *data.last_mut().unwrap() ^= 1; }
+                        bootstrap.votes.push(crate::database::VoteRecord {
+                            vote_hash: UInt256::calc_file_hash(&data), data,
+                            node_idx: ValidatorIndex::new(index as u32), seqno: index as i64,
+                        });
+                    }
                 }
                 _ => {
                     let sibling_kind = if kind == "empty" { "ordinary" } else { "empty" };
@@ -10640,7 +10713,7 @@ fn pq_live_recovery_authenticates_finalized_parent_chains_and_role_flags() {
                 bootstrap,
             )
             .apply_bootstrap(&mut target);
-            let succeeds = alteration == 0 || alteration == 6 || (alteration == 4 && kind == "empty");
+            let succeeds = alteration == 0 || alteration == 6 || alteration == 10 || (alteration == 4 && kind == "empty");
             assert_eq!(result.is_ok(), succeeds, "{kind}/{alteration}: {result:?}");
             let expected = match alteration {
                 7 => Some("finalized ancestor metadata missing"),

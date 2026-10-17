@@ -230,11 +230,20 @@ pub(crate) trait ConsensusBackend {
     /// VoteSignatureSet, relay the full cert, and cache it for standstill.
     /// Synchronous registration on the SXMAIN async-DB registry; the relay
     /// continuation runs `SessionProcessor`-side post-durability.
-    fn persist_notar_cert_then_relay(&mut self, event: &NotarizationReachedEvent);
+    fn persist_notar_cert_then_relay(&mut self, event: &NotarizationReachedEvent) {
+        self.persist_notar_cert(event, true);
+    }
+
+    /// Startup replay saves newly reconstructed certificates without gossip.
+    fn persist_notar_cert(&mut self, event: &NotarizationReachedEvent, relay: bool);
 
     /// Persist the skip certificate then (after durability) relay + cache it
     /// for standstill. See [`Self::persist_notar_cert_then_relay`].
-    fn persist_skip_cert_then_relay(&mut self, event: &SkipCertificateReachedEvent);
+    fn persist_skip_cert_then_relay(&mut self, event: &SkipCertificateReachedEvent) {
+        self.persist_skip_cert(event, true);
+    }
+
+    fn persist_skip_cert(&mut self, event: &SkipCertificateReachedEvent, relay: bool);
 
     /// Persist the finalization certificate then (after durability) relay,
     /// cache per-slot + last-final, and update standstill tracking. See

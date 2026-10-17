@@ -27,6 +27,7 @@ fn main() -> Result<()> {
     let mut decoded = Vec::new();
     let mut metadata = Vec::new();
     let mut certificates = Vec::new();
+    let mut votes = Vec::new();
     for entry in db.iterator(IteratorMode::Start) {
         let (key, value) = entry?;
         use rtos_api::ton::consensus::simplex::db::{candidate_resolver, key as keys, Vote};
@@ -44,6 +45,16 @@ fn main() -> Result<()> {
                 "block":format!("{:?}", v.candidate_hash_data.block())}));
         }
         if key.starts_with(&keys::vote::Vote::constructor_const().to_le_bytes()) {
+            if let Vote::Consensus_Simplex_Db_Vote(v) = rtos_api::deserialize_typed::<Vote>(&value)? {
+                use rtos_api::ton::consensus::simplex::{Vote as SignedVote, UnsignedVote};
+                let signed: SignedVote = rtos_api::deserialize_typed(&v.data)?;
+                let (role, slot, candidate) = match signed.vote() {
+                    UnsignedVote::Consensus_Simplex_NotarizeVote(v) => ("notar", *v.id.slot(), Some(format!("{:?}", v.id.clone().only()))),
+                    UnsignedVote::Consensus_Simplex_FinalizeVote(v) => ("final", *v.id.slot(), Some(format!("{:?}", v.id.clone().only()))),
+                    UnsignedVote::Consensus_Simplex_SkipVote(v) => ("skip", v.slot, None),
+                };
+                votes.push(json!({"role":role,"slot":slot,"candidate":candidate,"validator_index":v.node_idx,"seqno":v.seqno}));
+            }
             if let Vote::Consensus_Simplex_Db_Cert(v) = rtos_api::deserialize_typed::<Vote>(&value)? {
                 use rtos_api::ton::consensus::simplex::UnsignedVote;
                 let (role, id) = match v.cert.vote {
@@ -81,7 +92,7 @@ fn main() -> Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(output)?;
     serde_json::to_writer_pretty(&mut file, &json!({"schema":1,"authenticated":false,
         "database":database,"records":records,"candidate_metadata":metadata,
-        "certificates":certificates}))?;
+        "certificates":certificates,"votes":votes}))?;
     file.write_all(b"\n")?;
     Ok(())
 }

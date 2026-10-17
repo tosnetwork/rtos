@@ -45,7 +45,7 @@ use crate::{
     consensus_controller::ConsensusController,
     database::{
         Bootstrap, CandidateInfoRecord, FinalCertRecord, FinalizedBlockRecord, NotarCertRecord,
-        PoolStateRecord, SkipCertRecord, VoteRecord,
+        PoolStateRecord, ReceiverBootstrap, SkipCertRecord, VoteRecord,
     },
     database_controller::DatabaseController,
     misbehavior::VoteResult,
@@ -142,6 +142,10 @@ pub(crate) trait StartupRecoveryBackend {
     /// Run the post-restore standstill sync: range-clamp the receiver ingress
     /// cursor to the tracked interval and reschedule the standstill timer. Kept
     /// as an effect because it spans `SessionProcessor`-level helper state.
+    /// Preserve certificates reconstructed from authenticated stored votes.
+    /// Suppress historical gossip, while using the normal async save owner.
+    fn persist_reconstructed_certificate(&mut self, event: SimplexEvent);
+
     fn sync_standstill_after_restore(&mut self);
 }
 
@@ -257,7 +261,7 @@ impl SessionStartupRecoveryProcessor {
     /// This method:
     /// 1. Replays votes (order: global pass, set boundary, local flags)
     /// 2. Generates restart skip votes
-    /// 3. Drains startup events (keeps BroadcastVote only)
+    /// 3. Suppresses historical notifications and persists newly reconstructed certificates
     /// 4. Restores receiver caches (notar certs, candidate bytes)
     /// 5. Restores kept votes
     ///
@@ -390,13 +394,13 @@ impl SessionStartupRecoveryProcessor {
         );
         self.apply_pool_state_and_skip_votes(backend, &session_boot.pool_state)?;
 
-        // Step 5: Drain startup events (keep BroadcastVote only)
+        // Step 5: Suppress historical notifications, preserving reconstructed certificates.
         log::debug!(
             target: LOG_TARGET,
             "Session {}: step 5/12 - draining startup events",
             self.session_id.to_hex_string()
         );
-        let kept_votes = self.recovery_drain_startup_events(backend);
+        let kept_votes = self.recovery_drain_startup_events(backend, &receiver_boot);
         log::debug!(
             target: LOG_TARGET,
             "Session {}: step 5/12 complete - kept {} votes",
@@ -524,6 +528,7 @@ impl SessionStartupRecoveryProcessor {
         self.description.verify_own_journal(&bootstrap.own_journal)?;
         // Authenticate every persisted vote/certificate before touching the FSM,
         // receiver caches, finalized cursor, or listener callbacks.
+        let mut replayed_notars: HashMap<RawCandidateId, HashMap<ValidatorIndex, SignatureBytes>> = HashMap::new();
         for record in &bootstrap.votes {
             if UInt256::calc_file_hash(&record.data) != record.vote_hash {
                 rtos_block::fail!("PQ recovery vote key mismatch");
@@ -539,8 +544,11 @@ impl SessionStartupRecoveryProcessor {
             ) {
                 rtos_block::fail!("PQ recovery invalid vote signature/session");
             }
-            if Self::deserialize_vote_record(record).is_none() {
-                rtos_block::fail!("PQ recovery invalid vote encoding");
+            let (decoded, signature) = Self::deserialize_vote_record(record)
+                .ok_or_else(|| error!("PQ recovery invalid vote encoding"))?;
+            if let Vote::Notarize(vote) = decoded {
+                let id = RawCandidateId { slot: vote.slot, hash: vote.block_hash };
+                replayed_notars.entry(id).or_default().entry(record.node_idx).or_insert(signature);
             }
         }
         let mut finals = HashSet::new();
@@ -581,6 +589,31 @@ impl SessionStartupRecoveryProcessor {
                 &self.session_id,
             )?;
             notars.insert(record.candidate_id.clone());
+        }
+        // A crash may leave the individually authenticated votes durable but
+        // not their aggregate. Reconstruct the same NotarCert as pool vote
+        // replay, with distinct members and the normal weight/signature checks.
+        // This can authenticate an existing sparse ancestry without treating
+        // a leader proposal or an applied height as quorum evidence. The live
+        // replay below persists the newly reconstructed certificate.
+        for (id, signatures) in replayed_notars {
+            if notars.contains(&id) {
+                continue;
+            }
+            let certificate = crate::certificate::NotarCert {
+                vote: crate::simplex_state::NotarizeVote { slot: id.slot, block_hash: id.hash.clone() },
+                signatures: signatures.into_iter().map(|(validator_idx, signature)| {
+                    crate::certificate::VoteSignature::new(validator_idx, signature)
+                }).collect(),
+            };
+            if certificate.total_weight(&self.description)? < crate::utils::threshold_66(self.description.get_total_weight()) {
+                continue;
+            }
+            crate::certificate::NotarCert::from_tl_signatures(
+                &certificate.to_tl_vote_signature_set(), certificate.vote,
+                &self.description, &self.session_id,
+            )?;
+            notars.insert(id);
         }
         let mut parents = HashMap::new();
         for info in &bootstrap.candidate_infos {
@@ -1624,10 +1657,22 @@ impl SessionStartupRecoveryProcessor {
         backend.simplex_state_mut().generate_restart_skip_votes(window, slots_per_window) as usize
     }
 
-    fn recovery_drain_startup_events(&self, backend: &mut dyn StartupRecoveryBackend) -> Vec<Vote> {
+    fn recovery_drain_startup_events(
+        &self,
+        backend: &mut dyn StartupRecoveryBackend,
+        persisted: &ReceiverBootstrap,
+    ) -> Vec<Vote> {
         log::trace!("Session {}: recovery_drain_startup_events", self.session_id.to_hex_string());
 
-        // Drain all events, keeping only BroadcastVote
+        // Replaying individual votes can complete a quorum whose certificate
+        // was not saved before the crash. C++ persists a newly obtained quorum
+        // through SaveCertificate even when historical gossip is suppressed.
+        // Keep persistence separate from replay notifications: dropping both
+        // left an in-memory ancestor certificate absent at the next restart.
+        let notars: HashSet<_> = persisted.notar_certs.iter().map(|r| &r.candidate_id).collect();
+        let finals: HashSet<_> = persisted.final_certs.iter().map(|r| &r.candidate_id).collect();
+        let skips: HashSet<_> = persisted.skip_certs.iter().map(|r| r.slot).collect();
+        let mut saved_reconstructed = 0u32;
         let mut kept_votes = Vec::new();
         let mut dropped_finalized = 0u32;
         let mut dropped_skipped = 0u32;
@@ -1646,14 +1691,31 @@ impl SessionStartupRecoveryProcessor {
                 SimplexEvent::SlotSkipped(_) => {
                     dropped_skipped += 1;
                 }
-                SimplexEvent::NotarizationReached(_) => {
-                    dropped_notarization += 1;
+                SimplexEvent::NotarizationReached(event) => {
+                    let id = RawCandidateId { slot: event.slot, hash: event.block_hash.clone() };
+                    if !notars.contains(&id) {
+                        backend.persist_reconstructed_certificate(SimplexEvent::NotarizationReached(event));
+                        saved_reconstructed += 1;
+                    } else {
+                        dropped_notarization += 1;
+                    }
                 }
-                SimplexEvent::SkipCertificateReached(_) => {
-                    dropped_skip_cert_reached += 1;
+                SimplexEvent::SkipCertificateReached(event) => {
+                    if !skips.contains(&event.slot) {
+                        backend.persist_reconstructed_certificate(SimplexEvent::SkipCertificateReached(event));
+                        saved_reconstructed += 1;
+                    } else {
+                        dropped_skip_cert_reached += 1;
+                    }
                 }
-                SimplexEvent::FinalizationReached(_) => {
-                    dropped_finalization_reached += 1;
+                SimplexEvent::FinalizationReached(event) => {
+                    let id = RawCandidateId { slot: event.slot, hash: event.block_hash.clone() };
+                    if !finals.contains(&id) {
+                        backend.persist_reconstructed_certificate(SimplexEvent::FinalizationReached(event));
+                        saved_reconstructed += 1;
+                    } else {
+                        dropped_finalization_reached += 1;
+                    }
                 }
             }
         }
@@ -1662,7 +1724,8 @@ impl SessionStartupRecoveryProcessor {
             "Session {}: drained startup events: kept {} votes, dropped {dropped_finalized} \
             finalized, {dropped_skipped} skipped, {dropped_notarization} notarization, \
             {dropped_skip_cert_reached} skip_cert_reached, \
-            {dropped_finalization_reached} finalization_reached",
+            {dropped_finalization_reached} finalization_reached; \
+            saved {saved_reconstructed} reconstructed certificates",
             self.session_id.to_hex_string(),
             kept_votes.len(),
         );
