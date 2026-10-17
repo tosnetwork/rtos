@@ -1608,6 +1608,28 @@ impl ValidatorGroup {
         Ok(())
     }
 
+    /// Reserve before posting the asynchronous constructor. The manager's
+    /// current-group classification must not finish with an unclaimed start
+    /// that historical replay can overtake. This is only namespace ownership;
+    /// the checked constructor still validates every runtime and DB invariant.
+    fn reserve_namespace_before_worker(&self) -> Result<bool> {
+        let Some(runtime) = self.authenticated_runtime.as_ref().filter(|_| self.is_simplex()) else {
+            return Ok(true);
+        };
+        let mut admission = self.namespace_admission.lock()
+            .map_err(|_| error!("namespace admission poisoned"))?;
+        if admission.reservation.is_some() {
+            return Ok(true);
+        }
+        if admission.failed.is_some() {
+            fail!("Prior normal constructor lacks its retained namespace reservation");
+        }
+        match self.engine.reserve_normal_session_namespace(runtime)? {
+            Some(reservation) => { admission.reservation = Some(reservation); Ok(true) }
+            None => Ok(false),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn start_session(
         self: Arc<ValidatorGroup>,
@@ -1624,6 +1646,11 @@ impl ValidatorGroup {
         if let Err(error) = prepared {
             self.group_impl.execute_sync(|group| group.release_start_reservation()).await;
             return Err(error);
+        }
+        if !self.reserve_namespace_before_worker()? {
+            self.group_impl.execute_sync(|group| group.release_start_reservation()).await;
+            log::trace!(target: "validator", "Normal namespace occupied before worker admission; retry after generation change");
+            return Ok(());
         }
         self.clone().spawn_root_task(&rt.clone(), async move {
             let callback = self.make_validator_session_callback();

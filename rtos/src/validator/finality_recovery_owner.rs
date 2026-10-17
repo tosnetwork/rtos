@@ -33,6 +33,7 @@ pub(crate) enum AdmissionKind {
 #[derive(Default)]
 struct Reservations {
     stopping: bool,
+    bootstrap_holds: u32,
     occupied: HashMap<RecoveryKey, (AdmissionKind, u64)>,
     next_lease: u64,
 }
@@ -56,6 +57,21 @@ impl RecoveryRegistry {
             role_key(runtime.local_role(), UInt256::from(*runtime.local_adnl().data())),
         )
     }
+    /// Let the normal manager classify authenticated current namespaces before
+    /// historical replay can claim one. Existing leases are never preempted.
+    pub(crate) fn defer_recovery_admission(self: &Arc<Self>) -> Result<RecoveryBootstrapGate> {
+        let mut state = self.reservations.lock().unwrap();
+        if state.stopping {
+            fail!("Recovery session admission stopped");
+        }
+        state.bootstrap_holds = state.bootstrap_holds.checked_add(1)
+            .ok_or_else(|| error!("Recovery bootstrap gate count exhausted"))?;
+        Ok(RecoveryBootstrapGate { registry: self.clone() })
+    }
+    pub(crate) fn recovery_admission_deferred(&self) -> bool {
+        self.reservations.lock().unwrap().bootstrap_holds != 0
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         *self.changed.borrow()
     }
@@ -90,6 +106,9 @@ impl RecoveryRegistry {
         let mut state = self.reservations.lock().unwrap();
         if state.stopping {
             fail!("Recovery session admission stopped");
+        }
+        if kind == AdmissionKind::Recovery && state.bootstrap_holds != 0 {
+            return Ok(None);
         }
         if state.occupied.contains_key(&key) {
             return Ok(None);
@@ -161,6 +180,23 @@ impl RecoveryRegistry {
     }
 }
 
+/// This gate is only startup scheduling, never namespace or signing authority.
+/// Drop on the first normal classification attempt (or its owner's failure).
+/// Normal reservations continue to exclude recovery after the gate opens.
+pub(crate) struct RecoveryBootstrapGate {
+    registry: Arc<RecoveryRegistry>,
+}
+impl Drop for RecoveryBootstrapGate {
+    fn drop(&mut self) {
+        {
+            let mut state = self.registry.reservations.lock().unwrap();
+            state.bootstrap_holds = state.bootstrap_holds.checked_sub(1)
+                .expect("owned recovery bootstrap gate");
+        }
+        self.registry.changed.send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+}
+
 /// Release is explicit and belongs after checked session shutdown/join (or a
 /// failed construction which created no session). Dropping an observer or an
 /// unwinding owner must not advertise the namespace as free while threads live.
@@ -196,6 +232,45 @@ impl RecoveryReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_classification_reserves_normal_without_releasing_its_lease() {
+        let registry = Arc::new(RecoveryRegistry::default());
+        let gate = registry.defer_recovery_admission().unwrap();
+        let key = (UInt256::from([7; 32]), RecoveryRole::Validator);
+        assert!(registry.reserve_key(key.clone()).unwrap().is_none());
+        let normal = registry.reserve_kind(key.clone(), AdmissionKind::Normal).unwrap().unwrap();
+        let generation = registry.generation();
+        drop(gate);
+        assert!(registry.generation() != generation);
+        assert!(registry.reserve_key(key.clone()).unwrap().is_none(), "normal owner still holds its actual lease");
+        normal.release();
+        registry.reserve_key(key).unwrap().unwrap().release();
+    }
+
+    #[test]
+    fn nested_startup_gates_open_only_after_the_last_owner_drops() {
+        let registry = Arc::new(RecoveryRegistry::default());
+        let first = registry.defer_recovery_admission().unwrap();
+        let second = registry.defer_recovery_admission().unwrap();
+        let key = (UInt256::from([8; 32]), RecoveryRole::Validator);
+        drop(first);
+        assert!(registry.recovery_admission_deferred());
+        assert!(registry.reserve_key(key.clone()).unwrap().is_none());
+        drop(second);
+        assert!(!registry.recovery_admission_deferred());
+        registry.reserve_key(key).unwrap().unwrap().release();
+    }
+
+    #[test]
+    fn opening_a_startup_gate_does_not_reopen_stopped_admission() {
+        let registry = Arc::new(RecoveryRegistry::default());
+        let gate = registry.defer_recovery_admission().unwrap();
+        registry.stop();
+        drop(gate);
+        assert!(registry.defer_recovery_admission().is_err());
+        assert!(registry.reserve_key((UInt256::from([9;32]),RecoveryRole::Validator)).is_err());
+    }
+
     #[test]
     fn recovery_registry_follows_validator_and_observer_namespace_identity() {
         let registry = Arc::new(RecoveryRegistry::default());

@@ -46,7 +46,7 @@ use crate::{
         accept_block::create_new_proof_link,
         candidate_db::{CandidateDb, CandidateDbPool},
         out_msg_queue_manager::OutMsgQueueManager,
-        validator_manager::{start_validator_manager, ValidationStatus},
+        validator_manager::{start_validator_manager_with_startup_gate, ValidationStatus},
     },
 };
 #[cfg(feature = "telemetry")]
@@ -3148,14 +3148,18 @@ pub async fn run(
             // enabled only after fast-sync initialization below.
             engine.ensure_publication_worker().await?;
             crate::validator::recover_retained_finality(engine.clone()).await?;
-            engine.ensure_retired_session_recovery().await?;
-
-            // Start validator manager, which will start validator sessions when necessary
-            start_validator_manager(
+            // Current authenticated groups must claim their original namespaces
+            // before historical read-only replay considers those same stores.
+            // Retained source authentication and durable takeover above remain
+            // prerequisites; no recovery worker receives signing authority.
+            let gate = engine.finality_recovery_registry().defer_recovery_admission()?;
+            start_validator_manager_with_startup_gate(
                 Arc::clone(&engine) as Arc<dyn EngineOperations>,
                 validator_runtime,
                 vm_config,
+                gate,
             )?;
+            engine.ensure_retired_session_recovery().await?;
 
             // Sync by archives
             if sync_by_archives && !engine.check_sync().await? {

@@ -900,6 +900,7 @@ const CLEANUP_VERDICTS_KEPT: usize = 256;
 
 struct ValidatorManagerImpl {
     engine: Arc<dyn EngineOperations>,
+    startup_recovery_gate: Option<super::finality_recovery_owner::RecoveryBootstrapGate>,
     rt: tokio::runtime::Handle,
     /// Sessions for the current validator set (started or starting).
     current_sessions: HashMap<UInt256, Arc<ValidatorGroup>>,
@@ -1658,6 +1659,7 @@ impl ValidatorManagerImpl {
         engine.set_validation_status(ValidationStatus::Disabled);
         ValidatorManagerImpl {
             engine: engine.clone(),
+            startup_recovery_gate: None,
             rt: rt.clone(),
             current_sessions: HashMap::default(),
             future_sessions: HashMap::default(),
@@ -4071,7 +4073,9 @@ impl ValidatorManagerImpl {
                         target: "validator_manager",
                         "Updating shards according to masterblock {seqno}"
                     );
-                    match self.update_shards(mc_state).await {
+                    let update = self.update_shards(mc_state).await;
+                    self.startup_recovery_gate.take();
+                    match update {
                         Ok(()) => log::trace!(target: "validator_manager",
                             "Shards for masterblock {seqno} updated"),
                         Err(error) if crate::retired_history::is_retryable(&error) => {
@@ -4085,6 +4089,7 @@ impl ValidatorManagerImpl {
                     }
                 }
                 Err(e) => {
+                    self.startup_recovery_gate.take();
                     if self.engine.validation_status().allows_validate() {
                         fail!(
                             "State for {} lost while validating (status {:?}): error '{}'",
@@ -4128,16 +4133,36 @@ pub fn start_validator_manager(
     Ok(())
 }
 
+pub(crate) fn start_validator_manager_with_startup_gate(
+    engine: Arc<dyn EngineOperations>,
+    runtime: tokio::runtime::Handle,
+    config: ValidatorManagerConfig,
+    gate: super::finality_recovery_owner::RecoveryBootstrapGate,
+) -> Result<()> {
+    spawn_validator_manager_with_startup_gate(engine, runtime, config, Some(gate))?;
+    Ok(())
+}
+
 fn spawn_validator_manager(
     engine: Arc<dyn EngineOperations>,
     runtime: tokio::runtime::Handle,
     config: ValidatorManagerConfig,
+) -> Result<tokio::task::JoinHandle<()>> {
+    spawn_validator_manager_with_startup_gate(engine, runtime, config, None)
+}
+
+fn spawn_validator_manager_with_startup_gate(
+    engine: Arc<dyn EngineOperations>,
+    runtime: tokio::runtime::Handle,
+    config: ValidatorManagerConfig,
+    startup_recovery_gate: Option<super::finality_recovery_owner::RecoveryBootstrapGate>,
 ) -> Result<tokio::task::JoinHandle<()>> {
     const CHECK_VALIDATOR_TIMEOUT: u64 = 60; //secs
     engine.clone().register_service_task("validator manager", 0, Box::new(move || {
         // This owner alone knows whether group/thread teardown was certified.
         engine.acquire_stop(Engine::MASK_SERVICE_VALIDATOR_MANAGER);
         runtime.clone().spawn(async move {
+        let mut startup_recovery_gate = startup_recovery_gate;
         log::info!(
             target: "validator_manager",
             "checking if current node is a validator during {CHECK_VALIDATOR_TIMEOUT} secs"
@@ -4152,6 +4177,8 @@ fn spawn_validator_manager(
                 return;
             }
         } {
+            // With no current bindings there is no normal namespace to protect.
+            startup_recovery_gate.take();
             log::trace!(target: "validator_manager", "Not a validator, waiting...");
             for _ in 0..CHECK_VALIDATOR_TIMEOUT {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -4171,6 +4198,7 @@ fn spawn_validator_manager(
             }
             let mut manager =
                 ValidatorManagerImpl::create(engine.clone(), runtime.clone(), config.clone());
+            manager.startup_recovery_gate = startup_recovery_gate.take();
             let res = match std::panic::AssertUnwindSafe(manager.invoke()).catch_unwind().await {
                 Ok(result) => result,
                 Err(_) => {

@@ -722,7 +722,11 @@ async fn retired_service_socket_missing_body_reaches_node_wal_and_checked_join()
             })
             .await
             .expect("Retired owner did not fetch body and acknowledge node WAL");
-            assert_eq!(service.snapshot().active, 0);
+            // The service immediately scans completed namespaces for closing
+            // receipts, so its aggregate active count may include a new scan.
+            // Completion must instead release the actual session reservation;
+            // the source scan below independently verifies checked store drain.
+            assert!(!target.engine.finality_recovery_registry().owns(&target.runtime));
             let replies = replies.lock().unwrap().clone();
             for row in 0..=final_row {
                 let candidate = native_candidate(&provider, &input["rows"][row]);

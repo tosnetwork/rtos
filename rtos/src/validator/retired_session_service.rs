@@ -189,6 +189,9 @@ impl RetiredSessionService {
         active: &mut Vec<ActiveRecovery>,
         closures: &mut Vec<closing::ActiveClosure>,
     ) -> Result<()> {
+        if engine.finality_recovery_registry().recovery_admission_deferred() {
+            return Ok(());
+        }
         let path = namespace.to_owned();
         let record = tokio::task::spawn_blocking(move || {
             simplex::finality_recovery::scan_finality_recovery_namespace(&path)
