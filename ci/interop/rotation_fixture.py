@@ -38,10 +38,37 @@ def state_id(state, workchain):
 
 async def stop_rotation_node(node):
     started = time.monotonic()
+    async def capture_waiters():
+        await asyncio.sleep(10)
+        process = node['process']
+        if process.returncode is not None:
+            return
+        proc = Path(f'/proc/{process.pid}')
+        try:
+            if proc.joinpath('stat').read_text().split()[21] != node['start_ticks']:
+                return
+            threads = []
+            for task in sorted(proc.joinpath('task').iterdir()):
+                item = {'tid': int(task.name)}
+                for name in ['comm', 'wchan']:
+                    try:
+                        item[name] = task.joinpath(name).read_text().strip()
+                    except OSError as error:
+                        item[name + '_error'] = str(error)
+                threads.append(item)
+            write(node['directory'] / 'shutdown-waiters.json',
+                {'pid':process.pid, 'start_ticks':node['start_ticks'],
+                 'elapsed_seconds':time.monotonic()-started, 'threads':threads,
+                 'scope':'read-only proc snapshot; original 20-second stop deadline unchanged'})
+        except OSError:
+            return  # Process may finish normally during this read-only observation.
+    snapshot = asyncio.create_task(capture_waiters())
     try:
         return await stop_rust(node)
     finally:
         node['shutdown_elapsed_seconds'] = time.monotonic() - started
+        snapshot.cancel()
+        await asyncio.gather(snapshot, return_exceptions=True)
 
 
 async def start_rotation_node(binary, directory, log_name='node.log', environment=None):
