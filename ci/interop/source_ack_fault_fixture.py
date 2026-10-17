@@ -40,17 +40,21 @@ class SourceAckFailure:
         self.started = time.monotonic()
         self.deadline = self.started + args.recovery_timeout
         session = base64.b64decode(checkpoint['verified_final_certificates'][0]['session_id'], validate=True).hex()
-        prepared = json.loads((node['directory'] / 'validator-prepared.json').read_text())
-        candidates = [item for item in prepared['sessions'] if item['masterchain']
-            and item['committee_phase'] == 'successor' and item['session'] == session]
+        candidates = []
+        for manifest in (node['directory'] / 'node_db/catchains/consensus/v2').glob('*/session-runtime.json'):
+            runtime = json.loads(manifest.read_text())
+            if runtime['session'] == session and runtime['shard_workchain'] == -1:
+                candidates.append((manifest, runtime))
         if len(candidates) != 1:
-            raise RuntimeError('Source ACK target does not match the authenticated current MC session')
-        namespace = Path(candidates[0]['namespace']).resolve()
+            raise RuntimeError('Expected one exact authenticated current MC source runtime')
+        manifest, runtime = candidates[0]
+        namespace = manifest.parent.resolve()
         if not namespace.is_relative_to((node['directory'] / 'node_db').resolve()):
             raise RuntimeError('Source ACK namespace is outside the owned node database')
-        runtime = json.loads((namespace / 'session-runtime.json').read_text())
-        if runtime['session'] != session or runtime['role'] != 'validator' or runtime['shard_workchain'] != -1:
+        index = runtime['validator_index']
+        if runtime['role'] != 'validator' or runtime['catchain_seqno'] != checkpoint['gen_catchain_seqno'] or type(index) is not int or not 0 <= index < 4:
             raise RuntimeError('Source ACK target is not the current MC validator runtime')
+        (self.directory / 'selected-runtime.json').write_bytes(manifest.read_bytes())
         self.pending_directory = namespace / 'finality-pending'
         if not self.pending_directory.is_dir() or self.pending_directory.is_symlink():
             raise RuntimeError('Source ACK directory is not an existing owned source store')

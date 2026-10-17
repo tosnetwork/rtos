@@ -17,14 +17,14 @@ import source_ack_fault_fixture as source
 
 
 class SourceAckTests(unittest.IsolatedAsyncioTestCase):
-    def context(self, root, mode='sync-eio'):
-        node = root/'node'; namespace=node/'node_db'/'owned-current-session'; namespace.mkdir(parents=True)
+    def context(self, root, mode='sync-eio', stale_prepared=False):
+        node = root/'node'; namespace=node/'node_db/catchains/consensus/v2'/'owned-current-session'; namespace.mkdir(parents=True)
         pending=namespace/'finality-pending'; pending.mkdir()
         session=bytes([4])*32
-        (namespace/'session-runtime.json').write_text(json.dumps({'session':session.hex(), 'role':'validator', 'shard_workchain':-1}))
+        (namespace/'session-runtime.json').write_text(json.dumps({'session':session.hex(), 'role':'validator', 'shard_workchain':-1, 'catchain_seqno':1, 'validator_index':0}))
         (node/'validator-prepared.json').write_text(json.dumps({'sessions':[{'masterchain':True,
-            'committee_phase':'successor','session':session.hex(),'namespace':str(namespace)}]}))
-        checkpoint={'verified_final_certificates':[{'session_id':base64.b64encode(session).decode()}]}
+            'committee_phase':'successor','session':('0'*64 if stale_prepared else session.hex()),'namespace':str(namespace)}]}))
+        checkpoint={'gen_catchain_seqno':1,'verified_final_certificates':[{'session_id':base64.b64encode(session).decode()}]}
         process=SimpleNamespace(pid=10,returncode=None)
         item={'index':2,'directory':node,'process':process}
         args=SimpleNamespace(source_ack_fault=mode,recovery_timeout=1)
@@ -39,6 +39,24 @@ class SourceAckTests(unittest.IsolatedAsyncioTestCase):
         marker=context.directory/'native-error.marker';marker.write_text('source '+context.mode+': '+str(temporary)+'\n')
         context.capture_failure(marker,'Node WAL durable but source ACK needs retry: native error')
         return name,original
+
+    async def test_authenticated_runtime_is_used_when_offline_preparation_is_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context,_,_=self.context(Path(tmp),stale_prepared=True)
+            runtime=json.loads((context.directory/'selected-runtime.json').read_text())
+            self.assertEqual(runtime['session'],context.receipt['session'])
+            self.assertEqual(runtime['catchain_seqno'],1)
+
+    async def test_duplicate_authenticated_runtime_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);context,node,_=self.context(root)
+            current=Path(context.receipt['namespace'])/'session-runtime.json'
+            duplicate=current.parent.parent/'duplicate';duplicate.mkdir()
+            (duplicate/'session-runtime.json').write_bytes(current.read_bytes())
+            args=SimpleNamespace(source_ack_fault='sync-eio',recovery_timeout=1)
+            checkpoint={'gen_catchain_seqno':1,'verified_final_certificates':[{'session_id':base64.b64encode(bytes([4])*32).decode()}]}
+            with self.assertRaisesRegex(RuntimeError,'one exact authenticated'):
+                source.SourceAckFailure(args,root,node,checkpoint)
 
     async def test_exact_original_source_survives_interruption_and_recovered_reference(self):
         with tempfile.TemporaryDirectory() as tmp:
