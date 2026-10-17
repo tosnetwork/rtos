@@ -12272,25 +12272,30 @@ fn source_finality_main_worker_release_keeps_only_accepted_node_work_owned() {
 /// input, while source intent/ACK/output files are reopened from disk.
 #[test]
 fn source_finality_controller_empty_trigger_seals_all_roles_after_cold_retry() {
-    source_finality_empty_trigger_cold_retry_case(false, false, false);
+    source_finality_empty_trigger_cold_retry_case(false, false, false, false);
 }
 
 #[test]
 fn source_finality_controller_cold_retry_keeps_ancestor_handoff_below_applied_floor() {
-    source_finality_empty_trigger_cold_retry_case(true, false, false);
+    source_finality_empty_trigger_cold_retry_case(true, false, false, false);
 }
 
 #[test]
 fn source_finality_controller_replay_stops_at_materialized_parent_without_its_body() {
-    source_finality_empty_trigger_cold_retry_case(true, true, false);
+    source_finality_empty_trigger_cold_retry_case(true, true, false, false);
 }
 
 #[test]
 fn source_finality_replayed_children_share_only_fresh_accepted_ancestor_approval() {
-    source_finality_empty_trigger_cold_retry_case(false, false, true);
+    source_finality_empty_trigger_cold_retry_case(false, false, true, false);
 }
 
-fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_parent: bool, shared_approvals: bool) {
+#[test]
+fn source_finality_replay_reuses_materialized_ancestry_without_truncating_outputs() {
+    source_finality_empty_trigger_cold_retry_case(false, false, true, true);
+}
+
+fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_parent: bool, shared_approvals: bool, reuse_materialized_plan: bool) {
     use crate::finality_delivery::tests::{fixture_role, HeldSink};
     use rtos_block::Serializable;
     let temp = crate::authenticated_fixture::TestDirectory::new();
@@ -12445,7 +12450,16 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
     let mut final_slots = std::collections::BTreeSet::new();
     let mut parent_accepted = false;
     let mut rejected_parent_acceptance = false;
+    let mut ancestor_body_evicted = false;
     for _ in 0..16 {
+        if reuse_materialized_plan && !ancestor_body_evicted
+            && processor.consensus.is_finalized_block(&chain[0].0)
+        {
+            assert!(parent_accepted, "only actual fresh node acceptance can make ancestry reusable");
+            processor.candidate_book_mut().received_mut(&chain[0].0).unwrap().data =
+                consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new());
+            ancestor_body_evicted = true;
+        }
         for (draft,done) in std::mem::take(&mut *sink.0.lock().unwrap()) {
             if matches!(draft.finality, consensus_common::SessionFinality::Carrier(_)) {
                 assert!(parent_accepted, "child final cannot precede parent node acceptance");
@@ -12478,6 +12492,10 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
         if map.exists() && second_map.as_ref().is_none_or(|p|p.exists()) { break; }
     }
     assert!(parent_accepted);
+    if reuse_materialized_plan {
+        assert!(ancestor_body_evicted, "regression must remove the already accepted ancestor body");
+        assert!(map.exists(), "accepted ancestor reuse must finish the retained source with its complete output set");
+    }
     let value:serde_json::Value=serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
     assert_eq!(processor.callbacks.finality_retention_attempts(), if shared_approvals {2} else {1},
         "cold-recovery retries reuse only their own successful certificate-save phase");

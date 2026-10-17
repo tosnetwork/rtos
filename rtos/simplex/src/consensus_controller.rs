@@ -149,6 +149,10 @@ pub(crate) struct FinalizedEntry {
     // Keep this walk's dependencies in its output manifest across retries,
     // including empty candidates materialized while waiting for a child ACK.
     walked_candidates: HashSet<RawCandidateId>,
+    /// Complete output plan from a successful dependency resolution in this
+    /// process. Reusing a materialized ancestor must retain its full output
+    /// suffix, including Approval records still owned by this source.
+    resolved_output_plan: Vec<(RawCandidateId, crate::finality_recovery::ExpectedFinalityOutput)>,
     /// Time when finalization was first observed (for timeout / diagnostics).
     finalized_at: SystemTime,
 }
@@ -1512,7 +1516,7 @@ impl ConsensusController {
         // Always keep a pending entry until recursive parent-chain materialization
         // succeeds end-to-end. This provides deterministic retries on late body/cert
         // arrivals and ensures ancestor parity is eventually reached.
-        let entry = FinalizedEntry { event: event.clone(), intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), finalized_at: self.now() };
+        let entry = FinalizedEntry { event: event.clone(), intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), resolved_output_plan: Vec::new(), finalized_at: self.now() };
         // C++ state-resolver.cpp: a duplicate joins the existing InFlight
         // operation, preserving its original certificate and completed phases.
         self.finalized_pending_body.entry(finalized_id.clone()).or_insert(entry);
@@ -1763,6 +1767,7 @@ impl ConsensusController {
         let applied_floor = self.last_mc_finalized_seqno.unwrap_or(0);
         let mut complete = true;
         let mut expected_outputs = Vec::new();
+        let mut resolved_output_plan = Vec::new();
         // C++ state-resolver.cpp:927-946 awaits the complete parent operation
         // before publishing a non-empty WC child. Build the dependency stack
         // first; no child callback escapes while a parent is unresolved.
@@ -1831,11 +1836,28 @@ impl ConsensusController {
             // crossed node acceptance; do not require its old body again.
             // Keep the trigger's FinalCert path: a retained source still needs
             // its own handoff even when startup seeded this candidate id.
-            if workchain && !has_final_cert && self.finalized_blocks.contains(&current_id)
-                && !self.finalized_pending_body.get(trigger_id).is_some_and(|entry|
-                    entry.walked_candidates.contains(&current_id))
-            {
-                break;
+            if workchain && !has_final_cert && self.finalized_blocks.contains(&current_id) {
+                if let Some(entry) = self.finalized_pending_body.get(trigger_id) {
+                    // C++ returns the completed parent operation instead of
+                    // resolving its old body again. Only a fresh node-accepted
+                    // Approval can reuse this walk's previously resolved suffix;
+                    // a startup marker alone cannot supply that authority.
+                    if self.acknowledged_ancestor_approvals.contains(&current_id) {
+                        if let Some(index) = entry.resolved_output_plan.iter()
+                            .position(|(id, _)| id == &current_id)
+                        {
+                            let suffix = &entry.resolved_output_plan[index..];
+                            expected_outputs.extend(suffix.iter().map(|(_, output)| output.clone()));
+                            resolved_output_plan.extend_from_slice(suffix);
+                            break;
+                        }
+                    }
+                    if !entry.walked_candidates.contains(&current_id) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
             }
 
             if let Some(entry) = self.finalized_pending_body.get_mut(trigger_id) {
@@ -1874,11 +1896,13 @@ impl ConsensusController {
 
             if !received.is_empty && self.description.authenticated_runtime().is_some() {
                 let source = self.build_source_info_for_received(&received);
-                expected_outputs.push(crate::finality_recovery::ExpectedFinalityOutput::new(
+                let output = crate::finality_recovery::ExpectedFinalityOutput::new(
                     &received.block_id,
                     has_final_cert,
                     &UInt256::from(*source.source.id().data()),
-                ));
+                );
+                expected_outputs.push(output.clone());
+                resolved_output_plan.push((current_id.clone(), output));
             }
             // Step 2: evaluate local readiness + floor constraints for this block only.
             // C++ parity: cert-carrying walks bypass the floor check because the
@@ -1980,6 +2004,16 @@ impl ConsensusController {
         if workchain {
             if !complete {
                 return false;
+            }
+            if let Some(entry) = self.finalized_pending_body.get_mut(trigger_id) {
+                // Cache only a fully resolved plan. This optimization is bounded
+                // independently of the legal chain depth; larger plans keep the
+                // normal verified walk and output-sealing checks.
+                entry.resolved_output_plan = if resolved_output_plan.len() <= 1024 {
+                    resolved_output_plan
+                } else {
+                    Vec::new()
+                };
             }
             // ResolveCandidate/parent failure or a pending node handoff stops
             // this pass. The retained trigger retries the same parent first.
@@ -2817,7 +2851,7 @@ impl ConsensusController {
         event: BlockFinalizedEvent,
         finalized_at: SystemTime,
     ) {
-        self.finalized_pending_body.insert(id, FinalizedEntry { event, intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), finalized_at });
+        self.finalized_pending_body.insert(id, FinalizedEntry { event, intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), resolved_output_plan: Vec::new(), finalized_at });
         self.telemetry.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
     }
 }
