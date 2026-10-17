@@ -139,6 +139,22 @@ def retained_cpp_certificate(directory, target):
         responses=[base64.b64encode(path.read_bytes()).decode() for path in responses])
 
 
+class NativeStateNotReady(RuntimeError):
+    """The native peer explicitly reported local state/dependencies unavailable."""
+
+
+def native_state_not_ready(log):
+    clean = re.sub(r'\x1b\[[0-9;]*m', '', log)
+    errors = re.findall(r'liteserver error: \[Error : (-?\d+) : ([^\r\n]+)', clean)
+    def known(code, message):
+        # Pinned C++ common/errorcode.h: notready=651. The existing Rust
+        # ancestor-restoration miss currently has the narrower legacy 500 form.
+        return int(code) == 651 or (int(code) == 500 and (
+            message.startswith('LITE_SERVER_NOTREADY:') or
+            message.startswith('LITE_SERVER_UNKNOWN: Cannot load handle for (')))
+    return bool(errors) and all(known(code, message) for code, message in errors)
+
+
 async def native_state(snapshot, config, name, block_id, directory):
     """Use the same pinned native client for C++ and Rust full-state responses."""
     directory.mkdir()
@@ -146,9 +162,14 @@ async def native_state(snapshot, config, name, block_id, directory):
     config_path.write_text(config.to_json())
     data = directory / 'data'
     data.mkdir()
-    await child_checked([snapshot / 'build/lite-client/lite-client', '-C', config_path,
-        '-r', '-D', data, '-t', '15', '-c', 'getstate ' + block_text(block_id)],
-        directory / 'client.log')
+    try:
+        await child_checked([snapshot / 'build/lite-client/lite-client', '-C', config_path,
+            '-r', '-D', data, '-t', '15', '-c', 'getstate ' + block_text(block_id)],
+            directory / 'client.log')
+    except RuntimeError as error:
+        if str(error).startswith('Program exited 1; see ') and (directory / 'client.log').is_file() and native_state_not_ready((directory / 'client.log').read_text()):
+            raise NativeStateNotReady(str(error)) from error
+        raise
     # The native client also saves its startup masterchain block. Select the
     # state receipt for the requested full identity instead of counting files.
     log = re.sub(r'\x1b\[[0-9;]*m', '', (directory / 'client.log').read_text())

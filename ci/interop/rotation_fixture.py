@@ -14,7 +14,7 @@ import time
 
 sys.dont_write_bytecode = True
 from mixed_matrix import (child_checked, cpp_block, cpp_certificate, digest, identity,
-                          native_state, prepare_rust, reserve_port, rpc, stop_rust, write)
+                          NativeStateNotReady, native_state, prepare_rust, reserve_port, rpc, stop_rust, write)
 
 
 INITIAL = [0, 1, 2, 3]
@@ -47,6 +47,39 @@ async def start_rotation_node(binary, directory, log_name='node.log'):
             start_new_session=True)
     return {'process': process,
         'start_ticks': Path(f'/proc/{process.pid}/stat').read_text().split()[21]}
+
+
+async def native_recovery_state(snapshot, config, name, block_id, directory, deadline):
+    """Require the same full-state receipt within the original recovery budget.
+
+    Only explicit native not-ready responses retry. Every failed attempt remains
+    on disk; missing receipts, hash failures and other query errors still fail.
+    """
+    directory.mkdir()
+    failures = []
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('Native state remained unavailable at the original recovery deadline')
+        target = directory / f'attempt-{len(failures) + 1:04}'
+        try:
+            return await asyncio.wait_for(native_state(snapshot, config, name, block_id, target), remaining)
+        except NativeStateNotReady as error:
+            failures.append({'attempt': target.name, 'error': str(error), 'remaining_seconds': max(0, deadline - time.monotonic())})
+            write(directory / 'not-ready-attempts.json', failures)
+            await asyncio.sleep(min(.2, max(0, deadline - time.monotonic())))
+
+
+async def recovery_workchain_states(snapshot, lite_configs, indices, block_id, directory, deadline):
+    tasks = [asyncio.create_task(native_recovery_state(snapshot, lite_configs[i], str(i), block_id,
+        directory / str(i), deadline)) for i in indices]
+    try:
+        return await asyncio.gather(*tasks)
+    finally:
+        # A permanent failure/cancellation must also reap sibling native clients.
+        for task in tasks:
+            if not task.done():task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, rust_nodes,
@@ -135,8 +168,8 @@ async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, ru
             wc_dir = target / 'workchain'; wc_dir.mkdir()
             sample['references'] = {str(i): infos[i] for i in SUCCESSOR}
             sample['workchain'] = {'block': await cpp_block(args.snapshot, nodes[0], tops[0], wc_dir),
-                'states': await asyncio.gather(*(native_state(args.snapshot, lite_configs[i],
-                    str(i), tops[0], wc_dir / str(i)) for i in SUCCESSOR))}
+                'states': await recovery_workchain_states(args.snapshot, lite_configs, SUCCESSOR,
+                    tops[0], wc_dir, deadline)}
             write(target / 'sample.json', sample)
             await child_checked([args.block_checker, target / 'sample.json', target / 'checked-with-workchain.json'],
                 target / 'workchain-checker.log')
