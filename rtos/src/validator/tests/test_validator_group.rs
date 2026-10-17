@@ -1671,3 +1671,33 @@ async fn test_candidate_validation_uses_exact_historical_reference_not_latest_he
     assert!(candidate_validation_reference_top(&engine, &info, &candidate).await.unwrap_err()
         .to_string().contains("reference state identity differs"));
 }
+
+#[tokio::test]
+async fn test_mc_validation_parent_group_stop_cancels_live_and_ready_waits() {
+    let parent = BlockIdExt::with_params(ShardIdent::masterchain(), 7,
+        UInt256::from([0x51; 32]), UInt256::from([0x52; 32]));
+    let candidate = BlockIdExt::with_params(ShardIdent::masterchain(), 8,
+        UInt256::from([0x41; 32]), UInt256::from([0x42; 32]));
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let stop = tokio_util::sync::CancellationToken::new();
+    let tracker = tokio_util::task::TaskTracker::new();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (task_stop, task_entered) = (stop.clone(), entered.clone());
+    let (task_candidate, task_parent) = (candidate.clone(), parent.clone());
+    let task = tracker.spawn(async move {
+        task_entered.notify_one();
+        wait_for_mc_validation_parent_until_stop(rx, &task_candidate, &task_parent, &task_stop).await
+    });
+    entered.notified().await;
+    tracker.close();
+    assert!(tokio::time::timeout(Duration::from_millis(20), tracker.wait()).await.is_err(),
+        "live accepted-parent observer must remain owned before group stop");
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(1), tracker.wait()).await
+        .expect("group stop must drain the accepted-parent observer wait");
+    let error = task.await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("cancelled by group stop"));
+    // A stopped C++ actor cannot approve even if its parent is already ready.
+    let (_tx, rx) = tokio::sync::watch::channel(Some(parent.clone()));
+    assert!(wait_for_mc_validation_parent_until_stop(rx, &candidate, &parent, &stop).await.is_err());
+}

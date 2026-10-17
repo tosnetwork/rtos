@@ -230,6 +230,23 @@ async fn candidate_validation_reference_top(
     }
 }
 
+/// C++ block-validator.cpp:36-45 cancels next-block promises on StopRequested.
+/// This wait only observes an accepted head; it owns no block/state writes.
+async fn wait_for_mc_validation_parent_until_stop(
+    accepted_mc_block_rx: tokio::sync::watch::Receiver<Option<BlockIdExt>>,
+    candidate_block_id: &BlockIdExt,
+    candidate_parent_block_id: &BlockIdExt,
+    stop: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = stop.cancelled() => fail!("MC validation parent wait cancelled by group stop"),
+        result = wait_for_mc_validation_parent(
+            accepted_mc_block_rx, candidate_block_id, candidate_parent_block_id,
+        ) => result,
+    }
+}
+
 async fn wait_for_mc_validation_parent(
     mut accepted_mc_block_rx: tokio::sync::watch::Receiver<Option<BlockIdExt>>,
     candidate_block_id: &BlockIdExt,
@@ -2855,6 +2872,7 @@ impl ValidatorGroup {
             })
             .await;
         let accepted_mc_block_rx = self.accepted_mc_block_tx.subscribe();
+        let validation_stop = self.stop_requested.clone();
 
         let validation_task = self.spawn_task(&tokio::runtime::Handle::current(), async move {
             // C++ parity: bounded validation deadline.
@@ -2896,10 +2914,11 @@ impl ValidatorGroup {
                     if is_masterchain {
                         let prev_ids = info.read_prev_ids()?;
                         if let Some(candidate_parent_block_id) = prev_ids.first() {
-                            wait_for_mc_validation_parent(
+                            wait_for_mc_validation_parent_until_stop(
                                 accepted_mc_block_rx.clone(),
                                 &candidate_block_id,
                                 candidate_parent_block_id,
+                                &validation_stop,
                             )
                             .await?;
                         }
