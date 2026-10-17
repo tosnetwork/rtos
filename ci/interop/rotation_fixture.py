@@ -39,6 +39,143 @@ async def stop_rotation_node(node):
         node['shutdown_elapsed_seconds'] = time.monotonic() - started
 
 
+async def start_rotation_node(binary, directory, log_name='node.log'):
+    with (directory / log_name).open('w') as log:
+        process = await asyncio.create_subprocess_exec(str(binary), '--configs', str(directory),
+            '--zerostate', str(directory / 'zero'), '--initial-sync-disabled', cwd=directory,
+            stdout=log, stderr=log, env={**os.environ, 'TOKIO_WORKER_THREADS': '2'},
+            start_new_session=True)
+    return {'process': process,
+        'start_ticks': Path(f'/proc/{process.pid}/stat').read_text().split()[21]}
+
+
+async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, rust_nodes,
+                                  zero, governing, checkpoint, artifacts):
+    """Interrupt one owned successor, then reopen its existing data without preparation."""
+    index = args.interrupt_rust_member
+    node = next(node for node in rust_nodes if node['index'] == index)
+    directory = root / 'recovery'; directory.mkdir()
+    old_process = node['process']
+    prepared = node['directory'] / 'validator-prepared.json'
+    prepared_hash = digest(prepared)
+    prior = await asyncio.gather(*(asyncio.to_thread(rpc, url, 'getMasterchainInfo') for url in endpoints))
+    if any(identity(info['init']) != identity(zero) for info in prior):
+        raise RuntimeError('Pre-interruption endpoint changed Genesis')
+    receipt = {'member': index, 'before': checkpoint['block'],
+        'pre_interruption_references': dict(enumerate(prior)),
+        'old_process': {'pid': old_process.pid, 'start_ticks': node['start_ticks']},
+        'prepared_sha256': prepared_hash, 'phase': 'interrupting'}
+    write(directory / 'recovery.json', receipt)
+    if old_process.returncode is not None:
+        raise RuntimeError('Recovery member exited before the intended interruption')
+    old_process.kill()
+    interrupted_at = time.time()
+    code = await asyncio.wait_for(old_process.wait(), 10)
+    if code != -9:
+        raise RuntimeError(f'Recovery interruption did not reap SIGKILL: {code}')
+    receipt.update(interruption_returncode=code, interrupted_at_unix=interrupted_at, phase='waiting_for_survivors')
+    write(directory / 'recovery.json', receipt)
+    histories = [{} for _ in nodes]
+    deadline = time.monotonic() + args.recovery_timeout
+
+    async def common_checkpoint(indices, floor):
+        while time.monotonic() < deadline:
+            for live in rust_nodes:
+                if live['index'] in indices and live['process'].returncode is not None:
+                    raise RuntimeError(f"Live Rust recovery peer {live['index']} exited")
+            replies = await asyncio.gather(*(asyncio.to_thread(rpc, endpoints[i],
+                'getMasterchainInfo') for i in indices), return_exceptions=True)
+            for i, value in zip(indices, replies):
+                if isinstance(value, BaseException):continue
+                if identity(value['init']) != identity(zero):
+                    raise RuntimeError('Recovery endpoint changed Genesis')
+                histories[i][identity(value['last'])] = value
+                if len(histories[i]) > 512:del histories[i][next(iter(histories[i]))]
+            common = set.intersection(*(set(histories[i]) for i in indices))
+            newer = [key for key in common if key[2] > floor]
+            if newer:
+                key = max(newer, key=lambda key: key[2])
+                infos = {i: histories[i][key] for i in indices}
+                if len({info['state_root_hash'] for info in infos.values()}) != 1:
+                    raise RuntimeError('Recovery peers disagree on the applied state')
+                return infos
+            await asyncio.sleep(0.2)
+        raise TimeoutError('Interrupted member did not recover within the recovery deadline')
+
+    async def check_checkpoint(infos, label, with_workchain):
+        target = directory / label; target.mkdir()
+        block_id = infos[0]['last']
+        block = await cpp_block(args.snapshot, nodes[0], block_id, target)
+        state = await native_state(args.snapshot, lite_configs[0], 'cpp-0', block_id, target / 'mc-state')
+        proof = await cpp_certificate(args.snapshot, nodes[0], zero, block_id, target)
+        sample = {'zerostate': zero, 'reference': infos[0], 'comparison': infos[next(i for i in infos if i != 0)],
+            'all_references': {str(i): info for i, info in infos.items()},
+            'block': block, 'masterchain_state': state, 'certificates': [proof],
+            'governing_key_block': {**governing, 'certificates': [proof]}}
+        write(target / 'sample.json', sample)
+        await child_checked([args.block_checker, target / 'sample.json', target / 'checked.json'],
+            target / 'checker.log')
+        checked = json.loads((target / 'checked.json').read_text())
+        if {m['validator_id'] for m in checked['configuration']['current']['members']} != {member_id(i) for i in SUCCESSOR}:
+            raise RuntimeError('Recovery checkpoint changed the successor committee')
+        if not checked['verified_governing_key_blocks'] or checked['key_block']:
+            raise RuntimeError('Recovery checkpoint lacks successor finality')
+        if with_workchain:
+            tops = [top for top in checked['shard_tops'] if int(top['workchain']) == 0 and int(top['seqno']) > 0]
+            if len(tops) != 1:raise RuntimeError('Recovery needs one produced full workchain')
+            wc_dir = target / 'workchain'; wc_dir.mkdir()
+            sample['references'] = {str(i): infos[i] for i in SUCCESSOR}
+            sample['workchain'] = {'block': await cpp_block(args.snapshot, nodes[0], tops[0], wc_dir),
+                'states': await asyncio.gather(*(native_state(args.snapshot, lite_configs[i],
+                    str(i), tops[0], wc_dir / str(i)) for i in SUCCESSOR))}
+            write(target / 'sample.json', sample)
+            await child_checked([args.block_checker, target / 'sample.json', target / 'checked-with-workchain.json'],
+                target / 'workchain-checker.log')
+            checked = json.loads((target / 'checked-with-workchain.json').read_text())
+        return checked
+
+    floor = max(info['last']['seqno'] for info in prior)
+    while True:
+        survivor_infos = await common_checkpoint([i for i in range(6) if i != index], floor)
+        floor = survivor_infos[0]['last']['seqno']
+        survivor = await check_checkpoint(survivor_infos, f'survivors-{floor}', False)
+        if survivor['gen_utime'] > interrupted_at:break
+    receipt.update(phase='restarting_original_directory', survivor_checkpoint=survivor['block'])
+    write(directory / 'recovery.json', receipt)
+    for filename, expected in artifacts.items():
+        if digest(Path(filename)) != expected:raise RuntimeError('An executable or profile changed before restart')
+    if digest(prepared) != prepared_hash:raise RuntimeError('Prepared authority changed before restart')
+    node.update(await start_rotation_node(args.rust_node, node['directory'], 'node-restart.log'))
+    receipt['new_process'] = {'pid': node['process'].pid, 'start_ticks': node['start_ticks']}
+    receipt['phase'] = 'waiting_for_recovered_leadership'
+    write(directory / 'recovery.json', receipt)
+    # Clear all pre-interruption observations; acceptance needs fresh RPCs from every process.
+    histories = [{} for _ in nodes]
+    floor = survivor['block']['seqno']
+    minimum_wc = max((int(top['seqno']) for top in survivor['shard_tops'] if int(top['workchain']) == 0), default=0)
+    leaders = {}
+    while len(leaders) < 2:
+        infos = await common_checkpoint(list(range(6)), floor)
+        floor = infos[0]['last']['seqno']
+        checked = await check_checkpoint(infos, str(floor), True)
+        for chain, evidence, workchain in [('masterchain', checked, -1), ('workchain', checked['workchain_check'], 0)]:
+            if evidence['created_by'] != member_id(index):continue
+            if workchain == 0 and evidence['block']['seqno'] <= minimum_wc:continue
+            match = re.search(r'^\(' + str(workchain) + r':8000000000000000, ' +
+                str(evidence['block']['seqno']) + r'\): ValidatorGroup::on_generate_slot: .*Collation successful$',
+                (node['directory'] / 'node-restart.log').read_text(errors='replace'), re.M)
+            if not match:raise RuntimeError('Recovered creator lacks post-restart local collation evidence')
+            leaders.setdefault(chain, {'block': evidence['block'], 'sample_directory': str(directory / str(floor)),
+                'local_collation': match.group(0)})
+        receipt.update(leaders=leaders, last_checkpoint=checked['block'])
+        write(directory / 'recovery.json', receipt)
+    if digest(prepared) != prepared_hash:raise RuntimeError('Recovery changed prepared authority')
+    receipt.update(phase='recovered', all_six_applied_states_match=True,
+        successor_finality_checked=True, workchain_states_match=True, manual_database_repair=False)
+    write(directory / 'recovery.json', receipt)
+    return receipt
+
+
 def install_successor(module, nodes, profile):
     """Add an explicit future set before the native config account is created.
 
@@ -137,16 +274,8 @@ async def run(args, profile, root, artifacts):
                     directory = root / f'rust-{index}'
                     address, prepared = await prepare_rust(args, directory, index, network,
                         global_config, used, used)
-                    log = (directory / 'node.log').open('w')
-                    try:
-                        process = await asyncio.create_subprocess_exec(str(args.rust_node), '--configs',
-                            str(directory), '--zerostate', str(directory / 'zero'), '--initial-sync-disabled',
-                            cwd=directory, stdout=log, stderr=log,
-                            env={**os.environ, 'TOKIO_WORKER_THREADS': '2'}, start_new_session=True)
-                    finally:
-                        log.close()
-                    start_ticks = Path(f'/proc/{process.pid}/stat').read_text().split()[21]
-                    rust_nodes.append(dict(index=index, directory=directory, process=process, start_ticks=start_ticks))
+                    rust_nodes.append(dict(index=index, directory=directory,
+                        **await start_rotation_node(args.rust_node, directory)))
                     client = json.loads((directory / 'lite_client_config.json').read_text())
                     lite_configs.append(tos_api.Liteclient_config_global(
                         liteservers=[tos_api.Liteserver_desc(id=tos_api.Pub_ed25519(
@@ -197,6 +326,7 @@ async def run(args, profile, root, artifacts):
                     state = await native_state(args.snapshot, nodes[0].liteserver_config, 'cpp-0',
                         infos[0]['last'], directory / 'mc-state')
                     sample = {'zerostate': zero, 'reference': infos[0], 'comparison': infos[2],
+                        'all_references': dict(zip(endpoint_names, infos)),
                         'block': block, 'masterchain_state': state}
                     write(directory / 'sample.json', sample)
                     await child_checked([args.block_checker, directory / 'sample.json', directory / 'checked.json'],
@@ -288,12 +418,18 @@ async def run(args, profile, root, artifacts):
                             epochs[phase]['wc_creators'].setdefault(wc['created_by'], evidence)
                     write(root / 'epochs.json', epochs)
                     if all(len(epoch[k]) == 4 for epoch in epochs.values() for k in ['mc_creators', 'wc_creators']):
+                        recovery = None
+                        if args.interrupt_rust_member is not None:
+                            recovery = await recover_rotation_member(args, root, nodes, endpoints,
+                                lite_configs, rust_nodes, zero, governing_witnesses[checked['prev_key_block_seqno']],
+                                checked, artifacts)
                         for filename, expected in artifacts.items():
                             if digest(Path(filename)) != expected: raise RuntimeError('An executable or profile changed')
                         return {'status': ('mixed_membership_rotation_observed' if args.rust_node
                                           else 'cpp_membership_rotation_observed'), 'epochs': epochs,
                             'all_six_applied_mc_states_match': True, 'independent_post_rotation_finality_qualified': True,
-                            'mixed_rotation_qualified': bool(args.rust_node), 'election_rehearsal': False}
+                            'mixed_rotation_qualified': bool(args.rust_node), 'election_rehearsal': False,
+                            'recovery': recovery}
                 await asyncio.sleep(0.2)
             raise TimeoutError('C++ rotation did not satisfy both MC/WC creator epochs')
         finally:
@@ -320,9 +456,15 @@ def main():
     parser.add_argument('--prepare-genesis-only', action='store_true')
     parser.add_argument('--rust-node', type=Path)
     parser.add_argument('--validator-preparer', type=Path)
+    parser.add_argument('--interrupt-rust-member', type=int, choices=[2, 5])
+    parser.add_argument('--recovery-timeout', type=float, default=180)
     args = parser.parse_args()
     if bool(args.rust_node) != bool(args.validator_preparer):
         raise SystemExit('Mixed rotation requires both the Rust node and offline preparer')
+    if args.interrupt_rust_member is not None and (not args.rust_node or args.prepare_genesis_only):
+        raise SystemExit('Recovery requires a live mixed rotation fixture')
+    if not 0 < args.recovery_timeout <= 600:
+        raise SystemExit('Recovery timeout must be positive and at most 600 seconds')
     args.verify_workchain = args.include_genesis_successor = True
     if args.rust_node:
         args.rust_node, args.validator_preparer = args.rust_node.resolve(), args.validator_preparer.resolve()

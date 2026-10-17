@@ -244,3 +244,18 @@ The isolated build can then create a fresh exact session after its authenticated
 key-block height becomes known. Existing or partial namespaces are refused.
 The default build does not enable this fixture signing policy. This is separate
 from production custody, operator key rotation and full election qualification.
+
+Add `--interrupt-rust-member 2` (retained member) or `5` (joining member) to
+continue that same network through an actual process interruption after both
+creator epochs pass. The runner sends SIGKILL only to that owned Rust process,
+reaps it, and requires the five survivors to agree on a newer certified MC block
+whose generation time is after the interruption. It then starts the same binary
+with the same configuration and database directory, without running the preparer
+or repairing data. Fresh RPC observations from all six processes must agree;
+the restarted member must create both a new certified MC block and a newly
+anchored WC block, with matching post-restart collation logs and full WC states
+from all four active members. Recovery observations and both process identities
+are retained in `recovery/recovery.json`; the restarted process has a separate
+`node-restart.log`. `--recovery-timeout` bounds this combined recovery phase
+(default 180 seconds). The final normal shutdown limit remains 20 seconds per
+Rust process. A process interruption does not simulate a power failure.
