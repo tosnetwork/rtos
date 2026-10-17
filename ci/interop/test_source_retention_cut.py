@@ -19,7 +19,7 @@ import source_retention_cut_fixture as cut
 
 
 class RetentionTests(unittest.IsolatedAsyncioTestCase):
-    def context(self, root):
+    def context(self, root, point='after-fsync'):
         node = root/'node'; namespace=node/'node_db/catchains/consensus/v2/owned';namespace.mkdir(parents=True)
         pending=namespace/'finality-pending';pending.mkdir()
         session=bytes([4])*32
@@ -27,20 +27,23 @@ class RetentionTests(unittest.IsolatedAsyncioTestCase):
             'shard_workchain':-1,'catchain_seqno':1,'validator_index':0}))
         checkpoint={'gen_catchain_seqno':1,'verified_final_certificates':[{'session_id':base64.b64encode(session).decode()}]}
         node={'index':2,'directory':node,'process':SimpleNamespace(pid=10,returncode=None)}
-        args=SimpleNamespace(source_ack_fault=None,recovery_timeout=1)
+        args=SimpleNamespace(source_ack_fault=None,recovery_timeout=1,source_retention_cut_point=point)
         return cut.SourceRetentionCut(args,root,node,checkpoint),node,pending
 
     def captured(self, context, pending):
         record={'schema':1,'global_id':4,'zerostate':'exact-zero','protocol':2,'carrier_version':5,'wire_profile':1,
             'profile':'a'*64,'session_id':context.receipt['session'],'block_id':'exact-block',
             'is_final':True,'local_adnl':'b'*64,'local_validator_index':0,'source_validator':'c'*64,
-            'data':'original-body','signature_set':'original-cert'}
+            'data':'original-body','signature_set':'original-cert','created_at_unix_secs':1,'last_mc_finalized_seqno':0,'candidate_already_sent':False}
         identity=['rtos-source-finality-v1',record['global_id'],record['zerostate'],record['protocol'],
             record['carrier_version'],record['wire_profile'],record['profile'],record['session_id'],
             record['block_id'],record['is_final'],[record['local_adnl'],record['local_validator_index'],record['source_validator']]]
         name=hashlib.sha256(json.dumps(identity,separators=(',',':')).encode()).hexdigest()
-        original=json.dumps(record,separators=(',',':')).encode();temporary=pending/(name+'.tmp');temporary.write_bytes(original)
-        marker=context.directory/'native-stop.marker';marker.write_text(f'source retain-after-fsync pid=10: {temporary}\n')
+        original=json.dumps(record,separators=(',',':')).encode();temporary=pending/(name+'.tmp')
+        prefix=original if context.point=='after-fsync' else (b'' if context.point=='before-write' else original[:len(original)//2])
+        temporary.write_bytes(prefix)
+        if context.point!='after-fsync':(context.directory/'intended-source.json').write_bytes(original)
+        marker=context.directory/'native-stop.marker';marker.write_text(f'source {context.mode} pid=10: {temporary}\n')
         with patch.object(context,'process_status',return_value='Pid:\t10\nState:\tT (stopped)\n'):
             context.capture_stop(marker)
         return temporary,original
@@ -60,6 +63,23 @@ class RetentionTests(unittest.IsolatedAsyncioTestCase):
             temporary.unlink();await context.complete({'last_checkpoint':{'seqno':18}})
             self.assertTrue(context.receipt['interrupted_retention_recovered'])
             self.assertEqual(context.receipt['pending_sha256'],hashlib.sha256(original).hexdigest())
+
+    async def test_incomplete_prefix_preserved_and_only_uncommitted_hints_may_change(self):
+        for point in ['before-write','after-partial-write']:
+            with tempfile.TemporaryDirectory() as tmp:
+                context,node,pending=self.context(Path(tmp),point);temporary,original=self.captured(context,pending)
+                prefix=temporary.read_bytes();self.assertLess(len(prefix),len(original))
+                node['process'].returncode=-9
+                async def no_delay(*args):pass
+                with patch.object(ack,'hold',no_delay):await context.after_interruption()
+                self.assertEqual(temporary.read_bytes(),prefix)
+                self.assertIsNone(context.environment());node['process']=SimpleNamespace(pid=20,returncode=None)
+                rebuilt={**json.loads(original),'created_at_unix_secs':2,'last_mc_finalized_seqno':3,'candidate_already_sent':True}
+                temporary.with_suffix('.acked').write_text(json.dumps({'record':rebuilt,'node_receipt':'d'*64}))
+                temporary.unlink();await context.complete({'last_checkpoint':{}})
+                self.assertTrue(context.receipt['interrupted_retention_recovered'])
+                rebuilt['data']='changed body'
+                self.assertFalse(context.matches_recovered_source('acked',{'record':rebuilt},json.loads(original))[0])
 
     async def test_changed_temporary_cannot_reopen(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -114,7 +134,7 @@ class NativeRetentionCutTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):cls.directory.cleanup()
 
-    def probe(self, operation='fsync', correct=True, name=None, empty=False, control_kind='regular'):
+    def probe(self, operation='fsync', correct=True, name=None, empty=False, control_kind='regular', point='after-fsync'):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);selected=root/'selected';selected.mkdir();other=root/'other';other.mkdir()
             target=(selected if correct else other)/(name or ('a'*64+'.tmp'));marker=root/'marker';arm=root/'armed';arm.write_text('armed')
@@ -124,7 +144,7 @@ class NativeRetentionCutTests(unittest.TestCase):
             elif control_kind=='relative':control.write_text('selected\n')
             after=root/'after';data=b'' if empty else b'durable-source-proof'
             script='import os,sys;from pathlib import Path;p,after,op,data=sys.argv[1:];fd=os.open(p,os.O_WRONLY|os.O_CREAT,0o600);os.write(fd,bytes.fromhex(data));getattr(os,op)(fd);os.close(fd);Path(after).write_text("returned")'
-            environment={**os.environ,'LD_PRELOAD':str(self.library),'RTOS_TEST_RETAIN_CUT_DIRECTORY_FILE':str(control),'RTOS_TEST_RETAIN_CUT_ARM':str(arm),'RTOS_TEST_RETAIN_CUT_MARKER':str(marker)}
+            environment={**os.environ,'LD_PRELOAD':str(self.library),'RTOS_TEST_RETAIN_CUT_DIRECTORY_FILE':str(control),'RTOS_TEST_RETAIN_CUT_ARM':str(arm),'RTOS_TEST_RETAIN_CUT_MARKER':str(marker),'RTOS_TEST_RETAIN_CUT_POINT':point,'RTOS_TEST_RETAIN_CUT_INTENDED':str(root/'intended-source.json')}
             process=subprocess.Popen([sys.executable,'-c',script,str(target),str(after),operation,data.hex()],env=environment,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
             expect_stop=correct and name is None and not empty and control_kind=='regular'
             try:
@@ -136,8 +156,10 @@ class NativeRetentionCutTests(unittest.TestCase):
                         if any(l.startswith('State:') and l.split()[1]=='T' for l in status.splitlines()):break
                         if time.monotonic()>deadline:self.fail('native cut never stopped')
                         time.sleep(.01)
-                    self.assertEqual(target.read_bytes(),data);self.assertFalse(after.exists())
-                    self.assertEqual(marker.read_text(),f'source retain-after-fsync pid={process.pid}: {target}\n')
+                    expected=data if point=='after-fsync' else (b'' if point=='before-write' else data[:len(data)//2])
+                    self.assertEqual(target.read_bytes(),expected);self.assertFalse(after.exists())
+                    if point!='after-fsync':self.assertEqual((root/'intended-source.json').read_bytes(),data)
+                    self.assertEqual(marker.read_text(),f'source retain-{point} pid={process.pid}: {target}\n')
                 else:
                     out,err=process.communicate(timeout=5);self.assertEqual(process.returncode,0,err.decode())
                     self.assertTrue(after.exists());self.assertFalse(marker.exists())
@@ -145,6 +167,8 @@ class NativeRetentionCutTests(unittest.TestCase):
                 if process.poll() is None:process.kill()
                 process.communicate(timeout=5)
 
+    def test_before_write_leaves_empty_temporary(self):self.probe(point='before-write')
+    def test_partial_write_leaves_exact_prefix(self):self.probe(point='after-partial-write')
     def test_successful_fsync_stops_before_return_and_commit(self):self.probe()
     def test_successful_fdatasync_stops_before_return_and_commit(self):self.probe(operation='fdatasync')
     def test_wrong_directory_is_untouched(self):self.probe(correct=False)

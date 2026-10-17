@@ -26,14 +26,17 @@ def retention_cut_environment(args, root):
     return {**os.environ, 'LD_PRELOAD': str(args.source_retention_cut_library),
         'RTOS_TEST_RETAIN_CUT_DIRECTORY_FILE': str(directory / 'selected-directory'),
         'RTOS_TEST_RETAIN_CUT_ARM': str(directory / 'armed'),
-        'RTOS_TEST_RETAIN_CUT_MARKER': str(directory / 'native-stop.marker')}
+        'RTOS_TEST_RETAIN_CUT_MARKER': str(directory / 'native-stop.marker'),
+        'RTOS_TEST_RETAIN_CUT_POINT': getattr(args, 'source_retention_cut_point', 'after-fsync'),
+        'RTOS_TEST_RETAIN_CUT_INTENDED': str(directory / 'intended-source.json')}
 
 
 class SourceRetentionCut(SourceAckFailure):
     def __init__(self, args, root, node, checkpoint):
         super().__init__(args, root, node, checkpoint, directory=paths(root))
-        self.mode = 'retain-after-fsync'
-        self.receipt.update(mode=self.mode, fault_mechanism='test-only native stop after successful source retain fsync before commit rename; not media failure')
+        self.point = getattr(args, 'source_retention_cut_point', 'after-fsync')
+        self.mode = 'retain-' + self.point
+        self.receipt.update(mode=self.mode, fault_mechanism='test-only native stop at source retain '+self.point+' before commit rename; intended bytes are observation only, never supplied to restarted node')
         self.save()
 
     def process_status(self):
@@ -59,7 +62,7 @@ class SourceRetentionCut(SourceAckFailure):
             await asyncio.sleep(.05)
 
     def capture_stop(self, marker):
-        prefix = f'source retain-after-fsync pid={self.node["process"].pid}: '
+        prefix = f'source {self.mode} pid={self.node["process"].pid}: '
         lines = marker.read_text().splitlines()
         if len(lines) != 1 or not lines[0].startswith(prefix) or not self.stopped():
             raise RuntimeError('Retention marker is not this stopped owned process')
@@ -70,7 +73,12 @@ class SourceRetentionCut(SourceAckFailure):
         self.pending = target
         if target.is_symlink():
             raise RuntimeError('Retention target is not a regular owned source')
-        self.original = target.read_bytes()
+        self.interrupted_bytes = target.read_bytes()
+        self.original = self.interrupted_bytes if self.point == 'after-fsync' else (self.directory / 'intended-source.json').read_bytes()
+        if not self.original.startswith(self.interrupted_bytes) or not self.original:
+            raise RuntimeError('Interrupted retain is not a prefix of the observed write')
+        if self.point == 'before-write' and self.interrupted_bytes or self.point == 'after-partial-write' and not 0 < len(self.interrupted_bytes) < len(self.original):
+            raise RuntimeError('Native cut did not leave its declared incomplete prefix')
         if self.has_committed_source():
             raise RuntimeError('Retention cut was already committed')
         record = json.loads(self.original)
@@ -82,10 +90,11 @@ class SourceRetentionCut(SourceAckFailure):
         if record['schema'] != 1 or record['session_id'] != self.receipt['session'] or not record['is_final'] or source_id != self.source_id:
             raise RuntimeError('Interrupted retain changed authenticated source identity')
         (self.directory / 'retained-before.json').write_bytes(self.original)
+        (self.directory / 'temporary-before.bin').write_bytes(self.interrupted_bytes)
         (self.directory / 'stopped-process-status.txt').write_text(self.process_status())
         self.receipt.update(phase='retention_cut_observed', source_id=self.source_id,
             pending_sha256=hashlib.sha256(self.original).hexdigest(), pending_bytes=len(self.original),
-            temporary_bytes=len(self.original), source_is_final=True, source_block=record['block_id'],
+            temporary_bytes=len(self.interrupted_bytes), temporary_sha256=hashlib.sha256(self.interrupted_bytes).hexdigest(), source_is_final=True, source_block=record['block_id'],
             stopped_pid=self.node['process'].pid, stopped_state_verified=True,
             native_stop_observed_at_unix=time.time(), source_pending_committed_before_interruption=False,
             source_acknowledged_before_interruption=False)
@@ -95,6 +104,24 @@ class SourceRetentionCut(SourceAckFailure):
         return any(path.exists() for path in [self.pending.with_suffix('.json'), self.pending.with_suffix('.acked'),
             self.pending_directory / 'references-v1' / (self.source_id + '.reference'),
             self.pending_directory / 'references-v1' / (self.source_id + '.delivered')])
+
+    def preserved_source_bytes(self):
+        return self.interrupted_bytes
+
+    def matches_recovered_source(self, kind, value, before):
+        if self.point == 'after-fsync':
+            return super().matches_recovered_source(kind, value, before)
+        # These hints were never committed; normal certificate replay derives
+        # them again. Every identity, body and certificate field stays exact.
+        hints = {'created_at_unix_secs', 'last_mc_finalized_seqno', 'candidate_already_sent'}
+        if kind == 'acked':
+            record = value['record']
+            valid = set(record)==set(before) and {k:v for k,v in record.items() if k not in hints} == {k:v for k,v in before.items() if k not in hints}
+            return valid, value
+        reference = value['reference'] if kind == 'delivered' else value
+        expected = {**before, **{key:reference['metadata'][key] for key in hints}}
+        valid = reference['metadata'] == {**expected, 'data':'', 'signature_set':''} and reference['digest'] == hashlib.sha256(json.dumps(expected, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
+        return valid, reference
 
     async def after_interruption(self):
         if self.has_committed_source():

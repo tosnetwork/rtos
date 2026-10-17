@@ -123,8 +123,11 @@ class SourceAckFailure:
             source_acknowledged_before_interruption=False)
         self.save()
 
+    def preserved_source_bytes(self):
+        return self.original
+
     async def after_interruption(self):
-        if self.node['process'].returncode != -9 or self.pending.read_bytes() != self.original:
+        if self.node['process'].returncode != -9 or self.pending.read_bytes() != self.preserved_source_bytes():
             raise RuntimeError('Failed source evidence did not survive the intended SIGKILL')
         self.receipt.update(phase='waiting_for_survivors', interruption_returncode=-9,
             pending_preserved_after_interruption=True)
@@ -142,7 +145,7 @@ class SourceAckFailure:
             self.receipt['disarmed_at_unix'] = time.time()
 
     def environment(self):
-        if self.pending.read_bytes() != self.original:
+        if self.pending.read_bytes() != self.preserved_source_bytes():
             raise RuntimeError('Original source evidence changed before reopening the database')
         self.receipt['pending_preserved_before_restart'] = True
         self.disarm(); self.save()
@@ -155,6 +158,14 @@ class SourceAckFailure:
 
     def has_unacknowledged_source(self):
         return self.pending.exists()
+
+    def matches_recovered_source(self, kind, value, before):
+        if kind == 'acked':
+            return value['record'] == before, value
+        reference = value['reference'] if kind == 'delivered' else value
+        metadata = {**before, 'data': '', 'signature_set': ''}
+        valid = reference['digest'] == hashlib.sha256(self.original).hexdigest() and reference['metadata'] == metadata
+        return valid, reference
 
     async def complete(self, recovered):
         before = json.loads(self.original)
@@ -170,13 +181,7 @@ class SourceAckFailure:
                 except FileNotFoundError:
                     continue
                 value = json.loads(data)
-                if kind == 'acked':
-                    valid = value['record'] == before
-                    reference = value
-                else:
-                    reference = value['reference'] if kind == 'delivered' else value
-                    metadata = {**before, 'data': '', 'signature_set': ''}
-                    valid = reference['digest'] == hashlib.sha256(self.original).hexdigest() and reference['metadata'] == metadata
+                valid, reference = self.matches_recovered_source(kind, value, before)
                 if not valid or not re.fullmatch('[0-9a-f]{64}', reference['node_receipt']):
                     raise RuntimeError('Recovered ACK differs from the original retained source')
                 if self.has_unacknowledged_source():

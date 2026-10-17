@@ -1085,14 +1085,31 @@ impl PendingFinalityRecovery {
 }
 /// Scan retired v2 namespaces beneath the same root passed to runtime_directory.
 /// Busy stores are skipped. Malformed/unknown records are errors, never empty recovery.
+/// Bootstrap may defer a namespace with an interrupted JSON prefix only when
+/// its original certificate debt is still retained. This is scheduling data,
+/// never authentication or permission to alter the uncertain file.
+pub struct PendingFinalityBootstrapScan {
+    pub ready: Vec<PendingFinalityRecovery>,
+    pub deferred_certificate_replay: Vec<PathBuf>,
+}
+
 pub fn scan_pending_finality(root: &Path) -> Result<Vec<PendingFinalityRecovery>> {
+    Ok(scan_pending_finality_inner(root, false)?.ready)
+}
+
+pub fn scan_pending_finality_for_bootstrap(root: &Path) -> Result<PendingFinalityBootstrapScan> {
+    scan_pending_finality_inner(root, true)
+}
+
+fn scan_pending_finality_inner(root: &Path, allow_certificate_replay: bool) -> Result<PendingFinalityBootstrapScan> {
     let base = root.join("consensus/v2");
+    let mut result = PendingFinalityBootstrapScan { ready: Vec::new(), deferred_certificate_replay: Vec::new() };
     if !base.exists() {
-        return Ok(Vec::new());
+        return Ok(result);
     }
-    let mut records = Vec::new();
+    let records = &mut result.ready;
     let mut bytes = 0usize;
-    for namespace in std::fs::read_dir(base)? {
+    'namespaces: for namespace in std::fs::read_dir(base)? {
         let namespace = namespace?;
         if !namespace.file_type()?.is_dir() {
             continue;
@@ -1139,7 +1156,18 @@ pub fn scan_pending_finality(root: &Path) -> Result<Vec<PendingFinalityRecovery>
                 fail!("Interrupted source retention conflicts with committed source");
             }
             // read() checks schema, bounds, body identity and filename/domain.
-            PendingFinalityRecord::read(&path)?;
+            // A short write can leave an EOF instead of a complete record.
+            // Its retained certificate must be reconstructed through the normal
+            // checked session, not by trusting or deleting that JSON prefix.
+            if let Err(error) = PendingFinalityRecord::read(&path) {
+                let interrupted_json = error.downcast_ref::<serde_json::Error>()
+                    .is_some_and(|error| error.is_eof());
+                if allow_certificate_replay && interrupted_json && !store.intents.pending()?.is_empty() {
+                    result.deferred_certificate_replay.push(namespace.path());
+                    continue 'namespaces;
+                }
+                return Err(error);
+            }
             paths.push((0u8, path));
         }
         paths.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -1166,7 +1194,7 @@ pub fn scan_pending_finality(root: &Path) -> Result<Vec<PendingFinalityRecovery>
             }
             let size = record.data.len() + record.signature_set.len();
             if bytes + size > MAX_TOTAL_BYTES as usize || records.len() >= MAX_RECORDS {
-                return Ok(records);
+                return Ok(result);
             }
             bytes += size;
             records.push(PendingFinalityRecovery {
@@ -1176,7 +1204,7 @@ pub fn scan_pending_finality(root: &Path) -> Result<Vec<PendingFinalityRecovery>
             });
         }
     }
-    Ok(records)
+    Ok(result)
 }
 
 /// Session-local admission state. Accepted node work owns this Arc, so source
@@ -1912,6 +1940,83 @@ pub(crate) mod tests {
         assert_eq!(serde_json::to_vec(&ack.record).unwrap(), bytes);
         assert!(!temporary.exists() && !pending.exists());
         assert!(scan_pending_finality(temp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn source_finality_incomplete_retention_defers_only_to_retained_certificate_replay() {
+        for empty in [false, true] {
+            let temp = crate::authenticated_fixture::TestDirectory::new();
+            let (runtime, draft) = fixture();
+            let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+            let sink = Arc::new(HeldSink::default());
+            let source = SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
+            source.prepare_intents(false).unwrap();
+            source.bind_start(runtime.pin().zerostate.clone()).unwrap();
+            let consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(proof)) = &draft.finality else { unreachable!() };
+            let candidate = rtos_api::pq_finality::PqNetworkSignatureSet::from_final_fields(proof).unwrap().to_node().candidate;
+            let hash = UInt256::calc_file_hash(&rtos_api::serialize_boxed(&candidate).unwrap());
+            let event = crate::simplex_state::BlockFinalizedEvent {
+                slot: crate::block::SlotIndex::new(proof.slot), block_hash: hash.clone(), block_id: None,
+                certificate: Arc::new(crate::certificate::Certificate {
+                    vote: crate::simplex_state::FinalizeVote { slot: crate::block::SlotIndex::new(proof.slot), block_hash: hash },
+                    signatures: proof.signatures.iter().enumerate().map(|(i, signature)| crate::certificate::VoteSignature {
+                        validator_idx: crate::block::ValidatorIndex::new(i as u32), signature: signature.signature.clone(),
+                    }).collect(),
+                }),
+            };
+            source.retain_intent(vec![runtime.pin().zerostate.clone()], &event).unwrap();
+            let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
+            let original = record.encode().unwrap();
+            let temporary = source.store.directory.join(format!("{}.tmp", record.id().unwrap().to_hex_string()));
+            let prefix = if empty { &original[..0] } else { &original[..original.len()/2] };
+            std::fs::write(&temporary, prefix).unwrap();
+            drop(source);
+            assert!(scan_pending_finality(temp.path()).is_err(), "strict scanner must not hide unfinished evidence");
+            let report = scan_pending_finality_for_bootstrap(temp.path()).unwrap();
+            assert!(report.ready.is_empty());
+            assert_eq!(report.deferred_certificate_replay, vec![namespace.clone()]);
+            assert_eq!(std::fs::read(&temporary).unwrap(), prefix);
+            assert!(!temporary.with_extension("json").exists());
+            assert!(!temporary.with_extension("acked").exists());
+            drop(report);
+            // Retained certificate provenance authorizes no overwrite of a
+            // different uncertain identity, even under a genuine runtime.
+            let unrelated = temporary.with_file_name(format!("{}.tmp", UInt256::from([7; 32]).to_hex_string()));
+            std::fs::rename(&temporary, &unrelated).unwrap();
+            let blocked = SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
+            assert!(blocked.poll(draft.clone()).is_err());
+            assert!(sink.0.lock().unwrap().is_empty());
+            assert_eq!(std::fs::read(&unrelated).unwrap(), prefix);
+            assert!(!temporary.with_extension("json").exists());
+            drop(blocked);
+            std::fs::rename(&unrelated, &temporary).unwrap();
+            // The authenticated runtime's ordinary candidate replay performs the
+            // existing retain operation. Scanning supplied no body or receipt.
+            let source = SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
+            source.prepare_intents(true).unwrap();
+            assert_eq!(source.pending_intents().unwrap().len(), 1);
+            assert!(source.poll(draft).unwrap().is_none());
+            assert!(!temporary.exists());
+            assert_eq!(std::fs::read(temporary.with_extension("json")).unwrap(), original);
+            assert!(!temporary.with_extension("acked").exists());
+            let (_, finish) = sink.0.lock().unwrap().pop().unwrap();
+            finish(Ok(UInt256::from([3; 32])));
+            assert!(temporary.with_extension("acked").exists());
+        }
+    }
+
+    #[test]
+    fn source_finality_incomplete_retention_without_certificate_still_refuses_bootstrap() {
+        let temp = crate::authenticated_fixture::TestDirectory::new();
+        let (runtime, draft) = fixture();
+        let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+        let store = PendingFinalityStore::open(&namespace).unwrap();
+        let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
+        let temporary = store.directory.join(format!("{}.tmp", record.id().unwrap().to_hex_string()));
+        std::fs::write(&temporary, b"{\"schema\":").unwrap();
+        drop(store);
+        assert!(scan_pending_finality_for_bootstrap(temp.path()).is_err());
+        assert_eq!(std::fs::read(&temporary).unwrap(), b"{\"schema\":");
     }
 
     #[test]

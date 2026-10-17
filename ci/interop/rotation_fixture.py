@@ -695,6 +695,7 @@ def main():
     parser.add_argument('--source-ack-fault', choices=['sync-eio', 'write-enospc'])
     parser.add_argument('--source-ack-fault-library', type=Path)
     parser.add_argument('--source-retention-cut-library', type=Path)
+    parser.add_argument('--source-retention-cut-point', choices=['after-fsync','before-write','after-partial-write'], default='after-fsync')
     parser.add_argument('--recovery-timeout', type=float, default=180)
     parser.add_argument('--network-fault', choices=list(MODES))
     parser.add_argument('--additional-network-faults', choices=list(MODES), nargs='*', default=[])
@@ -712,6 +713,8 @@ def main():
         if not args.source_ack_fault_library:
             raise SystemExit('Source ACK fault requires its explicit native test library')
         args.source_ack_fault_library = args.source_ack_fault_library.resolve()
+    if args.source_retention_cut_point != 'after-fsync' and not args.source_retention_cut_library:
+        raise SystemExit('An incomplete retention cut requires its explicit native library')
     if args.source_retention_cut_library:
         require_namespace()
         if args.interrupt_rust_member is None or args.source_ack_fault or args.partition_restart or args.network_fault or args.additional_network_faults or args.prepare_genesis_only:

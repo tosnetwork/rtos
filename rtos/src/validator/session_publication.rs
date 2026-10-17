@@ -19,13 +19,16 @@ pub(crate) async fn recover_retained_finality(engine: Arc<dyn EngineOperations>)
         }
         let scan_root = root.clone();
         let pending = owned_source_io(engine.as_ref(), "scan retained finality", move || {
-            simplex::finality_delivery::scan_pending_finality(&scan_root)
+            simplex::finality_delivery::scan_pending_finality_for_bootstrap(&scan_root)
         })
         .await?;
-        if pending.is_empty() {
+        for namespace in &pending.deferred_certificate_replay {
+            log::warn!("Retained source namespace {} requires checked certificate replay before interrupted retention can complete", namespace.display());
+        }
+        if pending.ready.is_empty() {
             return Ok(());
         }
-        for source in pending {
+        for source in pending.ready {
             if engine.check_stop() {
                 fail!("Retained finality recovery stopped before admission");
             }
