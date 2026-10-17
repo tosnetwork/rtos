@@ -143,6 +143,9 @@ pub(crate) struct FinalizedEntry {
     /// C++ SaveCertificate -> FinalizationObserved, parent resolution retries
     /// must not repeat the already successful persistence phase.
     intent_retained: bool,
+    /// Source replay must observe its own node handoff before trusting any
+    /// startup callback cache. Keep successful parents through async retries.
+    acknowledged_source_candidates: HashSet<RawCandidateId>,
     /// Time when finalization was first observed (for timeout / diagnostics).
     finalized_at: SystemTime,
 }
@@ -341,6 +344,9 @@ pub(crate) struct ConsensusController {
     /// Finalized blocks (FinalCert observed) still waiting for candidate body
     /// arrival; materialization is deferred until the body arrives.
     finalized_pending_body: HashMap<RawCandidateId, FinalizedEntry>,
+    /// Only cryptographically verified pending source FinalCerts are registered
+    /// by SessionProcessor; this changes delivery scheduling, not authority.
+    replayed_source_finalizations: HashSet<RawCandidateId>,
     /// Dedup set for finalized delivery: emit at most once per finalized
     /// candidate id.
     finalized_delivery_sent: HashSet<RawCandidateId>,
@@ -427,6 +433,7 @@ impl ConsensusController {
             finalized_blocks: HashSet::new(),
             finalized_final_proofs: HashSet::new(),
             finalized_pending_body: HashMap::new(),
+            replayed_source_finalizations: HashSet::new(),
             finalized_delivery_sent: HashSet::new(),
             finalized_delivery_sent_seqno: HashMap::new(),
             last_mc_finalized_seqno,
@@ -564,6 +571,10 @@ impl ConsensusController {
         self.finalized_blocks.insert(id);
     }
 
+    pub(crate) fn register_source_finality_replay(&mut self, id: RawCandidateId) {
+        self.replayed_source_finalizations.insert(id);
+    }
+
     /// Mark a candidate id as finalized-callback-delivered (recovery seed).
     pub(crate) fn insert_finalized_delivery_sent(&mut self, id: RawCandidateId) {
         self.finalized_delivery_sent.insert(id);
@@ -593,7 +604,8 @@ impl ConsensusController {
     /// could let a later recursive parent-chain walk re-emit an
     /// already-delivered finalized callback.
     pub(crate) fn prune_below(&mut self, up_to_slot: SlotIndex) {
-        self.finalized_pending_body.retain(|id, _| id.slot >= up_to_slot);
+        let source_replay = &self.replayed_source_finalizations;
+        self.finalized_pending_body.retain(|id, _| id.slot >= up_to_slot || source_replay.contains(id));
         self.telemetry.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
         self.finalized_delivery_sent.retain(|id| id.slot >= up_to_slot);
     }
@@ -1485,7 +1497,7 @@ impl ConsensusController {
         // Always keep a pending entry until recursive parent-chain materialization
         // succeeds end-to-end. This provides deterministic retries on late body/cert
         // arrivals and ensures ancestor parity is eventually reached.
-        let entry = FinalizedEntry { event: event.clone(), intent_retained: false, finalized_at: self.now() };
+        let entry = FinalizedEntry { event: event.clone(), intent_retained: false, acknowledged_source_candidates: HashSet::new(), finalized_at: self.now() };
         // C++ state-resolver.cpp: a duplicate joins the existing InFlight
         // operation, preserving its original certificate and completed phases.
         self.finalized_pending_body.entry(finalized_id.clone()).or_insert(entry);
@@ -1707,6 +1719,7 @@ impl ConsensusController {
 
         for trigger_id in completed {
             self.finalized_pending_body.remove(&trigger_id);
+            self.replayed_source_finalizations.remove(&trigger_id);
         }
         self.telemetry.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
     }
@@ -1985,7 +1998,18 @@ impl ConsensusController {
     ) {
         // C++ parity: empty candidates never emit BlockFinalized / do_finalize_block.
         let durable = self.description.authenticated_runtime().is_some();
-        if received.is_empty || self.finalized_delivery_sent.contains(candidate_id) {
+        let trigger_id = RawCandidateId { slot: event.slot, hash: event.block_hash.clone() };
+        let source_replay = durable
+            && self.replayed_source_finalizations.contains(&trigger_id)
+            && self.finalized_pending_body.get(&trigger_id).is_some_and(|entry|
+                !entry.acknowledged_source_candidates.contains(candidate_id));
+        if source_replay {
+            // The startup seed is no completion receipt for this source. Keep
+            // the seqno/block conflict guard, but clear the delivered flag until
+            // the normal node handoff actually completes.
+            self.finalized_delivery_sent.remove(candidate_id);
+        }
+        if received.is_empty || (self.finalized_delivery_sent.contains(candidate_id) && !source_replay) {
             return;
         }
 
@@ -1999,6 +2023,7 @@ impl ConsensusController {
         if let Some(existing) = self.finalized_delivery_sent_seqno.get(&seqno) {
             if existing.block_id == received.block_id
                 && !(durable && has_final_cert && !existing.is_final)
+                && !source_replay
             {
                 log::debug!(
                     "Session {} recursive finalization: idempotent re-entry for \
@@ -2126,6 +2151,10 @@ impl ConsensusController {
             );
         }
         if delivered {
+            if source_replay {
+                self.finalized_pending_body.get_mut(&trigger_id).expect("registered source trigger")
+                    .acknowledged_source_candidates.insert(candidate_id.clone());
+            }
             let now = self.now();
             self.telemetry.record_self_collation_acceptance(
                 candidate_id,
@@ -2148,8 +2177,7 @@ impl ConsensusController {
             assert!(
                 previous.as_ref().is_none_or(|old| durable
                     && old.block_id == received.block_id
-                    && !old.is_final
-                    && has_final_cert),
+                    && (source_replay || (!old.is_final && has_final_cert))),
                 "Session {} protocol breach: duplicate finalized callback seqno={} \
                  previous_block_id={} new_block_id={}",
                 &self.session_id().to_hex_string()[..8],
@@ -2753,7 +2781,7 @@ impl ConsensusController {
         event: BlockFinalizedEvent,
         finalized_at: SystemTime,
     ) {
-        self.finalized_pending_body.insert(id, FinalizedEntry { event, intent_retained: false, finalized_at });
+        self.finalized_pending_body.insert(id, FinalizedEntry { event, intent_retained: false, acknowledged_source_candidates: HashSet::new(), finalized_at });
         self.telemetry.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
     }
 }

@@ -2785,6 +2785,11 @@ impl SessionProcessor {
                 signatures: certificate.signatures,
             }),
         };
+        // A verified source FinalCert still owns an unfinished handoff. Session
+        // finalized-block metadata alone cannot certify this source's node ACK.
+        self.consensus.register_source_finality_replay(RawCandidateId {
+            slot: event.slot, hash: event.block_hash.clone(),
+        });
         self.save_certificate_before_finalization(event, false);
         self.check_all();
         Ok(())

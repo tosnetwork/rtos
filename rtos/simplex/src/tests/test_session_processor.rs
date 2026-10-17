@@ -11922,7 +11922,14 @@ fn source_finality_controller_failed_certificate_save_retries_before_wal_handoff
     source_finality_controller_case(false, false, true, None);
 }
 #[derive(Clone, Copy)]
-enum CertificateGateCase { LiveSuccess, LiveFailure, ReplaySuccess, ReplayFailure }
+enum CertificateGateCase { LiveSuccess, LiveFailure, ReplaySuccess, ReplayFailure, ReplaySeededCandidate, ReplaySeededSeqno, ReplaySeededBoth }
+#[test]
+fn source_finality_authenticated_replay_requires_own_ack_despite_startup_delivery_seed() {
+    for case in [CertificateGateCase::ReplaySeededCandidate, CertificateGateCase::ReplaySeededSeqno,
+        CertificateGateCase::ReplaySeededBoth] {
+        source_finality_controller_case(false, false, false, Some(case));
+    }
+}
 #[test]
 fn source_finality_cpp_save_certificate_gates_live_and_replay_before_materialization() {
     for case in [CertificateGateCase::LiveSuccess, CertificateGateCase::LiveFailure,
@@ -12018,8 +12025,16 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain:
     if let Some(result) = &pending_certificate {
         processor.database.insert_final_cert_store(candidate_id.clone(), result.clone());
     }
+    if matches!(gate, Some(CertificateGateCase::ReplaySeededCandidate | CertificateGateCase::ReplaySeededBoth)) {
+        processor.consensus.insert_finalized_delivery_sent(candidate_id.clone());
+    }
+    if matches!(gate, Some(CertificateGateCase::ReplaySeededSeqno | CertificateGateCase::ReplaySeededBoth)) {
+        processor.consensus.insert_finalized_delivery_sent_seqno(draft.block_id.seq_no(), candidate_id.slot, draft.block_id.clone());
+    }
     let replay = high_floor || matches!(gate,
-        Some(CertificateGateCase::ReplaySuccess | CertificateGateCase::ReplayFailure));
+        Some(CertificateGateCase::ReplaySuccess | CertificateGateCase::ReplayFailure
+            | CertificateGateCase::ReplaySeededCandidate | CertificateGateCase::ReplaySeededSeqno
+            | CertificateGateCase::ReplaySeededBoth));
     if replay {
         processor.simplex_state.set_first_non_finalized_slot(SlotIndex::new(candidate_id.slot.value() + 100));
         processor.replay_finality_intent(event.certificate.to_tl().unwrap()).unwrap();
@@ -12094,6 +12109,13 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain:
         assert!(db.load_final_certs().unwrap().iter().any(|c| c.candidate_id == candidate_id));
         assert!(!processor.pending_saved_finalizations.contains_key(&candidate_id));
         assert_eq!(sink.0.lock().unwrap().len(), 1, "duplicate completion must not repeat WAL handoff");
+        if matches!(gate, Some(CertificateGateCase::ReplaySeededCandidate | CertificateGateCase::ReplaySeededSeqno | CertificateGateCase::ReplaySeededBoth)) {
+            processor.consensus.prune_below(SlotIndex::new(candidate_id.slot.value() + 100));
+            assert!(processor.consensus.finalized_pending_body_contains(&candidate_id),
+                "slot cleanup cannot discard an authenticated source handoff before its own ACK");
+            processor.with_consensus_backend(|controller, backend| controller.retry_pending_recursive_finalization(backend));
+            assert_eq!(sink.0.lock().unwrap().len(), 1, "old-slot retries must join the same node handoff");
+        }
         let final_broadcasts = receiver.drain_actions().into_iter().filter(|action| matches!(action,
             ReceiverAction::SendCertificate { certificate }
                 if matches!(certificate.vote(), rtos_api::ton::consensus::simplex::UnsignedVote::Consensus_Simplex_FinalizeVote(_))

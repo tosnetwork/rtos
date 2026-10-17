@@ -783,7 +783,7 @@ impl PendingFinalityStore {
         for entry in std::fs::read_dir(path.parent().unwrap())? {
             let other = entry?.path();
             if other.extension().and_then(|s| s.to_str()) == Some("tmp") && other != path {
-                fail!("Another uncertain source temporary requires retry/repair");
+                fail!("Another uncertain source temporary requires retry/repair (attempt={}, retained={})", path.display(), other.display());
             }
         }
         Ok(())
