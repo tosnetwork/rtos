@@ -139,6 +139,10 @@ use std::{
 pub(crate) struct FinalizedEntry {
     /// The finalization event from `SimplexState`.
     event: BlockFinalizedEvent,
+    /// Certificate retention completed for this in-flight finalization. As in
+    /// C++ SaveCertificate -> FinalizationObserved, parent resolution retries
+    /// must not repeat the already successful persistence phase.
+    intent_retained: bool,
     /// Time when finalization was first observed (for timeout / diagnostics).
     finalized_at: SystemTime,
 }
@@ -1426,8 +1430,10 @@ impl ConsensusController {
         // Always keep a pending entry until recursive parent-chain materialization
         // succeeds end-to-end. This provides deterministic retries on late body/cert
         // arrivals and ensures ancestor parity is eventually reached.
-        let entry = FinalizedEntry { event: event.clone(), finalized_at: self.now() };
-        self.finalized_pending_body.insert(finalized_id.clone(), entry);
+        let entry = FinalizedEntry { event: event.clone(), intent_retained: false, finalized_at: self.now() };
+        // C++ state-resolver.cpp: a duplicate joins the existing InFlight
+        // operation, preserving its original certificate and completed phases.
+        self.finalized_pending_body.entry(finalized_id.clone()).or_insert(entry);
         self.telemetry.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
 
         log::debug!(
@@ -1616,6 +1622,19 @@ impl ConsensusController {
                 continue;
             };
 
+            if self.description.authenticated_runtime().is_some()
+                && !self.finalized_pending_body.get(trigger_id).unwrap().intent_retained
+            {
+                if let Err(error) = self.callbacks.retain_finality_intent(
+                    backend.runtime().session_start_prev_blocks().to_vec(),
+                    &event,
+                ) {
+                    log::error!("Cannot durably retain finality intent: {error}");
+                    continue;
+                }
+                self.finalized_pending_body.get_mut(trigger_id).unwrap().intent_retained = true;
+            }
+
             if self.try_finalize_recursive_chain(backend, trigger_id, &event) {
                 if self.description.authenticated_runtime().is_some() {
                     if let Err(error) = self.callbacks.resolve_finality_intent(trigger_id) {
@@ -1658,15 +1677,6 @@ impl ConsensusController {
         trigger_id: &RawCandidateId,
         event: &BlockFinalizedEvent,
     ) -> bool {
-        if self.description.authenticated_runtime().is_some() {
-            if let Err(error) = self.callbacks.retain_finality_intent(
-                backend.runtime().session_start_prev_blocks().to_vec(),
-                event,
-            ) {
-                log::error!("Cannot durably retain finality intent: {error}");
-                return false;
-            }
-        }
         let applied_floor = self.last_mc_finalized_seqno.unwrap_or(0);
         let mut complete = true;
         let mut expected_outputs = Vec::new();
@@ -2655,7 +2665,7 @@ impl ConsensusController {
         event: BlockFinalizedEvent,
         finalized_at: SystemTime,
     ) {
-        self.finalized_pending_body.insert(id, FinalizedEntry { event, finalized_at });
+        self.finalized_pending_body.insert(id, FinalizedEntry { event, intent_retained: false, finalized_at });
         self.telemetry.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
     }
 }

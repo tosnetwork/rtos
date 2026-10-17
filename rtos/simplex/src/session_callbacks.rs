@@ -218,6 +218,10 @@ impl SessionCallbacks {
     ) -> rtos_block::Result<()> {
         self.delivery_source()?.retain_intent(prevs, event)
     }
+    #[cfg(test)]
+    pub(crate) fn finality_retention_attempts(&self) -> usize {
+        self.delivery_source().unwrap().retain_intent_attempts.load(Ordering::Relaxed)
+    }
     pub(crate) fn seal_finality_outputs(&self,id:&crate::block::RawCandidateId,outputs:Vec<crate::finality_recovery::ExpectedFinalityOutput>)->rtos_block::Result<()> {
         self.delivery_source()?.seal_outputs(id,outputs)
     }

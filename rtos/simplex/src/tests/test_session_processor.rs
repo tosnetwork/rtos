@@ -11713,17 +11713,21 @@ fn authenticated_observer_nonempty_query_emits_leader_evidence_after_pq_verifica
 
 #[test]
 fn source_finality_controller_waits_for_wal_before_persist_sent_and_gc() {
-    source_finality_controller_case(false, false);
+    source_finality_controller_case(false, false, false);
 }
 #[test]
 fn source_finality_controller_approval_upgrades_to_final_after_separate_wal_ack() {
-    source_finality_controller_case(true, false);
+    source_finality_controller_case(true, false, false);
 }
 #[test]
 fn source_finality_retained_final_certificate_cannot_be_skipped_by_later_applied_floor() {
-    source_finality_controller_case(false, true);
+    source_finality_controller_case(false, true, false);
 }
-fn source_finality_controller_case(upgrade: bool, high_floor: bool) {
+#[test]
+fn source_finality_controller_failed_certificate_save_retries_before_wal_handoff() {
+    source_finality_controller_case(false, false, true);
+}
+fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain: bool) {
     use crate::finality_delivery::tests::{fixture, fixture_role, HeldSink};
     let temp = crate::authenticated_fixture::TestDirectory::new();
     let (runtime, draft) = if upgrade || high_floor { fixture_role(true, ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap()) } else { fixture() };
@@ -11796,6 +11800,10 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool) {
         db.sync(Some(Duration::from_secs(5))).unwrap();
         assert!(!db.load_finalized_blocks().unwrap()[0].is_final);
     }
+    let blocked_intents = std::path::Path::new(&namespace).join("finality-intents");
+    if fail_retain {
+        std::fs::write(&blocked_intents, b"fixture obstruction before certificate retention").unwrap();
+    }
     if high_floor {
         let mut later = draft.block_id.clone();
         later.seq_no += 100;
@@ -11805,8 +11813,23 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool) {
         processor.simplex_state.set_first_non_finalized_slot(SlotIndex::new(candidate_id.slot.value() + 100));
         processor.replay_finality_intent(event.certificate.to_tl().unwrap()).unwrap();
     } else {
-        processor.handle_block_finalized(event);
+        processor.handle_block_finalized(event.clone());
     }
+    if fail_retain {
+        assert!(sink.0.lock().unwrap().is_empty(), "failed retention cannot authorize node handoff");
+        assert_eq!(processor.callbacks.finality_retention_attempts(), 1);
+        assert!(processor.consensus.finalized_pending_body_contains(&candidate_id));
+        std::fs::remove_file(&blocked_intents).unwrap();
+        processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
+    }
+    for _ in 0..3 {
+        processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
+    }
+    // C++ attaches a duplicate to its existing InFlight finalization. It does
+    // not redo a successful SaveCertificate phase while the node WAL is held.
+    processor.handle_block_finalized(event);
+    assert_eq!(processor.callbacks.finality_retention_attempts(), if fail_retain { 2 } else { 1 },
+        "parent/WAL retries must reuse the completed C++ certificate-save phase");
     assert_eq!(sink.0.lock().unwrap().len(), 1);
     assert_eq!(processor.consensus.is_finalized_block(&candidate_id), upgrade);
     assert!(!processor.consensus.finalized_delivery_sent_contains(&candidate_id));
@@ -11973,12 +11996,16 @@ fn source_finality_controller_empty_trigger_seals_all_roles_after_cold_retry() {
     let retained = processor.callbacks.pending_finality_intents().unwrap();
     assert_eq!(retained.len(), 1, "cold replay comes from the durable source certificate");
     processor.replay_finality_intent(runtime.wire_profile().deserialize_typed(&retained[0]).unwrap()).unwrap();
+    assert_eq!(processor.callbacks.finality_retention_attempts(), 1,
+        "cold recovery must establish persistence again instead of inheriting a warm phase");
     for _ in 0..8 {
         for (_,done) in std::mem::take(&mut *sink.0.lock().unwrap()) { done(Ok(UInt256::from([2;32]))); }
         processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
         if map.exists() { break; }
     }
     let value:serde_json::Value=serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
+    assert_eq!(processor.callbacks.finality_retention_attempts(), 1,
+        "cold-recovery retries reuse only their own successful certificate-save phase");
     let outputs=value["outputs"].as_array().unwrap();
     assert_eq!(outputs.len(),2,"empty nodes produce no output; both nonempty ancestors do");
     for (index,role) in [(0,false),(2,true)] {

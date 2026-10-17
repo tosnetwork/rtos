@@ -1134,6 +1134,8 @@ pub fn scan_pending_finality(root: &Path) -> Result<Vec<PendingFinalityRecovery>
 /// cancellation cannot drop the retention lock or turn an outstanding stage
 /// into an acknowledged delivery.
 pub(crate) struct SourceFinalityDelivery {
+    #[cfg(test)]
+    pub(crate) retain_intent_attempts: std::sync::atomic::AtomicUsize,
     runtime: Arc<AuthenticatedSessionRuntime>,
     store: Arc<PendingFinalityStore>,
     sink: consensus_common::finality_delivery::DurableFinalitySinkPtr,
@@ -1178,6 +1180,8 @@ impl SourceFinalityDelivery {
             runtime.recovery_binding().map(delivered::DiskRecoveryBinding::from_binding);
         let intents = store.intents.clone();
         Ok(Arc::new(Self {
+            #[cfg(test)]
+            retain_intent_attempts: std::sync::atomic::AtomicUsize::new(0),
             runtime,
             store,
             sink,
@@ -1211,6 +1215,8 @@ impl SourceFinalityDelivery {
         prevs: Vec<BlockIdExt>,
         event: &crate::simplex_state::BlockFinalizedEvent,
     ) -> Result<()> {
+        #[cfg(test)]
+        self.retain_intent_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.intents.retain(
             &self.runtime,
             prevs,
