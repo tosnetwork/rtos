@@ -128,5 +128,28 @@ class KernelPartitionTests(unittest.TestCase):
             finally:routing.close()
 
 
+    def test_restore_drains_already_delayed_packets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);routing=PacketMarks(root/'routing');routing.prepare()
+            try:
+                with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sender, socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as receiver:
+                    sender.bind(('127.0.0.1',0));receiver.bind(('127.0.0.1',0));receiver.settimeout(0.5)
+                    sender.setsockopt(socket.SOL_SOCKET,36,int(MARK,0))
+                    fault=PacketFault(root/'reorder','reorder',[sender.getsockname()[1]])
+                    try:
+                        fault.arm()
+                        for number in range(32):sender.sendto(bytes([number]),receiver.getsockname())
+                        fault.restore()
+                        values=[]
+                        while True:
+                            try:values.append(receiver.recv(100)[0])
+                            except TimeoutError:break
+                        self.assertEqual(sorted(values),list(range(32)),
+                            'restoring connectivity must drain delayed packets instead of silently dropping them')
+                    finally:
+                        if fault.owned:fault.restore()
+            finally:routing.close()
+
+
 if __name__ == '__main__':
     unittest.main()

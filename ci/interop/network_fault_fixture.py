@@ -63,7 +63,8 @@ async def exercise_network_member(args, root, nodes, endpoints, lite_configs, ru
         'before':checkpoint['block'],'phase':'arming','same_process':True,
         'manual_database_repair':False,'deadline_seconds':args.recovery_timeout}
     write(directory / 'receipt.json',receipt)
-    deadline = time.monotonic() + args.recovery_timeout
+    started = time.monotonic()
+    deadline = started + args.recovery_timeout
     histories = [{} for _ in nodes]
 
     async def common(indices, floor):
@@ -152,6 +153,8 @@ async def exercise_network_member(args, root, nodes, endpoints, lite_configs, ru
         stats=fault.statistics()
         if args.network_fault in ['partition','loss'] and stats['drops']<=0:
             raise RuntimeError('Packet-loss injection was not observed by the kernel')
+        if args.network_fault == 'reorder' and stats['drops'] != 0:
+            raise RuntimeError('Reorder-only case included unintended kernel queue loss')
         if args.network_fault in ['reorder','duplicate'] and stats['packets']<=0:
             raise RuntimeError('Packet impairment carried no traffic')
         receipt.update(survivor_checkpoint=checked['block'],survivor_certificates=certificates,kernel_statistics=stats)
@@ -184,6 +187,10 @@ async def exercise_network_member(args, root, nodes, endpoints, lite_configs, ru
     same_process()
     for filename,expected in artifacts.items():
         if digest(Path(filename))!=expected:raise RuntimeError('Packet exercise changed an executable or frozen input')
+    elapsed = time.monotonic() - started
+    if elapsed > args.recovery_timeout:
+        raise TimeoutError('Packet case completed after its original recovery deadline')
+    receipt.update(elapsed_seconds=elapsed,completed_at_unix=time.time())
     receipt.update(phase='recovered',same_process=True,all_six_applied_states_match=True,
         workchain_states_match=True,successor_finality_checked=True)
     write(directory/'receipt.json',receipt)

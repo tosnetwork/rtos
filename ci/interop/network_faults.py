@@ -10,7 +10,7 @@ MARK = '0x52540202'
 MODES = {
     'partition': ['loss', '100%'],
     'loss': ['loss', '20%'],
-    'reorder': ['delay', '100ms', 'reorder', '100%', 'gap', '5'],
+    'reorder': ['limit', '10000', 'delay', '100ms', 'reorder', '100%', 'gap', '5'],
     'duplicate': ['duplicate', '100%'],
 }
 
@@ -130,7 +130,21 @@ class PacketFault:
                 current = json.loads(self.command('tc', '-j', 'qdisc', 'show', 'dev', 'lo'))
                 if not any(q.get('root') and q['kind'] == 'prio' and q['handle'] == '1:' for q in current):
                     raise RuntimeError('Owned fixture qdisc changed; refusing unrelated deletion')
-                self.command('tc', 'qdisc', 'del', 'dev', 'lo', 'root', 'handle', '1:')
-                self.owned = False
+                # Stop admitting impaired packets, then drain already delayed
+                # data. Removing a nonempty netem queue would add hidden loss to
+                # the reorder case during restoration.
+                self.command('tc', 'filter', 'del', 'dev', 'lo', 'parent', '1:')
+                deadline = time.monotonic() + 2
+                try:
+                    while True:
+                        values = json.loads(self.command('tc', '-s', '-j', 'qdisc', 'show', 'dev', 'lo'))
+                        netem = next(q for q in values if q['kind'] == 'netem' and q['handle'] == '30:')
+                        if netem['qlen'] == 0:break
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError('Delayed fixture packets did not drain before qdisc removal')
+                        time.sleep(0.02)
+                finally:
+                    self.command('tc', 'qdisc', 'del', 'dev', 'lo', 'root', 'handle', '1:')
+                    self.owned = False
         finally:
             self.save()
