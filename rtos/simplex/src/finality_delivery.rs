@@ -1159,6 +1159,9 @@ enum SourceStage {
     Running,
     Retry(std::time::Instant),
     Durable(UInt256, FinalizedDeliveryDraft),
+    Accepting,
+    AcceptanceRetry(std::time::Instant, UInt256, FinalizedDeliveryDraft),
+    Accepted(UInt256, FinalizedDeliveryDraft),
     Acknowledging(UInt256, FinalizedDeliveryDraft),
 }
 impl SourceFinalityDelivery {
@@ -1263,6 +1266,18 @@ impl SourceFinalityDelivery {
             let mut stages = self.stages.lock().unwrap();
             match stages.get(&id) {
                 Some(SourceStage::Running) => return Ok(None),
+                Some(SourceStage::Accepting) => return Ok(None),
+                Some(SourceStage::AcceptanceRetry(at, _, _)) if std::time::Instant::now() < *at => return Ok(None),
+                Some(SourceStage::AcceptanceRetry(_, _, _)) => {
+                    let Some(SourceStage::AcceptanceRetry(_, receipt, draft)) = stages.remove(&id) else { unreachable!() };
+                    stages.insert(id.clone(), SourceStage::Accepting);
+                    drop(stages);
+                    return self.begin_acceptance(id, receipt, draft);
+                }
+                Some(SourceStage::Accepted(_, _)) => {
+                    let Some(SourceStage::Accepted(receipt, draft)) = stages.remove(&id) else { unreachable!() };
+                    return Ok(Some((receipt, draft)));
+                }
                 Some(SourceStage::Retry(at)) if std::time::Instant::now() < *at => return Ok(None),
                 Some(SourceStage::Acknowledging(receipt, draft)) => {
                     self.store.acknowledge(&id, receipt.clone())?;
@@ -1270,12 +1285,21 @@ impl SourceFinalityDelivery {
                     stages.remove(&id);
                     drop(stages);
                     self.request_compaction(result.0.clone(), result.1.clone());
+                    if !self.runtime.shard().is_masterchain() {
+                        self.stages.lock().unwrap().insert(id.clone(), SourceStage::Accepting);
+                        return self.begin_acceptance(id, result.0, result.1);
+                    }
                     return Ok(Some(result));
                 }
                 Some(SourceStage::Durable(_, _)) => {
                     let Some(SourceStage::Durable(receipt, draft)) = stages.remove(&id) else {
                         unreachable!()
                     };
+                    if !self.runtime.shard().is_masterchain() {
+                        stages.insert(id.clone(), SourceStage::Accepting);
+                        drop(stages);
+                        return self.begin_acceptance(id, receipt, draft);
+                    }
                     return Ok(Some((receipt, draft)));
                 }
                 _ => {}
@@ -1358,6 +1382,39 @@ impl SourceFinalityDelivery {
         }
         Ok(None)
     }
+    fn begin_acceptance(
+        self: &Arc<Self>,
+        id: UInt256,
+        receipt: UInt256,
+        draft: FinalizedDeliveryDraft,
+    ) -> Result<Option<(UInt256, FinalizedDeliveryDraft)>> {
+        let request = PendingFinalityRecord::from_draft(&self.runtime, &draft)?.request(receipt.clone());
+        let owner = self.clone();
+        let callback_id = id.clone();
+        let callback_receipt = receipt.clone();
+        let callback_draft = draft.clone();
+        if let Err(error) = self.sink.await_accepted(request, Box::new(move |result| {
+            let stage = match result {
+                Ok(()) => SourceStage::Accepted(callback_receipt, callback_draft),
+                Err(error) => {
+                    log::debug!("Parent node acceptance retained for retry: {error}");
+                    SourceStage::AcceptanceRetry(std::time::Instant::now() + std::time::Duration::from_millis(250), callback_receipt, callback_draft)
+                }
+            };
+            owner.stages.lock().unwrap().insert(callback_id, stage);
+        })) {
+            self.stages.lock().unwrap().insert(id, SourceStage::AcceptanceRetry(
+                std::time::Instant::now() + std::time::Duration::from_millis(250), receipt, draft));
+            return Err(error);
+        }
+        let mut stages = self.stages.lock().unwrap();
+        if matches!(stages.get(&id), Some(SourceStage::Accepted(_, _))) {
+            let Some(SourceStage::Accepted(receipt, draft)) = stages.remove(&id) else { unreachable!() };
+            return Ok(Some((receipt, draft)));
+        }
+        Ok(None)
+    }
+
     fn restore_draft(
         &self,
         retained: PendingFinalityRecord,
@@ -1504,8 +1561,20 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct HeldSink(
         pub(crate) Mutex<Vec<(FinalizedDeliveryDraft, FinalizedDeliveryCompletion)>>,
+        pub(crate) Mutex<Option<Vec<(CanonicalFinalityRequest, Box<dyn FnOnce(Result<()>) + Send>)>>>,
     );
     impl DurableFinalitySink for HeldSink {
+        fn await_accepted(&self, request: CanonicalFinalityRequest, done: Box<dyn FnOnce(Result<()>) + Send>) -> Result<()> {
+            let mut pending = self.1.lock().unwrap();
+            if let Some(pending) = pending.as_mut() {
+                pending.push((request, done));
+            } else {
+                drop(pending);
+                done(Ok(()));
+            }
+            Ok(())
+        }
+
         fn stage(
             &self,
             draft: FinalizedDeliveryDraft,

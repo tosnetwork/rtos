@@ -208,6 +208,11 @@ impl<T> Drop for ClosingCompletion<T> {
     }
 }
 enum Submission {
+    Acceptance {
+        request: CanonicalFinalityRequest,
+        runtime: Arc<AuthenticatedSessionRuntime>,
+        completion: ClosingCompletion<()>,
+    },
     HistoryDebt {
         request: CloseFinalityRequest,
         runtime: Arc<AuthenticatedSessionRuntime>,
@@ -271,6 +276,9 @@ impl Submission {
             Self::SourceDelivered { completion, .. } => {
                 completion.finish(Err(error!("Publication closing shutdown")))
             }
+            Self::Acceptance { completion, .. } => {
+                completion.finish(Err(error!("Publication acceptance shutdown")))
+            }
             Self::Canonical { completion, .. } => {
                 completion.finish(Err(error!("Publication retention shutdown")))
             }
@@ -304,6 +312,9 @@ impl Submission {
             Self::SourceDelivered { runtime, completion, .. } => {
                 hold(&mut completion.0, outstanding.begin(runtime.session_id())?)
             }
+            Self::Acceptance { runtime, completion, .. } => {
+                hold(&mut completion.0, outstanding.begin(runtime.session_id())?)
+            }
             Self::Canonical { runtime, completion, .. } => {
                 hold(&mut completion.0, outstanding.begin(runtime.session_id())?)
             }
@@ -335,6 +346,9 @@ impl Submission {
             Self::Draft { mut completion, .. } => {
                 completion.0.take();
             }
+            Self::Acceptance { mut completion, .. } => {
+                completion.0.take();
+            }
             Self::Canonical { mut completion, .. } => {
                 completion.0.take();
             }
@@ -348,6 +362,15 @@ struct SessionSink {
     historical: bool,
 }
 impl DurableFinalitySink for SessionSink {
+    fn await_accepted(
+        &self,
+        request: CanonicalFinalityRequest,
+        completion: Box<dyn FnOnce(Result<()>) + Send>,
+    ) -> Result<()> {
+        self.worker.admit_draft(Submission::Acceptance {
+            request, runtime: self.runtime.clone(), completion: ClosingCompletion(Some(completion)),
+        })
+    }
     fn lookup_terminal(
         &self,
         request: CloseFinalityRequest,
@@ -769,6 +792,23 @@ impl State {
             }
             Submission::SourceDelivered { confirmation, runtime, completion } => {
                 completion.finish(self.confirm_delivered(store, &runtime, confirmation).await);
+            }
+            Submission::Acceptance { request, runtime, completion } => {
+                let result = async {
+                    if self.stop.is_cancelled() {
+                        fail!("Publication shutdown before acceptance");
+                    }
+                    let id = request.node_receipt.clone();
+                    let (delivery, entry) = self.write(store, move |store| store.delivery(&id))
+                        .await?.ok_or_else(|| error!("Unknown acceptance delivery"))?;
+                    // Bind role, block, session, network and origin before using
+                    // the same authenticated accept operation as normal Query.
+                    canonical_record(&runtime, &request, &delivery, &entry, &self.limits)?;
+                    let engine = self.engine.upgrade().ok_or_else(|| error!("Publication Engine gone"))?;
+                    self.accept(store, engine, entry).await?;
+                    Ok(())
+                }.await;
+                completion.finish(result);
             }
             Submission::Canonical { request, runtime, completion } => {
                 let result = async {

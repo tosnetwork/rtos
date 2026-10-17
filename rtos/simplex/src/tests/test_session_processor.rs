@@ -6546,11 +6546,7 @@ fn test_recursive_finalization_defers_until_missing_parent_body_arrives() {
     fixture.run_pending_tasks();
 
     let initial_events = drain_finalized_events(&recording);
-    assert_eq!(initial_events.len(), 1);
-    assert!(
-        initial_events.iter().any(|(block_id, is_final)| block_id == &child_block && *is_final),
-        "trigger callback must be emitted immediately even when parent body is missing"
-    );
+    assert!(initial_events.is_empty(), "C++ WC child waits for the parent finalization");
     assert!(
         fixture.processor.consensus.finalized_pending_body_contains(&child_id),
         "trigger must remain in pending journal while parent body is missing"
@@ -6575,10 +6571,8 @@ fn test_recursive_finalization_defers_until_missing_parent_body_arrives() {
         .clone();
 
     let finalized_events = drain_finalized_events(&recording);
-    assert_eq!(finalized_events.len(), 1);
-    assert!(finalized_events
-        .iter()
-        .any(|(block_id, is_final)| block_id == &parent_block && !is_final));
+    assert_eq!(finalized_events, vec![(parent_block, false), (child_block, true)],
+        "C++ WC FinalizeBlock order is parent approval before child final");
     assert!(
         !fixture.processor.consensus.finalized_pending_body_contains(&child_id),
         "pending journal entry must clear after recursive completion"
@@ -6637,11 +6631,7 @@ fn test_recursive_finalization_defers_until_parent_notar_cert_arrives() {
     fixture.run_pending_tasks();
 
     let initial_events = drain_finalized_events(&recording);
-    assert_eq!(initial_events.len(), 1);
-    assert!(
-        initial_events.iter().any(|(block_id, is_final)| block_id == &child_block && *is_final),
-        "trigger callback must be emitted immediately even when ancestor NotarCert is missing"
-    );
+    assert!(initial_events.is_empty(), "C++ WC child waits for the parent finalization");
     assert!(
         fixture.processor.consensus.finalized_pending_body_contains(&child_id),
         "trigger must stay pending while ancestor NotarCert is missing"
@@ -6670,10 +6660,8 @@ fn test_recursive_finalization_defers_until_parent_notar_cert_arrives() {
     fixture.drain_pending_async_db_results();
 
     let finalized_events = drain_finalized_events(&recording);
-    assert_eq!(finalized_events.len(), 1);
-    assert!(finalized_events
-        .iter()
-        .any(|(block_id, is_final)| block_id == &parent_block && !is_final));
+    assert_eq!(finalized_events, vec![(parent_block, false), (child_block, true)],
+        "C++ WC FinalizeBlock order is parent approval before child final");
     assert!(
         !fixture.processor.consensus.finalized_pending_body_contains(&child_id),
         "pending journal entry must clear once notar cert arrives and retry runs"
@@ -12098,7 +12086,9 @@ fn source_finality_controller_empty_trigger_seals_all_roles_after_cold_retry() {
     assert!(!map.exists(),"a held node handoff cannot seal a complete walk");
     // Resolve only Final. Approval is a separate debt and must keep the map absent.
     let staged=std::mem::take(&mut *sink.0.lock().unwrap());
-    assert!(!staged.is_empty());
+    assert_eq!(staged.len(), 1, "C++ WC parent must be the sole pending handoff");
+    assert_eq!(staged[0].0.block_id, chain[0].1.block_id, "C++ WC parent must precede child final");
+    assert!(matches!(staged[0].0.finality, consensus_common::SessionFinality::PqApproval(_)));
     for (draft,done) in staged {
         if matches!(draft.finality,consensus_common::SessionFinality::PqApproval(_)) {
             done(Err(rtos_block::error!("held approval before restart")));
@@ -12111,6 +12101,7 @@ fn source_finality_controller_empty_trigger_seals_all_roles_after_cold_retry() {
     }
     drop(processor); db.close(None).unwrap(); drop(db);
     let sink=Arc::new(HeldSink::default());
+    *sink.1.lock().unwrap() = Some(Vec::new());
     let (db,mut processor)=make_processor(sink.clone());
     let retained = processor.callbacks.pending_finality_intents().unwrap();
     assert_eq!(retained.len(), 1, "cold replay comes from the durable source certificate");
@@ -12118,11 +12109,39 @@ fn source_finality_controller_empty_trigger_seals_all_roles_after_cold_retry() {
     drain_processor_storage_and_messages(&mut processor);
     assert_eq!(processor.callbacks.finality_retention_attempts(), 1,
         "cold recovery must establish persistence again instead of inheriting a warm phase");
-    for _ in 0..8 {
-        for (_,done) in std::mem::take(&mut *sink.0.lock().unwrap()) { done(Ok(UInt256::from([2;32]))); }
+    let mut parent_accepted = false;
+    let mut rejected_parent_acceptance = false;
+    for _ in 0..16 {
+        for (draft,done) in std::mem::take(&mut *sink.0.lock().unwrap()) {
+            if matches!(draft.finality, consensus_common::SessionFinality::Carrier(_)) {
+                assert!(parent_accepted, "child final cannot precede parent node acceptance");
+            }
+            done(Ok(UInt256::from([2;32])));
+        }
         processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+        let acceptance = std::mem::take(sink.1.lock().unwrap().as_mut().unwrap());
+        for (request,done) in acceptance {
+            for _ in 0..3 {
+                processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+            }
+            if request.block_id == chain[0].1.block_id {
+                assert!(!parent_accepted);
+                assert!(sink.0.lock().unwrap().is_empty(), "WAL custody does not release the WC child");
+                assert!(!processor.consensus.is_finalized_block(&chain[0].0),
+                    "WAL custody cannot materialize the parent before node acceptance");
+                if !rejected_parent_acceptance {
+                    done(Err(rtos_block::error!("injected parent node acceptance failure")));
+                    rejected_parent_acceptance = true;
+                    std::thread::sleep(Duration::from_millis(270));
+                    continue;
+                }
+                parent_accepted = true;
+            }
+            done(Ok(()));
+        }
         if map.exists() { break; }
     }
+    assert!(parent_accepted);
     let value:serde_json::Value=serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
     assert_eq!(processor.callbacks.finality_retention_attempts(), 1,
         "cold-recovery retries reuse only their own successful certificate-save phase");

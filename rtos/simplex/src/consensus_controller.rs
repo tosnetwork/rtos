@@ -1665,9 +1665,9 @@ impl ConsensusController {
     /// Incrementally resolve finalized trigger + parent chain.
     ///
     /// Processing model:
-    /// - The trigger is evaluated immediately (out-of-order friendly).
-    /// - Each ancestor is handled independently in the same walk.
-    /// - Missing data/certs for one block do not block already-ready blocks.
+    /// - MC follows its FinalCert context to the first non-empty block.
+    /// - WC resolves the dependency stack, then completes parents before children.
+    /// - A missing dependency or pending parent handoff keeps WC children queued.
     ///
     /// Return value:
     /// - `true`  => all currently relevant blocks are resolved/emitted/applied.
@@ -1686,6 +1686,11 @@ impl ConsensusController {
         let applied_floor = self.last_mc_finalized_seqno.unwrap_or(0);
         let mut complete = true;
         let mut expected_outputs = Vec::new();
+        // C++ state-resolver.cpp:927-946 awaits the complete parent operation
+        // before publishing a non-empty WC child. Build the dependency stack
+        // first; no child callback escapes while a parent is unresolved.
+        let workchain = !self.description.get_shard().is_masterchain();
+        let mut resolved_workchain = Vec::new();
         let mut visited = HashSet::new();
         let mut depth = 0u32;
         let mut depth_warned = false;
@@ -1789,7 +1794,13 @@ impl ConsensusController {
                 !has_final_cert && received.block_id.seq_no() < applied_floor;
             let body_available = received.has_real_body();
 
-            if body_available {
+            if workchain {
+                if !body_available && !block_below_applied_floor {
+                    backend.request_candidate(current_id.slot, current_id.hash.clone(), Some(Duration::ZERO));
+                    return false;
+                }
+                resolved_workchain.push((current_id.clone(), received.clone(), has_final_cert));
+            } else if body_available {
                 // Step 3: persist/apply local finalized state before listener callback emission.
                 let durable = self.description.authenticated_runtime().is_some();
                 if !durable
@@ -1868,6 +1879,28 @@ impl ConsensusController {
             };
 
             current_id = parent_id;
+        }
+
+        if workchain {
+            if !complete {
+                return false;
+            }
+            // ResolveCandidate/parent failure or a pending node handoff stops
+            // this pass. The retained trigger retries the same parent first.
+            for (id, received, has_final_cert) in resolved_workchain.into_iter().rev() {
+                let durable = self.description.authenticated_runtime().is_some();
+                if !durable && !self.maybe_apply_finalized_state(backend, &id, has_final_cert) {
+                    return false;
+                }
+                let mut ready = true;
+                self.try_emit_recursive_finalized_callback(
+                    backend, &id, &received, event, has_final_cert,
+                    trigger_slot, &trigger_candidate_hash_data, &mut ready,
+                );
+                if !ready || (durable && !self.maybe_apply_finalized_state(backend, &id, has_final_cert)) {
+                    return false;
+                }
+            }
         }
 
         if complete && self.description.authenticated_runtime().is_some() {

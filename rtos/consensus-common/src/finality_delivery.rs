@@ -104,6 +104,16 @@ pub type FinalityTerminalCompletion = Box<dyn FnOnce(Result<FinalityTerminalLook
 pub type FinalityCloseCompletion = Box<dyn FnOnce(Result<CloseOffer>) + Send>;
 
 pub trait DurableFinalitySink: Send + Sync {
+    /// C++ FinalizeBlock waits for node acceptance, independently of WAL custody.
+    /// The authenticated source coordinates must match the accepted record.
+    fn await_accepted(
+        &self,
+        _request: CanonicalFinalityRequest,
+        _completion: Box<dyn FnOnce(Result<()>) + Send>,
+    ) -> Result<()> {
+        rtos_block::fail!("Finality acceptance wait is unsupported")
+    }
+
     /// Owned exactly-once completion after admission. Unsupported keeps original
     /// source retention; public requests/offers are not consumed confirmations.
     fn lookup_terminal(
