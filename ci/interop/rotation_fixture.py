@@ -117,7 +117,12 @@ async def recovery_workchain_states(snapshot, lite_configs, indices, block_id, d
 async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, rust_nodes,
                                   zero, governing, checkpoint, artifacts):
     recovery_fault = None
-    if getattr(args, 'partition_restart', False):
+    if getattr(args, 'source_ack_partition_restart', False):
+        from source_ack_partition_fixture import SourceAckPartitionRestart
+        node = next(node for node in rust_nodes if node['index'] == args.interrupt_rust_member)
+        recovery_fault = SourceAckPartitionRestart(args, root, node,
+            endpoints[args.interrupt_rust_member], member_id, checkpoint)
+    elif getattr(args, 'partition_restart', False):
         from partition_restart_fixture import PartitionRestart
         node = next(node for node in rust_nodes if node['index'] == args.interrupt_rust_member)
         recovery_fault = PartitionRestart(args, root, node, endpoints[args.interrupt_rust_member], member_id)
@@ -404,6 +409,9 @@ async def run(args, profile, root, artifacts):
                     if args.source_ack_fault and index == args.interrupt_rust_member:
                         from source_ack_fault_fixture import source_ack_environment
                         environment = source_ack_environment(args, root)
+                        if args.source_ack_partition_restart:
+                            from source_ack_partition_fixture import source_ack_partition_environment
+                            environment = source_ack_partition_environment(args, root)
                     if args.source_retention_cut_library and index == args.interrupt_rust_member:
                         from source_retention_cut_fixture import retention_cut_environment
                         environment = retention_cut_environment(args, root)
@@ -654,6 +662,7 @@ async def run(args, profile, root, artifacts):
                             'observer_budget': observer_budget, 'recovery': recovery,
                             'partition_restart': json.loads((root / 'recovery-partition/receipt.json').read_text()) if args.partition_restart else None,
                             'source_ack_fault': json.loads((root / 'source-ack-fault/receipt.json').read_text()) if args.source_ack_fault else None,
+                            'source_ack_partition_restart': json.loads((root / 'source-ack-partition/receipt.json').read_text()) if args.source_ack_partition_restart else None,
                             'source_retention_cut': json.loads((root / 'source-retention-cut/receipt.json').read_text()) if args.source_retention_cut_library else None,
                             'network_fault': network_fault, 'weighted_quorum': weighted_quorum, 'initial_probe': initial_probe}
                 await asyncio.sleep(0.2)
@@ -692,6 +701,8 @@ def main():
     parser.add_argument('--interrupt-rust-member', type=int, choices=[2, 5])
     parser.add_argument('--partition-restart', action='store_true',
         help='Keep the interrupted member partitioned through restart; fault seconds apply before survivor proof and after restart')
+    parser.add_argument('--source-ack-partition-restart', action='store_true',
+        help='Explicitly combine source ACK IO failure with partition across original-DB restart')
     parser.add_argument('--source-ack-fault', choices=['sync-eio', 'write-enospc'])
     parser.add_argument('--source-ack-fault-library', type=Path)
     parser.add_argument('--source-retention-cut-library', type=Path)
@@ -706,9 +717,11 @@ def main():
     sequence = ([args.network_fault] if args.network_fault else []) + args.additional_network_faults
     if args.additional_network_faults and not args.network_fault or len(sequence) > 4 or len(set(sequence)) != len(sequence):
         raise SystemExit('Predeclare up to four distinct packet cases; repeats are not retries')
+    if args.source_ack_partition_restart and not (args.source_ack_fault and args.partition_restart):
+        raise SystemExit('Combined recovery requires both source ACK fault and partition restart')
     if args.source_ack_fault:
         require_namespace()
-        if args.interrupt_rust_member is None or args.partition_restart or args.network_fault or args.additional_network_faults or args.prepare_genesis_only:
+        if args.interrupt_rust_member is None or (args.partition_restart and not args.source_ack_partition_restart) or args.network_fault or args.additional_network_faults or args.prepare_genesis_only:
             raise SystemExit('Source ACK fault requires one interrupted Rust member and no other injected fault')
         if not args.source_ack_fault_library:
             raise SystemExit('Source ACK fault requires its explicit native test library')
@@ -798,6 +811,12 @@ def main():
         artifacts[str(path)] = digest(path)
         weighted_helpers[name] = digest(path)
         destination = args.output / 'weighted-sources' / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(path.read_bytes())
+    if args.source_ack_partition_restart:
+        path = driver.with_name('source_ack_partition_fixture.py')
+        artifacts[str(path)] = digest(path)
+        destination = args.output / 'fault-sources' / path.name
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(path.read_bytes())
     if args.partition_restart:
