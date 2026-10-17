@@ -116,6 +116,24 @@ async def recovery_workchain_states(snapshot, lite_configs, indices, block_id, d
 
 async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, rust_nodes,
                                   zero, governing, checkpoint, artifacts):
+    partition = None
+    if getattr(args, 'partition_restart', False):
+        from partition_restart_fixture import PartitionRestart
+        node = next(node for node in rust_nodes if node['index'] == args.interrupt_rust_member)
+        partition = PartitionRestart(args, root, node, endpoints[args.interrupt_rust_member], member_id)
+    try:
+        recovered = await _recover_rotation_member(args, root, nodes, endpoints, lite_configs,
+            rust_nodes, zero, governing, checkpoint, artifacts, partition)
+        if partition:
+            partition.complete(recovered)
+        return recovered
+    finally:
+        if partition:
+            partition.close()
+
+
+async def _recover_rotation_member(args, root, nodes, endpoints, lite_configs, rust_nodes,
+                                   zero, governing, checkpoint, artifacts, partition=None):
     """Interrupt one owned successor, then reopen its existing data without preparation."""
     index = args.interrupt_rust_member
     node = next(node for node in rust_nodes if node['index'] == index)
@@ -133,6 +151,8 @@ async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, ru
     write(directory / 'recovery.json', receipt)
     if old_process.returncode is not None:
         raise RuntimeError('Recovery member exited before the intended interruption')
+    if partition:
+        await partition.arm()
     old_process.kill()
     interrupted_at = time.time()
     code = await asyncio.wait_for(old_process.wait(), 10)
@@ -141,7 +161,9 @@ async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, ru
     receipt.update(interruption_returncode=code, interrupted_at_unix=interrupted_at, phase='waiting_for_survivors')
     write(directory / 'recovery.json', receipt)
     histories = [{} for _ in nodes]
-    deadline = time.monotonic() + args.recovery_timeout
+    deadline = partition.deadline if partition else time.monotonic() + args.recovery_timeout
+    if partition:
+        await partition.after_interruption()
 
     async def common_checkpoint(indices, floor):
         while time.monotonic() < deadline:
@@ -213,18 +235,24 @@ async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, ru
         survivor_infos = await common_checkpoint([i for i in range(6) if i != index], floor)
         floor = survivor_infos[0]['last']['seqno']
         survivor, _ = await check_checkpoint(survivor_infos, f'survivors-{floor}', False)
-        if survivor['gen_utime'] > interrupted_at:break
+        if survivor['gen_utime'] > interrupted_at:
+            if partition:
+                partition.survivor(survivor)
+            break
     receipt.update(phase='restarting_original_directory', survivor_checkpoint=survivor['block'])
     write(directory / 'recovery.json', receipt)
     for filename, expected in artifacts.items():
         if digest(Path(filename)) != expected:raise RuntimeError('An executable or profile changed before restart')
     if digest(prepared) != prepared_hash:raise RuntimeError('Prepared authority changed before restart')
-    node.update(await start_rotation_node(args.rust_node, node['directory'], 'node-restart.log'))
+    node.update(await start_rotation_node(args.rust_node, node['directory'], 'node-restart.log',
+        environment=partition.environment() if partition else None))
     restarted_at = time.time()
     receipt['new_process'] = {'pid': node['process'].pid, 'start_ticks': node['start_ticks']}
     receipt['restarted_at_unix'] = restarted_at
     receipt['phase'] = 'waiting_for_recovered_leadership'
     write(directory / 'recovery.json', receipt)
+    if partition:
+        await partition.after_restart(node)
     # Clear all pre-interruption observations; acceptance needs fresh RPCs from every process.
     histories = [{} for _ in nodes]
     floor = survivor['block']['seqno']
@@ -364,7 +392,7 @@ async def run(args, profile, root, artifacts):
                     directory = root / f'rust-{index}'
                     address, prepared = await prepare_rust(args, directory, index, network,
                         global_config, used, used)
-                    environment = marked_environment(args.socket_mark_library) if args.network_fault and index == args.network_fault_member else None
+                    environment = marked_environment(args.socket_mark_library) if (args.network_fault or args.partition_restart) and index == args.network_fault_member else None
                     rust_nodes.append(dict(index=index, directory=directory,
                         **await start_rotation_node(args.rust_node, directory, environment=environment)))
                     client = json.loads((directory / 'lite_client_config.json').read_text())
@@ -375,7 +403,7 @@ async def run(args, profile, root, artifacts):
                         validator=genesis.as_validator_config()))
                 else:
                     address = f'127.0.0.1:{reserve_port(socket.SOCK_STREAM, used)}'
-                    environment = marked_environment(args.socket_mark_library) if args.network_fault and index == args.network_fault_member else {}
+                    environment = marked_environment(args.socket_mark_library) if (args.network_fault or args.partition_restart) and index == args.network_fault_member else {}
                     await node.run(StartOptions(threads=2, verbosity=3, args=['--json-rpc-address', address], env=environment))
                     cpp_started.append((index, node))
                     lite_configs.append(node.liteserver_config)
@@ -622,7 +650,7 @@ async def run(args, profile, root, artifacts):
             write(root / 'rust-shutdown-timing.json', {str(node['index']):
                 {'elapsed_seconds': node['shutdown_elapsed_seconds'], 'normal_exit_limit_seconds': 20}
                 for node in rust_nodes})
-            if args.network_fault:
+            if args.network_fault or args.partition_restart:
                 stopped = await asyncio.gather(*(stop_cpp_with_receipt(index, node) for index, node in cpp_started))
                 write(root / 'cpp-shutdown.json', {str(index): value for index, value in stopped})
                 if any(not value['matches_pinned_tester_teardown'] for _, value in stopped) and sys.exception() is None:
@@ -644,6 +672,8 @@ def main():
     parser.add_argument('--rust-node', type=Path)
     parser.add_argument('--validator-preparer', type=Path)
     parser.add_argument('--interrupt-rust-member', type=int, choices=[2, 5])
+    parser.add_argument('--partition-restart', action='store_true',
+        help='Keep the interrupted member partitioned through restart; fault seconds apply before survivor proof and after restart')
     parser.add_argument('--recovery-timeout', type=float, default=180)
     parser.add_argument('--network-fault', choices=list(MODES))
     parser.add_argument('--additional-network-faults', choices=list(MODES), nargs='*', default=[])
@@ -654,9 +684,13 @@ def main():
     sequence = ([args.network_fault] if args.network_fault else []) + args.additional_network_faults
     if args.additional_network_faults and not args.network_fault or len(sequence) > 4 or len(set(sequence)) != len(sequence):
         raise SystemExit('Predeclare up to four distinct packet cases; repeats are not retries')
-    if args.network_fault:
+    if args.partition_restart:
+        if args.interrupt_rust_member is None or args.network_fault or args.additional_network_faults or args.prepare_genesis_only:
+            raise SystemExit('Partition restart requires one interrupted Rust member and no separate packet cases')
+        args.network_fault_member = args.interrupt_rust_member
+    if args.network_fault or args.partition_restart:
         require_namespace()
-        if args.interrupt_rust_member is not None or args.prepare_genesis_only:
+        if args.network_fault and (args.interrupt_rust_member is not None or args.prepare_genesis_only):
             raise SystemExit('Packet impairment is separate from process interruption')
         if not args.socket_mark_library or not 5 <= args.network_fault_seconds <= 30:
             raise SystemExit('Packet exercise requires its explicit socket-mark library and 5..30 second window')
@@ -705,7 +739,7 @@ def main():
     artifacts = {str(args.block_checker): digest(args.block_checker), str(args.profile): digest(args.profile)}
     if args.rust_node:
         artifacts.update({str(path): digest(path) for path in [args.rust_node, args.validator_preparer]})
-    if args.network_fault:
+    if args.network_fault or args.partition_restart:
         artifacts[str(args.socket_mark_library)] = digest(args.socket_mark_library)
     for item in manifest['binaries']:
         path = args.snapshot / 'build' / item['path']
@@ -726,12 +760,15 @@ def main():
         destination = args.output / 'weighted-sources' / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(path.read_bytes())
+    if args.partition_restart:
+        path = driver.with_name('partition_restart_fixture.py')
+        artifacts[str(path)] = digest(path)
     write(args.output / 'source.json', {'snapshot': manifest, 'artifacts': artifacts,
         'profile': profile, 'command': sys.argv, 'driver_sha256': digest(driver),
         'shared_helper_sha256': digest(helper), 'weighted_helpers_sha256': weighted_helpers})
     routing = None
-    if args.network_fault:
-        for name in ['network_faults.py','network_fault_fixture.py','network_fault/socket_mark.c']:
+    if args.network_fault or args.partition_restart:
+        for name in ['network_faults.py','network_fault_fixture.py','network_fault/socket_mark.c'] + (['partition_restart_fixture.py'] if args.partition_restart else []):
             path = driver.parent / name
             destination = args.output / 'fault-sources' / name
             destination.parent.mkdir(parents=True, exist_ok=True)
