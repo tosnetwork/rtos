@@ -283,6 +283,7 @@ pub(crate) trait ConsensusBackend {
     /// C++ `PoolImpl::ban`), so repeated forged traffic cannot starve the
     /// receiver/processor pipeline.
     fn ban_source_for_bad_signature(&self, source_idx: u32);
+    fn ban_peer_for_bad_signature(&self, peer: PublicKeyHash);
 
     /// Broadcast a locally produced, session-signed vote to all validators
     /// (forwards to `Receiver::send_vote`, which serializes the TL vote,
@@ -917,7 +918,17 @@ impl ConsensusController {
         source_idx: impl Into<Option<u32>>,
         tl_certificate: Certificate,
     ) -> bool {
-        let source_idx = source_idx.into().map(ValidatorIndex::new);
+        self.on_certificate_from_peer(backend, None, source_idx.into(), tl_certificate)
+    }
+
+    pub(crate) fn on_certificate_from_peer(
+        &mut self,
+        backend: &mut dyn ConsensusBackend,
+        peer: Option<PublicKeyHash>,
+        source_idx: Option<u32>,
+        tl_certificate: Certificate,
+    ) -> bool {
+        let source_idx = source_idx.map(ValidatorIndex::new);
 
         // Avoid logging the full TL certificate (includes signature bytes) on the hot path.
         // It is extremely verbose and materially slows down trace-enabled test runs.
@@ -1061,7 +1072,9 @@ impl ConsensusController {
                 // C++ parity (`pool.cpp`): bad-signature certificates trigger a
                 // temporary peer ban so repeated forged traffic cannot starve
                 // the receiver/processor pipeline.
-                if let Some(index) = source_idx {
+                if let Some(peer) = peer {
+                    backend.ban_peer_for_bad_signature(peer);
+                } else if let Some(index) = source_idx {
                     backend.ban_source_for_bad_signature(index.value());
                 }
                 return false;

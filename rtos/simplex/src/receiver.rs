@@ -338,6 +338,8 @@ pub(crate) trait Receiver: Send + Sync {
     ///
     /// Reference: C++ `PoolImpl::ban(peer)` (`pool.cpp`).
     fn ban_source_for_bad_signature(&self, source_idx: u32);
+    /// Ban the authenticated transport peer, including a non-validator observer.
+    fn ban_peer_for_bad_signature(&self, peer: PublicKeyHash);
 
     /// Stop the receiver
     fn stop(&self);
@@ -372,6 +374,12 @@ pub(crate) trait ReceiverListener: Send + Sync {
         if let Some(index) = source_idx {
             self.on_certificate(index, certificate);
         }
+    }
+
+    /// Preserve transport provenance across the receiver/processor queues.
+    fn on_transport_certificate(&self, peer: PublicKeyHash, source_idx: Option<u32>, certificate: Certificate) {
+        let _ = peer;
+        self.on_member_certificate(source_idx, certificate);
     }
 
     /// Incoming block candidate (from broadcast or query response)
@@ -920,6 +928,9 @@ impl ReceiverImpl {
         if self.membership.role(&adnl_id).is_err() {
             return;
         }
+        if self.bad_signature_ban_state.is_banned(&adnl_id, SystemTime::now()) {
+            return;
+        }
         let source_idx = self.adnl_to_idx.get(&adnl_id).copied();
         // Capture raw bytes before deserialization (for misbehavior proofs)
         // Wrap in RawVoteData (Arc) early for memory-efficient sharing
@@ -945,9 +956,18 @@ impl ReceiverImpl {
         // downcast returns Err(self) on failure, so we can try the next type
         let message = match message.downcast::<TlVoteBoxed>() {
             Ok(vote) => {
-                let Some(source_idx) = source_idx else {
+                // C++ Pool bans a transport member that sends votes without a
+                // validator role. Certificate forwarding remains permitted.
+                if !self.bad_signature_ban_state.admit_vote(
+                    adnl_id.clone(), source_idx.is_some(), SystemTime::now(),
+                ) {
+                    log::warn!(
+                        "SimplexReceiver {}: dropping vote from non-validator transport {}",
+                        self.session_id.to_hex_string(), key_to_base64(&adnl_id)
+                    );
                     return;
-                };
+                }
+                let Some(source_idx) = source_idx else { return; };
                 // Avoid logging full TL vote (includes signature bytes) on the hot path.
                 let (kind, slot, hash_prefix) = match vote.vote() {
                     UnsignedVote::Consensus_Simplex_NotarizeVote(v) => {
@@ -999,7 +1019,7 @@ impl ReceiverImpl {
                     hash_prefix,
                     sigs
                 );
-                self.process_incoming_certificate(source_idx, cert);
+                self.process_incoming_certificate(adnl_id, source_idx, cert);
                 return;
             }
             Err(message) => message,
@@ -1436,13 +1456,12 @@ struct DeduplicationKey {
 /// - `is_banned()` returns whether a source is currently banned and lazily
 ///   evicts expired entries so the map cannot grow unbounded.
 ///
-/// The ban map is source-keyed (validator index) instead of ADNL-keyed because
-/// Simplex source identities are fixed for the session lifetime, and
-/// SessionProcessor reports certificate verification failures by `source_idx`.
+/// Keys are authenticated ADNL transport identities, matching C++ PoolImpl.
+/// Validator-index callbacks are translated at the receiver boundary.
 #[derive(Debug, Default)]
 struct BadSignatureBanState {
     duration: Duration,
-    bans: HashMap<u32, SystemTime>,
+    bans: HashMap<PublicKeyHash, SystemTime>,
 }
 
 impl BadSignatureBanState {
@@ -1454,23 +1473,34 @@ impl BadSignatureBanState {
         self.duration
     }
 
-    /// Arm a ban for `source_idx`. `now` is parameterized for deterministic
+    /// Arm a ban for an authenticated peer. `now` is parameterized for deterministic
     /// unit tests; production callers pass `SystemTime::now()`.
-    fn record(&mut self, source_idx: u32, now: SystemTime) {
+    fn record(&mut self, peer: PublicKeyHash, now: SystemTime) {
         let expiry = now.checked_add(self.duration).unwrap_or(now);
-        self.bans.insert(source_idx, expiry);
+        self.bans.insert(peer, expiry);
     }
 
     /// Return true if the source is currently banned, evicting expired entries.
-    fn is_banned(&mut self, source_idx: u32, now: SystemTime) -> bool {
-        let Some(expiry) = self.bans.get(&source_idx).copied() else {
+    fn is_banned(&mut self, peer: &PublicKeyHash, now: SystemTime) -> bool {
+        let Some(expiry) = self.bans.get(peer).copied() else {
             return false;
         };
         if now < expiry {
             return true;
         }
-        self.bans.remove(&source_idx);
+        self.bans.remove(peer);
         false
+    }
+
+    fn admit_vote(&mut self, peer: PublicKeyHash, is_validator: bool, now: SystemTime) -> bool {
+        if self.is_banned(&peer, now) {
+            return false;
+        }
+        if !is_validator {
+            self.record(peer, now);
+            return false;
+        }
+        true
     }
 
     #[cfg(test)]
@@ -1739,14 +1769,15 @@ impl ReceiverImpl {
     /// and calls `handle_foreign_certificate(cert)`.
     ///
     /// # Arguments
-    /// * `source_idx` - Validator index of the sender
+    /// * `peer` - Authenticated ADNL transport sender, including observers
+    /// * `source_idx` - Optional validator index of the sender
     /// * `certificate` - Deserialized TL certificate object
-    fn process_incoming_certificate(&mut self, source_idx: Option<u32>, certificate: Certificate) {
+    fn process_incoming_certificate(&mut self, peer: PublicKeyHash, source_idx: Option<u32>, certificate: Certificate) {
         instrument!();
 
         // C++ parity (`pool.cpp` `is_banned()` precheck): skip processing of
         // certificate messages from temporarily banned peers entirely.
-        if source_idx.is_some_and(|index| self.is_source_temporarily_banned(index)) {
+        if self.bad_signature_ban_state.is_banned(&peer, SystemTime::now()) {
             log::trace!(
                 "SimplexReceiver {}: dropping certificate from temporarily banned source {:?}",
                 self.session_id.to_hex_string(),
@@ -1851,7 +1882,7 @@ impl ReceiverImpl {
         // Forward to listener for verification and application
         // SessionProcessor will verify the certificate signatures and update SimplexState
         if let Some(listener) = self.listener.upgrade() {
-            listener.on_member_certificate(source_idx, certificate);
+            listener.on_transport_certificate(peer, source_idx, certificate);
         }
     }
 
@@ -2143,34 +2174,30 @@ impl ReceiverImpl {
     // Source bans
     // ------------------------------------------------------------------
 
-    /// Apply a temporary bad-signature ban to a source index.
-    ///
-    /// C++ parity: mirrors `PoolImpl::ban(peer)` recording an absolute expiry
-    /// driven by `params_.bad_signature_ban_duration`.
+    /// Legacy validator-index notifications resolve to the same transport ban.
     fn ban_source_for_bad_signature_impl(&mut self, source_idx: u32) {
-        if (source_idx as usize) >= self.sources.len() {
-            log::trace!(
-                "SimplexReceiver {}: ignoring ban request for unknown source {}",
-                self.session_id.to_hex_string(),
-                source_idx
-            );
+        if let Some(stats) = self.sources.get(source_idx as usize) {
+            self.ban_peer_for_bad_signature_impl(stats.adnl_id.clone());
+        }
+    }
+
+    fn ban_peer_for_bad_signature_impl(&mut self, peer: PublicKeyHash) {
+        if self.membership.role(&peer).is_err() {
             return;
         }
-
-        self.bad_signature_ban_state.record(source_idx, SystemTime::now());
-
+        self.bad_signature_ban_state.record(peer.clone(), SystemTime::now());
         log::warn!(
-            "SimplexReceiver {}: temporarily banning source {} for {:?} due to bad vote/cert signature",
-            self.session_id.to_hex_string(),
-            source_idx,
+            "SimplexReceiver {}: temporarily banning transport {} for {:?}",
+            self.session_id.to_hex_string(), key_to_base64(&peer),
             self.bad_signature_ban_state.ban_duration()
         );
     }
 
-    /// Check whether a source index is currently banned, expiring stale entries.
     fn is_source_temporarily_banned(&mut self, source_idx: u32) -> bool {
-        self.bad_signature_ban_state.is_banned(source_idx, SystemTime::now())
+        self.sources.get(source_idx as usize).map(|stats| stats.adnl_id.clone())
+            .is_some_and(|peer| self.bad_signature_ban_state.is_banned(&peer, SystemTime::now()))
     }
+
 }
 
 // ======================================================================
@@ -4611,6 +4638,12 @@ impl Receiver for ReceiverWrapper {
     fn ban_source_for_bad_signature(&self, source_idx: u32) {
         self.task_queues.post_closure(Box::new(move |receiver: &mut ReceiverImpl| {
             receiver.ban_source_for_bad_signature_impl(source_idx);
+        }));
+    }
+
+    fn ban_peer_for_bad_signature(&self, peer: PublicKeyHash) {
+        self.task_queues.post_closure(Box::new(move |receiver: &mut ReceiverImpl| {
+            receiver.ban_peer_for_bad_signature_impl(peer);
         }));
     }
 

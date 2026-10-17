@@ -500,14 +500,45 @@ fn test_sliding_window_rate_limiter_enforces_window_limit() {
 // vote/certificate signature; subsequent traffic from that peer is dropped
 // until the ban expires.
 
+fn ban_peer(index: u8) -> consensus_common::PublicKeyHash {
+    KeyId::from_data([index; 32])
+}
+
+#[test]
+fn test_observer_vote_bans_transport_until_expiry_without_refresh_on_drops() {
+    let duration = Duration::from_secs(5);
+    let mut state = super::BadSignatureBanState::new(duration);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+    let observer = ban_peer(31);
+    assert!(!state.admit_vote(observer.clone(), false, now));
+    assert!(state.is_banned(&observer, now));
+    // Dropped traffic must not extend the window. The ban covers certificates
+    // too because protocol ingress checks the same transport map before parsing.
+    assert!(!state.admit_vote(observer.clone(), true, now + duration / 2));
+    assert!(!state.is_banned(&observer, now + duration));
+    assert!(state.admit_vote(ban_peer(32), true, now));
+    assert_eq!(state.active_bans(), 0);
+}
+
+#[test]
+fn test_transport_ban_is_scoped_to_peer_and_session() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+    let mut first = super::BadSignatureBanState::new(Duration::from_secs(5));
+    let mut next = super::BadSignatureBanState::new(Duration::from_secs(5));
+    first.record(ban_peer(31), now);
+    assert!(first.is_banned(&ban_peer(31), now));
+    assert!(!first.is_banned(&ban_peer(32), now));
+    assert!(!next.is_banned(&ban_peer(31), now));
+}
+
 /// A freshly constructed ban state must not consider any source banned.
 #[test]
 fn test_bad_signature_ban_state_starts_empty() {
     let mut state = super::BadSignatureBanState::new(Duration::from_secs(5));
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
 
-    assert!(!state.is_banned(0, now));
-    assert!(!state.is_banned(7, now));
+    assert!(!state.is_banned(&ban_peer(0), now));
+    assert!(!state.is_banned(&ban_peer(7), now));
     assert_eq!(state.active_bans(), 0);
 }
 
@@ -519,13 +550,13 @@ fn test_bad_signature_ban_state_record_and_expire() {
     let mut state = super::BadSignatureBanState::new(duration);
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
 
-    state.record(3, now);
+    state.record(ban_peer(3), now);
 
-    assert!(state.is_banned(3, now), "source must be banned immediately after record()");
-    assert!(state.is_banned(3, now + duration / 2), "source must remain banned mid-window");
+    assert!(state.is_banned(&ban_peer(3), now), "source must be banned immediately after record()");
+    assert!(state.is_banned(&ban_peer(3), now + duration / 2), "source must remain banned mid-window");
 
     let expired_at = now + duration + Duration::from_millis(1);
-    assert!(!state.is_banned(3, expired_at), "ban must lift at expiry");
+    assert!(!state.is_banned(&ban_peer(3), expired_at), "ban must lift at expiry");
     assert_eq!(
         state.active_bans(),
         0,
@@ -541,14 +572,14 @@ fn test_bad_signature_ban_state_record_refreshes_existing_entry() {
     let mut state = super::BadSignatureBanState::new(duration);
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
 
-    state.record(2, t0);
+    state.record(ban_peer(2), t0);
     let t1 = t0 + Duration::from_secs(3);
-    state.record(2, t1);
+    state.record(ban_peer(2), t1);
 
     assert_eq!(state.active_bans(), 1, "second record() must not create a new entry");
     let after_first_expiry = t0 + duration + Duration::from_millis(1);
     assert!(
-        state.is_banned(2, after_first_expiry),
+        state.is_banned(&ban_peer(2), after_first_expiry),
         "refreshed ban must extend past the original expiry"
     );
 }
@@ -559,11 +590,11 @@ fn test_bad_signature_ban_state_is_per_source() {
     let mut state = super::BadSignatureBanState::new(Duration::from_secs(5));
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
 
-    state.record(4, now);
+    state.record(ban_peer(4), now);
 
-    assert!(state.is_banned(4, now));
-    assert!(!state.is_banned(5, now));
-    assert!(!state.is_banned(0, now));
+    assert!(state.is_banned(&ban_peer(4), now));
+    assert!(!state.is_banned(&ban_peer(5), now));
+    assert!(!state.is_banned(&ban_peer(0), now));
 }
 
 // ============================================================================

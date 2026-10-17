@@ -2115,6 +2115,10 @@ impl ConsensusBackend for ConsensusBackendAdapter<'_> {
         self.receiver.ban_source_for_bad_signature(source_idx);
     }
 
+    fn ban_peer_for_bad_signature(&self, peer: consensus_common::PublicKeyHash) {
+        self.receiver.ban_peer_for_bad_signature(peer);
+    }
+
     fn send_vote(&self, signed_vote: TlVote) {
         // Receiver serializes the TL vote, broadcasts to all validators, and
         // loops it back through the listener for our own FSM accounting.
@@ -2835,6 +2839,17 @@ impl SessionProcessor {
         });
         if verified {
             // Immediately process any state changes
+            self.check_all();
+        }
+    }
+
+    pub(crate) fn on_transport_certificate(
+        &mut self, peer: consensus_common::PublicKeyHash, source_idx: Option<u32>, certificate: Certificate,
+    ) {
+        let verified = self.with_consensus_backend(|consensus, backend| {
+            consensus.on_certificate_from_peer(backend, Some(peer), source_idx, certificate)
+        });
+        if verified {
             self.check_all();
         }
     }

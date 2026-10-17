@@ -174,6 +174,7 @@ enum ReceiverAction {
     NotifyCertificateAccepted { slot: u32, kind: crate::receiver::StandstillCertificateType },
     /// ban_source_for_bad_signature() was called
     BanSourceForBadSignature { source_idx: u32 },
+    BanPeerForBadSignature { peer: consensus_common::PublicKeyHash },
 }
 
 /// Mock receiver that records all outbound calls
@@ -309,6 +310,10 @@ impl Receiver for MockReceiver {
             .lock()
             .unwrap()
             .push_back(ReceiverAction::BanSourceForBadSignature { source_idx });
+    }
+
+    fn ban_peer_for_bad_signature(&self, peer: consensus_common::PublicKeyHash) {
+        self.actions.lock().unwrap().push_back(ReceiverAction::BanPeerForBadSignature { peer });
     }
 
     fn stop(&self) {
@@ -12334,4 +12339,57 @@ fn source_finality_controller_empty_trigger_seals_all_roles_after_cold_retry() {
     }
     assert_eq!(value["released"],false,"sealed handoff is not Delivered confirmation");
     drop(processor); db.close(None).unwrap();
+}
+
+
+#[test]
+fn test_transport_certificate_rejection_bans_observer_peer_without_validator_index() {
+    let mut fixture = TestFixture::new(4);
+    fixture.drain_receiver_actions();
+    let peer = rtos_block::KeyId::from_data([0x71; 32]);
+    let cert = build_skip_certificate_tl(&SessionId::rand(), &fixture.nodes, 0, &[0,1,2]);
+    fixture.processor.on_transport_certificate(peer.clone(), None, cert);
+    let actions = fixture.drain_receiver_actions();
+    assert_eq!(actions.iter().filter(|action| matches!(action,
+        ReceiverAction::BanPeerForBadSignature { peer: actual } if actual == &peer)).count(), 1);
+    assert!(!actions.iter().any(|action| matches!(action, ReceiverAction::BanSourceForBadSignature { .. })));
+    assert!(!fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(0)));
+}
+
+#[test]
+fn test_transport_certificate_valid_observer_forwarding_is_accepted_without_ban() {
+    let mut fixture = TestFixture::new(4);
+    fixture.drain_receiver_actions();
+    let peer = rtos_block::KeyId::from_data([0x71; 32]);
+    let cert = build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, 0, &[0,1,2]);
+    fixture.processor.on_transport_certificate(peer, None, cert);
+    fixture.drain_pending_async_db_results();
+    assert!(fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(0)));
+    assert!(!fixture.drain_receiver_actions().iter().any(|action| matches!(action,
+        ReceiverAction::BanPeerForBadSignature { .. } | ReceiverAction::BanSourceForBadSignature { .. })));
+}
+
+#[test]
+fn test_transport_certificate_rejection_attributes_ban_to_transport_peer() {
+    let mut fixture = TestFixture::new(4);
+    fixture.drain_receiver_actions();
+    let peer = rtos_block::KeyId::from_data([0x72; 32]);
+    let cert = build_skip_certificate_tl(&SessionId::rand(), &fixture.nodes, 0, &[0,1,2]);
+    fixture.processor.on_transport_certificate(peer.clone(), Some(1), cert);
+    let actions = fixture.drain_receiver_actions();
+    assert_eq!(actions.iter().filter(|action| matches!(action,
+        ReceiverAction::BanPeerForBadSignature { peer: actual } if actual == &peer)).count(), 1);
+    assert!(!actions.iter().any(|action| matches!(action, ReceiverAction::BanSourceForBadSignature { .. })));
+}
+
+#[test]
+fn test_transport_certificate_outside_ingress_window_does_not_ban() {
+    let mut fixture = TestFixture::new(4);
+    fixture.drain_receiver_actions();
+    let slot = fixture.processor.simplex_state.first_too_new_vote_slot().value();
+    let peer = rtos_block::KeyId::from_data([0x71; 32]);
+    let cert = build_skip_certificate_tl(&SessionId::rand(), &fixture.nodes, slot, &[0,1,2]);
+    fixture.processor.on_transport_certificate(peer, None, cert);
+    assert!(!fixture.drain_receiver_actions().iter().any(|action| matches!(action,
+        ReceiverAction::BanPeerForBadSignature { .. } | ReceiverAction::BanSourceForBadSignature { .. })));
 }
