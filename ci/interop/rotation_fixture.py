@@ -203,6 +203,15 @@ async def run(args, profile, root, artifacts):
                         raise RuntimeError('Authenticated C++ state has an unexpected current committee')
                     seen.add(key)
                     if checked['key_block']:
+                        if checked['prev_key_block_seqno'] != 0:
+                            raise RuntimeError('This one-successor fixture encountered an additional key-block epoch')
+                        sample['governing_zerostate_boc'] = base64.b64encode(genesis.masterchain.file.read_bytes()).decode()
+                        sample['certificates'] = [await cpp_certificate(args.snapshot, nodes[0], zero,
+                            infos[0]['last'], directory)]
+                        write(directory / 'sample.json', sample)
+                        await child_checked([args.block_checker, directory / 'sample.json',
+                            directory / 'key-block-certified.json'], directory / 'key-block-checker.log')
+                        checked = json.loads((directory / 'key-block-certified.json').read_text())
                         write(directory / 'transition.json', {'phase': phase, 'checked': checked})
                         continue  # A transition block is still signed by its preceding set.
                     if phase == 'after' and (checked['gen_utime'] < activation or checked['prev_key_block_seqno'] == 0):
