@@ -85,13 +85,13 @@ pub(super) fn verify_candidate_for_relay(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use consensus_common::{session_runtime::SessionNetworkPin, ConsensusCommonFactory};
     use rtos_api::session_identity::SessionCoordinates;
-    use rtos_block::{BlockIdExt, ConfigParams, Deserializable, KeyId, ShardIdent};
+    use rtos_block::{BlockIdExt, ConfigParams, Deserializable, KeyId, ShardIdent, ValidatorSet};
 
-    fn fixture() -> (AuthenticatedSessionRuntime, CandidateAuthenticationEvidence) {
+    pub(in crate::validator) fn fixture() -> (AuthenticatedSessionRuntime, CandidateAuthenticationEvidence) {
         let json: serde_json::Value = serde_json::from_str(include_str!(
             "../full_node/finality/testdata/v2-propagation-recovery.json"
         ))
@@ -113,6 +113,10 @@ mod tests {
                 7,
             )
             .unwrap();
+        // Match the group's ValidatorSet representation. Prefix weights are
+        // internal lookup metadata and do not change the signed committee.
+        let committee = ValidatorSet::new(0, 100000, committee.len() as u16, committee)
+            .unwrap().list().to_vec();
         // This is an explicitly trusted isolated test configuration, not a test
         // of governing-chain authentication or network peer admission.
         let runtime = AuthenticatedSessionRuntime::from_authenticated_config(

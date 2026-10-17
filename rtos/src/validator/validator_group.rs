@@ -2212,7 +2212,11 @@ impl ValidatorGroup {
         );
         // No group/cache lock is held over network operations. Queue ownership
         // keeps this callback in the group's shutdown barrier.
-        let outcome = self.engine.relay_validated_candidate(&candidate, &plan).await;
+        let outcome = tokio::select! {
+            biased;
+            _ = self.stop_requested.cancelled() => fail!("Candidate relay stopped before network receipt"),
+            outcome = self.engine.relay_validated_candidate(&candidate, &plan) => outcome,
+        };
         if outcome.attempted() && !outcome.needs_retry() {
             self.candidate_relays.lock().unwrap().record_sent(id);
         }

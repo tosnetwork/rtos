@@ -3239,7 +3239,16 @@ impl Overlay {
                         }
                         let mut bytes = self.message_prefix.clone();
                         serialize_boxed_append(&mut bytes, &message)?;
-                        if let Err(err) = quic.message(bytes, Some(&self.adnl), &peers).await {
+                        // A direct QUIC send may wait for peer stream credit.
+                        // Overlay retirement must release that wait before its
+                        // owner can join; global QUIC shutdown happens later.
+                        // An interrupted send remains a failed, retryable relay.
+                        let sent = tokio::select! {
+                            biased;
+                            _ = self.tasks.cancelled() => Err(error!("Plumtree overlay retired during send")),
+                            result = quic.message(bytes, Some(&self.adnl), &peers) => result,
+                        };
+                        if let Err(err) = sent {
                             if first_error.is_none() {
                                 first_error = Some(err);
                             }

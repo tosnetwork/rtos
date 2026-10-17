@@ -1006,6 +1006,30 @@ impl QuicNode {
         self.peer_keys.get(key_id).is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn hold_stream_credit_for_test(
+        &self,
+        peers: &AdnlPeers,
+    ) -> Result<Vec<(quinn::SendStream, quinn::RecvStream)>> {
+        let state = self.local_key_state(peers.local())?;
+        let addr = self.addr_by_key(peers.other())?;
+        let outbound = Self::get_or_create_outbound_connection(&state.outbound, addr, peers.other())?;
+        let conn = outbound.conn.as_ref().ok_or_else(|| error!("fixture peer is not connected"))?;
+        let mut streams = Vec::new();
+        // Match the real loopback peer's configured stream bound. No test gate
+        // replaces open_bi: the next production send waits on Quinn's credit.
+        for _ in 0..1_000 {
+            match tokio::time::timeout(Duration::from_millis(50), conn.open_bi()).await {
+                Ok(result) => streams.push(result?),
+                Err(_) => break,
+            }
+        }
+        if streams.is_empty() {
+            fail!("fixture did not acquire any stream credit");
+        }
+        Ok(streams)
+    }
+
     pub async fn message(
         self: &Arc<Self>,
         data: Vec<u8>,

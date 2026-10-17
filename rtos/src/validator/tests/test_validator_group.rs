@@ -1287,6 +1287,69 @@ struct StoreGateEngine {
     entered: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
 }
+
+struct RelayGateEngine {
+    zero: BlockIdExt,
+    entered: tokio::sync::Semaphore,
+    dropped: Arc<AtomicBool>,
+}
+#[async_trait::async_trait]
+impl EngineOperations for RelayGateEngine {
+    fn zerostate_id(&self) -> Result<&BlockIdExt> { Ok(&self.zero) }
+    fn destroy_block_candidates(&self, _: &SessionId) -> Result<bool> { Ok(true) }
+    async fn relay_validated_candidate(
+        &self,
+        _: &crate::validator::propagation::ValidatedCandidateRelay,
+        _: &crate::validator::propagation::PropagationPlan,
+    ) -> crate::validator::propagation::PropagationOutcome {
+        struct Released(Arc<AtomicBool>);
+        impl Drop for Released {
+            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+        }
+        let _released = Released(self.dropped.clone());
+        self.entered.add_permits(1);
+        std::future::pending().await
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_group_stop_cancels_pending_authenticated_relay() {
+    let (runtime, evidence) = crate::validator::candidate_authentication::tests::fixture();
+    let runtime = Arc::new(runtime);
+    let engine = Arc::new(RelayGateEngine {
+        zero: runtime.pin().zerostate.clone(), entered: tokio::sync::Semaphore::new(0),
+        dropped: Arc::new(AtomicBool::new(false)),
+    });
+    let transport = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x61; 32]).unwrap();
+    assert_eq!(transport.id().data(), runtime.local_adnl().data());
+    let info = Arc::new(GeneralSessionInfo {
+        shard: runtime.shard().clone(), opts_hash: UInt256::default(),
+        catchain_seqno: runtime.catchain_seqno(), key_seqno: 0, max_vertical_seqno: 0,
+    });
+    let set = ValidatorSet::with_cc_seqno(0, 100000, runtime.committee().len() as u16,
+        runtime.catchain_seqno(), runtime.committee().to_vec()).unwrap();
+    let options = simplex::SessionOptions {
+        protocol: runtime.protocol(), proto_version: runtime.carrier_version(),
+        slots_per_leader_window: runtime.slots_per_leader_window(), wire_profile: runtime.wire_profile(),
+        ..Default::default()
+    };
+    let group = Arc::new(ValidatorGroup::new(info, transport, runtime.session_id().clone(),
+        UInt256::default(), set, 0, ConsensusOptions::Simplex(options), engine.clone(), false, None)
+        .with_authenticated_runtime(runtime).unwrap());
+    let block = evidence.block_id.clone();
+    let receiver = group.receiver.lock().unwrap().take().unwrap();
+    let queue_group = group.clone();
+    let rt = tokio::runtime::Handle::current();
+    group.spawn_task(&rt.clone(), async move { process_validation_queue(receiver, queue_group, rt).await });
+    group.action_queue.send(ValidationAction::OnAuthenticatedCandidate(evidence)).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), engine.entered.acquire()).await.unwrap().unwrap().forget();
+    tokio::time::timeout(Duration::from_secs(5), group.clone().stop(tokio::runtime::Handle::current(), false))
+        .await.expect("retirement must cancel relay without cancelling an apply").unwrap();
+    assert!(engine.dropped.load(Ordering::Acquire));
+    assert!(group.tasks.is_empty());
+    assert!(!group.candidate_relays.lock().unwrap().contains(&block), "cancelled relay cannot be marked sent");
+}
+
 #[async_trait::async_trait]
 impl EngineOperations for StoreGateEngine {
     async fn store_block(

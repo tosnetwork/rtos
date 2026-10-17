@@ -1613,7 +1613,8 @@ mod transport_tests {
     impl Subscriber for ObservedOverlay {
         async fn try_consume_custom(&self, bytes: &[u8], peers: &AdnlPeers) -> Result<bool> {
             let result = self.overlay.try_consume_custom(bytes, peers).await;
-            self.reports.send((sha256_digest(bytes), result.is_ok())).unwrap();
+            // The observation receiver may already be gone during fixture drain.
+            let _ = self.reports.send((sha256_digest(bytes), result.is_ok()));
             result
         }
         async fn try_consume_query_bundle(
@@ -1731,6 +1732,40 @@ mod transport_tests {
             );
         }
         (a, b, id)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlay_retirement_releases_real_quic_stream_credit_wait() {
+        let (a, b, id) = pair().await;
+        let mut received = b.subscriptions.lock().unwrap().pop().unwrap();
+        a.overlay.broadcast_plumtree(&id, &a.key, Certificate::Overlay_EmptyCertificate,
+            0, Some([111; 32]), b"establish fixture connection").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), received.recv()).await.unwrap().unwrap().unwrap();
+        let peers = AdnlPeers::with_keys(a.key.id().clone(), b.key.id().clone());
+        let held = a.quic.hold_stream_credit_for_test(&peers).await.unwrap();
+        let generation = a.overlay.overlay_generation(&id).unwrap();
+        let overlay = a.overlay.clone();
+        let key = a.key.clone();
+        let send_id = id.clone();
+        let mut send = tokio::spawn(async move {
+            overlay.broadcast_plumtree(&send_id, &key, Certificate::Overlay_EmptyCertificate,
+                0, Some([112; 32]), b"credit-blocked relay").await
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut send).await.is_err(),
+            "the actual transport send must be waiting for stream credit");
+        tokio::time::timeout(Duration::from_secs(5), a.overlay.delete_private_overlay_checked(&generation))
+            .await.expect("retirement cannot wait for global QUIC shutdown").unwrap();
+        let error = send.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("retired during send"), "{error}");
+        assert!(generation.drained());
+        assert!(!a.token.is_cancelled(), "overlay drain must precede transport shutdown");
+        drop(held);
+        let remote_generation = b.overlay.overlay_generation(&id).unwrap();
+        b.overlay.delete_private_overlay_checked(&remote_generation).await.unwrap();
+        a.quic.shutdown_and_wait().await.unwrap();
+        b.quic.shutdown_and_wait().await.unwrap();
+        a.overlay.adnl.stop_checked().await.unwrap();
+        b.overlay.adnl.stop_checked().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1962,7 +1997,13 @@ mod transport_tests {
             node.signature = b.key.sign(&serialize_boxed(&signed).unwrap()).unwrap().into();
             let info: OverlayNodeInfo<super::super::NodeV1, super::super::NodeV2> =
                 OverlayNodeInfo::V2(node.clone());
-            a.overlay.add_public_peer(&ip, &info, &id).unwrap().unwrap();
+            let admitted = a.overlay.add_public_peer(&ip, &info, &id).unwrap();
+            if flags == 4 {
+                assert!(admitted.is_none(), "unsupported role flag must be rejected");
+                assert!(OverlayUtils::verify_node(&id, &node).is_err());
+            } else {
+                admitted.unwrap();
+            }
             assert_eq!(sender.plumtree_neighbours().len(), usize::from(flags == 0));
         }
         a.overlay.delete_public_peer(b.key.id(), &id).unwrap();
