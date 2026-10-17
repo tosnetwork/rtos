@@ -431,7 +431,37 @@ impl DurableFinalitySink for SessionSink {
         self.worker.admit_draft(request)
     }
 }
+#[derive(Clone)]
+struct WorkerActivity {
+    phase: &'static str,
+    record: Option<(u64, String)>,
+    since: std::time::Instant,
+}
+impl Default for WorkerActivity {
+    fn default() -> Self {
+        Self { phase: "idle", record: None, since: std::time::Instant::now() }
+    }
+}
+/// A lexical activity scope: nested WAL work restores the owning accept phase.
+/// No mutex guard is held across an await or while a source callback runs.
+struct ActivityScope<'a> {
+    activity: &'a Mutex<WorkerActivity>,
+    previous: Option<WorkerActivity>,
+}
+impl ActivityScope<'_> {
+    fn phase(&self, phase: &'static str) {
+        let mut current = self.activity.lock().unwrap_or_else(|p| p.into_inner());
+        current.phase = phase;
+        current.since = std::time::Instant::now();
+    }
+}
+impl Drop for ActivityScope<'_> {
+    fn drop(&mut self) {
+        *self.activity.lock().unwrap_or_else(|p| p.into_inner()) = self.previous.take().unwrap();
+    }
+}
 struct State {
+    activity: Mutex<WorkerActivity>,
     engine: Weak<Engine>,
     io: Arc<OwnedTasks>,
     enabled: AtomicBool,
@@ -460,6 +490,7 @@ impl PublicationWorker {
     pub(crate) fn start(engine: &Arc<Engine>, domain: OutboxDomain) -> Result<Arc<Self>> {
         let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
         let state = Arc::new(State {
+            activity: Mutex::new(WorkerActivity::default()),
             engine: Arc::downgrade(engine),
             io: Arc::new(OwnedTasks::default()),
             enabled: AtomicBool::new(false),
@@ -580,23 +611,26 @@ impl PublicationWorker {
             request.disarm();
             return Err(error);
         }
-        let result = (|| {
-            let sender =
-                self.sender.lock().map_err(|_| error!("Publication admission poisoned"))?;
-            if self.state.stop.is_cancelled() || self.state.fatal.load(Ordering::Acquire) {
-                fail!("Publication admission closed");
+        let sender = (|| {
+            let sender = self.sender.lock().map_err(|_| error!("Publication admission poisoned"))?;
+            if self.state.fatal.load(Ordering::Acquire) {
+                fail!("Publication admission failed");
             }
-            Ok(sender.as_ref().ok_or_else(|| error!("Publication admission closed"))?.clone())
+            if self.state.stop.is_cancelled() {
+                fail!("Publication admission stopping");
+            }
+            sender.as_ref().cloned().ok_or_else(|| error!("Publication admission closed"))
         })();
-        let rejected = match result {
+        let (rejected, reason) = match sender {
             Ok(sender) => match sender.try_send(request) {
                 Ok(()) => return Ok(()),
-                Err(error) => error.into_inner(),
+                Err(mpsc::error::TrySendError::Full(request)) => (request, "Publication draft queue full".to_owned()),
+                Err(mpsc::error::TrySendError::Closed(request)) => (request, "Publication draft channel closed".to_owned()),
             },
-            Err(_) => request,
+            Err(error) => (request, error.to_string()),
         };
         rejected.disarm();
-        fail!("Publication draft queue full or closed; retain source evidence")
+        fail!("{reason}; {}; retain source evidence", self.state.activity_description())
     }
     pub(crate) async fn recover_draft(
         &self,
@@ -692,6 +726,17 @@ impl PublicationWorker {
     }
 }
 impl State {
+    fn activity_scope(&self, phase: &'static str, record: Option<(u64, String)>) -> ActivityScope<'_> {
+        let mut current = self.activity.lock().unwrap_or_else(|p| p.into_inner());
+        let next = WorkerActivity { phase, record: record.or_else(|| current.record.clone()), since: std::time::Instant::now() };
+        let previous = Some(std::mem::replace(&mut *current, next));
+        ActivityScope { activity: &self.activity, previous }
+    }
+    fn activity_description(&self) -> String {
+        let current = self.activity.lock().unwrap_or_else(|p| p.into_inner());
+        let (record, block) = current.record.as_ref().map(|(id, block)| (id.to_string(), block.as_str())).unwrap_or_else(|| ("none".to_owned(), "none"));
+        format!("worker_phase={} phase_ms={} record={} block={}", current.phase, current.since.elapsed().as_millis(), record, block)
+    }
     fn fatal(&self, message: String) {
         self.fatal.store(true, Ordering::Release);
         self.io.record_error(message);
@@ -723,6 +768,7 @@ impl State {
         store: &Arc<PropagationOutbox>,
         work: impl FnOnce(&PropagationOutbox) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        let _activity = self.activity_scope("wal_io", None);
         let store = store.clone();
         let result = self
             .blocking(move || {
@@ -779,6 +825,19 @@ impl State {
         }
     }
     async fn submit_one(&self, store: &Arc<PropagationOutbox>, command: Submission) {
+        let phase = match &command {
+            Submission::Acceptance { .. } => "accept_request",
+            Submission::HistoryDebt { .. } => "history_debt",
+            Submission::Terminal { .. } => "terminal_lookup",
+            Submission::OfferClose { .. } => "offer_close",
+            Submission::SourceDelivered { .. } => "source_delivered",
+            Submission::Canonical { .. } => "canonical_retention",
+            Submission::Legacy(_) => "legacy_submission",
+            Submission::Draft { .. } => "draft_retention",
+            Submission::Query { .. } => "accept_query",
+            Submission::Cleanup { .. } => "cleanup",
+        };
+        let _activity = self.activity_scope(phase, None);
         match command {
             Submission::HistoryDebt { request, runtime, budget, response } => {
                 let result = self.history_debt(store, request, runtime, budget).await;
@@ -1006,6 +1065,7 @@ impl State {
         engine: Arc<Engine>,
         entry: UnverifiedRecord,
     ) -> Result<AcceptedSessionBlock> {
+        let activity = self.activity_scope("accept_history", Some((entry.id.0, entry.record.block_id.to_string())));
         validate_plan(&entry)?;
         let publication = tokio::time::timeout(
             HISTORY_TIMEOUT,
@@ -1029,12 +1089,14 @@ impl State {
             let claims = historical_origin(&publication, origin)?;
             validate_creator_claim(&publication, &claims)?;
         }
+        activity.phase("accept_block");
         // Deliberately not cancelable: this phase can write state/proof data.
         let (entry, accepted) =
             accept_authenticated_publication(publication, engine.clone()).await?;
         let id = entry.id;
         let needs_verification = !self.acceptance_verified.lock().unwrap().contains(&id.0);
         if needs_verification {
+            activity.phase("accept_durability");
             if let Err(error) = engine.clone().ensure_publication_acceptance_durable(&accepted).await {
                 if error
                     .downcast_ref::<crate::internal_db::PublicationDurabilityFailure>()
@@ -1052,6 +1114,7 @@ impl State {
                 && !accepted.block().id().shard().is_masterchain()
                 && entry.record.protocol == SimplexProtocol::PrivateObserversPlumtree
             {
+                activity.phase("accept_shard_description");
                 accepted.register_shard_description(engine.clone(), entry.record.locally_generated).await?;
             }
         }
@@ -1204,6 +1267,7 @@ impl State {
         store: &Arc<PropagationOutbox>,
         receiver: &mut mpsc::Receiver<Submission>,
     ) {
+        let _activity = self.activity_scope("retry_snapshot", None);
         if self.stop.is_cancelled() {
             return;
         }
@@ -1712,6 +1776,7 @@ mod tests {
     use super::*;
     fn state() -> Arc<State> {
         Arc::new(State {
+            activity: Mutex::new(WorkerActivity::default()),
             engine: Weak::new(),
             io: Arc::new(OwnedTasks::default()),
             enabled: AtomicBool::new(false),
