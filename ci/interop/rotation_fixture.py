@@ -14,7 +14,7 @@ import time
 
 sys.dont_write_bytecode = True
 from network_faults import MODES, PacketMarks, marked_environment, require_namespace
-from network_fault_fixture import exercise_network_member
+from network_fault_fixture import exercise_network_member, stop_cpp_with_receipt
 
 from mixed_matrix import (child_checked, cpp_block, cpp_certificate, digest, identity,
                           NativeStateNotReady, native_state, prepare_rust, reserve_port, rpc, stop_rust, write)
@@ -502,6 +502,11 @@ async def run(args, profile, root, artifacts):
             write(root / 'rust-shutdown-timing.json', {str(node['index']):
                 {'elapsed_seconds': node['shutdown_elapsed_seconds'], 'normal_exit_limit_seconds': 20}
                 for node in rust_nodes})
+            if args.network_fault:
+                stopped = await asyncio.gather(*(stop_cpp_with_receipt(index, node) for index, node in cpp_started))
+                write(root / 'cpp-shutdown.json', {str(index): value for index, value in stopped})
+                if any(value['returncode'] != 0 for _, value in stopped) and sys.exception() is None:
+                    raise RuntimeError('Owned C++ packet-fault nodes did not stop normally')
             if any(code != 0 for code in codes) and sys.exception() is None:
                 raise RuntimeError('Owned Rust rotation nodes did not stop normally')
 

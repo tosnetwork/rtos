@@ -11,6 +11,22 @@ from mixed_matrix import child_checked, cpp_block, cpp_certificate, digest, iden
 from network_faults import PacketFault
 
 
+async def stop_cpp_with_receipt(index, node):
+    # Pinned 8f083dc tostester owns the actual subprocess behind this field.
+    # Capture it before stop() clears it; do not infer success from a missing PID.
+    process = node._Node__process
+    started = time.monotonic()
+    task = asyncio.create_task(node.stop())
+    try:
+        await asyncio.wait_for(asyncio.shield(task), 20)
+    except TimeoutError:
+        process.kill()
+        await process.wait()
+        await task
+    return index, {'returncode': process.returncode,
+        'elapsed_seconds': time.monotonic() - started, 'normal_exit_limit_seconds': 20}
+
+
 async def exercise_network_member(args, root, nodes, endpoints, lite_configs, rust_nodes,
                                   zero, governing, checkpoint, artifacts):
     from rotation_fixture import SUCCESSOR, member_id, recovery_workchain_states
