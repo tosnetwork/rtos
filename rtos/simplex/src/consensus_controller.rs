@@ -239,7 +239,13 @@ pub(crate) trait ConsensusBackend {
     /// Persist the finalization certificate then (after durability) relay,
     /// cache per-slot + last-final, and update standstill tracking. See
     /// [`Self::persist_notar_cert_then_relay`].
-    fn persist_final_cert_then_relay(&mut self, event: &FinalizationReachedEvent);
+    fn persist_final_cert_then_relay(&mut self, event: &FinalizationReachedEvent) {
+        self.persist_final_cert(event, true);
+    }
+
+    /// Startup replay shares the save completion without re-gossiping its
+    /// historical certificate (C++ suppress_certificate_broadcast_).
+    fn persist_final_cert(&mut self, event: &FinalizationReachedEvent, relay: bool);
 
     /// Persist a finalized-block record for restart recovery. On masterchain
     /// the write is registered with the SXMAIN async-DB registry (logging

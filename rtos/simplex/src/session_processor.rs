@@ -102,10 +102,8 @@ use crate::candidate_controller::{
 };
 #[cfg(test)]
 use crate::collation_controller::CollationResult;
-// `BlockFinalizedEvent` is named only by the consolidated `#[cfg(test)] impl
-// SessionProcessor` block at the end of this file; production dispatch matches
-// `SimplexEvent::BlockFinalized(_)` without naming the inner type.
-#[cfg(test)]
+// Finalization notifications cross the C++ SaveCertificate completion boundary
+// before entering the controller, including source recovery replay.
 use crate::simplex_state::BlockFinalizedEvent;
 // `TaskPtr` is referenced only by the `#[path]`-included unit tests (via
 // `super::*`); production validation/collation callbacks now post through the
@@ -276,6 +274,10 @@ pub(crate) struct SessionProcessor {
     /// Task queue for main processing
     task_queue: TaskQueuePtr,
     deferred_candidate_requests: DeferredCandidateRequests,
+    /// C++ pool.cpp: keep FinalizationObserved behind SaveCertificate.
+    // Some(event): waiting for storage. None: the saved notification is queued.
+    // Keep the key until actor dispatch so recovery cannot finish between them.
+    pending_saved_finalizations: HashMap<RawCandidateId, Option<BlockFinalizedEvent>>,
     /// Receiver for network communication
     receiver: ReceiverPtr,
     /// SimplexState FSM - core consensus state machine
@@ -552,6 +554,7 @@ impl SessionProcessor {
         let processor = Self {
             task_queue,
             deferred_candidate_requests: Arc::new(Mutex::new(HashMap::new())),
+            pending_saved_finalizations: HashMap::new(),
             receiver,
             simplex_state,
             // Consensus finalization aspect. Seeds the finalized-head + producer
@@ -2476,7 +2479,7 @@ impl ConsensusBackend for ConsensusBackendAdapter<'_> {
         );
     }
 
-    fn persist_final_cert_then_relay(&mut self, event: &FinalizationReachedEvent) {
+    fn persist_final_cert(&mut self, event: &FinalizationReachedEvent, relay: bool) {
         let candidate_id = RawCandidateId { slot: event.slot, hash: event.block_hash.clone() };
         let final_store_result =
             if let Some(existing) = self.database.final_cert_store_result(&candidate_id) {
@@ -2527,7 +2530,8 @@ impl ConsensusBackend for ConsensusBackendAdapter<'_> {
             }
         };
 
-        // Wait-for-store guarantee: certificate must be durable before broadcast/cache.
+        // C++ SaveCertificate completion gates FinalizationObserved as well as
+        // broadcast/cache; source replay crosses the same storage boundary.
         // Hand the wait off to the SXMAIN async-DB-results registry; the continuation runs
         // the post-persist work (relay full cert + cache per-slot standstill + cache last final
         // + update standstill state).
@@ -2558,6 +2562,7 @@ impl ConsensusBackend for ConsensusBackendAdapter<'_> {
                                  result already consumed for slot={slot} (redundant FSM re-emit, \
                                  skipping broadcast + standstill side-effects)",
                             );
+                            processor.publish_saved_finalization(&candidate_id_for_cb);
                         } else {
                             log::error!(
                                 "Session {session_short} handle_finalization_reached: final cert \
@@ -2573,6 +2578,11 @@ impl ConsensusBackend for ConsensusBackendAdapter<'_> {
                         );
                         processor.increment_error();
                     }
+                    return;
+                }
+
+                processor.publish_saved_finalization(&candidate_id_for_cb);
+                if !relay {
                     return;
                 }
 
@@ -2767,11 +2777,48 @@ impl SessionProcessor {
                 signatures: certificate.signatures,
             }),
         };
-        self.with_consensus_backend(|controller, backend| {
-            controller.handle_block_finalized(backend, event)
-        });
+        self.save_certificate_before_finalization(event, false);
         self.check_all();
         Ok(())
+    }
+
+    /// C++ pool.cpp:1129 waits for SaveCertificate before :1214 publishes
+    /// FinalizationObserved. Both FSM ingress and authenticated source replay
+    /// must cross that same boundary; a source file alone is not a session-DB
+    /// certificate receipt. Reuse the existing persist/relay completion owner.
+    fn save_certificate_before_finalization(&mut self, event: BlockFinalizedEvent, relay: bool) {
+        let id = RawCandidateId { slot: event.slot, hash: event.block_hash.clone() };
+        let reached = FinalizationReachedEvent {
+            slot: event.slot,
+            block_hash: event.block_hash.clone(),
+            certificate: event.certificate.clone(),
+        };
+        if self.pending_saved_finalizations.get(&id).is_some_and(Option::is_none) {
+            return;
+        }
+        self.pending_saved_finalizations.entry(id).or_insert(Some(event));
+        self.with_consensus_backend(|_, backend| backend.persist_final_cert(&reached, relay));
+    }
+
+    /// This is called only after the storage completion was classified as
+    /// successful. Publish as an actor message, as in C++, so storage callback
+    /// dispatch does not run the recursive finalization walk inline.
+    fn publish_saved_finalization(&mut self, id: &RawCandidateId) {
+        let Some(event) = self.pending_saved_finalizations.get_mut(id).and_then(Option::take) else {
+            return;
+        };
+        let id = id.clone();
+        crate::task_queue::post_closure(&self.task_queue, move |p: &mut SessionProcessor| {
+            p.pending_saved_finalizations.remove(&id);
+            p.with_consensus_backend(|controller, backend| {
+                controller.handle_block_finalized(backend, event);
+            });
+            p.check_all();
+        });
+    }
+
+    pub(crate) fn pending_finality_materialization_count(&self) -> usize {
+        self.pending_saved_finalizations.len() + self.consensus.finalized_pending_body_len()
     }
 
     pub(crate) fn on_certificate(
@@ -2828,9 +2875,7 @@ impl SessionProcessor {
                 // the borrowing backend; the pump itself stays on SessionProcessor
                 // (the BroadcastVote + SlotSkipped branches below own SP state).
                 SimplexEvent::BlockFinalized(e) => {
-                    self.with_consensus_backend(|consensus, backend| {
-                        consensus.handle_block_finalized(backend, e)
-                    });
+                    self.save_certificate_before_finalization(e, true);
                 }
                 SimplexEvent::SlotSkipped(event) => {
                     self.handle_slot_skipped(event.slot);

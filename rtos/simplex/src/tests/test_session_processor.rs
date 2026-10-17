@@ -594,6 +594,24 @@ impl crate::task_queue::TaskQueue<crate::task_queue::CallbackTaskPtr> for TestCa
 
 const TEST_DB_WATCHDOG: Duration = Duration::from_secs(30);
 
+/// Drive actual storage completions and the actor messages they publish.
+/// A storage receipt alone no longer executes finalization inline.
+fn drain_processor_storage_and_messages(processor: &mut SessionProcessor) {
+    let deadline = std::time::Instant::now() + TEST_DB_WATCHDOG;
+    let mut last_warning = SystemTime::now();
+    loop {
+        processor.process_pending_async_db_results();
+        while let Some(task) = processor.task_queue.pull_closure(Duration::ZERO, &mut last_warning) {
+            assert!(std::time::Instant::now() < deadline, "actor completion drain watchdog");
+            task(processor);
+        }
+        if processor.database.pending_is_empty() && processor.task_queue.is_empty() { break; }
+        let remaining = deadline.checked_duration_since(std::time::Instant::now())
+            .expect("storage completion drain watchdog");
+        processor.database.db().sync(Some(remaining)).unwrap();
+    }
+}
+
 /// Real temporary RocksDB database used by the session tests.
 struct MockDb;
 
@@ -8356,6 +8374,7 @@ fn test_late_join_finalization_cert_without_body_then_child_validates() {
 
     // Process events emitted by set_finalize_certificate (BlockFinalized + FinalizationReached).
     fixture.processor.check_all();
+    drain_processor_storage_and_messages(&mut fixture.processor);
 
     // The finalization should be in finalized_pending_body since no body exists.
     let far_id = RawCandidateId { slot: far_slot, hash: far_block_hash.clone() };
@@ -11713,21 +11732,30 @@ fn authenticated_observer_nonempty_query_emits_leader_evidence_after_pq_verifica
 
 #[test]
 fn source_finality_controller_waits_for_wal_before_persist_sent_and_gc() {
-    source_finality_controller_case(false, false, false);
+    source_finality_controller_case(false, false, false, None);
 }
 #[test]
 fn source_finality_controller_approval_upgrades_to_final_after_separate_wal_ack() {
-    source_finality_controller_case(true, false, false);
+    source_finality_controller_case(true, false, false, None);
 }
 #[test]
 fn source_finality_retained_final_certificate_cannot_be_skipped_by_later_applied_floor() {
-    source_finality_controller_case(false, true, false);
+    source_finality_controller_case(false, true, false, Some(CertificateGateCase::ReplaySuccess));
 }
 #[test]
 fn source_finality_controller_failed_certificate_save_retries_before_wal_handoff() {
-    source_finality_controller_case(false, false, true);
+    source_finality_controller_case(false, false, true, None);
 }
-fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain: bool) {
+#[derive(Clone, Copy)]
+enum CertificateGateCase { LiveSuccess, LiveFailure, ReplaySuccess, ReplayFailure }
+#[test]
+fn source_finality_cpp_save_certificate_gates_live_and_replay_before_materialization() {
+    for case in [CertificateGateCase::LiveSuccess, CertificateGateCase::LiveFailure,
+        CertificateGateCase::ReplaySuccess, CertificateGateCase::ReplayFailure] {
+        source_finality_controller_case(false, false, false, Some(case));
+    }
+}
+fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain: bool, gate: Option<CertificateGateCase>) {
     use crate::finality_delivery::tests::{fixture, fixture_role, HeldSink};
     let temp = crate::authenticated_fixture::TestDirectory::new();
     let (runtime, draft) = if upgrade || high_floor { fixture_role(true, ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap()) } else { fixture() };
@@ -11743,6 +11771,8 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain:
         .bind_pq_session(runtime.catchain_seqno()).unwrap());
     let db = crate::database::SimplexDb::open(&namespace, "source-ack").unwrap();
     let mut processor = make_pq_processor_with_description_for_test(db.clone(), description.clone());
+    let receiver = MockReceiver::new();
+    processor.receiver = receiver.clone();
     let listener = RecordingListener::new();
     let listener_dyn: Arc<dyn consensus_common::SessionListener + Send + Sync> = listener.clone();
     let sink = Arc::new(HeldSink::default());
@@ -11809,11 +11839,92 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain:
         later.seq_no += 100;
         processor.set_mc_finalized_block(later);
     }
-    if high_floor {
+    let pending_certificate = gate.map(|_| ManualAsyncResult::pending());
+    if let Some(result) = &pending_certificate {
+        processor.database.insert_final_cert_store(candidate_id.clone(), result.clone());
+    }
+    let replay = high_floor || matches!(gate,
+        Some(CertificateGateCase::ReplaySuccess | CertificateGateCase::ReplayFailure));
+    if replay {
         processor.simplex_state.set_first_non_finalized_slot(SlotIndex::new(candidate_id.slot.value() + 100));
         processor.replay_finality_intent(event.certificate.to_tl().unwrap()).unwrap();
+    } else if gate.is_some() {
+        processor.simplex_state.push_event_front(SimplexEvent::BlockFinalized(event.clone()));
+        processor.process_simplex_events();
     } else {
         processor.handle_block_finalized(event.clone());
+    }
+    if let Some(result) = pending_certificate {
+        assert!(sink.0.lock().unwrap().is_empty(), "SaveCertificate pending: no node WAL handoff");
+        assert!(!processor.consensus.finalized_pending_body_contains(&candidate_id));
+        assert_eq!(processor.pending_finality_materialization_count(), 1);
+        assert!(db.load_finalized_blocks().unwrap().is_empty(), "SaveCertificate pending: no finalized marker");
+        assert!(db.load_final_certs().unwrap().is_empty());
+        if matches!(gate, Some(CertificateGateCase::LiveSuccess)) {
+            let notar_vote = Vote::Notarize(crate::simplex_state::NotarizeVote {
+                slot: candidate_id.slot, block_hash: candidate_id.hash.clone(),
+            });
+            let signed = crate::utils::create_data_to_sign(runtime.session_id(),
+                &crate::utils::serialize_unsigned_vote(&crate::utils::vote_to_tl_unsigned(&notar_vote).unwrap()));
+            let signatures = [0xa9, 0xaa].iter().enumerate().map(|(index, seed)| {
+                let store = rtos_pq_consensus::ConsensusKeyStore::from_seed(&[*seed; 32], 0).unwrap();
+                crate::certificate::VoteSignature { validator_idx: ValidatorIndex::new(index as u32),
+                    signature: store.sign_consensus(&signed).unwrap().bytes.to_vec() }
+            }).collect();
+            let notar_cert = Arc::new(crate::certificate::Certificate {
+                    vote: crate::simplex_state::NotarizeVote { slot: candidate_id.slot, block_hash: candidate_id.hash.clone() },
+                    signatures,
+                });
+            crate::certificate::Certificate::<Vote>::from_tl(
+                &notar_cert.to_tl().unwrap(), &description, runtime.session_id(),
+            ).unwrap();
+            processor.handle_notarization_reached(NotarizationReachedEvent {
+                slot: candidate_id.slot, block_hash: candidate_id.hash.clone(), certificate: notar_cert,
+            });
+            db.sync(Some(TEST_DB_WATCHDOG)).unwrap();
+            processor.process_pending_async_db_results();
+            let mut last_warning = SystemTime::now();
+            while let Some(task) = processor.task_queue.pull_closure(Duration::ZERO, &mut last_warning) { task(&mut processor); }
+            assert!(db.load_notar_certs().unwrap().iter().any(|c| c.candidate_id == candidate_id));
+            assert!(sink.0.lock().unwrap().is_empty(), "NotarCert completion cannot release a pending FinalCert");
+            assert!(db.load_finalized_blocks().unwrap().is_empty());
+        }
+        let failed = matches!(gate, Some(CertificateGateCase::LiveFailure | CertificateGateCase::ReplayFailure));
+        if failed {
+            result.complete_err("injected certificate storage failure");
+            drain_processor_storage_and_messages(&mut processor);
+            assert!(sink.0.lock().unwrap().is_empty(), "failed save cannot publish finalization");
+            assert!(db.load_finalized_blocks().unwrap().is_empty());
+            assert!(processor.pending_saved_finalizations.contains_key(&candidate_id));
+            if replay {
+                processor.replay_finality_intent(event.certificate.to_tl().unwrap()).unwrap();
+            } else {
+                processor.simplex_state.push_event_front(SimplexEvent::FinalizationReached(FinalizationReachedEvent {
+                    slot: event.slot, block_hash: event.block_hash.clone(), certificate: event.certificate.clone(),
+                }));
+                processor.simplex_state.push_event_front(SimplexEvent::BlockFinalized(event.clone()));
+                processor.process_simplex_events();
+            }
+        } else {
+            // Release the completion only after the real storage worker saved
+            // the exact certificate; the pending receipt itself proves nothing.
+            db.save_final_cert_async(&candidate_id, &event.certificate).unwrap().wait().unwrap();
+            result.complete_ok();
+            processor.process_pending_async_db_results();
+            assert_eq!(processor.pending_finality_materialization_count(), 1,
+                "saved-but-not-yet-dispatched finalization is still in flight");
+            assert!(sink.0.lock().unwrap().is_empty());
+        }
+        drain_processor_storage_and_messages(&mut processor);
+        assert!(db.load_final_certs().unwrap().iter().any(|c| c.candidate_id == candidate_id));
+        assert!(!processor.pending_saved_finalizations.contains_key(&candidate_id));
+        assert_eq!(sink.0.lock().unwrap().len(), 1, "duplicate completion must not repeat WAL handoff");
+        let final_broadcasts = receiver.drain_actions().into_iter().filter(|action| matches!(action,
+            ReceiverAction::SendCertificate { certificate }
+                if matches!(certificate.vote(), rtos_api::ton::consensus::simplex::UnsignedVote::Consensus_Simplex_FinalizeVote(_))
+        )).count();
+        assert_eq!(final_broadcasts, usize::from(!replay),
+            "live completion relays once; C++ startup replay suppresses certificate broadcasts");
     }
     if fail_retain {
         assert!(sink.0.lock().unwrap().is_empty(), "failed retention cannot authorize node handoff");
@@ -11849,6 +11960,14 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain:
     processor.with_consensus_backend(|controller, backend| controller.retry_pending_recursive_finalization(backend));
     assert!(sink.0.lock().unwrap().is_empty(), "duplicate retry must not stage again");
     drop(processor); db.close(None).unwrap();
+    if gate.is_some() {
+        drop(db);
+        let reopened = crate::database::SimplexDb::open(&namespace, "source-ack").unwrap();
+        assert!(reopened.load_final_certs().unwrap().iter().any(|c| c.candidate_id == candidate_id));
+        assert!(reopened.load_finalized_blocks().unwrap().iter().any(|b| b.candidate_id == candidate_id && b.is_final),
+            "cold read must retain both the certificate and its later materialized marker");
+        reopened.close(None).unwrap();
+    }
 }
 
 #[test]
@@ -11996,6 +12115,7 @@ fn source_finality_controller_empty_trigger_seals_all_roles_after_cold_retry() {
     let retained = processor.callbacks.pending_finality_intents().unwrap();
     assert_eq!(retained.len(), 1, "cold replay comes from the durable source certificate");
     processor.replay_finality_intent(runtime.wire_profile().deserialize_typed(&retained[0]).unwrap()).unwrap();
+    drain_processor_storage_and_messages(&mut processor);
     assert_eq!(processor.callbacks.finality_retention_attempts(), 1,
         "cold recovery must establish persistence again instead of inheriting a warm phase");
     for _ in 0..8 {

@@ -1018,7 +1018,12 @@ impl SessionImpl {
                 match callbacks.pending_finality_intent_count() {
                     Ok(pending) => {
                         recovery_pending.store(pending, Ordering::Release);
-                        recovery_complete.store(pending == 0, Ordering::Release);
+                        // C++ InFlight finalization is not complete merely
+                        // because its saved notification has not run yet.
+                        recovery_complete.store(
+                            pending == 0 && processor.pending_finality_materialization_count() == 0,
+                            Ordering::Release,
+                        );
                     }
                     Err(error) => {
                         processor.stop(false);
