@@ -171,10 +171,12 @@ async def prepare_rust(args, directory, i, network, global_config, tcp_used, udp
     (directory / 'node-log.yml').write_text(
         "appenders:\n  console:\n    kind: console\n    encoder:\n      pattern: '{m}{n}'\n"
         "root:\n  level: info\n  appenders: [console]\n")
-    await child_checked([args.validator_preparer, '--configs', directory,
+    command = [args.validator_preparer, '--configs', directory,
         '--global-config', directory / 'global.json', '--zerostate', directory / 'zero' /
-        (network.zerostate.masterchain.file_hash.hex() + '.boc'), '--member', i],
-        directory.parent / f'prepare-{directory.name}.log')
+        (network.zerostate.masterchain.file_hash.hex() + '.boc'), '--member', i]
+    if getattr(args, 'include_genesis_successor', False):
+        command.append('--include-genesis-successor')
+    await child_checked(command, directory.parent / f'prepare-{directory.name}.log')
     prepared = json.loads((directory / 'validator-prepared.json').read_text())
     if prepared['public_test_member'] != i or prepared['validator_id'] != hashlib.sha256(
             f'n6-validator-id-{i}'.encode()).hexdigest():

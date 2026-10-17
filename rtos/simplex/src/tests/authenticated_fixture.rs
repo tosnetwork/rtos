@@ -27,6 +27,13 @@ pub fn runtime_with_members(
 pub fn runtime_with_members_on_shard(
     members: Vec<ValidatorDescr>, transport: crate::PrivateKey, shard: ShardIdent,
 ) -> (Arc<AuthenticatedSessionRuntime>, crate::PrivateKey, crate::SessionOptions) {
+    runtime_with_members_at_key(members, transport, shard, 0, ConsensusConfig::default().new_catchain_ids)
+}
+
+pub fn runtime_with_members_at_key(
+    members: Vec<ValidatorDescr>, transport: crate::PrivateKey, shard: ShardIdent,
+    key_seqno: u32, new_catchain_ids: bool,
+) -> (Arc<AuthenticatedSessionRuntime>, crate::PrivateKey, crate::SessionOptions) {
     let selected = SimplexConfig { protocol_version: 2, ..Default::default() };
     let selected_cell = selected.serialize().unwrap();
     let mut wrapper = BuilderData::new();
@@ -42,6 +49,7 @@ pub fn runtime_with_members_on_shard(
     config
         .set_config(ConfigParamEnum::ConfigParam29(ConsensusConfig {
             round_candidates: 1,
+            new_catchain_ids,
             ..Default::default()
         }))
         .unwrap();
@@ -67,13 +75,13 @@ pub fn runtime_with_members_on_shard(
                 shard: &shard,
                 catchain_seqno: 7,
                 vertical_seqno: 0,
-                last_key_block_seqno: 0,
-                new_catchain_ids: false,
+                last_key_block_seqno: key_seqno,
+                new_catchain_ids,
             },
             members,
             transport.id().clone(),
         )
-        .unwrap().bind_recovery_anchor(BlockIdExt::with_params(ShardIdent::masterchain(), 0, UInt256::from([21; 32]), UInt256::from([22; 32]))).unwrap(),
+        .unwrap().bind_recovery_anchor(BlockIdExt::with_params(ShardIdent::masterchain(), key_seqno, UInt256::from([21; 32]), UInt256::from([22; 32]))).unwrap(),
     );
     let options = crate::SessionOptions {
         protocol: runtime.protocol(),

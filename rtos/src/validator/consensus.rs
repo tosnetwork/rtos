@@ -653,7 +653,12 @@ impl ConsensusFactory {
         options.wait_for_db_init = true;
         let db_path = runtime.runtime_directory(&db_root).map_err(simplex::SessionCreationFailure::before_worker)?;
         let isolated_profile = std::path::Path::new(&db_path).join("isolated-signing.json");
-        if isolated_profile.try_exists().map_err(|e| simplex::SessionCreationFailure::before_worker(e.into()))? {
+        let isolated_schedule = std::path::Path::new(&db_path).parent()
+            .ok_or_else(|| simplex::SessionCreationFailure::before_worker(rtos_block::error!("Missing runtime parent")))?
+            .join("isolated-signing-schedule.json");
+        let scheduled_validator = matches!(runtime.local_role(), consensus_common::session_runtime::LocalRole::Validator(_))
+            && isolated_schedule.try_exists().map_err(|e| simplex::SessionCreationFailure::before_worker(e.into()))?;
+        if scheduled_validator || isolated_profile.try_exists().map_err(|e| simplex::SessionCreationFailure::before_worker(e.into()))? {
             #[cfg(feature = "isolated-consensus-signing")]
             {
                 let session = simplex::SessionFactory::create_isolated_authenticated_session_checked(

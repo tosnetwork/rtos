@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::{fs::{File, OpenOptions}, io::{Read, Write}, path::{Path, PathBuf}, sync::Arc};
 
 pub const PROFILE_FILE: &str = "isolated-signing.json";
+mod schedule;
+pub use schedule::{provision_schedule, SCHEDULE_FILE};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -129,7 +131,7 @@ impl crate::SessionFactory {
             if runtime.local_adnl() != local_transport_key.id() || delivery_sink.is_none() {
                 fail!("Isolated session requires matching transport and durable delivery sink");
             }
-            let signer = recover(&runtime, Path::new(&db_path))?;
+            let signer = schedule::recover_or_provision(&runtime, Path::new(&db_path))?;
             let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor)
                 .collect::<Result<Vec<_>>>()?;
             Ok((signer, nodes))

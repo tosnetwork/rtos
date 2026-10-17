@@ -28,6 +28,9 @@ struct Args {
     global_config: PathBuf,
     #[arg(long)]
     member: u8,
+    /// Also provision only the exact successor set committed in Genesis.
+    #[arg(long)]
+    include_genesis_successor: bool,
 }
 
 fn public_seed(label: &str, member: u8) -> UInt256 {
@@ -78,8 +81,15 @@ async fn main() -> anyhow::Result<()> {
         Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(transport_seed.as_slice())?;
     let stable_id = public_seed("id", args.member);
     let key_seqno = extra.last_key_block.as_ref().map_or(0, |block| block.seq_no);
-    if config.next_validator_set_present()? {
+    if config.next_validator_set_present()? && !args.include_genesis_successor {
         fail!("Interop Genesis preparation requires one initial validator set");
+    }
+    if args.include_genesis_successor && !config.next_validator_set_present()? {
+        fail!("Explicit Genesis successor required for rotation preparation");
+    }
+    let mut sets = vec![("initial", config.validator_set()?, 0_u32, 1_u32)];
+    if args.include_genesis_successor {
+        sets.push(("successor", config.next_validator_set()?, 1, 2));
     }
     let mut shards = vec![(ShardIdent::masterchain(), extra.validator_info.catchain_seqno)];
     extra.shards().iterate_shards(|shard, _| {
@@ -97,41 +107,50 @@ async fn main() -> anyhow::Result<()> {
     })?;
     let mut runtimes = Vec::new();
     for (shard, current_cc) in shards {
-        // The node eagerly prepares the immediate successor from this same
-        // initial set. This is explicit fixture provisioning, not live rotation.
-        for offset in 0..=1 {
-            let cc = current_cc
-                .checked_add(offset)
-                .ok_or_else(|| error!("Catchain sequence overflow"))?;
-            let (committee, _) = config.validator_set()?.calc_subset(
-                &config.catchain_config()?,
-                shard.shard_prefix_with_tag(),
-                shard.workchain_id(),
-                cc,
-            )?;
-            let runtime = AuthenticatedSessionRuntime::from_authenticated_config(
-                SessionNetworkPin { global_id: state.global_id(), zerostate: zero.clone() },
-                config,
-                rtos_api::session_identity::SessionCoordinates {
-                    shard: &shard,
-                    catchain_seqno: cc,
-                    vertical_seqno: 0,
-                    last_key_block_seqno: key_seqno,
-                    new_catchain_ids: false,
-                },
-                committee,
-                transport.id().clone(),
-            )?
-            .bind_recovery_anchor(zero.clone())?;
-            if let LocalRole::Validator(index) = runtime.local_role() {
-                if runtime.committee()[index as usize].validator_id()? != stable_id {
-                    fail!("Public test transport belongs to an unexpected validator");
+        // A bounded explicit schedule, never a live wildcard signer. A separate
+        // successor must already be committed by the authenticated Genesis.
+        for (phase, set, first, last) in &sets {
+            for offset in *first..=*last {
+                let cc = current_cc
+                    .checked_add(offset)
+                    .ok_or_else(|| error!("Catchain sequence overflow"))?;
+                let (committee, _) = set.calc_subset(
+                    &config.catchain_config()?,
+                    shard.shard_prefix_with_tag(),
+                    shard.workchain_id(),
+                    cc,
+                )?;
+                let runtime = AuthenticatedSessionRuntime::from_authenticated_config(
+                    SessionNetworkPin { global_id: state.global_id(), zerostate: zero.clone() },
+                    config,
+                    rtos_api::session_identity::SessionCoordinates {
+                        shard: &shard,
+                        catchain_seqno: cc,
+                        vertical_seqno: 0,
+                        last_key_block_seqno: key_seqno,
+                        new_catchain_ids: false,
+                    },
+                    committee,
+                    transport.id().clone(),
+                )?
+                .bind_recovery_anchor(zero.clone())?;
+                if let LocalRole::Validator(index) = runtime.local_role() {
+                    if runtime.committee()[index as usize].validator_id()? != stable_id {
+                        fail!("Public test transport belongs to an unexpected validator");
+                    }
+                    if !runtimes.iter().any(
+                        |(_, existing): &(&str, AuthenticatedSessionRuntime)| {
+                            existing.session_id() == runtime.session_id()
+                        },
+                    ) {
+                        runtimes.push((*phase, runtime));
+                    }
                 }
-                runtimes.push(runtime);
-            } else if shard.is_masterchain() && offset == 0 {
-                fail!("Public test member is absent from the masterchain committee");
             }
         }
+    }
+    if !runtimes.iter().any(|(_, runtime)| runtime.shard().is_masterchain()) {
+        fail!("Public test member is absent from the explicitly scheduled masterchain committees");
     }
     // Bind the fresh database before creating any session namespaces. Hold the
     // same production network lock throughout offline provisioning.
@@ -151,8 +170,18 @@ async fn main() -> anyhow::Result<()> {
     file.sync_all()?;
     let owner = root.join("isolated-owner");
     create_private_directory(&owner)?;
+    if args.include_genesis_successor {
+        let successors = runtimes.iter().filter(|(phase, _)| *phase == "successor")
+            .map(|(_, runtime)| runtime.clone()).collect::<Vec<_>>();
+        if !successors.is_empty() {
+            let expire_at = config.next_validator_set()?.utime_since().checked_add(600)
+                .ok_or_else(|| error!("Successor fixture expiry overflow"))?;
+            simplex::isolated_signing::provision_schedule(&successors, &root.join("node_db/catchains"),
+                &owner, &key_file, expire_at)?;
+        }
+    }
     let mut sessions = Vec::new();
-    for runtime in runtimes {
+    for (phase, runtime) in runtimes {
         let namespace = PathBuf::from(
             runtime.runtime_directory(
                 root.join("node_db/catchains")
@@ -163,10 +192,11 @@ async fn main() -> anyhow::Result<()> {
         // Each independent test shard has its own explicit journal owner. Never
         // reuse one single-session ownership record for MC and WC journals.
         let shard_owner = owner.join(format!(
-            "{}-{}-{}",
+            "{}-{}-{}-{}",
             runtime.shard().workchain_id(),
             runtime.shard().shard_prefix_with_tag(),
-            runtime.catchain_seqno()
+            runtime.catchain_seqno(),
+            runtime.session_id().to_hex_string()
         ));
         create_private_directory(&shard_owner)?;
         simplex::isolated_signing::provision(
@@ -178,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
             u32::MAX,
         )?;
         sessions.push(serde_json::json!({"shard":runtime.shard().to_string(),
+            "committee_phase":phase,
             "masterchain":runtime.shard().is_masterchain(),
             "catchain_seqno":runtime.catchain_seqno(),
             "session":runtime.session_id().to_hex_string(), "namespace":namespace,

@@ -35,6 +35,15 @@ fn main() -> Result<()> {
     let output = PathBuf::from(args.next().context("output argument required")?);
     ensure!(args.next().is_none(), "unexpected argument");
     let value: Value = serde_json::from_slice(&std::fs::read(request)?)?;
+    let result = check_request(&value, 0)?;
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(output)?;
+    file.write_all(&serde_json::to_vec_pretty(&result)?)?;
+    println!("{result}");
+    Ok(())
+}
+
+fn check_request(value: &Value, depth: u8) -> Result<Value> {
+    ensure!(depth <= 16, "governing key-block chain exceeds fixture bound");
     let reference = &value["reference"];
     let comparison = value.get("comparison").unwrap_or(&value["rust"]);
     let zero = identity(&value["zerostate"])?;
@@ -77,8 +86,34 @@ fn main() -> Result<()> {
         block.read_state_update()?.new_hash == state,
         "block state update differs from applied states"
     );
+    let mut configuration = Value::Null;
+    if let Some(source) = value.get("masterchain_state") {
+        ensure!(identity(&source["id"])? == expected, "masterchain state identity differs");
+        let bytes = base64_decode(source["boc"].as_str().context("masterchain state BOC required")?)?;
+        ensure!(UInt256::calc_file_hash(&bytes) == hash(&source["file_hash"])?,
+            "masterchain state file hash differs");
+        let cell = read_single_root_boc(&bytes)?;
+        ensure!(cell.repr_hash() == &state, "masterchain state differs from block state update");
+        let snapshot = ShardStateUnsplit::construct_from_cell(cell)?;
+        ensure!(snapshot.shard().is_masterchain() && u64::from(snapshot.seq_no()) == expected.2
+            && snapshot.global_id() == block.global_id(), "masterchain state header differs");
+        let extra = snapshot.read_custom()?.context("masterchain state configuration required")?;
+        let describe = |set: rtos_block::ValidatorSet| -> Result<Value> {
+            Ok(json!({"since":set.utime_since(), "until":set.utime_until(),
+                "members":set.list().iter().map(|member| Ok(json!({
+                    "validator_id":base64_encode(member.validator_id()?.as_slice()),
+                    "weight":member.weight}))).collect::<Result<Vec<_>>>()?}))
+        };
+        configuration = json!({"current":describe(extra.config.validator_set()?)?,
+            "next":describe(extra.config.next_validator_set()?)?,
+            "previous":describe(extra.config.prev_validator_set()?)?,
+            "catchain_seqno":extra.validator_info.catchain_seqno,
+            "state_root_checked":true});
+    }
     let mut certificates = Vec::new();
+    let mut governing_chain = Vec::new();
     if let Some(sources) = value.get("certificates") {
+        let governing_state = if info.prev_key_block_seqno() == 0 {
         let genesis_bytes = base64_decode(value["governing_zerostate_boc"].as_str()
             .context("governing zerostate body required")?)?;
         ensure!(UInt256::calc_file_hash(&genesis_bytes) == zero.4, "governing zerostate file hash differs");
@@ -87,8 +122,36 @@ fn main() -> Result<()> {
         let genesis = ShardStateUnsplit::construct_from_cell(genesis_root)?;
         ensure!(genesis.seq_no() == 0 && genesis.shard().is_masterchain()
             && genesis.global_id() == block.global_id(), "invalid governing zerostate header");
-        ensure!(info.prev_key_block_seqno() == 0, "certificate needs a later governing key block");
-        let extra = genesis.read_custom()?.context("masterchain configuration required")?;
+        genesis
+        } else {
+            let governing = value.get("governing_key_block")
+                .context("certificate needs an authenticated governing key block")?;
+            ensure!(identity(&governing["zerostate"])? == zero,
+                "governing key block belongs to another Genesis");
+            let governing_id = identity(&governing["block"]["id"])?;
+            ensure!(governing_id.0 == -1 && governing_id.1 == i64::MIN
+                && governing_id.2 == u64::from(info.prev_key_block_seqno())
+                && governing_id.2 < expected.2, "governing key-block identity differs from signed header");
+            ensure!(governing["certificates"].as_array().is_some_and(|sources| !sources.is_empty()),
+                "governing key block needs its own final certificate");
+            ensure!(governing.get("masterchain_state").is_some(),
+                "governing key block needs its complete resulting state");
+            let checked = check_request(governing, depth + 1)?;
+            ensure!(checked["key_block"] == true, "governing block is not a key block");
+            ensure!(checked["global_id"].as_i64() == Some(i64::from(block.global_id())),
+                "governing key-block global ID differs");
+            ensure!(checked["prev_key_block_seqno"].as_u64().context("governing predecessor required")?
+                < governing_id.2, "governing key-block chain does not decrease");
+            governing_chain.extend(checked["verified_governing_key_blocks"].as_array()
+                .context("governing chain report required")?.iter().cloned());
+            governing_chain.push(json!({"block":governing["block"]["id"],
+                "state_root_hash":checked["state_root_hash"],
+                "verified_final_certificates":checked["verified_final_certificates"]}));
+            let bytes = base64_decode(governing["masterchain_state"]["boc"].as_str()
+                .context("governing state body required")?)?;
+            ShardStateUnsplit::construct_from_cell(read_single_root_boc(&bytes)?)?
+        };
+        let extra = governing_state.read_custom()?.context("masterchain configuration required")?;
         let id = BlockIdExt::with_params(ShardIdent::masterchain(), expected.2.try_into()?,
             expected.3.clone(), expected.4.clone());
         let context = rtos_api::pq_finality::PqVerificationContext::from_governing_config(
@@ -194,6 +257,7 @@ fn main() -> Result<()> {
             checked_states.push(json!({"name":source["name"], "file_hash":base64_encode(file_hash.as_slice())}));
         }
         workchain_check = json!({"block":workchain["block"]["id"],
+            "gen_utime":wc_info.gen_utime(), "gen_catchain_seqno":wc_info.gen_catchain_seqno(),
             "created_by":base64_encode(wc_block.read_extra()?.created_by().as_slice()),
             "state_root_hash":base64_encode(wc_root.as_slice()), "states":checked_states,
             "masterchain_anchor_checked":true, "block_file_cell_and_header_checked":true,
@@ -202,12 +266,13 @@ fn main() -> Result<()> {
     let result = json!({"status":"block_and_state_match", "block":reference["last"],
         "created_by":base64_encode(block.read_extra()?.created_by().as_slice()),
         "state_root_hash":base64_encode(state.as_slice()), "global_id":block.global_id(),
+        "gen_utime":info.gen_utime(), "key_block":info.key_block(),
+        "prev_key_block_seqno":info.prev_key_block_seqno(),
+        "gen_catchain_seqno":info.gen_catchain_seqno(), "configuration":configuration,
         "file_hash_checked":true, "cell_hash_checked":true, "header_identity_checked":true,
         "state_update_matches_both":true, "verified_final_certificates":certificates,
+        "verified_governing_key_blocks":governing_chain,
         "shard_tops":shard_tops, "workchain_check":workchain_check,
         "active_signing_qualified":false});
-    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(output)?;
-    file.write_all(&serde_json::to_vec_pretty(&result)?)?;
-    println!("{result}");
-    Ok(())
+    Ok(result)
 }
