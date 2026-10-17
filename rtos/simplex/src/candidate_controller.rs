@@ -84,7 +84,7 @@ use std::{
 /// Delay before requesting a missing candidate from peers.
 ///
 /// This allows time for the broadcast to arrive naturally before triggering a query.
-const CANDIDATE_REQUEST_DELAY: Duration = Duration::from_secs(1);
+pub(crate) const CANDIDATE_REQUEST_DELAY: Duration = Duration::from_secs(1);
 
 /// Minimum interval between repeated `requestCandidate` attempts for the same (slot,hash).
 ///

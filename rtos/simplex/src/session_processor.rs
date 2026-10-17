@@ -158,9 +158,51 @@ use rtos_api::{
 use rtos_block::{error, sha256_digest, BlockIdExt, Error, Result, UInt256};
 use std::{
     collections::HashMap,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{atomic::AtomicBool, Arc, Mutex},
     time::{Duration, SystemTime},
 };
+
+// Coalesce repair effects before they enter SXMAIN. Throttling only after
+// dequeue permits many finality triggers to queue the same missing ancestor.
+type DeferredCandidateRequests = Arc<Mutex<HashMap<RawCandidateId, Duration>>>;
+
+struct CandidateRequestTicket {
+    pending: DeferredCandidateRequests,
+    id: RawCandidateId,
+    armed: bool,
+}
+impl Drop for CandidateRequestTicket {
+    fn drop(&mut self) {
+        if self.armed {
+            self.pending.lock().unwrap().remove(&self.id);
+        }
+    }
+}
+
+fn post_candidate_request(
+    queue: &TaskQueuePtr,
+    pending: &DeferredCandidateRequests,
+    slot: SlotIndex,
+    hash: UInt256,
+    delay: Option<Duration>,
+) {
+    let id = RawCandidateId { slot, hash: hash.clone() };
+    let delay = delay.unwrap_or(crate::candidate_controller::CANDIDATE_REQUEST_DELAY);
+    {
+        let mut requests = pending.lock().unwrap();
+        if let Some(old) = requests.get_mut(&id) {
+            *old = (*old).min(delay);
+            return;
+        }
+        requests.insert(id.clone(), delay);
+    }
+    let mut ticket = CandidateRequestTicket { pending: pending.clone(), id, armed: true };
+    crate::task_queue::post_closure(queue, move |p: &mut SessionProcessor| {
+        let delay = ticket.pending.lock().unwrap().remove(&ticket.id).expect("queued repair ticket");
+        ticket.armed = false;
+        p.request_candidate(slot, hash, Some(delay));
+    });
+}
 
 /*
     Constants
@@ -233,6 +275,7 @@ const RECENT_FINALIZED_DUMP_WINDOW: Duration = Duration::from_secs(10);
 pub(crate) struct SessionProcessor {
     /// Task queue for main processing
     task_queue: TaskQueuePtr,
+    deferred_candidate_requests: DeferredCandidateRequests,
     /// Receiver for network communication
     receiver: ReceiverPtr,
     /// SimplexState FSM - core consensus state machine
@@ -508,6 +551,7 @@ impl SessionProcessor {
 
         let processor = Self {
             task_queue,
+            deferred_candidate_requests: Arc::new(Mutex::new(HashMap::new())),
             receiver,
             simplex_state,
             // Consensus finalization aspect. Seeds the finalized-head + producer
@@ -1513,6 +1557,7 @@ struct CollationBackendAdapter<'a> {
     /// collation retry and next-slot self-loop re-dispatch use the controller
     /// task queue for the same reason.
     task_queue: &'a TaskQueuePtr,
+    deferred_candidate_requests: &'a DeferredCandidateRequests,
 }
 
 impl CollationBackend for CollationBackendAdapter<'_> {
@@ -1644,9 +1689,7 @@ impl CollationBackend for CollationBackendAdapter<'_> {
         // The fetch runs the full `request_candidate` machinery, which needs
         // `&mut SessionProcessor`; bounce it onto SXMAIN from the
         // `check_collation` parent-resolution gate.
-        crate::task_queue::post_closure(self.task_queue, move |p: &mut SessionProcessor| {
-            p.request_candidate(slot, hash, None);
-        });
+        post_candidate_request(self.task_queue, self.deferred_candidate_requests, slot, hash, None);
     }
 
     fn self_receive_candidate(&self, self_idx: u32, candidate: CandidateData) {
@@ -1686,6 +1729,7 @@ impl SessionProcessor {
             database,
             telemetry,
             task_queue,
+            deferred_candidate_requests,
             candidate,
             ..
         } = self;
@@ -1708,6 +1752,7 @@ impl SessionProcessor {
             database,
             telemetry: &**telemetry,
             task_queue: &*task_queue,
+            deferred_candidate_requests,
         };
         f(collation, &mut backend)
     }
@@ -1818,6 +1863,7 @@ struct ValidationBackendAdapter<'a> {
     /// for the shared throttle map, so it bounces a closure onto the main loop
     /// through this handle (mirrors `CollationBackend::request_parent_candidate`).
     task_queue: &'a TaskQueuePtr,
+    deferred_candidate_requests: &'a DeferredCandidateRequests,
     /// Finalized head seqno copied by value (so it reflects drain-time state).
     /// TODO: LK: move to SessionRuntime
     finalized_head_seqno: Option<u32>,
@@ -1853,9 +1899,7 @@ impl ValidationBackend for ValidationBackendAdapter<'_> {
     fn request_candidate(&self, slot: SlotIndex, hash: UInt256, delay: Option<Duration>) {
         // The fetch runs the full `request_candidate` machinery (shared throttle
         // map), which needs `&mut SessionProcessor`; bounce it onto SXMAIN.
-        crate::task_queue::post_closure(self.task_queue, move |p: &mut SessionProcessor| {
-            p.request_candidate(slot, hash, delay);
-        });
+        post_candidate_request(self.task_queue, self.deferred_candidate_requests, slot, hash, delay);
     }
 }
 
@@ -1886,6 +1930,7 @@ impl SessionProcessor {
             consensus,
             runtime,
             task_queue,
+            deferred_candidate_requests,
             ..
         } = self;
         let mut backend = ValidationBackendAdapter {
@@ -1900,6 +1945,7 @@ impl SessionProcessor {
             accepted_normal_head_block_id: consensus.accepted_normal_head_block_id(),
             runtime: &*runtime,
             task_queue: &*task_queue,
+            deferred_candidate_requests,
             finalized_head_seqno: consensus.finalized_head_seqno(),
         };
         f(validation, &mut backend)
@@ -2000,6 +2046,7 @@ struct ConsensusBackendAdapter<'a> {
     /// cross-controller cleanup machinery, which the borrowing backend cannot
     /// provide, so they bounce a closure onto the session main loop.
     task_queue: &'a TaskQueuePtr,
+    deferred_candidate_requests: &'a DeferredCandidateRequests,
     /// Receiver handle for the synchronous certificate-ingress effects:
     /// `notify_certificate_accepted` (standstill tracking on first store) and
     /// `ban_source_for_bad_signature` (temporary peer ban on a failed-verify
@@ -2150,9 +2197,7 @@ impl ConsensusBackend for ConsensusBackendAdapter<'_> {
     fn request_candidate(&self, slot: SlotIndex, hash: UInt256, delay: Option<Duration>) {
         // The fetch runs the full `request_candidate` machinery (shared throttle
         // map), which needs `&mut SessionProcessor`; bounce it onto SXMAIN.
-        crate::task_queue::post_closure(self.task_queue, move |p: &mut SessionProcessor| {
-            p.request_candidate(slot, hash, delay);
-        });
+        post_candidate_request(self.task_queue, self.deferred_candidate_requests, slot, hash, delay);
     }
 
     fn reset_slot_state(&self, slot: SlotIndex) {
@@ -2645,6 +2690,7 @@ impl SessionProcessor {
             database,
             telemetry,
             task_queue,
+            deferred_candidate_requests,
             receiver,
             ..
         } = self;
@@ -2655,6 +2701,7 @@ impl SessionProcessor {
             database,
             telemetry: &**telemetry,
             task_queue: &*task_queue,
+            deferred_candidate_requests,
             receiver: &*receiver,
         };
         f(consensus, &mut backend)

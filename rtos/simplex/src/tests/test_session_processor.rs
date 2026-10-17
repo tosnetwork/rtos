@@ -6700,7 +6700,12 @@ fn test_recovery_ancestry_requires_parent_evidence_even_below_applied_floor() {
     assert!(!authenticated.with_consensus_backend(|c, b| c.maybe_apply_finalized_state(b, &child, true)),
         "never persist a record whose required recovery ancestry is missing");
     assert!(db.load_finalized_blocks().unwrap().is_empty());
-    assert!(!fixture.processor.with_consensus_backend(|c, b| c.ensure_recoverable_ancestry(b, &child)));
+    fixture.run_pending_tasks();
+    for _ in 0..1000 {
+        assert!(!fixture.processor.with_consensus_backend(|c, b| c.ensure_recoverable_ancestry(b, &child)));
+    }
+    assert_eq!(fixture.task_queue.tasks.lock().unwrap().len(), 1,
+        "repeated finality-ancestry retries must not enqueue repeated repairs");
     fixture.run_pending_tasks();
     assert!(fixture.drain_receiver_actions().iter().any(|action| matches!(action,
         ReceiverAction::RequestCandidate { slot, block_hash }
@@ -6716,6 +6721,66 @@ fn test_recovery_ancestry_requires_parent_evidence_even_below_applied_floor() {
     fixture.drain_pending_async_db_results();
     assert!(fixture.processor.with_consensus_backend(|c, b| c.ensure_recoverable_ancestry(b, &child)),
         "the authenticated parent and its durably ingested NotarCert close the recovery gap");
+}
+
+#[test]
+fn test_deferred_candidate_repairs_coalesce_across_controllers_and_keep_urgent_delay() {
+    let mut fixture = TestFixture::new(4);
+    fixture.run_pending_tasks();
+    let slot = SlotIndex::new(69);
+    let hash = UInt256::rand();
+    for _ in 0..1000 {
+        fixture.processor.with_consensus_backend(|_, b| {
+            b.request_candidate(slot, hash.clone(), Some(Duration::from_secs(5)));
+        });
+        fixture.processor.with_validation_backend(|_, b| {
+            b.request_candidate(slot, hash.clone(), None);
+        });
+        fixture.processor.with_collation_backend(|_, b| {
+            b.request_parent_candidate(slot, hash.clone());
+        });
+    }
+    assert_eq!(fixture.task_queue.tasks.lock().unwrap().len(), 1,
+        "throttling after dequeue cannot bound the repair backlog");
+    fixture.processor.with_consensus_backend(|_, b| {
+        b.request_candidate(slot, hash.clone(), Some(Duration::ZERO));
+    });
+    let other_hash = UInt256::rand();
+    fixture.processor.with_consensus_backend(|_, b| {
+        b.request_candidate(slot, other_hash.clone(), Some(Duration::ZERO));
+    });
+    assert_eq!(fixture.task_queue.tasks.lock().unwrap().len(), 2,
+        "different candidate hashes in the same slot remain distinct");
+    fixture.run_pending_tasks();
+    let requests: Vec<_> = fixture.drain_receiver_actions().into_iter().filter_map(|action| {
+        match action { ReceiverAction::RequestCandidate { slot: s, block_hash } if s == slot.value()
+            => Some(block_hash), _ => None }
+    }).collect();
+    assert_eq!(requests, vec![hash.clone(), other_hash],
+        "an urgent retry must not inherit the first delayed request");
+    assert!(fixture.processor.deferred_candidate_requests.lock().unwrap().is_empty());
+    fixture.processor.with_consensus_backend(|_, b| {
+        b.request_candidate(slot, hash, Some(Duration::ZERO));
+    });
+    assert_eq!(fixture.task_queue.tasks.lock().unwrap().len(), 1,
+        "dequeued repairs must permit future retries through the normal limiter");
+}
+
+#[test]
+fn test_deferred_candidate_repair_discard_releases_ticket() {
+    let mut fixture = TestFixture::new(4);
+    fixture.run_pending_tasks();
+    let slot = SlotIndex::new(69);
+    let hash = UInt256::rand();
+    for _ in 0..2 {
+        fixture.processor.with_consensus_backend(|_, b| {
+            b.request_candidate(slot, hash.clone(), Some(Duration::ZERO));
+        });
+        assert_eq!(fixture.task_queue.tasks.lock().unwrap().len(), 1);
+        crate::task_queue::TaskQueue::flush(&*fixture.task_queue);
+        assert!(fixture.processor.deferred_candidate_requests.lock().unwrap().is_empty(),
+            "discarding a queued closure must not suppress the next repair");
+    }
 }
 
 #[test]
