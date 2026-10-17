@@ -112,6 +112,15 @@ async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, ru
             'all_references': {str(i): info for i, info in infos.items()},
             'block': block, 'masterchain_state': state, 'certificates': [proof],
             'governing_key_block': {**governing, 'certificates': [proof]}}
+        voted = False
+        if with_workchain:
+            key_seqno = governing['block']['id']['seqno']
+            target_cert, key_cert = await asyncio.gather(*(asyncio.to_thread(rpc, endpoints[index],
+                'getMasterchainBlockSignatures', {'seqno': seqno}) for seqno in [block_id['seqno'], key_seqno]))
+            sample['certificates'].append({'kind': 'rpc', 'name': f'restarted-rust-{index}', 'value': target_cert})
+            sample['governing_key_block']['certificates'].append(
+                {'kind': 'rpc', 'name': f'restarted-rust-{index}', 'value': key_cert})
+            voted = any(signature['validator_id'] == member_id(index) for signature in target_cert['signatures'])
         write(target / 'sample.json', sample)
         await child_checked([args.block_checker, target / 'sample.json', target / 'checked.json'],
             target / 'checker.log')
@@ -132,13 +141,13 @@ async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, ru
             await child_checked([args.block_checker, target / 'sample.json', target / 'checked-with-workchain.json'],
                 target / 'workchain-checker.log')
             checked = json.loads((target / 'checked-with-workchain.json').read_text())
-        return checked
+        return checked, voted
 
     floor = max(info['last']['seqno'] for info in prior)
     while True:
         survivor_infos = await common_checkpoint([i for i in range(6) if i != index], floor)
         floor = survivor_infos[0]['last']['seqno']
-        survivor = await check_checkpoint(survivor_infos, f'survivors-{floor}', False)
+        survivor, _ = await check_checkpoint(survivor_infos, f'survivors-{floor}', False)
         if survivor['gen_utime'] > interrupted_at:break
     receipt.update(phase='restarting_original_directory', survivor_checkpoint=survivor['block'])
     write(directory / 'recovery.json', receipt)
@@ -146,7 +155,9 @@ async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, ru
         if digest(Path(filename)) != expected:raise RuntimeError('An executable or profile changed before restart')
     if digest(prepared) != prepared_hash:raise RuntimeError('Prepared authority changed before restart')
     node.update(await start_rotation_node(args.rust_node, node['directory'], 'node-restart.log'))
+    restarted_at = time.time()
     receipt['new_process'] = {'pid': node['process'].pid, 'start_ticks': node['start_ticks']}
+    receipt['restarted_at_unix'] = restarted_at
     receipt['phase'] = 'waiting_for_recovered_leadership'
     write(directory / 'recovery.json', receipt)
     # Clear all pre-interruption observations; acceptance needs fresh RPCs from every process.
@@ -154,10 +165,14 @@ async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, ru
     floor = survivor['block']['seqno']
     minimum_wc = max((int(top['seqno']) for top in survivor['shard_tops'] if int(top['workchain']) == 0), default=0)
     leaders = {}
-    while len(leaders) < 2:
+    vote = None
+    while len(leaders) < 2 or vote is None:
         infos = await common_checkpoint(list(range(6)), floor)
         floor = infos[0]['last']['seqno']
-        checked = await check_checkpoint(infos, str(floor), True)
+        checked, voted = await check_checkpoint(infos, str(floor), True)
+        if voted and checked['gen_utime'] > restarted_at:
+            vote = {'block': checked['block'], 'validator_id': member_id(index),
+                'sample_directory': str(directory / str(floor)), 'source': f'restarted-rust-{index}'}
         for chain, evidence, workchain in [('masterchain', checked, -1), ('workchain', checked['workchain_check'], 0)]:
             if evidence['created_by'] != member_id(index):continue
             if workchain == 0 and evidence['block']['seqno'] <= minimum_wc:continue
@@ -167,7 +182,7 @@ async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, ru
             if not match:raise RuntimeError('Recovered creator lacks post-restart local collation evidence')
             leaders.setdefault(chain, {'block': evidence['block'], 'sample_directory': str(directory / str(floor)),
                 'local_collation': match.group(0)})
-        receipt.update(leaders=leaders, last_checkpoint=checked['block'])
+        receipt.update(leaders=leaders, vote=vote, last_checkpoint=checked['block'])
         write(directory / 'recovery.json', receipt)
     if digest(prepared) != prepared_hash:raise RuntimeError('Recovery changed prepared authority')
     receipt.update(phase='recovered', all_six_applied_states_match=True,

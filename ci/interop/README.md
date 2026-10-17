@@ -268,3 +268,9 @@ creators are certified, and stops downloading redundant WC states once that
 phase has all four WC creators. Every counted creator still needs the same
 independent certificate, body and state checks. Both runner sources are retained
 with hashes in each new rotation output directory.
+
+Recovery also requires the restarted member's own validator ID in a native
+FinalCert for a block generated after restart. The runner fetches that member's
+stored target and governing-key certificates and verifies both with the same
+independent checker. The receipt records the voting block alongside MC/WC
+leadership; observing other validators' signatures alone cannot satisfy it.
