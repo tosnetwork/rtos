@@ -15,7 +15,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
-from quorum_profile import quorum_threshold, matrix_committee_size, check_committee_weights
+from quorum_profile import quorum_threshold, matrix_committee_size, check_committee_weights, matrix_threshold_plan
 
 
 def digest(path):
@@ -493,7 +493,13 @@ async def run(args, root, snapshot, artifacts):
                         for path, expected in artifacts.items():
                             if digest(Path(path)) != expected:
                                 raise RuntimeError('An executable changed during matrix validation')
-                        return dict(status=('all_four_creators_accepted_with_matching_states' if member_count == 4
+                        threshold_fault = None
+                        if matrix_threshold_plan(profile, args.cpp_count) is not None:
+                            from threshold_fault_fixture import exercise_threshold_fault
+                            threshold_fault = await exercise_threshold_fault(args, root, members, endpoints,
+                                lite_configs, rust_nodes, zero, base64.b64encode(generated.file.read_bytes()).decode(),
+                                checked, artifacts, profile, deadline)
+                        return dict(threshold_fault=threshold_fault, status=('all_four_creators_accepted_with_matching_states' if member_count == 4
                             else 'all_declared_creators_accepted_with_matching_states'),
                             validator_count=member_count,
                             cpp_count=args.cpp_count, rust_count=member_count - args.cpp_count,
@@ -539,6 +545,7 @@ def main():
     args.genesis_profile = args.genesis_profile.resolve()
     profile = json.loads(args.genesis_profile.read_text())
     member_count = matrix_committee_size(profile, args.cpp_count)
+    matrix_threshold_plan(profile, args.cpp_count)
     if member_count != 4 and not args.prepare_genesis_only and not (
             args.verify_certificates and args.verify_workchain):
         raise SystemExit('Full active three/six matrix requires certificates and workchain state checks')
@@ -561,6 +568,11 @@ def main():
     artifacts[str(args.genesis_profile)] = digest(args.genesis_profile)
     helper = Path(__file__).with_name('quorum_profile.py')
     artifacts[str(helper)] = digest(helper)
+    if profile.get('threshold_fault') is not None:
+        fault_helper = Path(__file__).with_name('threshold_fault_fixture.py')
+        artifacts[str(fault_helper)] = digest(fault_helper)
+        recovery_helper = Path(__file__).with_name('rotation_fixture.py')
+        artifacts[str(recovery_helper)] = digest(recovery_helper)
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
     write(root / 'source.json', dict(cpp_snapshot=manifest, rust_revision=args.rust_revision,

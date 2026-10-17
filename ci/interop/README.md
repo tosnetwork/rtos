@@ -326,3 +326,19 @@ an accepted MC creator and, with `--verify-workchain`, an anchored WC creator;
 against the generated 17-unit weights. Three members therefore require 34/51,
 and six require 68/102 under the pinned C++ inclusive quorum rule. A healthy
 full-committee result alone does not close threshold fault-budget acceptance.
+
+A full active 3/6 profile may predeclare `threshold_fault` with
+`pause_at_quorum`, `pause_below_quorum`, `settle_seconds: 4` and
+`observe_seconds: 12`. The fixed three-member case pauses member2, then member1;
+the six-member case pauses members1/5, then member3. Member0 remains the native
+C++ proof anchor. Only the fixture's own validators in its fresh user/network
+namespace receive SIGSTOP/SIGCONT. A fresh exact-threshold FinalCert must name
+exactly the surviving members under the unchanged full committee. After the
+additional pause, the declared four-second settling period precedes a complete
+twelve-second responsive RPC observation with no finalized MC identity/state
+advance; this is bounded observational evidence. All paused original PIDs then
+resume and must appear in fresh authenticated votes and accepted MC/WC creator
+evidence, with every active endpoint's MC/WC state checked. The entire sequence
+shares the existing 180-second matrix deadline; it does not get a new recovery
+deadline. A finally block resumes owned paused processes on failure. No DB or
+production consensus change is made by the fixture.

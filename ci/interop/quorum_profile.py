@@ -60,3 +60,27 @@ def matrix_committee_size(profile, cpp_count):
     if profile.get('shard_validators') != count:
         raise ValueError('Full active matrix requires shard_validators == validator_count')
     return count
+
+
+def matrix_threshold_plan(profile, cpp_count):
+    plan = profile.get('threshold_fault')
+    if plan is None:
+        return None
+    count = matrix_committee_size(profile, cpp_count)
+    if count not in (3, 6) or cpp_count == 0:
+        raise ValueError('Threshold fault requires three/six active members and CPP anchor zero')
+    expected = {'pause_at_quorum': [2] if count == 3 else [1, 5],
+        'pause_below_quorum': [1] if count == 3 else [3],
+        'settle_seconds': 4, 'observe_seconds': 12}
+    if type(plan) is not dict or set(plan) != set(expected):
+        raise ValueError('Threshold fault requires the complete declared bounded plan')
+    for key, value in expected.items():
+        actual = plan[key]
+        if isinstance(value, list):
+            if type(actual) is not list or any(type(i) is not int for i in actual):
+                raise ValueError('Threshold pause members must be explicit integer indices')
+        elif type(actual) is not int:
+            raise ValueError('Threshold timing must be explicit integer seconds')
+        if actual != value:
+            raise ValueError('Threshold fault differs from the declared three/six-member case')
+    return {key: value.copy() if isinstance(value, list) else value for key, value in expected.items()}

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 
-from quorum_profile import MAX_TOTAL_WEIGHT, quorum_threshold, epoch_weights, check_committee_weights, initial_probe_weights, initial_probe_deadline, matrix_committee_size
+from quorum_profile import MAX_TOTAL_WEIGHT, quorum_threshold, epoch_weights, check_committee_weights, initial_probe_weights, initial_probe_deadline, matrix_committee_size, matrix_threshold_plan
 from rotation_fixture import install_successor, INITIAL, SUCCESSOR
 
 
@@ -22,6 +22,21 @@ class QuorumProfileTests(unittest.TestCase):
         for count in (True, 0, 2, 5, 7, 3.0, '6'):
             with self.assertRaises(ValueError):
                 matrix_committee_size({'validator_count': count, 'shard_validators': count}, 0)
+
+    def test_threshold_fault_plan_requires_the_complete_frozen_availability_case(self):
+        self.assertIsNone(matrix_threshold_plan({'shard_validators': 4}, 2))
+        for count, first, extra in [(3, [2], [1]), (6, [1, 5], [3])]:
+            plan = {'pause_at_quorum': first, 'pause_below_quorum': extra,
+                    'settle_seconds': 4, 'observe_seconds': 12}
+            profile = {'validator_count': count, 'shard_validators': count, 'threshold_fault': plan}
+            self.assertEqual(matrix_threshold_plan(profile, 1), plan)
+            for key, value in [('pause_at_quorum', [True]), ('pause_below_quorum', first),
+                               ('settle_seconds', True), ('settle_seconds', 3), ('observe_seconds', 1)]:
+                with self.assertRaises(ValueError):
+                    matrix_threshold_plan({**profile, 'threshold_fault': {**plan, key: value}}, 1)
+            with self.assertRaises(ValueError): matrix_threshold_plan(profile, 0)
+            with self.assertRaises(ValueError):
+                matrix_threshold_plan({**profile, 'threshold_fault': {'pause_at_quorum': first}}, 1)
 
     def test_cpp_boundary_is_inclusive_when_total_is_divisible_by_three(self):
         for total, expected in [(3, 2), (6, 4), (51, 34), (102, 68), (60, 40), (68, 46)]:
