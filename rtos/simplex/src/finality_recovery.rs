@@ -365,10 +365,48 @@ impl FinalityIntentStore {
             std::fs::create_dir(&directory)?;
             File::open(&self.namespace)?.sync_all()?;
         }
-        for path in self.paths()? {
+        let paths = self.paths()?;
+        self.recover_redundant_completion_temporary(&paths)?;
+        for path in paths {
             if path.extension().and_then(|s| s.to_str()) == Some("resolved") {
                 self.complete_path(&path)?;
             }
+        }
+        Ok(())
+    }
+    // A crash between completed-temp fsync and rename must not block every
+    // other intent. Only discard an exact redundant copy: the original pending
+    // proof remains durable and pending, and must still pass normal replay.
+    // This never promotes a temporary file to completed evidence.
+    fn recover_redundant_completion_temporary(&self, paths: &[PathBuf]) -> Result<()> {
+        let directory = self.namespace.join(DIRECTORY).join(COMPLETED_DIRECTORY);
+        if !directory.exists() {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(&directory)? {
+            let temporary = entry?.path();
+            if temporary.extension().and_then(|s| s.to_str()) != Some("tmp") {
+                continue;
+            }
+            let original = directory.parent().unwrap()
+                .join(temporary.file_name().unwrap()).with_extension("json");
+            if !paths.contains(&original) {
+                fail!("Completed temporary lacks its original pending proof");
+            }
+            read_intent(&original, &self.namespace)?;
+            let record: DiskIntent = serde_json::from_slice(&std::fs::read(&original)?)?;
+            let bytes = std::fs::read(&temporary)?;
+            // paths() has already enforced regular files and physical quotas.
+            // Decode with the completed schema and exact filename/domain checks.
+            decode_intent(&temporary.with_extension("complete"), &self.namespace, &bytes)?;
+            let completed: CompletedIntent = serde_json::from_slice(&bytes)?;
+            if serde_json::to_vec(&completed.record)? != serde_json::to_vec(&record)? {
+                fail!("Completed temporary conflicts with its original pending proof");
+            }
+            File::open(&original)?.sync_all()?;
+            File::open(original.parent().unwrap())?.sync_all()?;
+            std::fs::remove_file(&temporary)?;
+            File::open(&directory)?.sync_all()?;
         }
         Ok(())
     }
@@ -554,6 +592,10 @@ impl FinalityIntentStore {
                 file.write_all(&bytes)?;
                 file.sync_all()?;
                 drop(file);
+                #[cfg(test)]
+                if std::env::var_os("RTOS_CERT_COMPLETION_CRASH").is_some() {
+                    std::process::exit(78);
+                }
                 std::fs::rename(temporary, &completed)?;
             }
         }
@@ -876,14 +918,27 @@ mod tests {
         .unwrap();
         source.bind_start(runtime.pin().zerostate.clone()).unwrap();
         source.retain_intent(vec![runtime.pin().zerostate.clone()], &event).unwrap();
+        if std::env::var_os("RTOS_CERT_COMPLETION_CRASH").is_some() {
+            source.resolve_intent(&crate::block::RawCandidateId {
+                slot: event.slot, hash: event.block_hash.clone(),
+            }).unwrap();
+            panic!("completion crash point was not reached");
+        }
         // Exit without Drop, candidate body, source Draft, node stage or receipt.
         std::process::exit(77);
     }
     #[test]
     fn source_finality_cert_only_process_exit_retains_authentic_recovery_debt() {
+        check_source_finality_process_exit(false);
+        check_source_finality_process_exit(true);
+    }
+    fn check_source_finality_process_exit(completion_interrupted: bool) {
         let directory = crate::authenticated_fixture::TestDirectory::new();
-        let result = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        if completion_interrupted {
+            child.env("RTOS_CERT_COMPLETION_CRASH", "1");
+        }
+        let result = child.args([
                 "--exact",
                 "finality_recovery::tests::source_finality_cert_intent_process_child",
                 "--nocapture",
@@ -891,7 +946,7 @@ mod tests {
             .env("RTOS_CERT_INTENT_CRASH_ROOT", directory.path())
             .output()
             .unwrap();
-        assert_eq!(result.status.code(), Some(77), "{}", String::from_utf8_lossy(&result.stderr));
+        assert_eq!(result.status.code(), Some(if completion_interrupted { 78 } else { 77 }), "{}", String::from_utf8_lossy(&result.stderr));
         let records = scan_finality_recovery(directory.path()).unwrap();
         assert_eq!(
             records.len(),
@@ -902,7 +957,19 @@ mod tests {
         records[0].validate_runtime(&runtime).unwrap();
         let owner =
             crate::finality_delivery::PendingFinalityStore::open(&records[0].namespace).unwrap();
-        let intents = FinalityIntentStore::new(&records[0].namespace).pending().unwrap();
+        let store = FinalityIntentStore::new(&records[0].namespace);
+        let original_paths = store.paths().unwrap();
+        assert_eq!(original_paths.len(), 1);
+        let original_bytes = std::fs::read(&original_paths[0]).unwrap();
+        let temporary = store.completed_path(&original_paths[0]).with_extension("tmp");
+        assert_eq!(temporary.exists(), completion_interrupted);
+        store.prepare(true).unwrap();
+        assert!(!temporary.exists());
+        assert_eq!(std::fs::read(&original_paths[0]).unwrap(), original_bytes);
+        assert!(!store.completed_path(&original_paths[0]).exists(), "not declared completed");
+        assert_eq!(store.pending_count().unwrap(), 1, "normal replay remains mandatory");
+        store.prepare(true).unwrap(); // cold preparation is idempotent
+        let intents = store.pending().unwrap();
         assert_eq!(intents.len(), 1);
         let nodes = runtime
             .committee()
@@ -950,6 +1017,47 @@ mod tests {
             "this window must precede any full Draft or node custody"
         );
         drop(owner);
+    }
+    #[test]
+    fn source_finality_completion_temporary_requires_exact_pending_proof() {
+        let directory = crate::authenticated_fixture::TestDirectory::new();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "finality_recovery::tests::source_finality_cert_intent_process_child"])
+            .env("RTOS_CERT_INTENT_CRASH_ROOT", directory.path())
+            .output().unwrap();
+        assert_eq!(result.status.code(), Some(77));
+        let records = scan_finality_recovery(directory.path()).unwrap();
+        let namespace = &records[0].namespace;
+        let _owner = crate::finality_delivery::PendingFinalityStore::open(namespace).unwrap();
+        let store = FinalityIntentStore::new(namespace);
+        let original = store.paths().unwrap().remove(0);
+        let original_bytes = std::fs::read(&original).unwrap();
+        let record: DiskIntent = serde_json::from_slice(&original_bytes).unwrap();
+        let temporary = store.completed_path(&original).with_extension("tmp");
+        std::fs::create_dir_all(temporary.parent().unwrap()).unwrap();
+        let mut conflicting = record.clone();
+        conflicting.profile = UInt256::calc_file_hash(b"other profile").to_hex_string();
+        for bytes in [
+            b"{partial".to_vec(),
+            serde_json::to_vec(&CompletedIntent { schema: 2, record: record.clone() }).unwrap(),
+            serde_json::to_vec(&CompletedIntent { schema: 1, record: conflicting }).unwrap(),
+        ] {
+            std::fs::write(&temporary, &bytes).unwrap();
+            assert!(store.prepare(true).is_err());
+            assert_eq!(std::fs::read(&temporary).unwrap(), bytes);
+            assert_eq!(std::fs::read(&original).unwrap(), original_bytes);
+            assert!(!store.completed_path(&original).exists());
+            std::fs::remove_file(&temporary).unwrap();
+        }
+        let orphan = temporary.with_file_name("unknown.tmp");
+        std::fs::write(&orphan, serde_json::to_vec(&CompletedIntent { schema: 1, record }).unwrap()).unwrap();
+        assert!(store.prepare(true).is_err());
+        assert!(orphan.exists(), "unknown temporary is retained");
+        std::fs::remove_file(&orphan).unwrap();
+        File::create(&temporary).unwrap().set_len(MAX_INTENT_BYTES + 1).unwrap();
+        assert!(store.prepare(true).is_err(), "physical quotas still apply before recovery");
+        assert!(temporary.exists());
+        assert_eq!(std::fs::read(&original).unwrap(), original_bytes);
     }
     #[test]
     fn source_finality_legacy_namespace_is_not_silently_empty_or_upgraded() {
