@@ -2064,7 +2064,11 @@ impl OverlayNode {
         let (peers, data) = self
             .prepare_to_send_message(dst, data, &overlay, "Sending QUIC message to unknown overlay")
             .await?;
-        quic.message(data, Some(&self.adnl), &peers).await?;
+        tokio::select! {
+            biased;
+            _ = overlay.tasks.cancelled() => fail!("Overlay retired during QUIC message"),
+            result = quic.message(data, Some(&self.adnl), &peers) => { result?; },
+        }
         Ok(())
     }
 
@@ -2163,7 +2167,12 @@ impl OverlayNode {
             .await?;
         let mut data = overlay.query_prefix.clone();
         self.wire_profile.serialize_append(&mut data, &query.object)?;
-        match quic.query(data, Some(&self.adnl), &peers, timeout_ms).await? {
+        let response = tokio::select! {
+            biased;
+            _ = overlay.tasks.cancelled() => fail!("Overlay retired during QUIC query"),
+            result = quic.query(data, Some(&self.adnl), &peers, timeout_ms) => result?,
+        };
+        match response {
             Some(raw) => Ok(Some(match self.wire_profile {
                 rtos_api::WireProfile::Legacy => deserialize_boxed(&raw)?,
                 profile => profile.deserialize(&raw)?,

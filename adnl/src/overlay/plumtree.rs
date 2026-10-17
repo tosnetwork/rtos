@@ -1598,7 +1598,7 @@ mod transport_tests {
         node::{AdnlNode, AdnlNodeConfig, IpAddress},
         QuicNode, QuicRateLimitConfig,
     };
-    use rtos_api::TLObject;
+    use rtos_api::{AnyBoxedSerialize, TLObject};
     use std::{
         net::{SocketAddr, UdpSocket},
         time::Duration,
@@ -1766,6 +1766,58 @@ mod transport_tests {
         b.quic.shutdown_and_wait().await.unwrap();
         a.overlay.adnl.stop_checked().await.unwrap();
         b.overlay.adnl.stop_checked().await.unwrap();
+    }
+
+    async fn assert_retirement_releases_direct_quic_io(query: bool) {
+        let (a, b, id) = pair().await;
+        let mut received = b.subscriptions.lock().unwrap().pop().unwrap();
+        a.overlay.broadcast_plumtree(&id, &a.key, Certificate::Overlay_EmptyCertificate,
+            0, Some([113; 32]), b"establish direct I/O fixture connection").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), received.recv()).await.unwrap().unwrap().unwrap();
+        let peers = AdnlPeers::with_keys(a.key.id().clone(), b.key.id().clone());
+        let held = a.quic.hold_stream_credit_for_test(&peers).await.unwrap();
+        let generation = a.overlay.overlay_generation(&id).unwrap();
+        let overlay = a.overlay.clone();
+        let dst = b.key.id().clone();
+        let send_id = id.clone();
+        let mut send = tokio::spawn(async move {
+            if query {
+                let request = crate::common::TaggedTlObject::from(
+                    rtos_api::ton::rpc::adnl::Ping { value: 7 }.into_tl_object());
+                overlay.query_via_quic(&dst, &request, &send_id, Some(60_000)).await.map(|_| ())
+            } else {
+                overlay.message_via_quic(&dst, &crate::common::TaggedByteSlice {
+                    object: b"direct message blocked on real stream credit",
+                    #[cfg(feature = "telemetry")]
+                    tag: 0,
+                }, &send_id).await
+            }
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut send).await.is_err(),
+            "direct I/O must wait on actual stream credit");
+        tokio::time::timeout(Duration::from_secs(5), a.overlay.delete_private_overlay_checked(&generation))
+            .await.expect("overlay retirement must cancel its pending direct I/O").unwrap();
+        let error = send.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("Overlay retired during QUIC"), "{error}");
+        assert!(generation.drained());
+        assert!(!a.token.is_cancelled());
+        drop(held);
+        let remote = b.overlay.overlay_generation(&id).unwrap();
+        b.overlay.delete_private_overlay_checked(&remote).await.unwrap();
+        a.quic.shutdown_and_wait().await.unwrap();
+        b.quic.shutdown_and_wait().await.unwrap();
+        a.overlay.adnl.stop_checked().await.unwrap();
+        b.overlay.adnl.stop_checked().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlay_retirement_releases_direct_quic_query() {
+        assert_retirement_releases_direct_quic_io(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlay_retirement_releases_direct_quic_message() {
+        assert_retirement_releases_direct_quic_io(false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
