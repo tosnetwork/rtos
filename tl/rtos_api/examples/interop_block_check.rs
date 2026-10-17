@@ -259,8 +259,20 @@ fn check_request(value: &Value, depth: u8) -> Result<Value> {
             .context("state endpoint name required")).collect::<Result<_>>()?;
         let required: std::collections::BTreeSet<_> = value["references"].as_object()
             .context("all endpoint references required")?.keys().map(String::as_str).collect();
-        ensure!(names == required && names.len() == states.len() && names.len() == 4,
-            "exactly one workchain state from every fixture endpoint required");
+        let fixture_count = match value.get("fixture_validator_count") {
+            Some(count) => {
+                let count = count.as_u64().context("integer fixture validator count required")?;
+                ensure!([3, 4, 6].contains(&count), "unsupported fixture validator count");
+                let members = configuration["current"]["members"].as_array()
+                    .context("authenticated full committee required for explicit fixture count")?;
+                ensure!(members.len() as u64 == count,
+                    "fixture count differs from the authenticated current committee");
+                count as usize
+            }
+            None => 4,
+        };
+        ensure!(names == required && names.len() == states.len() && names.len() == fixture_count,
+            "exactly one workchain state from every declared fixture endpoint required");
         let mut checked_states = Vec::new();
         for source in states {
             ensure!(identity(&source["id"])? == wc_id, "workchain state identity differs");
@@ -280,7 +292,9 @@ fn check_request(value: &Value, depth: u8) -> Result<Value> {
             "created_by":base64_encode(wc_block.read_extra()?.created_by().as_slice()),
             "state_root_hash":base64_encode(wc_root.as_slice()), "states":checked_states,
             "masterchain_anchor_checked":true, "block_file_cell_and_header_checked":true,
-            "all_four_states_match_block_update":true});
+            "fixture_validator_count":fixture_count,
+            "all_declared_states_match_block_update":true,
+            "all_four_states_match_block_update":fixture_count == 4});
     }
     let result = json!({"status":"block_and_state_match", "block":reference["last"],
         "created_by":base64_encode(block.read_extra()?.created_by().as_slice()),

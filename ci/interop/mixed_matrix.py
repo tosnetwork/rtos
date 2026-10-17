@@ -407,6 +407,8 @@ async def run(args, root, snapshot, artifacts):
                         references=dict(zip(endpoint_names, infos)), comparison=infos[comparison_index],
                         comparison_endpoint=endpoint_names[comparison_index], block=block,
                         body_transport='native_rust_rpc' if rust_nodes else 'native_cpp_liteserver')
+                    if member_count != 4:
+                        sample['fixture_validator_count'] = member_count
                     if args.verify_certificates:
                         sample['masterchain_state'] = await native_state(snapshot, lite_configs[0],
                             endpoint_names[0], infos[0]['last'], directory / 'mc-state')
@@ -537,6 +539,9 @@ def main():
     args.genesis_profile = args.genesis_profile.resolve()
     profile = json.loads(args.genesis_profile.read_text())
     member_count = matrix_committee_size(profile, args.cpp_count)
+    if member_count != 4 and not args.prepare_genesis_only and not (
+            args.verify_certificates and args.verify_workchain):
+        raise SystemExit('Full active three/six matrix requires certificates and workchain state checks')
     if member_count != 4 and not args.prepare_genesis_only and any(
             profile.get(key) is None for key in ['expected_zerostate', 'expected_workchain_zerostate']):
         raise SystemExit('Freeze both generated Genesis identities before starting the declared matrix')
