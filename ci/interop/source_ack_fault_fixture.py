@@ -82,9 +82,11 @@ class SourceAckFailure:
         offset = log.stat().st_size
         (self.directory / 'selected-directory').write_text(str(self.pending_directory) + '\n')
         (self.directory / 'armed').write_text('one owned authenticated current MC source store\n')
-        self.receipt.update(phase='waiting_for_native_ack_failure', armed_at_unix=time.time())
+        self.receipt.update(phase='waiting_for_native_ack_failure', armed_at_unix=time.time(),
+            log_start_offset=offset)
         self.save()
         buffer = ''
+        latest_error = None
         expected = 'Input/output error' if self.mode == 'sync-eio' else 'No space left on device'
         marker = self.directory / 'native-error.marker'
         while True:
@@ -93,12 +95,17 @@ class SourceAckFailure:
                 raise RuntimeError('Source ACK target exited before the intended interruption')
             with log.open('rb') as stream:
                 stream.seek(offset); chunk = stream.read(1 << 20); offset += len(chunk)
-            buffer = (buffer + chunk.decode(errors='replace'))[-65536:]
+            buffer += chunk.decode(errors='replace')
+            # Inspect the complete bounded read before keeping the cross-read
+            # tail. A single qualified error may precede a large burst of noise.
             errors = [line for line in buffer.splitlines()
                 if 'Node WAL durable but source ACK needs retry:' in line and expected in line]
-            if marker.is_file() and errors:
+            if errors:
+                latest_error = errors[-1]
+            buffer = buffer[-65536:]
+            if marker.is_file() and latest_error is not None:
                 try:
-                    self.capture_failure(marker, errors[-1])
+                    self.capture_failure(marker, latest_error)
                 except AckWritePending:
                     # A later retry may have truncated the same uncommitted
                     # file after the native failure. Do not accept zero bytes,

@@ -1468,7 +1468,13 @@ impl SourceFinalityDelivery {
                 }
                 Some(SourceStage::Retry(at)) if std::time::Instant::now() < *at => return Ok(None),
                 Some(SourceStage::Acknowledging(receipt, draft)) => {
-                    self.store.acknowledge(&id, receipt.clone())?;
+                    // This state already owns the node's durable receipt, just
+                    // like the stage completion callback below. Keep retries
+                    // observable at that same custody boundary.
+                    if let Err(error) = self.store.acknowledge(&id, receipt.clone()) {
+                        log::error!("Node WAL durable but source ACK needs retry: {error}");
+                        return Err(error);
+                    }
                     let result = (receipt.clone(), draft.clone());
                     stages.remove(&id);
                     drop(stages);

@@ -94,6 +94,58 @@ class SourceAckTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(producer, return_exceptions=True)
                 context.close()
 
+    async def exercise_log_burst(self, split=False, late_marker=False, qualified=True, before_arm=False):
+        with tempfile.TemporaryDirectory() as tmp:
+            context,node,pending=self.context(Path(tmp))
+            context.deadline=time.monotonic()+.45
+            name='a'*64;temporary=pending/(name+'.ack.tmp')
+            original=json.dumps({'session_id':context.receipt['session'],'is_final':True,
+                'block_id':'exact block','data':'boc','signature_set':'certificate'}).encode()
+            (pending/(name+'.json')).write_bytes(original)
+            temporary.write_bytes(b'complete ACK retry')
+            log=node['directory']/'node.log'
+            error=('Node WAL durable but source ACK needs retry: Input/output error' if qualified
+                else 'Session finality retained/retry required: Input/output error')
+            log.write_text(error+'\n' if before_arm else '')
+            async def publish():
+                await asyncio.sleep(.01)
+                if not before_arm:
+                    if split:
+                        log.write_text(error[:30])
+                        await asyncio.sleep(.12)
+                        with log.open('a') as stream:stream.write(error[30:]+'\n'+('noise\n'*45000))
+                    else:
+                        with log.open('a') as stream:stream.write(error+'\n'+('noise\n'*45000))
+                if late_marker:await asyncio.sleep(.15)
+                (context.directory/'native-error.marker').write_text('source sync-eio: '+str(temporary)+'\n')
+            producer=asyncio.create_task(publish());deadline=context.deadline
+            try:
+                if qualified and not before_arm:
+                    await context.arm()
+                    self.assertEqual(context.receipt['native_error_line'],error)
+                    self.assertEqual(context.receipt['pending_sha256'],hashlib.sha256(original).hexdigest())
+                else:
+                    with self.assertRaises(TimeoutError):await context.arm()
+                    self.assertNotIn('native_error_observed_at_unix',context.receipt)
+                self.assertEqual(context.deadline,deadline)
+            finally:
+                producer.cancel();await asyncio.gather(producer,return_exceptions=True);context.close()
+
+    async def test_qualified_ack_error_before_64k_noise_is_not_discarded(self):
+        await self.exercise_log_burst()
+
+    async def test_qualified_ack_error_spanning_reads_survives_large_following_noise(self):
+        await self.exercise_log_burst(split=True)
+
+    async def test_qualified_ack_error_is_retained_until_exact_native_marker_arrives(self):
+        await self.exercise_log_burst(late_marker=True)
+
+    async def test_generic_retry_errno_with_marker_is_not_node_custody_evidence(self):
+        await self.exercise_log_burst(qualified=False)
+
+    async def test_pre_arm_qualified_error_cannot_be_reused(self):
+        await self.exercise_log_burst(before_arm=True)
+
     async def test_authenticated_runtime_is_used_when_offline_preparation_is_stale(self):
         with tempfile.TemporaryDirectory() as tmp:
             context,_,_=self.context(Path(tmp),stale_prepared=True)
