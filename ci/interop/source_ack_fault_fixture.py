@@ -41,7 +41,8 @@ class SourceAckFailure:
         self.directory = directory if directory is not None else paths(root)
         self.node = node
         self.mode = args.source_ack_fault
-        self.started = time.monotonic()
+        budget = getattr(args, 'original_recovery_budget', None)
+        self.started = time.monotonic() if budget is None else budget['monotonic']
         self.deadline = self.started + args.recovery_timeout
         session = base64.b64decode(checkpoint['verified_final_certificates'][0]['session_id'], validate=True).hex()
         candidates = []
@@ -65,7 +66,7 @@ class SourceAckFailure:
         self.receipt = {'phase': 'prepared', 'mode': self.mode, 'member': node['index'],
             'session': session, 'namespace': str(namespace), 'pending_directory': str(self.pending_directory),
             'old_pid': node['process'].pid, 'recovery_limit_seconds': args.recovery_timeout,
-            'budget_started_at_unix': time.time(), 'fault_mechanism': 'test-only native syscall interposition; not physical media failure'}
+            'budget_started_at_unix': time.time() if budget is None else budget['unix'], 'fault_mechanism': 'test-only native syscall interposition; not physical media failure'}
         self.save()
 
     def save(self):

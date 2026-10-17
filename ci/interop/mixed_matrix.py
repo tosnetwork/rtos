@@ -222,6 +222,9 @@ async def prepare_rust(args, directory, i, network, global_config, tcp_used, udp
         (network.zerostate.masterchain.file_hash.hex() + '.boc'), '--member', i]
     if getattr(args, 'include_genesis_successor', False):
         command.append('--include-genesis-successor')
+    expires = getattr(args, 'isolated_signer_expiries', {}).get(i)
+    if expires is not None:
+        command += ['--signer-expire-at', expires]
     await child_checked(command, directory.parent / f'prepare-{directory.name}.log')
     prepared = json.loads((directory / 'validator-prepared.json').read_text())
     if prepared['public_test_member'] != i or prepared['validator_id'] != hashlib.sha256(

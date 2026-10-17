@@ -117,6 +117,13 @@ async def recovery_workchain_states(snapshot, lite_configs, indices, block_id, d
 async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, rust_nodes,
                                   zero, governing, checkpoint, artifacts):
     recovery_fault = None
+    expiry = None
+    if getattr(args, 'signer_expiry_member', None) is not None:
+        from signer_expiry_fixture import SignerExpiry
+        expired_node = next(n for n in rust_nodes if n['index'] == args.signer_expiry_member)
+        expiry = SignerExpiry(args, root, expired_node, checkpoint)
+        checkpoint = await expiry.qualify(args, nodes, endpoints, lite_configs, zero, governing, checkpoint, member_id)
+        args.original_recovery_budget = {'monotonic': expiry.started, 'unix': expiry.started_unix}
     if getattr(args, 'source_ack_partition_restart', False):
         from source_ack_partition_fixture import SourceAckPartitionRestart
         node = next(node for node in rust_nodes if node['index'] == args.interrupt_rust_member)
@@ -139,6 +146,8 @@ async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, ru
             rust_nodes, zero, governing, checkpoint, artifacts, recovery_fault)
         if recovery_fault:
             await recovery_fault.complete(recovered)
+        if expiry:
+            await expiry.complete(recovered)
         return recovered
     finally:
         if recovery_fault:
@@ -669,6 +678,7 @@ async def run(args, profile, root, artifacts):
                             'mixed_rotation_qualified': bool(args.rust_node), 'election_rehearsal': False,
                             'observer_budget': observer_budget, 'recovery': recovery,
                             'partition_restart': json.loads((root / 'recovery-partition/receipt.json').read_text()) if args.partition_restart else None,
+                            'signer_expiry': json.loads((root / 'signer-expiry/receipt.json').read_text()) if args.signer_expiry_member is not None else None,
                             'source_ack_fault': json.loads((root / 'source-ack-fault/receipt.json').read_text()) if args.source_ack_fault else None,
                             'source_ack_partition_restart': json.loads((root / 'source-ack-partition/receipt.json').read_text()) if args.source_ack_partition_restart else None,
                             'source_retention_cut': json.loads((root / 'source-retention-cut/receipt.json').read_text()) if args.source_retention_cut_library else None,
@@ -707,6 +717,8 @@ def main():
     parser.add_argument('--rust-node', type=Path)
     parser.add_argument('--validator-preparer', type=Path)
     parser.add_argument('--interrupt-rust-member', type=int, choices=[2, 5])
+    parser.add_argument('--signer-expiry-member', type=int, choices=[5],
+        help='Offline-provision member5 custody to expire 50 seconds after successor activation')
     parser.add_argument('--recovery-below-quorum', action='store_true',
         help='Require a settled 12-second finality stall while the interrupted successor is needed for weighted quorum')
     parser.add_argument('--partition-restart', action='store_true',
@@ -792,9 +804,14 @@ def main():
         raise SystemExit('Observer budget must be a separate owned availability case')
     epoch_weights(profile, 'initial_weights', INITIAL)
     weights = epoch_weights(profile, 'successor_weights', SUCCESSOR)
+    from signer_expiry_fixture import expiry_plan
+    args.signer_expiry_plan = expiry_plan(profile, args)
+    if args.signer_expiry_plan:
+        args.isolated_signer_expiries = {5: args.signer_expiry_plan['expire_at']}
     if args.interrupt_rust_member is not None:
         from recovery_quorum_fixture import recovery_quorum_plan
-        args.recovery_quorum_plan = recovery_quorum_plan(profile, args.interrupt_rust_member, args.recovery_below_quorum)
+        args.recovery_quorum_plan = recovery_quorum_plan(profile, args.interrupt_rust_member, args.recovery_below_quorum,
+            unavailable=(5,) if args.signer_expiry_plan else ())
     if 'weighted_quorum_pause' in profile:
         if type(profile['weighted_quorum_pause']) is not list or any(type(i) is not int for i in profile['weighted_quorum_pause']) \
                 or profile['weighted_quorum_pause'] != [0, 2] or args.network_fault or args.interrupt_rust_member is not None:
@@ -828,7 +845,7 @@ def main():
     artifacts[str(driver)] = digest(driver)
     artifacts[str(helper)] = digest(helper)
     weighted_helpers = {}
-    for name in ['quorum_profile.py', 'weighted_quorum_fixture.py', 'observer_budget_fixture.py', 'recovery_quorum_fixture.py']:
+    for name in ['quorum_profile.py', 'weighted_quorum_fixture.py', 'observer_budget_fixture.py', 'recovery_quorum_fixture.py', 'signer_expiry_fixture.py']:
         path = driver.with_name(name)
         artifacts[str(path)] = digest(path)
         weighted_helpers[name] = digest(path)

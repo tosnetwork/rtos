@@ -30,6 +30,15 @@ class RecoveryQuorumTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):quorum.recovery_quorum_plan(self.profile(), 3, True)
         self.assertIsNone(quorum.recovery_quorum_plan({}, 2, False))
 
+    def test_expired_signer_keeps_original_weight_but_cannot_count_as_available(self):
+        plan=quorum.recovery_quorum_plan({},2,True,unavailable=(5,))
+        self.assertEqual(plan['weights'],{0:17,2:17,4:17,5:17})
+        self.assertEqual((plan['total_weight'],plan['quorum_weight'],plan['surviving_weight']),(68,46,34))
+        self.assertEqual(plan['survivor_members'],[0,4])
+        self.assertEqual(plan['unavailable_signer_members'],[5])
+        for bad in [(2,),(1,),(5,5),(True,)]:
+            with self.assertRaises(ValueError):quorum.recovery_quorum_plan({},2,True,unavailable=bad)
+
     async def observe(self, root, reader, *, deadline=None):
         plan=quorum.recovery_quorum_plan(self.profile(), 2, True)
         with patch.object(quorum, 'rpc', side_effect=reader):

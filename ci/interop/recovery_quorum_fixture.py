@@ -7,13 +7,15 @@ from partition_restart_fixture import hold
 from quorum_profile import epoch_weights, quorum_threshold
 
 
-def recovery_quorum_plan(profile, member, below_quorum):
+def recovery_quorum_plan(profile, member, below_quorum, *, unavailable=()):
     committee = [0, 2, 4, 5]
     if member not in committee:
         raise ValueError('Recovery member must belong to the successor committee')
     weights = epoch_weights(profile, 'successor_weights', committee)
     total = sum(weights.values()); threshold = quorum_threshold(total)
-    survivors = [i for i in committee if i != member]
+    if any(type(i) is not int or i not in committee or i == member for i in unavailable) or len(set(unavailable)) != len(unavailable):
+        raise ValueError('Unavailable signers must be distinct declared successor peers')
+    survivors = [i for i in committee if i != member and i not in unavailable]
     surviving = sum(weights[i] for i in survivors)
     if not below_quorum:
         if surviving < threshold:
@@ -21,10 +23,12 @@ def recovery_quorum_plan(profile, member, below_quorum):
         return None
     if surviving >= threshold:
         raise ValueError('Below-quorum observation requires insufficient surviving weight')
-    return {'member': member, 'weights': weights, 'total_weight': total, 'quorum_weight': threshold,
+    plan = {'member': member, 'weights': weights, 'total_weight': total, 'quorum_weight': threshold,
         'surviving_weight': surviving, 'survivor_members': survivors,
         'live_endpoints': [i for i in range(6) if i != member],
         'settle_seconds': 4, 'observe_seconds': 12}
+    if unavailable:plan['unavailable_signer_members'] = list(unavailable)
+    return plan
 
 
 async def observe_below_quorum(root, endpoints, zero, plan, deadline, *,

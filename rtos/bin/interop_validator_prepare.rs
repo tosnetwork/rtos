@@ -31,7 +31,33 @@ struct Args {
     /// Also provision only the exact successor set committed in Genesis.
     #[arg(long)]
     include_genesis_successor: bool,
+    /// A finite offline custody deadline for this public test member.
+    #[arg(long)]
+    signer_expire_at: Option<u32>,
 }
+
+fn signer_expiry(explicit: Option<u32>, now: u64) -> anyhow::Result<u32> {
+    match explicit {
+        None => Ok(u32::MAX),
+        Some(value) if value != u32::MAX && u64::from(value) > now && value != 0 => Ok(value),
+        _ => fail!("Explicit fixture signer expiry must be finite and in the future"),
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+    #[test]
+    fn explicit_custody_deadline_cannot_be_expired_or_unbounded() {
+        assert_eq!(signer_expiry(None, 100).unwrap(), u32::MAX);
+        assert_eq!(signer_expiry(Some(101), 100).unwrap(), 101);
+        for deadline in [0, 1, 99, 100, u32::MAX] {
+            assert!(signer_expiry(Some(deadline), 100).is_err());
+        }
+        assert!(signer_expiry(Some(u32::MAX - 1), u64::from(u32::MAX)).is_err());
+    }
+}
+
 
 fn public_seed(label: &str, member: u8) -> UInt256 {
     UInt256::calc_file_hash(format!("n6-validator-{label}-{member}").as_bytes())
@@ -50,6 +76,8 @@ fn create_private_directory(path: &std::path::Path) -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let expire_at = signer_expiry(args.signer_expire_at,
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())?;
     let root = args.configs.canonicalize()?;
     // Do not provision a running, previously used, or partially prepared node.
     for name in
@@ -174,10 +202,10 @@ async fn main() -> anyhow::Result<()> {
         let successors = runtimes.iter().filter(|(phase, _)| *phase == "successor")
             .map(|(_, runtime)| runtime.clone()).collect::<Vec<_>>();
         if !successors.is_empty() {
-            let expire_at = config.next_validator_set()?.utime_since().checked_add(600)
+            let schedule_expiry = config.next_validator_set()?.utime_since().checked_add(600)
                 .ok_or_else(|| error!("Successor fixture expiry overflow"))?;
             simplex::isolated_signing::provision_schedule(&successors, &root.join("node_db/catchains"),
-                &owner, &key_file, expire_at)?;
+                &owner, &key_file, schedule_expiry.min(expire_at))?;
         }
     }
     let mut sessions = Vec::new();
@@ -205,10 +233,10 @@ async fn main() -> anyhow::Result<()> {
             &shard_owner,
             &key_file,
             1,
-            u32::MAX,
+            expire_at,
         )?;
         sessions.push(serde_json::json!({"shard":runtime.shard().to_string(),
-            "committee_phase":phase,
+            "committee_phase":phase,"expire_at":expire_at,
             "masterchain":runtime.shard().is_masterchain(),
             "catchain_seqno":runtime.catchain_seqno(),
             "session":runtime.session_id().to_hex_string(), "namespace":namespace,
@@ -243,7 +271,7 @@ async fn main() -> anyhow::Result<()> {
         serde_json::to_vec_pretty(&serde_json::json!({
             "public_test_member":args.member,"validator_id":stable_id.to_hex_string(),
             "local_adnl":hex::encode(transport.id().data()),"zerostate":zero.to_string(),
-            "sessions":sessions,"active_voting_qualified":false
+            "sessions":sessions,"signer_expire_at":expire_at,"active_voting_qualified":false
         }))?,
     )?;
     Ok(())
