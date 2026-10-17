@@ -1098,7 +1098,27 @@ pub fn scan_pending_finality(root: &Path) -> Result<Vec<PendingFinalityRecovery>
         let Some(store) = PendingFinalityStore::lock(path)? else {
             continue;
         };
+        // The store permits one uncertain temporary. Resume the original
+        // pending source whose ACK was interrupted before another source tries
+        // to create its ACK temporary. This changes only recovery order: Engine
+        // still authenticates the original record and supplies a fresh durable
+        // receipt. Never read, promote, or remove the uncertain ACK here.
+        let mut paths = Vec::new();
         for path in store.paths()? {
+            let resume_ack = if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                match std::fs::symlink_metadata(path.with_extension("ack.tmp")) {
+                    Ok(metadata) if metadata.file_type().is_file() => true,
+                    Ok(_) => fail!("Invalid source ACK temporary"),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                false
+            };
+            paths.push((!resume_ack, path));
+        }
+        paths.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, path) in paths {
             if path.extension().and_then(|s| s.to_str()) == Some("delivered") {
                 let id: UInt256 = path.file_stem().unwrap().to_str().unwrap().parse()?;
                 store.delivered_reference(&id)?;
@@ -1792,6 +1812,59 @@ pub(crate) mod tests {
         recovered.into_iter().next().unwrap().acknowledge(UInt256::from([3; 32])).unwrap();
         assert!(scan_pending_finality(temp.path()).unwrap().is_empty());
     }
+    #[test]
+    fn source_finality_interrupted_ack_replays_first_without_promoting_temporary() {
+        for temporary_bytes in [Vec::new(), b"{torn".to_vec(), b"untrusted complete-looking ACK".to_vec()] {
+            let temp = crate::authenticated_fixture::TestDirectory::new();
+            let (runtime, first) = fixture_seqno(true, ShardIdent::masterchain(), 1);
+            let (other_runtime, second) = fixture_seqno(true, ShardIdent::masterchain(), 2);
+            assert_eq!(runtime.session_id(), other_runtime.session_id());
+            let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+            let mut records = [PendingFinalityRecord::from_draft(&runtime, &first).unwrap(),
+                PendingFinalityRecord::from_draft(&runtime, &second).unwrap()];
+            records.sort_by_key(|record| record.id().unwrap().to_hex_string());
+            let store = PendingFinalityStore::open(&namespace).unwrap();
+            for record in &records { store.retain(record).unwrap(); }
+            let last = records[1].id().unwrap();
+            let pending = store.directory.join(format!("{}.json", last.to_hex_string()));
+            let original = std::fs::read(&pending).unwrap();
+            let temporary = pending.with_extension("ack.tmp");
+            std::fs::write(&temporary, &temporary_bytes).unwrap();
+            drop(store);
+            let recovered = scan_pending_finality(temp.path()).unwrap();
+            assert_eq!(recovered.len(), 2);
+            assert_eq!(recovered[0].record().id().unwrap(), last,
+                "the unfinished ACK must be retried before an earlier filename allocates another temporary");
+            assert_eq!(std::fs::read(&temporary).unwrap(), temporary_bytes);
+            assert_eq!(std::fs::read(&pending).unwrap(), original);
+            assert!(!pending.with_extension("acked").exists(), "scan is not an acknowledgement");
+            let fresh_receipt = UInt256::from([3; 32]);
+            for source in recovered { source.acknowledge(fresh_receipt.clone()).unwrap(); }
+            let ack: AcknowledgedRecord = serde_json::from_slice(&std::fs::read(pending.with_extension("acked")).unwrap()).unwrap();
+            assert_eq!(ack.node_receipt, fresh_receipt.to_hex_string());
+            assert_eq!(serde_json::to_vec(&ack.record).unwrap(), original);
+            assert!(!temporary.exists());
+            assert!(scan_pending_finality(temp.path()).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn source_finality_unknown_temporary_still_blocks_new_mutation() {
+        let temp = crate::authenticated_fixture::TestDirectory::new();
+        let (runtime, draft) = fixture();
+        let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+        let store = PendingFinalityStore::open(&namespace).unwrap();
+        let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
+        store.retain(&record).unwrap();
+        let temporary = store.directory.join("unknown.tmp");
+        std::fs::write(&temporary, b"uncertain evidence").unwrap();
+        drop(store);
+        let mut recovered = scan_pending_finality(temp.path()).unwrap();
+        let error = recovered.pop().unwrap().acknowledge(UInt256::from([3; 32])).unwrap_err();
+        assert!(error.to_string().contains("Another uncertain source temporary"));
+        assert_eq!(std::fs::read(temporary).unwrap(), b"uncertain evidence");
+    }
+
     #[test]
     fn source_finality_retry_reuses_exact_retained_proof_and_metadata() {
         let temp = crate::authenticated_fixture::TestDirectory::new();
