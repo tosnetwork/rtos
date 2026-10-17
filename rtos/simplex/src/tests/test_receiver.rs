@@ -2322,3 +2322,40 @@ fn classical_target_receiver_real_candidate_repair_for_protocols_zero_one() {
 
 #[path = "test_authenticated_receiver.rs"]
 mod authenticated_receiver;
+
+
+#[test]
+fn test_receiver_certificate_ingress_boundary_reopens_after_progress() {
+    // Owned in-process overlay, not a packet-source authentication assertion.
+    let overlay = SessionFactory::create_in_process_overlay_manager(2);
+    let session = UInt256::rand();
+    let keys: Vec<_> = (0..2).map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap()).collect();
+    let nodes: Vec<_> = keys.iter().map(|key| SessionNode {
+        public_key: key.clone(), adnl_id: key.id().clone(), weight: 1,
+    }).collect();
+    let create = |index: usize| {
+        let (listener, stats) = TestReceiverListener::create(index as u32);
+        let erased: Arc<dyn ReceiverListener + Send + Sync> = listener.clone();
+        let receiver = crate::receiver::ReceiverWrapper::create(
+            session.clone(), &ShardIdent::masterchain(), &nodes, &keys[index], overlay.clone(),
+            Arc::downgrade(&erased), Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+            crate::receiver::ReceiverSettings {
+                slots_per_leader_window: 4, max_leader_window_desync: 2, ..Default::default()
+            },
+        ).unwrap();
+        (receiver, listener, stats)
+    };
+    let (sender, _sender_listener, _) = create(0);
+    let (receiver, _receiver_listener, stats) = create(1);
+    sender.send_certificate(make_skip_certificate(12));
+    sender.send_certificate(make_skip_certificate(11));
+    wait_until(Duration::from_secs(3), || stats.certificates_received.load(Ordering::Acquire) >= 1);
+    assert_eq!(stats.received_certificates.lock().unwrap().iter().map(certificate_slot).collect::<Vec<_>>(), vec![11],
+        "receiver must filter the exclusive boundary before the main-thread callback");
+    receiver.set_ingress_progress_slot(4);
+    sender.send_certificate(make_skip_certificate(12));
+    wait_until(Duration::from_secs(3), || stats.certificates_received.load(Ordering::Acquire) >= 2);
+    assert_eq!(stats.received_certificates.lock().unwrap().iter().map(certificate_slot).collect::<Vec<_>>(), vec![11,12]);
+    sender.stop(); receiver.stop();
+}

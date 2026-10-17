@@ -1544,33 +1544,55 @@ fn test_on_certificate_relays_and_caches_skip_certificate_once() {
 }
 
 #[test]
-fn test_future_certificate_is_not_rejected_like_cpp() {
-    let mut fixture = TestFixture::new(4);
+fn test_certificate_ingress_excludes_upper_boundary_before_verification() {
+    for source in [Some(1), None] {
+        let mut opts = SessionOptions::default();
+        opts.slots_per_leader_window = 4;
+        opts.max_leader_window_desync = 2;
+        let mut fixture = TestFixture::new_with_opts(4, opts);
+        fixture.drain_receiver_actions();
+        let boundary = fixture.processor.simplex_state.first_too_new_vote_slot().value();
+        assert_eq!(boundary, 12);
+        let valid = build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, boundary, &[0,1,2]);
+        fixture.processor.on_certificate(source, valid);
+        let wrong_session = build_skip_certificate_tl(&UInt256::from([77;32]), &fixture.nodes, boundary, &[0,1,2]);
+        fixture.processor.on_certificate(source, wrong_session);
+        fixture.drain_pending_async_db_results();
+        assert!(!fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(boundary)),
+            "exclusive ingress boundary cannot be admitted");
+        assert_eq!(fixture.processor.simplex_state.get_first_non_progressed_slot(), SlotIndex::new(0));
+        assert_eq!(fixture.processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed), 0,
+            "out-of-window certificate must not reach signature verification");
+        assert!(fixture.drain_receiver_actions().is_empty(),
+            "rejected ingress cannot persist, relay, request candidates or ban its source");
+    }
+}
+
+#[test]
+fn test_certificate_ingress_accepts_inside_boundary_and_after_progress() {
+    let mut opts = SessionOptions::default();
+    opts.slots_per_leader_window = 4;
+    opts.max_leader_window_desync = 2;
+    let mut fixture = TestFixture::new_with_opts(4, opts);
     fixture.drain_receiver_actions();
-
-    let slot = fixture.processor.simplex_state.first_too_new_vote_slot().value();
-    let tl_cert =
-        build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, slot, &[0, 1, 2]);
-
-    fixture.processor.on_certificate(1, tl_cert);
-    // Skip persist + relay are async (registry continuation); drain before asserting.
+    let boundary = fixture.processor.simplex_state.first_too_new_vote_slot().value();
+    let at_boundary = build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, boundary, &[0,1,2]);
+    fixture.processor.on_certificate(1, at_boundary.clone());
+    assert!(!fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(boundary)));
+    let inside = build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, boundary-1, &[0,1,2]);
+    fixture.processor.on_certificate(1, inside);
     fixture.drain_pending_async_db_results();
-
-    assert!(
-        fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(slot)),
-        "certificate at the vote too-new boundary should still be stored"
-    );
-    assert_eq!(
-        fixture.processor.simplex_state.get_first_non_progressed_slot(),
-        SlotIndex::new(0),
-        "out-of-order future certificate must not advance progress past unresolved earlier slots"
-    );
-
-    let actions = fixture.drain_receiver_actions();
-    assert!(
-        actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
-        "accepted future certificate should still be relayed"
-    );
+    assert!(fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(boundary-1)));
+    for slot in 0..4 {
+        let cert = build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, slot, &[0,1,2]);
+        fixture.processor.on_certificate(1, cert);
+        fixture.drain_pending_async_db_results();
+    }
+    assert!(fixture.processor.simplex_state.first_too_new_vote_slot().value() > boundary);
+    fixture.processor.on_certificate(1, at_boundary);
+    fixture.drain_pending_async_db_results();
+    assert!(fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(boundary)),
+        "the same certificate becomes admissible when real progress opens its window");
 }
 
 // ============================================================================
@@ -11578,8 +11600,8 @@ fn authenticated_observer_processor_accepts_only_valid_pq_quorum_without_signing
     let receiver = MockReceiver::new();
     let mut processor = make_pq_processor_with_description_for_test(db.clone(), description);
     processor.receiver = receiver.clone();
-    let make_certificate = |session: &SessionId, signers: &[usize], corrupt: bool| {
-        let vote = SkipVote { slot: 0 }.into_boxed();
+    let make_certificate_at = |slot: u32, session: &SessionId, signers: &[usize], corrupt: bool| {
+        let vote = SkipVote { slot: slot as i32 }.into_boxed();
         let preimage = crate::utils::create_data_to_sign(
             session, &crate::utils::serialize_unsigned_vote(&vote),
         );
@@ -11591,6 +11613,11 @@ fn authenticated_observer_processor_accepts_only_valid_pq_quorum_without_signing
         Certificate { vote, signatures: VoteSignatureSet { votes: signatures }.into_boxed() }
             .into_boxed()
     };
+    let make_certificate = |session: &SessionId, signers: &[usize], corrupt: bool| {
+        make_certificate_at(0, session, signers, corrupt)
+    };
+    let boundary = processor.simplex_state.first_too_new_vote_slot().value();
+    let boundary_cert = make_certificate_at(boundary, runtime.session_id(), &[0,1], false);
     let invalid = [
         make_certificate(runtime.session_id(), &[0], false), // weight 1 < quorum 2
         make_certificate(runtime.session_id(), &[0, 0], false), // duplicate cannot add weight
@@ -11600,6 +11627,11 @@ fn authenticated_observer_processor_accepts_only_valid_pq_quorum_without_signing
     let valid = make_certificate(runtime.session_id(), &[0, 1], false);
     let calls: Vec<_> = stores.iter().map(|store| store.consensus_signatures_produced()).collect();
     receiver.drain_actions();
+    processor.on_certificate(None::<u32>, boundary_cert);
+    assert!(!processor.simplex_state.has_skip_certificate(SlotIndex::new(boundary)));
+    assert!(db.load_skip_cert_by_slot(SlotIndex::new(boundary), Duration::from_secs(5)).unwrap().is_none());
+    assert!(receiver.drain_actions().is_empty());
+    assert_eq!(processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed), 0);
     for certificate in invalid {
         // None is a transport observer, not a forged committee index zero.
         processor.on_certificate(None::<u32>, certificate);

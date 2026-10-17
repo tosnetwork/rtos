@@ -1001,6 +1001,18 @@ impl ConsensusController {
             return false;
         }
 
+        // Match fixed C++ pool.cpp: the network ingress bound is exclusive
+        // and checked before certificate verification, persistence or repair.
+        if backend.simplex_state().is_vote_slot_too_far_ahead(tl_slot) {
+            log::warn!(
+                "Session {} on_certificate: REJECTED - slot {tl_slot} outside ingress window \
+                (first_too_new={}) kind={tl_kind} from source_idx={source_idx:?}",
+                &self.session_id().to_hex_string()[..8],
+                backend.simplex_state().first_too_new_vote_slot(),
+            );
+            return false;
+        }
+
         // Parse and verify the certificate (C++ strict policy)
         // Certificate::from_tl performs comprehensive validation:
         // - Rejects invalid validator indices

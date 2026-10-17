@@ -1587,18 +1587,13 @@ impl ReceiverImpl {
         // Reference: C++ pool.cpp only calls reschedule_standstill_resolution() in on_finalization()
     }
 
-    /// Returns `true` if a vote slot is outside the C++ vote ingress range
+    /// Returns `true` if a vote or certificate slot is outside the C++ ingress range
     /// `[first_active_slot, first_too_new_vote_slot())`.
-    fn is_vote_slot_out_of_bounds(&self, slot: u32) -> bool {
+    fn is_ingress_slot_out_of_bounds(&self, slot: u32) -> bool {
         slot < self.first_active_slot || slot >= self.first_too_new_vote_slot()
     }
 
-    /// Returns `true` if a certificate references an already finalized slot.
-    fn is_certificate_slot_too_old(&self, slot: u32) -> bool {
-        slot < self.first_active_slot
-    }
-
-    /// Returns the first slot that is considered "too new" for votes.
+    /// Returns the exclusive upper ingress bound shared by votes and certificates.
     ///
     /// Mirrors C++ `pool.cpp`:
     /// `(now_ / slots_per_leader_window + max_desync + 1) * slots_per_leader_window`
@@ -1669,7 +1664,7 @@ impl ReceiverImpl {
         // Keep the receiver prefilter cheap; SessionProcessor mirrors the C++
         // warning behavior while the receiver only traces Rust-side drops.
         let slot = Self::get_vote_slot(&vote);
-        if self.is_vote_slot_out_of_bounds(slot) {
+        if self.is_ingress_slot_out_of_bounds(slot) {
             log::trace!(
                 "SimplexReceiver {}: dropped vote from source {} - slot {} outside [{}, {})",
                 self.session_id.to_hex_string(),
@@ -1799,15 +1794,16 @@ impl ReceiverImpl {
             sigs
         );
 
-        // Mirror C++: drop finalized/old certificates cheaply, but do not reject
-        // a certificate only because its slot is ahead of the current vote horizon.
-        if self.is_certificate_slot_too_old(slot) {
+        // Fixed C++ pool.cpp uses the same exclusive upper ingress bound for
+        // certificates and votes, before verification or slot bookkeeping.
+        if self.is_ingress_slot_out_of_bounds(slot) {
             log::trace!(
-                "SimplexReceiver {}: dropped old certificate from source {:?} - slot {} < {} kind={}",
+                "SimplexReceiver {}: dropped certificate from source {:?} - slot {} outside [{}, {}) kind={}",
                 self.session_id.to_hex_string(),
                 source_idx,
                 slot,
                 self.first_active_slot,
+                self.first_too_new_vote_slot(),
                 kind
             );
             return;
