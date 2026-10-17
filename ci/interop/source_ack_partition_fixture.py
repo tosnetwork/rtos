@@ -24,6 +24,8 @@ def source_ack_partition_environment(args, root):
             raise RuntimeError('Intent cut refuses inherited controls')
         environment['RTOS_TEST_SOURCE_INTENT_ARM'] = str(root / 'source-ack-partition/intent-armed')
         environment['RTOS_TEST_SOURCE_INTENT_MARKER'] = str(root / 'source-ack-partition/intent-stop.marker')
+        environment['RTOS_TEST_SOURCE_INTENT_POINT'] = getattr(args, 'source_ack_intent_cut_point', 'after-fsync')
+        environment['RTOS_TEST_SOURCE_INTENT_INTENDED'] = str(root / 'source-ack-partition/intent-intended.json')
     return environment
 
 
@@ -52,6 +54,7 @@ class SourceAckPartitionRestart:
         self.directory = root / 'source-ack-partition'
         self.directory.mkdir()
         self.intent_stop = getattr(args, 'source_ack_intent_stop', False)
+        self.intent_point = getattr(args, 'source_ack_intent_cut_point', 'after-fsync')
         self.receipt = {'phase': 'prepared', 'member': args.interrupt_rust_member,
             'mode': 'source_ack_failure_and_partition_across_restart',
             'source_ack_fault': args.source_ack_fault,
@@ -119,7 +122,7 @@ class SourceAckPartitionRestart:
             temporary = Path(cut['path'])
             completed = temporary.parent / 'completed-v1' / temporary.with_suffix('.complete').name
             value = json.loads(completed.read_text())
-            if value.get('schema') != 1 or value.get('record') != json.loads(self.intent_original):
+            if value.get('schema') != 1 or value.get('record') != json.loads(self.intent_expected):
                 raise RuntimeError('Completed intent differs from the original stopped certificate')
             if temporary.exists() or temporary.with_suffix('.json').exists():
                 raise RuntimeError('Stopped certificate intent remains unresolved')
@@ -141,10 +144,10 @@ class SourceAckPartitionRestart:
             if process.returncode is not None:
                 raise RuntimeError('Intent cut target exited before the selected sync')
             if marker.exists():
-                match = re.fullmatch(r'intent after-fsync pid=(\d+): (.+)\n', marker.read_text())
-                if not match or int(match[1]) != process.pid:
+                match = re.fullmatch(r'intent (after-fsync|before-write|after-partial-write) pid=(\d+): (.+)\n', marker.read_text())
+                if not match or match[1] != self.intent_point or int(match[2]) != process.pid:
                     raise RuntimeError('Intent cut marker has a different process')
-                temporary = Path(match[2])
+                temporary = Path(match[3])
                 if temporary.parent != self.source.pending_directory.parent / 'finality-intents':
                     raise RuntimeError('Intent cut reached a different namespace')
                 if not re.fullmatch(r'(0|[1-9][0-9]{0,9})-[0-9a-f]{64}\.tmp', temporary.name):
@@ -154,18 +157,27 @@ class SourceAckPartitionRestart:
                     await asyncio.sleep(.02)
                     continue
                 original = temporary.read_bytes()
-                value = json.loads(original)
+                expected = original if self.intent_point == 'after-fsync' else (self.directory / 'intent-intended.json').read_bytes()
+                if self.intent_point == 'before-write' and original:
+                    raise RuntimeError('Intent before-write cut did not preserve an empty file')
+                if self.intent_point == 'after-partial-write' and not (0 < len(original) == len(expected) // 2 < len(expected) and expected.startswith(original)):
+                    raise RuntimeError('Intent half-write cut did not preserve the exact written prefix')
+                value = json.loads(expected)
                 if value['session_id'] != self.source.receipt['session'] or temporary.stem != f"{value['slot']}-{value['candidate_hash']}":
                     raise RuntimeError('Stopped intent identity differs from the authenticated source')
                 completed = temporary.parent / 'completed-v1' / temporary.with_suffix('.complete').name
                 if temporary.with_suffix('.json').exists() or temporary.with_suffix('.resolved').exists() or completed.exists():
                     raise RuntimeError('Intent cut already has committed or completed proof')
                 self.intent_original = original
+                self.intent_expected = expected
                 (self.directory / 'intent-before.json').write_bytes(original)
+                (self.directory / 'intent-original-record.json').write_bytes(expected)
                 (self.directory / 'intent-stopped-process.txt').write_text(status)
                 self.receipt['intent_cut'] = {'path': str(temporary), 'pid': process.pid,
                     'slot': value['slot'], 'candidate_hash': value['candidate_hash'],
                     'bytes': len(original), 'sha256': hashlib.sha256(original).hexdigest(),
+                    'point': self.intent_point, 'intended_bytes': len(expected),
+                    'intended_sha256': hashlib.sha256(expected).hexdigest(),
                     'observed_at_unix': time.time(), 'stopped_state_verified': True,
                     'normal_replay_completed': False}
                 self.save()

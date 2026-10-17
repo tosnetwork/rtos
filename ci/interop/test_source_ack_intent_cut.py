@@ -52,7 +52,7 @@ int main(int argc, char **argv) {
     def tearDownClass(cls):
         cls.workspace.cleanup()
 
-    def invoke(self, mode='fsync', negative=None):
+    def invoke(self, mode='fsync', negative=None, point='after-fsync'):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); namespace = root / 'owned'; pending = namespace / 'finality-pending'
             pending.mkdir(parents=True); intents = namespace / 'finality-intents'; intents.mkdir()
@@ -74,7 +74,9 @@ int main(int argc, char **argv) {
                 'RTOS_TEST_SOURCE_FAULT_ARM': str(arm), 'RTOS_TEST_SOURCE_FAULT_MARKER': str(root / 'ack-error.marker'),
                 'RTOS_TEST_SOURCE_FAULT_DIRECTORY_FILE': str(selector),
                 'RTOS_TEST_SOURCE_INTENT_ARM': str(root / 'intent-armed'),
-                'RTOS_TEST_SOURCE_INTENT_MARKER': str(marker)}
+                'RTOS_TEST_SOURCE_INTENT_MARKER': str(marker),
+                'RTOS_TEST_SOURCE_INTENT_POINT': point,
+                'RTOS_TEST_SOURCE_INTENT_INTENDED': str(root / 'intended.json')}
             child = subprocess.Popen([str(self.probe), str(target), str(ack),
                 'no-arm' if negative == 'missing_arm' else 'arm', mode], env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -94,8 +96,11 @@ int main(int argc, char **argv) {
                         time.sleep(.01)
                     self.assertTrue(marker.exists())
                     self.assertTrue(any(l.startswith('State:') and l.split()[1] == 'T' for l in status.splitlines()))
-                    self.assertEqual(marker.read_text(), f'intent after-fsync pid={child.pid}: {target}\n')
-                    self.assertEqual(target.read_bytes(), b'{"complete_test_write":true}')
+                    self.assertEqual(marker.read_text(), f'intent {point} pid={child.pid}: {target}\n')
+                    expected = b'{"complete_test_write":true}'
+                    actual = expected if point == 'after-fsync' else expected[:0 if point == 'before-write' else len(expected)//2]
+                    self.assertEqual(target.read_bytes(), actual)
+                    if point != 'after-fsync':self.assertEqual((root / 'intended.json').read_bytes(), expected)
                     self.assertFalse(target.with_suffix('.json').exists())
                     child.kill(); stdout, stderr = child.communicate(timeout=3)
                     self.assertEqual(child.returncode, -9, stderr)
@@ -105,8 +110,9 @@ int main(int argc, char **argv) {
                 child.communicate(timeout=3)
 
     def test_actual_fsync_and_fdatasync_stop_before_return(self):
-        for mode in ['fsync', 'fdatasync']:
-            with self.subTest(mode=mode):self.invoke(mode)
+        for point in ['after-fsync', 'before-write', 'after-partial-write']:
+            for mode in ['fsync', 'fdatasync']:
+                with self.subTest(mode=mode, point=point):self.invoke(mode, point=point)
 
     def test_exact_scope_and_arm_counterexamples(self):
         for negative in ['other_namespace', 'completed', 'wrong_name', 'leading_zero',

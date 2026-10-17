@@ -736,8 +736,8 @@ impl SessionImpl {
         };
 
         if authenticated_runtime.is_some() {
-            if let Err(error) =
-                callbacks.prepare_finality_intents(!bootstrap.final_certs.is_empty())
+            if let Err(error) = callbacks.prepare_finality_intents(!bootstrap.final_certs.is_empty())
+                .and_then(|()| callbacks.prepare_database_finality_intents(&bootstrap.final_certs))
             {
                 fail_startup(error, "Source finality provenance unavailable");
                 return;

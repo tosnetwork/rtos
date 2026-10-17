@@ -701,6 +701,7 @@ def main():
     parser.add_argument('--interrupt-rust-member', type=int, choices=[2, 5])
     parser.add_argument('--partition-restart', action='store_true',
         help='Keep the interrupted member partitioned through restart; fault seconds apply before survivor proof and after restart')
+    parser.add_argument('--source-ack-intent-cut-point', choices=['after-fsync','before-write','after-partial-write'], default='after-fsync')
     parser.add_argument('--source-ack-intent-stop', action='store_true',
         help='After ACK failure, stop an intact current source intent after fsync before rename')
     parser.add_argument('--source-ack-partition-restart', action='store_true',
@@ -719,6 +720,8 @@ def main():
     sequence = ([args.network_fault] if args.network_fault else []) + args.additional_network_faults
     if args.additional_network_faults and not args.network_fault or len(sequence) > 4 or len(set(sequence)) != len(sequence):
         raise SystemExit('Predeclare up to four distinct packet cases; repeats are not retries')
+    if args.source_ack_intent_cut_point != 'after-fsync' and not args.source_ack_intent_stop:
+        raise SystemExit('Incomplete intent cut requires its explicit intent stop option')
     if args.source_ack_intent_stop and not (args.source_ack_partition_restart and args.source_ack_fault == 'sync-eio'):
         raise SystemExit('Intent sync cut requires the explicit combined sync-eio restart')
     if args.source_ack_partition_restart and not (args.source_ack_fault and args.partition_restart):

@@ -177,10 +177,11 @@ pub fn authenticate_source_history_debt(
             .and_then(|n| n.checked_mul(32))
             .ok_or_else(|| error!("Source digest overflow"))?,
     )?;
-    let mut digests = Vec::with_capacity((paths.len() + 1) * 32);
+    let mut digests = Vec::with_capacity((paths.len() + 1) * 96);
     digests.extend_from_slice(
         UInt256::calc_file_hash(record.namespace.as_os_str().as_encoded_bytes()).as_slice(),
     );
+    let mut verified_certificates = 0usize;
     for path in paths {
         budget.step()?;
         let file = File::open(&path)?;
@@ -207,7 +208,19 @@ pub fn authenticate_source_history_debt(
         budget.workspace(
             1024 * std::mem::size_of::<rtos_api::ton::consensus::simplex::VoteSignature>(),
         )?;
-        let (actual, _certificate, wire) = decode_intent_typed(&path, &record.namespace, &bytes)?;
+        let (actual, _certificate, wire) = match decode_intent_typed(&path, &record.namespace, &bytes) {
+            Ok(value) => value,
+            Err(error) if interrupted_pending_id(&path, &error).is_some() => {
+                // Physical debt is retained and bound into the receipt, but
+                // contributes no certificate authority. At least one intact,
+                // matching quorum proof below remains mandatory.
+                digests.extend_from_slice(UInt256::calc_file_hash(b"uncommitted-source-intent").as_slice());
+                digests.extend_from_slice(UInt256::calc_file_hash(path.file_name().unwrap().as_encoded_bytes()).as_slice());
+                digests.extend_from_slice(UInt256::calc_file_hash(&bytes).as_slice());
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if !same_record(record, &actual) {
             fail!("Source history certificate locator mismatch");
         }
@@ -223,7 +236,11 @@ pub fn authenticate_source_history_debt(
         if !matches!(verified.vote, crate::simplex_state::Vote::Finalize(_)) {
             fail!("Source history certificate is not FinalCert");
         }
+        verified_certificates += 1;
         digests.extend_from_slice(UInt256::calc_file_hash(&bytes).as_slice());
+    }
+    if verified_certificates == 0 {
+        fail!("Source history has no verified retained certificate");
     }
     Ok(SourceHistoryDebt {
         record: record.clone(),
@@ -334,6 +351,26 @@ mod tests {
             .is_some(),
             "failed authentication releases its owner"
         );
+    }
+
+    #[test]
+    fn source_history_debt_torn_input_never_supplies_certificate_authority() {
+        let root = crate::authenticated_fixture::TestDirectory::new();
+        let (runtime, record, canonical) = retained(root.path());
+        let (_, target) = super::super::tests::signed_fixture_event(1);
+        let store = FinalityIntentStore::new(&record.namespace);
+        store.retain(&runtime, record.prev_blocks.clone(), record.start_masterchain.clone(), &target).unwrap();
+        let path = record.namespace.join(DIRECTORY).join(format!("{}-{}.json", target.slot.value(), target.block_hash.to_hex_string()));
+        let temporary = path.with_extension("tmp");
+        std::fs::rename(&path, &temporary).unwrap();
+        std::fs::write(&temporary, b"").unwrap();
+        let receipt = authenticate_source_history_debt(&record, &runtime, &Budget).unwrap();
+        assert_eq!(std::fs::read(&temporary).unwrap(), b"");
+        assert!(!path.exists());
+        drop(receipt);
+        std::fs::remove_file(canonical).unwrap();
+        assert!(authenticate_source_history_debt(&record, &runtime, &Budget).is_err(), "torn data alone grants no authority");
+        assert_eq!(std::fs::read(&temporary).unwrap(), b"");
     }
 
     #[test]

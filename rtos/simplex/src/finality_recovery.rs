@@ -87,6 +87,26 @@ struct DiskIntent {
     candidate_hash: String,
     certificate: String,
 }
+// A torn file is only a locator for a durable, independently verified DB
+// certificate. Neither its partial JSON fields nor its filename is authority.
+fn interrupted_pending_id(
+    path: &std::path::Path,
+    error: &anyhow::Error,
+) -> Option<crate::block::RawCandidateId> {
+    if path.extension()?.to_str()? != "tmp" || !error.downcast_ref::<serde_json::Error>()?.is_eof()
+    {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    let (slot, hash) = stem.split_once('-')?;
+    let number = slot.parse::<u32>().ok()?;
+    let digest = hash.parse::<UInt256>().ok()?;
+    if slot != number.to_string() || hash != digest.to_hex_string() {
+        return None;
+    }
+    Some(crate::block::RawCandidateId { slot: crate::block::SlotIndex::new(number), hash: digest })
+}
+
 /// A session has one or two parents; each is one block id in text form.
 const MAX_PREV_BLOCKS: usize = 2;
 const MAX_PREV_BLOCK_TEXT: usize = 512;
@@ -341,6 +361,7 @@ pub(crate) struct FinalityIntentStore {
     mutation: Mutex<()>,
     unresolved: Mutex<Option<std::collections::HashSet<PathBuf>>>,
     output_cursor: std::sync::atomic::AtomicUsize,
+    database_replay: Mutex<std::collections::HashMap<PathBuf, (SessionRecoveryRecord, Vec<u8>)>>,
     #[cfg(test)]
     fail_resolve_once: std::sync::atomic::AtomicBool,
 }
@@ -351,6 +372,7 @@ impl FinalityIntentStore {
             mutation: Mutex::new(()),
             unresolved: Mutex::new(None),
             output_cursor: std::sync::atomic::AtomicUsize::new(0),
+            database_replay: Mutex::new(std::collections::HashMap::new()),
             #[cfg(test)]
             fail_resolve_once: std::sync::atomic::AtomicBool::new(false),
         }
@@ -743,11 +765,75 @@ impl FinalityIntentStore {
         }
         Ok(())
     }
+    /// Prepare only in-memory replay inputs. The source floor must come from
+    /// intact records and be authenticated by the node; the exact certificate
+    /// must already be durable in this session DB and pass real quorum checks.
+    pub(crate) fn prepare_database_replay(
+        &self,
+        runtime: &AuthenticatedSessionRuntime,
+        certificates: &[crate::database::FinalCertRecord],
+    ) -> Result<()> {
+        let _guard = self.mutation.lock().unwrap();
+        self.database_replay.lock().unwrap().clear();
+        let mut torn = Vec::new();
+        for path in self.paths()? {
+            if let Err(error) = read_intent(&path, &self.namespace) {
+                let Some(id) = interrupted_pending_id(&path, &error) else {
+                    return Err(error);
+                };
+                torn.push((path, id));
+            }
+        }
+        if torn.is_empty() {
+            return Ok(());
+        }
+        let context = locate_session_start(&self.namespace)?
+            .ok_or_else(|| error!("Interrupted intent lacks session start provenance"))?;
+        context.validate_runtime(runtime)?;
+        let mut replay = std::collections::HashMap::new();
+        for (path, id) in torn {
+            let record = certificates
+                .iter()
+                .find(|record| record.candidate_id == id)
+                .ok_or_else(|| error!("Interrupted intent lacks its durable FinalCert"))?;
+            let wire = runtime.wire_profile().deserialize_typed(record.cert_bytes.as_slice())?;
+            let verified = crate::certificate::Certificate::<crate::simplex_state::Vote>::from_authenticated_runtime(
+                &wire, runtime, &|| Ok(()),
+            )?;
+            let crate::simplex_state::Vote::Finalize(vote) = verified.vote else {
+                fail!("Interrupted intent DB input is not FinalCert");
+            };
+            if vote.slot != id.slot || vote.block_hash != id.hash {
+                fail!("Interrupted intent DB certificate identity mismatch");
+            }
+            replay.insert(path, (context.clone(), record.cert_bytes.as_slice().to_vec()));
+        }
+        *self.database_replay.lock().unwrap() = replay;
+        Ok(())
+    }
+
+    fn read_replay_input(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(SessionRecoveryRecord, Vec<u8>)> {
+        match read_intent(path, &self.namespace) {
+            Ok(input) => Ok(input),
+            Err(error) => {
+                if interrupted_pending_id(path, &error).is_some() {
+                    if let Some(input) = self.database_replay.lock().unwrap().get(path) {
+                        return Ok(input.clone());
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn pending(&self) -> Result<Vec<Vec<u8>>> {
         let _guard = self.mutation.lock().unwrap();
         let mut pending = Vec::new();
         for path in self.paths()? {
-            let (_, certificate) = read_intent(&path, &self.namespace)?;
+            let (_, certificate) = self.read_replay_input(&path)?;
             if path.extension().and_then(|s| s.to_str()) == Some("json") {
                 let completed = self.completed_path(&path);
                 if completed.exists() {
@@ -784,7 +870,7 @@ impl FinalityIntentStore {
     pub(crate) fn authenticate_pending(&self, runtime: &AuthenticatedSessionRuntime) -> Result<()> {
         let _guard = self.mutation.lock().unwrap();
         for path in self.paths()? {
-            read_intent(&path, &self.namespace)?.0.validate_runtime(runtime)?;
+            self.read_replay_input(&path)?.0.validate_runtime(runtime)?;
         }
         Ok(())
     }
@@ -825,10 +911,26 @@ pub fn scan_finality_recovery(root: &std::path::Path) -> Result<Vec<SessionRecov
 /// This is untrusted input: the node must authenticate both historical anchors
 /// and the ordered parents before using it to resume a signing session.
 pub fn locate_session_start(namespace: &std::path::Path) -> Result<Option<SessionRecoveryRecord>> {
+    Ok(locate_session_context(namespace, false)?.0)
+}
+
+fn locate_session_context(namespace: &std::path::Path, inspect_outputs: bool) -> Result<(Option<SessionRecoveryRecord>, bool)> {
     let store = FinalityIntentStore::new(namespace);
     let mut found: Option<SessionRecoveryRecord> = None;
+    let mut interrupted = false;
+    let mut pending = false;
     for path in store.paths()? {
-        let (record, _) = read_intent(&path, namespace)?;
+        let (record, _) = match read_intent(&path, namespace) {
+            Ok(record) => record,
+            Err(error) if interrupted_pending_id(&path, &error).is_some() => {
+                interrupted = true;
+                pending = true;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        pending |= matches!(path.extension().and_then(|s| s.to_str()), Some("json" | "tmp"))
+            || (inspect_outputs && store.needs_output_rebuild(&path)?);
         if let Some(existing) = &found {
             if existing.binding != record.binding
                 || existing.pin != record.pin
@@ -848,7 +950,10 @@ pub fn locate_session_start(namespace: &std::path::Path) -> Result<Option<Sessio
             found = Some(record);
         }
     }
-    Ok(found)
+    if interrupted && found.is_none() {
+        fail!("Interrupted intent lacks session start provenance");
+    }
+    Ok((found, pending))
 }
 
 /// Scan one namespace so Engine can isolate malformed/legacy records and fairly
@@ -870,30 +975,8 @@ pub fn scan_finality_recovery_namespace(
     if !namespace.join(DIRECTORY).is_dir() {
         fail!("Legacy source lacks final certificate recovery provenance: {}", namespace.display());
     }
-    let mut found: Option<SessionRecoveryRecord> = None;
-    for path in store.paths()? {
-        let (record, _) = read_intent(&path, namespace)?;
-        if matches!(path.extension().and_then(|s| s.to_str()), Some("json" | "tmp"))
-            || store.needs_output_rebuild(&path)?
-        {
-            if let Some(existing) = &found {
-                if existing.binding != record.binding
-                    || existing.session_id != record.session_id
-                    || existing.prev_blocks != record.prev_blocks
-                    || existing.local_adnl != record.local_adnl
-                    || existing.start_masterchain != record.start_masterchain
-                    || existing.pin != record.pin
-                    || existing.profile != record.profile
-                    || existing.local_validator_index != record.local_validator_index
-                {
-                    fail!("Conflicting source recovery contexts within namespace");
-                }
-            } else {
-                found = Some(record);
-            }
-        }
-    }
-    Ok(found)
+    let (context, pending) = locate_session_context(namespace, true)?;
+    Ok(if pending { context } else { None })
 }
 
 #[path = "source_history_debt.rs"]
@@ -1054,6 +1137,143 @@ mod tests {
         );
         drop(owner);
     }
+    pub(super) fn signed_fixture_event(
+        slot: u32,
+    ) -> (std::sync::Arc<AuthenticatedSessionRuntime>, crate::simplex_state::BlockFinalizedEvent)
+    {
+        let (runtime, draft) = crate::finality_delivery::tests::fixture_at_slot(
+            true,
+            ShardIdent::masterchain(),
+            slot + 1,
+            slot,
+        );
+        let consensus_common::SessionFinality::Carrier(
+            rtos_block::BlockSignaturesVariant::SimplexPq(proof),
+        ) = draft.finality
+        else {
+            unreachable!()
+        };
+        let candidate = rtos_api::pq_finality::PqNetworkSignatureSet::from_final_fields(&proof)
+            .unwrap()
+            .to_node()
+            .candidate;
+        let hash = UInt256::calc_file_hash(&rtos_api::serialize_boxed(&candidate).unwrap());
+        let event = crate::simplex_state::BlockFinalizedEvent {
+            slot: crate::block::SlotIndex::new(slot),
+            block_hash: hash.clone(),
+            block_id: None,
+            certificate: std::sync::Arc::new(crate::certificate::Certificate {
+                vote: crate::simplex_state::FinalizeVote {
+                    slot: crate::block::SlotIndex::new(slot),
+                    block_hash: hash,
+                },
+                signatures: proof
+                    .signatures
+                    .iter()
+                    .enumerate()
+                    .map(|(i, signature)| crate::certificate::VoteSignature {
+                        validator_idx: crate::block::ValidatorIndex::new(i as u32),
+                        signature: signature.signature.clone(),
+                    })
+                    .collect(),
+            }),
+        };
+        (runtime, event)
+    }
+
+    #[test]
+    fn source_finality_torn_intent_uses_durable_same_candidate_certificate() {
+        for empty in [true, false] {
+            let root = crate::authenticated_fixture::TestDirectory::new();
+            let (runtime, previous) = signed_fixture_event(0);
+            let (_, target) = signed_fixture_event(1);
+            let namespace =
+                PathBuf::from(runtime.runtime_directory(root.path().to_str().unwrap()).unwrap());
+            std::fs::create_dir_all(namespace.join("finality-pending")).unwrap();
+            let store = FinalityIntentStore::new(&namespace);
+            let prevs = vec![runtime.pin().zerostate.clone()];
+            store
+                .retain(&runtime, prevs.clone(), runtime.pin().zerostate.clone(), &previous)
+                .unwrap();
+            // Match C++ and the real callback: FinalCert storage completes
+            // before the source intent write can begin.
+            let db =
+                crate::database::SimplexDb::open(namespace.join("db"), "torn-intent-test").unwrap();
+            let id =
+                crate::block::RawCandidateId { slot: target.slot, hash: target.block_hash.clone() };
+            db.save_final_cert_async(&id, &target.certificate)
+                .unwrap()
+                .wait_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            let saved =
+                db.load_final_cert_by_id(&id, std::time::Duration::from_secs(10)).unwrap().unwrap();
+            assert_eq!(saved.candidate_id, id);
+            store.retain(&runtime, prevs, runtime.pin().zerostate.clone(), &target).unwrap();
+            let canonical = namespace.join(DIRECTORY).join(format!(
+                "{}-{}.json",
+                id.slot.value(),
+                id.hash.to_hex_string()
+            ));
+            let full = std::fs::read(&canonical).unwrap();
+            let temporary = canonical.with_extension("tmp");
+            std::fs::rename(&canonical, &temporary).unwrap();
+            let prefix = &full[..if empty { 0 } else { full.len() / 2 }];
+            std::fs::write(&temporary, prefix).unwrap();
+            let recovered = locate_session_start(&namespace).unwrap().unwrap();
+            recovered.validate_runtime(&runtime).unwrap();
+            assert_eq!(std::fs::read(&temporary).unwrap(), prefix);
+            assert!(!canonical.exists());
+            assert!(store.pending().is_err(), "EOF alone is not a replay certificate");
+            assert!(store.prepare_database_replay(&runtime, &[]).is_err());
+            assert_eq!(std::fs::read(&temporary).unwrap(), prefix);
+            let mut wrong_key = saved.clone();
+            wrong_key.candidate_id = crate::block::RawCandidateId {
+                slot: previous.slot,
+                hash: previous.block_hash.clone(),
+            };
+            assert!(store.prepare_database_replay(&runtime, &[wrong_key]).is_err());
+            let mut wrong_proof = saved.clone();
+            wrong_proof.cert_bytes =
+                runtime.wire_profile().serialize(&previous.certificate.to_tl().unwrap()).unwrap();
+            let error = store.prepare_database_replay(&runtime, &[wrong_proof]).unwrap_err();
+            assert!(error.to_string().contains("identity mismatch"));
+            let mut forged = saved.clone();
+            let mut wire: rtos_api::ton::consensus::simplex::Certificate =
+                runtime.wire_profile().deserialize_typed(saved.cert_bytes.as_slice()).unwrap();
+            let rtos_api::ton::consensus::simplex::Certificate::Consensus_Simplex_Certificate(
+                ref mut certificate,
+            ) = wire;
+            let rtos_api::ton::consensus::simplex::VoteSignatureSet::Consensus_Simplex_VoteSignatureSet(ref mut signatures) = certificate.signatures;
+            signatures.votes = Vec::new().into();
+            forged.cert_bytes = runtime.wire_profile().serialize(&wire).unwrap();
+            assert!(store.prepare_database_replay(&runtime, &[forged]).is_err());
+            assert_eq!(std::fs::read(&temporary).unwrap(), prefix);
+            assert!(!canonical.exists());
+            store.prepare_database_replay(&runtime, &[saved]).unwrap();
+            store.authenticate_pending(&runtime).unwrap();
+            assert_eq!(store.pending().unwrap().len(), 2);
+            assert_eq!(store.pending_count().unwrap(), 2);
+            assert_eq!(std::fs::read(&temporary).unwrap(), prefix, "preparation is read-only");
+            assert!(!canonical.exists());
+            store
+                .retain(
+                    &runtime,
+                    vec![runtime.pin().zerostate.clone()],
+                    runtime.pin().zerostate.clone(),
+                    &target,
+                )
+                .unwrap();
+            assert!(!temporary.exists());
+            assert_eq!(std::fs::read(&canonical).unwrap(), full);
+            assert!(
+                !store.completed_path(&canonical).exists(),
+                "retention is not completed finality"
+            );
+            db.close(Some(std::time::Duration::from_secs(10))).unwrap();
+        }
+    }
+
     #[test]
     fn source_finality_pending_temporary_replays_before_unrelated_intents() {
         let directory = crate::authenticated_fixture::TestDirectory::new();
@@ -1199,7 +1419,11 @@ mod tests {
         for malformed in [b"".as_slice(), b"{partial".as_slice()] {
             std::fs::write(&temporary, malformed).unwrap();
             assert!(store.pending().is_err(), "torn inputs cannot be silently omitted");
-            assert!(locate_session_start(namespace).is_err());
+            if malformed.is_empty() {
+                assert!(locate_session_start(namespace).unwrap().is_some(), "only the intact context is located");
+            } else {
+                assert!(locate_session_start(namespace).is_err());
+            }
             assert_eq!(std::fs::read(&temporary).unwrap(), malformed);
             std::fs::remove_file(&temporary).unwrap();
         }

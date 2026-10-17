@@ -208,6 +208,9 @@ impl SessionCallbacks {
     ) -> rtos_block::Result<()> {
         self.delivery_source()?.prepare_intents(has_existing_certificates)
     }
+    pub(crate) fn prepare_database_finality_intents(&self, certificates: &[crate::database::FinalCertRecord]) -> rtos_block::Result<()> {
+        self.delivery_source()?.prepare_database_intents(certificates)
+    }
     pub(crate) fn bind_delivery_start(&self, anchor: BlockIdExt) -> rtos_block::Result<()> {
         self.delivery_source()?.bind_start(anchor)
     }

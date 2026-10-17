@@ -175,6 +175,13 @@ class CompositionArgumentTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'profile boundary'):
             self.arguments(['--source-ack-intent-stop', '--source-ack-partition-restart',
                 '--source-ack-fault', 'sync-eio', '--partition-restart'])
+    def test_torn_intent_point_requires_explicit_stop_and_declared_combination(self):
+        with self.assertRaisesRegex(SystemExit, 'requires its explicit intent stop'):
+            self.arguments(['--source-ack-intent-cut-point', 'before-write'])
+        for point in ['before-write', 'after-partial-write']:
+            with self.subTest(point=point), self.assertRaisesRegex(RuntimeError, 'profile boundary'):
+                self.arguments(['--source-ack-intent-cut-point', point, '--source-ack-intent-stop',
+                    '--source-ack-partition-restart', '--source-ack-fault', 'sync-eio', '--partition-restart'])
 
 
 if __name__ == '__main__':

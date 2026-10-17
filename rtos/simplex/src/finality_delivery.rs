@@ -1328,6 +1328,9 @@ impl SourceFinalityDelivery {
         let _timing = self.operation_timer("prepare_intents");
         self.intents.prepare(has_existing_certificates)
     }
+    pub(crate) fn prepare_database_intents(&self, certificates: &[crate::database::FinalCertRecord]) -> Result<()> {
+        self.intents.prepare_database_replay(&self.runtime, certificates)
+    }
     pub(crate) fn bind_start(&self, anchor: BlockIdExt) -> Result<()> {
         let mut slot = self.start_masterchain.lock().unwrap();
         if slot.is_some() {
@@ -1727,6 +1730,14 @@ pub(crate) mod tests {
         shard: ShardIdent,
         seqno: u32,
     ) -> (Arc<AuthenticatedSessionRuntime>, FinalizedDeliveryDraft) {
+        fixture_at_slot(is_final, shard, seqno, 0)
+    }
+    pub(crate) fn fixture_at_slot(
+        is_final: bool,
+        shard: ShardIdent,
+        seqno: u32,
+        slot: u32,
+    ) -> (Arc<AuthenticatedSessionRuntime>, FinalizedDeliveryDraft) {
         let stores: Vec<_> = [0xa9, 0xaa]
             .iter()
             .map(|seed| rtos_pq_consensus::ConsensusKeyStore::from_seed(&[*seed; 32], 0).unwrap())
@@ -1769,7 +1780,7 @@ pub(crate) mod tests {
         .into_boxed();
         let candidate_bytes = rtos_api::serialize_boxed(&candidate).unwrap();
         let id = rtos_api::ton::consensus::candidateid::CandidateId {
-            slot: 0,
+            slot: slot as i32,
             hash: UInt256::calc_file_hash(&candidate_bytes),
         }
         .into_boxed();
@@ -1797,7 +1808,7 @@ pub(crate) mod tests {
             sig_weight: runtime.committee().iter().map(|member| member.weight).sum(),
             signatures,
             session_id: runtime.session_id().clone(),
-            slot: 0,
+            slot,
             candidate_data: BlockSignaturesSimplex::bytes_to_cell_tree(&candidate_bytes).unwrap(),
         };
         let finality = if is_final {
