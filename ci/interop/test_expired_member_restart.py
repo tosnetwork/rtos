@@ -84,3 +84,14 @@ class ExpiredMemberRestartTests(unittest.TestCase):
             asyncio.run(ctx.complete(recovered))
             self.assertEqual(ctx.receipt['phase'],'expired_member_restarted_without_signing')
             self.assertTrue(ctx.receipt['authority_unchanged'])
+
+    def test_adjacent_scoped_constructor_failure_is_correlated_without_accepting_other_sessions(self):
+        ctx=passive.ExpiredFullNodeAcceptance(str,100,100,1000,'current')
+        scope='SESSION_LIFECYCLE: reset_after_failure shard=-1:8000000000000000 cc_seqno=1 session_id=current status=created -> retry (existing session ownership retained)'
+        error='Cannot start group: Isolated custody key differs from authenticated descriptor or has expired (construction drained=true); resetting session to Created for retry'
+        self.assertEqual(ctx.refusal(scope+'\n'+error),scope+'\n'+error)
+        for text in [scope.replace('session_id=current','session_id=old')+'\n'+error,
+                     scope+'\nother event\n'+error,
+                     scope+'\n'+error.replace('drained=true','drained=false'),
+                     scope.replace('reset_after_failure','unrelated')+'\n'+error]:
+            with self.assertRaises(RuntimeError):ctx.refusal(text)

@@ -1,5 +1,6 @@
 """An expired validator may recover as a full node, without regaining signing."""
 import time
+import re
 
 from quorum_profile import check_committee_weights
 
@@ -33,7 +34,16 @@ class ExpiredFullNodeAcceptance:
     def refusal(self, text):
         reasons=['Isolated custody key differs from authenticated descriptor or has expired',
                  'Isolated successor schedule requires a future finite expiry']
-        lines=[line for line in text.splitlines() if self.session in line and any(reason in line for reason in reasons)]
+        records=text.splitlines();lines=[]
+        def scoped(line):
+            return re.search(r'(?:^|\s)session_id='+re.escape(self.session)+r'(?=[\s:]|$)',line) is not None
+        for index,line in enumerate(records):
+            if not any(reason in line for reason in reasons):continue
+            if scoped(line):lines.append(line)
+            elif index>0 and line.startswith('Cannot start group: ') and '(construction drained=true); resetting session to Created for retry' in line:
+                previous=records[index-1]
+                if previous.startswith('SESSION_LIFECYCLE: reset_after_failure ') and scoped(previous):
+                    lines.append(previous+'\n'+line)
         if not lines:raise RuntimeError('Expired full node lacks current-session signing admission refusal')
         if any('ValidatorGroup::on_generate_slot:' in line and 'Collation successful' in line for line in text.splitlines()):
             raise RuntimeError('Expired full node unexpectedly collated a new candidate')
