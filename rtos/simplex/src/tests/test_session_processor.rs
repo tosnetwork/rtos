@@ -6653,6 +6653,15 @@ fn test_finalized_clears_journal_entry_on_apply() {
 
 #[test]
 fn test_recursive_finalization_defers_until_missing_parent_body_arrives() {
+    recursive_parent_body_recovery_case(false);
+}
+
+#[test]
+fn test_recursive_finalization_repairs_skipped_notarized_parent() {
+    recursive_parent_body_recovery_case(true);
+}
+
+fn recursive_parent_body_recovery_case(skipped_parent: bool) {
     let mut opts = SessionOptions::default();
     opts.use_callback_thread = false;
     let mut fixture = TestFixture::new_with_shard_and_local_idx(
@@ -6664,7 +6673,9 @@ fn test_recursive_finalization_defers_until_missing_parent_body_arrives() {
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
+    fixture
+        .processor
+        .set_listener_for_test(Arc::downgrade(&listener));
 
     let (parent_leader, parent_id, parent_broadcast) =
         make_signed_block_broadcast(&fixture, 41, vec![1u8, 2, 3]);
@@ -6675,7 +6686,9 @@ fn test_recursive_finalization_defers_until_missing_parent_body_arrives() {
         Some(parent_id.clone()),
     );
 
-    fixture.processor.on_candidate_received(child_leader, child_broadcast, None);
+    fixture
+        .processor
+        .on_candidate_received(child_leader, child_broadcast, None);
     let child_block = fixture
         .processor
         .candidate_book()
@@ -6685,34 +6698,68 @@ fn test_recursive_finalization_defers_until_missing_parent_body_arrives() {
         .clone();
 
     notarize_slot(&mut fixture, parent_id.slot, &parent_id.hash);
+    if skipped_parent {
+        skip_slot(&mut fixture, parent_id.slot);
+        assert!(fixture
+            .processor
+            .simplex_state
+            .has_skip_certificate_for_slot(&fixture.description, parent_id.slot));
+        assert!(fixture
+            .processor
+            .simplex_state
+            .get_notarize_certificate(parent_id.slot, &parent_id.hash)
+            .is_some());
+    }
 
-    fixture.processor.handle_block_finalized(BlockFinalizedEvent {
-        slot: child_id.slot,
-        block_hash: child_id.hash.clone(),
-        block_id: Some(child_block.clone()),
-        certificate: make_test_final_cert(child_id.slot, child_id.hash.clone()),
-    });
+    fixture
+        .processor
+        .handle_block_finalized(BlockFinalizedEvent {
+            slot: child_id.slot,
+            block_hash: child_id.hash.clone(),
+            block_id: Some(child_block.clone()),
+            certificate: make_test_final_cert(child_id.slot, child_id.hash.clone()),
+        });
     // Drain the deferred `request_candidate` bounce so the missing-parent
     // repair request reaches the (fake) receiver before we inspect its actions.
     fixture.run_pending_tasks();
 
     let initial_events = drain_finalized_events(&recording);
-    assert!(initial_events.is_empty(), "C++ WC child waits for the parent finalization");
     assert!(
-        fixture.processor.consensus.finalized_pending_body_contains(&child_id),
+        initial_events.is_empty(),
+        "C++ WC child waits for the parent finalization"
+    );
+    assert!(
+        fixture
+            .processor
+            .consensus
+            .finalized_pending_body_contains(&child_id),
         "trigger must remain in pending journal while parent body is missing"
     );
     assert!(
-        fixture.drain_receiver_actions().iter().any(|action| match action {
-            ReceiverAction::RequestCandidate { slot, block_hash } => {
-                *slot == parent_id.slot.value() && block_hash == &parent_id.hash
-            }
-            _ => false,
-        }),
+        fixture
+            .drain_receiver_actions()
+            .iter()
+            .any(|action| match action {
+                ReceiverAction::RequestCandidate { slot, block_hash } => {
+                    *slot == parent_id.slot.value() && block_hash == &parent_id.hash
+                }
+                _ => false,
+            }),
         "missing parent body must trigger immediate requestCandidate"
     );
 
-    fixture.processor.on_candidate_received(parent_leader, parent_broadcast, None);
+    let parent_notar = skipped_parent.then(|| {
+        make_notar_vote_signature_set_bytes(
+            fixture.processor.session_id(),
+            &fixture.nodes,
+            parent_id.slot,
+            parent_id.hash.clone(),
+            &[0, 1, 2],
+        )
+    });
+    fixture
+        .processor
+        .on_candidate_received(parent_leader, parent_broadcast, parent_notar);
     let parent_block = fixture
         .processor
         .candidate_book()
@@ -6722,10 +6769,16 @@ fn test_recursive_finalization_defers_until_missing_parent_body_arrives() {
         .clone();
 
     let finalized_events = drain_finalized_events(&recording);
-    assert_eq!(finalized_events, vec![(parent_block, false), (child_block, true)],
-        "C++ WC FinalizeBlock order is parent approval before child final");
+    assert_eq!(
+        finalized_events,
+        vec![(parent_block, false), (child_block, true)],
+        "C++ WC FinalizeBlock order is parent approval before child final"
+    );
     assert!(
-        !fixture.processor.consensus.finalized_pending_body_contains(&child_id),
+        !fixture
+            .processor
+            .consensus
+            .finalized_pending_body_contains(&child_id),
         "pending journal entry must clear after recursive completion"
     );
 }
@@ -12539,4 +12592,59 @@ fn test_candidate_query_fallback_reads_cold_disk_body_and_notar() {
         !fixture.processor.candidate_book().contains_received(&id),
         "serving disk bytes alone does not approve or finalize a candidate"
     );
+}
+
+#[test]
+fn test_deferred_finality_repair_cannot_be_downgraded_by_ordinary_requests() {
+    for finality_first in [false, true] {
+        let mut fixture = TestFixture::new(4);
+        fixture.run_pending_tasks();
+        fixture.drain_receiver_actions();
+        let slot = SlotIndex::new(69);
+        let hash = UInt256::rand();
+        skip_slot(&mut fixture, slot);
+        for _ in 0..1000 {
+            if finality_first {
+                fixture.processor.with_consensus_backend(|_, b| {
+                    b.request_candidate_for_finality(slot, hash.clone(), Some(Duration::ZERO))
+                });
+            }
+            fixture.processor.with_validation_backend(|_, b| {
+                b.request_candidate(slot, hash.clone(), Some(Duration::from_secs(5)))
+            });
+            if !finality_first {
+                fixture.processor.with_consensus_backend(|_, b| {
+                    b.request_candidate_for_finality(slot, hash.clone(), Some(Duration::ZERO))
+                });
+            }
+        }
+        assert_eq!(
+            fixture.task_queue.tasks.lock().unwrap().len(),
+            1,
+            "one candidate keeps one owned queued repair"
+        );
+        fixture.run_pending_tasks();
+        let rows: Vec<_> = fixture
+            .drain_receiver_actions()
+            .into_iter()
+            .filter_map(|action| match action {
+                ReceiverAction::RequestCandidate {
+                    slot: s,
+                    block_hash,
+                } if s == slot.value() => Some(block_hash),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![hash],
+            "ordinary delay/skip policy cannot downgrade the finality dependency"
+        );
+        assert!(fixture
+            .processor
+            .deferred_candidate_requests
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
 }

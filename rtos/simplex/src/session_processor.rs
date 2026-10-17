@@ -162,7 +162,9 @@ use std::{
 
 // Coalesce repair effects before they enter SXMAIN. Throttling only after
 // dequeue permits many finality triggers to queue the same missing ancestor.
-type DeferredCandidateRequests = Arc<Mutex<HashMap<RawCandidateId, Duration>>>;
+// Coalescing keeps both the earliest wake and a FinalCert dependency request;
+// an ordinary vote/validation request cannot downgrade the latter.
+type DeferredCandidateRequests = Arc<Mutex<HashMap<RawCandidateId, (Duration, bool)>>>;
 
 struct CandidateRequestTicket {
     pending: DeferredCandidateRequests,
@@ -183,22 +185,40 @@ fn post_candidate_request(
     slot: SlotIndex,
     hash: UInt256,
     delay: Option<Duration>,
+    for_finality: bool,
 ) {
-    let id = RawCandidateId { slot, hash: hash.clone() };
+    let id = RawCandidateId {
+        slot,
+        hash: hash.clone(),
+    };
     let delay = delay.unwrap_or(crate::candidate_controller::CANDIDATE_REQUEST_DELAY);
     {
         let mut requests = pending.lock().unwrap();
         if let Some(old) = requests.get_mut(&id) {
-            *old = (*old).min(delay);
+            old.0 = old.0.min(delay);
+            old.1 |= for_finality;
             return;
         }
-        requests.insert(id.clone(), delay);
+        requests.insert(id.clone(), (delay, for_finality));
     }
-    let mut ticket = CandidateRequestTicket { pending: pending.clone(), id, armed: true };
+    let mut ticket = CandidateRequestTicket {
+        pending: pending.clone(),
+        id,
+        armed: true,
+    };
     crate::task_queue::post_closure(queue, move |p: &mut SessionProcessor| {
-        let delay = ticket.pending.lock().unwrap().remove(&ticket.id).expect("queued repair ticket");
+        let (delay, for_finality) = ticket
+            .pending
+            .lock()
+            .unwrap()
+            .remove(&ticket.id)
+            .expect("queued repair ticket");
         ticket.armed = false;
-        p.request_candidate(slot, hash, Some(delay));
+        if for_finality {
+            p.request_candidate_for_finality(slot, hash, Some(delay));
+        } else {
+            p.request_candidate(slot, hash, Some(delay));
+        }
     });
 }
 
@@ -1257,6 +1277,16 @@ impl SessionProcessor {
         self.with_candidate_backend(|c, b| c.request_candidate(slot, block_hash, initial_delay, b));
     }
 
+    fn request_candidate_for_finality(
+        &mut self,
+        slot: SlotIndex,
+        hash: UInt256,
+        delay: Option<Duration>,
+    ) {
+        self.with_candidate_backend(|c, b| c.request_candidate_for_finality(slot, hash, delay, b));
+    }
+
+
     /// Cancel outbound repair for a slot after it finalizes / skips. Delegates to
     /// [`CandidateController::cancel_repairs_for_slot`].
     fn cancel_candidate_repairs_for_slot(&mut self, slot: SlotIndex) {
@@ -1692,7 +1722,7 @@ impl CollationBackend for CollationBackendAdapter<'_> {
         // The fetch runs the full `request_candidate` machinery, which needs
         // `&mut SessionProcessor`; bounce it onto SXMAIN from the
         // `check_collation` parent-resolution gate.
-        post_candidate_request(self.task_queue, self.deferred_candidate_requests, slot, hash, None);
+        post_candidate_request(self.task_queue, self.deferred_candidate_requests, slot, hash, None, false);
     }
 
     fn self_receive_candidate(&self, self_idx: u32, candidate: CandidateData) {
@@ -1902,7 +1932,7 @@ impl ValidationBackend for ValidationBackendAdapter<'_> {
     fn request_candidate(&self, slot: SlotIndex, hash: UInt256, delay: Option<Duration>) {
         // The fetch runs the full `request_candidate` machinery (shared throttle
         // map), which needs `&mut SessionProcessor`; bounce it onto SXMAIN.
-        post_candidate_request(self.task_queue, self.deferred_candidate_requests, slot, hash, delay);
+        post_candidate_request(self.task_queue, self.deferred_candidate_requests, slot, hash, delay, false);
     }
 }
 
@@ -2204,8 +2234,26 @@ impl ConsensusBackend for ConsensusBackendAdapter<'_> {
     fn request_candidate(&self, slot: SlotIndex, hash: UInt256, delay: Option<Duration>) {
         // The fetch runs the full `request_candidate` machinery (shared throttle
         // map), which needs `&mut SessionProcessor`; bounce it onto SXMAIN.
-        post_candidate_request(self.task_queue, self.deferred_candidate_requests, slot, hash, delay);
+        post_candidate_request(self.task_queue, self.deferred_candidate_requests, slot, hash, delay, false);
     }
+
+    fn request_candidate_for_finality(
+        &self,
+        slot: SlotIndex,
+        hash: UInt256,
+        delay: Option<Duration>,
+    ) {
+        post_candidate_request(
+            self.task_queue,
+            self.deferred_candidate_requests,
+            slot,
+            hash,
+            delay,
+            true,
+        );
+    }
+
+
 
     fn reset_slot_state(&self, slot: SlotIndex) {
         // `reset_slot_state` -> `cleanup_old_candidates` re-enters

@@ -225,6 +225,12 @@ pub(crate) trait ConsensusBackend {
     /// onto SXMAIN (the fetch needs `&mut SessionProcessor`).
     fn request_candidate(&self, slot: SlotIndex, hash: UInt256, delay: Option<Duration>);
 
+    /// FinalCert ancestry can include notarized skipped slots. Resolve their
+    /// contents without the ordinary obsolete-vote repair filter.
+    fn request_candidate_for_finality(&self, slot: SlotIndex, hash: UInt256, delay: Option<Duration>) {
+        self.request_candidate(slot,hash,delay);
+    }
+
     /// Reset per-slot state after a slot is materially finalized (FSM/receiver
     /// GC + precollation cleanup). Bounces onto SXMAIN: the underlying
     /// `SessionProcessor::reset_slot_state` re-enters `self.consensus`
@@ -1841,7 +1847,7 @@ impl ConsensusController {
                     trigger_id.slot,
                     &trigger_id.hash.to_hex_string()[..8],
                 );
-                backend.request_candidate(
+                backend.request_candidate_for_finality(
                     current_id.slot,
                     current_id.hash.clone(),
                     Some(Duration::ZERO),
@@ -1880,7 +1886,7 @@ impl ConsensusController {
 
             if workchain {
                 if !body_available && !block_below_applied_floor {
-                    backend.request_candidate(current_id.slot, current_id.hash.clone(), Some(Duration::ZERO));
+                    backend.request_candidate_for_finality(current_id.slot, current_id.hash.clone(), Some(Duration::ZERO));
                     return false;
                 }
                 resolved_workchain.push((current_id.clone(), received.clone(), has_final_cert));
@@ -1923,7 +1929,7 @@ impl ConsensusController {
                     trigger_id.slot,
                     &trigger_id.hash.to_hex_string()[..8],
                 );
-                backend.request_candidate(
+                backend.request_candidate_for_finality(
                     current_id.slot,
                     current_id.hash.clone(),
                     Some(Duration::ZERO),
@@ -2130,7 +2136,7 @@ impl ConsensusController {
                     candidate_id.slot,
                     &candidate_id.hash.to_hex_string()[..8],
                 );
-                backend.request_candidate(
+                backend.request_candidate_for_finality(
                     candidate_id.slot,
                     candidate_id.hash.clone(),
                     Some(Duration::ZERO),
@@ -2236,11 +2242,11 @@ impl ConsensusController {
         let mut cursor = candidate.clone();
         for _ in 0..MAX_CHAIN_DEPTH {
             let Some(received) = backend.candidate_book().received(&cursor) else {
-                backend.request_candidate(cursor.slot, cursor.hash, Some(Duration::ZERO));
+                backend.request_candidate_for_finality(cursor.slot, cursor.hash, Some(Duration::ZERO));
                 return false;
             };
             if received.candidate_hash_data_bytes.is_empty() {
-                backend.request_candidate(cursor.slot, cursor.hash, Some(Duration::ZERO));
+                backend.request_candidate_for_finality(cursor.slot, cursor.hash, Some(Duration::ZERO));
                 return false;
             }
             let Some(parent) = received.parent_id.clone() else {
@@ -2254,7 +2260,7 @@ impl ConsensusController {
                 return true;
             }
             if backend.simplex_state().get_notarize_certificate(parent.slot, &parent.hash).is_none() {
-                backend.request_candidate(parent.slot, parent.hash, Some(Duration::ZERO));
+                backend.request_candidate_for_finality(parent.slot, parent.hash, Some(Duration::ZERO));
                 return false;
             }
             cursor = parent;
