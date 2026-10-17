@@ -840,6 +840,7 @@ async fn import_shard_blocks(
         }
         shard_client_mc_block_id = mc_block_id.clone();
         sync_context.engine.save_shard_client_mc_block_id(mc_block_id)?;
+        sync_context.engine.observe_served_shard_progress(mc_block_id).await?;
     }
 
     let absent_blocks = absent_blocks.load(Ordering::Relaxed);

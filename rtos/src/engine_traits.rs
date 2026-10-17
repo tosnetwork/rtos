@@ -368,6 +368,15 @@ pub trait EngineOperations: Sync + Send {
     async fn load_last_applied_mc_block(&self) -> Result<BlockStuff> {
         unimplemented!()
     }
+    fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
+        None
+    }
+    async fn observe_served_shard_progress(&self, id: &BlockIdExt) -> Result<()> {
+        if let Some(cache) = self.served_masterchain_cache() {
+            cache.observe_shard_progress(self, id).await?;
+        }
+        Ok(())
+    }
     fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
         unimplemented!()
     }

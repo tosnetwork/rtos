@@ -20,6 +20,7 @@ pub mod confirmed_blocks;
 pub mod engine;
 pub mod engine_operations;
 pub mod engine_traits;
+pub mod served_masterchain;
 pub mod error;
 pub mod ext_messages;
 pub mod full_node;

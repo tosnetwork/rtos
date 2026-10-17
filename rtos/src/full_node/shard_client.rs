@@ -328,6 +328,7 @@ pub async fn load_shard_blocks(
 
     log::debug!("load_shard_blocks_cycle: processed mc block: {}", mc_block.id());
     engine.save_shard_client_mc_block_id(mc_block.id())?;
+    engine.observe_served_shard_progress(mc_block.id()).await?;
     drop(semaphore_permit);
     Ok(())
 }

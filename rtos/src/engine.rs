@@ -121,6 +121,7 @@ struct EngineOwners {
 }
 
 pub struct Engine {
+    pub(crate) served_masterchain: crate::served_masterchain::ServedMasterchain,
     #[cfg(test)]
     state_db_stop_started: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -159,7 +160,6 @@ pub struct Engine {
     confirmed_block_events: ConfirmedBlockEvents,
 
     servers: lockfree::queue::Queue<Box<dyn Stoppable>>,
-    stopper: Arc<Stopper>,
 
     zerostate_id: BlockIdExt,
     init_mc_block_id: BlockIdExt,
@@ -218,6 +218,9 @@ pub struct Engine {
     trace_collector: Option<simplex::TraceCollector>,
     // Drop after the engine-owned database/network fields.
     _network_binding: crate::network_db::DbNetworkBinding,
+    // The final destruction signal follows all owned resources and the binding
+    // lock. Waiting for the last Stopper owner must also wait for those drops.
+    stopper: Arc<Stopper>,
 }
 
 /// Only requests with identical retry policy may share a network operation.
@@ -940,6 +943,7 @@ impl Engine {
                     MessagesPool::new(now, external_messages_maximum_queue_length);
                 let candidate_db = CandidateDbPool::with_path(db.db_root_dir()?);
                 let engine = Arc::new(Engine {
+                    served_masterchain: Default::default(),
                     #[cfg(test)]
                     parent_apply_test_gate: std::sync::Mutex::new(None),
                     #[cfg(test)]
@@ -1406,6 +1410,7 @@ impl Engine {
         }
         self.publication_worker.lock().unwrap().take();
         // An unknown validator teardown retains its bit and blocks DB shutdown.
+        self.served_masterchain.state.lock().await.take();
         log::info!(target: "engine_shutdown", "Waiting for service flags before state database drain");
         let _ = self.stopper.clone().wait_stop_except(Self::MASK_SERVICE_SHARDSTATE_GC).await;
         #[cfg(test)]
@@ -2779,6 +2784,11 @@ impl Engine {
         // Before any work that can write: no floor is adopted while
         // truncating, and none may lie above the new head; the database
         // checks its durable floor as well.
+        // An explicit administrative rollback starts a new served-state epoch.
+        // Stop selection while truncating and release our cached read lease;
+        // Existing in-flight readers retain their own GC leases.
+        let mut served = self.served_masterchain.state.lock().await;
+        served.take();
         let _truncation = self.shard_states_keeper().begin_truncation(prev_block_id.seq_no())?;
         // check if previous state is present
         #[cfg(test)]
@@ -2968,6 +2978,8 @@ async fn boot(
             last_applied_mc_block.clone()
         }
     };
+
+    engine.observe_served_shard_progress(&shard_client_mc_block).await?;
 
     let ss_keeper_mc_block = match engine.db().load_full_node_state(PSS_KEEPER_MC_BLOCK) {
         Ok(Some(id)) => id.deref().clone(),

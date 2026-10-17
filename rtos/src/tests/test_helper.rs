@@ -589,6 +589,8 @@ pub async fn test_async(test: impl Fn() -> Pinned<'static, ()>, done: impl Fn())
 type Pinned<'a, X> = Pin<Box<dyn Future<Output = Result<X>> + 'a>>;
 
 pub struct TestEngine {
+    served_masterchain: crate::served_masterchain::ServedMasterchain,
+    served_gc_resolver: Arc<crate::internal_db::state_gc_resolver::AllowStateGcSmartResolver>,
     pub res_path: Option<String>,
     pub db: Arc<InternalDb>,
     pub now: AtomicU32,
@@ -655,6 +657,8 @@ impl TestEngine {
             check_only_msg_merger: false,
             shard_blocks,
             last_applied_mc_block_id: RwLock::new(None),
+            served_masterchain: Default::default(),
+            served_gc_resolver: Arc::new(crate::internal_db::state_gc_resolver::AllowStateGcSmartResolver::new(u64::MAX)),
             #[cfg(feature = "telemetry")]
             engine_telemetry: telemetry,
             engine_allocated: allocated,
@@ -1043,6 +1047,13 @@ impl TestEngine {
 
 #[async_trait::async_trait]
 impl EngineOperations for TestEngine {
+    fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
+        Some(&self.served_masterchain)
+    }
+    async fn load_and_pin_state(&self, id: &BlockIdExt) -> Result<crate::shard_states_keeper::PinnedShardStateGuard> {
+        crate::shard_states_keeper::PinnedShardStateGuard::new(self.load_state(id).await?, self.served_gc_resolver.clone())
+    }
+
     fn now(&self) -> u32 {
         self.now.load(Ordering::Relaxed)
     }

@@ -385,7 +385,7 @@ async fn resolve_account_state(
             block_id.clone()
         } else {
             // Reference block is not specified, use last known mc state
-            (*get_last_liteserver_state_block(engine)?).clone()
+            (*get_last_liteserver_state_block(engine).await?).clone()
         };
         mc_state_guard = engine.load_and_pin_state(&id).await?;
 
@@ -1035,7 +1035,7 @@ impl LiteServerQuerySubscriber {
 
         // Resolve "latest" block_id to actual id for a stable cache key.
         let resolved_root_hash = if block_id.seq_no == SEQNO_ANY {
-            get_last_liteserver_state_block(&context.engine)?.root_hash.clone()
+            get_last_liteserver_state_block(&context.engine).await?.root_hash.clone()
         } else {
             block_id.root_hash.clone()
         };
@@ -1657,8 +1657,9 @@ impl LiteServerQuerySubscriber {
     }
 
     async fn get_masterchain_info(engine: &Arc<dyn EngineOperations>) -> Result<MasterchainInfo> {
-        let mc_block_id = get_last_liteserver_state_block(engine)?;
-        let mc_state = engine.load_state(&mc_block_id).await?;
+        let served = crate::block::get_last_liteserver_state(engine).await?;
+        let mc_state = served.state();
+        let mc_block_id = mc_state.block_id();
         let state_root_hash = mc_state.root_cell().repr_hash().clone();
 
         let zerostate_block_id = engine.zerostate_id()?.clone();
@@ -1686,7 +1687,7 @@ impl LiteServerQuerySubscriber {
                 .load_shard_client_mc_block_id()?
                 .ok_or_else(|| error!("shard client state is not ready"))?
         } else {
-            get_last_liteserver_state_block(engine)?
+            get_last_liteserver_state_block(engine).await?
         };
 
         let mc_state = engine.load_state(&mc_block_id).await?;
@@ -1772,7 +1773,7 @@ impl LiteServerQuerySubscriber {
         shard: Option<i64>,
     ) -> Result<OutMsgQueueSizes> {
         let mode = OutMsgQueueSizesMode::from_bits_truncate(raw_mode);
-        let mc_block_id = get_last_liteserver_state_block(engine)?;
+        let mc_block_id = get_last_liteserver_state_block(engine).await?;
         let mc_state = engine.load_state(&mc_block_id).await?;
         let shard_hashes = mc_state.shard_state_extra()?.shards();
 
@@ -1842,7 +1843,7 @@ impl LiteServerQuerySubscriber {
         let mut seen = HashSet::new();
         library_list.retain(|h| seen.insert(h.clone()));
 
-        let mc_block_id = get_last_liteserver_state_block(engine)?;
+        let mc_block_id = get_last_liteserver_state_block(engine).await?;
         let mc_state = engine.load_state(&mc_block_id).await?;
         let state = mc_state.state()?;
         let libraries = state.libraries();
@@ -2666,7 +2667,7 @@ impl LiteServerQuerySubscriber {
         engine: &Arc<dyn EngineOperations>,
         id: &BlockIdExt,
     ) -> Result<BlockIdExt> {
-        let last_block_id = get_last_liteserver_state_block(engine)?;
+        let last_block_id = get_last_liteserver_state_block(engine).await?;
         if id.seq_no > last_block_id.seq_no {
             fail!(
                 "Requested block seq_no {} is greater than last known block seq_no {}",
@@ -3005,7 +3006,7 @@ impl LiteServerQuerySubscriber {
     }
 
     async fn watcher_loop(context: &Arc<SubscriberContext>) -> Result<()> {
-        let tip_id = get_last_liteserver_state_block(&context.engine)?;
+        let tip_id = get_last_liteserver_state_block(&context.engine).await?;
         let mut handle = context
             .engine
             .load_block_handle(&tip_id)?
@@ -3090,7 +3091,7 @@ impl Subscriber for LiteServerQuerySubscriber {
         // Early seqno check: if the target seqno is already reached
         let (data, maybe_wait) = Self::try_peel_wait_prefix(&data)?;
         let maybe_wait = if let Some((want_seqno, timeout_ms)) = maybe_wait {
-            if get_last_liteserver_state_block(&self.context.engine)?.seq_no >= want_seqno {
+            if get_last_liteserver_state_block(&self.context.engine).await?.seq_no >= want_seqno {
                 None
             } else {
                 Some((want_seqno, timeout_ms))

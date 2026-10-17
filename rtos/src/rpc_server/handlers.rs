@@ -113,12 +113,11 @@ fn read_single_root_boc_from_base64(boc: &str, param: &str) -> Result<Cell> {
 }
 
 async fn get_mc_state_id(ctx: &Ctx, mc_seq_no: Option<u32>) -> Result<BlockIdExt> {
-    let mc_block_id = get_last_liteserver_state_block(&ctx.engine)?;
-    let mc_state = ctx.engine.load_and_pin_state(&mc_block_id).await?;
+    let mc_state = crate::block::get_last_liteserver_state(&ctx.engine).await?;
     let mc_block_id = if let Some(mc_seq_no) = mc_seq_no {
         mc_state.state().find_block_id(mc_seq_no)?
     } else {
-        (*mc_block_id).clone()
+        mc_state.state().block_id().clone()
     };
     Ok(mc_block_id)
 }
@@ -389,8 +388,9 @@ async fn get_consensus_block(_: NoParams, ctx: Ctx) -> JsonResult {
 }
 
 async fn get_masterchain_info(_: NoParams, ctx: Ctx) -> JsonResult {
-    let mc_block_id = get_last_liteserver_state_block(&ctx.engine)?;
-    let mc_state = ctx.engine.load_state(&mc_block_id).await?;
+    let served = crate::block::get_last_liteserver_state(&ctx.engine).await?;
+    let mc_state = served.state();
+    let mc_block_id = mc_state.block_id();
     let state_root_hash = mc_state.root_cell().repr_hash();
     let zerostate_block: BlockIdExt = ctx.engine.zerostate_id()?.clone();
     let init = serialize_block_id(&zerostate_block);
@@ -1540,7 +1540,7 @@ async fn get_out_msg_queue_sizes_with_type(
     item_type_name: Option<&str>,
 ) -> JsonResult {
     let mode = p.mode.unwrap_or(0);
-    let mc_id = get_last_liteserver_state_block(&ctx.engine)?;
+    let mc_id = get_last_liteserver_state_block(&ctx.engine).await?;
     let mc_state = ctx.engine.load_state(&mc_id).await?;
     let shard_hashes = mc_state.shard_state_extra()?.shards();
 
@@ -1610,7 +1610,7 @@ struct GetConfigParamParams {
 }
 
 async fn get_config_param(p: GetConfigParamParams, ctx: Ctx) -> JsonResult {
-    let mc_block_id = get_last_liteserver_state_block(&ctx.engine)?;
+    let mc_block_id = get_last_liteserver_state_block(&ctx.engine).await?;
     let mut mc_state = ctx.engine.load_and_pin_state(&mc_block_id).await?;
     if let Some(mc_seq_no) = p.seqno {
         let mc_block_id = mc_state.state().find_block_id(mc_seq_no)?;
@@ -1642,7 +1642,7 @@ struct GetConfigAllParams {
 }
 
 async fn get_config_all(p: GetConfigAllParams, ctx: Ctx) -> JsonResult {
-    let mc_block_id = get_last_liteserver_state_block(&ctx.engine)?;
+    let mc_block_id = get_last_liteserver_state_block(&ctx.engine).await?;
     let mut mc_state = ctx.engine.load_and_pin_state(&mc_block_id).await?;
     if let Some(seqno) = p.seqno {
         let mc_block_id = mc_state.state().find_block_id(seqno)?;
@@ -1669,7 +1669,7 @@ struct GetLibrariesParams {
 }
 
 async fn get_libraries(p: GetLibrariesParams, ctx: Ctx) -> JsonResult {
-    let mc_block_id = get_last_liteserver_state_block(&ctx.engine)?;
+    let mc_block_id = get_last_liteserver_state_block(&ctx.engine).await?;
     let mc_state = ctx.engine.load_and_pin_state(&mc_block_id).await?;
     let libraries = mc_state.state().state()?.libraries();
     let mut result = Vec::new();

@@ -35,6 +35,7 @@ use std::{collections::HashMap, sync::Arc};
 use warp::Reply;
 
 struct MockEngine {
+    served_masterchain: crate::served_masterchain::ServedMasterchain,
     last_mc_block_id: Arc<BlockIdExt>,
     zerostate_id: BlockIdExt,
     states: HashMap<BlockIdExt, Arc<ShardStateStuff>>,
@@ -58,6 +59,7 @@ impl MockEngine {
             lookup_by_seqno: HashMap::new(),
             confirmed_block_events: ConfirmedBlockEvents::new(),
             gc_resolver: Arc::new(AllowStateGcSmartResolver::new(u64::MAX)),
+            served_masterchain: Default::default(),
         }
     }
 
@@ -90,6 +92,10 @@ impl EngineOperations for NoStateEngine {}
 
 #[async_trait::async_trait]
 impl EngineOperations for MockEngine {
+    fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
+        Some(&self.served_masterchain)
+    }
+
     fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
         println!("load_last_applied_mc_block_id");
         Ok(Some(self.last_mc_block_id.clone()))

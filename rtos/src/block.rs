@@ -866,20 +866,19 @@ pub async fn get_block_proof(
     }
 }
 
-pub fn get_last_liteserver_state_block(
+pub async fn get_last_liteserver_state(
+    engine: &Arc<dyn EngineOperations>,
+) -> Result<crate::shard_states_keeper::PinnedShardStateGuard> {
+    let cache = engine.served_masterchain_cache()
+        .ok_or_else(|| error!("Engine has no served masterchain state owner"))?;
+    cache.load(engine.as_ref()).await
+}
+
+pub async fn get_last_liteserver_state_block(
     engine: &Arc<dyn EngineOperations>,
 ) -> Result<Arc<BlockIdExt>> {
-    let last_mc_id = engine
-        .load_last_applied_mc_block_id()?
-        .ok_or_else(|| error!("Cannot load last applied mc block id"))?;
-    let Some(shard_client_id) = engine.load_shard_client_mc_block_id()? else {
-        return Ok(last_mc_id);
-    };
-    if shard_client_id.seq_no + 8 < last_mc_id.seq_no {
-        Ok(last_mc_id)
-    } else {
-        Ok(shard_client_id)
-    }
+    let state = get_last_liteserver_state(engine).await?;
+    Ok(Arc::new(state.state().block_id().clone()))
 }
 
 pub async fn resolve_target_and_base(
@@ -901,7 +900,7 @@ pub async fn resolve_target_and_base(
         ensure_mc_full(&tb)?;
         tb
     } else if allow_weak {
-        get_last_liteserver_state_block(engine)?.as_ref().clone()
+        get_last_liteserver_state_block(engine).await?.as_ref().clone()
     } else {
         engine
             .load_shard_client_mc_block_id()?
@@ -919,7 +918,7 @@ pub async fn resolve_target_and_base(
             target_block.clone()
         }
     } else {
-        get_last_liteserver_state_block(engine)?.as_ref().clone()
+        get_last_liteserver_state_block(engine).await?.as_ref().clone()
     };
 
     Ok((target_block, base_block))

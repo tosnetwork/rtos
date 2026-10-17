@@ -514,6 +514,9 @@ impl EngineOperations for Engine {
         }
     }
 
+    fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
+        Some(&self.served_masterchain)
+    }
     fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
         self.db().load_full_node_state(LAST_APPLIED_MC_BLOCK)
     }
