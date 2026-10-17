@@ -184,6 +184,8 @@ struct TestReceiverListener {
     stats: Arc<ReceiverStats>,
     fallback_candidate_payloads: Mutex<HashMap<(u32, UInt256), Vec<u8>>>,
     fallback_notar_payloads: Mutex<HashMap<(u32, UInt256), Vec<u8>>>,
+    hold_local_fallback: AtomicBool,
+    held_local_fallbacks: Mutex<Vec<consensus_common::QueryResponseCallback>>,
 }
 
 impl TestReceiverListener {
@@ -193,6 +195,8 @@ impl TestReceiverListener {
             stats: stats.clone(),
             fallback_candidate_payloads: Mutex::new(HashMap::new()),
             fallback_notar_payloads: Mutex::new(HashMap::new()),
+            hold_local_fallback: AtomicBool::new(false),
+            held_local_fallbacks: Mutex::new(Vec::new()),
         });
         (listener, stats)
     }
@@ -305,6 +309,10 @@ impl ReceiverListener for TestReceiverListener {
         want_notar: bool,
         response_callback: consensus_common::QueryResponseCallback,
     ) {
+        if self.hold_local_fallback.load(Ordering::Acquire) {
+            self.held_local_fallbacks.lock().unwrap().push(response_callback);
+            return;
+        }
         let has_configured_fallback = {
             let candidates = self.fallback_candidate_payloads.lock().unwrap();
             let notars = self.fallback_notar_payloads.lock().unwrap();
@@ -2380,6 +2388,27 @@ fn test_receiver_restored_invalid_cache_repairs_before_delivery() {
     restored_cache_delivery_case("bad_notar");
 }
 
+#[test]
+fn test_receiver_cold_local_lookup_precedes_peer_selection() {
+    restored_cache_delivery_case("local_fallback");
+}
+
+#[test]
+fn test_receiver_invalid_local_lookup_uses_verified_peer_repair() {
+    restored_cache_delivery_case("local_bad_notar");
+    restored_cache_delivery_case("local_wrong_identity");
+}
+
+#[test]
+fn test_receiver_cancelled_local_lookup_cannot_fulfill_recreated_request() {
+    restored_cache_delivery_case("local_cancel");
+}
+
+#[test]
+fn test_receiver_local_lookup_timeout_reaches_peer_and_ignores_late_reply() {
+    restored_cache_delivery_case("local_timeout");
+}
+
 fn restored_cache_delivery_case(mode: &str) {
     use consensus_common::simplex_protocol::SimplexProtocol;
     for protocol in [SimplexProtocol::Private, SimplexProtocol::BlockSync] {
@@ -2448,7 +2477,7 @@ fn restored_cache_delivery_case(mode: &str) {
         .into_boxed();
         let wire = profile.serialize(&candidate).unwrap();
         let notar = build_valid_notar_bytes(&session, slot, &hash, &[(0, &keys[0]), (1, &keys[1])]);
-        let peer = if mode != "complete" {
+        let peer = if mode != "complete" && mode != "local_fallback" && mode != "local_cancel" {
             let peer = ReceiverInstance::create_with_profile(
                 1,
                 session.clone(),
@@ -2469,7 +2498,28 @@ fn restored_cache_delivery_case(mode: &str) {
         } else {
             None
         };
-        if mode != "notar_only" {
+        if mode.starts_with("local_") {
+            let mut local_body = wire.clone();
+            if mode == "local_wrong_identity" {
+                let mut wrong = candidate.clone();
+                if let CandidateData::Consensus_Block(block) = &mut wrong {
+                    block.slot -= 1;
+                }
+                local_body = profile.serialize(&wrong).unwrap();
+            }
+            let local_notar = if mode == "local_bad_notar" {
+                vec![0; 12]
+            } else {
+                notar.clone()
+            };
+            receiver._listener.set_query_fallback_payloads(
+                slot,
+                hash.clone(),
+                local_body,
+                local_notar,
+            );
+        }
+        if mode != "notar_only" && !mode.starts_with("local_") {
             let bytes = if mode == "wrong_identity" {
                 let mut wrong = candidate.clone();
                 if let CandidateData::Consensus_Block(block) = &mut wrong {
@@ -2483,7 +2533,7 @@ fn restored_cache_delivery_case(mode: &str) {
                 .receiver
                 .cache_candidate_bytes(slot, hash.clone(), bytes);
         }
-        if mode != "body_only" {
+        if mode != "body_only" && !mode.starts_with("local_") {
             receiver.receiver.cache_notarization_cert(
                 slot,
                 hash.clone(),
@@ -2494,12 +2544,90 @@ fn restored_cache_delivery_case(mode: &str) {
                 },
             );
         }
-        receiver.receiver.request_candidate(slot, hash.clone());
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let local_reply = || {
+            let response = TlCandidateAndCert {
+                candidate: wire.clone().into(),
+                notar: notar.clone().into(),
+            }
+            .into_boxed();
+            consensus_common::ConsensusCommonFactory::create_block_payload(
+                profile.serialize(&response).unwrap(),
+            )
+        };
+        if mode == "local_cancel" || mode == "local_timeout" {
+            receiver
+                ._listener
+                .hold_local_fallback
+                .store(true, Ordering::Release);
+        }
+        if mode == "local_cancel" {
+            for expected in [1, 2] {
+                receiver.receiver.request_candidate(slot, hash.clone());
+                let until = std::time::Instant::now() + Duration::from_secs(3);
+                while receiver
+                    ._listener
+                    .held_local_fallbacks
+                    .lock()
+                    .unwrap()
+                    .len()
+                    < expected
+                    && std::time::Instant::now() < until
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(
+                    receiver
+                        ._listener
+                        .held_local_fallbacks
+                        .lock()
+                        .unwrap()
+                        .len(),
+                    expected
+                );
+                if expected == 1 {
+                    receiver.receiver.cancel_candidate_requests_for_slot(slot);
+                }
+            }
+            let mut held =
+                std::mem::take(&mut *receiver._listener.held_local_fallbacks.lock().unwrap());
+            held.remove(0)(Ok(local_reply()));
+            thread::sleep(Duration::from_millis(150));
+            assert_eq!(
+                receiver.stats.broadcasts_received.load(Ordering::Acquire),
+                0,
+                "cancelled lookup cannot fulfill the new request for the same id"
+            );
+            receiver
+                ._listener
+                .hold_local_fallback
+                .store(false, Ordering::Release);
+            held.remove(0)(Ok(local_reply()));
+        } else {
+            receiver.receiver.request_candidate(slot, hash.clone());
+        }
+        let deadline = std::time::Instant::now()
+            + Duration::from_secs(if mode == "local_timeout" { 8 } else { 5 });
         while receiver.stats.broadcasts_received.load(Ordering::Acquire) == 0
             && std::time::Instant::now() < deadline
         {
             thread::sleep(Duration::from_millis(10));
+        }
+        if mode == "local_timeout" {
+            assert_eq!(
+                receiver.stats.broadcasts_received.load(Ordering::Acquire),
+                1,
+                "a lost local completion must fall back to the live peer"
+            );
+            let held =
+                std::mem::take(&mut *receiver._listener.held_local_fallbacks.lock().unwrap());
+            assert_eq!(held.len(), 1);
+            held.into_iter().next().unwrap()(Ok(local_reply()));
+            thread::sleep(Duration::from_millis(150));
+            assert_eq!(
+                receiver.stats.broadcasts_received.load(Ordering::Acquire),
+                1,
+                "late local completion cannot duplicate the peer fulfillment"
+            );
         }
         // Explicit subsequent requests must also be fulfilled, rather than suppressed by cache presence.
         if receiver.stats.broadcasts_received.load(Ordering::Acquire) == 1 {

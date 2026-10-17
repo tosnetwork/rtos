@@ -230,12 +230,12 @@ pub(crate) trait Receiver: Send + Sync {
     /// resolves obsolete pending work instead of continuing to retry it.
     fn cancel_candidate_requests_for_slot(&self, slot: u32);
 
-    /// Request a missing candidate from peers (block repair)
+    /// Resolve a missing candidate from local storage, then peers (block repair)
     ///
     /// Called by SessionProcessor when a finalization event requires a candidate
     /// that wasn't received via broadcast. The receiver will:
-    /// 1. Send requestCandidate query to a peer
-    /// 2. Handle response and call on_candidate_received on listener
+    /// 1. Probe local cache and exact-id DB fallback
+    /// 2. Verify and deliver local contents, or query a peer for missing parts
     /// 3. Retry with different peers on timeout/failure
     ///
     /// # Arguments
@@ -2773,6 +2773,8 @@ impl Default for CandidateResolveConfig {
 struct CandidateRequestState {
     /// Time when the request was initiated
     start_time: SystemTime,
+    /// Identifies one local DB lookup across cancellation/recreation of this id.
+    local_lookup: Option<Arc<()>>,
     /// Number of retry attempts so far
     retry_count: u32,
     /// Current timeout for this request (grows with exponential backoff)
@@ -2910,32 +2912,18 @@ impl ReceiverImpl {
             return;
         }
 
-        let source_idx = match self.select_peer_for_candidate_request(None, None, SystemTime::now())
-        {
-            Some(idx) => idx,
-            None => {
-                log::warn!(
-                    "SimplexReceiver {}: request_candidate slot={} hash={} - no peers available",
-                    self.session_id.to_hex_string(),
-                    slot,
-                    &block_hash.to_hex_string()[..8]
-                );
-                return;
-            }
-        };
-
-        self.candidate_requests_counter.increment(1);
         self.pending_requests.insert(
             key,
             CandidateRequestState {
                 start_time: SystemTime::now(),
+                local_lookup: None,
                 retry_count: 0,
                 current_timeout: self.candidate_resolve_config.timeout,
                 attempt_id: 0,
                 in_flight: false,
                 in_flight_want_candidate: false,
                 in_flight_want_notar: false,
-                source_idx,
+                source_idx: ValidatorIndex::new(0),
                 cached_notar: None,
                 cached_candidate: None,
                 giveup_reports: 0,
@@ -2943,6 +2931,161 @@ impl ReceiverImpl {
             },
         );
 
+        // C++ ResolveCandidate probes exact-id local contents/NotarCert before
+        // selecting a peer. The same owned SXMAIN fallback serves this lookup;
+        // its result still crosses the normal identity/signature checks below.
+        if let Some(listener) = self.listener.upgrade() {
+            let token = Arc::new(());
+            self.pending_requests
+                .get_mut(&(slot, block_hash.clone()))
+                .unwrap()
+                .local_lookup = Some(token.clone());
+            let queues = self.get_task_queues();
+            let reply_hash = block_hash.clone();
+            let reply_token = token.clone();
+            listener.on_candidate_query_fallback(
+                slot,
+                block_hash.clone(),
+                true,
+                true,
+                Box::new(move |result| {
+                    queues.post_closure(Box::new(move |receiver| {
+                        receiver.finish_local_candidate_lookup(
+                            slot,
+                            reply_hash,
+                            reply_token,
+                            result,
+                        );
+                    }));
+                }),
+            );
+            // A lost listener completion must not strand peer repair. The DB
+            // fallback has bounded reads; this deadline only retires the lookup
+            // token, never a DB/session owner. Late/cancelled replies are ignored.
+            self.post_delayed_action(
+                SystemTime::now() + Duration::from_secs(5),
+                move |receiver| {
+                    receiver.finish_local_candidate_lookup(
+                        slot,
+                        block_hash,
+                        token,
+                        Err(error!("Local candidate lookup completion deadline")),
+                    );
+                },
+            );
+        } else {
+            self.start_peer_candidate_request(slot, block_hash);
+        }
+    }
+
+    fn finish_local_candidate_lookup(
+        &mut self,
+        slot: SlotIndex,
+        block_hash: UInt256,
+        token: Arc<()>,
+        result: Result<BlockPayloadPtr>,
+    ) {
+        let key = (slot, block_hash.clone());
+        let Some(state) = self.pending_requests.get_mut(&key) else {
+            return;
+        };
+        if !state
+            .local_lookup
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &token))
+        {
+            return;
+        }
+        state.local_lookup = None;
+        let response = result.and_then(|payload| {
+            if payload.data().len() as u64 > self.max_candidate_query_answer_size {
+                fail!("Local candidate response exceeds query budget");
+            }
+            self.wire_profile
+                .deserialize_typed::<CandidateAndCertBoxed>(payload.data())
+        });
+        match response {
+            Ok(response) => {
+                let body = response.candidate();
+                let notar = response.notar();
+                if !body.is_empty() {
+                    match Self::validate_repair_candidate_identity(
+                        self.wire_profile,
+                        &self.session_id,
+                        &self.sources,
+                        self.slots_per_leader_window,
+                        &self.shard,
+                        self.max_candidate_size,
+                        self.max_candidate_query_answer_size,
+                        self.proto_version,
+                        slot,
+                        &block_hash,
+                        body,
+                    ) {
+                        Ok(_) => self.resolver_cache.cache_candidate(
+                            slot,
+                            block_hash.clone(),
+                            body.to_vec(),
+                        ),
+                        Err(reason) => {
+                            log::warn!(target: "simplex_resolver", "Local candidate lookup rejected slot={slot}: {reason}")
+                        }
+                    }
+                }
+                if !notar.is_empty() {
+                    match Self::validate_repair_notar_signature_set(
+                        self.wire_profile,
+                        &self.session_id,
+                        &self.sources,
+                        self.max_candidate_query_answer_size,
+                        slot,
+                        &block_hash,
+                        notar,
+                    ) {
+                        Ok(_) => self.resolver_cache.cache_notar_cert(
+                            slot,
+                            block_hash.clone(),
+                            notar.to_vec(),
+                        ),
+                        Err(reason) => {
+                            log::warn!(target: "simplex_resolver", "Local NotarCert lookup rejected slot={slot}: {reason}")
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                log::debug!("Local candidate lookup did not resolve slot={slot}: {error}")
+            }
+        }
+        // Local data has no peer sender to blame. Invalid local pieces are not
+        // persisted or promoted and do not ban whichever peer is selected next.
+        if self.deliver_cached_candidate(slot, &block_hash) {
+            log::info!(target: "simplex_resolver",
+                "LOCAL_CANDIDATE_RECOVERY: session={} slot={} hash={} validated local lookup delivered",
+                self.session_id.to_hex_string(),slot.value(),block_hash.to_hex_string());
+            self.pending_requests.remove(&key);
+        } else {
+            self.start_peer_candidate_request(slot, block_hash);
+        }
+    }
+
+    fn start_peer_candidate_request(&mut self, slot: SlotIndex, block_hash: UInt256) {
+        let key = (slot, block_hash.clone());
+        let Some(source_idx) =
+            self.select_peer_for_candidate_request(None, None, SystemTime::now())
+        else {
+            self.pending_requests.remove(&key);
+            log::warn!(
+                "SimplexReceiver {}: candidate slot={slot} unresolved locally; no peers available",
+                self.session_id.to_hex_string()
+            );
+            return;
+        };
+        let Some(state) = self.pending_requests.get_mut(&key) else {
+            return;
+        };
+        state.source_idx = source_idx;
+        self.candidate_requests_counter.increment(1);
         self.send_candidate_request(slot, block_hash);
     }
 
@@ -3025,6 +3168,9 @@ impl ReceiverImpl {
             let Some(state_ro) = self.pending_requests.get(&key) else {
                 return;
             };
+            if state_ro.local_lookup.is_some() {
+                return;
+            }
             let have_candidate = state_ro.cached_candidate.is_some()
                 || self.resolver_cache.get_candidate(slot, &block_hash).is_some();
             let have_notar = state_ro.cached_notar.is_some()

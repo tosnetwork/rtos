@@ -253,6 +253,7 @@ fn test_merge_candidate_response_parts_body_then_notar_completes_merge() {
 
     let mut cache = super::CandidateResolverCache::new();
     let mut state = super::CandidateRequestState {
+        local_lookup: None,
         start_time: SystemTime::now(),
         retry_count: 0,
         current_timeout: Duration::from_millis(500),
@@ -310,6 +311,7 @@ fn test_merge_candidate_response_parts_uses_locally_cached_notar() {
     cache.cache_notar_cert(slot, block_hash.clone(), cached_notar.clone());
 
     let mut state = super::CandidateRequestState {
+        local_lookup: None,
         start_time: SystemTime::now(),
         retry_count: 0,
         current_timeout: Duration::from_millis(500),
@@ -351,6 +353,7 @@ fn test_merge_candidate_response_parts_uses_locally_cached_candidate() {
     cache.cache_candidate(slot, block_hash.clone(), cached_candidate.clone());
 
     let mut state = super::CandidateRequestState {
+        local_lookup: None,
         start_time: SystemTime::now(),
         retry_count: 0,
         current_timeout: Duration::from_millis(500),
@@ -390,6 +393,7 @@ fn test_merge_candidate_response_parts_notar_then_body_completes_merge() {
 
     let mut cache = super::CandidateResolverCache::new();
     let mut state = super::CandidateRequestState {
+        local_lookup: None,
         start_time: SystemTime::now(),
         retry_count: 0,
         current_timeout: Duration::from_millis(500),
@@ -443,6 +447,7 @@ fn test_merge_candidate_response_parts_preserves_existing_parts() {
 
     let mut cache = super::CandidateResolverCache::new();
     let mut state = super::CandidateRequestState {
+        local_lookup: None,
         start_time: SystemTime::now(),
         retry_count: 0,
         current_timeout: Duration::from_millis(500),
@@ -690,6 +695,7 @@ fn test_merge_candidate_response_parts_does_not_write_resolver_cache() {
 
     let mut cache = super::CandidateResolverCache::new();
     let mut state = super::CandidateRequestState {
+        local_lookup: None,
         start_time: SystemTime::now(),
         retry_count: 0,
         current_timeout: Duration::from_millis(500),

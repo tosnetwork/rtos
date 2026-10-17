@@ -12463,3 +12463,80 @@ fn test_transport_certificate_outside_ingress_window_does_not_ban() {
     assert!(!fixture.drain_receiver_actions().iter().any(|action| matches!(action,
         ReceiverAction::BanPeerForBadSignature { .. } | ReceiverAction::BanSourceForBadSignature { .. })));
 }
+
+#[test]
+fn test_candidate_query_fallback_reads_cold_disk_body_and_notar() {
+    let mut fixture = TestFixture::new(4);
+    let (_leader, id, candidate) = make_signed_block_broadcast(&fixture, 9, vec![7, 9, 11]);
+    let wire = fixture
+        .description
+        .opts()
+        .wire_profile
+        .serialize(&candidate)
+        .unwrap();
+    let vote = crate::simplex_state::NotarizeVote {
+        slot: id.slot,
+        block_hash: id.hash.clone(),
+    };
+    let signed_vote = crate::simplex_state::Vote::Notarize(vote.clone());
+    let bytes = crate::utils::create_data_to_sign(
+        fixture.processor.session_id(),
+        &crate::utils::serialize_unsigned_vote(
+            &crate::utils::vote_to_tl_unsigned(&signed_vote).unwrap(),
+        ),
+    );
+    let cert = crate::certificate::Certificate {
+        vote,
+        signatures: [0, 1, 2]
+            .iter()
+            .map(|&i| crate::certificate::VoteSignature {
+                validator_idx: ValidatorIndex::new(i as u32),
+                signature: fixture.nodes[i].public_key.sign(&bytes).unwrap().to_vec(),
+            })
+            .collect(),
+    };
+    let db = fixture.processor.database.db().clone();
+    db.save_candidate_payload_async(&id, &wire)
+        .unwrap()
+        .wait()
+        .unwrap();
+    db.save_notar_cert_async(&id, &cert)
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert!(!fixture.processor.candidate_book().contains_received(&id));
+    assert!(fixture
+        .processor
+        .candidate_book()
+        .cached_data(&id)
+        .is_none());
+    assert!(fixture
+        .processor
+        .simplex_state
+        .get_notarize_certificate(id.slot, &id.hash)
+        .is_none());
+    let (tx, rx) = channel();
+    fixture.processor.handle_candidate_query_fallback(
+        id.slot,
+        id.hash.clone(),
+        true,
+        true,
+        Box::new(move |result| tx.send(result).unwrap()),
+    );
+    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    let response = fixture
+        .description
+        .opts()
+        .wire_profile
+        .deserialize_typed::<CandidateAndCert>(result.data())
+        .unwrap();
+    assert_eq!(response.candidate(), &wire);
+    assert_eq!(
+        response.notar(),
+        &rtos_api::serialize_boxed(&cert.to_tl_vote_signature_set()).unwrap()
+    );
+    assert!(
+        !fixture.processor.candidate_book().contains_received(&id),
+        "serving disk bytes alone does not approve or finalize a candidate"
+    );
+}
