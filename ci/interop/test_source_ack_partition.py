@@ -165,6 +165,16 @@ class CompositionArgumentTests(unittest.TestCase):
     def test_declared_combination_reaches_profile_validation(self):
         with self.assertRaisesRegex(RuntimeError, 'profile boundary'):
             self.arguments(['--source-ack-partition-restart', '--source-ack-fault', 'sync-eio', '--partition-restart'])
+    def test_intent_stop_requires_explicit_combined_sync_failure(self):
+        for extra in [['--source-ack-intent-stop'],
+                ['--source-ack-intent-stop', '--source-ack-partition-restart', '--source-ack-fault', 'write-enospc', '--partition-restart']]:
+            with self.subTest(extra=extra), self.assertRaisesRegex(SystemExit, 'explicit combined sync-eio'):
+                self.arguments(extra)
+
+    def test_intent_stop_reaches_profile_with_declared_combination(self):
+        with self.assertRaisesRegex(RuntimeError, 'profile boundary'):
+            self.arguments(['--source-ack-intent-stop', '--source-ack-partition-restart',
+                '--source-ack-fault', 'sync-eio', '--partition-restart'])
 
 
 if __name__ == '__main__':

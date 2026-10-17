@@ -1,6 +1,8 @@
 // Test-only: one exact source-ack file operation fails in the owned node.
 #define _GNU_SOURCE
 #include <errno.h>
+#include <signal.h>
+#include <stdint.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -70,15 +72,74 @@ static int fail_once(int fd, const char *operation, int error_number) {
     errno = error_number;
     return 1;
 }
+// An independently armed intent cut is used only after the ACK failure was
+// observed. It never changes the intent bytes or the successful sync result.
+static void stop_synced_intent(int fd) {
+    const char *arm = getenv("RTOS_TEST_SOURCE_INTENT_ARM");
+    const char *marker = getenv("RTOS_TEST_SOURCE_INTENT_MARKER");
+    const char *selector = getenv("RTOS_TEST_SOURCE_FAULT_DIRECTORY_FILE");
+    struct stat info;
+    if (!arm || !marker || !selector || lstat(arm, &info) || !S_ISREG(info.st_mode)) return;
+    int control = open(selector, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (control < 0) return;
+    char directory[PATH_MAX];
+    if (fstat(control, &info) || !S_ISREG(info.st_mode) || info.st_size <= 0 || info.st_size >= PATH_MAX) {
+        close(control); return;
+    }
+    ssize_t count = read(control, directory, (size_t)info.st_size);
+    close(control);
+    if (count != info.st_size) return;
+    if (directory[count - 1] == '\n') --count;
+    if (count <= 0 || directory[0] != '/' || memchr(directory, 0, (size_t)count)
+        || memchr(directory, '\n', (size_t)count)) return;
+    directory[count] = 0;
+    char *base = strrchr(directory, '/');
+    if (!base || strcmp(base, "/finality-pending")) return;
+    *base = 0;
+    char expected[PATH_MAX];
+    int prefix = snprintf(expected, sizeof(expected), "%s/finality-intents/", directory);
+    if (prefix <= 0 || prefix >= (int)sizeof(expected)) return;
+    char link[64], path[PATH_MAX];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t length = readlink(link, path, sizeof(path) - 1);
+    if (length <= 0) return;
+    path[length] = 0;
+    if (strncmp(path, expected, (size_t)prefix)) return;
+    const char *name = path + prefix;
+    size_t digits = strspn(name, "0123456789");
+    if (!digits || digits > 10 || name[digits] != '-' || (digits > 1 && name[0] == '0')) return;
+    char *end;
+    unsigned long slot = strtoul(name, &end, 10);
+    if (slot > UINT32_MAX || end != name + digits) return;
+    const char *hash = name + digits + 1;
+    if (strlen(hash) != 68 || strspn(hash, "0123456789abcdef") != 64 || strcmp(hash + 64, ".tmp")) return;
+    if (fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_size <= 0 || info.st_size > (16 << 20)) return;
+    int proof = open(marker, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (proof < 0) return;
+    char message[PATH_MAX + 64];
+    int size = snprintf(message, sizeof(message), "intent after-fsync pid=%ld: %s\n", (long)getpid(), path);
+    ssize_t written = syscall(SYS_write, proof, message, (size_t)size);
+    int synced = syscall(SYS_fsync, proof), closed = close(proof);
+    if (written != size || synced || closed) return;
+    raise(SIGSTOP);
+}
 ssize_t write(int fd, const void *bytes, size_t count) {
     if (count && fail_once(fd, "write-enospc", ENOSPC)) return -1;
     return syscall(SYS_write, fd, bytes, count);
 }
 int fsync(int fd) {
     if (fail_once(fd, "sync-eio", EIO)) return -1;
-    return syscall(SYS_fsync, fd);
+    int result = (int)syscall(SYS_fsync, fd);
+    int saved_errno = errno;
+    if (!result) stop_synced_intent(fd);
+    errno = saved_errno;
+    return result;
 }
 int fdatasync(int fd) {
     if (fail_once(fd, "sync-eio", EIO)) return -1;
-    return syscall(SYS_fdatasync, fd);
+    int result = (int)syscall(SYS_fdatasync, fd);
+    int saved_errno = errno;
+    if (!result) stop_synced_intent(fd);
+    errno = saved_errno;
+    return result;
 }

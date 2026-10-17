@@ -150,11 +150,14 @@ pub fn authenticate_source_history_debt(
             if *count > limit_count || *total > limit_bytes {
                 fail!("Source history debt quota exceeded");
             }
-            if ext == Some("tmp") {
+            // An intact pending-write temp can supply a certificate for the
+            // normal authenticated replay. It proves no completion or node ACK.
+            // Completed-write temps still need their canonical pending proof.
+            if in_completed && ext == Some("tmp") {
                 continue;
             }
             if (in_completed && ext != Some("complete"))
-                || (!in_completed && !matches!(ext, Some("json" | "resolved")))
+                || (!in_completed && !matches!(ext, Some("json" | "resolved" | "tmp")))
             {
                 fail!("Unexpected source history artifact");
             }
@@ -294,6 +297,45 @@ mod tests {
         let path = FinalityIntentStore::new(&namespace).paths().unwrap().remove(0);
         (runtime, record, path)
     }
+    #[test]
+    fn source_history_debt_pending_temporary_requires_real_certificate_without_publication() {
+        let root = crate::authenticated_fixture::TestDirectory::new();
+        let (runtime, record, path) = retained(root.path());
+        let original = std::fs::read(&path).unwrap();
+        let temporary = path.with_extension("tmp");
+        std::fs::rename(&path, &temporary).unwrap();
+        let receipt = authenticate_source_history_debt(&record, &runtime, &Budget).unwrap();
+        assert!(same_record(receipt.record(), &record));
+        assert_eq!(std::fs::read(&temporary).unwrap(), original);
+        assert!(!path.exists(), "authentication must not publish an uncommitted intent");
+        drop(receipt);
+        let mut disk: DiskIntent = serde_json::from_slice(&original).unwrap();
+        let mut wire: rtos_api::ton::consensus::simplex::Certificate =
+            WireProfile::T0.deserialize_typed(&hex::decode(&disk.certificate).unwrap()).unwrap();
+        let rtos_api::ton::consensus::simplex::Certificate::Consensus_Simplex_Certificate(
+            ref mut cert,
+        ) = wire;
+        let rtos_api::ton::consensus::simplex::VoteSignatureSet::Consensus_Simplex_VoteSignatureSet(
+            ref mut signatures,
+        ) = cert.signatures;
+        signatures.votes = Vec::new().into();
+        disk.certificate = hex::encode(WireProfile::T0.serialize(&wire).unwrap());
+        let invalid = serde_json::to_vec(&disk).unwrap();
+        std::fs::write(&temporary, &invalid).unwrap();
+        let error = authenticate_source_history_debt(&record, &runtime, &Budget).err().unwrap();
+        assert!(error.to_string().contains("Not enough signatures"), "{error:#}");
+        assert_eq!(std::fs::read(&temporary).unwrap(), invalid);
+        assert!(!path.exists());
+        assert!(
+            crate::finality_delivery::PendingFinalityStore::lock(
+                record.namespace.join("finality-pending")
+            )
+            .unwrap()
+            .is_some(),
+            "failed authentication releases its owner"
+        );
+    }
+
     #[test]
     fn source_history_debt_real_certificate_holds_owner_until_receipt_drop() {
         let root = crate::authenticated_fixture::TestDirectory::new();

@@ -475,10 +475,15 @@ impl FinalityIntentStore {
                     if completed_temps > 1 || pending_temps > 1 {
                         fail!("Source recovery temporary quota exceeded");
                     }
-                    continue;
+                    // Pending-write temporaries are uncommitted certificate inputs.
+                    // Expose intact records to authenticated replay without renaming or
+                    // deleting them here. Completed-write temps remain separate evidence.
+                    if completed {
+                        continue;
+                    }
                 }
                 if (in_completed && extension != Some("complete"))
-                    || (!in_completed && !matches!(extension, Some("json" | "resolved")))
+                    || (!in_completed && !matches!(extension, Some("json" | "resolved" | "tmp")))
                 {
                     fail!("Unexpected source recovery artifact");
                 }
@@ -646,10 +651,36 @@ impl FinalityIntentStore {
             &path
         };
         if old.exists() {
-            read_intent(old, &self.namespace)?.0.validate_runtime(runtime)?;
+            let (existing, certificate) = read_intent(old, &self.namespace)?;
+            existing.validate_runtime(runtime)?;
+            let temporary = path.with_extension("tmp");
+            let redundant = match std::fs::symlink_metadata(&temporary) {
+                Ok(metadata) => {
+                    if !metadata.file_type().is_file() {
+                        fail!("Pending intent temporary is not a regular file");
+                    }
+                    let (pending, pending_certificate) = read_intent(&temporary, &self.namespace)?;
+                    pending.validate_runtime(runtime)?;
+                    if certificate != pending_certificate
+                        || existing.prev_blocks != pending.prev_blocks
+                        || existing.start_masterchain != pending.start_masterchain
+                    {
+                        fail!("Pending intent temporary conflicts with retained proof");
+                    }
+                    true
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
+            // Only authenticated normal replay reaches this path. Make the
+            // canonical proof durable before removing an exact redundant copy.
             File::open(old)?.sync_all()?;
             File::open(old.parent().unwrap())?.sync_all()?;
             File::open(&directory)?.sync_all()?;
+            if redundant {
+                std::fs::remove_file(temporary)?;
+                File::open(&directory)?.sync_all()?;
+            }
             return Ok(());
         }
         let disk = record.disk(event)?;
@@ -728,8 +759,10 @@ impl FinalityIntentStore {
                     }
                 }
             }
-            if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                pending.push(certificate);
+            if matches!(path.extension().and_then(|s| s.to_str()), Some("json" | "tmp")) {
+                if !pending.contains(&certificate) {
+                    pending.push(certificate);
+                }
             }
         }
         // Initialize once: after a failed rename/fsync transition the in-process
@@ -739,7 +772,10 @@ impl FinalityIntentStore {
             *cached = Some(
                 self.paths()?
                     .into_iter()
-                    .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+                    .filter(|p| {
+                        matches!(p.extension().and_then(|s| s.to_str()), Some("json" | "tmp"))
+                    })
+                    .map(|p| p.with_extension("json"))
                     .collect(),
             );
         }
@@ -837,7 +873,7 @@ pub fn scan_finality_recovery_namespace(
     let mut found: Option<SessionRecoveryRecord> = None;
     for path in store.paths()? {
         let (record, _) = read_intent(&path, namespace)?;
-        if path.extension().and_then(|s| s.to_str()) == Some("json")
+        if matches!(path.extension().and_then(|s| s.to_str()), Some("json" | "tmp"))
             || store.needs_output_rebuild(&path)?
         {
             if let Some(existing) = &found {
@@ -1018,6 +1054,183 @@ mod tests {
         );
         drop(owner);
     }
+    #[test]
+    fn source_finality_pending_temporary_replays_before_unrelated_intents() {
+        let directory = crate::authenticated_fixture::TestDirectory::new();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "finality_recovery::tests::source_finality_cert_intent_process_child",
+            ])
+            .env("RTOS_CERT_INTENT_CRASH_ROOT", directory.path())
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(77));
+        let records = scan_finality_recovery(directory.path()).unwrap();
+        let namespace = &records[0].namespace;
+        let (runtime, _) = crate::finality_delivery::tests::fixture();
+        let store = FinalityIntentStore::new(namespace);
+        let original = store.paths().unwrap().remove(0);
+        let bytes = std::fs::read(&original).unwrap();
+        let temporary = original.with_extension("tmp");
+        // An intact pending-write crash image, before publication. No scan may
+        // promote it; only the authenticated normal certificate replay may retain it.
+        std::fs::rename(&original, &temporary).unwrap();
+        assert!(FinalityIntentStore::prepare_temporary(
+            &namespace.join(DIRECTORY).join("other.tmp")
+        )
+        .is_err());
+        let pending = store.pending().unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "intact intent temporary must be offered to normal certificate replay"
+        );
+        assert_eq!(store.pending_count().unwrap(), 1);
+        assert_eq!(scan_finality_recovery(directory.path()).unwrap().len(), 1);
+        assert!(locate_session_start(namespace).unwrap().is_some());
+        store.authenticate_pending(&runtime).unwrap();
+        assert_eq!(std::fs::read(&temporary).unwrap(), bytes);
+        assert!(!original.exists());
+        assert!(!store.completed_path(&original).exists());
+        let nodes = runtime
+            .committee()
+            .iter()
+            .map(crate::SimplexSessionNode::from_descriptor)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let transport =
+            rtos_block::Ed25519KeyOption::<rtos_block::ZeroizingBytes>::from_private_key(
+                &[0x71; 32],
+            )
+            .unwrap();
+        let options = crate::SessionOptions {
+            protocol: runtime.protocol(),
+            proto_version: runtime.carrier_version(),
+            wire_profile: runtime.wire_profile(),
+            slots_per_leader_window: runtime.slots_per_leader_window(),
+            ..Default::default()
+        };
+        let description = crate::session_description::SessionDescription::new_with_runtime(
+            &options,
+            runtime.session_id().clone(),
+            1,
+            &nodes,
+            transport,
+            runtime.shard(),
+            std::time::SystemTime::now(),
+            None,
+            Some(&runtime),
+        )
+        .unwrap()
+        .bind_pq_session(runtime.catchain_seqno())
+        .unwrap();
+        let wire = runtime.wire_profile().deserialize_typed(&pending[0]).unwrap();
+        let certificate = crate::certificate::Certificate::<crate::simplex_state::Vote>::from_tl(
+            &wire,
+            &description,
+            runtime.session_id(),
+        )
+        .unwrap();
+        let crate::simplex_state::Vote::Finalize(vote) = certificate.vote else {
+            panic!("expected FinalCert")
+        };
+        let event = crate::simplex_state::BlockFinalizedEvent {
+            slot: vote.slot,
+            block_hash: vote.block_hash.clone(),
+            block_id: None,
+            certificate: std::sync::Arc::new(crate::certificate::Certificate {
+                vote,
+                signatures: certificate.signatures,
+            }),
+        };
+        store
+            .retain(
+                &runtime,
+                records[0].prev_blocks.clone(),
+                records[0].start_masterchain.clone(),
+                &event,
+            )
+            .unwrap();
+        assert!(!temporary.exists());
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        assert_eq!(
+            store.pending_count().unwrap(),
+            1,
+            "retention is not node ACK or completed proof"
+        );
+        assert!(!store.completed_path(&original).exists());
+        FinalityIntentStore::prepare_temporary(&namespace.join(DIRECTORY).join("other.tmp"))
+            .unwrap();
+
+        // An exact duplicate remains uncommitted until authenticated retain has
+        // re-established the canonical file/directory durability barriers.
+        std::fs::write(&temporary, &bytes).unwrap();
+        assert_eq!(store.pending().unwrap().len(), 1);
+        assert_eq!(store.pending_count().unwrap(), 1);
+        assert!(temporary.exists());
+        store
+            .retain(
+                &runtime,
+                records[0].prev_blocks.clone(),
+                records[0].start_masterchain.clone(),
+                &event,
+            )
+            .unwrap();
+        assert!(!temporary.exists());
+
+        let mut wrong_runtime: DiskIntent = serde_json::from_slice(&bytes).unwrap();
+        wrong_runtime.profile = UInt256::calc_file_hash(b"other runtime").to_hex_string();
+        let changed = serde_json::to_vec(&wrong_runtime).unwrap();
+        std::fs::write(&temporary, &changed).unwrap();
+        assert!(store.authenticate_pending(&runtime).is_err());
+        assert!(store
+            .retain(
+                &runtime,
+                records[0].prev_blocks.clone(),
+                records[0].start_masterchain.clone(),
+                &event
+            )
+            .is_err());
+        assert_eq!(std::fs::read(&temporary).unwrap(), changed);
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        std::fs::remove_file(&temporary).unwrap();
+
+        for malformed in [b"".as_slice(), b"{partial".as_slice()] {
+            std::fs::write(&temporary, malformed).unwrap();
+            assert!(store.pending().is_err(), "torn inputs cannot be silently omitted");
+            assert!(locate_session_start(namespace).is_err());
+            assert_eq!(std::fs::read(&temporary).unwrap(), malformed);
+            std::fs::remove_file(&temporary).unwrap();
+        }
+        let wrong_name = temporary.with_file_name("unknown.tmp");
+        std::fs::write(&wrong_name, &bytes).unwrap();
+        assert!(store.pending().is_err());
+        assert_eq!(std::fs::read(&wrong_name).unwrap(), bytes);
+        std::fs::remove_file(wrong_name).unwrap();
+        File::create(&temporary).unwrap().set_len(MAX_INTENT_BYTES + 1).unwrap();
+        assert!(store.pending().is_err(), "physical quotas apply before parsing");
+        assert_eq!(std::fs::metadata(&temporary).unwrap().len(), MAX_INTENT_BYTES + 1);
+        std::fs::remove_file(&temporary).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&original, &temporary).unwrap();
+            assert!(store.pending().is_err());
+            assert!(store
+                .retain(
+                    &runtime,
+                    records[0].prev_blocks.clone(),
+                    records[0].start_masterchain.clone(),
+                    &event
+                )
+                .is_err());
+            assert!(temporary.is_symlink());
+            std::fs::remove_file(&temporary).unwrap();
+        }
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        assert!(!store.completed_path(&original).exists());
+    }
+
     #[test]
     fn source_finality_completion_temporary_requires_exact_pending_proof() {
         let directory = crate::authenticated_fixture::TestDirectory::new();
