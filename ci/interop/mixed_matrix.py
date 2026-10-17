@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import urllib.error
 
 
 def digest(path):
@@ -33,10 +34,20 @@ def identity(block):
 def rpc(url, method, params=None):
     body = json.dumps(dict(jsonrpc='2.0', id=1, method=method, params=params or {})).encode()
     request = urllib.request.Request(url, body, {'Content-Type': 'application/json'})
-    with urllib.request.urlopen(request, timeout=3) as response:
-        value = json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            value = json.load(response)
+    except urllib.error.HTTPError as error:
+        # Preserve the node's reason and exact requested height. A bare HTTP
+        # status cannot distinguish unavailable proof data from invalid data.
+        with error:
+            raw = error.read(64 * 1024 + 1)
+        detail = raw[:64 * 1024].decode('utf-8', errors='replace')
+        if len(raw) > 64 * 1024:
+            detail += ' [response truncated]'
+        raise RuntimeError(f'RPC {method} params={params or {}} HTTP {error.code}: {detail}') from error
     if 'error' in value:
-        raise RuntimeError(str(value['error']))
+        raise RuntimeError(f'RPC {method} params={params or {}}: {value["error"]}')
     return value['result']
 
 
