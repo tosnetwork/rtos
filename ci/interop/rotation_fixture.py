@@ -14,6 +14,7 @@ import sys
 import time
 
 sys.dont_write_bytecode = True
+from quorum_profile import epoch_weights, check_committee_weights, quorum_threshold
 from network_faults import MODES, PacketMarks, marked_environment, require_namespace
 from network_fault_fixture import exercise_network_member, stop_cpp_with_receipt
 
@@ -242,16 +243,26 @@ def install_successor(module, nodes, profile):
         anchor = '\nconfig.new_consensus_params_all!\n'
         if code.count(anchor) != 1:
             raise RuntimeError('Pinned Genesis template insertion point differs')
+        initial = epoch_weights(profile, 'initial_weights', INITIAL)
+        successor = epoch_weights(profile, 'successor_weights', SUCCESSOR)
+        for position, index in enumerate(INITIAL):
+            filename = f'pq-validator-{position}.boc'
+            old = f'17 "{filename}" file>B B>boc register-validator'
+            if code.count(old) != 1:
+                raise RuntimeError('Pinned initial PQ validator template differs')
+            (directory / filename).write_bytes(module._pq_validator_descriptor(
+                nodes[index].pq_initial_validator, initial[index]).to_boc())
+            code = code.replace(old, f'{initial[index]} "{filename}" file>B B>boc register-validator')
         lines = ['dictnew 0 validator-dict 2!', 'validators-weight 0!']
         for index in SUCCESSOR:
             filename = f'rotation-validator-{index}.boc'
             (directory / filename).write_bytes(module._pq_validator_descriptor(
-                nodes[index].pq_initial_validator, 17).to_boc())
-            lines.append(f'17 "{filename}" file>B B>boc register-validator')
+                nodes[index].pq_initial_validator, successor[index]).to_boc())
+            lines.append(f'{successor[index]} "{filename}" file>B B>boc register-validator')
         since = profile['genesis_time'] + profile['activation_delay']
         until = since + profile['successor_valid_for']
         lines.append(f'<b x{{12}} s, {since} 32 u, {until} 32 u, '
-                     '4 16 u, 4 16 u, 68 64 u, validator-dict @ first dict, b> 36 config!')
+                     f'4 16 u, 4 16 u, {sum(successor.values())} 64 u, validator-dict @ first dict, b> 36 config!')
         original(install, code.replace(anchor, anchor + '\n'.join(lines) + '\n'), directory, **kwargs)
 
     module.run_fift = generate
@@ -349,6 +360,8 @@ async def run(args, profile, root, artifacts):
             governing_witnesses = {}
             seen = set()
             epochs = {phase: {'mc_creators': {}, 'wc_creators': {}} for phase in ['before', 'after']}
+            if profile.get('weighted_quorum_pause'):
+                for epoch in epochs.values(): epoch['mc_signers'] = {}
             baseline_wc_cc = 0
             deadline = time.monotonic() + args.timeout
             while time.monotonic() < deadline:
@@ -393,6 +406,9 @@ async def run(args, profile, root, artifacts):
                         phase, committee = 'after', SUCCESSOR
                     else:
                         raise RuntimeError('Authenticated C++ state has an unexpected current committee')
+                    expected_weights = epoch_weights(profile,
+                        'initial_weights' if phase == 'before' else 'successor_weights', committee)
+                    check_committee_weights(checked, expected_weights, member_id)
                     seen.add(key)
                     if phase == 'before' and all(len(group) == 4 for group in epochs['before'].values()):
                         write(directory / 'phase-complete.json', {'phase': phase,
@@ -432,6 +448,12 @@ async def run(args, profile, root, artifacts):
                             write(gov_dir / 'bodies.json', governing_witnesses[key_seqno])
                         sample['certificates'] = [proof]
                         sample['governing_key_block'] = {**governing_witnesses[key_seqno], 'certificates': [proof]}
+                    if profile.get('weighted_quorum_pause'):
+                        for signer_index in committee:
+                            signature_set = await asyncio.to_thread(rpc, endpoints[signer_index],
+                                'getMasterchainBlockSignatures', {'seqno': key[2]})
+                            sample['certificates'].append({'kind': 'rpc',
+                                'name': endpoint_names[signer_index], 'value': signature_set})
                     tops = [top for top in checked['shard_tops'] if int(top['workchain']) == 0 and int(top['seqno']) > 0]
                     if tops and len(epochs[phase]['wc_creators']) < 4:
                         top = tops[0]; wc_dir = directory / 'workchain'; wc_dir.mkdir()
@@ -447,6 +469,11 @@ async def run(args, profile, root, artifacts):
                         raise RuntimeError('Successor sample lacks independently verified governing history')
                     if checked['created_by'] not in {member_id(i) for i in committee}:
                         raise RuntimeError('Non-transition block creator is absent from the current committee')
+                    if profile.get('weighted_quorum_pause'):
+                        for certificate in checked['verified_final_certificates']:
+                            for signer in certificate['validator_ids']:
+                                epochs[phase]['mc_signers'].setdefault(signer,
+                                    {'check': checked, 'sample_directory': str(directory)})
                     evidence = {'check': checked, 'sample_directory': str(directory)}
                     mc_member = next(i for i in committee if member_id(i) == checked['created_by'])
                     if args.rust_node and mc_member in [2, 3, 5]:
@@ -475,7 +502,13 @@ async def run(args, profile, root, artifacts):
                                 evidence['local_collation'] = match.group(0)
                             epochs[phase]['wc_creators'].setdefault(wc['created_by'], evidence)
                     write(root / 'epochs.json', epochs)
-                    if all(len(epoch[k]) == 4 for epoch in epochs.values() for k in ['mc_creators', 'wc_creators']):
+                    if all(len(group) == 4 for epoch in epochs.values() for group in epoch.values()):
+                        weighted_quorum = None
+                        if profile.get('weighted_quorum_pause'):
+                            from weighted_quorum_fixture import exercise_weighted_quorum
+                            weighted_quorum = await exercise_weighted_quorum(args, root, nodes, endpoints,
+                                lite_configs, rust_nodes, zero, governing_witnesses[checked['prev_key_block_seqno']],
+                                checked, artifacts, profile)
                         recovery = None
                         network_fault = None
                         if args.network_fault:
@@ -507,7 +540,7 @@ async def run(args, profile, root, artifacts):
                                           else 'cpp_membership_rotation_observed'), 'epochs': epochs,
                             'all_six_applied_mc_states_match': True, 'independent_post_rotation_finality_qualified': True,
                             'mixed_rotation_qualified': bool(args.rust_node), 'election_rehearsal': False,
-                            'recovery': recovery, 'network_fault': network_fault}
+                            'recovery': recovery, 'network_fault': network_fault, 'weighted_quorum': weighted_quorum}
                 await asyncio.sleep(0.2)
             raise TimeoutError('C++ rotation did not satisfy both MC/WC creator epochs')
         finally:
@@ -581,6 +614,14 @@ def main():
         raise SystemExit('Unsupported bounded isolated rotation schedule')
     if profile['consensus']['protocol_version'] != 2 or not profile['consensus']['use_quic']:
         raise SystemExit('Rotation fixture requires the explicit native protocol-2 QUIC profile')
+    epoch_weights(profile, 'initial_weights', INITIAL)
+    weights = epoch_weights(profile, 'successor_weights', SUCCESSOR)
+    if 'weighted_quorum_pause' in profile:
+        if type(profile['weighted_quorum_pause']) is not list or any(type(i) is not int for i in profile['weighted_quorum_pause']) \
+                or profile['weighted_quorum_pause'] != [0, 2] or args.network_fault or args.interrupt_rust_member is not None:
+            raise SystemExit('Weighted quorum pause requires the explicit isolated [0,2] scenario only')
+        if sum(weights[i] for i in [4, 5]) != quorum_threshold(sum(weights.values())):
+            raise SystemExit('Declared surviving pair must equal the C++ quorum exactly')
     manifest = json.loads((args.snapshot / 'manifest.json').read_text())
     if manifest['cpp_source_commit'] != profile['cpp_revision'] \
             or profile['cpp_revision'] != '8f083dc06bff16705710a01de15eb3123d5d696b':
@@ -599,9 +640,19 @@ def main():
     helper = driver.with_name('mixed_matrix.py')
     (args.output / 'driver.py').write_bytes(driver.read_bytes())
     (args.output / 'shared-helper.py').write_bytes(helper.read_bytes())
+    artifacts[str(driver)] = digest(driver)
+    artifacts[str(helper)] = digest(helper)
+    weighted_helpers = {}
+    for name in ['quorum_profile.py', 'weighted_quorum_fixture.py']:
+        path = driver.with_name(name)
+        artifacts[str(path)] = digest(path)
+        weighted_helpers[name] = digest(path)
+        destination = args.output / 'weighted-sources' / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(path.read_bytes())
     write(args.output / 'source.json', {'snapshot': manifest, 'artifacts': artifacts,
         'profile': profile, 'command': sys.argv, 'driver_sha256': digest(driver),
-        'shared_helper_sha256': digest(helper)})
+        'shared_helper_sha256': digest(helper), 'weighted_helpers_sha256': weighted_helpers})
     routing = None
     if args.network_fault:
         for name in ['network_faults.py','network_fault_fixture.py','network_fault/socket_mark.c']:

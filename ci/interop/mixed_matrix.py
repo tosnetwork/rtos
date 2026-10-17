@@ -15,6 +15,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from quorum_profile import quorum_threshold
 
 
 def digest(path):
@@ -359,9 +360,9 @@ async def run(args, root, snapshot, artifacts):
             total = sum(weights.values())
             cpp_weight = sum(weights[hashlib.sha256(f'n6-validator-id-{i}'.encode()).hexdigest()]
                              for i in range(args.cpp_count))
-            write(root / 'quorum.json', dict(total_weight=total, quorum_weight=total * 2 // 3 + 1,
+            write(root / 'quorum.json', dict(total_weight=total, quorum_weight=quorum_threshold(total),
                 cpp_weight=cpp_weight, rust_weight=total - cpp_weight,
-                cpp_alone_can_finalize=cpp_weight >= total * 2 // 3 + 1))
+                cpp_alone_can_finalize=cpp_weight >= quorum_threshold(total)))
             observations = [{} for _ in endpoints]
             checked_keys, creators = set(), {}
             workchain_keys, workchain_creators = set(), {}

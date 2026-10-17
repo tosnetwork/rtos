@@ -274,3 +274,30 @@ FinalCert for a block generated after restart. The runner fetches that member's
 stored target and governing-key certificates and verifies both with the same
 independent checker. The receipt records the voting block alongside MC/WC
 leadership; observing other validators' signatures alone cannot satisfy it.
+
+Nonuniform rotation and exact weighted quorum use the same pinned six-node
+rotation fixture. Optional `initial_weights` and `successor_weights` objects map
+physical member indices (JSON strings) to positive integer weights; omitted
+objects retain the original weight 17. Both the native PQ descriptor and its
+Fift registration use the explicit weight. Every observed authenticated current
+committee must match the frozen weights exactly.
+
+The predeclared `weighted_quorum_pause: [0, 2]` case requires successor members
+4 and 5 to hold exactly the pinned C++ quorum, ceil(2W/3). One useful profile is
+initial {0:30, 1:10, 2:11, 3:9}, successor {0:9, 2:11, 4:10, 5:30}:
+W=60 and quorum=40, rather than the strict-greater comparator 41. After all four
+members in each epoch have authenticated MC signatures and MC/WC creator
+receipts, the fixture pauses only its own members 0 and 2 in a fresh namespace.
+A fresh MC FinalCert must contain exactly members 4 and 5, with weight 40 under
+the unchanged full four-member committee. It then resumes both original PIDs
+and requires new authenticated votes, accepted MC/WC creators and matching full
+six-node MC / four-active-node anchored WC states within the original 180-second
+fault budget. All processes are resumed in the failure path; the normal Rust
+exit limit remains 20 seconds. This scenario cannot combine with packet faults
+or process-restart flags. Run a native all-C++ control before its mixed variant.
+
+This is a nonuniform four-active-member rotation on six physical nodes. It does
+not qualify three- or six-active-member threshold networks, arbitrary Byzantine
+faults, actual elections, or a weighted WC certificate independent of its
+verified MC anchor. Old-group observers remain outside successor certificate
+membership. No production signing or quorum rule is changed.
