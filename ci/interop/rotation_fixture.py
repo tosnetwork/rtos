@@ -17,6 +17,7 @@ sys.dont_write_bytecode = True
 from quorum_profile import epoch_weights, check_committee_weights, quorum_threshold, initial_probe_weights, observer_budget_plan
 from network_faults import MODES, PacketMarks, marked_environment, require_namespace
 from network_fault_fixture import exercise_network_member, stop_cpp_with_receipt
+from workchain_history_fixture import collect_workchain_history, eligible_workchain
 
 from mixed_matrix import (child_checked, cpp_block, cpp_certificate, digest, identity,
                           NativeStateNotReady, native_state, prepare_rust, reserve_port, rpc, stop_rust, write)
@@ -484,6 +485,7 @@ async def run(args, profile, root, artifacts):
                 for epoch in epochs.values(): epoch['mc_signers'] = {}
             initial_probe = None
             baseline_wc_cc = 0
+            workchain_history_cache = {}
             deadline = time.monotonic() + args.timeout
             while time.monotonic() < deadline:
                 for node in rust_nodes:
@@ -622,13 +624,21 @@ async def run(args, profile, root, artifacts):
                         evidence['local_collation'] = match.group(0)
                     epochs[phase]['mc_creators'].setdefault(checked['created_by'], evidence)
                     wc = checked['workchain_check']
+                    wc_samples = [] if wc is None else [(wc, directory)]
                     if wc is not None:
                         if phase == 'before': baseline_wc_cc = max(baseline_wc_cc, wc['gen_catchain_seqno'])
-                        eligible = phase == 'before' or (wc['gen_utime'] >= activation
-                            and wc['gen_catchain_seqno'] > baseline_wc_cc)
+                        if args.workchain_creator_history:
+                            missing = {member_id(i) for i in committee} - set(epochs[phase]['wc_creators'])
+                            if eligible_workchain(wc, phase, activation, baseline_wc_cc):
+                                missing.discard(wc['created_by'])
+                            wc_samples += await collect_workchain_history(args, nodes, lite_configs,
+                                endpoint_names, committee, sample, checked, directory, deadline, missing,
+                                phase, activation, baseline_wc_cc, workchain_history_cache)
+                    for wc, wc_directory in wc_samples:
+                        eligible = eligible_workchain(wc, phase, activation, baseline_wc_cc)
                         if eligible and wc['created_by'] in {member_id(i) for i in committee}:
-                            evidence = {'check': wc, 'masterchain_anchor': infos[0]['last'],
-                                'sample_directory': str(directory)}
+                            evidence = {'check': wc, 'masterchain_anchor': json.loads((wc_directory / 'sample.json').read_text())['reference']['last'],
+                                'sample_directory': str(wc_directory)}
                             wc_member = next(i for i in committee if member_id(i) == wc['created_by'])
                             if args.rust_node and wc_member in [2, 3, 5]:
                                 node = next(n for n in rust_nodes if n['index'] == wc_member)
@@ -747,6 +757,7 @@ def main():
     parser.add_argument('--rust-node', type=Path)
     parser.add_argument('--validator-preparer', type=Path)
     parser.add_argument('--interrupt-rust-member', type=int, choices=[2, 5])
+    parser.add_argument('--workchain-creator-history', action='store_true', help='Check missed creators through full historical WC bodies and states')
     parser.add_argument('--finality-diagnostics', action='store_true', help='Trace finality dependencies on the interrupted Rust node')
     parser.add_argument('--expired-member-restart', action='store_true',
         help='Restart the expired member5 as a synchronized full node without restoring signing authority')
