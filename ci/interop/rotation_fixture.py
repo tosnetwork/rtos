@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Observe real C++ committee replacement before qualifying mixed rotation."""
+"""Check real MC/WC production and authenticated finality across committee replacement."""
 import argparse
 import asyncio
 import base64
@@ -155,6 +155,7 @@ async def run(args, profile, root, artifacts):
                     'rust': {str(n['index']): {'pid': n['process'].pid, 'start_ticks': n['start_ticks']} for n in rust_nodes}})
             write(root / 'rpc-endpoints.json', dict(zip(endpoint_names, endpoints)))
             histories = [{} for _ in nodes]
+            governing_witnesses = {}
             seen = set()
             epochs = {phase: {'mc_creators': {}, 'wc_creators': {}} for phase in ['before', 'after']}
             baseline_wc_cc = 0
@@ -212,7 +213,20 @@ async def run(args, profile, root, artifacts):
                         sample['governing_zerostate_boc'] = base64.b64encode(genesis.masterchain.file.read_bytes()).decode()
                         sample['certificates'] = [proof]
                     else:
-                        sample['unverified_post_rotation_finality'] = proof
+                        key_seqno = checked['prev_key_block_seqno']
+                        if key_seqno not in governing_witnesses:
+                            key_id = await asyncio.to_thread(rpc, endpoints[0], 'lookupBlock',
+                                {'workchain': -1, 'shard': str(-(1 << 63)), 'seqno': key_seqno})
+                            gov_dir = root / 'governing' / str(key_seqno); gov_dir.mkdir(parents=True)
+                            key_body = await cpp_block(args.snapshot, nodes[0], key_id, gov_dir)
+                            key_state = await native_state(args.snapshot, lite_configs[0], 'cpp-0',
+                                key_id, gov_dir / 'state')
+                            governing_witnesses[key_seqno] = {'zerostate': zero, 'block': key_body,
+                                'masterchain_state': key_state,
+                                'governing_zerostate_boc': base64.b64encode(genesis.masterchain.file.read_bytes()).decode()}
+                            write(gov_dir / 'bodies.json', governing_witnesses[key_seqno])
+                        sample['certificates'] = [proof]
+                        sample['governing_key_block'] = {**governing_witnesses[key_seqno], 'certificates': [proof]}
                     tops = [top for top in checked['shard_tops'] if int(top['workchain']) == 0 and int(top['seqno']) > 0]
                     if tops:
                         top = tops[0]; wc_dir = directory / 'workchain'; wc_dir.mkdir()
@@ -224,6 +238,8 @@ async def run(args, profile, root, artifacts):
                     await child_checked([args.block_checker, directory / 'sample.json', directory / 'epoch-checked.json'],
                         directory / 'epoch-checker.log')
                     checked = json.loads((directory / 'epoch-checked.json').read_text())
+                    if phase == 'after' and not checked['verified_governing_key_blocks']:
+                        raise RuntimeError('Successor sample lacks independently verified governing history')
                     if checked['created_by'] not in {member_id(i) for i in committee}:
                         raise RuntimeError('Non-transition block creator is absent from the current committee')
                     evidence = {'check': checked, 'sample_directory': str(directory)}
@@ -259,8 +275,8 @@ async def run(args, profile, root, artifacts):
                             if digest(Path(filename)) != expected: raise RuntimeError('An executable or profile changed')
                         return {'status': ('mixed_membership_rotation_observed' if args.rust_node
                                           else 'cpp_membership_rotation_observed'), 'epochs': epochs,
-                            'all_six_applied_mc_states_match': True, 'independent_post_rotation_finality_qualified': False,
-                            'mixed_rotation_qualified': False, 'election_rehearsal': False}
+                            'all_six_applied_mc_states_match': True, 'independent_post_rotation_finality_qualified': True,
+                            'mixed_rotation_qualified': bool(args.rust_node), 'election_rehearsal': False}
                 await asyncio.sleep(0.2)
             raise TimeoutError('C++ rotation did not satisfy both MC/WC creator epochs')
         finally:
@@ -296,6 +312,15 @@ def main():
     if profile['schema'] != 1 or profile['global_version'] != 16 or profile['initial_members'] != INITIAL \
             or profile['successor_members'] != SUCCESSOR:
         raise SystemExit('Unsupported explicit rotation profile')
+    if any(type(profile.get(key)) is not int for key in
+           ['global_id', 'genesis_time', 'activation_delay', 'successor_valid_for']):
+        raise SystemExit('Rotation times and network ID must be explicit integers')
+    if profile['global_id'] != 4 or not 90 <= profile['activation_delay'] <= 3600 \
+            or profile['successor_valid_for'] <= 600 or profile['genesis_time'] < 0 \
+            or profile['genesis_time'] + profile['activation_delay'] + profile['successor_valid_for'] > 0xffffffff:
+        raise SystemExit('Unsupported bounded isolated rotation schedule')
+    if profile['consensus']['protocol_version'] != 2 or not profile['consensus']['use_quic']:
+        raise SystemExit('Rotation fixture requires the explicit native protocol-2 QUIC profile')
     manifest = json.loads((args.snapshot / 'manifest.json').read_text())
     if manifest['cpp_source_commit'] != profile['cpp_revision'] \
             or profile['cpp_revision'] != '8f083dc06bff16705710a01de15eb3123d5d696b':

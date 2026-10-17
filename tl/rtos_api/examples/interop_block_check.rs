@@ -44,6 +44,23 @@ fn main() -> Result<()> {
 
 fn check_request(value: &Value, depth: u8) -> Result<Value> {
     ensure!(depth <= 16, "governing key-block chain exceeds fixture bound");
+    // A historical governing witness needs authenticated block/state bodies,
+    // not a claim that two RPC clients observed that past height as their head.
+    // Root requests still require the actual native endpoint checkpoints.
+    let witness_only = depth > 0 && value.get("reference").is_none()
+        && value.get("comparison").is_none() && value.get("rust").is_none();
+    let expanded = if witness_only {
+        let bytes = base64_decode(value["masterchain_state"]["boc"].as_str()
+            .context("governing state witness body required")?)?;
+        let state_root = read_single_root_boc(&bytes)?.repr_hash().clone();
+        let mut zero = value["zerostate"].clone(); zero["@type"] = json!("tos.blockIdExt");
+        let checkpoint = json!({"init":zero, "last":value["block"]["id"],
+            "state_root_hash":base64_encode(state_root.as_slice())});
+        let mut expanded = value.clone();
+        expanded["reference"] = checkpoint.clone(); expanded["comparison"] = checkpoint;
+        Some(expanded)
+    } else { None };
+    let value = expanded.as_ref().unwrap_or(value);
     let reference = &value["reference"];
     let comparison = value.get("comparison").unwrap_or(&value["rust"]);
     let zero = identity(&value["zerostate"])?;
@@ -270,7 +287,8 @@ fn check_request(value: &Value, depth: u8) -> Result<Value> {
         "prev_key_block_seqno":info.prev_key_block_seqno(),
         "gen_catchain_seqno":info.gen_catchain_seqno(), "configuration":configuration,
         "file_hash_checked":true, "cell_hash_checked":true, "header_identity_checked":true,
-        "state_update_matches_both":true, "verified_final_certificates":certificates,
+        "state_update_matches_both":!witness_only, "governing_state_witness_checked":witness_only,
+        "verified_final_certificates":certificates,
         "verified_governing_key_blocks":governing_chain,
         "shard_tops":shard_tops, "workchain_check":workchain_check,
         "active_signing_qualified":false});

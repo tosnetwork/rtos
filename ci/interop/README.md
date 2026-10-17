@@ -207,3 +207,40 @@ retains native client logs and state bodies. This proves state availability and
 masterchain inclusion in the initial frozen epoch, with the containing
 masterchain FinalCert checked. It does not independently export a workchain
 FinalCert, prove a workchain database applied cursor, or qualify set rotation.
+
+## Predeclared successor rotation
+
+`rotation_fixture.py` deploys six public fixture identities with initial members
+`[0,1,2,3]` and successor members `[0,2,4,5]`. The pinned C++ Fift generator
+places the declared successor in Genesis Param36 before creating the production
+configuration account. The account's ordinary tock activates that set, moves the
+previous set to Param32 and emits the real key-block transition. This exercises
+committee replacement; it does not exercise an elector or stake application.
+
+Supply a schema-1 profile with global ID 4, version 16, explicit Genesis time,
+wallet seed label, activation delay, successor lifetime, the two member lists,
+the Simplex options, the pinned C++ revision and nullable complete MC/WC Genesis
+IDs. First run `--prepare-genesis-only` and then pass its `frozen-profile.json`
+to the live invocation while the declared activation remains in the future.
+Each output directory must be new. The original `testnet-v16.json` stays fixed.
+
+Without Rust arguments all six processes use C++. Adding `--rust-node` and
+`--validator-preparer` uses Rust members 2, 3 and 5: each active committee then
+contains two C++ and two Rust members. Both epochs require all four members'
+MC and WC production, six matching native applied-MC checkpoints, four complete
+WC states, authenticated MC anchors and Rust creators' local collation logs.
+Retired members continue observing. Every owned Rust process must exit normally.
+
+The checker authenticates successor FinalCerts through the actual governing key
+block's own certificate and complete resulting state, recursively anchored to
+Genesis. Historical governing witnesses do not claim that RPC endpoints observed
+that past block as their head. Both block/state bodies are independently checked;
+a supplied validator list or configuration hash grants no authority.
+
+The offline preparer requires `--include-genesis-successor` for these fixtures.
+It binds only the Genesis-declared successor committees, profile, local identity,
+shard/catchain coordinates and database, with expiry 600 seconds after activation.
+The isolated build can then create a fresh exact session after its authenticated
+key-block height becomes known. Existing or partial namespaces are refused.
+The default build does not enable this fixture signing policy. This is separate
+from production custody, operator key rotation and full election qualification.
