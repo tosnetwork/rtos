@@ -688,6 +688,25 @@ impl SessionStartupRecoveryProcessor {
                 rtos_block::fail!("PQ recovery finalized parent mismatch");
             }
         }
+        // The materialized-record table can omit notarized ancestors. Traverse
+        // their authenticated metadata instead of requiring adjacent table
+        // rows to be immediate parents. No record is discarded, and a missing
+        // link, unsupported ancestor, or competing branch still fails before
+        // replay changes any state or registers an overlay.
+        let mut previous = None;
+        for record in &bootstrap.finalized_blocks {
+            let mut cursor = record.parent.as_ref();
+            while cursor != previous {
+                let id = cursor.ok_or_else(|| error!("PQ recovery disconnected finalized chain"))?;
+                if !supported.contains(id) {
+                    rtos_block::fail!("PQ recovery finalized ancestor lacks authenticated finality");
+                }
+                cursor = parents.get(id)
+                    .ok_or_else(|| error!("PQ recovery finalized ancestor metadata missing"))?
+                    .as_ref();
+            }
+            previous = Some(&record.candidate_id);
+        }
         Ok(())
     }
 

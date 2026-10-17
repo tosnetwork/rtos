@@ -799,6 +799,18 @@ fn pq_strict_bootstrap_preserves_records_and_classical_loader_policy() {
     assert!(bootstrap.pool_state.is_some());
     // This is a decoding test, not signature authentication: the bootstrap must
     // retain all records for the separate preflight, including synthetic bytes.
+    let sparse_id = create_candidate_id(3, 45);
+    let missing_parent = create_candidate_id(2, 46);
+    db.save_finalized_block_async(&FinalizedBlockRecord {
+        candidate_id: sparse_id.clone(),
+        block_id: create_block_id(3),
+        parent: Some(missing_parent.clone()),
+        is_final: true,
+    }).unwrap().wait().unwrap();
+    let sparse = load().unwrap();
+    assert_eq!(sparse.finalized_blocks.len(), 2);
+    assert_eq!(sparse.finalized_blocks[1].candidate_id, sparse_id);
+    assert_eq!(sparse.finalized_blocks[1].parent.as_ref(), Some(&missing_parent));
     let bad_key = serialize_candidate_info_key(&create_candidate_id(3, 44)).unwrap();
     db.storage.set(bad_key, vec![0], None).wait().unwrap();
     assert!(load().is_err());

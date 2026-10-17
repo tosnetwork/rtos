@@ -10391,15 +10391,15 @@ fn pq_live_recovery_authenticates_finalized_parent_chains_and_role_flags() {
             candidate_id: parent.candidate_id.clone(),
             notar_cert_bytes: serialize_boxed(&signatures("parent", "notarize", 2)).unwrap(),
         });
-        let final_cert = |count| {
+        let final_cert = |proof_kind: &str, id: &crate::block::RawCandidateId, count| {
             serialize_boxed(
                 &Certificate {
                     vote: FinalizeVote {
-                        id: TlCandidateId { slot: 99, hash: child.candidate_id.hash.clone() }
+                        id: TlCandidateId { slot: 99, hash: id.hash.clone() }
                             .into_boxed(),
                     }
                     .into_boxed(),
-                    signatures: signatures(kind, "finalize", count),
+                    signatures: signatures(proof_kind, "finalize", count),
                 }
                 .into_boxed(),
             )
@@ -10407,17 +10407,41 @@ fn pq_live_recovery_authenticates_finalized_parent_chains_and_role_flags() {
         };
         valid.final_certs.push(FinalCertRecord {
             candidate_id: child.candidate_id.clone(),
-            cert_bytes: final_cert(2),
+            cert_bytes: final_cert(kind, &child.candidate_id, 2),
         });
-        for alteration in 0..6 {
+        for alteration in 0..10 {
             let mut bootstrap = valid.clone();
             match alteration {
                 0 => {}
                 1 => bootstrap.final_certs.clear(),
                 2 => bootstrap.notar_certs.clear(),
-                3 => bootstrap.final_certs[0].cert_bytes = final_cert(1),
+                3 => bootstrap.final_certs[0].cert_bytes = final_cert(kind, &child.candidate_id, 1),
                 4 => bootstrap.finalized_blocks[0].is_final = true,
-                _ => bootstrap.final_certs[0].cert_bytes.push(0),
+                5 => bootstrap.final_certs[0].cert_bytes.push(0),
+                6 => { bootstrap.finalized_blocks.remove(0); }
+                7 => {
+                    bootstrap.finalized_blocks.remove(0);
+                    bootstrap.candidate_infos.remove(0);
+                }
+                8 => {
+                    bootstrap.finalized_blocks.remove(0);
+                    bootstrap.notar_certs.clear();
+                }
+                _ => {
+                    let sibling_kind = if kind == "empty" { "ordinary" } else { "empty" };
+                    let sibling = info(sibling_kind, 99);
+                    bootstrap.finalized_blocks.push(FinalizedBlockRecord {
+                        candidate_id: sibling.candidate_id.clone(),
+                        block_id: sibling.candidate_hash_data.block().clone(),
+                        parent: Some(parent.candidate_id.clone()),
+                        is_final: true,
+                    });
+                    bootstrap.final_certs.push(FinalCertRecord {
+                        candidate_id: sibling.candidate_id.clone(),
+                        cert_bytes: final_cert(sibling_kind, &sibling.candidate_id, 2),
+                    });
+                    bootstrap.candidate_infos.push(sibling);
+                }
             }
             let description = f::description(parent.candidate_hash_data.block().shard().clone(), 0);
             let mut target =
@@ -10429,8 +10453,17 @@ fn pq_live_recovery_authenticates_finalized_parent_chains_and_role_flags() {
                 bootstrap,
             )
             .apply_bootstrap(&mut target);
-            let succeeds = alteration == 0 || (alteration == 4 && kind == "empty");
+            let succeeds = alteration == 0 || alteration == 6 || (alteration == 4 && kind == "empty");
             assert_eq!(result.is_ok(), succeeds, "{kind}/{alteration}: {result:?}");
+            let expected = match alteration {
+                7 => Some("finalized ancestor metadata missing"),
+                8 => Some("finalized ancestor lacks authenticated finality"),
+                9 => Some("disconnected finalized chain"),
+                _ => None,
+            };
+            if let Some(expected) = expected {
+                assert!(result.as_ref().unwrap_err().to_string().contains(expected), "{result:?}");
+            }
             if !succeeds {
                 assert_eq!(target.simplex_state.get_first_non_finalized_slot(), before);
             }

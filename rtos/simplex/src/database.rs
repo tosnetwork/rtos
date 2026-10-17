@@ -1623,13 +1623,11 @@ impl SimplexDb {
             }
         }
         bootstrap.finalized_blocks.sort_by_key(|record| record.candidate_id.slot);
-        let mut expected_parent = None;
-        for record in &bootstrap.finalized_blocks {
-            if record.parent != expected_parent {
-                return Err(error!("PQ bootstrap: inconsistent finalized chain"));
-            }
-            expected_parent = Some(record.candidate_id.clone());
-        }
+        // Finalized delivery is sparse: MC stops its recursive delivery after
+        // consuming the FinalCert, so notarized parents need not have their own
+        // finalized-table entry. Preserve every decoded record. The recovery
+        // preflight authenticates the intervening candidate metadata and
+        // certificates before checking ancestry or allowing replay.
         bootstrap.notar_certs.sort_by_key(|record| record.candidate_id.slot);
         bootstrap.final_certs.sort_by_key(|record| record.candidate_id.slot);
         bootstrap.skip_certs.sort_by_key(|record| record.slot);
