@@ -13,6 +13,9 @@ import sys
 import time
 
 sys.dont_write_bytecode = True
+from network_faults import MODES, PacketMarks, marked_environment, require_namespace
+from network_fault_fixture import exercise_network_member
+
 from mixed_matrix import (child_checked, cpp_block, cpp_certificate, digest, identity,
                           NativeStateNotReady, native_state, prepare_rust, reserve_port, rpc, stop_rust, write)
 
@@ -39,11 +42,11 @@ async def stop_rotation_node(node):
         node['shutdown_elapsed_seconds'] = time.monotonic() - started
 
 
-async def start_rotation_node(binary, directory, log_name='node.log'):
+async def start_rotation_node(binary, directory, log_name='node.log', environment=None):
     with (directory / log_name).open('w') as log:
         process = await asyncio.create_subprocess_exec(str(binary), '--configs', str(directory),
             '--zerostate', str(directory / 'zero'), '--initial-sync-disabled', cwd=directory,
-            stdout=log, stderr=log, env={**os.environ, 'TOKIO_WORKER_THREADS': '2'},
+            stdout=log, stderr=log, env={**(environment or os.environ), 'TOKIO_WORKER_THREADS': '2'},
             start_new_session=True)
     return {'process': process,
         'start_ticks': Path(f'/proc/{process.pid}/stat').read_text().split()[21]}
@@ -322,8 +325,9 @@ async def run(args, profile, root, artifacts):
                     directory = root / f'rust-{index}'
                     address, prepared = await prepare_rust(args, directory, index, network,
                         global_config, used, used)
+                    environment = marked_environment(args.socket_mark_library) if args.network_fault and index == args.network_fault_member else None
                     rust_nodes.append(dict(index=index, directory=directory,
-                        **await start_rotation_node(args.rust_node, directory)))
+                        **await start_rotation_node(args.rust_node, directory, environment=environment)))
                     client = json.loads((directory / 'lite_client_config.json').read_text())
                     lite_configs.append(tos_api.Liteclient_config_global(
                         liteservers=[tos_api.Liteserver_desc(id=tos_api.Pub_ed25519(
@@ -332,7 +336,8 @@ async def run(args, profile, root, artifacts):
                         validator=genesis.as_validator_config()))
                 else:
                     address = f'127.0.0.1:{reserve_port(socket.SOCK_STREAM, used)}'
-                    await node.run(StartOptions(threads=2, verbosity=3, args=['--json-rpc-address', address]))
+                    environment = marked_environment(args.socket_mark_library) if args.network_fault and index == args.network_fault_member else {}
+                    await node.run(StartOptions(threads=2, verbosity=3, args=['--json-rpc-address', address], env=environment))
                     cpp_started.append((index, node))
                     lite_configs.append(node.liteserver_config)
                 endpoints.append('http://' + address + '/jsonRPC')
@@ -471,6 +476,11 @@ async def run(args, profile, root, artifacts):
                     write(root / 'epochs.json', epochs)
                     if all(len(epoch[k]) == 4 for epoch in epochs.values() for k in ['mc_creators', 'wc_creators']):
                         recovery = None
+                        network_fault = None
+                        if args.network_fault:
+                            network_fault = await exercise_network_member(args, root, nodes, endpoints,
+                                lite_configs, rust_nodes, zero, governing_witnesses[checked['prev_key_block_seqno']],
+                                checked, artifacts)
                         if args.interrupt_rust_member is not None:
                             recovery = await recover_rotation_member(args, root, nodes, endpoints,
                                 lite_configs, rust_nodes, zero, governing_witnesses[checked['prev_key_block_seqno']],
@@ -481,7 +491,7 @@ async def run(args, profile, root, artifacts):
                                           else 'cpp_membership_rotation_observed'), 'epochs': epochs,
                             'all_six_applied_mc_states_match': True, 'independent_post_rotation_finality_qualified': True,
                             'mixed_rotation_qualified': bool(args.rust_node), 'election_rehearsal': False,
-                            'recovery': recovery}
+                            'recovery': recovery, 'network_fault': network_fault}
                 await asyncio.sleep(0.2)
             raise TimeoutError('C++ rotation did not satisfy both MC/WC creator epochs')
         finally:
@@ -510,7 +520,18 @@ def main():
     parser.add_argument('--validator-preparer', type=Path)
     parser.add_argument('--interrupt-rust-member', type=int, choices=[2, 5])
     parser.add_argument('--recovery-timeout', type=float, default=180)
+    parser.add_argument('--network-fault', choices=list(MODES))
+    parser.add_argument('--network-fault-member', type=int, choices=[2,5], default=2)
+    parser.add_argument('--network-fault-seconds', type=float, default=12)
+    parser.add_argument('--socket-mark-library', type=Path)
     args = parser.parse_args()
+    if args.network_fault:
+        require_namespace()
+        if args.interrupt_rust_member is not None or args.prepare_genesis_only:
+            raise SystemExit('Packet impairment is separate from process interruption')
+        if not args.socket_mark_library or not 5 <= args.network_fault_seconds <= 30:
+            raise SystemExit('Packet exercise requires its explicit socket-mark library and 5..30 second window')
+        args.socket_mark_library = args.socket_mark_library.resolve()
     if bool(args.rust_node) != bool(args.validator_preparer):
         raise SystemExit('Mixed rotation requires both the Rust node and offline preparer')
     if args.interrupt_rust_member is not None and (not args.rust_node or args.prepare_genesis_only):
@@ -542,6 +563,8 @@ def main():
     artifacts = {str(args.block_checker): digest(args.block_checker), str(args.profile): digest(args.profile)}
     if args.rust_node:
         artifacts.update({str(path): digest(path) for path in [args.rust_node, args.validator_preparer]})
+    if args.network_fault:
+        artifacts[str(args.socket_mark_library)] = digest(args.socket_mark_library)
     for item in manifest['binaries']:
         path = args.snapshot / 'build' / item['path']
         if digest(path) != item['sha256']:raise SystemExit(f'C++ executable changed: {path}')
@@ -554,8 +577,20 @@ def main():
     write(args.output / 'source.json', {'snapshot': manifest, 'artifacts': artifacts,
         'profile': profile, 'command': sys.argv, 'driver_sha256': digest(driver),
         'shared_helper_sha256': digest(helper)})
+    routing = None
+    if args.network_fault:
+        for name in ['network_faults.py','network_fault_fixture.py','network_fault/socket_mark.c']:
+            path = driver.parent / name
+            destination = args.output / 'fault-sources' / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(path.read_bytes())
+        routing = PacketMarks(args.output / 'packet-routing')
     try:
-        result = asyncio.run(run(args, profile, args.output, artifacts))
+        if routing: routing.prepare()
+        try:
+            result = asyncio.run(run(args, profile, args.output, artifacts))
+        finally:
+            if routing: routing.close()
     except BaseException as error:
         write(args.output / 'result.json', {'status': 'failed', 'error_type': type(error).__name__, 'error': str(error)})
         raise
