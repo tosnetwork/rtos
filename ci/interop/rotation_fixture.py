@@ -523,6 +523,9 @@ async def run(args, profile, root, artifacts):
                             base64.b64encode(genesis.masterchain.file.read_bytes()).decode(),
                             checked, artifacts, profile, initial=True, rotation_deadline=deadline)
                         probe_root = root / 'initial-weighted-probe'
+                        probe_final = json.loads((probe_root / str(initial_probe['last_checkpoint']['seqno']) /
+                            'checked-with-workchain.json').read_text())
+                        baseline_wc_cc = max(baseline_wc_cc, probe_final['workchain_check']['gen_catchain_seqno'])
                         probe_samples = {Path(initial_probe['survivor_sample'])}
                         probe_samples.update(Path(entry['sample_directory']) for entry in initial_probe['votes'].values())
                         for probe_sample in probe_samples:
