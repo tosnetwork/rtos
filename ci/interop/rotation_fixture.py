@@ -31,6 +31,14 @@ def state_id(state, workchain):
             'file_hash': base64.b64encode(state.file_hash).decode()}
 
 
+async def stop_rotation_node(node):
+    started = time.monotonic()
+    try:
+        return await stop_rust(node)
+    finally:
+        node['shutdown_elapsed_seconds'] = time.monotonic() - started
+
+
 def install_successor(module, nodes, profile):
     """Add an explicit future set before the native config account is created.
 
@@ -289,10 +297,13 @@ async def run(args, profile, root, artifacts):
                 await asyncio.sleep(0.2)
             raise TimeoutError('C++ rotation did not satisfy both MC/WC creator epochs')
         finally:
-            codes = await asyncio.gather(*(stop_rust(node) for node in rust_nodes), return_exceptions=True)
+            codes = await asyncio.gather(*(stop_rotation_node(node) for node in rust_nodes), return_exceptions=True)
             write(root / 'rust-shutdown.json', {str(node['index']):
                 (str(code) if isinstance(code, BaseException) else code)
                 for node, code in zip(rust_nodes, codes)})
+            write(root / 'rust-shutdown-timing.json', {str(node['index']):
+                {'elapsed_seconds': node['shutdown_elapsed_seconds'], 'normal_exit_limit_seconds': 20}
+                for node in rust_nodes})
             if any(code != 0 for code in codes) and sys.exception() is None:
                 raise RuntimeError('Owned Rust rotation nodes did not stop normally')
 
