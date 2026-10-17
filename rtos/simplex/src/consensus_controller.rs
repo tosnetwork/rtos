@@ -146,6 +146,9 @@ pub(crate) struct FinalizedEntry {
     /// Source replay must observe its own node handoff before trusting any
     /// startup callback cache. Keep successful parents through async retries.
     acknowledged_source_candidates: HashSet<RawCandidateId>,
+    // Keep this walk's dependencies in its output manifest across retries,
+    // including empty candidates materialized while waiting for a child ACK.
+    walked_candidates: HashSet<RawCandidateId>,
     /// Time when finalization was first observed (for timeout / diagnostics).
     finalized_at: SystemTime,
 }
@@ -1497,7 +1500,7 @@ impl ConsensusController {
         // Always keep a pending entry until recursive parent-chain materialization
         // succeeds end-to-end. This provides deterministic retries on late body/cert
         // arrivals and ensures ancestor parity is eventually reached.
-        let entry = FinalizedEntry { event: event.clone(), intent_retained: false, acknowledged_source_candidates: HashSet::new(), finalized_at: self.now() };
+        let entry = FinalizedEntry { event: event.clone(), intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), finalized_at: self.now() };
         // C++ state-resolver.cpp: a duplicate joins the existing InFlight
         // operation, preserving its original certificate and completed phases.
         self.finalized_pending_body.entry(finalized_id.clone()).or_insert(entry);
@@ -1809,6 +1812,22 @@ impl ConsensusController {
                 );
                 self.telemetry.increment_error();
                 return self.description.authenticated_runtime().is_none();
+            }
+
+            // C++ StateResolver::finalization_of checks its persisted marker
+            // before ResolveCandidate. A materialized ancestor has already
+            // crossed node acceptance; do not require its old body again.
+            // Keep the trigger's FinalCert path: a retained source still needs
+            // its own handoff even when startup seeded this candidate id.
+            if workchain && !has_final_cert && self.finalized_blocks.contains(&current_id)
+                && !self.finalized_pending_body.get(trigger_id).is_some_and(|entry|
+                    entry.walked_candidates.contains(&current_id))
+            {
+                break;
+            }
+
+            if let Some(entry) = self.finalized_pending_body.get_mut(trigger_id) {
+                entry.walked_candidates.insert(current_id.clone());
             }
 
             // Step 1: resolve candidate metadata/body holder.
@@ -2782,7 +2801,7 @@ impl ConsensusController {
         event: BlockFinalizedEvent,
         finalized_at: SystemTime,
     ) {
-        self.finalized_pending_body.insert(id, FinalizedEntry { event, intent_retained: false, acknowledged_source_candidates: HashSet::new(), finalized_at });
+        self.finalized_pending_body.insert(id, FinalizedEntry { event, intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), finalized_at });
         self.telemetry.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
     }
 }

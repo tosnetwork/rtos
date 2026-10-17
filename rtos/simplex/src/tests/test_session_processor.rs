@@ -12219,15 +12219,20 @@ fn source_finality_main_worker_release_keeps_only_accepted_node_work_owned() {
 /// input, while source intent/ACK/output files are reopened from disk.
 #[test]
 fn source_finality_controller_empty_trigger_seals_all_roles_after_cold_retry() {
-    source_finality_empty_trigger_cold_retry_case(false);
+    source_finality_empty_trigger_cold_retry_case(false, false);
 }
 
 #[test]
 fn source_finality_controller_cold_retry_keeps_ancestor_handoff_below_applied_floor() {
-    source_finality_empty_trigger_cold_retry_case(true);
+    source_finality_empty_trigger_cold_retry_case(true, false);
 }
 
-fn source_finality_empty_trigger_cold_retry_case(high_floor: bool) {
+#[test]
+fn source_finality_controller_replay_stops_at_materialized_parent_without_its_body() {
+    source_finality_empty_trigger_cold_retry_case(true, true);
+}
+
+fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_parent: bool) {
     use crate::finality_delivery::tests::{fixture_role, HeldSink};
     use rtos_block::Serializable;
     let temp = crate::authenticated_fixture::TestDirectory::new();
@@ -12294,7 +12299,13 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool) {
         callbacks.initialize_delivery(runtime.clone(),std::path::Path::new(&namespace)).unwrap();
         callbacks.bind_delivery_start(runtime.pin().zerostate.clone()).unwrap();
         processor.consensus.set_callbacks_for_test(callbacks.clone()); processor.callbacks=callbacks;
-        for (id,received) in &chain { processor.candidate_book_mut().insert_received(id.clone(),received.clone()); }
+        for (index,(id,received)) in chain.iter().enumerate() {
+            if materialized_parent && index==0 {
+                processor.consensus.insert_finalized_block(id.clone());
+            } else {
+                processor.candidate_book_mut().insert_received(id.clone(),received.clone());
+            }
+        }
         // Rehydrate every ancestor's quorum evidence, including empty nodes.
         // Body-callback suppression never replaces recovery authentication.
         for (id, _) in chain.iter().take(3) {
@@ -12314,6 +12325,21 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool) {
     let sink=Arc::new(HeldSink::default());
     let (db,mut processor)=make_processor(sink.clone());
     processor.handle_block_finalized(event.clone());
+    if materialized_parent {
+        let staged=std::mem::take(&mut *sink.0.lock().unwrap());
+        assert_eq!(staged.len(),1,"C++ persisted parent marker must terminate recovery before a pruned body lookup");
+        assert_eq!(staged[0].0.block_id,chain[2].1.block_id);
+        assert!(matches!(staged[0].0.finality,consensus_common::SessionFinality::Carrier(_)));
+        for (_,done) in staged { done(Ok(UInt256::from([3;32]))); }
+        for _ in 0..8 {
+            processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+            if map.exists() { break; }
+        }
+        assert!(map.exists(),"current source still needs its own node handoff before closure");
+        let value:serde_json::Value=serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
+        assert_eq!(value["outputs"].as_array().unwrap().len(),1);
+        drop(processor);db.close(None).unwrap();return;
+    }
     assert!(!map.exists(),"a held node handoff cannot seal a complete walk");
     // Resolve only Final. Approval is a separate debt and must keep the map absent.
     let staged=std::mem::take(&mut *sink.0.lock().unwrap());
