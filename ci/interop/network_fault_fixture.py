@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 import re
+import signal
 import time
 import urllib.error
 
@@ -15,6 +16,7 @@ async def stop_cpp_with_receipt(index, node):
     # Pinned 8f083dc tostester owns the actual subprocess behind this field.
     # Capture it before stop() clears it; do not infer success from a missing PID.
     process = node._Node__process
+    alive = process.returncode is None
     started = time.monotonic()
     task = asyncio.create_task(node.stop())
     try:
@@ -23,8 +25,10 @@ async def stop_cpp_with_receipt(index, node):
         process.kill()
         await process.wait()
         await task
-    return index, {'returncode': process.returncode,
-        'elapsed_seconds': time.monotonic() - started, 'normal_exit_limit_seconds': 20}
+    elapsed = time.monotonic() - started
+    return index, {'returncode': process.returncode, 'requested_signal': 'SIGTERM',
+        'alive_before_stop': alive, 'elapsed_seconds': elapsed, 'teardown_limit_seconds': 20,
+        'matches_pinned_tester_teardown': alive and process.returncode in [0, -signal.SIGTERM] and elapsed <= 20}
 
 
 async def exercise_network_member(args, root, nodes, endpoints, lite_configs, rust_nodes,

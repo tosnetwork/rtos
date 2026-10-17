@@ -521,8 +521,8 @@ async def run(args, profile, root, artifacts):
             if args.network_fault:
                 stopped = await asyncio.gather(*(stop_cpp_with_receipt(index, node) for index, node in cpp_started))
                 write(root / 'cpp-shutdown.json', {str(index): value for index, value in stopped})
-                if any(value['returncode'] != 0 for _, value in stopped) and sys.exception() is None:
-                    raise RuntimeError('Owned C++ packet-fault nodes did not stop normally')
+                if any(not value['matches_pinned_tester_teardown'] for _, value in stopped) and sys.exception() is None:
+                    raise RuntimeError('Owned C++ packet-fault teardown differs from pinned tester')
             if any(code != 0 for code in codes) and sys.exception() is None:
                 raise RuntimeError('Owned Rust rotation nodes did not stop normally')
 
