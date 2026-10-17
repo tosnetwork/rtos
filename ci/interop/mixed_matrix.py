@@ -48,11 +48,14 @@ def reserve_port(kind, used):
     for port in range(20000, min(ephemeral_low, 32768)):
         if port in used:
             continue
-        with socket.socket(socket.AF_INET, kind) as sock:
-            try:
-                sock.bind(('0.0.0.0', port))
-            except OSError:
-                continue
+        try:
+            # ADNL uses its UDP port for a TCP listener too. Check both
+            # transports and share one reservation set across all listeners.
+            for probe_kind in [kind, socket.SOCK_STREAM if kind == socket.SOCK_DGRAM else socket.SOCK_DGRAM]:
+                with socket.socket(socket.AF_INET, probe_kind) as sock:
+                    sock.bind(('0.0.0.0', port))
+        except OSError:
+            continue
         used.add(port)
         return port
     raise RuntimeError('No free fixture listener port below the automatic client-port pool')
@@ -187,7 +190,7 @@ async def run(args, root, snapshot, artifacts):
     from tostester.network import Network, StartOptions, _write_model
     from tosapi import tos_api
 
-    tcp_used, udp_used = set(), set()
+    tcp_used = udp_used = set()
     network_dir = root / 'network'
     network_dir.mkdir()
     rust_nodes = []
