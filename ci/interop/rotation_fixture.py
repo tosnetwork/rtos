@@ -637,7 +637,9 @@ async def run(args, profile, root, artifacts):
                                           else 'cpp_membership_rotation_observed'), 'epochs': epochs,
                             'all_six_applied_mc_states_match': True, 'independent_post_rotation_finality_qualified': True,
                             'mixed_rotation_qualified': bool(args.rust_node), 'election_rehearsal': False,
-                            'observer_budget': observer_budget, 'recovery': recovery, 'network_fault': network_fault, 'weighted_quorum': weighted_quorum, 'initial_probe': initial_probe}
+                            'observer_budget': observer_budget, 'recovery': recovery,
+                            'partition_restart': json.loads((root / 'recovery-partition/receipt.json').read_text()) if args.partition_restart else None,
+                            'network_fault': network_fault, 'weighted_quorum': weighted_quorum, 'initial_probe': initial_probe}
                 await asyncio.sleep(0.2)
             raise TimeoutError('Rotation did not satisfy declared creator/signer epochs: ' +
                 json.dumps({phase: {kind: len(group) for kind, group in groups.items()}
