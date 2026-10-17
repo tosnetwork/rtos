@@ -20,6 +20,7 @@ mod confirmed_blocks;
 mod engine;
 mod engine_operations;
 mod engine_traits;
+mod served_masterchain;
 mod error;
 mod full_node;
 mod internal_db;
