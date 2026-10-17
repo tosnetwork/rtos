@@ -779,6 +779,43 @@ impl PendingFinalityStore {
         paths.sort();
         Ok(paths)
     }
+    /// A reference temporary is an untrusted lookup hint, never an ACK or
+    /// canonical record. Only its original complete ACK can enter node recovery.
+    fn interrupted_reference_owner(&self) -> Result<Option<UInt256>> {
+        let _guard = self.mutation.lock().unwrap();
+        self.paths_under_mutation()?; // Keep regular-file and physical budgets.
+        let directory = self.directory.join(REFERENCE_DIRECTORY);
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mut owner = None;
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("tmp") { continue; }
+            let text = path.file_stem().and_then(|s| s.to_str())
+                .ok_or_else(|| error!("Invalid interrupted canonical reference name"))?;
+            let id: UInt256 = text.parse()?;
+            if text != id.to_hex_string() || owner.is_some() {
+                fail!("Invalid interrupted canonical reference identity");
+            }
+            if self.reference_path(&id).exists() || self.delivered_path(&id).exists() {
+                fail!("Interrupted canonical reference conflicts with committed evidence");
+            }
+            let acknowledged = self.directory.join(format!("{text}.acked"));
+            match std::fs::symlink_metadata(&acknowledged) {
+                Ok(metadata) if metadata.file_type().is_file() => {},
+                _ => fail!("Interrupted canonical reference lacks original acknowledged source"),
+            }
+            if PendingFinalityRecord::read(&acknowledged)?.id()? != id {
+                fail!("Interrupted canonical reference source identity mismatch");
+            }
+            owner = Some(id);
+        }
+        Ok(owner)
+    }
+
     fn prepare_temporary(path: &Path) -> Result<()> {
         for entry in std::fs::read_dir(path.parent().unwrap())? {
             let other = entry?.path();
@@ -1069,6 +1106,7 @@ pub struct PendingFinalityRecovery {
     store: Arc<PendingFinalityStore>,
     record: PendingFinalityRecord,
     interrupted_retention: bool,
+    interrupted_compaction: bool,
 }
 impl PendingFinalityRecovery {
     pub fn record(&self) -> &PendingFinalityRecord {
@@ -1080,7 +1118,13 @@ impl PendingFinalityRecovery {
         if self.interrupted_retention {
             self.store.retain(&self.record)?;
         }
-        self.store.acknowledge(&self.record.id()?, node_receipt)
+        self.store.acknowledge(&self.record.id()?, node_receipt.clone())?;
+        if self.interrupted_compaction {
+            // A fresh authenticated node takeover authorizes the normal
+            // fsync/rename compaction. No bytes come from the old temporary.
+            self.store.compact(&self.record, node_receipt)?;
+        }
+        Ok(())
     }
 }
 /// Scan retired v2 namespaces beneath the same root passed to runtime_directory.
@@ -1127,6 +1171,7 @@ fn scan_pending_finality_inner(root: &Path, allow_certificate_replay: bool) -> R
         // still authenticates the original record and supplies a fresh durable
         // receipt. Never read, promote, or remove the uncertain ACK here.
         let mut paths = Vec::new();
+        let interrupted_reference = store.interrupted_reference_owner()?;
         for path in store.paths()? {
             let resume_ack = if path.extension().and_then(|s| s.to_str()) == Some("json") {
                 match std::fs::symlink_metadata(path.with_extension("ack.tmp")) {
@@ -1138,7 +1183,10 @@ fn scan_pending_finality_inner(root: &Path, allow_certificate_replay: bool) -> R
             } else {
                 false
             };
-            paths.push((if resume_ack { 1u8 } else { 2u8 }, path));
+            let resume_compaction = path.extension().and_then(|s| s.to_str()) == Some("acked")
+                && interrupted_reference.as_ref().is_some_and(|id|
+                    path.file_stem().and_then(|s| s.to_str()) == Some(id.to_hex_string().as_str()));
+            paths.push((if resume_compaction { 0u8 } else if resume_ack { 1u8 } else { 2u8 }, path));
         }
         // paths() has already enforced regular-file and physical temporary
         // quotas. Only a complete, exact source identity can be offered to the
@@ -1190,6 +1238,13 @@ fn scan_pending_finality_inner(root: &Path, allow_certificate_replay: bool) -> R
                 {
                     fail!("Conflicting pending and acknowledged source records");
                 }
+                if interrupted_reference.as_ref() != Some(&record.id()?) {
+                    continue;
+                }
+            } else if path.extension().and_then(|s| s.to_str()) == Some("json")
+                && interrupted_reference.as_ref() == Some(&record.id()?) {
+                // The ACK branch above already checked this duplicate pending
+                // record byte for byte. Offer the original source only once.
                 continue;
             }
             let size = record.data.len() + record.signature_set.len();
@@ -1201,6 +1256,7 @@ fn scan_pending_finality_inner(root: &Path, allow_certificate_replay: bool) -> R
                 store: store.clone(),
                 record,
                 interrupted_retention: path.extension().and_then(|s| s.to_str()) == Some("tmp"),
+                interrupted_compaction: path.extension().and_then(|s| s.to_str()) == Some("acked"),
             });
         }
     }
@@ -1880,6 +1936,69 @@ pub(crate) mod tests {
         recovered.into_iter().next().unwrap().acknowledge(UInt256::from([3; 32])).unwrap();
         assert!(scan_pending_finality(temp.path()).unwrap().is_empty());
     }
+    #[test]
+    fn source_finality_interrupted_reference_replays_original_ack_before_other_work() {
+        for mode in 0..3 {
+            let temp = crate::authenticated_fixture::TestDirectory::new();
+            let (runtime, first) = fixture_seqno(true, ShardIdent::masterchain(), 1);
+            let (_, second) = fixture_seqno(true, ShardIdent::masterchain(), 2);
+            let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+            let mut records = [PendingFinalityRecord::from_draft(&runtime, &first).unwrap(),
+                PendingFinalityRecord::from_draft(&runtime, &second).unwrap()];
+            records.sort_by_key(|record| record.id().unwrap().to_hex_string());
+            let record = &records[1]; let id = record.id().unwrap();
+            let store = PendingFinalityStore::open(&namespace).unwrap();
+            for source in &records { store.retain(source).unwrap(); }
+            let old_receipt = UInt256::from([3; 32]);
+            store.acknowledge(&id, old_receipt.clone()).unwrap();
+            let ack = store.directory.join(format!("{}.acked", id.to_hex_string()));
+            let original_ack = std::fs::read(&ack).unwrap();
+            let reference = store.reference_path(&id);
+            std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+            let mut metadata: DiskRecord = serde_json::from_slice(&record.encode().unwrap()).unwrap();
+            metadata.data.clear(); metadata.signature_set.clear();
+            let expected = serde_json::to_vec(&CanonicalReference {
+                recovery_binding: None, schema: 1, node_receipt: old_receipt.to_hex_string(),
+                digest: UInt256::calc_file_hash(&record.encode().unwrap()).to_hex_string(), metadata,
+            }).unwrap();
+            let bytes = match mode { 0 => Vec::new(), 1 => expected[..expected.len()/2].to_vec(), _ => expected };
+            let unfinished = reference.with_extension("tmp"); std::fs::write(&unfinished, &bytes).unwrap();
+            drop(store);
+            let recovered = scan_pending_finality(temp.path()).unwrap();
+            assert_eq!(recovered.len(), 2, "unfinished reference must offer its full original ACK for authenticated node takeover");
+            assert_eq!(recovered[0].record().id().unwrap(), id, "resume the owner of the reference temporary first");
+            assert_eq!(std::fs::read(&unfinished).unwrap(), bytes);
+            assert_eq!(std::fs::read(&ack).unwrap(), original_ack);
+            assert!(!reference.exists(), "scanning must not commit an uncertain reference");
+            let fresh_receipt = UInt256::from([4; 32]);
+            for source in recovered { source.acknowledge(fresh_receipt.clone()).unwrap(); }
+            assert!(!unfinished.exists() && !ack.exists());
+            let store = PendingFinalityStore::open(&namespace).unwrap();
+            let compacted = store.reference(&id).unwrap().unwrap();
+            compacted.matches(record).unwrap();
+            assert_eq!(compacted.node_receipt, fresh_receipt.to_hex_string());
+        }
+    }
+
+    #[test]
+    fn source_finality_interrupted_reference_requires_original_ack_without_committed_conflict() {
+        for conflict in [false, true] {
+            let temp = crate::authenticated_fixture::TestDirectory::new();
+            let (runtime, draft) = fixture();
+            let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+            let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
+            let id = record.id().unwrap(); let store = PendingFinalityStore::open(&namespace).unwrap();
+            store.retain(&record).unwrap(); store.acknowledge(&id, UInt256::from([3;32])).unwrap();
+            let reference = store.reference_path(&id); std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+            let temporary = reference.with_extension("tmp"); std::fs::write(&temporary, b"{interrupted").unwrap();
+            if conflict { std::fs::write(&reference, b"untrusted committed conflict").unwrap(); }
+            else { std::fs::remove_file(store.directory.join(format!("{}.acked", id.to_hex_string()))).unwrap(); }
+            drop(store);
+            assert!(scan_pending_finality(temp.path()).is_err(), "missing ACK or committed conflict must not become recovery authority");
+            assert_eq!(std::fs::read(&temporary).unwrap(), b"{interrupted");
+        }
+    }
+
     #[test]
     fn source_finality_interrupted_ack_replays_first_without_promoting_temporary() {
         for temporary_bytes in [Vec::new(), b"{torn".to_vec(), b"untrusted complete-looking ACK".to_vec()] {

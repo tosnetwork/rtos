@@ -10422,6 +10422,8 @@ fn pq_live_processor_candidate_persistence_and_authenticated_recovery() {
     )
     .apply_bootstrap(&mut restored)
     .unwrap();
+    assert!(!restored.runtime.is_generated(SlotIndex::new(99)),
+        "restored peer candidate must not fence our local production slot");
     for alteration in 0..3 {
         let mut bad = bootstrap.clone();
         match alteration {
@@ -10437,6 +10439,8 @@ fn pq_live_processor_candidate_persistence_and_authenticated_recovery() {
         )
         .apply_bootstrap(&mut target)
         .is_err());
+        assert!(!target.runtime.is_generated(SlotIndex::new(99)),
+            "unauthenticated payload or metadata cannot set a local production fence");
     }
     drop(restored);
     db.close(Some(Duration::from_secs(10))).unwrap();
@@ -11620,6 +11624,10 @@ fn custody_real_candidate_recovery_uses_durable_carrier() {
                 )
                 .apply_bootstrap(&mut target)
                 .unwrap();
+                assert!(target.runtime.is_generated(SlotIndex::new(99)),
+                    "restored durable own candidate must fence re-collation of its slot");
+                assert!(!target.runtime.is_sent_generated(SlotIndex::new(99)),
+                    "recovery must not manufacture evidence of network publication");
                 let actions = receiver.drain_actions();
                 assert!(
                     !actions.iter().any(|a| matches!(

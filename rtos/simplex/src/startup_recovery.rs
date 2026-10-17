@@ -146,6 +146,10 @@ pub(crate) trait StartupRecoveryBackend {
     /// Suppress historical gossip, while using the normal async save owner.
     fn persist_reconstructed_certificate(&mut self, event: SimplexEvent);
 
+    /// A complete authenticated local candidate already owns its slot. This
+    /// restores the production fence, without claiming a network send.
+    fn restore_own_generated_slot(&mut self, slot: SlotIndex);
+
     fn sync_standstill_after_restore(&mut self);
 }
 
@@ -327,6 +331,14 @@ impl SessionStartupRecoveryProcessor {
             self.candidate_info_map = Self::build_candidate_info_map(&bootstrap.candidate_infos);
         }
 
+        // Metadata alone never marks a slot generated. The set is derived only
+        // after authenticating the complete PQ bootstrap/journal, and applied
+        // below only to IDs for which actual candidate bytes are restored.
+        let own_payloads: HashSet<_> = bootstrap.candidate_infos.iter()
+            .filter(|record| self.description.pq_context().is_some()
+                && self.self_idx == Some(ValidatorIndex::new(record.leader_idx)))
+            .map(|record| record.candidate_id.clone()).collect();
+
         self.recovery_begin_startup_replay(backend);
 
         // Split bootstrap into session, receiver, and candidate payload parts
@@ -466,7 +478,7 @@ impl SessionStartupRecoveryProcessor {
             "Session {}: step 10/12 - restoring candidate bytes cache",
             self.session_id.to_hex_string()
         );
-        self.restore_candidate_cache(backend, &session_boot.finalized_blocks, &candidate_payloads)?;
+        self.restore_candidate_cache(backend, &session_boot.finalized_blocks, &candidate_payloads, &own_payloads)?;
 
         // Step 10b: Rebuild receiver standstill caches (votes + cert bundles + last_final_cert)
         //
@@ -1331,6 +1343,7 @@ impl SessionStartupRecoveryProcessor {
         backend: &mut dyn StartupRecoveryBackend,
         finalized_blocks: &[FinalizedBlockRecord],
         candidate_payloads: &[(RawCandidateId, Vec<u8>)],
+        own_payloads: &HashSet<RawCandidateId>,
     ) -> Result<()> {
         let mut restored_empty = 0u32;
         let mut restored_payload = 0u32;
@@ -1341,6 +1354,9 @@ impl SessionStartupRecoveryProcessor {
         //    C++ parity: CandidateResolver loads full candidate bytes from DB.
         let payload_ids: HashSet<_> = candidate_payloads.iter().map(|(id, _)| id.clone()).collect();
         for (id, bytes) in candidate_payloads {
+            if own_payloads.contains(id) {
+                backend.restore_own_generated_slot(id.slot);
+            }
             self.recovery_cache_candidate_bytes(backend, id.slot, id.hash.clone(), bytes.clone());
             restored_payload += 1;
         }

@@ -4359,6 +4359,11 @@ impl StartupRecoveryBackend for SessionProcessor {
         });
     }
 
+    fn restore_own_generated_slot(&mut self, slot: SlotIndex) {
+        let now = self.now();
+        self.runtime.set_generated(slot, true, now);
+    }
+
     fn sync_standstill_after_restore(&mut self) {
         // Range-clamp the receiver ingress cursor to the tracked interval and
         // reschedule the standstill timer. Goes through the SessionProcessor
