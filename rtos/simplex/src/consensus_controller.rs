@@ -2074,6 +2074,47 @@ impl ConsensusController {
         (!self.finalized_pending_body.is_empty()).then_some(SlotIndex::new(0))
     }
 
+    /// A materialized row must remain authenticatable after a crash. The
+    /// applied MC floor can suppress old body callbacks, but cannot stand in
+    /// for the candidate metadata and quorum evidence needed by bootstrap.
+    /// Stop at an already materialized ancestor: it passed this same gate (or
+    /// authenticated startup replay). Query missing history through the normal
+    /// verified candidate resolver and keep the source intent pending.
+    pub(crate) fn ensure_recoverable_ancestry(
+        &self,
+        backend: &mut dyn ConsensusBackend,
+        candidate: &RawCandidateId,
+    ) -> bool {
+        let mut cursor = candidate.clone();
+        for _ in 0..MAX_CHAIN_DEPTH {
+            let Some(received) = backend.candidate_book().received(&cursor) else {
+                backend.request_candidate(cursor.slot, cursor.hash, Some(Duration::ZERO));
+                return false;
+            };
+            if received.candidate_hash_data_bytes.is_empty() {
+                backend.request_candidate(cursor.slot, cursor.hash, Some(Duration::ZERO));
+                return false;
+            }
+            let Some(parent) = received.parent_id.clone() else {
+                return true;
+            };
+            if parent.slot >= cursor.slot {
+                log::error!("Session {} cannot persist non-decreasing recovery ancestry", self.session_id());
+                return false;
+            }
+            if self.finalized_blocks.contains(&parent) {
+                return true;
+            }
+            if backend.simplex_state().get_notarize_certificate(parent.slot, &parent.hash).is_none() {
+                backend.request_candidate(parent.slot, parent.hash, Some(Duration::ZERO));
+                return false;
+            }
+            cursor = parent;
+        }
+        log::error!("Session {} recovery ancestry exceeds MAX_CHAIN_DEPTH", self.session_id());
+        false
+    }
+
     /// Apply finalized-driven local state once the candidate body is available.
     ///
     /// Updates local finalized/head cursors, persists finalized records for
@@ -2098,6 +2139,12 @@ impl ConsensusController {
                 || self.finalized_final_proofs.contains(finalized_id))
         {
             return true;
+        }
+
+        if self.description.authenticated_runtime().is_some()
+            && !self.ensure_recoverable_ancestry(backend, finalized_id)
+        {
+            return false;
         }
 
         let Some(received) = backend.candidate_book().received(finalized_id).cloned() else {

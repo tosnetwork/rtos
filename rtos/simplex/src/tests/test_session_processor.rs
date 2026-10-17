@@ -6663,6 +6663,62 @@ fn test_recursive_finalization_defers_until_parent_notar_cert_arrives() {
 }
 
 #[test]
+fn test_recovery_ancestry_requires_parent_evidence_even_below_applied_floor() {
+    let mut opts = SessionOptions::default();
+    opts.use_callback_thread = false;
+    let mut fixture = TestFixture::new_with_shard_and_local_idx(
+        4, 0, ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap(), opts,
+    );
+    let (parent_leader, parent, parent_data) =
+        make_signed_block_broadcast(&fixture, 51, vec![7, 7, 7]);
+    let (leader, child, data) = make_signed_block_broadcast_with_parent(
+        &fixture, 69, vec![8, 8, 8], Some(parent.clone()),
+    );
+    fixture.processor.on_candidate_received(leader, data, None);
+    fixture.processor.set_mc_finalized_block(BlockIdExt::with_params(
+        fixture.description.get_shard().clone(), 1000, UInt256::rand(), UInt256::rand(),
+    ));
+    // Exercise the production materialization gate as well as the resolver.
+    // CandidateBook is an already-verified input boundary here; cryptographic
+    // rejection is covered by pq_live_recovery_* above.
+    let (nodes, keys) = crate::pq_fixture::members();
+    let members = nodes.iter().map(|n| n.descriptor.clone().unwrap()).collect();
+    let (runtime, key, options) = crate::authenticated_fixture::runtime_with_members_on_shard(
+        members, keys[0].clone(), fixture.description.get_shard().clone(),
+    );
+    let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor)
+        .collect::<rtos_block::Result<Vec<_>>>().unwrap();
+    let description = Arc::new(SessionDescription::new_with_runtime(
+        &options, runtime.session_id().clone(), 1, &nodes, key, runtime.shard(),
+        SystemTime::now(), None, Some(&runtime),
+    ).unwrap().bind_pq_session(runtime.catchain_seqno()).unwrap());
+    let db = MockDb::new();
+    let mut authenticated = make_pq_processor_with_description_for_test(db.clone(), description);
+    authenticated.candidate_book_mut().insert_received(
+        child.clone(), fixture.processor.candidate_book().received(&child).unwrap().clone(),
+    );
+    assert!(!authenticated.with_consensus_backend(|c, b| c.maybe_apply_finalized_state(b, &child, true)),
+        "never persist a record whose required recovery ancestry is missing");
+    assert!(db.load_finalized_blocks().unwrap().is_empty());
+    assert!(!fixture.processor.with_consensus_backend(|c, b| c.ensure_recoverable_ancestry(b, &child)));
+    fixture.run_pending_tasks();
+    assert!(fixture.drain_receiver_actions().iter().any(|action| matches!(action,
+        ReceiverAction::RequestCandidate { slot, block_hash }
+            if *slot == parent.slot.value() && block_hash == &parent.hash)));
+
+    fixture.processor.on_candidate_received(parent_leader, parent_data, None);
+    assert!(!fixture.processor.with_consensus_backend(|c, b| c.ensure_recoverable_ancestry(b, &child)),
+        "a signed proposal alone cannot support an ancestor's finality");
+    let notar = make_notar_vote_signature_set_bytes(
+        fixture.processor.session_id(), &fixture.nodes, parent.slot, parent.hash.clone(), &[0, 1, 2],
+    );
+    fixture.processor.process_received_notar_cert(parent.slot, &parent.hash, &notar);
+    fixture.drain_pending_async_db_results();
+    assert!(fixture.processor.with_consensus_backend(|c, b| c.ensure_recoverable_ancestry(b, &child)),
+        "the authenticated parent and its durably ingested NotarCert close the recovery gap");
+}
+
+#[test]
 fn test_recursive_finalization_traverses_empty_ancestor_without_callback() {
     let mut opts = SessionOptions::default();
     opts.use_callback_thread = false;
@@ -11818,10 +11874,13 @@ fn source_finality_controller_empty_trigger_seals_all_roles_after_cold_retry() {
         callbacks.bind_delivery_start(runtime.pin().zerostate.clone()).unwrap();
         processor.consensus.set_callbacks_for_test(callbacks.clone()); processor.callbacks=callbacks;
         for (id,received) in &chain { processor.candidate_book_mut().insert_received(id.clone(),received.clone()); }
-        let root=&chain[0].0;
-        processor.simplex_state.set_notarize_certificate(&description,root.slot,&root.hash,
-            Arc::new(crate::certificate::Certificate { vote:crate::simplex_state::NotarizeVote {
-                slot:root.slot,block_hash:root.hash.clone()},signatures:sign(root,false) })).unwrap();
+        // Rehydrate every ancestor's quorum evidence, including empty nodes.
+        // Body-callback suppression never replaces recovery authentication.
+        for (id, _) in chain.iter().take(3) {
+            processor.simplex_state.set_notarize_certificate(&description,id.slot,&id.hash,
+                Arc::new(crate::certificate::Certificate { vote:crate::simplex_state::NotarizeVote {
+                    slot:id.slot,block_hash:id.hash.clone()},signatures:sign(id,false) })).unwrap();
+        }
         (db,processor)
     };
     let map = std::path::Path::new(&namespace).join("finality-intents/outputs-v1")

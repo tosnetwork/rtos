@@ -1098,6 +1098,8 @@ fn authenticated_schema3_native_signing_and_exact_recovery_bind_runtime() {
     nodes[1] = crate::SimplexSessionNode::from_descriptor(&custody_descriptor(&store)).unwrap();
     let members = nodes.iter().map(|node| node.descriptor.clone().unwrap()).collect();
     let (runtime, transport, options) = crate::authenticated_fixture::runtime_with_members(members, keys[1].clone());
+    let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor)
+        .collect::<rtos_block::Result<Vec<_>>>().unwrap();
     let make_description = || Arc::new(SessionDescription::new_with_runtime(
         &options, runtime.session_id().clone(), 42, &nodes, transport.clone(), runtime.shard(),
         SystemTime::now(), None, Some(&runtime),

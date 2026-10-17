@@ -8,7 +8,7 @@ use rtos_api::{
             key::{finalizedblock::FinalizedBlock as Key, FinalizedBlock as BoxedKey},
             FinalizedBlock as BoxedValue,
         },
-        CandidateParent,
+        CandidateHashData, CandidateParent,
     },
     Constructor,
 };
@@ -25,8 +25,35 @@ fn main() -> Result<()> {
     // Never create, repair, or update the inspected database.
     let db = DB::open_for_read_only(&Options::default(), &database, false)?;
     let mut decoded = Vec::new();
+    let mut metadata = Vec::new();
+    let mut certificates = Vec::new();
     for entry in db.iterator(IteratorMode::Start) {
         let (key, value) = entry?;
+        use rtos_api::ton::consensus::simplex::db::{candidate_resolver, key as keys, Vote};
+        if key.starts_with(&keys::candidate_resolver::candidateinfo::CandidateInfo::constructor_const().to_le_bytes()) {
+            let k = rtos_api::deserialize_typed::<keys::candidate_resolver::CandidateInfo>(&key)?.only();
+            let v = rtos_api::deserialize_typed::<candidate_resolver::CandidateInfo>(&value)?.only();
+            let parent = match &v.candidate_hash_data {
+                CandidateHashData::Consensus_CandidateHashDataEmpty(v) => Some(format!("{:?}", v.parent)),
+                CandidateHashData::Consensus_CandidateHashDataOrdinary(v) => match &v.parent {
+                    CandidateParent::Consensus_CandidateParent(p) => Some(format!("{:?}", p.id.clone().only())),
+                    CandidateParent::Consensus_CandidateWithoutParents => None,
+                },
+            };
+            metadata.push(json!({"candidate":format!("{:?}", k.candidateId), "parent":parent,
+                "block":format!("{:?}", v.candidate_hash_data.block())}));
+        }
+        if key.starts_with(&keys::vote::Vote::constructor_const().to_le_bytes()) {
+            if let Vote::Consensus_Simplex_Db_Cert(v) = rtos_api::deserialize_typed::<Vote>(&value)? {
+                use rtos_api::ton::consensus::simplex::UnsignedVote;
+                let (role, id) = match v.cert.vote {
+                    UnsignedVote::Consensus_Simplex_NotarizeVote(v) => ("notar", format!("{:?}", v.id.only())),
+                    UnsignedVote::Consensus_Simplex_FinalizeVote(v) => ("final", format!("{:?}", v.id.only())),
+                    UnsignedVote::Consensus_Simplex_SkipVote(_) => continue,
+                };
+                certificates.push(json!({"role":role,"candidate":id}));
+            }
+        }
         if !key.starts_with(&Key::constructor_const().to_le_bytes()) {
             continue;
         }
@@ -53,7 +80,8 @@ fn main() -> Result<()> {
     drop(db);
     let mut file = OpenOptions::new().write(true).create_new(true).open(output)?;
     serde_json::to_writer_pretty(&mut file, &json!({"schema":1,"authenticated":false,
-        "database":database,"records":records}))?;
+        "database":database,"records":records,"candidate_metadata":metadata,
+        "certificates":certificates}))?;
     file.write_all(b"\n")?;
     Ok(())
 }
