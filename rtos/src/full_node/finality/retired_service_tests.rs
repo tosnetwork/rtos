@@ -78,6 +78,104 @@ async fn stage(sink: &DurableFinalitySinkPtr, draft: FinalizedDeliveryDraft) -> 
         .map_err(|error| rtos_block::error!("Historical sink completion dropped: {error}"))?
 }
 
+async fn await_source_acceptance(
+    sink: &DurableFinalitySinkPtr,
+    request: consensus_common::finality_delivery::CanonicalFinalityRequest,
+) -> Result<()> {
+    let (sent, received) = tokio::sync::oneshot::channel();
+    sink.await_accepted(
+        request,
+        Box::new(move |result| {
+            let _ = sent.send(result);
+        }),
+    )?;
+    tokio::time::timeout(Duration::from_secs(20), received)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retired_service_repeated_acceptance_reuses_this_process_verification() {
+    use consensus_common::finality_delivery::{CanonicalFinalityRequest, FinalityDeliveryRole};
+    for final_role in [false, true] {
+        let fixture = SpoolFixture::new_for_transport(0, 0x60).await;
+        let recovery = locator(&fixture);
+        let valid = draft(&fixture, final_role);
+        let result =
+            std::panic::AssertUnwindSafe(async {
+                let authenticated =
+                    authenticate_retired_session(fixture.engine.as_ref(), &recovery)
+                        .await
+                        .unwrap();
+                let worker = fixture.engine.ensure_publication_worker().await.unwrap();
+                let sink = worker.historical_sink(&authenticated).unwrap();
+                let id = stage(&sink, valid.clone()).await.unwrap();
+                let accepted = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    fixture.engine.clone().await_publication(id.clone()),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(accepted.block(), &fixture.block);
+                assert_eq!(
+                    fixture
+                        .engine
+                        .load_state(fixture.block.id())
+                        .await
+                        .unwrap()
+                        .root_cell()
+                        .repr_hash(),
+                    &fixture.state_root
+                );
+                let request = CanonicalFinalityRequest {
+                    node_receipt: id,
+                    block_id: fixture.block.id().clone(),
+                    role: if final_role {
+                        FinalityDeliveryRole::Final
+                    } else {
+                        FinalityDeliveryRole::Approval
+                    },
+                    local_adnl: UInt256::from(*fixture.runtime.local_adnl().data()),
+                    local_validator_index: match fixture.runtime.local_role() {
+                        LocalRole::Validator(i) => Some(i),
+                        LocalRole::Observer => None,
+                    },
+                    source_validator: UInt256::from(*valid.source_info.source.id().data()),
+                };
+                await_source_acceptance(&sink, request.clone())
+                    .await
+                    .unwrap();
+                let before = worker.test_acceptance_request_runs();
+                await_source_acceptance(&sink, request.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(worker.test_acceptance_request_runs(),before,
+                "a repeated bound source request must reuse this process's actual node acceptance");
+                let mut wrong_role = request.clone();
+                wrong_role.role = if final_role {
+                    FinalityDeliveryRole::Approval
+                } else {
+                    FinalityDeliveryRole::Final
+                };
+                assert!(await_source_acceptance(&sink, wrong_role).await.is_err());
+                let mut wrong_block = request;
+                wrong_block.block_id.seq_no += 1;
+                assert!(await_source_acceptance(&sink, wrong_block).await.is_err());
+                assert_eq!(
+                    worker.test_acceptance_request_runs(),
+                    before,
+                    "wrong coordinates cannot borrow cached acceptance"
+                );
+            })
+            .catch_unwind()
+            .await;
+        fixture.engine.clone().wait_stop().await.unwrap();
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retired_service_historical_sink_accepts_without_key_and_reauthenticates_each_block() {
     for row in 0..2 {

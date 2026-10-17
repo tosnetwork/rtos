@@ -473,6 +473,8 @@ struct State {
     cursor: Mutex<(u64, std::collections::BTreeMap<u64, usize>)>,
     acceptance_turn: AtomicBool,
     acceptance_verified: Mutex<std::collections::BTreeSet<u64>>,
+    #[cfg(test)]
+    acceptance_request_runs: std::sync::atomic::AtomicUsize,
     acceptance_cursor: Mutex<u64>,
     acceptance_retry: Mutex<std::collections::BTreeMap<u64, tokio::time::Instant>>,
     retry_after: Mutex<std::collections::BTreeMap<(u64, PublicationEffect), tokio::time::Instant>>,
@@ -502,6 +504,8 @@ impl PublicationWorker {
             cursor: Mutex::new(Default::default()),
             acceptance_turn: AtomicBool::new(true),
             acceptance_verified: Mutex::new(Default::default()),
+            #[cfg(test)]
+            acceptance_request_runs: std::sync::atomic::AtomicUsize::new(0),
             acceptance_cursor: Mutex::new(0),
             acceptance_retry: Mutex::new(Default::default()),
             retry_after: Mutex::new(Default::default()),
@@ -701,6 +705,10 @@ impl PublicationWorker {
         result.await.map_err(|e| error!("Publication cleanup owner: {e}"))?
     }
     #[cfg(test)]
+    pub(crate) fn test_acceptance_request_runs(&self) -> usize {
+        self.state.acceptance_request_runs.load(Ordering::Relaxed)
+    }
+    #[cfg(test)]
     pub(crate) fn set_cleanup_commit_hook(
         &self,
         hook: Option<Arc<dyn Fn(&crate::propagation_outbox::PropagationOutbox) + Send + Sync>>,
@@ -863,7 +871,18 @@ impl State {
                     // Bind role, block, session, network and origin before using
                     // the same authenticated accept operation as normal Query.
                     canonical_record(&runtime, &request, &delivery, &entry, &self.limits)?;
+                    // A persisted stage is not acceptance authority after restart.
+                    // Reuse only a completed acceptance verified by this worker,
+                    // after binding the full source request above.
+                    let verified = self.acceptance_verified.lock().unwrap().contains(&entry.id.0);
+                    if verified && matches!(entry.stage,
+                        PublicationStage::AcceptedDraft | PublicationStage::Ready | PublicationStage::Completed)
+                    {
+                        return Ok(());
+                    }
                     let engine = self.engine.upgrade().ok_or_else(|| error!("Publication Engine gone"))?;
+                    #[cfg(test)]
+                    self.acceptance_request_runs.fetch_add(1, Ordering::Relaxed);
                     self.accept(store, engine, entry).await?;
                     Ok(())
                 }.await;
@@ -1788,6 +1807,8 @@ mod tests {
             cursor: Mutex::new(Default::default()),
             acceptance_turn: AtomicBool::new(true),
             acceptance_verified: Mutex::new(Default::default()),
+            #[cfg(test)]
+            acceptance_request_runs: std::sync::atomic::AtomicUsize::new(0),
             acceptance_cursor: Mutex::new(0),
             acceptance_retry: Mutex::new(Default::default()),
             retry_after: Mutex::new(Default::default()),
