@@ -67,7 +67,7 @@ impl AuthenticatedSessionRuntime {
         pin: SessionNetworkPin,
         config: &ConfigParams,
         coordinates: SessionCoordinates<'_>,
-        committee: Vec<ValidatorDescr>,
+        mut committee: Vec<ValidatorDescr>,
         local_adnl: PublicKeyHash,
     ) -> Result<Self> {
         if !pin.zerostate.shard().is_masterchain()
@@ -88,6 +88,10 @@ impl AuthenticatedSessionRuntime {
                 + u64::from(carrier.max_collated_bytes)
                 + (1u64 << 20),
         )?;
+        // Subset selection and ValidatorSet construction can supply different
+        // cached prefix sums for the same ordered, weighted committee. Own a
+        // canonical representation before deriving any runtime consumers.
+        Self::normalize_committee_prefixes(&mut committee)?;
         let identity = derive_session_from_config(pin.global_id, config, coordinates, &committee)?;
         let ordered =
             committee.iter().map(ValidatorDescr::adnl_addr).collect::<Result<Vec<_>>>()?;
@@ -163,24 +167,30 @@ impl AuthenticatedSessionRuntime {
     /// Whether a live group may retain its immutable admission snapshot.
     /// The session hash alone does not encode a change to transport members.
     pub fn same_admission(&self, other: &Self) -> bool {
-        // Later MC snapshots can authenticate the same immutable admission.
-        // They must not rotate a live session solely to change its recovery anchor.
-        self.pin == other.pin
-            && self.coordinates == other.coordinates
-            && self.profile == other.profile
-            && self.session == other.session
-            && self.shard == other.shard
-            && self.catchain_seqno == other.catchain_seqno
-            && self.protocol == other.protocol
-            && self.carrier_version == other.carrier_version
-            && self.slots_per_leader_window == other.slots_per_leader_window
-            && self.max_candidate_size == other.max_candidate_size
-            && self.wire_profile == other.wire_profile
-            && self.committee == other.committee
-            && self.members == other.members
-            && self.current_total_set == other.current_total_set
-            && self.local_role == other.local_role
-            && self.local_adnl == other.local_adnl
+        self.admission_mismatch(other).is_none()
+    }
+
+    /// First inconsistent public admission field, for restart diagnostics.
+    /// Anchors may differ when two authenticated states admit the same session.
+    pub fn admission_mismatch(&self, other: &Self) -> Option<&'static str> {
+        macro_rules! compare {
+            ($($field:ident),+ $(,)?) => {
+                $(if self.$field != other.$field { return Some(stringify!($field)); })+
+            };
+        }
+        compare!(pin, coordinates, profile, session, shard, catchain_seqno,
+            protocol, carrier_version, slots_per_leader_window, max_candidate_size,
+            wire_profile, committee, members, current_total_set, local_role, local_adnl);
+        None
+    }
+
+    fn normalize_committee_prefixes(committee: &mut [ValidatorDescr]) -> Result<()> {
+        let mut prefix = 0;
+        for member in committee {
+            member.prev_weight_sum = prefix;
+            prefix = rtos_block::checked_add_validator_weight(prefix, member.weight)?;
+        }
+        Ok(())
     }
 
     pub fn runtime_directory(&self, root: &str) -> Result<String> {

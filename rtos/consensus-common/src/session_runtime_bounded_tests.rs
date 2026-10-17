@@ -166,3 +166,55 @@ fn bounded_config_consumer_scope_preserves_unused_bad_sets() {
     assert!(config.runtime_session_config_bounded(true, &budget).is_err());
     assert!(config.governing_session_config_bounded(true, &budget).is_ok());
 }
+
+#[test]
+fn recovery_admission_canonicalizes_only_cached_committee_prefixes() {
+    let (pin, config, nodes) = fixture();
+    let shard = ShardIdent::masterchain();
+    let local = nodes[2].adnl_addr().unwrap();
+    // A shuffled subset may retain prefix caches from its full set; a live
+    // ValidatorSet rebuild recomputes those caches in subset order.
+    let mut raw = vec![nodes[2].clone(), nodes[0].clone()];
+    raw[0].weight = 17;
+    raw[1].weight = 29;
+    raw[0].prev_weight_sum = 999;
+    raw[1].prev_weight_sum = 0;
+    let canonical = ValidatorSet::new(1, 100, 2, raw.clone()).unwrap();
+    assert_ne!(raw, canonical.list());
+    let create = |committee| AuthenticatedSessionRuntime::from_authenticated_config(
+        pin.clone(), &config, coords(&shard), committee, local.clone()).unwrap();
+    let live = create(canonical.list().to_vec());
+    let recovered = create(raw.clone());
+    assert!(live.same_admission(&recovered));
+    assert_eq!(recovered.committee(), canonical.list());
+    assert_eq!(recovered.committee()[0].prev_weight_sum, 0);
+    assert_eq!(recovered.committee()[1].prev_weight_sum, 17);
+    let identity = derive_session_from_config(pin.global_id, &config, coords(&shard), &raw).unwrap();
+    assert_eq!(recovered.session_id(), &identity.session_id);
+    let budget = ConfigBudget::new(1_000_000, 32 << 20);
+    let decoded = config.session_config_bounded(true, &budget).unwrap();
+    let bounded = AuthenticatedSessionRuntime::from_decoded_config_bounded(
+        pin.clone(), &decoded, coords(&shard), raw.clone(), local.clone(), &budget).unwrap();
+    assert!(live.same_admission(&bounded));
+    assert_eq!(live.pq_context().unwrap().validator_info(), bounded.pq_context().unwrap().validator_info());
+    let mut changed = raw.clone();
+    changed[1].weight += 1;
+    assert!(!live.same_admission(&create(changed)));
+    let mut changed = raw;
+    changed.reverse();
+    assert!(!live.same_admission(&create(changed)));
+    // Same session ID is insufficient: transport admission and local role also
+    // have to remain identical, even though neither is the prefix cache.
+    let mut changed = live.clone();
+    changed.members.push(KeyId::from_data([98; 32]));
+    assert_eq!(live.admission_mismatch(&changed), Some("members"));
+    let mut changed = live.clone();
+    changed.local_role = LocalRole::Observer;
+    assert_eq!(live.admission_mismatch(&changed), Some("local_role"));
+    let mut changed = live.clone();
+    changed.committee[0].adnl_addr = Some(UInt256::from([97; 32]));
+    assert_eq!(live.admission_mismatch(&changed), Some("committee"));
+    let mut changed = live.clone();
+    changed.committee[0] = nodes[1].clone();
+    assert_eq!(live.admission_mismatch(&changed), Some("committee"));
+}

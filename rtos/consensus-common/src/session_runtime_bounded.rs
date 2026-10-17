@@ -5,7 +5,7 @@ impl AuthenticatedSessionRuntime {
         pin: SessionNetworkPin,
         config: &rtos_block::DecodedSessionConfig,
         coordinates: SessionCoordinates<'_>,
-        committee: Vec<ValidatorDescr>,
+        mut committee: Vec<ValidatorDescr>,
         local_adnl: PublicKeyHash,
         budget: &dyn rtos_block::config_read_budget::ConfigReadBudget,
     ) -> Result<Self> {
@@ -26,6 +26,9 @@ impl AuthenticatedSessionRuntime {
                 + u64::from(carrier.max_collated_bytes)
                 + (1u64 << 20),
         )?;
+        // Charge the in-place canonicalization; no extra committee allocation.
+        cb::steps(budget, committee.len())?;
+        Self::normalize_committee_prefixes(&mut committee)?;
         let identity = rtos_api::session_identity::derive_session_from_decoded_bounded(
             pin.global_id,
             config,

@@ -1185,8 +1185,8 @@ impl ValidatorGroup {
         let authenticated = super::retired_session_auth::authenticate_retired_session(
             self.engine.as_ref(), &record,
         ).await?;
-        if !current.same_admission(authenticated.runtime()) {
-            fail!("Recovered session admission differs from current authenticated admission");
+        if let Some(field) = current.admission_mismatch(authenticated.runtime()) {
+            fail!("Recovered session admission differs from current authenticated admission: {field}");
         }
         self.recovered_session_start = Some((
             authenticated.record().prev_blocks.clone(),
