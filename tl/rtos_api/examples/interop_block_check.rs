@@ -2,7 +2,7 @@
 //! Check native block/state checkpoints and optional authenticated final certificates.
 use anyhow::{ensure, Context, Result};
 use rtos_block::{
-    base64_decode, base64_encode, read_single_root_boc, Block, BlockIdExt, Deserializable,
+    base64_decode, base64_encode, read_single_root_boc, BlkPrevInfo, Block, BlockIdExt, Deserializable,
     ShardIdent, ShardStateUnsplit, UInt256,
 };
 use serde_json::{json, Value};
@@ -27,6 +27,52 @@ fn identity(value: &Value) -> Result<(i64, i64, u64, UInt256, UInt256)> {
         hash(&value["root_hash"])?,
         hash(&value["file_hash"])?,
     ))
+}
+
+// The fixture has one unsplit full workchain. Historical creator evidence must
+// remain linked to an authenticated masterchain top through every real body.
+fn workchain_parent(block: &Block) -> Result<Value> {
+    let info = block.read_info()?;
+    ensure!(!info.after_split() && !info.after_merge(), "split workchain ancestry is unsupported");
+    let BlkPrevInfo::Block { prev } = info.read_prev_ref()? else {
+        anyhow::bail!("single workchain parent required");
+    };
+    ensure!(prev.seq_no.checked_add(1) == Some(info.seq_no()), "workchain ancestry height gap");
+    Ok(json!({"@type":"tos.blockIdExt", "workchain":info.shard().workchain_id(),
+        "shard":(info.shard().shard_prefix_with_tag() as i64).to_string(),
+        "seqno":prev.seq_no, "root_hash":base64_encode(prev.root_hash.as_slice()),
+        "file_hash":base64_encode(prev.file_hash.as_slice())}))
+}
+
+fn check_workchain_anchor(workchain: &Value, tops: &[Value], global_id: i32) -> Result<usize> {
+    let target = identity(&workchain["block"]["id"])?;
+    let chain = match workchain.get("anchor_chain") {
+        Some(value) => value.as_array().context("workchain anchor chain array required")?.as_slice(),
+        None => &[],
+    };
+    ensure!(chain.len() <= 64, "workchain anchor chain exceeds fixture bound");
+    let top = chain.first().map(|link| &link["id"]).unwrap_or(&workchain["block"]["id"]);
+    let mut expected = identity(top)?;
+    ensure!(tops.iter().any(|id| identity(id).ok().as_ref() == Some(&expected)),
+        "workchain block is not anchored by the checked masterchain block");
+    for link in chain {
+        let id = identity(&link["id"])?;
+        ensure!(id == expected && id.0 == 0 && id.1 == i64::MIN && id.2 > target.2,
+            "workchain anchor link identity or order differs");
+        let bytes = base64_decode(link["boc"].as_str().context("anchor link BOC required")?)?;
+        ensure!(UInt256::calc_file_hash(&bytes) == id.4, "workchain anchor file hash differs");
+        let cell = read_single_root_boc(&bytes)?;
+        ensure!(cell.repr_hash() == &id.3, "workchain anchor cell hash differs");
+        let block = Block::construct_from_cell(cell)?;
+        let info = block.read_info()?;
+        ensure!(block.global_id() == global_id && u64::from(info.seq_no()) == id.2
+            && info.shard().workchain_id() == 0
+            && info.shard().shard_prefix_with_tag() == 1_u64 << 63,
+            "workchain anchor header differs");
+        expected = identity(&workchain_parent(&block)?)?;
+    }
+    ensure!(expected == target, "workchain anchor does not reach the exact target");
+    Ok(chain.len())
 }
 
 fn main() -> Result<()> {
@@ -241,8 +287,7 @@ fn check_request(value: &Value, depth: u8) -> Result<Value> {
         let wc_id = identity(&workchain["block"]["id"])?;
         ensure!(wc_id.0 == 0 && wc_id.1 == i64::MIN && wc_id.2 > 0,
             "fixture needs a produced full workchain-0 block");
-        ensure!(shard_tops.iter().any(|id| identity(id).ok().as_ref() == Some(&wc_id)),
-            "workchain block is not anchored by the checked masterchain block");
+        let anchor_links = check_workchain_anchor(workchain, &shard_tops, block.global_id())?;
         let bytes = base64_decode(workchain["block"]["boc"].as_str().context("workchain block BOC required")?)?;
         ensure!(UInt256::calc_file_hash(&bytes) == wc_id.4, "workchain block file hash differs");
         let cell = read_single_root_boc(&bytes)?;
@@ -292,6 +337,7 @@ fn check_request(value: &Value, depth: u8) -> Result<Value> {
             "created_by":base64_encode(wc_block.read_extra()?.created_by().as_slice()),
             "state_root_hash":base64_encode(wc_root.as_slice()), "states":checked_states,
             "masterchain_anchor_checked":true, "block_file_cell_and_header_checked":true,
+            "masterchain_anchor_links":anchor_links, "previous_block":workchain_parent(&wc_block)?,
             "fixture_validator_count":fixture_count,
             "all_declared_states_match_block_update":true,
             "all_four_states_match_block_update":fixture_count == 4});
