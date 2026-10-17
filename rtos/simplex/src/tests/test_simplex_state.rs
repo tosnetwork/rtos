@@ -3803,6 +3803,48 @@ fn create_test_notar_cert(
 }
 
 #[test]
+fn test_certificate_needs_matches_cpp_kind_bundle_without_creating_slots() {
+    let desc = create_test_desc(4, 2);
+    let slot = SlotIndex::new(5);
+    let hash = UInt256::from([0x31; 32]);
+    let other_hash = UInt256::from([0x32; 32]);
+    let signers = [ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+    let votes = |slot, hash: UInt256| [
+        Vote::Notarize(NotarizeVote { slot, block_hash: hash.clone() }),
+        Vote::Skip(SkipVote { slot }),
+        Vote::Finalize(FinalizeVote { slot, block_hash: hash }),
+    ];
+    for kind in 0..3 {
+        let mut state = SimplexState::new(&desc).unwrap();
+        let before = (state.slot_votes.len(), state.get_tracked_slots_interval());
+        for vote in votes(SlotIndex::new(10_000), hash.clone()) {
+            assert!(state.needs_certificate(&vote));
+        }
+        assert_eq!((state.slot_votes.len(), state.get_tracked_slots_interval()), before,
+            "a needs lookup is read-only and must not materialize future slots");
+        // Store at the verified FSM boundary without pumping save events. This
+        // is the same bundle predicate for pending and completed async saves.
+        match kind {
+            0 => { state.slot_votes_at(slot).store_notarize_certificate(&hash,
+                create_test_notar_cert(&desc, slot, hash.clone(), &signers)).unwrap(); }
+            1 => { state.slot_votes_at(slot).store_skip_certificate(
+                create_test_skip_cert(&desc, slot, &signers)).unwrap(); }
+            _ => { state.slot_votes_at(slot).store_finalize_certificate(&hash,
+                create_test_final_cert(&desc, slot, hash.clone(), &signers)).unwrap(); }
+        }
+        for candidate_hash in [hash.clone(), other_hash.clone()] {
+            for (query_kind, vote) in votes(slot, candidate_hash).iter().enumerate() {
+                assert_eq!(state.needs_certificate(vote), query_kind != kind,
+                    "C++ needs is per kind/slot, independent of candidate hash");
+            }
+        }
+        for vote in votes(slot + 1, hash.clone()) {
+            assert!(state.needs_certificate(&vote), "one slot cannot suppress another");
+        }
+    }
+}
+
+#[test]
 fn test_collect_cached_certificates_in_range_filters_and_sorts() {
     let desc = create_test_desc(4, 2);
     let mut state = SimplexState::new(&desc).expect("Failed to create state");

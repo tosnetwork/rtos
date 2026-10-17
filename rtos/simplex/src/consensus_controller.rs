@@ -904,9 +904,9 @@ impl ConsensusController {
     /// then stores it through [`ConsensusBackend::simplex_state_mut`] and relays
     /// via the standstill tracker on first store.
     ///
-    /// Returns `true` iff the certificate passed verification (so the caller
-    /// pumps `check_all()`); rejected / late / invalid-source certificates
-    /// return `false`.
+    /// Returns `true` iff a still-needed certificate passed verification (so
+    /// the caller pumps `check_all()`). Duplicates, rejected, late and
+    /// invalid-source certificates return `false`.
     ///
     /// Reference: C++ pool.cpp `handle(IncomingProtocolMessage)` →
     /// `handle_foreign_certificate(cert)`: look up the slot, store the cert
@@ -1019,6 +1019,21 @@ impl ConsensusController {
                 &self.session_id().to_hex_string()[..8],
                 backend.simplex_state().first_too_new_vote_slot(),
             );
+            return false;
+        }
+
+        // Receiver acceptance notifications cannot recall copies already queued
+        // on this actor. Match fixed C++ pool.cpp: CertificateBundle::needs is
+        // checked here before Certificate::from_tl, repair or persistence.
+        let raw_vote = match &tl_certificate {
+            Certificate::Consensus_Simplex_Certificate(c) => {
+                crate::utils::tl_unsigned_to_vote(&c.vote)
+            }
+        };
+        let Ok(raw_vote) = raw_vote else {
+            return false;
+        };
+        if !backend.simplex_state().needs_certificate(&raw_vote) {
             return false;
         }
 

@@ -1544,6 +1544,62 @@ fn test_on_certificate_relays_and_caches_skip_certificate_once() {
 }
 
 #[test]
+fn test_queued_certificate_duplicates_skip_verification_and_effects_like_cpp() {
+    for kind in 0..3 {
+        for source in [Some(1u32), None] {
+            let mut fixture = TestFixture::new(4);
+            let make = |session: &SessionId, kind, slot: u32, hash: UInt256| {
+                use rtos_api::ton::consensus::simplex::unsignedvote;
+                let id = TlCandidateId { slot: slot as i32, hash }.into_boxed();
+                let vote = match kind {
+                    0 => unsignedvote::NotarizeVote { id }.into_boxed(),
+                    1 => unsignedvote::SkipVote { slot: slot as i32 }.into_boxed(),
+                    _ => unsignedvote::FinalizeVote { id }.into_boxed(),
+                };
+                let preimage = crate::utils::create_data_to_sign(session,
+                    &crate::utils::serialize_unsigned_vote(&vote));
+                let signatures = (0..3).map(|index| VoteSignature {
+                    who: index as i32,
+                    signature: fixture.nodes[index].public_key.sign(&preimage).unwrap().to_vec(),
+                }.into_boxed()).collect();
+                Certificate { vote, signatures: VoteSignatureSet { votes: signatures }.into_boxed() }.into_boxed()
+            };
+            let hash = UInt256::from([0x51; 32]);
+            let valid = make(fixture.description.get_session_id(), kind, 5, hash.clone());
+            let other_slot = make(fixture.description.get_session_id(), kind, 6, hash.clone());
+            let wrong_context = make(&UInt256::from([0x91; 32]), kind, 5, UInt256::from([0x52; 32]));
+            let unknown_wrong_context = make(&UInt256::from([0x91; 32]), kind, 6, hash.clone());
+            let other_kind_wrong_context = make(&UInt256::from([0x91; 32]), 1 - kind.min(1), 5, hash);
+            // Call the actor ingress directly: these messages already passed
+            // the receiver before its acceptance notification could filter them.
+            assert!(fixture.processor.with_consensus_backend(|c, b| c.on_certificate(b, source, valid.clone())));
+            fixture.drain_receiver_actions();
+            let queued = fixture.task_queue.tasks.lock().unwrap().len();
+            let progress = fixture.processor.simplex_state.get_first_non_progressed_slot();
+            for duplicate in [valid, wrong_context] {
+                assert!(!fixture.processor.with_consensus_backend(|c, b| c.on_certificate(b, source, duplicate)),
+                    "a known kind/slot must not verify again or pump the FSM");
+            }
+            assert_eq!(fixture.processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed), 0,
+                "known-kind ingress must stop before crypto, including another hash/context");
+            assert!(fixture.drain_receiver_actions().is_empty());
+            assert_eq!(fixture.task_queue.tasks.lock().unwrap().len(), queued);
+            assert_eq!(fixture.processor.simplex_state.get_first_non_progressed_slot(), progress);
+            assert!(!fixture.processor.with_consensus_backend(|c, b| c.on_certificate(b, source, unknown_wrong_context)));
+            assert_eq!(fixture.processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed), 1,
+                "a new slot still requires full verification");
+            if kind != 2 {
+                assert!(!fixture.processor.with_consensus_backend(|c, b| c.on_certificate(b, source, other_kind_wrong_context)));
+                assert_eq!(fixture.processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed), 2,
+                    "another kind in the same live slot still requires verification");
+            }
+            assert!(fixture.processor.with_consensus_backend(|c, b| c.on_certificate(b, source, other_slot)),
+                "a valid new slot remains admissible");
+        }
+    }
+}
+
+#[test]
 fn test_certificate_ingress_excludes_upper_boundary_before_verification() {
     for source in [Some(1), None] {
         let mut opts = SessionOptions::default();
@@ -11713,6 +11769,7 @@ fn authenticated_observer_processor_accepts_only_valid_pq_quorum_without_signing
         make_certificate(runtime.session_id(), &[0, 1], true),
     ];
     let valid = make_certificate(runtime.session_id(), &[0, 1], false);
+    let queued_duplicate = make_certificate(&UInt256::from([0xff; 32]), &[0, 1], false);
     let calls: Vec<_> = stores.iter().map(|store| store.consensus_signatures_produced()).collect();
     receiver.drain_actions();
     processor.on_certificate(None::<u32>, boundary_cert);
@@ -11746,6 +11803,11 @@ fn authenticated_observer_processor_accepts_only_valid_pq_quorum_without_signing
     assert!(!actions.iter().any(|action| matches!(action,
         ReceiverAction::SendVote { .. } | ReceiverAction::CacheOurVoteForStandstill { .. }
     )));
+    let verify_failures = processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed);
+    processor.on_certificate(None::<u32>, queued_duplicate);
+    assert_eq!(processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed), verify_failures,
+        "queued known-kind PQ certificate must stop before repeated verification");
+    assert!(receiver.drain_actions().is_empty());
     processor.on_certificate(None::<u32>, valid);
     drain(&mut processor);
     assert!(!receiver.drain_actions().iter().any(|action| matches!(action,

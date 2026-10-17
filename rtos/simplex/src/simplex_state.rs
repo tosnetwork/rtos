@@ -1140,6 +1140,27 @@ impl SimplexState {
     // ------------------------------------------------------------------
     // Certificates
     // ------------------------------------------------------------------
+    /// C++ CertificateBundle::needs: once a verified certificate of this kind
+    /// is held for a slot, queued copies need no further verification. The FSM
+    /// also holds the certificate while its async save is in flight. Candidate
+    /// hashes do not distinguish needs within one kind; other kinds remain
+    /// independent. Ingress bounds are checked by the caller before this read.
+    pub(crate) fn needs_certificate(&self, vote: &Vote) -> bool {
+        let slot = match vote {
+            Vote::Notarize(vote) => vote.slot,
+            Vote::Finalize(vote) => vote.slot,
+            Vote::Skip(vote) => vote.slot,
+        };
+        let Some(state) = self.slot_votes.get(&slot) else {
+            return true;
+        };
+        match vote {
+            Vote::Notarize(_) => state.notarize_certificate.is_none(),
+            Vote::Finalize(_) => state.finalize_certificate.is_none(),
+            Vote::Skip(_) => state.skip_certificate.is_none(),
+        }
+    }
+
     /// Get cached notarization certificate for a block in a slot
     ///
     /// Returns the cached certificate if notarization threshold (2/3) was reached,
