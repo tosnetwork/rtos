@@ -1188,27 +1188,34 @@ impl QuicNode {
 
     /// Shut down all QUIC endpoints, cancel background tasks, and release resources.
     pub fn shutdown(&self) {
+        log::info!(target: TARGET, "QUIC shutdown: closing worker admission");
         self.tasks.close();
+        log::info!(target: TARGET, "QUIC shutdown: worker admission closed");
         // Cancel all background tasks (accept loops, connection checkers, drain tasks)
         self.cancellation_token.cancel();
+        log::info!(target: TARGET, "QUIC shutdown: transport cancellation requested");
 
         // Close all outbound connections in every local key state
         for entry in self.local_keys.iter() {
             let outbound = &entry.val().outbound;
             for conn_entry in outbound.map().iter() {
                 if let Some(ref conn) = conn_entry.val().conn {
+                    log::info!(target: TARGET, "QUIC shutdown: closing outbound connection {}", conn.stable_id());
                     conn.close(0u32.into(), b"shutdown");
                 }
             }
         }
+        log::info!(target: TARGET, "QUIC shutdown: outbound connections closed");
 
         // Close all endpoints
+        log::info!(target: TARGET, "QUIC shutdown: acquiring endpoint registry");
         if let Ok(endpoints) = self.endpoints.lock() {
             for (port, state) in endpoints.iter() {
                 log::info!(target: TARGET, "Shutting down QUIC endpoint on port {port}");
                 state.endpoint.close(0u32.into(), b"shutdown");
             }
         }
+        log::info!(target: TARGET, "QUIC shutdown: endpoint close requested");
     }
 
     /// Join actual workers, including subscriber calls already admitted from a stream.
@@ -1233,13 +1240,16 @@ impl QuicNode {
     }
 
     async fn finish_shutdown(&self) -> Result<()> {
+        log::info!(target: TARGET, "QUIC shutdown: joining application workers");
         let result = self.tasks.wait().await;
+        log::info!(target: TARGET, "QUIC shutdown: application workers joined");
         // A key command already executing when shutdown started may have created
         // an endpoint. No key worker remains now, so this snapshot is final.
         self.shutdown();
         let endpoints: Vec<_> =
             self.endpoints.lock().unwrap().values().map(|state| state.endpoint.clone()).collect();
         for endpoint in endpoints {
+            log::info!(target: TARGET, "QUIC shutdown: waiting for endpoint idle");
             tokio::select! {
                 _ = endpoint.wait_idle() => {},
                 // A failed driver may no longer deliver idle notifications.
@@ -1248,6 +1258,7 @@ impl QuicNode {
                 _ = self.drivers.cancelled() => {},
             }
         }
+        log::info!(target: TARGET, "QUIC shutdown: endpoints idle, releasing endpoint and connection handles");
         // wait_idle only drains connections. Quinn's endpoint driver terminates
         // after its last Endpoint reference drops; it still owns the UDP socket.
         self.endpoints.lock().unwrap().clear();
@@ -1257,7 +1268,9 @@ impl QuicNode {
             self.local_keys.remove(&key);
         }
         self.inbound_pools.lock().unwrap().clear();
+        log::info!(target: TARGET, "QUIC shutdown: joining endpoint drivers");
         let drivers = self.drivers.wait().await;
+        log::info!(target: TARGET, "QUIC shutdown: endpoint drivers joined");
         match (result, drivers) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
