@@ -342,3 +342,16 @@ evidence, with every active endpoint's MC/WC state checked. The entire sequence
 shares the existing 180-second matrix deadline; it does not get a new recovery
 deadline. A finally block resumes owned paused processes on failure. No DB or
 production consensus change is made by the fixture.
+
+The nonuniform full-six profile may declare `validator_weights` with members0–4
+at6 each and member5 at30, and `threshold_fault.kind: low_weight_majority`.
+Its fixed plan has `pause_at_quorum: []`, `pause_below_quorum: [5]`, and the
+same4-second settling /12-second observation. Native PQ descriptors and Fift
+registrations share these frozen weights. The full current total remains60
+and the C++ quorum40; five low-weight members together have only30. The
+fresh healthy baseline certificate must include member5 and pass the actual
+weighted quorum; it is not called an exact40 certificate (the least reachable
+sufficient sum here is42). Only member5 is paused and restored, and its fresh
+authenticated vote, MC/WC creator evidence and every endpoint's complete states
+are required after resume. CPP control precedes mixed3CPP3Rust, where member5
+is Rust. Existing equal-weight plans retain their original exact-boundary gates.

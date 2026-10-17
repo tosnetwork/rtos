@@ -11,7 +11,7 @@ import time
 
 from mixed_matrix import child_checked, cpp_block, cpp_certificate, digest, identity, native_state, rpc, write
 from network_faults import require_namespace
-from quorum_profile import check_committee_weights, matrix_committee_size, matrix_threshold_plan, quorum_threshold
+from quorum_profile import check_committee_weights, matrix_committee_size, matrix_threshold_plan, quorum_threshold, matrix_weights
 
 
 async def exercise_threshold_fault(args, root, nodes, endpoints, lite_configs, rust_nodes,
@@ -22,12 +22,13 @@ async def exercise_threshold_fault(args, root, nodes, endpoints, lite_configs, r
     plan = matrix_threshold_plan(profile, args.cpp_count)
     directory = root / 'threshold-fault'; directory.mkdir()
     rust = {n['index']: n for n in rust_nodes}
-    weights = {i: 17 for i in range(count)}
+    weights = matrix_weights(profile, args.cpp_count)
+    weighted = plan.get('kind') == 'low_weight_majority'
     member_id = lambda i: base64.b64encode(hashlib.sha256(f'n6-validator-id-{i}'.encode()).digest()).decode()
-    quorum = quorum_threshold(17 * count)
+    total = sum(weights.values()); quorum = quorum_threshold(total)
     survivors = [i for i in range(count) if i not in plan['pause_at_quorum']]
     below = [i for i in survivors if i not in plan['pause_below_quorum']]
-    if sum(weights[i] for i in survivors) != quorum or sum(weights[i] for i in below) >= quorum:
+    if (not weighted and sum(weights[i] for i in survivors) != quorum) or sum(weights[i] for i in below) >= quorum:
         raise RuntimeError('Declared availability stages do not straddle the pinned CPP quorum')
     processes = {}
     for i, node in enumerate(nodes):
@@ -35,9 +36,11 @@ async def exercise_threshold_fault(args, root, nodes, endpoints, lite_configs, r
         processes[str(i)] = {'pid': pid, 'start_ticks': Path(f'/proc/{pid}/stat').read_text().split()[21]}
     started = time.monotonic()
     receipt = {'phase': 'starting', 'plan': plan, 'namespace': namespace, 'processes': processes,
-        'before': checkpoint['block'], 'validator_count': count, 'total_weight': count * 17,
+        'before': checkpoint['block'], 'validator_count': count, 'total_weight': total, 'weights': weights,
+        'positive_kind': 'high_weight_required' if weighted else 'exact_quorum',
         'quorum_weight': quorum, 'survivor_members': survivors, 'below_quorum_members': below,
-        'below_quorum_weight': len(below) * 17, 'available_budget_seconds': deadline - started,
+        'below_quorum_weight': sum(weights[i] for i in below),
+        'below_quorum_count_majority': len(below) * 2 > count, 'available_budget_seconds': deadline - started,
         'same_processes': True, 'manual_database_repair': False,
         'negative_scope': 'no observed finalized MC head advance during the declared bounded window',
         'workchain_scope': 'complete state on every active endpoint, block update and authenticated MC anchor'}
@@ -134,14 +137,18 @@ async def exercise_threshold_fault(args, root, nodes, endpoints, lite_configs, r
         floor = checkpoint['block']['seqno']
         while True:
             infos = await common(survivors, floor); floor = infos[0]['last']['seqno']
-            checked = await check(infos, f'exact-{floor}', False)
+            positive_label = f'positive-{floor}' if weighted else f'exact-{floor}'
+            checked = await check(infos, positive_label, False)
             if checked['gen_utime'] <= receipt['quorum_paused_at_unix']: continue
             expected = {member_id(i) for i in survivors}
             certs = checked['verified_final_certificates']
-            if not certs or any(set(c['validator_ids']) != expected or c['verified_weight'] != quorum for c in certs):
+            if weighted:
+                if not certs or any(member_id(5) not in c['validator_ids'] or c['verified_weight'] < quorum for c in certs):
+                    raise RuntimeError('Weighted baseline lacks the necessary high-weight member')
+            elif not certs or any(set(c['validator_ids']) != expected or c['verified_weight'] != quorum for c in certs):
                 raise RuntimeError('Fresh exact-threshold certificate lacks the declared necessary members')
-            receipt.update(phase='exact_quorum_verified', survivor_checkpoint=checked['block'],
-                survivor_certificates=certs, survivor_sample=f'exact-{floor}')
+            receipt.update(phase='weighted_baseline_verified' if weighted else 'exact_quorum_verified', survivor_checkpoint=checked['block'],
+                survivor_certificates=certs, survivor_sample=positive_label)
             write(directory / 'receipt.json', receipt); break
         receipt['below_stop_states'] = await pause(plan['pause_below_quorum'])
         receipt['below_paused_at_unix'] = time.time()

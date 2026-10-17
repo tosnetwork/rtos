@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 
-from quorum_profile import MAX_TOTAL_WEIGHT, quorum_threshold, epoch_weights, check_committee_weights, initial_probe_weights, initial_probe_deadline, matrix_committee_size, matrix_threshold_plan
+from quorum_profile import MAX_TOTAL_WEIGHT, quorum_threshold, epoch_weights, check_committee_weights, initial_probe_weights, initial_probe_deadline, matrix_committee_size, matrix_threshold_plan, matrix_weights, install_matrix_weights
 from rotation_fixture import install_successor, INITIAL, SUCCESSOR
 
 
@@ -37,6 +37,43 @@ class QuorumProfileTests(unittest.TestCase):
             with self.assertRaises(ValueError): matrix_threshold_plan(profile, 0)
             with self.assertRaises(ValueError):
                 matrix_threshold_plan({**profile, 'threshold_fault': {'pause_at_quorum': first}}, 1)
+
+    def test_weighted_majority_budget_uses_the_full_frozen_committee(self):
+        weights = {str(i): 30 if i == 5 else 6 for i in range(6)}
+        plan = {'kind': 'low_weight_majority', 'pause_at_quorum': [],
+            'pause_below_quorum': [5], 'settle_seconds': 4, 'observe_seconds': 12}
+        profile = {'validator_count': 6, 'shard_validators': 6,
+            'validator_weights': weights, 'threshold_fault': plan}
+        self.assertEqual(matrix_weights(profile, 3), {int(i): w for i, w in weights.items()})
+        self.assertEqual(matrix_threshold_plan(profile, 3), plan)
+        self.assertEqual(quorum_threshold(sum(weights.values())), 40)
+        self.assertEqual(sum(w for i, w in weights.items() if i != '5'), 30)
+        for bad in [{**weights, '5': 29}, {**weights, '0': True}, {'5': 30}]:
+            with self.assertRaises(ValueError):
+                matrix_threshold_plan({**profile, 'validator_weights': bad}, 3)
+        with self.assertRaises(ValueError):
+            matrix_threshold_plan({**profile, 'threshold_fault': {**plan, 'pause_below_quorum': [4]}}, 3)
+        with self.assertRaises(ValueError):
+            matrix_threshold_plan({**profile, 'threshold_fault': {k:v for k,v in plan.items() if k!='kind'}}, 3)
+
+    def test_matrix_descriptor_and_fift_weights_cannot_diverge(self):
+        captured=[]
+        class Descriptor:
+            def __init__(self, identity, weight): self.data=bytes([identity,weight])
+            def to_boc(self): return self.data
+        module=SimpleNamespace(run_fift=lambda install,code,directory,**kwargs:captured.append(code),
+            _pq_validator_descriptor=lambda identity,weight:Descriptor(identity,weight))
+        nodes=[SimpleNamespace(pq_initial_validator=i) for i in range(6)]
+        weights={i:30 if i==5 else 6 for i in range(6)}
+        install_matrix_weights(module,nodes,weights)
+        template='\n'.join(f'17 "pq-validator-{i}.boc" file>B B>boc register-validator' for i in range(6))
+        with tempfile.TemporaryDirectory() as tmp:
+            directory=Path(tmp);module.run_fift(None,template,directory)
+            for i,w in weights.items():
+                self.assertEqual((directory/f'pq-validator-{i}.boc').read_bytes(),bytes([i,w]))
+                self.assertIn(f'{w} "pq-validator-{i}.boc"',captured[0])
+            with self.assertRaisesRegex(RuntimeError,'template differs'):
+                module.run_fift(None,'unknown native template',directory)
 
     def test_cpp_boundary_is_inclusive_when_total_is_divisible_by_three(self):
         for total, expected in [(3, 2), (6, 4), (51, 34), (102, 68), (60, 40), (68, 46)]:

@@ -62,6 +62,28 @@ def matrix_committee_size(profile, cpp_count):
     return count
 
 
+def matrix_weights(profile, cpp_count):
+    count = matrix_committee_size(profile, cpp_count)
+    return epoch_weights(profile, 'validator_weights', range(count))
+
+
+def install_matrix_weights(module, nodes, weights):
+    """Keep the native PQ descriptor and Fift registration weights identical."""
+    original = module.run_fift
+    def generate(install, code, directory, **kwargs):
+        for index, weight in weights.items():
+            filename = f'pq-validator-{index}.boc'
+            old = f'17 "{filename}" file>B B>boc register-validator'
+            if code.count(old) != 1:
+                raise RuntimeError('Pinned matrix PQ validator template differs')
+            (directory / filename).write_bytes(module._pq_validator_descriptor(
+                nodes[index].pq_initial_validator, weight).to_boc())
+            code = code.replace(old, f'{weight} "{filename}" file>B B>boc register-validator')
+        return original(install, code, directory, **kwargs)
+    module.run_fift = generate
+    return original
+
+
 def matrix_threshold_plan(profile, cpp_count):
     plan = profile.get('threshold_fault')
     if plan is None:
@@ -69,9 +91,16 @@ def matrix_threshold_plan(profile, cpp_count):
     count = matrix_committee_size(profile, cpp_count)
     if count not in (3, 6) or cpp_count == 0:
         raise ValueError('Threshold fault requires three/six active members and CPP anchor zero')
+    weighted = type(plan) is dict and plan.get('kind') == 'low_weight_majority'
+    if weighted and (count != 6 or matrix_weights(profile, cpp_count) != {0:6,1:6,2:6,3:6,4:6,5:30}):
+        raise ValueError('Low-weight majority requires the explicit full six-member 6/6/6/6/6/30 profile')
     expected = {'pause_at_quorum': [2] if count == 3 else [1, 5],
         'pause_below_quorum': [1] if count == 3 else [3],
         'settle_seconds': 4, 'observe_seconds': 12}
+    if weighted:
+        expected.update(kind='low_weight_majority', pause_at_quorum=[], pause_below_quorum=[5])
+    elif matrix_weights(profile, cpp_count) != {i:17 for i in range(count)}:
+        raise ValueError('Equal-weight threshold plan requires uniform 17-unit weights')
     if type(plan) is not dict or set(plan) != set(expected):
         raise ValueError('Threshold fault requires the complete declared bounded plan')
     for key, value in expected.items():
@@ -79,6 +108,9 @@ def matrix_threshold_plan(profile, cpp_count):
         if isinstance(value, list):
             if type(actual) is not list or any(type(i) is not int for i in actual):
                 raise ValueError('Threshold pause members must be explicit integer indices')
+        elif key == 'kind':
+            if type(actual) is not str:
+                raise ValueError('Threshold kind must be explicit text')
         elif type(actual) is not int:
             raise ValueError('Threshold timing must be explicit integer seconds')
         if actual != value:

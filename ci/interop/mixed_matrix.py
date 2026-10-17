@@ -15,7 +15,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
-from quorum_profile import quorum_threshold, matrix_committee_size, check_committee_weights, matrix_threshold_plan
+from quorum_profile import quorum_threshold, matrix_committee_size, check_committee_weights, matrix_threshold_plan, matrix_weights, install_matrix_weights
 
 
 def digest(path):
@@ -249,6 +249,7 @@ async def run(args, root, snapshot, artifacts):
                        base_port=args.base_port) as network:
         profile = json.loads(args.genesis_profile.read_text())
         member_count = matrix_committee_size(profile, args.cpp_count)
+        expected_weights = matrix_weights(profile, args.cpp_count)
         network.config.shard_validators = profile['shard_validators']
         network.config.global_id = profile['global_id']
         network.config.global_version = profile['global_version']
@@ -272,7 +273,15 @@ async def run(args, root, snapshot, artifacts):
                 hashlib.sha256(f'n6-validator-seed-{i}'.encode()).digest())
             node.announce_to(dht)
             members.append(node)
-        generated = network._get_or_generate_zerostate().masterchain
+        import tostester.zerostate as genesis_module
+        original = None
+        if 'validator_weights' in profile:
+            original = install_matrix_weights(genesis_module, members, expected_weights)
+        try:
+            generated = network._get_or_generate_zerostate().masterchain
+        finally:
+            if original is not None:
+                genesis_module.run_fift = original
         zero = dict(workchain=-1, shard=str(-(1 << 63)), seqno=0,
             root_hash=base64.b64encode(generated.root_hash).decode(),
             file_hash=base64.b64encode(generated.file_hash).decode())
@@ -360,6 +369,10 @@ async def run(args, root, snapshot, artifacts):
             weights = {m['validator_id']: m['weight'] for m in master['committee']}
             if len(weights) != member_count or set(weights) != {base64.b64decode(c).hex() for c in expected_creators}:
                 raise RuntimeError('Authenticated committee differs from the declared reserved identities')
+            desired_weights = {hashlib.sha256(f'n6-validator-id-{i}'.encode()).hexdigest(): w
+                for i, w in expected_weights.items()}
+            if weights != desired_weights:
+                raise RuntimeError('Prepared committee differs from the frozen member weights')
             total = sum(weights.values())
             cpp_weight = sum(weights[hashlib.sha256(f'n6-validator-id-{i}'.encode()).hexdigest()]
                              for i in range(args.cpp_count))
@@ -427,7 +440,7 @@ async def run(args, root, snapshot, artifacts):
                         directory / 'checked.json'], directory / 'checker.log')
                     checked = json.loads((directory / 'checked.json').read_text())
                     if args.verify_certificates:
-                        check_committee_weights(checked, {i: 17 for i in range(member_count)},
+                        check_committee_weights(checked, expected_weights,
                             lambda i: base64.b64encode(hashlib.sha256(f'n6-validator-id-{i}'.encode()).digest()).decode())
                     if args.verify_workchain:
                         tops = [top for top in checked['shard_tops']
@@ -545,6 +558,7 @@ def main():
     args.genesis_profile = args.genesis_profile.resolve()
     profile = json.loads(args.genesis_profile.read_text())
     member_count = matrix_committee_size(profile, args.cpp_count)
+    matrix_weights(profile, args.cpp_count)
     matrix_threshold_plan(profile, args.cpp_count)
     if member_count != 4 and not args.prepare_genesis_only and not (
             args.verify_certificates and args.verify_workchain):
