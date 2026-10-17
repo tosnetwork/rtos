@@ -301,3 +301,16 @@ not qualify three- or six-active-member threshold networks, arbitrary Byzantine
 faults, actual elections, or a weighted WC certificate independent of its
 verified MC anchor. Old-group observers remain outside successor certificate
 membership. No production signing or quorum rule is changed.
+
+To make low-weight participation necessary, the optional initial probe uses
+`initial_probe_pause: [1]` with initial weights {0:29, 1:11, 2:10, 3:10}.
+After all initial MC/WC creators have been observed it pauses its own member 1.
+The remaining active members 0/2/3 have weight 49; any two have at most 39,
+below the unchanged quorum 40. A fresh independently authenticated certificate
+must contain exactly all three. It then resumes member 1's original PID and
+requires its fresh vote/MC/WC creators plus matching full states. The original
+all-four-signer gate is filled only from verified probe certificates. Both this
+probe and its restoration must finish before the predeclared initial epoch
+ends and within the original rotation deadline. The normal successor exact
+40/60 pause remains mandatory afterward. This changes the availability input
+of the experiment, not quorum assembly or signature verification.

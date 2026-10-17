@@ -14,7 +14,7 @@ import sys
 import time
 
 sys.dont_write_bytecode = True
-from quorum_profile import epoch_weights, check_committee_weights, quorum_threshold
+from quorum_profile import epoch_weights, check_committee_weights, quorum_threshold, initial_probe_weights
 from network_faults import MODES, PacketMarks, marked_environment, require_namespace
 from network_fault_fixture import exercise_network_member, stop_cpp_with_receipt
 
@@ -362,6 +362,7 @@ async def run(args, profile, root, artifacts):
             epochs = {phase: {'mc_creators': {}, 'wc_creators': {}} for phase in ['before', 'after']}
             if profile.get('weighted_quorum_pause'):
                 for epoch in epochs.values(): epoch['mc_signers'] = {}
+            initial_probe = None
             baseline_wc_cc = 0
             deadline = time.monotonic() + args.timeout
             while time.monotonic() < deadline:
@@ -514,6 +515,26 @@ async def run(args, profile, root, artifacts):
                                 evidence['local_collation'] = match.group(0)
                             epochs[phase]['wc_creators'].setdefault(wc['created_by'], evidence)
                     write(root / 'epochs.json', epochs)
+                    if profile.get('initial_probe_pause') and phase == 'before' and initial_probe is None \
+                            and len(epochs['before']['mc_creators']) == 4 and len(epochs['before']['wc_creators']) == 4:
+                        from weighted_quorum_fixture import exercise_weighted_quorum
+                        initial_probe = await exercise_weighted_quorum(args, root, nodes, endpoints,
+                            lite_configs, rust_nodes, zero,
+                            base64.b64encode(genesis.masterchain.file.read_bytes()).decode(),
+                            checked, artifacts, profile, initial=True, rotation_deadline=deadline)
+                        probe_root = root / 'initial-weighted-probe'
+                        probe_samples = {Path(initial_probe['survivor_sample'])}
+                        probe_samples.update(Path(entry['sample_directory']) for entry in initial_probe['votes'].values())
+                        for probe_sample in probe_samples:
+                            checked_file = probe_sample / 'checked-with-workchain.json'
+                            if not checked_file.exists(): checked_file = probe_sample / 'checked.json'
+                            verified = json.loads(checked_file.read_text())
+                            check_committee_weights(verified, epoch_weights(profile, 'initial_weights', INITIAL), member_id)
+                            for certificate in verified['verified_final_certificates']:
+                                for signer in certificate['validator_ids']:
+                                    epochs['before']['mc_signers'].setdefault(signer,
+                                        {'check': verified, 'sample_directory': str(probe_sample)})
+                        write(root / 'epochs.json', epochs)
                     if all(len(group) == 4 for epoch in epochs.values() for group in epoch.values()):
                         weighted_quorum = None
                         if profile.get('weighted_quorum_pause'):
@@ -552,9 +573,11 @@ async def run(args, profile, root, artifacts):
                                           else 'cpp_membership_rotation_observed'), 'epochs': epochs,
                             'all_six_applied_mc_states_match': True, 'independent_post_rotation_finality_qualified': True,
                             'mixed_rotation_qualified': bool(args.rust_node), 'election_rehearsal': False,
-                            'recovery': recovery, 'network_fault': network_fault, 'weighted_quorum': weighted_quorum}
+                            'recovery': recovery, 'network_fault': network_fault, 'weighted_quorum': weighted_quorum, 'initial_probe': initial_probe}
                 await asyncio.sleep(0.2)
-            raise TimeoutError('C++ rotation did not satisfy both MC/WC creator epochs')
+            raise TimeoutError('Rotation did not satisfy declared creator/signer epochs: ' +
+                json.dumps({phase: {kind: len(group) for kind, group in groups.items()}
+                    for phase, groups in epochs.items()}))
         finally:
             codes = await asyncio.gather(*(stop_rotation_node(node) for node in rust_nodes), return_exceptions=True)
             write(root / 'rust-shutdown.json', {str(node['index']):
@@ -634,6 +657,8 @@ def main():
             raise SystemExit('Weighted quorum pause requires the explicit isolated [0,2] scenario only')
         if sum(weights[i] for i in [4, 5]) != quorum_threshold(sum(weights.values())):
             raise SystemExit('Declared surviving pair must equal the C++ quorum exactly')
+    if 'initial_probe_pause' in profile:
+        initial_probe_weights(profile)
     manifest = json.loads((args.snapshot / 'manifest.json').read_text())
     if manifest['cpp_source_commit'] != profile['cpp_revision'] \
             or profile['cpp_revision'] != '8f083dc06bff16705710a01de15eb3123d5d696b':

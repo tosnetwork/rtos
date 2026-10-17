@@ -9,20 +9,23 @@ import time
 
 from mixed_matrix import child_checked, cpp_block, cpp_certificate, digest, identity, native_state, rpc, write
 from network_faults import require_namespace
-from quorum_profile import check_committee_weights, epoch_weights, quorum_threshold
+from quorum_profile import check_committee_weights, epoch_weights, initial_probe_weights, initial_probe_deadline, quorum_threshold
 
 
 async def exercise_weighted_quorum(args, root, nodes, endpoints, lite_configs, rust_nodes,
-                                   zero, governing, checkpoint, artifacts, profile):
-    from rotation_fixture import SUCCESSOR, member_id, recovery_workchain_states
+                                   zero, governing, checkpoint, artifacts, profile, *,
+                                   initial=False, rotation_deadline=None):
+    from rotation_fixture import INITIAL, SUCCESSOR, member_id, recovery_workchain_states
     require_namespace()
-    directory = root / 'weighted-quorum'; directory.mkdir()
-    weights = epoch_weights(profile, 'successor_weights', SUCCESSOR)
+    committee = INITIAL if initial else SUCCESSOR
+    anchor = 0 if initial else 4
+    directory = root / ('initial-weighted-probe' if initial else 'weighted-quorum'); directory.mkdir()
+    weights = initial_probe_weights(profile) if initial else epoch_weights(profile, 'successor_weights', SUCCESSOR)
     total = sum(weights.values()); threshold = quorum_threshold(total)
-    paused = profile['weighted_quorum_pause']
+    paused = profile['initial_probe_pause' if initial else 'weighted_quorum_pause']
     live = [i for i in range(6) if i not in paused]
-    survivors = [i for i in SUCCESSOR if i not in paused]
-    if survivors != [4, 5] or sum(weights[i] for i in survivors) != threshold:
+    survivors = [i for i in committee if i not in paused]
+    if not initial and (survivors != [4, 5] or sum(weights[i] for i in survivors) != threshold):
         raise RuntimeError('Weighted pause must retain the declared exact-quorum pair')
     rust_by_index = {n['index']: n for n in rust_nodes}
     processes = {}
@@ -38,12 +41,17 @@ async def exercise_weighted_quorum(args, root, nodes, endpoints, lite_configs, r
 
     receipt = {'phase': 'pausing', 'before': checkpoint['block'], 'processes': processes,
         'paused_members': paused, 'survivor_members': survivors, 'weights': weights,
-        'total_weight': total, 'quorum_weight': threshold,
+        'total_weight': total, 'quorum_weight': threshold, 'surviving_weight': sum(weights[i] for i in survivors),
         'strict_greater_threshold_for_comparison_only': total * 2 // 3 + 1,
         'same_processes': True, 'manual_database_repair': False, 'deadline_seconds': args.recovery_timeout,
         'exact_quorum_chain': 'masterchain', 'workchain_scope': 'full anchored states after all active members resume'}
     write(directory / 'receipt.json', receipt)
     started = time.monotonic(); deadline = started + args.recovery_timeout
+    if initial:
+        if rotation_deadline is None: raise RuntimeError('Initial probe needs the original rotation deadline')
+        activation = profile['genesis_time'] + profile['activation_delay']
+        deadline = initial_probe_deadline(started, args.recovery_timeout, rotation_deadline, activation, time.time())
+    receipt['available_budget_seconds'] = deadline - started
     histories = [{} for _ in nodes]
 
     async def common(indices, floor):
@@ -69,30 +77,31 @@ async def exercise_weighted_quorum(args, root, nodes, endpoints, lite_configs, r
 
     async def check(infos, label, with_wc):
         target = directory / label; target.mkdir()
-        anchor = 4  # active C++ survivor in both all-C++ and mixed variants
         block_id = infos[anchor]['last']
         proof = await cpp_certificate(args.snapshot, nodes[anchor], zero, block_id, target)
-        proof['name'] = 'cpp-4'
+        proof['name'] = f'cpp-{anchor}'
         sample = {'zerostate': zero, 'reference': infos[anchor],
             'comparison': infos[next(i for i in infos if i != anchor)],
             'all_references': {str(i): v for i, v in infos.items()},
             'block': await cpp_block(args.snapshot, nodes[anchor], block_id, target),
-            'masterchain_state': await native_state(args.snapshot, lite_configs[anchor], 'cpp-4', block_id, target / 'mc-state'),
-            'certificates': [proof], 'governing_key_block': {**governing, 'certificates': [proof]}}
+            'masterchain_state': await native_state(args.snapshot, lite_configs[anchor], f'cpp-{anchor}', block_id, target / 'mc-state'),
+            'certificates': [proof]}
+        if initial: sample['governing_zerostate_boc'] = governing
+        else: sample['governing_key_block'] = {**governing, 'certificates': [proof]}
         write(target / 'sample.json', sample)
         await child_checked([args.block_checker, target / 'sample.json', target / 'checked.json'], target / 'checker.log')
         checked = json.loads((target / 'checked.json').read_text())
         check_committee_weights(checked, weights, member_id)
-        if checked['key_block'] or not checked['verified_governing_key_blocks']:
+        if checked['key_block'] or (not initial and not checked['verified_governing_key_blocks']):
             raise RuntimeError('Weighted sample lacks successor finality')
         if with_wc:
             tops = [top for top in checked['shard_tops'] if top['workchain'] == 0 and top['seqno'] > 0]
             if len(tops) != 1: raise RuntimeError('Weighted recovery requires one full workchain')
             wc = target / 'workchain'; wc.mkdir()
-            sample['references'] = {str(i): infos[i] for i in SUCCESSOR}
+            sample['references'] = {str(i): infos[i] for i in committee}
             sample['workchain'] = {
                 'block': await cpp_block(args.snapshot, nodes[anchor], tops[0], wc),
-                'states': await recovery_workchain_states(args.snapshot, lite_configs, SUCCESSOR, tops[0], wc, deadline)}
+                'states': await recovery_workchain_states(args.snapshot, lite_configs, committee, tops[0], wc, deadline)}
             write(target / 'sample.json', sample)
             await child_checked([args.block_checker, target / 'sample.json', target / 'checked-with-workchain.json'], target / 'workchain-checker.log')
             checked = json.loads((target / 'checked-with-workchain.json').read_text())
@@ -113,13 +122,13 @@ async def exercise_weighted_quorum(args, root, nodes, endpoints, lite_configs, r
         receipt.update(phase='paused', observed_process_states=states); write(directory / 'receipt.json', receipt)
         floor = checkpoint['block']['seqno']
         while True:
-            infos = await common(live, floor); floor = infos[4]['last']['seqno']
+            infos = await common(live, floor); floor = infos[anchor]['last']['seqno']
             checked = await check(infos, f'survivors-{floor}', False)
             if checked['gen_utime'] <= receipt['paused_at_unix']: continue
             expected = {member_id(i) for i in survivors}
             certificates = checked['verified_final_certificates']
-            if not certificates or any(set(c['validator_ids']) != expected or c['verified_weight'] != threshold for c in certificates):
-                raise RuntimeError('Fresh survivor certificate is not the exact declared weighted pair')
+            if not certificates or any(set(c['validator_ids']) != expected or c['verified_weight'] != sum(weights[i] for i in survivors) for c in certificates):
+                raise RuntimeError('Fresh survivor certificate does not contain the declared necessary members')
             receipt.update(survivor_checkpoint=checked['block'], survivor_sample=str(directory / f'survivors-{floor}'),
                 survivor_certificates=certificates)
             break
@@ -134,7 +143,7 @@ async def exercise_weighted_quorum(args, root, nodes, endpoints, lite_configs, r
     votes, leaders = {}, {str(i): {} for i in paused}
     floor = receipt['survivor_checkpoint']['seqno']
     while len(votes) != len(paused) or any(len(v) != 2 for v in leaders.values()):
-        infos = await common(list(range(6)), floor); floor = infos[4]['last']['seqno']
+        infos = await common(list(range(6)), floor); floor = infos[anchor]['last']['seqno']
         checked = await check(infos, str(floor), True)
         for i in paused:
             signer = member_id(i)
@@ -155,9 +164,10 @@ async def exercise_weighted_quorum(args, root, nodes, endpoints, lite_configs, r
     if any(digest(Path(name)) != expected for name, expected in artifacts.items()):
         raise RuntimeError('Weighted quorum executable or profile changed')
     receipt.update(phase='recovered', elapsed_seconds=time.monotonic() - started,
-        all_six_applied_states_match=True, workchain_states_match=True, successor_finality_checked=True,
+        all_six_applied_states_match=True, workchain_states_match=True,
         completed_at_unix=time.time())
-    if receipt['elapsed_seconds'] > args.recovery_timeout:
+    receipt['initial_finality_checked' if initial else 'successor_finality_checked'] = True
+    if time.monotonic() > deadline:
         raise TimeoutError('Weighted quorum receipt exceeded the original deadline')
     write(directory / 'receipt.json', receipt)
     return receipt

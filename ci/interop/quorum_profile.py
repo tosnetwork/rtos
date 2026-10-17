@@ -26,3 +26,25 @@ def check_committee_weights(checked, expected, member_id):
         raise RuntimeError('Authenticated committee weights differ from the frozen profile')
     total = sum(desired.values())
     return {'members': desired, 'total_weight': total, 'quorum_weight': quorum_threshold(total)}
+
+
+def initial_probe_weights(profile):
+    paused = profile.get('initial_probe_pause')
+    if type(paused) is not list or len(paused) != 1 or type(paused[0]) is not int or paused != [1]:
+        raise ValueError('Initial probe requires the explicit owned member [1]')
+    if profile.get('weighted_quorum_pause') != [0, 2]:
+        raise ValueError('Initial probe must precede the declared successor weighted case')
+    weights = epoch_weights(profile, 'initial_weights', [0, 1, 2, 3])
+    threshold = quorum_threshold(sum(weights.values()))
+    live = [0, 2, 3]
+    surviving = sum(weights[i] for i in live)
+    if surviving < threshold or any(surviving - weights[i] >= threshold for i in live):
+        raise ValueError('Every surviving initial member must be necessary for quorum')
+    return weights
+
+
+def initial_probe_deadline(started, timeout, rotation_deadline, activation, wall_now):
+    deadline = min(started + timeout, rotation_deadline, started + activation - wall_now)
+    if deadline <= started:
+        raise TimeoutError('Initial epoch has ended before the declared probe')
+    return deadline

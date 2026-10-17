@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 
-from quorum_profile import MAX_TOTAL_WEIGHT, quorum_threshold, epoch_weights, check_committee_weights
+from quorum_profile import MAX_TOTAL_WEIGHT, quorum_threshold, epoch_weights, check_committee_weights, initial_probe_weights, initial_probe_deadline
 from rotation_fixture import install_successor, INITIAL, SUCCESSOR
 
 
@@ -56,6 +56,27 @@ class QuorumProfileTests(unittest.TestCase):
                 self.assertIn(f'{weight} "rotation-validator-{i}.boc"', captured[0])
         self.assertIn('4 16 u, 4 16 u, 60 64 u', captured[0])
         self.assertEqual(original.__name__, '<lambda>')
+
+    def test_initial_probe_requires_every_remaining_member(self):
+        profile = {'initial_probe_pause': [1], 'weighted_quorum_pause': [0, 2],
+            'initial_weights': {'0': 29, '1': 11, '2': 10, '3': 10}}
+        weights = initial_probe_weights(profile)
+        self.assertEqual(sum(weights[i] for i in [0, 2, 3]), 49)
+        self.assertEqual(quorum_threshold(sum(weights.values())), 40)
+        for bad in [[True], [2], [], None]:
+            with self.assertRaises(ValueError): initial_probe_weights({**profile, 'initial_probe_pause': bad})
+        with self.assertRaises(ValueError):
+            initial_probe_weights({**profile, 'initial_weights': {'0': 30, '1': 10, '2': 11, '3': 9}})
+        with self.assertRaises(ValueError):
+            initial_probe_weights({**profile, 'weighted_quorum_pause': [1]})
+
+    def test_initial_probe_cannot_extend_epoch_or_rotation_deadline(self):
+        self.assertEqual(initial_probe_deadline(1000, 180, 1100, 2060, 2000), 1060)
+        self.assertEqual(initial_probe_deadline(1000, 180, 1010, 2200, 2000), 1010)
+        self.assertEqual(initial_probe_deadline(1000, 5, 1100, 2200, 2000), 1005)
+        for activation, rotation in [(2000, 1100), (1999, 1100), (2200, 1000)]:
+            with self.assertRaises(TimeoutError):
+                initial_probe_deadline(1000, 180, rotation, activation, 2000)
 
     def test_changed_pinned_template_fails_instead_of_silently_using_equal_weights(self):
         module = SimpleNamespace(run_fift=lambda *args: self.fail('wrong template must not run'))
