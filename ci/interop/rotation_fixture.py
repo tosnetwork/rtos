@@ -125,6 +125,10 @@ async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, ru
         from source_ack_fault_fixture import SourceAckFailure
         node = next(node for node in rust_nodes if node['index'] == args.interrupt_rust_member)
         recovery_fault = SourceAckFailure(args, root, node, checkpoint)
+    elif getattr(args, 'source_retention_cut_library', None):
+        from source_retention_cut_fixture import SourceRetentionCut
+        node = next(node for node in rust_nodes if node['index'] == args.interrupt_rust_member)
+        recovery_fault = SourceRetentionCut(args, root, node, checkpoint)
     try:
         recovered = await _recover_rotation_member(args, root, nodes, endpoints, lite_configs,
             rust_nodes, zero, governing, checkpoint, artifacts, recovery_fault)
@@ -400,6 +404,9 @@ async def run(args, profile, root, artifacts):
                     if args.source_ack_fault and index == args.interrupt_rust_member:
                         from source_ack_fault_fixture import source_ack_environment
                         environment = source_ack_environment(args, root)
+                    if args.source_retention_cut_library and index == args.interrupt_rust_member:
+                        from source_retention_cut_fixture import retention_cut_environment
+                        environment = retention_cut_environment(args, root)
                     rust_nodes.append(dict(index=index, directory=directory,
                         **await start_rotation_node(args.rust_node, directory, environment=environment)))
                     client = json.loads((directory / 'lite_client_config.json').read_text())
@@ -647,6 +654,7 @@ async def run(args, profile, root, artifacts):
                             'observer_budget': observer_budget, 'recovery': recovery,
                             'partition_restart': json.loads((root / 'recovery-partition/receipt.json').read_text()) if args.partition_restart else None,
                             'source_ack_fault': json.loads((root / 'source-ack-fault/receipt.json').read_text()) if args.source_ack_fault else None,
+                            'source_retention_cut': json.loads((root / 'source-retention-cut/receipt.json').read_text()) if args.source_retention_cut_library else None,
                             'network_fault': network_fault, 'weighted_quorum': weighted_quorum, 'initial_probe': initial_probe}
                 await asyncio.sleep(0.2)
             raise TimeoutError('Rotation did not satisfy declared creator/signer epochs: ' +
@@ -660,7 +668,7 @@ async def run(args, profile, root, artifacts):
             write(root / 'rust-shutdown-timing.json', {str(node['index']):
                 {'elapsed_seconds': node['shutdown_elapsed_seconds'], 'normal_exit_limit_seconds': 20}
                 for node in rust_nodes})
-            if args.network_fault or args.partition_restart or args.source_ack_fault:
+            if args.network_fault or args.partition_restart or args.source_ack_fault or args.source_retention_cut_library:
                 stopped = await asyncio.gather(*(stop_cpp_with_receipt(index, node) for index, node in cpp_started))
                 write(root / 'cpp-shutdown.json', {str(index): value for index, value in stopped})
                 if any(not value['matches_pinned_tester_teardown'] for _, value in stopped) and sys.exception() is None:
@@ -686,6 +694,7 @@ def main():
         help='Keep the interrupted member partitioned through restart; fault seconds apply before survivor proof and after restart')
     parser.add_argument('--source-ack-fault', choices=['sync-eio', 'write-enospc'])
     parser.add_argument('--source-ack-fault-library', type=Path)
+    parser.add_argument('--source-retention-cut-library', type=Path)
     parser.add_argument('--recovery-timeout', type=float, default=180)
     parser.add_argument('--network-fault', choices=list(MODES))
     parser.add_argument('--additional-network-faults', choices=list(MODES), nargs='*', default=[])
@@ -703,6 +712,11 @@ def main():
         if not args.source_ack_fault_library:
             raise SystemExit('Source ACK fault requires its explicit native test library')
         args.source_ack_fault_library = args.source_ack_fault_library.resolve()
+    if args.source_retention_cut_library:
+        require_namespace()
+        if args.interrupt_rust_member is None or args.source_ack_fault or args.partition_restart or args.network_fault or args.additional_network_faults or args.prepare_genesis_only:
+            raise SystemExit('Source retention cut requires one interrupted Rust member and no other injected fault')
+        args.source_retention_cut_library = args.source_retention_cut_library.resolve()
     if args.partition_restart:
         if args.interrupt_rust_member is None or args.network_fault or args.additional_network_faults or args.prepare_genesis_only:
             raise SystemExit('Partition restart requires one interrupted Rust member and no separate packet cases')
@@ -760,6 +774,8 @@ def main():
         artifacts.update({str(path): digest(path) for path in [args.rust_node, args.validator_preparer]})
     if args.source_ack_fault:
         artifacts[str(args.source_ack_fault_library)] = digest(args.source_ack_fault_library)
+    if args.source_retention_cut_library:
+        artifacts[str(args.source_retention_cut_library)] = digest(args.source_retention_cut_library)
     if args.network_fault or args.partition_restart:
         artifacts[str(args.socket_mark_library)] = digest(args.socket_mark_library)
     for item in manifest['binaries']:
@@ -793,6 +809,13 @@ def main():
         path = driver.parents[2] / 'rtos/src/tests/finality_source_fault.c'
         artifacts[str(path)] = digest(path)
         (destination.parent / path.name).write_bytes(path.read_bytes())
+    if args.source_retention_cut_library:
+        for path in [driver.with_name('source_retention_cut_fixture.py'), driver.with_name('source_ack_fault_fixture.py'),
+                driver.parents[2] / 'rtos/src/tests/finality_retention_cut.c']:
+            artifacts[str(path)] = digest(path)
+            destination = args.output / 'fault-sources' / path.name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(path.read_bytes())
     write(args.output / 'source.json', {'snapshot': manifest, 'artifacts': artifacts,
         'profile': profile, 'command': sys.argv, 'driver_sha256': digest(driver),
         'shared_helper_sha256': digest(helper), 'weighted_helpers_sha256': weighted_helpers})

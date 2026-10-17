@@ -33,8 +33,8 @@ def source_ack_environment(args, root):
 
 
 class SourceAckFailure:
-    def __init__(self, args, root, node, checkpoint):
-        self.directory = paths(root)
+    def __init__(self, args, root, node, checkpoint, *, directory=None):
+        self.directory = directory if directory is not None else paths(root)
         self.node = node
         self.mode = args.source_ack_fault
         self.started = time.monotonic()
@@ -153,6 +153,9 @@ class SourceAckFailure:
             new_start_ticks=node['start_ticks'], restarted_at_unix=time.time())
         self.save()
 
+    def has_unacknowledged_source(self):
+        return self.pending.exists()
+
     async def complete(self, recovered):
         before = json.loads(self.original)
         while True:
@@ -176,7 +179,7 @@ class SourceAckFailure:
                     valid = reference['digest'] == hashlib.sha256(self.original).hexdigest() and reference['metadata'] == metadata
                 if not valid or not re.fullmatch('[0-9a-f]{64}', reference['node_receipt']):
                     raise RuntimeError('Recovered ACK differs from the original retained source')
-                if self.pending.exists():
+                if self.has_unacknowledged_source():
                     continue
                 (self.directory / 'recovered-ack.json').write_bytes(data)
                 self.receipt.update(phase='recovered', recovered_ack_kind=kind,
