@@ -41,13 +41,21 @@ def rpc(url, method, params=None):
 
 
 def reserve_port(kind, used):
-    while True:
+    # Stay below the kernel's automatic client-port pool. Closing an ephemeral
+    # reservation before offline preparation lets unrelated outgoing traffic
+    # claim it before the validator's listener starts.
+    ephemeral_low = int(Path('/proc/sys/net/ipv4/ip_local_port_range').read_text().split()[0])
+    for port in range(20000, min(ephemeral_low, 32768)):
+        if port in used:
+            continue
         with socket.socket(socket.AF_INET, kind) as sock:
-            sock.bind(('127.0.0.1', 0))
-            port = sock.getsockname()[1]
-        if port not in used:
-            used.add(port)
-            return port
+            try:
+                sock.bind(('0.0.0.0', port))
+            except OSError:
+                continue
+        used.add(port)
+        return port
+    raise RuntimeError('No free fixture listener port below the automatic client-port pool')
 
 
 async def child_checked(command, log_path, cwd=None):
@@ -261,7 +269,12 @@ async def run(args, root, snapshot, artifacts):
                         env={**os.environ, 'TOKIO_WORKER_THREADS': '2'}, start_new_session=True)
                 finally:
                     log.close()
-                rust_nodes.append(dict(index=i, directory=directory, process=process))
+                try:
+                    start_ticks = Path(f'/proc/{process.pid}/stat').read_text().split()[21]
+                except FileNotFoundError:
+                    await process.wait()
+                    raise RuntimeError(f'Rust {i} exited {process.returncode} during startup; see its node.log')
+                rust_nodes.append(dict(index=i, directory=directory, process=process, start_ticks=start_ticks))
                 endpoint_names.append(f'rust-{i}')
                 endpoints.append('http://' + address + '/jsonRPC')
                 if args.verify_workchain:
@@ -273,7 +286,7 @@ async def run(args, root, snapshot, artifacts):
                         validator=network.zerostate.as_validator_config()))
                 write(root / 'processes.json', dict(cpp={node.name: node.process_id for node in cpp_nodes},
                     rust={str(node['index']): dict(pid=node['process'].pid,
-                        start_ticks=Path(f"/proc/{node['process'].pid}/stat").read_text().split()[21])
+                        start_ticks=node['start_ticks'])
                         for node in rust_nodes}))
             write(root / 'rpc-endpoints.json', dict(zip(endpoint_names, endpoints)))
             if rust_nodes:
@@ -285,7 +298,7 @@ async def run(args, root, snapshot, artifacts):
                     network, global_config, tcp_used, udp_used)
             write(root / 'processes.json', dict(cpp={node.name: node.process_id for node in cpp_nodes},
                 rust={str(node['index']): dict(pid=node['process'].pid,
-                    start_ticks=Path(f"/proc/{node['process'].pid}/stat").read_text().split()[21])
+                    start_ticks=node['start_ticks'])
                     for node in rust_nodes}))
             comparison_index = args.cpp_count if 0 < args.cpp_count < 4 else 1
             body_index = args.cpp_count if rust_nodes else 0
@@ -434,7 +447,7 @@ async def run(args, root, snapshot, artifacts):
             codes = await asyncio.gather(*(stop_rust(node) for node in rust_nodes), return_exceptions=True)
             write(root / 'rust-shutdown.json', {str(node['index']):
                 (str(code) if isinstance(code, BaseException) else code) for node, code in zip(rust_nodes, codes)})
-            if any(code != 0 for code in codes):
+            if any(code != 0 for code in codes) and sys.exception() is None:
                 raise RuntimeError('At least one owned Rust process did not shut down normally')
 
 
