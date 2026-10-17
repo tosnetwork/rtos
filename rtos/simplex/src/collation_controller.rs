@@ -2299,6 +2299,11 @@ impl CollationController {
         true
     }
 
+    fn owns_collation_request(&self, slot: SlotIndex, request_id: u32) -> bool {
+        self.precollated(slot).is_some_and(|entry|
+            entry.request.get_request_id() == request_id && !entry.request.is_cancelled())
+    }
+
     /// Handle a successful collation result. Moved from `SessionProcessor`
     /// matching origin/master: classifies the candidate against the FSM progress
     /// cursor and current leader window inline (discard-stale / publish-current /
@@ -2313,6 +2318,14 @@ impl CollationController {
     ) {
         instrument!();
         check_execution_time!(50_000);
+
+        // Cancellation/reset or a retry may have replaced this request while
+        // its callback was queued. It no longer owns publication or the pipeline.
+        if !self.owns_collation_request(slot, request_id) {
+            log::debug!("Session {} ignoring obsolete collation completion: slot {}, request_id={}",
+                self.session_id().to_hex_string(), slot, request_id);
+            return;
+        }
 
         // The real collation has resolved; release the single-in-flight marker. Empty
         // fillers carry a different request id, so this leaves them untouched.
@@ -2548,6 +2561,12 @@ impl CollationController {
         err: Error,
     ) {
         instrument!();
+
+        if !self.owns_collation_request(slot, request_id) {
+            log::debug!("Session {} ignoring obsolete collation failure: slot {}, request_id={}",
+                self.session_id().to_hex_string(), slot, request_id);
+            return;
+        }
 
         // Capture the original attempt's deadline context (soft/hard cutoffs + budget
         // anchor) BEFORE releasing the single-in-flight marker, so a genuine-error
@@ -3169,6 +3188,15 @@ impl CollationController {
                     }
                 }
             }
+        }
+
+        // A late result can still publish in its original leader window, but
+        // it must not start new work behind either consensus progress or a
+        // generation already dispatched while that result was in flight.
+        if target_slot < backend.first_non_progressed_slot()
+            || self.last_generated_slot().is_some_and(|last| target_slot < last)
+        {
+            return;
         }
 
         // Must still be in the current leader window.

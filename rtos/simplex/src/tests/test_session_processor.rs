@@ -4193,7 +4193,8 @@ fn test_self_collation_retry_counts_total_only_once() {
 
 #[test]
 fn test_self_collation_failure_only_on_terminal_drop() {
-    let mut fixture = TestFixture::new(4);
+    let opts = SessionOptions { slots_per_leader_window: 4, ..Default::default() };
+    let mut fixture = TestFixture::new_with_opts(4, opts);
     let slot = SlotIndex::new(0);
     let request_id = 904;
 
@@ -4208,6 +4209,10 @@ fn test_self_collation_failure_only_on_terminal_drop() {
         now,
     );
 
+    fixture.processor.collation.insert_precollated(slot, PrecollatedBlock {
+        request: AsyncRequestImpl::new(request_id, false, now), result: None, parent: None,
+    });
+
     // A genuine error while the slot is still current schedules a single
     // restart sharing the window-end budget - it is NOT terminal, so the
     // self-collation funnel records no failure (the whole slot is one
@@ -4216,10 +4221,19 @@ fn test_self_collation_failure_only_on_terminal_drop() {
     assert_eq!(metrics_counter(&fixture.processor, "simplex_self_collates.failure"), 0);
     assert_eq!(metrics_counter(&fixture.processor, "simplex_self_collates.total"), 1);
 
+    // The consumed failed request has no further rights. A real retry owns a
+    // new request id at this same slot while retaining the slot's one funnel.
+    let retry_id = request_id + 1;
+    fixture.processor.collation.insert_precollated(slot, PrecollatedBlock {
+        request: AsyncRequestImpl::new(retry_id, false, now), result: None, parent: None,
+    });
+    fixture.processor.on_collation_failed_impl(slot, request_id, error!("obsolete callback"));
+    assert!(fixture.processor.collation.precollated_contains(slot));
+
     // Once the slot has progressed past (here: skip-certified by consensus), a
     // failure for it is terminal and marks the self-collation flow as failed.
     skip_slot(&mut fixture, slot);
-    fixture.processor.on_collation_failed_impl(slot, request_id, error!("slot already passed"));
+    fixture.processor.on_collation_failed_impl(slot, retry_id, error!("slot already passed"));
 
     assert_eq!(metrics_counter(&fixture.processor, "simplex_self_collates.total"), 1);
     assert_eq!(metrics_counter(&fixture.processor, "simplex_self_collates.success"), 0);
@@ -7786,6 +7800,14 @@ fn test_on_collation_complete_publishes_late_same_window_slot_cpp_parity() {
         fixture.description.get_window_idx(slot),
         "precondition: window 0 must still be current after slot 0 skip"
     );
+
+    // A second callback/generation has already advanced within this same
+    // leader window. Publishing the older result must not schedule slot1 after
+    // slot3, as observed on an actual interrupted-node restart.
+    skip_slot(&mut fixture, SlotIndex::new(1));
+    skip_slot(&mut fixture, SlotIndex::new(2));
+    fixture.processor.check_collation();
+    assert!(fixture.processor.collation.precollated_contains(SlotIndex::new(3)));
 
     let block_id =
         BlockIdExt::with_params(ShardIdent::masterchain(), 1, UInt256::rand(), UInt256::rand());
