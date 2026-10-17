@@ -116,3 +116,28 @@ def matrix_threshold_plan(profile, cpp_count):
         if actual != value:
             raise ValueError('Threshold fault differs from the declared three/six-member case')
     return {key: value.copy() if isinstance(value, list) else value for key, value in expected.items()}
+
+
+def observer_budget_plan(profile):
+    plan = profile.get('observer_budget')
+    if plan is None:
+        return None
+    expected = {'pause_at_quorum': [], 'pause_below_quorum': [0, 2],
+                'settle_seconds': 4, 'observe_seconds': 12}
+    if type(plan) is not dict or set(plan) != set(expected):
+        raise ValueError('Observer budget requires the complete bounded plan')
+    for key, value in expected.items():
+        actual = plan[key]
+        if isinstance(value, list):
+            if type(actual) is not list or any(type(i) is not int for i in actual):
+                raise ValueError('Observer pause indices must be explicit integers')
+        elif type(actual) is not int:
+            raise ValueError('Observer timing must be explicit integer seconds')
+        if actual != value:
+            raise ValueError('Observer budget differs from the declared successor case')
+    for key, indices in [('initial_weights', [0,1,2,3]), ('successor_weights', [0,2,4,5])]:
+        if epoch_weights(profile, key, indices) != {i:17 for i in indices}:
+            raise ValueError('Observer availability case requires frozen equal-weight committees')
+    if any(profile.get(key) is not None for key in ['weighted_quorum_pause','initial_probe_pause']):
+        raise ValueError('Observer availability must be a separate declared case')
+    return {key: value.copy() if isinstance(value, list) else value for key,value in expected.items()}

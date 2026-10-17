@@ -355,3 +355,20 @@ sufficient sum here is42). Only member5 is paused and restored, and its fresh
 authenticated vote, MC/WC creator evidence and every endpoint's complete states
 are required after resume. CPP control precedes mixed3CPP3Rust, where member5
 is Rust. Existing equal-weight plans retain their original exact-boundary gates.
+
+A rotation profile may separately declare `observer_budget` with
+`pause_at_quorum: []`, `pause_below_quorum: [0,2]`, `settle_seconds: 4` and
+`observe_seconds: 12`. Both frozen committees use17-unit weights. The runner
+requires all four authenticated MC signers and MC/WC creators in both epochs.
+After rotation, current members are0/2/4/5 (68 total, quorum46); retired1/3
+remain running observers. Pausing only0/2 leaves active4/5 at34/68 while both
+observers still serve RPC and independently authenticated current-group proofs.
+All four responsive endpoints must show no finalized MC identity/state advance
+for the full declared window. Original0/2 then resume and must supply fresh
+votes, accepted MC/WC creators, six matching applied MC states and complete WC
+states on all four active members. The same original240-second rotation deadline
+covers this sequence. Rust MC runtime roles are bound to the exact authenticated
+certificate session; retired3 must be observer with no validator index, while
+retained2/new5 are validators. CPP retired members require corresponding MC
+observer startup logs. This legitimate availability/role observation does not
+replace acceptance for invalid old-group votes submitted to a new group.

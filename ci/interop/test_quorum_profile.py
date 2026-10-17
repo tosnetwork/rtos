@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 
-from quorum_profile import MAX_TOTAL_WEIGHT, quorum_threshold, epoch_weights, check_committee_weights, initial_probe_weights, initial_probe_deadline, matrix_committee_size, matrix_threshold_plan, matrix_weights, install_matrix_weights
+from quorum_profile import MAX_TOTAL_WEIGHT, quorum_threshold, epoch_weights, check_committee_weights, initial_probe_weights, initial_probe_deadline, matrix_committee_size, matrix_threshold_plan, matrix_weights, install_matrix_weights, observer_budget_plan
 from rotation_fixture import install_successor, INITIAL, SUCCESSOR
 
 
@@ -74,6 +74,20 @@ class QuorumProfileTests(unittest.TestCase):
                 self.assertIn(f'{w} "pq-validator-{i}.boc"',captured[0])
             with self.assertRaisesRegex(RuntimeError,'template differs'):
                 module.run_fift(None,'unknown native template',directory)
+
+    def test_observer_budget_preserves_full_current_committee_and_original_window(self):
+        plan={'pause_at_quorum':[], 'pause_below_quorum':[0,2], 'settle_seconds':4, 'observe_seconds':12}
+        profile={'observer_budget':plan}
+        self.assertEqual(observer_budget_plan(profile),plan)
+        self.assertIsNone(observer_budget_plan({}))
+        for key,value in [('pause_below_quorum',[True,2]),('pause_below_quorum',[1,3]),
+                          ('settle_seconds',True),('settle_seconds',0),('observe_seconds',1)]:
+            with self.assertRaises(ValueError):
+                observer_budget_plan({'observer_budget':{**plan,key:value}})
+        with self.assertRaises(ValueError):
+            observer_budget_plan({**profile,'successor_weights':{'0':9,'2':11,'4':10,'5':30}})
+        with self.assertRaises(ValueError):
+            observer_budget_plan({**profile,'weighted_quorum_pause':[0,2]})
 
     def test_cpp_boundary_is_inclusive_when_total_is_divisible_by_three(self):
         for total, expected in [(3, 2), (6, 4), (51, 34), (102, 68), (60, 40), (68, 46)]:

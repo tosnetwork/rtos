@@ -14,7 +14,7 @@ import sys
 import time
 
 sys.dont_write_bytecode = True
-from quorum_profile import epoch_weights, check_committee_weights, quorum_threshold, initial_probe_weights
+from quorum_profile import epoch_weights, check_committee_weights, quorum_threshold, initial_probe_weights, observer_budget_plan
 from network_faults import MODES, PacketMarks, marked_environment, require_namespace
 from network_fault_fixture import exercise_network_member, stop_cpp_with_receipt
 
@@ -360,7 +360,7 @@ async def run(args, profile, root, artifacts):
             governing_witnesses = {}
             seen = set()
             epochs = {phase: {'mc_creators': {}, 'wc_creators': {}} for phase in ['before', 'after']}
-            if profile.get('weighted_quorum_pause'):
+            if profile.get('weighted_quorum_pause') or profile.get('observer_budget'):
                 for epoch in epochs.values(): epoch['mc_signers'] = {}
             initial_probe = None
             baseline_wc_cc = 0
@@ -449,7 +449,7 @@ async def run(args, profile, root, artifacts):
                             write(gov_dir / 'bodies.json', governing_witnesses[key_seqno])
                         sample['certificates'] = [proof]
                         sample['governing_key_block'] = {**governing_witnesses[key_seqno], 'certificates': [proof]}
-                    if profile.get('weighted_quorum_pause'):
+                    if profile.get('weighted_quorum_pause') or profile.get('observer_budget'):
                         for signer_index in committee:
                             if args.rust_node and signer_index in [2, 3, 5]:
                                 signature_set = await asyncio.to_thread(rpc, endpoints[signer_index],
@@ -482,7 +482,7 @@ async def run(args, profile, root, artifacts):
                         raise RuntimeError('Successor sample lacks independently verified governing history')
                     if checked['created_by'] not in {member_id(i) for i in committee}:
                         raise RuntimeError('Non-transition block creator is absent from the current committee')
-                    if profile.get('weighted_quorum_pause'):
+                    if profile.get('weighted_quorum_pause') or profile.get('observer_budget'):
                         for certificate in checked['verified_final_certificates']:
                             for signer in certificate['validator_ids']:
                                 epochs[phase]['mc_signers'].setdefault(signer,
@@ -545,6 +545,12 @@ async def run(args, profile, root, artifacts):
                             weighted_quorum = await exercise_weighted_quorum(args, root, nodes, endpoints,
                                 lite_configs, rust_nodes, zero, governing_witnesses[checked['prev_key_block_seqno']],
                                 checked, artifacts, profile)
+                        observer_budget = None
+                        if profile.get('observer_budget'):
+                            from observer_budget_fixture import exercise_observer_budget
+                            observer_budget = await exercise_observer_budget(args, root, nodes, endpoints,
+                                lite_configs, rust_nodes, zero, governing_witnesses[checked['prev_key_block_seqno']],
+                                checked, artifacts, profile, deadline)
                         recovery = None
                         network_fault = None
                         if args.network_fault:
@@ -576,7 +582,7 @@ async def run(args, profile, root, artifacts):
                                           else 'cpp_membership_rotation_observed'), 'epochs': epochs,
                             'all_six_applied_mc_states_match': True, 'independent_post_rotation_finality_qualified': True,
                             'mixed_rotation_qualified': bool(args.rust_node), 'election_rehearsal': False,
-                            'recovery': recovery, 'network_fault': network_fault, 'weighted_quorum': weighted_quorum, 'initial_probe': initial_probe}
+                            'observer_budget': observer_budget, 'recovery': recovery, 'network_fault': network_fault, 'weighted_quorum': weighted_quorum, 'initial_probe': initial_probe}
                 await asyncio.sleep(0.2)
             raise TimeoutError('Rotation did not satisfy declared creator/signer epochs: ' +
                 json.dumps({phase: {kind: len(group) for kind, group in groups.items()}
@@ -652,6 +658,9 @@ def main():
         raise SystemExit('Unsupported bounded isolated rotation schedule')
     if profile['consensus']['protocol_version'] != 2 or not profile['consensus']['use_quic']:
         raise SystemExit('Rotation fixture requires the explicit native protocol-2 QUIC profile')
+    observer_budget_plan(profile)
+    if profile.get('observer_budget') and (args.network_fault or args.interrupt_rust_member is not None):
+        raise SystemExit('Observer budget must be a separate owned availability case')
     epoch_weights(profile, 'initial_weights', INITIAL)
     weights = epoch_weights(profile, 'successor_weights', SUCCESSOR)
     if 'weighted_quorum_pause' in profile:
@@ -683,7 +692,7 @@ def main():
     artifacts[str(driver)] = digest(driver)
     artifacts[str(helper)] = digest(helper)
     weighted_helpers = {}
-    for name in ['quorum_profile.py', 'weighted_quorum_fixture.py']:
+    for name in ['quorum_profile.py', 'weighted_quorum_fixture.py', 'observer_budget_fixture.py']:
         path = driver.with_name(name)
         artifacts[str(path)] = digest(path)
         weighted_helpers[name] = digest(path)
