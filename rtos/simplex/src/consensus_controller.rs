@@ -362,6 +362,10 @@ pub(crate) struct ConsensusController {
     /// Seqno-level finalized callback tracking (at most one callback per seqno
     /// for a distinct block; idempotent for the same block id).
     finalized_delivery_sent_seqno: HashMap<u32, FinalizedSeqnoRecord>,
+    /// Ancestor Approval handoffs actually accepted by the node in this process.
+    /// Never seeded from startup markers, and never substitutes for a trigger's
+    /// own FinalCert source handoff. Shared replays join this completed result.
+    acknowledged_ancestor_approvals: HashSet<RawCandidateId>,
 
     /*
         ====================================================================
@@ -445,6 +449,7 @@ impl ConsensusController {
             replayed_source_finalizations: HashSet::new(),
             finalized_delivery_sent: HashSet::new(),
             finalized_delivery_sent_seqno: HashMap::new(),
+            acknowledged_ancestor_approvals: HashSet::new(),
             last_mc_finalized_seqno,
             accepted_normal_head_seqno,
             accepted_normal_head_block_id: None,
@@ -617,6 +622,7 @@ impl ConsensusController {
         self.finalized_pending_body.retain(|id, _| id.slot >= up_to_slot || source_replay.contains(id));
         self.telemetry.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
         self.finalized_delivery_sent.retain(|id| id.slot >= up_to_slot);
+        self.acknowledged_ancestor_approvals.retain(|id| id.slot >= up_to_slot);
     }
 }
 
@@ -2030,7 +2036,8 @@ impl ConsensusController {
         let source_replay = durable
             && self.replayed_source_finalizations.contains(&trigger_id)
             && self.finalized_pending_body.get(&trigger_id).is_some_and(|entry|
-                !entry.acknowledged_source_candidates.contains(candidate_id));
+                !entry.acknowledged_source_candidates.contains(candidate_id))
+            && (has_final_cert || !self.acknowledged_ancestor_approvals.contains(candidate_id));
         if source_replay {
             // The startup seed is no completion receipt for this source. Keep
             // the seqno/block conflict guard, but clear the delivered flag until
@@ -2179,6 +2186,9 @@ impl ConsensusController {
             );
         }
         if delivered {
+            if durable && !has_final_cert {
+                self.acknowledged_ancestor_approvals.insert(candidate_id.clone());
+            }
             if source_replay {
                 self.finalized_pending_body.get_mut(&trigger_id).expect("registered source trigger")
                     .acknowledged_source_candidates.insert(candidate_id.clone());

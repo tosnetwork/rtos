@@ -12272,20 +12272,25 @@ fn source_finality_main_worker_release_keeps_only_accepted_node_work_owned() {
 /// input, while source intent/ACK/output files are reopened from disk.
 #[test]
 fn source_finality_controller_empty_trigger_seals_all_roles_after_cold_retry() {
-    source_finality_empty_trigger_cold_retry_case(false, false);
+    source_finality_empty_trigger_cold_retry_case(false, false, false);
 }
 
 #[test]
 fn source_finality_controller_cold_retry_keeps_ancestor_handoff_below_applied_floor() {
-    source_finality_empty_trigger_cold_retry_case(true, false);
+    source_finality_empty_trigger_cold_retry_case(true, false, false);
 }
 
 #[test]
 fn source_finality_controller_replay_stops_at_materialized_parent_without_its_body() {
-    source_finality_empty_trigger_cold_retry_case(true, true);
+    source_finality_empty_trigger_cold_retry_case(true, true, false);
 }
 
-fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_parent: bool) {
+#[test]
+fn source_finality_replayed_children_share_only_fresh_accepted_ancestor_approval() {
+    source_finality_empty_trigger_cold_retry_case(false, false, true);
+}
+
+fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_parent: bool, shared_approvals: bool) {
     use crate::finality_delivery::tests::{fixture_role, HeldSink};
     use rtos_block::Serializable;
     let temp = crate::authenticated_fixture::TestDirectory::new();
@@ -12304,7 +12309,9 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
     let stores: Vec<_> = [0xa9, 0xaa].iter().map(|seed|
         rtos_pq_consensus::ConsensusKeyStore::from_seed(&[*seed;32],0).unwrap()).collect();
     let mut chain: Vec<(RawCandidateId, ReceivedCandidate)> = Vec::new();
-    for (slot, empty) in [(0, false), (1, true), (2, false), (3, true)] {
+    let layout = if shared_approvals { vec![(0,false),(1,true),(2,false),(3,true),(4,false)] }
+        else { vec![(0,false),(1,true),(2,false),(3,true)] };
+    for (slot, empty) in layout {
         let parent = chain.last().map(|(id,_)| id.clone());
         let (block_id, data) = if empty {
             let previous = &chain.last().unwrap().1;
@@ -12341,6 +12348,12 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
     let event = BlockFinalizedEvent {slot:trigger.slot,block_hash:trigger.hash.clone(),block_id:None,
         certificate:Arc::new(crate::certificate::Certificate { vote:crate::simplex_state::FinalizeVote {
             slot:trigger.slot,block_hash:trigger.hash.clone()},signatures:sign(&trigger,true) })};
+    let second_event = shared_approvals.then(|| {
+        let id = &chain[4].0;
+        BlockFinalizedEvent {slot:id.slot,block_hash:id.hash.clone(),block_id:None,
+            certificate:Arc::new(crate::certificate::Certificate { vote:crate::simplex_state::FinalizeVote {
+                slot:id.slot,block_hash:id.hash.clone()},signatures:sign(id,true) })}
+    });
     let listener = RecordingListener::new();
     let listener_dyn:Arc<dyn consensus_common::SessionListener+Send+Sync> = listener.clone();
     let make_processor = |sink:Arc<HeldSink>| {
@@ -12361,7 +12374,7 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
         }
         // Rehydrate every ancestor's quorum evidence, including empty nodes.
         // Body-callback suppression never replaces recovery authentication.
-        for (id, _) in chain.iter().take(3) {
+        for (id, _) in chain.iter().take(if shared_approvals {4} else {3}) {
             processor.simplex_state.set_notarize_certificate(&description,id.slot,&id.hash,
                 Arc::new(crate::certificate::Certificate { vote:crate::simplex_state::NotarizeVote {
                     slot:id.slot,block_hash:id.hash.clone()},signatures:sign(id,false) })).unwrap();
@@ -12378,6 +12391,7 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
     let sink=Arc::new(HeldSink::default());
     let (db,mut processor)=make_processor(sink.clone());
     processor.handle_block_finalized(event.clone());
+    if let Some(second) = &second_event { processor.handle_block_finalized(second.clone()); }
     if materialized_parent {
         let staged=std::mem::take(&mut *sink.0.lock().unwrap());
         assert_eq!(staged.len(),1,"C++ persisted parent marker must terminate recovery before a pruned body lookup");
@@ -12413,18 +12427,30 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
     let sink=Arc::new(HeldSink::default());
     *sink.1.lock().unwrap() = Some(Vec::new());
     let (db,mut processor)=make_processor(sink.clone());
+    if shared_approvals {
+        // A startup delivery seed is deliberately insufficient: both replays
+        // must first obtain this boot's real ancestor node acceptance.
+        processor.consensus.insert_finalized_delivery_sent(chain[0].0.clone());
+        processor.consensus.insert_finalized_delivery_sent_seqno(chain[0].1.block_id.seq_no(),
+            chain[0].0.slot,chain[0].1.block_id.clone());
+    }
     let retained = processor.callbacks.pending_finality_intents().unwrap();
-    assert_eq!(retained.len(), 1, "cold replay comes from the durable source certificate");
-    processor.replay_finality_intent(runtime.wire_profile().deserialize_typed(&retained[0]).unwrap()).unwrap();
+    assert_eq!(retained.len(), if shared_approvals {2} else {1}, "cold replay comes from the durable source certificate");
+    for wire in &retained { processor.replay_finality_intent(runtime.wire_profile().deserialize_typed(wire).unwrap()).unwrap(); }
     drain_processor_storage_and_messages(&mut processor);
-    assert_eq!(processor.callbacks.finality_retention_attempts(), 1,
+    assert_eq!(processor.callbacks.finality_retention_attempts(), if shared_approvals {2} else {1},
         "cold recovery must establish persistence again instead of inheriting a warm phase");
+    let second_map = second_event.as_ref().map(|e|std::path::Path::new(&namespace)
+        .join("finality-intents/outputs-v1").join(format!("{}-{}.outputs",e.slot.value(),e.block_hash.to_hex_string())));
+    let mut final_slots = std::collections::BTreeSet::new();
     let mut parent_accepted = false;
     let mut rejected_parent_acceptance = false;
     for _ in 0..16 {
         for (draft,done) in std::mem::take(&mut *sink.0.lock().unwrap()) {
             if matches!(draft.finality, consensus_common::SessionFinality::Carrier(_)) {
                 assert!(parent_accepted, "child final cannot precede parent node acceptance");
+                let consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(proof)) = &draft.finality else { unreachable!() };
+                final_slots.insert(proof.slot);
             }
             done(Ok(UInt256::from([2;32])));
         }
@@ -12435,7 +12461,7 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
                 processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
             }
             if request.block_id == chain[0].1.block_id {
-                assert!(!parent_accepted);
+                assert!(!parent_accepted, "replayed children must join one fresh accepted ancestor approval");
                 assert!(sink.0.lock().unwrap().is_empty(), "WAL custody does not release the WC child");
                 assert!(!processor.consensus.is_finalized_block(&chain[0].0),
                     "WAL custody cannot materialize the parent before node acceptance");
@@ -12449,11 +12475,11 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
             }
             done(Ok(()));
         }
-        if map.exists() { break; }
+        if map.exists() && second_map.as_ref().is_none_or(|p|p.exists()) { break; }
     }
     assert!(parent_accepted);
     let value:serde_json::Value=serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
-    assert_eq!(processor.callbacks.finality_retention_attempts(), 1,
+    assert_eq!(processor.callbacks.finality_retention_attempts(), if shared_approvals {2} else {1},
         "cold-recovery retries reuse only their own successful certificate-save phase");
     let outputs=value["outputs"].as_array().unwrap();
     assert_eq!(outputs.len(),2,"empty nodes produce no output; both nonempty ancestors do");
@@ -12461,6 +12487,17 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
         assert!(outputs.iter().any(|v|v["block_id"]==chain[index].1.block_id.to_string() && v["is_final"]==role));
     }
     assert_eq!(value["released"],false,"sealed handoff is not Delivered confirmation");
+    if let Some(second_map) = second_map {
+        assert!(second_map.exists(), "both original triggers must seal their complete output sets");
+        let second:serde_json::Value=serde_json::from_slice(&std::fs::read(second_map).unwrap()).unwrap();
+        let second_outputs=second["outputs"].as_array().unwrap();
+        assert_eq!(second_outputs.len(),3,"the later child retains both ancestor approvals and its own Final");
+        for (index,role) in [(0,false),(2,false),(4,true)] {
+            assert!(second_outputs.iter().any(|v|v["block_id"]==chain[index].1.block_id.to_string() && v["is_final"]==role));
+        }
+        assert_eq!(final_slots,std::collections::BTreeSet::from([3,4]),
+            "each FinalCert context still needs its separate original source handoff");
+    }
     drop(processor); db.close(None).unwrap();
 }
 
