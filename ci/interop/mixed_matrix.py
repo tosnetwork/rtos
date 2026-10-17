@@ -15,7 +15,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
-from quorum_profile import quorum_threshold
+from quorum_profile import quorum_threshold, matrix_committee_size, check_committee_weights
 
 
 def digest(path):
@@ -248,6 +248,7 @@ async def run(args, root, snapshot, artifacts):
     async with Network(Install(snapshot / 'build', snapshot / 'source'), network_dir,
                        base_port=args.base_port) as network:
         profile = json.loads(args.genesis_profile.read_text())
+        member_count = matrix_committee_size(profile, args.cpp_count)
         network.config.shard_validators = profile['shard_validators']
         network.config.global_id = profile['global_id']
         network.config.global_version = profile['global_version']
@@ -263,7 +264,7 @@ async def run(args, root, snapshot, artifacts):
                 setattr(consensus, key, value)
         dht = network.create_dht_node()
         members = []
-        for i in range(4):
+        for i in range(member_count):
             transport = Key(SigningKey(hashlib.sha256(f'n6-validator-transport-{i}'.encode()).digest()))
             node = network.create_full_node(validator_key=transport)
             node.make_initial_pq_validator(
@@ -287,6 +288,8 @@ async def run(args, root, snapshot, artifacts):
             raise RuntimeError('Generated Genesis differs from the frozen full identity')
         if profile.get('expected_workchain_zerostate') is not None and identity(shard_zero) != identity(profile['expected_workchain_zerostate']):
             raise RuntimeError('Generated workchain Genesis differs from the frozen full identity')
+        write(root / 'frozen-profile.json', {**profile, 'expected_zerostate': zero,
+            'expected_workchain_zerostate': shard_zero})
         if args.prepare_genesis_only:
             return dict(status='genesis_prepared_only', zerostate=zero, active_validators_started=False)
         await dht.run(StartOptions(threads=1, verbosity=3))
@@ -306,10 +309,10 @@ async def run(args, root, snapshot, artifacts):
         expected_creators = {
             base64.b64encode(hashlib.sha256(f'n6-validator-id-{i}'.encode()).digest()).decode():
                 ('cpp' if i < args.cpp_count else 'rust', i)
-            for i in range(4)
+            for i in range(member_count)
         }
         try:
-            for i in range(args.cpp_count, 4):
+            for i in range(args.cpp_count, member_count):
                 directory = root / f'rust-{i}'
                 address, prepared = await prepare_rust(args, directory, i, network, global_config, tcp_used, udp_used)
                 log = (directory / 'node.log').open('w')
@@ -351,12 +354,12 @@ async def run(args, root, snapshot, artifacts):
                 rust={str(node['index']): dict(pid=node['process'].pid,
                     start_ticks=node['start_ticks'])
                     for node in rust_nodes}))
-            comparison_index = args.cpp_count if 0 < args.cpp_count < 4 else 1
+            comparison_index = args.cpp_count if 0 < args.cpp_count < member_count else 1
             body_index = args.cpp_count if rust_nodes else 0
             master = next(s for s in first_prepared['sessions'] if s['masterchain'] and s['catchain_seqno'] == 0)
             weights = {m['validator_id']: m['weight'] for m in master['committee']}
-            if len(weights) != 4 or set(weights) != {base64.b64decode(c).hex() for c in expected_creators}:
-                raise RuntimeError('Authenticated committee differs from the four reserved identities')
+            if len(weights) != member_count or set(weights) != {base64.b64decode(c).hex() for c in expected_creators}:
+                raise RuntimeError('Authenticated committee differs from the declared reserved identities')
             total = sum(weights.values())
             cpp_weight = sum(weights[hashlib.sha256(f'n6-validator-id-{i}'.encode()).hexdigest()]
                              for i in range(args.cpp_count))
@@ -419,6 +422,9 @@ async def run(args, root, snapshot, artifacts):
                     await child_checked([args.block_checker, directory / 'sample.json',
                         directory / 'checked.json'], directory / 'checker.log')
                     checked = json.loads((directory / 'checked.json').read_text())
+                    if args.verify_certificates:
+                        check_committee_weights(checked, {i: 17 for i in range(member_count)},
+                            lambda i: hashlib.sha256(f'n6-validator-id-{i}'.encode()).hexdigest())
                     if args.verify_workchain:
                         tops = [top for top in checked['shard_tops']
                             if int(top['workchain']) == 0 and int(top['shard']) == -(1 << 63)
@@ -483,9 +489,11 @@ async def run(args, root, snapshot, artifacts):
                         for path, expected in artifacts.items():
                             if digest(Path(path)) != expected:
                                 raise RuntimeError('An executable changed during matrix validation')
-                        return dict(status='all_four_creators_accepted_with_matching_states',
-                            cpp_count=args.cpp_count, rust_count=4 - args.cpp_count,
-                            control_kind=('all_cpp' if args.cpp_count == 4 else 'all_rust' if args.cpp_count == 0 else 'mixed'),
+                        return dict(status=('all_four_creators_accepted_with_matching_states' if member_count == 4
+                            else 'all_declared_creators_accepted_with_matching_states'),
+                            validator_count=member_count,
+                            cpp_count=args.cpp_count, rust_count=member_count - args.cpp_count,
+                            control_kind=('all_cpp' if args.cpp_count == member_count else 'all_rust' if args.cpp_count == 0 else 'mixed'),
                             creators=creators, common_state_checkpoints=len(checked_keys),
                             final_certificates_required=args.verify_certificates,
                             workchain_states_required=args.verify_workchain,
@@ -493,7 +501,7 @@ async def run(args, root, snapshot, artifacts):
                             workchain_state_checkpoints=len(workchain_keys),
                             mixed_validator_qualified=False)
                 await asyncio.sleep(0.1)
-            raise TimeoutError(f'Not all four creators were accepted within {args.timeout} seconds')
+            raise TimeoutError(f'Not all {member_count} declared creators were accepted within {args.timeout} seconds')
         finally:
             codes = await asyncio.gather(*(stop_rust(node) for node in rust_nodes), return_exceptions=True)
             write(root / 'rust-shutdown.json', {str(node['index']):
@@ -509,7 +517,7 @@ def main():
     parser.add_argument('--validator-preparer', type=Path, required=True)
     parser.add_argument('--block-checker', type=Path, required=True)
     parser.add_argument('--rust-revision', required=True)
-    parser.add_argument('--cpp-count', type=int, choices=[0, 1, 2, 3, 4], required=True)
+    parser.add_argument('--cpp-count', type=int, choices=range(7), required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--base-port', type=int, default=55700)
     parser.add_argument('--timeout', type=float, default=180)
@@ -526,6 +534,10 @@ def main():
     manifest = json.loads((args.snapshot / 'manifest.json').read_text())
     args.genesis_profile = args.genesis_profile.resolve()
     profile = json.loads(args.genesis_profile.read_text())
+    member_count = matrix_committee_size(profile, args.cpp_count)
+    if member_count != 4 and not args.prepare_genesis_only and any(
+            profile.get(key) is None for key in ['expected_zerostate', 'expected_workchain_zerostate']):
+        raise SystemExit('Freeze both generated Genesis identities before starting the declared matrix')
     if profile['schema'] != 1 or profile['cpp_revision'] != manifest['cpp_source_commit']:
         raise SystemExit('Frozen Genesis profile does not match this baseline')
     if manifest['cpp_source_commit'] != '8f083dc06bff16705710a01de15eb3123d5d696b':
@@ -540,6 +552,8 @@ def main():
             raise SystemExit(f'C++ snapshot executable changed: {path}')
         artifacts[str(path)] = item['sha256']
     artifacts[str(args.genesis_profile)] = digest(args.genesis_profile)
+    helper = Path(__file__).with_name('quorum_profile.py')
+    artifacts[str(helper)] = digest(helper)
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
     write(root / 'source.json', dict(cpp_snapshot=manifest, rust_revision=args.rust_revision,

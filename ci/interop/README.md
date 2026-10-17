@@ -314,3 +314,15 @@ probe and its restoration must finish before the predeclared initial epoch
 ends and within the original rotation deadline. The normal successor exact
 40/60 pause remains mandatory afterward. This changes the availability input
 of the experiment, not quorum assembly or signature verification.
+
+For full active committee size checks, `mixed_matrix.py` accepts a frozen
+profile with `validator_count` equal to 3 or 6 and the same `shard_validators`.
+The default remains four. `--cpp-count` must fit that declared committee.
+Prepare with `--prepare-genesis-only`, then use its `frozen-profile.json` for
+the namespace run; both complete MC/WC Genesis identities are mandatory before
+starting a non-default committee. Each declared identity must be observed as
+an accepted MC creator and, with `--verify-workchain`, an anchored WC creator;
+`--verify-certificates` also checks all authenticated current committee weights
+against the generated 17-unit weights. Three members therefore require 34/51,
+and six require 68/102 under the pinned C++ inclusive quorum rule. A healthy
+full-committee result alone does not close threshold fault-budget acceptance.

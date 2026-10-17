@@ -4,11 +4,25 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 
-from quorum_profile import MAX_TOTAL_WEIGHT, quorum_threshold, epoch_weights, check_committee_weights, initial_probe_weights, initial_probe_deadline
+from quorum_profile import MAX_TOTAL_WEIGHT, quorum_threshold, epoch_weights, check_committee_weights, initial_probe_weights, initial_probe_deadline, matrix_committee_size
 from rotation_fixture import install_successor, INITIAL, SUCCESSOR
 
 
 class QuorumProfileTests(unittest.TestCase):
+    def test_full_active_matrix_sizes_and_cpp_population_are_explicit(self):
+        self.assertEqual(matrix_committee_size({'shard_validators': 4}, 2), 4)
+        for count in (3, 4, 6):
+            profile = {'validator_count': count, 'shard_validators': count}
+            for cpp in range(count + 1):
+                self.assertEqual(matrix_committee_size(profile, cpp), count)
+            for cpp in (-1, count + 1, True, 1.5):
+                with self.assertRaises(ValueError): matrix_committee_size(profile, cpp)
+            with self.assertRaises(ValueError):
+                matrix_committee_size({**profile, 'shard_validators': count - 1}, 0)
+        for count in (True, 0, 2, 5, 7, 3.0, '6'):
+            with self.assertRaises(ValueError):
+                matrix_committee_size({'validator_count': count, 'shard_validators': count}, 0)
+
     def test_cpp_boundary_is_inclusive_when_total_is_divisible_by_three(self):
         for total, expected in [(3, 2), (6, 4), (51, 34), (102, 68), (60, 40), (68, 46)]:
             self.assertEqual(quorum_threshold(total), expected)

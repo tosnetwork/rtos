@@ -48,3 +48,15 @@ def initial_probe_deadline(started, timeout, rotation_deadline, activation, wall
     if deadline <= started:
         raise TimeoutError('Initial epoch has ended before the declared probe')
     return deadline
+
+
+def matrix_committee_size(profile, cpp_count):
+    """Require a full active 3/4/6-member committee, preserving legacy four."""
+    count = profile.get('validator_count', 4)
+    if type(count) is not int or count not in (3, 4, 6):
+        raise ValueError('Matrix validator_count must be exactly 3, 4 or 6')
+    if type(cpp_count) is not int or not 0 <= cpp_count <= count:
+        raise ValueError('CPP count must be within the declared active committee')
+    if profile.get('shard_validators') != count:
+        raise ValueError('Full active matrix requires shard_validators == validator_count')
+    return count
