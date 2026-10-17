@@ -1148,6 +1148,28 @@ pub(crate) struct SourceFinalityDelivery {
     // Last field: publish release only after all stores and their file locks drop.
     namespace_release: SourceNamespaceRelease,
 }
+/// Record slow source work on the consensus actor before changing its IO
+/// ownership. This preserves the durability boundary and identifies whether
+/// source persistence, rather than candidate generation, stalls live callbacks.
+struct SourceOperationTimer<'a> {
+    source: &'a SourceFinalityDelivery,
+    operation: &'static str,
+    started: std::time::Instant,
+}
+impl Drop for SourceOperationTimer<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        if elapsed >= std::time::Duration::from_millis(100) {
+            log::warn!(
+                "Source finality operation session={} shard={} operation={} elapsed_ms={}",
+                self.source.runtime.session_id(),
+                self.source.runtime.shard(),
+                self.operation,
+                elapsed.as_millis(),
+            );
+        }
+    }
+}
 struct SourceNamespaceRelease(Arc<std::sync::atomic::AtomicBool>);
 impl Drop for SourceNamespaceRelease {
     fn drop(&mut self) {
@@ -1165,6 +1187,9 @@ enum SourceStage {
     Acknowledging(UInt256, FinalizedDeliveryDraft),
 }
 impl SourceFinalityDelivery {
+    fn operation_timer(&self, operation: &'static str) -> SourceOperationTimer<'_> {
+        SourceOperationTimer { source: self, operation, started: std::time::Instant::now() }
+    }
     pub(crate) fn open(
         runtime: Arc<AuthenticatedSessionRuntime>,
         namespace: &Path,
@@ -1203,6 +1228,7 @@ impl SourceFinalityDelivery {
         self.namespace_release.0.clone()
     }
     pub(crate) fn prepare_intents(&self, has_existing_certificates: bool) -> Result<()> {
+        let _timing = self.operation_timer("prepare_intents");
         self.intents.prepare(has_existing_certificates)
     }
     pub(crate) fn bind_start(&self, anchor: BlockIdExt) -> Result<()> {
@@ -1220,6 +1246,7 @@ impl SourceFinalityDelivery {
     ) -> Result<()> {
         #[cfg(test)]
         self.retain_intent_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _timing = self.operation_timer("retain_intent");
         self.intents.retain(
             &self.runtime,
             prevs,
@@ -1236,16 +1263,20 @@ impl SourceFinalityDelivery {
         id: &crate::block::RawCandidateId,
         outputs: Vec<crate::finality_recovery::ExpectedFinalityOutput>,
     ) -> Result<()> {
+        let _timing = self.operation_timer("seal_outputs");
         self.intents.seal_outputs(id, outputs)
     }
     pub(crate) fn resolve_intent(&self, id: &crate::block::RawCandidateId) -> Result<()> {
+        let _timing = self.operation_timer("resolve_intent");
         self.intents.resolve(id)
     }
     pub(crate) fn pending_intent_count(&self) -> Result<usize> {
+        let _timing = self.operation_timer("pending_intent_count");
         Ok(self.intents.pending_count()?
             + if self.delivered_sink.is_some() { self.intents.legacy_output_count()? } else { 0 })
     }
     pub(crate) fn pending_intents(&self) -> Result<Vec<Vec<u8>>> {
+        let _timing = self.operation_timer("pending_intents");
         self.intents.authenticate_pending(&self.runtime)?;
         if self.delivered_sink.is_some() {
             self.intents.pending_with_legacy_outputs()
@@ -1260,6 +1291,7 @@ impl SourceFinalityDelivery {
         self: &Arc<Self>,
         draft: FinalizedDeliveryDraft,
     ) -> Result<Option<(UInt256, FinalizedDeliveryDraft)>> {
+        let _timing = self.operation_timer("poll_delivery");
         let record = PendingFinalityRecord::from_draft(&self.runtime, &draft)?;
         let id = record.id()?;
         {

@@ -619,6 +619,7 @@ pub fn scan_finality_closures_namespace_report(
 
 impl SourceFinalityDelivery {
     pub(crate) fn consumed(&self, draft: &FinalizedDeliveryDraft) -> Result<bool> {
+        let _timing = self.operation_timer("consumed");
         let id = PendingFinalityRecord::from_draft(&self.runtime, draft)?.id()?;
         if matches!(self.stages.lock().unwrap().get(&id), Some(SourceStage::Consumed)) {
             return Ok(true);
@@ -716,6 +717,7 @@ impl SourceFinalityDelivery {
     }
     /// Bounded round-robin batch; failed requests wait at least one second.
     pub(crate) fn maintain_closing(self: &Arc<Self>) -> Result<()> {
+        let _timing = self.operation_timer("maintain_closing");
         if self.delivered_sink.is_none() {
             return Ok(());
         }

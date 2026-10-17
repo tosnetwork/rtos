@@ -3564,6 +3564,7 @@ impl CollationController {
                 );
             }
 
+            let queued_at = std::time::Instant::now();
             queue.post(move |collation, backend| match result {
                 Ok(candidate) => {
                     let expected_block_id = collation
@@ -3573,11 +3574,12 @@ impl CollationController {
                         .unwrap_or_else(|| "unknown".to_string());
                     log::info!(
                         "Session {} COLLATION_FLOW callback: expected_block_id={} slot={} \
-                        outcome=generated generation_ms={} candidate_block_id={}",
+                        outcome=generated generation_ms={} callback_queue_ms={} candidate_block_id={}",
                         &collation.session_id().to_hex_string()[..8],
                         expected_block_id,
                         slot,
                         generation_duration.as_millis(),
+                        queued_at.elapsed().as_millis(),
                         candidate.id,
                     );
                     log::trace!(
@@ -3601,11 +3603,12 @@ impl CollationController {
                         .unwrap_or_else(|| "unknown".to_string());
                     log::info!(
                         "Session {} COLLATION_FLOW callback: expected_block_id={} slot={} \
-                        outcome=callback_failure generation_ms={} error={}",
+                        outcome=callback_failure generation_ms={} callback_queue_ms={} error={}",
                         &collation.session_id().to_hex_string()[..8],
                         expected_block_id,
                         slot,
                         generation_duration.as_millis(),
+                        queued_at.elapsed().as_millis(),
                         err,
                     );
                     log::warn!(
