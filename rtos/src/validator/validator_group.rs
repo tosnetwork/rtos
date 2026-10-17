@@ -212,6 +212,24 @@ fn should_suppress_stale_finalized_rebroadcast(
     )
 }
 
+async fn candidate_validation_reference_top(
+    engine: &dyn EngineOperations,
+    info: &rtos_block::BlockInfo,
+    candidate: &BlockIdExt,
+) -> Result<Option<BlockIdExt>> {
+    let (_, reference) = info.read_master_id()?.master_block_id();
+    let mc = engine.load_state(&reference).await?;
+    if mc.block_id() != &reference || !reference.shard().is_masterchain() {
+        fail!("Candidate validation reference state identity differs");
+    }
+    if candidate.shard().is_masterchain() {
+        Ok(Some(mc.block_id().clone()))
+    } else {
+        Ok(mc.shard_state_extra()?.shards().find_shard(candidate.shard())?
+            .map(|shard| shard.block_id().clone()))
+    }
+}
+
 async fn wait_for_mc_validation_parent(
     mut accepted_mc_block_rx: tokio::sync::watch::Receiver<Option<BlockIdExt>>,
     candidate_block_id: &BlockIdExt,
@@ -2887,17 +2905,15 @@ impl ValidatorGroup {
                         }
                     }
 
-                    // Obsolete candidate guard (parity with legacy path)
-                    let last_applied_block_opt = if general_session_info.shard.is_masterchain() {
-                        let mc = engine.load_last_applied_mc_state().await?;
-                        Some(mc.block_id().clone())
-                    } else {
-                        let mc = engine.load_last_applied_mc_state().await?;
-                        mc.shard_state_extra()?
-                            .shards()
-                            .find_shard(&general_session_info.shard)?
-                            .map(|x| x.block_id().clone())
-                    };
+                    // Simplex validates the chain described by the candidate,
+                    // including its exact MC reference (C++ block-validator).
+                    // The node's newer applied head must not pre-reject recovery
+                    // catch-up before the full candidate-native validator runs.
+                    // MC stale-branch protection above still uses the session's
+                    // accepted head; ValidateQuery still checks the full state.
+                    let last_applied_block_opt = candidate_validation_reference_top(
+                        engine.as_ref(), &info, &candidate_block_id,
+                    ).await?;
                     if let Some(last_applied_block) = &last_applied_block_opt {
                         if last_applied_block.seq_no >= candidate_block_id.seq_no {
                             fail!(

@@ -820,7 +820,15 @@ impl Overlay {
             };
             #[cfg(feature = "telemetry")]
             addrs.push(peers.other().to_string());
-            let err = match method {
+            // Distribution also owns this generation when called by ordinary
+            // two-step/FEC broadcasts. A stalled peer must not pin retirement
+            // until global transport shutdown, which happens after overlay join.
+            let err = tokio::select! {
+                biased;
+                _ = self.tasks.cancelled() => fail!("Overlay retired during broadcast distribution"),
+                result = async {
+                    Ok::<_, anyhow::Error>(
+                    match method {
                 BroadcastSendMethod::Fast => {
                     self.adnl.send_custom_get_status(data, peers, AdnlSendMethod::Fast).await.err()
                 }
@@ -836,6 +844,8 @@ impl Overlay {
                 BroadcastSendMethod::Safe => {
                     self.adnl.send_custom_get_status(data, peers, AdnlSendMethod::Safe).await.err()
                 }
+            })
+                } => result?,
             };
             if let Some(e) = err {
                 log::warn!(

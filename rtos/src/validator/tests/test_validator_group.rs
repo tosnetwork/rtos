@@ -1625,3 +1625,49 @@ async fn test_group_retirement_undrained_refusal_never_releases_its_lease() {
     drop(refused);
     assert!(registry.validator_reserved_for_test(&key), "dropping never releases either");
 }
+
+#[tokio::test]
+async fn test_candidate_validation_uses_exact_historical_reference_not_latest_head() {
+    struct ReferenceEngine {
+        state: Arc<crate::shard_state::ShardStateStuff>,
+        requested: Mutex<Vec<BlockIdExt>>,
+    }
+    #[async_trait::async_trait]
+    impl EngineOperations for ReferenceEngine {
+        async fn load_state(&self, id: &BlockIdExt) -> Result<Arc<crate::shard_state::ShardStateStuff>> {
+            self.requested.lock().unwrap().push(id.clone());
+            Ok(self.state.clone())
+        }
+        async fn load_last_applied_mc_state(&self) -> Result<Arc<crate::shard_state::ShardStateStuff>> {
+            panic!("historical validation must not substitute the newer applied head");
+        }
+    }
+    let reference = BlockIdExt::with_params(ShardIdent::masterchain(), 2,
+        UInt256::from([2; 32]), UInt256::from([3; 32]));
+    let mut state = rtos_block::ShardStateUnsplit::with_ident(ShardIdent::masterchain());
+    state.set_seq_no(2);
+    state.write_custom(Some(&rtos_block::McStateExtra::default())).unwrap();
+    let state = crate::shard_state::ShardStateStuff::from_state(reference.clone(), state,
+        #[cfg(feature = "telemetry")]
+        &crate::collator_test_bundle::create_engine_telemetry(),
+        &crate::collator_test_bundle::create_engine_allocated()).unwrap();
+    let engine = ReferenceEngine { state, requested: Mutex::new(Vec::new()) };
+    let mut info = rtos_block::BlockInfo::default();
+    info.set_shard(ShardIdent::masterchain());
+    info.set_seq_no(3).unwrap();
+    info.set_prev_stuff(false, &rtos_block::BlkPrevInfo::Block { prev: rtos_block::ExtBlkRef {
+        end_lt: 0, seq_no: 2, root_hash: reference.root_hash().clone(),
+        file_hash: reference.file_hash().clone(),
+    }}).unwrap();
+    let candidate = BlockIdExt::with_params(ShardIdent::masterchain(), 3,
+        UInt256::from([4; 32]), UInt256::from([5; 32]));
+    assert_eq!(candidate_validation_reference_top(&engine, &info, &candidate).await.unwrap(),
+        Some(reference.clone()));
+    assert_eq!(*engine.requested.lock().unwrap(), vec![reference]);
+    // Matching seqno is insufficient: a different hash cannot borrow the state.
+    info.set_prev_stuff(false, &rtos_block::BlkPrevInfo::Block { prev: rtos_block::ExtBlkRef {
+        end_lt: 0, seq_no: 2, root_hash: UInt256::from([6; 32]), file_hash: UInt256::from([7; 32]),
+    }}).unwrap();
+    assert!(candidate_validation_reference_top(&engine, &info, &candidate).await.unwrap_err()
+        .to_string().contains("reference state identity differs"));
+}

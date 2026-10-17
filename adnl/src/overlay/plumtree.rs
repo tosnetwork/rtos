@@ -1821,6 +1821,41 @@ mod transport_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlay_retirement_releases_two_step_quic_broadcast() {
+        let (a, b, id) = pair().await;
+        let mut received = b.subscriptions.lock().unwrap().pop().unwrap();
+        a.overlay.broadcast_plumtree(&id, &a.key, Certificate::Overlay_EmptyCertificate,
+            0, Some([114; 32]), b"establish two-step connection").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), received.recv()).await.unwrap().unwrap().unwrap();
+        let peers = AdnlPeers::with_keys(a.key.id().clone(), b.key.id().clone());
+        let held = a.quic.hold_stream_credit_for_test(&peers).await.unwrap();
+        let generation = a.overlay.overlay_generation(&id).unwrap();
+        let overlay = a.overlay.clone();
+        let send_id = id.clone();
+        let mut send = tokio::spawn(async move {
+            overlay.broadcast_twostep(&send_id, &crate::common::TaggedByteSlice {
+                object: b"two-step reliable broadcast waiting for stream credit",
+                #[cfg(feature = "telemetry")]
+                tag: 0,
+            }, None, 0, Vec::new()).await
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut send).await.is_err());
+        tokio::time::timeout(Duration::from_secs(5), a.overlay.delete_private_overlay_checked(&generation))
+            .await.expect("two-step broadcast must release its overlay on retirement").unwrap();
+        let error = send.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("retired during broadcast distribution"), "{error}");
+        assert!(generation.drained());
+        assert!(!a.token.is_cancelled());
+        drop(held);
+        let remote = b.overlay.overlay_generation(&id).unwrap();
+        b.overlay.delete_private_overlay_checked(&remote).await.unwrap();
+        a.quic.shutdown_and_wait().await.unwrap();
+        b.quic.shutdown_and_wait().await.unwrap();
+        a.overlay.adnl.stop_checked().await.unwrap();
+        b.overlay.adnl.stop_checked().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn owned_consumer_isolated_across_real_overlay_recreation() {
         let (a, b, id) = pair().await;
         let mut old = b.subscriptions.lock().unwrap().pop().unwrap();
