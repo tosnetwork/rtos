@@ -115,7 +115,7 @@ class PartitionRestart:
         self.receipt.update(phase='network_restored', restored_at_unix=time.time())
         self.save()
 
-    def complete(self, recovered):
+    async def complete(self, recovered):
         if time.monotonic() >= self.deadline:
             raise TimeoutError('Partition restart exceeded the original recovery deadline')
         self.receipt.update(phase='recovered', final_checkpoint=recovered['last_checkpoint'],

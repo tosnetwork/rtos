@@ -116,24 +116,28 @@ async def recovery_workchain_states(snapshot, lite_configs, indices, block_id, d
 
 async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, rust_nodes,
                                   zero, governing, checkpoint, artifacts):
-    partition = None
+    recovery_fault = None
     if getattr(args, 'partition_restart', False):
         from partition_restart_fixture import PartitionRestart
         node = next(node for node in rust_nodes if node['index'] == args.interrupt_rust_member)
-        partition = PartitionRestart(args, root, node, endpoints[args.interrupt_rust_member], member_id)
+        recovery_fault = PartitionRestart(args, root, node, endpoints[args.interrupt_rust_member], member_id)
+    elif getattr(args, 'source_ack_fault', None):
+        from source_ack_fault_fixture import SourceAckFailure
+        node = next(node for node in rust_nodes if node['index'] == args.interrupt_rust_member)
+        recovery_fault = SourceAckFailure(args, root, node, checkpoint)
     try:
         recovered = await _recover_rotation_member(args, root, nodes, endpoints, lite_configs,
-            rust_nodes, zero, governing, checkpoint, artifacts, partition)
-        if partition:
-            partition.complete(recovered)
+            rust_nodes, zero, governing, checkpoint, artifacts, recovery_fault)
+        if recovery_fault:
+            await recovery_fault.complete(recovered)
         return recovered
     finally:
-        if partition:
-            partition.close()
+        if recovery_fault:
+            recovery_fault.close()
 
 
 async def _recover_rotation_member(args, root, nodes, endpoints, lite_configs, rust_nodes,
-                                   zero, governing, checkpoint, artifacts, partition=None):
+                                   zero, governing, checkpoint, artifacts, recovery_fault=None):
     """Interrupt one owned successor, then reopen its existing data without preparation."""
     index = args.interrupt_rust_member
     node = next(node for node in rust_nodes if node['index'] == index)
@@ -151,8 +155,8 @@ async def _recover_rotation_member(args, root, nodes, endpoints, lite_configs, r
     write(directory / 'recovery.json', receipt)
     if old_process.returncode is not None:
         raise RuntimeError('Recovery member exited before the intended interruption')
-    if partition:
-        await partition.arm()
+    if recovery_fault:
+        await recovery_fault.arm()
     old_process.kill()
     interrupted_at = time.time()
     code = await asyncio.wait_for(old_process.wait(), 10)
@@ -161,9 +165,9 @@ async def _recover_rotation_member(args, root, nodes, endpoints, lite_configs, r
     receipt.update(interruption_returncode=code, interrupted_at_unix=interrupted_at, phase='waiting_for_survivors')
     write(directory / 'recovery.json', receipt)
     histories = [{} for _ in nodes]
-    deadline = partition.deadline if partition else time.monotonic() + args.recovery_timeout
-    if partition:
-        await partition.after_interruption()
+    deadline = recovery_fault.deadline if recovery_fault else time.monotonic() + args.recovery_timeout
+    if recovery_fault:
+        await recovery_fault.after_interruption()
 
     async def common_checkpoint(indices, floor):
         while time.monotonic() < deadline:
@@ -236,8 +240,8 @@ async def _recover_rotation_member(args, root, nodes, endpoints, lite_configs, r
         floor = survivor_infos[0]['last']['seqno']
         survivor, _ = await check_checkpoint(survivor_infos, f'survivors-{floor}', False)
         if survivor['gen_utime'] > interrupted_at:
-            if partition:
-                partition.survivor(survivor)
+            if recovery_fault:
+                recovery_fault.survivor(survivor)
             break
     receipt.update(phase='restarting_original_directory', survivor_checkpoint=survivor['block'])
     write(directory / 'recovery.json', receipt)
@@ -245,14 +249,14 @@ async def _recover_rotation_member(args, root, nodes, endpoints, lite_configs, r
         if digest(Path(filename)) != expected:raise RuntimeError('An executable or profile changed before restart')
     if digest(prepared) != prepared_hash:raise RuntimeError('Prepared authority changed before restart')
     node.update(await start_rotation_node(args.rust_node, node['directory'], 'node-restart.log',
-        environment=partition.environment() if partition else None))
+        environment=recovery_fault.environment() if recovery_fault else None))
     restarted_at = time.time()
     receipt['new_process'] = {'pid': node['process'].pid, 'start_ticks': node['start_ticks']}
     receipt['restarted_at_unix'] = restarted_at
     receipt['phase'] = 'waiting_for_recovered_leadership'
     write(directory / 'recovery.json', receipt)
-    if partition:
-        await partition.after_restart(node)
+    if recovery_fault:
+        await recovery_fault.after_restart(node)
     # Clear all pre-interruption observations; acceptance needs fresh RPCs from every process.
     histories = [{} for _ in nodes]
     floor = survivor['block']['seqno']
@@ -393,6 +397,9 @@ async def run(args, profile, root, artifacts):
                     address, prepared = await prepare_rust(args, directory, index, network,
                         global_config, used, used)
                     environment = marked_environment(args.socket_mark_library) if (args.network_fault or args.partition_restart) and index == args.network_fault_member else None
+                    if args.source_ack_fault and index == args.interrupt_rust_member:
+                        from source_ack_fault_fixture import source_ack_environment
+                        environment = source_ack_environment(args, root)
                     rust_nodes.append(dict(index=index, directory=directory,
                         **await start_rotation_node(args.rust_node, directory, environment=environment)))
                     client = json.loads((directory / 'lite_client_config.json').read_text())
@@ -639,6 +646,7 @@ async def run(args, profile, root, artifacts):
                             'mixed_rotation_qualified': bool(args.rust_node), 'election_rehearsal': False,
                             'observer_budget': observer_budget, 'recovery': recovery,
                             'partition_restart': json.loads((root / 'recovery-partition/receipt.json').read_text()) if args.partition_restart else None,
+                            'source_ack_fault': json.loads((root / 'source-ack-fault/receipt.json').read_text()) if args.source_ack_fault else None,
                             'network_fault': network_fault, 'weighted_quorum': weighted_quorum, 'initial_probe': initial_probe}
                 await asyncio.sleep(0.2)
             raise TimeoutError('Rotation did not satisfy declared creator/signer epochs: ' +
@@ -652,7 +660,7 @@ async def run(args, profile, root, artifacts):
             write(root / 'rust-shutdown-timing.json', {str(node['index']):
                 {'elapsed_seconds': node['shutdown_elapsed_seconds'], 'normal_exit_limit_seconds': 20}
                 for node in rust_nodes})
-            if args.network_fault or args.partition_restart:
+            if args.network_fault or args.partition_restart or args.source_ack_fault:
                 stopped = await asyncio.gather(*(stop_cpp_with_receipt(index, node) for index, node in cpp_started))
                 write(root / 'cpp-shutdown.json', {str(index): value for index, value in stopped})
                 if any(not value['matches_pinned_tester_teardown'] for _, value in stopped) and sys.exception() is None:
@@ -676,6 +684,8 @@ def main():
     parser.add_argument('--interrupt-rust-member', type=int, choices=[2, 5])
     parser.add_argument('--partition-restart', action='store_true',
         help='Keep the interrupted member partitioned through restart; fault seconds apply before survivor proof and after restart')
+    parser.add_argument('--source-ack-fault', choices=['sync-eio', 'write-enospc'])
+    parser.add_argument('--source-ack-fault-library', type=Path)
     parser.add_argument('--recovery-timeout', type=float, default=180)
     parser.add_argument('--network-fault', choices=list(MODES))
     parser.add_argument('--additional-network-faults', choices=list(MODES), nargs='*', default=[])
@@ -686,6 +696,13 @@ def main():
     sequence = ([args.network_fault] if args.network_fault else []) + args.additional_network_faults
     if args.additional_network_faults and not args.network_fault or len(sequence) > 4 or len(set(sequence)) != len(sequence):
         raise SystemExit('Predeclare up to four distinct packet cases; repeats are not retries')
+    if args.source_ack_fault:
+        require_namespace()
+        if args.interrupt_rust_member is None or args.partition_restart or args.network_fault or args.additional_network_faults or args.prepare_genesis_only:
+            raise SystemExit('Source ACK fault requires one interrupted Rust member and no other injected fault')
+        if not args.source_ack_fault_library:
+            raise SystemExit('Source ACK fault requires its explicit native test library')
+        args.source_ack_fault_library = args.source_ack_fault_library.resolve()
     if args.partition_restart:
         if args.interrupt_rust_member is None or args.network_fault or args.additional_network_faults or args.prepare_genesis_only:
             raise SystemExit('Partition restart requires one interrupted Rust member and no separate packet cases')
@@ -741,6 +758,8 @@ def main():
     artifacts = {str(args.block_checker): digest(args.block_checker), str(args.profile): digest(args.profile)}
     if args.rust_node:
         artifacts.update({str(path): digest(path) for path in [args.rust_node, args.validator_preparer]})
+    if args.source_ack_fault:
+        artifacts[str(args.source_ack_fault_library)] = digest(args.source_ack_fault_library)
     if args.network_fault or args.partition_restart:
         artifacts[str(args.socket_mark_library)] = digest(args.socket_mark_library)
     for item in manifest['binaries']:
@@ -765,6 +784,15 @@ def main():
     if args.partition_restart:
         path = driver.with_name('partition_restart_fixture.py')
         artifacts[str(path)] = digest(path)
+    if args.source_ack_fault:
+        path = driver.with_name('source_ack_fault_fixture.py')
+        artifacts[str(path)] = digest(path)
+        destination = args.output / 'fault-sources' / path.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(path.read_bytes())
+        path = driver.parents[2] / 'rtos/src/tests/finality_source_fault.c'
+        artifacts[str(path)] = digest(path)
+        (destination.parent / path.name).write_bytes(path.read_bytes())
     write(args.output / 'source.json', {'snapshot': manifest, 'artifacts': artifacts,
         'profile': profile, 'command': sys.argv, 'driver_sha256': digest(driver),
         'shared_helper_sha256': digest(helper), 'weighted_helpers_sha256': weighted_helpers})

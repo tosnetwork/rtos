@@ -64,7 +64,7 @@ class PartitionRestartTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(context.receipt['isolated_rpc_timeout_observed'])
             self.assertGreater(context.receipt['kernel_after_restart_hold']['drops'],
                 context.receipt['kernel_before_restart_hold']['drops'])
-            context.complete({'last_checkpoint': {'seqno': 15}, 'manual_database_repair': False})
+            await context.complete({'last_checkpoint': {'seqno': 15}, 'manual_database_repair': False})
             context.close()
             self.assertEqual(context.receipt['phase'], 'recovered')
             self.assertEqual(context.fault.restores, 1)
