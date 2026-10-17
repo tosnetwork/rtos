@@ -119,10 +119,23 @@ async def cpp_certificate(snapshot, node, zero, target, directory):
     command = 'saveblkproofchain finality ' + block_text(zero) + ' ' + block_text(target)
     await child_checked([snapshot / 'build/lite-client/lite-client', '-C', config, '-r',
         '-t', '20', '-c', command], directory / 'proof-client.log', cwd=directory)
+    return retained_cpp_certificate(directory, target)
+
+
+def retained_cpp_certificate(directory, target):
+    # The native client can return exit 0 after logging capture rejection.
+    # Its exact-target completion receipt is mandatory; partial raw responses
+    # alone do not mean that the requested proof was exported successfully.
     responses = sorted(directory.glob('finality-*.response.tl'))
     if not responses:
         raise RuntimeError('Native C++ LiteServer did not export finality proof responses')
+    complete = directory / 'finality.complete'
+    expected = f'Z01_CHAIN_CAPTURE_OK segments={len(responses)} target={block_text(target)}'
+    if not complete.is_file() or complete.read_text().strip().upper() != expected.upper() \
+            or {p.name for p in responses} != {f'finality-{i}.response.tl' for i in range(len(responses))}:
+        raise RuntimeError('Native C++ finality capture lacks an exact-target completion receipt')
     return dict(kind='cpp_lite', name='cpp-0',
+        capture_receipt=complete.read_text().strip(),
         responses=[base64.b64encode(path.read_bytes()).decode() for path in responses])
 
 

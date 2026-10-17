@@ -259,3 +259,12 @@ are retained in `recovery/recovery.json`; the restarted process has a separate
 `node-restart.log`. `--recovery-timeout` bounds this combined recovery phase
 (default 180 seconds). The final normal shutdown limit remains 20 seconds per
 Rust process. A process interruption does not simulate a power failure.
+
+Native C++ proof capture must retain its exact-target `finality.complete`
+receipt as well as all numbered responses. A zero client exit code alone is
+insufficient: the pinned client can log a capture rejection and still exit zero.
+The rotation runner stops collecting the initial phase once its required MC/WC
+creators are certified, and stops downloading redundant WC states once that
+phase has all four WC creators. Every counted creator still needs the same
+independent certificate, body and state checks. Both runner sources are retained
+with hashes in each new rotation output directory.

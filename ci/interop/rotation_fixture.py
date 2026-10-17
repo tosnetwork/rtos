@@ -340,6 +340,10 @@ async def run(args, profile, root, artifacts):
                     else:
                         raise RuntimeError('Authenticated C++ state has an unexpected current committee')
                     seen.add(key)
+                    if phase == 'before' and all(len(group) == 4 for group in epochs['before'].values()):
+                        write(directory / 'phase-complete.json', {'phase': phase,
+                            'reason': 'All required initial creators already certified; await the successor'})
+                        continue
                     if checked['key_block']:
                         if checked['prev_key_block_seqno'] != 0:
                             raise RuntimeError('This one-successor fixture encountered an additional key-block epoch')
@@ -375,7 +379,7 @@ async def run(args, profile, root, artifacts):
                         sample['certificates'] = [proof]
                         sample['governing_key_block'] = {**governing_witnesses[key_seqno], 'certificates': [proof]}
                     tops = [top for top in checked['shard_tops'] if int(top['workchain']) == 0 and int(top['seqno']) > 0]
-                    if tops:
+                    if tops and len(epochs[phase]['wc_creators']) < 4:
                         top = tops[0]; wc_dir = directory / 'workchain'; wc_dir.mkdir()
                         wc_block = await cpp_block(args.snapshot, nodes[0], top, wc_dir)
                         states = await asyncio.gather(*(native_state(args.snapshot, lite_configs[i],
@@ -495,8 +499,13 @@ def main():
         if digest(path) != item['sha256']:raise SystemExit(f'C++ executable changed: {path}')
         artifacts[str(path)] = item['sha256']
     args.output.mkdir(parents=True, exist_ok=False)
+    driver = Path(__file__)
+    helper = driver.with_name('mixed_matrix.py')
+    (args.output / 'driver.py').write_bytes(driver.read_bytes())
+    (args.output / 'shared-helper.py').write_bytes(helper.read_bytes())
     write(args.output / 'source.json', {'snapshot': manifest, 'artifacts': artifacts,
-        'profile': profile, 'command': sys.argv, 'driver_sha256': digest(Path(__file__))})
+        'profile': profile, 'command': sys.argv, 'driver_sha256': digest(driver),
+        'shared_helper_sha256': digest(helper)})
     try:
         result = asyncio.run(run(args, profile, args.output, artifacts))
     except BaseException as error:
