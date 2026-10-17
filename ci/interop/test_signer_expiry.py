@@ -99,3 +99,23 @@ class SignerExpiryTests(unittest.IsolatedAsyncioTestCase):
                         out=await ctx.qualify(args,[None]*6,list(range(6)),[None]*6,zero,{},cp,str)
                         self.assertEqual(out['block'],block)
                         self.assertEqual(ctx.receipt['phase'],'qualified_before_interruption')
+
+    async def test_recovery_reuses_observer_started_at_first_successor_checkpoint(self):
+        import rotation_fixture as rotation
+        import source_ack_partition_fixture as combined
+        args=self.args();observer=SimpleNamespace(started=time.monotonic()-30,started_unix=time.time()-30,
+            qualify=AsyncMock(return_value={'qualified':'early-observer'}),complete=AsyncMock())
+        args.signer_expiry_observer=observer
+        class Context:
+            async def complete(self,recovered):pass
+            def close(self):pass
+        operation=AsyncMock(return_value={'last_checkpoint':{'seqno':100}})
+        with patch.object(expiry,'SignerExpiry',side_effect=AssertionError('late observer reconstruction')), \
+                patch.object(combined,'SourceAckPartitionRestart',return_value=Context()), \
+                patch.object(rotation,'_recover_rotation_member',operation):
+            await rotation.recover_rotation_member(args,Path('root'),[None]*6,[None]*6,[None]*6,
+                [{'index':2},{'index':5}],{}, {}, {'original':'checkpoint'}, {})
+        observer.qualify.assert_awaited_once()
+        self.assertEqual(operation.call_args.args[8],{'qualified':'early-observer'})
+        self.assertEqual(args.original_recovery_budget['monotonic'],observer.started)
+        observer.complete.assert_awaited_once()

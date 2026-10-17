@@ -119,9 +119,9 @@ async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, ru
     recovery_fault = None
     expiry = None
     if getattr(args, 'signer_expiry_member', None) is not None:
-        from signer_expiry_fixture import SignerExpiry
-        expired_node = next(n for n in rust_nodes if n['index'] == args.signer_expiry_member)
-        expiry = SignerExpiry(args, root, expired_node, checkpoint)
+        expiry = getattr(args, 'signer_expiry_observer', None)
+        if expiry is None:
+            raise RuntimeError('Signer expiry observer was not started at the first successor checkpoint')
         checkpoint = await expiry.qualify(args, nodes, endpoints, lite_configs, zero, governing, checkpoint, member_id)
         args.original_recovery_budget = {'monotonic': expiry.started, 'unix': expiry.started_unix}
     if getattr(args, 'source_ack_partition_restart', False):
@@ -574,6 +574,10 @@ async def run(args, profile, root, artifacts):
                     checked = json.loads((directory / 'epoch-checked.json').read_text())
                     if phase == 'after' and not checked['verified_governing_key_blocks']:
                         raise RuntimeError('Successor sample lacks independently verified governing history')
+                    if phase == 'after' and args.signer_expiry_member is not None and getattr(args, 'signer_expiry_observer', None) is None:
+                        from signer_expiry_fixture import SignerExpiry
+                        expired_node = next(n for n in rust_nodes if n['index'] == args.signer_expiry_member)
+                        args.signer_expiry_observer = SignerExpiry(args, root, expired_node, checked)
                     if checked['created_by'] not in {member_id(i) for i in committee}:
                         raise RuntimeError('Non-transition block creator is absent from the current committee')
                     if profile.get('weighted_quorum_pause') or profile.get('observer_budget'):
