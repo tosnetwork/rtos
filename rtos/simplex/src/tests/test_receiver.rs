@@ -138,6 +138,7 @@ struct ReceiverStats {
     votes_received: AtomicU32,
     received_vote_bytes: Mutex<Vec<(u32, Vec<u8>)>>,
     received_candidates: Mutex<Vec<CandidateData>>,
+    received_candidate_notars: Mutex<Vec<Option<Vec<u8>>>>,
     /// Number of broadcasts received
     broadcasts_received: AtomicU32,
     /// Number of certificates received
@@ -164,6 +165,7 @@ impl ReceiverStats {
             votes_received: AtomicU32::new(0),
             received_vote_bytes: Mutex::new(Vec::new()),
             received_candidates: Mutex::new(Vec::new()),
+            received_candidate_notars: Mutex::new(Vec::new()),
             broadcasts_received: AtomicU32::new(0),
             certificates_received: AtomicU32::new(0),
             received_certificates: Mutex::new(Vec::new()),
@@ -231,8 +233,9 @@ impl ReceiverListener for TestReceiverListener {
         &self,
         source_idx: u32,
         candidate: CandidateData,
-        _notar_cert: Option<Vec<u8>>,
+        notar_cert: Option<Vec<u8>>,
     ) {
+        self.stats.received_candidate_notars.lock().unwrap().push(notar_cert);
         self.stats.received_candidates.lock().unwrap().push(candidate.clone());
         let count = self.stats.broadcasts_received.fetch_add(1, Ordering::Release) + 1;
         log::trace!(
@@ -2358,4 +2361,172 @@ fn test_receiver_certificate_ingress_boundary_reopens_after_progress() {
     wait_until(Duration::from_secs(3), || stats.certificates_received.load(Ordering::Acquire) >= 2);
     assert_eq!(stats.received_certificates.lock().unwrap().iter().map(certificate_slot).collect::<Vec<_>>(), vec![11,12]);
     sender.stop(); receiver.stop();
+}
+
+#[test]
+fn test_receiver_restored_complete_cache_delivers_historical_candidate() {
+    restored_cache_delivery_case("complete");
+}
+
+#[test]
+fn test_receiver_restored_partial_cache_delivers_historical_candidate() {
+    restored_cache_delivery_case("body_only");
+    restored_cache_delivery_case("notar_only");
+}
+
+#[test]
+fn test_receiver_restored_invalid_cache_repairs_before_delivery() {
+    restored_cache_delivery_case("wrong_identity");
+    restored_cache_delivery_case("bad_notar");
+}
+
+fn restored_cache_delivery_case(mode: &str) {
+    use consensus_common::simplex_protocol::SimplexProtocol;
+    for protocol in [SimplexProtocol::Private, SimplexProtocol::BlockSync] {
+        let profile = rtos_api::WireProfile::T0;
+        let session = UInt256::rand();
+        let keys: Vec<PrivateKey> = (0..2)
+            .map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap())
+            .collect();
+        let nodes: Vec<_> = keys
+            .iter()
+            .map(|key| SessionNode {
+                public_key: key.clone(),
+                adnl_id: key.id().clone(),
+                weight: 1,
+            })
+            .collect();
+        // No peer receiver exists: satisfying this request must use restored local bytes.
+        let overlay = consensus_common::ConsensusCommonFactory::create_in_process_overlay_manager_with_profile(2, profile);
+        let receiver = ReceiverInstance::create_with_profile(
+            0,
+            session.clone(),
+            &nodes,
+            keys[0].clone(),
+            overlay.clone(),
+            protocol,
+            profile,
+        )
+        .unwrap();
+        receiver.receiver.set_ingress_progress_slot(200);
+        let slot = 99;
+        let body = vec![7u8; 1024];
+        let collated = vec![9u8; 128];
+        let root_hash = UInt256::from_slice(&sha256_digest(&body));
+        let file_hash = UInt256::from_slice(&sha256_digest(&body));
+        let collated_hash = UInt256::from_slice(&sha256_digest(&collated));
+        let block = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            slot,
+            root_hash.clone(),
+            file_hash,
+        );
+        let hash = crate::utils::compute_candidate_id_hash_u32(
+            slot,
+            Some(&block),
+            Some(&collated_hash),
+            None,
+        );
+        let leader =
+            (slot / crate::SessionOptions::default().slots_per_leader_window) as usize % keys.len();
+        let inner = TlCandidate {
+            src: UInt256::default(),
+            round: slot as i32,
+            root_hash,
+            data: body.into(),
+            collated_data: collated.into(),
+        }
+        .into_boxed();
+        let candidate = CandidateDataBlock {
+            slot: slot as i32,
+            candidate: serialize_boxed(&inner).unwrap().into(),
+            parent: CandidateParent::Consensus_CandidateWithoutParents,
+            signature: crate::utils::sign_candidate_u32(&session, slot, &hash, &keys[leader])
+                .unwrap()
+                .into(),
+        }
+        .into_boxed();
+        let wire = profile.serialize(&candidate).unwrap();
+        let notar = build_valid_notar_bytes(&session, slot, &hash, &[(0, &keys[0]), (1, &keys[1])]);
+        let peer = if mode != "complete" {
+            let peer = ReceiverInstance::create_with_profile(
+                1,
+                session.clone(),
+                &nodes,
+                keys[1].clone(),
+                overlay,
+                protocol,
+                profile,
+            )
+            .unwrap();
+            peer._listener.set_query_fallback_payloads(
+                slot,
+                hash.clone(),
+                wire.clone(),
+                notar.clone(),
+            );
+            Some(peer)
+        } else {
+            None
+        };
+        if mode != "notar_only" {
+            let bytes = if mode == "wrong_identity" {
+                let mut wrong = candidate.clone();
+                if let CandidateData::Consensus_Block(block) = &mut wrong {
+                    block.slot -= 1;
+                }
+                profile.serialize(&wrong).unwrap()
+            } else {
+                wire.clone()
+            };
+            receiver
+                .receiver
+                .cache_candidate_bytes(slot, hash.clone(), bytes);
+        }
+        if mode != "body_only" {
+            receiver.receiver.cache_notarization_cert(
+                slot,
+                hash.clone(),
+                if mode == "bad_notar" {
+                    vec![0; 12]
+                } else {
+                    notar.clone()
+                },
+            );
+        }
+        receiver.receiver.request_candidate(slot, hash.clone());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while receiver.stats.broadcasts_received.load(Ordering::Acquire) == 0
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Explicit subsequent requests must also be fulfilled, rather than suppressed by cache presence.
+        if receiver.stats.broadcasts_received.load(Ordering::Acquire) == 1 {
+            receiver.receiver.request_candidate(slot, hash);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while receiver.stats.broadcasts_received.load(Ordering::Acquire) < 2
+                && std::time::Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        receiver.stop();
+        if let Some(peer) = peer {
+            peer.stop();
+        }
+        assert_eq!(
+            receiver.stats.broadcasts_received.load(Ordering::Acquire),
+            2,
+            "restored cache must fulfill each explicit request: {mode}"
+        );
+        let candidates = receiver.stats.received_candidates.lock().unwrap();
+        assert!(candidates
+            .iter()
+            .all(|candidate| profile.serialize(candidate).unwrap() == wire));
+        assert_eq!(
+            *receiver.stats.received_candidate_notars.lock().unwrap(),
+            vec![Some(notar.clone()), Some(notar)]
+        );
+    }
 }

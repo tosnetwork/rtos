@@ -2903,6 +2903,13 @@ impl ReceiverImpl {
             return;
         }
 
+        // C++ ResolveCandidate returns complete local state to its awaiter. Startup
+        // restores our serving cache separately from CandidateBook, so cache presence
+        // alone cannot stand in for delivering the body to SessionProcessor.
+        if self.deliver_cached_candidate(slot, &block_hash) {
+            return;
+        }
+
         let source_idx = match self.select_peer_for_candidate_request(None, None, SystemTime::now())
         {
             Some(idx) => idx,
@@ -2939,6 +2946,78 @@ impl ReceiverImpl {
         self.send_candidate_request(slot, block_hash);
     }
 
+    /// Fulfill a local resolution through the same validated listener ingress as
+    /// peer repair. A restored serving entry is not a SessionProcessor delivery.
+    fn deliver_cached_candidate(&mut self, slot: SlotIndex, block_hash: &UInt256) -> bool {
+        let key = (slot, block_hash.clone());
+        let pending = self.pending_requests.get(&key);
+        let candidate_bytes = pending
+            .and_then(|state| state.cached_candidate.as_ref())
+            .or_else(|| self.resolver_cache.get_candidate(slot, block_hash))
+            .cloned();
+        let notar_bytes = pending
+            .and_then(|state| state.cached_notar.as_ref())
+            .or_else(|| self.resolver_cache.get_notar_cert(slot, block_hash))
+            .cloned();
+        let (Some(candidate_bytes), Some(notar_bytes)) = (candidate_bytes, notar_bytes) else {
+            return false;
+        };
+        let candidate = match Self::validate_repair_candidate_identity(
+            self.wire_profile,
+            &self.session_id,
+            &self.sources,
+            self.slots_per_leader_window,
+            &self.shard,
+            self.max_candidate_size,
+            self.max_candidate_query_answer_size,
+            self.proto_version,
+            slot,
+            block_hash,
+            &candidate_bytes,
+        ) {
+            Ok(candidate) => candidate,
+            Err(reason) => {
+                log::warn!(
+                    "SimplexReceiver {}: invalid cached candidate slot={slot}: {reason}",
+                    self.session_id.to_hex_string()
+                );
+                self.resolver_cache.remove_candidate(slot, block_hash);
+                if let Some(state) = self.pending_requests.get_mut(&key) {
+                    state.cached_candidate = None;
+                }
+                return false;
+            }
+        };
+        if let Err(reason) = Self::validate_repair_notar_signature_set(
+            self.wire_profile,
+            &self.session_id,
+            &self.sources,
+            self.max_candidate_query_answer_size,
+            slot,
+            block_hash,
+            &notar_bytes,
+        ) {
+            log::warn!(
+                "SimplexReceiver {}: invalid cached notar slot={slot}: {reason}",
+                self.session_id.to_hex_string()
+            );
+            self.resolver_cache.notar_certs.remove(&key);
+            if let Some(state) = self.pending_requests.get_mut(&key) {
+                state.cached_notar = None;
+            }
+            return false;
+        }
+        let Some(listener) = self.listener.upgrade() else {
+            return false;
+        };
+        // Local cache fulfillment has no remote transport sender to attribute.
+        let source_idx = self.local_idx.unwrap_or_else(|| {
+            slot.value() / self.slots_per_leader_window % self.sources.len() as u32
+        });
+        listener.on_candidate_received(source_idx, candidate, Some(notar_bytes));
+        true
+    }
+
     /// Send one requestCandidate attempt for a pending request.
     fn send_candidate_request(&mut self, slot: SlotIndex, block_hash: UInt256) {
         let key = (slot, block_hash.clone());
@@ -2956,13 +3035,12 @@ impl ReceiverImpl {
         };
 
         if !want_candidate && !want_notar {
-            log::trace!(
-                "SimplexReceiver {}: requestCandidate slot={slot} hash={} \
-                already complete in cache, cancelling pending request",
-                self.session_id.to_hex_string(),
-                &block_hash.to_hex_string()[..8],
-            );
-            self.pending_requests.remove(&key);
+            if self.deliver_cached_candidate(slot, &block_hash) {
+                self.pending_requests.remove(&key);
+            } else {
+                // Invalid local pieces were evicted; request their replacements.
+                self.retry_candidate_request(slot, block_hash, false, "invalid_cached_resolution");
+            }
             return;
         }
 
@@ -3542,7 +3620,9 @@ impl ReceiverImpl {
                             // Forward newly observed parts immediately. SessionProcessor can merge
                             // body/notar callbacks in any order. We reuse the candidate parsed
                             // during pre-validation to avoid double TL decoding.
-                            if candidate_part_new {
+                            let complete_pair =
+                                !merged_candidate_bytes.is_empty() && !merged_notar.is_empty();
+                            if candidate_part_new && !complete_pair {
                                 let candidate = match parsed_candidate.clone() {
                                     Some(c) => c,
                                     None => {
@@ -3577,7 +3657,7 @@ impl ReceiverImpl {
                                         notar_for_candidate,
                                     );
                                 }
-                            } else if notar_part_new {
+                            } else if notar_part_new && (!complete_pair || !cached_candidate_missing) {
                                 if let Some(listener) = self.listener.upgrade() {
                                     listener.on_candidate_notar_received(
                                         source_idx,
@@ -3630,51 +3710,16 @@ impl ReceiverImpl {
                                 return;
                             }
 
-                            let _candidate = match self
-                                .wire_profile
-                                .deserialize(merged_candidate_bytes.as_slice())
-                            {
-                                Ok(msg) => match msg.downcast::<CandidateData>() {
-                                    Ok(c) => c,
-                                    Err(_) => {
-                                        self.resolver_cache.remove_candidate(slot, &block_hash);
-                                        if let Some(state) = self.pending_requests.get_mut(&key) {
-                                            state.cached_candidate = None;
-                                        }
-                                        log::warn!(
-                                            "SimplexReceiver {}: unexpected candidate type in response",
-                                            self.session_id.to_hex_string()
-                                        );
-                                        self.retry_candidate_request(
-                                            slot,
-                                            block_hash,
-                                            false,
-                                            "bad_candidate_type",
-                                        );
-                                        return;
-                                    }
-                                },
-                                Err(e) => {
-                                    self.resolver_cache.remove_candidate(slot, &block_hash);
-                                    if let Some(state) = self.pending_requests.get_mut(&key) {
-                                        state.cached_candidate = None;
-                                    }
-                                    log::warn!(
-                                        "SimplexReceiver {}: failed to deserialize candidate: {}",
-                                        self.session_id.to_hex_string(),
-                                        e
-                                    );
-                                    self.retry_candidate_request(
-                                        slot,
-                                        block_hash,
-                                        false,
-                                        "candidate_deserialize_error",
-                                    );
-                                    return;
-                                }
-                            };
-
-                            // Remove from pending only when merged candidate+notar is complete.
+                            // Restored serving-cache bodies have not reached the requester.
+                            // Bodies learned by this pending request were forwarded above or
+                            // in a previous partial response; keep their callback dedup.
+                            if cached_candidate_missing && !self.deliver_cached_candidate(slot, &block_hash) {
+                                self.retry_candidate_request(
+                                    slot, block_hash, false, "cached_resolution_not_delivered",
+                                );
+                                return;
+                            }
+                            // Remove from pending only after delivery of the complete pair.
                             self.pending_requests.remove(&key);
                         }
                         Err(message) => {
