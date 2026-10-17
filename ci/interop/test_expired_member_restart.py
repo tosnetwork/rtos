@@ -95,3 +95,56 @@ class ExpiredMemberRestartTests(unittest.TestCase):
                      scope+'\n'+error.replace('drained=true','drained=false'),
                      scope.replace('reset_after_failure','unrelated')+'\n'+error]:
             with self.assertRaises(RuntimeError):ctx.refusal(text)
+
+
+class PendingIntentRecoveryTests(unittest.TestCase):
+    def context(self, root):
+        from pathlib import Path
+        import json
+        namespaces=root/'owned';pending=namespaces/'session.validator/finality-intents'
+        pending.mkdir(parents=True)
+        record={'slot':7,'candidate_hash':'a'*64,'certificate':'original exact proof'}
+        source=pending/('7-'+'a'*64+'.json');source.write_text(json.dumps(record))
+        return namespaces,source,record
+
+    def test_original_record_is_observation_only_and_missing_proof_cannot_complete(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);namespaces,source,record=self.context(root);original=source.read_bytes()
+            ctx=passive.PendingIntentRecovery(namespaces,root/'evidence')
+            self.assertEqual(source.read_bytes(),original)
+            self.assertFalse(ctx.complete());source.unlink();self.assertFalse(ctx.complete())
+
+    def test_exact_completed_proof_and_removed_pending_are_both_required(self):
+        import tempfile,json
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);namespaces,source,record=self.context(root)
+            ctx=passive.PendingIntentRecovery(namespaces,root/'evidence')
+            proof=source.parent/'completed-v1'/source.with_suffix('.complete').name
+            proof.parent.mkdir();proof.write_text(json.dumps({'schema':1,'record':record}))
+            self.assertFalse(ctx.complete());source.unlink();self.assertTrue(ctx.complete())
+            self.assertTrue((root/'evidence/receipt.json').exists())
+
+    def test_other_certificate_or_symlink_cannot_close_original_obligation(self):
+        import tempfile,json
+        from pathlib import Path
+        for mode in ['changed','symlink']:
+            with tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);namespaces,source,record=self.context(root)
+                ctx=passive.PendingIntentRecovery(namespaces,root/'evidence');source.unlink()
+                proof=source.parent/'completed-v1'/source.with_suffix('.complete').name;proof.parent.mkdir()
+                if mode=='changed':proof.write_text(json.dumps({'schema':1,'record':{**record,'certificate':'other proof'}}))
+                else:proof.symlink_to(root/'missing')
+                with self.assertRaises(RuntimeError):ctx.complete()
+
+    def test_empty_snapshot_or_candidate_filename_mismatch_refuses(self):
+        import tempfile
+        from pathlib import Path
+        for mode in ['empty','wrong_name']:
+            with tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);namespaces,source,record=self.context(root)
+                if mode=='empty':source.unlink()
+                else:source.rename(source.with_name('8-'+'a'*64+'.json'))
+                with self.assertRaises(RuntimeError):passive.PendingIntentRecovery(namespaces,root/'evidence')

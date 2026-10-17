@@ -12219,6 +12219,15 @@ fn source_finality_main_worker_release_keeps_only_accepted_node_work_owned() {
 /// input, while source intent/ACK/output files are reopened from disk.
 #[test]
 fn source_finality_controller_empty_trigger_seals_all_roles_after_cold_retry() {
+    source_finality_empty_trigger_cold_retry_case(false);
+}
+
+#[test]
+fn source_finality_controller_cold_retry_keeps_ancestor_handoff_below_applied_floor() {
+    source_finality_empty_trigger_cold_retry_case(true);
+}
+
+fn source_finality_empty_trigger_cold_retry_case(high_floor: bool) {
     use crate::finality_delivery::tests::{fixture_role, HeldSink};
     use rtos_block::Serializable;
     let temp = crate::authenticated_fixture::TestDirectory::new();
@@ -12292,6 +12301,11 @@ fn source_finality_controller_empty_trigger_seals_all_roles_after_cold_retry() {
             processor.simplex_state.set_notarize_certificate(&description,id.slot,&id.hash,
                 Arc::new(crate::certificate::Certificate { vote:crate::simplex_state::NotarizeVote {
                     slot:id.slot,block_hash:id.hash.clone()},signatures:sign(id,false) })).unwrap();
+        }
+        if high_floor {
+            processor.set_mc_finalized_block(BlockIdExt::with_params(
+                runtime.shard().clone(), 1000, UInt256::rand(), UInt256::rand(),
+            ));
         }
         (db,processor)
     };

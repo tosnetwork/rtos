@@ -182,6 +182,13 @@ async def _recover_rotation_member(args, root, nodes, endpoints, lite_configs, r
         raise RuntimeError(f'Recovery interruption did not reap SIGKILL: {code}')
     receipt.update(interruption_returncode=code, interrupted_at_unix=interrupted_at, phase='waiting_for_survivors')
     write(directory / 'recovery.json', receipt)
+    pending_intents = None
+    if getattr(args, 'expired_member_restart', False):
+        from expired_member_restart_fixture import PendingIntentRecovery
+        pending_intents = PendingIntentRecovery(
+            node['directory'] / 'node_db/catchains/consensus/v2', directory / 'original-intents')
+        receipt['pre_restart_pending_intent_count'] = len(pending_intents.records)
+        write(directory / 'recovery.json', receipt)
     histories = [{} for _ in nodes]
     deadline = recovery_fault.deadline if recovery_fault else time.monotonic() + args.recovery_timeout
     if recovery_fault:
@@ -302,7 +309,8 @@ async def _recover_rotation_member(args, root, nodes, endpoints, lite_configs, r
                 expired_full_node={'member':index,'expire_at':args.signer_expiry_plan['expire_at'],
                     'required_observation_seconds':12,'samples':acceptance.samples})
             write(directory / 'recovery.json', receipt)
-            if done:
+            if done and pending_intents.complete():
+                receipt['all_original_pending_intents_completed'] = True
                 log = (node['directory'] / 'node-restart.log').read_text(errors='replace')
                 receipt['expired_full_node']['refusal_line'] = acceptance.refusal(log)
                 receipt['expired_full_node']['signing_authority_restored'] = False

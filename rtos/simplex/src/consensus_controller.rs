@@ -1852,8 +1852,11 @@ impl ConsensusController {
             // Step 2: evaluate local readiness + floor constraints for this block only.
             // C++ parity: cert-carrying walks bypass the floor check because the
             // recursive finalization in C++ has no applied-floor guard.
-            let block_below_applied_floor =
-                !has_final_cert && received.block_id.seq_no() < applied_floor;
+            // C++ StateResolver awaits each parent FinalizeBlock; an applied
+            // top is not this source's durable handoff receipt. Authenticated
+            // recovery retains that dependency walk below the applied top.
+            let block_below_applied_floor = self.description.authenticated_runtime().is_none()
+                && !has_final_cert && received.block_id.seq_no() < applied_floor;
             let body_available = received.has_real_body();
 
             if workchain {
@@ -2399,21 +2402,19 @@ impl ConsensusController {
 
     /* Finalized-callback emission helpers */
 
-    /// Shard/MC callback-emission policy: on MC emit only with FinalCert
-    /// context; on shardchains emit only at/above the applied-top floor.
+    /// MC ancestors without FinalCert never emit. Authenticated WC recovery
+    /// waits for every parent handoff, including below the applied top; legacy
+    /// sessions retain their applied-floor optimization.
     fn should_emit_on_block_finalized_for_block(
         &self,
         block_id: &BlockIdExt,
         has_final_cert: bool,
         applied_floor: u32,
     ) -> bool {
-        if self.description.authenticated_runtime().is_some() && has_final_cert {
-            return true;
-        }
         if self.description.get_shard().is_masterchain() {
             return has_final_cert;
         }
-        block_id.seq_no() >= applied_floor
+        self.description.authenticated_runtime().is_some() || block_id.seq_no() >= applied_floor
     }
 
     /// Emit `on_block_finalized` to the listener for finalized-driven acceptance.
