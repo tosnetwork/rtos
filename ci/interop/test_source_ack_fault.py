@@ -40,6 +40,60 @@ class SourceAckTests(unittest.IsolatedAsyncioTestCase):
         context.capture_failure(marker,'Node WAL durable but source ACK needs retry: native error')
         return name,original
 
+    async def test_ack_truncate_retry_waits_for_nonempty_observation_in_original_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context, node, pending = self.context(Path(tmp))
+            log = node['directory'] / 'node.log'; log.write_text('')
+            name = 'a' * 64
+            original = json.dumps({'session_id':context.receipt['session'], 'is_final':True,
+                'block_id':'public block', 'data':'boc', 'signature_set':'certificate'}).encode()
+            (pending / (name + '.json')).write_bytes(original)
+            temporary = pending / (name + '.ack.tmp')
+            async def publish_failure_then_retry_bytes():
+                await asyncio.sleep(.01)
+                temporary.write_bytes(b'')
+                (context.directory / 'native-error.marker').write_text('source sync-eio: ' + str(temporary) + '\n')
+                log.write_text('Node WAL durable but source ACK needs retry: Input/output error\n')
+                await asyncio.sleep(.2)
+                temporary.write_bytes(b'complete retry ACK')
+            producer = asyncio.create_task(publish_failure_then_retry_bytes())
+            started = time.monotonic(); deadline = context.deadline
+            try:
+                await context.arm()
+                self.assertGreaterEqual(time.monotonic() - started, .2)
+                self.assertEqual(context.deadline, deadline)
+                self.assertEqual(context.receipt['temporary_bytes'], len(b'complete retry ACK'))
+                self.assertEqual(context.receipt['source_id'], name)
+                self.assertEqual(context.receipt['pending_sha256'], hashlib.sha256(original).hexdigest())
+            finally:
+                producer.cancel()
+                await asyncio.gather(producer, return_exceptions=True)
+                context.close()
+
+    async def test_empty_ack_retry_observation_cannot_extend_deadline_or_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context, node, pending = self.context(Path(tmp))
+            context.deadline = time.monotonic() + .15
+            log = node['directory'] / 'node.log'; log.write_text('')
+            name = 'a' * 64; temporary = pending / (name + '.ack.tmp')
+            (pending / (name + '.json')).write_text(json.dumps({'session_id':context.receipt['session']}))
+            async def publish():
+                await asyncio.sleep(.01)
+                temporary.write_bytes(b'')
+                (context.directory / 'native-error.marker').write_text('source sync-eio: ' + str(temporary) + '\n')
+                log.write_text('Node WAL durable but source ACK needs retry: Input/output error\n')
+            producer = asyncio.create_task(publish())
+            try:
+                with self.assertRaisesRegex(TimeoutError, 'original recovery deadline'):
+                    await context.arm()
+                self.assertEqual(context.receipt['phase'], 'waiting_for_native_ack_failure')
+                self.assertNotIn('native_error_observed_at_unix', context.receipt)
+                self.assertEqual(temporary.read_bytes(), b'')
+            finally:
+                producer.cancel()
+                await asyncio.gather(producer, return_exceptions=True)
+                context.close()
+
     async def test_authenticated_runtime_is_used_when_offline_preparation_is_stale(self):
         with tempfile.TemporaryDirectory() as tmp:
             context,_,_=self.context(Path(tmp),stale_prepared=True)

@@ -14,6 +14,10 @@ from network_faults import require_namespace
 from partition_restart_fixture import hold
 
 
+class AckWritePending(RuntimeError):
+    """The failed ACK is being retried; no acceptable byte observation yet."""
+
+
 def paths(root):
     directory = root / 'source-ack-fault'
     directory.mkdir(exist_ok=True)
@@ -92,8 +96,15 @@ class SourceAckFailure:
             errors = [line for line in buffer.splitlines()
                 if 'Node WAL durable but source ACK needs retry:' in line and expected in line]
             if marker.is_file() and errors:
-                self.capture_failure(marker, errors[-1])
-                return
+                try:
+                    self.capture_failure(marker, errors[-1])
+                except AckWritePending:
+                    # A later retry may have truncated the same uncommitted
+                    # file after the native failure. Do not accept zero bytes,
+                    # reset the deadline, or stop the process in this window.
+                    pass
+                else:
+                    return
             await asyncio.sleep(.1)
 
     def capture_failure(self, marker, error):
@@ -110,6 +121,8 @@ class SourceAckFailure:
         if (self.pending_directory / (self.source_id + '.acked')).exists():
             raise RuntimeError('Failed source ACK was already published')
         size = target.stat().st_size
+        if self.mode == 'sync-eio' and size == 0:
+            raise AckWritePending('Source ACK retry has not supplied a nonempty observation yet')
         if (size > 0) != (self.mode == 'sync-eio'):
             raise RuntimeError('Source ACK temporary bytes do not match the failed syscall')
         record = json.loads(self.original)
