@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import base64
+import copy
 import hashlib
 import json
 import os
@@ -478,9 +479,24 @@ async def run(args, profile, root, artifacts):
                         recovery = None
                         network_fault = None
                         if args.network_fault:
-                            network_fault = await exercise_network_member(args, root, nodes, endpoints,
-                                lite_configs, rust_nodes, zero, governing_witnesses[checked['prev_key_block_seqno']],
-                                checked, artifacts)
+                            if args.additional_network_faults:
+                                case_root = root / 'network-cases'; case_root.mkdir()
+                                network_fault = {'predeclared_modes': [args.network_fault] + args.additional_network_faults,
+                                                 'cases': [], 'recovery_seconds_per_case': args.recovery_timeout}
+                                for case_number, mode in enumerate(network_fault['predeclared_modes'], 1):
+                                    directory = case_root / f'{case_number:02}-{mode}'; directory.mkdir()
+                                    case_args = copy.copy(args); case_args.network_fault = mode
+                                    receipt = await exercise_network_member(case_args, directory, nodes, endpoints,
+                                        lite_configs, rust_nodes, zero, governing_witnesses[checked['prev_key_block_seqno']],
+                                        checked, artifacts)
+                                    network_fault['cases'].append(receipt)
+                                    write(root / 'network-suite.json', network_fault)
+                                    checked = json.loads((directory / 'network-fault' / str(receipt['last_checkpoint']['seqno']) /
+                                                        'checked-with-workchain.json').read_text())
+                            else:
+                                network_fault = await exercise_network_member(args, root, nodes, endpoints,
+                                    lite_configs, rust_nodes, zero, governing_witnesses[checked['prev_key_block_seqno']],
+                                    checked, artifacts)
                         if args.interrupt_rust_member is not None:
                             recovery = await recover_rotation_member(args, root, nodes, endpoints,
                                 lite_configs, rust_nodes, zero, governing_witnesses[checked['prev_key_block_seqno']],
@@ -526,10 +542,14 @@ def main():
     parser.add_argument('--interrupt-rust-member', type=int, choices=[2, 5])
     parser.add_argument('--recovery-timeout', type=float, default=180)
     parser.add_argument('--network-fault', choices=list(MODES))
+    parser.add_argument('--additional-network-faults', choices=list(MODES), nargs='*', default=[])
     parser.add_argument('--network-fault-member', type=int, choices=[2,5], default=2)
     parser.add_argument('--network-fault-seconds', type=float, default=12)
     parser.add_argument('--socket-mark-library', type=Path)
     args = parser.parse_args()
+    sequence = ([args.network_fault] if args.network_fault else []) + args.additional_network_faults
+    if args.additional_network_faults and not args.network_fault or len(sequence) > 4 or len(set(sequence)) != len(sequence):
+        raise SystemExit('Predeclare up to four distinct packet cases; repeats are not retries')
     if args.network_fault:
         require_namespace()
         if args.interrupt_rust_member is not None or args.prepare_genesis_only:
