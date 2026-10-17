@@ -1553,13 +1553,28 @@ fn test_certificate_ingress_excludes_upper_boundary_before_verification() {
         fixture.drain_receiver_actions();
         let boundary = fixture.processor.simplex_state.first_too_new_vote_slot().value();
         assert_eq!(boundary, 12);
-        let valid = build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, boundary, &[0,1,2]);
-        fixture.processor.on_certificate(source, valid);
-        let wrong_session = build_skip_certificate_tl(&UInt256::from([77;32]), &fixture.nodes, boundary, &[0,1,2]);
-        fixture.processor.on_certificate(source, wrong_session);
+        let id = TlCandidateId { slot: boundary as i32, hash: UInt256::from([42;32]) }.into_boxed();
+        let votes: Vec<rtos_api::ton::consensus::simplex::UnsignedVote> = vec![
+            SkipVote { slot: boundary as i32 }.into_boxed(),
+            rtos_api::ton::consensus::simplex::unsignedvote::NotarizeVote { id: id.clone() }.into_boxed(),
+            rtos_api::ton::consensus::simplex::unsignedvote::FinalizeVote { id }.into_boxed(),
+        ];
+        for vote in votes {
+            for session in [SessionId::default(), UInt256::from([77;32])] {
+                let preimage = crate::utils::create_data_to_sign(&session, &crate::utils::serialize_unsigned_vote(&vote));
+                let signatures = (0..3).map(|index| VoteSignature {
+                    who: index as i32,
+                    signature: fixture.nodes[index].public_key.sign(&preimage).unwrap().to_vec(),
+                }.into_boxed()).collect();
+                let certificate = Certificate { vote: vote.clone(), signatures: VoteSignatureSet { votes: signatures }.into_boxed() }.into_boxed();
+                fixture.processor.on_certificate(source, certificate);
+            }
+        }
         fixture.drain_pending_async_db_results();
         assert!(!fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(boundary)),
             "exclusive ingress boundary cannot be admitted");
+        assert!(!fixture.processor.simplex_state.has_finalize_certificate(SlotIndex::new(boundary)));
+        assert_eq!(fixture.processor.simplex_state.get_notarize_weight(SlotIndex::new(boundary), &UInt256::from([42;32])), 0);
         assert_eq!(fixture.processor.simplex_state.get_first_non_progressed_slot(), SlotIndex::new(0));
         assert_eq!(fixture.processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed), 0,
             "out-of-window certificate must not reach signature verification");

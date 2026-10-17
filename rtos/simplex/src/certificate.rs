@@ -459,12 +459,6 @@ impl<T: ToTlUnsignedVote> Certificate<T> {
             }
             voted[validator_idx.value() as usize] = true;
 
-            // Verify signature
-            let validator_key = desc.get_source_public_key(validator_idx);
-            if validator_key.verify_simplex(&vote_bytes, &sig.signature).is_err() {
-                fail!("Invalid vote signature for validator {}", validator_idx)
-            }
-
             voted_weight = rtos_block::checked_add_validator_weight(
                 voted_weight,
                 desc.get_node_weight(validator_idx),
@@ -480,6 +474,16 @@ impl<T: ToTlUnsignedVote> Certificate<T> {
                 voted_weight,
                 threshold
             )
+        }
+
+        // Fixed C++ certificate.cpp completes index/duplicate/weight checks
+        // before performing any signature verification.
+        for signature in &signatures {
+            let validator_idx = signature.validator_idx;
+            let validator_key = desc.get_source_public_key(validator_idx);
+            if validator_key.verify_simplex(&vote_bytes, &signature.signature).is_err() {
+                fail!("Invalid vote signature for validator {}", validator_idx)
+            }
         }
 
         Ok(Self { vote, signatures })

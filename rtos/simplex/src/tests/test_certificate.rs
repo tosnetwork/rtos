@@ -336,10 +336,16 @@ fn test_certificate_invalid_signature() {
     let signed = sign_vote(&fsm_vote, &session_id, &keys[0]).expect("sign_vote failed");
 
     // Create signature claiming to be from validator 1 (but signed by validator 0)
-    let signatures = vec![VoteSignature::new(
+    // Supply quorum weight so the signature check is reached after the
+    // structural/weight gate, as in fixed C++.
+    let mut signatures = vec![VoteSignature::new(
         ValidatorIndex::new(1), // Wrong validator!
         signed.signature().to_vec(),
     )];
+    for index in [0,2] {
+        let signature = sign_vote(&fsm_vote, &session_id, &keys[index]).unwrap();
+        signatures.push(VoteSignature::new(ValidatorIndex::new(index as u32), signature.signature().to_vec()));
+    }
 
     let cert: NotarCert = Certificate::new(vote.clone(), signatures);
     let tl_sigs = cert.to_tl_vote_signature_set();
@@ -565,5 +571,30 @@ fn test_unverified_certificate_weight_rejects_duplicate_and_unknown_signers() {
         let certificate = Certificate::new(create_test_vote(0), signatures);
         assert!(certificate.total_weight(&desc).is_err());
         assert!(!certificate.has_sufficient_weight(&desc));
+    }
+}
+
+
+#[test]
+fn test_certificate_structural_and_weight_checks_precede_signatures_like_cpp() {
+    let (description, _) = create_test_session_desc(4);
+    let session = create_test_session_id();
+    let vote = create_test_vote(3);
+    // Ordinary small fixtures: even an invalid signature must not change
+    // which earlier structural/weight condition is reported.
+    for (indices, expected) in [
+        (vec![0], "Not enough signatures"),
+        (vec![0,0], "Duplicate validator index"),
+        (vec![0,4], "Invalid validator index"),
+        (vec![0,1,2], "Invalid vote signature"),
+    ] {
+        let signatures = indices.into_iter().map(|index| {
+            VoteSignature::new(ValidatorIndex::new(index), vec![0;64])
+        }).collect();
+        let certificate: NotarCert = Certificate::new(vote.clone(), signatures);
+        let error = NotarCert::from_tl_signatures(
+            &certificate.to_tl_vote_signature_set(), vote.clone(), &description, &session,
+        ).unwrap_err().to_string();
+        assert!(error.contains(expected), "fixed CPP validation order: expected {expected}, got {error}");
     }
 }
