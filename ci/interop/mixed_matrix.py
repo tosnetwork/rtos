@@ -211,7 +211,7 @@ async def prepare_rust(args, directory, i, network, global_config, tcp_used, udp
         ip_address_quic=f'127.0.0.1:{reserve_port(socket.SOCK_DGRAM, udp_used)}',
         boot_from_zerostate=True, restore_db=True, archival_mode=None,
         validation_countdown_mode='except-zerostate', json_rpc_server={'address': address})
-    if args.verify_workchain:
+    if args.verify_workchain or args.verify_certificates:
         config['lite_server_port'] = reserve_port(socket.SOCK_STREAM, tcp_used)
     write(directory / 'default_config.json', config)
     (directory / 'node-log.yml').write_text(
@@ -331,7 +331,7 @@ async def run(args, root, snapshot, artifacts):
                 rust_nodes.append(dict(index=i, directory=directory, process=process, start_ticks=start_ticks))
                 endpoint_names.append(f'rust-{i}')
                 endpoints.append('http://' + address + '/jsonRPC')
-                if args.verify_workchain:
+                if args.verify_workchain or args.verify_certificates:
                     client = json.loads((directory / 'lite_client_config.json').read_text())
                     lite_configs.append(tos_api.Liteclient_config_global(
                         liteservers=[tos_api.Liteserver_desc(id=tos_api.Pub_ed25519(
@@ -408,6 +408,8 @@ async def run(args, root, snapshot, artifacts):
                         comparison_endpoint=endpoint_names[comparison_index], block=block,
                         body_transport='native_rust_rpc' if rust_nodes else 'native_cpp_liteserver')
                     if args.verify_certificates:
+                        sample['masterchain_state'] = await native_state(snapshot, lite_configs[0],
+                            endpoint_names[0], infos[0]['last'], directory / 'mc-state')
                         sample['governing_zerostate_boc'] = base64.b64encode(generated.file.read_bytes()).decode()
                         if rust_nodes:
                             certs = await asyncio.gather(*(asyncio.to_thread(rpc, url,
@@ -424,7 +426,7 @@ async def run(args, root, snapshot, artifacts):
                     checked = json.loads((directory / 'checked.json').read_text())
                     if args.verify_certificates:
                         check_committee_weights(checked, {i: 17 for i in range(member_count)},
-                            lambda i: hashlib.sha256(f'n6-validator-id-{i}'.encode()).hexdigest())
+                            lambda i: base64.b64encode(hashlib.sha256(f'n6-validator-id-{i}'.encode()).digest()).decode())
                     if args.verify_workchain:
                         tops = [top for top in checked['shard_tops']
                             if int(top['workchain']) == 0 and int(top['shard']) == -(1 << 63)
