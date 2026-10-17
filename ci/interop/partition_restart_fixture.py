@@ -24,6 +24,10 @@ async def hold(seconds, deadline, check):
 
 class PartitionRestart:
     def __init__(self, args, root, node, endpoint, member_id):
+        self.root = root
+        self.below_quorum = getattr(args, 'recovery_below_quorum', False)
+        self.quorum_plan = getattr(args, 'recovery_quorum_plan', None)
+        self.member_identity = member_id
         self.directory = root / 'recovery-partition'
         self.directory.mkdir()
         self.seconds = args.network_fault_seconds
@@ -65,6 +69,17 @@ class PartitionRestart:
         self.save()
 
     def survivor(self, checked):
+        if self.below_quorum:
+            from recovery_quorum_fixture import validate_below_quorum_checkpoint
+            observation = json.loads((self.root / 'recovery-quorum/receipt.json').read_text())
+            validate_below_quorum_checkpoint(checked, observation, self.quorum_plan, self.member_identity)
+            self.receipt.update(survivor_checkpoint=checked['block'],
+                survivor_kind='historical_checkpoint_after_below_quorum_stall',
+                below_quorum_observation=observation,
+                surviving_weight=self.quorum_plan['surviving_weight'],
+                total_weight=self.quorum_plan['total_weight'], quorum_weight=self.quorum_plan['quorum_weight'])
+            self.save()
+            return
         members = {m['validator_id']: m['weight'] for m in checked['configuration']['current']['members']}
         survivors = set(members) - {self.member_id}
         if self.member_id not in members or not checked['verified_final_certificates']:

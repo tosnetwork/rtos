@@ -111,6 +111,29 @@ class PartitionRestartTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(context.receipt['total_weight'], 68)
             self.assertEqual(context.receipt['surviving_weight'], 51)
 
+    async def test_below_quorum_uses_historical_checkpoint_without_claiming_new_survivor_certificate(self):
+        from recovery_quorum_fixture import recovery_quorum_plan
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); context, _ = self.context(root)
+            context.below_quorum = True
+            context.quorum_plan = recovery_quorum_plan({'successor_weights': {'0':10,'2':30,'4':10,'5':10}},2,True)
+            proof = self.proof(); proof['state_root_hash']='state'
+            for entry in proof['configuration']['current']['members']:
+                entry['weight']=context.quorum_plan['weights'][int(entry['validator_id'])]
+            proof['verified_final_certificates']=[{'validator_ids':['0','2','4'],'verified_weight':50}]
+            d=root/'recovery-quorum';d.mkdir()
+            observation={'phase':'observed_no_finality','plan':context.quorum_plan,'block':proof['block'],
+                'state_root_hash':'state','observation_count':60,'observation_elapsed_seconds':12.1,'required_observe_seconds':12}
+            # Real IDs include complete hashes; identity compares all fields.
+            proof['block'].update(workchain=-1,shard='-9223372036854775808',root_hash='root',file_hash='file')
+            (d/'receipt.json').write_text(json.dumps(observation))
+            context.survivor(proof)
+            self.assertEqual(context.receipt['surviving_weight'],30)
+            self.assertEqual(context.receipt['quorum_weight'],40)
+            self.assertNotIn('survivor_certificates',context.receipt)
+            self.assertEqual(context.receipt['survivor_kind'],'historical_checkpoint_after_below_quorum_stall')
+            context.close()
+
     async def test_plain_recovery_does_not_create_packet_fault(self):
         async def plain(*args):return {'phase': 'recovered'}
         with patch.object(rotation, '_recover_rotation_member', plain), \

@@ -227,6 +227,7 @@ async def _recover_rotation_member(args, root, nodes, endpoints, lite_configs, r
         checked = json.loads((target / 'checked.json').read_text())
         if {m['validator_id'] for m in checked['configuration']['current']['members']} != {member_id(i) for i in SUCCESSOR}:
             raise RuntimeError('Recovery checkpoint changed the successor committee')
+        check_committee_weights(checked, epoch_weights(json.loads(args.profile.read_text()), 'successor_weights', SUCCESSOR), member_id)
         if not checked['verified_governing_key_blocks'] or checked['key_block']:
             raise RuntimeError('Recovery checkpoint lacks successor finality')
         if with_workchain:
@@ -244,7 +245,14 @@ async def _recover_rotation_member(args, root, nodes, endpoints, lite_configs, r
         return checked, voted
 
     floor = max(info['last']['seqno'] for info in prior)
-    while True:
+    below_quorum = getattr(args, 'recovery_below_quorum', False)
+    if below_quorum:
+        from recovery_quorum_fixture import observe_below_quorum
+        survivor_infos = await observe_below_quorum(root, endpoints, zero, args.recovery_quorum_plan, deadline)
+        floor = survivor_infos[0]['last']['seqno']
+        survivor, _ = await check_checkpoint(survivor_infos, f'below-quorum-{floor}', False)
+        recovery_fault.survivor(survivor)
+    while not below_quorum:
         survivor_infos = await common_checkpoint([i for i in range(6) if i != index], floor)
         floor = survivor_infos[0]['last']['seqno']
         survivor, _ = await check_checkpoint(survivor_infos, f'survivors-{floor}', False)
@@ -699,6 +707,8 @@ def main():
     parser.add_argument('--rust-node', type=Path)
     parser.add_argument('--validator-preparer', type=Path)
     parser.add_argument('--interrupt-rust-member', type=int, choices=[2, 5])
+    parser.add_argument('--recovery-below-quorum', action='store_true',
+        help='Require a settled 12-second finality stall while the interrupted successor is needed for weighted quorum')
     parser.add_argument('--partition-restart', action='store_true',
         help='Keep the interrupted member partitioned through restart; fault seconds apply before survivor proof and after restart')
     parser.add_argument('--source-ack-intent-cut-point', choices=['after-fsync','before-write','after-partial-write'], default='after-fsync')
@@ -740,6 +750,8 @@ def main():
         if args.interrupt_rust_member is None or args.source_ack_fault or args.partition_restart or args.network_fault or args.additional_network_faults or args.prepare_genesis_only:
             raise SystemExit('Source retention cut requires one interrupted Rust member and no other injected fault')
         args.source_retention_cut_library = args.source_retention_cut_library.resolve()
+    if args.recovery_below_quorum and not args.partition_restart:
+        raise SystemExit('Below-quorum recovery requires the explicit partitioned original-DB restart')
     if args.partition_restart:
         if args.interrupt_rust_member is None or args.network_fault or args.additional_network_faults or args.prepare_genesis_only:
             raise SystemExit('Partition restart requires one interrupted Rust member and no separate packet cases')
@@ -780,6 +792,9 @@ def main():
         raise SystemExit('Observer budget must be a separate owned availability case')
     epoch_weights(profile, 'initial_weights', INITIAL)
     weights = epoch_weights(profile, 'successor_weights', SUCCESSOR)
+    if args.interrupt_rust_member is not None:
+        from recovery_quorum_fixture import recovery_quorum_plan
+        args.recovery_quorum_plan = recovery_quorum_plan(profile, args.interrupt_rust_member, args.recovery_below_quorum)
     if 'weighted_quorum_pause' in profile:
         if type(profile['weighted_quorum_pause']) is not list or any(type(i) is not int for i in profile['weighted_quorum_pause']) \
                 or profile['weighted_quorum_pause'] != [0, 2] or args.network_fault or args.interrupt_rust_member is not None:
@@ -813,7 +828,7 @@ def main():
     artifacts[str(driver)] = digest(driver)
     artifacts[str(helper)] = digest(helper)
     weighted_helpers = {}
-    for name in ['quorum_profile.py', 'weighted_quorum_fixture.py', 'observer_budget_fixture.py']:
+    for name in ['quorum_profile.py', 'weighted_quorum_fixture.py', 'observer_budget_fixture.py', 'recovery_quorum_fixture.py']:
         path = driver.with_name(name)
         artifacts[str(path)] = digest(path)
         weighted_helpers[name] = digest(path)
