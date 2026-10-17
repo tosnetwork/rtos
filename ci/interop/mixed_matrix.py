@@ -220,6 +220,8 @@ async def prepare_rust(args, directory, i, network, global_config, tcp_used, udp
     if getattr(args,'finality_diagnostics',False) and i==args.interrupt_rust_member:
         with (directory/'node-log.yml').open('a') as stream:
             stream.write("loggers:\n  simplex::consensus_controller:\n    level: trace\n"
+                "  simplex::candidate_controller:\n    level: trace\n"
+                "  simplex::receiver:\n    level: debug\n"
                 "  simplex::finality_delivery:\n    level: debug\n"
                 "  simplex_resolver:\n    level: debug\n")
     command = [args.validator_preparer, '--configs', directory,

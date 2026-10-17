@@ -12648,3 +12648,45 @@ fn test_deferred_finality_repair_cannot_be_downgraded_by_ordinary_requests() {
             .is_empty());
     }
 }
+
+#[test]
+fn test_query_repair_restores_absent_body_despite_retained_validation_decision() {
+    for rejected in [false, true] {
+        let mut fixture = TestFixture::new(4);
+        let (leader, id, candidate) = make_signed_block_broadcast(&fixture, 9, vec![1, 3, 5, 7]);
+        if rejected {
+            fixture.processor.validation.insert_rejected(id.clone());
+        } else {
+            fixture.processor.validation.insert_approved(
+                id.clone(),
+                (
+                    SystemTime::now(),
+                    consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new()),
+                ),
+            );
+        }
+        assert!(!fixture.processor.candidate_book().contains_received(&id));
+        let notar = make_notar_vote_signature_set_bytes(
+            fixture.processor.session_id(),
+            &fixture.nodes,
+            id.slot,
+            id.hash.clone(),
+            &[0, 1, 2],
+        );
+        fixture
+            .processor
+            .on_candidate_received(leader, candidate, Some(notar));
+        assert!(
+            fixture.processor.candidate_book().has_real_body(&id),
+            "a retained validation decision is not the missing candidate body"
+        );
+        if rejected {
+            assert!(
+                fixture.processor.validation.is_rejected(&id),
+                "data repair does not approve a rejected candidate"
+            );
+        } else {
+            assert!(fixture.processor.validation.approved_contains(&id));
+        }
+    }
+}

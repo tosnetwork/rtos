@@ -570,15 +570,11 @@ impl CandidateController {
             }
         }
 
-        // Check if candidate already known.
-        // A finalized-boundary stub (seeded by handle_block_finalized with empty data) is NOT
-        // "already known" for this purpose -- we want the real body to overwrite it.
-        let is_finalized_stub = self
-            .book
-            .received(&candidate_id)
-            .map(|r| !r.has_real_body())
-            .unwrap_or(false);
-        if !is_finalized_stub
+        // Validation decisions do not supply candidate contents. Both an absent
+        // entry and a finalized-boundary stub must accept an authenticated body
+        // again; keep the existing approval/rejection decision separately.
+        let body_missing = !self.book.has_real_body(&candidate_id);
+        if !body_missing
             && (b.candidate_known_in_validation(&candidate_id)
                 || self.book.contains_received(&candidate_id))
         {
