@@ -715,6 +715,37 @@ impl SourceFinalityDelivery {
             log::debug!("Source close not admitted: {error}");
         }
     }
+    /// Like C++ actor IO awaits, source closure maintenance must not execute
+    /// filesystem scans on the consensus event loop. Coalesce wakeups while
+    /// one scan is running; its Arc retains the namespace and shutdown receipt.
+    pub(crate) fn request_closing_maintenance(self: &Arc<Self>) -> Result<bool> {
+        if self.delivered_sink.is_none() {
+            return Ok(false);
+        }
+        {
+            let mut state = self.closing_maintenance.lock()
+                .map_err(|_| error!("Source maintenance scheduling poisoned"))?;
+            let now = std::time::Instant::now();
+            if state.running || now < state.next_attempt {
+                return Ok(false);
+            }
+            state.running = true;
+            state.next_attempt = now + std::time::Duration::from_secs(1);
+        }
+        let owner = self.clone();
+        let name = format!("SXClose-{}", &self.runtime.session_id().to_hex_string()[..8]);
+        if let Err(error) = std::thread::Builder::new().name(name).spawn(move || {
+            let _completion = ClosingMaintenanceCompletion(owner.clone());
+            if let Err(error) = owner.maintain_closing() {
+                log::error!("Source closure retained: {error}");
+            }
+        }) {
+            self.closing_maintenance.lock().unwrap().running = false;
+            return Err(error.into());
+        }
+        Ok(true)
+    }
+
     /// Bounded round-robin batch; failed requests wait at least one second.
     pub(crate) fn maintain_closing(self: &Arc<Self>) -> Result<()> {
         let _timing = self.operation_timer("maintain_closing");
@@ -1226,6 +1257,62 @@ mod tests {
         assert_eq!(locator.request().unwrap(), offer.request);
         assert!(locator.metadata().unwrap().signature_set.is_empty());
     }
+    #[test]
+    fn source_closing_maintenance_keeps_actor_responsive_and_namespace_owned() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let (_dir, runtime, store, _record, offer) = setup();
+        let namespace = store.directory.parent().unwrap().to_owned();
+        drop(store);
+        let confirm: DeliveredCompletionSink = Arc::new(|_, done| {
+            done(Ok(()));
+            Ok(())
+        });
+        let source = SourceFinalityDelivery::open_with_delivered(
+            runtime, &namespace, Arc::new(TerminalSink(offer)), Some(confirm),
+        ).unwrap();
+        source.close_cursor.lock().unwrap().0 = Instant::now() - Duration::from_secs(2);
+        source.closing_maintenance.lock().unwrap().next_attempt = Instant::now();
+        let receipt = source.namespace_release_receipt();
+        let store = source.store.clone();
+        let (scan_started_tx, scan_started) = mpsc::channel();
+        *store.scan_started.lock().unwrap() = Some(scan_started_tx);
+        // Hold the actual store's IO mutex. A synchronous actor scan would
+        // block here; cleanup below releases it even if the assertion fails.
+        let blocked_io = store.mutation.lock().unwrap();
+        let actor_source = source.clone();
+        let (returned_tx, returned) = mpsc::channel();
+        let actor = std::thread::spawn(move || {
+            let result = actor_source.request_closing_maintenance();
+            let _ = returned_tx.send(result);
+        });
+        let mut source = Some(source);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(returned.recv_timeout(Duration::from_secs(2))
+                .expect("actor must return while source IO is blocked").unwrap());
+            scan_started.recv_timeout(Duration::from_secs(2)).unwrap();
+            for _ in 0..1000 {
+                assert!(!source.as_ref().unwrap().request_closing_maintenance().unwrap(),
+                    "repeated actor wakeups must not enqueue additional scans");
+            }
+            drop(source.take());
+            assert!(!receipt.load(Ordering::Acquire),
+                "an in-flight IO worker must own the source namespace after actor retirement");
+            assert!(PendingFinalityStore::lock(namespace.join(DIRECTORY)).unwrap().is_none());
+        }));
+        drop(blocked_io);
+        drop(store);
+        actor.join().unwrap();
+        drop(source);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !receipt.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(receipt.load(Ordering::Acquire));
+        assert!(PendingFinalityStore::lock(namespace.join(DIRECTORY)).unwrap().is_some());
+        if let Err(error) = outcome { std::panic::resume_unwind(error); }
+    }
+
     #[test]
     fn source_delivered_namespace_receipt_waits_for_actual_confirmation_completion() {
         let (dir, runtime, store, _record, offer) = setup();

@@ -153,7 +153,7 @@ impl SessionCallbacks {
     pub(crate) fn maintain_finality_closing(&self) {
         let source = self.source_delivery.lock().unwrap().clone();
         if let Some(source) = source {
-            if let Err(error) = source.maintain_closing() {
+            if let Err(error) = source.request_closing_maintenance() {
                 log::error!("Source closure retained: {error}");
             }
         }

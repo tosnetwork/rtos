@@ -1145,9 +1145,25 @@ pub(crate) struct SourceFinalityDelivery {
     delivered_sink: Option<DeliveredCompletionSink>,
     closing: Mutex<std::collections::HashSet<UInt256>>,
     close_cursor: Mutex<(std::time::Instant, usize)>,
+    closing_maintenance: Mutex<ClosingMaintenance>,
     // Last field: publish release only after all stores and their file locks drop.
     namespace_release: SourceNamespaceRelease,
 }
+/// Scheduling state only: never hold this lock across filesystem work.
+struct ClosingMaintenance {
+    running: bool,
+    next_attempt: std::time::Instant,
+}
+
+/// A worker owns the source namespace until every synchronous scan operation
+/// has returned. Reset admission on errors or unwind as well as success.
+struct ClosingMaintenanceCompletion(Arc<SourceFinalityDelivery>);
+impl Drop for ClosingMaintenanceCompletion {
+    fn drop(&mut self) {
+        self.0.closing_maintenance.lock().unwrap().running = false;
+    }
+}
+
 /// Record slow source work on the consensus actor before changing its IO
 /// ownership. This preserves the durability boundary and identifies whether
 /// source persistence, rather than candidate generation, stalls live callbacks.
@@ -1216,6 +1232,10 @@ impl SourceFinalityDelivery {
             delivered_sink,
             closing: Mutex::new(std::collections::HashSet::new()),
             close_cursor: Mutex::new((std::time::Instant::now(), 0)),
+            closing_maintenance: Mutex::new(ClosingMaintenance {
+                running: false,
+                next_attempt: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            }),
             intents,
             start_masterchain: Mutex::new(None),
             stages: Mutex::new(std::collections::HashMap::new()),
