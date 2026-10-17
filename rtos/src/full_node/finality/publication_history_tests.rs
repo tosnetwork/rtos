@@ -163,7 +163,9 @@ fn expected_publication(source: &PendingFinalityRecord, block: &BlockStuff) -> P
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publication_history_capsule_real_engine_wal_reopen_and_revocation() {
-    for final_role in [false, true] {
+    for (final_role, interrupted_retention) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
         let (fixture, key_id) = history_fixture().await;
         let recovery = locator(&fixture);
         let input = draft(&fixture, final_role);
@@ -181,6 +183,13 @@ async fn publication_history_capsule_real_engine_wal_reopen_and_revocation() {
         assert!(ordinary.is_file(), "expected actual ordinary proof file before simulation");
         std::fs::rename(&ordinary, dir.path().join("unavailable-key-proof")).unwrap();
         retain_pending_finality(&recovery.namespace, &source).unwrap();
+        let source_path = recovery.namespace.join("finality-pending")
+            .join(format!("{}.json", source.id().unwrap().to_hex_string()));
+        let original_source = std::fs::read(&source_path).unwrap();
+        if interrupted_retention {
+            // Same bytes as an interrupted retain before its commit rename.
+            std::fs::rename(&source_path, source_path.with_extension("tmp")).unwrap();
+        }
         let source_root = actual_root.join("catchains");
         let capsule = actual_root.join("retired-history-v1");
         let withdrawn = dir.path().join("withdrawn-capsule");
@@ -221,6 +230,11 @@ async fn publication_history_capsule_real_engine_wal_reopen_and_revocation() {
             let source_owner = pending.pop().unwrap();
             assert_eq!(source_owner.record().id().unwrap(), source.id().unwrap());
             assert_eq!(source_owner.record().data, source.data);
+            if interrupted_retention {
+                assert!(!source_path.exists());
+                assert!(!source_path.with_extension("acked").exists());
+                assert_eq!(std::fs::read(source_path.with_extension("tmp")).unwrap(), original_source);
+            }
             std::fs::rename(&withdrawn, &capsule).unwrap();
             let id = stage(&sink, input.clone()).await.unwrap();
             assert_eq!(id, expected_id);
@@ -228,6 +242,7 @@ async fn publication_history_capsule_real_engine_wal_reopen_and_revocation() {
             // This is the real source store ACK operation, strictly after the
             // actual sink's WAL completion. It is not a fabricated Sent receipt.
             source_owner.acknowledge(id.clone()).unwrap();
+            assert!(!source_path.with_extension("tmp").exists());
             assert!(scan_pending_finality(&source_root).unwrap().is_empty());
             let accepted = tokio::time::timeout(
                 Duration::from_secs(20),

@@ -1068,12 +1068,18 @@ pub fn retain_pending_finality(
 pub struct PendingFinalityRecovery {
     store: Arc<PendingFinalityStore>,
     record: PendingFinalityRecord,
+    interrupted_retention: bool,
 }
 impl PendingFinalityRecovery {
     pub fn record(&self) -> &PendingFinalityRecord {
         &self.record
     }
     pub fn acknowledge(self, node_receipt: UInt256) -> Result<()> {
+        // Engine supplies this only after authenticating the original source
+        // and durably taking it over. Scanning a temporary is never a commit.
+        if self.interrupted_retention {
+            self.store.retain(&self.record)?;
+        }
         self.store.acknowledge(&self.record.id()?, node_receipt)
     }
 }
@@ -1115,7 +1121,26 @@ pub fn scan_pending_finality(root: &Path) -> Result<Vec<PendingFinalityRecovery>
             } else {
                 false
             };
-            paths.push((!resume_ack, path));
+            paths.push((if resume_ack { 1u8 } else { 2u8 }, path));
+        }
+        // paths() has already enforced regular-file and physical temporary
+        // quotas. Only a complete, exact source identity can be offered to the
+        // ordinary Engine recovery path. Unknown/torn files are never removed.
+        for entry in std::fs::read_dir(&store.directory)? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("tmp") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue; };
+            if stem.len() != 64 || !stem.bytes().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+            if path.with_extension("json").exists() || path.with_extension("acked").exists() {
+                fail!("Interrupted source retention conflicts with committed source");
+            }
+            // read() checks schema, bounds, body identity and filename/domain.
+            PendingFinalityRecord::read(&path)?;
+            paths.push((0u8, path));
         }
         paths.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         for (_, path) in paths {
@@ -1144,7 +1169,11 @@ pub fn scan_pending_finality(root: &Path) -> Result<Vec<PendingFinalityRecovery>
                 return Ok(records);
             }
             bytes += size;
-            records.push(PendingFinalityRecovery { store: store.clone(), record });
+            records.push(PendingFinalityRecovery {
+                store: store.clone(),
+                record,
+                interrupted_retention: path.extension().and_then(|s| s.to_str()) == Some("tmp"),
+            });
         }
     }
     Ok(records)
@@ -1845,6 +1874,66 @@ pub(crate) mod tests {
             assert_eq!(serde_json::to_vec(&ack.record).unwrap(), original);
             assert!(!temporary.exists());
             assert!(scan_pending_finality(temp.path()).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn source_finality_interrupted_retention_waits_for_node_takeover_before_commit() {
+        let temp = crate::authenticated_fixture::TestDirectory::new();
+        let (runtime, first) = fixture_seqno(true, ShardIdent::masterchain(), 1);
+        let (_, second) = fixture_seqno(true, ShardIdent::masterchain(), 2);
+        let (_, third) = fixture_seqno(true, ShardIdent::masterchain(), 3);
+        let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+        let store = PendingFinalityStore::open(&namespace).unwrap();
+        for draft in [&first, &second] {
+            store.retain(&PendingFinalityRecord::from_draft(&runtime, draft).unwrap()).unwrap();
+        }
+        let original = PendingFinalityRecord::from_draft(&runtime, &third).unwrap();
+        let id = original.id().unwrap();
+        let pending = store.directory.join(format!("{}.json", id.to_hex_string()));
+        let temporary = pending.with_extension("tmp");
+        let bytes = original.encode().unwrap();
+        std::fs::write(&temporary, &bytes).unwrap();
+        drop(store);
+        // A rejected/dropped Engine admission leaves the only original proof
+        // untouched. Reopening must offer it again, ahead of unrelated ACKs.
+        let recovered = scan_pending_finality(temp.path()).unwrap();
+        assert_eq!(recovered.len(), 3);
+        assert_eq!(recovered[0].record().id().unwrap(), id);
+        assert_eq!(std::fs::read(&temporary).unwrap(), bytes);
+        assert!(!pending.exists() && !pending.with_extension("acked").exists());
+        drop(recovered);
+        let recovered = scan_pending_finality(temp.path()).unwrap();
+        let fresh_receipt = UInt256::from([3; 32]);
+        for source in recovered { source.acknowledge(fresh_receipt.clone()).unwrap(); }
+        let ack: AcknowledgedRecord = serde_json::from_slice(
+            &std::fs::read(pending.with_extension("acked")).unwrap()).unwrap();
+        assert_eq!(ack.node_receipt, fresh_receipt.to_hex_string());
+        assert_eq!(serde_json::to_vec(&ack.record).unwrap(), bytes);
+        assert!(!temporary.exists() && !pending.exists());
+        assert!(scan_pending_finality(temp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn source_finality_invalid_retention_temporary_is_preserved() {
+        for kind in ["empty", "torn", "wrong_identity"] {
+            let temp = crate::authenticated_fixture::TestDirectory::new();
+            let (runtime, draft) = fixture();
+            let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+            let store = PendingFinalityStore::open(&namespace).unwrap();
+            let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
+            let name = if kind == "wrong_identity" { UInt256::from([7; 32]) } else { record.id().unwrap() };
+            let temporary = store.directory.join(format!("{}.tmp", name.to_hex_string()));
+            let bytes = match kind { "empty" => Vec::new(), "torn" => b"{torn".to_vec(), _ => record.encode().unwrap() };
+            std::fs::write(&temporary, &bytes).unwrap();
+            drop(store);
+            let error = scan_pending_finality(temp.path()).err().expect("invalid temporary admitted");
+            if kind == "wrong_identity" {
+                assert!(error.to_string().contains("filename/domain mismatch"));
+            }
+            assert_eq!(std::fs::read(&temporary).unwrap(), bytes);
+            assert!(!temporary.with_extension("json").exists());
+            assert!(!temporary.with_extension("acked").exists());
         }
     }
 
