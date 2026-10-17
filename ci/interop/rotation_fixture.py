@@ -450,10 +450,22 @@ async def run(args, profile, root, artifacts):
                         sample['governing_key_block'] = {**governing_witnesses[key_seqno], 'certificates': [proof]}
                     if profile.get('weighted_quorum_pause'):
                         for signer_index in committee:
-                            signature_set = await asyncio.to_thread(rpc, endpoints[signer_index],
-                                'getMasterchainBlockSignatures', {'seqno': key[2]})
-                            sample['certificates'].append({'kind': 'rpc',
-                                'name': endpoint_names[signer_index], 'value': signature_set})
+                            if args.rust_node and signer_index in [2, 3, 5]:
+                                signature_set = await asyncio.to_thread(rpc, endpoints[signer_index],
+                                    'getMasterchainBlockSignatures', {'seqno': key[2]})
+                                sample['certificates'].append({'kind': 'rpc',
+                                    'name': endpoint_names[signer_index], 'value': signature_set})
+                            elif signer_index != 0:
+                                # Fixed C++ toslib's signature JSON API first
+                                # looks up seqno-1, which has no block-0 header.
+                                # Its native finality export supports that same
+                                # exact target and preserves full certificates.
+                                proof_dir = directory / f'certificate-{signer_index}'
+                                proof_dir.mkdir()
+                                own_proof = await cpp_certificate(args.snapshot, nodes[signer_index],
+                                    zero, infos[0]['last'], proof_dir)
+                                own_proof['name'] = endpoint_names[signer_index]
+                                sample['certificates'].append(own_proof)
                     tops = [top for top in checked['shard_tops'] if int(top['workchain']) == 0 and int(top['seqno']) > 0]
                     if tops and len(epochs[phase]['wc_creators']) < 4:
                         top = tops[0]; wc_dir = directory / 'workchain'; wc_dir.mkdir()
