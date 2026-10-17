@@ -13,8 +13,15 @@ from quorum_profile import check_committee_weights
 
 def expiry_plan(profile, args):
     member = getattr(args, 'signer_expiry_member', None)
-    if member is None:return None
-    if member != 5 or args.interrupt_rust_member != 2 or not args.source_ack_partition_restart \
+    passive = getattr(args, 'expired_member_restart', False)
+    if member is None:
+        if passive:raise ValueError('Expired member restart requires its explicit finite expiry')
+        return None
+    if passive:
+        if member != 5 or args.interrupt_rust_member != 5 or not args.source_ack_partition_restart \
+                or args.recovery_below_quorum or args.source_ack_fault not in ['sync-eio','write-enospc']:
+            raise ValueError('Expired member restart requires member5 ACK/partition restart with surviving quorum')
+    elif member != 5 or args.interrupt_rust_member != 2 or not args.source_ack_partition_restart \
             or not args.recovery_below_quorum or args.source_ack_fault != 'sync-eio':
         raise ValueError('Signer expiry requires the declared member5 plus member2 ACK/partition restart combination')
     if any(profile.get(k) for k in ['weighted_quorum_pause','initial_probe_pause','observer_budget']):
@@ -23,8 +30,8 @@ def expiry_plan(profile, args):
     if epoch_weights(profile,'successor_weights',[0,2,4,5]) != {i:17 for i in [0,2,4,5]}:
         raise ValueError('Signer expiry combination requires the original equal-weight committee')
     return {'member':5, 'expire_at':profile['genesis_time']+profile['activation_delay']+50,
-        'interrupted_member':2, 'quorum_weight':46, 'total_weight':68,
-        'surviving_weight_during_interruption':34, 'surviving_weight_after_restart':51}
+        'interrupted_member':5 if passive else 2, 'quorum_weight':46, 'total_weight':68,
+        'surviving_weight_during_interruption':51 if passive else 34, 'surviving_weight_after_restart':51}
 
 
 class SignerExpiry:
@@ -111,6 +118,18 @@ class SignerExpiry:
             self.save();return checked
 
     async def complete(self,recovered):
+        if getattr(self.args,'expired_member_restart',False):
+            if self.receipt['phase']!='qualified_before_interruption':
+                raise RuntimeError('Expired restart lacks qualified natural expiry evidence')
+            process=self.node['process'];ticks=self.node['start_ticks']
+            if process.pid==self.pid or process.returncode is not None or Path(f'/proc/{process.pid}/stat').read_text().split()[21]!=ticks:
+                raise RuntimeError('Expired full node did not remain alive as a new process')
+            if time.monotonic()>=self.deadline:raise TimeoutError('Expired restart exceeded the original recovery deadline')
+            if any(digest(Path(p))!=h for p,h in self.bindings.items()):raise RuntimeError('Expired restart changed signing authority')
+            self.receipt.update(phase='expired_member_restarted_without_signing',new_pid=process.pid,new_start_ticks=ticks,
+                last_checkpoint=recovered['last_checkpoint'],authority_unchanged=True,old_process_replaced=True,
+                full_node_observation=recovered['expired_full_node'])
+            self.save();return
         self.alive()
         self.receipt.update(phase='recovered_with_peer_still_expired',last_checkpoint=recovered['last_checkpoint'],
             same_expired_process=True,authority_unchanged=True)

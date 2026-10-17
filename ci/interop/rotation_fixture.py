@@ -289,7 +289,25 @@ async def _recover_rotation_member(args, root, nodes, endpoints, lite_configs, r
     minimum_wc = max((int(top['seqno']) for top in survivor['shard_tops'] if int(top['workchain']) == 0), default=0)
     leaders = {}
     vote = None
-    while len(leaders) < 2 or vote is None:
+    if getattr(args, 'expired_member_restart', False):
+        from expired_member_restart_fixture import ExpiredFullNodeAcceptance
+        acceptance = ExpiredFullNodeAcceptance(member_id, restarted_at, minimum_wc, deadline,
+            args.signer_expiry_observer.session)
+        while True:
+            infos = await common_checkpoint(list(range(6)), floor)
+            floor = infos[0]['last']['seqno']
+            checked, voted = await check_checkpoint(infos, str(floor), True)
+            done = acceptance.observe(checked, voted, directory / str(floor))
+            receipt.update(phase='observing_expired_full_node',last_checkpoint=checked['block'],
+                expired_full_node={'member':index,'expire_at':args.signer_expiry_plan['expire_at'],
+                    'required_observation_seconds':12,'samples':acceptance.samples})
+            write(directory / 'recovery.json', receipt)
+            if done:
+                log = (node['directory'] / 'node-restart.log').read_text(errors='replace')
+                receipt['expired_full_node']['refusal_line'] = acceptance.refusal(log)
+                receipt['expired_full_node']['signing_authority_restored'] = False
+                break
+    while not getattr(args, 'expired_member_restart', False) and (len(leaders) < 2 or vote is None):
         infos = await common_checkpoint(list(range(6)), floor)
         floor = infos[0]['last']['seqno']
         checked, voted = await check_checkpoint(infos, str(floor), True)
@@ -721,6 +739,8 @@ def main():
     parser.add_argument('--rust-node', type=Path)
     parser.add_argument('--validator-preparer', type=Path)
     parser.add_argument('--interrupt-rust-member', type=int, choices=[2, 5])
+    parser.add_argument('--expired-member-restart', action='store_true',
+        help='Restart the expired member5 as a synchronized full node without restoring signing authority')
     parser.add_argument('--signer-expiry-member', type=int, choices=[5],
         help='Offline-provision member5 custody to expire 50 seconds after successor activation')
     parser.add_argument('--recovery-below-quorum', action='store_true',
@@ -815,7 +835,7 @@ def main():
     if args.interrupt_rust_member is not None:
         from recovery_quorum_fixture import recovery_quorum_plan
         args.recovery_quorum_plan = recovery_quorum_plan(profile, args.interrupt_rust_member, args.recovery_below_quorum,
-            unavailable=(5,) if args.signer_expiry_plan else ())
+            unavailable=(5,) if args.signer_expiry_plan and not args.expired_member_restart else ())
     if 'weighted_quorum_pause' in profile:
         if type(profile['weighted_quorum_pause']) is not list or any(type(i) is not int for i in profile['weighted_quorum_pause']) \
                 or profile['weighted_quorum_pause'] != [0, 2] or args.network_fault or args.interrupt_rust_member is not None:
@@ -849,7 +869,7 @@ def main():
     artifacts[str(driver)] = digest(driver)
     artifacts[str(helper)] = digest(helper)
     weighted_helpers = {}
-    for name in ['quorum_profile.py', 'weighted_quorum_fixture.py', 'observer_budget_fixture.py', 'recovery_quorum_fixture.py', 'signer_expiry_fixture.py']:
+    for name in ['quorum_profile.py', 'weighted_quorum_fixture.py', 'observer_budget_fixture.py', 'recovery_quorum_fixture.py', 'signer_expiry_fixture.py', 'expired_member_restart_fixture.py']:
         path = driver.with_name(name)
         artifacts[str(path)] = digest(path)
         weighted_helpers[name] = digest(path)
