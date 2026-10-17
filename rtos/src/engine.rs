@@ -1346,6 +1346,7 @@ impl Engine {
         }
         futures::future::join_all(tasks).await;
 
+        log::info!(target: "engine_shutdown", "Joining full-node overlays and out-message queues");
         let (router_result, queue_result) = tokio::join!(
             async {
                 if let Some(router) = &router {
@@ -1376,7 +1377,9 @@ impl Engine {
         }
         drop(router);
         drop(queue);
+        log::info!(target: "engine_shutdown", "Full-node overlays and out-message queues joined");
 
+        log::info!(target: "engine_shutdown", "Joining background sampling and broadcast ingress");
         if let Err(error) = self.background_tasks.wait().await {
             self.stopper.report_service_failure(0, format!("background sampling: {error}"));
         }
@@ -1384,15 +1387,18 @@ impl Engine {
             self.stopper.report_service_failure(0, format!("broadcast ingress: {error}"));
         }
 
+        log::info!(target: "engine_shutdown", "Joining pending finality recovery");
         if let Err(error) = finality_tasks.wait().await {
             self.stopper.report_service_failure(0, format!("finality recovery: {error}"));
         }
 
+        log::info!(target: "engine_shutdown", "Joining node services");
         if let Err(error) = self.service_tasks.wait().await {
             self.stopper.report_service_failure(0, format!("service ownership: {error}"));
         }
         // Publication acceptance may write shard state. Its actor and every
         // admitted blocking WAL operation must finish before state DB shutdown.
+        log::info!(target: "engine_shutdown", "Joining publication worker");
         if let Some(worker) = publication_worker {
             if let Err(error) = worker.wait().await {
                 self.stopper.report_service_failure(0, format!("publication worker: {error}"));
@@ -1400,6 +1406,7 @@ impl Engine {
         }
         self.publication_worker.lock().unwrap().take();
         // An unknown validator teardown retains its bit and blocks DB shutdown.
+        log::info!(target: "engine_shutdown", "Waiting for service flags before state database drain");
         let _ = self.stopper.clone().wait_stop_except(Self::MASK_SERVICE_SHARDSTATE_GC).await;
         #[cfg(test)]
         self.state_db_stop_started.store(true, Ordering::Release);
