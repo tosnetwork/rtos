@@ -1246,21 +1246,13 @@ impl QuicNode {
         // A key command already executing when shutdown started may have created
         // an endpoint. No key worker remains now, so this snapshot is final.
         self.shutdown();
-        let endpoints: Vec<_> =
-            self.endpoints.lock().unwrap().values().map(|state| state.endpoint.clone()).collect();
-        for endpoint in endpoints {
-            log::info!(target: TARGET, "QUIC shutdown: waiting for endpoint idle");
-            tokio::select! {
-                _ = endpoint.wait_idle() => {},
-                // A failed driver may no longer deliver idle notifications.
-                // Release its endpoint refs and join the remaining drivers;
-                // their retained error is returned below.
-                _ = self.drivers.cancelled() => {},
-            }
-        }
-        log::info!(target: TARGET, "QUIC shutdown: endpoints idle, releasing endpoint and connection handles");
-        // wait_idle only drains connections. Quinn's endpoint driver terminates
-        // after its last Endpoint reference drops; it still owns the UDP socket.
+        // Pinned C++ 8f083dc QuicServer::close_connection reclaims locally
+        // without waiting for peer acknowledgement. Application subscribers are
+        // already joined above; Quinn's close/draining timers must not keep the
+        // node alive. Cancel the owned drivers, then join their real termination
+        // below before reporting the UDP sockets released.
+        log::info!(target: TARGET, "QUIC shutdown: cancelling local drivers and releasing connection handles");
+        self.drivers.close();
         self.endpoints.lock().unwrap().clear();
         // Closed Connection handles retain their UDP socket too.
         let keys: Vec<_> = self.local_keys.iter().map(|entry| entry.key().clone()).collect();
