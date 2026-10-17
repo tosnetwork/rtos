@@ -747,6 +747,7 @@ def main():
     parser.add_argument('--rust-node', type=Path)
     parser.add_argument('--validator-preparer', type=Path)
     parser.add_argument('--interrupt-rust-member', type=int, choices=[2, 5])
+    parser.add_argument('--finality-diagnostics', action='store_true', help='Trace finality dependencies on the interrupted Rust node')
     parser.add_argument('--expired-member-restart', action='store_true',
         help='Restart the expired member5 as a synchronized full node without restoring signing authority')
     parser.add_argument('--signer-expiry-member', type=int, choices=[5],

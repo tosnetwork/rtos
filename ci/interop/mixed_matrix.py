@@ -217,6 +217,11 @@ async def prepare_rust(args, directory, i, network, global_config, tcp_used, udp
     (directory / 'node-log.yml').write_text(
         "appenders:\n  console:\n    kind: console\n    encoder:\n      pattern: '{m}{n}'\n"
         "root:\n  level: info\n  appenders: [console]\n")
+    if getattr(args,'finality_diagnostics',False) and i==args.interrupt_rust_member:
+        with (directory/'node-log.yml').open('a') as stream:
+            stream.write("loggers:\n  simplex::consensus_controller:\n    level: trace\n"
+                "  simplex::finality_delivery:\n    level: debug\n"
+                "  simplex_resolver:\n    level: debug\n")
     command = [args.validator_preparer, '--configs', directory,
         '--global-config', directory / 'global.json', '--zerostate', directory / 'zero' /
         (network.zerostate.masterchain.file_hash.hex() + '.boc'), '--member', i]
