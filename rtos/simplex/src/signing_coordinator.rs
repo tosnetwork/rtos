@@ -695,12 +695,8 @@ impl SigningCoordinator {
             persisted?;
             state.records.insert(k, record);
             self.checkpoint("after_signed")?;
-            self.live(&mut state)?;
             Ok(bytes)
         })();
-        if result.is_err() {
-            state.poisoned = true;
-        }
         let total_elapsed = started.elapsed();
         if total_elapsed >= Duration::from_millis(100) {
             // These write timings include storage queueing and durable completion;
@@ -709,7 +705,7 @@ impl SigningCoordinator {
             let measured = lock_elapsed + intent_elapsed + signing_elapsed
                 + verification_elapsed + signed_elapsed;
             log::warn!(
-                "SIGNING_FLOW: session={} kind={} slot={} success={} lock_ms={} \
+                "SIGNING_FLOW: session={} kind={} slot={} pre_release_ok={} lock_ms={} \
                 intent_write_ms={} sign_ms={} verify_ms={} signed_write_ms={} other_ms={} total_ms={}",
                 UInt256::from(state.header.binding.session).to_hex_string(),
                 kind,
@@ -723,6 +719,15 @@ impl SigningCoordinator {
                 total_elapsed.saturating_sub(measured).as_millis(),
                 total_elapsed.as_millis(),
             );
+        }
+        // Console logging can itself block. Keep the final authority/expiry
+        // check after diagnostics, immediately before releasing signed bytes.
+        let result = result.and_then(|bytes| {
+            self.live(&mut state)?;
+            Ok(bytes)
+        });
+        if result.is_err() {
+            state.poisoned = true;
         }
         result
     }
