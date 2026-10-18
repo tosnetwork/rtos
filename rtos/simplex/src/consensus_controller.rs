@@ -1952,6 +1952,12 @@ impl ConsensusController {
 
             if workchain {
                 if !body_available && !block_below_applied_floor {
+                    log::debug!(target: "simplex_resolver",
+                        "WC_FINALITY_BODY_PENDING: session={} source_slot={} source_hash={} dependency_slot={} dependency_hash={} hash_data_bytes={} body_bytes={} empty={} required_remaining={}",
+                        self.session_id().to_hex_string(), trigger_id.slot.value(), trigger_id.hash.to_hex_string(),
+                        current_id.slot.value(), current_id.hash.to_hex_string(),
+                        received.candidate_hash_data_bytes.len(), received.data.data().len(), received.is_empty,
+                        remaining_required.len());
                     backend.request_candidate_for_finality(current_id.slot, current_id.hash.clone(), Some(Duration::ZERO));
                     return false;
                 }
@@ -2334,10 +2340,18 @@ impl ConsensusController {
         let mut cursor = candidate.clone();
         for _ in 0..MAX_CHAIN_DEPTH {
             let Some(received) = backend.candidate_book().received(&cursor) else {
+                log::debug!(target: "simplex_resolver",
+                    "RECOVERY_ANCESTRY_PENDING: session={} candidate_slot={} candidate_hash={} dependency_slot={} dependency_hash={} reason=missing_metadata",
+                    self.session_id().to_hex_string(), candidate.slot.value(), candidate.hash.to_hex_string(),
+                    cursor.slot.value(), cursor.hash.to_hex_string());
                 backend.request_candidate_for_finality(cursor.slot, cursor.hash, Some(Duration::ZERO));
                 return false;
             };
             if received.candidate_hash_data_bytes.is_empty() {
+                log::debug!(target: "simplex_resolver",
+                    "RECOVERY_ANCESTRY_PENDING: session={} candidate_slot={} candidate_hash={} dependency_slot={} dependency_hash={} reason=missing_hash_data",
+                    self.session_id().to_hex_string(), candidate.slot.value(), candidate.hash.to_hex_string(),
+                    cursor.slot.value(), cursor.hash.to_hex_string());
                 backend.request_candidate_for_finality(cursor.slot, cursor.hash, Some(Duration::ZERO));
                 return false;
             }
@@ -2352,6 +2366,10 @@ impl ConsensusController {
                 return true;
             }
             if backend.simplex_state().get_notarize_certificate(parent.slot, &parent.hash).is_none() {
+                log::debug!(target: "simplex_resolver",
+                    "RECOVERY_ANCESTRY_PENDING: session={} candidate_slot={} candidate_hash={} dependency_slot={} dependency_hash={} reason=missing_notar",
+                    self.session_id().to_hex_string(), candidate.slot.value(), candidate.hash.to_hex_string(),
+                    parent.slot.value(), parent.hash.to_hex_string());
                 backend.request_candidate_for_finality(parent.slot, parent.hash, Some(Duration::ZERO));
                 return false;
             }
