@@ -226,7 +226,10 @@ async def prepare_rust(args, directory, i, network, global_config, tcp_used, udp
                 "  simplex::finality_delivery:\n    level: debug\n"
                 "  simplex_resolver:\n    level: debug\n"
                 "  rtos::publication_worker:\n    level: debug\n"
-                "  rtos::network::full_node_overlays:\n    level: debug\n")
+                "  rtos::network::full_node_overlays:\n    level: debug\n"
+                "  rtos::network::overlay_client:\n    level: debug\n"
+                "  overlay:\n    level: debug\n"
+                "  dht:\n    level: debug\n")
     command = [args.validator_preparer, '--configs', directory,
         '--global-config', directory / 'global.json', '--zerostate', directory / 'zero' /
         (network.zerostate.masterchain.file_hash.hex() + '.boc'), '--member', i]
