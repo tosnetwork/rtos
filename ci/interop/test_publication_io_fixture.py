@@ -94,6 +94,21 @@ class PublicationIoFixtureTests(unittest.TestCase):
         for record in [{'is_final':False,'data':'ab'},{'is_final':True,'data':''}]:
             with self.assertRaises(RuntimeError):selector_for(record,'a'*64,10)
 
+    def test_expiry_plan_accepts_only_complete_explicit_node_io_composition(self):
+        from signer_expiry_fixture import expiry_plan
+        def args():return SimpleNamespace(signer_expiry_member=5,interrupt_rust_member=5,
+            expired_member_restart=True,source_ack_partition_restart=False,recovery_below_quorum=False,
+            source_ack_fault=None,publication_io_library=Path('io.so'),partition_restart=True,
+            source_retention_cut_library=Path('retain.so'),source_retention_cut_point='after-fsync')
+        profile={'genesis_time':1000,'activation_delay':90}
+        plan=expiry_plan(profile,args())
+        self.assertEqual((plan['expire_at'],plan['total_weight'],plan['quorum_weight'],plan['surviving_weight_during_interruption']),(1140,68,46,51))
+        for field,value in [('partition_restart',False),('source_retention_cut_library',None),
+                            ('source_retention_cut_point','before-write'),('source_ack_fault','sync-eio'),
+                            ('interrupt_rust_member',2),('recovery_below_quorum',True)]:
+            changed=args();setattr(changed,field,value)
+            with self.subTest(field=field),self.assertRaises(ValueError):expiry_plan(profile,changed)
+
     def test_followup_requires_expired_original_restart_for_new_case(self):
         validate_followup_frontier(SimpleNamespace(followup_intent_frontier=True,
             expired_member_restart=True,publication_io_library=Path('fault.so')))

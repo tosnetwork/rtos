@@ -18,9 +18,15 @@ def expiry_plan(profile, args):
         if passive:raise ValueError('Expired member restart requires its explicit finite expiry')
         return None
     if passive:
-        if member != 5 or args.interrupt_rust_member != 5 or not args.source_ack_partition_restart \
-                or args.recovery_below_quorum or args.source_ack_fault not in ['sync-eio','write-enospc']:
-            raise ValueError('Expired member restart requires member5 ACK/partition restart with surviving quorum')
+        ack_case = args.source_ack_partition_restart and args.source_ack_fault in ['sync-eio','write-enospc']
+        node_io_case = bool(getattr(args, 'publication_io_library', None)) \
+            and getattr(args, 'partition_restart', False) \
+            and bool(getattr(args, 'source_retention_cut_library', None)) \
+            and getattr(args, 'source_retention_cut_point', None) == 'after-fsync' \
+            and not args.source_ack_partition_restart and args.source_ack_fault is None
+        if member != 5 or args.interrupt_rust_member != 5 or args.recovery_below_quorum \
+                or not (ack_case or node_io_case):
+            raise ValueError('Expired member restart requires member5 explicit ACK or node-body IO/partition restart with surviving quorum')
     elif member != 5 or args.interrupt_rust_member != 2 or not args.source_ack_partition_restart \
             or not args.recovery_below_quorum or args.source_ack_fault != 'sync-eio':
         raise ValueError('Signer expiry requires the declared member5 plus member2 ACK/partition restart combination')
