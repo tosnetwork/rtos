@@ -1738,6 +1738,66 @@ mod transport_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn semiprivate_pending_root_recovers_after_late_adnl_address() {
+        let a = endpoint_with_profile(131, rtos_api::WireProfile::T0).await;
+        let b = endpoint_with_profile(132, rtos_api::WireProfile::T0).await;
+        let id = OverlayShortId::from_data([133; 32]);
+        let roots = vec![a.key.id().clone(), b.key.id().clone()];
+        let mut delayed = Vec::new();
+        for local in [&a, &b] {
+            local.overlay.add_semiprivate_overlay(
+                OverlayParams::with_id_only(&id), Some(&local.key), &roots, &roots,
+                None, 1, true,
+            ).unwrap();
+            local.subscriptions.lock().unwrap()
+                .push(local.overlay.subscribe_broadcast(&id).unwrap());
+            local.overlay.configure_plumtree(&id, config(&a.key),
+                &tokio::runtime::Handle::current()).unwrap();
+            assert!(local.overlay.get_overlay(&id, "late root").unwrap()
+                .plumtree_neighbours().is_empty());
+            let raw = local.overlay.get_overlay(&id, "late initialization").unwrap();
+            let pending = raw.pending_peers.pop().expect("the authenticated remote root is pending");
+            assert!(raw.pending_peers.pop().is_none());
+            delayed.push((raw, pending));
+        }
+        // Model creation being preempted before add_peers_to_overlay: the
+        // maintenance task first observes an empty queue. Restore only the
+        // same root that the authenticated constructor originally enqueued.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        for (raw, pending) in delayed { raw.pending_peers.push(pending); }
+        for (local, remote) in [(&a, &b), (&b, &a)] {
+            local.quic.add_peer_key(remote.key.id().clone(), remote.addr).unwrap();
+            let ip = IpAddress::from_versioned_string(&remote.addr.to_string(), None).unwrap();
+            local.overlay.adnl.add_peer(local.key.id(), &ip, Some(&ip), &remote.key).unwrap();
+        }
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if [&a, &b].iter().all(|local|
+                    local.overlay.get_overlay(&id, "late root").unwrap()
+                        .plumtree_neighbours().len() == 1) { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await;
+        if ready.is_ok() {
+            let data = b"authenticated root became reachable after creation";
+            let mut received = b.subscriptions.lock().unwrap().pop().unwrap();
+            a.overlay.broadcast_plumtree(&id, &a.key, Certificate::Overlay_EmptyCertificate,
+                0, Some([134; 32]), data).await.unwrap();
+            let delivered = tokio::time::timeout(Duration::from_secs(5), received.recv())
+                .await.expect("actual semiprivate broadcast delivery").unwrap().unwrap();
+            assert_eq!(delivered.data, data);
+            assert_eq!(delivered.recv_from, *a.key.id());
+        }
+        for local in [&a, &b] {
+            let generation = local.overlay.overlay_generation(&id).unwrap();
+            local.overlay.delete_public_overlay_checked(&generation).await.unwrap();
+            local.quic.shutdown_and_wait().await.unwrap();
+            local.overlay.adnl.stop_checked().await.unwrap();
+        }
+        assert!(ready.is_ok(), "semiprivate pending roots never consumed their late ADNL addresses");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn overlay_retirement_releases_real_quic_stream_credit_wait() {
         let (a, b, id) = pair().await;
         let mut received = b.subscriptions.lock().unwrap().pop().unwrap();

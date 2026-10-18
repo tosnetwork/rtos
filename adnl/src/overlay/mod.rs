@@ -2482,7 +2482,7 @@ impl OverlayNode {
                 }
             });
             tasks.spawn_cancelable("overlay maintenance", async move {
-                let local_adnl_key = if overlay.overlay_type.is_private() {
+                let local_adnl_key = if !overlay.overlay_type.is_public() {
                     Some(overlay.overlay_key().unwrap_or(&default_key).id())
                 } else {
                     None
@@ -2505,6 +2505,9 @@ impl OverlayNode {
                     } else {
                         base_tick_ms
                     };
+                    // An empty pass only chooses the idle cadence. Creation or
+                    // address discovery may enqueue an authorized peer later.
+                    has_pending = local_adnl_key.is_some();
                     if timeout_broadcast_gc >= Self::TIMEOUT_BROADCAST_GC_MS {
                         timeout_broadcast_gc = 0;
                         overlay

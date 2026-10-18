@@ -611,6 +611,8 @@ struct State {
     ready: tokio::sync::watch::Sender<Option<std::result::Result<(), String>>>,
     cursor: Mutex<(u64, std::collections::BTreeMap<u64, usize>)>,
     acceptance_turn: AtomicBool,
+    close_send_turn: AtomicBool,
+    close_interest: Mutex<std::collections::BTreeSet<u64>>,
     acceptance_verified: Mutex<std::collections::BTreeSet<u64>>,
     accepted_receipts: Mutex<AcceptanceCache>,
     #[cfg(test)]
@@ -621,6 +623,8 @@ struct State {
     background_acceptance_runs: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     background_routing_turns: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    background_paused: AtomicBool,
     acceptance_cursor: Mutex<u64>,
     acceptance_retry: Mutex<std::collections::BTreeMap<u64, tokio::time::Instant>>,
     retry_after: Mutex<std::collections::BTreeMap<(u64, PublicationEffect), tokio::time::Instant>>,
@@ -649,6 +653,8 @@ impl PublicationWorker {
             ready: tokio::sync::watch::channel(None).0,
             cursor: Mutex::new(Default::default()),
             acceptance_turn: AtomicBool::new(true),
+            close_send_turn: AtomicBool::new(true),
+            close_interest: Mutex::new(Default::default()),
             acceptance_verified: Mutex::new(Default::default()),
             accepted_receipts: Mutex::new(Default::default()),
             #[cfg(test)]
@@ -659,6 +665,8 @@ impl PublicationWorker {
             background_acceptance_runs: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             background_routing_turns: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            background_paused: AtomicBool::new(false),
             acceptance_cursor: Mutex::new(0),
             acceptance_retry: Mutex::new(Default::default()),
             retry_after: Mutex::new(Default::default()),
@@ -864,6 +872,12 @@ impl PublicationWorker {
     #[cfg(test)]
     pub(crate) fn test_actual_acceptance_runs(&self) -> usize {
         self.state.actual_acceptance_runs.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pause_background(&self, paused: bool) {
+        self.state.background_paused.store(paused, Ordering::Release);
+        if !paused { self.state.wake.notify_one(); }
     }
     #[cfg(test)]
     pub(crate) fn test_background_runs(&self) -> (usize, usize) {
@@ -1468,35 +1482,47 @@ impl State {
         {
             let mut cursor = self.cursor.lock().unwrap();
             let mut retry = self.retry_after.lock().unwrap();
+            let mut closing = self.close_interest.lock().unwrap();
+            closing.retain(|id| entries.iter().any(|entry|
+                entry.id.0 == *id && entry.stage != PublicationStage::Completed));
             cursor.1.retain(|id, _| entries.iter().any(|entry| entry.id.0 == *id));
             retry.retain(|(id, effect), _| {
                 entries.iter().any(|entry| entry.id.0 == *id && entry.pending.contains(effect))
             });
             let start = entries.iter().position(|entry| entry.id.0 > cursor.0).unwrap_or(0);
             let mut selected = None;
-            for index in 0..entries.len() {
-                let entry = &entries[(start + index) % entries.len()];
-                // Expired intents stay durable, but cannot delay live work.
-                if entry.stage != PublicationStage::Ready || entry.record.is_expired(now_unix_secs)
-                {
-                    continue;
-                }
-                let offset = *cursor.1.get(&entry.id.0).unwrap_or(&0);
-                for step in 0..entry.pending.len() {
-                    let index = (offset + step) % entry.pending.len();
-                    let effect = &entry.pending[index];
-                    if retry.get(&(entry.id.0, effect.clone())).is_some_and(|at| *at > now) {
+            // A bound source is waiting for this delivery's actual effects.
+            // Alternate that class with ordinary traffic when both are ready;
+            // neither class bypasses expiry, exact targets or retry backoff.
+            let prefer_close = self.close_send_turn.load(Ordering::Acquire);
+            for close_turn in [prefer_close, !prefer_close] {
+                for index in 0..entries.len() {
+                    let entry = &entries[(start + index) % entries.len()];
+                    if closing.contains(&entry.id.0) != close_turn { continue; }
+                    // Expired intents stay durable, but cannot delay live work.
+                    if entry.stage != PublicationStage::Ready || entry.record.is_expired(now_unix_secs)
+                    {
                         continue;
                     }
-                    cursor.0 = entry.id.0;
-                    cursor.1.insert(entry.id.0, index + 1);
-                    retry.insert((entry.id.0, effect.clone()), now + RETRY_INTERVAL);
-                    selected = Some((entry.clone(), effect.clone()));
-                    break;
+                    let offset = *cursor.1.get(&entry.id.0).unwrap_or(&0);
+                    for step in 0..entry.pending.len() {
+                        let index = (offset + step) % entry.pending.len();
+                        let effect = &entry.pending[index];
+                        if retry.get(&(entry.id.0, effect.clone())).is_some_and(|at| *at > now) {
+                            continue;
+                        }
+                        cursor.0 = entry.id.0;
+                        cursor.1.insert(entry.id.0, index + 1);
+                        retry.insert((entry.id.0, effect.clone()), now + RETRY_INTERVAL);
+                        selected = Some((entry.clone(), effect.clone()));
+                        self.close_send_turn.store(!close_turn, Ordering::Release);
+                        break;
+                    }
+                    if selected.is_some() {
+                        break;
+                    }
                 }
-                if selected.is_some() {
-                    break;
-                }
+                if selected.is_some() { break; }
             }
             selected
         }
@@ -1543,6 +1569,8 @@ impl State {
         store: &Arc<PropagationOutbox>,
         receiver: &mut mpsc::Receiver<Submission>,
     ) {
+        #[cfg(test)]
+        if self.background_paused.load(Ordering::Acquire) { return; }
         let _activity = self.activity_scope("retry_snapshot", None);
         if self.stop.is_cancelled() {
             return;
@@ -2073,6 +2101,8 @@ mod tests {
             ready: tokio::sync::watch::channel(None).0,
             cursor: Mutex::new(Default::default()),
             acceptance_turn: AtomicBool::new(true),
+            close_send_turn: AtomicBool::new(true),
+            close_interest: Mutex::new(Default::default()),
             acceptance_verified: Mutex::new(Default::default()),
             accepted_receipts: Mutex::new(Default::default()),
             #[cfg(test)]
@@ -2083,6 +2113,8 @@ mod tests {
             background_acceptance_runs: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             background_routing_turns: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            background_paused: AtomicBool::new(false),
             acceptance_cursor: Mutex::new(0),
             acceptance_retry: Mutex::new(Default::default()),
             retry_after: Mutex::new(Default::default()),
@@ -2440,6 +2472,26 @@ mod tests {
             state.select_acceptance(&entries, now + RETRY_INTERVAL).unwrap().id,
             RecordId(1)
         );
+    }
+
+    #[test]
+    fn publication_worker_bound_close_sends_share_turns_and_keep_retry_guards() {
+        let worker = state();
+        let now = tokio::time::Instant::now();
+        let ordinary = scheduling_entry(1, 200);
+        let closing = scheduling_entry(2, 200);
+        let entries = vec![ordinary, closing];
+        worker.close_interest.lock().unwrap().insert(2);
+        assert_eq!(worker.select_retry(&entries, 100, now).unwrap().0.id, RecordId(2));
+        assert_eq!(worker.select_retry(&entries, 100, now).unwrap().0.id, RecordId(1));
+        assert!(worker.select_retry(&entries, 100, now).is_none(), "focus cannot bypass target backoff");
+        assert_eq!(worker.select_retry(&entries, 100, now + RETRY_INTERVAL).unwrap().0.id, RecordId(2));
+        assert!(worker.select_retry(&entries, 201, now + RETRY_INTERVAL).is_none(),
+            "an expired focused record cannot be sent or discarded");
+        assert_eq!(entries[1].pending.len(), 1);
+        let remaining = vec![entries[0].clone()];
+        worker.select_retry(&remaining, 100, now + RETRY_INTERVAL);
+        assert!(worker.close_interest.lock().unwrap().is_empty(), "removed delivery interest must be pruned");
     }
 
     #[test]

@@ -53,13 +53,39 @@ fn reference_backup(namespace: &Path) -> Option<(PathBuf, Vec<u8>)> {
 }
 
 async fn circulation(events: usize) {
+    circulation_with_close_demand(events, false).await;
+}
+
+async fn circulation_with_close_demand(events: usize, close_demand: bool) {
     let signer = std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER")
         .expect("set RTOS_PUBLIC_FIXTURE_SIGNER to the archived public-only fixture signer");
     assert!(Path::new(&signer).is_file());
     let pair = Pair::with_source_transport("included").await;
+    let mut certified_receivers = Vec::new();
     let run = std::panic::AssertUnwindSafe(async {
         let engine = &pair.provider;
         let observer = pair.observer.as_ref().expect("source fixture includes a public observer");
+        let issuer = engine.network().context().stack.adnl
+            .key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
+        let certified = observer.overlays_router().unwrap()
+            .test_certified_fast_sync_recipient(ShardIdent::MASTERCHAIN, &issuer).await.unwrap();
+        certified_receivers.push(certified.clone());
+        let certified_id = adnl::OverlayShortId::from_data(*certified.id().data());
+        // There is no external DHT in this isolated network. Exchange fresh
+        // signed advertisements through the same membership-verification API
+        // used for public fixture peers, before emitting the finite source set.
+        // This also advertises each root's normal original-sender flags.
+        for root in [engine, &pair.receiver] {
+            for (local, remote) in [(root, observer), (observer, root)] {
+                let advertised = remote.network().context().stack.overlay
+                    .get_signed_node(&certified_id, true).unwrap();
+                local.network().context().stack.overlay.add_public_peer(
+                    remote.network().context().stack.adnl.ip_address_adnl(),
+                    &advertised,
+                    &certified_id,
+                ).unwrap();
+            }
+        }
         // Bootstrap MC1 uses the real existing proof and application path;
         // every subsequent event is first admitted by the actual source driver.
         engine.clone().download_and_apply_block(pair.master.id(), 1, false).await.unwrap();
@@ -112,6 +138,8 @@ async fn circulation(events: usize) {
             wire_profile: WireProfile::T0,
         };
         let sink = engine.clone().durable_finality_sink(runtime.clone()).await.unwrap();
+        let worker = engine.ensure_publication_worker().await.unwrap();
+        if close_demand { worker.test_pause_background(true); }
         let confirm =
             engine.ensure_publication_worker().await.unwrap().delivered_sink(runtime.clone());
         let driver =
@@ -178,6 +206,26 @@ async fn circulation(events: usize) {
                 assert!(backup.is_some(), "save an actual pre-Delivered reference");
                 first = Some(draft.clone());
             }
+            if close_demand {
+                let before = worker.test_actual_acceptance_runs();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        driver.maintain().unwrap();
+                        let (active, closed) = inspect_closure_progress(engine.db(), &domain).unwrap();
+                        assert!(closed.is_empty(), "pending transport cannot yield a close offer");
+                        if let Some(entry) = active.iter().find(|entry|
+                            entry.record.block_id == id
+                                && entry.stage == crate::propagation_outbox::PublicationStage::Ready)
+                        {
+                            assert!(!entry.pending.is_empty(), "real effects must remain pending");
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }).await.expect("authenticated close demand did not drive actual acceptance/routing");
+                assert_eq!(worker.test_actual_acceptance_runs(), before + 1);
+                worker.test_pause_background(false);
+            }
             // Inspect the actual worker's completed checkpoint before allowing
             // source closure. Both FastSync effects must really remain in the
             // fixed plan and have no outstanding receipt debt.
@@ -221,13 +269,15 @@ async fn circulation(events: usize) {
             })
             .await
             .expect("real network effects/custody/Delivered/Released did not finish");
-            // Committee members intentionally do not consume Plumtree data.
-            // Keep the second root for real FastSync outbound effects, while
-            // this public observer must process this exact candidate/finality.
+            // The certified observer receives both transports. Finality's
+            // shared Engine handler may deduplicate the second arrival; require
+            // actual FastSync ingress and successful finality handling, without
+            // requiring the same evidence to be accepted twice.
             tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
                     if observer.test_finality_received_ids.lock().unwrap().contains(&id)
                         && observer.try_get_cached_block_candidate(&id).is_some()
+                        && certified.received_candidate_and_finality_ingress(&id)
                     {
                         break;
                     }
@@ -235,7 +285,7 @@ async fn circulation(events: usize) {
                 }
             })
             .await
-            .expect("public observer did not process the exact candidate and finality");
+            .expect("public and certified FastSync observers did not process the exact candidate and finality");
             // Keep the real receiving frontier current AFTER ingress checks.
             observer.clone().download_and_apply_block(&id, id.seq_no(), false).await.unwrap();
             assert_eq!(
@@ -294,6 +344,7 @@ async fn circulation(events: usize) {
     })
     .catch_unwind()
     .await;
+    for receiver in certified_receivers { receiver.stop_and_wait().await.unwrap(); }
     pair.stop_all().await;
     let (runtime, namespace, domain, first, (old_path, old_bytes)) =
         run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
@@ -342,6 +393,12 @@ async fn circulation(events: usize) {
 #[ignore = "requires explicit public fixture signer and real multi-Engine network/WAL"]
 async fn persistent_closure_engine_real_source_smoke_and_cold_backup() {
     circulation(2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit public signer and real source/Engine/transport required"]
+async fn persistent_closure_authenticated_demand_drives_acceptance_before_offer() {
+    circulation_with_close_demand(1, true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

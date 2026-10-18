@@ -74,6 +74,7 @@ pub struct FastSyncOverlayClient {
     received_for_test: std::sync::Mutex<(
         std::collections::HashSet<rtos_block::BlockIdExt>,
         std::collections::HashSet<rtos_block::BlockIdExt>,
+        std::collections::HashSet<rtos_block::BlockIdExt>,
     )>,
     #[cfg(test)]
     exit_gate: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -183,6 +184,14 @@ impl FastSyncOverlayClient {
         seen.0.contains(id) && seen.1.contains(id)
     }
 
+    /// Observe transport arrival independently of finality's cross-overlay
+    /// deduplication. Callers must separately assert successful Engine handling.
+    #[cfg(test)]
+    pub(crate) fn received_candidate_and_finality_ingress(&self, id: &rtos_block::BlockIdExt) -> bool {
+        let seen = self.received_for_test.lock().unwrap();
+        seen.0.contains(id) && seen.2.contains(id)
+    }
+
     #[cfg(test)]
     pub(crate) fn hold_listener_exit(&self) -> tokio::sync::oneshot::Sender<()> {
         let (release, gate) = tokio::sync::oneshot::channel();
@@ -287,6 +296,8 @@ impl FastSyncOverlayClient {
             Broadcast::TonNode_BlockFinalityBroadcast(broadcast) => {
                 #[cfg(test)]
                 let received_id = broadcast.id.clone();
+                #[cfg(test)]
+                self.received_for_test.lock().unwrap().2.insert(received_id.clone());
                 self.engine.clone().process_block_finality_broadcast(
                     broadcast, src.clone(), received_bytes,
                 ).await?;

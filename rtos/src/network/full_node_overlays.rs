@@ -1570,6 +1570,54 @@ impl FullNodeOverlaysRouter {
             .is_some_and(|overlay| overlay.received_candidate_and_finality(id))
     }
 
+    /// Isolated source-circulation fixtures need a real certified non-root
+    /// recipient, just as a deployed non-voting full node does. Root producers
+    /// retain their ordinary DoNotReceivePlumtreeBroadcasts policy.
+    #[cfg(test)]
+    pub(crate) async fn test_certified_fast_sync_recipient(
+        self: &Arc<Self>,
+        shard: ShardIdent,
+        issuer: &Arc<dyn KeyOption>,
+    ) -> Result<Arc<FastSyncOverlayClient>> {
+        let head = self.engine.load_last_applied_mc_block_id()?
+            .ok_or_else(|| error!("Fixture recipient has no applied anchor"))?;
+        let state = self.engine.load_state(&head).await?;
+        let config = state.config_params()?;
+        let mut validators = Vec::new();
+        for set in [config.prev_validator_set()?, config.validator_set()?, config.next_validator_set()?] {
+            validators.extend_from_slice(set.list());
+        }
+        let (roots, _) = fast_sync_transport_authority(&validators,
+            self.network.context().stack.overlay.wire_profile())?;
+        let key = self.network.context().stack.adnl
+            .key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)?;
+        if !roots.contains(issuer.id()) || roots.contains(key.id()) {
+            rtos_block::fail!("Fixture must use a governing root issuer and a non-root recipient");
+        }
+        let expires = rtos_block::UnixTime::now().checked_add(3600)
+            .ok_or_else(|| error!("Fixture membership expiry overflow"))?;
+        let certificate_id = rtos_api::ton::overlay::membercertificateid::MemberCertificateId {
+            node: rtos_api::ton::adnl::id::short::Short {
+                id: rtos_block::UInt256::from_slice(key.id().data()),
+            },
+            flags: 0, slot: 0, expire_at: i32::try_from(expires)?,
+        };
+        let signature = issuer.sign(&rtos_api::serialize_boxed(
+            &rtos_api::IntoBoxed::into_boxed(certificate_id.clone()))?)?;
+        let certificate = rtos_api::ton::overlay::membercertificate::MemberCertificate {
+            issued_by: issuer.try_into()?, flags: certificate_id.flags,
+            slot: certificate_id.slot, expire_at: certificate_id.expire_at, signature,
+        };
+        let client = FastSyncOverlayClient::new(
+            shard, &validators, Some(&key), Some(certificate),
+            self.tasks.cancellation().child_token(), self.network.context().clone(),
+            self.engine.clone(), self.policy.clone(), self.network.default_rldp_roundtrip(),
+            true, self.tasks.clone(),
+        ).await?;
+        self.configure_fast_sync_propagation(&client)?;
+        Ok(client)
+    }
+
     fn fast_sync_overlay(&self, shard: &ShardIdent) -> Option<Arc<FastSyncOverlayClient>> {
         let shard =
             trim_shard(shard, self.monitor_min_split_for_fast_sync.load(Ordering::Relaxed)).ok()?;

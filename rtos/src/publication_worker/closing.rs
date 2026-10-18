@@ -136,10 +136,25 @@ impl State {
         {
             fail!("Persistent repair closing currently requires masterchain Final");
         }
-        let (delivery, entry) = self.original_source(store, runtime, &request).await?;
+        let (delivery, mut entry) = self.original_source(store, runtime, &request).await?;
+        if entry.stage != PublicationStage::Completed || !entry.pending.is_empty() {
+            // FinalizeBlock completion is real work, not a stage observation.
+            // The exact canonical source has been bound above; drive its normal
+            // authenticated acceptance rather than waiting behind unrelated WAL
+            // repair. Pending effects still need their real transport receipts.
+            self.close_interest.lock().unwrap().insert(entry.id.0);
+            self.accept(store, engine.clone(), entry).await?;
+            let (_, accepted) = self.original_source(store, runtime, &request).await?;
+            if self.enabled.load(Ordering::Acquire) {
+                self.resolve_draft(store, &engine, accepted).await?;
+            }
+            entry = self.original_source(store, runtime, &request).await?.1;
+            self.wake.notify_one();
+        }
         if entry.stage != PublicationStage::Completed || !entry.pending.is_empty() {
             fail!("Delivery still has acceptance or propagation obligations");
         }
+        self.close_interest.lock().unwrap().remove(&entry.id.0);
         let recovery = runtime
             .recovery_binding()
             .ok_or_else(|| error!("Closing source lacks authenticated runtime recovery binding"))?;
