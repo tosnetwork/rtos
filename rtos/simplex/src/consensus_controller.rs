@@ -100,6 +100,7 @@ use crate::{
     block::{CandidateId as BlockCandidateId, RawCandidateId, SlotIndex, ValidatorIndex},
     candidate_book::{CandidateBook, ReceivedCandidate, EMPTY_CHAIN_WARN_DEPTH, MAX_CHAIN_DEPTH},
     database::{FinalizedBlockRecord, VoteRecord},
+    finality_recovery::ExpectedFinalityOutput,
     misbehavior::{MisbehaviorReport, VoteResult},
     receiver::StandstillCertificateType,
     session_callbacks::SessionCallbacks,
@@ -170,6 +171,29 @@ struct FinalizedSeqnoRecord {
     is_final: bool,
     slot: SlotIndex,
     block_id: BlockIdExt,
+}
+
+/// One synchronous dependency-resolution pass, never an acceptance receipt.
+/// C++ InFlight shares the parent operation and its already-derived identity.
+#[derive(Default)]
+struct FinalityRetryPass {
+    pending_ancestors: HashSet<RawCandidateId>,
+    outputs: HashMap<(BlockIdExt, bool, UInt256), ExpectedFinalityOutput>,
+}
+impl FinalityRetryPass {
+    fn output(&mut self, block: &BlockIdExt, is_final: bool, source: &UInt256) -> ExpectedFinalityOutput {
+        let key = (block.clone(), is_final, source.clone());
+        if let Some(output) = self.outputs.get(&key) {
+            return output.clone();
+        }
+        let output = ExpectedFinalityOutput::new(block, is_final, source);
+        // This is a memory bound on the optimization, not a legal chain limit.
+        // Larger passes continue through the same constructor without caching.
+        if self.outputs.len() < 1024 {
+            self.outputs.insert(key, output.clone());
+        }
+        output
+    }
 }
 
 /// Session-owned reads/effects the finalization pipeline needs but cannot reach
@@ -1715,7 +1739,7 @@ impl ConsensusController {
         // C++ InFlight attaches children to the same pending parent operation.
         // This set lasts only for this synchronous pass: a completion or timed
         // retry must poll the real handoff again, with its original evidence.
-        let mut pending_ancestor_handoffs = HashSet::new();
+        let mut pass = FinalityRetryPass::default();
         for trigger_id in pending_ids {
             // Clone event payload to avoid holding a map borrow across processing.
             let Some(event) =
@@ -1737,7 +1761,7 @@ impl ConsensusController {
                 self.finalized_pending_body.get_mut(trigger_id).unwrap().intent_retained = true;
             }
 
-            if self.try_finalize_recursive_chain(backend, trigger_id, &event, &mut pending_ancestor_handoffs) {
+            if self.try_finalize_recursive_chain(backend, trigger_id, &event, &mut pass) {
                 if self.description.authenticated_runtime().is_some() {
                     if let Err(error) = self.callbacks.resolve_finality_intent(trigger_id) {
                         log::error!("Cannot durably resolve source finality intent: {error}");
@@ -1779,7 +1803,7 @@ impl ConsensusController {
         backend: &mut dyn ConsensusBackend,
         trigger_id: &RawCandidateId,
         event: &BlockFinalizedEvent,
-        pending_ancestor_handoffs: &mut HashSet<RawCandidateId>,
+        pass: &mut FinalityRetryPass,
     ) -> bool {
         if self.description.authenticated_runtime().is_some()
             && self.finalized_pending_body.get(trigger_id)
@@ -1936,7 +1960,7 @@ impl ConsensusController {
 
             if !received.is_empty && self.description.authenticated_runtime().is_some() {
                 let source = self.build_source_info_for_received(&received);
-                let output = crate::finality_recovery::ExpectedFinalityOutput::new(
+                let output = pass.output(
                     &received.block_id,
                     has_final_cert,
                     &UInt256::from(*source.source.id().data()),
@@ -2079,7 +2103,7 @@ impl ConsensusController {
                 let durable = self.description.authenticated_runtime().is_some();
                 // Approval is the same ancestor operation for every child in
                 // this pass. Each FinalCert still crosses its own source path.
-                if durable && !has_final_cert && pending_ancestor_handoffs.contains(&id) {
+                if durable && !has_final_cert && pass.pending_ancestors.contains(&id) {
                     log::debug!(target: "simplex_resolver",
                         "FINALITY_OUTPUT_PENDING: session={} source_slot={} source_hash={} dependency_slot={} dependency_hash={} block_id={} final=false body_bytes={} joined=true",
                         self.session_id().to_hex_string(), trigger_id.slot.value(), trigger_id.hash.to_hex_string(),
@@ -2096,7 +2120,7 @@ impl ConsensusController {
                 );
                 if !ready {
                     if durable && !has_final_cert {
-                        pending_ancestor_handoffs.insert(id);
+                        pass.pending_ancestors.insert(id);
                     }
                     return false;
                 }
@@ -2952,5 +2976,43 @@ impl ConsensusController {
     ) {
         self.finalized_pending_body.insert(id, FinalizedEntry { event, intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), resolved_output_plan: Vec::new(), sealed_output_requirements: None, finalized_at });
         self.telemetry.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
+    }
+}
+
+#[cfg(test)]
+mod retry_pass_tests {
+    use super::*;
+
+    #[test]
+    fn finality_retry_output_cache_preserves_all_inputs_and_overflow() {
+        let block = |seq| BlockIdExt::with_params(
+            rtos_block::ShardIdent::masterchain(), seq,
+            UInt256::from([1; 32]), UInt256::from([2; 32]));
+        let source = UInt256::from([3; 32]);
+        let other_source = UInt256::from([4; 32]);
+        let mut pass = FinalityRetryPass::default();
+        let first = pass.output(&block(1), false, &source);
+        let before = ExpectedFinalityOutput::construction_count_for_test();
+        assert_eq!(pass.output(&block(1), false, &source), first);
+        assert_eq!(ExpectedFinalityOutput::construction_count_for_test(), before);
+        assert_ne!(pass.output(&block(1), true, &source), first);
+        assert_ne!(pass.output(&block(1), false, &other_source), first);
+        assert_ne!(pass.output(&block(2), false, &source), first);
+        assert_eq!(ExpectedFinalityOutput::construction_count_for_test() - before, 3);
+        for seq in 1000..2024 { pass.output(&block(seq), false, &source); }
+        assert_eq!(pass.outputs.len(), 1024);
+        let before = ExpectedFinalityOutput::construction_count_for_test();
+        let uncached = pass.output(&block(9999), true, &other_source);
+        assert_eq!(uncached.block_id, block(9999).to_string());
+        assert!(uncached.is_final);
+        assert_eq!(uncached.source_validator, other_source.to_hex_string());
+        assert_eq!(pass.output(&block(9999), true, &other_source), uncached);
+        assert_eq!(ExpectedFinalityOutput::construction_count_for_test() - before, 2,
+            "overflow must compute the original output rather than discard or alias it");
+        assert_eq!(pass.output(&block(1), false, &source), first);
+        let before = ExpectedFinalityOutput::construction_count_for_test();
+        assert_eq!(FinalityRetryPass::default().output(&block(1), false, &source), first);
+        assert_eq!(ExpectedFinalityOutput::construction_count_for_test() - before, 1,
+            "a fresh pass must rebuild identity from its actual current inputs");
     }
 }

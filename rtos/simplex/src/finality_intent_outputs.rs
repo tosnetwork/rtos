@@ -13,8 +13,18 @@ pub(crate) struct ExpectedFinalityOutput {
     pub is_final: bool,
     pub source_validator: String,
 }
+#[cfg(test)]
+std::thread_local! {
+    static OUTPUT_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 impl ExpectedFinalityOutput {
+    #[cfg(test)]
+    pub(crate) fn construction_count_for_test() -> usize {
+        OUTPUT_CONSTRUCTIONS.with(|count| count.get())
+    }
     pub(crate) fn new(block: &BlockIdExt, is_final: bool, source: &UInt256) -> Self {
+        #[cfg(test)]
+        OUTPUT_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
         Self { block_id: block.to_string(), is_final, source_validator: source.to_hex_string() }
     }
 }

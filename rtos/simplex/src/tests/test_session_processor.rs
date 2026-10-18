@@ -12545,7 +12545,10 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
         // C++ attaches the second finalization to the existing InFlight work.
         for _ in 0..3 {
             let before = processor.callbacks.finality_poll_attempts();
+            let built_before = crate::finality_recovery::ExpectedFinalityOutput::construction_count_for_test();
             processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+            assert_eq!(crate::finality_recovery::ExpectedFinalityOutput::construction_count_for_test() - built_before, 4,
+                "a shared exact output identity must be constructed once per recovery pass");
             assert_eq!(processor.callbacks.finality_poll_attempts() - before, 1,
                 "one recovery pass must poll a shared pending ancestor only once");
         }
