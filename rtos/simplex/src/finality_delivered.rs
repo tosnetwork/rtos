@@ -625,7 +625,8 @@ impl SourceFinalityDelivery {
     pub(crate) fn consumed(&self, draft: &FinalizedDeliveryDraft) -> Result<bool> {
         let _timing = self.operation_timer("consumed");
         let id = PendingFinalityRecord::from_draft(&self.runtime, draft)?.id()?;
-        if matches!(self.stages.lock().unwrap().get(&id), Some(SourceStage::Consumed)) {
+        if matches!(self.stages.lock().unwrap().get(&id),
+            Some(SourceStage::Consumed | SourceStage::AcceptanceConsumed)) {
             return Ok(true);
         }
         if self.store.confirmed_without_backup(&id)? {

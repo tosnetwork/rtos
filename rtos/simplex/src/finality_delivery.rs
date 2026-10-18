@@ -1354,6 +1354,9 @@ impl Drop for SourceNamespaceRelease {
 }
 enum SourceStage {
     Consumed,
+    // Only a successful node acceptance consumed by this live session may
+    // populate this state. It is not persisted and grants no MC custody.
+    AcceptanceConsumed,
     Running,
     Retry(std::time::Instant),
     Durable(UInt256, FinalizedDeliveryDraft),
@@ -1498,6 +1501,7 @@ impl SourceFinalityDelivery {
                 match stages.get(&id) {
                     None => "new",
                     Some(SourceStage::Consumed) => "consumed",
+                    Some(SourceStage::AcceptanceConsumed) => "acceptance_consumed",
                     Some(SourceStage::Running) => "running",
                     Some(SourceStage::Retry(_)) => "retry",
                     Some(SourceStage::Durable(_, _)) => "durable",
@@ -1507,6 +1511,7 @@ impl SourceFinalityDelivery {
                     Some(SourceStage::Acknowledging(_, _)) => "acknowledging",
                 });
             match stages.get(&id) {
+                Some(SourceStage::AcceptanceConsumed) => return Ok(None),
                 Some(SourceStage::Running) => return Ok(None),
                 Some(SourceStage::Accepting) => return Ok(None),
                 Some(SourceStage::AcceptanceRetry(at, _, _)) if std::time::Instant::now() < *at => return Ok(None),
@@ -1518,6 +1523,7 @@ impl SourceFinalityDelivery {
                 }
                 Some(SourceStage::Accepted(_, _)) => {
                     let Some(SourceStage::Accepted(receipt, draft)) = stages.remove(&id) else { unreachable!() };
+                    stages.insert(id.clone(), SourceStage::AcceptanceConsumed);
                     return Ok(Some((receipt, draft)));
                 }
                 Some(SourceStage::Retry(at)) if std::time::Instant::now() < *at => return Ok(None),
@@ -1668,6 +1674,7 @@ impl SourceFinalityDelivery {
         let mut stages = self.stages.lock().unwrap();
         if matches!(stages.get(&id), Some(SourceStage::Accepted(_, _))) {
             let Some(SourceStage::Accepted(receipt, draft)) = stages.remove(&id) else { unreachable!() };
+            stages.insert(id.clone(), SourceStage::AcceptanceConsumed);
             return Ok(Some((receipt, draft)));
         }
         Ok(None)
@@ -2334,6 +2341,69 @@ pub(crate) mod tests {
         assert_eq!(restored.len(), 2);
         assert_eq!(restored.iter().filter(|r| r.record().is_final).count(), 1);
         assert_eq!(restored.iter().filter(|r| !r.record().is_final).count(), 1);
+    }
+
+    #[test]
+    fn source_finality_workchain_acceptance_is_reused_only_in_current_process() {
+        for is_final in [false, true] {
+            for immediate in [false, true] {
+                let temp = crate::authenticated_fixture::TestDirectory::new();
+                let (runtime, draft) = fixture_role(is_final,
+                    ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap());
+                let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+                let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
+                let receipt = UInt256::from([4; 32]);
+                let sink = Arc::new(HeldSink::default());
+                if !immediate {
+                    *sink.1.lock().unwrap() = Some(Vec::new());
+                }
+                let source = SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
+                assert!(!source.consumed(&draft).unwrap());
+                assert!(source.poll(draft.clone()).unwrap().is_none());
+                let (_, staged) = sink.0.lock().unwrap().pop().unwrap();
+                staged(Ok(receipt.clone()));
+                if !immediate {
+                    assert!(source.poll(draft.clone()).unwrap().is_none());
+                    assert!(!source.consumed(&draft).unwrap(), "in-flight acceptance cannot complete a source");
+                    let (_, accepted) = sink.1.lock().unwrap().as_mut().unwrap().pop().unwrap();
+                    accepted(Err(error!("transient node acceptance failure")));
+                    assert!(!source.consumed(&draft).unwrap(), "failure cannot populate completed acceptance");
+                    assert!(source.poll(draft.clone()).unwrap().is_none());
+                    assert!(sink.1.lock().unwrap().as_ref().unwrap().is_empty(), "retain the retry backoff");
+                    if let Some(SourceStage::AcceptanceRetry(at, _, _)) =
+                        source.stages.lock().unwrap().get_mut(&record.id().unwrap()) {
+                        *at = std::time::Instant::now();
+                    } else {
+                        panic!("failed acceptance must retain its original receipt for retry");
+                    }
+                    assert!(source.poll(draft.clone()).unwrap().is_none());
+                    let (_, accepted) = sink.1.lock().unwrap().as_mut().unwrap().pop().unwrap();
+                    accepted(Ok(()));
+                }
+                assert_eq!(source.poll(draft.clone()).unwrap().unwrap().0, receipt);
+                for _ in 0..8 {
+                    assert!(source.consumed(&draft).unwrap(), "successful acceptance must remain reusable");
+                    assert!(source.poll(draft.clone()).unwrap().is_none(), "notify the session listener only once");
+                }
+                assert!(sink.0.lock().unwrap().is_empty());
+                assert!(sink.1.lock().unwrap().as_ref().is_none_or(Vec::is_empty));
+                assert!(!source.store.delivered_path(&record.id().unwrap()).exists(), "WC acceptance is not MC custody");
+                drop(source);
+                *sink.1.lock().unwrap() = Some(Vec::new());
+                let cold = SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
+                assert!(!cold.consumed(&draft).unwrap(), "a cold process must reauthenticate node acceptance");
+                assert!(cold.poll(draft.clone()).unwrap().is_none());
+                let (_, staged) = sink.0.lock().unwrap().pop().expect("cold WAL handoff");
+                staged(Ok(receipt.clone()));
+                assert!(cold.poll(draft.clone()).unwrap().is_none());
+                assert_eq!(sink.1.lock().unwrap().as_ref().unwrap().len(), 1);
+                assert!(!cold.consumed(&draft).unwrap());
+                let (_, accepted) = sink.1.lock().unwrap().as_mut().unwrap().pop().unwrap();
+                accepted(Ok(()));
+                assert_eq!(cold.poll(draft.clone()).unwrap().unwrap().0, receipt);
+                assert!(cold.consumed(&draft).unwrap());
+            }
+        }
     }
 
     #[test]
