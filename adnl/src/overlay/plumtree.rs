@@ -2014,6 +2014,78 @@ mod transport_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn certified_receiver_remains_eligible_for_plumtree_publication() {
+        let local = endpoint_with_profile(131, rtos_api::WireProfile::T0).await;
+        let remote = endpoint_with_profile(132, rtos_api::WireProfile::T0).await;
+        let transport: Arc<dyn KeyOption> = rtos_block::Ed25519KeyOption::<rtos_block::ZeroizingBytes>::from_private_key(&[134; 32]).unwrap();
+        local.overlay.adnl.add_key(transport.clone(), 1).unwrap();
+        let id = OverlayShortId::from_data([133; 32]);
+        let fields = rtos_api::ton::overlay::membercertificateid::MemberCertificateId {
+            node: rtos_api::ton::adnl::id::short::Short { id: UInt256::from_slice(remote.key.id().data()) },
+            flags: 0, slot: 0, expire_at: (rtos_block::UnixTime::now() + 3600) as i32,
+        };
+        let certificate = rtos_api::ton::overlay::membercertificate::MemberCertificate {
+            issued_by: (&transport).try_into().unwrap(), flags: 0, slot: 0,
+            expire_at: fields.expire_at,
+            signature: transport.sign(&serialize_boxed(&fields.into_boxed()).unwrap()).unwrap(),
+        };
+        let roots = vec![transport.id().clone()];
+        for (endpoint, key, cert, original) in [(&local, &transport, None, true), (&remote, &remote.key, Some(certificate.clone()), false)] {
+            endpoint.overlay.add_semiprivate_overlay(OverlayParams::with_id_only(&id), Some(key),
+                &roots, &roots, cert, 5, true).unwrap();
+            endpoint.subscriptions.lock().unwrap().push(endpoint.overlay.subscribe_broadcast(&id).unwrap());
+            let mut cfg = config(&transport);cfg.fixed_members = false;cfg.original_sender = original;
+            endpoint.overlay.configure_plumtree(&id, cfg, &tokio::runtime::Handle::current()).unwrap();
+        }
+        let node = remote.overlay.get_signed_node(&id, false).unwrap();
+        let ip = IpAddress::from_versioned_string(&remote.addr.to_string(), None).unwrap();
+        local.overlay.adnl.add_peer(local.key.id(), &ip, None, &remote.key).unwrap();
+        assert!(local.overlay.add_public_peer_from_known_adnl(&node, &id).unwrap().is_none(),
+            "a different local identity's address is not an overlay connection");
+        let quic_ip = IpAddress::from_versioned_string("127.0.0.1:19001", None).unwrap();
+        local.overlay.adnl.add_peer(transport.id(), &ip, Some(&quic_ip), &remote.key).unwrap();
+        let before = local.overlay.adnl.peer_ip_address(transport.id(), remote.key.id()).unwrap();
+        assert!(local.overlay.add_public_peer_from_known_adnl(&node, &id).unwrap().is_some());
+        assert_eq!(local.overlay.adnl.peer_ip_address(transport.id(), remote.key.id()).unwrap(), before,
+            "cached admission must preserve the actual ADNL and QUIC addresses");
+        let overlay = local.overlay.get_overlay(&id, "certified receiver").unwrap();
+        overlay.check_peer(remote.key.id(), Some(&certificate)).unwrap();
+        assert_eq!(overlay.plumtree_neighbours(), vec![*remote.key.id().data()],
+            "publication must retain the authenticated receiver's member certificate");
+        let super::super::OverlayNodeInfo::V1(mut forged) = node else { unreachable!() };
+        forged.flags ^= 2;
+        assert!(local.overlay.add_public_peer_from_known_adnl(
+            &super::super::OverlayNodeInfo::<_, super::super::NodeV2>::V1(forged), &id,
+        ).unwrap().is_none(), "known address cannot bypass advertisement signature checks");
+        assert_eq!(overlay.plumtree_neighbours(), vec![*remote.key.id().data()]);
+        local.overlay.delete_public_overlay(&id).unwrap();
+        remote.overlay.delete_public_overlay(&id).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn semiprivate_peer_address_stays_bound_to_overlay_transport() {
+        let local = endpoint_with_profile(121, rtos_api::WireProfile::T0).await;
+        let remote = endpoint_with_profile(122, rtos_api::WireProfile::T0).await;
+        let transport: Arc<dyn KeyOption> = rtos_block::Ed25519KeyOption::<rtos_block::ZeroizingBytes>::from_private_key(&[123; 32]).unwrap();
+        local.overlay.adnl.add_key(transport.clone(), 1).unwrap();
+        let id = OverlayShortId::from_data([124; 32]);
+        let roots = vec![transport.id().clone(), remote.key.id().clone()];
+        for (endpoint, key) in [(&local, &transport), (&remote, &remote.key)] {
+            endpoint.overlay.add_semiprivate_overlay(OverlayParams::with_id_only(&id), Some(key),
+                &roots, &roots, None, 5, true).unwrap();
+        }
+        let node = remote.overlay.get_signed_node(&id, false).unwrap();
+        let ip = IpAddress::from_versioned_string(&remote.addr.to_string(), None).unwrap();
+        assert!(local.overlay.add_public_peer(&ip, &node, &id).unwrap().is_some());
+        assert!(local.overlay.adnl.peer_ip_address(transport.id(), remote.key.id()).unwrap().is_some(),
+            "discovered peer must be reachable under the overlay transport identity");
+        assert!(local.overlay.adnl.peer_ip_address(local.key.id(), remote.key.id()).unwrap().is_none(),
+            "semiprivate discovery must not populate the unrelated default identity");
+        local.overlay.delete_public_overlay(&id).unwrap();
+        remote.overlay.delete_public_overlay(&id).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn target_peer_discovery_uses_native_request_with_flags_and_certificates() {
         use super::super::{Nodes, OverlayNodeInfo};
         use rtos_api::ton::rpc::overlay::GetRandomPeers;

@@ -1700,6 +1700,26 @@ impl OverlayNode {
         peer: &OverlayNodeInfo<N1, N2>,
         overlay_id: &Arc<OverlayShortId>,
     ) -> Result<Option<Arc<KeyId>>> {
+        self.add_public_peer_impl(Some(peer_ip_address), peer, overlay_id)
+    }
+
+    /// Reuse only an address already known under this overlay's local ADNL key.
+    /// The signed advertisement and membership certificate still pass through
+    /// the ordinary admission checks, even when no DHT lookup is necessary.
+    pub fn add_public_peer_from_known_adnl<N1: Borrow<NodeV1>, N2: Borrow<NodeV2>>(
+        &self,
+        peer: &OverlayNodeInfo<N1, N2>,
+        overlay_id: &Arc<OverlayShortId>,
+    ) -> Result<Option<Arc<KeyId>>> {
+        self.add_public_peer_impl(None, peer, overlay_id)
+    }
+
+    fn add_public_peer_impl<N1: Borrow<NodeV1>, N2: Borrow<NodeV2>>(
+        &self,
+        peer_ip_address: Option<&IpAddress>,
+        peer: &OverlayNodeInfo<N1, N2>,
+        overlay_id: &Arc<OverlayShortId>,
+    ) -> Result<Option<Arc<KeyId>>> {
         let overlay = self.get_overlay(overlay_id, "Trying add peer to unknown public overlay")?;
         if overlay.overlay_type.is_private() {
             fail!("Trying to add public peer to private overlay {overlay_id}")
@@ -1734,8 +1754,17 @@ impl OverlayNode {
             log::warn!(target: TARGET, "Error when verifying overlay peer {}: {e}", key.id());
             return Ok(None);
         }
-        let Some(ret) = self.adnl.add_peer(self.node_key.id(), peer_ip_address, None, &key)? else {
-            return Ok(None);
+        let local_key = overlay.overlay_key().unwrap_or(&self.node_key).id();
+        let ret = if let Some(address) = peer_ip_address {
+            let Some(ret) = self.adnl.add_peer(local_key, address, None, &key)? else {
+                return Ok(None);
+            };
+            ret
+        } else {
+            if self.adnl.peer_ip_address(local_key, key.id())?.is_none() {
+                return Ok(None);
+            }
+            key.id().clone()
         };
         overlay.known_peers.add(&ret)?;
         // if overlay.random_peers.count() < Self::MAX_OVERLAY_PEERS {
