@@ -135,7 +135,7 @@ class PartitionRestartTests(unittest.IsolatedAsyncioTestCase):
             context.close()
 
     async def test_plain_recovery_does_not_create_packet_fault(self):
-        async def plain(*args):return {'phase': 'recovered'}
+        async def plain(*args):return {'phase': 'recovered'}, None
         with patch.object(rotation, '_recover_rotation_member', plain), \
                 patch.object(combined, 'PartitionRestart', side_effect=AssertionError('unexpected packet fault')):
             result = await rotation.recover_rotation_member(SimpleNamespace(), None, [], [], [], [], None, None, None, {})
