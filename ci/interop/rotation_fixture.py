@@ -153,6 +153,15 @@ async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, ru
         # Only then may a separately requested live frontier start its own clock.
         if followup is not None:
             recovered['original_recovery_verified_at_unix'] = time.time()
+            # close() may refresh the live receipts' elapsed counters after the
+            # additional observation. Preserve the actual original acceptance
+            # point, including nested cut evidence, before starting that stage.
+            recovered['original_recovery_acceptance'] = copy.deepcopy({
+                'source_ack_fault': recovery_fault.source.receipt,
+                'source_ack_partition_restart': recovery_fault.receipt,
+                'partition_restart': recovery_fault.partition.receipt,
+                'signer_expiry': expiry.receipt,
+            })
             write(root / 'recovery/recovery.json', recovered)
             await followup()
         return recovered

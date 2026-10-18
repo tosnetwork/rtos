@@ -169,10 +169,25 @@ class FollowupOrderingTests(unittest.IsolatedAsyncioTestCase):
             events.append('recover')
             return receipt, followup
 
-        expiry = SimpleNamespace(started=100, started_unix=200, qualify=qualify, complete=expiry_complete)
+        source_receipt = {'phase': 'recovered', 'elapsed_seconds': 120,
+                          'metadata': {'proof': 'original'}}
+        combined_receipt = {'phase': 'recovered', 'elapsed_seconds': 120.01}
+        partition_receipt = {'phase': 'recovered', 'elapsed_seconds': 119}
+        expiry_receipt = {'phase': 'expired_member_restarted_without_signing', 'elapsed_seconds': 120.02}
+        expiry = SimpleNamespace(started=100, started_unix=200, qualify=qualify,
+            complete=expiry_complete, receipt=expiry_receipt)
         args = SimpleNamespace(signer_expiry_member=5, signer_expiry_observer=expiry,
             source_ack_partition_restart=True, interrupt_rust_member=5)
-        fault = SimpleNamespace(complete=original_ack, close=lambda: events.append('close'))
+
+        def close():
+            events.append('close')
+            for value in [source_receipt, combined_receipt, partition_receipt, expiry_receipt]:
+                value['elapsed_seconds'] = 400
+            source_receipt['metadata']['proof'] = 'later cleanup'
+
+        fault = SimpleNamespace(complete=original_ack, close=close,
+            source=SimpleNamespace(receipt=source_receipt), receipt=combined_receipt,
+            partition=SimpleNamespace(receipt=partition_receipt))
         with patch('source_ack_partition_fixture.SourceAckPartitionRestart', return_value=fault), \
              patch.object(rotation_fixture, '_recover_rotation_member', recover), \
              patch.object(rotation_fixture, 'write'):
@@ -183,6 +198,15 @@ class FollowupOrderingTests(unittest.IsolatedAsyncioTestCase):
                     await call
             else:
                 self.assertIs(await call, receipt)
+        if failure == 'original_ack':
+            self.assertNotIn('original_recovery_acceptance', receipt)
+        else:
+            saved = receipt['original_recovery_acceptance']
+            self.assertEqual(saved['source_ack_fault']['elapsed_seconds'], 120)
+            self.assertEqual(saved['source_ack_fault']['metadata']['proof'], 'original')
+            self.assertEqual(saved['source_ack_partition_restart']['elapsed_seconds'], 120.01)
+            self.assertEqual(saved['partition_restart']['elapsed_seconds'], 119)
+            self.assertEqual(saved['signer_expiry']['elapsed_seconds'], 120.02)
         return events
 
     async def test_original_ack_and_expiry_finish_before_any_followup_budget(self):
