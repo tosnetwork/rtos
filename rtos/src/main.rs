@@ -31,6 +31,8 @@ mod propagation_outbox;
 pub(crate) mod propagation_outbox_auth;
 pub(crate) mod publication_worker;
 pub(crate) mod publication_repair;
+#[cfg(all(target_os = "linux", feature = "isolated-consensus-signing"))]
+pub(crate) mod publication_io_test_control;
 mod rng;
 mod rpc_server;
 mod shard_state;
