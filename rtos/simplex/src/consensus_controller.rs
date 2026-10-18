@@ -626,7 +626,16 @@ impl ConsensusController {
         self.finalized_pending_body.retain(|id, _| id.slot >= up_to_slot || source_replay.contains(id));
         self.telemetry.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
         self.finalized_delivery_sent.retain(|id| id.slot >= up_to_slot);
-        self.acknowledged_ancestor_approvals.retain(|id| id.slot >= up_to_slot);
+        // C++ keeps an in-flight finalization's completed parent operation;
+        // advancing the live slot window cannot turn it back into a body read.
+        // Pin only receipts already earned by actual node acceptance, and only
+        // while a retained source's complete resolved plan still references
+        // them. Once those plans finish, the next prune reclaims the receipts.
+        let in_flight_ancestors: HashSet<_> = self.finalized_pending_body.values()
+            .flat_map(|entry| entry.resolved_output_plan.iter().map(|(id, _)| id.clone()))
+            .collect();
+        self.acknowledged_ancestor_approvals.retain(|id|
+            id.slot >= up_to_slot || in_flight_ancestors.contains(id));
     }
 }
 
@@ -2824,6 +2833,10 @@ impl ConsensusController {
 
     pub(crate) fn set_finalized_head_before_split(&mut self, value: bool) {
         self.finalized_head_before_split = value;
+    }
+
+    pub(crate) fn accepted_ancestor_approval_contains_for_test(&self, id: &RawCandidateId) -> bool {
+        self.acknowledged_ancestor_approvals.contains(id)
     }
 
     pub(crate) fn finalized_pending_body_is_empty(&self) -> bool {

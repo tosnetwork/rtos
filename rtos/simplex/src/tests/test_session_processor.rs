@@ -12272,30 +12272,35 @@ fn source_finality_main_worker_release_keeps_only_accepted_node_work_owned() {
 /// input, while source intent/ACK/output files are reopened from disk.
 #[test]
 fn source_finality_controller_empty_trigger_seals_all_roles_after_cold_retry() {
-    source_finality_empty_trigger_cold_retry_case(false, false, false, false);
+    source_finality_empty_trigger_cold_retry_case(false, false, false, false, false);
 }
 
 #[test]
 fn source_finality_controller_cold_retry_keeps_ancestor_handoff_below_applied_floor() {
-    source_finality_empty_trigger_cold_retry_case(true, false, false, false);
+    source_finality_empty_trigger_cold_retry_case(true, false, false, false, false);
 }
 
 #[test]
 fn source_finality_controller_replay_stops_at_materialized_parent_without_its_body() {
-    source_finality_empty_trigger_cold_retry_case(true, true, false, false);
+    source_finality_empty_trigger_cold_retry_case(true, true, false, false, false);
 }
 
 #[test]
 fn source_finality_replayed_children_share_only_fresh_accepted_ancestor_approval() {
-    source_finality_empty_trigger_cold_retry_case(false, false, true, false);
+    source_finality_empty_trigger_cold_retry_case(false, false, true, false, false);
 }
 
 #[test]
 fn source_finality_replay_reuses_materialized_ancestry_without_truncating_outputs() {
-    source_finality_empty_trigger_cold_retry_case(false, false, true, true);
+    source_finality_empty_trigger_cold_retry_case(false, false, true, true, false);
 }
 
-fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_parent: bool, shared_approvals: bool, reuse_materialized_plan: bool) {
+#[test]
+fn source_finality_replay_pruning_keeps_inflight_accepted_ancestor_receipts() {
+    source_finality_empty_trigger_cold_retry_case(false, false, true, true, true);
+}
+
+fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_parent: bool, shared_approvals: bool, reuse_materialized_plan: bool, prune_after_acceptance: bool) {
     use crate::finality_delivery::tests::{fixture_role, HeldSink};
     use rtos_block::Serializable;
     let temp = crate::authenticated_fixture::TestDirectory::new();
@@ -12459,6 +12464,14 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
             processor.candidate_book_mut().received_mut(&chain[0].0).unwrap().data =
                 consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new());
             ancestor_body_evicted = true;
+            if prune_after_acceptance {
+                // This source has a real, freshly accepted parent and an
+                // already resolved output plan. Slot cleanup may advance while
+                // its child handoff is still in flight, as during catch-up.
+                processor.consensus.prune_below(SlotIndex::new(1000));
+                assert!(processor.consensus.accepted_ancestor_approval_contains_for_test(&chain[0].0),
+                    "retained sources must keep their actual accepted ancestor receipt");
+            }
         }
         for (draft,done) in std::mem::take(&mut *sink.0.lock().unwrap()) {
             if matches!(draft.finality, consensus_common::SessionFinality::Carrier(_)) {
@@ -12495,6 +12508,14 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
     if reuse_materialized_plan {
         assert!(ancestor_body_evicted, "regression must remove the already accepted ancestor body");
         assert!(map.exists(), "accepted ancestor reuse must finish the retained source with its complete output set");
+    }
+    if prune_after_acceptance {
+        processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+        assert!(processor.consensus.finalized_pending_body_is_empty(),
+            "all retained source plans must have finished before testing reclamation");
+        processor.consensus.prune_below(SlotIndex::new(1000));
+        assert!(!processor.consensus.accepted_ancestor_approval_contains_for_test(&chain[0].0),
+            "unreferenced old receipts must be reclaimed after source completion");
     }
     let value:serde_json::Value=serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
     assert_eq!(processor.callbacks.finality_retention_attempts(), if shared_approvals {2} else {1},
