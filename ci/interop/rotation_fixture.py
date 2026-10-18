@@ -814,7 +814,7 @@ async def run(args, profile, root, artifacts):
             write(root / 'rust-shutdown-timing.json', {str(node['index']):
                 {'elapsed_seconds': node['shutdown_elapsed_seconds'], 'normal_exit_limit_seconds': 20}
                 for node in rust_nodes})
-            if args.network_fault or args.partition_restart or args.source_ack_fault or args.source_retention_cut_library:
+            if args.network_fault or args.partition_restart or args.source_ack_fault or args.source_retention_cut_library or first_intent_cut is not None:
                 stopped = await asyncio.gather(*(stop_cpp_with_receipt(index, node) for index, node in cpp_started))
                 write(root / 'cpp-shutdown.json', {str(index): value for index, value in stopped})
                 if any(not value['matches_pinned_tester_teardown'] for _, value in stopped) and sys.exception() is None:
