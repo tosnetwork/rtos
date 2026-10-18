@@ -1461,6 +1461,24 @@ impl SourceFinalityDelivery {
         let id = record.id()?;
         {
             let mut stages = self.stages.lock().unwrap();
+            // Correlate the controller's source/dependency wait with the exact
+            // output record. A past body wait alone cannot identify a later
+            // stall once ResolveCandidate has returned its payload.
+            log::debug!(target: "simplex_resolver",
+                "FINALITY_OUTPUT_STAGE: session={} record_id={} block_id={} final={} stage={}",
+                self.runtime.session_id().to_hex_string(), id.to_hex_string(), record.block_id,
+                record.is_final,
+                match stages.get(&id) {
+                    None => "new",
+                    Some(SourceStage::Consumed) => "consumed",
+                    Some(SourceStage::Running) => "running",
+                    Some(SourceStage::Retry(_)) => "retry",
+                    Some(SourceStage::Durable(_, _)) => "durable",
+                    Some(SourceStage::Accepting) => "accepting",
+                    Some(SourceStage::AcceptanceRetry(_, _, _)) => "acceptance_retry",
+                    Some(SourceStage::Accepted(_, _)) => "accepted",
+                    Some(SourceStage::Acknowledging(_, _)) => "acknowledging",
+                });
             match stages.get(&id) {
                 Some(SourceStage::Running) => return Ok(None),
                 Some(SourceStage::Accepting) => return Ok(None),

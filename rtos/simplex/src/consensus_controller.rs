@@ -2231,6 +2231,10 @@ impl ConsensusController {
                     candidate_id.slot,
                     &candidate_id.hash.to_hex_string()[..8],
                 );
+                log::debug!(target: "simplex_resolver",
+                    "FINALITY_OUTPUT_CERT_PENDING: session={} source_slot={} source_hash={} dependency_slot={} dependency_hash={} reason=missing_notar",
+                    self.session_id().to_hex_string(), trigger_id.slot.value(), trigger_id.hash.to_hex_string(),
+                    candidate_id.slot.value(), candidate_id.hash.to_hex_string());
                 backend.request_candidate_for_finality(
                     candidate_id.slot,
                     candidate_id.hash.clone(),
@@ -2312,6 +2316,11 @@ impl ConsensusController {
                 received.block_id,
             );
         } else {
+            log::debug!(target: "simplex_resolver",
+                "FINALITY_OUTPUT_PENDING: session={} source_slot={} source_hash={} dependency_slot={} dependency_hash={} block_id={} final={} body_bytes={}",
+                self.session_id().to_hex_string(), trigger_id.slot.value(), trigger_id.hash.to_hex_string(),
+                candidate_id.slot.value(), candidate_id.hash.to_hex_string(), received.block_id,
+                has_final_cert, received.data.data().len());
             *complete = false;
         }
     }
