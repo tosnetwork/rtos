@@ -171,7 +171,7 @@ fn retained(session: [u8; 32], origin: Option<RecoveryOrigin>) -> (UnverifiedRec
     let entry = UnverifiedRecord {
         id: RecordId(77),
         stage: PublicationStage::DraftDurable,
-        record,
+        record: std::sync::Arc::new(record),
         pending: vec![],
     };
     let delivery = Delivery {

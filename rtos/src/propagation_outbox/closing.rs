@@ -852,7 +852,7 @@ mod tests {
         store.begin_close_offer_inner(c.clone(), &d, &e)?;
         assert!(store.delivery(&d.delivery_id)?.is_some());
         assert!(store
-            .stage_draft(e.record.clone(), d.last_mc, d.candidate_already_sent, d.origin.clone())
+            .stage_draft(e.record.as_ref().clone(), d.last_mc, d.candidate_already_sent, d.origin.clone())
             .is_err());
         drop(store);
         let store = open(disk.clone());
@@ -864,7 +864,7 @@ mod tests {
         let mut wrong = c.clone();
         wrong.binding.source_digest = UInt256::default();
         assert!(store.confirm_close_inner(wrong).is_err());
-        let mut replay = e.record.clone();
+        let mut replay = e.record.as_ref().clone();
         replay.effects.push(PublicationEffect {
             kind: PublicationKind::Block,
             target: PublicationTarget::Public,
@@ -915,7 +915,7 @@ mod tests {
             assert!(store.begin_close_offer_inner(bad, &d, &e).is_err());
         }
         let mut changed = e.clone();
-        changed.record.carrier = StoredCarrier::Final(vec![10]);
+        Arc::make_mut(&mut changed.record).carrier = StoredCarrier::Final(vec![10]);
         assert!(store.begin_close_offer_inner(c.clone(), &d, &changed).is_err());
         store.begin_close_offer_inner(c.clone(), &d, &e)?;
         assert_eq!(store.begin_close_offer_inner(c.clone(), &d, &e)?, c);
@@ -959,7 +959,7 @@ mod tests {
         assert!(store.lookup_close(&d.delivery_id)?.unwrap().released);
         assert!(store.delivery(&d.delivery_id)?.is_none());
         assert!(store
-            .stage_draft(e.record, d.last_mc, d.candidate_already_sent, d.origin)
+            .stage_draft(Arc::unwrap_or_clone(e.record), d.last_mc, d.candidate_already_sent, d.origin)
             .is_err());
         assert_eq!(store.confirm_close_inner(c)?.offer().generation, 1);
         Ok(())

@@ -480,7 +480,7 @@ struct AcceptanceCache {
     payload_bytes: usize,
 }
 struct CachedAcceptance {
-    record: PublicationRecord,
+    record: Arc<PublicationRecord>,
     accepted: AcceptedSessionBlock,
     payload_bytes: usize,
 }
@@ -513,7 +513,7 @@ impl AcceptanceCache {
     fn insert(
         &mut self,
         id: RecordId,
-        record: PublicationRecord,
+        record: Arc<PublicationRecord>,
         accepted: &AcceptedSessionBlock,
         limits: &Limits,
     ) {
@@ -564,7 +564,7 @@ impl AcceptanceCache {
         }
         let accepted = cached.accepted.clone();
         let mut record = before.record.clone();
-        record.effects = effects;
+        Arc::make_mut(&mut record).effects = effects;
         self.insert(before.id, record, &accepted, limits);
     }
     fn remove(&mut self, id: u64) {
@@ -692,11 +692,11 @@ impl PublicationWorker {
             id: RecordId(1),
             stage: PublicationStage::Prepared,
             pending: record.effects.clone(),
-            record,
+            record: Arc::new(record),
         };
         crate::propagation_outbox::validate_recovery_record(&probe, &self.state.limits)?;
         validate_plan(&probe)?;
-        let record = probe.record;
+        let record = Arc::unwrap_or_clone(probe.record);
         let (response, result) = oneshot::channel();
         {
             let sender =
@@ -774,7 +774,7 @@ impl PublicationWorker {
         let probe = UnverifiedRecord {
             id: RecordId(1),
             stage: PublicationStage::DraftDurable,
-            record: record.clone(),
+            record: Arc::new(record.clone()),
             pending: Vec::new(),
         };
         crate::propagation_outbox::validate_recovery_record(&probe, &self.state.limits)?;
@@ -1106,7 +1106,7 @@ impl State {
                     let probe = UnverifiedRecord {
                         id: RecordId(1),
                         stage: PublicationStage::DraftDurable,
-                        record: record.clone(),
+                        record: Arc::new(record.clone()),
                         pending: Vec::new(),
                     };
                     crate::propagation_outbox::validate_recovery_record(&probe, &self.limits)?;
@@ -1172,7 +1172,7 @@ impl State {
                 id: RecordId(1),
                 stage: PublicationStage::Prepared,
                 pending: command.record.effects.clone(),
-                record: command.record.clone(),
+                record: Arc::new(command.record.clone()),
             };
             validate_plan(&probe)?;
             // Authentication happens before durable admission; bogus metadata or
@@ -2075,7 +2075,7 @@ mod tests {
             id: RecordId(id),
             stage: PublicationStage::Ready,
             pending: vec![effect.clone()],
-            record: PublicationRecord {
+            record: Arc::new(PublicationRecord {
                 domain: OutboxDomain {
                     zerostate: Default::default(),
                     global_id: 0,
@@ -2094,7 +2094,7 @@ mod tests {
                 created_at_unix_secs: 1,
                 expires_at_unix_secs: expires,
                 effects: vec![effect],
-            },
+            }),
         }
     }
     #[test]
@@ -2220,7 +2220,7 @@ mod tests {
             tasks: Arc::new(OwnedTasks::default()),
             state: state(),
         };
-        let record = scheduling_entry(1, 200).record;
+        let record = Arc::unwrap_or_clone(scheduling_entry(1, 200).record);
         let session = record.session_id.clone();
         // One below the maximum still admits; at the maximum admission is
         // refused before anything is enqueued and the callback never runs.
@@ -2266,7 +2266,7 @@ mod tests {
             tasks: Arc::new(OwnedTasks::default()),
             state: state(),
         };
-        let record = scheduling_entry(1, 200).record;
+        let record = Arc::unwrap_or_clone(scheduling_entry(1, 200).record);
         let session = record.session_id.clone();
         let request = Submission::Draft {
             record,
@@ -2296,7 +2296,7 @@ mod tests {
             state: state(),
         };
         let request = Submission::Draft {
-            record: scheduling_entry(1, 200).record,
+            record: Arc::unwrap_or_clone(scheduling_entry(1, 200).record),
             last_mc: 0,
             candidate_already_sent: false,
             historical: false,
@@ -2320,7 +2320,7 @@ mod tests {
         let now = tokio::time::Instant::now();
         let mut draft = scheduling_entry(1, 1);
         draft.stage = PublicationStage::DraftDurable;
-        draft.record.effects.clear();
+        Arc::make_mut(&mut draft.record).effects.clear();
         draft.pending.clear();
         let mut prepared = scheduling_entry(2, 1);
         prepared.stage = PublicationStage::Prepared;
@@ -2355,7 +2355,7 @@ mod tests {
         let now = tokio::time::Instant::now();
         let mut blocked = scheduling_entry(1, 200);
         blocked.stage = PublicationStage::AcceptedDraft;
-        blocked.record.effects.clear();
+        Arc::make_mut(&mut blocked.record).effects.clear();
         blocked.pending.clear();
         let mut draft = blocked.clone();
         draft.id = RecordId(2);
@@ -2417,7 +2417,7 @@ mod tests {
             target: PublicationTarget::Public,
         };
         first.pending.push(second_effect.clone());
-        first.record.effects.push(second_effect.clone());
+        Arc::make_mut(&mut first.record).effects.push(second_effect.clone());
         let entries = vec![first, scheduling_entry(2, 200)];
         let now = tokio::time::Instant::now();
         assert_eq!(state.select_retry(&entries, 100, now).unwrap().0.id, RecordId(1));

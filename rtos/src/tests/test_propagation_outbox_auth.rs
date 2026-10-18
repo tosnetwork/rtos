@@ -188,7 +188,7 @@ async fn fixture(final_role: bool) -> (HistoryEngine, UnverifiedRecord) {
         UnverifiedRecord {
             id: RecordId(1),
             stage: PublicationStage::Prepared,
-            record,
+            record: std::sync::Arc::new(record),
             pending: vec![effect],
         },
     )
@@ -230,7 +230,7 @@ async fn outbox_auth_rejects_tampered_domains_body_carrier_and_pending() {
     macro_rules! bad {
         ($field:ident, $value:expr) => {{
             let mut entry = good.clone();
-            entry.record.$field = $value;
+            std::sync::Arc::make_mut(&mut entry.record).$field = $value;
             cases.push(entry);
         }};
     }
@@ -238,22 +238,22 @@ async fn outbox_auth_rejects_tampered_domains_body_carrier_and_pending() {
     bad!(session_id, UInt256::from([9; 32]));
     bad!(protocol, consensus_common::simplex_protocol::SimplexProtocol::try_from(1u32).unwrap());
     let mut entry = good.clone();
-    entry.record.domain.global_id += 1;
+    std::sync::Arc::make_mut(&mut entry.record).domain.global_id += 1;
     cases.push(entry);
     let mut entry = good.clone();
-    entry.record.domain.zerostate.file_hash = UInt256::from([9; 32]);
+    std::sync::Arc::make_mut(&mut entry.record).domain.zerostate.file_hash = UInt256::from([9; 32]);
     cases.push(entry);
     let mut entry = good.clone();
-    entry.record.domain.wire_profile = WireProfile::Legacy;
+    std::sync::Arc::make_mut(&mut entry.record).domain.wire_profile = WireProfile::Legacy;
     cases.push(entry);
     let mut entry = good.clone();
-    entry.record.block_data[0] ^= 1;
+    std::sync::Arc::make_mut(&mut entry.record).block_data[0] ^= 1;
     cases.push(entry);
     let mut entry = good.clone();
-    entry.record.block_id.seq_no += 1;
+    std::sync::Arc::make_mut(&mut entry.record).block_id.seq_no += 1;
     cases.push(entry);
     let mut entry = good.clone();
-    entry.record.prev[0].file_hash = UInt256::from([9; 32]);
+    std::sync::Arc::make_mut(&mut entry.record).prev[0].file_hash = UInt256::from([9; 32]);
     cases.push(entry);
     bad!(carrier, StoredCarrier::Approval(good.record.carrier.bytes().to_vec()));
     let mut appended = good.record.carrier.bytes().to_vec();
@@ -301,7 +301,7 @@ async fn outbox_auth_rejects_tampered_domains_body_carrier_and_pending() {
     noncanonical.extend_from_slice(&(signature.len() as u64).to_le_bytes()[..7]);
     noncanonical.extend_from_slice(&encoded[offset..]);
     let mut entry = good.clone();
-    entry.record.carrier = StoredCarrier::Final(noncanonical);
+    std::sync::Arc::make_mut(&mut entry.record).carrier = StoredCarrier::Final(noncanonical);
     assert!(authenticate_publication(
         &MasterchainProofVerifier::default(),
         &engine,
@@ -316,7 +316,7 @@ async fn outbox_auth_rejects_tampered_domains_body_carrier_and_pending() {
         .await
         .is_err());
     let (engine, mut approval) = fixture(false).await;
-    approval.record.effects[0].kind = PublicationKind::Finality;
+    std::sync::Arc::make_mut(&mut approval.record).effects[0].kind = PublicationKind::Finality;
     approval.pending = approval.record.effects.clone();
     assert!(authenticate_publication(
         &MasterchainProofVerifier::default(),
@@ -343,7 +343,7 @@ async fn outbox_auth_ready_and_cached_metadata_cannot_replace_history() {
     .is_err());
     engine.deny_history = false;
     engine.pin.file_hash = UInt256::from([17; 32]);
-    entry.record.domain.zerostate = engine.pin.clone();
+    std::sync::Arc::make_mut(&mut entry.record).domain.zerostate = engine.pin.clone();
     assert!(
         authenticate_publication(
             &MasterchainProofVerifier::default(),
@@ -356,7 +356,7 @@ async fn outbox_auth_ready_and_cached_metadata_cannot_replace_history() {
         "matching serialized pin must not authenticate wrong state"
     );
     engine.pin = engine.zero.block_id().clone();
-    entry.record.domain.zerostate = engine.pin.clone();
+    std::sync::Arc::make_mut(&mut entry.record).domain.zerostate = engine.pin.clone();
     engine.wire = WireProfile::Legacy;
     assert!(authenticate_publication(
         &MasterchainProofVerifier::default(),

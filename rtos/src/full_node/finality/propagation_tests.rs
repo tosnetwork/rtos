@@ -479,7 +479,7 @@ async fn publication_recovery_replays_prepared_and_ready_acceptance() {
             let mut entry = UnverifiedRecord {
                 id: RecordId(1),
                 stage: PublicationStage::Prepared,
-                record: PublicationRecord {
+                record: std::sync::Arc::new(PublicationRecord {
                     domain: OutboxDomain {
                         zerostate: context.zerostate().clone(),
                         global_id: context.global_id(),
@@ -501,7 +501,7 @@ async fn publication_recovery_replays_prepared_and_ready_acceptance() {
                     created_at_unix_secs: 100,
                     expires_at_unix_secs: 200,
                     effects: vec![effect.clone()],
-                },
+                }),
                 pending: vec![effect],
             };
             let mut wrong_init = context.history_init().clone();
@@ -551,7 +551,7 @@ async fn publication_recovery_replays_prepared_and_ready_acceptance() {
             }
             // Exercise the actual Engine admission and owned worker. Publication
             // stays disabled so every selected target must survive shutdown.
-            let mut record = entry.record;
+            let mut record = std::sync::Arc::unwrap_or_clone(entry.record);
             record.created_at_unix_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -591,7 +591,7 @@ async fn publication_recovery_replays_prepared_and_ready_acceptance() {
         let pending = outbox.pending().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].stage, PublicationStage::Ready);
-        assert_eq!(pending[0].record, record);
+        assert_eq!(pending[0].record.as_ref(), &record);
         assert_eq!(pending[0].pending, record.effects);
         drop(outbox);
         reopened.clone().wait_stop().await.unwrap();

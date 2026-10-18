@@ -155,7 +155,10 @@ pub enum PublicationStage {
 pub struct UnverifiedRecord {
     pub id: RecordId,
     pub stage: PublicationStage,
-    pub record: PublicationRecord,
+    /// Shared immutable evidence, like the candidate reference retained by a
+    /// resolver. A transport checkpoint changes only stage/pending, while old
+    /// readers keep the same retained input. Full snapshot sync is unchanged.
+    pub record: Arc<PublicationRecord>,
     pub pending: Vec<PublicationEffect>,
 }
 
@@ -294,7 +297,7 @@ impl PropagationOutbox {
         next.entries.push(UnverifiedRecord {
             id,
             stage: PublicationStage::Prepared,
-            record,
+            record: Arc::new(record),
             pending,
         });
         self.commit(&mut state, next)?;
@@ -410,7 +413,7 @@ impl PropagationOutbox {
         {
             let existing =
                 state.snapshot.entries.iter().find(|e| e.id == delivery.record_id).unwrap();
-            let mut original = existing.record.clone();
+            let mut original = existing.record.as_ref().clone();
             original.effects.clear();
             // Recovery may conservatively demote local routing claims. Preserve
             // the first authenticated intent rather than deriving it again.
@@ -429,7 +432,7 @@ impl PropagationOutbox {
         next.entries.push(UnverifiedRecord {
             id: record_id,
             stage: PublicationStage::DraftDurable,
-            record,
+            record: Arc::new(record),
             pending: Vec::new(),
         });
         next.deliveries.push(Delivery {
@@ -607,7 +610,7 @@ impl PropagationOutbox {
         }
         effects.sort();
         effects.dedup();
-        entry.record.effects = effects.clone();
+        Arc::make_mut(&mut entry.record).effects = effects.clone();
         entry.pending = effects;
         entry.stage = if entry.pending.is_empty() {
             PublicationStage::Completed
@@ -1116,7 +1119,7 @@ fn decode_snapshot(bytes: &[u8], domain: &OutboxDomain, limits: &Limits) -> Resu
         };
         validate_record(&record, domain, limits)?;
         validate_pending(&record, stage, &pending)?;
-        entries.push(UnverifiedRecord { id, stage, record, pending });
+        entries.push(UnverifiedRecord { id, stage, record: Arc::new(record), pending });
     }
     let mut deliveries = Vec::new();
     let mut delivery_ids = BTreeSet::new();
@@ -1361,6 +1364,74 @@ mod tests {
     }
 
     #[test]
+    fn outbox_checkpoints_share_immutable_recovery_evidence() -> Result<()> {
+        let disk = Arc::new(MemoryStore::default());
+        let store = memory(disk.clone(), Limits::default());
+        let mut first = record(1);
+        first.block_data = vec![31; 1 << 20];
+        first.proof_data = Some(vec![41; 1 << 20]);
+        let id = store.enqueue(first.clone())?;
+        store.mark_ready(id)?;
+        let held = store.pending()?.remove(0);
+        let other = store.enqueue(record(2))?;
+        store.mark_ready(other)?;
+        let before = disk.sync_attempts.load(Ordering::Relaxed);
+        assert!(store.checkpoint_sent(id, &[effect(PublicationKind::Candidate)])?);
+        let current = store.pending()?.into_iter().find(|entry| entry.id == id).unwrap();
+        assert_eq!(held.record.block_data.as_ptr(), current.record.block_data.as_ptr(),
+            "a transport checkpoint copied retained block evidence");
+        assert_eq!(held.record.proof_data.as_ref().unwrap().as_ptr(),
+            current.record.proof_data.as_ref().unwrap().as_ptr(),
+            "a transport checkpoint copied retained proof evidence");
+        assert_eq!(held.record, current.record);
+        assert_eq!(held.pending.len(), 3, "a reader's earlier checkpoint must not change");
+        assert_eq!(current.pending.len(), 2);
+        assert_eq!(disk.sync_attempts.load(Ordering::Relaxed), before + 1);
+        assert!(!store.checkpoint_sent(id, &[effect(PublicationKind::Candidate)])?);
+        assert_eq!(disk.sync_attempts.load(Ordering::Relaxed), before + 1);
+        let reopened = memory(disk, Limits::default());
+        let restored = reopened.pending()?.into_iter().find(|entry| entry.id == id).unwrap();
+        assert_eq!(restored, current, "reopen must use the full synced checkpoint");
+        Ok(())
+    }
+
+    #[test]
+    fn outbox_target_freeze_preserves_held_draft_and_syncs_complete_evidence() -> Result<()> {
+        for failure in [0, 1, 2] {
+            let disk = Arc::new(MemoryStore::default());
+            let store = memory(disk.clone(), Limits::default());
+            let delivery = store.stage_draft(record(1), 7, false, None)?;
+            let (coordinates, _) = store.delivery(&delivery)?.unwrap();
+            store.mark_accepted(coordinates.record_id)?;
+            let (_, held) = store.delivery(&delivery)?.unwrap();
+            assert!(held.record.effects.is_empty());
+            let targets = vec![effect(PublicationKind::Block)];
+            disk.failure.store(failure, Ordering::Release);
+            let result = store.resolve_draft(coordinates.record_id, targets.clone());
+            assert_eq!(result.is_ok(), failure == 0);
+            assert!(held.record.effects.is_empty(), "target freeze mutated an earlier reader");
+            assert!(held.pending.is_empty());
+            if failure != 0 {
+                assert!(store.pending().is_err(), "uncertain writes must remain sticky");
+            }
+            disk.failure.store(0, Ordering::Release);
+            let reopened = memory(disk, Limits::default());
+            let (_, restored) = reopened.delivery(&delivery)?.unwrap();
+            assert_eq!(restored.record.block_data, held.record.block_data);
+            assert_eq!(restored.record.proof_data, held.record.proof_data);
+            assert_eq!(restored.record.carrier, held.record.carrier);
+            if failure == 1 {
+                assert_eq!(restored, held, "a rejected write must preserve the prior snapshot");
+            } else {
+                assert_eq!(restored.stage, PublicationStage::Ready);
+                assert_eq!(restored.pending, targets);
+                assert_eq!(restored.record.effects, targets);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn outbox_mutation_epoch_advances_on_every_write_and_fails_closed_on_exhaustion() -> Result<()>
     {
         let disk = Arc::new(MemoryStore::default());
@@ -1583,7 +1654,7 @@ mod tests {
             entries: vec![UnverifiedRecord {
                 id: RecordId(1),
                 stage: PublicationStage::Prepared,
-                record: empty.clone(),
+                record: Arc::new(empty.clone()),
                 pending: Vec::new(),
             }],
             deliveries: Vec::new(),

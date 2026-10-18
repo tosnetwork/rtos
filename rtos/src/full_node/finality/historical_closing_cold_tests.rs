@@ -210,7 +210,7 @@ async fn historical_closing_first_cold_full_canonical_recovers_without_source_ru
             namespace,
             domain,
             original_close,
-            entries[0].record.clone(),
+            entries[0].record.as_ref().clone(),
         )
     })
     .catch_unwind()
@@ -286,7 +286,7 @@ async fn historical_closing_first_cold_full_canonical_recovers_without_source_ru
         let (entries, closes) = inspect_closure_progress(cold.db(), &domain).unwrap();
         assert_eq!(entries.len(), 1, "history admission does not discharge pending effects");
         assert_eq!(
-            entries[0].record, original_record,
+            entries[0].record.as_ref(), &original_record,
             "history recovery cannot change canonical bytes or original age"
         );
         assert!(closes.is_empty(), "history admission cannot mint compact custody");
@@ -314,8 +314,8 @@ async fn historical_closing_first_cold_full_canonical_recovers_without_source_ru
         assert_eq!(locators[0].request().unwrap(), original_close);
         drop(locators);
         assert_eq!(
-            inspect_closure_progress(offline.db(), &domain).unwrap().0[0].record,
-            original_record
+            inspect_closure_progress(offline.db(), &domain).unwrap().0[0].record.as_ref(),
+            &original_record
         );
         let observed =
             crate::historical_recovery::test_hooks::install(offline.as_ref(), false, false);
