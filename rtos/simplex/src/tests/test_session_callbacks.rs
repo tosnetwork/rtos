@@ -659,3 +659,40 @@ fn run_worker_loop_processes_queued_closures_then_exits_on_stop() {
         "is_stopped_flag must be set by run_worker_loop on clean exit",
     );
 }
+
+
+#[test]
+fn finality_ready_coalesces_main_queue_and_respects_stop_without_owning_queue() {
+    use crate::task_queue::{TaskPtr, TaskQueuePtr};
+    #[derive(Default)]
+    struct MainQueue(Mutex<VecDeque<TaskPtr>>);
+    impl TaskQueue<TaskPtr> for MainQueue {
+        fn is_overloaded(&self) -> bool { false }
+        fn is_empty(&self) -> bool { self.0.lock().unwrap().is_empty() }
+        fn post_closure(&self, task: TaskPtr) { self.0.lock().unwrap().push_back(task); }
+        fn pull_closure(&self, _: Duration, _: &mut SystemTime) -> Option<TaskPtr> {
+            self.0.lock().unwrap().pop_front()
+        }
+        fn flush(&self) { self.0.lock().unwrap().clear(); }
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let (callbacks, _) = make_callbacks(stop.clone(), false);
+    let queue = Arc::new(MainQueue::default());
+    let main: TaskQueuePtr = queue.clone();
+    let ready = callbacks.delivery_ready_callback(main.clone());
+    assert_eq!(Arc::strong_count(&callbacks), 1, "delivery waker cannot retain callbacks/source lifetime");
+    assert_eq!(Arc::strong_count(&queue), 2, "waker holds only a weak main queue");
+    for _ in 0..1000 { ready(); }
+    assert_eq!(queue.0.lock().unwrap().len(), 1, "completion burst must coalesce");
+    let stopped_ready = callbacks.delivery_ready_callback(main.clone());
+    stop.store(true, Ordering::Release);
+    stopped_ready();
+    assert_eq!(queue.0.lock().unwrap().len(), 1, "stopped source cannot enqueue a continuation");
+    let lost_queue_ready = callbacks.delivery_ready_callback(main.clone());
+    stop.store(false, Ordering::Release);
+    let weak = Arc::downgrade(&queue);
+    drop(main);
+    drop(queue);
+    assert!(weak.upgrade().is_none());
+    lost_queue_ready();
+}

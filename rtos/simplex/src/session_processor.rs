@@ -1277,6 +1277,19 @@ impl SessionProcessor {
         self.with_candidate_backend(|c, b| c.ensure_candidate_available(block_id, opts, b));
     }
 
+    /// A durable source or node-acceptance completion is an explicit
+    /// continuation, not unrelated traffic waiting for the periodic fallback.
+    pub(crate) fn on_finality_delivery_ready(&mut self) {
+        if self.consensus.durable_pending_floor().is_none() { return; }
+        self.with_consensus_backend(|consensus, backend| {
+            consensus.retry_pending_recursive_finalization(backend)
+        });
+        self.next_finality_retry = self.now() + Duration::from_millis(250);
+        if self.consensus.durable_pending_floor().is_some() {
+            self.runtime.set_next_awake_time(self.next_finality_retry);
+        }
+    }
+
     /// Schedule a (possibly delayed, throttled) `requestCandidate`. Delegates to
     /// [`CandidateController::request_candidate`].
     fn request_candidate(

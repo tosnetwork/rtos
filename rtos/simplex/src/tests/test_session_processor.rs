@@ -12230,8 +12230,13 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain:
     processor.cleanup_old_slots(SlotIndex::new(1000));
     assert!(processor.candidate_book().received(&candidate_id).is_some(), "held finality must retain body ancestry");
     let (_, complete) = sink.0.lock().unwrap().pop().unwrap();
+    processor.set_time(processor.now());
+    let now = processor.now(); // The fixture stores timestamps at microsecond precision.
+    processor.next_finality_retry = now + Duration::from_millis(250);
     complete(Ok(UInt256::from([7; 32])));
-    processor.with_consensus_backend(|controller, backend| controller.retry_pending_recursive_finalization(backend));
+    assert!(!processor.consensus.finalized_delivery_sent_contains(&candidate_id));
+    processor.on_finality_delivery_ready();
+    assert_eq!(processor.now(), now, "completed delivery must resume without advancing the fallback clock");
     assert!(processor.consensus.is_finalized_block(&candidate_id));
     assert!(processor.consensus.finalized_delivery_sent_contains(&candidate_id));
     db.sync(Some(Duration::from_secs(5))).unwrap(); processor.process_pending_async_db_results();

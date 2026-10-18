@@ -697,6 +697,7 @@ impl SourceFinalityDelivery {
                 match result {
                     Ok(()) => {
                         owner.stages.lock().unwrap().insert(completed_id, SourceStage::Consumed);
+                        owner.notify_ready();
                     }
                     Err(error) => {
                         log::debug!("Source Delivered remains retained for retry: {error}");

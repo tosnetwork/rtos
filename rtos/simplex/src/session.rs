@@ -624,7 +624,7 @@ impl SessionImpl {
         let _source_delivery_lifetime = callbacks.delivery_lifetime();
         if let Some(runtime) = authenticated_runtime.as_ref() {
             if let Err(error) =
-                callbacks.initialize_delivery(runtime.clone(), std::path::Path::new(&db_path))
+                callbacks.initialize_delivery_on_queue(runtime.clone(), std::path::Path::new(&db_path), task_queue.clone())
             {
                 fail_startup(error, "durable finality source admission failed");
                 return;

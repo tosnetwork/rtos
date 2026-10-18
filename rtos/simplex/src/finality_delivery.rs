@@ -1293,7 +1293,9 @@ fn scan_pending_finality_inner(root: &Path, allow_certificate_replay: bool) -> R
 /// Session-local admission state. Accepted node work owns this Arc, so source
 /// cancellation cannot drop the retention lock or turn an outstanding stage
 /// into an acknowledged delivery.
+pub(crate) type SourceReadyCallback = Arc<dyn Fn() + Send + Sync>;
 pub(crate) struct SourceFinalityDelivery {
+    ready_callback: Option<SourceReadyCallback>,
     #[cfg(test)]
     pub(crate) retain_intent_attempts: std::sync::atomic::AtomicUsize,
     runtime: Arc<AuthenticatedSessionRuntime>,
@@ -1366,6 +1368,9 @@ enum SourceStage {
     Acknowledging(UInt256, FinalizedDeliveryDraft),
 }
 impl SourceFinalityDelivery {
+    pub(super) fn notify_ready(&self) {
+        if let Some(callback) = &self.ready_callback { callback(); }
+    }
     fn operation_timer(&self, operation: &'static str) -> SourceOperationTimer<'_> {
         SourceOperationTimer { source: self, operation, started: std::time::Instant::now() }
     }
@@ -1382,6 +1387,15 @@ impl SourceFinalityDelivery {
         sink: consensus_common::finality_delivery::DurableFinalitySinkPtr,
         delivered_sink: Option<DeliveredCompletionSink>,
     ) -> Result<Arc<Self>> {
+        Self::open_with_ready(runtime, namespace, sink, delivered_sink, None)
+    }
+    pub(crate) fn open_with_ready(
+        runtime: Arc<AuthenticatedSessionRuntime>,
+        namespace: &Path,
+        sink: consensus_common::finality_delivery::DurableFinalitySinkPtr,
+        delivered_sink: Option<DeliveredCompletionSink>,
+        ready_callback: Option<SourceReadyCallback>,
+    ) -> Result<Arc<Self>> {
         let store = PendingFinalityStore::open(namespace)?;
         *store.runtime_binding.lock().unwrap() =
             runtime.recovery_binding().map(delivered::DiskRecoveryBinding::from_binding);
@@ -1393,6 +1407,7 @@ impl SourceFinalityDelivery {
             store,
             sink,
             delivered_sink,
+            ready_callback,
             closing: Mutex::new(std::collections::HashSet::new()),
             close_cursor: Mutex::new((std::time::Instant::now(), 0)),
             closing_maintenance: Mutex::new(ClosingMaintenance {
@@ -1622,6 +1637,7 @@ impl SourceFinalityDelivery {
                     };
                     owner.stages.lock().unwrap().insert(completion_id, state);
                     if compact {
+                        owner.notify_ready();
                         owner.request_compaction(compact_receipt.unwrap(), compact_draft.unwrap());
                     }
                 }
@@ -1658,6 +1674,7 @@ impl SourceFinalityDelivery {
                 owner.runtime.session_id().to_hex_string(), callback_id.to_hex_string(),
                 callback_receipt.to_hex_string(), started.elapsed().as_millis(),
                 result.as_ref().err().map(ToString::to_string));
+            let accepted = result.is_ok();
             let stage = match result {
                 Ok(()) => SourceStage::Accepted(callback_receipt, callback_draft),
                 Err(error) => {
@@ -1666,6 +1683,7 @@ impl SourceFinalityDelivery {
                 }
             };
             owner.stages.lock().unwrap().insert(callback_id, stage);
+            if accepted { owner.notify_ready(); }
         })) {
             self.stages.lock().unwrap().insert(id, SourceStage::AcceptanceRetry(
                 std::time::Instant::now() + std::time::Duration::from_millis(250), receipt, draft));
@@ -1763,6 +1781,7 @@ impl SourceFinalityDelivery {
                             .lock()
                             .unwrap()
                             .insert(id, SourceStage::Durable(receipt, draft));
+                        owner.notify_ready();
                     }
                     Err(error) => {
                         log::error!("Canonical source lookup retained for retry: {error}");
@@ -2341,6 +2360,45 @@ pub(crate) mod tests {
         assert_eq!(restored.len(), 2);
         assert_eq!(restored.iter().filter(|r| r.record().is_final).count(), 1);
         assert_eq!(restored.iter().filter(|r| !r.record().is_final).count(), 1);
+    }
+
+    #[test]
+    fn source_finality_progress_notifies_after_wal_and_node_acceptance() {
+        for is_final in [false, true] {
+            let temp = crate::authenticated_fixture::TestDirectory::new();
+            let (runtime, draft) = fixture_role(is_final,
+                ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap());
+            let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+            let sink = Arc::new(HeldSink::default());
+            *sink.1.lock().unwrap() = Some(Vec::new());
+            let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = wakes.clone();
+            let source = SourceFinalityDelivery::open_with_ready(runtime.clone(), &namespace, sink.clone(), None,
+                Some(Arc::new(move || { observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }))).unwrap();
+            assert!(source.poll(draft.clone()).unwrap().is_none());
+            assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 0, "uncommitted work cannot wake a completed continuation");
+            let (_, staged) = sink.0.lock().unwrap().pop().unwrap();
+            let receipt = UInt256::from([4; 32]);
+            staged(Ok(receipt.clone()));
+            assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 1, "successful durable stage must wake its awaiter");
+            assert!(!source.consumed(&draft).unwrap());
+            assert!(source.poll(draft.clone()).unwrap().is_none());
+            let (_, accepted) = sink.1.lock().unwrap().as_mut().unwrap().pop().unwrap();
+            accepted(Err(error!("transient node acceptance failure")));
+            assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 1, "failed acceptance retains the existing timed retry");
+            assert!(!source.consumed(&draft).unwrap());
+            let id = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap().id().unwrap();
+            if let Some(SourceStage::AcceptanceRetry(at, _, _)) = source.stages.lock().unwrap().get_mut(&id) {
+                *at = std::time::Instant::now();
+            } else { panic!("acceptance retry missing"); }
+            assert!(source.poll(draft.clone()).unwrap().is_none());
+            let (_, accepted) = sink.1.lock().unwrap().as_mut().unwrap().pop().unwrap();
+            accepted(Ok(()));
+            assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 2, "successful node acceptance must wake its awaiter");
+            assert_eq!(source.poll(draft.clone()).unwrap().unwrap().0, receipt);
+            assert!(source.consumed(&draft).unwrap());
+            assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
     }
 
     #[test]

@@ -168,13 +168,58 @@ impl SessionCallbacks {
         runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
         namespace: &std::path::Path,
     ) -> rtos_block::Result<()> {
+        self.initialize_delivery_with_ready(runtime, namespace, None)
+    }
+    pub(crate) fn initialize_delivery_on_queue(
+        &self,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        namespace: &std::path::Path,
+        queue: crate::task_queue::TaskQueuePtr,
+    ) -> rtos_block::Result<()> {
+        self.initialize_delivery_with_ready(runtime, namespace, Some(self.delivery_ready_callback(queue)))
+    }
+    fn delivery_ready_callback(&self, queue: crate::task_queue::TaskQueuePtr)
+        -> crate::finality_delivery::SourceReadyCallback
+    {
+        // A completion resumes SXMAIN, like the C++ await continuation. Keep
+        // only a weak queue reference and at most one outstanding wake task.
+        let queue = Arc::downgrade(&queue);
+        let stop = self.stop_flag.clone();
+        let pending = Arc::new(AtomicBool::new(false));
+        let session = self.session_id.clone();
+        Arc::new(move || {
+            if stop.load(Ordering::Acquire) || pending.swap(true, Ordering::AcqRel) { return; }
+            if let Some(queue) = queue.upgrade() {
+                let pending = pending.clone();
+                let session = session.clone();
+                let stopped = stop.clone();
+                let queued = std::time::Instant::now();
+                queue.post_closure(Box::new(move |processor| {
+                    pending.store(false, Ordering::Release);
+                    if stopped.load(Ordering::Acquire) { return; }
+                    log::debug!(target: "simplex_resolver", "FINALITY_DELIVERY_READY: session={} queue_ms={}",
+                        session.to_hex_string(), queued.elapsed().as_millis());
+                    processor.on_finality_delivery_ready();
+                }));
+            } else {
+                pending.store(false, Ordering::Release);
+            }
+        })
+    }
+    fn initialize_delivery_with_ready(
+        &self,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        namespace: &std::path::Path,
+        ready: Option<crate::finality_delivery::SourceReadyCallback>,
+    ) -> rtos_block::Result<()> {
         let sink =
             self.delivery_sink.clone().ok_or_else(|| rtos_block::error!("Missing durable sink"))?;
-        let source = crate::finality_delivery::SourceFinalityDelivery::open_with_delivered(
+        let source = crate::finality_delivery::SourceFinalityDelivery::open_with_ready(
             runtime,
             namespace,
             sink,
             self.delivered_completion.clone(),
+            ready,
         )?;
         let mut slot = self.source_delivery.lock().unwrap();
         if slot.is_some() {
