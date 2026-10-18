@@ -20,6 +20,11 @@ pub(super) struct Lease {
     dependencies: Vec<Dependency>,
 }
 pub(super) async fn prepare(db: &InternalDb, fixture: &Fixture, retained: u32, defer_begin: bool) -> Result<Lease> {
+    let root = Path::new(db.db_root_dir()?).parent().unwrap();
+    let marker = root.join("forced-truncation-fixture");
+    fs::write(&marker, b"Explicit forced-recovery fixture; not read by production node")?;
+    fs::File::open(&marker)?.sync_all()?;
+    fs::File::open(root)?.sync_all()?;
     let (mut binding, _, _) = sst_fixture_for_test();
     binding.domain.zerostate = fixture.id(0, false);
     binding.domain.history_init = fixture.id(0, false);
@@ -53,7 +58,7 @@ fn spawn(binary: &Path, root: &Path, zero: &Path, path: &Path) -> Result<Process
             .arg(root)
             .arg("--zerostate")
             .arg(zero)
-            .arg("--initial-sync-disabled")
+            .arg("--initial-sync-disabled").args(forced_cursor_fixture_args(root))
             .current_dir(root)
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log))
@@ -269,7 +274,7 @@ pub(super) async fn run(
         if cut.ends_with("-cache-loss") { cache_loss::sync_fixture(root)?; }
         let statement = match cut {
             "truncation-before-progress" => {
-                "db.save_full_node_state(SHARD_CLIENT_MC_BLOCK, last_mc_block.id())?;"
+                "db.save_full_node_state(SHARD_CLIENT_MC_BLOCK, shard_client_progress)?;"
             }
             "repack-before-rename" => {
                 "sync_child(source.last().unwrap(), &old)?;"

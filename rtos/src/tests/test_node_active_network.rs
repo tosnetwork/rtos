@@ -22,7 +22,7 @@ fn launch(binary: &Path, root: &Path, boot: usize, fault: Option<&Fault>) -> Res
     let mut command = Command::new(binary);
     command.env("TOKIO_WORKER_THREADS", "2")
         .arg("--configs").arg(root).arg("--zerostate").arg(root.join("zero"))
-        .arg("--initial-sync-disabled").current_dir(root)
+        .arg("--initial-sync-disabled").args(forced_cursor_fixture_args(root)).current_dir(root)
         .stdout(Stdio::from(file.try_clone()?)).stderr(Stdio::from(file));
     if let Some(fault) = fault {
         command.env("LD_PRELOAD", &fault.library).env("RTOS_TEST_SOURCE_FAULT_MODE", &fault.mode)

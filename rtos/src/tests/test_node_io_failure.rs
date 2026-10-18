@@ -36,7 +36,7 @@ pub(super) async fn recovery_fault(binary: &Path, root: &Path, zero: &Path, mode
         .env("RTOS_TEST_RECOVERY_FAULT_MODE", mode)
         .env("RTOS_TEST_FIXTURE_ROOT", root)
         .arg("--configs").arg(root).arg("--zerostate").arg(zero)
-        .arg("--initial-sync-disabled").current_dir(root)
+        .arg("--initial-sync-disabled").args(forced_cursor_fixture_args(root)).current_dir(root)
         .stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log)).spawn()?);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {

@@ -13,7 +13,7 @@ pub(super) async fn run(binary: &Path, root: &Path, zero: &Path, fixture: &Fixtu
         let path = root.join(format!("active-node-{attempt}.log"));
         let log = fs::File::create(&path)?;
         let mut node = Process(Command::new(binary).env("TOKIO_WORKER_THREADS", "2")
-            .arg("--configs").arg(root).arg("--zerostate").arg(zero).arg("--initial-sync-disabled")
+            .arg("--configs").arg(root).arg("--zerostate").arg(zero).arg("--initial-sync-disabled").args(forced_cursor_fixture_args(root))
             .current_dir(root).stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log)).spawn()?);
         let deadline = Instant::now() + Duration::from_secs(100);
         let advanced = loop {

@@ -79,7 +79,8 @@ pub async fn check_db(
 
         set_restoring(&db.config.db_directory)?;
         if check_genesis_checkpoint(db, check_stop)
-            .map_err(|err| restore_failure(err, is_broken))? {
+            .map_err(|err| restore_failure(err, is_broken))?
+        {
             log::info!("Genesis checkpoint and workchain states are consistent after interruption");
         } else {
             match restore_last_applied_mc_block(db, check_stop).await {
@@ -91,7 +92,8 @@ pub async fn check_db(
                         check_stop,
                     )
                     .await?;
-                    restore(db, &last_applied_mc_block, &shard_client_mc_block).await
+                    restore(db, &last_applied_mc_block, &shard_client_mc_block, force, check_stop)
+                        .await
                         .map_err(|err| restore_failure(err, is_broken))?;
                 }
                 Ok(None) => {
@@ -121,10 +123,12 @@ fn check_genesis_checkpoint(
         Ok(Some(id)) if id.seq_no() == 0 => id,
         _ => return Ok(false),
     };
-    if !id.shard().is_masterchain_ext() { fail!("Invalid genesis masterchain checkpoint"); }
+    if !id.shard().is_masterchain_ext() {
+        fail!("Invalid genesis masterchain checkpoint");
+    }
     for key in [SHARD_CLIENT_MC_BLOCK, PSS_KEEPER_MC_BLOCK, ARCHIVES_GC_BLOCK] {
         match db.load_full_node_state(key)? {
-            Some(other) if other.as_ref() == id.as_ref() => {},
+            Some(other) if other.as_ref() == id.as_ref() => {}
             Some(_) => fail!("Genesis checkpoint conflicts with {key}"),
             None => return Ok(false), // Partial boot still requires its recovery path.
         }
@@ -136,6 +140,18 @@ fn check_genesis_checkpoint(
         }
         Ok(true)
     })?;
+    check_genesis_states(db, &id, check_stop)?;
+    Ok(true)
+}
+
+fn check_genesis_states(
+    db: &InternalDb,
+    id: &BlockIdExt,
+    check_stop: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<()> {
+    if id.seq_no() != 0 || !id.shard().is_masterchain_ext() {
+        fail!("Invalid genesis recovery cursor");
+    }
     let verify = |id: &BlockIdExt| -> Result<()> {
         check_stop()?;
         if !db.load_block_handle(id)?.is_some_and(|handle| handle.is_applied()) {
@@ -143,15 +159,17 @@ fn check_genesis_checkpoint(
         }
         db.load_shard_state_dynamic(id)?.verify_zerostate(id)
     };
-    verify(&id)?;
-    let state = db.load_shard_state_dynamic(&id)?;
+    verify(id)?;
+    let state = db.load_shard_state_dynamic(id)?;
     for (workchain, descriptor) in state.workchains()? {
         verify(&BlockIdExt::with_params(
             rtos_block::ShardIdent::with_tagged_prefix(workchain, rtos_block::SHARD_FULL)?,
-            0, descriptor.zerostate_root_hash, descriptor.zerostate_file_hash,
+            0,
+            descriptor.zerostate_root_hash,
+            descriptor.zerostate_file_hash,
         ))?;
     }
-    Ok(true)
+    Ok(())
 }
 
 pub fn set_graceful_termination(db_dir: &str) {
@@ -244,8 +262,17 @@ async fn restore_shard_client_mc_block(
     last_applied_mc_block: &BlockStuff,
     processed_wc: i32,
     check_stop: &(dyn Fn() -> Result<()> + Sync),
-) -> Result<BlockStuff> {
-    let mut block = match db.load_full_node_state(SHARD_CLIENT_MC_BLOCK) {
+) -> Result<BlockIdExt> {
+    let stored = db.load_full_node_state(SHARD_CLIENT_MC_BLOCK);
+    if let Ok(Some(id)) = &stored {
+        if id.seq_no() == 0 {
+            // Zerostates have no block/proof file. Check the actual MC and WC
+            // zero states instead of treating a valid initial cursor as damage.
+            check_genesis_states(db, id, check_stop)?;
+            return Ok(id.as_ref().clone());
+        }
+    }
+    let mut block = match stored {
         Ok(None) => {
             log::warn!("SHARD_CLIENT_MC_BLOCK is None, use last applied mc block instead");
             last_applied_mc_block.clone()
@@ -288,7 +315,7 @@ async fn restore_shard_client_mc_block(
         match check_shard_client_mc_block(db, &block, processed_wc, false, check_stop).await {
             Ok(_) => {
                 log::info!("restore_shard_client_mc_block: {} has all shard blocks", block.id());
-                return Ok(block);
+                return Ok(block.id().clone());
             }
             Err(e) => {
                 log::warn!("{} doesn't have all shard blocks: {}, use prev", block.id(), e);
@@ -305,52 +332,116 @@ async fn restore_shard_client_mc_block(
     }
 }
 
+/// Check the independently recovered cursors are on the same hash-linked MC
+/// ancestry. This storage check does not replace normal Engine boot proof checks.
+async fn check_cursor_ancestry(
+    db: &InternalDb,
+    head: &BlockStuff,
+    shard_client: &BlockIdExt,
+    check_stop: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<()> {
+    if shard_client.seq_no() > head.id().seq_no() {
+        fail!("Recovered shard-client cursor is ahead of checked masterchain head");
+    }
+    let mut current = head.clone();
+    loop {
+        check_stop()?;
+        if current.id().seq_no() == shard_client.seq_no() {
+            if current.id() != shard_client {
+                fail!("Recovered masterchain and shard-client cursors disagree");
+            }
+            return Ok(());
+        }
+        let (prev, second) = current.construct_prev_id()?;
+        if second.is_some()
+            || !prev.shard().is_masterchain_ext()
+            || prev.seq_no().checked_add(1) != Some(current.id().seq_no())
+        {
+            fail!("Invalid recovered masterchain cursor ancestry");
+        }
+        if prev.seq_no() == shard_client.seq_no() {
+            if &prev != shard_client {
+                fail!("Shard-client cursor is not an ancestor of checked masterchain head");
+            }
+            return Ok(());
+        }
+        current = check_one_block(db, &prev, false, true).await?;
+    }
+}
+
 async fn restore(
     db: &InternalDb,
     last_applied_mc_block: &BlockStuff,
-    shard_client_mc_block: &BlockStuff,
+    shard_client_mc_block: &BlockIdExt,
+    force: bool,
+    check_stop: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<()> {
-    let last_mc_block = if last_applied_mc_block.id().seq_no() > shard_client_mc_block.id().seq_no()
-    {
+    let intact_head = !force
+        && db
+            .load_full_node_state(LAST_APPLIED_MC_BLOCK)?
+            .is_some_and(|id| id.as_ref() == last_applied_mc_block.id());
+    let last_mc_block = if intact_head {
+        let state = db.load_shard_state_dynamic(last_applied_mc_block.id())?;
+        if *state.root_cell().repr_hash()
+            != last_applied_mc_block.block()?.read_state_update()?.new_hash
+        {
+            fail!("Checked masterchain cursor state differs from its block update");
+        }
+        check_cursor_ancestry(db, last_applied_mc_block, shard_client_mc_block, check_stop).await?;
+        last_applied_mc_block.id()
+    } else if last_applied_mc_block.id().seq_no() > shard_client_mc_block.seq_no() {
         shard_client_mc_block
     } else {
-        last_applied_mc_block
+        last_applied_mc_block.id()
     };
 
-    log::info!("restore, use as last block: {}", last_mc_block.id());
+    log::info!("restore, use as last block: {}", last_mc_block);
 
-    // truncate DB
-    log::debug!("try to truncate database after {}", last_mc_block.id());
-    match db.load_block_next1(last_mc_block.id()) {
-        Err(_) => {
-            log::info!(
-                "Can't load next mc block (prev {}), \
+    // C++ initializes the processed MC head and shard client independently.
+    // A checked healthy head does not become a truncation request merely
+    // because the shard client is behind; its normal client catches up later.
+    // Forced recovery and a damaged/recovered head retain the truncation path.
+    if intact_head {
+        log::info!(
+            "Preserving checked MC {} and shard-client cursor {} for normal catch-up",
+            last_mc_block,
+            shard_client_mc_block
+        );
+    } else {
+        log::debug!("try to truncate database after {}", last_mc_block);
+        match db.load_block_next1(last_mc_block) {
+            Err(_) => {
+                log::info!(
+                    "Can't load next mc block (prev {}), \
                 db truncation will be skipped",
-                last_mc_block.id()
-            );
-        }
-        Ok(next_id) => {
-            db.truncate_database(&next_id).await
-                .map_err(|err| error!("Database recovery truncation failed at {}: {}", next_id, err))?;
-            log::info!("Database was truncated at {}", next_id);
+                    last_mc_block
+                );
+            }
+            Ok(next_id) => {
+                db.truncate_database(&next_id).await.map_err(|err| {
+                    error!("Database recovery truncation failed at {}: {}", next_id, err)
+                })?;
+                log::info!("Database was truncated at {}", next_id);
+            }
         }
     }
-    db.save_full_node_state(SHARD_CLIENT_MC_BLOCK, last_mc_block.id())?;
-    db.save_full_node_state(LAST_APPLIED_MC_BLOCK, last_mc_block.id())?;
+    let shard_client_progress = if intact_head { shard_client_mc_block } else { last_mc_block };
+    db.save_full_node_state(SHARD_CLIENT_MC_BLOCK, shard_client_progress)?;
+    db.save_full_node_state(LAST_APPLIED_MC_BLOCK, last_mc_block)?;
 
     if let Some(block_id) = db.load_validator_state(LAST_ROTATION_MC_BLOCK)? {
-        if block_id.seq_no > last_mc_block.id().seq_no {
-            db.save_validator_state(LAST_ROTATION_MC_BLOCK, last_mc_block.id())?;
+        if block_id.seq_no > last_mc_block.seq_no {
+            db.save_validator_state(LAST_ROTATION_MC_BLOCK, last_mc_block)?;
         }
     }
     if let Some(block_id) = db.load_full_node_state(PSS_KEEPER_MC_BLOCK)? {
-        if block_id.seq_no > last_mc_block.id().seq_no {
-            db.save_full_node_state(PSS_KEEPER_MC_BLOCK, last_mc_block.id())?;
+        if block_id.seq_no > last_mc_block.seq_no {
+            db.save_full_node_state(PSS_KEEPER_MC_BLOCK, last_mc_block)?;
         }
     }
     if let Some(block_id) = db.load_full_node_state(ARCHIVES_GC_BLOCK)? {
-        if block_id.seq_no > last_mc_block.id().seq_no {
-            db.save_full_node_state(ARCHIVES_GC_BLOCK, last_mc_block.id())?;
+        if block_id.seq_no > last_mc_block.seq_no {
+            db.save_full_node_state(ARCHIVES_GC_BLOCK, last_mc_block)?;
         }
     }
 

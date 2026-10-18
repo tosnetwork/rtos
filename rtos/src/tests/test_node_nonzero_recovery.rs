@@ -9,6 +9,15 @@ use std::{
 };
 
 struct Process(Child);
+
+// Truncation fault scenarios explicitly request the forced recovery path.
+// A healthy shard-client lag is no longer an implicit truncation request.
+fn forced_cursor_fixture_args(root: &Path) -> Vec<&'static str> {
+    if root.join("forced-truncation-fixture").exists() {
+        eprintln!("Explicit --force-check-db selected for truncation fault fixture");
+        vec!["--force-check-db"]
+    } else { Vec::new() }
+}
 impl Drop for Process {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -85,6 +94,9 @@ async fn actual_node_preserves_building_with_unverified_inputs() -> Result<()> {
 
 #[path = "test_node_truncation_recovery.rs"]
 mod truncation_recovery;
+
+#[path = "test_restore_independent_cursors.rs"]
+mod independent_cursors;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires RTOS_NODE_RECOVERY_BINARY built from this revision"]
@@ -602,7 +614,7 @@ async fn exercise_nonzero_recovery_with_finality(
                 .arg(root)
                 .arg("--zerostate")
                 .arg(&zero)
-                .arg("--initial-sync-disabled")
+                .arg("--initial-sync-disabled").args(forced_cursor_fixture_args(root))
                 .current_dir(root)
                 .stdout(Stdio::from(log.try_clone()?))
                 .stderr(Stdio::from(log))
@@ -740,7 +752,7 @@ async fn exercise_nonzero_recovery_with_finality(
                 .arg(root)
                 .arg("--zerostate")
                 .arg(&zero)
-                .arg("--initial-sync-disabled")
+                .arg("--initial-sync-disabled").args(forced_cursor_fixture_args(root))
                 .current_dir(root)
                 .stdout(Stdio::from(log.try_clone()?))
                 .stderr(Stdio::from(log))
@@ -969,7 +981,7 @@ quit
                 .arg(root)
                 .arg("--zerostate")
                 .arg(zero)
-                .arg("--initial-sync-disabled")
+                .arg("--initial-sync-disabled").args(forced_cursor_fixture_args(root))
                 .env("TOKIO_WORKER_THREADS", "2")
                 .current_dir(root)
                 .process_group(0)

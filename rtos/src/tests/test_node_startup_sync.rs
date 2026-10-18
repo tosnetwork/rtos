@@ -53,7 +53,7 @@ quit
     let log = fs::File::create(&path)?;
     let mut debugger = Debugger(Process(Command::new("gdb").args(["--batch", "-nx", "-x"])
         .arg(&script).arg("--args").arg(binary).arg("--configs").arg(root)
-        .arg("--zerostate").arg(zero).arg("--initial-sync-disabled")
+        .arg("--zerostate").arg(zero).arg("--initial-sync-disabled").args(forced_cursor_fixture_args(root))
         .env("TOKIO_WORKER_THREADS", "2")
         .env("RTOS_TEST_STATE_FAULT_PREFIX", format!("{}/node_db/db/", root.display()))
         .env("RTOS_TEST_ROOT_WAL_ARM", &arm).env("RTOS_TEST_STATE_FAULT_MARKER", &proof)
