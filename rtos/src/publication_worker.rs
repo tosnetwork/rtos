@@ -264,6 +264,31 @@ enum Submission {
         response: oneshot::Sender<Result<cleanup_steps::CleanupStepOutcome>>,
     },
 }
+
+enum WorkerTurn {
+    Stop,
+    Command(Option<Submission>),
+    Retry,
+}
+
+async fn next_worker_turn(
+    stop: &CancellationToken,
+    tick: &mut tokio::time::Interval,
+    receiver: &mut mpsc::Receiver<Submission>,
+    wake: &Notify,
+) -> WorkerTurn {
+    // Keep the mailbox FIFO moving before taking another eager repair turn.
+    // The original periodic retry still wins when due, including under a busy
+    // mailbox, so cold/expired/Completed repair and sends cannot starve.
+    tokio::select! {
+        biased;
+        _ = stop.cancelled() => WorkerTurn::Stop,
+        _ = tick.tick() => WorkerTurn::Retry,
+        command = receiver.recv() => WorkerTurn::Command(command),
+        _ = wake.notified() => WorkerTurn::Retry,
+    }
+}
+
 impl Submission {
     fn reject(self) {
         match self {
@@ -954,11 +979,10 @@ impl State {
             if self.engine.strong_count() == 0 {
                 break;
             }
-            let command = tokio::select! {
-                _ = self.stop.cancelled() => { receiver.close(); None },
-                command = receiver.recv() => command,
-                _ = tick.tick() => { self.recover(&store, &mut receiver).await; continue; },
-                _ = self.wake.notified() => { self.recover(&store, &mut receiver).await; continue; },
+            let command = match next_worker_turn(&self.stop, &mut tick, &mut receiver, &self.wake).await {
+                WorkerTurn::Stop => { receiver.close(); None },
+                WorkerTurn::Command(command) => command,
+                WorkerTurn::Retry => { self.recover(&store, &mut receiver).await; continue; },
             };
             if let Some(command) = command {
                 #[cfg(test)]
@@ -2114,6 +2138,52 @@ mod tests {
         })))
         .finish(Ok(UInt256::from([7; 32])));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn publication_worker_queued_commands_precede_eager_maintenance() {
+        let stop = CancellationToken::new();
+        let wake = Notify::new();
+        let (sender, mut receiver) = mpsc::channel(QUEUE_CAPACITY);
+        let mut tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(60), RETRY_INTERVAL);
+        for index in 0..QUEUE_CAPACITY {
+            let (response, _) = oneshot::channel();
+            sender.try_send(Submission::Query {
+                id: UInt256::from([index as u8; 32]), response,
+            }).unwrap();
+        }
+        for index in 0..QUEUE_CAPACITY {
+            wake.notify_one();
+            match next_worker_turn(&stop, &mut tick, &mut receiver, &wake).await {
+                WorkerTurn::Command(Some(Submission::Query { id, .. })) => {
+                    assert_eq!(id, UInt256::from([index as u8; 32]));
+                }
+                _ => panic!("eager maintenance overtook queued command {index}"),
+            }
+        }
+        assert!(matches!(next_worker_turn(&stop, &mut tick, &mut receiver, &wake).await,
+            WorkerTurn::Retry), "idle maintenance notification must remain available");
+    }
+
+    #[tokio::test]
+    async fn publication_worker_due_maintenance_and_stop_precede_busy_mailbox() {
+        let stop = CancellationToken::new();
+        let wake = Notify::new();
+        let (sender, mut receiver) = mpsc::channel(QUEUE_CAPACITY);
+        let (response, _) = oneshot::channel();
+        sender.try_send(Submission::Query { id: UInt256::default(), response }).unwrap();
+        let mut tick = tokio::time::interval_at(
+            tokio::time::Instant::now() - RETRY_INTERVAL, RETRY_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        assert!(matches!(next_worker_turn(&stop, &mut tick, &mut receiver, &wake).await,
+            WorkerTurn::Retry), "the original due retry must not starve behind commands");
+        assert_eq!(receiver.len(), 1);
+        wake.notify_one();
+        stop.cancel();
+        assert!(matches!(next_worker_turn(&stop, &mut tick, &mut receiver, &wake).await,
+            WorkerTurn::Stop), "shutdown must retain the queued request for rejection");
+        assert_eq!(receiver.len(), 1);
     }
     #[test]
     fn publication_worker_canonical_completion_survives_owner_and_callback_failure() {
