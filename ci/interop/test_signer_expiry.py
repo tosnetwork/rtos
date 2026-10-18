@@ -109,7 +109,7 @@ class SignerExpiryTests(unittest.IsolatedAsyncioTestCase):
         class Context:
             async def complete(self,recovered):pass
             def close(self):pass
-        operation=AsyncMock(return_value={'last_checkpoint':{'seqno':100}})
+        operation=AsyncMock(return_value=({'last_checkpoint':{'seqno':100}},None))
         with patch.object(expiry,'SignerExpiry',side_effect=AssertionError('late observer reconstruction')), \
                 patch.object(combined,'SourceAckPartitionRestart',return_value=Context()), \
                 patch.object(rotation,'_recover_rotation_member',operation):

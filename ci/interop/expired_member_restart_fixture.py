@@ -52,16 +52,30 @@ class ExpiredFullNodeAcceptance:
 
 class PendingIntentRecovery:
     """Observe pre-restart obligations; snapshots are never input to the node."""
-    def __init__(self, namespaces, evidence):
+    def __init__(self, namespaces, evidence, *, live=False):
         import hashlib
         import json
         from pathlib import Path
-        self.namespaces=Path(namespaces);self.evidence=Path(evidence);self.records=[]
+        self.namespaces=Path(namespaces);self.evidence=Path(evidence);self.records=[];self.completed_during_capture=[]
         self.evidence.mkdir(parents=True,exist_ok=False)
         for source in sorted(self.namespaces.glob('*/finality-intents/*.json')):
             if source.is_symlink() or source.parent.is_symlink() or source.parent.parent.is_symlink():
                 raise RuntimeError('Pending intent snapshot requires an owned regular namespace')
-            raw=source.read_bytes();record=json.loads(raw)
+            try:
+                raw=source.read_bytes()
+            except FileNotFoundError:
+                if not live:raise
+                proof=source.parent/'completed-v1'/source.with_suffix('.complete').name
+                if source.exists() or proof.is_symlink() or proof.parent.is_symlink() or not proof.is_file():
+                    raise RuntimeError('Live capture lost an intent without an exact completion record')
+                proof_raw=proof.read_bytes();value=json.loads(proof_raw);record=value.get('record',{})
+                expected=str(record.get('slot'))+'-'+str(record.get('candidate_hash'))+'.json'
+                if value.get('schema')!=1 or source.name!=expected or not re.fullmatch(r'(0|[1-9][0-9]*)-[0-9a-f]{64}\.json',source.name):
+                    raise RuntimeError('Live capture raced with a different completed candidate')
+                self.completed_during_capture.append({'path':str(source.relative_to(self.namespaces)),
+                    'completion_sha256':hashlib.sha256(proof_raw).hexdigest()})
+                continue
+            record=json.loads(raw)
             expected=str(record['slot'])+'-'+record['candidate_hash']+'.json'
             if source.name!=expected or not re.fullmatch(r'(0|[1-9][0-9]*)-[0-9a-f]{64}\.json',source.name):
                 raise RuntimeError('Pending intent filename differs from its exact candidate')
@@ -93,3 +107,35 @@ class PendingIntentRecovery:
             completed.append({'path':str(proof.relative_to(self.namespaces)),'sha256':hashlib.sha256(raw).hexdigest()})
         self._write({'phase':'all_original_intents_completed','count':len(self.records),'records':self.records,'completed':completed})
         return True
+
+
+def validate_followup_frontier(args):
+    if getattr(args, 'followup_intent_frontier', False) and not (
+        getattr(args, 'expired_member_restart', False)
+        and getattr(args, 'source_ack_partition_restart', False)
+    ):
+        raise RuntimeError('Follow-up frontier requires the explicit expired-member original ACK restart')
+
+
+class LiveIntentFrontier(PendingIntentRecovery):
+    """A separate live frontier after original recovery; never extends that budget."""
+    def __init__(self, namespaces, evidence):
+        self.started=time.monotonic();self.started_unix=time.time()
+        self.deadline=self.started+180
+        super().__init__(namespaces,evidence,live=True)
+
+    def _write(self, value):
+        elapsed=time.monotonic()-self.started
+        if elapsed>=180:
+            raise TimeoutError('Follow-up captured intents exceeded their separate 180-second budget')
+        value={**value,'phase':{'retained_before_restart':'followup_frontier_captured',
+            'all_original_intents_completed':'followup_frontier_completed'}[value['phase']],
+            'separate_budget_seconds':180,'budget_started_at_unix':self.started_unix,
+            'elapsed_seconds':elapsed,'original_recovery_budget_extended':False,
+            'completed_during_capture':self.completed_during_capture}
+        super()._write(value)
+
+    def complete(self):
+        if time.monotonic()>=self.deadline:
+            raise TimeoutError('Follow-up captured intents exceeded their separate 180-second budget')
+        return super().complete()

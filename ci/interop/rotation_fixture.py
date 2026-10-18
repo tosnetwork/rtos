@@ -143,12 +143,18 @@ async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, ru
         node = next(node for node in rust_nodes if node['index'] == args.interrupt_rust_member)
         recovery_fault = SourceRetentionCut(args, root, node, checkpoint)
     try:
-        recovered = await _recover_rotation_member(args, root, nodes, endpoints, lite_configs,
+        recovered, followup = await _recover_rotation_member(args, root, nodes, endpoints, lite_configs,
             rust_nodes, zero, governing, checkpoint, artifacts, recovery_fault)
         if recovery_fault:
             await recovery_fault.complete(recovered)
         if expiry:
             await expiry.complete(recovered)
+        # The original ACK and expiry checks above retain their original budget.
+        # Only then may a separately requested live frontier start its own clock.
+        if followup is not None:
+            recovered['original_recovery_verified_at_unix'] = time.time()
+            write(root / 'recovery/recovery.json', recovered)
+            await followup()
         return recovered
     finally:
         if recovery_fault:
@@ -195,8 +201,9 @@ async def _recover_rotation_member(args, root, nodes, endpoints, lite_configs, r
     if recovery_fault:
         await recovery_fault.after_interruption()
 
-    async def common_checkpoint(indices, floor):
-        while time.monotonic() < deadline:
+    async def common_checkpoint(indices, floor, *, observation_deadline=None):
+        limit = deadline if observation_deadline is None else observation_deadline
+        while time.monotonic() < limit:
             for live in rust_nodes:
                 if live['index'] in indices and live['process'].returncode is not None:
                     raise RuntimeError(f"Live Rust recovery peer {live['index']} exited")
@@ -217,9 +224,11 @@ async def _recover_rotation_member(args, root, nodes, endpoints, lite_configs, r
                     raise RuntimeError('Recovery peers disagree on the applied state')
                 return infos
             await asyncio.sleep(0.2)
-        raise TimeoutError('Interrupted member did not recover within the recovery deadline')
+        raise TimeoutError('Interrupted member did not recover within the recovery deadline'
+            if observation_deadline is None else 'Follow-up frontier exceeded its separate checkpoint deadline')
 
-    async def check_checkpoint(infos, label, with_workchain):
+    async def check_checkpoint(infos, label, with_workchain, *, observation_deadline=None):
+        limit = deadline if observation_deadline is None else observation_deadline
         target = directory / label; target.mkdir()
         block_id = infos[0]['last']
         block = await cpp_block(args.snapshot, nodes[0], block_id, target)
@@ -254,7 +263,7 @@ async def _recover_rotation_member(args, root, nodes, endpoints, lite_configs, r
             sample['references'] = {str(i): infos[i] for i in SUCCESSOR}
             sample['workchain'] = {'block': await cpp_block(args.snapshot, nodes[0], tops[0], wc_dir),
                 'states': await recovery_workchain_states(args.snapshot, lite_configs, SUCCESSOR,
-                    tops[0], wc_dir, deadline)}
+                    tops[0], wc_dir, limit)}
             write(target / 'sample.json', sample)
             await child_checked([args.block_checker, target / 'sample.json', target / 'checked-with-workchain.json'],
                 target / 'workchain-checker.log')
@@ -338,7 +347,42 @@ async def _recover_rotation_member(args, root, nodes, endpoints, lite_configs, r
     receipt.update(phase='recovered', all_six_applied_states_match=True,
         successor_finality_checked=True, workchain_states_match=True, manual_database_repair=False)
     write(directory / 'recovery.json', receipt)
-    return receipt
+
+    async def observe_followup_frontier():
+        nonlocal histories
+        from expired_member_restart_fixture import LiveIntentFrontier, ExpiredFullNodeAcceptance
+        frontier = LiveIntentFrontier(node['directory'] / 'node_db/catchains/consensus/v2',
+            directory / 'followup-intents')
+        histories = [{} for _ in nodes]
+        followup_floor = receipt['last_checkpoint']['seqno']
+        followup_minimum_wc = receipt['expired_full_node']['samples'][-1]['workchain']['seqno']
+        observer = ExpiredFullNodeAcceptance(member_id, restarted_at, followup_minimum_wc,
+            frontier.deadline, args.signer_expiry_observer.session)
+        receipt['followup_intent_frontier'] = {'phase':'observing','count':len(frontier.records),
+            'separate_budget_seconds':180,'budget_started_at_unix':frontier.started_unix,
+            'original_recovery_budget_extended':False,'samples':observer.samples}
+        write(directory / 'recovery.json', receipt)
+        while True:
+            infos = await common_checkpoint(list(range(6)), followup_floor,
+                observation_deadline=frontier.deadline)
+            followup_floor = infos[0]['last']['seqno']
+            label = 'followup-' + str(followup_floor)
+            checked, voted = await check_checkpoint(infos, label, True,
+                observation_deadline=frontier.deadline)
+            progress = observer.observe(checked, voted, directory / label)
+            if progress and frontier.complete():
+                break
+            write(directory / 'recovery.json', receipt)
+        for filename, expected in artifacts.items():
+            if digest(Path(filename)) != expected:raise RuntimeError('An executable or profile changed during follow-up')
+        if digest(prepared) != prepared_hash:raise RuntimeError('Follow-up changed prepared authority')
+        receipt['followup_intent_frontier'].update(phase='completed',
+            elapsed_seconds=time.monotonic()-frontier.started,
+            all_captured_intents_completed=True,
+            refusal_line=observer.refusal((node['directory'] / 'node-restart.log').read_text(errors='replace')))
+        write(directory / 'recovery.json', receipt)
+
+    return receipt, observe_followup_frontier if getattr(args, 'followup_intent_frontier', False) else None
 
 
 def install_successor(module, nodes, profile):
@@ -759,6 +803,8 @@ def main():
     parser.add_argument('--interrupt-rust-member', type=int, choices=[2, 5])
     parser.add_argument('--workchain-creator-history', action='store_true', help='Check missed creators through full historical WC bodies and states')
     parser.add_argument('--finality-diagnostics', action='store_true', help='Trace finality dependencies on the interrupted Rust node')
+    parser.add_argument('--followup-intent-frontier', action='store_true',
+        help='After original ACK recovery, capture new intents and require their completion and fresh states within a separate 180 seconds')
     parser.add_argument('--expired-member-restart', action='store_true',
         help='Restart the expired member5 as a synchronized full node without restoring signing authority')
     parser.add_argument('--signer-expiry-member', type=int, choices=[5],
@@ -783,6 +829,8 @@ def main():
     parser.add_argument('--network-fault-seconds', type=float, default=12)
     parser.add_argument('--socket-mark-library', type=Path)
     args = parser.parse_args()
+    from expired_member_restart_fixture import validate_followup_frontier
+    validate_followup_frontier(args)
     sequence = ([args.network_fault] if args.network_fault else []) + args.additional_network_faults
     if args.additional_network_faults and not args.network_fault or len(sequence) > 4 or len(set(sequence)) != len(sequence):
         raise SystemExit('Predeclare up to four distinct packet cases; repeats are not retries')
