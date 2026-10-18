@@ -2337,6 +2337,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn source_finality_cold_workchain_ack_waits_for_acceptance_with_closing_enabled() {
+        for is_final in [false, true] {
+            let temp = crate::authenticated_fixture::TestDirectory::new();
+            let (runtime, draft) = fixture_role(is_final,
+                ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap());
+            let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+            let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
+            let receipt = UInt256::from([4; 32]);
+            {
+                let store = PendingFinalityStore::open(&namespace).unwrap();
+                store.retain(&record).unwrap();
+                store.acknowledge(&record.id().unwrap(), receipt.clone()).unwrap();
+            }
+            let sink = Arc::new(HeldSink::default());
+            *sink.1.lock().unwrap() = Some(Vec::new());
+            let source = SourceFinalityDelivery::open_with_delivered(runtime, &namespace,
+                sink.clone(), Some(Arc::new(|_, _| panic!("Workchain cannot mint MC custody")))).unwrap();
+            assert!(source.poll(draft.clone()).expect("cold WC must use normal acceptance").is_none());
+            let (_, staged) = sink.0.lock().unwrap().pop().expect("normal WAL staging");
+            staged(Ok(receipt.clone()));
+            assert!(source.poll(draft.clone()).unwrap().is_none(), "WAL handoff is not acceptance");
+            let (request, accepted) = sink.1.lock().unwrap().as_mut().unwrap().pop()
+                .expect("actual node acceptance must be requested");
+            assert_eq!(request.node_receipt, receipt);
+            assert_eq!(request.block_id, draft.block_id);
+            accepted(Ok(()));
+            assert_eq!(source.poll(draft).unwrap().unwrap().0, receipt);
+            assert!(!source.store.delivered_path(&record.id().unwrap()).exists());
+        }
+    }
+
+    #[test]
     fn source_finality_process_crash_child() {
         let Ok(root) = std::env::var("RTOS_SOURCE_FINALITY_CHILD_ROOT") else {
             return;
@@ -2450,6 +2482,7 @@ pub(crate) mod tests {
     #[derive(Default)]
     struct CanonicalSink {
         stages: Mutex<Vec<(FinalizedDeliveryDraft, FinalizedDeliveryCompletion)>>,
+        acceptances: Mutex<Vec<(CanonicalFinalityRequest, Box<dyn FnOnce(Result<()>) + Send>)>>,
         lookups: Mutex<
             Vec<(
                 CanonicalFinalityRequest,
@@ -2458,6 +2491,11 @@ pub(crate) mod tests {
         >,
     }
     impl consensus_common::finality_delivery::DurableFinalitySink for CanonicalSink {
+        fn await_accepted(&self, request: CanonicalFinalityRequest,
+            done: Box<dyn FnOnce(Result<()>) + Send>) -> Result<()> {
+            self.acceptances.lock().unwrap().push((request, done));
+            Ok(())
+        }
         fn stage(
             &self,
             draft: FinalizedDeliveryDraft,
@@ -2488,6 +2526,38 @@ pub(crate) mod tests {
             created_at_unix_secs: draft.created_at_unix_secs,
         }
     }
+    #[test]
+    fn source_finality_cold_workchain_reference_waits_for_acceptance_with_closing_enabled() {
+        for is_final in [false, true] {
+            let temp = crate::authenticated_fixture::TestDirectory::new();
+            let (runtime, draft) = fixture_role(is_final,
+                ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap());
+            let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+            let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
+            let receipt = UInt256::from([4; 32]);
+            {
+                let store = PendingFinalityStore::open(&namespace).unwrap();
+                store.retain(&record).unwrap();
+                store.acknowledge(&record.id().unwrap(), receipt.clone()).unwrap();
+                store.compact(&record, receipt.clone()).unwrap();
+            }
+            let sink = Arc::new(CanonicalSink::default());
+            let source = SourceFinalityDelivery::open_with_delivered(runtime, &namespace,
+                sink.clone(), Some(Arc::new(|_, _| panic!("Workchain cannot mint MC custody")))).unwrap();
+            assert!(source.poll(draft.clone()).unwrap().is_none());
+            let (request, canonical) = sink.lookups.lock().unwrap().pop().unwrap();
+            canonical(Ok(canonical_response(request, &draft)));
+            assert!(source.poll(draft.clone()).unwrap().is_none(), "canonical custody is not acceptance");
+            let (request, accepted) = sink.acceptances.lock().unwrap().pop().unwrap();
+            assert_eq!(request.node_receipt, receipt);
+            assert_eq!(request.block_id, draft.block_id);
+            accepted(Ok(()));
+            assert_eq!(source.poll(draft).unwrap().unwrap().0, receipt);
+            assert!(sink.stages.lock().unwrap().is_empty(), "reference cannot create a new draft");
+            assert!(!source.store.delivered_path(&record.id().unwrap()).exists());
+        }
+    }
+
     #[test]
     fn source_finality_canonical_reference_holds_owner_and_replays_original_after_reopen() {
         let directory = crate::authenticated_fixture::TestDirectory::new();

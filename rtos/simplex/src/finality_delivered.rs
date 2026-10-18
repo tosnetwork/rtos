@@ -191,6 +191,15 @@ impl PendingFinalityStore {
             }
         };
         reference_request(&reference)?;
+        let record = reference.metadata_record()?;
+        if !record.is_final || !record.block_id.shard().is_masterchain() {
+            if delivered.exists() {
+                fail!("Delivered role outside MC Final custody");
+            }
+            // Other roles retain their ordinary WAL custody and must re-enter
+            // node acceptance. They cannot use the MC Final release protocol.
+            return Ok(None);
+        }
         Ok(Some(FinalityCloseRecovery { store: self.clone(), reference }))
     }
     pub(super) fn check_delivered_health(&self) -> Result<()> {
@@ -1424,13 +1433,16 @@ mod boundary_tests {
             store.retain(&record).unwrap();
             let receipt = UInt256::from([4; 32]);
             store.acknowledge(&record.id().unwrap(), receipt.clone()).unwrap();
-            let reference = store.close_locator(&record.id().unwrap()).unwrap().unwrap().reference;
+            assert!(store.close_locator(&record.id().unwrap()).unwrap().is_none());
+            store.compact(&record, receipt.clone()).unwrap();
+            let reference = store.reference(&record.id().unwrap()).unwrap().unwrap();
             let offer =
                 CloseOffer { request: record.close_request(receipt).unwrap(), generation: 1 };
             assert!(store.commit_delivered(&runtime, &reference, &offer).is_err());
             assert!(store
                 .directory
-                .join(format!("{}.acked", record.id().unwrap().to_hex_string()))
+                .join(REFERENCE_DIRECTORY)
+                .join(format!("{}.reference", record.id().unwrap().to_hex_string()))
                 .exists());
         }
     }
