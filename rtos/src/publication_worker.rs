@@ -289,6 +289,28 @@ async fn next_worker_turn(
     }
 }
 
+async fn service_while_sending<S, C>(
+    sending: &mut Option<std::pin::Pin<Box<S>>>,
+    command: C,
+) -> Option<S::Output>
+where
+    S: std::future::Future,
+    C: std::future::Future<Output = ()>,
+{
+    tokio::pin!(command);
+    tokio::select! {
+        _ = &mut command => None,
+        result = sending.as_mut().expect("in-flight publication send").as_mut() => {
+            // A timed-out future can still own transport locks until dropped.
+            // Release it before draining the already admitted command. The
+            // command may write a WAL, so its future must never be cancelled.
+            drop(sending.take());
+            command.await;
+            Some(result)
+        }
+    }
+}
+
 impl Submission {
     fn reject(self) {
         match self {
@@ -1449,20 +1471,26 @@ impl State {
         accepted: &AcceptedSessionBlock,
         plan: &PropagationPlan,
     ) -> Option<crate::validator::propagation::PropagationOutcome> {
-        let sending = tokio::time::timeout(
+        let mut sending = Some(Box::pin(tokio::time::timeout(
             SEND_TIMEOUT,
             engine.propagate_accepted_session_block(accepted, plan),
-        );
-        tokio::pin!(sending);
+        )));
         loop {
             tokio::select! {
                 _ = self.stop.cancelled() => return None,
-                result = &mut sending => {
+                result = sending.as_mut().unwrap().as_mut() => {
                     if result.is_err() { metrics::counter!("rtos_publication_send_timeouts_total").increment(1); }
                     return result.ok();
                 },
                 command = receiver.recv() => match command {
-                    Some(command) => self.submit_one(store, command).await,
+                    Some(command) => {
+                        if let Some(result) = service_while_sending(
+                            &mut sending, self.submit_one(store, command),
+                        ).await {
+                            if result.is_err() { metrics::counter!("rtos_publication_send_timeouts_total").increment(1); }
+                            return result.ok();
+                        }
+                    },
                     None => return None,
                 },
             }
@@ -2170,6 +2198,75 @@ mod tests {
         })))
         .finish(Ok(UInt256::from([7; 32])));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn publication_worker_pending_send_advances_while_command_waits_for_its_lock() {
+        let shared = Arc::new(tokio::sync::Mutex::new(()));
+        let held = shared.clone();
+        let (entered, ready) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let mut sending = Some(Box::pin(async move {
+            let _guard = held.lock().await;
+            entered.send(()).unwrap();
+            released.await.unwrap();
+            7u8
+        }));
+        assert!(futures::poll!(sending.as_mut().unwrap().as_mut()).is_pending());
+        ready.await.unwrap();
+        let completed = Arc::new(AtomicBool::new(false));
+        let done = completed.clone();
+        let command = async move {
+            release.send(()).unwrap();
+            let _guard = shared.lock().await;
+            done.store(true, Ordering::Release);
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(1), service_while_sending(&mut sending, command),
+        ).await.expect("mailbox command stopped polling the send that owns its required lock");
+        assert_eq!(result, Some(7));
+        assert!(completed.load(Ordering::Acquire), "admitted command must finish before send returns");
+        assert!(sending.is_none(), "completed send owner must be dropped before command drain");
+    }
+
+    #[tokio::test]
+    async fn publication_worker_timed_out_send_releases_owner_before_command_drain() {
+        let shared = Arc::new(tokio::sync::Mutex::new(()));
+        let held = shared.clone();
+        let mut sending = Some(Box::pin(tokio::time::timeout(
+            Duration::from_millis(20), async move {
+                let _guard = held.lock().await;
+                std::future::pending::<u8>().await
+            },
+        )));
+        assert!(futures::poll!(sending.as_mut().unwrap().as_mut()).is_pending());
+        assert!(shared.try_lock().is_err());
+        let completed = Arc::new(AtomicBool::new(false));
+        let done = completed.clone();
+        let command = async move {
+            let _guard = shared.lock().await;
+            done.store(true, Ordering::Release);
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(1), service_while_sending(&mut sending, command),
+        ).await.expect("timed-out send retained the lock required by the admitted command");
+        assert!(result.unwrap().is_err());
+        assert!(completed.load(Ordering::Acquire));
+        assert!(sending.is_none());
+    }
+
+    #[tokio::test]
+    async fn publication_worker_finished_command_keeps_pending_send_alive() {
+        let (sent, received) = oneshot::channel();
+        let mut sending = Some(Box::pin(async move { received.await.unwrap() }));
+        let completed = Arc::new(AtomicBool::new(false));
+        let done = completed.clone();
+        let command = async move { done.store(true, Ordering::Release); };
+        assert_eq!(service_while_sending(&mut sending, command).await, None);
+        assert!(completed.load(Ordering::Acquire));
+        assert!(sending.is_some(), "completing a command must not cancel its concurrent send");
+        sent.send(9u8).unwrap();
+        assert_eq!(sending.take().unwrap().await, 9);
     }
 
     #[tokio::test]
