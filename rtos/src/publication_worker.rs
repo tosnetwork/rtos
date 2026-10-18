@@ -1027,7 +1027,7 @@ impl State {
                         // Drive the next eligible turn without wall-clock sleeps.
                         // All IO still runs on the real publication actor.
                         self.acceptance_retry.lock().unwrap().clear();
-                        self.recover(&store, &mut receiver).await;
+                        self.recover_turn(&store, &mut receiver).await;
                         let _ = response.send(Ok(()));
                         continue;
                     }
@@ -1505,8 +1505,8 @@ impl State {
         if entries.is_empty() {
             return None;
         }
-        // Round-robin eligible effects. Success advances immediately; failure
-        // has a separate minimum one-second backoff for each exact target.
+        // Choose a record and its first eligible effect round-robin. A retry
+        // turn visits that record's other due original effects as well.
         {
             let mut cursor = self.cursor.lock().unwrap();
             let mut retry = self.retry_after.lock().unwrap();
@@ -1555,6 +1555,26 @@ impl State {
             selected
         }
     }
+    fn select_retry_record(
+        &self,
+        entries: &[UnverifiedRecord],
+        now_unix_secs: u64,
+        now: tokio::time::Instant,
+    ) -> Option<(UnverifiedRecord, Vec<PublicationEffect>)> {
+        let (entry, first) = self.select_retry(entries, now_unix_secs, now)?;
+        let mut effects = vec![first.clone()];
+        let mut retry = self.retry_after.lock().unwrap();
+        for effect in &entry.pending {
+            if effect == &first
+                || retry.get(&(entry.id.0, effect.clone())).is_some_and(|at| *at > now)
+            {
+                continue;
+            }
+            retry.insert((entry.id.0, effect.clone()), now + RETRY_INTERVAL);
+            effects.push(effect.clone());
+        }
+        Some((entry, effects))
+    }
     fn select_acceptance(
         &self,
         entries: &[UnverifiedRecord],
@@ -1599,6 +1619,13 @@ impl State {
     ) {
         #[cfg(test)]
         if self.background_paused.load(Ordering::Acquire) { return; }
+        self.recover_turn(store, receiver).await;
+    }
+    async fn recover_turn(
+        &self,
+        store: &Arc<PropagationOutbox>,
+        receiver: &mut mpsc::Receiver<Submission>,
+    ) {
         let _activity = self.activity_scope("retry_snapshot", None);
         if self.stop.is_cancelled() {
             return;
@@ -1675,10 +1702,11 @@ impl State {
         }
         let now_unix_secs =
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let selected = self.select_retry(&entries, now_unix_secs, tokio::time::Instant::now());
-        let Some((entry, effect)) = selected else {
+        let selected = self.select_retry_record(&entries, now_unix_secs, tokio::time::Instant::now());
+        let Some((entry, effects)) = selected else {
             return;
         };
+        let effect = effects[0].clone();
         drop(entries);
         {
             if self.stop.is_cancelled() {
@@ -1728,8 +1756,15 @@ impl State {
                 Ok(plan) => plan,
                 Err(_) => return,
             };
-            {
-                if self.stop.is_cancelled() {
+            log::debug!("Publication retry record={} due_effects={} pending={}",
+                entry.id.0, effects.len(), entry.pending.len());
+            for effect in effects {
+                if self.stop.is_cancelled() || !self.enabled.load(Ordering::Acquire) {
+                    return;
+                }
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                if entry.record.is_expired(now) {
+                    metrics::counter!("rtos_publication_expired_pending_total").increment(1);
                     return;
                 }
                 let destination = destination(&effect);
@@ -1745,7 +1780,7 @@ impl State {
                         tokio::time::Instant::now() + RETRY_INTERVAL,
                     );
                     self.wake.notify_one();
-                    return;
+                    continue;
                 };
                 let sent = outcome.receipts.iter().any(|receipt| {
                     receipt.kind == destination.kind
@@ -1763,10 +1798,9 @@ impl State {
                         self.write(store, move |store| store.checkpoint_sent(id, &[effect])).await
                     {
                         log::error!("Publication checkpoint failed: {error}");
-                        if self.fatal.load(Ordering::Acquire) {
-                            return;
-                        }
+                        return;
                     }
+                    log::debug!("Publication retry checkpoint record={} target={destination:?}", entry.id.0);
                 } else {
                     metrics::counter!("rtos_publication_pending_send_attempts_total").increment(1);
                     log::debug!(
@@ -2589,6 +2623,31 @@ mod tests {
         let remaining = vec![entries[0].clone()];
         worker.select_retry(&remaining, 100, now + RETRY_INTERVAL);
         assert!(worker.close_interest.lock().unwrap().is_empty(), "removed delivery interest must be pruned");
+    }
+
+    #[test]
+    fn publication_worker_retry_record_keeps_original_targets_and_individual_backoff() {
+        let worker = state();
+        let now = tokio::time::Instant::now();
+        let mut first = scheduling_entry(1, 200);
+        let finality = PublicationEffect { kind: PublicationKind::Finality, target: PublicationTarget::FastSync };
+        let custom = PublicationEffect { kind: PublicationKind::Block, target: PublicationTarget::Custom("original".into()) };
+        first.pending.extend([finality.clone(), custom.clone()]);
+        Arc::make_mut(&mut first.record).effects = first.pending.clone();
+        let entries = vec![first.clone(), scheduling_entry(2, 200)];
+        worker.retry_after.lock().unwrap().insert((1, custom.clone()), now + RETRY_INTERVAL * 2);
+        let (selected, effects) = worker.select_retry_record(&entries, 100, now).unwrap();
+        assert_eq!(selected.id, RecordId(1));
+        assert_eq!(effects, vec![first.pending[0].clone(), finality]);
+        assert_eq!(selected.pending, first.pending, "selection is not a Sent checkpoint");
+        assert_eq!(worker.select_retry_record(&entries, 100, now).unwrap().0.id, RecordId(2));
+        assert!(worker.select_retry_record(&entries, 100, now).is_none());
+        let (_, effects) = worker.select_retry_record(&entries, 100, now + RETRY_INTERVAL).unwrap();
+        assert_eq!(effects.len(), 2);
+        assert!(!effects.contains(&custom), "grouping must not bypass a target's later deadline");
+        assert!(effects.iter().all(|effect| first.pending.contains(effect)));
+        assert!(worker.select_retry_record(&entries, 201, now + RETRY_INTERVAL * 2).is_none());
+        assert_eq!(entries[0].pending.len(), 3, "expiry cannot acknowledge or discard unsent effects");
     }
 
     #[test]

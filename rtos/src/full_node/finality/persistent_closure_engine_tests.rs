@@ -57,6 +57,10 @@ async fn circulation(events: usize) {
 }
 
 async fn circulation_with_close_demand(events: usize, close_demand: bool) {
+    circulation_with_retry_turn(events, close_demand, false).await;
+}
+
+async fn circulation_with_retry_turn(events: usize, close_demand: bool, single_retry: bool) {
     let signer = std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER")
         .expect("set RTOS_PUBLIC_FIXTURE_SIGNER to the archived public-only fixture signer");
     assert!(Path::new(&signer).is_file());
@@ -224,6 +228,39 @@ async fn circulation_with_close_demand(events: usize, close_demand: bool) {
                     }
                 }).await.expect("authenticated close demand did not drive actual acceptance/routing");
                 assert_eq!(worker.test_actual_acceptance_runs(), before + 1);
+                if single_retry {
+                    let (active, _) = inspect_closure_progress(engine.db(), &domain).unwrap();
+                    let entry = active.iter().find(|entry| entry.record.block_id == id)
+                        .expect("the original publication must still precede source closure");
+                    let original = entry.record.effects.clone();
+                    assert_eq!(entry.pending, original);
+                    assert!(original.len() > 1, "fixture must retain its complete multi-target plan");
+                    let digest = crate::propagation_outbox::effects_digest(&original).unwrap();
+                    tokio::time::timeout(Duration::from_secs(30), async {
+                        loop {
+                            worker.test_retry_background().await.unwrap();
+                            let (active, closed) = inspect_closure_progress(engine.db(), &domain).unwrap();
+                            if let Some(entry) = active.iter().find(|entry| entry.record.block_id == id) {
+                                if entry.pending.len() == original.len() {
+                                    // Cold verification, discovery or a target's
+                                    // original backoff may precede any real send.
+                                    tokio::time::sleep(Duration::from_millis(20)).await;
+                                    continue;
+                                }
+                                assert!(entry.stage == crate::propagation_outbox::PublicationStage::Completed
+                                    && entry.pending.is_empty(),
+                                    "first successful retry turn split the original frozen effects: stage={:?}, pending={}",
+                                    entry.stage, entry.pending.len());
+                            } else {
+                                let closed = closed.iter().find(|entry| entry.binding.canonical.block_id == id)
+                                    .expect("original record disappeared without a real closed source");
+                                assert!(closed.released);
+                                assert_eq!(closed.binding.effects_digest, digest);
+                            }
+                            break;
+                        }
+                    }).await.expect("no successful real publication retry before fixture deadline");
+                }
                 worker.test_pause_background(false);
             }
             // Inspect the actual worker's completed checkpoint before allowing
@@ -231,6 +268,9 @@ async fn circulation_with_close_demand(events: usize, close_demand: bool) {
             // fixed plan and have no outstanding receipt debt.
             tokio::time::timeout(Duration::from_secs(90), async {
                 loop {
+                    // The explicit retry above already witnessed all original
+                    // effects complete, including any resulting Released close.
+                    if single_retry { break; }
                     let (active, _) = inspect_closure_progress(engine.db(), &domain).unwrap();
                     if let Some(entry) = active.iter().find(|e| {
                         e.record.block_id == id
@@ -399,6 +439,12 @@ async fn persistent_closure_engine_real_source_smoke_and_cold_backup() {
 #[ignore = "explicit public signer and real source/Engine/transport required"]
 async fn persistent_closure_authenticated_demand_drives_acceptance_before_offer() {
     circulation_with_close_demand(1, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit public signer and real source/Engine/transport required"]
+async fn persistent_closure_single_retry_completes_original_effect_plan() {
+    circulation_with_retry_turn(1, true, true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
