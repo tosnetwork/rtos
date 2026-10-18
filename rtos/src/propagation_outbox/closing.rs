@@ -344,9 +344,24 @@ pub(super) fn reject_terminal_record(
     Ok(())
 }
 fn validate_history(snapshot: &Snapshot, domain: &OutboxDomain) -> Result<()> {
+    validate_history_with(snapshot, domain, delivery_id)
+}
+fn validate_history_with(
+    snapshot: &Snapshot,
+    domain: &OutboxDomain,
+    mut live_delivery_id: impl FnMut(&PublicationRecord) -> Result<UInt256>,
+) -> Result<()> {
     if snapshot.next_close_generation == 0 || snapshot.closing.len() > MAX_CLOSE_RECORDS {
         fail!("Invalid close history capacity/allocator");
     }
+    // Each released record must exclude every live delivery identity, even
+    // under a different record ID. Hash the immutable identity once per live
+    // entry instead of repeating the same scan for every released record.
+    let live_delivery_ids: BTreeSet<_> = if snapshot.closing.iter().any(|c| c.released) {
+        snapshot.entries.iter().filter_map(|entry| live_delivery_id(&entry.record).ok()).collect()
+    } else {
+        BTreeSet::new()
+    };
     let mut ids = BTreeSet::new();
     let mut generations = BTreeSet::new();
     let mut records = BTreeSet::new();
@@ -383,10 +398,7 @@ fn validate_history(snapshot: &Snapshot, domain: &OutboxDomain) -> Result<()> {
         if c.released {
             if entry.is_some()
                 || delivery.is_some()
-                || snapshot
-                    .entries
-                    .iter()
-                    .any(|e| delivery_id(&e.record).is_ok_and(|id| id == c.binding.delivery_id))
+                || live_delivery_ids.contains(&c.binding.delivery_id)
             {
                 fail!("Released event still has canonical data");
             }
@@ -637,6 +649,43 @@ mod tests {
         let second = store.confirm_close_inner(c)?;
         Ok((first, second))
     }
+    #[test]
+    fn close_history_hashes_live_ids_once_and_refuses_revival_under_a_new_record_id() -> Result<()> {
+        let store = PropagationOutbox::load(Arc::new(Disk::default()), domain(), Limits::default(), None)?;
+        let mut revival = None;
+        for seq in 1..=8 {
+            let (delivery, entry, close) = setup(&store, seq)?;
+            if revival.is_none() { revival = Some(entry); }
+            let entry = store.delivery(&delivery.delivery_id)?.unwrap().1;
+            store.begin_close_offer_inner(close.clone(), &delivery, &entry)?;
+            store.confirm_close_inner(close)?;
+        }
+        for seq in 9..=12 { setup(&store, seq)?; }
+        let mut snapshot = store.state.lock().unwrap().snapshot.clone();
+        assert_eq!(snapshot.entries.len(), 4);
+        assert_eq!(snapshot.closing.iter().filter(|c| c.released).count(), 8);
+        let mut hashes = 0usize;
+        validate_history_with(&snapshot, &domain(), |record| {
+            hashes += 1;
+            delivery_id(record)
+        })?;
+        assert!(hashes <= snapshot.entries.len(), "rehashed live delivery IDs for each released record: {hashes}");
+        let mut revived = revival.unwrap();
+        revived.id = RecordId(snapshot.next_id);
+        snapshot.next_id += 1;
+        snapshot.entries.push(revived);
+        assert!(validate_history(&snapshot, &domain()).is_err(), "a new record ID cannot revive a released delivery");
+        snapshot.entries.pop();
+        snapshot.closing.clear();
+        let mut hashes = 0usize;
+        validate_history_with(&snapshot, &domain(), |record| {
+            hashes += 1;
+            delivery_id(record)
+        })?;
+        assert_eq!(hashes, 0, "no released history needs no live ID set");
+        Ok(())
+    }
+
     #[test]
     fn cleanup_close_removal_refuses_any_mismatch_changing_nothing() -> Result<()> {
         let disk = Arc::new(Disk::default());
