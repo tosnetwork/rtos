@@ -145,6 +145,79 @@ async fn retired_service_routing_retry_reuses_actual_node_acceptance() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retired_service_repeated_query_reuses_actual_typed_acceptance() {
+    for final_role in [false, true] {
+        let fixture = SpoolFixture::new_for_transport(0, 0x60).await;
+        let result =
+            std::panic::AssertUnwindSafe(async {
+                let authenticated =
+                    authenticate_retired_session(fixture.engine.as_ref(), &locator(&fixture))
+                        .await
+                        .unwrap();
+                let worker = fixture.engine.ensure_publication_worker().await.unwrap();
+                let sink = worker.historical_sink(&authenticated).unwrap();
+                let id = stage(&sink, draft(&fixture, final_role)).await.unwrap();
+                let accepted = fixture.engine.clone().await_publication(id.clone()).await.unwrap();
+                assert_eq!(accepted.block(), &fixture.block);
+                assert_eq!(accepted.is_final(), final_role);
+                assert_eq!(accepted.phase(), AcceptancePhase::Preapplied);
+                let before = worker.test_actual_acceptance_runs();
+                assert!(before > 0, "first result must come from actual Engine acceptance");
+                for _ in 0..3 {
+                    let retry = fixture.engine.clone().await_publication(id.clone()).await.unwrap();
+                    assert_eq!(retry.block(), accepted.block());
+                    assert_eq!(
+                        retry.proof().root_cell().repr_hash(),
+                        accepted.proof().root_cell().repr_hash()
+                    );
+                    assert_eq!(retry.is_final(), final_role);
+                    assert_eq!(retry.phase(), accepted.phase());
+                    assert_eq!(retry.already_present(), accepted.already_present());
+                }
+                assert_eq!(
+                    fixture
+                        .engine
+                        .load_state(fixture.block.id())
+                        .await
+                        .unwrap()
+                        .root_cell()
+                        .repr_hash(),
+                    &fixture.state_root
+                );
+                assert_eq!(worker.test_actual_acceptance_runs(), before,
+                "repeated typed queries must reuse this worker's actual durable Engine acceptance");
+                id
+            })
+            .catch_unwind()
+            .await;
+        fixture.engine.clone().wait_stop().await.unwrap();
+        let id = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        let SpoolFixture { dir, engine, block, state_root, .. } = fixture;
+        drop(engine);
+        let reopened = open_engine(dir.path()).await;
+        let cold = std::panic::AssertUnwindSafe(async {
+            let worker = reopened.ensure_publication_worker().await.unwrap();
+            let accepted = reopened.clone().await_publication(id).await.unwrap();
+            assert_eq!(accepted.block(), &block);
+            assert_eq!(accepted.is_final(), final_role);
+            assert_eq!(accepted.phase(), AcceptancePhase::Preapplied);
+            assert_eq!(
+                reopened.load_state(block.id()).await.unwrap().root_cell().repr_hash(),
+                &state_root
+            );
+            assert!(
+                worker.test_actual_acceptance_runs() > 0,
+                "disk acceptance flags must not seed a cold worker's typed receipt cache"
+            );
+        })
+        .catch_unwind()
+        .await;
+        reopened.clone().wait_stop().await.unwrap();
+        cold.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retired_service_repeated_acceptance_reuses_this_process_verification() {
     use consensus_common::finality_delivery::{CanonicalFinalityRequest, FinalityDeliveryRole};
     for final_role in [false, true] {

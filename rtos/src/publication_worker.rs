@@ -468,6 +468,91 @@ impl Drop for ActivityScope<'_> {
         *self.activity.lock().unwrap_or_else(|p| p.into_inner()) = self.previous.take().unwrap();
     }
 }
+// C++ state-resolver keeps completed typed resolution results. Keep the
+// corresponding receipt process-local, bounded, and separate from disk stage
+// flags: an Accepted/Completed flag alone never constructs a verified receipt.
+#[derive(Default)]
+struct AcceptanceCache {
+    entries: std::collections::BTreeMap<u64, CachedAcceptance>,
+    order: std::collections::VecDeque<u64>,
+    payload_bytes: usize,
+}
+struct CachedAcceptance {
+    record: PublicationRecord,
+    accepted: AcceptedSessionBlock,
+    payload_bytes: usize,
+}
+impl AcceptanceCache {
+    fn get(
+        &mut self,
+        entry: &UnverifiedRecord,
+        engine: &dyn EngineOperations,
+    ) -> Result<Option<AcceptedSessionBlock>> {
+        if !matches!(
+            entry.stage,
+            PublicationStage::AcceptedDraft | PublicationStage::Ready | PublicationStage::Completed
+        ) {
+            return Ok(None);
+        }
+        let Some(cached) = self.entries.get(&entry.id.0) else { return Ok(None) };
+        // Full immutable content/role/domain binding, including effects. A
+        // resolved draft with a changed plan takes the normal acceptance path.
+        if cached.record != entry.record {
+            return Ok(None);
+        }
+        let receipt = cached.accepted.current_receipt(engine)?;
+        if receipt.is_some() {
+            self.order.retain(|id| *id != entry.id.0);
+            self.order.push_back(entry.id.0);
+        }
+        Ok(receipt)
+    }
+    fn insert(
+        &mut self,
+        id: RecordId,
+        record: PublicationRecord,
+        accepted: &AcceptedSessionBlock,
+        limits: &Limits,
+    ) {
+        self.remove(id.0);
+        let payload_bytes = record
+            .block_data
+            .len()
+            .saturating_add(record.proof_data.as_ref().map_or(0, Vec::len))
+            .saturating_add(record.carrier.bytes().len().saturating_mul(2))
+            .saturating_add(accepted.block().data().len())
+            .saturating_add(accepted.proof().data().len())
+            .saturating_add(
+                record
+                    .effects
+                    .iter()
+                    .map(|effect| match &effect.target {
+                        PublicationTarget::Custom(name) => name.len(),
+                        _ => 0,
+                    })
+                    .sum::<usize>(),
+            );
+        if limits.max_records == 0 || payload_bytes > limits.max_snapshot_bytes {
+            return;
+        }
+        while self.entries.len() >= limits.max_records
+            || self.payload_bytes.saturating_add(payload_bytes) > limits.max_snapshot_bytes
+        {
+            let Some(oldest) = self.order.front().copied() else { break };
+            self.remove(oldest);
+        }
+        self.entries
+            .insert(id.0, CachedAcceptance { record, accepted: accepted.clone(), payload_bytes });
+        self.order.push_back(id.0);
+        self.payload_bytes += payload_bytes;
+    }
+    fn remove(&mut self, id: u64) {
+        if let Some(old) = self.entries.remove(&id) {
+            self.payload_bytes -= old.payload_bytes;
+        }
+        self.order.retain(|old| *old != id);
+    }
+}
 struct State {
     activity: Mutex<WorkerActivity>,
     engine: Weak<Engine>,
@@ -481,8 +566,11 @@ struct State {
     cursor: Mutex<(u64, std::collections::BTreeMap<u64, usize>)>,
     acceptance_turn: AtomicBool,
     acceptance_verified: Mutex<std::collections::BTreeSet<u64>>,
+    accepted_receipts: Mutex<AcceptanceCache>,
     #[cfg(test)]
     acceptance_request_runs: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    actual_acceptance_runs: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     background_acceptance_runs: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -516,8 +604,11 @@ impl PublicationWorker {
             cursor: Mutex::new(Default::default()),
             acceptance_turn: AtomicBool::new(true),
             acceptance_verified: Mutex::new(Default::default()),
+            accepted_receipts: Mutex::new(Default::default()),
             #[cfg(test)]
             acceptance_request_runs: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            actual_acceptance_runs: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             background_acceptance_runs: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -723,6 +814,10 @@ impl PublicationWorker {
     #[cfg(test)]
     pub(crate) fn test_acceptance_request_runs(&self) -> usize {
         self.state.acceptance_request_runs.load(Ordering::Relaxed)
+    }
+    #[cfg(test)]
+    pub(crate) fn test_actual_acceptance_runs(&self) -> usize {
+        self.state.actual_acceptance_runs.load(Ordering::Relaxed)
     }
     #[cfg(test)]
     pub(crate) fn test_background_runs(&self) -> (usize, usize) {
@@ -1156,8 +1251,18 @@ impl State {
             let claims = historical_origin(&publication, origin)?;
             validate_creator_claim(&publication, &claims)?;
         }
+        // Authentication and creator/origin binding above still run on every
+        // request, including cache hits. A new worker starts with no receipts.
+        let record = publication.entry().record.clone();
+        if let Some(receipt) = self.accepted_receipts.lock().unwrap()
+            .get(publication.entry(), engine.as_ref())?
+        {
+            return Ok(receipt);
+        }
         activity.phase("accept_block");
         // Deliberately not cancelable: this phase can write state/proof data.
+        #[cfg(test)]
+        self.actual_acceptance_runs.fetch_add(1, Ordering::Relaxed);
         let (entry, accepted) =
             accept_authenticated_publication(publication, engine.clone()).await?;
         let id = entry.id;
@@ -1187,6 +1292,7 @@ impl State {
         }
         self.write(store, move |store| store.mark_accepted(id)).await?;
         self.acceptance_verified.lock().unwrap().insert(id.0);
+        self.accepted_receipts.lock().unwrap().insert(id, record, &accepted, &self.limits);
         Ok(accepted)
     }
     async fn routing_ready(
@@ -1865,8 +1971,11 @@ mod tests {
             cursor: Mutex::new(Default::default()),
             acceptance_turn: AtomicBool::new(true),
             acceptance_verified: Mutex::new(Default::default()),
+            accepted_receipts: Mutex::new(Default::default()),
             #[cfg(test)]
             acceptance_request_runs: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            actual_acceptance_runs: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             background_acceptance_runs: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]

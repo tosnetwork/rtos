@@ -341,6 +341,7 @@ impl EngineOperations for PqAcceptEngine {
     ) -> Result<crate::internal_db::BlockResult> {
         assert_eq!(id, self.handle.id());
         *self.proof.lock().unwrap() = Some(proof.clone());
+        if proof.is_link() { self.handle.set_proof_link(); } else { self.handle.set_proof(); }
         self.proofs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(crate::internal_db::BlockResult::with_status(
             self.handle.clone(),
@@ -528,10 +529,29 @@ async fn pq_live_accept_result_separates_persistence_publication_and_inclusion()
     assert_eq!(engine.tops.load(Ordering::Relaxed), 0);
     assert_eq!(engine.broadcasts.load(Ordering::Relaxed), 0);
 
+    let cached = accepted.current_receipt(engine.as_ref()).unwrap().unwrap();
+    assert_eq!(cached.phase(), AcceptancePhase::Preapplied);
+    assert!(!cached.already_present());
+    assert!(cached.is_final());
+    assert!(!approved.current_receipt(engine.as_ref()).unwrap().unwrap().is_final());
+    // A pruned state must force the ordinary acceptance path, even with a
+    // process-local verified receipt. This is a mock of GC prerequisites.
+    handle.reset_state();
+    assert!(accepted.current_receipt(engine.as_ref()).unwrap().is_none());
+    handle.set_state();
+
     // This mock represents inclusion already recorded elsewhere; it is not an
     // execution or MC-proof test. Reconstructing a publication must not rewrite
     // the accepted proof or require apply to run a second time.
     handle.set_block_applied();
+    let advanced = accepted.current_receipt(engine.as_ref()).unwrap().unwrap();
+    assert_eq!(advanced.phase(), AcceptancePhase::Applied);
+    assert!(advanced.already_present());
+    assert!(advanced.is_final());
+    let approved_after_inclusion = approved.current_receipt(engine.as_ref()).unwrap().unwrap();
+    assert_eq!(approved_after_inclusion.phase(), AcceptancePhase::Applied);
+    assert!(!approved_after_inclusion.is_final(), "inclusion must never upgrade the receipt's role");
+    assert_eq!(engine.proofs.load(Ordering::Relaxed), 2);
     let retried = accept_pq_session_block(
         block.id().clone(),
         Some(data.clone()),

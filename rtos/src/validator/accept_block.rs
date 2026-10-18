@@ -1008,16 +1008,35 @@ enum AcceptedFinality {
 
 /// Created only after governing-context verification and successful persistence.
 /// Private fields bind the exact publication carrier to its verification result.
+#[derive(Clone)]
 pub struct AcceptedSessionBlock {
     block: BlockStuff,
     proof: BlockProofStuff,
-    finality: AcceptedFinality,
+    finality: Arc<AcceptedFinality>,
     prev: Vec<BlockIdExt>,
     phase: AcceptancePhase,
     already_present: bool,
 }
 
 impl AcceptedSessionBlock {
+    /// Reuse only this process's opaque verified receipt. GC or a missing
+    /// persistence prerequisite falls back to normal authenticated acceptance.
+    /// MC inclusion can advance a shard receipt from preapplied to applied.
+    pub(crate) fn current_receipt(&self, engine: &dyn EngineOperations) -> Result<Option<Self>> {
+        let Some(handle) = engine.load_block_handle(self.block.id())? else {
+            return Ok(None);
+        };
+        let has_proof = if self.proof.is_link() { handle.has_proof_link() } else { handle.has_proof() };
+        if !handle.has_data() || !handle.has_state() || !has_proof
+            || (self.phase == AcceptancePhase::Applied && !handle.is_applied())
+        {
+            return Ok(None);
+        }
+        let mut receipt = self.clone();
+        receipt.phase = if handle.is_applied() { AcceptancePhase::Applied } else { AcceptancePhase::Preapplied };
+        receipt.already_present = handle.is_applied();
+        Ok(Some(receipt))
+    }
     pub fn block(&self) -> &BlockStuff {
         &self.block
     }
@@ -1035,10 +1054,10 @@ impl AcceptedSessionBlock {
         self.already_present
     }
     pub fn is_final(&self) -> bool {
-        matches!(&self.finality, AcceptedFinality::Final { .. })
+        matches!(self.finality.as_ref(), AcceptedFinality::Final { .. })
     }
     pub fn network_signatures(&self) -> Result<rtos_api::pq_finality::PqNetworkSignatureSet> {
-        match &self.finality {
+        match self.finality.as_ref() {
             AcceptedFinality::Final { carrier, .. } => {
                 rtos_api::pq_finality::PqNetworkSignatureSet::from_final_fields(carrier)
             }
@@ -1051,7 +1070,7 @@ impl AcceptedSessionBlock {
     /// when the earlier CandidateReceived callback did not reach this node.
     /// This receipt does not promote notarization into finality authority.
     pub fn candidate_relay(&self) -> Result<super::propagation::ValidatedCandidateRelay> {
-        let session_id = match &self.finality {
+        let session_id = match self.finality.as_ref() {
             AcceptedFinality::Final { _verified, .. } => _verified.session_id(),
             AcceptedFinality::Approval { _verified, .. } => _verified.session_id(),
         };
@@ -1072,7 +1091,7 @@ impl AcceptedSessionBlock {
         self.network_signatures()
     }
     fn final_carrier(&self) -> Result<BlockSignaturesVariant> {
-        match &self.finality {
+        match self.finality.as_ref() {
             AcceptedFinality::Final { carrier, .. } => {
                 Ok(BlockSignaturesVariant::SimplexPq(carrier.clone()))
             }
@@ -1343,7 +1362,7 @@ pub(crate) async fn accept_authenticated_mc_repair(
     Ok(AcceptedSessionBlock {
         block,
         proof,
-        finality: AcceptedFinality::Final { carrier, _verified: verified },
+        finality: Arc::new(AcceptedFinality::Final { carrier, _verified: verified }),
         prev: previous.prev,
         phase: AcceptancePhase::Applied,
         already_present: true,
@@ -1375,7 +1394,7 @@ async fn persist_authenticated_pq_block(
         return Ok(AcceptedSessionBlock {
             block,
             proof,
-            finality: authenticated,
+            finality: Arc::new(authenticated),
             prev,
             phase: AcceptancePhase::Applied,
             already_present: true,
@@ -1414,7 +1433,7 @@ async fn persist_authenticated_pq_block(
     Ok(AcceptedSessionBlock {
         block,
         proof,
-        finality: authenticated,
+        finality: Arc::new(authenticated),
         prev,
         phase,
         already_present: false,
