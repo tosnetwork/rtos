@@ -141,6 +141,68 @@ async fn persistent_repair_ledger_unknown_wal_poison_and_bad_record_fail_closed(
     assert!(db.repair_protection().state(&block(99)));
     Ok(())
 }
+#[tokio::test]
+async fn persistent_repair_ledger_sync_contention_preserves_authenticated_retry() -> Result<()> {
+    use crate::retired_history::RetryableHistoryError;
+    for contention in [
+        RetryableHistoryError::WriterBusy,
+        RetryableHistoryError::IoCapacity,
+        RetryableHistoryError::PreparationCapacity,
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (db, leases) = open(dir.path())?;
+        let budget = HistoryReadBudget::new(Default::default());
+        let generation = leases.begin(&binding(), dependencies(), &budget)?;
+        let error = anyhow::Error::from(contention).context("dependency synchronization");
+        leases.dependency_sync_failed(&error);
+        let guard = leases
+            .protection
+            .authentication()
+            .await
+            .expect("bounded admission contention must permit authenticated retry");
+        assert!(leases.protection.state(&block(1)));
+        assert!(!leases.protection.state(&block(99)));
+        assert_eq!(leases.lookup(generation, &budget)?.state, LeaseState::Protecting);
+        assert_eq!(leases.begin(&binding(), dependencies(), &budget)?, generation);
+        leases.durable(generation, &budget)?;
+        drop(guard);
+        drop(leases);
+        drop(db);
+        let (_db, reopened) = open(dir.path())?;
+        assert_eq!(
+            reopened.lookup(generation, &HistoryReadBudget::new(Default::default()))?.state,
+            LeaseState::DurableCustody
+        );
+        assert!(reopened.protection.authentication().await.is_ok());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn persistent_repair_ledger_dependency_sync_io_failure_still_requires_cold_recovery(
+) -> Result<()> {
+    for error in [
+        anyhow::Error::from(std::io::Error::from_raw_os_error(5)),
+        error!("Retained history writer busy"),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (db, leases) = open(dir.path())?;
+        let budget = HistoryReadBudget::new(Default::default());
+        let generation = leases.begin(&binding(), dependencies(), &budget)?;
+        leases.dependency_sync_failed(&error);
+        assert!(leases.protection.authentication().await.is_err());
+        assert!(leases.protection.state(&block(99)));
+        assert!(leases.lookup(generation, &budget).is_err());
+        drop(leases);
+        drop(db);
+        let (_db, reopened) = open(dir.path())?;
+        assert_eq!(
+            reopened.lookup(generation, &HistoryReadBudget::new(Default::default()))?.state,
+            LeaseState::Protecting
+        );
+    }
+    Ok(())
+}
 #[test]
 fn persistent_repair_binding_strict_codec_no_approval_or_unknown_fields() -> Result<()> {
     let item = binding();
@@ -215,8 +277,13 @@ async fn ledger_real_capacity(dependency_count: usize) -> Result<()> {
     for n in 1..=dependency_count as u32 {
         let mut dep = dependencies().remove(0);
         // Unlike block(), this accepts sequence numbers beyond one byte.
-        dep.id = BlockIdExt::with_params(ShardIdent::masterchain(), n,
-            UInt256::from([1; 32]), UInt256::from([2; 32])).to_string();
+        dep.id = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            n,
+            UInt256::from([1; 32]),
+            UInt256::from([2; 32]),
+        )
+        .to_string();
         deps.push(dep);
     }
     deps.sort();
@@ -225,7 +292,9 @@ async fn ledger_real_capacity(dependency_count: usize) -> Result<()> {
     for n in 1..=MAX_LEASES as u64 + 1 {
         let bytes = serde_json::to_vec(&capacity_record(n, &deps)?)?;
         assert!(bytes.len() <= MAX_RECORD_BYTES);
-        if rows.len() == MAX_LEASES || total + bytes.len() > MAX_TOTAL_BYTES { break; }
+        if rows.len() == MAX_LEASES || total + bytes.len() > MAX_TOTAL_BYTES {
+            break;
+        }
         total += bytes.len();
         rows.push(bytes);
     }
@@ -244,20 +313,36 @@ async fn ledger_real_capacity(dependency_count: usize) -> Result<()> {
     drop(db);
     let (db, leases) = open(dir.path())?;
     let guard = leases.protection.authentication().await?;
-    assert_eq!(leases.begin(&capacity_binding(count as u64), deps.clone(),
-        &HistoryReadBudget::new(Default::default()))?, count as u64);
+    assert_eq!(
+        leases.begin(
+            &capacity_binding(count as u64),
+            deps.clone(),
+            &HistoryReadBudget::new(Default::default())
+        )?,
+        count as u64
+    );
     assert_eq!(leases.memory.lock().unwrap().bytes, total);
     let before = physical_ledger(&leases)?;
-    assert_eq!(before.get(format!("lease/{:020}", count).as_bytes()),
-        Some(&(last.len(), UInt256::calc_file_hash(&last))));
-    let error = leases.begin(&capacity_binding(count as u64 + 1), deps.clone(),
-        &HistoryReadBudget::new(Default::default())).unwrap_err().to_string();
+    assert_eq!(
+        before.get(format!("lease/{:020}", count).as_bytes()),
+        Some(&(last.len(), UInt256::calc_file_hash(&last)))
+    );
+    let error = leases
+        .begin(
+            &capacity_binding(count as u64 + 1),
+            deps.clone(),
+            &HistoryReadBudget::new(Default::default()),
+        )
+        .unwrap_err()
+        .to_string();
     if count == MAX_LEASES {
         assert!(error.contains("history capacity exhausted"), "{error}");
     } else {
         assert!(error.contains("lease capacity exhausted"), "{error}");
-        assert!(total + serde_json::to_vec(&capacity_record(count as u64 + 1, &deps)?)?.len()
-            > MAX_TOTAL_BYTES);
+        assert!(
+            total + serde_json::to_vec(&capacity_record(count as u64 + 1, &deps)?)?.len()
+                > MAX_TOTAL_BYTES
+        );
     }
     eprintln!("ledger capacity: dependencies={dependency_count}, records={count}, bytes={total}, rejection={error}");
     assert_eq!(physical_ledger(&leases)?, before);
@@ -272,11 +357,13 @@ async fn ledger_real_capacity(dependency_count: usize) -> Result<()> {
     Ok(())
 }
 #[tokio::test]
-async fn persistent_repair_ledger_real_small_record_capacity_preserves_cold_records() -> Result<()> {
+async fn persistent_repair_ledger_real_small_record_capacity_preserves_cold_records() -> Result<()>
+{
     ledger_real_capacity(1).await
 }
 #[tokio::test]
-async fn persistent_repair_ledger_real_large_record_byte_capacity_preserves_cold_records() -> Result<()> {
+async fn persistent_repair_ledger_real_large_record_byte_capacity_preserves_cold_records(
+) -> Result<()> {
     ledger_real_capacity(MAX_DEPENDENCIES).await
 }
 
@@ -422,7 +509,8 @@ fn persistent_repair_ledger_distinguishes_absent_from_mismatched_and_checks_in_o
 }
 
 #[test]
-fn persistent_repair_ledger_release_fails_closed_when_protection_was_not_registered() -> Result<()> {
+fn persistent_repair_ledger_release_fails_closed_when_protection_was_not_registered() -> Result<()>
+{
     use crate::publication_dependency_leases::LeaseRelease;
     let dir = tempfile::tempdir()?;
     let (_db, leases) = open(dir.path())?;

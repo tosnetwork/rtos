@@ -665,7 +665,7 @@ pub(crate) async fn obtain_durable_mc_custody(
             }
             .await;
             if let Err(error) = synchronized {
-                leases.poison();
+                leases.dependency_sync_failed(&error);
                 return Err(error);
             }
 
@@ -801,7 +801,7 @@ pub(crate) async fn reopen_durable_mc_custody(
         }
         .await;
         if let Err(error) = synchronized {
-            leases.poison();
+            leases.dependency_sync_failed(&error);
             return Err(error);
         }
 

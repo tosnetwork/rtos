@@ -194,6 +194,17 @@ impl DependencyLeases {
         memory.poisoned = true;
         self.protection.poison();
     }
+    pub(crate) fn dependency_sync_failed(&self, error: &anyhow::Error) {
+        // Protecting is already durable. Bounded history admission contention
+        // leaves that exact lease in place for authenticated retry; it does not
+        // establish custody. Unknown sync outcomes still require cold recovery.
+        if crate::retired_history::is_retryable(error) {
+            log::debug!("Repair dependency sync deferred with protection retained: {error:#}");
+        } else {
+            log::error!("Repair dependency sync failed; cold recovery required: {error:#}");
+            self.poison();
+        }
+    }
     pub(crate) fn protection(&self) -> &Arc<RepairProtection> {
         &self.protection
     }
@@ -417,11 +428,11 @@ impl DependencyLeases {
 }
 
 #[cfg(test)]
-#[path = "tests/test_persistent_repair_ledger.rs"]
-mod tests;
-#[cfg(test)]
 #[path = "tests/test_disk_full_ledger.rs"]
 pub(crate) mod disk_full_tests;
+#[cfg(test)]
+#[path = "tests/test_persistent_repair_ledger.rs"]
+mod tests;
 
 #[cfg(test)]
 pub(crate) fn sst_fixture_for_test() -> (
