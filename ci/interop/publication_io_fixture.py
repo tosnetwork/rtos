@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import struct
 import time
 
 from mixed_matrix import write
@@ -32,13 +33,27 @@ def publication_io_environment(args, root):
     return environment
 
 
+def delivery_receipt(record):
+    # Match the existing delivery_coordinates encoder, not the source-file ID.
+    def block(value):
+        match = re.fullmatch(r'\((-?[0-9]+):([0-9a-f]{16}), ([0-9]+), rh ([0-9a-f]{64}), fh ([0-9a-f]{64})\)', value)
+        if match is None:raise RuntimeError('Invalid full publication block ID')
+        wc,shard,seqno,root,file_hash=match.groups()
+        return struct.pack('<iQI',int(wc),int(shard,16),int(seqno))+bytes.fromhex(root+file_hash)
+    data=b'RTOS-finality-delivery-v1'+block(record['zerostate'])
+    data+=struct.pack('<iBB',record['global_id'],record['wire_profile'],record['protocol'])
+    data+=bytes.fromhex(record['profile']+record['session_id'])+block(record['block_id'])
+    data+=bytes([int(record['is_final'])])
+    return hashlib.sha256(data).hexdigest()
+
+
 def selector_for(record, source_id, pid):
     body = bytes.fromhex(record['data'])
     if not record['is_final'] or not body or not re.fullmatch('[0-9a-f]{64}', source_id):
         raise RuntimeError('Publication IO requires the original complete Final source')
     return {'schema': 1, 'pid': pid, 'session_id': record['session_id'],
         'block_id': record['block_id'], 'block_sha256': hashlib.sha256(body).hexdigest(),
-        'source_id': source_id}
+        'source_id': source_id, 'node_receipt':delivery_receipt(record)}
 
 
 class PublicationIoSource(SourceRetentionCut):
@@ -89,38 +104,82 @@ class PublicationIoSource(SourceRetentionCut):
                 or target['device'] != info.st_dev or target['inode'] != info.st_ino \
                 or hashlib.sha256(path.read_bytes()).hexdigest() != selector['block_sha256']:
             raise RuntimeError('Native acceptance cut does not match exact owned worker/body identity')
-        pending = self.pending.with_suffix('.json')
-        if self.pending.exists() or pending.read_bytes() != self.original:
-            raise RuntimeError('Resumed source did not commit its original bytes before acceptance')
-        self.pending = pending
-        for path in [pending.with_suffix('.acked'), pending.with_suffix('.ack.tmp'), self.pending_directory/'references-v1'/(self.source_id+'.reference'),
+        publication=target['publication']
+        if publication != failed['publication'] or publication['node_receipt'] != selector['node_receipt'] \
+                or publication['stage'] != 'DraftDurable' or not failed['retained_draft_verified']:
+            raise RuntimeError('Failed acceptance lost its exact retained WAL draft')
+        if self.pending.exists():raise RuntimeError('Complete source retain did not resume its normal commit')
+        pending=self.pending.with_suffix('.json');ack=pending.with_suffix('.acked')
+        self.source_snapshot={}
+        for path in [pending,ack]:
+            if not path.exists():continue
+            raw=path.read_bytes()
+            if path==pending:
+                if raw!=self.original:raise RuntimeError('Committed source bytes changed')
+            else:
+                value=json.loads(raw)
+                if value['record']!=json.loads(self.original) or value['node_receipt']!=selector['node_receipt']:
+                    raise RuntimeError('WAL handoff ACK differs from exact original source/delivery')
+                (self.io_directory/'wal-handoff-acked.json').write_bytes(raw)
+            self.source_snapshot[path]=raw
+        if not self.source_snapshot:raise RuntimeError('Failed acceptance lost its full source custody')
+        self.pending=pending if pending in self.source_snapshot else ack
+        self.preserved_bytes=self.source_snapshot[self.pending]
+        self.expected_node_receipt=selector['node_receipt']
+        for path in [pending.with_suffix('.ack.tmp'),self.pending_directory/'references-v1'/(self.source_id+'.reference'),
                      self.pending_directory/'references-v1'/(self.source_id+'.delivered')]:
-            if path.exists(): raise RuntimeError('Failed acceptance already acknowledged its source')
+            if path.exists():raise RuntimeError('Failed acceptance already published canonical delivery')
         (self.io_directory/'stopped-process-status.txt').write_text(self.process_status())
         self.receipt.update(phase='native_node_body_sync_failure_observed',
             node_io_target=target, source_pending_committed_before_interruption=True,
-            source_acknowledged_before_interruption=False, node_io_failure_before_callback=True, node_observed_error=failed,
+            source_acknowledged_before_interruption=ack in self.source_snapshot,
+            source_ack_scope='full node WAL handoff only, not block acceptance',
+            source_canonical_delivery_before_interruption=False,
+            node_io_failure_before_callback=True, node_observed_error=failed,
             native_error_observed_at_unix=time.time())
         self.save()
 
     # At the second cut the source is committed. Reuse the exact committed-source
     # recovery contract, not the uncommitted-retain reconstruction contract.
     def preserved_source_bytes(self):
-        return SourceAckFailure.preserved_source_bytes(self)
+        return self.preserved_bytes
+
+    def check_source_snapshot(self):
+        if any(path.read_bytes()!=raw for path,raw in self.source_snapshot.items()):
+            raise RuntimeError('Full source custody changed before original-DB restart')
 
     async def after_interruption(self):
+        self.check_source_snapshot()
         await SourceAckFailure.after_interruption(self)
 
     def environment(self):
+        self.check_source_snapshot()
         return SourceAckFailure.environment(self)
 
     def has_unacknowledged_source(self):
         return SourceAckFailure.has_unacknowledged_source(self)
 
     async def complete(self, recovered):
-        await SourceAckFailure.complete(self, recovered)
-        self.receipt['node_io_original_source_recovered'] = True
-        self.save()
+        # A source .acked only proves the earlier full-WAL handoff. Wait for
+        # normal accepted/canonical delivery, never count that ACK as recovery.
+        delivered=self.pending_directory/'references-v1'/(self.source_id+'.delivered')
+        while True:
+            self.check_budget()
+            if self.node['process'].returncode is not None:raise RuntimeError('Recovered node exited before canonical delivery')
+            if delivered.exists():
+                raw=delivered.read_bytes();value=json.loads(raw)
+                valid,reference=SourceAckFailure.matches_recovered_source(self,'delivered',value,json.loads(self.original))
+                if not valid or reference['node_receipt']!=self.expected_node_receipt:
+                    raise RuntimeError('Recovered canonical delivery differs from exact original source')
+                if not any(path.exists() for path in self.source_snapshot):
+                    (self.io_directory/'recovered-canonical.json').write_bytes(raw)
+                    self.receipt.update(phase='recovered',recovered_ack_kind='delivered',
+                        recovered_ack_sha256=hashlib.sha256(raw).hexdigest(),
+                        recovered_node_receipt=reference['node_receipt'],final_checkpoint=recovered['last_checkpoint'],
+                        original_source_canonical_delivery_recovered=True,node_io_original_source_recovered=True,
+                        manual_database_repair=False)
+                    self.save();return
+            await asyncio.sleep(.05)
 
 
 class PublicationIoRestart:

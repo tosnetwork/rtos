@@ -1,7 +1,10 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Isolated Linux fixture: bind a native sync cut to one authenticated acceptance.
 //! Observations never replace the actual synchronization or its error handling.
-use crate::validator::accept_block::AcceptedSessionBlock;
+use crate::{
+    propagation_outbox::{delivery_id, PropagationOutbox, UnverifiedRecord},
+    validator::accept_block::AcceptedSessionBlock,
+};
 use rtos_block::{fail, Result, UInt256};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -30,6 +33,7 @@ struct Selector {
     block_id: String,
     block_sha256: String,
     source_id: String,
+    node_receipt: String,
 }
 #[derive(Deserialize, Serialize)]
 struct Witness {
@@ -37,12 +41,43 @@ struct Witness {
     selector_sha256: String,
     selector: Selector,
     proof_sha256: String,
+    publication: PublicationContext,
     artifact: String,
     pid: u32,
     tid: u32,
     device: u64,
     inode: u64,
     path: PathBuf,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct PublicationContext {
+    record_id: u64,
+    node_receipt: String,
+    stage: String,
+}
+impl PublicationContext {
+    fn from_entry(entry: &UnverifiedRecord) -> Result<Self> {
+        Ok(Self {
+            record_id: entry.id.0,
+            node_receipt: delivery_id(&entry.record)?.to_hex_string(),
+            stage: format!("{:?}", entry.stage),
+        })
+    }
+}
+tokio::task_local! { static PUBLICATION: PublicationContext; }
+
+pub(crate) async fn acceptance_scope<T>(
+    entry: &UnverifiedRecord,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if std::env::var_os(CONTROL).is_none() {
+        return work.await;
+    }
+    PUBLICATION.scope(PublicationContext::from_entry(entry)?, work).await
+}
+fn matches_publication(selector: &Selector, publication: &PublicationContext) -> bool {
+    publication.node_receipt == selector.node_receipt && publication.stage == "DraftDurable"
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -75,6 +110,7 @@ fn load(control: &Path) -> Result<Option<(Selector, String)>> {
         || !is_digest(&selector.session_id)
         || !is_digest(&selector.block_sha256)
         || !is_digest(&selector.source_id)
+        || !is_digest(&selector.node_receipt)
     {
         fail!("Invalid publication IO selector identity");
     }
@@ -105,6 +141,7 @@ fn arm(
     selector: &Selector,
     selector_sha256: &str,
     proof_sha256: &str,
+    publication: &PublicationContext,
     path: &Path,
 ) -> Result<()> {
     let path = path.canonicalize()?;
@@ -127,6 +164,7 @@ fn arm(
         selector_sha256: selector_sha256.to_owned(),
         selector: selector.clone(),
         proof_sha256: proof_sha256.to_owned(),
+        publication: publication.clone(),
         artifact: "loose_block_body".into(),
         pid,
         tid,
@@ -157,6 +195,10 @@ pub(crate) fn for_acceptance(accepted: &AcceptedSessionBlock) -> Result<SyncObse
     ) {
         return Ok(None);
     }
+    let Ok(publication) = PUBLICATION.try_with(Clone::clone) else { return Ok(None) };
+    if !matches_publication(&selector, &publication) {
+        return Ok(None);
+    }
     let name = storage::archives::package_entry_id::PackageEntryId::Block(accepted.block().id())
         .filename_short();
     let proof_sha256 = digest(accepted.proof().data());
@@ -166,7 +208,7 @@ pub(crate) fn for_acceptance(accepted: &AcceptedSessionBlock) -> Result<SyncObse
             && path.file_name().and_then(|part| part.to_str()) == Some(name.as_str())
             && !armed.swap(true, Ordering::SeqCst)
         {
-            arm(&control, &selector, &selector_sha256, &proof_sha256, path)?;
+            arm(&control, &selector, &selector_sha256, &proof_sha256, &publication, path)?;
         }
         Ok(())
     })))
@@ -174,7 +216,12 @@ pub(crate) fn for_acceptance(accepted: &AcceptedSessionBlock) -> Result<SyncObse
 
 /// Called synchronously after the publication worker marks the real typed
 /// durability failure fatal, before it returns an unsuccessful acceptance.
-pub(crate) fn after_fatal(accepted: &AcceptedSessionBlock, error: &anyhow::Error) -> Result<()> {
+pub(crate) fn after_fatal(
+    entry: &UnverifiedRecord,
+    store: &PropagationOutbox,
+    accepted: &AcceptedSessionBlock,
+    error: &anyhow::Error,
+) -> Result<()> {
     let Some(control) = std::env::var_os(CONTROL) else { return Ok(()) };
     let control = PathBuf::from(control);
     let Some((selector, selector_sha256)) = load(&control)? else { return Ok(()) };
@@ -187,6 +234,17 @@ pub(crate) fn after_fatal(accepted: &AcceptedSessionBlock, error: &anyhow::Error
         accepted.is_final(),
     ) {
         return Ok(());
+    }
+    let publication = PublicationContext::from_entry(entry)?;
+    if !matches_publication(&selector, &publication) {
+        return Ok(());
+    }
+    let (_, retained) = store
+        .delivery(&delivery_id(&entry.record)?)?
+        .ok_or_else(|| rtos_block::error!("Failed publication lost its full WAL draft"))?;
+    if PublicationContext::from_entry(&retained)? != publication || retained.record != entry.record
+    {
+        fail!("Failed publication advanced or changed its durable draft");
     }
     let target_bytes = std::fs::read(control.join("target.json"))?;
     let target: Witness = serde_json::from_slice(&target_bytes)?;
@@ -202,6 +260,7 @@ pub(crate) fn after_fatal(accepted: &AcceptedSessionBlock, error: &anyhow::Error
     };
     if target.schema != 1
         || target.selector != selector
+        || target.publication != publication
         || target.selector_sha256 != selector_sha256
         || target.pid != std::process::id()
         || target.artifact != "loose_block_body"
@@ -217,6 +276,7 @@ pub(crate) fn after_fatal(accepted: &AcceptedSessionBlock, error: &anyhow::Error
         "target_sha256":digest(&target_bytes), "native_marker_sha256":digest(&marker),
         "error":error.to_string(), "typed_durability_failure":true,
         "publication_owner_marked_fatal":true, "accepted_callback_returned":false,
+        "retained_draft_verified":true, "publication":publication,
     });
     write_new(&control.join("failed.json"), &serde_json::to_vec(&failed)?)?;
     File::open(&control)?.sync_all()?;
@@ -247,8 +307,14 @@ mod tests {
             block_id: "block".into(),
             block_sha256: digest(b"actual body"),
             source_id: "b".repeat(64),
+            node_receipt: "e".repeat(64),
         };
-        arm(&directory, &selector, &"c".repeat(64), &"d".repeat(64), &body).unwrap();
+        let publication = PublicationContext {
+            record_id: 7,
+            node_receipt: selector.node_receipt.clone(),
+            stage: "DraftDurable".into(),
+        };
+        arm(&directory, &selector, &"c".repeat(64), &"d".repeat(64), &publication, &body).unwrap();
         let witness: serde_json::Value =
             serde_json::from_slice(&std::fs::read(directory.join("target.json")).unwrap()).unwrap();
         let native = std::fs::read_to_string(directory.join("target.native")).unwrap();
@@ -259,8 +325,34 @@ mod tests {
         assert_eq!(witness["pid"], std::process::id());
         assert!(native.ends_with(&format!("\n{}\n", body.display())));
         assert_eq!(std::fs::read(&body).unwrap(), b"actual body");
-        assert!(arm(&directory, &selector, "c", "d", &body).is_err());
+        assert!(arm(&directory, &selector, "c", "d", &publication, &body).is_err());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn publication_io_requires_the_exact_unaccepted_wal_delivery() {
+        let selector = Selector {
+            schema: 1,
+            pid: 7,
+            session_id: "a".repeat(64),
+            block_id: "block".into(),
+            block_sha256: digest(b"body"),
+            source_id: "b".repeat(64),
+            node_receipt: "c".repeat(64),
+        };
+        let mut publication = PublicationContext {
+            record_id: 9,
+            node_receipt: selector.node_receipt.clone(),
+            stage: "DraftDurable".into(),
+        };
+        assert!(matches_publication(&selector, &publication));
+        publication.node_receipt = "d".repeat(64);
+        assert!(!matches_publication(&selector, &publication));
+        publication.node_receipt = selector.node_receipt.clone();
+        for stage in ["Prepared", "Ready", "AcceptedDraft", "Completed"] {
+            publication.stage = stage.into();
+            assert!(!matches_publication(&selector, &publication));
+        }
     }
 
     #[test]
@@ -272,6 +364,7 @@ mod tests {
             block_id: "full block identity".into(),
             block_sha256: digest(b"body"),
             source_id: "b".repeat(64),
+            node_receipt: "e".repeat(64),
         };
         assert!(matches(&selector, 7, &selector.session_id, &selector.block_id, b"body", true));
         assert!(!matches(&selector, 8, &selector.session_id, &selector.block_id, b"body", true));

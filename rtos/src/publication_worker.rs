@@ -1309,14 +1309,19 @@ impl State {
         let needs_verification = !self.acceptance_verified.lock().unwrap().contains(&id.0);
         if needs_verification {
             activity.phase("accept_durability");
-            if let Err(error) = engine.clone().ensure_publication_acceptance_durable(&accepted).await {
+            let durability = engine.clone().ensure_publication_acceptance_durable(&accepted);
+            #[cfg(all(target_os = "linux", feature = "isolated-consensus-signing"))]
+            let durability = crate::publication_io_test_control::acceptance_scope(&entry, durability).await;
+            #[cfg(not(all(target_os = "linux", feature = "isolated-consensus-signing")))]
+            let durability = durability.await;
+            if let Err(error) = durability {
                 if error
                     .downcast_ref::<crate::internal_db::PublicationDurabilityFailure>()
                     .is_some()
                 {
                     self.fatal(error.to_string());
                     #[cfg(all(target_os = "linux", feature = "isolated-consensus-signing"))]
-                    crate::publication_io_test_control::after_fatal(&accepted, &error)?;
+                    crate::publication_io_test_control::after_fatal(&entry, store.as_ref(), &accepted, &error)?;
                 }
                 return Err(error);
             }
