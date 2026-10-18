@@ -1614,7 +1614,17 @@ impl SourceFinalityDelivery {
         let callback_id = id.clone();
         let callback_receipt = receipt.clone();
         let callback_draft = draft.clone();
+        let started = std::time::Instant::now();
+        log::debug!(target: "simplex_resolver",
+            "SOURCE_ACCEPT_REQUEST: session={} record_id={} node_receipt={} block_id={} role={:?}",
+            self.runtime.session_id().to_hex_string(), id.to_hex_string(), receipt.to_hex_string(),
+            request.block_id, request.role);
         if let Err(error) = self.sink.await_accepted(request, Box::new(move |result| {
+            log::debug!(target: "simplex_resolver",
+                "SOURCE_ACCEPT_COMPLETE: session={} record_id={} node_receipt={} elapsed_ms={} error={:?}",
+                owner.runtime.session_id().to_hex_string(), callback_id.to_hex_string(),
+                callback_receipt.to_hex_string(), started.elapsed().as_millis(),
+                result.as_ref().err().map(ToString::to_string));
             let stage = match result {
                 Ok(()) => SourceStage::Accepted(callback_receipt, callback_draft),
                 Err(error) => {

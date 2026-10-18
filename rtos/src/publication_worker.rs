@@ -213,6 +213,7 @@ enum Submission {
     Acceptance {
         request: CanonicalFinalityRequest,
         runtime: Arc<AuthenticatedSessionRuntime>,
+        queued_at: std::time::Instant,
         completion: ClosingCompletion<()>,
     },
     HistoryDebt {
@@ -376,7 +377,8 @@ impl DurableFinalitySink for SessionSink {
         completion: Box<dyn FnOnce(Result<()>) + Send>,
     ) -> Result<()> {
         self.worker.admit_draft(Submission::Acceptance {
-            request, runtime: self.runtime.clone(), completion: ClosingCompletion(Some(completion)),
+            request, runtime: self.runtime.clone(), queued_at: std::time::Instant::now(),
+            completion: ClosingCompletion(Some(completion)),
         })
     }
     fn lookup_terminal(
@@ -1000,7 +1002,12 @@ impl State {
             Submission::SourceDelivered { confirmation, runtime, completion } => {
                 completion.finish(self.confirm_delivered(store, &runtime, confirmation).await);
             }
-            Submission::Acceptance { request, runtime, completion } => {
+            Submission::Acceptance { request, runtime, queued_at, completion } => {
+                let started = std::time::Instant::now();
+                log::debug!(target: "simplex_resolver",
+                    "NODE_ACCEPT_BEGIN: session={} node_receipt={} block_id={} role={:?} queue_ms={}",
+                    runtime.session_id().to_hex_string(), request.node_receipt.to_hex_string(),
+                    request.block_id, request.role, queued_at.elapsed().as_millis());
                 let result = async {
                     if self.stop.is_cancelled() {
                         fail!("Publication shutdown before acceptance");
@@ -1008,9 +1015,17 @@ impl State {
                     let id = request.node_receipt.clone();
                     let (delivery, entry) = self.write(store, move |store| store.delivery(&id))
                         .await?.ok_or_else(|| error!("Unknown acceptance delivery"))?;
+                    log::debug!(target: "simplex_resolver",
+                        "NODE_ACCEPT_LOOKUP: session={} node_receipt={} record={} elapsed_ms={}",
+                        runtime.session_id().to_hex_string(), request.node_receipt.to_hex_string(),
+                        entry.id.0, started.elapsed().as_millis());
                     // Bind role, block, session, network and origin before using
                     // the same authenticated accept operation as normal Query.
                     canonical_record(&runtime, &request, &delivery, &entry, &self.limits)?;
+                    log::debug!(target: "simplex_resolver",
+                        "NODE_ACCEPT_BOUND: session={} node_receipt={} record={} elapsed_ms={}",
+                        runtime.session_id().to_hex_string(), request.node_receipt.to_hex_string(),
+                        entry.id.0, started.elapsed().as_millis());
                     // A persisted stage is not acceptance authority after restart.
                     // Reuse only a completed acceptance verified by this worker,
                     // after binding the full source request above.
@@ -1023,6 +1038,10 @@ impl State {
                     self.accept(store, engine, entry).await?;
                     Ok(())
                 }.await;
+                log::debug!(target: "simplex_resolver",
+                    "NODE_ACCEPT_END: session={} node_receipt={} elapsed_ms={} error={:?}",
+                    runtime.session_id().to_hex_string(), request.node_receipt.to_hex_string(),
+                    started.elapsed().as_millis(), result.as_ref().err().map(ToString::to_string));
                 completion.finish(result);
             }
             Submission::Canonical { request, runtime, completion } => {
@@ -1228,6 +1247,14 @@ impl State {
         entry: UnverifiedRecord,
     ) -> Result<AcceptedSessionBlock> {
         let activity = self.activity_scope("accept_history", Some((entry.id.0, entry.record.block_id.to_string())));
+        let started = std::time::Instant::now();
+        let trace_record = entry.id.0;
+        let trace_phase = |phase: &str| {
+            log::debug!(target: "simplex_resolver",
+                "NODE_ACCEPT_PHASE: record={} phase={} elapsed_ms={}",
+                trace_record, phase, started.elapsed().as_millis());
+        };
+        trace_phase("history_begin");
         validate_plan(&entry)?;
         let publication = tokio::time::timeout(
             HISTORY_TIMEOUT,
@@ -1240,6 +1267,7 @@ impl State {
         )
         .await
         .map_err(|_| error!("Publication history authentication timed out"))??;
+        trace_phase("history_done");
         let id = publication.entry().id;
         if let Some(delivery) =
             self.write(store, move |store| store.delivery_for_record(id)).await?
@@ -1251,20 +1279,24 @@ impl State {
             let claims = historical_origin(&publication, origin)?;
             validate_creator_claim(&publication, &claims)?;
         }
+        trace_phase("origin_done");
         // Authentication and creator/origin binding above still run on every
         // request, including cache hits. A new worker starts with no receipts.
         let record = publication.entry().record.clone();
         if let Some(receipt) = self.accepted_receipts.lock().unwrap()
             .get(publication.entry(), engine.as_ref())?
         {
+            trace_phase("cached_receipt");
             return Ok(receipt);
         }
         activity.phase("accept_block");
+        trace_phase("block_begin");
         // Deliberately not cancelable: this phase can write state/proof data.
         #[cfg(test)]
         self.actual_acceptance_runs.fetch_add(1, Ordering::Relaxed);
         let (entry, accepted) =
             accept_authenticated_publication(publication, engine.clone()).await?;
+        trace_phase("block_done");
         let id = entry.id;
         let needs_verification = !self.acceptance_verified.lock().unwrap().contains(&id.0);
         if needs_verification {
@@ -1290,7 +1322,9 @@ impl State {
                 accepted.register_shard_description(engine.clone(), entry.record.locally_generated).await?;
             }
         }
+        trace_phase("durability_done");
         self.write(store, move |store| store.mark_accepted(id)).await?;
+        trace_phase("wal_done");
         self.acceptance_verified.lock().unwrap().insert(id.0);
         self.accepted_receipts.lock().unwrap().insert(id, record, &accepted, &self.limits);
         Ok(accepted)
