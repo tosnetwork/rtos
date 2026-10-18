@@ -119,3 +119,46 @@ class SignerExpiryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(operation.call_args.args[8],{'qualified':'early-observer'})
         self.assertEqual(args.original_recovery_budget['monotonic'],observer.started)
         observer.complete.assert_awaited_once()
+
+
+    def test_runtime_start_retry_preserves_first_observation_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);args,node,cp,ns=self.context(root)
+            runtime=ns/'session-runtime.json';original=runtime.read_bytes();runtime.unlink()
+            with patch.object(expiry.time,'monotonic',return_value=100.0):
+                with self.assertRaisesRegex(RuntimeError,'exact current active MC runtime'):
+                    expiry.SignerExpiry(args,root,node,cp)
+            self.assertFalse((root/'signer-expiry/receipt.json').exists())
+            runtime.write_bytes(original)
+            with patch.object(expiry.time,'monotonic',return_value=100.5):
+                ctx=expiry.SignerExpiry(args,root,node,cp)
+            self.assertEqual(ctx.started,100.0)
+            self.assertEqual(ctx.deadline,102.0)
+            self.assertEqual(ctx.receipt['budget_started_at_unix'],ctx.started_unix)
+
+
+    def test_runtime_start_wait_cannot_extend_expiry_or_observation_deadline(self):
+        for overdue in ['budget','expiry']:
+            with tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);args,node,cp,ns=self.context(root)
+                runtime=ns/'session-runtime.json';original=runtime.read_bytes();runtime.unlink()
+                with patch.object(expiry.time,'monotonic',return_value=100.0):
+                    with self.assertRaises(expiry.SignerExpiryRuntimePending):expiry.SignerExpiry(args,root,node,cp)
+                runtime.write_bytes(original)
+                if overdue=='budget':
+                    with patch.object(expiry.time,'monotonic',return_value=103.0):
+                        with self.assertRaisesRegex(TimeoutError,'original recovery deadline'):expiry.SignerExpiry(args,root,node,cp)
+                else:
+                    with patch.object(expiry.time,'monotonic',return_value=100.5), \
+                            patch.object(expiry.time,'time',return_value=args.signer_expiry_plan['expire_at']):
+                        with self.assertRaisesRegex(RuntimeError,'live pre-expiry'):expiry.SignerExpiry(args,root,node,cp)
+                self.assertFalse((root/'signer-expiry').exists())
+
+    def test_ambiguous_current_runtime_is_fatal_not_startup_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);args,node,cp,ns=self.context(root)
+            other=ns.parent/'duplicate';other.mkdir()
+            (other/'session-runtime.json').write_bytes((ns/'session-runtime.json').read_bytes())
+            with self.assertRaisesRegex(RuntimeError,'exact current active MC runtime') as error:
+                expiry.SignerExpiry(args,root,node,cp)
+            self.assertNotIsInstance(error.exception,expiry.SignerExpiryRuntimePending)

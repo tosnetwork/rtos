@@ -688,9 +688,15 @@ async def run(args, profile, root, artifacts):
                     if phase == 'after' and not checked['verified_governing_key_blocks']:
                         raise RuntimeError('Successor sample lacks independently verified governing history')
                     if phase == 'after' and args.signer_expiry_member is not None and getattr(args, 'signer_expiry_observer', None) is None:
-                        from signer_expiry_fixture import SignerExpiry
+                        from signer_expiry_fixture import SignerExpiry, SignerExpiryRuntimePending
                         expired_node = next(n for n in rust_nodes if n['index'] == args.signer_expiry_member)
-                        args.signer_expiry_observer = SignerExpiry(args, root, expired_node, checked)
+                        try:
+                            args.signer_expiry_observer = SignerExpiry(args, root, expired_node, checked)
+                        except SignerExpiryRuntimePending:
+                            # Native state can lead this peer's async group start.
+                            # Retry exact matching within the first observation's
+                            # budget and original expiry, without arming the fault.
+                            continue
                     if checked['created_by'] not in {member_id(i) for i in committee}:
                         raise RuntimeError('Non-transition block creator is absent from the current committee')
                     if profile.get('weighted_quorum_pause') or profile.get('observer_budget'):

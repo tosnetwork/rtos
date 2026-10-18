@@ -40,19 +40,29 @@ def expiry_plan(profile, args):
         'surviving_weight_during_interruption':51 if passive else 34, 'surviving_weight_after_restart':51}
 
 
+class SignerExpiryRuntimePending(RuntimeError):
+    """The exact certified current runtime is still starting."""
+
+
 class SignerExpiry:
     def __init__(self,args,root,node,checkpoint):
         self.args=args;self.root=root;self.node=node
-        self.directory=root/'signer-expiry';self.directory.mkdir()
-        self.started=time.monotonic();self.deadline=self.started+args.recovery_timeout
-        self.started_unix=time.time();self.plan=args.signer_expiry_plan
-        if self.started_unix>=self.plan['expire_at']:
+        self.directory=root/'signer-expiry'
+        now=time.monotonic();now_unix=time.time()
+        anchor=getattr(args,'signer_expiry_observation_start',None)
+        if anchor is None:
+            anchor=(now,now_unix);args.signer_expiry_observation_start=anchor
+        self.started,self.started_unix=anchor
+        self.deadline=self.started+args.recovery_timeout;self.plan=args.signer_expiry_plan
+        if now_unix>=self.plan['expire_at']:
             raise RuntimeError('Signer expiry must be observed from a live pre-expiry session')
+        if now>=self.deadline:raise TimeoutError('Signer expiry exceeded the original recovery deadline')
         session=base64.b64decode(checkpoint['verified_final_certificates'][0]['session_id'],validate=True).hex()
         candidates=[]
         for path in (node['directory']/'node_db/catchains/consensus/v2').glob('*/session-runtime.json'):
             value=json.loads(path.read_text())
             if value['session']==session and value['shard_workchain']==-1 and value['role']=='validator':candidates.append(path)
+        if not candidates:raise SignerExpiryRuntimePending('Signer expiry needs the exact current active MC runtime')
         if len(candidates)!=1:raise RuntimeError('Signer expiry needs the exact current active MC runtime')
         runtime=candidates[0];profile=runtime.with_name('isolated-signing.json')
         value=json.loads(profile.read_text());schedule=profile.parent.parent/'isolated-signing-schedule.json'
@@ -63,6 +73,7 @@ class SignerExpiry:
         self.bindings={str(p):digest(p) for p in [profile,schedule,node['directory']/'validator-prepared.json']}
         self.session=session;self.pid=node['process'].pid;self.ticks=node['start_ticks']
         self.log=node['directory']/'node.log';self.offset=self.log.stat().st_size
+        self.directory.mkdir()
         (self.directory/'selected-runtime.json').write_bytes(runtime.read_bytes())
         (self.directory/'original-profile.json').write_bytes(profile.read_bytes())
         # Contains only public authority metadata and local paths, never key bytes.
