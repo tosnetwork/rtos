@@ -102,9 +102,31 @@ struct DiskRecord {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AcknowledgedRecord {
+    // Persist coordinates before canonical compaction; history still authenticates them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_binding: Option<delivered::DiskRecoveryBinding>,
     schema: u32,
     node_receipt: String,
     record: DiskRecord,
+}
+impl AcknowledgedRecord {
+    fn read(path: &Path) -> Result<Self> {
+        let file = File::open(path)?;
+        if file.metadata()?.len() > MAX_RECORD_BYTES {
+            fail!("Oversized acknowledged source finality record");
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_RECORD_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_RECORD_BYTES {
+            fail!("Acknowledged source record grew");
+        }
+        let value: Self = serde_json::from_slice(&bytes)?;
+        if value.schema != 1 {
+            fail!("Unknown acknowledged source finality schema");
+        }
+        let _: UInt256 = value.node_receipt.parse()?;
+        Ok(value)
+    }
 }
 /// Contains no payload. The node reference must already be durable before this
 /// marker replaces a full ACK. Its digest commits every original source field.
@@ -865,8 +887,12 @@ impl PendingFinalityStore {
             let mut metadata: DiskRecord = serde_json::from_slice(&original.encode()?)?;
             metadata.data.clear();
             metadata.signature_set.clear();
+            let mut recovery_binding = self.runtime_binding.lock().unwrap().clone();
+            if recovery_binding.is_none() {
+                recovery_binding = AcknowledgedRecord::read(&ack)?.recovery_binding;
+            }
             let reference = CanonicalReference {
-                recovery_binding: self.runtime_binding.lock().unwrap().clone(),
+                recovery_binding,
                 schema: 1,
                 node_receipt: receipt.to_hex_string(),
                 digest: UInt256::calc_file_hash(&original.encode()?).to_hex_string(),
@@ -1031,6 +1057,7 @@ impl PendingFinalityStore {
         }
         if !acknowledged.exists() {
             let bytes = serde_json::to_vec(&AcknowledgedRecord {
+                recovery_binding: self.runtime_binding.lock().unwrap().clone(),
                 schema: 1,
                 node_receipt: node_receipt.to_hex_string(),
                 record: serde_json::from_slice(&record.encode()?)?,

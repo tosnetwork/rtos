@@ -177,18 +177,13 @@ impl PendingFinalityStore {
                 return Ok(None);
             }
             let record = PendingFinalityRecord::read(&ack)?;
-            let file = File::open(&ack)?;
-            let mut bytes = Vec::new();
-            file.take(MAX_RECORD_BYTES + 1).read_to_end(&mut bytes)?;
-            if bytes.len() as u64 > MAX_RECORD_BYTES {
-                fail!("Source ACK grew");
-            }
-            let ack: AcknowledgedRecord = serde_json::from_slice(&bytes)?;
+            let ack = AcknowledgedRecord::read(&ack)?;
             let mut metadata: DiskRecord = serde_json::from_slice(&record.encode()?)?;
             metadata.data.clear();
             metadata.signature_set.clear();
             CanonicalReference {
-                recovery_binding: self.runtime_binding.lock().unwrap().clone(),
+                recovery_binding: ack.recovery_binding
+                    .or_else(|| self.runtime_binding.lock().unwrap().clone()),
                 schema: 1,
                 node_receipt: ack.node_receipt,
                 digest: record.canonical_digest()?.to_hex_string(),
@@ -969,6 +964,53 @@ mod tests {
         let offer = CloseOffer { request, generation: 1 };
         (dir, runtime, store, record, offer)
     }
+    #[test]
+    fn source_delivered_full_ack_reopen_preserves_recovery_coordinates() {
+        for compact in [false, true] {
+            let (_dir, _runtime, store, record, offer) = setup();
+            let id = record.id().unwrap();
+            let namespace = store.directory.parent().unwrap().to_owned();
+            drop(store);
+            let store = PendingFinalityStore::open(&namespace).unwrap();
+            assert!(store.runtime_binding.lock().unwrap().is_none());
+            if compact {
+                store.compact(&record, offer.request.canonical.node_receipt.clone()).unwrap();
+            }
+            let locator = store.close_locator(&id).unwrap().unwrap();
+            assert_eq!(locator.request().unwrap(), offer.request,
+                "full durable ACK must retain checked-history coordinates before canonical compaction");
+            assert!(!store.delivered_path(&id).exists(), "reopening is not a completed delivery");
+        }
+    }
+
+    #[test]
+    fn source_delivered_full_ack_coordinates_are_not_completion_authority() {
+        for legacy in [false, true] {
+            let (_dir, runtime, store, record, offer) = setup();
+            let id = record.id().unwrap();
+            let ack = store.directory.join(format!("{}.acked", id.to_hex_string()));
+            let mut disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&ack).unwrap()).unwrap();
+            if legacy {
+                disk.as_object_mut().unwrap().remove("recovery_binding");
+            } else {
+                let mut wrong = runtime.recovery_binding().unwrap().clone();
+                wrong.governing_masterchain.root_hash = UInt256::from([99; 32]);
+                disk["recovery_binding"]["governing"] = serde_json::json!(wrong.governing_masterchain.to_string());
+            }
+            std::fs::write(&ack, serde_json::to_vec(&disk).unwrap()).unwrap();
+            let namespace = store.directory.parent().unwrap().to_owned();
+            drop(store);
+            let store = PendingFinalityStore::open(&namespace).unwrap();
+            let locator = store.close_locator(&id).unwrap().unwrap();
+            if legacy {
+                assert!(locator.request().unwrap().domain.recovery_binding.is_none());
+            }
+            assert!(store.commit_delivered(&runtime, &locator.reference, &offer).is_err());
+            assert!(ack.exists());
+            assert!(!store.delivered_path(&id).exists());
+        }
+    }
+
     fn concurrent_confirmed_scan(unlocked_control: bool) {
         use std::sync::mpsc;
         use std::time::Duration;
