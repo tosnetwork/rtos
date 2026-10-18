@@ -19,14 +19,14 @@
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────────────┐
 //! │ Caller Thread                                                           │
-//! │   storage.get/set/erase → posts closure → returns StorageAsyncResultPtr │
+//! │   storage.get/set/erase → posts work → returns StorageAsyncResultPtr │
 //! └────────────────────────────────┬────────────────────────────────────────┘
 //!                                  │
 //!                                  ▼
 //! ┌─────────────────────────────────────────────────────────────────────────┐
 //! │ DB Processing Thread (kv-db:{storage_id})                               │
 //! │   - Opens CatchainPersistentDb (thread-local)                           │
-//! │   - Processes closures from task queue                                  │
+//! │   - Processes ordered reads and durable write groups                                  │
 //! │   - Posts callbacks to callback queue (if enabled)                      │
 //! │   - Dumps metrics every 30s                                             │
 //! └────────────────────────────────┬────────────────────────────────────────┘
@@ -236,9 +236,24 @@ type StorageTask = Box<
 /// Callback closure type - executed in callback thread
 type StorageCallback = Box<dyn FnOnce() + Send>;
 
+/// Mutations may share a durable commit, as C++ KeyValueActor does. Reads
+/// and explicit barriers remain queue boundaries; acknowledgements follow WAL
+/// synchronization, never just admission into a batch.
+struct StorageMutation {
+    key: StorageKey,
+    value: Option<StorageValue>,
+    result: Arc<StorageAsyncResultImpl<()>>,
+    callback: Option<StorageWriteCallback>,
+}
+
+enum StorageWork {
+    Task(StorageTask),
+    Mutation(StorageMutation),
+}
+
 /// Task descriptor with creation time (for latency tracking)
 struct TaskDesc {
-    task: StorageTask,
+    task: StorageWork,
     #[allow(dead_code)]
     creation_time: SystemTime, // For future latency tracking
 }
@@ -612,6 +627,9 @@ impl RocksDbAsyncKeyValueStorage {
             path.display()
         );
 
+        // A non-mutation pulled while collecting writes stays ahead of every
+        // later queue entry, including sync/close markers.
+        let mut deferred = None;
         // Processing loop
         loop {
             activity_node.tick();
@@ -627,7 +645,11 @@ impl RocksDbAsyncKeyValueStorage {
             }
 
             // Pull task with timeout
-            match task_rx.recv_timeout(THREAD_POLL_TIMEOUT) {
+            let next = match deferred.take() {
+                Some(task) => Ok(task),
+                None => task_rx.recv_timeout(THREAD_POLL_TIMEOUT),
+            };
+            match next {
                 Ok(task_desc) => {
                     metrics.db_queue_pulls.increment(1);
 
@@ -635,8 +657,30 @@ impl RocksDbAsyncKeyValueStorage {
                     // consistent state when its marker task signals completion
                     pending_count.fetch_sub(1, Ordering::SeqCst);
 
-                    // Execute task with DB access
-                    (task_desc.task)(&db, &metrics, &callback_tx);
+                    match task_desc.task {
+                        StorageWork::Task(task) => task(&db, &metrics, &callback_tx),
+                        StorageWork::Mutation(first) => {
+                            let mut writes = vec![first];
+                            // Snapshot the queued work: no batching timer or
+                            // unbounded drain of concurrently arriving writes.
+                            let queued = task_rx.len();
+                            for _ in 0..queued {
+                                match task_rx.try_recv() {
+                                    Ok(TaskDesc { task: StorageWork::Mutation(write), .. }) => {
+                                        metrics.db_queue_pulls.increment(1);
+                                        pending_count.fetch_sub(1, Ordering::SeqCst);
+                                        writes.push(write);
+                                    }
+                                    Ok(barrier) => {
+                                        deferred = Some(barrier);
+                                        break;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            Self::commit_mutations(&db, &metrics, &callback_tx, &storage_id, writes);
+                        }
+                    }
                 }
                 Err(crossbeam::channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
@@ -763,8 +807,54 @@ impl RocksDbAsyncKeyValueStorage {
         );
     }
 
+    fn commit_mutations(
+        db: &CatchainPersistentDb,
+        metrics: &StorageMetrics,
+        callback_tx: &Option<Sender<StorageCallback>>,
+        storage_id: &str,
+        writes: Vec<StorageMutation>,
+    ) {
+        use std::ops::Deref;
+        let mut batch = rocksdb::WriteBatch::default();
+        for write in &writes {
+            match &write.value {
+                Some(value) => {
+                    metrics.writes.increment(1);
+                    batch.put(&write.key, value);
+                }
+                None => {
+                    metrics.erases.increment(1);
+                    batch.delete(&write.key);
+                }
+            }
+        }
+        let mut options = rocksdb::WriteOptions::default();
+        options.set_sync(true);
+        let error = db.deref().deref().write_opt(batch, &options).err().map(|e| e.to_string());
+        for write in writes {
+            let operation = if write.value.is_some() { "set" } else { "erase" };
+            let outcome = || match &error {
+                None => Ok(()),
+                Some(error) => Err(rtos_block::error!("{} failed: {}", operation, error)),
+            };
+            if let Some(error) = &error {
+                log::error!(target: LOG_TARGET,
+                    "AsyncKeyValueStorage {}: {} failed: {}", storage_id, operation, error);
+            }
+            write.result.set(outcome());
+            if let Some(callback) = write.callback {
+                let result = outcome();
+                Self::invoke_callback(callback_tx, metrics, move || callback(result));
+            }
+        }
+    }
+
     /// Posts a task to the DB processing thread
     fn post_task(&self, task: StorageTask) {
+        self.post_work(StorageWork::Task(task));
+    }
+
+    fn post_work(&self, task: StorageWork) {
         self.pending_count.fetch_add(1, Ordering::SeqCst);
         self.db_queue_posts.increment(1);
 
@@ -1222,41 +1312,9 @@ impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
         );
 
         let result = StorageAsyncResultImpl::<()>::new();
-        let result_clone = result.clone();
-        let storage_id = self.storage_id.clone();
-
-        self.post_task(Box::new(move |db, metrics, callback_tx| {
-            metrics.writes.increment(1);
-
-            // Access underlying rocksdb through Deref chain
-            use std::ops::Deref;
-            let mut options = rocksdb::WriteOptions::default();
-            options.set_sync(true);
-            match db.deref().deref().put_opt(&key, &value, &options) {
-                Ok(()) => {
-                    result_clone.set(Ok(()));
-                    if let Some(callback) = on_complete {
-                        Self::invoke_callback(callback_tx, metrics, move || callback(Ok(())));
-                    }
-                }
-                Err(e) => {
-                    log::error!(
-                        target: LOG_TARGET,
-                        "AsyncKeyValueStorage {}: set failed: {}",
-                        storage_id,
-                        e
-                    );
-                    let err_msg = format!("set failed: {}", e);
-                    result_clone.set(Err(rtos_block::error!("{}", err_msg)));
-                    if let Some(callback) = on_complete {
-                        Self::invoke_callback(callback_tx, metrics, move || {
-                            callback(Err(rtos_block::error!("{}", err_msg)));
-                        });
-                    }
-                }
-            };
+        self.post_work(StorageWork::Mutation(StorageMutation {
+            key, value: Some(value), result: result.clone(), callback: on_complete,
         }));
-
         result
     }
 
@@ -1280,41 +1338,9 @@ impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
         );
 
         let result = StorageAsyncResultImpl::<()>::new();
-        let result_clone = result.clone();
-        let storage_id = self.storage_id.clone();
-
-        self.post_task(Box::new(move |db, metrics, callback_tx| {
-            metrics.erases.increment(1);
-
-            // Access underlying rocksdb through Deref chain
-            use std::ops::Deref;
-            let mut options = rocksdb::WriteOptions::default();
-            options.set_sync(true);
-            match db.deref().deref().delete_opt(&key, &options) {
-                Ok(()) => {
-                    result_clone.set(Ok(()));
-                    if let Some(callback) = on_complete {
-                        Self::invoke_callback(callback_tx, metrics, move || callback(Ok(())));
-                    }
-                }
-                Err(e) => {
-                    log::error!(
-                        target: LOG_TARGET,
-                        "AsyncKeyValueStorage {}: erase failed: {}",
-                        storage_id,
-                        e
-                    );
-                    let err_msg = format!("erase failed: {}", e);
-                    result_clone.set(Err(rtos_block::error!("{}", err_msg)));
-                    if let Some(callback) = on_complete {
-                        Self::invoke_callback(callback_tx, metrics, move || {
-                            callback(Err(rtos_block::error!("{}", err_msg)));
-                        });
-                    }
-                }
-            };
+        self.post_work(StorageWork::Mutation(StorageMutation {
+            key, value: None, result: result.clone(), callback: on_complete,
         }));
-
         result
     }
 
