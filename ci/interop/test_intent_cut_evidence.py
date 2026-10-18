@@ -92,6 +92,16 @@ class CutEvidenceTests(unittest.TestCase):
                 else:(root/'source-ack-partition/intent-stopped-process.txt').write_text('State:\tT\nPid:\t999\n')
                 with self.assertRaises(ValueError):self.check(root)
 
+    def test_missing_original_receipts_cannot_silently_reduce_deadline_checks(self):
+        for missing in ['partition_restart', 'signer_expiry']:
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                recovery = self.fixture(root)
+                del recovery['original_recovery_acceptance'][missing]
+                (root/'source-ack-recovery/recovery/recovery.json').write_text(json.dumps(recovery))
+                with self.assertRaisesRegex(ValueError, 'original receipt set differs'):
+                    self.check(root)
+
     def test_wrong_length_or_full_record_cannot_pass_as_partial(self):
         for raw in [b'',b'123',b'12345678',b'9234']:
             with self.subTest(raw=raw),self.assertRaises(ValueError):

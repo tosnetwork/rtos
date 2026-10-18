@@ -52,6 +52,8 @@ def verify(evidence, *, genesis, mode, point):
     require(metadata['compiled_product_commit'] == functional['source_commit'], 'node commit differs')
     require(metadata['commit'] == functional['fixture_commit'], 'fixture commit differs')
     phases = recovery['original_recovery_acceptance']
+    require(set(phases) == {'source_ack_fault', 'source_ack_partition_restart',
+                            'partition_restart', 'signer_expiry'}, 'original receipt set differs')
     combined, fault = phases['source_ack_partition_restart'], phases['source_ack_fault']
     cut = combined['intent_cut']
     command = read(archive / 'source.json')['command']
