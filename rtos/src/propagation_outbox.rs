@@ -209,6 +209,9 @@ struct Snapshot {
 struct State {
     snapshot: Snapshot,
     failed: Option<String>,
+    /// This exclusive writer has successfully synced the current full snapshot.
+    /// Decoding a snapshot after reopen never grants this process-local receipt.
+    snapshot_synced: bool,
     /// Advanced by every write attempt, successful or not; None once
     /// exhausted, which refuses every cleanup projection.
     mutation_epoch: Option<u64>,
@@ -256,7 +259,7 @@ impl PropagationOutbox {
             store,
             domain,
             limits,
-            state: Mutex::new(State { snapshot, failed: None, mutation_epoch: Some(0) }),
+            state: Mutex::new(State { snapshot, failed: None, snapshot_synced: false, mutation_epoch: Some(0) }),
             _writer: writer,
         })
     }
@@ -563,8 +566,10 @@ impl PropagationOutbox {
 
     /// A delivery mapping is a permanent source reference, including after
     /// Completed. No delivery or canonical evidence may be reclaimed without a
-    /// separate source retirement protocol. Re-sync before a source compacts
-    /// its full ACK; an uncertain write poisons this owner just like admission.
+    /// separate source retirement protocol. A source may compact its full ACK
+    /// only after this exclusive writer synced the complete current snapshot.
+    /// Cold reads need that barrier; repeated requests reuse its successful
+    /// result. An uncertain later write poisons this owner just like admission.
     pub(crate) fn retain_delivery(&self, expected: &Delivery) -> Result<()> {
         let mut state = self.lock()?;
         if state.snapshot.closing.iter().any(|c| c.binding.delivery_id == expected.delivery_id) {
@@ -575,6 +580,9 @@ impl PropagationOutbox {
         }
         if expected.origin.is_none() {
             fail!("Canonical source reference requires a retained origin");
+        }
+        if state.snapshot_synced {
+            return Ok(());
         }
         let next = state.snapshot.clone();
         self.commit(&mut state, next)
@@ -644,6 +652,7 @@ impl PropagationOutbox {
             return Err(error);
         }
         state.snapshot = next;
+        state.snapshot_synced = true;
         Ok(())
     }
 }
@@ -1268,6 +1277,7 @@ mod tests {
         bytes: Mutex<Option<Vec<u8>>>,
         /// 1 fails before commit; 2 simulates an ambiguous error after commit.
         failure: AtomicU8,
+        sync_attempts: std::sync::atomic::AtomicUsize,
     }
     impl SnapshotStore for MemoryStore {
         fn load(&self, maximum: usize) -> Result<Option<Vec<u8>>> {
@@ -1278,6 +1288,7 @@ mod tests {
             Ok(bytes.clone())
         }
         fn replace_sync(&self, bytes: &[u8]) -> Result<()> {
+            self.sync_attempts.fetch_add(1, Ordering::Relaxed);
             let failure = self.failure.load(Ordering::Acquire);
             if failure == 1 {
                 fail!("Injected write failure before commit");
@@ -1746,6 +1757,44 @@ mod tests {
     }
 
     #[test]
+    fn outbox_canonical_reference_reuses_only_current_writer_synced_snapshot() -> Result<()> {
+        for failure in [1, 2] {
+            let disk = Arc::new(MemoryStore::default());
+            let store = memory(disk.clone(), Limits::default());
+            let origin = RecoveryOrigin {
+                carrier_version: 14,
+                local_adnl: UInt256::from([1; 32]),
+                source_validator: UInt256::from([2; 32]),
+                local_validator_index: Some(0),
+            };
+            let id = store.stage_draft(record(1), 7, true, Some(origin))?;
+            let (delivery, original) = store.delivery(&id)?.unwrap();
+            let writes = disk.sync_attempts.load(Ordering::Relaxed);
+            let bytes = disk.bytes.lock().unwrap().clone();
+            for _ in 0..8 { store.retain_delivery(&delivery)?; }
+            assert_eq!(disk.sync_attempts.load(Ordering::Relaxed), writes,
+                "canonical reference must reuse this writer's already synced full snapshot");
+            assert_eq!(*disk.bytes.lock().unwrap(), bytes);
+            let mut forged = delivery.clone();
+            forged.last_mc += 1;
+            assert!(store.retain_delivery(&forged).is_err());
+            drop(store);
+            let reopened = memory(disk.clone(), Limits::default());
+            reopened.retain_delivery(&delivery)?;
+            assert_eq!(disk.sync_attempts.load(Ordering::Relaxed), writes + 1,
+                "cold decoding alone must not stand in for a current-writer sync");
+            reopened.retain_delivery(&delivery)?;
+            assert_eq!(disk.sync_attempts.load(Ordering::Relaxed), writes + 1);
+            assert_eq!(reopened.delivery(&id)?.unwrap().1, original);
+            disk.failure.store(failure, Ordering::Release);
+            assert!(reopened.mark_accepted(delivery.record_id).is_err());
+            assert!(reopened.retain_delivery(&delivery).is_err(),
+                "an uncertain later write invalidates every prior synchronized reference");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn outbox_canonical_reference_reopen_and_uncertain_sync() -> Result<()> {
         for failure in [0, 1, 2] {
             let disk = Arc::new(MemoryStore::default());
@@ -1761,6 +1810,8 @@ mod tests {
             store.mark_accepted(delivery.record_id)?;
             store.resolve_draft(delivery.record_id, Vec::new())?;
             assert_eq!(store.delivery(&id)?.unwrap().1.stage, PublicationStage::Completed);
+            drop(store);
+            let store = memory(disk.clone(), Limits::default());
             let mut other = delivery.clone();
             other.origin.as_mut().unwrap().local_adnl = UInt256::from([9; 32]);
             assert!(store.retain_delivery(&other).is_err());
