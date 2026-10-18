@@ -1641,6 +1641,9 @@ mod transport_tests {
         }
     }
     async fn endpoint(seed: u8) -> Endpoint {
+        endpoint_with_profile(seed, rtos_api::WireProfile::Legacy).await
+    }
+    async fn endpoint_with_profile(seed: u8, profile: rtos_api::WireProfile) -> Endpoint {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = socket.local_addr().unwrap();
         drop(socket);
@@ -1657,7 +1660,7 @@ mod transport_tests {
         )
         .await
         .unwrap();
-        let overlay = OverlayNode::with_params(adnl, &[55; 32], 0).unwrap();
+        let overlay = OverlayNode::with_params_and_profile(adnl, &[55; 32], 0, profile).unwrap();
         let token = CancellationToken::new();
         let (tx, reports) = tokio::sync::mpsc::unbounded_channel();
         let quic = QuicNode::new(
@@ -2007,6 +2010,62 @@ mod transport_tests {
                 }
                 Err(object) => Ok(QueryResult::Rejected(object)),
             }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn target_peer_discovery_uses_native_request_with_flags_and_certificates() {
+        use super::super::{Nodes, OverlayNodeInfo};
+        use rtos_api::ton::rpc::overlay::GetRandomPeers;
+        for (semiprivate, original_sender) in [(false, false), (false, true), (true, false), (true, true)] {
+            let endpoint = endpoint_with_profile(111, rtos_api::WireProfile::T0).await;
+            let issuer = endpoint_with_profile(110, rtos_api::WireProfile::T0).await;
+            let id = OverlayShortId::from_data([112; 32]);
+            let certificate = if semiprivate && !original_sender {
+                let fields = rtos_api::ton::overlay::membercertificateid::MemberCertificateId {
+                    node: rtos_api::ton::adnl::id::short::Short { id: UInt256::from_slice(endpoint.key.id().data()) },
+                    flags: 0, slot: 0, expire_at: (rtos_block::UnixTime::now() + 3600) as i32,
+                };
+                Some(rtos_api::ton::overlay::membercertificate::MemberCertificate {
+                    issued_by: (&issuer.key).try_into().unwrap(), flags: 0, slot: 0,
+                    expire_at: fields.expire_at,
+                    signature: issuer.key.sign(&serialize_boxed(&fields.into_boxed()).unwrap()).unwrap(),
+                })
+            } else { None };
+            if semiprivate {
+                let roots = if original_sender { vec![endpoint.key.id().clone()] } else { vec![issuer.key.id().clone()] };
+                endpoint.overlay.add_semiprivate_overlay(
+                    OverlayParams::with_id_only(&id), Some(&endpoint.key),
+                    &roots, &roots, certificate.clone(), 5, true,
+                ).unwrap();
+            } else {
+                endpoint.overlay.add_local_workchain_overlay(OverlayParams::with_id_only(&id)).unwrap();
+            }
+            let mut cfg = config(&endpoint.key);
+            cfg.fixed_members = false;
+            cfg.original_sender = original_sender;
+            endpoint.subscriptions.lock().unwrap().push(endpoint.overlay.subscribe_broadcast(&id).unwrap());
+            endpoint.overlay.configure_plumtree(&id, cfg, &tokio::runtime::Handle::current()).unwrap();
+            let overlay = endpoint.overlay.get_overlay(&id, "target peer discovery").unwrap();
+            let peers = overlay.prepare_random_peers(&endpoint.key, overlay.use_v2_peer_advertisements()).unwrap();
+            let Nodes::V1(peers) = peers else {
+                panic!("pinned C++ target supports overlay.getRandomPeers, not getRandomPeersV2");
+            };
+            assert_eq!(peers.nodes.len(), 1);
+            assert_eq!(peers.nodes[0].flags, if original_sender { 2 } else { 0 });
+            assert_eq!(peers.nodes[0].certificate, certificate.clone().map(IntoBoxed::into_boxed).unwrap_or_default());
+            let bytes = rtos_api::WireProfile::T0.serialize(&GetRandomPeers { peers }).unwrap();
+            // Native generated tos_api.h overlay_getRandomPeers::ID, baseline8812403.
+            assert_eq!(&bytes[..4], &1223582891u32.to_le_bytes());
+            let parsed: GetRandomPeers = rtos_api::WireProfile::T0.deserialize_typed(&bytes).unwrap();
+            OverlayUtils::verify_node(&id, &parsed.peers.nodes[0]).unwrap();
+            overlay.check_peer(endpoint.key.id(), certificate.as_ref()).unwrap();
+            let mut forged = parsed.peers.nodes[0].clone();
+            forged.flags ^= 2;
+            assert!(OverlayUtils::verify_node(&id, &forged).is_err());
+            let OverlayNodeInfo::V1(node) = overlay.get_signed_node(&endpoint.key, false).unwrap() else { unreachable!() };
+            assert_eq!(node.flags, if original_sender { 2 } else { 0 });
+            endpoint.overlay.delete_public_overlay(&id).unwrap();
         }
     }
 

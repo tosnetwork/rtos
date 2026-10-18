@@ -559,6 +559,7 @@ declare_counted!(
         rldp: Option<Arc<RldpNode>>,
         options: Arc<AtomicU32>,
         overlay_type: OverlayType,
+        wire_profile: rtos_api::WireProfile,
         flags: u8,
         hops: Option<u8>,
         // All known peers in overlay (for private overlay - all peers except ourself)
@@ -870,7 +871,10 @@ impl Overlay {
     }
 
     fn use_v2_peer_advertisements(&self) -> bool {
-        self.overlay_type.has_certified_members() || self.plumtree.get().is_some()
+        // The pinned target carries flags and member certificates in overlay.node
+        // and supports overlay.getRandomPeers. Its schema has no V2 request.
+        self.wire_profile == rtos_api::WireProfile::Legacy
+            && (self.overlay_type.has_certified_members() || self.plumtree.get().is_some())
     }
 
     async fn get_random_peers(
@@ -2380,6 +2384,7 @@ impl OverlayNode {
             adnl: self.adnl.clone(),
             rldp: self.rldp.get().cloned(),
             quic,
+            wire_profile: self.wire_profile,
             flags: params.flags,
             hops: params.hops,
             known_peers: AddressCacheWithBads::with_params(Self::MAX_PEERS, policy),
