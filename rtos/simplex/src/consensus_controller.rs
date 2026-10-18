@@ -1712,6 +1712,10 @@ impl ConsensusController {
 
         // Collect completed triggers first; remove after the pass.
         let mut completed = Vec::new();
+        // C++ InFlight attaches children to the same pending parent operation.
+        // This set lasts only for this synchronous pass: a completion or timed
+        // retry must poll the real handoff again, with its original evidence.
+        let mut pending_ancestor_handoffs = HashSet::new();
         for trigger_id in pending_ids {
             // Clone event payload to avoid holding a map borrow across processing.
             let Some(event) =
@@ -1733,7 +1737,7 @@ impl ConsensusController {
                 self.finalized_pending_body.get_mut(trigger_id).unwrap().intent_retained = true;
             }
 
-            if self.try_finalize_recursive_chain(backend, trigger_id, &event) {
+            if self.try_finalize_recursive_chain(backend, trigger_id, &event, &mut pending_ancestor_handoffs) {
                 if self.description.authenticated_runtime().is_some() {
                     if let Err(error) = self.callbacks.resolve_finality_intent(trigger_id) {
                         log::error!("Cannot durably resolve source finality intent: {error}");
@@ -1775,6 +1779,7 @@ impl ConsensusController {
         backend: &mut dyn ConsensusBackend,
         trigger_id: &RawCandidateId,
         event: &BlockFinalizedEvent,
+        pending_ancestor_handoffs: &mut HashSet<RawCandidateId>,
     ) -> bool {
         if self.description.authenticated_runtime().is_some()
             && self.finalized_pending_body.get(trigger_id)
@@ -2072,6 +2077,15 @@ impl ConsensusController {
             // this pass. The retained trigger retries the same parent first.
             for (id, received, has_final_cert) in resolved_workchain.into_iter().rev() {
                 let durable = self.description.authenticated_runtime().is_some();
+                // Approval is the same ancestor operation for every child in
+                // this pass. Each FinalCert still crosses its own source path.
+                if durable && !has_final_cert && pending_ancestor_handoffs.contains(&id) {
+                    log::debug!(target: "simplex_resolver",
+                        "FINALITY_OUTPUT_PENDING: session={} source_slot={} source_hash={} dependency_slot={} dependency_hash={} block_id={} final=false body_bytes={} joined=true",
+                        self.session_id().to_hex_string(), trigger_id.slot.value(), trigger_id.hash.to_hex_string(),
+                        id.slot.value(), id.hash.to_hex_string(), received.block_id, received.data.data().len());
+                    return false;
+                }
                 if !durable && !self.maybe_apply_finalized_state(backend, &id, has_final_cert) {
                     return false;
                 }
@@ -2080,7 +2094,13 @@ impl ConsensusController {
                     backend, &id, &received, event, has_final_cert,
                     trigger_slot, &trigger_candidate_hash_data, &mut ready,
                 );
-                if !ready || (durable && !self.maybe_apply_finalized_state(backend, &id, has_final_cert)) {
+                if !ready {
+                    if durable && !has_final_cert {
+                        pending_ancestor_handoffs.insert(id);
+                    }
+                    return false;
+                }
+                if durable && !self.maybe_apply_finalized_state(backend, &id, has_final_cert) {
                     return false;
                 }
             }

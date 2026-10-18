@@ -270,6 +270,10 @@ impl SessionCallbacks {
     pub(crate) fn finality_retention_attempts(&self) -> usize {
         self.delivery_source().unwrap().retain_intent_attempts.load(Ordering::Relaxed)
     }
+    #[cfg(test)]
+    pub(crate) fn finality_poll_attempts(&self) -> usize {
+        self.delivery_source().unwrap().poll_attempts.load(Ordering::Relaxed)
+    }
     pub(crate) fn sealed_finality_output_requirements(
         &self, id: &crate::block::RawCandidateId,
     ) -> rtos_block::Result<Option<Vec<crate::finality_recovery::ExpectedFinalityOutput>>> {

@@ -12540,6 +12540,20 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
         assert_eq!(std::fs::read(&map).unwrap(), presealed_bytes.unwrap());
         drop(processor); db.close(None).unwrap(); return;
     }
+    if shared_approvals {
+        // Both authenticated source intents wait on this same held parent WAL.
+        // C++ attaches the second finalization to the existing InFlight work.
+        for _ in 0..3 {
+            let before = processor.callbacks.finality_poll_attempts();
+            processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+            assert_eq!(processor.callbacks.finality_poll_attempts() - before, 1,
+                "one recovery pass must poll a shared pending ancestor only once");
+        }
+        assert!(processor.consensus.finalized_pending_body_contains(&trigger));
+        assert!(processor.consensus.finalized_pending_body_contains(&chain[4].0));
+        assert!(!processor.consensus.is_finalized_block(&chain[0].0),
+            "joining an in-flight ancestor must not grant acceptance");
+    }
     let second_map = second_event.as_ref().map(|e|std::path::Path::new(&namespace)
         .join("finality-intents/outputs-v1").join(format!("{}-{}.outputs",e.slot.value(),e.block_hash.to_hex_string())));
     let mut final_slots = std::collections::BTreeSet::new();

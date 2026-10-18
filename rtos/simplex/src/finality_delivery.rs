@@ -1298,6 +1298,8 @@ pub(crate) struct SourceFinalityDelivery {
     ready_callback: Option<SourceReadyCallback>,
     #[cfg(test)]
     pub(crate) retain_intent_attempts: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) poll_attempts: std::sync::atomic::AtomicUsize,
     runtime: Arc<AuthenticatedSessionRuntime>,
     store: Arc<PendingFinalityStore>,
     sink: consensus_common::finality_delivery::DurableFinalitySinkPtr,
@@ -1403,6 +1405,8 @@ impl SourceFinalityDelivery {
         Ok(Arc::new(Self {
             #[cfg(test)]
             retain_intent_attempts: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            poll_attempts: std::sync::atomic::AtomicUsize::new(0),
             runtime,
             store,
             sink,
@@ -1505,6 +1509,8 @@ impl SourceFinalityDelivery {
         draft: FinalizedDeliveryDraft,
     ) -> Result<Option<(UInt256, FinalizedDeliveryDraft)>> {
         let _timing = self.operation_timer("poll_delivery");
+        #[cfg(test)]
+        self.poll_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let record = PendingFinalityRecord::from_draft(&self.runtime, &draft)?;
         let id = record.id()?;
         {
