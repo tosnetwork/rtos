@@ -777,6 +777,11 @@ pub trait SimplexSession: ConsensusSession {
     fn finality_recovery_pending(&self) -> Option<usize> {
         None
     }
+    /// Distinct intents durably completed by this session owner. This is only
+    /// scheduling progress; namespace drain and full recovery remain separate.
+    fn finality_recovery_resolved(&self) -> u64 {
+        0
+    }
     /// Observer of the teardown of the storage instance this session opened.
     /// None means no storage was opened or teardown cannot be certified, which
     /// retirement preparation treats as a refusal.

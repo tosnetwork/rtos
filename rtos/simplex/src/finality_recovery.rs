@@ -414,6 +414,7 @@ pub(crate) struct FinalityIntentStore {
     legacy_output_count_cache: Mutex<Option<usize>>,
     unresolved: Mutex<Option<std::collections::HashSet<PathBuf>>>,
     output_cursor: std::sync::atomic::AtomicUsize,
+    resolved_intents: std::sync::atomic::AtomicU64,
     database_replay: Mutex<std::collections::HashMap<PathBuf, (SessionRecoveryRecord, Vec<u8>)>>,
     #[cfg(test)]
     fail_resolve_once: std::sync::atomic::AtomicBool,
@@ -427,6 +428,7 @@ impl FinalityIntentStore {
             legacy_output_count_cache: Mutex::new(None),
             unresolved: Mutex::new(None),
             output_cursor: std::sync::atomic::AtomicUsize::new(0),
+            resolved_intents: std::sync::atomic::AtomicU64::new(0),
             database_replay: Mutex::new(std::collections::HashMap::new()),
             #[cfg(test)]
             fail_resolve_once: std::sync::atomic::AtomicBool::new(false),
@@ -869,6 +871,7 @@ impl FinalityIntentStore {
         let directory = self.namespace.join(DIRECTORY);
         let path = directory.join(format!("{}-{}.json", id.slot.value(), id.hash.to_hex_string()));
         let resolved = path.with_extension("resolved");
+        let was_pending = path.exists() || resolved.exists();
         if !path.exists()
             && !resolved.exists()
             && !self.completed_path(&path).exists()
@@ -889,7 +892,15 @@ impl FinalityIntentStore {
         if let Some(pending) = self.unresolved.lock().unwrap().as_mut() {
             pending.remove(&path);
         }
+        if was_pending {
+            self.resolved_intents.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         Ok(())
+    }
+    /// Scheduling progress only, after durable completion and pending removal.
+    /// Repeated resolution, cold evidence and failed fsyncs never advance it.
+    pub(crate) fn resolved_intent_count(&self) -> u64 {
+        self.resolved_intents.load(std::sync::atomic::Ordering::Acquire)
     }
     /// Prepare only in-memory replay inputs. The source floor must come from
     /// intact records and be authenticated by the node; the exact certificate
@@ -1765,8 +1776,10 @@ mod tests {
         );
         let id = crate::block::RawCandidateId { slot: event.slot, hash };
         assert_eq!(reopened.pending_count().unwrap(), 1);
+        assert_eq!(reopened.resolved_intent_count(), 0);
         reopened.fail_resolve_once.store(true, std::sync::atomic::Ordering::Release);
         assert!(reopened.resolve(&id).is_err());
+        assert_eq!(reopened.resolved_intent_count(), 0);
         assert_eq!(
             reopened.pending_count().unwrap(),
             1,
@@ -1780,6 +1793,11 @@ mod tests {
         );
         reopened.resolve(&id).unwrap();
         assert_eq!(reopened.pending_count().unwrap(), 0);
+        assert_eq!(reopened.resolved_intent_count(), 1);
+        reopened.resolve(&id).unwrap();
+        assert_eq!(reopened.resolved_intent_count(), 1, "idempotent resolution is not new progress");
+        assert_eq!(FinalityIntentStore::new(&namespace).resolved_intent_count(), 0,
+            "cold completed evidence is not progress by the current owner");
         // Resolving the certificate does not prove that its complete output set
         // was sealed. Legacy completed evidence must remain discoverable.
         let reconstruction = scan_finality_recovery(directory.path()).unwrap();

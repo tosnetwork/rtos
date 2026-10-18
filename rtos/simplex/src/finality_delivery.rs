@@ -1480,6 +1480,9 @@ impl SourceFinalityDelivery {
         let _timing = self.operation_timer("resolve_intent");
         self.intents.resolve(id)
     }
+    pub(crate) fn resolved_intent_count(&self) -> u64 {
+        self.intents.resolved_intent_count()
+    }
     pub(crate) fn pending_intent_count(&self) -> Result<usize> {
         let _timing = self.operation_timer("pending_intent_count");
         Ok(self.intents.pending_count()?

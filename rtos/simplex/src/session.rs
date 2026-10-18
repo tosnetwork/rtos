@@ -406,6 +406,9 @@ impl SimplexSession for SessionImpl {
         let count = self.recovery_pending.load(Ordering::Acquire);
         (count != usize::MAX).then_some(count)
     }
+    fn finality_recovery_resolved(&self) -> u64 {
+        self._callbacks.resolved_finality_intent_count()
+    }
     fn ensure_candidate_available(
         &self,
         block_id: BlockIdExt,

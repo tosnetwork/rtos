@@ -288,6 +288,10 @@ impl SessionCallbacks {
     ) -> rtos_block::Result<()> {
         self.delivery_source()?.resolve_intent(id)
     }
+    pub(crate) fn resolved_finality_intent_count(&self) -> u64 {
+        self.source_delivery.lock().unwrap().as_ref()
+            .map_or(0, |source| source.resolved_intent_count())
+    }
     pub(crate) fn pending_finality_intent_count(&self) -> rtos_block::Result<usize> {
         self.delivery_source()?.pending_intent_count()
     }

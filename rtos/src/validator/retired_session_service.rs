@@ -241,6 +241,7 @@ impl RetiredSessionService {
             listener,
             last_progress_at: tokio::time::Instant::now(),
             pending_low_watermark: None,
+            resolved_high_watermark: 0,
         });
         let constructor = tokio::task::spawn_blocking(move || {
             simplex::SessionFactory::create_finality_recovery_session_with_delivered_checked(
@@ -331,13 +332,21 @@ impl RetiredSessionService {
                 // C++ dependency resolution stays in flight while it makes
                 // progress. Rotate stalled owners fairly, but do not discard
                 // a warm resolver merely because its total age reached a slice.
-                // Only a new low in durable pending debt renews this window;
-                // new arrivals, repeated reads and unknown counters do not.
+                // A durable completion can be masked by newly discovered debt.
+                // Track completed intents as well as the pending low watermark;
+                // new arrivals, repeated reads and unknown counters do not renew it.
                 if let Some(pending) = owner.session.as_ref()
                     .and_then(|session| session.finality_recovery_pending())
                 {
                     if owner.pending_low_watermark.is_none_or(|low| pending < low) {
                         owner.pending_low_watermark = Some(pending);
+                        owner.last_progress_at = tokio::time::Instant::now();
+                    }
+                }
+                if let Some(session) = owner.session.as_ref() {
+                    let resolved = session.finality_recovery_resolved();
+                    if resolved > owner.resolved_high_watermark {
+                        owner.resolved_high_watermark = resolved;
                         owner.last_progress_at = tokio::time::Instant::now();
                     }
                 }
@@ -399,6 +408,7 @@ struct ActiveRecovery {
     listener: Arc<dyn SessionListener + Send + Sync>,
     last_progress_at: tokio::time::Instant,
     pending_low_watermark: Option<usize>,
+    resolved_high_watermark: u64,
 }
 
 /// Bounded lexicographic round-robin enumeration. Directory entries and retired
@@ -501,6 +511,7 @@ mod tests {
                 listener: Arc::new(RecoveryListener),
                 last_progress_at: tokio::time::Instant::now(),
             pending_low_watermark: None,
+            resolved_high_watermark: 0,
             };
             let (release, held) = std::sync::mpsc::channel();
             let mut slow = new_owner("slow");
@@ -551,6 +562,7 @@ mod tests {
 
     struct ProgressSession {
         pending: std::sync::atomic::AtomicUsize,
+        resolved: std::sync::atomic::AtomicU64,
         stopped: std::sync::atomic::AtomicBool,
     }
     impl std::fmt::Display for ProgressSession {
@@ -575,12 +587,15 @@ mod tests {
             (n != usize::MAX).then_some(n)
         }
         fn finality_recovery_complete(&self) -> bool { self.finality_recovery_pending() == Some(0) }
+        fn finality_recovery_resolved(&self) -> u64 { self.resolved.load(std::sync::atomic::Ordering::Acquire) }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn retired_recovery_preserves_progress_but_retires_stalled_or_completed_owners() {
-        for (pending, stopping, keep) in [(8,false,true),(9,false,false),(10,false,false),
-            (usize::MAX,false,false),(0,false,false),(8,true,false)] {
+        for (pending, resolved, stopping, keep) in [(8,0,false,true),(9,0,false,false),
+            (10,0,false,false),(usize::MAX,0,false,false),(0,0,false,false),
+            (8,0,true,false),(10,1,false,true),(9,1,false,true),(10,1,true,false),
+            (0,1,false,false)] {
             let service = RetiredSessionService {
                 status: Mutex::new(Default::default()),
                 initialized: tokio::sync::watch::channel(false).0,
@@ -589,6 +604,7 @@ mod tests {
             let stopper = crate::engine::Stopper::new();
             let session = Arc::new(ProgressSession {
                 pending: std::sync::atomic::AtomicUsize::new(9),
+                resolved: std::sync::atomic::AtomicU64::new(0),
                 stopped: std::sync::atomic::AtomicBool::new(false),
             });
             let mut active = vec![ActiveRecovery {
@@ -596,13 +612,21 @@ mod tests {
                 failure: None, constructing: None, retiring: None, completed: false,
                 listener: Arc::new(RecoveryListener), last_progress_at: tokio::time::Instant::now(),
             pending_low_watermark: None,
+            resolved_high_watermark: 0,
             }];
             service.poll_owners(&stopper, &mut active, false).await.unwrap();
             // Age alone must not evict a source that has just reduced durable debt.
             active[0].last_progress_at = tokio::time::Instant::now() - REPLAY_SLICE - Duration::from_secs(1);
             session.pending.store(pending, std::sync::atomic::Ordering::Release);
+            session.resolved.store(resolved, std::sync::atomic::Ordering::Release);
             service.poll_owners(&stopper, &mut active, stopping).await.unwrap();
             let preserved = active[0].retiring.is_none();
+            if preserved {
+                active[0].last_progress_at = tokio::time::Instant::now() - REPLAY_SLICE - Duration::from_secs(1);
+                service.poll_owners(&stopper, &mut active, false).await.unwrap();
+                assert!(active[0].retiring.is_some(),
+                    "observing the same completed count cannot indefinitely renew a stalled owner");
+            }
             tokio::time::timeout(Duration::from_secs(2), async {
                 while !active.is_empty() {
                     service.poll_owners(&stopper, &mut active, true).await.unwrap();
@@ -610,7 +634,7 @@ mod tests {
                 }
             }).await.unwrap();
             assert_eq!(preserved, keep,
-                "progressing historical source must survive its age slice; stalled/increasing/unknown/completed/stopping owners still retire (pending={pending}, stopping={stopping})");
+                "progressing historical source must survive its age slice; stalled/increasing/unknown/completed/stopping owners still retire (pending={pending}, resolved={resolved}, stopping={stopping})");
         }
     }
 
