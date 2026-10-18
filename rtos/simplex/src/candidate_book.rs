@@ -50,6 +50,11 @@ use crate::{
 };
 use rtos_block::{BlockIdExt, UInt256};
 use std::{collections::HashMap, time::SystemTime};
+#[cfg(test)]
+std::thread_local! {
+    static RECEIVED_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 
 /// Soft warning threshold for deep parent-chain ancestry walks.
 ///
@@ -134,7 +139,13 @@ impl CandidateBook {
 impl CandidateBook {
     /// Look up a received candidate by id.
     pub(crate) fn received(&self, id: &RawCandidateId) -> Option<&ReceivedCandidate> {
+        #[cfg(test)]
+        RECEIVED_LOOKUPS.with(|count| count.set(count.get() + 1));
         self.received_candidates.get(id)
+    }
+    #[cfg(test)]
+    pub(crate) fn received_lookup_count_for_test() -> usize {
+        RECEIVED_LOOKUPS.with(|count| count.get())
     }
 
     /// Look up a received candidate by id for mutation.

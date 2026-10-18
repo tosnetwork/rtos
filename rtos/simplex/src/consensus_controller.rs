@@ -154,11 +154,32 @@ pub(crate) struct FinalizedEntry {
     /// process. Reusing a materialized ancestor must retain its full output
     /// suffix, including Approval records still owned by this source.
     resolved_output_plan: Vec<(RawCandidateId, crate::finality_recovery::ExpectedFinalityOutput)>,
+    /// Process-local C++ InFlight continuation, rebuilt from evidence after restart.
+    continuation: Option<FinalityContinuation>,
     /// Exact preexisting sealed obligations, bound to this retained source.
     /// They only require more work; they never seed accepted receipts.
     sealed_output_requirements: Option<Vec<crate::finality_recovery::ExpectedFinalityOutput>>,
     /// Time when finalization was first observed (for timeout / diagnostics).
     finalized_at: SystemTime,
+}
+
+/// Immutable metadata captured only after complete dependency resolution.
+#[derive(Clone)]
+struct FinalityPlanStep {
+    id: RawCandidateId,
+    block: BlockIdExt,
+    parent: Option<RawCandidateId>,
+    is_empty: bool,
+    has_final_cert: bool,
+    source: Option<UInt256>,
+}
+#[derive(Clone)]
+struct FinalityContinuation {
+    steps: Vec<FinalityPlanStep>,
+    next: usize,
+    outputs: Vec<ExpectedFinalityOutput>,
+    trigger_hash_data: Vec<u8>,
+    requirements: Option<Vec<ExpectedFinalityOutput>>,
 }
 
 /// Value of `finalized_delivery_sent_seqno`: the delivered `BlockIdExt` plus the
@@ -634,6 +655,11 @@ impl ConsensusController {
     ) {
         self.finalized_delivery_sent_seqno
             .insert(seqno, FinalizedSeqnoRecord { is_final: true, slot, block_id });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn continuation_cursor_for_test(&self, id: &RawCandidateId) -> Option<usize> {
+        self.finalized_pending_body.get(id)?.continuation.as_ref().map(|plan| plan.next)
     }
 
     /* History pruning */
@@ -1552,7 +1578,7 @@ impl ConsensusController {
         // Always keep a pending entry until recursive parent-chain materialization
         // succeeds end-to-end. This provides deterministic retries on late body/cert
         // arrivals and ensures ancestor parity is eventually reached.
-        let entry = FinalizedEntry { event: event.clone(), intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), resolved_output_plan: Vec::new(), sealed_output_requirements: None, finalized_at: self.now() };
+        let entry = FinalizedEntry { event: event.clone(), intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), resolved_output_plan: Vec::new(), continuation: None, sealed_output_requirements: None, finalized_at: self.now() };
         // C++ state-resolver.cpp: a duplicate joins the existing InFlight
         // operation, preserving its original certificate and completed phases.
         self.finalized_pending_body.entry(finalized_id.clone()).or_insert(entry);
@@ -1817,6 +1843,13 @@ impl ConsensusController {
                         self.session_id().to_hex_string(), trigger_id.slot, trigger_id.hash.to_hex_string());
                     return false;
                 }
+            }
+        }
+        if !self.description.get_shard().is_masterchain()
+            && self.description.authenticated_runtime().is_some()
+        {
+            if let Some(result) = self.resume_finality_plan(backend, trigger_id, event, pass) {
+                return result;
             }
         }
         let required_output_set: Option<HashSet<_>> = self.finalized_pending_body.get(trigger_id)
@@ -2097,6 +2130,24 @@ impl ConsensusController {
                     Vec::new()
                 };
             }
+            if self.description.authenticated_runtime().is_some() && resolved_workchain.len() <= 1024 {
+                let steps = resolved_workchain.iter().rev().map(|(id, received, has_final_cert)| {
+                    FinalityPlanStep {
+                        id: id.clone(), block: received.block_id.clone(), parent: received.parent_id.clone(),
+                        is_empty: received.is_empty, has_final_cert: *has_final_cert,
+                        source: (!received.is_empty).then(||
+                            UInt256::from(*self.build_source_info_for_received(received).source.id().data())),
+                    }
+                }).collect();
+                let entry = self.finalized_pending_body.get_mut(trigger_id).expect("registered source");
+                entry.continuation = Some(FinalityContinuation {
+                    steps, next: 0, outputs: expected_outputs, trigger_hash_data: trigger_candidate_hash_data,
+                    requirements: entry.sealed_output_requirements.clone(),
+                });
+                // Larger plans retain the original complete walk. The bound is
+                // only on cached work, never on valid ancestry or output debt.
+                return self.resume_finality_plan(backend, trigger_id, event, pass).unwrap_or(false);
+            }
             // ResolveCandidate/parent failure or a pending node handoff stops
             // this pass. The retained trigger retries the same parent first.
             for (id, received, has_final_cert) in resolved_workchain.into_iter().rev() {
@@ -2138,6 +2189,96 @@ impl ConsensusController {
             }
         }
         complete
+    }
+
+    /// Resume the original operation, like a C++ parent coroutine returning
+    /// from FinalizeBlock. The cursor is never persisted or seeded by disk tags.
+    fn resume_finality_plan(
+        &mut self,
+        backend: &mut dyn ConsensusBackend,
+        trigger_id: &RawCandidateId,
+        event: &BlockFinalizedEvent,
+        pass: &mut FinalityRetryPass,
+    ) -> Option<bool> {
+        let mut plan = self.finalized_pending_body.get_mut(trigger_id)?.continuation.take()?;
+        if self.finalized_pending_body.get(trigger_id)?.sealed_output_requirements != plan.requirements {
+            return None; // Newly bound obligations need the complete original resolver.
+        }
+        let result = self.drive_finality_plan(backend, trigger_id, event, pass, &mut plan);
+        if result.is_some() {
+            self.finalized_pending_body.get_mut(trigger_id)?.continuation = Some(plan);
+        }
+        result
+    }
+
+    fn drive_finality_plan(
+        &mut self,
+        backend: &mut dyn ConsensusBackend,
+        trigger_id: &RawCandidateId,
+        event: &BlockFinalizedEvent,
+        pass: &mut FinalityRetryPass,
+        plan: &mut FinalityContinuation,
+    ) -> Option<bool> {
+        while let Some(step) = plan.steps.get(plan.next) {
+            let Some(received) = backend.candidate_book().received(&step.id).cloned() else {
+                backend.request_candidate_for_finality(step.id.slot, step.id.hash.clone(), Some(Duration::ZERO));
+                return Some(false);
+            };
+            let source = (!received.is_empty).then(||
+                UInt256::from(*self.build_source_info_for_received(&received).source.id().data()));
+            if received.slot != step.id.slot || received.block_id != step.block
+                || received.parent_id != step.parent || received.is_empty != step.is_empty
+                || source != step.source
+                || (!received.candidate_hash_data_bytes.is_empty()
+                    && UInt256::calc_file_hash(&received.candidate_hash_data_bytes) != step.id.hash)
+            {
+                log::debug!(target: "simplex_resolver",
+                    "FINALITY_PLAN_INVALIDATED: session={} source_slot={} dependency_slot={} reason=metadata_changed",
+                    self.session_id().to_hex_string(), trigger_id.slot.value(), step.id.slot.value());
+                return None;
+            }
+            if !received.has_real_body() {
+                log::debug!(target: "simplex_resolver",
+                    "WC_FINALITY_BODY_PENDING: session={} source_slot={} source_hash={} dependency_slot={} dependency_hash={} hash_data_bytes={} body_bytes={} empty={} required_remaining=0 continuation=true",
+                    self.session_id().to_hex_string(), trigger_id.slot.value(), trigger_id.hash.to_hex_string(),
+                    step.id.slot.value(), step.id.hash.to_hex_string(), received.candidate_hash_data_bytes.len(),
+                    received.data.data().len(), received.is_empty);
+                backend.request_candidate_for_finality(step.id.slot, step.id.hash.clone(), Some(Duration::ZERO));
+                return Some(false);
+            }
+            if !step.has_final_cert && pass.pending_ancestors.contains(&step.id) {
+                log::debug!(target: "simplex_resolver",
+                    "FINALITY_OUTPUT_PENDING: session={} source_slot={} source_hash={} dependency_slot={} dependency_hash={} block_id={} final=false body_bytes={} joined=true continuation=true",
+                    self.session_id().to_hex_string(), trigger_id.slot.value(), trigger_id.hash.to_hex_string(),
+                    step.id.slot.value(), step.id.hash.to_hex_string(), received.block_id, received.data.data().len());
+                return Some(false);
+            }
+            let mut ready = true;
+            self.try_emit_recursive_finalized_callback(
+                backend, &step.id, &received, event, step.has_final_cert,
+                trigger_id.slot, &plan.trigger_hash_data, &mut ready,
+            );
+            if !ready {
+                if !step.has_final_cert { pass.pending_ancestors.insert(step.id.clone()); }
+                return Some(false);
+            }
+            if !self.maybe_apply_finalized_state(backend, &step.id, step.has_final_cert) {
+                return Some(false);
+            }
+            // The non-empty handoff (or the prior parent for an empty step)
+            // and the same materialization gate as the full walk have succeeded.
+            // WAL custody or a startup marker cannot advance a non-empty step.
+            plan.next += 1;
+            log::debug!(target: "simplex_resolver",
+                "FINALITY_PLAN_ADVANCED: session={} source_slot={} completed_steps={} total_steps={}",
+                self.session_id().to_hex_string(), trigger_id.slot.value(), plan.next, plan.steps.len());
+        }
+        if let Err(error) = self.callbacks.seal_finality_outputs(trigger_id, plan.outputs.clone()) {
+            log::error!("Session {} source {}:{} cannot seal original finality plan: {error}",
+                self.session_id().to_hex_string(), trigger_id.slot, trigger_id.hash.to_hex_string());
+            return Some(false);
+        }
+        Some(true)
     }
 
     /// Attempt to emit `on_block_finalized()` for one block in recursive walk.
@@ -2974,7 +3115,7 @@ impl ConsensusController {
         event: BlockFinalizedEvent,
         finalized_at: SystemTime,
     ) {
-        self.finalized_pending_body.insert(id, FinalizedEntry { event, intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), resolved_output_plan: Vec::new(), sealed_output_requirements: None, finalized_at });
+        self.finalized_pending_body.insert(id, FinalizedEntry { event, intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), resolved_output_plan: Vec::new(), continuation: None, sealed_output_requirements: None, finalized_at });
         self.telemetry.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
     }
 }

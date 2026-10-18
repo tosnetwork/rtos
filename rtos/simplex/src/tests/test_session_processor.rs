@@ -12338,10 +12338,16 @@ fn source_finality_cold_replay_does_not_accept_changed_sealed_output_role() {
     source_finality_empty_trigger_cold_retry_case(false, false, false, false, false, PresealedColdPlan::ChangedParentRole);
 }
 
-enum PresealedColdPlan { None, Exact, ChangedParentRole }
+#[test]
+fn source_finality_long_empty_plan_keeps_uncached_full_walk() {
+    source_finality_empty_trigger_cold_retry_case(false, false, false, false, false, PresealedColdPlan::LongUncachedChain);
+}
+
+enum PresealedColdPlan { None, Exact, ChangedParentRole, LongUncachedChain }
 
 fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_parent: bool, shared_approvals: bool, reuse_materialized_plan: bool, prune_after_acceptance: bool, presealed_case: PresealedColdPlan) {
-    let presealed_cold_plan = !matches!(presealed_case, PresealedColdPlan::None);
+    let long_uncached_chain = matches!(presealed_case, PresealedColdPlan::LongUncachedChain);
+    let presealed_cold_plan = matches!(presealed_case, PresealedColdPlan::Exact | PresealedColdPlan::ChangedParentRole);
     use crate::finality_delivery::tests::{fixture_role, HeldSink};
     use rtos_block::Serializable;
     let temp = crate::authenticated_fixture::TestDirectory::new();
@@ -12360,7 +12366,9 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
     let stores: Vec<_> = [0xa9, 0xaa].iter().map(|seed|
         rtos_pq_consensus::ConsensusKeyStore::from_seed(&[*seed;32],0).unwrap()).collect();
     let mut chain: Vec<(RawCandidateId, ReceivedCandidate)> = Vec::new();
-    let layout = if shared_approvals { vec![(0,false),(1,true),(2,false),(3,true),(4,false)] }
+    let layout = if long_uncached_chain {
+        std::iter::once((0,false)).chain((1..=1024).map(|slot| (slot,true))).collect()
+    } else if shared_approvals { vec![(0,false),(1,true),(2,false),(3,true),(4,false)] }
         else { vec![(0,false),(1,true),(2,false),(3,true)] };
     for (slot, empty) in layout {
         let parent = chain.last().map(|(id,_)| id.clone());
@@ -12395,7 +12403,7 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
             validator_idx:ValidatorIndex::new(i as u32),signature:s.sign_consensus(&bytes).unwrap().bytes.to_vec()
         }).collect::<Vec<_>>()
     };
-    let trigger = chain[3].0.clone();
+    let trigger = chain[if long_uncached_chain { chain.len()-1 } else { 3 }].0.clone();
     let event = BlockFinalizedEvent {slot:trigger.slot,block_hash:trigger.hash.clone(),block_id:None,
         certificate:Arc::new(crate::certificate::Certificate { vote:crate::simplex_state::FinalizeVote {
             slot:trigger.slot,block_hash:trigger.hash.clone()},signatures:sign(&trigger,true) })};
@@ -12443,6 +12451,29 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
     let (db,mut processor)=make_processor(sink.clone());
     processor.handle_block_finalized(event.clone());
     if let Some(second) = &second_event { processor.handle_block_finalized(second.clone()); }
+    if long_uncached_chain {
+        assert_eq!(chain.len(), 1025);
+        assert_eq!(processor.consensus.continuation_cursor_for_test(&trigger), None,
+            "oversized valid plans must use the full resolver rather than a partial continuation");
+        assert!(!map.exists());
+        assert!(!processor.consensus.is_finalized_block(&chain[0].0));
+        let staged=std::mem::take(&mut *sink.0.lock().unwrap());
+        assert_eq!(staged.len(), 1, "the long empty chain still owes its original Final handoff");
+        assert_eq!(staged[0].0.block_id, chain[0].1.block_id);
+        assert!(matches!(staged[0].0.finality, consensus_common::SessionFinality::Carrier(_)));
+        for (_,done) in staged { done(Ok(UInt256::from([0x35;32]))); }
+        for _ in 0..8 {
+            processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+            if map.exists() { break; }
+        }
+        let value:serde_json::Value=serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
+        let outputs=value["outputs"].as_array().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0]["block_id"], chain[0].1.block_id.to_string());
+        assert_eq!(outputs[0]["is_final"], true);
+        assert!(processor.consensus.finalized_pending_body_is_empty());
+        drop(processor); db.close(None).unwrap(); return;
+    }
     if materialized_parent {
         let staged=std::mem::take(&mut *sink.0.lock().unwrap());
         assert_eq!(staged.len(),1,"C++ persisted parent marker must terminate recovery before a pruned body lookup");
@@ -12546,11 +12577,42 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
         for _ in 0..3 {
             let before = processor.callbacks.finality_poll_attempts();
             let built_before = crate::finality_recovery::ExpectedFinalityOutput::construction_count_for_test();
+            let reads_before = CandidateBook::received_lookup_count_for_test();
             processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
-            assert_eq!(crate::finality_recovery::ExpectedFinalityOutput::construction_count_for_test() - built_before, 4,
-                "a shared exact output identity must be constructed once per recovery pass");
+            assert_eq!(CandidateBook::received_lookup_count_for_test() - reads_before, 2,
+                "two in-flight sources must read only their actual current waiting candidates");
+            assert!(crate::finality_recovery::ExpectedFinalityOutput::construction_count_for_test() - built_before <= 4,
+                "an exact output identity must not be rebuilt for a shared or already resolved plan");
             assert_eq!(processor.callbacks.finality_poll_attempts() - before, 1,
                 "one recovery pass must poll a shared pending ancestor only once");
+        }
+        for id in [&trigger, &chain[4].0] {
+            assert_eq!(processor.consensus.continuation_cursor_for_test(id), Some(0),
+                "a held WAL cannot advance a source continuation");
+        }
+        let data = processor.candidate_book().received(&chain[0].0).unwrap().data.clone();
+        processor.candidate_book_mut().received_mut(&chain[0].0).unwrap().data =
+            consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new());
+        let before = processor.callbacks.finality_poll_attempts();
+        processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+        assert_eq!(processor.callbacks.finality_poll_attempts(), before,
+            "missing pending body must request repair before polling the node");
+        for id in [&trigger, &chain[4].0] {
+            assert_eq!(processor.consensus.continuation_cursor_for_test(id), Some(0));
+        }
+        processor.candidate_book_mut().received_mut(&chain[0].0).unwrap().data = data;
+        // A changed dependency edge cannot reuse a previously resolved plan.
+        processor.candidate_book_mut().received_mut(&chain[0].0).unwrap().parent_id = Some(chain[4].0.clone());
+        processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+        for id in [&trigger, &chain[4].0] {
+            assert_eq!(processor.consensus.continuation_cursor_for_test(id), None,
+                "changed live metadata must invalidate the cached plan before any child handoff");
+        }
+        assert_eq!(processor.callbacks.finality_poll_attempts(), before);
+        processor.candidate_book_mut().received_mut(&chain[0].0).unwrap().parent_id = None;
+        processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+        for id in [&trigger, &chain[4].0] {
+            assert_eq!(processor.consensus.continuation_cursor_for_test(id), Some(0));
         }
         assert!(processor.consensus.finalized_pending_body_contains(&trigger));
         assert!(processor.consensus.finalized_pending_body_contains(&chain[4].0));
@@ -12603,6 +12665,12 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
                 }
                 if !rejected_parent_acceptance {
                     done(Err(rtos_block::error!("injected parent node acceptance failure")));
+                    if shared_approvals {
+                        for id in [&trigger, &chain[4].0] {
+                            assert_eq!(processor.consensus.continuation_cursor_for_test(id), Some(0),
+                                "failed node acceptance must preserve the exact waiting position");
+                        }
+                    }
                     rejected_parent_acceptance = true;
                     std::thread::sleep(Duration::from_millis(270));
                     continue;
