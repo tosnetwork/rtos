@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "cpp_revision": "8f083dc06bff16705710a01de15eb3123d5d696b",
+  "cpp_revision": "881240331ee48a291b96d73f8b8b93bae005ace0",
   "global_id": 3,
   "global_version": 16,
   "genesis_time": 1792180800,
@@ -20,16 +20,17 @@
     "workchain": -1,
     "shard": "-9223372036854775808",
     "seqno": 0,
-    "root_hash": "BtlGvhDPk8Tpq4G2cBi6XWpiuq/L7E6QT4xPxTb7gO0=",
-    "file_hash": "kNcYS2WlR5CzvvbMxc4VMeFUx0mrlr8ZCSMXdYURUWM=",
+    "root_hash": "UP1l9eWaGB9TFUgsGQaRYnJ/K/a50cSoc+wVWMAxBYI=",
+    "file_hash": "jS25NEXly9tm72OIROAP+gmcuuJtuNQU6Y+Zw3s5XXA=",
     "@type": "tosNode.blockIdExt"
   },
   "expected_workchain_zerostate": {
-    "@type": "tosNode.blockIdExt",
     "workchain": 0,
     "shard": "-9223372036854775808",
     "seqno": 0,
     "root_hash": "8biqDnQdr1iiwlnkrD33BDxNKZYWUSptWgPwnMkdBEs=",
-    "file_hash": "xzDVh4DUX3RLsOWGAnkIbd3fWtf7VpiXxiJ1T7R3Ofo="
-  }
+    "file_hash": "xzDVh4DUX3RLsOWGAnkIbd3fWtf7VpiXxiJ1T7R3Ofo=",
+    "@type": "tosNode.blockIdExt"
+  },
+  "auth_network_tag": "76b12fa4e8d1d6b2f8738db6350c388dd28ac69fbb8458199e08a928cfc8f96a"
 }

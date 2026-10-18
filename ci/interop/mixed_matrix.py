@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Require every active validator to create a block accepted by the mixed network."""
 import argparse
+from cpp_baseline import configure_auth_namespace, require_cpp_baseline
 import asyncio
 import base64
 import hashlib
@@ -260,6 +261,7 @@ async def run(args, root, snapshot, artifacts):
         profile = json.loads(args.genesis_profile.read_text())
         member_count = matrix_committee_size(profile, args.cpp_count)
         expected_weights = matrix_weights(profile, args.cpp_count)
+        configure_auth_namespace(network.config, profile)
         network.config.shard_validators = profile['shard_validators']
         network.config.global_id = profile['global_id']
         network.config.global_version = profile['global_version']
@@ -578,12 +580,12 @@ def main():
         raise SystemExit('Freeze both generated Genesis identities before starting the declared matrix')
     if profile['schema'] != 1 or profile['cpp_revision'] != manifest['cpp_source_commit']:
         raise SystemExit('Frozen Genesis profile does not match this baseline')
-    if manifest['cpp_source_commit'] != '8f083dc06bff16705710a01de15eb3123d5d696b':
-        raise SystemExit('Matrix requires the frozen C++ 8f083dc baseline')
+    require_cpp_baseline(manifest['cpp_source_commit'], profile)
     banner = subprocess.run([str(args.rust_node), '--help'], capture_output=True, text=True, check=True)
     if args.rust_revision not in banner.stdout + banner.stderr:
         raise SystemExit('Rust executable does not report the pinned source revision')
-    artifacts = {str(path): digest(path) for path in [args.rust_node, args.validator_preparer, args.block_checker]}
+    artifacts = {str(path): digest(path) for path in [args.rust_node, args.validator_preparer, args.block_checker,
+        Path(__file__).with_name('cpp_baseline.py')]}
     for item in manifest['binaries']:
         path = args.snapshot / 'build' / item['path']
         if digest(path) != item['sha256']:

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check real MC/WC production and authenticated finality across committee replacement."""
 import argparse
+from cpp_baseline import configure_auth_namespace, require_cpp_baseline
 import asyncio
 import base64
 import copy
@@ -457,6 +458,7 @@ async def run(args, profile, root, artifacts):
     async with Network(Install(args.snapshot / 'build', args.snapshot / 'source'),
                        root / 'network', base_port=args.base_port) as network:
         config = network.config
+        configure_auth_namespace(config, profile)
         config.global_id, config.global_version = profile['global_id'], 16
         config.genesis_time = profile['genesis_time']
         config.genesis_wallet_seed = hashlib.sha256(profile['wallet_seed_label'].encode()).digest()
@@ -970,10 +972,10 @@ def main():
     if 'initial_probe_pause' in profile:
         initial_probe_weights(profile)
     manifest = json.loads((args.snapshot / 'manifest.json').read_text())
-    if manifest['cpp_source_commit'] != profile['cpp_revision'] \
-            or profile['cpp_revision'] != '8f083dc06bff16705710a01de15eb3123d5d696b':
-        raise SystemExit('Rotation requires the pinned C++ baseline')
-    artifacts = {str(args.block_checker): digest(args.block_checker), str(args.profile): digest(args.profile)}
+    require_cpp_baseline(manifest['cpp_source_commit'], profile)
+    baseline_policy = Path(__file__).with_name('cpp_baseline.py')
+    artifacts = {str(args.block_checker): digest(args.block_checker), str(args.profile): digest(args.profile),
+        str(baseline_policy): digest(baseline_policy)}
     if args.rust_node:
         artifacts.update({str(path): digest(path) for path in [args.rust_node, args.validator_preparer]})
     if args.source_ack_fault:

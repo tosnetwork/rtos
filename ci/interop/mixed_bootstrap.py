@@ -13,6 +13,7 @@ import socket
 import sys
 import time
 import urllib.request
+from cpp_baseline import ACTIVE_CPP_REVISION, DEFAULT_AUTH_NETWORK_TAG, configure_auth_namespace, require_cpp_baseline
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--snapshot', type=Path, required=True)
@@ -44,11 +45,11 @@ preparer_sha256 = None
 if args.validator_preparer:
     with args.validator_preparer.open('rb') as stream:
         preparer_sha256 = hashlib.file_digest(stream, 'sha256').hexdigest()
-    if manifest['cpp_source_commit'] != '8f083dc06bff16705710a01de15eb3123d5d696b':
-        raise SystemExit('Active validator comparison requires the frozen 8f083dc C++ baseline')
+    require_cpp_baseline(manifest['cpp_source_commit'])
 (root / 'source.json').write_text(json.dumps(dict(
     cpp_snapshot=manifest, rust_binary=str(args.rust_node.resolve()),
     rust_binary_sha256=rust_sha256, driver_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    baseline_policy_sha256=hashlib.sha256(Path(__file__).with_name('cpp_baseline.py').read_bytes()).hexdigest(),
     command=sys.argv, initial_rust_signing=args.validator_preparer is not None,
     validator_preparer_sha256=preparer_sha256,
 ), indent=2) + '\n')
@@ -89,6 +90,8 @@ async def main():
     network_dir.mkdir()
     async with Network(Install(snapshot / 'build', snapshot / 'source'),
                        network_dir, base_port=args.base_port) as network:
+        configure_auth_namespace(network.config, dict(cpp_revision=ACTIVE_CPP_REVISION,
+            auth_network_tag=DEFAULT_AUTH_NETWORK_TAG))
         network.config.shard_validators = 4
         dht = network.create_dht_node()
         members = []

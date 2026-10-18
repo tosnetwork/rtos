@@ -1,5 +1,7 @@
 # Local C++ / Rust interop runners
 
+The active C++ reference is `881240331ee48a291b96d73f8b8b93bae005ace0`. The default version-16 profile pins its AUTH network tag and regenerated masterchain/workchain Genesis identities. Historical `8f083dc` profiles remain available only for explicit matching-snapshot replay; their results do not qualify the new reference. Updating this pin does not establish Rust compatibility with the new C++ baseline.
+
 The snapshot pins the executable's reported commit, copies the C++ programs,
 checks their SHA-256 values, and exports the matching test sources. Supply a
 clean C++ checkout at the requested revision and its existing build directory:
