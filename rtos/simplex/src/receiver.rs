@@ -3059,7 +3059,18 @@ impl ReceiverImpl {
         }
         // Local data has no peer sender to blame. Invalid local pieces are not
         // persisted or promoted and do not ban whichever peer is selected next.
+        #[cfg(any(test, feature = "isolated-consensus-signing"))]
+        let local_body_witness = if crate::cold_bootstrap_test_control::enabled() {
+            self.resolver_cache.get_candidate(slot, &block_hash)
+                .map(|bytes| (bytes.len(), UInt256::calc_file_hash(bytes)))
+        } else { None };
         if self.deliver_cached_candidate(slot, &block_hash) {
+            #[cfg(any(test, feature = "isolated-consensus-signing"))]
+            if let Err(error) = crate::cold_bootstrap_test_control::record_delivery(
+                &self.session_id, slot, &block_hash, local_body_witness,
+            ) {
+                log::warn!("TEST_COLD_BOOTSTRAP delivery witness failed: {error}");
+            }
             log::info!(target: "simplex_resolver",
                 "LOCAL_CANDIDATE_RECOVERY: session={} slot={} hash={} validated local lookup delivered",
                 self.session_id.to_hex_string(),slot.value(),block_hash.to_hex_string());

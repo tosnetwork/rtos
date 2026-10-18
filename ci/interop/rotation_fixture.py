@@ -851,6 +851,8 @@ def main():
     parser.add_argument('--first-intent-cut-library', type=Path,
         help='Cut the first initial MC intent of member2, then reopen its original directory')
     parser.add_argument('--first-intent-cut-point', choices=['before-write','after-partial-write'], default='after-partial-write')
+    parser.add_argument('--cold-bootstrap-body', action='store_true',
+        help='Isolated test: keep the stopped exact candidate cold in volatile startup state; require local body delivery')
     parser.add_argument('--source-ack-intent-cut-point', choices=['after-fsync','before-write','after-partial-write'], default='after-fsync')
     parser.add_argument('--source-ack-intent-stop', action='store_true',
         help='After ACK failure, stop an intact current source intent after fsync before rename')

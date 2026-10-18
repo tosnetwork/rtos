@@ -170,6 +170,8 @@ mod session_runtime;
 mod session_telemetry;
 mod simplex_state;
 mod startup_recovery;
+#[cfg(any(test, feature = "isolated-consensus-signing"))]
+mod cold_bootstrap_test_control;
 mod task_queue;
 pub mod trace_collector;
 pub mod utils;

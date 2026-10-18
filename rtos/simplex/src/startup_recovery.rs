@@ -331,6 +331,9 @@ impl SessionStartupRecoveryProcessor {
             self.candidate_info_map = Self::build_candidate_info_map(&bootstrap.candidate_infos);
         }
 
+        #[cfg(any(test, feature = "isolated-consensus-signing"))]
+        crate::cold_bootstrap_test_control::apply_from_environment(&self.description, &mut bootstrap)?;
+
         // Metadata alone never marks a slot generated. The set is derived only
         // after authenticating the complete PQ bootstrap/journal, and applied
         // below only to IDs for which actual candidate bytes are restored.

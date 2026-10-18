@@ -18,6 +18,11 @@ from source_ack_fault_fixture import SourceAckFailure, source_ack_environment
 def validate_intent_cut(args):
     point = getattr(args, 'source_ack_intent_cut_point', 'after-fsync')
     enabled = getattr(args, 'source_ack_intent_stop', False)
+    if getattr(args, 'cold_bootstrap_body', False) and not (
+        enabled and getattr(args, 'source_ack_intent_cut_point', 'after-fsync') == 'after-partial-write'
+        and getattr(args, 'expired_member_restart', False)
+    ):
+        raise SystemExit('Cold bootstrap body requires an explicit half-written intent and expired-member restart')
     if point not in ('after-fsync', 'before-write', 'after-partial-write'):
         raise SystemExit('Unsupported intent cut point')
     if point != 'after-fsync' and not enabled:
@@ -31,6 +36,8 @@ def validate_intent_cut(args):
 
 
 def source_ack_partition_environment(args, root):
+    if getattr(args, 'cold_bootstrap_body', False) and 'RTOS_TEST_COLD_BOOTSTRAP_CONTROL' in os.environ:
+        raise RuntimeError('Cold bootstrap refuses inherited control')
     environment = source_ack_environment(args, root)
     marked = marked_environment(args.socket_mark_library)
     environment['LD_PRELOAD'] += ':' + marked['LD_PRELOAD']
@@ -70,6 +77,7 @@ class SourceAckPartitionRestart:
         self.directory = root / 'source-ack-partition'
         self.directory.mkdir()
         self.intent_stop = getattr(args, 'source_ack_intent_stop', False)
+        self.cold_body = getattr(args, 'cold_bootstrap_body', False)
         self.intent_point = getattr(args, 'source_ack_intent_cut_point', 'after-fsync')
         self.receipt = {'phase': 'prepared', 'member': args.interrupt_rust_member,
             'mode': 'source_ack_failure_and_partition_across_restart',
@@ -119,6 +127,19 @@ class SourceAckPartitionRestart:
         environment = self.partition.environment()
         if any(key.startswith(('RTOS_TEST_SOURCE_FAULT_', 'RTOS_TEST_SOURCE_INTENT_')) for key in environment):
             raise RuntimeError('Restart inherited source IO fault settings')
+        if self.cold_body:
+            cut = self.receipt['intent_cut']
+            value = json.loads(self.intent_expected)
+            directory = self.directory / 'cold-bootstrap'
+            directory.mkdir()
+            selector = {key: value[key] for key in ['session_id','profile','local_adnl',
+                'local_validator_index','global_id','zerostate','slot','candidate_hash']}
+            selector.update(schema=1, namespace=str(Path(cut['path']).parent.parent))
+            raw = (json.dumps(selector, indent=2) + '\n').encode()
+            (directory / 'selector.json').write_bytes(raw)
+            environment['RTOS_TEST_COLD_BOOTSTRAP_CONTROL'] = str(directory)
+            self.receipt['cold_bootstrap_body'] = {'directory': str(directory),
+                'selector_sha256': hashlib.sha256(raw).hexdigest(), 'normal_local_delivery_observed': False}
         self.receipt['source_fault_removed_before_restart'] = True
         self.save()
         return environment
@@ -144,6 +165,33 @@ class SourceAckPartitionRestart:
                 raise RuntimeError('Stopped certificate intent remains unresolved')
             (self.directory / 'intent-completed.json').write_bytes(completed.read_bytes())
             cut.update(normal_replay_completed=True, completed_sha256=hashlib.sha256(completed.read_bytes()).hexdigest())
+        if self.cold_body:
+            cold = self.receipt['cold_bootstrap_body']
+            directory = Path(cold['directory'])
+            raw = (directory / 'applied.json').read_bytes()
+            if (directory / 'delivered.json').read_bytes() != raw:
+                raise RuntimeError('Cold bootstrap exact body was not delivered through normal local lookup')
+            observed = json.loads(raw)
+            body = (directory / 'payload-before.bin').read_bytes()
+            block = (directory / 'block-before.bin').read_bytes()
+            cut = self.receipt['intent_cut']
+            if observed['schema'] != 1 or observed['selector_sha256'] != cold['selector_sha256'] \
+                    or observed['pid'] != recovered['new_process']['pid'] \
+                    or observed['session_id'] != self.source.receipt['session'] \
+                    or observed['slot'] != cut['slot'] or observed['candidate_hash'] != cut['candidate_hash'] \
+                    or observed['payload_bytes'] != len(body) or not body \
+                    or observed['payload_sha256'] != hashlib.sha256(body).hexdigest() \
+                    or observed['block_bytes'] != len(block) or not block \
+                    or observed['block_sha256'] != hashlib.sha256(block).hexdigest() \
+                    or ('fh ' + observed['block_sha256']) not in observed['block_id'] \
+                    or observed['leader_index'] == observed['local_validator_index']:
+                raise RuntimeError('Cold bootstrap receipt differs from exact owned candidate body/process')
+            log = (self.source.node['directory'] / 'node-restart.log').read_text(errors='replace')
+            marker = f"LOCAL_CANDIDATE_RECOVERY: session={observed['session_id']} slot={observed['slot']} hash={observed['candidate_hash']} validated local lookup delivered"
+            if marker not in log:
+                raise RuntimeError('Cold bootstrap exact post-restart local delivery marker absent')
+            cold.update(normal_local_delivery_observed=True, witness=observed,
+                witness_sha256=hashlib.sha256(raw).hexdigest(), post_restart_marker=marker)
         self.receipt.update(phase='recovered',
             original_source_ack_recovered=self.source.receipt['original_source_ack_recovered'],
             isolated_rpc_timeout_observed=self.partition.receipt['isolated_rpc_timeout_observed'],
