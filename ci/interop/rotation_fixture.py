@@ -445,6 +445,8 @@ async def run(args, profile, root, artifacts):
 
     used, endpoints, nodes = set(), [], []
     rust_nodes, cpp_started, lite_configs = [], [], []
+    first_intent_cut = None
+    first_intent_task = None
     endpoint_names = [('rust' if args.rust_node and i in [2, 3, 5] else 'cpp') + f'-{i}' for i in range(6)]
     (root / 'network').mkdir()
     async with Network(Install(args.snapshot / 'build', args.snapshot / 'source'),
@@ -486,6 +488,9 @@ async def run(args, profile, root, artifacts):
                 raise RuntimeError(f'Generated rotation Genesis differs from frozen {key}')
         if args.prepare_genesis_only:
             return {'status': 'rotation_genesis_prepared', 'validators_started': False}
+        if getattr(args, 'first_intent_cut_library', None):
+            from first_intent_cut_fixture import FirstIntentCut
+            first_intent_cut = FirstIntentCut(args, root)
         if any(profile.get(key) is None for key in ['expected_zerostate', 'expected_workchain_zerostate']):
             raise RuntimeError('Prepare and freeze the rotation profile before starting validators')
         activation = profile['genesis_time'] + profile['activation_delay']
@@ -512,8 +517,13 @@ async def run(args, profile, root, artifacts):
                     if args.source_retention_cut_library and index == args.interrupt_rust_member:
                         from source_retention_cut_fixture import retention_cut_environment
                         environment = retention_cut_environment(args, root)
+                    if first_intent_cut is not None and index == 2:
+                        environment = first_intent_cut.environment()
                     rust_nodes.append(dict(index=index, directory=directory,
                         **await start_rotation_node(args.rust_node, directory, environment=environment)))
+                    if first_intent_cut is not None and index == 2:
+                        first_intent_task = asyncio.create_task(
+                            first_intent_cut.supervise(rust_nodes[-1], start_rotation_node))
                     client = json.loads((directory / 'lite_client_config.json').read_text())
                     lite_configs.append(tos_api.Liteclient_config_global(
                         liteservers=[tos_api.Liteserver_desc(id=tos_api.Pub_ed25519(
@@ -541,7 +551,11 @@ async def run(args, profile, root, artifacts):
             workchain_history_cache = {}
             deadline = time.monotonic() + args.timeout
             while time.monotonic() < deadline:
+                if first_intent_task is not None and first_intent_task.done():
+                    first_intent_task.result()
                 for node in rust_nodes:
+                    if node.get('first_intent_restarting', False):
+                        continue
                     if node['process'].returncode is not None:
                         raise RuntimeError(f"Rust {node['index']} exited {node['process'].returncode}")
                 replies = await asyncio.gather(*(asyncio.to_thread(rpc, url, 'getMasterchainInfo')
@@ -670,10 +684,12 @@ async def run(args, profile, root, artifacts):
                     mc_member = next(i for i in committee if member_id(i) == checked['created_by'])
                     if args.rust_node and mc_member in [2, 3, 5]:
                         node = next(n for n in rust_nodes if n['index'] == mc_member)
-                        match = re.search(r'^\(-1:8000000000000000, ' + str(key[2]) +
-                            r'\): ValidatorGroup::on_generate_slot: .*Collation successful$',
-                            (node['directory'] / 'node.log').read_text(errors='replace'), re.M)
-                        if not match:raise RuntimeError('Rust MC creator lacks local collation evidence')
+                        pattern = r'^\(-1:8000000000000000, ' + str(key[2]) + r'\): ValidatorGroup::on_generate_slot: .*Collation successful$'
+                        logs = ['node.log', 'node-restart.log'] if first_intent_cut is not None and mc_member == 2 else ['node.log']
+                        matches = [(name, re.search(pattern, (node['directory']/name).read_text(errors='replace'), re.M)) for name in logs if (node['directory']/name).exists()]
+                        matched = next(((name, match) for name, match in matches if match), None)
+                        if matched is None:raise RuntimeError('Rust MC creator lacks local collation evidence')
+                        evidence['local_collation_log'], match = matched
                         evidence['local_collation'] = match.group(0)
                     epochs[phase]['mc_creators'].setdefault(checked['created_by'], evidence)
                     wc = checked['workchain_check']
@@ -695,10 +711,12 @@ async def run(args, profile, root, artifacts):
                             wc_member = next(i for i in committee if member_id(i) == wc['created_by'])
                             if args.rust_node and wc_member in [2, 3, 5]:
                                 node = next(n for n in rust_nodes if n['index'] == wc_member)
-                                match = re.search(r'^\(0:8000000000000000, ' + str(wc['block']['seqno']) +
-                                    r'\): ValidatorGroup::on_generate_slot: .*Collation successful$',
-                                    (node['directory'] / 'node.log').read_text(errors='replace'), re.M)
-                                if not match:raise RuntimeError('Rust WC creator lacks local collation evidence')
+                                pattern = r'^\(0:8000000000000000, ' + str(wc['block']['seqno']) + r'\): ValidatorGroup::on_generate_slot: .*Collation successful$'
+                                logs = ['node.log', 'node-restart.log'] if first_intent_cut is not None and wc_member == 2 else ['node.log']
+                                matches = [(name, re.search(pattern, (node['directory']/name).read_text(errors='replace'), re.M)) for name in logs if (node['directory']/name).exists()]
+                                matched = next(((name, match) for name, match in matches if match), None)
+                                if matched is None:raise RuntimeError('Rust WC creator lacks local collation evidence')
+                                evidence['local_collation_log'], match = matched
                                 evidence['local_collation'] = match.group(0)
                             epochs[phase]['wc_creators'].setdefault(wc['created_by'], evidence)
                     write(root / 'epochs.json', epochs)
@@ -765,6 +783,9 @@ async def run(args, profile, root, artifacts):
                                 checked, artifacts)
                         for filename, expected in artifacts.items():
                             if digest(Path(filename)) != expected: raise RuntimeError('An executable or profile changed')
+                        if first_intent_task is not None:
+                            await first_intent_task
+                            first_intent_cut.qualify_rotation(epochs, member_id(2))
                         return {'status': ('mixed_membership_rotation_observed' if args.rust_node
                                           else 'cpp_membership_rotation_observed'), 'epochs': epochs,
                             'all_six_applied_mc_states_match': True, 'independent_post_rotation_finality_qualified': True,
@@ -775,12 +796,17 @@ async def run(args, profile, root, artifacts):
                             'source_ack_fault': json.loads((root / 'source-ack-fault/receipt.json').read_text()) if args.source_ack_fault else None,
                             'source_ack_partition_restart': json.loads((root / 'source-ack-partition/receipt.json').read_text()) if args.source_ack_partition_restart else None,
                             'source_retention_cut': json.loads((root / 'source-retention-cut/receipt.json').read_text()) if args.source_retention_cut_library else None,
+                            'first_intent_cut': first_intent_cut.receipt if first_intent_cut is not None else None,
                             'network_fault': network_fault, 'weighted_quorum': weighted_quorum, 'initial_probe': initial_probe}
                 await asyncio.sleep(0.2)
             raise TimeoutError('Rotation did not satisfy declared creator/signer epochs: ' +
                 json.dumps({phase: {kind: len(group) for kind, group in groups.items()}
                     for phase, groups in epochs.items()}))
         finally:
+            if first_intent_task is not None:
+                if not first_intent_task.done():
+                    first_intent_task.cancel()
+                await asyncio.gather(first_intent_task, return_exceptions=True)
             codes = await asyncio.gather(*(stop_rotation_node(node) for node in rust_nodes), return_exceptions=True)
             write(root / 'rust-shutdown.json', {str(node['index']):
                 (str(code) if isinstance(code, BaseException) else code)
@@ -822,6 +848,9 @@ def main():
         help='Require a settled 12-second finality stall while the interrupted successor is needed for weighted quorum')
     parser.add_argument('--partition-restart', action='store_true',
         help='Keep the interrupted member partitioned through restart; fault seconds apply before survivor proof and after restart')
+    parser.add_argument('--first-intent-cut-library', type=Path,
+        help='Cut the first initial MC intent of member2, then reopen its original directory')
+    parser.add_argument('--first-intent-cut-point', choices=['before-write','after-partial-write'], default='after-partial-write')
     parser.add_argument('--source-ack-intent-cut-point', choices=['after-fsync','before-write','after-partial-write'], default='after-fsync')
     parser.add_argument('--source-ack-intent-stop', action='store_true',
         help='After ACK failure, stop an intact current source intent after fsync before rename')
@@ -838,6 +867,8 @@ def main():
     parser.add_argument('--network-fault-seconds', type=float, default=12)
     parser.add_argument('--socket-mark-library', type=Path)
     args = parser.parse_args()
+    from first_intent_cut_fixture import validate_first_intent_cut
+    validate_first_intent_cut(args)
     from expired_member_restart_fixture import validate_followup_frontier
     validate_followup_frontier(args)
     sequence = ([args.network_fault] if args.network_fault else []) + args.additional_network_faults
@@ -951,6 +982,15 @@ def main():
         destination = args.output / 'weighted-sources' / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(path.read_bytes())
+    if args.first_intent_cut_library:
+        args.first_intent_cut_library = args.first_intent_cut_library.resolve()
+        for path in [args.first_intent_cut_library, driver.with_name('first_intent_cut_fixture.py'),
+                     driver.with_name('verify_intent_cut_evidence.py'),
+                     driver.parents[2] / 'rtos/src/tests/finality_source_fault.c']:
+            artifacts[str(path)] = digest(path)
+            destination = args.output / 'first-intent-sources' / path.name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(path.read_bytes())
     if args.source_ack_partition_restart:
         path = driver.with_name('source_ack_partition_fixture.py')
         artifacts[str(path)] = digest(path)
