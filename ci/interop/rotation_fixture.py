@@ -843,10 +843,8 @@ def main():
     sequence = ([args.network_fault] if args.network_fault else []) + args.additional_network_faults
     if args.additional_network_faults and not args.network_fault or len(sequence) > 4 or len(set(sequence)) != len(sequence):
         raise SystemExit('Predeclare up to four distinct packet cases; repeats are not retries')
-    if args.source_ack_intent_cut_point != 'after-fsync' and not args.source_ack_intent_stop:
-        raise SystemExit('Incomplete intent cut requires its explicit intent stop option')
-    if args.source_ack_intent_stop and not (args.source_ack_partition_restart and args.source_ack_fault == 'sync-eio'):
-        raise SystemExit('Intent sync cut requires the explicit combined sync-eio restart')
+    from source_ack_partition_fixture import validate_intent_cut
+    validate_intent_cut(args)
     if args.source_ack_partition_restart and not (args.source_ack_fault and args.partition_restart):
         raise SystemExit('Combined recovery requires both source ACK fault and partition restart')
     if args.source_ack_fault:

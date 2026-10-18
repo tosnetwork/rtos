@@ -165,23 +165,55 @@ class CompositionArgumentTests(unittest.TestCase):
     def test_declared_combination_reaches_profile_validation(self):
         with self.assertRaisesRegex(RuntimeError, 'profile boundary'):
             self.arguments(['--source-ack-partition-restart', '--source-ack-fault', 'sync-eio', '--partition-restart'])
-    def test_intent_stop_requires_explicit_combined_sync_failure(self):
+    def test_intent_stop_requires_explicit_combined_ack_failure(self):
         for extra in [['--source-ack-intent-stop'],
-                ['--source-ack-intent-stop', '--source-ack-partition-restart', '--source-ack-fault', 'write-enospc', '--partition-restart']]:
-            with self.subTest(extra=extra), self.assertRaisesRegex(SystemExit, 'explicit combined sync-eio'):
+                ['--source-ack-intent-stop', '--source-ack-fault', 'sync-eio', '--partition-restart'],
+                ['--source-ack-intent-stop', '--source-ack-partition-restart', '--source-ack-fault', 'write-enospc'],
+                ['--source-ack-intent-stop', '--source-ack-partition-restart', '--partition-restart']]:
+            with self.subTest(extra=extra), self.assertRaisesRegex(SystemExit, 'explicit source ACK fault and partition restart'):
                 self.arguments(extra)
 
     def test_intent_stop_reaches_profile_with_declared_combination(self):
-        with self.assertRaisesRegex(RuntimeError, 'profile boundary'):
-            self.arguments(['--source-ack-intent-stop', '--source-ack-partition-restart',
-                '--source-ack-fault', 'sync-eio', '--partition-restart'])
+        for mode in ['sync-eio', 'write-enospc']:
+            with self.subTest(mode=mode), self.assertRaisesRegex(RuntimeError, 'profile boundary'):
+                self.arguments(['--source-ack-intent-stop', '--source-ack-partition-restart',
+                    '--source-ack-fault', mode, '--partition-restart'])
+
     def test_torn_intent_point_requires_explicit_stop_and_declared_combination(self):
         with self.assertRaisesRegex(SystemExit, 'requires its explicit intent stop'):
             self.arguments(['--source-ack-intent-cut-point', 'before-write'])
-        for point in ['before-write', 'after-partial-write']:
-            with self.subTest(point=point), self.assertRaisesRegex(RuntimeError, 'profile boundary'):
-                self.arguments(['--source-ack-intent-cut-point', point, '--source-ack-intent-stop',
-                    '--source-ack-partition-restart', '--source-ack-fault', 'sync-eio', '--partition-restart'])
+        for mode in ['sync-eio', 'write-enospc']:
+            for point in ['before-write', 'after-partial-write']:
+                with self.subTest(mode=mode, point=point), self.assertRaisesRegex(RuntimeError, 'profile boundary'):
+                    self.arguments(['--source-ack-intent-cut-point', point, '--source-ack-intent-stop',
+                        '--source-ack-partition-restart', '--source-ack-fault', mode, '--partition-restart'])
+
+
+class IntentCutAdmissionTests(unittest.TestCase):
+    def args(self, **overrides):
+        values = dict(source_ack_intent_stop=True, source_ack_intent_cut_point='before-write',
+            source_ack_partition_restart=True, partition_restart=True, source_ack_fault='sync-eio')
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_both_native_ack_modes_keep_all_explicit_cut_points(self):
+        for mode in ['sync-eio', 'write-enospc']:
+            for point in ['after-fsync', 'before-write', 'after-partial-write']:
+                with self.subTest(mode=mode, point=point):
+                    combined.validate_intent_cut(self.args(source_ack_fault=mode,
+                        source_ack_intent_cut_point=point))
+
+    def test_missing_composition_or_unsupported_mode_is_refused(self):
+        for changes in [dict(source_ack_partition_restart=False), dict(partition_restart=False),
+            dict(source_ack_fault=None), dict(source_ack_fault='unsupported'),
+            dict(source_ack_intent_stop=False), dict(source_ack_intent_cut_point='unsupported')]:
+            with self.subTest(changes=changes), self.assertRaises(SystemExit):
+                combined.validate_intent_cut(self.args(**changes))
+
+    def test_no_cut_keeps_ordinary_runs_unchanged(self):
+        combined.validate_intent_cut(self.args(source_ack_intent_stop=False,
+            source_ack_intent_cut_point='after-fsync', source_ack_partition_restart=False,
+            partition_restart=False, source_ack_fault=None))
 
 
 if __name__ == '__main__':

@@ -28,8 +28,14 @@ class IntentCutNativeTests(unittest.TestCase):
 int main(int argc, char **argv) {
     if (argc != 5) return 20;
     int ack = open(argv[2], O_WRONLY|O_CREAT|O_TRUNC, 0600);
-    if (ack < 0 || write(ack, "ack", 3) != 3) return 21;
-    if (fsync(ack) != -1 || errno != EIO) return 22;
+    if (ack < 0) return 21;
+    const char *fault_mode = getenv("RTOS_TEST_SOURCE_FAULT_MODE");
+    ssize_t written = write(ack, "ack", 3);
+    if (!strcmp(fault_mode, "write-enospc")) {
+        if (written != -1 || errno != ENOSPC) return 22;
+    } else {
+        if (written != 3 || fsync(ack) != -1 || errno != EIO) return 22;
+    }
     close(ack);
     if (!strcmp(argv[3], "arm")) {
         int arm = open(getenv("RTOS_TEST_SOURCE_INTENT_ARM"), O_WRONLY|O_CREAT, 0600);
@@ -52,7 +58,7 @@ int main(int argc, char **argv) {
     def tearDownClass(cls):
         cls.workspace.cleanup()
 
-    def invoke(self, mode='fsync', negative=None, point='after-fsync'):
+    def invoke(self, mode='fsync', negative=None, point='after-fsync', fault_mode='sync-eio'):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); namespace = root / 'owned'; pending = namespace / 'finality-pending'
             pending.mkdir(parents=True); intents = namespace / 'finality-intents'; intents.mkdir()
@@ -70,7 +76,7 @@ int main(int argc, char **argv) {
             ack = pending / ('b' * 64 + '.ack.tmp'); arm = root / 'armed'; arm.write_text('1')
             marker = root / 'intent-stop.marker'
             env = {**os.environ, 'LD_PRELOAD': str(self.library),
-                'RTOS_TEST_SOURCE_FAULT_FILE': str(ack), 'RTOS_TEST_SOURCE_FAULT_MODE': 'sync-eio',
+                'RTOS_TEST_SOURCE_FAULT_FILE': str(ack), 'RTOS_TEST_SOURCE_FAULT_MODE': fault_mode,
                 'RTOS_TEST_SOURCE_FAULT_ARM': str(arm), 'RTOS_TEST_SOURCE_FAULT_MARKER': str(root / 'ack-error.marker'),
                 'RTOS_TEST_SOURCE_FAULT_DIRECTORY_FILE': str(selector),
                 'RTOS_TEST_SOURCE_INTENT_ARM': str(root / 'intent-armed'),
@@ -105,19 +111,25 @@ int main(int argc, char **argv) {
                     child.kill(); stdout, stderr = child.communicate(timeout=3)
                     self.assertEqual(child.returncode, -9, stderr)
                     self.assertEqual(stdout, b'', 'selected sync must not have returned')
+                self.assertEqual((root / 'ack-error.marker').read_text(), f'source {fault_mode}: {ack}\n')
+                self.assertEqual(ack.read_bytes(), b'ack' if fault_mode == 'sync-eio' else b'')
             finally:
                 if child.poll() is None:child.kill()
                 child.communicate(timeout=3)
 
     def test_actual_fsync_and_fdatasync_stop_before_return(self):
-        for point in ['after-fsync', 'before-write', 'after-partial-write']:
-            for mode in ['fsync', 'fdatasync']:
-                with self.subTest(mode=mode, point=point):self.invoke(mode, point=point)
+        for fault_mode in ['sync-eio', 'write-enospc']:
+            for point in ['after-fsync', 'before-write', 'after-partial-write']:
+                for mode in ['fsync', 'fdatasync']:
+                    with self.subTest(fault_mode=fault_mode, mode=mode, point=point):
+                        self.invoke(mode, point=point, fault_mode=fault_mode)
 
     def test_exact_scope_and_arm_counterexamples(self):
-        for negative in ['other_namespace', 'completed', 'wrong_name', 'leading_zero',
-                'out_of_range', 'selector_symlink', 'missing_arm']:
-            with self.subTest(negative=negative):self.invoke(negative=negative)
+        for fault_mode in ['sync-eio', 'write-enospc']:
+            for negative in ['other_namespace', 'completed', 'wrong_name', 'leading_zero',
+                    'out_of_range', 'selector_symlink', 'missing_arm']:
+                with self.subTest(fault_mode=fault_mode, negative=negative):
+                    self.invoke(negative=negative, fault_mode=fault_mode)
 
 
 if __name__ == '__main__':unittest.main()

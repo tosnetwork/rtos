@@ -14,6 +14,22 @@ from partition_restart_fixture import PartitionRestart
 from source_ack_fault_fixture import SourceAckFailure, source_ack_environment
 
 
+
+def validate_intent_cut(args):
+    point = getattr(args, 'source_ack_intent_cut_point', 'after-fsync')
+    enabled = getattr(args, 'source_ack_intent_stop', False)
+    if point not in ('after-fsync', 'before-write', 'after-partial-write'):
+        raise SystemExit('Unsupported intent cut point')
+    if point != 'after-fsync' and not enabled:
+        raise SystemExit('Incomplete intent cut requires its explicit intent stop option')
+    if enabled and not (
+        getattr(args, 'source_ack_partition_restart', False)
+        and getattr(args, 'partition_restart', False)
+        and getattr(args, 'source_ack_fault', None) in ('sync-eio', 'write-enospc')
+    ):
+        raise SystemExit('Intent cut requires an explicit source ACK fault and partition restart')
+
+
 def source_ack_partition_environment(args, root):
     environment = source_ack_environment(args, root)
     marked = marked_environment(args.socket_mark_library)
