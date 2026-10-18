@@ -13,8 +13,11 @@ use storage::durability::SyncPoint;
 #[derive(Clone, Copy, Debug)]
 enum Failure {
     File,
+    ProofFile,
     Directory,
+    ArtifactWal,
     StateWal,
+    RebuiltStateWal,
     HandleWal,
     CatchainWal,
 }
@@ -31,6 +34,7 @@ async fn exercise_sync_boundary(failure: Option<Failure>) {
     let hit_observer = hit.clone();
     let events_observer = events.clone();
     let node_wals = AtomicUsize::new(0);
+    let files = AtomicUsize::new(0);
     engine.db().set_publication_sync_observer(Some(Arc::new(move |point, path| {
         let name = path.file_name().and_then(|name| name.to_str());
         let node_ordinal = if point == SyncPoint::Wal && name == Some("db") {
@@ -42,9 +46,14 @@ async fn exercise_sync_boundary(failure: Option<Failure>) {
         eprintln!("PUBLICATION_SYNC_BEGIN {point:?} {}", path.display());
         let selected = match failure {
             Some(Failure::File) => point == SyncPoint::File,
+            Some(Failure::ProofFile) => point == SyncPoint::File
+                && files.fetch_add(1, Ordering::SeqCst) + 1 == 2,
             Some(Failure::Directory) => point == SyncPoint::Directory,
-            // Two artifact barriers precede the actual state queue/WAL barrier.
-            Some(Failure::StateWal) => node_ordinal == 3,
+            // This fixture reconstructs a missing state: flush pending state,
+            // then the rebuilt state, before the final handle metadata barrier.
+            Some(Failure::ArtifactWal) => node_ordinal == 1,
+            Some(Failure::StateWal) => node_ordinal == 2,
+            Some(Failure::RebuiltStateWal) => node_ordinal == 3,
             Some(Failure::HandleWal) => node_ordinal == 4,
             Some(Failure::CatchainWal) => point == SyncPoint::Wal && name == Some("catchains"),
             None => false,
@@ -86,6 +95,16 @@ async fn exercise_sync_boundary(failure: Option<Failure>) {
             assert!(stored.pending.is_empty());
             assert!(stored.record.effects.is_empty());
             let events = events.lock().unwrap();
+            let artifact_barrier = events.iter().position(|(point, path)|
+                *point == SyncPoint::Wal && path.file_name().is_some_and(|name| name == "db"))
+                .expect("artifact metadata WAL barrier");
+            let artifacts = &events[..artifact_barrier];
+            assert_eq!(artifacts.iter().filter(|(point, _)| *point == SyncPoint::File).count(), 2,
+                "body and proof must share one artifact durability barrier");
+            let mut directories = std::collections::HashSet::new();
+            for (_, path) in artifacts.iter().filter(|(point, _)| *point == SyncPoint::Directory) {
+                assert!(directories.insert(path.clone()), "shared artifact directory synced twice");
+            }
             assert!(events.iter().filter(|(point, _)| *point == SyncPoint::File).count() >= 2);
             assert!(events.iter().any(|(point, _)| *point == SyncPoint::Directory));
             assert!(
@@ -94,7 +113,7 @@ async fn exercise_sync_boundary(failure: Option<Failure>) {
                     .filter(|(point, path)| *point == SyncPoint::Wal
                         && path.file_name().is_some_and(|name| name == "db"))
                     .count()
-                    >= 4
+                    == 4
             );
             assert!(events.iter().any(|(point, path)| *point == SyncPoint::Wal
                 && path.file_name().is_some_and(|name| name == "catchains")));
@@ -139,8 +158,11 @@ async fn publication_sync_real_calls_precede_accepted_draft() {
 async fn publication_sync_faults_never_promote_draft_and_drain_owned_io() {
     for failure in [
         Failure::File,
+        Failure::ProofFile,
         Failure::Directory,
+        Failure::ArtifactWal,
         Failure::StateWal,
+        Failure::RebuiltStateWal,
         Failure::HandleWal,
         Failure::CatchainWal,
     ] {

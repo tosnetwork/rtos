@@ -1301,3 +1301,104 @@ async fn cancelled_manager_reads_close_actual_file_before_domain_drain() -> Resu
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn publication_artifact_group_syncs_loose_files_and_packed_package_once() -> Result<()> {
+    use crate::durability::SyncPoint;
+    let dir = tempfile::tempdir()?;
+    let (manager, db) = create_manager(dir.path().to_str().unwrap(), "artifact-group", false).await?;
+    let (handles, _) = create_block_handle_storage(db.clone());
+    let id = BlockIdExt::with_params(ShardIdent::masterchain(), 17,
+        UInt256::from([0x51; 32]), UInt256::from([0x52; 32]));
+    let handle = handles.create_handle(id.clone(), BlockMeta::with_data(0, 0, 0, 0, 0), None)?.unwrap();
+    manager.add_file(&PackageEntryId::Block(&id), b"body").await?;
+    manager.add_file(&PackageEntryId::Proof(&id), b"proof").await?;
+    handle.set_data(); handle.set_proof(); handle.set_block_applied();
+    for packed in [false, true] {
+        if packed {
+            manager.move_to_archive(&handle, || Ok(())).await?;
+            handle.set_archived();
+        }
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = events.clone();
+        manager.sync_block_artifacts(&handle, false, Some(Arc::new(move |point, path| {
+            observed.lock().unwrap().push((point, path.to_path_buf()));
+            Ok(())
+        }))).await?;
+        let events = events.lock().unwrap();
+        assert_eq!(events.iter().filter(|(p, _)| *p == SyncPoint::File).count(), if packed { 1 } else { 2 });
+        let mut directories = std::collections::HashSet::new();
+        for (_, path) in events.iter().filter(|(p, _)| *p == SyncPoint::Directory) {
+            assert!(directories.insert(path), "duplicate namespace barrier");
+        }
+        assert!(!directories.is_empty());
+        assert!(events.iter().any(|(p, _)| *p == SyncPoint::Wal));
+        assert_eq!(manager.get_file(&handle, &PackageEntryId::Block(&id)).await?, b"body");
+        assert_eq!(manager.get_file(&handle, &PackageEntryId::Proof(&id)).await?, b"proof");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn publication_artifact_group_sync_failures_require_fresh_owner_and_preserve_artifacts() -> Result<()> {
+    use crate::durability::SyncPoint;
+    for packed in [false, true] {
+        let failures = if packed {
+            vec![(SyncPoint::File, 1), (SyncPoint::Directory, 1), (SyncPoint::Wal, 1)]
+        } else {
+            vec![(SyncPoint::File, 1), (SyncPoint::File, 2),
+                (SyncPoint::Directory, 1), (SyncPoint::Wal, 1)]
+        };
+        for (selected, ordinal) in failures {
+            let dir = tempfile::tempdir()?;
+            let (manager, db) = create_manager(dir.path().to_str().unwrap(), "artifact-failures", false).await?;
+            let (handles, _) = create_block_handle_storage(db.clone());
+            let id = BlockIdExt::with_params(ShardIdent::masterchain(), 18,
+                UInt256::from([0x61; 32]), UInt256::from([0x62; 32]));
+            let handle = handles.create_handle(id.clone(), BlockMeta::with_data(0, 0, 0, 0, 0), None)?.unwrap();
+            manager.add_file(&PackageEntryId::Block(&id), b"body").await?;
+            manager.add_file(&PackageEntryId::ProofLink(&id), b"proof-link").await?;
+            handle.set_data(); handle.set_proof_link(); handle.set_block_applied();
+            if packed {
+                manager.move_to_archive(&handle, || { handle.set_archived(); Ok(()) }).await?;
+            }
+            handles.save_handle(&handle, None)?;
+            handles.sync_pending().await?;
+            let hit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let fired = hit.clone();
+            let count = std::sync::atomic::AtomicUsize::new(0);
+            let error = manager.sync_block_artifacts(&handle, true, Some(Arc::new(move |point, _| {
+                if point == selected && count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == ordinal {
+                    fired.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(std::io::Error::from_raw_os_error(5).into());
+                }
+                Ok(())
+            }))).await.unwrap_err();
+            assert!(hit.load(std::sync::atomic::Ordering::SeqCst), "{error}");
+            if packed && selected != SyncPoint::Wal {
+                assert!(manager.snapshot().view.binding().domain().recovery_required());
+                assert!(manager.sync_block_artifacts(&handle, true, None).await.is_err(),
+                    "uncertain package owner must remain refused");
+            }
+            assert_eq!(handle.is_archived(), packed);
+            assert!(handle.has_data() && handle.has_proof_link());
+            drop(handle);
+            drop(manager);
+            handles.close_and_wait().await?;
+            crate::tests::late_index_eio_support::close_db(db).await;
+            // No previous provider or native writer may survive this cold reopen.
+            let (manager, db) = create_manager(dir.path().to_str().unwrap(), "artifact-failures", false).await?;
+            let (handles, _) = create_block_handle_storage(db.clone());
+            let handle = handles.load_handle_by_id(&id)?.expect("durable artifact handle");
+            assert_eq!(handle.is_archived(), packed);
+            assert_eq!(manager.get_file(&handle, &PackageEntryId::Block(&id)).await?, b"body");
+            assert_eq!(manager.get_file(&handle, &PackageEntryId::ProofLink(&id)).await?, b"proof-link");
+            manager.sync_block_artifacts(&handle, true, None).await?;
+            drop(handle);
+            drop(manager);
+            handles.close_and_wait().await?;
+            crate::tests::late_index_eio_support::close_db(db).await;
+        }
+    }
+    Ok(())
+}

@@ -283,6 +283,39 @@ impl ArchiveManager {
         Ok(())
     }
 
+    /// Commit one block's body and selected proof as a single artifact group.
+    /// Both file locks prevent loose artifact deletion until the shared file,
+    /// namespace, provider-index and node metadata barriers have completed.
+    pub async fn sync_block_artifacts(
+        &self,
+        handle: &BlockHandle,
+        proof_is_link: bool,
+        observer: crate::durability::SyncObservation,
+    ) -> Result<()> {
+        let _body = handle.block_file_lock().write().await;
+        let _proof = handle.proof_file_lock().write().await;
+        if handle.is_archived() {
+            let id = self.get_package_id(get_mc_seq_no(handle), handle.is_key_block()?).await?;
+            let descriptor = self.get_file_desc(&id, false).await?
+                .ok_or_else(|| error!("Required archive descriptor is absent"))?;
+            // Both entries belong to this block's same package/provider.
+            descriptor.archive_slice().sync_block_package(handle, observer.clone()).await?;
+        } else {
+            let body = PackageEntryId::Block(handle.id());
+            let proof = if proof_is_link {
+                PackageEntryId::ProofLink(handle.id())
+            } else {
+                PackageEntryId::Proof(handle.id())
+            };
+            super::package::sync_files_and_parents_observed(&[
+                self.unapplied_files_path.join(body.filename_short()),
+                self.unapplied_files_path.join(proof.filename_short()),
+            ], observer.clone()).await?;
+        }
+        self.db.sync_wal_observed(observer.as_deref())?;
+        Ok(())
+    }
+
     /// Strict bounded read. Unlike the legacy recovery loader, errors do not
     /// clear handle flags or fall back to another source.
     #[cfg(any(test, feature = "integration-test-support"))]

@@ -545,6 +545,37 @@ pub(crate) async fn sync_file_and_parents_observed(
         .await.map_err(|e| error!("Native file sync task failed: {e}"))?
 }
 
+/// One publication's loose body and proof share their namespace barrier.
+/// Sync every file before synchronizing each containing directory once.
+pub(crate) async fn sync_files_and_parents_observed(
+    paths: &[PathBuf],
+    observer: crate::durability::SyncObservation,
+) -> Result<()> {
+    let paths = paths.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let mut directories = std::collections::HashSet::new();
+        for path in &paths {
+            let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+            crate::durability::before(observer.as_deref(), crate::durability::SyncPoint::File, path)?;
+            file.sync_all()?;
+            for parent in path.ancestors().skip(1) {
+                if !parent.as_os_str().is_empty() {
+                    directories.insert(parent.to_path_buf());
+                }
+            }
+        }
+        let mut directories: Vec<_> = directories.into_iter().collect();
+        // Persist children before their ancestors, including newly created chains.
+        directories.sort_by(|a, b| b.components().count().cmp(&a.components().count()).then(a.cmp(b)));
+        for directory in directories {
+            let file = std::fs::File::open(&directory)?;
+            crate::durability::before(observer.as_deref(), crate::durability::SyncPoint::Directory, &directory)?;
+            file.sync_all()?;
+        }
+        Ok(())
+    }).await.map_err(|e| error!("Native artifact group sync task failed: {e}"))?
+}
+
 pub(crate) fn sync_file_and_parents_native(
     path: &Path,
     observer: Option<&crate::durability::SyncObserver>,

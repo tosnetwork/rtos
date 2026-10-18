@@ -1312,11 +1312,7 @@ impl InternalDb {
             }
         }
         self.archive_manager
-            .sync_file(&handle, &body_id, self.publication_sync_observer())
-            .await
-            .map_err(publication_durability_failure)?;
-        self.archive_manager
-            .sync_file(&handle, &proof_id, self.publication_sync_observer())
+            .sync_block_artifacts(&handle, selected.is_link(), self.publication_sync_observer())
             .await
             .map_err(publication_durability_failure)?;
         Ok((handle, selected))

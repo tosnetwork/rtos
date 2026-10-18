@@ -969,6 +969,14 @@ impl State {
         }
     }
     async fn submit_one(&self, store: &Arc<PropagationOutbox>, command: Submission) {
+        // Cancellation and a ready mailbox can win the actor select in either
+        // order. A queued request has not started its transaction and must not
+        // resume acceptance after an earlier uncertain WAL result stopped us.
+        // Already executing operations still finish before reaching this seam.
+        if self.stop.is_cancelled() || self.fatal.load(Ordering::Acquire) {
+            command.reject();
+            return;
+        }
         let phase = match &command {
             #[cfg(test)]
             Submission::RetryBackground { .. } => "test_retry_background",
