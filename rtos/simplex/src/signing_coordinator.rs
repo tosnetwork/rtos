@@ -16,7 +16,7 @@ use std::{
     io::{Read, Write},
     path::Path,
     sync::Mutex,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub(crate) const PREFIX: &[u8; 4] = b"RSJ1";
@@ -618,7 +618,15 @@ impl SigningCoordinator {
         Ok(())
     }
     fn authorize(&self, decision: Decision) -> Result<Vec<u8>> {
+        let started = Instant::now();
+        let kind = decision.kind;
+        let slot = decision.slot;
         let mut state = self.state.lock().map_err(|_| error!("journal lock poisoned"))?;
+        let lock_elapsed = started.elapsed();
+        let mut intent_elapsed = Duration::ZERO;
+        let mut signing_elapsed = Duration::ZERO;
+        let mut verification_elapsed = Duration::ZERO;
+        let mut signed_elapsed = Duration::ZERO;
         let result = (|| {
             self.live(&mut state)?;
             let k = key(&decision)?;
@@ -649,16 +657,26 @@ impl SigningCoordinator {
             };
             Self::verify_record(&self.identity, &state.header.binding, &record)?;
             self.checkpoint("before_intent")?;
-            self.put(k.clone(), encode(&record)?)?;
+            let encoded_intent = encode(&record)?;
+            let phase_started = Instant::now();
+            let persisted = self.put(k.clone(), encoded_intent);
+            intent_elapsed = phase_started.elapsed();
+            persisted?;
             state.records.insert(k.clone(), record.clone());
             self.checkpoint("after_intent")?;
             self.live(&mut state)?;
             self.checkpoint("before_sign")?;
             let preimage = Self::preimage(&state.header.binding, &record.decision)?;
-            let signature = self.signer.sign(&preimage)?;
+            let phase_started = Instant::now();
+            let signature = self.signer.sign(&preimage);
+            signing_elapsed = phase_started.elapsed();
+            let signature = signature?;
             self.checkpoint("after_sign")?;
             self.live(&mut state)?;
-            self.identity.verify_simplex(&preimage, &signature)?;
+            let phase_started = Instant::now();
+            let verified = self.identity.verify_simplex(&preimage, &signature);
+            verification_elapsed = phase_started.elapsed();
+            verified?;
             let bytes = if record.decision.kind == 3 {
                 let mut candidate: CandidateData =
                     tl_with_profile(state.header.binding.wire()?, &record.decision.unsigned)?;
@@ -670,7 +688,11 @@ impl SigningCoordinator {
             };
             record.signed = Some(bytes.clone());
             self.checkpoint("before_signed")?;
-            self.put(k.clone(), encode(&record)?)?;
+            let encoded_signed = encode(&record)?;
+            let phase_started = Instant::now();
+            let persisted = self.put(k.clone(), encoded_signed);
+            signed_elapsed = phase_started.elapsed();
+            persisted?;
             state.records.insert(k, record);
             self.checkpoint("after_signed")?;
             self.live(&mut state)?;
@@ -678,6 +700,29 @@ impl SigningCoordinator {
         })();
         if result.is_err() {
             state.poisoned = true;
+        }
+        let total_elapsed = started.elapsed();
+        if total_elapsed >= Duration::from_millis(100) {
+            // These write timings include storage queueing and durable completion;
+            // they do not identify an individual syscall. Keep intent-before-sign
+            // and signed-record-before-release ordering, including error poisoning.
+            let measured = lock_elapsed + intent_elapsed + signing_elapsed
+                + verification_elapsed + signed_elapsed;
+            log::warn!(
+                "SIGNING_FLOW: session={} kind={} slot={} success={} lock_ms={} \
+                intent_write_ms={} sign_ms={} verify_ms={} signed_write_ms={} other_ms={} total_ms={}",
+                UInt256::from(state.header.binding.session).to_hex_string(),
+                kind,
+                slot,
+                result.is_ok(),
+                lock_elapsed.as_millis(),
+                intent_elapsed.as_millis(),
+                signing_elapsed.as_millis(),
+                verification_elapsed.as_millis(),
+                signed_elapsed.as_millis(),
+                total_elapsed.saturating_sub(measured).as_millis(),
+                total_elapsed.as_millis(),
+            );
         }
         result
     }
