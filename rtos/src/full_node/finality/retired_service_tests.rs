@@ -96,6 +96,55 @@ async fn await_source_acceptance(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retired_service_routing_retry_reuses_actual_node_acceptance() {
+    for final_role in [false, true] {
+        let fixture = SpoolFixture::new_for_transport(0, 0x60).await;
+        let recovery = locator(&fixture);
+        let valid = draft(&fixture, final_role);
+        let SpoolFixture {
+            dir,
+            engine,
+            runtime,
+            block,
+            state_root,
+            ..
+        } = fixture;
+        engine.clone().wait_stop().await.unwrap();
+        drop(engine);
+        let path = dir.path().join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["validator_key_ring"] = serde_json::json!({});
+        config["consensus_transport_bindings"] = serde_json::json!([]);
+        std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let reopened = open_engine(dir.path()).await;
+        let result = std::panic::AssertUnwindSafe(async {
+            assert!(reopened.adnl_key_by_id(runtime.local_adnl()).is_none(),
+                "real routing authority must be unavailable throughout the retry");
+            let authenticated = authenticate_retired_session(reopened.as_ref(), &recovery).await.unwrap();
+            let worker = reopened.ensure_publication_worker().await.unwrap();
+            let sink = worker.historical_sink(&authenticated).unwrap();
+            let id = stage(&sink, valid).await.unwrap();
+            let accepted = tokio::time::timeout(Duration::from_secs(20),
+                reopened.clone().await_publication(id)).await.unwrap().unwrap();
+            assert_eq!(accepted.block(), &block);
+            assert_eq!(reopened.load_state(block.id()).await.unwrap().root_cell().repr_hash(), &state_root);
+            worker.enable();
+            let before = worker.test_background_runs();
+            for _ in 0..2 {
+                tokio::time::timeout(Duration::from_secs(20), worker.test_retry_background()).await.unwrap().unwrap();
+            }
+            let after = worker.test_background_runs();
+            assert!(after.1 >= before.1 + 2, "both actual routing retry turns must run");
+            assert_eq!(after.0, before.0,
+                "routing retries must not repeat actual acceptance already durably verified by this worker");
+        }).catch_unwind().await;
+        reopened.clone().wait_stop().await.unwrap();
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retired_service_repeated_acceptance_reuses_this_process_verification() {
     use consensus_common::finality_delivery::{CanonicalFinalityRequest, FinalityDeliveryRole};
     for final_role in [false, true] {

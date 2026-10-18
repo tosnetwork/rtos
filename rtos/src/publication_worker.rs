@@ -208,6 +208,8 @@ impl<T> Drop for ClosingCompletion<T> {
     }
 }
 enum Submission {
+    #[cfg(test)]
+    RetryBackground { response: oneshot::Sender<Result<()>> },
     Acceptance {
         request: CanonicalFinalityRequest,
         runtime: Arc<AuthenticatedSessionRuntime>,
@@ -264,6 +266,10 @@ enum Submission {
 impl Submission {
     fn reject(self) {
         match self {
+            #[cfg(test)]
+            Self::RetryBackground { response } => {
+                let _ = response.send(Err(error!("Publication retry test shutdown")));
+            }
             Self::HistoryDebt { response, .. } => {
                 let _ = response.send(Err(error!("Publication history admission shutdown")));
             }
@@ -327,6 +333,8 @@ impl Submission {
             Self::Legacy(request) => {
                 request.response.outstanding = Some(outstanding.begin(&request.record.session_id)?)
             }
+            #[cfg(test)]
+            Self::RetryBackground { .. } => {}
             Self::Query { .. } | Self::Cleanup { .. } => {}
         }
         Ok(())
@@ -475,6 +483,10 @@ struct State {
     acceptance_verified: Mutex<std::collections::BTreeSet<u64>>,
     #[cfg(test)]
     acceptance_request_runs: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    background_acceptance_runs: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    background_routing_turns: std::sync::atomic::AtomicUsize,
     acceptance_cursor: Mutex<u64>,
     acceptance_retry: Mutex<std::collections::BTreeMap<u64, tokio::time::Instant>>,
     retry_after: Mutex<std::collections::BTreeMap<(u64, PublicationEffect), tokio::time::Instant>>,
@@ -506,6 +518,10 @@ impl PublicationWorker {
             acceptance_verified: Mutex::new(Default::default()),
             #[cfg(test)]
             acceptance_request_runs: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            background_acceptance_runs: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            background_routing_turns: std::sync::atomic::AtomicUsize::new(0),
             acceptance_cursor: Mutex::new(0),
             acceptance_retry: Mutex::new(Default::default()),
             retry_after: Mutex::new(Default::default()),
@@ -709,6 +725,17 @@ impl PublicationWorker {
         self.state.acceptance_request_runs.load(Ordering::Relaxed)
     }
     #[cfg(test)]
+    pub(crate) fn test_background_runs(&self) -> (usize, usize) {
+        (self.state.background_acceptance_runs.load(Ordering::Relaxed),
+         self.state.background_routing_turns.load(Ordering::Relaxed))
+    }
+    #[cfg(test)]
+    pub(crate) async fn test_retry_background(&self) -> Result<()> {
+        let (response, result) = oneshot::channel();
+        self.admit_draft(Submission::RetryBackground { response })?;
+        result.await.map_err(|error| error!("Publication retry test: {error}"))?
+    }
+    #[cfg(test)]
     pub(crate) fn set_cleanup_commit_hook(
         &self,
         hook: Option<Arc<dyn Fn(&crate::propagation_outbox::PropagationOutbox) + Send + Sync>>,
@@ -818,6 +845,18 @@ impl State {
                 _ = self.wake.notified() => { self.recover(&store, &mut receiver).await; continue; },
             };
             if let Some(command) = command {
+                #[cfg(test)]
+                let command = match command {
+                    Submission::RetryBackground { response } => {
+                        // Drive the next eligible turn without wall-clock sleeps.
+                        // All IO still runs on the real publication actor.
+                        self.acceptance_retry.lock().unwrap().clear();
+                        self.recover(&store, &mut receiver).await;
+                        let _ = response.send(Ok(()));
+                        continue;
+                    }
+                    command => command,
+                };
                 self.submit_one(&store, command).await;
             } else {
                 // These requests have not started a WAL transaction. Active
@@ -834,6 +873,8 @@ impl State {
     }
     async fn submit_one(&self, store: &Arc<PropagationOutbox>, command: Submission) {
         let phase = match &command {
+            #[cfg(test)]
+            Submission::RetryBackground { .. } => "test_retry_background",
             Submission::Acceptance { .. } => "accept_request",
             Submission::HistoryDebt { .. } => "history_debt",
             Submission::Terminal { .. } => "terminal_lookup",
@@ -847,6 +888,10 @@ impl State {
         };
         let _activity = self.activity_scope(phase, None);
         match command {
+            #[cfg(test)]
+            Submission::RetryBackground { response } => {
+                let _ = response.send(Err(error!("Nested publication retry test refused")));
+            }
             Submission::HistoryDebt { request, runtime, budget, response } => {
                 let result = self.history_debt(store, request, runtime, budget).await;
                 let _ = response.send(result);
@@ -874,10 +919,7 @@ impl State {
                     // A persisted stage is not acceptance authority after restart.
                     // Reuse only a completed acceptance verified by this worker,
                     // after binding the full source request above.
-                    let verified = self.acceptance_verified.lock().unwrap().contains(&entry.id.0);
-                    if verified && matches!(entry.stage,
-                        PublicationStage::AcceptedDraft | PublicationStage::Ready | PublicationStage::Completed)
-                    {
+                    if self.acceptance_verified_in_process(&entry) {
                         return Ok(());
                     }
                     let engine = self.engine.upgrade().ok_or_else(|| error!("Publication Engine gone"))?;
@@ -1078,6 +1120,12 @@ impl State {
         self.write(store, move |store| store.resolve_draft(id, effects)).await?;
         Ok(true)
     }
+    fn acceptance_verified_in_process(&self, entry: &UnverifiedRecord) -> bool {
+        matches!(entry.stage,
+            PublicationStage::AcceptedDraft | PublicationStage::Ready | PublicationStage::Completed)
+            && self.acceptance_verified.lock().unwrap().contains(&entry.id.0)
+    }
+
     async fn accept(
         &self,
         store: &Arc<PropagationOutbox>,
@@ -1320,7 +1368,17 @@ impl State {
                     let id = entry.id;
                     // Actual acceptance precedes routing and never depends on a
                     // retired local key or publication expiry.
-                    self.accept(store, engine.clone(), entry).await?;
+                    #[cfg(test)]
+                    self.background_routing_turns.fetch_add(1, Ordering::Relaxed);
+                    // Routing can stay unavailable after acceptance completed.
+                    // C++ reuses completed finalization instead of re-entering
+                    // block acceptance for every routing retry. Persisted tags
+                    // alone never authorize this shortcut after a cold start.
+                    if !self.acceptance_verified_in_process(&entry) {
+                        #[cfg(test)]
+                        self.background_acceptance_runs.fetch_add(1, Ordering::Relaxed);
+                        self.accept(store, engine.clone(), entry).await?;
+                    }
                     if self.enabled.load(Ordering::Acquire) {
                         let entry = self
                             .snapshot(store)
@@ -1809,6 +1867,10 @@ mod tests {
             acceptance_verified: Mutex::new(Default::default()),
             #[cfg(test)]
             acceptance_request_runs: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            background_acceptance_runs: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            background_routing_turns: std::sync::atomic::AtomicUsize::new(0),
             acceptance_cursor: Mutex::new(0),
             acceptance_retry: Mutex::new(Default::default()),
             retry_after: Mutex::new(Default::default()),
