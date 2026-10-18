@@ -517,7 +517,7 @@ impl SmartContractInfo {
         if version >= 11 {
             params.push(msg_info);
         }
-        if version >= 17 {
+        if version >= 16 {
             params.push(self.incoming_storage_stats.as_ref().map_or(StackItem::None, |stats| {
                 StackItem::tuple(vec![
                     StackItem::int(1),

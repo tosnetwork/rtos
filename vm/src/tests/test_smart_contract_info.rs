@@ -573,7 +573,7 @@ fn test_convert_stack_tuple_pair_with_inner_tuple() {
 fn incoming_storage_context_version_boundary_and_absence() {
     use crate::smart_contract_info::IncomingStorageStats;
     use rtos_block::ConfigParam8;
-    for version in [14, 16, 17, 18, 19] {
+    for version in [14, 15, 16, 17, 18, 19] {
         for present in [false, true] {
             let mut config = ConfigParams::default();
             let mut version_param = ConfigParam8::default();
@@ -589,8 +589,8 @@ fn incoming_storage_context_version_boundary_and_absence() {
             }
             let outer = info.as_temp_data_item();
             let tuple = outer.as_tuple().unwrap()[0].as_tuple().unwrap();
-            assert_eq!(tuple.len(), if version >= 17 { 19 } else { 18 });
-            if version >= 17 {
+            assert_eq!(tuple.len(), if version >= 16 { 19 } else { 18 });
+            if version >= 16 {
                 if present {
                     let stats = tuple[18].as_tuple().unwrap();
                     assert_eq!(stats.len(), 4);

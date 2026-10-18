@@ -138,12 +138,12 @@ fn incoming_storage_matches_cpp_transactions() {
                                 let (tx, account) = run(&name,cfg,account,cell,special,&mut rows);
                                 let description = tx.read_description().unwrap();
                                 let rtos_block::TransactionDescr::Ordinary(desc) = description else { panic!("ordinary"); };
-                                let success = probe == "length" || (version >= 17 && (probe == "null" || (external && !special)));
+                                let success = probe == "length" || (version >= 16 && (probe == "null" || (external && !special)));
                                 let rtos_block::TrComputePhase::Vm(compute) = desc.compute_ph else { panic!("compute"); };
                                 assert_eq!(compute.success,success,"{name}");
                                 if probe == "length" {
                                     let data = account.get_data().unwrap();
-                                    assert_eq!(SliceData::load_cell(data).unwrap().get_next_byte().unwrap(), if version>=17 {19} else {18},"{name}");
+                                    assert_eq!(SliceData::load_cell(data).unwrap().get_next_byte().unwrap(), if version>=16 {19} else {18},"{name}");
                                 }
                             }
                         }
