@@ -724,7 +724,10 @@ impl SourceFinalityDelivery {
     /// filesystem scans on the consensus event loop. Coalesce wakeups while
     /// one scan is running; its Arc retains the namespace and shutdown receipt.
     pub(crate) fn request_closing_maintenance(self: &Arc<Self>) -> Result<bool> {
-        if self.delivered_sink.is_none() {
+        // Only MC Final can enter the release protocol (close_locator and
+        // validate_runtime enforce the same custody rule). WC acceptance keeps
+        // its normal replay path; scanning those retained files cannot close it.
+        if self.delivered_sink.is_none() || !self.runtime.shard().is_masterchain() {
             return Ok(false);
         }
         {
@@ -754,7 +757,7 @@ impl SourceFinalityDelivery {
     /// Bounded round-robin batch; failed requests wait at least one second.
     pub(crate) fn maintain_closing(self: &Arc<Self>) -> Result<()> {
         let _timing = self.operation_timer("maintain_closing");
-        if self.delivered_sink.is_none() {
+        if self.delivered_sink.is_none() || !self.runtime.shard().is_masterchain() {
             return Ok(());
         }
         let mut cursor = self.close_cursor.lock().unwrap();
@@ -1419,6 +1422,34 @@ mod tests {
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+    #[test]
+    fn source_closing_workchain_never_scans_mc_custody() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        for is_final in [false, true] {
+            let dir = crate::authenticated_fixture::TestDirectory::new();
+            let (runtime, draft) = super::super::tests::fixture_role(is_final,
+                rtos_block::ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap());
+            let namespace = PathBuf::from(runtime.runtime_directory(dir.path().to_str().unwrap()).unwrap());
+            let source = SourceFinalityDelivery::open_with_delivered(runtime.clone(), &namespace,
+                Arc::new(super::super::tests::HeldSink::default()),
+                Some(Arc::new(|_, _| panic!("WC cannot close MC custody")))).unwrap();
+            let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
+            source.store.retain(&record).unwrap();
+            source.store.acknowledge(&record.id().unwrap(), UInt256::from([4; 32])).unwrap();
+            let original = std::fs::read(source.store.directory.join(format!("{}.acked", record.id().unwrap().to_hex_string()))).unwrap();
+            source.close_cursor.lock().unwrap().0 = Instant::now() - Duration::from_secs(2);
+            source.closing_maintenance.lock().unwrap().next_attempt = Instant::now();
+            let (tx, scans) = mpsc::channel();
+            *source.store.scan_started.lock().unwrap() = Some(tx);
+            source.maintain_closing().unwrap();
+            assert!(scans.try_recv().is_err(), "WC has no MC custody: do not scan its retained source files");
+            assert!(!source.request_closing_maintenance().unwrap(), "WC must not schedule an ineligible closure worker");
+            assert_eq!(std::fs::read(source.store.directory.join(format!("{}.acked", record.id().unwrap().to_hex_string()))).unwrap(), original);
+            assert!(!source.store.delivered_path(&record.id().unwrap()).exists());
+        }
+    }
+
     #[test]
     fn source_delivered_non_mc_roles_preserve_original() {
         for (is_final, shard) in [
