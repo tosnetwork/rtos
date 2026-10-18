@@ -1414,6 +1414,11 @@ impl SourceFinalityDelivery {
             event,
         )
     }
+    pub(crate) fn sealed_output_requirements(
+        &self, id: &crate::block::RawCandidateId,
+    ) -> Result<Option<Vec<crate::finality_recovery::ExpectedFinalityOutput>>> {
+        self.intents.sealed_output_requirements(&self.runtime, id)
+    }
     pub(crate) fn seal_outputs(
         &self,
         id: &crate::block::RawCandidateId,
@@ -1421,6 +1426,10 @@ impl SourceFinalityDelivery {
     ) -> Result<()> {
         let _timing = self.operation_timer("seal_outputs");
         self.intents.seal_outputs(id, outputs)
+    }
+    #[cfg(test)]
+    pub(crate) fn fail_intent_resolution_once_for_test(&self) {
+        self.intents.fail_resolution_once_for_test();
     }
     pub(crate) fn resolve_intent(&self, id: &crate::block::RawCandidateId) -> Result<()> {
         let _timing = self.operation_timer("resolve_intent");

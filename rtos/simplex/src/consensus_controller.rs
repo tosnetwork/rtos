@@ -153,6 +153,9 @@ pub(crate) struct FinalizedEntry {
     /// process. Reusing a materialized ancestor must retain its full output
     /// suffix, including Approval records still owned by this source.
     resolved_output_plan: Vec<(RawCandidateId, crate::finality_recovery::ExpectedFinalityOutput)>,
+    /// Exact preexisting sealed obligations, bound to this retained source.
+    /// They only require more work; they never seed accepted receipts.
+    sealed_output_requirements: Option<Vec<crate::finality_recovery::ExpectedFinalityOutput>>,
     /// Time when finalization was first observed (for timeout / diagnostics).
     finalized_at: SystemTime,
 }
@@ -1525,7 +1528,7 @@ impl ConsensusController {
         // Always keep a pending entry until recursive parent-chain materialization
         // succeeds end-to-end. This provides deterministic retries on late body/cert
         // arrivals and ensures ancestor parity is eventually reached.
-        let entry = FinalizedEntry { event: event.clone(), intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), resolved_output_plan: Vec::new(), finalized_at: self.now() };
+        let entry = FinalizedEntry { event: event.clone(), intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), resolved_output_plan: Vec::new(), sealed_output_requirements: None, finalized_at: self.now() };
         // C++ state-resolver.cpp: a duplicate joins the existing InFlight
         // operation, preserving its original certificate and completed phases.
         self.finalized_pending_body.entry(finalized_id.clone()).or_insert(entry);
@@ -1773,6 +1776,24 @@ impl ConsensusController {
         trigger_id: &RawCandidateId,
         event: &BlockFinalizedEvent,
     ) -> bool {
+        if self.description.authenticated_runtime().is_some()
+            && self.finalized_pending_body.get(trigger_id)
+                .is_some_and(|entry| entry.sealed_output_requirements.is_none())
+        {
+            match self.callbacks.sealed_finality_output_requirements(trigger_id) {
+                Ok(required) => self.finalized_pending_body.get_mut(trigger_id).unwrap()
+                    .sealed_output_requirements = required,
+                Err(error) => {
+                    log::error!("Session {} source {}:{} cannot bind sealed output requirements: {error}",
+                        self.session_id().to_hex_string(), trigger_id.slot, trigger_id.hash.to_hex_string());
+                    return false;
+                }
+            }
+        }
+        let required_output_set: Option<HashSet<_>> = self.finalized_pending_body.get(trigger_id)
+            .and_then(|entry| entry.sealed_output_requirements.as_ref())
+            .map(|outputs| outputs.iter().cloned().collect());
+        let mut remaining_required = required_output_set.clone().unwrap_or_default();
         let applied_floor = self.last_mc_finalized_seqno.unwrap_or(0);
         let mut complete = true;
         let mut expected_outputs = Vec::new();
@@ -1856,12 +1877,17 @@ impl ConsensusController {
                             .position(|(id, _)| id == &current_id)
                         {
                             let suffix = &entry.resolved_output_plan[index..];
-                            expected_outputs.extend(suffix.iter().map(|(_, output)| output.clone()));
-                            resolved_output_plan.extend_from_slice(suffix);
-                            break;
+                            if remaining_required.iter().all(|required|
+                                suffix.iter().any(|(_, output)| output == required))
+                            {
+                                for (_, output) in suffix { remaining_required.remove(output); }
+                                expected_outputs.extend(suffix.iter().map(|(_, output)| output.clone()));
+                                resolved_output_plan.extend_from_slice(suffix);
+                                break;
+                            }
                         }
                     }
-                    if !entry.walked_candidates.contains(&current_id) {
+                    if !entry.walked_candidates.contains(&current_id) && remaining_required.is_empty() {
                         break;
                     }
                 } else {
@@ -1910,6 +1936,7 @@ impl ConsensusController {
                     has_final_cert,
                     &UInt256::from(*source.source.id().data()),
                 );
+                remaining_required.remove(&output);
                 expected_outputs.push(output.clone());
                 resolved_output_plan.push((current_id.clone(), output));
             }
@@ -2010,6 +2037,17 @@ impl ConsensusController {
             current_id = parent_id;
         }
 
+        // An already materialized parent may shorten new work, but cannot
+        // erase any output this exact source had sealed before interruption.
+        // Require the full original set before issuing WC callbacks; every
+        // member still crosses the normal certificate/node-acceptance path.
+        if !remaining_required.is_empty() || required_output_set.as_ref().is_some_and(|required|
+            expected_outputs.iter().any(|output| !required.contains(output)))
+        {
+            log::debug!("Session {} source {}:{} sealed output obligations not fully resolved",
+                self.session_id().to_hex_string(), trigger_id.slot, trigger_id.hash.to_hex_string());
+            return false;
+        }
         if workchain {
             if !complete {
                 return false;
@@ -2044,7 +2082,8 @@ impl ConsensusController {
 
         if complete && self.description.authenticated_runtime().is_some() {
             if let Err(error) = self.callbacks.seal_finality_outputs(trigger_id, expected_outputs) {
-                log::error!("Cannot seal complete finality output set: {error}");
+                log::error!("Session {} source {}:{} cannot seal complete finality output set: {error}",
+                    self.session_id().to_hex_string(), trigger_id.slot, trigger_id.hash.to_hex_string());
                 return false;
             }
         }
@@ -2864,7 +2903,7 @@ impl ConsensusController {
         event: BlockFinalizedEvent,
         finalized_at: SystemTime,
     ) {
-        self.finalized_pending_body.insert(id, FinalizedEntry { event, intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), resolved_output_plan: Vec::new(), finalized_at });
+        self.finalized_pending_body.insert(id, FinalizedEntry { event, intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), resolved_output_plan: Vec::new(), sealed_output_requirements: None, finalized_at });
         self.telemetry.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
     }
 }

@@ -225,8 +225,17 @@ impl SessionCallbacks {
     pub(crate) fn finality_retention_attempts(&self) -> usize {
         self.delivery_source().unwrap().retain_intent_attempts.load(Ordering::Relaxed)
     }
+    pub(crate) fn sealed_finality_output_requirements(
+        &self, id: &crate::block::RawCandidateId,
+    ) -> rtos_block::Result<Option<Vec<crate::finality_recovery::ExpectedFinalityOutput>>> {
+        self.delivery_source()?.sealed_output_requirements(id)
+    }
     pub(crate) fn seal_finality_outputs(&self,id:&crate::block::RawCandidateId,outputs:Vec<crate::finality_recovery::ExpectedFinalityOutput>)->rtos_block::Result<()> {
         self.delivery_source()?.seal_outputs(id,outputs)
+    }
+    #[cfg(test)]
+    pub(crate) fn fail_intent_resolution_once_for_test(&self) {
+        self.delivery_source().unwrap().fail_intent_resolution_once_for_test();
     }
     pub(crate) fn resolve_finality_intent(
         &self,

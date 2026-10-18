@@ -377,6 +377,10 @@ impl FinalityIntentStore {
             fail_resolve_once: std::sync::atomic::AtomicBool::new(false),
         }
     }
+    #[cfg(test)]
+    pub(crate) fn fail_resolution_once_for_test(&self) {
+        self.fail_resolve_once.store(true, std::sync::atomic::Ordering::Release);
+    }
     pub(crate) fn prepare(&self, has_existing_certificates: bool) -> Result<()> {
         let _guard = self.mutation.lock().unwrap();
         let directory = self.namespace.join(DIRECTORY);
@@ -1652,6 +1656,25 @@ mod tests {
             !reopened.output_is_released(&id).unwrap(),
             "sealing expected outputs does not manufacture Delivered confirmation"
         );
+        let required = reopened.sealed_output_requirements(&runtime, &id).unwrap().unwrap();
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0].block_id, draft.block_id.to_string());
+        let output_path = namespace.join("finality-intents/outputs-v1")
+            .join(format!("{}-{}.outputs", id.slot.value(), id.hash.to_hex_string()));
+        let original_output = std::fs::read(&output_path).unwrap();
+        let mut wrong_digest: serde_json::Value = serde_json::from_slice(&original_output).unwrap();
+        wrong_digest["digest"] = serde_json::json!(UInt256::from([0x5e; 32]).to_hex_string());
+        std::fs::write(&output_path, serde_json::to_vec(&wrong_digest).unwrap()).unwrap();
+        assert!(reopened.sealed_output_requirements(&runtime, &id).is_err(),
+            "a foreign certificate digest must not become replay requirements");
+        let mut wrong_metadata: serde_json::Value = serde_json::from_slice(&original_output).unwrap();
+        wrong_metadata["metadata"]["local_adnl"] =
+            serde_json::json!(UInt256::from([0x5f; 32]).to_hex_string());
+        std::fs::write(&output_path, serde_json::to_vec(&wrong_metadata).unwrap()).unwrap();
+        assert!(reopened.sealed_output_requirements(&runtime, &id).is_err(),
+            "a matching digest cannot authorize changed output metadata");
+        std::fs::write(&output_path, &original_output).unwrap();
+        assert_eq!(reopened.sealed_output_requirements(&runtime, &id).unwrap(), Some(required));
         assert_eq!(reopened.legacy_output_count().unwrap(), 0);
         assert!(scan_finality_recovery(directory.path()).unwrap().is_empty());
         let start = locate_session_start(&namespace).unwrap().expect("completed intent preserves live session floor");

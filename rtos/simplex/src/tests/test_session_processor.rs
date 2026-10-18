@@ -12272,35 +12272,48 @@ fn source_finality_main_worker_release_keeps_only_accepted_node_work_owned() {
 /// input, while source intent/ACK/output files are reopened from disk.
 #[test]
 fn source_finality_controller_empty_trigger_seals_all_roles_after_cold_retry() {
-    source_finality_empty_trigger_cold_retry_case(false, false, false, false, false);
+    source_finality_empty_trigger_cold_retry_case(false, false, false, false, false, PresealedColdPlan::None);
 }
 
 #[test]
 fn source_finality_controller_cold_retry_keeps_ancestor_handoff_below_applied_floor() {
-    source_finality_empty_trigger_cold_retry_case(true, false, false, false, false);
+    source_finality_empty_trigger_cold_retry_case(true, false, false, false, false, PresealedColdPlan::None);
 }
 
 #[test]
 fn source_finality_controller_replay_stops_at_materialized_parent_without_its_body() {
-    source_finality_empty_trigger_cold_retry_case(true, true, false, false, false);
+    source_finality_empty_trigger_cold_retry_case(true, true, false, false, false, PresealedColdPlan::None);
 }
 
 #[test]
 fn source_finality_replayed_children_share_only_fresh_accepted_ancestor_approval() {
-    source_finality_empty_trigger_cold_retry_case(false, false, true, false, false);
+    source_finality_empty_trigger_cold_retry_case(false, false, true, false, false, PresealedColdPlan::None);
 }
 
 #[test]
 fn source_finality_replay_reuses_materialized_ancestry_without_truncating_outputs() {
-    source_finality_empty_trigger_cold_retry_case(false, false, true, true, false);
+    source_finality_empty_trigger_cold_retry_case(false, false, true, true, false, PresealedColdPlan::None);
 }
 
 #[test]
 fn source_finality_replay_pruning_keeps_inflight_accepted_ancestor_receipts() {
-    source_finality_empty_trigger_cold_retry_case(false, false, true, true, true);
+    source_finality_empty_trigger_cold_retry_case(false, false, true, true, true, PresealedColdPlan::None);
 }
 
-fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_parent: bool, shared_approvals: bool, reuse_materialized_plan: bool, prune_after_acceptance: bool) {
+#[test]
+fn source_finality_cold_replay_preserves_presealed_outputs_after_parent_materialization() {
+    source_finality_empty_trigger_cold_retry_case(false, false, false, false, false, PresealedColdPlan::Exact);
+}
+
+#[test]
+fn source_finality_cold_replay_does_not_accept_changed_sealed_output_role() {
+    source_finality_empty_trigger_cold_retry_case(false, false, false, false, false, PresealedColdPlan::ChangedParentRole);
+}
+
+enum PresealedColdPlan { None, Exact, ChangedParentRole }
+
+fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_parent: bool, shared_approvals: bool, reuse_materialized_plan: bool, prune_after_acceptance: bool, presealed_case: PresealedColdPlan) {
+    let presealed_cold_plan = !matches!(presealed_case, PresealedColdPlan::None);
     use crate::finality_delivery::tests::{fixture_role, HeldSink};
     use rtos_block::Serializable;
     let temp = crate::authenticated_fixture::TestDirectory::new();
@@ -12418,25 +12431,63 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
         drop(processor);db.close(None).unwrap();return;
     }
     assert!(!map.exists(),"a held node handoff cannot seal a complete walk");
-    // Resolve only Final. Approval is a separate debt and must keep the map absent.
-    let staged=std::mem::take(&mut *sink.0.lock().unwrap());
-    assert_eq!(staged.len(), 1, "C++ WC parent must be the sole pending handoff");
-    assert_eq!(staged[0].0.block_id, chain[0].1.block_id, "C++ WC parent must precede child final");
-    assert!(matches!(staged[0].0.finality, consensus_common::SessionFinality::PqApproval(_)));
-    for (draft,done) in staged {
-        if matches!(draft.finality,consensus_common::SessionFinality::PqApproval(_)) {
-            done(Err(rtos_block::error!("held approval before restart")));
-        } else { done(Ok(UInt256::from([1;32]))); }
-    }
-    processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
-    assert!(!map.exists(),"Final ACK must not fill an ancestor Approval hole");
-    for (_,done) in std::mem::take(&mut *sink.0.lock().unwrap()) {
-        done(Err(rtos_block::error!("restart with source debt")));
-    }
+    let pending_path = std::path::Path::new(&namespace).join("finality-intents")
+        .join(format!("{}-{}.json", trigger.slot.value(), trigger.hash.to_hex_string()));
+    let completed_path = pending_path.parent().unwrap().join("completed-v1")
+        .join(pending_path.with_extension("complete").file_name().unwrap());
+    let presealed_bytes = if presealed_cold_plan {
+        // The existing IO fault leaves the exact crash window: the full plan
+        // and completion proof are durable, but the source intent is not yet
+        // unlinked. A completed ancestor must not shrink that source's plan.
+        processor.callbacks.fail_intent_resolution_once_for_test();
+        let mut warm_handoffs = 0;
+        for _ in 0..16 {
+            for (_, done) in std::mem::take(&mut *sink.0.lock().unwrap()) {
+                warm_handoffs += 1;
+                done(Ok(UInt256::from([0x28; 32])));
+            }
+            processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+            if map.exists() && completed_path.exists() { break; }
+        }
+        assert_eq!(warm_handoffs, 2, "both original roles must cross the warm node sink");
+        assert!(pending_path.exists() && completed_path.exists());
+        assert!(processor.consensus.is_finalized_block(&chain[0].0));
+        let mut bytes = std::fs::read(&map).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["outputs"].as_array().unwrap().len(), 2);
+        if matches!(presealed_case, PresealedColdPlan::ChangedParentRole) {
+            let parent = value["outputs"].as_array_mut().unwrap().iter_mut()
+                .find(|output| output["block_id"] == chain[0].1.block_id.to_string()).unwrap();
+            parent["is_final"] = serde_json::json!(true);
+            bytes = serde_json::to_vec(&value).unwrap();
+            std::fs::write(&map, &bytes).unwrap();
+        }
+        Some(bytes)
+    } else {
+        // Resolve only Final. Approval is a separate debt and must keep the map absent.
+        let staged=std::mem::take(&mut *sink.0.lock().unwrap());
+        assert_eq!(staged.len(), 1, "C++ WC parent must be the sole pending handoff");
+        assert_eq!(staged[0].0.block_id, chain[0].1.block_id, "C++ WC parent must precede child final");
+        assert!(matches!(staged[0].0.finality, consensus_common::SessionFinality::PqApproval(_)));
+        for (draft,done) in staged {
+            if matches!(draft.finality,consensus_common::SessionFinality::PqApproval(_)) {
+                done(Err(rtos_block::error!("held approval before restart")));
+            } else { done(Ok(UInt256::from([1;32]))); }
+        }
+        processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+        assert!(!map.exists(),"Final ACK must not fill an ancestor Approval hole");
+        for (_,done) in std::mem::take(&mut *sink.0.lock().unwrap()) {
+            done(Err(rtos_block::error!("restart with source debt")));
+        }
+        None
+    };
     drop(processor); db.close(None).unwrap(); drop(db);
     let sink=Arc::new(HeldSink::default());
     *sink.1.lock().unwrap() = Some(Vec::new());
     let (db,mut processor)=make_processor(sink.clone());
+    if presealed_cold_plan {
+        processor.consensus.insert_finalized_block(chain[0].0.clone());
+    }
     if shared_approvals {
         // A startup delivery seed is deliberately insufficient: both replays
         // must first obtain this boot's real ancestor node acceptance.
@@ -12450,6 +12501,17 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
     drain_processor_storage_and_messages(&mut processor);
     assert_eq!(processor.callbacks.finality_retention_attempts(), if shared_approvals {2} else {1},
         "cold recovery must establish persistence again instead of inheriting a warm phase");
+    if matches!(presealed_case, PresealedColdPlan::ChangedParentRole) {
+        for _ in 0..4 {
+            processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+        }
+        assert!(sink.0.lock().unwrap().is_empty(), "a declared role cannot manufacture a node handoff");
+        assert!(sink.1.lock().unwrap().as_ref().unwrap().is_empty(),
+            "a declared role cannot seed this boot's node acceptance");
+        assert!(pending_path.exists(), "inconsistent original debt must remain pending");
+        assert_eq!(std::fs::read(&map).unwrap(), presealed_bytes.unwrap());
+        drop(processor); db.close(None).unwrap(); return;
+    }
     let second_map = second_event.as_ref().map(|e|std::path::Path::new(&namespace)
         .join("finality-intents/outputs-v1").join(format!("{}-{}.outputs",e.slot.value(),e.block_hash.to_hex_string())));
     let mut final_slots = std::collections::BTreeSet::new();
@@ -12490,8 +12552,10 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
             if request.block_id == chain[0].1.block_id {
                 assert!(!parent_accepted, "replayed children must join one fresh accepted ancestor approval");
                 assert!(sink.0.lock().unwrap().is_empty(), "WAL custody does not release the WC child");
-                assert!(!processor.consensus.is_finalized_block(&chain[0].0),
-                    "WAL custody cannot materialize the parent before node acceptance");
+                if !presealed_cold_plan {
+                    assert!(!processor.consensus.is_finalized_block(&chain[0].0),
+                        "WAL custody cannot materialize the parent before node acceptance");
+                }
                 if !rejected_parent_acceptance {
                     done(Err(rtos_block::error!("injected parent node acceptance failure")));
                     rejected_parent_acceptance = true;
@@ -12502,9 +12566,15 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
             }
             done(Ok(()));
         }
-        if map.exists() && second_map.as_ref().is_none_or(|p|p.exists()) { break; }
+        if map.exists() && second_map.as_ref().is_none_or(|p|p.exists())
+            && (!presealed_cold_plan || !pending_path.exists()) { break; }
     }
-    assert!(parent_accepted);
+    assert!(parent_accepted, "presealed obligations still require this boot's node acceptance");
+    if let Some(original) = presealed_bytes {
+        assert_eq!(std::fs::read(&map).unwrap(), original,
+            "cold replay must preserve the exact original full output set");
+        assert!(!pending_path.exists(), "normal replay must finish the original intent");
+    }
     if reuse_materialized_plan {
         assert!(ancestor_body_evicted, "regression must remove the already accepted ancestor body");
         assert!(map.exists(), "accepted ancestor reuse must finish the retained source with its complete output set");

@@ -6,7 +6,7 @@ const OUTPUT_DIRECTORY: &str = "outputs-v1";
 const MAX_OUTPUTS: usize = 1024;
 const MAX_OUTPUT_BYTES: u64 = 256 << 10;
 const MAX_OUTPUT_TOTAL: u64 = 32 << 20;
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExpectedFinalityOutput {
     pub block_id: String,
@@ -150,6 +150,49 @@ impl FinalityIntentStore {
         } else {
             Ok(serde_json::from_slice(&bytes)?)
         }
+    }
+    /// A prior sealed set is an obligation, never proof of node acceptance.
+    /// Bind it to the exact retained certificate and authenticated runtime
+    /// before letting it constrain a new walk. Released locators without a
+    /// full certificate keep the existing normal closure path.
+    pub(crate) fn sealed_output_requirements(
+        &self,
+        runtime: &AuthenticatedSessionRuntime,
+        id: &crate::block::RawCandidateId,
+    ) -> Result<Option<Vec<ExpectedFinalityOutput>>> {
+        let _guard = self.mutation.lock().unwrap();
+        let path = self.output_path(id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let output = OutputSet::read(&path)?;
+        let pending = self.namespace.join(DIRECTORY).join(format!(
+            "{}-{}.json",
+            id.slot.value(),
+            id.hash.to_hex_string()
+        ));
+        let completed = self.completed_path(&pending);
+        let resolved = pending.with_extension("resolved");
+        let original_path = if completed.exists() {
+            completed
+        } else if pending.exists() {
+            pending
+        } else if resolved.exists() {
+            resolved
+        } else {
+            return Ok(None);
+        };
+        read_intent(&original_path, &self.namespace)?.0.validate_runtime(runtime)?;
+        let mut original = Self::canonical_intent(&original_path)?;
+        if UInt256::calc_file_hash(&serde_json::to_vec(&original)?).to_hex_string() != output.digest
+        {
+            fail!("Sealed output certificate changed");
+        }
+        original.certificate.clear();
+        if serde_json::to_vec(&original)? != serde_json::to_vec(&output.metadata)? {
+            fail!("Sealed output metadata changed");
+        }
+        Ok(Some(output.outputs))
     }
     pub(crate) fn seal_outputs(
         &self,
