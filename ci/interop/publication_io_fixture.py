@@ -122,18 +122,26 @@ class PublicationIoSource(SourceRetentionCut):
                     raise RuntimeError('WAL handoff ACK differs from exact original source/delivery')
                 (self.io_directory/'wal-handoff-acked.json').write_bytes(raw)
             self.source_snapshot[path]=raw
-        if not self.source_snapshot:raise RuntimeError('Failed acceptance lost its full source custody')
-        self.pending=pending if pending in self.source_snapshot else ack
+        reference_path=self.pending_directory/'references-v1'/(self.source_id+'.reference')
+        if reference_path.exists():
+            raw=reference_path.read_bytes();value=json.loads(raw)
+            valid,reference=SourceAckFailure.matches_recovered_source(self,'reference',value,json.loads(self.original))
+            if not valid or reference['node_receipt']!=selector['node_receipt']:
+                raise RuntimeError('Canonical WAL custody reference differs from exact full draft')
+            self.source_snapshot[reference_path]=raw
+            (self.io_directory/'source-reference-before.json').write_bytes(raw)
+        if not self.source_snapshot:raise RuntimeError('Failed acceptance lost its source and full WAL custody')
+        self.pending=next(iter(self.source_snapshot))
         self.preserved_bytes=self.source_snapshot[self.pending]
         self.expected_node_receipt=selector['node_receipt']
-        for path in [pending.with_suffix('.ack.tmp'),self.pending_directory/'references-v1'/(self.source_id+'.reference'),
-                     self.pending_directory/'references-v1'/(self.source_id+'.delivered')]:
+        for path in [pending.with_suffix('.ack.tmp'),self.pending_directory/'references-v1'/(self.source_id+'.delivered')]:
             if path.exists():raise RuntimeError('Failed acceptance already published canonical delivery')
         (self.io_directory/'stopped-process-status.txt').write_text(self.process_status())
         self.receipt.update(phase='native_node_body_sync_failure_observed',
             node_io_target=target, source_pending_committed_before_interruption=True,
             source_acknowledged_before_interruption=ack in self.source_snapshot,
             source_ack_scope='full node WAL handoff only, not block acceptance',
+            source_custody_before=[{'path':str(path),'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest()} for path,raw in self.source_snapshot.items()],
             source_canonical_delivery_before_interruption=False,
             node_io_failure_before_callback=True, node_observed_error=failed,
             native_error_observed_at_unix=time.time())
@@ -168,6 +176,10 @@ class PublicationIoSource(SourceRetentionCut):
             if self.node['process'].returncode is not None:raise RuntimeError('Recovered node exited before canonical delivery')
             if delivered.exists():
                 raw=delivered.read_bytes();value=json.loads(raw)
+                if value.get('schema')!=1 or type(value.get('generation')) is not int or value['generation']<=0:
+                    raise RuntimeError('Malformed canonical delivered closing proof')
+                if value.get('node_confirmed') is not True:
+                    await asyncio.sleep(.05);continue
                 valid,reference=SourceAckFailure.matches_recovered_source(self,'delivered',value,json.loads(self.original))
                 if not valid or reference['node_receipt']!=self.expected_node_receipt:
                     raise RuntimeError('Recovered canonical delivery differs from exact original source')
@@ -177,6 +189,7 @@ class PublicationIoSource(SourceRetentionCut):
                         recovered_ack_sha256=hashlib.sha256(raw).hexdigest(),
                         recovered_node_receipt=reference['node_receipt'],final_checkpoint=recovered['last_checkpoint'],
                         original_source_canonical_delivery_recovered=True,node_io_original_source_recovered=True,
+                        canonical_node_confirmed=True,canonical_close_generation=value['generation'],
                         manual_database_repair=False)
                     self.save();return
             await asyncio.sleep(.05)

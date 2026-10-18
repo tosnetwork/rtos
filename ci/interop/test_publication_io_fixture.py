@@ -35,7 +35,11 @@ class PublicationIoFixtureTests(unittest.TestCase):
             'profile':'a'*64,'zerostate':identity(0,'0'*64,'2'*64)}
         source.original=json.dumps(record).encode()
         selector=selector_for(record,source.source_id,10)
-        if acknowledged:
+        if acknowledged is None:
+            directory_ref=source.pending_directory/'references-v1';directory_ref.mkdir()
+            reference={'digest':sha(source.original),'metadata':{**record,'data':'','signature_set':''},'node_receipt':selector['node_receipt']}
+            (directory_ref/(source.source_id+'.reference')).write_text(json.dumps(reference))
+        elif acknowledged:
             source.pending.with_suffix('.acked').write_text(json.dumps({'record':record,'node_receipt':selector['node_receipt']}))
         else:source.pending.with_suffix('.json').write_bytes(source.original)
         selected=json.dumps(selector).encode(); (source.io_directory/'selector.json').write_bytes(selected)
@@ -65,10 +69,10 @@ class PublicationIoFixtureTests(unittest.TestCase):
         self.assertNotEqual(delivery_receipt(coordinates),'20758516678bd6b147aa1ade12051b8f9442be5854b38522edc79d37943f188a')
 
     def test_full_wal_handoff_ack_is_not_block_acceptance(self):
-        for acknowledged in [False,True]:
+        for acknowledged in [False,True,None]:
             with self.subTest(acknowledged=acknowledged),tempfile.TemporaryDirectory() as temporary:
                 source,selector,marker,_,_=self.context(Path(temporary),acknowledged);self.capture(source,selector,marker)
-                self.assertEqual(source.receipt['source_acknowledged_before_interruption'],acknowledged)
+                self.assertEqual(source.receipt['source_acknowledged_before_interruption'],acknowledged is True)
                 self.assertFalse(source.receipt['source_canonical_delivery_before_interruption'])
                 self.assertTrue(source.receipt['node_observed_error']['retained_draft_verified'])
                 self.assertIsNone(source.environment())
@@ -109,8 +113,8 @@ class PublicationIoFixtureTests(unittest.TestCase):
                 failed['target_sha256']=sha(raw);(source.io_directory/'failed.json').write_text(json.dumps(failed))
                 with self.assertRaisesRegex(RuntimeError,'retained WAL draft'):self.capture(source,selector,marker)
 
-    def test_source_mutation_or_early_canonical_proof_cannot_pass(self):
-        for mode in ['source','missing','receipt','reference']:
+    def test_source_mutation_or_early_delivered_proof_cannot_pass(self):
+        for mode in ['source','missing','receipt','delivered']:
             with self.subTest(mode=mode),tempfile.TemporaryDirectory() as temporary:
                 source,selector,marker,_,_=self.context(Path(temporary));ack=source.pending.with_suffix('.acked')
                 if mode=='missing':ack.unlink()
@@ -119,8 +123,8 @@ class PublicationIoFixtureTests(unittest.TestCase):
                     if mode=='source':value['record']['data']='abcd'
                     else:value['node_receipt']='0'*64
                     ack.write_text(json.dumps(value))
-                if mode=='reference':
-                    directory=source.pending_directory/'references-v1';directory.mkdir();(directory/(source.source_id+'.reference')).write_text('{}')
+                if mode=='delivered':
+                    directory=source.pending_directory/'references-v1';directory.mkdir();(directory/(source.source_id+'.delivered')).write_text('{}')
                 with self.assertRaises(RuntimeError):self.capture(source,selector,marker)
 
     def test_recovery_waits_for_canonical_delivery_after_full_handoff_ack(self):
@@ -132,11 +136,25 @@ class PublicationIoFixtureTests(unittest.TestCase):
             reference={'digest':sha(source.original),'metadata':{**json.loads(source.original),'data':'','signature_set':''},
                        'node_receipt':selector['node_receipt']}
             directory=source.pending_directory/'references-v1';directory.mkdir()
-            (directory/(source.source_id+'.delivered')).write_text(json.dumps({'schema':1,'reference':reference}))
+            delivered=directory/(source.source_id+'.delivered')
+            value={'schema':1,'reference':reference,'generation':1,'node_confirmed':False}
+            delivered.write_text(json.dumps(value))
             for path in source.source_snapshot:path.unlink()
+            with patch('publication_io_fixture.asyncio.sleep',side_effect=RuntimeError('still waiting')):
+                with self.assertRaisesRegex(RuntimeError,'still waiting'):
+                    asyncio.run(source.complete({'last_checkpoint':{'seqno':9}}))
+            value['node_confirmed']=True;delivered.write_text(json.dumps(value))
             asyncio.run(source.complete({'last_checkpoint':{'seqno':9}}))
             self.assertTrue(source.receipt['original_source_canonical_delivery_recovered'])
             self.assertEqual(source.receipt['recovered_ack_kind'],'delivered')
+
+    def test_malformed_close_generation_cannot_finish_recovery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source,selector,marker,_,_=self.context(Path(temporary));self.capture(source,selector,marker)
+            directory=source.pending_directory/'references-v1';directory.mkdir()
+            (directory/(source.source_id+'.delivered')).write_text(json.dumps({'schema':1,'generation':0,'node_confirmed':True}))
+            with self.assertRaisesRegex(RuntimeError,'Malformed canonical'):
+                asyncio.run(source.complete({'last_checkpoint':{}}))
 
     def test_approval_and_empty_body_cannot_select_node_final_acceptance(self):
         for record in [{'is_final':False,'data':'ab'},{'is_final':True,'data':''}]:
