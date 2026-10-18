@@ -186,6 +186,29 @@ async fn retired_service_repeated_query_reuses_actual_typed_acceptance() {
                 );
                 assert_eq!(worker.test_actual_acceptance_runs(), before,
                 "repeated typed queries must reuse this worker's actual durable Engine acceptance");
+                worker.enable();
+                let domain = crate::propagation_outbox::OutboxDomain {
+                    zerostate: fixture.runtime.pin().zerostate.clone(),
+                    global_id: fixture.runtime.pin().global_id,
+                    wire_profile: fixture.runtime.wire_profile(),
+                };
+                let resolved = tokio::time::timeout(Duration::from_secs(20), async {
+                    loop {
+                        let (_, entry) = crate::propagation_outbox::inspect_delivery(
+                            fixture.engine.db(), &domain, &Limits::default(), &id,
+                        ).unwrap().unwrap();
+                        if matches!(entry.stage, PublicationStage::Ready | PublicationStage::Completed) {
+                            break entry;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await.expect("actual routing owner did not resolve targets");
+                assert!(!resolved.record.effects.is_empty(), "actual routing must have resolved");
+                let routed = fixture.engine.clone().await_publication(id.clone()).await.unwrap();
+                assert_eq!(routed.block(), accepted.block());
+                assert_eq!(routed.is_final(), final_role);
+                assert_eq!(worker.test_actual_acceptance_runs(), before,
+                    "routing resolution must preserve this actor's completed acceptance");
                 id
             })
             .catch_unwind()

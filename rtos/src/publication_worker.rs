@@ -498,7 +498,8 @@ impl AcceptanceCache {
         }
         let Some(cached) = self.entries.get(&entry.id.0) else { return Ok(None) };
         // Full immutable content/role/domain binding, including effects. A
-        // resolved draft with a changed plan takes the normal acceptance path.
+        // changed plan takes the normal acceptance path unless this actor has
+        // updated the cache after its own authenticated, durable resolution.
         if cached.record != entry.record {
             return Ok(None);
         }
@@ -547,6 +548,24 @@ impl AcceptanceCache {
             .insert(id.0, CachedAcceptance { record, accepted: accepted.clone(), payload_bytes });
         self.order.push_back(id.0);
         self.payload_bytes += payload_bytes;
+    }
+    fn resolved_routing(
+        &mut self,
+        before: &UnverifiedRecord,
+        effects: Vec<PublicationEffect>,
+        limits: &Limits,
+    ) {
+        if before.stage != PublicationStage::AcceptedDraft {
+            return;
+        }
+        let Some(cached) = self.entries.get(&before.id.0) else { return };
+        if cached.record != before.record {
+            return;
+        }
+        let accepted = cached.accepted.clone();
+        let mut record = before.record.clone();
+        record.effects = effects;
+        self.insert(before.id, record, &accepted, limits);
     }
     fn remove(&mut self, id: u64) {
         if let Some(old) = self.entries.remove(&id) {
@@ -992,6 +1011,7 @@ impl State {
             Submission::Cleanup { .. } => "cleanup",
         };
         let _activity = self.activity_scope(phase, None);
+        let command_started = std::time::Instant::now();
         match command {
             #[cfg(test)]
             Submission::RetryBackground { response } => {
@@ -1140,6 +1160,7 @@ impl State {
                 self.wake.notify_one();
             }
         }
+        log::debug!("Publication command phase={} elapsed_ms={}", phase, command_started.elapsed().as_millis());
     }
     async fn submit_legacy(&self, store: &Arc<PropagationOutbox>, command: LegacySubmission) {
         let result = async {
@@ -1239,7 +1260,16 @@ impl State {
             plan.for_destination(&destination)?;
             effects.push(effect_from_destination(destination)?);
         }
+        effects.sort();
+        effects.dedup();
+        let resolved_effects = effects.clone();
         self.write(store, move |store| store.resolve_draft(id, effects)).await?;
+        // Destination resolution changes only routing metadata, after actual
+        // acceptance and a successful WAL commit. Retain that same opaque
+        // result rather than accepting the block again for its resolved plan.
+        // Cache misses, eviction and cold starts still use normal acceptance.
+        self.accepted_receipts.lock().unwrap()
+            .resolved_routing(&entry, resolved_effects, &self.limits);
         Ok(true)
     }
     fn acceptance_verified_in_process(&self, entry: &UnverifiedRecord) -> bool {
