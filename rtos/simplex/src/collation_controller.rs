@@ -214,7 +214,7 @@ use rtos_block::{error, fail, sha256_digest, BlockIdExt, BocFlags, Error, Result
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// Warn threshold for self-collation generation latency. Moved verbatim from
@@ -2955,6 +2955,16 @@ impl CollationController {
             parent.as_ref().map(|p| format!("{}:{}", p.slot, &p.hash.to_hex_string()[..8]))
         );
 
+        // Measure the publication boundary separately from collation. The
+        // candidate is not on the network until durable signing and candidate
+        // metadata persistence have both finished. Use a monotonic clock for
+        // durations and wall time only to correlate peer receive/Skip records.
+        let publication_started = Instant::now();
+        let publication_started_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or_default();
+
         // Determine if this is an empty block.
         let is_empty = matches!(result, CollationResult::Empty { .. });
 
@@ -3007,6 +3017,8 @@ impl CollationController {
             }
         };
 
+        let preparation_finished = Instant::now();
+
         // No PQ signature exists during preparation. Both full and empty
         // candidates cross the same durable publication boundary before any
         // generated-parent cache, local chain head, broadcast or self-receive.
@@ -3027,6 +3039,8 @@ impl CollationController {
             }
         }
 
+        let sealing_finished = Instant::now();
+
         // Persist candidate info (synchronously, via the collation backend). The
         // hash-data bytes are built here while `prepared` is still borrowed, so
         // only owned scalars cross the seam.
@@ -3041,6 +3055,8 @@ impl CollationController {
                 signature,
             );
         }
+
+        let persistence_finished = Instant::now();
 
         // Trace: own candidate successfully generated, persisted, and about to be
         // published. `prepared` is a `GeneratedBlockDesc` (candidate_hash +
@@ -3117,7 +3133,30 @@ impl CollationController {
         let broadcast_slot = slot.value();
         let broadcast_hash = prepared.candidate_hash.clone();
         let broadcast_data = prepared.tl_candidate_data;
+        let broadcast_started = Instant::now();
         backend.broadcast_candidate(broadcast_slot, broadcast_hash, broadcast_data);
+        let publication_finished = Instant::now();
+        if !is_empty {
+            log::info!(
+                "Session {} PUBLICATION_FLOW: slot={} candidate={} \
+                started_unix_ms={} finished_unix_ms={} prepare_ms={} seal_ms={} \
+                persist_ms={} pre_broadcast_ms={} broadcast_call_ms={} total_ms={}",
+                self.session_id().to_hex_string(),
+                slot,
+                prepared.candidate_hash.to_hex_string(),
+                publication_started_unix_ms,
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis())
+                    .unwrap_or_default(),
+                preparation_finished.duration_since(publication_started).as_millis(),
+                sealing_finished.duration_since(preparation_finished).as_millis(),
+                persistence_finished.duration_since(sealing_finished).as_millis(),
+                broadcast_started.duration_since(persistence_finished).as_millis(),
+                publication_finished.duration_since(broadcast_started).as_millis(),
+                publication_finished.duration_since(publication_started).as_millis(),
+            );
+        }
 
         // DEBUG: short pattern for quick grep (COLLATION = block generation flow).
         log::debug!(
