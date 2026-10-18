@@ -104,6 +104,18 @@ class FirstIntentCut:
             + list(intent_directory.glob('*-*.resolved')) + list(intent_directory.glob('completed-v1/*.complete'))
         if paths != [target]:
             raise RuntimeError('First-intent source contains other retained/completed intents')
+        inventory = []
+        for path in sorted(intent_directory.rglob('*')):
+            if path.is_symlink():
+                raise RuntimeError('First-intent directory contains an unexpected symlink')
+            if path.is_file():
+                data = path.read_bytes()
+                inventory.append({'path': str(path.relative_to(intent_directory)),
+                    'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+        if [entry['path'] for entry in inventory] != [target.name]:
+            raise RuntimeError('First-intent directory has additional physical evidence')
+        inventory_bytes = (json.dumps(inventory, indent=2) + '\n').encode()
+        (self.directory / 'intent-directory-at-stop.json').write_bytes(inventory_bytes)
         context = selected / 'finality-session-start.json'
         start = json.loads(context.read_text())
         if start != {k: v for k, v in record.items() if k not in ['slot', 'candidate_hash', 'certificate']}:
@@ -121,6 +133,7 @@ class FirstIntentCut:
             session_start_sha256=sha(context.read_bytes()), session=record['session_id'],
             slot=record['slot'], candidate_hash=record['candidate_hash'],
             prepared_sha256=sha(prepared_bytes), stopped_state_verified=True,
+            stopped_directory_inventory_sha256=sha(inventory_bytes),
             stopped_at_unix=time.time())
         self.save()
         node['first_intent_restarting'] = True
