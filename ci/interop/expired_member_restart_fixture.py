@@ -120,9 +120,9 @@ class PendingIntentRecovery:
 def validate_followup_frontier(args):
     if getattr(args, 'followup_intent_frontier', False) and not (
         getattr(args, 'expired_member_restart', False)
-        and getattr(args, 'source_ack_partition_restart', False)
+        and (getattr(args, 'source_ack_partition_restart', False) or getattr(args, 'publication_io_library', None))
     ):
-        raise RuntimeError('Follow-up frontier requires the explicit expired-member original ACK restart')
+        raise RuntimeError('Follow-up frontier requires an explicit expired-member source/acceptance restart')
 
 
 class LiveIntentFrontier(PendingIntentRecovery):

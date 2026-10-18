@@ -1249,6 +1249,17 @@ impl InternalDb {
         block: &BlockStuff,
         proof: &BlockProofStuff,
     ) -> Result<(Arc<BlockHandle>, BlockProofStuff)> {
+        self.ensure_publication_artifacts_observed(block, proof, None).await
+    }
+
+    /// An observation belongs to this acceptance, never to another DB worker.
+    pub(crate) async fn ensure_publication_artifacts_observed(
+        &self,
+        block: &BlockStuff,
+        proof: &BlockProofStuff,
+        observer: storage::durability::SyncObservation,
+    ) -> Result<(Arc<BlockHandle>, BlockProofStuff)> {
+        let observer = observer.or_else(|| self.publication_sync_observer());
         let handle = self
             .create_or_load_block_handle(block.id(), Some(block.block()?), None, None)?
             .to_non_updated()
@@ -1312,7 +1323,7 @@ impl InternalDb {
             }
         }
         self.archive_manager
-            .sync_block_artifacts(&handle, selected.is_link(), self.publication_sync_observer())
+            .sync_block_artifacts(&handle, selected.is_link(), observer)
             .await
             .map_err(publication_durability_failure)?;
         Ok((handle, selected))

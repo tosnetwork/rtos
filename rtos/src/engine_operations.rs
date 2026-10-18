@@ -1405,8 +1405,14 @@ impl EngineOperations for Engine {
     ) -> Result<()> {
         #[cfg(test)]
         crate::publication_repair::assert_ordinary_durability_allowed(self.as_ref());
-        let (handle, persisted_proof) =
-            self.db().ensure_publication_artifacts(accepted.block(), accepted.proof()).await?;
+        #[cfg(all(target_os = "linux", feature = "isolated-consensus-signing"))]
+        let observer = crate::publication_io_test_control::for_acceptance(accepted)?;
+        #[cfg(not(all(target_os = "linux", feature = "isolated-consensus-signing")))]
+        let observer = None;
+        let (handle, persisted_proof) = self
+            .db()
+            .ensure_publication_artifacts_observed(accepted.block(), accepted.proof(), observer)
+            .await?;
         if persisted_proof.is_link() {
             persisted_proof.check_proof_link()?;
         } else {

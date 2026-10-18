@@ -125,7 +125,12 @@ async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, ru
             raise RuntimeError('Signer expiry observer was not started at the first successor checkpoint')
         checkpoint = await expiry.qualify(args, nodes, endpoints, lite_configs, zero, governing, checkpoint, member_id)
         args.original_recovery_budget = {'monotonic': expiry.started, 'unix': expiry.started_unix}
-    if getattr(args, 'source_ack_partition_restart', False):
+    if getattr(args, 'publication_io_library', None):
+        from publication_io_fixture import PublicationIoRestart
+        node = next(node for node in rust_nodes if node['index'] == args.interrupt_rust_member)
+        recovery_fault = PublicationIoRestart(args, root, node,
+            endpoints[args.interrupt_rust_member], member_id, checkpoint)
+    elif getattr(args, 'source_ack_partition_restart', False):
         from source_ack_partition_fixture import SourceAckPartitionRestart
         node = next(node for node in rust_nodes if node['index'] == args.interrupt_rust_member)
         recovery_fault = SourceAckPartitionRestart(args, root, node,
@@ -157,8 +162,8 @@ async def recover_rotation_member(args, root, nodes, endpoints, lite_configs, ru
             # additional observation. Preserve the actual original acceptance
             # point, including nested cut evidence, before starting that stage.
             recovered['original_recovery_acceptance'] = copy.deepcopy({
-                'source_ack_fault': recovery_fault.source.receipt,
-                'source_ack_partition_restart': recovery_fault.receipt,
+                ('node_io_source' if getattr(args, 'publication_io_library', None) else 'source_ack_fault'): recovery_fault.source.receipt,
+                ('publication_io_restart' if getattr(args, 'publication_io_library', None) else 'source_ack_partition_restart'): recovery_fault.receipt,
                 'partition_restart': recovery_fault.partition.receipt,
                 'signer_expiry': expiry.receipt,
             })
@@ -517,6 +522,9 @@ async def run(args, profile, root, artifacts):
                     if args.source_retention_cut_library and index == args.interrupt_rust_member:
                         from source_retention_cut_fixture import retention_cut_environment
                         environment = retention_cut_environment(args, root)
+                        if args.publication_io_library:
+                            from publication_io_fixture import publication_io_environment
+                            environment = publication_io_environment(args, root)
                     if first_intent_cut is not None and index == 2:
                         environment = first_intent_cut.environment()
                     rust_nodes.append(dict(index=index, directory=directory,
@@ -795,7 +803,8 @@ async def run(args, profile, root, artifacts):
                             'signer_expiry': json.loads((root / 'signer-expiry/receipt.json').read_text()) if args.signer_expiry_member is not None else None,
                             'source_ack_fault': json.loads((root / 'source-ack-fault/receipt.json').read_text()) if args.source_ack_fault else None,
                             'source_ack_partition_restart': json.loads((root / 'source-ack-partition/receipt.json').read_text()) if args.source_ack_partition_restart else None,
-                            'source_retention_cut': json.loads((root / 'source-retention-cut/receipt.json').read_text()) if args.source_retention_cut_library else None,
+                            ('node_io_source' if args.publication_io_library else 'source_retention_cut'): json.loads((root / 'source-retention-cut/receipt.json').read_text()) if args.source_retention_cut_library else None,
+                            'publication_io_restart': json.loads((root / 'publication-io/receipt.json').read_text()) if args.publication_io_library else None,
                             'first_intent_cut': first_intent_cut.receipt if first_intent_cut is not None else None,
                             'network_fault': network_fault, 'weighted_quorum': weighted_quorum, 'initial_probe': initial_probe}
                 await asyncio.sleep(0.2)
@@ -860,6 +869,8 @@ def main():
         help='Explicitly combine source ACK IO failure with partition across original-DB restart')
     parser.add_argument('--source-ack-fault', choices=['sync-eio', 'write-enospc'])
     parser.add_argument('--source-ack-fault-library', type=Path)
+    parser.add_argument('--publication-io-library', type=Path,
+        help='Isolated native EIO at the exact retained Final acceptance body fsync, followed by partitioned restart')
     parser.add_argument('--source-retention-cut-library', type=Path)
     parser.add_argument('--source-retention-cut-point', choices=['after-fsync','before-write','after-partial-write'], default='after-fsync')
     parser.add_argument('--recovery-timeout', type=float, default=180)
@@ -889,9 +900,15 @@ def main():
         args.source_ack_fault_library = args.source_ack_fault_library.resolve()
     if args.source_retention_cut_point != 'after-fsync' and not args.source_retention_cut_library:
         raise SystemExit('An incomplete retention cut requires its explicit native library')
+    if args.publication_io_library:
+        if not (args.source_retention_cut_library and args.partition_restart) or args.source_ack_fault \
+                or args.source_ack_intent_stop or args.cold_bootstrap_body \
+                or args.source_retention_cut_point != 'after-fsync':
+            raise SystemExit('Node publication IO requires explicit synced retain and partition restart without ACK/intent/cold cuts')
+        args.publication_io_library = args.publication_io_library.resolve()
     if args.source_retention_cut_library:
         require_namespace()
-        if args.interrupt_rust_member is None or args.source_ack_fault or args.partition_restart or args.network_fault or args.additional_network_faults or args.prepare_genesis_only:
+        if args.interrupt_rust_member is None or args.source_ack_fault or (args.partition_restart and not args.publication_io_library) or args.network_fault or args.additional_network_faults or args.prepare_genesis_only:
             raise SystemExit('Source retention cut requires one interrupted Rust member and no other injected fault')
         args.source_retention_cut_library = args.source_retention_cut_library.resolve()
     if args.recovery_below_quorum and not args.partition_restart:
@@ -963,6 +980,8 @@ def main():
         artifacts[str(args.source_ack_fault_library)] = digest(args.source_ack_fault_library)
     if args.source_retention_cut_library:
         artifacts[str(args.source_retention_cut_library)] = digest(args.source_retention_cut_library)
+    if args.publication_io_library:
+        artifacts[str(args.publication_io_library)] = digest(args.publication_io_library)
     if args.network_fault or args.partition_restart:
         artifacts[str(args.socket_mark_library)] = digest(args.socket_mark_library)
     for item in manifest['binaries']:
@@ -1014,6 +1033,13 @@ def main():
     if args.source_retention_cut_library:
         for path in [driver.with_name('source_retention_cut_fixture.py'), driver.with_name('source_ack_fault_fixture.py'),
                 driver.parents[2] / 'rtos/src/tests/finality_retention_cut.c']:
+            artifacts[str(path)] = digest(path)
+            destination = args.output / 'fault-sources' / path.name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(path.read_bytes())
+    if args.publication_io_library:
+        for path in [driver.with_name('publication_io_fixture.py'),
+                driver.parents[2] / 'rtos/src/tests/publication_io_fault.c']:
             artifacts[str(path)] = digest(path)
             destination = args.output / 'fault-sources' / path.name
             destination.parent.mkdir(parents=True, exist_ok=True)

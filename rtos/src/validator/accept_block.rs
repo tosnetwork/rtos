@@ -1053,6 +1053,13 @@ impl AcceptedSessionBlock {
     pub fn already_present(&self) -> bool {
         self.already_present
     }
+    #[cfg(feature = "isolated-consensus-signing")]
+    pub(crate) fn authenticated_session_id(&self) -> &UInt256 {
+        match self.finality.as_ref() {
+            AcceptedFinality::Final { _verified, .. } => _verified.session_id(),
+            AcceptedFinality::Approval { _verified, .. } => _verified.session_id(),
+        }
+    }
     pub fn is_final(&self) -> bool {
         matches!(self.finality.as_ref(), AcceptedFinality::Final { .. })
     }

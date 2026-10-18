@@ -1315,6 +1315,8 @@ impl State {
                     .is_some()
                 {
                     self.fatal(error.to_string());
+                    #[cfg(all(target_os = "linux", feature = "isolated-consensus-signing"))]
+                    crate::publication_io_test_control::after_fatal(&accepted, &error)?;
                 }
                 return Err(error);
             }

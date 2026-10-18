@@ -70,6 +70,13 @@ static void publish_stop(const char *path, const char *point) {
     // The parent verifies actual stopped state, then kills this exact child.
     // Even an unexpected SIGCONT cannot let the commit rename proceed.
     if (syscall(SYS_kill, getpid(), SIGSTOP)) _exit(125);
+    // Only the two-stage acceptance fixture may resume a fully synced retain.
+    // Its parent removes the retain arm and installs the exact acceptance cut
+    // before SIGCONT. All incomplete-write cuts remain terminal until SIGKILL.
+    const char *resume = getenv("RTOS_TEST_RETAIN_CUT_RESUME_SYNCED");
+    const char *arm = getenv("RTOS_TEST_RETAIN_CUT_ARM");
+    if (!strcmp(point, "after-fsync") && resume && !strcmp(resume, "1")
+        && arm && access(arm, F_OK) && errno == ENOENT) return;
     for (;;) syscall(SYS_pause);
 }
 static void stop_after_sync(int fd) {

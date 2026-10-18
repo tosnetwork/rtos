@@ -79,3 +79,6 @@ mod repair_provenance;
 mod publication_dependency_leases;
 
 pub(crate) mod bounded_session_derivation;
+
+#[cfg(all(target_os = "linux", feature = "isolated-consensus-signing"))]
+pub(crate) mod publication_io_test_control;
