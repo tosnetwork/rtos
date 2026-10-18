@@ -411,6 +411,7 @@ pub(crate) struct FinalityIntentStore {
     namespace: PathBuf,
     mutation: Mutex<()>,
     durable_start: Mutex<Option<Vec<u8>>>,
+    legacy_output_count_cache: Mutex<Option<usize>>,
     unresolved: Mutex<Option<std::collections::HashSet<PathBuf>>>,
     output_cursor: std::sync::atomic::AtomicUsize,
     database_replay: Mutex<std::collections::HashMap<PathBuf, (SessionRecoveryRecord, Vec<u8>)>>,
@@ -423,6 +424,7 @@ impl FinalityIntentStore {
             namespace: namespace.to_owned(),
             mutation: Mutex::new(()),
             durable_start: Mutex::new(None),
+            legacy_output_count_cache: Mutex::new(None),
             unresolved: Mutex::new(None),
             output_cursor: std::sync::atomic::AtomicUsize::new(0),
             database_replay: Mutex::new(std::collections::HashMap::new()),
@@ -430,12 +432,19 @@ impl FinalityIntentStore {
             fail_resolve_once: std::sync::atomic::AtomicBool::new(false),
         }
     }
+    // Called under mutation before every operation that can change intent or
+    // output files, including attempts that later fail. The namespace owner is
+    // the only writer; a cold owner starts without a reusable count.
+    fn invalidate_legacy_output_count(&self) {
+        *self.legacy_output_count_cache.lock().unwrap() = None;
+    }
     #[cfg(test)]
     pub(crate) fn fail_resolution_once_for_test(&self) {
         self.fail_resolve_once.store(true, std::sync::atomic::Ordering::Release);
     }
     pub(crate) fn prepare(&self, has_existing_certificates: bool) -> Result<()> {
         let _guard = self.mutation.lock().unwrap();
+        self.invalidate_legacy_output_count();
         let directory = self.namespace.join(DIRECTORY);
         if !directory.exists() {
             if has_existing_certificates {
@@ -763,6 +772,7 @@ impl FinalityIntentStore {
         event: &crate::simplex_state::BlockFinalizedEvent,
     ) -> Result<()> {
         let _guard = self.mutation.lock().unwrap();
+        self.invalidate_legacy_output_count();
         let record = SessionRecoveryRecord::from_runtime(
             runtime,
             self.namespace.clone(),
@@ -855,6 +865,7 @@ impl FinalityIntentStore {
     }
     pub(crate) fn resolve(&self, id: &crate::block::RawCandidateId) -> Result<()> {
         let _guard = self.mutation.lock().unwrap();
+        self.invalidate_legacy_output_count();
         let directory = self.namespace.join(DIRECTORY);
         let path = directory.join(format!("{}-{}.json", id.slot.value(), id.hash.to_hex_string()));
         let resolved = path.with_extension("resolved");
@@ -889,6 +900,7 @@ impl FinalityIntentStore {
         certificates: &[crate::database::FinalCertRecord],
     ) -> Result<()> {
         let _guard = self.mutation.lock().unwrap();
+        self.invalidate_legacy_output_count();
         self.database_replay.lock().unwrap().clear();
         let mut torn = Vec::new();
         for path in self.paths()? {
