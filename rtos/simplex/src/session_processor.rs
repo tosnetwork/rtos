@@ -298,6 +298,8 @@ pub(crate) struct SessionProcessor {
     // Some(event): waiting for storage. None: the saved notification is queued.
     // Keep the key until actor dispatch so recovery cannot finish between them.
     pending_saved_finalizations: HashMap<RawCandidateId, Option<BlockFinalizedEvent>>,
+    /// Periodic fallback only; body/certificate arrivals still resume immediately.
+    next_finality_retry: SystemTime,
     /// Receiver for network communication
     receiver: ReceiverPtr,
     /// SimplexState FSM - core consensus state machine
@@ -575,6 +577,7 @@ impl SessionProcessor {
             task_queue,
             deferred_candidate_requests: Arc::new(Mutex::new(HashMap::new())),
             pending_saved_finalizations: HashMap::new(),
+            next_finality_retry: SystemTime::UNIX_EPOCH,
             receiver,
             simplex_state,
             // Consensus finalization aspect. Seeds the finalized-head + producer
@@ -1051,10 +1054,18 @@ impl SessionProcessor {
         self.process_simplex_events();
 
         if self.consensus.durable_pending_floor().is_some() {
-            self.with_consensus_backend(|consensus, backend| {
-                consensus.retry_pending_recursive_finalization(backend)
-            });
-            self.runtime.set_next_awake_time(now + Duration::from_millis(250));
+            // C++ attaches duplicate notifications to the existing InFlight
+            // conversion. Unrelated vote/callback traffic must not restart a
+            // full pending-source scan on every check_all invocation. Keep the
+            // existing fallback interval while dependency arrivals retain their
+            // immediate continuations.
+            if now >= self.next_finality_retry {
+                self.with_consensus_backend(|consensus, backend| {
+                    consensus.retry_pending_recursive_finalization(backend)
+                });
+                self.next_finality_retry = self.now() + Duration::from_millis(250);
+            }
+            self.runtime.set_next_awake_time(self.next_finality_retry);
         }
 
         // Keep receiver standstill slots aligned even when the FSM tracked

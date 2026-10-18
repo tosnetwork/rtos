@@ -4881,10 +4881,17 @@ fn test_has_real_candidate_body_returns_false_for_stub() {
         .unwrap()
         .candidate_hash_data_bytes = vec![1, 2, 3];
 
-    // Now should be true
+    assert!(
+        !fixture.processor.candidate_book().has_real_body(&candidate_id),
+        "hash metadata alone must not suppress body retrieval"
+    );
+    fixture.processor.candidate_book_mut().received_mut(&candidate_id).unwrap().data =
+        consensus_common::ConsensusCommonFactory::create_block_payload(
+            make_test_boc(b"candidate-body", BocFlags::Crc32),
+        );
     assert!(
         fixture.processor.candidate_book().has_real_body(&candidate_id),
-        "entry with non-empty candidate_hash_data_bytes must count as real body"
+        "metadata and actual body must count as present"
     );
 }
 
@@ -11897,6 +11904,8 @@ fn authenticated_observer_nonempty_query_emits_leader_evidence_after_pq_verifica
     let (runtime, transport, options) = crate::authenticated_fixture::runtime_with_members(
         nodes.iter().map(|node| node.descriptor.clone().unwrap()).collect(), observer,
     );
+    let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor)
+        .collect::<rtos_block::Result<Vec<_>>>().unwrap();
     let description = Arc::new(SessionDescription::new_with_runtime(
         &options, runtime.session_id().clone(), 1, &nodes, transport, runtime.shard(),
         SystemTime::now(), None, Some(&runtime),
@@ -12188,6 +12197,20 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain:
         assert!(sink.0.lock().unwrap().is_empty(), "failed retention cannot authorize node handoff");
         assert_eq!(processor.callbacks.finality_retention_attempts(), 1);
         assert!(processor.consensus.finalized_pending_body_contains(&candidate_id));
+        // Unrelated actor callbacks must not each restart the same blocked
+        // certificate conversion. The periodic fallback keeps its own horizon.
+        processor.set_time(SystemTime::now());
+        processor.check_all();
+        assert_eq!(processor.callbacks.finality_retention_attempts(), 2);
+        for _ in 0..16 {
+            processor.check_all();
+        }
+        assert_eq!(processor.callbacks.finality_retention_attempts(), 2,
+            "unrelated wakeups must join pending finalization between periodic retries");
+        processor.advance_time(Duration::from_millis(250));
+        processor.check_all();
+        assert_eq!(processor.callbacks.finality_retention_attempts(), 3,
+            "the original retry horizon must still retry failed certificate retention");
         std::fs::remove_file(&blocked_intents).unwrap();
         processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
     }
@@ -12197,7 +12220,7 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain:
     // C++ attaches a duplicate to its existing InFlight finalization. It does
     // not redo a successful SaveCertificate phase while the node WAL is held.
     processor.handle_block_finalized(event);
-    assert_eq!(processor.callbacks.finality_retention_attempts(), if fail_retain { 2 } else { 1 },
+    assert_eq!(processor.callbacks.finality_retention_attempts(), if fail_retain { 4 } else { 1 },
         "parent/WAL retries must reuse the completed C++ certificate-save phase");
     assert_eq!(sink.0.lock().unwrap().len(), 1);
     assert_eq!(processor.consensus.is_finalized_block(&candidate_id), upgrade);
