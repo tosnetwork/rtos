@@ -451,6 +451,7 @@ async def run(args, profile, root, artifacts):
 
     used, endpoints, nodes = set(), [], []
     rust_nodes, cpp_started, lite_configs = [], [], []
+    propagation_receiver = None
     first_intent_cut = None
     first_intent_task = None
     endpoint_names = [('rust' if args.rust_node and i in [2, 3, 5] else 'cpp') + f'-{i}' for i in range(6)]
@@ -509,6 +510,9 @@ async def run(args, profile, root, artifacts):
             _write_model(global_config, tos_api.Config_global(
                 dht=tos_api.Dht_config_global(static_nodes=tos_api.Dht_nodes(nodes=[dht.signed_address]), k=3, a=3),
                 validator=genesis.as_validator_config()))
+            from propagation_receiver_fixture import start_receiver
+            propagation_receiver = await start_receiver(args, profile, network, dht, nodes,
+                root, used, reserve_port, StartOptions)
             for index, node in enumerate(nodes):
                 if args.rust_node and index in [2, 3, 5]:
                     directory = root / f'rust-{index}'
@@ -549,6 +553,10 @@ async def run(args, profile, root, artifacts):
                 endpoints.append('http://' + address + '/jsonRPC')
                 write(root / 'processes.json', {'cpp': {str(i): n.process_id for i, n in cpp_started},
                     'rust': {str(n['index']): {'pid': n['process'].pid, 'start_ticks': n['start_ticks']} for n in rust_nodes}})
+            if propagation_receiver is not None:
+                registry = json.loads((root / 'processes.json').read_text())
+                registry['propagation_receivers'] = {'cpp-receiver': propagation_receiver.node.process_id}
+                write(root / 'processes.json', registry)
             write(root / 'rpc-endpoints.json', dict(zip(endpoint_names, endpoints)))
             histories = [{} for _ in nodes]
             governing_witnesses = {}
@@ -796,7 +804,12 @@ async def run(args, profile, root, artifacts):
                         if first_intent_task is not None:
                             await first_intent_task
                             first_intent_cut.qualify_rotation(epochs, member_id(2))
-                        return {'status': ('mixed_membership_rotation_observed' if args.rust_node
+                        receiver_receipt = None
+                        if propagation_receiver is not None:
+                            target = recovery['last_checkpoint'] if recovery else checked['block']
+                            receiver_receipt = await propagation_receiver.verify_checkpoint(target, rpc, identity)
+                        return {'propagation_receiver': receiver_receipt,
+                            'status': ('mixed_membership_rotation_observed' if args.rust_node
                                           else 'cpp_membership_rotation_observed'), 'epochs': epochs,
                             'all_six_applied_mc_states_match': True, 'independent_post_rotation_finality_qualified': True,
                             'mixed_rotation_qualified': bool(args.rust_node), 'election_rehearsal': False,
@@ -830,6 +843,11 @@ async def run(args, profile, root, artifacts):
                 write(root / 'cpp-shutdown.json', {str(index): value for index, value in stopped})
                 if any(not value['matches_pinned_tester_teardown'] for _, value in stopped) and sys.exception() is None:
                     raise RuntimeError('Owned C++ packet-fault teardown differs from pinned tester')
+            if propagation_receiver is not None:
+                _, stopped_receiver = await stop_cpp_with_receipt(6, propagation_receiver.node)
+                write(root / 'propagation-receiver-shutdown.json', stopped_receiver)
+                if not stopped_receiver['matches_pinned_tester_teardown'] and sys.exception() is None:
+                    raise RuntimeError('Nonvoting native receiver did not stop normally')
             if any(code != 0 for code in codes) and sys.exception() is None:
                 raise RuntimeError('Owned Rust rotation nodes did not stop normally')
 
@@ -971,11 +989,14 @@ def main():
             raise SystemExit('Declared surviving pair must equal the C++ quorum exactly')
     if 'initial_probe_pause' in profile:
         initial_probe_weights(profile)
+    from propagation_receiver_fixture import receiver_plan
+    receiver_plan(profile)
     manifest = json.loads((args.snapshot / 'manifest.json').read_text())
     require_cpp_baseline(manifest['cpp_source_commit'], profile)
+    receiver_helper = Path(__file__).with_name('propagation_receiver_fixture.py')
     baseline_policy = Path(__file__).with_name('cpp_baseline.py')
     artifacts = {str(args.block_checker): digest(args.block_checker), str(args.profile): digest(args.profile),
-        str(baseline_policy): digest(baseline_policy)}
+        str(baseline_policy): digest(baseline_policy), str(receiver_helper): digest(receiver_helper)}
     if args.rust_node:
         artifacts.update({str(path): digest(path) for path in [args.rust_node, args.validator_preparer]})
     if args.source_ack_fault:
