@@ -37,7 +37,15 @@ class ExpiredFullNodeAcceptance:
         records=text.splitlines();lines=[]
         def scoped(line):
             return re.search(r'(?:^|\s)session_id='+re.escape(self.session)+r'(?=[\s:]|$)',line) is not None
+        retired_constructor = 'Cannot start group: consensus key was retired in this process (construction drained=true); resetting session to Created for retry'
         for index,line in enumerate(records):
+            # A prior expired WC construction may retire the same custody key
+            # before MC admission. Accept only the complete constructor refusal
+            # adjacent to this exact current session, never a generic tombstone log.
+            if line == retired_constructor:
+                if index>0 and records[index-1].startswith('SESSION_LIFECYCLE: reset_after_failure ') and scoped(records[index-1]):
+                    lines.append(records[index-1]+'\n'+line)
+                continue
             if not any(reason in line for reason in reasons):continue
             if scoped(line):lines.append(line)
             elif index>0 and line.startswith('Cannot start group: ') and '(construction drained=true); resetting session to Created for retry' in line:

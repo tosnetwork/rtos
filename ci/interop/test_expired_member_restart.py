@@ -97,6 +97,21 @@ class ExpiredMemberRestartTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):ctx.refusal(text)
 
 
+    def test_current_session_retired_constructor_refusal_is_scoped_and_terminal(self):
+        ctx=passive.ExpiredFullNodeAcceptance(str,100,100,1000,'current')
+        scope='SESSION_LIFECYCLE: reset_after_failure shard=-1:8000000000000000 cc_seqno=1 session_id=current status=created -> retry (existing session ownership retained)'
+        error='Cannot start group: consensus key was retired in this process (construction drained=true); resetting session to Created for retry'
+        self.assertEqual(ctx.refusal(scope+'\n'+error),scope+'\n'+error)
+        for text in [error,
+                     'session_id=current consensus key was retired in this process',
+                     scope.replace('session_id=current','session_id=current-other')+'\n'+error,
+                     scope.replace('session_id=current','session_id=old')+'\n'+error,
+                     scope+'\nother event\n'+error,
+                     scope+'\n'+error.replace('drained=true','drained=false'),
+                     scope.replace('reset_after_failure','unrelated')+'\n'+error]:
+            with self.subTest(text=text), self.assertRaises(RuntimeError):ctx.refusal(text)
+
+
 class PendingIntentRecoveryTests(unittest.TestCase):
     def context(self, root):
         from pathlib import Path
