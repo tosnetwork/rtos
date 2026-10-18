@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from verify_first_intent_evidence import verify
+from verify_first_intent_evidence import verify, verify_references
 
 
 class FirstIntentEvidenceTests(unittest.TestCase):
@@ -63,6 +63,20 @@ class FirstIntentEvidenceTests(unittest.TestCase):
             self.write(root,cut,result)
             with self.assertRaisesRegex(ValueError, r"result\['first_intent_cut'\]"):
                 self.check(root)
+
+    def test_all_six_nodes_must_have_matching_full_state_references(self):
+        reference={'last': {'seqno': 7, 'root_hash': 'root', 'file_hash': 'file'},
+                   'init': {'seqno': 0, 'root_hash': 'genesis'}, 'state_root_hash': 'state'}
+        request={'reference': reference, 'all_references': {name: copy.deepcopy(reference)
+                 for name in ['cpp-0','cpp-1','cpp-4','rust-2','rust-3','rust-5']}}
+        verify_references(request)
+        for mutation in ['missing', 'extra', 'last', 'init', 'state_root_hash']:
+            with self.subTest(mutation=mutation):
+                altered=copy.deepcopy(request)
+                if mutation=='missing': del altered['all_references']['rust-2']
+                elif mutation=='extra': altered['all_references']['fake-peer']=reference
+                else: altered['all_references']['rust-2'][mutation]='different'
+                with self.assertRaises(ValueError): verify_references(altered)
 
     def test_existing_output_is_never_rewritten(self):
         with tempfile.TemporaryDirectory() as tmp:

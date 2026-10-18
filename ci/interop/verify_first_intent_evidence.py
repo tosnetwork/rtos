@@ -13,6 +13,17 @@ import subprocess
 from verify_intent_cut_evidence import require, verify_written_prefix
 
 
+
+def verify_references(request):
+    references = request.get('all_references', {})
+    require(set(references) == {'cpp-0', 'cpp-1', 'cpp-4', 'rust-2', 'rust-3', 'rust-5'},
+            'Missing or extra node in six-peer state references')
+    for reference in references.values():
+        require(all(reference[key] == request['reference'][key]
+                    for key in ['last', 'init', 'state_root_hash']),
+                'Six-peer block, genesis or applied state differs')
+
+
 def verify(evidence, *, output, genesis, point, product, fixture, native_checker, product_directory):
     require(point in ('before-write', 'after-partial-write'), 'Unsupported first-intent point')
     d, v = Path(evidence), Path(output)
@@ -103,8 +114,7 @@ def verify(evidence, *, output, genesis, point, product, fixture, native_checker
         request = read(sample)
         require(all((checked[k] for k in ['cell_hash_checked', 'file_hash_checked', 'header_identity_checked', 'state_update_matches_both'])), "Evidence check failed: all((checked[k] for k in ['cell_hash_checked', 'file_hash_checked', 'header_identity_checked', 'state_update_matches_both']))")
         require(checked['verified_final_certificates'] and all((cert['final_certificate_checked'] for cert in checked['verified_final_certificates'])), "Evidence check failed: checked['verified_final_certificates'] and all((cert['final_certificate_checked'] for cert in checked['verified_final_certificates']))")
-        for ref in request.get('all_references', {}).values():
-            require(all((ref[k] == request['reference'][k] for k in ['last', 'init', 'state_root_hash'])), "Evidence check failed: all((ref[k] == request['reference'][k] for k in ['last', 'init', 'state_root_hash']))")
+        verify_references(request)
         if request.get('workchain'):
             wc = checked['workchain_check']
             require(wc['all_four_states_match_block_update'] and wc['masterchain_anchor_checked'] and (len(wc['states']) == 4), "Evidence check failed: wc['all_four_states_match_block_update'] and wc['masterchain_anchor_checked'] and (len(wc['states']) == 4)")
