@@ -85,7 +85,7 @@ class PublicationIoNativeTests(unittest.TestCase):
                 if process.poll() is None: process.kill()
                 process.communicate()
 
-    def test_two_stage_interposers_resume_complete_retain_then_stop_exact_body(self):
+    def two_stage(self, early_continue=False):
         with tempfile.TemporaryDirectory(dir=self.temp.name) as directory:
             root=Path(directory); pending=root/'pending'; pending.mkdir()
             temporary=pending/('a'*64+'.tmp'); canonical=temporary.with_suffix('.json')
@@ -112,6 +112,16 @@ class PublicationIoNativeTests(unittest.TestCase):
             try:
                 stopped_at(root/'retain.marker')
                 self.assertEqual(temporary.read_bytes(),b'complete source'); self.assertFalse(canonical.exists())
+                if early_continue:
+                    # Model the issuing thread reaching the arm check before
+                    # the entire multithreaded process has entered group stop.
+                    process.send_signal(signal.SIGCONT)
+                    deadline=time.monotonic()+2
+                    while time.monotonic()<deadline:
+                        state=Path('/proc',str(process.pid),'status').read_text()
+                        if not any(line.startswith('State:') and line.split()[1]=='T' for line in state.splitlines()):break
+                        time.sleep(.01)
+                    self.assertFalse(canonical.exists(), 'armed retain advanced on an early continue')
                 st=body.stat()
                 (root/'target.native').write_text(f'{process.pid} {process.pid} {st.st_dev} {st.st_ino}\n{body}\n')
                 arm.unlink(); process.send_signal(signal.SIGCONT)
@@ -122,6 +132,9 @@ class PublicationIoNativeTests(unittest.TestCase):
             finally:
                 if process.poll() is None:process.kill()
                 process.communicate()
+
+    def test_two_stage_interposers_resume_complete_retain_then_stop_exact_body(self):self.two_stage()
+    def test_resume_rechecks_disarm_after_early_continue(self):self.two_stage(early_continue=True)
 
     def test_node_mode_returns_real_eio_to_caller_without_native_stop(self): self.exercise('return')
     def test_exact_fsync_delivers_eio_only_after_resume(self): self.exercise('exact')

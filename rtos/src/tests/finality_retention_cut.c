@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 static int selected_path(int fd, char path[PATH_MAX], int allow_empty) {
@@ -75,8 +76,16 @@ static void publish_stop(const char *path, const char *point) {
     // before SIGCONT. All incomplete-write cuts remain terminal until SIGKILL.
     const char *resume = getenv("RTOS_TEST_RETAIN_CUT_RESUME_SYNCED");
     const char *arm = getenv("RTOS_TEST_RETAIN_CUT_ARM");
-    if (!strcmp(point, "after-fsync") && resume && !strcmp(resume, "1")
-        && arm && access(arm, F_OK) && errno == ENOENT) return;
+    if (!strcmp(point, "after-fsync") && resume && !strcmp(resume, "1") && arm) {
+        // In a multithreaded process the issuer can continue briefly before
+        // group stop completes. Recheck disarm after SIGCONT; a one-shot check
+        // followed by pause can miss both disarm and the resume signal.
+        const struct timespec interval = { .tv_sec = 0, .tv_nsec = 10000000 };
+        for (;;) {
+            if (access(arm, F_OK) && errno == ENOENT) return;
+            syscall(SYS_nanosleep, &interval, NULL);
+        }
+    }
     for (;;) syscall(SYS_pause);
 }
 static void stop_after_sync(int fd) {
