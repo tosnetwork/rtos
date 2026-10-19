@@ -835,7 +835,7 @@ impl ConsensusOverlayListener for OverlayListenerImpl {
 
         // Drop candidates on the consensus overlay when block-sync is the canonical path
         // (C++ ref: `private-overlay.cpp` early-return when block sync is enabled)
-        if self.protocol.uses_block_sync()
+        if self.protocol.enable_block_sync()
             && source == consensus_common::BroadcastSource::ConsensusOverlay
             && is_candidate_payload(data)
         {
@@ -5135,7 +5135,7 @@ impl ReceiverWrapper {
     ) -> Result<ReceiverPtr> {
         let ids: Vec<crate::SimplexSessionNode> = ids.iter().cloned().map(Into::into).collect();
         if runtime.is_none() {
-            settings.protocol.admits_runtime()?;
+            settings.protocol.admits_unauthenticated_runtime()?;
         }
         if let Some(runtime) = runtime {
             if runtime.session_id() != &session_id
@@ -5220,7 +5220,7 @@ impl ReceiverWrapper {
             overlay_id.to_hex_string(),
             overlay_short_id,
             use_quic,
-            protocol.uses_block_sync(),
+            protocol.enable_block_sync(),
         );
 
         // Create task queues
@@ -5822,7 +5822,7 @@ mod protocol_broadcast_tests {
                     tag.to_le_bytes().to_vec(),
                 );
                 listener.on_broadcast(rtos_block::KeyId::from_data([1; 32]), &payload, source);
-                let expected = !(protocol.uses_block_sync()
+                let expected = !(protocol.enable_block_sync()
                     && source == consensus_common::BroadcastSource::ConsensusOverlay);
                 assert_eq!(
                     queues.task_receiver.try_recv().is_ok(),

@@ -561,3 +561,123 @@ async fn a_group_takes_only_the_signer_of_its_admitted_member() -> Result<()> {
         .is_err());
     teardown(manager).await
 }
+
+/// The production session factory, for every supported protocol: a validator
+/// session needs its custody signer, an observer session refuses one, and an
+/// observer exists only where the protocol puts observers in the private overlay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_session_factory_takes_a_signer_for_validators_only() -> Result<()> {
+    use consensus_common::session_runtime::{
+        AuthenticatedSessionRuntime, AuthorizedObserver, LocalAdmission, SessionNetworkPin,
+    };
+    for (protocol, seed) in [(0u8, 0x62u8), (1, 0x65), (2, 0x68)] {
+        let ours = Member::new(seed, 0)?;
+        let theirs = Member::new(seed + 1, 0)?;
+        let outside = Member::new(seed + 2, 0)?;
+        let custody = custody_of(&ours, &[(ours.store.clone(), 0)]);
+        let fixture = build_fixture(
+            &[&ours, &theirs],
+            &[outside.descriptor()],
+            protocol,
+            Some(custody.clone()),
+            &[&ours, &outside],
+        )
+        .await?;
+        let committee = masterchain_committee(&fixture)?;
+        let shard = ShardIdent::masterchain();
+        let manager = manager_of(&fixture);
+        let validator = manager
+            .simplex_session_runtime(
+                &fixture.state,
+                &shard,
+                0,
+                0,
+                0,
+                &committee,
+                Some(&ours.validator_id),
+                false,
+            )?
+            .ok_or_else(|| error!("protocol {protocol}: no validator admission"))?;
+        let options = SimplexSessionOptions {
+            protocol: validator.protocol(),
+            proto_version: validator.carrier_version(),
+            wire_profile: validator.wire_profile(),
+            slots_per_leader_window: validator.slots_per_leader_window(),
+            ..Default::default()
+        };
+        let root = tempfile::tempdir()?;
+        let create = |runtime: Arc<AuthenticatedSessionRuntime>,
+                      key: &PrivateKey,
+                      signer: Option<simplex::SessionSigner>| {
+            crate::validator::consensus::ConsensusFactory::create_simplex_authenticated_session(
+                &options,
+                runtime,
+                key,
+                root.path().to_string_lossy().to_string(),
+                consensus_common::ConsensusCommonFactory::create_dummy_overlay_manager(),
+                std::sync::Weak::<
+                    crate::validator::validator_session_listener::ValidatorSessionListener,
+                >::new(),
+                None,
+                None,
+                None,
+                signer,
+            )
+            .err()
+            .map(|failure| failure.to_string())
+        };
+        let refused = create(validator.clone(), &ours.transport, None)
+            .ok_or_else(|| error!("protocol {protocol}: a validator session without a signer"))?;
+        anyhow::ensure!(refused.contains("requires its consensus signer"), "{protocol}: {refused}");
+        let observers =
+            AuthorizedObserver::select(fixture.state.config_params()?, &committee, |d| {
+                d.validator_id().is_ok_and(|id| id == outside.validator_id)
+            })?;
+        anyhow::ensure!(observers.len() == 1, "protocol {protocol}: observer selection");
+        let observer = AuthenticatedSessionRuntime::from_authenticated_admission(
+            SessionNetworkPin {
+                global_id: fixture.state.state()?.global_id(),
+                zerostate: fixture.bootstrap.zerostate_id.clone(),
+            },
+            fixture.state.config_params()?,
+            rtos_api::session_identity::SessionCoordinates {
+                shard: &shard,
+                catchain_seqno: 0,
+                vertical_seqno: 0,
+                last_key_block_seqno: 0,
+                new_catchain_ids: false,
+            },
+            committee.clone(),
+            LocalAdmission::Observer(observers[0].clone()),
+        );
+        if protocol < 2 {
+            // Observers of protocols 0 and 1 are not private overlay members.
+            anyhow::ensure!(observer.is_err(), "protocol {protocol}: an observer runtime");
+            teardown(manager).await?;
+            continue;
+        }
+        let observer = Arc::new(observer?);
+        anyhow::ensure!(observer.local_role() == LocalRole::Observer);
+        let signer = custody.read(|custody| {
+            simplex::SessionSigner::from_custody_match(
+                custody,
+                &ours.validator_id,
+                &committee[0],
+                1,
+            )
+            .or_else(|_| {
+                simplex::SessionSigner::from_custody_match(
+                    custody,
+                    &ours.validator_id,
+                    &committee[1],
+                    1,
+                )
+            })
+        })?;
+        let refused = create(observer, &outside.transport, Some(signer))
+            .ok_or_else(|| error!("an observer session took a signer"))?;
+        anyhow::ensure!(refused.contains("takes no consensus signer"), "{refused}");
+        teardown(manager).await?;
+    }
+    Ok(())
+}

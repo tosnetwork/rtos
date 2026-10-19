@@ -2723,7 +2723,7 @@ impl ValidatorManagerImpl {
             // C++ parity: manager.cpp builds overlay_members + block-sync-overlay.cpp
             // builds authorized_keys from bus.validator_set (current set only)
             // Network requires observers - fail loudly if we can't honour it.
-            let block_sync_params = if opts.protocol.uses_block_sync() {
+            let block_sync_params = if opts.protocol.enable_block_sync() {
                 let p = consensus_common::BlockSyncOverlayParams::from_config(
                     config_params,
                     cfg.slots_per_leader_window,

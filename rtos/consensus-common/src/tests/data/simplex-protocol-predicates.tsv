@@ -1,0 +1,7 @@
+version	supported	enable_block_sync	use_new_db_names	observers_in_private_overlay	enable_plumtree_broadcast
+0	1	0	0	0	0
+1	1	1	0	0	0
+2	1	0	1	1	1
+3	0	0	1	1	1
+4	0	0	1	1	1
+max_supported	2

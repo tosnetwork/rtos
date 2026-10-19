@@ -2244,13 +2244,17 @@ fn test_receiver_typed_protocol_and_membership_fail_before_overlay_start() {
         assert_eq!(overlay.0.load(Ordering::SeqCst), 0);
     }
     let error = create(vec![node], SimplexProtocol::PrivateObserversPlumtree, &key).err().unwrap();
-    assert!(error.to_string().contains("protocol version 2 runtime"), "{error}");
+    assert!(error.to_string().contains("2 requires an authenticated runtime"), "{error}");
     assert_eq!(overlay.0.load(Ordering::SeqCst), 0);
     let options = crate::SessionOptions {
         protocol: SimplexProtocol::PrivateObserversPlumtree,
         ..Default::default()
     };
-    assert!(options.validate().unwrap_err().to_string().contains("protocol version 2 runtime"));
+    let error = options.validate().unwrap_err().to_string();
+    assert!(error.contains("2 requires an authenticated runtime"), "{error}");
+    for protocol in [SimplexProtocol::Private, SimplexProtocol::BlockSync] {
+        assert!(crate::SessionOptions { protocol, ..Default::default() }.validate().is_ok());
+    }
 }
 
 #[test]

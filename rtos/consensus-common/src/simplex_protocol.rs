@@ -25,12 +25,18 @@ impl TryFrom<u32> for SimplexProtocol {
             0 => Ok(Self::Private),
             1 => Ok(Self::BlockSync),
             2 => Ok(Self::PrivateObserversPlumtree),
-            _ => fail!("Unsupported Simplex protocol version {version}"),
+            _ => fail!(
+                "Unsupported Simplex protocol version {version}: this build supports up to {}",
+                Self::MAX_SUPPORTED_PROTOCOL_VERSION
+            ),
         }
     }
 }
 
 impl SimplexProtocol {
+    /// The newest protocol version this build runs; a newer one is refused.
+    pub const MAX_SUPPORTED_PROTOCOL_VERSION: u32 = 2;
+
     pub fn version(self) -> u32 {
         match self {
             Self::Private => 0,
@@ -39,13 +45,34 @@ impl SimplexProtocol {
         }
     }
 
-    pub fn uses_block_sync(self) -> bool {
-        self == Self::BlockSync
+    /// Observers follow the session through the separate block-sync overlay.
+    pub fn enable_block_sync(self) -> bool {
+        self.version() == 1
     }
 
-    pub fn admits_runtime(self) -> Result<()> {
-        if self == Self::PrivateObserversPlumtree {
-            fail!("Simplex protocol version 2 runtime is not implemented");
+    /// Observers are members of the private consensus overlay.
+    pub fn observers_in_private_overlay(self) -> bool {
+        self.version() >= 2
+    }
+
+    /// Public and fast-sync overlays may use Plumtree broadcasts.
+    pub fn enable_plumtree_broadcast(self) -> bool {
+        self.version() >= 2
+    }
+
+    /// The private overlay membership is the union of the authenticated
+    /// previous, current and next total sets, which only an authenticated
+    /// runtime carries. This describes how membership is built; it admits no
+    /// validator or observer by itself.
+    pub fn requires_authenticated_runtime(self) -> bool {
+        self.observers_in_private_overlay()
+    }
+
+    /// Refuse to build a session of this protocol without an authenticated
+    /// runtime, which could only guess the observer membership.
+    pub fn admits_unauthenticated_runtime(self) -> Result<()> {
+        if self.requires_authenticated_runtime() {
+            fail!("Simplex protocol version {} requires an authenticated runtime", self.version());
         }
         Ok(())
     }
@@ -123,7 +150,7 @@ pub struct SimplexNamespace<'a> {
 
 impl SimplexNamespace<'_> {
     pub fn runtime_directory(&self, root: &str) -> Result<String> {
-        self.protocol.admits_runtime()?;
+        self.protocol.admits_unauthenticated_runtime()?;
         if self.role == OverlayMemberRole::Observer {
             return Err(error!("Block-sync observers have no consensus database"));
         }
@@ -162,13 +189,47 @@ mod tests {
         assert!(SimplexMembership::new(&[], [key(1)]).is_err());
     }
 
+    /// The predicate table printed by a driver built against the reference
+    /// node's NewConsensusConfig.
     #[test]
-    fn recognized_v2_and_unknown_versions_never_select_a_runtime_directory() {
+    fn protocol_predicates_match_the_reference_table() {
+        let table = include_str!("tests/data/simplex-protocol-predicates.tsv");
+        let mut rows = 0;
+        for line in table.lines().skip(1) {
+            let fields: Vec<_> = line.split('\t').collect();
+            if fields[0] == "max_supported" {
+                assert_eq!(
+                    fields[1].parse::<u32>().unwrap(),
+                    SimplexProtocol::MAX_SUPPORTED_PROTOCOL_VERSION
+                );
+                continue;
+            }
+            let version: u32 = fields[0].parse().unwrap();
+            let flag = |index: usize| fields[index] == "1";
+            rows += 1;
+            match SimplexProtocol::try_from(version) {
+                Ok(protocol) => {
+                    assert!(flag(1), "version {version} is supported here only");
+                    assert_eq!(protocol.version(), version);
+                    assert_eq!(protocol.enable_block_sync(), flag(2), "version {version}");
+                    assert_eq!(protocol.observers_in_private_overlay(), flag(4), "{version}");
+                    assert_eq!(protocol.enable_plumtree_broadcast(), flag(5), "{version}");
+                    assert_eq!(protocol.requires_authenticated_runtime(), flag(4));
+                    assert_eq!(protocol.admits_unauthenticated_runtime().is_ok(), !flag(4));
+                }
+                Err(_) => assert!(!flag(1), "version {version} is supported by the reference"),
+            }
+        }
+        assert_eq!(rows, 5);
+    }
+
+    #[test]
+    fn unauthenticated_v2_and_unknown_versions_never_select_a_runtime_directory() {
         let shard = ShardIdent::masterchain();
         let session = UInt256::from([0x12; 32]);
         for version in 0..=2 {
             let protocol = SimplexProtocol::try_from(version).unwrap();
-            assert_eq!(protocol.uses_block_sync(), version == 1);
+            assert_eq!(protocol.enable_block_sync(), version == 1);
             let namespace = SimplexNamespace {
                 protocol,
                 role: OverlayMemberRole::Validator(0),
@@ -177,7 +238,8 @@ mod tests {
                 session_id: &session,
             };
             if version == 2 {
-                assert!(namespace.runtime_directory("/isolated").is_err());
+                let error = namespace.runtime_directory("/isolated").unwrap_err().to_string();
+                assert!(error.contains("requires an authenticated runtime"), "{error}");
             } else {
                 assert_eq!(
                     namespace.runtime_directory("/isolated").unwrap(),

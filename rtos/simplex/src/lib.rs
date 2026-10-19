@@ -631,7 +631,7 @@ impl SessionOptions {
     }
     /// Validate options and return error if invalid
     pub fn validate(&self) -> Result<()> {
-        self.protocol.admits_runtime()?;
+        self.protocol.admits_unauthenticated_runtime()?;
         self.validate_fields()
     }
 
