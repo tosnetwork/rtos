@@ -5,7 +5,12 @@
  * See the LICENSE file in the root of this repository.
  */
 
+use super::privacy::{
+    BroadcastCheckResult, BroadcastVerifier, OverlayCertificate, OverlayPrivacyRules,
+};
 use crate::rldp::{RaptorqDecoder, RaptorqEncoder};
+#[cfg(test)]
+use rtos_api::ton::overlay::certificateid::CertificateId;
 use rtos_api::{
     serialize_boxed,
     ton::{
@@ -17,7 +22,6 @@ use rtos_api::{
             },
             broadcast_plumtree_fec::{id::Id as FecId, tosign::ToSign as FecToSign},
             broadcast_plumtree_simple::tosign::ToSign as SimpleToSign,
-            certificateid::{CertificateId, CertificateIdV2},
             Broadcast, Certificate,
         },
         rpc::overlay::RepairPlumtreePart,
@@ -95,78 +99,52 @@ impl PlumtreeConfig {
         Ok(())
     }
 
-    fn directly_allowed(&self, key: &[u8; 32], size: usize, any_sender: bool) -> bool {
-        match self.authorized_keys.get(key) {
-            Some(cap) => size <= *cap,
-            None => !any_sender && size <= self.max_untrusted_size && self.untrusted_flags & 3 == 3,
-        }
+    /// The overlay privacy rules this transport policy installs.
+    fn rules(&self) -> OverlayPrivacyRules {
+        OverlayPrivacyRules::new(
+            u32::try_from(self.max_untrusted_size).unwrap_or(u32::MAX),
+            self.untrusted_flags,
+            self.authorized_keys
+                .iter()
+                .map(|(key, cap)| (*key, u32::try_from(*cap).unwrap_or(u32::MAX)))
+                .collect(),
+        )
     }
 
+    /// Every Plumtree carrier, simple included, is admitted as FEC and only
+    /// with an `Allowed` source verdict from the common verifier.
+    #[allow(clippy::too_many_arguments)]
     fn authorize(
         &self,
+        verifier: &BroadcastVerifier,
         overlay: &[u8; 32],
         key: &Arc<dyn KeyOption>,
         cert: &Certificate,
         size: usize,
         any_sender: bool,
         now: f64,
+        message_from: Option<&Arc<KeyId>>,
     ) -> Result<()> {
         if size == 0 || size > MAX_PLUMTREE_PAYLOAD {
             fail!("Invalid Plumtree admission size");
         }
-        if self.directly_allowed(key.id().data(), size, any_sender) {
-            return Ok(());
+        let cert = OverlayCertificate::from_tl(cert)?;
+        let verdict = verifier.check_source_eligible_at(
+            &self.rules(),
+            self.fixed_members,
+            overlay,
+            key.id().data(),
+            cert.as_ref(),
+            size as u32,
+            true,
+            any_sender,
+            message_from,
+            now as i32,
+            Instant::now(),
+        );
+        if verdict != BroadcastCheckResult::Allowed {
+            fail!("Plumtree source is not allowed");
         }
-        if self.fixed_members {
-            fail!("Plumtree source is not authorized");
-        }
-        let (issuer, expiry, max_size, flags, signature) = match cert {
-            Certificate::Overlay_Certificate(c) => (
-                &c.issued_by,
-                c.expire_at,
-                c.max_size,
-                2 | if c.max_size > 768 { 1 } else { 0 },
-                &c.signature,
-            ),
-            Certificate::Overlay_CertificateV2(c) => {
-                (&c.issued_by, c.expire_at, c.max_size, c.flags as u32, &c.signature)
-            }
-            Certificate::Overlay_EmptyCertificate => fail!("Missing Plumtree source certificate"),
-        };
-        let issuer: Arc<dyn KeyOption> = issuer.try_into()?;
-        // All Plumtree carriers, including simple, require AllowFec + Trusted.
-        if (expiry as f64) < now.floor()
-            || max_size <= 0
-            || size > max_size as usize
-            || flags & 3 != 3
-            || !self.authorized_keys.get(issuer.id().data()).is_some_and(|cap| size <= *cap)
-        {
-            fail!("Ineligible Plumtree source certificate");
-        }
-        let default_flags = 2 | if max_size > 768 { 1 } else { 0 };
-        let preimage = if flags == default_flags {
-            serialize_boxed(
-                &CertificateId {
-                    overlay_id: UInt256::with_array(*overlay),
-                    node: UInt256::with_array(*key.id().data()),
-                    expire_at: expiry,
-                    max_size,
-                }
-                .into_boxed(),
-            )?
-        } else {
-            serialize_boxed(
-                &CertificateIdV2 {
-                    overlay_id: UInt256::with_array(*overlay),
-                    node: UInt256::with_array(*key.id().data()),
-                    expire_at: expiry,
-                    max_size,
-                    flags: flags as i32,
-                }
-                .into_boxed(),
-            )?
-        };
-        issuer.verify(&preimage, signature)?;
         Ok(())
     }
 }
@@ -253,10 +231,12 @@ struct Auth {
     signature: Vec<u8>,
 }
 impl Auth {
+    #[allow(clippy::too_many_arguments)]
     fn verify(
         &self,
         key: PartKey,
         policy: &PlumtreeConfig,
+        verifier: &BroadcastVerifier,
         overlay: &[u8; 32],
         admission_size: usize,
         any_sender: bool,
@@ -271,7 +251,16 @@ impl Auth {
             fail!("Plumtree needs a transport Ed25519 key");
         }
         let src: Arc<dyn KeyOption> = (&self.src).try_into()?;
-        policy.authorize(overlay, &src, &self.cert, admission_size, any_sender, now)?;
+        policy.authorize(
+            verifier,
+            overlay,
+            &src,
+            &self.cert,
+            admission_size,
+            any_sender,
+            now,
+            None,
+        )?;
         src.verify(&key.preimage(self.timestamp, self.size, self.hash)?, &self.signature)?;
         Ok(src.id().clone())
     }
@@ -335,6 +324,7 @@ pub(crate) enum Action {
 /// under this state lock; actions are executed after releasing it.
 pub(crate) struct Engine {
     policy: PlumtreeConfig,
+    verifier: Arc<BroadcastVerifier>,
     overlay: [u8; 32],
     states: BTreeMap<[u8; 32], BroadcastState>,
     missing: BTreeMap<PartKey, Missing>,
@@ -343,10 +333,21 @@ pub(crate) struct Engine {
     outstanding: BTreeMap<(PartKey, [u8; 32]), usize>,
 }
 impl Engine {
+    #[cfg(test)]
     pub fn new(policy: PlumtreeConfig, overlay: [u8; 32]) -> Result<Self> {
+        Self::with_verifier(policy, overlay, Arc::new(BroadcastVerifier::default()))
+    }
+    /// The verifier is the overlay's common one, so certificate checks share
+    /// its issuer limiters and signature rejections.
+    pub fn with_verifier(
+        policy: PlumtreeConfig,
+        overlay: [u8; 32],
+        verifier: Arc<BroadcastVerifier>,
+    ) -> Result<Self> {
         policy.validate()?;
         Ok(Self {
             policy,
+            verifier,
             overlay,
             states: BTreeMap::new(),
             missing: BTreeMap::new(),
@@ -501,7 +502,15 @@ impl Engine {
                 .find(|(p, auth)| {
                     !missing.tried.contains(*p)
                         && auth
-                            .verify(*key, &self.policy, &self.overlay, auth.size, false, now)
+                            .verify(
+                                *key,
+                                &self.policy,
+                                &self.verifier,
+                                &self.overlay,
+                                auth.size,
+                                false,
+                                now,
+                            )
                             .is_ok()
                 })
                 .map(|(p, _)| *p)
@@ -600,7 +609,15 @@ impl Engine {
                     hash: *m.data_hash.as_array(),
                     signature: m.signature.to_vec(),
                 };
-                auth.verify(key, &self.policy, &self.overlay, auth.size, false, now)?;
+                auth.verify(
+                    key,
+                    &self.policy,
+                    &self.verifier,
+                    &self.overlay,
+                    auth.size,
+                    false,
+                    now,
+                )?;
                 let eager_empty = self.slots[key.tree as usize].eager.is_empty();
                 let missing = self.missing.entry(key).or_insert_with(|| Missing {
                     created: mono,
@@ -741,8 +758,15 @@ impl Engine {
             self.slots[key.tree as usize].eager.remove(&peer);
             return Ok(vec![Self::control(key, peer, now, false)]);
         }
-        let source =
-            auth.verify(key, &self.policy, &self.overlay, full_size, flags & 1 != 0, now)?;
+        let source = auth.verify(
+            key,
+            &self.policy,
+            &self.verifier,
+            &self.overlay,
+            full_size,
+            flags & 1 != 0,
+            now,
+        )?;
         let wire_size = serialize_boxed(&message)?.len();
         // Account decoder input/output reservation as well as every retained TL carrier.
         let reserve = wire_size + if self.states.contains_key(&key.id) { 0 } else { full_size * 3 };
@@ -871,6 +895,7 @@ impl Engine {
             state.parts[&key.part].auth.verify(
                 *key,
                 &self.policy,
+                &self.verifier,
                 &self.overlay,
                 state.full_size,
                 flags & 1 != 0,
@@ -914,12 +939,14 @@ impl Engine {
             fail!("Invalid Plumtree send size");
         }
         self.policy.authorize(
+            &self.verifier,
             &self.overlay,
             signer,
             &certificate,
             data.len(),
             flags & 1 != 0,
             now,
+            None,
         )?;
         if serialize_boxed(&certificate)?.len() > MAX_CERT {
             fail!("Oversized Plumtree certificate");
@@ -1573,17 +1600,22 @@ mod tests {
         .into_boxed();
         let mut cfg = policy(&issuer);
         cfg.fixed_members = false;
-        cfg.authorize(&overlay, &signer, &cert, 100, false, now).unwrap();
-        assert!(cfg.authorize(&[8; 32], &signer, &cert, 100, false, now).is_err());
-        assert!(cfg.authorize(&overlay, &signer, &cert, 1001, false, now).is_err());
-        assert!(cfg.authorize(&overlay, &signer, &cert, 100, false, now + 4.0).is_err());
+        let verifier = BroadcastVerifier::default();
+        let authorize =
+            |cfg: &PlumtreeConfig, overlay: &[u8; 32], cert: &Certificate, size, now| {
+                cfg.authorize(&verifier, overlay, &signer, cert, size, false, now, None)
+            };
+        authorize(&cfg, &overlay, &cert, 100, now).unwrap();
+        assert!(authorize(&cfg, &[8; 32], &cert, 100, now).is_err());
+        assert!(authorize(&cfg, &overlay, &cert, 1001, now).is_err());
+        assert!(authorize(&cfg, &overlay, &cert, 100, now + 4.0).is_err());
         let mut no_trust = cert.clone();
         if let Certificate::Overlay_CertificateV2(c) = &mut no_trust {
             c.flags = 1;
         }
-        assert!(cfg.authorize(&overlay, &signer, &no_trust, 100, false, now).is_err());
+        assert!(authorize(&cfg, &overlay, &no_trust, 100, now).is_err());
         cfg.fixed_members = true;
-        assert!(cfg.authorize(&overlay, &signer, &cert, 100, false, now).is_err());
+        assert!(authorize(&cfg, &overlay, &cert, 100, now).is_err());
     }
 }
 

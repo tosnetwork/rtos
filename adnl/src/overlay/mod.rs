@@ -84,6 +84,7 @@ use std::{
 
 mod broadcast;
 mod plumtree;
+mod privacy;
 use broadcast::{
     BroadcastData, BroadcastFecProtocol, BroadcastId, BroadcastProtocol, BroadcastRecvContext,
     BroadcastSendContext, BroadcastSendMethod, BroadcastSimpleProtocol,
@@ -91,6 +92,11 @@ use broadcast::{
     OwnedBroadcast,
 };
 pub use broadcast::{BroadcastRecvInfo, BroadcastSendInfo};
+pub use privacy::{
+    BroadcastCheckResult, OverlayCertificate, OverlayPrivacyRules, BROADCAST_FLAG_ANY_SENDER,
+    BROADCAST_FLAG_FIXED_NEIGHBOURS, CERTIFICATE_FLAG_ALLOW_FEC, CERTIFICATE_FLAG_TRUSTED,
+    MAX_FEC_BROADCAST_SIZE, MAX_SIMPLE_BROADCAST_SIZE,
+};
 
 /// Owned readiness lease for one concrete overlay generation. Dropping it
 /// closes bounded broadcast admission; recreating an overlay creates a new queue.
@@ -572,6 +578,8 @@ declare_counted!(
         overlay_id: Arc<OverlayShortId>,
         owned_broadcasts: lockfree::map::Map<BroadcastId, OwnedBroadcast>,
         plumtree: OnceLock<PlumtreeTransport>,
+        // Common broadcast verifier: issuer limiters and signature rejections
+        verifier: Arc<privacy::BroadcastVerifier>,
         // Peers waiting for ADNL address resolution before being added to known_peers
         pending_peers: lockfree::queue::Queue<Arc<KeyId>>,
         purge_broadcasts: lockfree::queue::Queue<BroadcastId>,
@@ -2426,6 +2434,7 @@ impl OverlayNode {
             overlay_type,
             owned_broadcasts: lockfree::map::Map::new(),
             plumtree: OnceLock::new(),
+            verifier: Arc::new(privacy::BroadcastVerifier::default()),
             pending_peers: lockfree::queue::Queue::new(),
             purge_broadcasts: lockfree::queue::Queue::new(),
             purge_broadcasts_count: AtomicU32::new(0),
@@ -3421,7 +3430,8 @@ impl OverlayNode {
             fail!("Plumtree membership envelope exceeds its authenticated wire budget");
         }
         let original_sender = config.original_sender;
-        let engine = plumtree::Engine::new(config, *overlay_id.data())?;
+        let engine =
+            plumtree::Engine::with_verifier(config, *overlay_id.data(), overlay.verifier.clone())?;
         let local = overlay.overlay_key().unwrap_or(&self.node_key).id().clone();
         overlay.plumtree.set(PlumtreeTransport { quic, engine: std::sync::Mutex::new(engine), local, original_sender, stopped: std::sync::atomic::AtomicBool::new(false) })
             .map_err(|_| error!("Plumtree policy is already installed; recreate the overlay to change its authority"))?;
