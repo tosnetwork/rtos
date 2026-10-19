@@ -10,6 +10,16 @@ use rtos_pq_crypto::{MAX_CONTEXT_BYTES, MAX_MESSAGE_BYTES, PUBLIC_KEY_BYTES, SIG
 const BASE_GAS: i64 = 50_000;
 const CHUNK_BYTES: usize = 127;
 
+/// First global version with PQCHECKSIG_MLDSA44 (F93100).
+pub const PQ_MLDSA44_MIN_VERSION: u32 = 16;
+/// First global version with PQCHECKSIG_FALCON512_PADDED (F93101). Suite 2 of
+/// PQCHECKSIG_SUITE shares this gate.
+pub const PQ_FALCON512_MIN_VERSION: u32 = 16;
+/// First global version with PQCHECKSIG_SUITE (F93102).
+pub const PQ_SUITE_MIN_VERSION: u32 = 16;
+/// First global version with LMSCHECKFEEHASH (F93103).
+pub const PQ_LMS_FEE_HASH_MIN_VERSION: u32 = 16;
+
 fn read_bytes(engine: &mut Engine, cell: Cell, limit: usize) -> Result<Vec<u8>> {
     read_bytes_priced(engine, cell, limit, 1)
 }
@@ -58,7 +68,7 @@ pub(super) fn execute_pq_mldsa44(engine: &mut Engine) -> Status {
     // Preserve historical exception metering before activation. From v4 the
     // invalid-instruction charge can exhaust gas before exception dispatch;
     // older versions charge the exception too before detecting exhaustion.
-    if engine.block_version() < 16 {
+    if engine.block_version() < PQ_MLDSA44_MIN_VERSION {
         return engine.reject_unavailable_instruction();
     }
     engine.load_instruction(Instruction::new("PQCHECKSIG_MLDSA44"))?;
@@ -93,7 +103,7 @@ pub(super) fn execute_pq_mldsa44(engine: &mut Engine) -> Status {
 
 pub(super) fn execute_pq_falcon512(engine: &mut Engine) -> Status {
     use rtos_pq_crypto::falcon512::{MAX_MESSAGE_BYTES, PUBLIC_KEY_BYTES, SIGNATURE_BYTES};
-    if engine.block_version() < 19 {
+    if engine.block_version() < PQ_FALCON512_MIN_VERSION {
         return engine.reject_unavailable_instruction();
     }
     engine.load_instruction(Instruction::new("PQCHECKSIG_FALCON512_PADDED"))?;

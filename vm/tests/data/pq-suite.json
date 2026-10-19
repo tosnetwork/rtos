@@ -221,7 +221,7 @@
     },
     {
       "name": "t0-s2-valid",
-      "version": 19,
+      "version": 16,
       "gas": 1000000,
       "ignore": false,
       "repeats": 1,
@@ -245,7 +245,7 @@
     },
     {
       "name": "t0-s2-bitflip",
-      "version": 19,
+      "version": 16,
       "gas": 1000000,
       "ignore": false,
       "repeats": 1,
@@ -269,7 +269,7 @@
     },
     {
       "name": "t0-s2-nonempty-context",
-      "version": 19,
+      "version": 16,
       "gas": 1000000,
       "ignore": false,
       "repeats": 1,
@@ -292,8 +292,8 @@
       ]
     },
     {
-      "name": "t0-s2-refused-at-genesis",
-      "version": 18,
+      "name": "t0-s2-refused-before-genesis",
+      "version": 15,
       "gas": 1000000,
       "ignore": false,
       "repeats": 1,
@@ -306,8 +306,8 @@
       ],
       "program": null,
       "expected": [
-        5,
-        84,
+        6,
+        60,
         99,
         0,
         "-",
@@ -7603,12 +7603,12 @@
       "program": null,
       "expected": [
         -14,
-        84,
+        20034,
         99,
         0,
         "-",
         "-",
-        3
+        2
       ]
     },
     {
@@ -7627,12 +7627,12 @@
       "program": null,
       "expected": [
         -14,
-        84,
+        20034,
         99,
         0,
         "-",
         "-",
-        3
+        2
       ]
     },
     {
@@ -7650,8 +7650,8 @@
       ],
       "program": null,
       "expected": [
-        5,
-        84,
+        -14,
+        20034,
         99,
         0,
         "-",
@@ -7674,12 +7674,12 @@
       ],
       "program": null,
       "expected": [
-        5,
-        84,
-        99,
         0,
-        "-",
-        "-",
+        23299,
+        -1,
+        1,
+        "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
         2
       ]
     },
@@ -7795,12 +7795,12 @@
       "program": null,
       "expected": [
         -14,
-        84,
+        20034,
         99,
         0,
         "-",
         "-",
-        3
+        2
       ]
     },
     {
@@ -7819,12 +7819,12 @@
       "program": null,
       "expected": [
         -14,
-        84,
+        20034,
         99,
         0,
         "-",
         "-",
-        3
+        2
       ]
     },
     {
@@ -7842,8 +7842,8 @@
       ],
       "program": null,
       "expected": [
-        5,
-        84,
+        -14,
+        20034,
         99,
         0,
         "-",
@@ -7866,12 +7866,12 @@
       ],
       "program": null,
       "expected": [
-        5,
-        84,
-        99,
         0,
-        "-",
-        "-",
+        23299,
+        -1,
+        1,
+        "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
         2
       ]
     },
@@ -7987,12 +7987,12 @@
       "program": null,
       "expected": [
         -14,
-        84,
+        20034,
         99,
         0,
         "-",
         "-",
-        3
+        2
       ]
     },
     {
@@ -8011,12 +8011,12 @@
       "program": null,
       "expected": [
         -14,
-        84,
+        20034,
         99,
         0,
         "-",
         "-",
-        3
+        2
       ]
     },
     {
@@ -8034,8 +8034,8 @@
       ],
       "program": null,
       "expected": [
-        5,
-        84,
+        -14,
+        20034,
         99,
         0,
         "-",
@@ -8058,12 +8058,12 @@
       ],
       "program": null,
       "expected": [
-        5,
-        84,
-        99,
         0,
-        "-",
-        "-",
+        23299,
+        -1,
+        1,
+        "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
         2
       ]
     },
@@ -11874,12 +11874,12 @@
       ],
       "program": 55,
       "expected": [
-        5,
-        102,
-        99,
         0,
-        "-",
-        "-",
+        23317,
+        -1,
+        1,
+        "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
         3
       ]
     },
@@ -11898,12 +11898,12 @@
       ],
       "program": 55,
       "expected": [
-        5,
-        102,
-        99,
         0,
-        "-",
-        "-",
+        23317,
+        -1,
+        1,
+        "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
         3
       ]
     },
@@ -23693,7 +23693,7 @@
     },
     {
       "name": "t0-s2-valid-gas23298",
-      "version": 19,
+      "version": 16,
       "gas": 23298,
       "ignore": false,
       "repeats": 1,
@@ -23717,7 +23717,7 @@
     },
     {
       "name": "t0-s2-valid-gas23299",
-      "version": 19,
+      "version": 16,
       "gas": 23299,
       "ignore": false,
       "repeats": 1,
@@ -23741,7 +23741,7 @@
     },
     {
       "name": "t0-s2-valid-gas23300",
-      "version": 19,
+      "version": 16,
       "gas": 23300,
       "ignore": false,
       "repeats": 1,
@@ -23765,7 +23765,7 @@
     },
     {
       "name": "t0-s2-bitflip-gas23298",
-      "version": 19,
+      "version": 16,
       "gas": 23298,
       "ignore": false,
       "repeats": 1,
@@ -23789,7 +23789,7 @@
     },
     {
       "name": "t0-s2-bitflip-gas23299",
-      "version": 19,
+      "version": 16,
       "gas": 23299,
       "ignore": false,
       "repeats": 1,
@@ -23813,7 +23813,7 @@
     },
     {
       "name": "t0-s2-bitflip-gas23300",
-      "version": 19,
+      "version": 16,
       "gas": 23300,
       "ignore": false,
       "repeats": 1,
@@ -23837,7 +23837,7 @@
     },
     {
       "name": "t0-s2-nonempty-context-gas20183",
-      "version": 19,
+      "version": 16,
       "gas": 20183,
       "ignore": false,
       "repeats": 1,
@@ -23861,7 +23861,7 @@
     },
     {
       "name": "t0-s2-nonempty-context-gas20184",
-      "version": 19,
+      "version": 16,
       "gas": 20184,
       "ignore": false,
       "repeats": 1,
@@ -23885,7 +23885,7 @@
     },
     {
       "name": "t0-s2-nonempty-context-gas20185",
-      "version": 19,
+      "version": 16,
       "gas": 20185,
       "ignore": false,
       "repeats": 1,
@@ -23908,9 +23908,9 @@
       ]
     },
     {
-      "name": "t0-s2-refused-at-genesis-gas83",
-      "version": 18,
-      "gas": 83,
+      "name": "t0-s2-refused-before-genesis-gas59",
+      "version": 15,
+      "gas": 59,
       "ignore": false,
       "repeats": 1,
       "operands": [
@@ -23923,7 +23923,7 @@
       "program": null,
       "expected": [
         -14,
-        84,
+        60,
         99,
         0,
         "-",
@@ -23932,9 +23932,9 @@
       ]
     },
     {
-      "name": "t0-s2-refused-at-genesis-gas84",
-      "version": 18,
-      "gas": 84,
+      "name": "t0-s2-refused-before-genesis-gas60",
+      "version": 15,
+      "gas": 60,
       "ignore": false,
       "repeats": 1,
       "operands": [
@@ -23946,8 +23946,8 @@
       ],
       "program": null,
       "expected": [
-        5,
-        84,
+        6,
+        60,
         99,
         0,
         "-",
@@ -23956,9 +23956,9 @@
       ]
     },
     {
-      "name": "t0-s2-refused-at-genesis-gas85",
-      "version": 18,
-      "gas": 85,
+      "name": "t0-s2-refused-before-genesis-gas61",
+      "version": 15,
+      "gas": 61,
       "ignore": false,
       "repeats": 1,
       "operands": [
@@ -23970,8 +23970,8 @@
       ],
       "program": null,
       "expected": [
-        5,
-        84,
+        6,
+        60,
         99,
         0,
         "-",

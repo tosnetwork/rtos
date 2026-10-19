@@ -31,6 +31,10 @@ mod lms_fee;
 mod null;
 mod poseidon2;
 mod pq;
+pub use pq::{
+    PQ_FALCON512_MIN_VERSION, PQ_LMS_FEE_HASH_MIN_VERSION, PQ_MLDSA44_MIN_VERSION,
+    PQ_SUITE_MIN_VERSION,
+};
 mod pq_suite;
 mod rand;
 mod serialization;

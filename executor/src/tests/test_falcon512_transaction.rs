@@ -135,7 +135,7 @@ fn falcon512_complete_transactions() {
         if [0, 2, 3].iter().any(|i| operands[*i].as_u64().is_none()) {
             continue;
         }
-        for version in [18, 19, 20] {
+        for version in [15, 16, 18, 19, 20] {
             for bounce in [false, true] {
                 let name = format!("{}-v{version}-bounce{bounce}", case["name"].as_str().unwrap());
                 let address = MsgAddressInt::with_standart(None, 0, [0x5a; 32].into()).unwrap();
@@ -176,7 +176,7 @@ fn falcon512_complete_transactions() {
                 let rtos_block::TrComputePhase::Vm(compute) = desc.compute_ph else {
                     panic!("VM phase");
                 };
-                let expected_exit = if version < 19 {
+                let expected_exit = if version < rtos_vm::executor::PQ_FALCON512_MIN_VERSION {
                     6
                 } else {
                     match case["expected"][0].as_i64().unwrap() {
@@ -199,7 +199,7 @@ fn falcon512_complete_transactions() {
             }
         }
     }
-    assert_eq!(rows.len(), 1518);
+    assert_eq!(rows.len(), 2530);
     if let Some(path) = std::env::var_os("RTOS_FALCON_EXPORT") {
         std::fs::write(path, rows.join("\n") + "\n").unwrap();
     }

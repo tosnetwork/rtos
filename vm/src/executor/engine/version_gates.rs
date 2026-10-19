@@ -1,4 +1,8 @@
 // Copyright 2026 TOS Blockchain Teams. SPDX-License-Identifier: GPL-3.0-only
+use crate::executor::pq::{
+    PQ_FALCON512_MIN_VERSION, PQ_LMS_FEE_HASH_MIN_VERSION, PQ_MLDSA44_MIN_VERSION,
+    PQ_SUITE_MIN_VERSION,
+};
 use rtos_block::{Result, SliceData};
 
 /// CP0 registration gates, before operand decoding and instruction gas.
@@ -65,13 +69,13 @@ pub(super) fn registration(code: &SliceData) -> Result<Option<(u32, usize)>> {
         // BLS_PAIRING, BLS_PUSHR.
         0xf93030..=0xf93031 => Some((4, 24)),
         // PQCHECKSIG_MLDSA44.
-        0xf93100..=0xf93100 => Some((16, 24)),
+        0xf93100..=0xf93100 => Some((PQ_MLDSA44_MIN_VERSION, 24)),
         // PQCHECKSIG_FALCON512_PADDED.
-        0xf93101..=0xf93101 => Some((19, 24)),
+        0xf93101..=0xf93101 => Some((PQ_FALCON512_MIN_VERSION, 24)),
         // PQCHECKSIG_SUITE.
-        0xf93102..=0xf93102 => Some((16, 24)),
+        0xf93102..=0xf93102 => Some((PQ_SUITE_MIN_VERSION, 24)),
         // LMSCHECKFEEHASH.
-        0xf93103..=0xf93103 => Some((17, 24)),
+        0xf93103..=0xf93103 => Some((PQ_LMS_FEE_HASH_MIN_VERSION, 24)),
         // POSEIDON2_PERM8, POSEIDON2_HASH7, POSEIDON2_PATH7.
         0xf93200..=0xf93202 => Some((16, 24)),
         // LDSTDADDR, LDSTDADDRQ.

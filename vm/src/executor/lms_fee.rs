@@ -1,7 +1,7 @@
 // Copyright 2026 TOS Blockchain Teams. SPDX-License-Identifier: GPL-3.0-only
 use super::{
     engine::{storage::fetch_stack, Engine},
-    pq::read_bytes_priced,
+    pq::{read_bytes_priced, PQ_LMS_FEE_HASH_MIN_VERSION},
     types::Instruction,
 };
 use crate::stack::StackItem;
@@ -9,7 +9,7 @@ use rtos_block::{fail, ExceptionCode, Status};
 use rtos_pq_crypto::lms_fee::{self, Outcome};
 
 pub(super) fn execute_lms_fee_hash(engine: &mut Engine) -> Status {
-    if engine.block_version() < 17 {
+    if engine.block_version() < PQ_LMS_FEE_HASH_MIN_VERSION {
         return engine.reject_unavailable_instruction();
     }
     engine.load_instruction(Instruction::new("LMSCHECKFEEHASH"))?;

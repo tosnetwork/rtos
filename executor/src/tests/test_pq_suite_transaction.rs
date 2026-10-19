@@ -188,10 +188,8 @@ fn pq_suite_complete_transactions() {
                 let rtos_block::TrComputePhase::Vm(compute) = desc.compute_ph else {
                     panic!("VM phase");
                 };
-                let expected_exit = if version < 16 {
+                let expected_exit = if version < rtos_vm::executor::PQ_SUITE_MIN_VERSION {
                     6
-                } else if suite == 2 && version < 19 {
-                    5
                 } else {
                     match case["expected"][0].as_i64().unwrap() {
                         0 => {

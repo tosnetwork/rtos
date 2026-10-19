@@ -2,7 +2,7 @@
 // RTOS: bounded suite dispatch through self-contained verification backends.
 use super::{
     engine::{storage::fetch_stack, Engine},
-    pq::read_bytes_priced,
+    pq::{read_bytes_priced, PQ_FALCON512_MIN_VERSION, PQ_SUITE_MIN_VERSION},
     types::Instruction,
 };
 use crate::stack::StackItem;
@@ -10,7 +10,7 @@ use rtos_block::{fail, ExceptionCode, Status};
 use rtos_pq_crypto::{falcon512, lms_fee, slhdsa128s};
 
 pub(super) fn execute_pq_suite(engine: &mut Engine) -> Status {
-    if engine.block_version() < 16 {
+    if engine.block_version() < PQ_SUITE_MIN_VERSION {
         return engine.reject_unavailable_instruction();
     }
     engine.load_instruction(Instruction::new("PQCHECKSIG_SUITE"))?;
@@ -44,7 +44,7 @@ pub(super) fn execute_pq_suite(engine: &mut Engine) -> Status {
         }
         2 => {
             // Generic dispatch cannot activate Falcon before its dedicated opcode.
-            if engine.block_version() < 19 {
+            if engine.block_version() < PQ_FALCON512_MIN_VERSION {
                 fail!(ExceptionCode::RangeCheckError, "PQ suite not active at this version");
             }
             engine.try_use_gas(20_000)?;

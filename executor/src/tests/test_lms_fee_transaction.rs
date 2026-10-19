@@ -139,7 +139,7 @@ fn lms_fee_complete_transactions() {
         {
             continue;
         }
-        for version in [16, 17, 19] {
+        for version in [15, 16, 17, 19] {
             for bounce in [false, true] {
                 let name = format!("{}-v{version}-bounce{bounce}", case["name"].as_str().unwrap());
                 let mut prefix = "DROP ".to_owned();
@@ -194,7 +194,7 @@ fn lms_fee_complete_transactions() {
                 let rtos_block::TrComputePhase::Vm(compute) = desc.compute_ph else {
                     panic!("compute");
                 };
-                let expected = if version < 17 {
+                let expected = if version < rtos_vm::executor::PQ_LMS_FEE_HASH_MIN_VERSION {
                     6
                 } else {
                     match case["expected"][0].as_i64().unwrap() {
@@ -217,7 +217,7 @@ fn lms_fee_complete_transactions() {
             }
         }
     }
-    assert_eq!(rows.len(), 726);
+    assert_eq!(rows.len(), 968);
     if let Some(path) = std::env::var_os("RTOS_LMS_FEE_EXPORT") {
         std::fs::write(path, rows.join("\n") + "\n").unwrap();
     }

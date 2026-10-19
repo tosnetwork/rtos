@@ -18,7 +18,7 @@ fn lms_fee_vm_matches_frozen_cpp_cases() {
         .map(|v| read_single_root_boc(hex::decode(v.as_str().unwrap()).unwrap()).unwrap())
         .collect();
     let cases = fixture["cases"].as_array().unwrap();
-    assert_eq!(cases.len(), 427);
+    assert_eq!(cases.len(), 516);
     for case in cases {
         let name = case["name"].as_str().unwrap();
         let repeats = case["repeats"].as_u64().unwrap() as usize;
