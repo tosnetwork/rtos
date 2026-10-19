@@ -1037,23 +1037,29 @@ impl Handlers {
                 ),
         )
     }
-    /// Dumping functions
+    /// Dumping functions. The whole 0xFE page is assigned: every 0xFE00..0xFEEF opcode is a
+    /// 16-bit instruction without effect on execution, 0xFEF0..0xFEFF a debug string.
     fn add_code_page_0_debug(&mut self) -> &mut Handlers {
         self.add_subset(
             0xFE,
             Handlers::new()
                 .set(0x00, execute_dump_stack)
                 .set_range(0x01..0x0F, execute_dump_stack_top)
+                .set(0x0F, execute_dummy_debug)
                 .set(0x10, execute_dump_hex)
                 .set(0x11, execute_print_hex)
                 .set(0x12, execute_dump_bin)
                 .set(0x13, execute_print_bin)
                 .set(0x14, execute_dump_str)
                 .set(0x15, execute_print_str)
+                .set_range(0x16..0x1E, execute_dummy_debug)
                 .set(0x1E, execute_debug_off)
                 .set(0x1F, execute_debug_on)
                 .set_range(0x20..0x2F, execute_dump_var)
+                .set(0x2F, execute_dummy_debug)
                 .set_range(0x30..0x3F, execute_print_var)
+                .set(0x3F, execute_dummy_debug)
+                .set_range(0x40..0xF0, execute_dummy_debug)
                 .set_range(0xF0..0xFF, execute_dump_string)
                 .set(0xFF, execute_dump_string),
         )

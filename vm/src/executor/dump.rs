@@ -16,7 +16,7 @@ use crate::{
     },
     stack::StackItem,
 };
-use rtos_block::{fail, ExceptionCode, Mask, Status};
+use rtos_block::{Mask, Status};
 use std::{cmp, str, sync::Arc};
 
 const STR: u8 = 0x01;
@@ -242,45 +242,36 @@ pub(crate) fn execute_print_var(engine: &mut Engine) -> Status {
     })
 }
 
-fn internal_dump_string<F>(engine: &mut Engine, name: &'static str, how: u8, op: F) -> Status
-where
-    F: FnOnce(&mut Engine, &str) -> Status,
-{
+/// 0xFEFn: a debug string of n + 1 bytes. Execution only skips the bytes: the instruction is
+/// charged as a 16-bit opcode and fails (InvalidOpcode) only when the code ends before the
+/// declared data. The content never raises an exception; with debug output enabled the first
+/// byte selects the log form and the rest is logged lossily.
+pub(crate) fn execute_dump_string(engine: &mut Engine) -> Status {
     engine.load_instruction(
-        Instruction::new(name).set_opts(InstructionOptions::Bytestring(12, 0, 4, 1)),
+        Instruction::new("DEBUGSTR").set_opts(InstructionOptions::Bytestring(12, 0, 4, 1)),
     )?;
-    match str::from_utf8(&engine.cmd.slice().get_bytestring(8)) {
-        Ok(string) => {
-            if engine.debug() {
-                op(engine, string)?
+    if engine.debug() {
+        let bytes = engine.cmd.slice().get_bytestring(0);
+        if let Some((kind, text)) = bytes.split_first() {
+            let text = String::from_utf8_lossy(text).into_owned();
+            match kind {
+                0 if text.is_empty() => engine.flush(),
+                0 => engine.dump(&text),
+                1 => {
+                    engine.dump(&text);
+                    engine.flush();
+                }
+                _ => engine.dump(&text),
             }
         }
-        Err(err) => fail!(ExceptionCode::InvalidOpcode, "convert from utf-8 error {}", err),
-    }
-    if how.bit(FLUSH) {
-        engine.flush();
     }
     Ok(())
 }
 
-pub(crate) fn execute_dump_string(engine: &mut Engine) -> Status {
-    let length = 1 + (0x0F & engine.last_cmd() as usize);
-    match engine.next_cmd()? {
-        0 if length == 1 => internal_dump_string(engine, "LOGFLUSH", FLUSH, |_, _| Ok(())),
-        0 => internal_dump_string(engine, "LOGSTR", 0, |engine, string| {
-            engine.dump(string);
-            Ok(())
-        }),
-        1 => internal_dump_string(engine, "PRINTSTR", FLUSH, |engine, string| {
-            engine.dump(string);
-            Ok(())
-        }),
-        // TODO: dump s0 as TL-B supported type
-        _ => internal_dump_string(engine, "DUMPTOSFMT", 0, |engine, string| {
-            engine.dump(string);
-            Ok(())
-        }),
-    }
+/// Debug opcodes without a debug action (0xFE0F, 0xFE16..0xFE1D, 0xFE2F, 0xFE3F,
+/// 0xFE40..0xFEEF): 16-bit no-ops.
+pub(crate) fn execute_dummy_debug(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("DEBUG"))
 }
 
 #[cfg(test)]

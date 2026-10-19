@@ -71,3 +71,49 @@ fn test_dump_commands() {
     execute_print_str(engine).unwrap();
     execute_dump_string(engine).unwrap(); // flush with LF
 }
+
+/// Debug output must not change execution: every 0xFExx opcode and debug strings with
+/// arbitrary content (including invalid UTF-8) give the same exit code, gas and steps with
+/// debug output enabled (DEBUGON plus a trace callback) as without it.
+#[test]
+fn debug_output_does_not_change_execution() {
+    use crate::{error::tvm_exception_or_custom_code, executor::gas::gas_state::Gas};
+
+    fn run(code: &[u8], debug: bool) -> (i32, i64, u32) {
+        // DEBUGON, PUSHINT 1, PUSHNULL, NEWC, NEWC ENDC, then the probe, then PUSHINT 7.
+        let mut bytes = vec![0xFE, 0x1F, 0x71, 0x6D, 0xC8, 0xC8, 0xC9];
+        bytes.extend_from_slice(code);
+        bytes.push(0x77);
+        let mut builder = BuilderData::new();
+        builder.append_raw(&bytes, bytes.len() * 8).unwrap();
+        let code = builder.into_cell().unwrap();
+        let mut engine = Engine::with_capabilities(0)
+            .setup(code, None, None, Some(Gas::test_with_limit(100_000)), vec![])
+            .unwrap();
+        if debug {
+            engine.set_trace(Engine::TRACE_ALL);
+            engine.set_trace_callback(|_, _| {});
+        }
+        let exit = match engine.execute() {
+            Ok(exit) => exit,
+            Err(err) => tvm_exception_or_custom_code(&err),
+        };
+        (exit, engine.gas_used(), engine.steps())
+    }
+
+    let mut probes = (0x00..=0xEFu8).map(|op| vec![0xFE, op]).collect::<Vec<_>>();
+    for len in 1..=16usize {
+        for fill in [0x00u8, 0x01, 0x02, 0x41, 0xC3, 0xFF] {
+            let mut probe = vec![0xFE, 0xF0 | (len as u8 - 1)];
+            probe.extend(std::iter::repeat_n(fill, len));
+            probes.push(probe.clone());
+            probe[2] = 0x00;
+            probes.push(probe.clone());
+            probe[2] = 0x01;
+            probes.push(probe);
+        }
+    }
+    for probe in probes {
+        assert_eq!(run(&probe, true), run(&probe, false), "{probe:02x?}");
+    }
+}

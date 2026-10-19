@@ -3406,5 +3406,7548 @@
     "setup": "PUSHNULL PUSHINT 0",
     "tail": "PUSHINT 7",
     "gas": 1000
+  },
+  {
+    "name": "debug-fe00-tail-v4",
+    "code": "fe00",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe01-tail-v4",
+    "code": "fe01",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe02-tail-v4",
+    "code": "fe02",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe03-tail-v4",
+    "code": "fe03",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe04-tail-v4",
+    "code": "fe04",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe05-tail-v4",
+    "code": "fe05",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe06-tail-v4",
+    "code": "fe06",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe07-tail-v4",
+    "code": "fe07",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe08-tail-v4",
+    "code": "fe08",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe09-tail-v4",
+    "code": "fe09",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0a-tail-v4",
+    "code": "fe0a",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0b-tail-v4",
+    "code": "fe0b",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0c-tail-v4",
+    "code": "fe0c",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0d-tail-v4",
+    "code": "fe0d",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0e-tail-v4",
+    "code": "fe0e",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0f-tail-v4",
+    "code": "fe0f",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe10-tail-v4",
+    "code": "fe10",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe11-tail-v4",
+    "code": "fe11",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe12-tail-v4",
+    "code": "fe12",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe13-tail-v4",
+    "code": "fe13",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe14-tail-v4",
+    "code": "fe14",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe15-tail-v4",
+    "code": "fe15",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe16-tail-v4",
+    "code": "fe16",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe17-tail-v4",
+    "code": "fe17",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe18-tail-v4",
+    "code": "fe18",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe19-tail-v4",
+    "code": "fe19",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1a-tail-v4",
+    "code": "fe1a",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1b-tail-v4",
+    "code": "fe1b",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1c-tail-v4",
+    "code": "fe1c",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1d-tail-v4",
+    "code": "fe1d",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1e-tail-v4",
+    "code": "fe1e",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1f-tail-v4",
+    "code": "fe1f",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe20-tail-v4",
+    "code": "fe20",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe21-tail-v4",
+    "code": "fe21",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe22-tail-v4",
+    "code": "fe22",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe23-tail-v4",
+    "code": "fe23",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe24-tail-v4",
+    "code": "fe24",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe25-tail-v4",
+    "code": "fe25",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe26-tail-v4",
+    "code": "fe26",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe27-tail-v4",
+    "code": "fe27",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe28-tail-v4",
+    "code": "fe28",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe29-tail-v4",
+    "code": "fe29",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2a-tail-v4",
+    "code": "fe2a",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2b-tail-v4",
+    "code": "fe2b",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2c-tail-v4",
+    "code": "fe2c",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2d-tail-v4",
+    "code": "fe2d",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2e-tail-v4",
+    "code": "fe2e",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2f-tail-v4",
+    "code": "fe2f",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe30-tail-v4",
+    "code": "fe30",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe31-tail-v4",
+    "code": "fe31",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe32-tail-v4",
+    "code": "fe32",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe33-tail-v4",
+    "code": "fe33",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe34-tail-v4",
+    "code": "fe34",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe35-tail-v4",
+    "code": "fe35",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe36-tail-v4",
+    "code": "fe36",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe37-tail-v4",
+    "code": "fe37",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe38-tail-v4",
+    "code": "fe38",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe39-tail-v4",
+    "code": "fe39",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3a-tail-v4",
+    "code": "fe3a",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3b-tail-v4",
+    "code": "fe3b",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3c-tail-v4",
+    "code": "fe3c",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3d-tail-v4",
+    "code": "fe3d",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3e-tail-v4",
+    "code": "fe3e",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3f-tail-v4",
+    "code": "fe3f",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe40-tail-v4",
+    "code": "fe40",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe41-tail-v4",
+    "code": "fe41",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe42-tail-v4",
+    "code": "fe42",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe43-tail-v4",
+    "code": "fe43",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe44-tail-v4",
+    "code": "fe44",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe45-tail-v4",
+    "code": "fe45",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe46-tail-v4",
+    "code": "fe46",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe47-tail-v4",
+    "code": "fe47",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe48-tail-v4",
+    "code": "fe48",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe49-tail-v4",
+    "code": "fe49",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4a-tail-v4",
+    "code": "fe4a",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4b-tail-v4",
+    "code": "fe4b",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4c-tail-v4",
+    "code": "fe4c",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4d-tail-v4",
+    "code": "fe4d",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4e-tail-v4",
+    "code": "fe4e",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4f-tail-v4",
+    "code": "fe4f",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe50-tail-v4",
+    "code": "fe50",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe51-tail-v4",
+    "code": "fe51",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe52-tail-v4",
+    "code": "fe52",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe53-tail-v4",
+    "code": "fe53",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe54-tail-v4",
+    "code": "fe54",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe55-tail-v4",
+    "code": "fe55",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe56-tail-v4",
+    "code": "fe56",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe57-tail-v4",
+    "code": "fe57",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe58-tail-v4",
+    "code": "fe58",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe59-tail-v4",
+    "code": "fe59",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5a-tail-v4",
+    "code": "fe5a",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5b-tail-v4",
+    "code": "fe5b",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5c-tail-v4",
+    "code": "fe5c",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5d-tail-v4",
+    "code": "fe5d",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5e-tail-v4",
+    "code": "fe5e",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5f-tail-v4",
+    "code": "fe5f",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe60-tail-v4",
+    "code": "fe60",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe61-tail-v4",
+    "code": "fe61",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe62-tail-v4",
+    "code": "fe62",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe63-tail-v4",
+    "code": "fe63",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe64-tail-v4",
+    "code": "fe64",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe65-tail-v4",
+    "code": "fe65",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe66-tail-v4",
+    "code": "fe66",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe67-tail-v4",
+    "code": "fe67",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe68-tail-v4",
+    "code": "fe68",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe69-tail-v4",
+    "code": "fe69",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6a-tail-v4",
+    "code": "fe6a",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6b-tail-v4",
+    "code": "fe6b",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6c-tail-v4",
+    "code": "fe6c",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6d-tail-v4",
+    "code": "fe6d",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6e-tail-v4",
+    "code": "fe6e",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6f-tail-v4",
+    "code": "fe6f",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe70-tail-v4",
+    "code": "fe70",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe71-tail-v4",
+    "code": "fe71",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe72-tail-v4",
+    "code": "fe72",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe73-tail-v4",
+    "code": "fe73",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe74-tail-v4",
+    "code": "fe74",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe75-tail-v4",
+    "code": "fe75",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe76-tail-v4",
+    "code": "fe76",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe77-tail-v4",
+    "code": "fe77",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe78-tail-v4",
+    "code": "fe78",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe79-tail-v4",
+    "code": "fe79",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7a-tail-v4",
+    "code": "fe7a",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7b-tail-v4",
+    "code": "fe7b",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7c-tail-v4",
+    "code": "fe7c",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7d-tail-v4",
+    "code": "fe7d",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7e-tail-v4",
+    "code": "fe7e",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7f-tail-v4",
+    "code": "fe7f",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe80-tail-v4",
+    "code": "fe80",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe81-tail-v4",
+    "code": "fe81",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe82-tail-v4",
+    "code": "fe82",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe83-tail-v4",
+    "code": "fe83",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe84-tail-v4",
+    "code": "fe84",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe85-tail-v4",
+    "code": "fe85",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe86-tail-v4",
+    "code": "fe86",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe87-tail-v4",
+    "code": "fe87",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe88-tail-v4",
+    "code": "fe88",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe89-tail-v4",
+    "code": "fe89",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8a-tail-v4",
+    "code": "fe8a",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8b-tail-v4",
+    "code": "fe8b",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8c-tail-v4",
+    "code": "fe8c",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8d-tail-v4",
+    "code": "fe8d",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8e-tail-v4",
+    "code": "fe8e",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8f-tail-v4",
+    "code": "fe8f",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe90-tail-v4",
+    "code": "fe90",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe91-tail-v4",
+    "code": "fe91",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe92-tail-v4",
+    "code": "fe92",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe93-tail-v4",
+    "code": "fe93",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe94-tail-v4",
+    "code": "fe94",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe95-tail-v4",
+    "code": "fe95",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe96-tail-v4",
+    "code": "fe96",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe97-tail-v4",
+    "code": "fe97",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe98-tail-v4",
+    "code": "fe98",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe99-tail-v4",
+    "code": "fe99",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9a-tail-v4",
+    "code": "fe9a",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9b-tail-v4",
+    "code": "fe9b",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9c-tail-v4",
+    "code": "fe9c",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9d-tail-v4",
+    "code": "fe9d",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9e-tail-v4",
+    "code": "fe9e",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9f-tail-v4",
+    "code": "fe9f",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea0-tail-v4",
+    "code": "fea0",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea1-tail-v4",
+    "code": "fea1",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea2-tail-v4",
+    "code": "fea2",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea3-tail-v4",
+    "code": "fea3",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea4-tail-v4",
+    "code": "fea4",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea5-tail-v4",
+    "code": "fea5",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea6-tail-v4",
+    "code": "fea6",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea7-tail-v4",
+    "code": "fea7",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea8-tail-v4",
+    "code": "fea8",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea9-tail-v4",
+    "code": "fea9",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feaa-tail-v4",
+    "code": "feaa",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feab-tail-v4",
+    "code": "feab",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feac-tail-v4",
+    "code": "feac",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fead-tail-v4",
+    "code": "fead",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feae-tail-v4",
+    "code": "feae",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feaf-tail-v4",
+    "code": "feaf",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb0-tail-v4",
+    "code": "feb0",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb1-tail-v4",
+    "code": "feb1",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb2-tail-v4",
+    "code": "feb2",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb3-tail-v4",
+    "code": "feb3",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb4-tail-v4",
+    "code": "feb4",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb5-tail-v4",
+    "code": "feb5",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb6-tail-v4",
+    "code": "feb6",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb7-tail-v4",
+    "code": "feb7",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb8-tail-v4",
+    "code": "feb8",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb9-tail-v4",
+    "code": "feb9",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feba-tail-v4",
+    "code": "feba",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-febb-tail-v4",
+    "code": "febb",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-febc-tail-v4",
+    "code": "febc",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-febd-tail-v4",
+    "code": "febd",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-febe-tail-v4",
+    "code": "febe",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-febf-tail-v4",
+    "code": "febf",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec0-tail-v4",
+    "code": "fec0",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec1-tail-v4",
+    "code": "fec1",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec2-tail-v4",
+    "code": "fec2",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec3-tail-v4",
+    "code": "fec3",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec4-tail-v4",
+    "code": "fec4",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec5-tail-v4",
+    "code": "fec5",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec6-tail-v4",
+    "code": "fec6",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec7-tail-v4",
+    "code": "fec7",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec8-tail-v4",
+    "code": "fec8",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec9-tail-v4",
+    "code": "fec9",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feca-tail-v4",
+    "code": "feca",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fecb-tail-v4",
+    "code": "fecb",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fecc-tail-v4",
+    "code": "fecc",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fecd-tail-v4",
+    "code": "fecd",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fece-tail-v4",
+    "code": "fece",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fecf-tail-v4",
+    "code": "fecf",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed0-tail-v4",
+    "code": "fed0",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed1-tail-v4",
+    "code": "fed1",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed2-tail-v4",
+    "code": "fed2",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed3-tail-v4",
+    "code": "fed3",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed4-tail-v4",
+    "code": "fed4",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed5-tail-v4",
+    "code": "fed5",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed6-tail-v4",
+    "code": "fed6",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed7-tail-v4",
+    "code": "fed7",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed8-tail-v4",
+    "code": "fed8",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed9-tail-v4",
+    "code": "fed9",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feda-tail-v4",
+    "code": "feda",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fedb-tail-v4",
+    "code": "fedb",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fedc-tail-v4",
+    "code": "fedc",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fedd-tail-v4",
+    "code": "fedd",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fede-tail-v4",
+    "code": "fede",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fedf-tail-v4",
+    "code": "fedf",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee0-tail-v4",
+    "code": "fee0",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee1-tail-v4",
+    "code": "fee1",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee2-tail-v4",
+    "code": "fee2",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee3-tail-v4",
+    "code": "fee3",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee4-tail-v4",
+    "code": "fee4",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee5-tail-v4",
+    "code": "fee5",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee6-tail-v4",
+    "code": "fee6",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee7-tail-v4",
+    "code": "fee7",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee8-tail-v4",
+    "code": "fee8",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee9-tail-v4",
+    "code": "fee9",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feea-tail-v4",
+    "code": "feea",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feeb-tail-v4",
+    "code": "feeb",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feec-tail-v4",
+    "code": "feec",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feed-tail-v4",
+    "code": "feed",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feee-tail-v4",
+    "code": "feee",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feef-tail-v4",
+    "code": "feef",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef0-tail-v4",
+    "code": "fef0",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef1-tail-v4",
+    "code": "fef1",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef2-tail-v4",
+    "code": "fef2",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef3-tail-v4",
+    "code": "fef3",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef4-tail-v4",
+    "code": "fef4",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef5-tail-v4",
+    "code": "fef5",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef6-tail-v4",
+    "code": "fef6",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef7-tail-v4",
+    "code": "fef7",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef8-tail-v4",
+    "code": "fef8",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef9-tail-v4",
+    "code": "fef9",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fefa-tail-v4",
+    "code": "fefa",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fefb-tail-v4",
+    "code": "fefb",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fefc-tail-v4",
+    "code": "fefc",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fefd-tail-v4",
+    "code": "fefd",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fefe-tail-v4",
+    "code": "fefe",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feff-tail-v4",
+    "code": "feff",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe00-tail-v16",
+    "code": "fe00",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe01-tail-v16",
+    "code": "fe01",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe02-tail-v16",
+    "code": "fe02",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe03-tail-v16",
+    "code": "fe03",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe04-tail-v16",
+    "code": "fe04",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe05-tail-v16",
+    "code": "fe05",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe06-tail-v16",
+    "code": "fe06",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe07-tail-v16",
+    "code": "fe07",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe08-tail-v16",
+    "code": "fe08",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe09-tail-v16",
+    "code": "fe09",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0a-tail-v16",
+    "code": "fe0a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0b-tail-v16",
+    "code": "fe0b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0c-tail-v16",
+    "code": "fe0c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0d-tail-v16",
+    "code": "fe0d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0e-tail-v16",
+    "code": "fe0e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0f-tail-v16",
+    "code": "fe0f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe10-tail-v16",
+    "code": "fe10",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe11-tail-v16",
+    "code": "fe11",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe12-tail-v16",
+    "code": "fe12",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe13-tail-v16",
+    "code": "fe13",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe14-tail-v16",
+    "code": "fe14",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe15-tail-v16",
+    "code": "fe15",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe16-tail-v16",
+    "code": "fe16",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe17-tail-v16",
+    "code": "fe17",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe18-tail-v16",
+    "code": "fe18",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe19-tail-v16",
+    "code": "fe19",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1a-tail-v16",
+    "code": "fe1a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1b-tail-v16",
+    "code": "fe1b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1c-tail-v16",
+    "code": "fe1c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1d-tail-v16",
+    "code": "fe1d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1e-tail-v16",
+    "code": "fe1e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1f-tail-v16",
+    "code": "fe1f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe20-tail-v16",
+    "code": "fe20",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe21-tail-v16",
+    "code": "fe21",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe22-tail-v16",
+    "code": "fe22",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe23-tail-v16",
+    "code": "fe23",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe24-tail-v16",
+    "code": "fe24",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe25-tail-v16",
+    "code": "fe25",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe26-tail-v16",
+    "code": "fe26",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe27-tail-v16",
+    "code": "fe27",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe28-tail-v16",
+    "code": "fe28",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe29-tail-v16",
+    "code": "fe29",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2a-tail-v16",
+    "code": "fe2a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2b-tail-v16",
+    "code": "fe2b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2c-tail-v16",
+    "code": "fe2c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2d-tail-v16",
+    "code": "fe2d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2e-tail-v16",
+    "code": "fe2e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2f-tail-v16",
+    "code": "fe2f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe30-tail-v16",
+    "code": "fe30",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe31-tail-v16",
+    "code": "fe31",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe32-tail-v16",
+    "code": "fe32",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe33-tail-v16",
+    "code": "fe33",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe34-tail-v16",
+    "code": "fe34",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe35-tail-v16",
+    "code": "fe35",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe36-tail-v16",
+    "code": "fe36",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe37-tail-v16",
+    "code": "fe37",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe38-tail-v16",
+    "code": "fe38",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe39-tail-v16",
+    "code": "fe39",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3a-tail-v16",
+    "code": "fe3a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3b-tail-v16",
+    "code": "fe3b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3c-tail-v16",
+    "code": "fe3c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3d-tail-v16",
+    "code": "fe3d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3e-tail-v16",
+    "code": "fe3e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3f-tail-v16",
+    "code": "fe3f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe40-tail-v16",
+    "code": "fe40",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe41-tail-v16",
+    "code": "fe41",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe42-tail-v16",
+    "code": "fe42",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe43-tail-v16",
+    "code": "fe43",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe44-tail-v16",
+    "code": "fe44",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe45-tail-v16",
+    "code": "fe45",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe46-tail-v16",
+    "code": "fe46",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe47-tail-v16",
+    "code": "fe47",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe48-tail-v16",
+    "code": "fe48",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe49-tail-v16",
+    "code": "fe49",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4a-tail-v16",
+    "code": "fe4a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4b-tail-v16",
+    "code": "fe4b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4c-tail-v16",
+    "code": "fe4c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4d-tail-v16",
+    "code": "fe4d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4e-tail-v16",
+    "code": "fe4e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4f-tail-v16",
+    "code": "fe4f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe50-tail-v16",
+    "code": "fe50",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe51-tail-v16",
+    "code": "fe51",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe52-tail-v16",
+    "code": "fe52",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe53-tail-v16",
+    "code": "fe53",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe54-tail-v16",
+    "code": "fe54",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe55-tail-v16",
+    "code": "fe55",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe56-tail-v16",
+    "code": "fe56",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe57-tail-v16",
+    "code": "fe57",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe58-tail-v16",
+    "code": "fe58",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe59-tail-v16",
+    "code": "fe59",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5a-tail-v16",
+    "code": "fe5a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5b-tail-v16",
+    "code": "fe5b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5c-tail-v16",
+    "code": "fe5c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5d-tail-v16",
+    "code": "fe5d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5e-tail-v16",
+    "code": "fe5e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5f-tail-v16",
+    "code": "fe5f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe60-tail-v16",
+    "code": "fe60",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe61-tail-v16",
+    "code": "fe61",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe62-tail-v16",
+    "code": "fe62",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe63-tail-v16",
+    "code": "fe63",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe64-tail-v16",
+    "code": "fe64",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe65-tail-v16",
+    "code": "fe65",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe66-tail-v16",
+    "code": "fe66",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe67-tail-v16",
+    "code": "fe67",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe68-tail-v16",
+    "code": "fe68",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe69-tail-v16",
+    "code": "fe69",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6a-tail-v16",
+    "code": "fe6a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6b-tail-v16",
+    "code": "fe6b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6c-tail-v16",
+    "code": "fe6c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6d-tail-v16",
+    "code": "fe6d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6e-tail-v16",
+    "code": "fe6e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6f-tail-v16",
+    "code": "fe6f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe70-tail-v16",
+    "code": "fe70",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe71-tail-v16",
+    "code": "fe71",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe72-tail-v16",
+    "code": "fe72",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe73-tail-v16",
+    "code": "fe73",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe74-tail-v16",
+    "code": "fe74",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe75-tail-v16",
+    "code": "fe75",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe76-tail-v16",
+    "code": "fe76",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe77-tail-v16",
+    "code": "fe77",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe78-tail-v16",
+    "code": "fe78",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe79-tail-v16",
+    "code": "fe79",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7a-tail-v16",
+    "code": "fe7a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7b-tail-v16",
+    "code": "fe7b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7c-tail-v16",
+    "code": "fe7c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7d-tail-v16",
+    "code": "fe7d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7e-tail-v16",
+    "code": "fe7e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7f-tail-v16",
+    "code": "fe7f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe80-tail-v16",
+    "code": "fe80",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe81-tail-v16",
+    "code": "fe81",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe82-tail-v16",
+    "code": "fe82",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe83-tail-v16",
+    "code": "fe83",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe84-tail-v16",
+    "code": "fe84",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe85-tail-v16",
+    "code": "fe85",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe86-tail-v16",
+    "code": "fe86",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe87-tail-v16",
+    "code": "fe87",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe88-tail-v16",
+    "code": "fe88",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe89-tail-v16",
+    "code": "fe89",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8a-tail-v16",
+    "code": "fe8a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8b-tail-v16",
+    "code": "fe8b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8c-tail-v16",
+    "code": "fe8c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8d-tail-v16",
+    "code": "fe8d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8e-tail-v16",
+    "code": "fe8e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8f-tail-v16",
+    "code": "fe8f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe90-tail-v16",
+    "code": "fe90",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe91-tail-v16",
+    "code": "fe91",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe92-tail-v16",
+    "code": "fe92",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe93-tail-v16",
+    "code": "fe93",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe94-tail-v16",
+    "code": "fe94",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe95-tail-v16",
+    "code": "fe95",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe96-tail-v16",
+    "code": "fe96",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe97-tail-v16",
+    "code": "fe97",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe98-tail-v16",
+    "code": "fe98",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe99-tail-v16",
+    "code": "fe99",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9a-tail-v16",
+    "code": "fe9a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9b-tail-v16",
+    "code": "fe9b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9c-tail-v16",
+    "code": "fe9c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9d-tail-v16",
+    "code": "fe9d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9e-tail-v16",
+    "code": "fe9e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9f-tail-v16",
+    "code": "fe9f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea0-tail-v16",
+    "code": "fea0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea1-tail-v16",
+    "code": "fea1",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea2-tail-v16",
+    "code": "fea2",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea3-tail-v16",
+    "code": "fea3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea4-tail-v16",
+    "code": "fea4",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea5-tail-v16",
+    "code": "fea5",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea6-tail-v16",
+    "code": "fea6",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea7-tail-v16",
+    "code": "fea7",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea8-tail-v16",
+    "code": "fea8",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea9-tail-v16",
+    "code": "fea9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feaa-tail-v16",
+    "code": "feaa",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feab-tail-v16",
+    "code": "feab",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feac-tail-v16",
+    "code": "feac",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fead-tail-v16",
+    "code": "fead",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feae-tail-v16",
+    "code": "feae",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feaf-tail-v16",
+    "code": "feaf",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb0-tail-v16",
+    "code": "feb0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb1-tail-v16",
+    "code": "feb1",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb2-tail-v16",
+    "code": "feb2",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb3-tail-v16",
+    "code": "feb3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb4-tail-v16",
+    "code": "feb4",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb5-tail-v16",
+    "code": "feb5",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb6-tail-v16",
+    "code": "feb6",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb7-tail-v16",
+    "code": "feb7",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb8-tail-v16",
+    "code": "feb8",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb9-tail-v16",
+    "code": "feb9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feba-tail-v16",
+    "code": "feba",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-febb-tail-v16",
+    "code": "febb",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-febc-tail-v16",
+    "code": "febc",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-febd-tail-v16",
+    "code": "febd",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-febe-tail-v16",
+    "code": "febe",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-febf-tail-v16",
+    "code": "febf",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec0-tail-v16",
+    "code": "fec0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec1-tail-v16",
+    "code": "fec1",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec2-tail-v16",
+    "code": "fec2",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec3-tail-v16",
+    "code": "fec3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec4-tail-v16",
+    "code": "fec4",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec5-tail-v16",
+    "code": "fec5",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec6-tail-v16",
+    "code": "fec6",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec7-tail-v16",
+    "code": "fec7",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec8-tail-v16",
+    "code": "fec8",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec9-tail-v16",
+    "code": "fec9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feca-tail-v16",
+    "code": "feca",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fecb-tail-v16",
+    "code": "fecb",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fecc-tail-v16",
+    "code": "fecc",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fecd-tail-v16",
+    "code": "fecd",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fece-tail-v16",
+    "code": "fece",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fecf-tail-v16",
+    "code": "fecf",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed0-tail-v16",
+    "code": "fed0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed1-tail-v16",
+    "code": "fed1",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed2-tail-v16",
+    "code": "fed2",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed3-tail-v16",
+    "code": "fed3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed4-tail-v16",
+    "code": "fed4",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed5-tail-v16",
+    "code": "fed5",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed6-tail-v16",
+    "code": "fed6",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed7-tail-v16",
+    "code": "fed7",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed8-tail-v16",
+    "code": "fed8",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed9-tail-v16",
+    "code": "fed9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feda-tail-v16",
+    "code": "feda",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fedb-tail-v16",
+    "code": "fedb",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fedc-tail-v16",
+    "code": "fedc",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fedd-tail-v16",
+    "code": "fedd",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fede-tail-v16",
+    "code": "fede",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fedf-tail-v16",
+    "code": "fedf",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee0-tail-v16",
+    "code": "fee0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee1-tail-v16",
+    "code": "fee1",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee2-tail-v16",
+    "code": "fee2",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee3-tail-v16",
+    "code": "fee3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee4-tail-v16",
+    "code": "fee4",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee5-tail-v16",
+    "code": "fee5",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee6-tail-v16",
+    "code": "fee6",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee7-tail-v16",
+    "code": "fee7",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee8-tail-v16",
+    "code": "fee8",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee9-tail-v16",
+    "code": "fee9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feea-tail-v16",
+    "code": "feea",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feeb-tail-v16",
+    "code": "feeb",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feec-tail-v16",
+    "code": "feec",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feed-tail-v16",
+    "code": "feed",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feee-tail-v16",
+    "code": "feee",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feef-tail-v16",
+    "code": "feef",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef0-tail-v16",
+    "code": "fef0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef1-tail-v16",
+    "code": "fef1",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef2-tail-v16",
+    "code": "fef2",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef3-tail-v16",
+    "code": "fef3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef4-tail-v16",
+    "code": "fef4",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef5-tail-v16",
+    "code": "fef5",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef6-tail-v16",
+    "code": "fef6",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef7-tail-v16",
+    "code": "fef7",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef8-tail-v16",
+    "code": "fef8",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef9-tail-v16",
+    "code": "fef9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fefa-tail-v16",
+    "code": "fefa",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fefb-tail-v16",
+    "code": "fefb",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fefc-tail-v16",
+    "code": "fefc",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fefd-tail-v16",
+    "code": "fefd",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fefe-tail-v16",
+    "code": "fefe",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feff-tail-v16",
+    "code": "feff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe00-alone-v16",
+    "code": "fe00",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe01-alone-v16",
+    "code": "fe01",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe02-alone-v16",
+    "code": "fe02",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe03-alone-v16",
+    "code": "fe03",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe04-alone-v16",
+    "code": "fe04",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe05-alone-v16",
+    "code": "fe05",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe06-alone-v16",
+    "code": "fe06",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe07-alone-v16",
+    "code": "fe07",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe08-alone-v16",
+    "code": "fe08",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe09-alone-v16",
+    "code": "fe09",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0a-alone-v16",
+    "code": "fe0a",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0b-alone-v16",
+    "code": "fe0b",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0c-alone-v16",
+    "code": "fe0c",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0d-alone-v16",
+    "code": "fe0d",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0e-alone-v16",
+    "code": "fe0e",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0f-alone-v16",
+    "code": "fe0f",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe10-alone-v16",
+    "code": "fe10",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe11-alone-v16",
+    "code": "fe11",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe12-alone-v16",
+    "code": "fe12",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe13-alone-v16",
+    "code": "fe13",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe14-alone-v16",
+    "code": "fe14",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe15-alone-v16",
+    "code": "fe15",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe16-alone-v16",
+    "code": "fe16",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe17-alone-v16",
+    "code": "fe17",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe18-alone-v16",
+    "code": "fe18",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe19-alone-v16",
+    "code": "fe19",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1a-alone-v16",
+    "code": "fe1a",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1b-alone-v16",
+    "code": "fe1b",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1c-alone-v16",
+    "code": "fe1c",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1d-alone-v16",
+    "code": "fe1d",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1e-alone-v16",
+    "code": "fe1e",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe1f-alone-v16",
+    "code": "fe1f",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe20-alone-v16",
+    "code": "fe20",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe21-alone-v16",
+    "code": "fe21",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe22-alone-v16",
+    "code": "fe22",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe23-alone-v16",
+    "code": "fe23",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe24-alone-v16",
+    "code": "fe24",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe25-alone-v16",
+    "code": "fe25",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe26-alone-v16",
+    "code": "fe26",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe27-alone-v16",
+    "code": "fe27",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe28-alone-v16",
+    "code": "fe28",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe29-alone-v16",
+    "code": "fe29",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2a-alone-v16",
+    "code": "fe2a",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2b-alone-v16",
+    "code": "fe2b",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2c-alone-v16",
+    "code": "fe2c",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2d-alone-v16",
+    "code": "fe2d",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2e-alone-v16",
+    "code": "fe2e",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe2f-alone-v16",
+    "code": "fe2f",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe30-alone-v16",
+    "code": "fe30",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe31-alone-v16",
+    "code": "fe31",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe32-alone-v16",
+    "code": "fe32",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe33-alone-v16",
+    "code": "fe33",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe34-alone-v16",
+    "code": "fe34",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe35-alone-v16",
+    "code": "fe35",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe36-alone-v16",
+    "code": "fe36",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe37-alone-v16",
+    "code": "fe37",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe38-alone-v16",
+    "code": "fe38",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe39-alone-v16",
+    "code": "fe39",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3a-alone-v16",
+    "code": "fe3a",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3b-alone-v16",
+    "code": "fe3b",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3c-alone-v16",
+    "code": "fe3c",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3d-alone-v16",
+    "code": "fe3d",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3e-alone-v16",
+    "code": "fe3e",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe3f-alone-v16",
+    "code": "fe3f",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe40-alone-v16",
+    "code": "fe40",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe41-alone-v16",
+    "code": "fe41",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe42-alone-v16",
+    "code": "fe42",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe43-alone-v16",
+    "code": "fe43",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe44-alone-v16",
+    "code": "fe44",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe45-alone-v16",
+    "code": "fe45",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe46-alone-v16",
+    "code": "fe46",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe47-alone-v16",
+    "code": "fe47",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe48-alone-v16",
+    "code": "fe48",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe49-alone-v16",
+    "code": "fe49",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4a-alone-v16",
+    "code": "fe4a",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4b-alone-v16",
+    "code": "fe4b",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4c-alone-v16",
+    "code": "fe4c",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4d-alone-v16",
+    "code": "fe4d",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4e-alone-v16",
+    "code": "fe4e",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe4f-alone-v16",
+    "code": "fe4f",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe50-alone-v16",
+    "code": "fe50",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe51-alone-v16",
+    "code": "fe51",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe52-alone-v16",
+    "code": "fe52",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe53-alone-v16",
+    "code": "fe53",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe54-alone-v16",
+    "code": "fe54",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe55-alone-v16",
+    "code": "fe55",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe56-alone-v16",
+    "code": "fe56",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe57-alone-v16",
+    "code": "fe57",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe58-alone-v16",
+    "code": "fe58",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe59-alone-v16",
+    "code": "fe59",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5a-alone-v16",
+    "code": "fe5a",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5b-alone-v16",
+    "code": "fe5b",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5c-alone-v16",
+    "code": "fe5c",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5d-alone-v16",
+    "code": "fe5d",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5e-alone-v16",
+    "code": "fe5e",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe5f-alone-v16",
+    "code": "fe5f",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe60-alone-v16",
+    "code": "fe60",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe61-alone-v16",
+    "code": "fe61",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe62-alone-v16",
+    "code": "fe62",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe63-alone-v16",
+    "code": "fe63",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe64-alone-v16",
+    "code": "fe64",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe65-alone-v16",
+    "code": "fe65",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe66-alone-v16",
+    "code": "fe66",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe67-alone-v16",
+    "code": "fe67",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe68-alone-v16",
+    "code": "fe68",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe69-alone-v16",
+    "code": "fe69",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6a-alone-v16",
+    "code": "fe6a",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6b-alone-v16",
+    "code": "fe6b",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6c-alone-v16",
+    "code": "fe6c",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6d-alone-v16",
+    "code": "fe6d",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6e-alone-v16",
+    "code": "fe6e",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe6f-alone-v16",
+    "code": "fe6f",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe70-alone-v16",
+    "code": "fe70",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe71-alone-v16",
+    "code": "fe71",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe72-alone-v16",
+    "code": "fe72",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe73-alone-v16",
+    "code": "fe73",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe74-alone-v16",
+    "code": "fe74",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe75-alone-v16",
+    "code": "fe75",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe76-alone-v16",
+    "code": "fe76",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe77-alone-v16",
+    "code": "fe77",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe78-alone-v16",
+    "code": "fe78",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe79-alone-v16",
+    "code": "fe79",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7a-alone-v16",
+    "code": "fe7a",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7b-alone-v16",
+    "code": "fe7b",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7c-alone-v16",
+    "code": "fe7c",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7d-alone-v16",
+    "code": "fe7d",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7e-alone-v16",
+    "code": "fe7e",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe7f-alone-v16",
+    "code": "fe7f",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe80-alone-v16",
+    "code": "fe80",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe81-alone-v16",
+    "code": "fe81",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe82-alone-v16",
+    "code": "fe82",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe83-alone-v16",
+    "code": "fe83",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe84-alone-v16",
+    "code": "fe84",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe85-alone-v16",
+    "code": "fe85",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe86-alone-v16",
+    "code": "fe86",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe87-alone-v16",
+    "code": "fe87",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe88-alone-v16",
+    "code": "fe88",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe89-alone-v16",
+    "code": "fe89",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8a-alone-v16",
+    "code": "fe8a",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8b-alone-v16",
+    "code": "fe8b",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8c-alone-v16",
+    "code": "fe8c",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8d-alone-v16",
+    "code": "fe8d",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8e-alone-v16",
+    "code": "fe8e",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe8f-alone-v16",
+    "code": "fe8f",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe90-alone-v16",
+    "code": "fe90",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe91-alone-v16",
+    "code": "fe91",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe92-alone-v16",
+    "code": "fe92",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe93-alone-v16",
+    "code": "fe93",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe94-alone-v16",
+    "code": "fe94",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe95-alone-v16",
+    "code": "fe95",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe96-alone-v16",
+    "code": "fe96",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe97-alone-v16",
+    "code": "fe97",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe98-alone-v16",
+    "code": "fe98",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe99-alone-v16",
+    "code": "fe99",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9a-alone-v16",
+    "code": "fe9a",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9b-alone-v16",
+    "code": "fe9b",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9c-alone-v16",
+    "code": "fe9c",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9d-alone-v16",
+    "code": "fe9d",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9e-alone-v16",
+    "code": "fe9e",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe9f-alone-v16",
+    "code": "fe9f",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea0-alone-v16",
+    "code": "fea0",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea1-alone-v16",
+    "code": "fea1",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea2-alone-v16",
+    "code": "fea2",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea3-alone-v16",
+    "code": "fea3",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea4-alone-v16",
+    "code": "fea4",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea5-alone-v16",
+    "code": "fea5",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea6-alone-v16",
+    "code": "fea6",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea7-alone-v16",
+    "code": "fea7",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea8-alone-v16",
+    "code": "fea8",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fea9-alone-v16",
+    "code": "fea9",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feaa-alone-v16",
+    "code": "feaa",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feab-alone-v16",
+    "code": "feab",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feac-alone-v16",
+    "code": "feac",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fead-alone-v16",
+    "code": "fead",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feae-alone-v16",
+    "code": "feae",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feaf-alone-v16",
+    "code": "feaf",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb0-alone-v16",
+    "code": "feb0",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb1-alone-v16",
+    "code": "feb1",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb2-alone-v16",
+    "code": "feb2",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb3-alone-v16",
+    "code": "feb3",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb4-alone-v16",
+    "code": "feb4",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb5-alone-v16",
+    "code": "feb5",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb6-alone-v16",
+    "code": "feb6",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb7-alone-v16",
+    "code": "feb7",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb8-alone-v16",
+    "code": "feb8",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feb9-alone-v16",
+    "code": "feb9",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feba-alone-v16",
+    "code": "feba",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-febb-alone-v16",
+    "code": "febb",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-febc-alone-v16",
+    "code": "febc",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-febd-alone-v16",
+    "code": "febd",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-febe-alone-v16",
+    "code": "febe",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-febf-alone-v16",
+    "code": "febf",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec0-alone-v16",
+    "code": "fec0",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec1-alone-v16",
+    "code": "fec1",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec2-alone-v16",
+    "code": "fec2",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec3-alone-v16",
+    "code": "fec3",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec4-alone-v16",
+    "code": "fec4",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec5-alone-v16",
+    "code": "fec5",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec6-alone-v16",
+    "code": "fec6",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec7-alone-v16",
+    "code": "fec7",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec8-alone-v16",
+    "code": "fec8",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fec9-alone-v16",
+    "code": "fec9",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feca-alone-v16",
+    "code": "feca",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fecb-alone-v16",
+    "code": "fecb",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fecc-alone-v16",
+    "code": "fecc",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fecd-alone-v16",
+    "code": "fecd",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fece-alone-v16",
+    "code": "fece",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fecf-alone-v16",
+    "code": "fecf",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed0-alone-v16",
+    "code": "fed0",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed1-alone-v16",
+    "code": "fed1",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed2-alone-v16",
+    "code": "fed2",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed3-alone-v16",
+    "code": "fed3",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed4-alone-v16",
+    "code": "fed4",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed5-alone-v16",
+    "code": "fed5",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed6-alone-v16",
+    "code": "fed6",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed7-alone-v16",
+    "code": "fed7",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed8-alone-v16",
+    "code": "fed8",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fed9-alone-v16",
+    "code": "fed9",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feda-alone-v16",
+    "code": "feda",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fedb-alone-v16",
+    "code": "fedb",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fedc-alone-v16",
+    "code": "fedc",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fedd-alone-v16",
+    "code": "fedd",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fede-alone-v16",
+    "code": "fede",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fedf-alone-v16",
+    "code": "fedf",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee0-alone-v16",
+    "code": "fee0",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee1-alone-v16",
+    "code": "fee1",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee2-alone-v16",
+    "code": "fee2",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee3-alone-v16",
+    "code": "fee3",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee4-alone-v16",
+    "code": "fee4",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee5-alone-v16",
+    "code": "fee5",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee6-alone-v16",
+    "code": "fee6",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee7-alone-v16",
+    "code": "fee7",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee8-alone-v16",
+    "code": "fee8",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fee9-alone-v16",
+    "code": "fee9",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feea-alone-v16",
+    "code": "feea",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feeb-alone-v16",
+    "code": "feeb",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feec-alone-v16",
+    "code": "feec",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feed-alone-v16",
+    "code": "feed",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feee-alone-v16",
+    "code": "feee",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feef-alone-v16",
+    "code": "feef",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef0-alone-v16",
+    "code": "fef0",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef1-alone-v16",
+    "code": "fef1",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef2-alone-v16",
+    "code": "fef2",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef3-alone-v16",
+    "code": "fef3",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef4-alone-v16",
+    "code": "fef4",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef5-alone-v16",
+    "code": "fef5",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef6-alone-v16",
+    "code": "fef6",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef7-alone-v16",
+    "code": "fef7",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef8-alone-v16",
+    "code": "fef8",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fef9-alone-v16",
+    "code": "fef9",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fefa-alone-v16",
+    "code": "fefa",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fefb-alone-v16",
+    "code": "fefb",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fefc-alone-v16",
+    "code": "fefc",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fefd-alone-v16",
+    "code": "fefd",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fefe-alone-v16",
+    "code": "fefe",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-feff-alone-v16",
+    "code": "feff",
+    "version": 16,
+    "setup": "NOP",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str1-ascii-v16",
+    "code": "fef041",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str1-ff-v16",
+    "code": "fef0ff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str1-zero-v16",
+    "code": "fef000",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str1-utf8-v16",
+    "code": "fef0c3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str1-badutf8-v16",
+    "code": "fef0c3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str1-kind1-v16",
+    "code": "fef001",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str1-kind2-v16",
+    "code": "fef002",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str2-ascii-v16",
+    "code": "fef14141",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str2-ff-v16",
+    "code": "fef1ffff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str2-zero-v16",
+    "code": "fef10000",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str2-utf8-v16",
+    "code": "fef1c3a9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str2-badutf8-v16",
+    "code": "fef1c328",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str2-kind1-v16",
+    "code": "fef101e2",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str2-kind2-v16",
+    "code": "fef10280",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str3-ascii-v16",
+    "code": "fef2414141",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str3-ff-v16",
+    "code": "fef2ffffff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str3-zero-v16",
+    "code": "fef2000000",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str3-utf8-v16",
+    "code": "fef2c3a9c3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str3-badutf8-v16",
+    "code": "fef2c328c3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str3-kind1-v16",
+    "code": "fef201e282",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str3-kind2-v16",
+    "code": "fef2028080",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str4-ascii-v16",
+    "code": "fef341414141",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str4-ff-v16",
+    "code": "fef3ffffffff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str4-zero-v16",
+    "code": "fef300000000",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str4-utf8-v16",
+    "code": "fef3c3a9c3a9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str4-badutf8-v16",
+    "code": "fef3c328c328",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str4-kind1-v16",
+    "code": "fef301e282ac",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str4-kind2-v16",
+    "code": "fef302808080",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str5-ascii-v16",
+    "code": "fef44141414141",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str5-ff-v16",
+    "code": "fef4ffffffffff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str5-zero-v16",
+    "code": "fef40000000000",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str5-utf8-v16",
+    "code": "fef4c3a9c3a9c3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str5-badutf8-v16",
+    "code": "fef4c328c328c3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str5-kind1-v16",
+    "code": "fef401e282ace2",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str5-kind2-v16",
+    "code": "fef40280808080",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str6-ascii-v16",
+    "code": "fef5414141414141",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str6-ff-v16",
+    "code": "fef5ffffffffffff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str6-zero-v16",
+    "code": "fef5000000000000",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str6-utf8-v16",
+    "code": "fef5c3a9c3a9c3a9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str6-badutf8-v16",
+    "code": "fef5c328c328c328",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str6-kind1-v16",
+    "code": "fef501e282ace282",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str6-kind2-v16",
+    "code": "fef5028080808080",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str7-ascii-v16",
+    "code": "fef641414141414141",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str7-ff-v16",
+    "code": "fef6ffffffffffffff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str7-zero-v16",
+    "code": "fef600000000000000",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str7-utf8-v16",
+    "code": "fef6c3a9c3a9c3a9c3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str7-badutf8-v16",
+    "code": "fef6c328c328c328c3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str7-kind1-v16",
+    "code": "fef601e282ace282ac",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str7-kind2-v16",
+    "code": "fef602808080808080",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str8-ascii-v16",
+    "code": "fef74141414141414141",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str8-ff-v16",
+    "code": "fef7ffffffffffffffff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str8-zero-v16",
+    "code": "fef70000000000000000",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str8-utf8-v16",
+    "code": "fef7c3a9c3a9c3a9c3a9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str8-badutf8-v16",
+    "code": "fef7c328c328c328c328",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str8-kind1-v16",
+    "code": "fef701e282ace282ace2",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str8-kind2-v16",
+    "code": "fef70280808080808080",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str9-ascii-v16",
+    "code": "fef8414141414141414141",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str9-ff-v16",
+    "code": "fef8ffffffffffffffffff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str9-zero-v16",
+    "code": "fef8000000000000000000",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str9-utf8-v16",
+    "code": "fef8c3a9c3a9c3a9c3a9c3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str9-badutf8-v16",
+    "code": "fef8c328c328c328c328c3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str9-kind1-v16",
+    "code": "fef801e282ace282ace282",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str9-kind2-v16",
+    "code": "fef8028080808080808080",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str10-ascii-v16",
+    "code": "fef941414141414141414141",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str10-ff-v16",
+    "code": "fef9ffffffffffffffffffff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str10-zero-v16",
+    "code": "fef900000000000000000000",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str10-utf8-v16",
+    "code": "fef9c3a9c3a9c3a9c3a9c3a9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str10-badutf8-v16",
+    "code": "fef9c328c328c328c328c328",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str10-kind1-v16",
+    "code": "fef901e282ace282ace282ac",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str10-kind2-v16",
+    "code": "fef902808080808080808080",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str11-ascii-v16",
+    "code": "fefa4141414141414141414141",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str11-ff-v16",
+    "code": "fefaffffffffffffffffffffff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str11-zero-v16",
+    "code": "fefa0000000000000000000000",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str11-utf8-v16",
+    "code": "fefac3a9c3a9c3a9c3a9c3a9c3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str11-badutf8-v16",
+    "code": "fefac328c328c328c328c328c3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str11-kind1-v16",
+    "code": "fefa01e282ace282ace282ace2",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str11-kind2-v16",
+    "code": "fefa0280808080808080808080",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str12-ascii-v16",
+    "code": "fefb414141414141414141414141",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str12-ff-v16",
+    "code": "fefbffffffffffffffffffffffff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str12-zero-v16",
+    "code": "fefb000000000000000000000000",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str12-utf8-v16",
+    "code": "fefbc3a9c3a9c3a9c3a9c3a9c3a9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str12-badutf8-v16",
+    "code": "fefbc328c328c328c328c328c328",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str12-kind1-v16",
+    "code": "fefb01e282ace282ace282ace282",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str12-kind2-v16",
+    "code": "fefb028080808080808080808080",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str13-ascii-v16",
+    "code": "fefc41414141414141414141414141",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str13-ff-v16",
+    "code": "fefcffffffffffffffffffffffffff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str13-zero-v16",
+    "code": "fefc00000000000000000000000000",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str13-utf8-v16",
+    "code": "fefcc3a9c3a9c3a9c3a9c3a9c3a9c3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str13-badutf8-v16",
+    "code": "fefcc328c328c328c328c328c328c3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str13-kind1-v16",
+    "code": "fefc01e282ace282ace282ace282ac",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str13-kind2-v16",
+    "code": "fefc02808080808080808080808080",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str14-ascii-v16",
+    "code": "fefd4141414141414141414141414141",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str14-ff-v16",
+    "code": "fefdffffffffffffffffffffffffffff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str14-zero-v16",
+    "code": "fefd0000000000000000000000000000",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str14-utf8-v16",
+    "code": "fefdc3a9c3a9c3a9c3a9c3a9c3a9c3a9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str14-badutf8-v16",
+    "code": "fefdc328c328c328c328c328c328c328",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str14-kind1-v16",
+    "code": "fefd01e282ace282ace282ace282ace2",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str14-kind2-v16",
+    "code": "fefd0280808080808080808080808080",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str15-ascii-v16",
+    "code": "fefe414141414141414141414141414141",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str15-ff-v16",
+    "code": "fefeffffffffffffffffffffffffffffff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str15-zero-v16",
+    "code": "fefe000000000000000000000000000000",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str15-utf8-v16",
+    "code": "fefec3a9c3a9c3a9c3a9c3a9c3a9c3a9c3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str15-badutf8-v16",
+    "code": "fefec328c328c328c328c328c328c328c3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str15-kind1-v16",
+    "code": "fefe01e282ace282ace282ace282ace282",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str15-kind2-v16",
+    "code": "fefe028080808080808080808080808080",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str16-ascii-v16",
+    "code": "feff41414141414141414141414141414141",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str16-ff-v16",
+    "code": "feffffffffffffffffffffffffffffffffff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str16-zero-v16",
+    "code": "feff00000000000000000000000000000000",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str16-utf8-v16",
+    "code": "feffc3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str16-badutf8-v16",
+    "code": "feffc328c328c328c328c328c328c328c328",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str16-kind1-v16",
+    "code": "feff01e282ace282ace282ace282ace282ac",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str16-kind2-v16",
+    "code": "feff02808080808080808080808080808080",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str1-short1-v16",
+    "code": "fef041",
+    "bits": 23,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str1-short4-v16",
+    "code": "fef041",
+    "bits": 20,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str1-short8-v16",
+    "code": "fef041",
+    "bits": 16,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str2-short1-v16",
+    "code": "fef14141",
+    "bits": 31,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str2-short4-v16",
+    "code": "fef14141",
+    "bits": 28,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str2-short8-v16",
+    "code": "fef14141",
+    "bits": 24,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str3-short1-v16",
+    "code": "fef2414141",
+    "bits": 39,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str3-short4-v16",
+    "code": "fef2414141",
+    "bits": 36,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str3-short8-v16",
+    "code": "fef2414141",
+    "bits": 32,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str4-short1-v16",
+    "code": "fef341414141",
+    "bits": 47,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str4-short4-v16",
+    "code": "fef341414141",
+    "bits": 44,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str4-short8-v16",
+    "code": "fef341414141",
+    "bits": 40,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str5-short1-v16",
+    "code": "fef44141414141",
+    "bits": 55,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str5-short4-v16",
+    "code": "fef44141414141",
+    "bits": 52,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str5-short8-v16",
+    "code": "fef44141414141",
+    "bits": 48,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str6-short1-v16",
+    "code": "fef5414141414141",
+    "bits": 63,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str6-short4-v16",
+    "code": "fef5414141414141",
+    "bits": 60,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str6-short8-v16",
+    "code": "fef5414141414141",
+    "bits": 56,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str7-short1-v16",
+    "code": "fef641414141414141",
+    "bits": 71,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str7-short4-v16",
+    "code": "fef641414141414141",
+    "bits": 68,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str7-short8-v16",
+    "code": "fef641414141414141",
+    "bits": 64,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str8-short1-v16",
+    "code": "fef74141414141414141",
+    "bits": 79,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str8-short4-v16",
+    "code": "fef74141414141414141",
+    "bits": 76,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str8-short8-v16",
+    "code": "fef74141414141414141",
+    "bits": 72,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str9-short1-v16",
+    "code": "fef8414141414141414141",
+    "bits": 87,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str9-short4-v16",
+    "code": "fef8414141414141414141",
+    "bits": 84,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str9-short8-v16",
+    "code": "fef8414141414141414141",
+    "bits": 80,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str10-short1-v16",
+    "code": "fef941414141414141414141",
+    "bits": 95,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str10-short4-v16",
+    "code": "fef941414141414141414141",
+    "bits": 92,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str10-short8-v16",
+    "code": "fef941414141414141414141",
+    "bits": 88,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str11-short1-v16",
+    "code": "fefa4141414141414141414141",
+    "bits": 103,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str11-short4-v16",
+    "code": "fefa4141414141414141414141",
+    "bits": 100,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str11-short8-v16",
+    "code": "fefa4141414141414141414141",
+    "bits": 96,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str12-short1-v16",
+    "code": "fefb414141414141414141414141",
+    "bits": 111,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str12-short4-v16",
+    "code": "fefb414141414141414141414141",
+    "bits": 108,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str12-short8-v16",
+    "code": "fefb414141414141414141414141",
+    "bits": 104,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str13-short1-v16",
+    "code": "fefc41414141414141414141414141",
+    "bits": 119,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str13-short4-v16",
+    "code": "fefc41414141414141414141414141",
+    "bits": 116,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str13-short8-v16",
+    "code": "fefc41414141414141414141414141",
+    "bits": 112,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str14-short1-v16",
+    "code": "fefd4141414141414141414141414141",
+    "bits": 127,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str14-short4-v16",
+    "code": "fefd4141414141414141414141414141",
+    "bits": 124,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str14-short8-v16",
+    "code": "fefd4141414141414141414141414141",
+    "bits": 120,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str15-short1-v16",
+    "code": "fefe414141414141414141414141414141",
+    "bits": 135,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str15-short4-v16",
+    "code": "fefe414141414141414141414141414141",
+    "bits": 132,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str15-short8-v16",
+    "code": "fefe414141414141414141414141414141",
+    "bits": 128,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str16-short1-v16",
+    "code": "feff41414141414141414141414141414141",
+    "bits": 143,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str16-short4-v16",
+    "code": "feff41414141414141414141414141414141",
+    "bits": 140,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str16-short8-v16",
+    "code": "feff41414141414141414141414141414141",
+    "bits": 136,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str0-short-v16",
+    "code": "fef0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-str0-short12-v16",
+    "code": "fef0",
+    "bits": 12,
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "gas": 1000
+  },
+  {
+    "name": "debug-fe0f-g18-v16",
+    "code": "fe0f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 18
+  },
+  {
+    "name": "debug-fe0f-g43-v16",
+    "code": "fe0f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 43
+  },
+  {
+    "name": "debug-fe0f-g44-v16",
+    "code": "fe0f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 44
+  },
+  {
+    "name": "debug-fe0f-g45-v16",
+    "code": "fe0f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 45
+  },
+  {
+    "name": "debug-fe0f-g49-v16",
+    "code": "fe0f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 49
+  },
+  {
+    "name": "debug-fe0f-g62-v16",
+    "code": "fe0f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 62
+  },
+  {
+    "name": "debug-fe0f-g63-v16",
+    "code": "fe0f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 63
+  },
+  {
+    "name": "debug-fe0f-g94-v16",
+    "code": "fe0f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 94
+  },
+  {
+    "name": "debug-fe0f-g95-v16",
+    "code": "fe0f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 95
+  },
+  {
+    "name": "debug-fe40-g18-v16",
+    "code": "fe40",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 18
+  },
+  {
+    "name": "debug-fe40-g43-v16",
+    "code": "fe40",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 43
+  },
+  {
+    "name": "debug-fe40-g44-v16",
+    "code": "fe40",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 44
+  },
+  {
+    "name": "debug-fe40-g45-v16",
+    "code": "fe40",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 45
+  },
+  {
+    "name": "debug-fe40-g49-v16",
+    "code": "fe40",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 49
+  },
+  {
+    "name": "debug-fe40-g62-v16",
+    "code": "fe40",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 62
+  },
+  {
+    "name": "debug-fe40-g63-v16",
+    "code": "fe40",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 63
+  },
+  {
+    "name": "debug-fe40-g94-v16",
+    "code": "fe40",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 94
+  },
+  {
+    "name": "debug-fe40-g95-v16",
+    "code": "fe40",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 95
+  },
+  {
+    "name": "debug-feef-g18-v16",
+    "code": "feef",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 18
+  },
+  {
+    "name": "debug-feef-g43-v16",
+    "code": "feef",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 43
+  },
+  {
+    "name": "debug-feef-g44-v16",
+    "code": "feef",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 44
+  },
+  {
+    "name": "debug-feef-g45-v16",
+    "code": "feef",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 45
+  },
+  {
+    "name": "debug-feef-g49-v16",
+    "code": "feef",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 49
+  },
+  {
+    "name": "debug-feef-g62-v16",
+    "code": "feef",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 62
+  },
+  {
+    "name": "debug-feef-g63-v16",
+    "code": "feef",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 63
+  },
+  {
+    "name": "debug-feef-g94-v16",
+    "code": "feef",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 94
+  },
+  {
+    "name": "debug-feef-g95-v16",
+    "code": "feef",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 95
+  },
+  {
+    "name": "debug-fef341424344-g18-v16",
+    "code": "fef341424344",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 18
+  },
+  {
+    "name": "debug-fef341424344-g43-v16",
+    "code": "fef341424344",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 43
+  },
+  {
+    "name": "debug-fef341424344-g44-v16",
+    "code": "fef341424344",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 44
+  },
+  {
+    "name": "debug-fef341424344-g45-v16",
+    "code": "fef341424344",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 45
+  },
+  {
+    "name": "debug-fef341424344-g49-v16",
+    "code": "fef341424344",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 49
+  },
+  {
+    "name": "debug-fef341424344-g62-v16",
+    "code": "fef341424344",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 62
+  },
+  {
+    "name": "debug-fef341424344-g63-v16",
+    "code": "fef341424344",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 63
+  },
+  {
+    "name": "debug-fef341424344-g94-v16",
+    "code": "fef341424344",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 94
+  },
+  {
+    "name": "debug-fef341424344-g95-v16",
+    "code": "fef341424344",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 95
+  },
+  {
+    "name": "debug-fef0-g18-v16",
+    "code": "fef0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 18
+  },
+  {
+    "name": "debug-fef0-g43-v16",
+    "code": "fef0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 43
+  },
+  {
+    "name": "debug-fef0-g44-v16",
+    "code": "fef0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 44
+  },
+  {
+    "name": "debug-fef0-g45-v16",
+    "code": "fef0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 45
+  },
+  {
+    "name": "debug-fef0-g49-v16",
+    "code": "fef0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 49
+  },
+  {
+    "name": "debug-fef0-g62-v16",
+    "code": "fef0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 62
+  },
+  {
+    "name": "debug-fef0-g63-v16",
+    "code": "fef0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 63
+  },
+  {
+    "name": "debug-fef0-g94-v16",
+    "code": "fef0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 94
+  },
+  {
+    "name": "debug-fef0-g95-v16",
+    "code": "fef0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 95
   }
 ]
