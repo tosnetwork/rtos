@@ -1610,5 +1610,175 @@ fn size_limits_cpp_cell_hashes() {
     assert_eq!(count, 14);
 }
 
+// ConfigParam 39 vectors packed by the reference schema code (4-bit
+// constructor tags `validator_temp_key#3` and `signed_temp_key#4`). Each row
+// holds the entry tuples, the reference cell and its hash, and the reference
+// validation verdict on the cell written by this crate from the same tuples.
+const CONFIG_PARAM_39_VECTORS: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/config-param-39-vectors.tsv"));
+
+struct TempKeyTuple {
+    map_key: UInt256,
+    adnl_addr: UInt256,
+    public_key: [u8; 32],
+    seqno: u32,
+    valid_until: u32,
+    r: [u8; 32],
+    s: [u8; 32],
+}
+
+fn hex32(text: &str) -> [u8; 32] {
+    let mut out = [0; 32];
+    hex::decode_to_slice(text, &mut out).unwrap();
+    out
+}
+
+fn temp_key_tuples(text: &str) -> Vec<TempKeyTuple> {
+    if text == "-" {
+        return Vec::new();
+    }
+    text.split(',')
+        .map(|entry| {
+            let f: Vec<_> = entry.split(':').collect();
+            assert_eq!(f.len(), 8, "{entry}");
+            assert_eq!(f[7], "simple", "{entry}");
+            TempKeyTuple {
+                map_key: UInt256::from(hex32(f[0])),
+                adnl_addr: UInt256::from(hex32(f[1])),
+                public_key: hex32(f[2]),
+                seqno: f[3].parse().unwrap(),
+                valid_until: f[4].parse().unwrap(),
+                r: hex32(f[5]),
+                s: hex32(f[6]),
+            }
+        })
+        .collect()
+}
+
+fn config_param_39_from(tuples: &[TempKeyTuple]) -> ConfigParam39 {
+    let mut param = ConfigParam39::new();
+    for t in tuples {
+        let key = ValidatorTempKey::with_params(
+            t.adnl_addr.clone(),
+            SigPubKey::from_bytes(&t.public_key).unwrap(),
+            t.seqno,
+            t.valid_until,
+        );
+        let signed = ValidatorSignedTempKey::with_key_and_signature(
+            key,
+            CryptoSignature::with_r_s(&t.r, &t.s),
+        );
+        param.insert(&t.map_key, &signed).unwrap();
+    }
+    param
+}
+
+fn config_param_39_rows() -> Vec<(String, Vec<TempKeyTuple>, Cell, String, bool)> {
+    CONFIG_PARAM_39_VECTORS
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| {
+            let f: Vec<_> = line.split('\t').collect();
+            assert_eq!(f.len(), 5, "{line}");
+            let cell = read_single_root_boc(hex::decode(f[2]).unwrap()).unwrap();
+            (f[0].to_string(), temp_key_tuples(f[1]), cell, f[3].to_lowercase(), f[4] == "1")
+        })
+        .collect()
+}
+
+#[test]
+fn config_param_39_matches_reference_vectors() {
+    let header = CONFIG_PARAM_39_VECTORS.lines().next().unwrap();
+    assert!(
+        header.contains("reference_commit=881240331ee48a291b96d73f8b8b93bae005ace0"),
+        "{header}"
+    );
+    let rows = config_param_39_rows();
+    assert_eq!(rows.len(), 6);
+    for (id, tuples, cell, hash, reference_accepts_ours) in rows {
+        // reference cell -> fields
+        assert_eq!(cell.repr_hash().as_hex_string(), hash, "{id}");
+        let decoded = ConfigParam39::construct_from_cell(cell.clone()).unwrap();
+        assert_eq!(decoded.validator_keys.len().unwrap(), tuples.len(), "{id}");
+        for t in &tuples {
+            let entry = decoded.get(&t.map_key).unwrap();
+            assert_eq!(entry.key().adnl_addr(), &t.adnl_addr, "{id}");
+            assert_eq!(entry.key().temp_public_key().as_slice(), &t.public_key, "{id}");
+            assert_eq!(entry.key().seqno(), t.seqno, "{id}");
+            assert_eq!(entry.key().valid_until(), t.valid_until, "{id}");
+            assert_eq!(entry.signature().as_r_s_bytes(), (&t.r[..], &t.s[..]), "{id}");
+        }
+        // fields -> the identical cell, which the reference validator accepts
+        let ours = config_param_39_from(&tuples).serialize().unwrap();
+        assert_eq!(ours.repr_hash().as_hex_string(), hash, "{id}");
+        assert!(reference_accepts_ours, "{id}");
+    }
+}
+
+#[test]
+fn config_param_39_rejects_other_tags() {
+    let rows = config_param_39_rows();
+    let (_, tuples, _, _, _) = rows.iter().find(|row| row.0 == "one").unwrap();
+    let entry = config_param_39_from(tuples).get(&tuples[0].map_key).unwrap();
+    for (outer, inner) in [(4, 3), (4, 2), (4, 5), (2, 3), (5, 3), (0, 3)] {
+        let mut key = BuilderData::new();
+        key.append_bits(inner, 4).unwrap();
+        let body = entry.key().serialize().unwrap();
+        let mut body = SliceData::load_cell(body).unwrap();
+        body.move_by(4).unwrap();
+        key.append_bytestring(&body).unwrap();
+        let mut signed = BuilderData::new();
+        signed.append_bits(outer, 4).unwrap();
+        entry.signature().write_to(&mut signed).unwrap();
+        signed.checked_append_reference(key.into_cell().unwrap()).unwrap();
+        let result = ValidatorSignedTempKey::construct_from_cell(signed.into_cell().unwrap());
+        assert_eq!(result.is_ok(), (outer, inner) == (4, 3), "{outer} {inner}");
+    }
+}
+
+/// Writes the cells this crate builds from the vector tuples, one
+/// `id<TAB>boc` line each, for the reference validator.
+#[test]
+#[ignore]
+fn export_config_param_39_cells() {
+    let out = std::env::var("RTOS_P39_EXPORT").expect("RTOS_P39_EXPORT");
+    let input =
+        std::fs::read_to_string(std::env::var("RTOS_P39_INPUT").expect("RTOS_P39_INPUT")).unwrap();
+    let mut text = String::new();
+    for line in input.lines().filter(|line| !line.starts_with('#')) {
+        let f: Vec<_> = line.split('\t').collect();
+        let cell = config_param_39_from(&temp_key_tuples(f[1])).serialize().unwrap();
+        text += &format!("{}\t{}\n", f[0], hex::encode(crate::write_boc(&cell).unwrap()));
+    }
+    std::fs::write(out, text).unwrap();
+}
+
+/// Decodes `id<TAB>boc` lines of reference cells and writes `id<TAB>ok|error`.
+#[test]
+#[ignore]
+fn decode_config_param_39_cells() {
+    let out = std::env::var("RTOS_P39_DECODED").expect("RTOS_P39_DECODED");
+    let input =
+        std::fs::read_to_string(std::env::var("RTOS_P39_CELLS").expect("RTOS_P39_CELLS")).unwrap();
+    let mut text = String::new();
+    for line in input.lines().filter(|line| !line.starts_with('#')) {
+        let f: Vec<_> = line.split('\t').collect();
+        let cell = read_single_root_boc(hex::decode(f[1]).unwrap()).unwrap();
+        let verdict = match ConfigParam39::construct_from_cell(cell).and_then(|param| {
+            let mut n = 0;
+            param.validator_keys.iterate(|_| {
+                n += 1;
+                Ok(true)
+            })?;
+            Ok(n)
+        }) {
+            Ok(n) => format!("ok:{n}"),
+            Err(err) => format!("error:{err}"),
+        };
+        text += &format!("{}\t{}\n", f[0], verdict);
+    }
+    std::fs::write(out, text).unwrap();
+}
+
 #[path = "test_config_param_schema.rs"]
 mod schema_corpus;

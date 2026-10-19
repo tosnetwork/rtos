@@ -3081,6 +3081,7 @@ impl Serializable for ConfigParam13 {
 //     valid_until:uint32
 // = ValidatorTempKey;
 
+/// Four-bit constructor tag.
 const VALIDATOR_TEMP_KEY_TAG: u8 = 0x3;
 
 #[derive(Clone, Default, Debug, Eq, PartialEq)]
@@ -3141,7 +3142,7 @@ impl ValidatorTempKey {
 
 impl Deserializable for ValidatorTempKey {
     fn read_from(&mut self, slice: &mut SliceData) -> Result<()> {
-        let tag = slice.get_next_byte()?; // TODO what is tag length in bits???
+        let tag = slice.get_next_int(4)? as u8;
         if tag != VALIDATOR_TEMP_KEY_TAG {
             fail!(Self::invalid_tag(tag as u32))
         }
@@ -3155,7 +3156,7 @@ impl Deserializable for ValidatorTempKey {
 
 impl Serializable for ValidatorTempKey {
     fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
-        cell.append_u8(VALIDATOR_TEMP_KEY_TAG)?; // TODO what is tag length in bits???
+        cell.append_bits(VALIDATOR_TEMP_KEY_TAG as usize, 4)?;
         self.adnl_addr.write_to(cell)?;
         self.temp_public_key.write_to(cell)?;
         self.seqno.write_to(cell)?;
@@ -3169,6 +3170,7 @@ impl Serializable for ValidatorTempKey {
 //     signature:CryptoSignature
 // = ValidatorSignedTempKey;
 
+/// Four-bit constructor tag.
 const VALIDATOR_SIGNED_TEMP_KEY_TAG: u8 = 0x4;
 
 #[derive(Clone, Default, Debug, Eq, PartialEq)]
@@ -3194,7 +3196,7 @@ impl ValidatorSignedTempKey {
 
 impl Deserializable for ValidatorSignedTempKey {
     fn read_from(&mut self, slice: &mut SliceData) -> Result<()> {
-        let tag = slice.get_next_byte()?; // TODO what is tag length in bits???
+        let tag = slice.get_next_int(4)? as u8;
         if tag != VALIDATOR_SIGNED_TEMP_KEY_TAG {
             fail!(Self::invalid_tag(tag as u32))
         }
@@ -3206,7 +3208,7 @@ impl Deserializable for ValidatorSignedTempKey {
 
 impl Serializable for ValidatorSignedTempKey {
     fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
-        cell.append_u8(VALIDATOR_SIGNED_TEMP_KEY_TAG)?; // TODO what is tag length in bits???
+        cell.append_bits(VALIDATOR_SIGNED_TEMP_KEY_TAG as usize, 4)?;
         self.signature.write_to(cell)?;
         cell.checked_append_reference(self.key.serialize()?)?;
         Ok(())
