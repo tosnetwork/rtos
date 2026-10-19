@@ -14,9 +14,10 @@ use common::*;
 use rtos_assembler::compile_code_to_cell;
 use rtos_block::{ExceptionCode, SliceData};
 use rtos_vm::{
-    executor::gas::gas_state::Gas,
+    error::tvm_exception_code,
+    executor::{gas::gas_state::Gas, Engine},
     int,
-    stack::{integer::IntegerData, StackItem},
+    stack::{integer::IntegerData, savelist::SaveList, Stack, StackItem},
 };
 
 #[test]
@@ -131,198 +132,211 @@ fn set_gas_limit_negative() {
     .expect_failure(ExceptionCode::OutOfGas);
 }
 
+/// C++ reference results for raw opcode bytes on the F8 gas page: (opcode,
+/// global version, integer stack items, gas limit, exit code, gas used, steps).
+/// F802, F804 and F805 are not registered by the reference VM, so they are
+/// rejected as invalid opcodes before any operand is examined; F801 and F807
+/// are implemented neighbours kept as controls.
+#[rustfmt::skip]
+const RAW_GAS_PAGE_CASES: &[(u16, u32, usize, i64, i32, i64, u32)] = &[
+    (0xf802, 0, 0, 1000, 6, 60, 2),
+    (0xf802, 0, 0, 60, 6, 60, 2),
+    (0xf802, 0, 0, 59, -14, 60, 3),
+    (0xf802, 0, 0, 10, -14, 60, 3),
+    (0xf802, 0, 0, 9, -14, 60, 3),
+    (0xf802, 0, 0, 0, -14, 60, 3),
+    (0xf802, 0, 1, 1000, 6, 60, 2),
+    (0xf802, 0, 1, 60, 6, 60, 2),
+    (0xf802, 0, 1, 59, -14, 60, 3),
+    (0xf802, 0, 1, 10, -14, 60, 3),
+    (0xf802, 0, 1, 9, -14, 60, 3),
+    (0xf802, 0, 1, 0, -14, 60, 3),
+    (0xf802, 3, 0, 1000, 6, 60, 2),
+    (0xf802, 3, 0, 60, 6, 60, 2),
+    (0xf802, 3, 0, 59, -14, 60, 3),
+    (0xf802, 3, 0, 10, -14, 60, 3),
+    (0xf802, 3, 0, 9, -14, 60, 3),
+    (0xf802, 3, 0, 0, -14, 60, 3),
+    (0xf802, 3, 1, 1000, 6, 60, 2),
+    (0xf802, 3, 1, 60, 6, 60, 2),
+    (0xf802, 3, 1, 59, -14, 60, 3),
+    (0xf802, 3, 1, 10, -14, 60, 3),
+    (0xf802, 3, 1, 9, -14, 60, 3),
+    (0xf802, 3, 1, 0, -14, 60, 3),
+    (0xf802, 4, 0, 1000, 6, 60, 2),
+    (0xf802, 4, 0, 60, 6, 60, 2),
+    (0xf802, 4, 0, 59, -14, 60, 3),
+    (0xf802, 4, 0, 10, -14, 60, 3),
+    (0xf802, 4, 0, 9, -14, 10, 2),
+    (0xf802, 4, 0, 0, -14, 10, 2),
+    (0xf802, 4, 1, 1000, 6, 60, 2),
+    (0xf802, 4, 1, 60, 6, 60, 2),
+    (0xf802, 4, 1, 59, -14, 60, 3),
+    (0xf802, 4, 1, 10, -14, 60, 3),
+    (0xf802, 4, 1, 9, -14, 10, 2),
+    (0xf802, 4, 1, 0, -14, 10, 2),
+    (0xf802, 16, 0, 1000, 6, 60, 2),
+    (0xf802, 16, 0, 60, 6, 60, 2),
+    (0xf802, 16, 0, 59, -14, 60, 3),
+    (0xf802, 16, 0, 10, -14, 60, 3),
+    (0xf802, 16, 0, 9, -14, 10, 2),
+    (0xf802, 16, 0, 0, -14, 10, 2),
+    (0xf802, 16, 1, 1000, 6, 60, 2),
+    (0xf802, 16, 1, 60, 6, 60, 2),
+    (0xf802, 16, 1, 59, -14, 60, 3),
+    (0xf802, 16, 1, 10, -14, 60, 3),
+    (0xf802, 16, 1, 9, -14, 10, 2),
+    (0xf802, 16, 1, 0, -14, 10, 2),
+    (0xf804, 0, 0, 1000, 6, 60, 2),
+    (0xf804, 0, 0, 60, 6, 60, 2),
+    (0xf804, 0, 0, 59, -14, 60, 3),
+    (0xf804, 0, 0, 10, -14, 60, 3),
+    (0xf804, 0, 0, 9, -14, 60, 3),
+    (0xf804, 0, 0, 0, -14, 60, 3),
+    (0xf804, 0, 1, 1000, 6, 60, 2),
+    (0xf804, 0, 1, 60, 6, 60, 2),
+    (0xf804, 0, 1, 59, -14, 60, 3),
+    (0xf804, 0, 1, 10, -14, 60, 3),
+    (0xf804, 0, 1, 9, -14, 60, 3),
+    (0xf804, 0, 1, 0, -14, 60, 3),
+    (0xf804, 3, 0, 1000, 6, 60, 2),
+    (0xf804, 3, 0, 60, 6, 60, 2),
+    (0xf804, 3, 0, 59, -14, 60, 3),
+    (0xf804, 3, 0, 10, -14, 60, 3),
+    (0xf804, 3, 0, 9, -14, 60, 3),
+    (0xf804, 3, 0, 0, -14, 60, 3),
+    (0xf804, 3, 1, 1000, 6, 60, 2),
+    (0xf804, 3, 1, 60, 6, 60, 2),
+    (0xf804, 3, 1, 59, -14, 60, 3),
+    (0xf804, 3, 1, 10, -14, 60, 3),
+    (0xf804, 3, 1, 9, -14, 60, 3),
+    (0xf804, 3, 1, 0, -14, 60, 3),
+    (0xf804, 4, 0, 1000, 6, 60, 2),
+    (0xf804, 4, 0, 60, 6, 60, 2),
+    (0xf804, 4, 0, 59, -14, 60, 3),
+    (0xf804, 4, 0, 10, -14, 60, 3),
+    (0xf804, 4, 0, 9, -14, 10, 2),
+    (0xf804, 4, 0, 0, -14, 10, 2),
+    (0xf804, 4, 1, 1000, 6, 60, 2),
+    (0xf804, 4, 1, 60, 6, 60, 2),
+    (0xf804, 4, 1, 59, -14, 60, 3),
+    (0xf804, 4, 1, 10, -14, 60, 3),
+    (0xf804, 4, 1, 9, -14, 10, 2),
+    (0xf804, 4, 1, 0, -14, 10, 2),
+    (0xf804, 16, 0, 1000, 6, 60, 2),
+    (0xf804, 16, 0, 60, 6, 60, 2),
+    (0xf804, 16, 0, 59, -14, 60, 3),
+    (0xf804, 16, 0, 10, -14, 60, 3),
+    (0xf804, 16, 0, 9, -14, 10, 2),
+    (0xf804, 16, 0, 0, -14, 10, 2),
+    (0xf804, 16, 1, 1000, 6, 60, 2),
+    (0xf804, 16, 1, 60, 6, 60, 2),
+    (0xf804, 16, 1, 59, -14, 60, 3),
+    (0xf804, 16, 1, 10, -14, 60, 3),
+    (0xf804, 16, 1, 9, -14, 10, 2),
+    (0xf804, 16, 1, 0, -14, 10, 2),
+    (0xf805, 0, 0, 1000, 6, 60, 2),
+    (0xf805, 0, 0, 60, 6, 60, 2),
+    (0xf805, 0, 0, 59, -14, 60, 3),
+    (0xf805, 0, 0, 10, -14, 60, 3),
+    (0xf805, 0, 0, 9, -14, 60, 3),
+    (0xf805, 0, 0, 0, -14, 60, 3),
+    (0xf805, 0, 1, 1000, 6, 60, 2),
+    (0xf805, 0, 1, 60, 6, 60, 2),
+    (0xf805, 0, 1, 59, -14, 60, 3),
+    (0xf805, 0, 1, 10, -14, 60, 3),
+    (0xf805, 0, 1, 9, -14, 60, 3),
+    (0xf805, 0, 1, 0, -14, 60, 3),
+    (0xf805, 3, 0, 1000, 6, 60, 2),
+    (0xf805, 3, 0, 60, 6, 60, 2),
+    (0xf805, 3, 0, 59, -14, 60, 3),
+    (0xf805, 3, 0, 10, -14, 60, 3),
+    (0xf805, 3, 0, 9, -14, 60, 3),
+    (0xf805, 3, 0, 0, -14, 60, 3),
+    (0xf805, 3, 1, 1000, 6, 60, 2),
+    (0xf805, 3, 1, 60, 6, 60, 2),
+    (0xf805, 3, 1, 59, -14, 60, 3),
+    (0xf805, 3, 1, 10, -14, 60, 3),
+    (0xf805, 3, 1, 9, -14, 60, 3),
+    (0xf805, 3, 1, 0, -14, 60, 3),
+    (0xf805, 4, 0, 1000, 6, 60, 2),
+    (0xf805, 4, 0, 60, 6, 60, 2),
+    (0xf805, 4, 0, 59, -14, 60, 3),
+    (0xf805, 4, 0, 10, -14, 60, 3),
+    (0xf805, 4, 0, 9, -14, 10, 2),
+    (0xf805, 4, 0, 0, -14, 10, 2),
+    (0xf805, 4, 1, 1000, 6, 60, 2),
+    (0xf805, 4, 1, 60, 6, 60, 2),
+    (0xf805, 4, 1, 59, -14, 60, 3),
+    (0xf805, 4, 1, 10, -14, 60, 3),
+    (0xf805, 4, 1, 9, -14, 10, 2),
+    (0xf805, 4, 1, 0, -14, 10, 2),
+    (0xf805, 16, 0, 1000, 6, 60, 2),
+    (0xf805, 16, 0, 60, 6, 60, 2),
+    (0xf805, 16, 0, 59, -14, 60, 3),
+    (0xf805, 16, 0, 10, -14, 60, 3),
+    (0xf805, 16, 0, 9, -14, 10, 2),
+    (0xf805, 16, 0, 0, -14, 10, 2),
+    (0xf805, 16, 1, 1000, 6, 60, 2),
+    (0xf805, 16, 1, 60, 6, 60, 2),
+    (0xf805, 16, 1, 59, -14, 60, 3),
+    (0xf805, 16, 1, 10, -14, 60, 3),
+    (0xf805, 16, 1, 9, -14, 10, 2),
+    (0xf805, 16, 1, 0, -14, 10, 2),
+    (0xf801, 0, 1, 1000, 0, 31, 2),
+    (0xf807, 0, 0, 1000, 6, 60, 2),
+    (0xf801, 16, 1, 1000, 0, 31, 2),
+    (0xf807, 16, 0, 1000, 0, 31, 2),
+];
+
 #[test]
-fn buygas_normal() {
-    test_case(
-        "PUSHINT 1000
-         BUYGAS",
-    )
-    .with_gas(Gas::test_with_limit(1000))
-    .skip_fift_check() // temporarily disable fift while no implementation
-    .expect_success()
-    .expect_gas(1000000000, 100, 0, 35);
+fn unregistered_gas_conversion_opcodes_match_cpp() {
+    for &(opcode, version, items, gas_limit, exit, gas_used, steps) in RAW_GAS_PAGE_CASES {
+        let name = format!("{opcode:04x}-v{version}-items{items}-gas{gas_limit}");
+        let code =
+            SliceData::new(vec![(opcode >> 8) as u8, opcode as u8, 0x80]).into_cell().unwrap();
+        let mut stack = Stack::new();
+        for _ in 0..items {
+            stack.push(int!(1000));
+        }
+        let mut engine = Engine::with_capabilities(0)
+            .setup_checked(code, SaveList::new(), stack, Gas::test_with_limit(gas_limit), vec![])
+            .unwrap();
+        engine.set_block_version(version);
+        let actual_exit = match engine.execute() {
+            Ok(code) => code,
+            Err(error) => match tvm_exception_code(&error) {
+                Some(ExceptionCode::OutOfGas) => -14,
+                Some(code) => code as i32,
+                None => panic!("{name}: {error}"),
+            },
+        };
+        assert_eq!(
+            (actual_exit, engine.gas_used(), engine.steps()),
+            (exit, gas_used, steps),
+            "{name}: exit, gas, steps"
+        );
+    }
 }
 
 #[test]
-fn buygas_out_of_range() {
-    test_case(
-        "PUSHINT 115792089237316195423570985008687907853269984665640564039457584007913129639935
-        BUYGAS",
-    )
-    .with_gas(Gas::test_with_limit(1000))
-    .skip_fift_check() // temporarily disable fift while no implementation
-    .expect_success()
-    .expect_gas(1000000000, 1000000000, 0, 999999946);
-}
-
-#[test]
-fn buygas_fail_out_of_gas() {
-    let mut gas = Gas::test_with_limit(100);
-    gas.use_gas(100);
-
-    test_case(
-        "PUSHINT 10000
-         BUYGAS",
-    )
-    .with_gas(gas)
-    .skip_fift_check() // temporarily disable fift while no implementation
-    .expect_gas(1000000000, 100, 0, -34)
-    .expect_failure(ExceptionCode::OutOfGas);
-}
-
-#[test]
-fn buygas_with_zero_gas_limit() {
-    test_case(
-        "PUSHINT 10000
-         BUYGAS",
-    )
-    .with_gas(Gas::test_with_limit(0))
-    .skip_fift_check() // temporarily disable fift while no implementation
-    .expect_gas(1000000000, 0, 0, -34)
-    .expect_failure(ExceptionCode::OutOfGas);
-}
-
-#[test]
-fn buygas_fail_stack_underflow() {
-    test_case("BUYGAS")
-        .with_gas(Gas::test_with_limit(1000))
-        .skip_fift_check() // temporarily disable fift while no implementation
-        .expect_gas(1000000000, 1000, 0, 924)
-        .expect_failure(ExceptionCode::StackUnderflow);
-}
-
-#[test]
-fn buygas_negative() {
-    test_case(
-        "PUSHINT -70
-         BUYGAS",
-    )
-    .with_gas(Gas::test_with_limit(1000))
-    .skip_fift_check() // temporarily disable fift while no implementation
-    .expect_gas(1000000000, 1000, 0, 948)
-    .expect_failure(ExceptionCode::OutOfGas);
-}
-
-#[test]
-fn gramtogas() {
-    test_case(
-        "PUSHINT 10
-         GRAMTOGAS",
-    )
-    .with_gas(Gas::test_with_limit(1000))
-    .skip_fift_check() // temporarily disable fift while no implementation
-    .expect_gas(1000000000, 1000, 0, 951)
-    .expect_item(int!(1));
-}
-
-#[test]
-fn gramtogas_neg() {
-    test_case(
-        "PUSHINT -10
-         GRAMTOGAS",
-    )
-    .with_gas(Gas::test_with_limit(1000))
-    .skip_fift_check() // temporarily disable fift while no implementation
-    .expect_gas(1000000000, 1000, 0, 943)
-    .expect_item(int!(0));
-}
-
-#[test]
-fn gramtogas_spec_limit() {
-    let bigint = (num::BigInt::from(i64::MAX) + 7) * 10;
-    test_case(format!(
-        "PUSHINT {}
-         GRAMTOGAS",
-        bigint
-    ))
-    .with_gas(Gas::test_with_limit(1000))
-    .skip_fift_check() // temporarily disable fift while no implementation
-    .expect_gas(1000000000, 1000, 0, 946)
-    .expect_item(int!(i64::MAX));
-}
-
-#[test]
-fn gramtogas_fail_stack_underflow() {
-    test_case("GRAMTOGAS")
-        .with_gas(Gas::test_with_limit(1000))
-        .skip_fift_check() // temporarily disable fift while no implementation
-        .expect_gas(1000000000, 1000, 0, 924)
-        .expect_failure(ExceptionCode::StackUnderflow);
+fn unregistered_gas_conversion_mnemonics_are_not_assembled_or_disassembled() {
+    for mnemonic in ["BUYGAS", "GRAMTOGAS", "GASTOGRAM"] {
+        assert!(compile_code_to_cell(mnemonic).is_err(), "{mnemonic} must not assemble");
+    }
+    for bytes in [[0xf8u8, 0x02], [0xf8, 0x04], [0xf8, 0x05]] {
+        let mut slice = SliceData::from_raw(bytes.to_vec(), 16);
+        if let Ok(text) = rtos_assembler::disasm::disasm(&mut slice) {
+            for mnemonic in ["BUYGAS", "GRAMTOGAS", "GASTOGRAM"] {
+                assert!(!text.contains(mnemonic), "{text}");
+            }
+        }
+    }
 }
 
 #[test]
 fn gasconsumed() {
     test_case("GASCONSUMED").expect_int_stack(&[26]);
-}
-
-#[test]
-fn gastogram() {
-    test_case(
-        "PUSHINT 200
-         GASTOGRAM",
-    )
-    .with_gas(Gas::test_with_limit(1000))
-    .skip_fift_check() // temporarily disable fift while no implementation
-    .expect_gas(1000000000, 1000, 0, 935)
-    .expect_item(int!(2000));
-}
-
-#[test]
-fn gastogram_neg() {
-    test_case(
-        "PUSHINT -10
-         GASTOGRAM",
-    )
-    .with_gas(Gas::test_with_limit(1000))
-    .skip_fift_check() // temporarily disable fift while no implementation
-    .expect_gas(1000000000, 1000, 0, 943)
-    .expect_item(int!(-100));
-}
-
-#[test]
-fn gastogram_max() {
-    test_case(format!(
-        "
-        PUSHINT {}
-        GASTOGRAM
-    ",
-        i64::MAX
-    ))
-    .skip_fift_check() // temporarily disable fift while no implementation
-    .expect_item(int!(i64::MAX as i128 * 10));
-}
-
-#[test]
-fn gastogram_fail_stack_underflow() {
-    test_case("GASTOGRAM")
-        .with_gas(Gas::test_with_limit(1000))
-        .skip_fift_check() // temporarily disable fift while no implementation
-        .expect_gas(1000000000, 1000, 0, 924)
-        .expect_failure(ExceptionCode::StackUnderflow);
-}
-
-#[test]
-fn gastogram_o_gramtogas_eq_identity() {
-    test_case(
-        "
-        PUSHINT 10000
-        GASTOGRAM
-        GRAMTOGAS",
-    )
-    .skip_fift_check() // temporarily disable fift while no implementation
-    .expect_item(int!(10000));
-}
-
-#[test]
-fn gramtogas_o_gastogram_eq_identity() {
-    test_case(
-        "
-        PUSHINT 1000000000
-        GRAMTOGAS
-        GASTOGRAM",
-    )
-    .skip_fift_check() // temporarily disable fift while no implementation
-    .expect_item(int!(1000000000));
 }
 
 #[test]

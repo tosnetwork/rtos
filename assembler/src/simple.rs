@@ -93,7 +93,6 @@ impl Engine {
         BREMBITREFS                          => 0xCF, 0x37
         BREMREFS                             => 0xCF, 0x36
         BTOS                                 => 0xCF, 0x50
-        BUYGAS                               => 0xF8, 0x02
         CADR                                 => 0x6F, 0xB4
         CADDR                                => 0x6F, 0xD4
         CDDR                                 => 0x6F, 0xB5
@@ -292,7 +291,6 @@ impl Engine {
         FITS z = parse_const_u8_plus_one     => 0xB4, z
         FITSX                                => 0xB6, 0x00
         GASCONSUMED                          => 0xF8, 0x07
-        GASTOGRAM                            => 0xF8, 0x05
         GEQ                                  => 0xBE
         GETEXTRABALANCE                      => 0xf8, 0x80
         GETFORWARDFEE                        => 0xF8, 0x38
@@ -307,7 +305,6 @@ impl Engine {
         GETPRECOMPILEDGAS                    => 0xF8, 0x39
         GETSTORAGEFEE                        => 0xF8, 0x37
         GLOBALID                             => 0xF8, 0x35
-        GRAMTOGAS                            => 0xF8, 0x04
         GREATER                              => 0xBC
         GTINT z = parse_const_i8             => 0xC2, z
         HASHBU                               => 0xF9, 0x16

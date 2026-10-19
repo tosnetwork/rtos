@@ -1826,10 +1826,7 @@ impl Loader {
     create_handler_2!(dictugetexecz, 0xf4bf, "DICTUGETEXECZ");
     create_handler_2!(accept, 0xf800, "ACCEPT");
     create_handler_2!(setgaslimit, 0xf801, "SETGASLIMIT");
-    create_handler_2!(buygas, 0xf802, "BUYGAS");
-    create_handler_2!(gramtogas, 0xf804, "GRAMTOGAS");
     create_handler_2!(gasconsumed, 0xf807, "GASCONSUMED");
-    create_handler_2!(gastogram, 0xf805, "GASTOGRAM");
     create_handler_2!(commit, 0xf80f, "COMMIT");
     create_handler_2!(randu256, 0xf810, "RANDU256");
     create_handler_2!(rand, 0xf811, "RAND");
