@@ -145,10 +145,11 @@ pub(crate) type ReceiverListenerPtr = Weak<dyn ReceiverListener + Send + Sync>;
 /// Used by SessionProcessor to broadcast votes, blocks, and manage standstill.
 /// Implementation: ReceiverWrapper
 pub(crate) trait Receiver: Send + Sync {
-    /// Send vote to all validators
+    /// Send an own vote to every other validator
     ///
-    /// Signs the vote, broadcasts to all validators, and processes loopback
-    /// (our own vote is submitted to the listener for FSM accounting).
+    /// The caller has already applied the signed vote to local consensus
+    /// state, and calls this only if that local accounting accepted it; there
+    /// is no loopback here.
     ///
     /// # Arguments
     /// * `vote` - Signed TL vote to broadcast
@@ -1268,17 +1269,9 @@ impl ReceiverImpl {
             }
         }
 
-        // Process loopback - submit our own vote to the listener for FSM accounting
-        // Only on first send (re-broadcast votes were already accounted for)
-        if !is_rebroadcast {
-            log::trace!(
-                "SimplexReceiver {}: processing loopback for own vote",
-                self.session_id.to_hex_string()
-            );
-            if let Some(listener) = self.listener.upgrade() {
-                listener.on_vote(local_idx, vote.into_boxed(), raw_vote);
-            }
-        }
+        // No loopback: the session applied this vote locally before asking for
+        // it to be sent, and sends only a vote that local accounting accepted.
+        let _ = (local_idx, raw_vote);
     }
 
     /// Send block candidate to all validators

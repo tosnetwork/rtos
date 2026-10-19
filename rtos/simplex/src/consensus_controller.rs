@@ -1408,12 +1408,40 @@ impl ConsensusController {
         // Publication is gated by the durable intent and the exact signed bytes
         // the signing journal committed before returning them.
 
+        // The signature becomes observable here. As in the reference node, the
+        // vote is first accounted locally, and it is broadcast only if that
+        // local accounting applied it: a vote this node itself rejects must not
+        // reach a peer, directly or inside a certificate built on it.
+        let Some(local_idx) = self.description.local_validator_index() else {
+            return;
+        };
+        let boxed = rtos_api::IntoBoxed::into_boxed(signed_vote.clone());
+        let raw_vote: RawVoteData = match self.description.opts().wire_profile.serialize(&boxed) {
+            Ok(bytes) => bytes.into(),
+            Err(e) => {
+                log::error!(
+                    "Session {} broadcast_vote: cannot serialize own vote: {}",
+                    self.session_id().to_hex_string(),
+                    e
+                );
+                self.telemetry.increment_error();
+                return;
+            }
+        };
+        if !self.on_vote(backend, local_idx.value(), boxed, raw_vote) {
+            log::warn!(
+                "Session {} broadcast_vote: own vote was not applied locally; not broadcasting it",
+                self.session_id().to_hex_string()
+            );
+            return;
+        }
+
         log::trace!(
             "Session {} broadcast_vote: sending signed vote",
             self.session_id().to_hex_string()
         );
 
-        // Send via receiver to all validators (serializes + broadcasts + loopback).
+        // Send to every other validator; local accounting is already done.
         backend.send_vote(signed_vote);
     }
 }

@@ -11115,7 +11115,11 @@ fn own_journal_real_vote_controller_and_recovery() {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(sent, again);
+            // The vote was applied locally on its first cast; a repeated cast
+            // releases the committed bytes but local accounting reports a
+            // duplicate, so nothing is published again and nothing is signed.
+            assert!(again.is_empty(), "an already applied own vote is not published again");
+            assert_eq!(sent.len(), 1);
             assert_eq!(h.calls.load(Ordering::SeqCst), 1);
         }
     }
@@ -11567,7 +11571,8 @@ fn custody_real_vote_controller_and_recovery() {
                         _ => None,
                     })
                     .collect();
-                assert_eq!(sent, again);
+                assert!(again.is_empty(), "an already applied own vote is not published again");
+                assert_eq!(sent.len(), 1);
                 assert_eq!(h.signature_count(), 1);
             }
         }
@@ -12925,3 +12930,47 @@ fn test_query_repair_restores_absent_body_despite_retained_validation_decision()
     }
 }
 
+/// An own vote is published only after local accounting applied it, as the
+/// reference applies an own vote before broadcasting it. A vote local state
+/// rejects is still signed and journalled (the decision was made), but it never
+/// reaches a peer, directly or through a certificate.
+#[test]
+fn own_vote_rejected_locally_is_never_published() {
+    let h = crate::signing_coordinator::tests::Harness::custody(rtos_api::WireProfile::Legacy);
+    h.description.install_coordinator(h.coordinator.clone()).unwrap();
+    let mut processor =
+        make_pq_processor_with_description_for_test(h.db.clone(), h.description.clone());
+    let receiver = MockReceiver::new();
+    processor.receiver = receiver.clone();
+    let published = |actions: &[ReceiverAction]| {
+        actions
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    ReceiverAction::SendVote { .. } | ReceiverAction::SendCertificate { .. }
+                )
+            })
+            .count()
+    };
+
+    let too_far = processor.simplex_state.first_too_new_vote_slot();
+    let rejected =
+        crate::simplex_state::Vote::Skip(crate::simplex_state::SkipVote { slot: too_far });
+    processor.with_consensus_backend(|controller, backend| {
+        controller.broadcast_vote_after_persist(backend, rejected)
+    });
+    assert_eq!(h.signature_count(), 1, "the decision is signed and journalled first");
+    assert_eq!(published(&receiver.drain_actions()), 0, "a locally rejected vote must not be sent");
+
+    let accepted = crate::simplex_state::Vote::Skip(crate::simplex_state::SkipVote {
+        slot: SlotIndex::new(0),
+    });
+    processor.with_consensus_backend(|controller, backend| {
+        controller.broadcast_vote_after_persist(backend, accepted)
+    });
+    assert_eq!(h.signature_count(), 2);
+    let actions = receiver.drain_actions();
+    assert_eq!(published(&actions), 1, "an applied own vote is sent exactly once");
+    assert!(actions.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })));
+}
