@@ -25,16 +25,17 @@ use rtos_api::{
         rpc::ton_node::{
             DownloadBlock, DownloadBlockFull, DownloadBlockProof, DownloadBlockProofLink,
             DownloadKeyBlockProof, DownloadKeyBlockProofLink, DownloadNextBlockFull,
-            DownloadPersistentStateSliceV2, DownloadZeroState, GetArchiveInfo, GetArchiveSlice,
-            GetCapabilities, GetNextBlockDescription, GetNextKeyBlockIds, GetPersistentStateSizeV2,
-            GetShardArchiveInfo, PrepareBlock, PrepareBlockProof, PrepareKeyBlockProof,
-            PreparePersistentState, PrepareZeroState,
+            DownloadNextBlocksFull, DownloadPersistentStateSliceV2, DownloadZeroState,
+            GetArchiveInfo, GetArchiveSlice, GetCapabilities, GetNextBlockDescription,
+            GetNextKeyBlockIds, GetPersistentStateSizeV2, GetShardArchiveInfo, PrepareBlock,
+            PrepareBlockProof, PrepareKeyBlockProof, PreparePersistentState, PrepareZeroState,
         },
         ton_node::{
             self,
             archiveinfo::ArchiveInfo,
             capabilities::Capabilities,
             datafull::{DataFull, DataFullCompressed},
+            nextblocksfull::NextBlocksFull,
             persistentstateidv2::PersistentStateIdV2,
             ArchiveInfo as ArchiveInfoBoxed, BlockDescription, DataFull as DataFullBoxed,
             KeyBlocks, Prepared, PreparedProof, PreparedState,
@@ -43,10 +44,11 @@ use rtos_api::{
     AnyBoxedSerialize, IntoBoxed, TLObject,
 };
 use rtos_block::{
-    fail, lz4_compress, read_single_root_boc, BlockIdExt, BocWriter, Result, ShardIdent,
+    error, fail, lz4_compress, read_single_root_boc, BlockIdExt, BocFlags, BocWriter, Result,
+    ShardIdent,
 };
 use std::{cmp::min, fmt::Debug, sync::Arc};
-use storage::types::PersistentStatePartId;
+use storage::{block_handle_db::BlockHandle, types::PersistentStatePartId};
 
 // max part size for partially transmitted data like archives and states
 const PART_MAX_SIZE: usize = 1 << 21;
@@ -236,6 +238,8 @@ impl FullNodeOverlayService {
     }
 
     const NEXT_KEY_BLOCKS_LIMIT: usize = 8;
+    const NEXT_BLOCKS_MAX_BLOCKS: u32 = 10;
+    const NEXT_BLOCKS_MAX_TOTAL_SIZE: usize = 1 << 20;
 
     fn build_next_key_blocks_answer(
         blocks: Vec<BlockIdExt>,
@@ -306,6 +310,51 @@ impl FullNodeOverlayService {
         Ok(answer.into_tl_object())
     }
 
+    /// One block with its proof as a full-block answer: the full proof when
+    /// the block has one, otherwise its proof link; `None` when the block's
+    /// data or both proofs are missing.
+    async fn block_full_entry(
+        &self,
+        handle: &Arc<BlockHandle>,
+        compressed: bool,
+    ) -> Result<Option<DataFullBoxed>> {
+        let has_proof = handle.has_proof();
+        if !handle.has_data() || !(has_proof || handle.has_proof_link()) {
+            return Ok(None);
+        }
+        let is_link = !has_proof;
+        let block = self.engine.load_block_raw(handle).await?;
+        let proof = self.engine.load_block_proof_raw(handle, is_link).await?;
+        Ok(Some(Self::serialize_block_full(
+            handle.id().clone(),
+            proof,
+            block,
+            is_link,
+            compressed,
+        )?))
+    }
+
+    /// tonNode.dataFull, or with compression tonNode.dataFullCompressed: the
+    /// proof and block roots in one BOC with a CRC32C, LZ4-compressed.
+    fn serialize_block_full(
+        id: BlockIdExt,
+        proof: Vec<u8>,
+        block: Vec<u8>,
+        is_link: bool,
+        compressed: bool,
+    ) -> Result<DataFullBoxed> {
+        let is_link = if is_link { ton::Bool::BoolTrue } else { ton::Bool::BoolFalse };
+        if !compressed {
+            return Ok(DataFull { id, proof, block, is_link }.into_boxed());
+        }
+        let proof_root = read_single_root_boc(&proof)?;
+        let block_root = read_single_root_boc(&block)?;
+        let mut data = vec![];
+        BocWriter::with_flags([proof_root, block_root], BocFlags::Crc32)?.write(&mut data)?;
+        let compressed = lz4_compress(&data, false)?;
+        Ok(DataFullCompressed { id, compressed, is_link }.into_boxed())
+    }
+
     // tonNode.downloadNextBlockFull prev_block:tonNode.blockIdExt = tonNode.DataFull;
     async fn download_next_block_full(&self, query: DownloadNextBlockFull) -> Result<TLObject> {
         let mut answer = DataFullBoxed::TonNode_DataFullEmpty;
@@ -313,28 +362,75 @@ impl FullNodeOverlayService {
             if prev_handle.has_next1() {
                 let next_id = self.engine.load_block_next1(&query.prev_block)?;
                 if let Some(next_handle) = self.engine.load_block_handle(&next_id)? {
-                    let has_proof_link = next_handle.has_proof_link();
-                    let has_proof = next_handle.has_proof();
-                    if next_handle.has_data() && (has_proof || has_proof_link) {
-                        let block = self.engine.load_block_raw(&next_handle).await?;
-                        let proof =
-                            self.engine.load_block_proof_raw(&next_handle, has_proof_link).await?;
-                        answer = DataFull {
-                            id: next_id,
-                            proof,
-                            block,
-                            is_link: if has_proof_link {
-                                ton::Bool::BoolTrue
-                            } else {
-                                ton::Bool::BoolFalse
-                            },
-                        }
-                        .into_boxed();
+                    if let Some(entry) =
+                        self.block_full_entry(&next_handle, self.compression).await?
+                    {
+                        answer = entry;
                     }
                 }
             }
         }
         Ok(answer.into_tl_object())
+    }
+
+    // tonNode.downloadNextBlocksFull prev_block:tonNode.blockIdExt max_blocks:int
+    //     = tonNode.NextBlocksFull;
+    // Always answered with the blocks collected so far, also when a later
+    // block cannot be read.
+    async fn download_next_blocks_full(&self, query: DownloadNextBlocksFull) -> Result<TLObject> {
+        let mut blocks = Vec::new();
+        if let Err(e) = self.collect_next_blocks_full(&query, &mut blocks).await {
+            log::debug!(
+                "downloadNextBlocksFull after {}: {e} (sending {} blocks)",
+                query.prev_block,
+                blocks.len()
+            );
+        }
+        Ok(NextBlocksFull { blocks }.into_boxed().into_tl_object())
+    }
+
+    async fn collect_next_blocks_full(
+        &self,
+        query: &DownloadNextBlocksFull,
+        blocks: &mut Vec<DataFullBoxed>,
+    ) -> Result<()> {
+        // The requested count is read as unsigned, so a negative one asks for
+        // the most.
+        let max_blocks = min(query.max_blocks as u32, Self::NEXT_BLOCKS_MAX_BLOCKS) as usize;
+        if !query.prev_block.shard().is_masterchain() || !query.prev_block.shard().is_full() {
+            fail!("expected masterchain block");
+        }
+        let mut handle = self
+            .engine
+            .load_block_handle(&query.prev_block)?
+            .ok_or_else(|| error!("unknown block {}", query.prev_block))?;
+        let mut total_size = 0usize;
+        while blocks.len() < max_blocks && handle.has_next1() {
+            let next_id = self.engine.load_block_next1(handle.id())?;
+            let Some(next) = self.engine.load_block_handle(&next_id)? else {
+                break;
+            };
+            if !next.has_data() || !next.has_proof() {
+                break;
+            }
+            let block = self.engine.load_block_raw(&next).await?;
+            let proof = self.engine.load_block_proof_raw(&next, false).await?;
+            let entry = Self::serialize_block_full(next.id().clone(), proof, block, false, true)?;
+            // The size of the entry without its constructor.
+            let size = serialize_boxed(&entry)?.len().saturating_sub(4);
+            if total_size.saturating_add(size) > Self::NEXT_BLOCKS_MAX_TOTAL_SIZE
+                && !blocks.is_empty()
+            {
+                break;
+            }
+            total_size = total_size.saturating_add(size);
+            blocks.push(entry);
+            if total_size > Self::NEXT_BLOCKS_MAX_TOTAL_SIZE {
+                break;
+            }
+            handle = next;
+        }
+        Ok(())
     }
 
     // tonNode.downloadBlockFull block:tonNode.blockIdExt = tonNode.DataFull;
@@ -343,40 +439,8 @@ impl FullNodeOverlayService {
         self.block_download_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut answer = DataFullBoxed::TonNode_DataFullEmpty;
         if let Some(handle) = self.engine.load_block_handle(&query.block)? {
-            let has_proof_link = handle.has_proof_link();
-            let has_proof = handle.has_proof();
-            if handle.has_data() && (has_proof || has_proof_link) {
-                let block = self.engine.load_block_raw(&handle).await?;
-                let proof = self.engine.load_block_proof_raw(&handle, has_proof_link).await?;
-                answer = if self.compression {
-                    let mut data = vec![];
-                    let proof_root = read_single_root_boc(&proof)?;
-                    let block_root = read_single_root_boc(&block)?;
-                    BocWriter::with_roots([proof_root, block_root])?.write(&mut data)?;
-                    let compressed = lz4_compress(&data, false)?;
-                    DataFullCompressed {
-                        id: query.block,
-                        compressed,
-                        is_link: if has_proof_link {
-                            ton::Bool::BoolTrue
-                        } else {
-                            ton::Bool::BoolFalse
-                        },
-                    }
-                    .into_boxed()
-                } else {
-                    DataFull {
-                        id: query.block,
-                        proof,
-                        block,
-                        is_link: if has_proof_link {
-                            ton::Bool::BoolTrue
-                        } else {
-                            ton::Bool::BoolFalse
-                        },
-                    }
-                    .into_boxed()
-                };
+            if let Some(entry) = self.block_full_entry(&handle, self.compression).await? {
+                answer = entry;
             }
         }
         Ok(answer.into_tl_object())
@@ -864,6 +928,14 @@ impl Subscriber for FullNodeOverlayService {
 
         let query = match self
             .consume_query::<DownloadNextBlockFull, _>(query, &Self::download_next_block_full)
+            .await?
+        {
+            Ok(answer) => return Ok(answer),
+            Err(query) => query,
+        };
+
+        let query = match self
+            .consume_query::<DownloadNextBlocksFull, _>(query, &Self::download_next_blocks_full)
             .await?
         {
             Ok(answer) => return Ok(answer),

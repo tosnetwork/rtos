@@ -154,6 +154,11 @@ fn fixed_reference_target_codec_bidirectional() {
         crate::ton::rpc::ton_node::DownloadNextBlockFull::default().into_tl_object(),
     ));
     cases.push((
+        "tosNode.downloadNextBlocksFull",
+        true,
+        crate::ton::rpc::ton_node::DownloadNextBlocksFull::default().into_tl_object(),
+    ));
+    cases.push((
         "tosNode.downloadPersistentStateSliceV2",
         true,
         crate::ton::rpc::ton_node::DownloadPersistentStateSliceV2::default().into_tl_object(),
@@ -293,6 +298,13 @@ fn fixed_reference_target_codec_bidirectional() {
         "tosNode.newShardBlockBroadcast",
         false,
         crate::ton::ton_node::broadcast::NewShardBlockBroadcast::default()
+            .into_boxed()
+            .into_tl_object(),
+    ));
+    cases.push((
+        "tosNode.nextBlocksFull",
+        false,
+        crate::ton::ton_node::nextblocksfull::NextBlocksFull::default()
             .into_boxed()
             .into_tl_object(),
     ));

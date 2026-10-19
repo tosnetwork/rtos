@@ -104,6 +104,7 @@ const CONSTRUCTORS: &[(u32, u32)] = &[
     (0xec23483a, 0x4f95e21f), // tosNode.downloadKeyBlockProof
     (0x12e42ad2, 0xc13d3142), // tosNode.downloadKeyBlockProofLink
     (0x6ea0374a, 0x87ad0787), // tosNode.downloadNextBlockFull
+    (0xc4bcf88f, 0xf7e28640), // tosNode.downloadNextBlocksFull
     (0x868c8410, 0x94271ee8), // tosNode.downloadPersistentStateSliceV2
     (0xadcc1e5a, 0xf9c3b1c6), // tosNode.downloadZeroState
     (0xdc75a209, 0xc91793c5), // tosNode.externalMessage
@@ -128,6 +129,7 @@ const CONSTRUCTORS: &[(u32, u32)] = &[
     (0x0cd86894, 0xa40feb13), // tosNode.newBlockCandidateBroadcastCompressed
     (0x9f0e7f35, 0x735e4059), // tosNode.newBlockCandidateBroadcastCompressedV2
     (0xa49dc229, 0x6816f601), // tosNode.newShardBlock
+    (0x476cdac5, 0x6eb47142), // tosNode.nextBlocksFull
     (0x0af2fabc, 0xcdd111f0), // tosNode.newShardBlockBroadcast
     (0xe2c33da6, 0x6b9d20c5), // tosNode.notFound
     (0x32390a51, 0x69684d1f), // tosNode.notFoundState

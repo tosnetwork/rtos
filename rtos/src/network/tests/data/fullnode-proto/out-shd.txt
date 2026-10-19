@@ -1,0 +1,8 @@
+SHD inactive.queries getCapabilities=error downloadBlockFull=error prepareBlock=error getCapabilities=error downloadBlockFull=error prepareBlock=error getCapabilities=error downloadBlockFull=error prepareBlock=error 
+SHD inactive.messages 9:25387614 9:25387614 9:25387614 9:25387614 9:25387614 9:25387614 9:25387614 9:25387614 9:25387614 
+SHD inactive.tracked_sources 0
+SHD active.queries getCapabilities=ok:c060bff5030000000200000000000000 getCapabilities=ok:c060bff5030000000200000000000000 getCapabilities=ok:c060bff5030000000200000000000000 
+SHD active.messages -
+SHD active.tracked_sources 0
+SHD forget.neighbours 1 3 
+SHD forget.overlay 2 7 

@@ -12,7 +12,7 @@ use crate::types::owned_tasks::OwnedTasks;
  */
 use adnl::{
     common::{spawn_cancelable, Query, Wait},
-    node::{AddressCache, AdnlNode},
+    node::AddressCache,
     OverlayNode, OverlayShortId,
 };
 use rand::Rng;
@@ -25,7 +25,7 @@ use std::{
     cmp::min,
     fmt::{Display, Formatter},
     sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -41,9 +41,9 @@ pub struct Neighbour {
     roundtrip_rldp: AtomicU64,
     all_attempts: AtomicU64,
     fail_attempts: AtomicU64,
-    fines_points: AtomicU32,
-    active_check: AtomicBool,
-    unreliability: AtomicU16, // RLDP-unreliablity | ADNL-unreliability
+    // One counter for every query outcome, whatever its transport: a failure
+    // adds one, a success takes one off down to zero.
+    unreliability: AtomicU32,
 }
 
 pub struct Neighbours {
@@ -60,12 +60,13 @@ pub struct Neighbours {
     tasks: Arc<OwnedTasks>,
 }
 
-pub const PROTOCOL_VERSION_MAJOR: i32 = 2;
-pub const PROTOCOL_VERSION_MINOR: i32 = 0;
-pub const BETTER_REPLACE_UNRELIABILITY: u8 = 5;
-pub const FAIL_UNRELIABILITY: u8 = 10;
-
-const FINES_POINTS_COUNT: u32 = 100;
+pub const PROTOCOL_VERSION_MAJOR: i32 = 3;
+pub const PROTOCOL_VERSION_MINOR: i32 = 2;
+/// A full neighbour list drops its most unreliable member for a new peer
+/// only when that member's unreliability is above this.
+pub const BETTER_REPLACE_UNRELIABILITY: u32 = 5;
+/// Neighbours whose relative unreliability is above this are never chosen.
+pub const FAIL_UNRELIABILITY: u32 = 10;
 
 pub const UPDATE_FLAG_SUCCESS: u8 = 0x01;
 pub const UPDATE_FLAG_IS_RLDP: u8 = 0x02;
@@ -76,14 +77,15 @@ impl Display for Neighbour {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} unr {}, rt ADNL {}, rt RLDP {}, peer stat: {:.4}, fines {}",
+            "{} unr {}, version {}.{}, rt ADNL {}, rt RLDP {}, peer stat: {:.4}",
             self.id(),
-            self.effective_unreliability(),
+            self.unreliability(),
+            self.proto_version_major.load(Ordering::Relaxed),
+            self.proto_version_minor.load(Ordering::Relaxed),
             self.roundtrip_adnl.load(Ordering::Relaxed),
             self.roundtrip_rldp.load(Ordering::Relaxed),
             self.fail_attempts.load(Ordering::Relaxed) as f64
                 / self.all_attempts.load(Ordering::Relaxed) as f64,
-            self.fines_points.load(Ordering::Relaxed)
         )
     }
 }
@@ -99,29 +101,32 @@ impl Neighbour {
             roundtrip_rldp: AtomicU64::new(default_rldp_roundtrip as u64),
             all_attempts: AtomicU64::new(0),
             fail_attempts: AtomicU64::new(0),
-            fines_points: AtomicU32::new(0),
-            active_check: AtomicBool::new(false),
-            //roundtrip_relax_at: 0,
-            //roundtrip_weight: 0.0,
-            unreliability: AtomicU16::new(0),
+            unreliability: AtomicU32::new(0),
         }
     }
 
-    /// Corrected unreliability
-    pub fn effective_unreliability(&self) -> u8 {
-        let mut unr = self.unreliability.load(Ordering::Relaxed);
-        let major = self.proto_version_major.load(Ordering::Relaxed);
-        let minor = self.proto_version_minor.load(Ordering::Relaxed);
-        if major < PROTOCOL_VERSION_MAJOR {
-            unr += (4 << 8) + 4;
-        } else if (major == PROTOCOL_VERSION_MAJOR) && (minor < PROTOCOL_VERSION_MINOR) {
-            unr += (2 << 8) + 2;
-        }
-        (unr as u8).max((unr >> 8) as u8)
+    pub fn unreliability(&self) -> u32 {
+        self.unreliability.load(Ordering::Relaxed)
+    }
+
+    /// The protocol version the neighbour advertised, as unsigned numbers;
+    /// 0.0 until its capabilities are known.
+    pub fn version(&self) -> (u32, u32) {
+        (
+            self.proto_version_major.load(Ordering::Relaxed) as u32,
+            self.proto_version_minor.load(Ordering::Relaxed) as u32,
+        )
     }
 
     pub fn is_good(&self) -> bool {
-        self.effective_unreliability() <= BETTER_REPLACE_UNRELIABILITY
+        self.unreliability() <= BETTER_REPLACE_UNRELIABILITY
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_state(&self, unreliability: u32, major: i32, minor: i32) {
+        self.unreliability.store(unreliability, Ordering::Relaxed);
+        self.proto_version_major.store(major, Ordering::Relaxed);
+        self.proto_version_minor.store(minor, Ordering::Relaxed);
     }
 
     pub fn update_proto_version(&self, q: &Capabilities) {
@@ -134,23 +139,9 @@ impl Neighbour {
     }
 
     pub fn query_success(&self, roundtrip: u64, is_rldp: bool) {
-        loop {
-            let old = self.unreliability.load(Ordering::Relaxed);
-            let mask = if is_rldp { 0xFF00 } else { 0x00FF };
-            if (old & mask) > 0 {
-                let new = old - (0x0101 & mask);
-                if self
-                    .unreliability
-                    .compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_err()
-                {
-                    continue;
-                } else {
-                    // log::trace!("query_success (key_id {}) new value: {}", self.id, new_un);
-                }
-            }
-            break;
-        }
+        let _ = self
+            .unreliability
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| Some(old.saturating_sub(1)));
         if is_rldp {
             self.update_roundtrip_rldp(roundtrip)
         } else {
@@ -159,23 +150,9 @@ impl Neighbour {
     }
 
     pub fn query_failed(&self, roundtrip: u64, is_rldp: bool) {
-        loop {
-            let old = self.unreliability.load(Ordering::Relaxed);
-            let mask = if is_rldp { 0xFF00 } else { 0x00FF };
-            if (old & mask) < (0xFFFF & mask) {
-                let new = old + (0x0101 & mask);
-                if self
-                    .unreliability
-                    .compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_err()
-                {
-                    continue;
-                } else {
-                    // log::trace!("query_failed (key_id {}, overlay: ) new value: {}", self.id, un);
-                }
-            }
-            break;
-        }
+        let _ = self
+            .unreliability
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| Some(old.saturating_add(1)));
         let labels = [("neighbour", self.id.to_string())];
         metrics::counter!("rtos_node_network_neighbour_failures_total", &labels).increment(1);
         if is_rldp {
@@ -184,11 +161,6 @@ impl Neighbour {
             self.update_roundtrip_adnl(roundtrip)
         }
     }
-
-    // Unused
-    // pub fn capabilities(&self) -> i64 {
-    //     self.capabilities.load(Ordering::Relaxed)
-    // }
 
     pub fn roundtrip_adnl(&self) -> Option<u64> {
         Self::roundtrip(&self.roundtrip_adnl)
@@ -232,6 +204,85 @@ impl Neighbour {
 }
 
 pub const MAX_NEIGHBOURS: usize = 16;
+
+/// Whether a neighbour advertises at least the required version.
+fn is_eligible(neighbour: &Neighbour, required: (u32, u32)) -> bool {
+    let (major, minor) = neighbour.version();
+    major > required.0 || (major == required.0 && minor >= required.1)
+}
+
+/// Selection weight of a neighbour whose unreliability is `unreliability`
+/// when the least unreliable eligible neighbour has `min_unreliability`:
+/// 2^(FAIL_UNRELIABILITY - u), where u is the difference plus 4 for an older
+/// major version and 2 for an older minor one; none above the cutoff.
+pub(crate) fn selection_weight(
+    unreliability: u32,
+    min_unreliability: u32,
+    (major, minor): (u32, u32),
+) -> Option<u32> {
+    let mut unr = unreliability.saturating_sub(min_unreliability);
+    if major < PROTOCOL_VERSION_MAJOR as u32 {
+        unr = unr.saturating_add(4);
+    } else if major == PROTOCOL_VERSION_MAJOR as u32 && minor < PROTOCOL_VERSION_MINOR as u32 {
+        unr = unr.saturating_add(2);
+    }
+    if unr <= FAIL_UNRELIABILITY {
+        Some(1u32 << (FAIL_UNRELIABILITY - unr))
+    } else {
+        None
+    }
+}
+
+/// Weighted random choice among the neighbours advertising at least
+/// `required`; `None` when none of them is eligible and within the cutoff.
+pub(crate) fn choose_from(
+    neighbours: &[Arc<Neighbour>],
+    required: (u32, u32),
+    rng: &mut impl Rng,
+) -> Option<Arc<Neighbour>> {
+    let min_unreliability =
+        neighbours.iter().filter(|n| is_eligible(n, required)).map(|n| n.unreliability()).min()?;
+    let mut best = None;
+    let mut sum = 0u64;
+    for neighbour in neighbours.iter().filter(|n| is_eligible(n, required)) {
+        if let Some(weight) =
+            selection_weight(neighbour.unreliability(), min_unreliability, neighbour.version())
+        {
+            sum = sum.saturating_add(weight as u64);
+            if rng.gen_range(0..sum) < weight as u64 {
+                best = Some(neighbour.clone());
+            }
+        }
+    }
+    best
+}
+
+/// The neighbour a full list gives up for a new peer: its most unreliable
+/// member when that one is above BETTER_REPLACE_UNRELIABILITY (`true`), a
+/// uniformly random member otherwise (`false`); `None` for an empty list.
+pub(crate) fn replacement_victim(
+    neighbours: &[Arc<Neighbour>],
+    rng: &mut impl Rng,
+) -> Option<(Arc<Neighbour>, bool)> {
+    let mut worst = None;
+    let mut random = None;
+    let mut max_unreliability = 0;
+    for (count, neighbour) in neighbours.iter().enumerate() {
+        let unreliability = neighbour.unreliability();
+        if unreliability > max_unreliability {
+            max_unreliability = unreliability;
+            worst = Some(neighbour.clone());
+        }
+        if rng.gen_range(0..=count) == 0 {
+            random = Some(neighbour.clone());
+        }
+    }
+    if max_unreliability > BETTER_REPLACE_UNRELIABILITY {
+        worst.map(|n| (n, true))
+    } else {
+        random.map(|n| (n, false))
+    }
+}
 const PING_DELAY_MS: u64 = 1000; // Neighbour ping recommended minimum delay
 const RESERVE_PING_DELAY_MS: u64 = 30000; // Reserved neighbour ping recommended minimum delay
 
@@ -326,7 +377,6 @@ impl Neighbours {
         log::trace!("neighbours reserve before: {}", self.reserve.descr());
         let mut ex = false;
         let mut rng = rand::thread_rng();
-        let mut is_delete_peer = false;
 
         let (mut iter, mut current) = overlay_peers.first();
         while let Some(elem) = current {
@@ -343,54 +393,21 @@ impl Neighbours {
             }
 
             if count == MAX_NEIGHBOURS {
-                let mut cur_worst = None;
-                let mut cur_rand = None;
-                let mut u = 0;
-
-                // Iteration by active peers to find both worst unreliability peer
-                // and random peer to replace
-                for (cnt, current) in self.get_peers_iter().enumerate() {
-                    let un = current.effective_unreliability();
-                    if un > u {
-                        u = un;
-                        cur_worst = Some(current.clone());
-                    }
-                    if cnt == 0 || rng.gen_range(0..cnt) == 0 {
-                        cur_rand = Some(current.clone());
-                    }
-                }
-                let mut deleted_peer = cur_rand;
-
-                if u > BETTER_REPLACE_UNRELIABILITY {
-                    deleted_peer = cur_worst;
-                    is_delete_peer = true;
-                } else {
+                let peers: Vec<_> = self.get_peers_iter().collect();
+                let (deleted_peer, is_bad) = replacement_victim(&peers, &mut rng)
+                    .ok_or_else(|| error!("Internal error: deleted peer is not set!"))?;
+                if !is_bad {
                     ex = true;
                 }
-
-                let deleted_peer = deleted_peer
-                    .ok_or_else(|| error!("Internal error: deleted peer is not set!"))?;
                 log::trace!(
-                    "deleted_peer: {} max un: {} is_delete_peer: {}",
+                    "deleted_peer: {} unr: {} is_bad: {is_bad}",
                     deleted_peer.id(),
-                    u,
-                    is_delete_peer.to_string()
+                    deleted_peer.unreliability(),
                 );
-                if is_delete_peer {
+                if is_bad {
                     self.reserve.on_active_replaced(&reserve_peer, deleted_peer.clone());
                 }
-                self.peers.replace(
-                    deleted_peer.id(),
-                    elem.clone(),
-                    reserve_peer,
-                    is_delete_peer,
-                )?;
-
-                if is_delete_peer {
-                    self.overlay.delete_public_peer(deleted_peer.id(), &self.overlay_id)?;
-                    self.remove_overlay_peer(deleted_peer.id());
-                    is_delete_peer = false;
-                }
+                self.peers.replace(deleted_peer.id(), elem.clone(), reserve_peer, is_bad)?;
             } else {
                 self.peers.insert(elem.clone(), reserve_peer)?;
             }
@@ -443,53 +460,23 @@ impl Neighbours {
     }
 
     pub fn choose_neighbour(&self) -> Result<Option<Arc<Neighbour>>> {
-        let count = self.peers.count();
-        if count == 0 {
-            return Ok(None);
-        }
+        self.choose_neighbour_with_version(0, 0)
+    }
 
-        let mut rng = rand::thread_rng();
-        let mut best: Option<Arc<Neighbour>> = None;
-        let mut sum = 0;
-        let node_stat = self.fail_attempts.load(Ordering::Relaxed) as f64
-            / self.all_attempts.load(Ordering::Relaxed) as f64;
-        log::trace!(
-            "Select neighbour for overlay {}, node stat: {:.4}",
-            self.overlay_id,
-            node_stat
-        );
-
-        for neighbour in self.get_peers_iter() {
-            let unr = neighbour.effective_unreliability();
-            let peer_stat = neighbour.fail_attempts.load(Ordering::Relaxed) as f64
-                / neighbour.all_attempts.load(Ordering::Relaxed) as f64;
-            let fines_points = neighbour.fines_points.load(Ordering::Relaxed);
-            if count == 1 {
-                return Ok(Some(neighbour.clone()));
-            }
+    /// A weighted random neighbour among those advertising at least
+    /// `major`.`minor`.
+    pub fn choose_neighbour_with_version(
+        &self,
+        major: u32,
+        minor: u32,
+    ) -> Result<Option<Arc<Neighbour>>> {
+        let peers: Vec<_> = self.get_peers_iter().collect();
+        for neighbour in &peers {
             let labels = [("neighbour", neighbour.id().to_string())];
-            metrics::gauge!("rtos_node_network_neighbour_unreliability", &labels).set(unr as f64);
-            log::trace!("Neighbour {}", neighbour);
-            if unr <= FAIL_UNRELIABILITY {
-                if node_stat * 1.2 < peer_stat {
-                    if fines_points > 0 {
-                        let _ = neighbour.fines_points.fetch_update(
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                            |x| if x > 0 { Some(x - 1) } else { None },
-                        );
-                        continue;
-                    }
-                    neighbour.active_check.store(true, Ordering::Relaxed);
-                }
-                let w = (1 << (FAIL_UNRELIABILITY - unr)) as i64;
-                sum += w;
-                if rng.gen_range(0..sum) < w {
-                    best = Some(neighbour.clone());
-                }
-            }
+            metrics::gauge!("rtos_node_network_neighbour_unreliability", &labels)
+                .set(neighbour.unreliability() as f64);
         }
-
+        let best = choose_from(&peers, (major, minor), &mut rand::thread_rng());
         if let Some(best) = &best {
             log::trace!("Selected neighbour {} for overlay {}", best, self.overlay_id);
         } else {
@@ -519,12 +506,6 @@ impl Neighbours {
                 if (update_flag & UPDATE_FLAG_IS_REG_IN_COMMON_STAT) != 0 {
                     self.fail_attempts.fetch_add(1, Ordering::Relaxed);
                 }
-            }
-            if neighbour.active_check.load(Ordering::Relaxed) {
-                if (update_flag & UPDATE_FLAG_SUCCESS) == 0 {
-                    neighbour.fines_points.fetch_add(FINES_POINTS_COUNT, Ordering::Relaxed);
-                }
-                neighbour.active_check.store(false, Ordering::Relaxed);
             }
         };
         log::trace!("Update stats for neighbour {} for overlay {}", neighbour, self.overlay_id);
@@ -604,13 +585,22 @@ impl Neighbours {
     ) -> Result<()> {
         let now = Instant::now();
         peer.set_last_ping(self.start.elapsed().as_millis() as u64);
-
         let query = GetCapabilities.into_tl_object().into();
-        let timeout = Some(AdnlNode::calc_timeout(peer.roundtrip_adnl()));
-        match self.overlay.query(&peer.id, &query, &self.overlay_id, timeout).await {
-            Ok(Some(answer)) => {
-                let caps: Capabilities = Query::parse(answer, &query.object)?;
-                let status = if !ping_reserve { "active" } else { "reserve" };
+        let answer = self
+            .overlay
+            .query(&peer.id, &query, &self.overlay_id, Some(Self::TIMEOUT_PING_MAX_MS))
+            .await;
+        let roundtrip = now.elapsed().as_millis() as u64;
+        let common = if !ping_reserve { UPDATE_FLAG_IS_REG_IN_COMMON_STAT } else { 0u8 };
+        let status = if !ping_reserve { "active" } else { "reserve" };
+        // A missing, failed or unparsable answer counts as a failed ping.
+        let caps = match answer {
+            Ok(Some(answer)) => Query::parse::<_, Capabilities>(answer, &query.object),
+            Ok(None) => Err(error!("no answer")),
+            Err(e) => Err(e),
+        };
+        match caps {
+            Ok(caps) => {
                 log::trace!(
                     "Got capabilities from {} {} {}: {:?}",
                     status,
@@ -618,38 +608,17 @@ impl Neighbours {
                     self.overlay_id,
                     caps
                 );
-                let roundtrip = now.elapsed().as_millis() as u64;
-                self.update_neighbour_stats(
-                    &peer,
-                    roundtrip,
-                    if !ping_reserve {
-                        UPDATE_FLAG_IS_REG_IN_COMMON_STAT | UPDATE_FLAG_SUCCESS
-                    } else {
-                        UPDATE_FLAG_SUCCESS
-                    },
-                );
+                self.update_neighbour_stats(&peer, roundtrip, common | UPDATE_FLAG_SUCCESS);
                 self.got_neighbour_capabilities(&peer, roundtrip, &caps);
                 Ok(())
             }
-            _ => {
-                // We are not registering failed ping here.
-                // Successful ping will improve unreliability.
-                // Failed ping will NOT modify unreliability.
-                //
-                if peer.is_good() {
-                    let roundtrip = now.elapsed().as_millis() as u64;
-                    self.update_neighbour_stats(
-                        &peer,
-                        roundtrip,
-                        if !ping_reserve { UPDATE_FLAG_IS_REG_IN_COMMON_STAT } else { 0u8 },
-                    );
-                }
-                let status = if !ping_reserve { "active" } else { "reserve" };
+            Err(e) => {
+                self.update_neighbour_stats(&peer, roundtrip, common);
                 fail!(
-                    "Capabilities were not received from {} {} (unr {}) {}",
+                    "Capabilities were not received from {} {} (unr {}) {}: {e}",
                     status,
                     peer.id,
-                    peer.effective_unreliability(),
+                    peer.unreliability(),
                     self.overlay_id
                 )
             }
@@ -811,7 +780,7 @@ impl NeighboursCache {
         existing_in_reserve: Option<Arc<Neighbour>>,
         bad_peer: bool,
     ) -> Result<bool> {
-        let new_unr = existing_in_reserve.as_ref().map_or(0, |v| v.effective_unreliability());
+        let new_unr = existing_in_reserve.as_ref().map_or(0, |v| v.unreliability());
         log::debug!(
             "started replace (old: {}, new: {}) {}, new_unr: {}",
             &old,
@@ -902,7 +871,7 @@ impl ReserveNeighbours {
             log::trace!("reserve del: {}", &reserve_peer.as_ref().unwrap().id());
             self.reserve.remove(reserve_peer.as_ref().unwrap().id());
         }
-        log::trace!("reserve ins: {}, unr {}", &peer.id(), peer.effective_unreliability());
+        log::trace!("reserve ins: {}, unr {}", &peer.id(), peer.unreliability());
         self.reserve.insert(peer.id().clone(), peer);
     }
 
@@ -925,11 +894,7 @@ impl ReserveNeighbours {
     pub fn descr(&self) -> String {
         let mut rv: String = String::new();
         for guard in self.reserve.iter() {
-            rv.push_str(&format!(
-                "{}: unr {}; ",
-                guard.key(),
-                guard.val().effective_unreliability()
-            ));
+            rv.push_str(&format!("{}: unr {}; ", guard.key(), guard.val().unreliability()));
         }
         rv
     }

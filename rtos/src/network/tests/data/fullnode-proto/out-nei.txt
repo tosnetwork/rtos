@@ -1,0 +1,15 @@
+NEI constants 3 2 16 5.000000 10.000000
+NEI stats F:1:0.0 F:2:0.0 F:3:0.0 S:2:0.0 C32:1:3.2 F:2:3.2 X:3:3.2 X:4:3.2 S:3:3.2 S:2:3.2 S:1:3.2 S:0:3.2 S:0:3.2 F:1:3.2 C20:0:2.0 F:1:2.0 F:2:2.0 X:3:2.0 C31:2:3.1 S:1:3.1 S:0:3.1 S:0:3.1 S:0:3.1 S:0:3.1 S:0:3.1 
+NEI choose.plain req 0.0 rows 0,3,2;1,3,2;2,3,2;5,3,2; draws 400000 counts 1=224076 2=112365 3=56530 4=7029 
+NEI choose.versions req 0.0 rows 0,2,0;0,3,0;0,3,2;0,3,1;0,4,0;0,0,0; draws 400000 counts 1=9565 2=37882 3=152882 4=38138 5=151903 6=9630 
+NEI choose.normalized req 0.0 rows 7,3,2;9,3,2;20,3,2; draws 400000 counts 1=320042 2=79958 
+NEI choose.sole req 0.0 rows 30,3,2; draws 400000 counts 1=400000 
+NEI choose.sole_old req 0.0 rows 30,2,0; draws 400000 counts 1=400000 
+NEI choose.cutoff req 0.0 rows 0,3,2;10,3,2;11,3,2;8,3,1;9,3,1;6,2,5;7,2,5; draws 400000 counts 1=398836 2=388 4=389 6=387 
+NEI choose.required req 3.0 rows 0,2,9;5,3,0;6,3,2;20,3,1; draws 400000 counts 2=134317 3=265683 
+NEI choose.required_none req 3.0 rows 0,2,9;0,1,0; draws 400000 counts zero=400000 
+NEI choose.required_minor req 3.2 rows 0,3,1;4,3,2;4,4,0; draws 400000 counts 2=199526 3=200474 
+NEI choose.empty req 0.0 rows  draws 400000 counts zero=400000 
+NEI rotate.bad6 inserted 3874 replaced 1=128 10=123 11=118 12=131 13=107 14=106 15=152 16=135 2=141 3=132 4=2000 5=120 6=108 7=111 8=125 9=137 
+NEI rotate.bad5 inserted 2000 replaced 1=127 10=120 11=114 12=124 13=150 14=131 15=132 16=132 2=137 3=103 4=134 5=112 6=132 7=118 8=118 9=116 
+NEI rotate.notfull size 16
