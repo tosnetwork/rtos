@@ -611,10 +611,23 @@ impl SessionImpl {
             runtime.protocol()
                 == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
         }) {
-            Some(runtime) => match crate::runtime_manifest::RuntimeManifest::open(
-                runtime,
-                std::path::Path::new(&db_path),
+            // A validator signing with its custody signer creates its namespace
+            // on first use, as the reference node creates its consensus
+            // database; any other validator namespace is provisioned explicitly.
+            Some(runtime) => match if matches!(
+                own_signer,
+                Some(crate::signing_coordinator::OwnSigner::Production(_))
             ) {
+                crate::runtime_manifest::RuntimeManifest::open_or_provision_validator(
+                    runtime,
+                    std::path::Path::new(&db_path),
+                )
+            } else {
+                crate::runtime_manifest::RuntimeManifest::open(
+                    runtime,
+                    std::path::Path::new(&db_path),
+                )
+            } {
                 Ok(manifest) => Some(manifest),
                 Err(error) => {
                     fail_startup(error, "durable runtime admission failed");

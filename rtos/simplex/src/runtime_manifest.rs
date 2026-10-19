@@ -135,13 +135,36 @@ impl RuntimeManifest {
         }
         Ok((Self { _locked: file }, rtos_block::UInt256::calc_file_hash(&bytes)))
     }
+    /// The namespace of a validator that signs with its custody signer, as the
+    /// reference node opens its consensus database: an existing namespace is
+    /// verified exactly as `open` does; a missing one is created first, with
+    /// its empty database and manifest durable before the session uses it.
+    pub fn open_or_provision_validator(
+        runtime: &AuthenticatedSessionRuntime,
+        directory: &Path,
+    ) -> Result<Self> {
+        if !matches!(runtime.local_role(), LocalRole::Validator(_)) {
+            fail!("Validator namespace provisioning requires validator role");
+        }
+        match std::fs::symlink_metadata(directory) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Self::provision_validator(runtime, directory)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Self::open(runtime, directory)
+    }
     #[cfg(any(test, feature = "integration-test-support"))]
     pub(crate) fn provision_test_validator(
         runtime: &AuthenticatedSessionRuntime,
         directory: &Path,
     ) -> Result<()> {
+        Self::provision_validator(runtime, directory)
+    }
+    fn provision_validator(runtime: &AuthenticatedSessionRuntime, directory: &Path) -> Result<()> {
         if !matches!(runtime.local_role(), LocalRole::Validator(_)) {
-            fail!("Test provisioning requires validator role");
+            fail!("Validator namespace provisioning requires validator role");
         }
         // Explicit fixture provisioning never repairs or completes an existing
         // namespace. Atomic create_dir rejects existing files, directories and
@@ -236,6 +259,30 @@ mod tests {
             validator.runtime_directory("root").unwrap(),
             observer.runtime_directory("root").unwrap()
         );
+    }
+
+    /// A custody-signed validator creates a missing namespace on first use and
+    /// afterwards reopens exactly that namespace; an existing namespace is
+    /// verified, never recreated, and a manifest of another binding is refused.
+    #[test]
+    fn authenticated_manifest_custody_validator_creates_its_namespace_once() {
+        let temp = crate::authenticated_fixture::TestDirectory::new();
+        let directory = temp.path().join("custody-validator");
+        let (validator, _, _) = runtime(true);
+        let first = RuntimeManifest::open_or_provision_validator(&validator, &directory).unwrap();
+        let manifest = std::fs::read(directory.join("session-runtime.json")).unwrap();
+        assert!(directory.join(validator.session_id().to_hex_string()).join("CURRENT").is_file());
+        // The held lock spans the session.
+        assert!(RuntimeManifest::open_or_provision_validator(&validator, &directory).is_err());
+        drop(first);
+        drop(RuntimeManifest::open_or_provision_validator(&validator, &directory).unwrap());
+        assert_eq!(std::fs::read(directory.join("session-runtime.json")).unwrap(), manifest);
+        let (observer, _, _) = runtime(false);
+        assert!(RuntimeManifest::open_or_provision_validator(&observer, &directory).is_err());
+        assert!(RuntimeManifest::open(&observer, &directory).is_err());
+        // A namespace whose database is gone is not silently recreated.
+        std::fs::remove_dir_all(directory.join(validator.session_id().to_hex_string())).unwrap();
+        assert!(RuntimeManifest::open_or_provision_validator(&validator, &directory).is_err());
     }
 }
 
