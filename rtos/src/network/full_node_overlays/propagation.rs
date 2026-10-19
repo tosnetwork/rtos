@@ -135,12 +135,28 @@ impl FullNodeOverlaysRouter {
         Ok(())
     }
 
+    /// Plumtree broadcasts are sent over QUIC. As in the reference overlay, a
+    /// node without a QUIC sender warns and runs the overlay without Plumtree;
+    /// a QUIC sender that is present but cannot be initialized is an error.
+    fn plumtree_sender_available(&self, overlay: &str, shard: &ShardIdent) -> bool {
+        let available = self.network.context().stack.quic.is_some();
+        if !available {
+            log::warn!(
+                "Plumtree broadcast sender is not set; Plumtree is disabled in the {overlay} \
+                 overlay of {shard}"
+            );
+        }
+        available
+    }
     pub(super) fn configure_public_propagation(
         &self,
         client: &FullNodeOverlayClient,
     ) -> Result<()> {
         let config = self.propagation_config.read().unwrap();
         if let Some(config) = config.as_ref().filter(|c| c.enabled(client.shard())) {
+            if !self.plumtree_sender_available("public", client.shard()) {
+                return Ok(());
+            }
             self.network.ensure_public_overlay_quic()?;
             client.overlay_client().configure_plumtree(config.policy(false))?;
         }
@@ -152,6 +168,9 @@ impl FullNodeOverlaysRouter {
     ) -> Result<()> {
         let config = self.propagation_config.read().unwrap();
         if let Some(config) = config.as_ref().filter(|c| c.enabled(client.shard())) {
+            if !self.plumtree_sender_available("fast-sync", client.shard()) {
+                return Ok(());
+            }
             client.client().configure_plumtree(config.policy(true))?;
         }
         Ok(())
@@ -281,7 +300,20 @@ impl FullNodeOverlaysRouter {
             Ok(()) => PropagationStatus::Sent,
             Err(error) => PropagationStatus::Failed(format!("{error:#}")),
         };
-        if targets.public {
+        // Without a QUIC sender the overlays run without Plumtree, and the
+        // reference overlay drops a Plumtree broadcast; nothing is retried.
+        let no_sender = plumtree && self.network.context().stack.quic.is_none();
+        if no_sender {
+            let skipped =
+                || PropagationStatus::Skipped("Plumtree broadcast sender is not set".into());
+            if targets.public {
+                outcome.record(kind, PropagationTarget::Public, skipped());
+            }
+            if targets.fast_sync {
+                outcome.record(kind, PropagationTarget::FastSync, skipped());
+            }
+        }
+        if targets.public && !no_sender {
             let result: Result<()> = async {
                 let client = self.overlay_client(id.shard()).await?;
                 if plumtree {
@@ -302,7 +334,7 @@ impl FullNodeOverlaysRouter {
             .await;
             outcome.record(kind, PropagationTarget::Public, status(result));
         }
-        if targets.fast_sync {
+        if targets.fast_sync && !no_sender {
             let receipt = if let Some(client) = self.fast_sync_overlay(id.shard()) {
                 let result: Result<()> = async {
                     if plumtree {
