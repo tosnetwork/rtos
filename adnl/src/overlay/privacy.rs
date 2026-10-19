@@ -597,6 +597,11 @@ impl BroadcastVerifier {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn clear_rejections_for_test(&self) {
+        self.rejected.lock().unwrap().clear();
+    }
+
     /// Drop limiters of issuers the rules no longer authorize.
     pub(crate) fn retain_authorized(&self, rules: &OverlayPrivacyRules) {
         if let Ok(mut limiters) = self.limiters.lock() {

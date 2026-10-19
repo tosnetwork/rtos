@@ -281,17 +281,16 @@ impl FullNodeOverlaysRouter {
             let result: Result<()> = async {
                 let client = self.overlay_client(id.shard()).await?;
                 if plumtree {
-                    let config = self
-                        .propagation_config
+                    self.propagation_config
                         .read()
                         .unwrap()
                         .clone()
                         .filter(|c| c.enabled(id.shard()))
                         .ok_or_else(|| error!("No authenticated public Plumtree configuration"))?;
-                    let signer = config
-                        .signer
-                        .ok_or_else(|| error!("No authenticated public transport signer"))?;
-                    client.overlay_client().broadcast_plumtree(&signer, simple_id, bytes).await
+                    // The shard's outbound source signs; publication requires
+                    // its verdict, certificate included, to be Allowed.
+                    let source = self.public_outbound_source(&client, bytes.len(), true)?;
+                    client.overlay_client().broadcast_plumtree(&source, simple_id, bytes).await
                 } else {
                     self.send_public_broadcast(&client, &tagged, PublicBroadcastKind::Block).await
                 }

@@ -241,6 +241,7 @@ impl Auth {
         admission_size: usize,
         any_sender: bool,
         now: f64,
+        message_from: Option<&[u8; 32]>,
     ) -> Result<Arc<KeyId>> {
         check_time(self.timestamp, now)?;
         // Bounds precede public-key work and retained allocation.
@@ -251,6 +252,9 @@ impl Auth {
             fail!("Plumtree needs a transport Ed25519 key");
         }
         let src: Arc<dyn KeyOption> = (&self.src).try_into()?;
+        // Certificate and source signatures relayed by a peer go through the
+        // common verifier, which refuses that peer for a while after a bad one.
+        let from = message_from.map(|peer| KeyId::from_data(*peer));
         policy.authorize(
             verifier,
             overlay,
@@ -259,9 +263,14 @@ impl Auth {
             admission_size,
             any_sender,
             now,
-            None,
+            from.as_ref(),
         )?;
-        src.verify(&key.preimage(self.timestamp, self.size, self.hash)?, &self.signature)?;
+        verifier.check_signature_from_peer(
+            &src,
+            &key.preimage(self.timestamp, self.size, self.hash)?,
+            &self.signature,
+            from.as_ref(),
+        )?;
         Ok(src.id().clone())
     }
     fn ihave(&self, key: PartKey, now: f64) -> Broadcast {
@@ -510,6 +519,7 @@ impl Engine {
                                 auth.size,
                                 false,
                                 now,
+                                Some(*p),
                             )
                             .is_ok()
                 })
@@ -617,6 +627,7 @@ impl Engine {
                     auth.size,
                     false,
                     now,
+                    Some(&peer),
                 )?;
                 let eager_empty = self.slots[key.tree as usize].eager.is_empty();
                 let missing = self.missing.entry(key).or_insert_with(|| Missing {
@@ -766,6 +777,7 @@ impl Engine {
             full_size,
             flags & 1 != 0,
             now,
+            Some(&peer),
         )?;
         let wire_size = serialize_boxed(&message)?.len();
         // Account decoder input/output reservation as well as every retained TL carrier.
@@ -900,6 +912,7 @@ impl Engine {
                 state.full_size,
                 flags & 1 != 0,
                 now,
+                None,
             )?;
         }
         if neighbours.is_empty() {
@@ -1529,8 +1542,12 @@ mod tests {
                 5 => bad.src = (&wrong).try_into().unwrap(),
                 _ => bad.part_index = 1,
             }
+            // A bad signature refuses its relaying peer for a while, so each
+            // mutation arrives from its own peer.
             assert!(
-                receiver.receive([1; 32], bad.into_boxed(), None, &[], now, mono).is_err(),
+                receiver
+                    .receive([10 + mutation; 32], bad.into_boxed(), None, &[], now, mono)
+                    .is_err(),
                 "mutation {mutation}"
             );
             assert!(receiver.missing.is_empty());
@@ -2049,6 +2066,10 @@ mod transport_tests {
         assert!(!consumed(&mut b, &bytes).await);
         let received_overlay = b.overlay.get_overlay(&id, "test").unwrap();
         assert!(!received_overlay.plumtree_engine().unwrap().states.contains_key(&[95; 32]));
+        // The bad signature refused the sender for a while; lift it so the
+        // following probes reach their own checks.
+        assert!(received_overlay.verifier.is_peer_banned(a.key.id()));
+        received_overlay.verifier.clear_rejections_for_test();
         // Legacy one-byte hop postfixes are not a Plumtree wire extension.
         let mut trailing = OverlayUtils::calc_message_prefix(&id).unwrap();
         let valid =
@@ -2842,3 +2863,7 @@ mod recovery_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "plumtree_source_tests.rs"]
+mod source_tests;

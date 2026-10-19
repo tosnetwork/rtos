@@ -3732,6 +3732,13 @@ impl OverlayNode {
     ) -> Result<()> {
         let overlay = self.get_overlay(overlay_id, "Plumtree broadcast to unknown overlay")?;
         let _lease = overlay.tasks.enter()?;
+        // Without an explicit certificate the source's own one is attached.
+        let certificate = match certificate {
+            OverlayCertificateTl::Overlay_EmptyCertificate => overlay
+                .local_certificate(signer.id())
+                .map_or(OverlayCertificateTl::Overlay_EmptyCertificate, |cert| cert.to_tl()),
+            certificate => certificate,
+        };
         let neighbours = overlay.plumtree_neighbours();
         let actions = overlay.plumtree_engine()?.publish(
             signer,

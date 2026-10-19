@@ -1416,13 +1416,8 @@ impl FullNodeOverlaysRouter {
                 )
                 .await;
         }
-        let source = self.shard_certificates.choose_outbound_source(
-            client.shard(),
-            &self.full_node_adnl_key()?,
-            size,
-            size > MAX_SIMPLE_BROADCAST_SIZE as usize,
-            rtos_block::UnixTime::now() as i32,
-        )?;
+        let source =
+            self.public_outbound_source(client, size, size > MAX_SIMPLE_BROADCAST_SIZE as usize)?;
         client
             .send_broadcast(
                 broadcast,
@@ -1431,6 +1426,22 @@ impl FullNodeOverlaysRouter {
                 AdnlSendMethod::Fast,
             )
             .await
+    }
+
+    /// The key a broadcast of `size` bytes on this shard overlay is sent as.
+    pub(crate) fn public_outbound_source(
+        &self,
+        client: &FullNodeOverlayClient,
+        size: usize,
+        is_fec: bool,
+    ) -> Result<Arc<dyn KeyOption>> {
+        self.shard_certificates.choose_outbound_source(
+            client.shard(),
+            &self.full_node_adnl_key()?,
+            size,
+            is_fec,
+            rtos_block::UnixTime::now() as i32,
+        )
     }
 
     /// Console import of a certificate for one of this node's shard sources.
