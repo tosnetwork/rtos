@@ -218,3 +218,176 @@ async fn authenticated_observer_receiver_verifies_pq_candidate_and_authorizes_qu
     anyhow::ensure!(overlay_drained && !panicked.load(Ordering::SeqCst));
     result
 }
+
+/// Records every direct message and query destination of one overlay.
+#[derive(Default)]
+struct RecordingOverlay {
+    messages: Mutex<Vec<PublicKeyHash>>,
+    queries: Mutex<Vec<PublicKeyHash>>,
+}
+impl ConsensusOverlay for RecordingOverlay {
+    fn send_message(&self, to: &PublicKeyHash, _: &PublicKeyHash, _: &BlockPayloadPtr, _: bool) {
+        self.messages.lock().unwrap().push(to.clone());
+    }
+    fn send_message_multicast(
+        &self,
+        to: &[PublicKeyHash],
+        _: &PublicKeyHash,
+        _: &BlockPayloadPtr,
+        _: bool,
+    ) {
+        self.messages.lock().unwrap().extend(to.iter().cloned());
+    }
+    fn send_query(
+        &self,
+        to: &PublicKeyHash,
+        _: &PublicKeyHash,
+        _: &str,
+        _: Duration,
+        _: &BlockPayloadPtr,
+        _: QueryResponseCallback,
+    ) {
+        self.queries.lock().unwrap().push(to.clone());
+    }
+    fn send_query_via_rldp(
+        &self,
+        to: PublicKeyHash,
+        _: String,
+        _: QueryResponseCallback,
+        _: SystemTime,
+        _: BlockPayloadPtr,
+        _: u64,
+        _: bool,
+    ) {
+        // The callback is dropped unanswered: the request times out and retries.
+        self.queries.lock().unwrap().push(to);
+    }
+    fn send_broadcast_fec_ex(
+        &self,
+        _: &PublicKeyHash,
+        _: &PublicKeyHash,
+        _: BlockPayloadPtr,
+        _: Option<Vec<u8>>,
+    ) {
+    }
+    fn get_impl(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+struct RecordingManager(Arc<RecordingOverlay>);
+impl ConsensusOverlayManager for RecordingManager {
+    fn wire_profile(&self) -> rtos_api::WireProfile {
+        rtos_api::WireProfile::T0
+    }
+    fn start_overlay(
+        &self,
+        _: &PrivateKey,
+        _: &Arc<PrivateOverlayShortId>,
+        _: &[ConsensusNode],
+        _: ConsensusOverlayListenerPtr,
+        _: ConsensusOverlayLogReplayListenerPtr,
+        _: OverlayTransportType,
+        _: Option<BlockSyncOverlayParams>,
+    ) -> Result<ConsensusOverlayPtr> {
+        anyhow::bail!("Authenticated test must not use legacy overlay creation")
+    }
+    fn start_authenticated_overlay(
+        &self,
+        _: &PrivateKey,
+        _: &Arc<PrivateOverlayShortId>,
+        _: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        _: ConsensusOverlayListenerPtr,
+        _: ConsensusOverlayLogReplayListenerPtr,
+        _: OverlayTransportType,
+    ) -> Result<ConsensusOverlayPtr> {
+        Ok(self.0.clone())
+    }
+    fn stop_overlay(&self, _: &Arc<PrivateOverlayShortId>, _: &ConsensusOverlayPtr) {}
+}
+
+/// A protocol 2 validator sends each newly cast vote directly to every private
+/// overlay member but itself, observers included (C++ apply_own_vote
+/// BroadcastToAll), replays its votes on standstill to the validators only
+/// (BroadcastToValidators), and resolves candidates from any other member
+/// (OutgoingOverlayRequest without a destination).
+#[test]
+fn authenticated_validator_votes_reach_observers_directly_and_resolver_asks_any_member() {
+    let (nodes, keys) = crate::pq_fixture::members();
+    let committee: Vec<_> = nodes.iter().map(|node| node.descriptor.clone().unwrap()).collect();
+    let observer_store =
+        rtos_pq_consensus::ConsensusKeyStore::from_seed(&[0x97; 32], 0).expect("observer key");
+    let observer_adnl = UInt256::from([0x96; 32]);
+    let mut total = committee.clone();
+    total.push(rtos_block::ValidatorDescr::with_pq_params(
+        UInt256::from([9; 32]),
+        observer_store.consensus_key().clone(),
+        1,
+        observer_adnl.clone(),
+    ));
+    let (runtime, key, options) = crate::authenticated_fixture::runtime_with_total_set(
+        committee,
+        total,
+        keys[0].clone(),
+        ShardIdent::masterchain(),
+        0,
+        false,
+    );
+    let observer = rtos_block::KeyId::from_data(*observer_adnl.as_array());
+    let validator = nodes[1].adnl_id.clone();
+    assert!(runtime.members().contains(&observer), "observer is an overlay member");
+    let overlay = Arc::new(RecordingOverlay::default());
+    let manager: ConsensusOverlayManagerPtr = Arc::new(RecordingManager(overlay.clone()));
+    let (listener, _) = TestReceiverListener::create(0);
+    let listener: Arc<dyn ReceiverListener + Send + Sync> = listener;
+    let mut settings =
+        crate::receiver::ReceiverSettings::from_session_options(&options, 8 << 20, 9 << 20);
+    settings.standstill_timeout = Duration::from_millis(200);
+    settings.candidate_resolve_config.timeout = Duration::from_millis(100);
+    settings.candidate_resolve_config.timeout_cap = Duration::from_millis(100);
+    settings.candidate_resolve_config.cooldown = Duration::from_millis(10);
+    let receiver = crate::receiver::ReceiverWrapper::create_with_runtime(
+        runtime.session_id().clone(),
+        runtime.shard(),
+        &nodes,
+        &key,
+        manager,
+        Arc::downgrade(&listener),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+        settings,
+        Some(&runtime),
+    )
+    .expect("receiver");
+    receiver.start();
+    let count = |list: &Mutex<Vec<PublicKeyHash>>, peer: &PublicKeyHash| {
+        list.lock().unwrap().iter().filter(|to| *to == peer).count()
+    };
+    let TlVoteBoxed::Consensus_Simplex_Vote(vote) =
+        crate::pq_fixture::vote("skip", "skip", 0, crate::pq_fixture::CONTEXT);
+
+    // Standstill replay of a cached vote: validators only.
+    receiver.cache_our_vote_for_standstill(vote.clone());
+    receiver.set_standstill_slots(0, 200);
+    receiver.reschedule_standstill();
+    wait_until(Duration::from_secs(5), || count(&overlay.messages, &validator) >= 1);
+    assert!(count(&overlay.messages, &validator) >= 1, "standstill replay reached no validator");
+    assert_eq!(count(&overlay.messages, &observer), 0, "standstill replay reached an observer");
+    assert_eq!(count(&overlay.messages, runtime.local_adnl()), 0, "sent to itself");
+
+    // A newly cast vote: every other member, the observer included.
+    receiver.send_vote(vote);
+    wait_until(Duration::from_secs(5), || count(&overlay.messages, &observer) >= 1);
+    assert_eq!(count(&overlay.messages, &observer), 1, "observer did not get the vote directly");
+    assert_eq!(count(&overlay.messages, runtime.local_adnl()), 0, "sent to itself");
+
+    // Candidate resolution rotates over every other member.
+    receiver.request_candidate(120, UInt256::from([0x33; 32]));
+    wait_until(Duration::from_secs(10), || {
+        count(&overlay.queries, &observer) >= 1 && count(&overlay.queries, &validator) >= 1
+    });
+    assert!(count(&overlay.queries, &observer) >= 1, "resolver never asked the observer");
+    assert!(count(&overlay.queries, &validator) >= 1, "resolver never asked the validator");
+    assert_eq!(count(&overlay.queries, runtime.local_adnl()), 0, "queried itself");
+    receiver.stop();
+}

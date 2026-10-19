@@ -34,6 +34,16 @@ pub fn runtime_with_members_at_key(
     members: Vec<ValidatorDescr>, transport: crate::PrivateKey, shard: ShardIdent,
     key_seqno: u32, new_catchain_ids: bool,
 ) -> (Arc<AuthenticatedSessionRuntime>, crate::PrivateKey, crate::SessionOptions) {
+    let total = members.clone();
+    runtime_with_total_set(members, total, transport, shard, key_seqno, new_catchain_ids)
+}
+
+/// A protocol 2 runtime of `members` whose current total set is `total`:
+/// descriptors of `total` outside the committee are private overlay observers.
+pub fn runtime_with_total_set(
+    members: Vec<ValidatorDescr>, total: Vec<ValidatorDescr>, transport: crate::PrivateKey,
+    shard: ShardIdent, key_seqno: u32, new_catchain_ids: bool,
+) -> (Arc<AuthenticatedSessionRuntime>, crate::PrivateKey, crate::SessionOptions) {
     let selected = SimplexConfig { protocol_version: 2, ..Default::default() };
     let selected_cell = selected.serialize().unwrap();
     let mut wrapper = BuilderData::new();
@@ -56,7 +66,7 @@ pub fn runtime_with_members_at_key(
     config.set_config(ConfigParamEnum::ConfigParam28(CatchainConfig::default())).unwrap();
     config
         .set_config(ConfigParamEnum::ConfigParam34(ConfigParam34 {
-            cur_validators: ValidatorSet::new(1, 100, 2, members.clone()).unwrap(),
+            cur_validators: ValidatorSet::new(1, 100, 2, total).unwrap(),
         }))
         .unwrap();
     let runtime = Arc::new(

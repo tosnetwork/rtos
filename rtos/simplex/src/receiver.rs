@@ -55,7 +55,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::{
-    block::{SlotIndex, ValidatorIndex},
+    block::SlotIndex,
     utils::ACTIVITY_THRESHOLD,
     ActivityNodePtr, BlockPayloadPtr, ConsensusOverlayListener, ConsensusOverlayLogReplayListener,
     ConsensusOverlayManagerPtr, MetricsHandle, PrivateKey, PublicKeyHash, RawVoteData, SessionId,
@@ -467,6 +467,9 @@ pub(crate) struct ReceiverImpl {
     /// Local source index
     local_idx: Option<u32>,
     membership: consensus_common::simplex_protocol::SimplexMembership,
+    /// Overlay members other than this node that are not validators: the
+    /// observers of a protocol that puts them in the private overlay.
+    observer_peers: Vec<PublicKeyHash>,
     /// Receiver listener (weak reference to SessionProcessor)
     listener: ReceiverListenerPtr,
     /// Per-source statistics
@@ -1243,21 +1246,37 @@ impl ReceiverImpl {
             raw_vote.to_raw_buffer(),
         );
 
+        // C++ pool.cpp apply_own_vote: a newly cast vote goes to every private
+        // overlay member but this node (BroadcastToAll), which includes the
+        // observers where the protocol makes them members. A standstill replay
+        // goes to the validators only (BroadcastToValidators).
+        let observers = if is_rebroadcast { 0 } else { self.observer_peers.len() };
         log::trace!(
-            "SimplexReceiver {}: {} vote to {} validators, size={}",
+            "SimplexReceiver {}: {} vote to {} validators and {} observers, size={}",
             self.session_id.to_hex_string(),
             if is_rebroadcast { "re-broadcasting" } else { "sending" },
             self.send_order.len(),
+            observers,
             payload.data().len()
         );
 
         // Update metrics (bytes are per-message, multiplied by recipient count)
         let msg_size = payload.data().len() as u64;
-        let recipient_count =
-            self.send_order.iter().filter(|&&idx| Some(idx) != self.local_idx).count();
-        self.out_messages_bytes.increment(msg_size * recipient_count as u64);
-        self.out_bytes.increment(msg_size * recipient_count as u64);
-        self.out_messages_count.increment(recipient_count as u64);
+        let recipient_count = self
+            .send_order
+            .iter()
+            .filter(|&&idx| Some(idx) != self.local_idx)
+            .count()
+            .saturating_add(observers) as u64;
+        self.out_messages_bytes.increment(msg_size.saturating_mul(recipient_count));
+        self.out_bytes.increment(msg_size.saturating_mul(recipient_count));
+        self.out_messages_count.increment(recipient_count);
+
+        if !is_rebroadcast {
+            for observer in &self.observer_peers {
+                self.overlay.send_message(observer, &self.local_adnl_id, &payload, false);
+            }
+        }
 
         // Send to all validators in shuffled order
         for &target_idx in &self.send_order {
@@ -2999,8 +3018,10 @@ struct CandidateRequestState {
     in_flight_want_candidate: bool,
     /// Requested notar cert flag for the current in-flight attempt.
     in_flight_want_notar: bool,
-    /// Validator index of the peer being queried
-    source_idx: ValidatorIndex,
+    /// The overlay member being queried: a validator, or an observer where
+    /// the protocol makes observers members (C++ OutgoingOverlayRequest
+    /// without a destination picks any other private overlay member).
+    source: Option<PublicKeyHash>,
     /// Accumulated notar bytes from partial responses (C++ CandidateAndCert::merge parity).
     /// Peers may return notar-only when the candidate body is unavailable; we cache it
     /// here so that when a body-only response arrives later, the merged result is complete.
@@ -3012,9 +3033,9 @@ struct CandidateRequestState {
     /// Number of soft-giveup reports emitted for this request.
     giveup_reports: u32,
     /// Per-peer dedup window for identical partial repairs.
-    /// Keyed by validator index; the peer should not be re-queried for this
-    /// `(slot, hash)` before the stored timestamp.
-    peer_retry_not_before: HashMap<u32, SystemTime>,
+    /// Keyed by the peer's transport identity; the peer should not be
+    /// re-queried for this `(slot, hash)` before the stored timestamp.
+    peer_retry_not_before: HashMap<PublicKeyHash, SystemTime>,
 }
 
 /// Single-threaded cache for candidate resolver
@@ -3135,7 +3156,7 @@ impl ReceiverImpl {
                 in_flight: false,
                 in_flight_want_candidate: false,
                 in_flight_want_notar: false,
-                source_idx: ValidatorIndex::new(0),
+                source: None,
                 cached_notar: None,
                 cached_candidate: None,
                 giveup_reports: 0,
@@ -3294,8 +3315,7 @@ impl ReceiverImpl {
 
     fn start_peer_candidate_request(&mut self, slot: SlotIndex, block_hash: UInt256) {
         let key = (slot, block_hash.clone());
-        let Some(source_idx) =
-            self.select_peer_for_candidate_request(None, None, SystemTime::now())
+        let Some(source) = self.select_peer_for_candidate_request(None, None, SystemTime::now())
         else {
             self.pending_requests.remove(&key);
             log::warn!(
@@ -3307,7 +3327,7 @@ impl ReceiverImpl {
         let Some(state) = self.pending_requests.get_mut(&key) else {
             return;
         };
-        state.source_idx = source_idx;
+        state.source = Some(source);
         self.candidate_requests_counter.increment(1);
         self.send_candidate_request(slot, block_hash);
     }
@@ -3377,17 +3397,24 @@ impl ReceiverImpl {
             return false;
         };
         // Local cache fulfillment has no remote transport sender to attribute.
-        let source_idx = self.local_idx.unwrap_or_else(|| {
-            slot.value() / self.slots_per_leader_window % self.sources.len() as u32
-        });
+        let source_idx = self.local_idx.unwrap_or_else(|| self.slot_leader_index(slot));
         listener.on_candidate_received(source_idx, candidate, Some(notar_bytes));
         true
+    }
+
+    /// The validator index that leads `slot`.
+    fn slot_leader_index(&self, slot: SlotIndex) -> u32 {
+        let validators = u32::try_from(self.sources.len()).unwrap_or(u32::MAX);
+        slot.value()
+            .checked_div(self.slots_per_leader_window)
+            .and_then(|window| window.checked_rem(validators))
+            .unwrap_or(0)
     }
 
     /// Send one requestCandidate attempt for a pending request.
     fn send_candidate_request(&mut self, slot: SlotIndex, block_hash: UInt256) {
         let key = (slot, block_hash.clone());
-        let (source_idx, request_timeout, want_candidate, want_notar) = {
+        let (source, request_timeout, want_candidate, want_notar) = {
             let Some(state_ro) = self.pending_requests.get(&key) else {
                 return;
             };
@@ -3400,7 +3427,7 @@ impl ReceiverImpl {
                 || self.resolver_cache.get_notar_cert(slot, &block_hash).is_some();
             let want_candidate = !have_candidate;
             let want_notar = !have_notar;
-            (state_ro.source_idx, state_ro.current_timeout, want_candidate, want_notar)
+            (state_ro.source.clone(), state_ro.current_timeout, want_candidate, want_notar)
         };
 
         if !want_candidate && !want_notar {
@@ -3425,16 +3452,12 @@ impl ReceiverImpl {
             state.attempt_id
         };
 
-        let peer_adnl_id = match self.sources.get(source_idx.value() as usize) {
-            Some(stats) => stats.adnl_id.clone(),
-            None => {
-                log::error!(
-                    "SimplexReceiver {}: send_candidate_request - invalid validator idx {}",
-                    self.session_id.to_hex_string(),
-                    source_idx
-                );
-                return;
-            }
+        let Some(peer_adnl_id) = source.filter(|peer| self.membership.role(peer).is_ok()) else {
+            log::error!(
+                "SimplexReceiver {}: send_candidate_request - no overlay member selected",
+                self.session_id.to_hex_string(),
+            );
+            return;
         };
 
         let candidate_id = CandidateId { slot: slot.value() as i32, hash: block_hash.clone() };
@@ -3461,10 +3484,11 @@ impl ReceiverImpl {
 
         log::trace!(
             "SimplexReceiver {}: sending {query_name} slot={slot} hash={} \
-            to validator {source_idx} (attempt={attempt_id} timeout={request_timeout:?} \
+            to {} (attempt={attempt_id} timeout={request_timeout:?} \
             want_candidate={want_candidate} want_notar={want_notar})",
             self.session_id.to_hex_string(),
             &block_hash.to_hex_string()[..8],
+            key_to_base64(&peer_adnl_id),
         );
 
         // Capture data for callback (we need to move these into the closure)
@@ -3512,7 +3536,7 @@ impl ReceiverImpl {
         let Some(state_ro) = self.pending_requests.get(&key) else {
             return;
         };
-        let prev_source_idx = state_ro.source_idx.value();
+        let prev_source = state_ro.source.clone();
         let current_timeout = state_ro.current_timeout;
         let start_time = state_ro.start_time;
         let prev_giveup_reports = state_ro.giveup_reports;
@@ -3529,9 +3553,11 @@ impl ReceiverImpl {
             state.in_flight = false;
             state.in_flight_want_candidate = false;
             state.in_flight_want_notar = false;
-            state
-                .peer_retry_not_before
-                .insert(prev_source_idx, now + CANDIDATE_QUERY_RATE_LIMIT_WINDOW);
+            if let Some(prev_source) = &prev_source {
+                state
+                    .peer_retry_not_before
+                    .insert(prev_source.clone(), now + CANDIDATE_QUERY_RATE_LIMIT_WINDOW);
+            }
 
             let partial_notar_phase =
                 state.cached_candidate.is_some() && state.cached_notar.is_none();
@@ -3557,20 +3583,19 @@ impl ReceiverImpl {
 
         let mut wait_for_peer_window = false;
         let selected_source = self.pending_requests.get(&key).and_then(|state_ro| {
-            self.select_peer_for_candidate_request(Some(state_ro), Some(prev_source_idx), now)
+            self.select_peer_for_candidate_request(Some(state_ro), prev_source.as_ref(), now)
                 .or_else(|| {
-                    let (peer_idx, ready_at) = self.earliest_peer_retry_ready(state_ro, now)?;
+                    let (peer, ready_at) = self.earliest_peer_retry_ready(state_ro, now)?;
                     if let Ok(wait_for_peer) = ready_at.duration_since(now) {
                         retry_delay = retry_delay.max(wait_for_peer);
                         wait_for_peer_window = true;
                     }
-                    Some(peer_idx)
+                    Some(peer)
                 })
         });
-        let next_source_idx =
-            selected_source.unwrap_or_else(|| ValidatorIndex::new(prev_source_idx));
+        let next_source = selected_source.or(prev_source);
         if let Some(state) = self.pending_requests.get_mut(&key) {
-            state.source_idx = next_source_idx;
+            state.source = next_source.clone();
         } else {
             return;
         }
@@ -3606,12 +3631,12 @@ impl ReceiverImpl {
 
         log::trace!(
             "SimplexReceiver {}: scheduling candidate retry slot={} hash={} \
-            to validator {} in {:?} (retry {}, reason={}, next_query_timeout={:?}, \
+            to {} in {:?} (retry {}, reason={}, next_query_timeout={:?}, \
             peer_window_wait={})",
             self.session_id.to_hex_string(),
             slot,
             &block_hash.to_hex_string()[..8],
-            next_source_idx,
+            next_source.as_ref().map(key_to_base64).unwrap_or_default(),
             retry_delay,
             retry_count,
             reason,
@@ -3667,6 +3692,19 @@ impl ReceiverImpl {
     // Peer selection
     // ------------------------------------------------------------------
 
+    /// The peers a candidate request may go to: every private overlay member
+    /// but this node, as C++ OutgoingOverlayRequest without a destination picks
+    /// from other_overlay_nodes_ (observers included where they are members).
+    fn candidate_request_peers(&self) -> Vec<PublicKeyHash> {
+        let local_idx = self.local_idx;
+        self.send_order
+            .iter()
+            .filter(|&&idx| Some(idx) != local_idx)
+            .filter_map(|&idx| self.sources.get(idx as usize).map(|stats| stats.adnl_id.clone()))
+            .chain(self.observer_peers.iter().cloned())
+            .collect()
+    }
+
     /// Select a peer for candidate request, skipping self and (optionally) a specific peer.
     /// If state is provided, enforce per-peer dedup windows for identical partial repairs.
     ///
@@ -3675,63 +3713,39 @@ impl ReceiverImpl {
     fn select_peer_for_candidate_request(
         &self,
         state: Option<&CandidateRequestState>,
-        exclude: Option<u32>,
+        exclude: Option<&PublicKeyHash>,
         now: SystemTime,
-    ) -> Option<ValidatorIndex> {
-        let len = self.send_order.len();
-        if len <= 1 {
+    ) -> Option<PublicKeyHash> {
+        let peers = self.candidate_request_peers();
+        let len = peers.len();
+        if len == 0 {
             return None; // Only self or empty
         }
 
-        // Start from a random position and find first non-self peer
+        // Start from a random position
         let mut rng = rand::thread_rng();
         let start_idx = rng.gen_range(0..len);
+        let open = |peer: &PublicKeyHash| {
+            state.is_none_or(|state_ro| Self::peer_retry_window_open(state_ro, peer, now))
+        };
+        let rotated = || peers.iter().cycle().skip(start_idx).take(len);
 
-        // First pass: skip self and excluded peer (if provided)
-        for offset in 0..len {
-            let idx = (start_idx + offset) % len;
-            let validator_idx = self.send_order[idx];
-            if Some(validator_idx) == self.local_idx {
-                continue;
-            }
-            if let Some(ex) = exclude {
-                if validator_idx == ex {
-                    continue;
-                }
-            }
-            if let Some(state_ro) = state {
-                if !Self::peer_retry_window_open(state_ro, validator_idx, now) {
-                    continue;
-                }
-            }
-            return Some(ValidatorIndex::new(validator_idx));
-        }
-
-        // Fallback: ignore exclude, but still skip self and respect dedup windows
-        for offset in 0..len {
-            let idx = (start_idx + offset) % len;
-            let validator_idx = self.send_order[idx];
-            if Some(validator_idx) == self.local_idx {
-                continue;
-            }
-            if let Some(state_ro) = state {
-                if !Self::peer_retry_window_open(state_ro, validator_idx, now) {
-                    continue;
-                }
-            }
-            return Some(ValidatorIndex::new(validator_idx));
-        }
-        None
+        // First pass: skip the excluded peer (if provided); fallback: ignore
+        // exclude, but still respect dedup windows
+        rotated()
+            .find(|peer| Some(*peer) != exclude && open(peer))
+            .or_else(|| rotated().find(|peer| open(peer)))
+            .cloned()
     }
 
     fn peer_retry_window_open(
         state: &CandidateRequestState,
-        validator_idx: u32,
+        peer: &PublicKeyHash,
         now: SystemTime,
     ) -> bool {
         state
             .peer_retry_not_before
-            .get(&validator_idx)
+            .get(peer)
             .map(|not_before| now.duration_since(*not_before).is_ok())
             .unwrap_or(true)
     }
@@ -3740,15 +3754,13 @@ impl ReceiverImpl {
         &self,
         state: &CandidateRequestState,
         now: SystemTime,
-    ) -> Option<(ValidatorIndex, SystemTime)> {
-        self.send_order
-            .iter()
-            .copied()
-            .filter(|idx| Some(*idx) != self.local_idx)
-            .filter_map(|validator_idx| {
-                let not_before = state.peer_retry_not_before.get(&validator_idx).copied()?;
+    ) -> Option<(PublicKeyHash, SystemTime)> {
+        self.candidate_request_peers()
+            .into_iter()
+            .filter_map(|peer| {
+                let not_before = state.peer_retry_not_before.get(&peer).copied()?;
                 if not_before.duration_since(now).is_ok() {
-                    Some((ValidatorIndex::new(validator_idx), not_before))
+                    Some((peer, not_before))
                 } else {
                     None
                 }
@@ -3772,14 +3784,10 @@ impl ReceiverImpl {
 
         let key = (slot, block_hash.clone());
 
-        let (source_idx, want_candidate, want_notar) = match self.pending_requests.get_mut(&key) {
+        let (source, want_candidate, want_notar) = match self.pending_requests.get_mut(&key) {
             Some(state) if state.attempt_id == attempt_id && state.in_flight => {
                 state.in_flight = false;
-                (
-                    state.source_idx.value(),
-                    state.in_flight_want_candidate,
-                    state.in_flight_want_notar,
-                )
+                (state.source.clone(), state.in_flight_want_candidate, state.in_flight_want_notar)
             }
             Some(_) => {
                 log::trace!(
@@ -3801,6 +3809,12 @@ impl ReceiverImpl {
                 return;
             }
         };
+        // A responder outside the committee has no validator index; the
+        // response is attributed to the slot's leader, as a local resolution is.
+        let source_idx = source
+            .as_ref()
+            .and_then(|peer| self.adnl_to_idx.get(peer).copied())
+            .unwrap_or_else(|| self.slot_leader_index(slot));
 
         match result {
             Ok(response_payload) => {
@@ -5340,6 +5354,17 @@ impl ReceiverWrapper {
             pubkey_to_idx.insert(pubkey_hash.clone(), idx);
             send_order.push(idx);
         }
+        let observer_peers: Vec<PublicKeyHash> = membership
+            .members()
+            .filter(|member| {
+                *member != &local_adnl_id
+                    && matches!(
+                        membership.role(member),
+                        Ok(consensus_common::simplex_protocol::OverlayMemberRole::Observer)
+                    )
+            })
+            .cloned()
+            .collect();
 
         // Create thread management
         let mut receiver_threads = ReceiverThreads::new(session_id.clone(), panicked_flag);
@@ -5380,6 +5405,7 @@ impl ReceiverWrapper {
                     local_adnl_id: local_adnl_id.clone(),
                     local_idx,
                     membership,
+                    observer_peers,
                     listener: listener_clone,
                     sources,
                     adnl_to_idx,
