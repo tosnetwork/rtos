@@ -622,9 +622,14 @@ impl ConfigParams {
 
     /// The raw root of the mandatory-parameter list in parameter 9, if present.
     pub fn mandatory_params_root(&self) -> Result<Option<Cell>> {
+        self.raw_config_cell(9)
+    }
+
+    /// The cell referenced by a dictionary entry, without typed decoding.
+    pub fn raw_config_cell(&self, index: u32) -> Result<Option<Cell>> {
         Ok(self
             .config_params
-            .get(9u32.write_to_bitstring()?)?
+            .get(index.write_to_bitstring()?)?
             .and_then(|value| value.reference_opt(0)))
     }
 

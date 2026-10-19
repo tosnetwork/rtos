@@ -257,6 +257,29 @@ impl ValidateBase {
     }
 }
 
+/// The configuration dictionary root held by a configuration contract: the
+/// first reference of the persistent data of an active account. Any other
+/// shape is an error.
+fn config_from_contract(accounts: &ShardAccounts, address: &AccountId) -> Result<Cell> {
+    let Some(shard_account) = accounts.account(address)? else {
+        fail!("configuration smart contract not found or it has no state")
+    };
+    let account = shard_account.read_account()?;
+    let Some(data) = account.get_data() else {
+        fail!("cannot extract persistent data from configuration smart contract state")
+    };
+    if data.cell_type() != CellType::Ordinary {
+        fail!("configuration smart contract data is not an ordinary cell")
+    }
+    if data.references_count() == 0 {
+        fail!(
+            "configuration smart contract does not contain a valid configuration in the first \
+            reference of its persistent data"
+        )
+    }
+    data.reference(0)
+}
+
 pub struct ValidateQuery {
     // current state of blockchain
     shard: ShardIdent,
@@ -6235,60 +6258,63 @@ impl ValidateQuery {
         Ok(())
     }
 
+    /// Mirrors the reference configuration-update check. Four configurations
+    /// are involved: the previous and the next masterchain state
+    /// configurations, and the configurations held in the next account states
+    /// of the old and of the new configuration contract.
     fn check_config_update(base: &ValidateBase) -> Result<()> {
-        if base.next_state_extra.config.config_params.count(10000).is_err() {
-            reject_query!("new configuration failed to pass letmated validity checks")
+        let prev_config = &base.prev_state_extra.config;
+        let next_config = &base.next_state_extra.config;
+        if !next_config.config_params_shape_is_valid() {
+            reject_query!("new configuration failed to pass automated validity checks")
         }
-        if base.prev_state_extra.config.config_params.count(10000).is_err() {
-            reject_query!("old configuration failed to pass letmated validity checks")
+        if !prev_config.config_params_shape_is_valid() {
+            // An invalid previous state is an internal failure, not a fault of the candidate.
+            fail!("old configuration failed to pass automated validity checks")
         }
-        if !base.next_state_extra.config.valid_config_data(false, None)? {
+        let old_mparams = base.config_params.mandatory_params_root()?;
+        if !next_config.config_data_is_valid(false, old_mparams.clone()) {
             reject_query!(
-                "new configuration parameters failed to pass per-parameter letmated validity \
+                "new configuration parameters failed to pass per-parameter automated validity \
                 checks, or one of mandatory configuration parameters is missing"
             )
         }
-        base.prev_state_extra
-            .config
-            .validate_auth_policy_transition(&base.next_state_extra.config)?;
-        base.prev_state_extra
-            .config
-            .validate_workchain_execution_transition(&base.next_state_extra.config)?;
-        let new_accounts = base.next_state()?.read_accounts()?;
-        let config_address = base.prev_state_extra.config.config_address()?;
-        let new_config_address = base.next_state_extra.config.config_address()?;
-        let cfg_acc_changed = config_address != new_config_address;
-        let config_address = config_address.into();
-        let old_config_root = match new_accounts.get(&config_address)? {
-            Some(account) => account.read_account()?.get_data(),
-            None => reject_query!(
+        let old_cfg_addr = prev_config.config_addr.clone();
+        let new_cfg_addr = next_config.config_addr.clone();
+        let accounts = &base.next_state_accounts;
+        let old_contract_root = match config_from_contract(accounts, &old_cfg_addr) {
+            Ok(root) => root,
+            Err(err) => reject_query!(
                 "cannot extract configuration from the new state of the (old) configuration \
-                smart contract {config_address:x}"
+                smart contract {old_cfg_addr:x} : {err}"
             ),
         };
-        let new_config_root = match new_accounts.get(&config_address)? {
-            Some(account) => account.read_account()?.get_data(),
-            None => reject_query!(
+        let new_contract_root = match config_from_contract(accounts, &new_cfg_addr) {
+            Ok(root) => root,
+            Err(err) => reject_query!(
                 "cannot extract configuration from the new state of the (new) configuration \
-                smart contract {new_config_address:x}"
+                smart contract {new_cfg_addr:x} : {err}"
             ),
         };
-        if old_config_root != new_config_root {
+        let cfg_acc_changed = new_cfg_addr != old_cfg_addr;
+        if Some(new_contract_root.repr_hash()) != next_config.root().map(|root| root.repr_hash()) {
             reject_query!(
-                "the new configuration is different from that stored in the persistent data of the \
-                (new) configuration smart contract {config_address:x}"
+                "the new configuration is different from that stored in the persistent data of \
+                the (new) configuration smart contract {old_cfg_addr:x}"
             )
         }
-        let old_config = base.prev_state_extra.config.clone();
-        let new_config = base.next_state_extra.config.clone();
-        if !old_config.valid_config_data(true, None)? {
+        let old_contract_config =
+            ConfigParams::with_address_and_params(old_cfg_addr.clone(), Some(old_contract_root));
+        if !old_contract_config.config_data_is_valid(true, old_mparams.clone()) {
             reject_query!(
-                "configuration extracted from (old) configuration smart contract {:x} failed to \
-                pass per-parameter validity checks, or one of mandatory parameters is missing",
-                old_config.config_addr
+                "configuration extracted from (old) configuration smart contract {old_cfg_addr:x} \
+                failed to pass per-parameter validity checks, or one of mandatory parameters is \
+                missing"
             )
         }
-        if new_config.important_config_parameters_changed(&old_config, false)? {
+        prev_config.validate_auth_policy_transition(next_config)?;
+        prev_config.validate_workchain_execution_transition(next_config)?;
+        if next_config.important_config_parameters_changed(prev_config, false)? {
             // same as the check in Collator::create_mc_state_extra()
             log::warn!(
                 target: "validate_query",
@@ -6304,85 +6330,78 @@ impl ValidateQuery {
             }
         } else if base.info.key_block()
             && !(cfg_acc_changed
-                || new_config.important_config_parameters_changed(&old_config, true)?)
+                || next_config.important_config_parameters_changed(prev_config, true)?)
         {
             reject_query!(
                 "no important parameters have been changed, but the block is marked as a key block"
             )
         }
-        let want_cfg_addr = match old_config.config(0)? {
-            Some(ConfigParamEnum::ConfigParam0(param)) => param.config_addr,
-            _ => {
-                if cfg_acc_changed {
-                    reject_query!(
-                        "new state of old configuration smart contract {:x} contains no value \
-                        for parameter 0 (new configuration smart contract address), but the \
-                        configuration smart contract has been somehow changed to {:x}",
-                        old_config.config_addr,
-                        new_config.config_addr
-                    )
-                } else {
-                    return Ok(());
-                }
-            }
-        };
-        if want_cfg_addr == config_address {
+        let param0 = old_contract_config.raw_config_cell(0)?;
+        let Some(param0) = param0 else {
             if cfg_acc_changed {
                 reject_query!(
-                    "new state of old configuration smart contract {:x} contains the same value \
-                    for parameter 0 (configuration smart contract address), but the \
-                    configuration smart contract has been somehow changed to {:x}",
-                    old_config.config_addr,
-                    new_config.config_addr
+                    "new state of old configuration smart contract {old_cfg_addr:x} contains no \
+                    value for parameter 0 (new configuration smart contract address), but the \
+                    configuration smart contract has been somehow changed to {new_cfg_addr:x}"
+                )
+            }
+            return Ok(());
+        };
+        let mut param0 = SliceData::load_cell(param0)?;
+        if param0.remaining_bits() < 256 {
+            reject_query!("parameter 0 of the old configuration smart contract is too short")
+        }
+        let want_cfg_addr = param0.get_next_slice(256)?;
+        if want_cfg_addr == old_cfg_addr {
+            if cfg_acc_changed {
+                reject_query!(
+                    "new state of old configuration smart contract {old_cfg_addr:x} contains the \
+                    same value for parameter 0 (configuration smart contract address), but the \
+                    configuration smart contract has been somehow changed to {new_cfg_addr:x}"
                 )
             }
             return Ok(());
         }
-        if want_cfg_addr != new_config.config_addr && cfg_acc_changed {
+        if want_cfg_addr != new_cfg_addr && cfg_acc_changed {
             reject_query!(
-                "new state of old configuration smart contract {:x} contains {:x} \
-                as the value for parameter 0 (new configuration smart contract address), but the \
-                configuration smart contract has been somehow changed to a different value {:x}",
-                old_config.config_addr,
-                want_cfg_addr,
-                new_config.config_addr
+                "new state of old configuration smart contract {old_cfg_addr:x} contains \
+                {want_cfg_addr:x} as the value for parameter 0 (new configuration smart contract \
+                address), but the configuration smart contract has been somehow changed to a \
+                different value {new_cfg_addr:x}"
             )
         }
         // now old_cfg_addr = new_cfg_addr != want_cfg_addr
         // the configuration smart contract has not been switched to want_cfg_addr, have to check why
-        let want_config_root = match new_accounts.get(&want_cfg_addr.clone().into()) {
-            Ok(Some(account)) => account.read_account()?.get_data(),
-            _ => {
+        let want_contract_root = match config_from_contract(accounts, &want_cfg_addr) {
+            Ok(root) => root,
+            Err(err) => {
                 log::warn!(
                     target: "validate_query",
-                    "({}): switching of configuration smart contract did not happen \
-                    because the suggested new configuration smart contract {want_cfg_addr:x} does not \
-                    contain a valid configuration",
+                    "({}): switching of configuration smart contract did not happen because the \
+                    suggested new configuration smart contract {want_cfg_addr:x} does not contain \
+                    a valid configuration : {err}",
                     base.next_block_descr,
                 );
                 return Ok(());
             }
         };
-        // if !base.config_params.valid_config_data(&base.prev_state_extra.config, true, false)? {
         let want_config =
-            ConfigParams::with_address_and_params(want_cfg_addr.clone(), want_config_root);
-        if !want_config.valid_config_data(false, None)? {
+            ConfigParams::with_address_and_params(want_cfg_addr.clone(), Some(want_contract_root));
+        if !want_config.config_data_is_valid(false, old_mparams) {
             log::warn!(
                 target: "validate_query",
-                "({}): switching of configuration smart contract did not happen because \
-                the configuration extracted from suggested new configuration smart contract {want_cfg_addr:x} \
-                failed to pass per-parameter validity checks, or one of \
+                "({}): switching of configuration smart contract did not happen because the \
+                configuration extracted from suggested new configuration smart contract \
+                {want_cfg_addr:x} failed to pass per-parameter validity checks, or one of \
                 mandatory configuration parameters is missing",
                 base.next_block_descr,
             );
             return Ok(());
         }
         reject_query!(
-            "old configuration smart contract {:x} suggested {:x} as the new configuration \
-            smart contract, but the switchover did not happen without a good reason \
-            (the suggested configuration appears to be valid)",
-            old_config.config_addr,
-            want_cfg_addr
+            "old configuration smart contract {old_cfg_addr:x} suggested {want_cfg_addr:x} as the \
+            new configuration smart contract, but the switchover did not happen without a good \
+            reason (the suggested configuration appears to be valid)"
         )
     }
 
