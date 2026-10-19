@@ -14,7 +14,7 @@ use adnl::common::add_unbound_object_to_map_with_update;
 use rtos_block::{fail, BlockIdExt, Result, ShardIdent};
 use std::{
     collections::{HashMap, HashSet},
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use storage::shardstate_db_async::AllowStateGcResolver;
 
@@ -25,8 +25,21 @@ pub struct AllowStateGcSmartResolver {
     life_time_sec: u64,
     repair_protection: Option<std::sync::Arc<storage::repair_protection::RepairProtection>>,
     pinned_roots: parking_lot::RwLock<HashMap<BlockIdExt, u32>>,
+    // When set, deletion decisions use `committed` only: the progress staged
+    // before a barrier that made its prerequisite pointer writes durable.
+    durable_gate: AtomicBool,
+    next_ticket: AtomicU64,
+    staged: parking_lot::Mutex<Option<(u64, GcProgress)>>,
+    committed: parking_lot::RwLock<GcProgress>,
     #[cfg(test)]
     test_expired: std::sync::atomic::AtomicBool,
+}
+
+/// GC boundaries derived from masterchain progress.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct GcProgress {
+    min_ref_mc_block: u32,
+    min_actual_ss: HashMap<ShardIdent, u32>,
 }
 
 impl AllowStateGcSmartResolver {
@@ -44,8 +57,23 @@ impl AllowStateGcSmartResolver {
             life_time_sec,
             repair_protection: None,
             pinned_roots: parking_lot::RwLock::new(HashMap::new()),
+            durable_gate: AtomicBool::new(false),
+            next_ticket: AtomicU64::new(0),
+            staged: parking_lot::Mutex::new(None),
+            committed: parking_lot::RwLock::new(GcProgress::default()),
             #[cfg(test)]
             test_expired: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn live_progress(&self) -> GcProgress {
+        GcProgress {
+            min_ref_mc_block: self.min_ref_mc_block.load(Ordering::Acquire),
+            min_actual_ss: self
+                .min_actual_ss
+                .iter()
+                .map(|kv| (kv.key().clone(), kv.val().load(Ordering::Acquire)))
+                .collect(),
         }
     }
 
@@ -205,24 +233,26 @@ impl AllowStateGcSmartResolver {
         if recent {
             return Ok(false);
         }
+        if self.durable_gate.load(Ordering::Acquire) {
+            return Ok(Self::progress_allows(&self.committed.read(), block_id));
+        }
+        Ok(Self::progress_allows(&self.live_progress(), block_id))
+    }
+
+    fn progress_allows(progress: &GcProgress, block_id: &BlockIdExt) -> bool {
         if block_id.shard().is_masterchain() {
-            if block_id.seq_no() != 0 {
-                // we need zerostate
-                let min_ref_mc_block = self.min_ref_mc_block.load(Ordering::Relaxed);
-                return Ok(block_id.seq_no() < min_ref_mc_block);
-            }
-        } else if let Some(kv) = self.min_actual_ss.get(block_id.shard()) {
-            let min_actual = kv.val().load(Ordering::Relaxed);
-            return Ok(block_id.seq_no() < min_actual);
-        } else {
-            for kv in self.min_actual_ss.iter() {
-                if block_id.shard().intersect_with(kv.key()) {
-                    let min_actual = kv.val().load(Ordering::Relaxed);
-                    return Ok(block_id.seq_no() < min_actual);
-                }
+            // The zerostate is always needed.
+            return block_id.seq_no() != 0 && block_id.seq_no() < progress.min_ref_mc_block;
+        }
+        if let Some(min_actual) = progress.min_actual_ss.get(block_id.shard()) {
+            return block_id.seq_no() < *min_actual;
+        }
+        for (shard, min_actual) in &progress.min_actual_ss {
+            if block_id.shard().intersect_with(shard) {
+                return block_id.seq_no() < *min_actual;
             }
         }
-        Ok(false)
+        false
     }
 }
 
@@ -231,6 +261,82 @@ impl AllowStateGcResolver for AllowStateGcSmartResolver {
         let old = AllowStateGcSmartResolver::allow_state_gc(self, block_id, saved_at, gc_utime)?;
         let pinned = self.pinned_roots.read().get(block_id).map(|c| *c > 0).unwrap_or(false);
         Ok(old && !pinned)
+    }
+
+    fn stage_gc_progress(&self) -> Option<u64> {
+        if !self.durable_gate.load(Ordering::Acquire) {
+            return None;
+        }
+        let ticket = self.next_ticket.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        *self.staged.lock() = Some((ticket, self.live_progress()));
+        Some(ticket)
+    }
+
+    fn commit_gc_progress(&self, ticket: u64) {
+        let mut staged = self.staged.lock();
+        if staged.as_ref().is_some_and(|(staged_ticket, _)| *staged_ticket == ticket) {
+            if let Some((_, progress)) = staged.take() {
+                *self.committed.write() = progress;
+            }
+        }
+    }
+
+    fn require_durable_progress(&self) {
+        self.durable_gate.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod durable_progress_tests {
+    use super::*;
+
+    fn mc(seq_no: u32) -> BlockIdExt {
+        BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            seq_no,
+            Default::default(),
+            Default::default(),
+        )
+    }
+
+    /// Gated decisions use only committed progress, and commit installs the
+    /// progress captured at staging, not progress advanced afterwards.
+    #[test]
+    fn gated_resolver_uses_only_committed_progress() {
+        let resolver = AllowStateGcSmartResolver::new(0);
+        resolver.test_advance_expired_mc_boundary(10);
+        assert!(AllowStateGcResolver::allow_state_gc(&resolver, &mc(5), 0, 0).unwrap());
+        resolver.require_durable_progress();
+        assert!(
+            !AllowStateGcResolver::allow_state_gc(&resolver, &mc(5), 0, 0).unwrap(),
+            "live progress must not authorize deletion once gated"
+        );
+        let ticket = resolver.stage_gc_progress().unwrap();
+        resolver.test_advance_expired_mc_boundary(20);
+        resolver.commit_gc_progress(ticket);
+        assert!(AllowStateGcResolver::allow_state_gc(&resolver, &mc(5), 0, 0).unwrap());
+        assert!(
+            !AllowStateGcResolver::allow_state_gc(&resolver, &mc(15), 0, 0).unwrap(),
+            "progress advanced after staging was committed"
+        );
+        // A stale ticket does not install anything.
+        let current = resolver.stage_gc_progress().unwrap();
+        resolver.commit_gc_progress(current.wrapping_sub(1));
+        assert!(!AllowStateGcResolver::allow_state_gc(&resolver, &mc(15), 0, 0).unwrap());
+        resolver.commit_gc_progress(current);
+        assert!(AllowStateGcResolver::allow_state_gc(&resolver, &mc(15), 0, 0).unwrap());
+        // The zerostate is never eligible, and pins still hold.
+        assert!(!AllowStateGcResolver::allow_state_gc(&resolver, &mc(0), 0, 0).unwrap());
+        resolver.reserve_absent_repair_state(&mc(5)).unwrap();
+        assert!(!AllowStateGcResolver::allow_state_gc(&resolver, &mc(5), 0, 0).unwrap());
+    }
+
+    #[test]
+    fn ungated_resolver_keeps_live_decisions() {
+        let resolver = AllowStateGcSmartResolver::new(0);
+        assert_eq!(resolver.stage_gc_progress(), None);
+        resolver.test_advance_expired_mc_boundary(10);
+        assert!(AllowStateGcResolver::allow_state_gc(&resolver, &mc(5), 0, 0).unwrap());
     }
 }
 

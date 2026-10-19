@@ -178,11 +178,20 @@ impl SsCallback {
 impl storage::shardstate_db_async::Callback for SsCallback {
     async fn invoke(&self, job: storage::shardstate_db_async::Job) {
         self.handle.set_state_saved();
-        if let Err(e) = self.block_handle_storage.save_handle(&self.handle, None) {
-            log::error!("SsCallback: failed to save block handle: {e}");
-        }
-        if let Some(inner) = &self.inner {
-            inner.invoke(job).await;
+        let Some(inner) = &self.inner else {
+            if let Err(e) = self.block_handle_storage.save_handle(&self.handle, None) {
+                log::error!("SsCallback: failed to save block handle: {e}");
+            }
+            return;
+        };
+        // The inner callback tells its caller the state is saved, so the saved
+        // flag (and the state written before it) must be durable first.
+        match self.block_handle_storage.save_handle_durable(&self.handle).await {
+            Ok(()) => inner.invoke(job).await,
+            Err(e) => log::error!(
+                "SsCallback: saved state flag of {} is not durable, not reporting it saved: {e}",
+                self.handle.id()
+            ),
         }
     }
 }
@@ -626,7 +635,8 @@ impl InternalDb {
     }
 
     fn store_db_version(&self, v: u32) -> Result<()> {
-        self.full_node_state_db.put(&DB_VERSION, &v.serialize())
+        // Synchronized, and ordered against queued node-state writes.
+        self.block_handle_storage.save_full_node_state_raw_sync(DB_VERSION, &v.serialize())
     }
 
     pub fn load_db_version(&self) -> Result<u32> {
@@ -689,7 +699,22 @@ impl InternalDb {
 
     pub fn start_states_gc(&self, resolver: Arc<dyn AllowStateGcResolver>) {
         if let StateDb::Dynamic(db) = &self.state_db {
-            db.clone().start_gc(resolver, self.cells_gc_interval.clone())
+            // The resolver advances to the lowest of the shard client, last
+            // rotation and archives GC pointers (and the keeper's applied
+            // block). Each value is readable only after it was queued to the
+            // ordered handle writer or written synchronously, so a writer
+            // barrier issued after the progress is staged makes every pointer
+            // that progress depends on durable before anything is deleted.
+            let handles = self.block_handle_storage.clone();
+            let barrier: storage::shardstate_db_async::GcProgressBarrier = Arc::new(move || {
+                let handles = handles.clone();
+                Box::pin(async move { handles.sync_pending().await })
+            });
+            db.clone().start_gc_with_progress_barrier(
+                resolver,
+                self.cells_gc_interval.clone(),
+                Some(barrier),
+            )
         }
     }
 
@@ -1589,14 +1614,21 @@ impl InternalDb {
                     let state = state.clone();
                     let db = db.clone();
                     let state_root = state.root_cell().clone();
+                    // The archival state DB is a separate physical database:
+                    // sync it before anything advertises the state as saved.
                     tokio::task::spawn_blocking(move || {
-                        db.put(state.block_id(), state.root_cell().clone())
+                        db.put(state.block_id(), state.root_cell().clone())?;
+                        db.sync_wal()
                     })
                     .await??;
+                    let flagged = handle.set_state() | handle.set_state_saved();
                     if let Some(callback) = callback_ss {
+                        self.block_handle_storage.save_handle_durable(handle).await?;
                         callback.invoke(Job::PutState(state_root, handle.id().clone())).await;
-                    }
-                    if handle.set_state() | handle.set_state_saved() {
+                        if flagged && callback_handle.is_some() {
+                            self.store_block_handle(handle, callback_handle)?;
+                        }
+                    } else if flagged {
                         self.store_block_handle(handle, callback_handle)?;
                     }
                 }
@@ -1608,6 +1640,9 @@ impl InternalDb {
                     );
                     let callback =
                         Some(Arc::new(callback) as Arc<dyn storage::shardstate_db_async::Callback>);
+                    // The dynamic state DB shares the node DB's WAL with the
+                    // handle table (see `construct`), so the synchronized
+                    // handle commit in `SsCallback` also covers the state.
                     db.put(state.block_id(), state.root_cell().clone(), callback).await?;
                     if handle.set_state() {
                         self.store_block_handle(handle, callback_handle)?;
@@ -1634,7 +1669,12 @@ impl InternalDb {
                 StateDb::Archive(db) => {
                     let db = db.clone();
                     let id = handle.id().clone();
-                    tokio::task::spawn_blocking(move || db.put_update(&id, state_update)).await??;
+                    // Separate physical database: durable before the flags.
+                    tokio::task::spawn_blocking(move || {
+                        db.put_update(&id, state_update)?;
+                        db.sync_wal()
+                    })
+                    .await??;
                     if handle.set_state() | handle.set_state_saved() {
                         self.store_block_handle(handle, None)?;
                     }
@@ -2091,6 +2131,17 @@ impl InternalDb {
         }
     }
 
+    /// Like `store_block_applied`, but returns only after the applied flag and
+    /// every earlier queued write are durable. An apply that reports success
+    /// through this cannot lose its applied flag in a crash.
+    pub async fn store_block_applied_durable(&self, handle: &Arc<BlockHandle>) -> Result<bool> {
+        let _tc = time_checker!(|| format!("store_block_applied_durable {}", handle.id()), 30);
+        let newly = handle.set_block_applied();
+        // Also re-save an already applied handle: its flag may still be queued.
+        self.block_handle_storage.save_handle_durable(handle).await?;
+        Ok(newly)
+    }
+
     pub async fn archive_block(
         &self,
         id: &BlockIdExt,
@@ -2183,6 +2234,23 @@ impl InternalDb {
     pub fn save_full_node_state(&self, key: &'static str, block_id: &BlockIdExt) -> Result<()> {
         let _tc = time_checker!(|| format!("save_full_node_state {}", key), 30);
         self.block_handle_storage.save_full_node_state(key.to_string(), block_id)
+    }
+
+    /// Saves a block-id pointer and returns after it, and every write queued
+    /// before it, is durable. For pointers whose consumers must not move on
+    /// before they survive a crash (shard client, init block, GC floors).
+    pub async fn save_full_node_state_durable(
+        &self,
+        key: &'static str,
+        block_id: &BlockIdExt,
+    ) -> Result<()> {
+        let _tc = time_checker!(|| format!("save_full_node_state_durable {}", key), 30);
+        self.block_handle_storage.save_full_node_state_durable(key.to_string(), block_id).await
+    }
+
+    /// Deletes a block-id pointer and returns after the deletion is durable.
+    pub async fn drop_full_node_state_durable(&self, key: &'static str) -> Result<()> {
+        self.block_handle_storage.drop_full_node_state_durable(key.to_string()).await
     }
 
     /// Switches the validator-state DB to a fresh WAL (tests only), so its
@@ -2395,10 +2463,24 @@ impl InternalDb {
         self.archive_manager.test_pause_gc_selection()
     }
 
+    /// `LAST_UNNEEDED_KEY_BLOCK` authorizes deletion at startup: providers
+    /// drop archive column families below it and unreadable slices below it
+    /// leave the index. So it is a deletion authority, not a completion
+    /// cursor, and it must be durable before any slice is removed. Its own
+    /// justification is the archives-GC progress the caller derived it from,
+    /// which a writer barrier makes durable first. Any failure stops before
+    /// destructive work.
     pub async fn archive_gc(&self, last_unneeded_key_block: &BlockIdExt) -> Result<()> {
         let _tc = time_checker!(|| format!("archive_gc {}", last_unneeded_key_block), 300);
+        self.block_handle_storage.sync_pending().await?;
+        self.block_handle_storage
+            .save_full_node_state_durable(
+                LAST_UNNEEDED_KEY_BLOCK.to_string(),
+                last_unneeded_key_block,
+            )
+            .await?;
         self.archive_manager.gc(last_unneeded_key_block).await;
-        self.save_full_node_state(LAST_UNNEEDED_KEY_BLOCK, last_unneeded_key_block)
+        Ok(())
     }
 
     pub fn assign_mc_ref_seq_no(
@@ -2647,6 +2729,9 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests/test_node_db_recovery.rs"]
 mod node_db_recovery_tests;
+
+#[cfg(test)]
+mod durability_tests;
 
 // The pinned DB slice is checked before deserialization; no attacker-sized Vec.
 fn validate_repair_linkage(bytes: &[u8], expected: &BlockIdExt) -> Result<()> {

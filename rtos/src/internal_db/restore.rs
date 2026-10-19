@@ -105,6 +105,12 @@ pub async fn check_db(
                 Err(err) => return Err(restore_failure(err, is_broken)),
             }
         }
+        // Every restored pointer and handle must be durable before the beacon
+        // that makes the next start repeat recovery is removed.
+        db.block_handle_storage
+            .sync_pending()
+            .await
+            .map_err(|err| restore_failure(err, is_broken))?;
         reset_restoring(&db.config.db_directory)?;
     }
     set_unexpected_termination(&db.config.db_directory)?;
@@ -194,6 +200,13 @@ fn set_unexpected_termination(db_dir: &str) -> Result<()> {
     Ok(())
 }
 
+fn sync_directory(dir: &Path) -> Result<()> {
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Declares recovery complete: removes the beacons and makes the removal
+/// durable. The caller has already made the restored metadata durable.
 fn reset_restoring(db_dir: &str) -> Result<()> {
     let path = Path::new(db_dir).join(RESTORING_BEACON_FILE);
     remove_file(&path)?;
@@ -201,17 +214,20 @@ fn reset_restoring(db_dir: &str) -> Result<()> {
     if path.exists() {
         remove_file(&path)?;
     }
-    Ok(())
+    sync_directory(Path::new(db_dir))
 }
 
 fn check_restoring(db_dir: &str) -> bool {
     Path::new(db_dir).join(RESTORING_BEACON_FILE).as_path().exists()
 }
 
+/// Establishes the recovery beacon durably before any destructive recovery
+/// work, so an interrupted recovery is repeated on the next start.
 fn set_restoring(db_dir: &str) -> Result<()> {
     let path = Path::new(db_dir).join(RESTORING_BEACON_FILE);
     write(&path, "")?;
-    Ok(())
+    std::fs::File::open(&path)?.sync_all()?;
+    sync_directory(Path::new(db_dir))
 }
 
 async fn restore_last_applied_mc_block(
@@ -431,7 +447,9 @@ async fn restore(
 
     if let Some(block_id) = db.load_validator_state(LAST_ROTATION_MC_BLOCK)? {
         if block_id.seq_no > last_mc_block.seq_no {
-            db.save_validator_state(LAST_ROTATION_MC_BLOCK, last_mc_block)?;
+            // Synchronized like every other writer of this key; it is ordered
+            // after any older queued value, which can no longer overwrite it.
+            db.save_validator_state_sync(LAST_ROTATION_MC_BLOCK, last_mc_block)?;
         }
     }
     if let Some(block_id) = db.load_full_node_state(PSS_KEEPER_MC_BLOCK)? {
