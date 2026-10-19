@@ -215,7 +215,7 @@ impl AuthenticatedSessionRuntime {
         let current_total_set =
             current.list().iter().map(ValidatorDescr::adnl_addr).collect::<Result<Vec<_>>>()?;
         let mut members: BTreeSet<_> = ordered.iter().cloned().collect();
-        if protocol == SimplexProtocol::PrivateObserversPlumtree {
+        if protocol.observers_in_private_overlay() {
             for set in [config.prev_validator_set()?, current, config.next_validator_set()?] {
                 for member in set.list() {
                     members.insert(member.adnl_addr()?);
@@ -310,6 +310,8 @@ impl AuthenticatedSessionRuntime {
     }
 
     pub fn runtime_directory(&self, root: &str) -> Result<String> {
+        // A durable layout: each existing directory keeps the exact spelling it
+        // was created with, so the layout follows the exact protocol version.
         if self.protocol != SimplexProtocol::PrivateObserversPlumtree {
             return crate::simplex_protocol::SimplexNamespace {
                 protocol: self.protocol,

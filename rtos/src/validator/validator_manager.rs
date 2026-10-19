@@ -3086,10 +3086,8 @@ impl ValidatorManagerImpl {
                 ConsensusOptions::Simplex(options) => Some(options.protocol),
                 _ => None,
             };
-            let observers_in_overlay = simplex_protocol
-                == Some(
-                    consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree,
-                );
+            let observers_in_overlay =
+                simplex_protocol.is_some_and(|protocol| protocol.observers_in_private_overlay());
             // Every Simplex session, of every protocol, is admitted from this
             // authenticated snapshot: as the validator custody selected, or as
             // an observer the reference observer selection admits.

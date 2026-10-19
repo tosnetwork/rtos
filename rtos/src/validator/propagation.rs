@@ -105,7 +105,7 @@ impl PropagationPlan {
         last_mc_finalized_seqno: u32,
         candidate_already_sent: bool,
     ) -> Self {
-        let v2 = protocol == SimplexProtocol::PrivateObserversPlumtree;
+        let v2 = protocol.enable_plumtree_broadcast();
         let mut plan = Self {
             candidate_targets: TargetSet::NONE,
             block_targets: TargetSet::NONE,

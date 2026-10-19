@@ -980,8 +980,7 @@ impl AdnlOverlay {
         private_runtime: Option<Arc<crate::session_runtime::AuthenticatedSessionRuntime>>,
     ) -> Result<Arc<Self>> {
         if let Some(runtime) = &private_runtime {
-            if runtime.protocol()
-                != crate::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
+            if !runtime.protocol().observers_in_private_overlay()
                 || runtime.local_adnl() != local_validator_key.id()
                 || runtime.overlay_short_id()? != overlay_id
                 || runtime.wire_profile() != stack.overlay.wire_profile()

@@ -2428,8 +2428,7 @@ impl ValidatorGroup {
         // callback; collation/validation success alone cannot authorize relay.
         let legacy_candidate_broadcast = !matches!(
             &self.consensus_options,
-            ConsensusOptions::Simplex(options)
-                if options.protocol == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
+            ConsensusOptions::Simplex(options) if options.protocol.enable_plumtree_broadcast()
         );
         if is_simplex {
             match &parent {
@@ -2887,8 +2886,7 @@ impl ValidatorGroup {
         // callback; collation/validation success alone cannot authorize relay.
         let legacy_candidate_broadcast = !matches!(
             &self.consensus_options,
-            ConsensusOptions::Simplex(options)
-                if options.protocol == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree
+            ConsensusOptions::Simplex(options) if options.protocol.enable_plumtree_broadcast()
         );
         let (expected_current_round, prev_block_ids, mc_block_id_opt, min_ts) = group_impl
             .execute_sync(|group_impl| {

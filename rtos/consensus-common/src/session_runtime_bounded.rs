@@ -47,7 +47,7 @@ impl AuthenticatedSessionRuntime {
         for v in config.current.list() {
             current_total_set.push(v.adnl_addr_bounded(budget)?);
         }
-        let extra = if protocol == SimplexProtocol::PrivateObserversPlumtree {
+        let extra = if protocol.observers_in_private_overlay() {
             config
                 .previous
                 .list()
@@ -94,7 +94,7 @@ impl AuthenticatedSessionRuntime {
             }
             insert(&mut members, key.clone(), budget)?;
         }
-        if protocol == SimplexProtocol::PrivateObserversPlumtree {
+        if protocol.observers_in_private_overlay() {
             for set in [&config.previous, &config.current, &config.next] {
                 for v in set.list() {
                     insert(&mut members, v.adnl_addr_bounded(budget)?, budget)?;

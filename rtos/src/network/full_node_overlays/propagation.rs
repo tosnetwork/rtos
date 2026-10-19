@@ -55,6 +55,14 @@ impl PropagationConfig {
     }
 }
 
+/// Whether a workchain's full-node overlays use Plumtree: the reference full
+/// node reads enable_plumtree_broadcast of the workchain's configuration, which
+/// holds for protocol 2 and newer, including a version this build would refuse
+/// to validate with.
+fn full_node_plumtree_enabled(config: Option<&rtos_block::SimplexConfig>) -> bool {
+    config.is_some_and(|config| u32::from(config.protocol_version) >= 2)
+}
+
 impl FullNodeOverlaysRouter {
     /// Only called with configuration read from the actual applied MC state.
     /// Consumer ownership is established by client construction before activation.
@@ -64,15 +72,8 @@ impl FullNodeOverlaysRouter {
         signer: Option<&Arc<dyn KeyOption>>,
         binding: &FastSyncRefreshBinding,
     ) -> Result<()> {
-        let enabled = |c: Option<rtos_block::SimplexConfig>| -> Result<bool> {
-            c.map(|c| {
-                c.validate_protocol_version()?;
-                Ok(c.protocol_version == 2)
-            })
-            .unwrap_or(Ok(false))
-        };
-        let mc = enabled(config.get_mc_simplex_config()?)?;
-        let shard = enabled(config.get_shard_simplex_config()?)?;
+        let mc = full_node_plumtree_enabled(config.get_mc_simplex_config()?.as_ref());
+        let shard = full_node_plumtree_enabled(config.get_shard_simplex_config()?.as_ref());
         if (mc || shard) && self.network.context().stack.overlay.wire_profile() != WireProfile::T0 {
             rtos_block::fail!("v2 full-node propagation requires the pinned T0 wire profile");
         }
@@ -266,8 +267,7 @@ impl FullNodeOverlaysRouter {
             Err(error) => return failed_selected(kind, targets, destination, error),
         };
         let mut outcome = PropagationOutcome::default();
-        let plumtree =
-            protocol == SimplexProtocol::PrivateObserversPlumtree && kind != PropagationKind::Block;
+        let plumtree = protocol.enable_plumtree_broadcast() && kind != PropagationKind::Block;
         let tagged = TaggedByteSlice {
             object: bytes,
             #[cfg(feature = "telemetry")]
@@ -690,7 +690,9 @@ mod configuration_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn propagation_normal_applied_configuration_installs_and_rotates_transport() -> Result<()>
     {
-        for (protocol, binding_mode) in [(0, 0), (1, 0), (2, 0), (2, 1), (2, 2)] {
+        // Protocol 3 is newer than this build validates with; the reference
+        // full node still selects Plumtree for it (enable_plumtree_broadcast).
+        for (protocol, binding_mode) in [(0, 0), (1, 0), (2, 0), (2, 1), (2, 2), (3, 0)] {
             let bootstrap = EmulatorNetworkBootstrap::build_with_config(2, |config, keys| {
                 let corpus: serde_json::Value = serde_json::from_str(include_str!(
                     "../../../../tl/rtos_api/tests/data/live-pq.json"
@@ -821,7 +823,7 @@ mod configuration_tests {
                         .expect_err("an isolated overlay has no outbound neighbours")
                         .to_string();
                     assert!(
-                        error.contains(if protocol == 2 {
+                        error.contains(if protocol >= 2 {
                             "no outbound neighbour"
                         } else {
                             "disabled"
