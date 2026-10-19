@@ -82,13 +82,19 @@ pub(super) struct Node {
 
 impl Node {
     pub(super) async fn start(started: bool) -> Self {
+        Self::start_with(started, serde_json::json!({})).await
+    }
+
+    /// A node whose configuration is created from a default configuration
+    /// with `extra` fields.
+    pub(super) async fn start_with(started: bool, extra: serde_json::Value) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let configs = dir.path().to_str().unwrap().to_string();
-        std::fs::write(
-            dir.path().join("default_config.json"),
-            r#"{ "ip_address": "127.0.0.1:47931" }"#,
-        )
-        .unwrap();
+        let mut default = serde_json::json!({ "ip_address": "127.0.0.1:47931" });
+        for (name, value) in extra.as_object().unwrap() {
+            default[name] = value.clone();
+        }
+        std::fs::write(dir.path().join("default_config.json"), default.to_string()).unwrap();
         let config =
             TonNodeConfig::from_file(&configs, "config.json", None, "default_config.json", None)
                 .await

@@ -1381,3 +1381,7 @@ mod permissions_tests;
 #[cfg(test)]
 #[path = "../tests/test_control_keys.rs"]
 mod key_tests;
+
+#[cfg(test)]
+#[path = "../tests/test_control_pq_section.rs"]
+mod pq_section_tests;

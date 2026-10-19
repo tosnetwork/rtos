@@ -529,6 +529,16 @@ pub struct TonNodeConfig {
     /// Explicit local transport ownership only; never a consensus signing key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     consensus_transport_bindings: Vec<ConsensusTransportBindingJson>,
+    /// The post-quantum consensus section exactly as written, a null one
+    /// included. Every write of the configuration carries it unchanged; only
+    /// the consensus key loader decodes and checks it.
+    #[serde(
+        default,
+        rename = "pq_consensus",
+        deserialize_with = "keep_section",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pq_consensus: Option<serde_json::Value>,
     #[serde(skip_serializing)]
     control_server_port: Option<u16>,
     control_server: Option<AdnlServerConfigJson>,
@@ -625,6 +635,14 @@ pub struct ValidatorKeysJson {
     pub validator_key_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validator_adnl_key_id: Option<String>,
+}
+
+/// A present section is kept as written, `null` included; an absent one
+/// stays absent.
+fn keep_section<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error> {
+    <serde_json::Value as serde::Deserialize>::deserialize(deserializer).map(Some)
 }
 
 /// An ADNL id added by the operator, with its address category. The node's
@@ -1293,6 +1311,23 @@ impl TonNodeConfig {
 
     async fn save_to_file(&self, file_name: &str) -> Result<()> {
         let config_file_path = self.build_config_path(file_name);
+        // A write never drops or changes the post-quantum consensus section
+        // the file holds; such a write is refused.
+        match std::fs::read(&config_file_path) {
+            Ok(bytes) => {
+                let on_disk: serde_json::Value = serde_json::from_slice(&bytes)?;
+                let section = crate::pq_consensus_config::CONFIG_FIELD;
+                if on_disk.get(section) != self.pq_consensus.as_ref() {
+                    fail!(
+                        "refusing to write {}: the write would drop or change its {section} \
+                         section",
+                        config_file_path.display()
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
         write_config_durable(&config_file_path, &serde_json::to_vec_pretty(&self)?)?;
         Ok(())
     }
@@ -1972,13 +2007,14 @@ impl TonNodeConfig {
     /// reads, taken in one step.
     fn control_view(&self) -> Result<ControlConfigView> {
         let node = self.node_identities_tagged();
-        let pq_consensus = match std::fs::read(self.build_config_path(&self.file_name)) {
-            Ok(bytes) => {
-                let json: serde_json::Value = serde_json::from_slice(&bytes)?;
-                crate::pq_consensus_config::parse_pq_consensus(&json)?
+        let pq_consensus = match &self.pq_consensus {
+            Some(section) => {
+                let at = format!("$.{}", crate::pq_consensus_config::CONFIG_FIELD);
+                crate::pq_consensus_config::PqConsensusConfig::from_json(section, &at).map_err(
+                    |refused| error!("post-quantum consensus configuration refused: {refused}"),
+                )?
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
+            None => None,
         };
         Ok(ControlConfigView {
             ip_address: self
