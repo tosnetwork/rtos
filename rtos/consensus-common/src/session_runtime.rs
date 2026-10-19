@@ -312,6 +312,12 @@ impl AuthenticatedSessionRuntime {
     pub fn runtime_directory(&self, root: &str) -> Result<String> {
         // A durable layout: each existing directory keeps the exact spelling it
         // was created with, so the layout follows the exact protocol version.
+        // The layout is storage-only. The reference node names its session
+        // databases differently, but a directory name never reaches the
+        // network or the session identity, and renaming an existing one would
+        // reopen an empty vote journal at restart and let this node vote twice
+        // in a slot it has already voted in. A new protocol version already
+        // gets a new session id, so it never reuses an older journal.
         if self.protocol != SimplexProtocol::PrivateObserversPlumtree {
             return crate::simplex_protocol::SimplexNamespace {
                 protocol: self.protocol,
