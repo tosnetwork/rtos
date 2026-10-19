@@ -1,0 +1,111 @@
+{
+   "@type" : "engine.validator.config",
+   "out_port" : 3278,
+   "addrs" : [
+      {
+         "@type" : "engine.addr",
+         "ip" : 2130706433,
+         "port" : 47202,
+         "categories" : [
+            0
+         ],
+         "priority_categories" : [
+         ]
+      }
+   ],
+   "adnl" : [
+      {
+         "@type" : "engine.adnl",
+         "id" : "HVj4XkkQ68EQwUpMOGHC1s4xDtUKsUPfRpdktwL9ZLo=",
+         "category" : 0
+      },
+      {
+         "@type" : "engine.adnl",
+         "id" : "KvNcF6553VB6uzwnPvYLdlbciuSqGh57ln5Hx4lyiS8=",
+         "category" : 0
+      }
+   ],
+   "dht" : [
+      {
+         "@type" : "engine.dht",
+         "id" : "KvNcF6553VB6uzwnPvYLdlbciuSqGh57ln5Hx4lyiS8="
+      }
+   ],
+   "validators" : [
+      {
+         "@type" : "engine.validator",
+         "id" : "HVj4XkkQ68EQwUpMOGHC1s4xDtUKsUPfRpdktwL9ZLo=",
+         "temp_keys" : [
+            {
+               "@type" : "engine.validatorTempKey",
+               "key" : "HVj4XkkQ68EQwUpMOGHC1s4xDtUKsUPfRpdktwL9ZLo=",
+               "expire_at" : 2147483647
+            }
+         ],
+         "adnl_addrs" : [
+            {
+               "@type" : "engine.validatorAdnlAddress",
+               "id" : "HVj4XkkQ68EQwUpMOGHC1s4xDtUKsUPfRpdktwL9ZLo=",
+               "expire_at" : 2147483647
+            }
+         ],
+         "election_date" : 0,
+         "expire_at" : 2147483647
+      }
+   ],
+   "collators" : [
+   ],
+   "fullnode" : "KvNcF6553VB6uzwnPvYLdlbciuSqGh57ln5Hx4lyiS8=",
+   "fullnodeslaves" : [
+   ],
+   "fullnodemasters" : [
+   ],
+   "liteservers" : [
+      {
+         "@type" : "engine.liteServer",
+         "id" : "aKhhC2JBlN7vc4dkj5kiuucGM7v0Wb280xPY3GQ4n+I=",
+         "port" : 47203
+      }
+   ],
+   "control" : [
+      {
+         "@type" : "engine.controlInterface",
+         "id" : "Hl9WPwZib9h443kLUXOY8mHHLKejhNX7Ik8OseaKreU=",
+         "port" : 47204,
+         "allowed" : [
+            {
+               "@type" : "engine.controlProcess",
+               "id" : "LOjlDw3QpmY+UraKV10cVjdV8OVg7z39BUNV4dbxKBI=",
+               "permissions" : 7
+            },
+            {
+               "@type" : "engine.controlProcess",
+               "id" : "QuxFtEb8mnYunOVQkQly235w1VKREOjp4DgFzStQj78=",
+               "permissions" : 4
+            },
+            {
+               "@type" : "engine.controlProcess",
+               "id" : "faATfnFSzNqQGdy9o1sP4ASFBGnhAH2HNtqVU7mntW8=",
+               "permissions" : 2
+            },
+            {
+               "@type" : "engine.controlProcess",
+               "id" : "ukWe97ZCjiDwDNu/9/o2gm37sQDcwfcpP6KMMfQ6L1E=",
+               "permissions" : 15
+            },
+            {
+               "@type" : "engine.controlProcess",
+               "id" : "2dH+D2U5dwgiYALTebTgjn8/qRRE+PNneLEQ++FTyIY=",
+               "permissions" : 1
+            }
+         ]
+      }
+   ],
+   "shards_to_monitor" : [
+   ],
+   "gc" : {
+      "@type" : "engine.gc",
+      "ids" : [
+      ]
+   }
+}

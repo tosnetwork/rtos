@@ -83,7 +83,7 @@ fn unix_now() -> u32 {
 /// stuck the way a shutdown can: a lock held forever, a reader blocked on a
 /// pipe nobody writes, and a writer blocked on a full pipe nobody reads.
 fn run_child(scenario: &str) {
-    init_logger::<std::path::PathBuf>(None);
+    init_logging(None).unwrap();
     let mut args = vec!["rtos".to_string()];
     for value in scenario.split(',') {
         args.push("--shutdown-at".to_string());

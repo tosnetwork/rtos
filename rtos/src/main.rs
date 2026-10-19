@@ -233,33 +233,67 @@ static GLOBAL: TracingAllocator = TracingAllocator {
     overhead: AtomicU64::new(0),
 };
 
-fn init_logger<T: AsRef<std::path::Path>>(log_config_path: Option<T>) {
-    if let Some(path) = log_config_path {
-        if let Err(err) = log4rs::init_file(path, Default::default()) {
-            println!("Error while initializing log by {}: {}", err, err);
-        } else {
-            return;
-        }
-    }
-
-    let level = log::LevelFilter::Info;
+/// The log configuration of a node without a log configuration file: the
+/// standard output at `level`.
+fn default_log_config(level: log::LevelFilter) -> std::result::Result<log4rs::Config, String> {
     let stdout = log4rs::append::console::ConsoleAppender::builder()
         .target(log4rs::append::console::Target::Stdout)
         .build();
-
-    let config = log4rs::config::Config::builder()
+    log4rs::config::Config::builder()
         .appender(
             log4rs::config::Appender::builder()
                 .filter(Box::new(log4rs::filter::threshold::ThresholdFilter::new(level)))
                 .build("stdout", Box::new(stdout)),
         )
-        .build(log4rs::config::Root::builder().appender("stdout").build(log::LevelFilter::Info))
-        .unwrap();
+        .build(log4rs::config::Root::builder().appender("stdout").build(level))
+        .map_err(|error| format!("bad default log configuration: {error}"))
+}
 
-    let result = log4rs::init_config(config);
-    if let Err(e) = result {
-        println!("Error init log: {}", e);
+/// Changes the log level of the running node, as the reference engine's
+/// verbosity changes: the root level of the log configuration the node
+/// started with. Levels a log configuration file sets for named loggers
+/// stay as the file sets them.
+struct Log4rsVerbosity {
+    handle: log4rs::Handle,
+    source: Option<std::path::PathBuf>,
+}
+
+impl network::control::VerbosityControl for Log4rsVerbosity {
+    fn set_level(&self, level: log::LevelFilter) -> Result<()> {
+        let mut config = match &self.source {
+            Some(path) => {
+                log4rs::config::load_config_file(path, Default::default()).map_err(|error| {
+                    rtos_block::error!(
+                        "cannot reload the log configuration {}: {error}",
+                        path.display()
+                    )
+                })?
+            }
+            None => default_log_config(level).map_err(|error| rtos_block::error!("{error}"))?,
+        };
+        config.root_mut().set_level(level);
+        self.handle.set_config(config);
+        Ok(())
     }
+}
+
+/// Sets up logging from the log configuration file, or the default one, and
+/// installs the control that changes its level at run time.
+fn init_logging(path: Option<&std::path::Path>) -> std::result::Result<(), String> {
+    let config = match path {
+        Some(path) => {
+            log4rs::config::load_config_file(path, Default::default()).map_err(|error| {
+                format!("cannot initialize logging from {}: {error}", path.display())
+            })?
+        }
+        None => default_log_config(log::LevelFilter::Info)?,
+    };
+    let handle = log4rs::init_config(config).map_err(|error| format!("Error init log: {error}"))?;
+    network::control::install_verbosity_control(Box::new(Log4rsVerbosity {
+        handle,
+        source: path.map(std::path::Path::to_path_buf),
+    }))
+    .map_err(|error| error.to_string())
 }
 
 static NOT_SET_LABEL: &str = "Not set";
@@ -758,13 +792,9 @@ fn run_node() -> i32 {
         return 0;
     }
 
-    if let Some(path) = config.log_config_path() {
-        if let Err(error) = log4rs::init_file(&path, Default::default()) {
-            eprintln!("cannot initialize logging from {}: {error}", path.display());
-            return EXIT_CONFIG;
-        }
-    } else {
-        init_logger::<std::path::PathBuf>(None);
+    if let Err(error) = init_logging(config.log_config_path().as_deref()) {
+        eprintln!("{error}");
+        return EXIT_CONFIG;
     }
     log::info!("{}", version);
     scheduled_shutdown::log_lines(&shutdown_lines);
@@ -1003,6 +1033,10 @@ mod scheduled_shutdown {
 #[cfg(test)]
 #[path = "tests/test_scheduled_shutdown.rs"]
 mod scheduled_shutdown_tests;
+
+#[cfg(test)]
+#[path = "tests/test_verbosity_logging.rs"]
+mod verbosity_logging_tests;
 
 #[cfg(test)]
 mod shutdown_tests {

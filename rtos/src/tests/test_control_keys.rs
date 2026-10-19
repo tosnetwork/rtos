@@ -37,7 +37,14 @@ const SERVER_PUB: &str =
 struct StartedEngine;
 
 #[async_trait::async_trait]
-impl EngineOperations for StartedEngine {}
+impl EngineOperations for StartedEngine {
+    fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<rtos_block::BlockIdExt>>> {
+        Ok(None)
+    }
+    fn load_shard_client_mc_block_id(&self) -> Result<Option<Arc<rtos_block::BlockIdExt>>> {
+        Ok(None)
+    }
+}
 
 #[derive(Default)]
 pub(super) struct Recorder {
@@ -88,9 +95,29 @@ impl Node {
     /// A node whose configuration is created from a default configuration
     /// with `extra` fields.
     pub(super) async fn start_with(started: bool, extra: serde_json::Value) -> Self {
+        let source = if started {
+            DataSource::Engine(Arc::new(StartedEngine))
+        } else {
+            DataSource::Status(Arc::new(NotStarted))
+        };
+        Self::start_with_source(source, extra).await
+    }
+
+    /// A started node backed by `engine`.
+    pub(super) async fn start_with_engine(engine: Arc<dyn EngineOperations>) -> Self {
+        Self::start_with_source(DataSource::Engine(engine), serde_json::json!({})).await
+    }
+
+    async fn start_with_source(source: DataSource, extra: serde_json::Value) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let configs = dir.path().to_str().unwrap().to_string();
-        let mut default = serde_json::json!({ "ip_address": "127.0.0.1:47931" });
+        // The control and lite server sections are only configuration here;
+        // the server under test is started separately below.
+        let mut default = serde_json::json!({
+            "ip_address": "127.0.0.1:47931",
+            "control_server_port": 47932,
+            "lite_server_port": 47933,
+        });
         for (name, value) in extra.as_object().unwrap() {
             default[name] = value.clone();
         }
@@ -118,11 +145,6 @@ impl Node {
             "server_key": serde_json::from_str::<serde_json::Value>(SERVER_KEY).unwrap(),
             "clients": { "list": listed },
         });
-        let source = if started {
-            DataSource::Engine(Arc::new(StartedEngine))
-        } else {
-            DataSource::Status(Arc::new(NotStarted))
-        };
         let server = ControlServer::with_params(
             AdnlServerConfig::from_json_with_permissions(&json.to_string()).unwrap(),
             source,

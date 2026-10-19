@@ -21,7 +21,7 @@ use rtos_api::{
             ControlQueryError as ControlQueryErrorBoxed, KeyHash as KeyHashBoxed,
             Signature as SignatureBoxed,
         },
-        rpc::engine::validator::GetTime,
+        rpc::engine::validator::{AddDhtId, GetTime},
     },
     AnyBoxedSerialize,
 };
@@ -220,7 +220,19 @@ fn served_queries_require_the_reference_bits() {
     for (query, bits) in expected {
         assert_eq!(required_permission(&query), Some(bits), "{query:?}");
     }
-    assert_eq!(required_permission(&GetTime::default().into_tl_object()), None);
+    for (query, bits) in [
+        (GetTime::default().into_tl_object(), VEP_DEFAULT),
+        (SetVerbosity::default().into_tl_object(), VEP_DEFAULT),
+        (ExportPrivateKey::default().into_tl_object(), VEP_UNSAFE),
+        (ExportAllPrivateKeys::default().into_tl_object(), VEP_UNSAFE),
+        (DelAdnlId::default().into_tl_object(), VEP_MODIFY),
+        (DelValidatorPermanentKey::default().into_tl_object(), VEP_MODIFY),
+        (DelValidatorTempKey::default().into_tl_object(), VEP_MODIFY),
+        (DelValidatorAdnlAddress::default().into_tl_object(), VEP_MODIFY),
+    ] {
+        assert_eq!(required_permission(&query), Some(bits), "{query:?}");
+    }
+    assert_eq!(required_permission(&AddDhtId::default().into_tl_object()), None);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -383,7 +395,7 @@ async fn a_known_unserved_function_is_unsupported() {
             .await;
     let mut connection = connect(&server, &operator).await;
     assert_eq!(
-        refusal(ask(&mut connection, GetTime::default()).await),
+        refusal(ask(&mut connection, AddDhtId::default()).await),
         Some((621, "query not supported".to_string()))
     );
     // An unknown constructor is a parse error, not an unsupported query.

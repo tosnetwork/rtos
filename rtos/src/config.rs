@@ -1973,6 +1973,46 @@ impl TonNodeConfig {
         result
     }
 
+    /// Every private key the node holds, by key id: the key ring, the node's
+    /// ADNL identities and the control and lite server keys.
+    fn private_keys(&self) -> Result<Vec<ExportedKey>> {
+        let mut options: Vec<KeyOptionJson> = Vec::new();
+        if let Some(ring) = &self.validator_key_ring {
+            options.extend(ring.values().cloned());
+        }
+        if let Some(node) = &self.adnl_node {
+            let node = serde_json::to_value(node)?;
+            for key in node.get("keys").and_then(|keys| keys.as_array()).into_iter().flatten() {
+                if let Some(data) = key.get("data") {
+                    options.push(serde_json::from_value(data.clone())?);
+                }
+            }
+        }
+        for server in [
+            self.control_server.as_ref().map(serde_json::to_value).transpose()?,
+            self.lite_server.as_ref().map(serde_json::to_value).transpose()?,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(key) = server.get("server_key") {
+                options.push(serde_json::from_value(key.clone())?);
+            }
+        }
+        let mut keys: Vec<ExportedKey> = Vec::new();
+        for option in &options {
+            let key = get_key_option_factory().from_private_key_json(option)?;
+            let id = *key.id().data();
+            if keys.iter().any(|known| known.id == id) {
+                continue;
+            }
+            let secret = key.pvt_key()?.lock()?.as_ref().to_vec();
+            keys.push(ExportedKey { id, secret });
+        }
+        keys.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(keys)
+    }
+
     /// The server key id, port and listed clients of a server section.
     fn server_view(value: serde_json::Value) -> Result<ServerView> {
         let key: KeyOptionJson = serde_json::from_value(
@@ -2068,6 +2108,25 @@ impl TonNodeConfig {
     }
 }
 
+/// A private key for an encrypted export; the key material is cleared when
+/// it is dropped and never printed.
+pub struct ExportedKey {
+    pub id: [u8; 32],
+    pub secret: Vec<u8>,
+}
+
+impl std::fmt::Debug for ExportedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ExportedKey({})", base64_encode(self.id))
+    }
+}
+
+impl Drop for ExportedKey {
+    fn drop(&mut self) {
+        self.secret.iter_mut().for_each(|byte| *byte = 0);
+    }
+}
+
 /// A control or lite server as the configuration projection lists it.
 #[derive(Debug, Clone)]
 pub struct ServerView {
@@ -2118,6 +2177,7 @@ enum Task {
     SetExtMessagesBroadcastDisabled(bool),
     KeyCommand(KeyCommand),
     ControlView,
+    PrivateKeys,
 }
 
 #[derive(Debug)]
@@ -2129,6 +2189,7 @@ enum Answer {
     AdnlKeys(Vec<(String, usize)>),
     CustomOverlays(Result<CustomOverlaysConfigBoxed>),
     ControlView(Box<ControlConfigView>),
+    PrivateKeys(Result<Vec<ExportedKey>>),
 }
 
 impl ExtMessagesSetting {
@@ -2770,6 +2831,20 @@ impl NodeConfigHandler {
         }
     }
 
+    /// Every private key the node holds, by key id, for an encrypted export.
+    pub async fn exportable_private_keys(&self) -> Result<Vec<ExportedKey>> {
+        let (wait, mut queue_reader) = Wait::new();
+        let pushed_task = (wait.clone(), Task::PrivateKeys);
+        wait.request();
+        self.send_task(pushed_task)?;
+        match wait.wait(&mut queue_reader, true).await {
+            Some(None) => fail!("Answer was not set!"),
+            Some(Some(Answer::PrivateKeys(keys))) => keys,
+            Some(Some(_)) => fail!("Bad answer (PrivateKeys)!"),
+            None => fail!("Waiting returned an internal error!"),
+        }
+    }
+
     /// The configuration as the control interface projects it.
     pub async fn control_view(&self) -> Result<ControlConfigView> {
         let (wait, mut queue_reader) = Wait::new();
@@ -3042,6 +3117,7 @@ impl NodeConfigHandler {
                         self.notify_validator_transport_changed();
                         Answer::Result(result)
                     }
+                    Task::PrivateKeys => Answer::PrivateKeys(actual_config.private_keys()),
                     Task::ControlView => match actual_config.control_view() {
                         Ok(view) => Answer::ControlView(Box::new(view)),
                         Err(error) => Answer::Result(Err(error)),

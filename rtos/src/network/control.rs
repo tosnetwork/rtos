@@ -33,11 +33,13 @@ use rtos_api::{
         engine::validator::{
             controlqueryerror::ControlQueryError,
             customoverlay::CustomOverlay,
+            exportedprivatekeys::ExportedPrivateKeys,
             jsonconfig::JsonConfig,
             keyhash::KeyHash,
             onestat::OneStat,
             signature::Signature,
             stats::Stats,
+            time::Time,
             //ControlQueryError as ControlQueryErrorBoxed,
             Success,
         },
@@ -52,10 +54,10 @@ use rtos_api::{
                 AddAdnlId, AddCustomOverlay, AddValidatorAdnlAddress, AddValidatorPermanentKey,
                 AddValidatorTempKey, ControlQuery, DelAdnlId, DelCustomOverlay,
                 DelValidatorAdnlAddress, DelValidatorPermanentKey, DelValidatorTempKey,
-                ExportPublicKey, GenerateKeyPair, GetBundle, GetConfig, GetFutureBundle,
-                GetSelectedStats, GetStats, ImportPrivateKey, ImportShardOverlayCertificate,
-                SetExtMessagesBroadcastDisabled, ShowCustomOverlays, Sign,
-                SignShardOverlayCertificate,
+                ExportAllPrivateKeys, ExportPrivateKey, ExportPublicKey, GenerateKeyPair,
+                GetBundle, GetConfig, GetFutureBundle, GetSelectedStats, GetStats, GetTime,
+                ImportPrivateKey, ImportShardOverlayCertificate, SetExtMessagesBroadcastDisabled,
+                SetVerbosity, ShowCustomOverlays, Sign, SignShardOverlayCertificate,
             },
             lite_server::{
                 GetBlock, GetConfigAll, GetConfigParams, Query as LiteServerQuery, SendMessage,
@@ -70,11 +72,13 @@ use rtos_api::{
     IntoBoxed, TLObject,
 };
 use rtos_block::{
-    base64_encode, error, fail, AccountId, BlockIdExt, KeyId, MerkleProof, MsgAddressInt, Result,
-    Serializable, ShardAccount, ShardIdent, UInt256, ED25519_KEY_TYPE,
+    base64_encode, error, fail, sha256_digest, AccountId, BlockIdExt, KeyId, KeyOption,
+    MerkleProof, MsgAddressInt, Result, Serializable, ShardAccount, ShardIdent, UInt256,
+    ED25519_KEY_TYPE,
 };
 use rtos_block_json::serialize_config_param;
-use std::{collections::HashSet, sync::Arc};
+use secrets_vault::vault_block::get_key_option_factory;
+use std::sync::Arc;
 
 /// Permission bits of a control client, as the reference engine defines them.
 pub(crate) const VEP_DEFAULT: u32 = 1;
@@ -96,6 +100,10 @@ pub(crate) fn required_permission(query: &TLObject) -> Option<u32> {
         };
     }
     table!(
+        GetTime => VEP_DEFAULT,
+        SetVerbosity => VEP_DEFAULT,
+        ExportPrivateKey => VEP_UNSAFE,
+        ExportAllPrivateKeys => VEP_UNSAFE,
         GenerateKeyPair => VEP_DEFAULT,
         ImportPrivateKey => VEP_DEFAULT,
         ExportPublicKey => VEP_DEFAULT,
@@ -166,6 +174,417 @@ struct CloseConnection;
 /// A signed wire field read as the unsigned value it encodes.
 fn wire_unsigned(value: i32) -> u32 {
     u32::from_ne_bytes(value.to_ne_bytes())
+}
+
+/// The constructor of `pk.ed25519`, the serialized form of an exported key.
+const PRIVATE_KEY_ED25519: u32 = 0x4968_2317;
+
+/// The reference engine's default outgoing port, which this node does not
+/// configure separately.
+const DEFAULT_OUT_PORT: i64 = 3278;
+
+/// A block id as the reference engine prints it.
+fn block_id_to_str(id: &BlockIdExt) -> String {
+    format!(
+        "({},{:016x},{}):{}:{}",
+        id.shard().workchain_id(),
+        id.shard().shard_prefix_with_tag(),
+        id.seq_no(),
+        hex::encode_upper(id.root_hash.as_slice()),
+        hex::encode_upper(id.file_hash.as_slice())
+    )
+}
+
+/// Encrypts `data` to an Ed25519 public key as the reference engine's
+/// Ed25519 encryptor does: an ephemeral public key, the SHA-256 of the data,
+/// then the data under AES-CTR keyed from the shared secret and the digest.
+pub fn encrypt_for(public: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    let ephemeral = get_key_option_factory().generate()?;
+    let shared = ephemeral.shared_secret(public)?;
+    let secret: [u8; 32] =
+        shared.lock()?.as_ref().try_into().map_err(|_| error!("shared secret is not 32 bytes"))?;
+    let digest = sha256_digest(data);
+    let mut body = data.to_vec();
+    adnl::common::AdnlCryptoUtils::build_cipher_secure(&secret, &digest).apply_keystream(&mut body);
+    let mut out = Vec::with_capacity(64 + body.len());
+    out.extend_from_slice(ephemeral.pub_key()?);
+    out.extend_from_slice(&digest);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Decrypts what [`encrypt_for`] produced, with the recipient's key. The
+/// console decrypts an exported key set with it, through the library.
+#[allow(dead_code)]
+pub fn decrypt_with(key: &Arc<dyn KeyOption>, data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() < 64 {
+        fail!("message is too short");
+    }
+    let shared = key.shared_secret(&data[..32])?;
+    let secret: [u8; 32] =
+        shared.lock()?.as_ref().try_into().map_err(|_| error!("shared secret is not 32 bytes"))?;
+    let digest: [u8; 32] = data[32..64].try_into().map_err(|_| error!("bad digest"))?;
+    let mut body = data[64..].to_vec();
+    adnl::common::AdnlCryptoUtils::build_cipher_secure(&secret, &digest).apply_keystream(&mut body);
+    if sha256_digest(&body) != digest {
+        fail!("sha256 mismatch after decryption");
+    }
+    Ok(body)
+}
+
+fn obj(fields: Vec<(&'static str, TdJson)>) -> TdJson {
+    TdJson::Obj(fields)
+}
+
+fn typed(name: &str, mut fields: Vec<(&'static str, TdJson)>) -> TdJson {
+    fields.insert(0, ("@type", TdJson::Str(name.to_string())));
+    obj(fields)
+}
+
+fn int(value: impl Into<i64>) -> TdJson {
+    TdJson::Int(value.into())
+}
+
+fn text(value: impl Into<String>) -> TdJson {
+    TdJson::Str(value.into())
+}
+
+/// The id bytes a base64 key id stands for, for ordering as the reference
+/// engine's maps order them.
+fn id_bytes(id: &str) -> Vec<u8> {
+    rtos_block::base64_decode(id).unwrap_or_default()
+}
+
+/// A signed 32-bit field holding an unsigned value, as the reference engine
+/// writes it.
+fn signed(value: u32) -> i64 {
+    i64::from(i32::from_ne_bytes(value.to_ne_bytes()))
+}
+
+/// The configuration in the reference engine's `engine.validator.config`
+/// schema. Lists the node has no counterpart for are empty.
+fn config_json(view: &crate::config::ControlConfigView) -> Result<TdJson> {
+    let mut addrs = Vec::new();
+    if let Some(address) = &view.ip_address {
+        let address: std::net::SocketAddrV4 =
+            address.parse().map_err(|e| error!("bad ADNL address {address}: {e}"))?;
+        addrs.push(typed(
+            "engine.addr",
+            vec![
+                ("ip", int(signed(u32::from(*address.ip())))),
+                ("port", int(address.port())),
+                ("categories", TdJson::Arr(vec![int(0)])),
+                ("priority_categories", TdJson::Arr(vec![])),
+            ],
+        ));
+    }
+    let mut adnl = view.adnl.clone();
+    adnl.sort_by_key(|entry| id_bytes(&entry.id));
+    let adnl = adnl
+        .iter()
+        .map(|entry| {
+            typed("engine.adnl", vec![("id", text(&entry.id)), ("category", int(entry.category))])
+        })
+        .collect();
+    let mut dht = view.dht.clone();
+    dht.sort_by_key(|id| id_bytes(id));
+    let dht = dht.iter().map(|id| typed("engine.dht", vec![("id", text(id))])).collect();
+    let mut validators = view.validators.clone();
+    validators.sort_by_key(|(key, _, _)| id_bytes(&key.validator_key_id));
+    let validators = validators
+        .iter()
+        .map(|(key, temps, addresses)| {
+            let mut temps = temps.clone();
+            temps.sort_by_key(|entry| id_bytes(&entry.key_id));
+            let mut addresses = addresses.clone();
+            // An address bound before the address list existed is listed too.
+            if let Some(bound) = &key.validator_adnl_key_id {
+                if !addresses.iter().any(|entry| &entry.key_id == bound) {
+                    addresses.push(crate::config::ValidatorBoundKeyJson {
+                        validator_key_id: key.validator_key_id.clone(),
+                        key_id: bound.clone(),
+                        expire_at: u32::from_ne_bytes(key.expire_at.to_ne_bytes()),
+                    });
+                }
+            }
+            addresses.sort_by_key(|entry| id_bytes(&entry.key_id));
+            typed(
+                "engine.validator",
+                vec![
+                    ("id", text(&key.validator_key_id)),
+                    (
+                        "temp_keys",
+                        TdJson::Arr(
+                            temps
+                                .iter()
+                                .map(|entry| {
+                                    typed(
+                                        "engine.validatorTempKey",
+                                        vec![
+                                            ("key", text(&entry.key_id)),
+                                            ("expire_at", int(signed(entry.expire_at))),
+                                        ],
+                                    )
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "adnl_addrs",
+                        TdJson::Arr(
+                            addresses
+                                .iter()
+                                .map(|entry| {
+                                    typed(
+                                        "engine.validatorAdnlAddress",
+                                        vec![
+                                            ("id", text(&entry.key_id)),
+                                            ("expire_at", int(signed(entry.expire_at))),
+                                        ],
+                                    )
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    ("election_date", int(key.election_id)),
+                    ("expire_at", int(key.expire_at)),
+                ],
+            )
+        })
+        .collect();
+    let mut fields = vec![
+        ("out_port", int(DEFAULT_OUT_PORT)),
+        ("addrs", TdJson::Arr(addrs)),
+        ("adnl", TdJson::Arr(adnl)),
+        ("dht", TdJson::Arr(dht)),
+        ("validators", TdJson::Arr(validators)),
+        ("collators", TdJson::Arr(vec![])),
+        ("fullnode", text(view.fullnode.clone().unwrap_or_else(|| base64_encode([0u8; 32])))),
+        ("fullnodeslaves", TdJson::Arr(vec![])),
+        ("fullnodemasters", TdJson::Arr(vec![])),
+    ];
+    if view.ext_messages_broadcast_disabled {
+        fields.push((
+            "fullnodeconfig",
+            typed(
+                "engine.validator.fullNodeConfig",
+                vec![("ext_messages_broadcast_disabled", TdJson::Bool(true))],
+            ),
+        ));
+    }
+    if !view.state_serializer_enabled || view.pq_consensus.is_some() {
+        let mut extra = vec![
+            ("state_serializer_enabled", TdJson::Bool(view.state_serializer_enabled)),
+            ("fast_sync_member_certificates", TdJson::Arr(vec![])),
+            ("fast_sync_overlay_clients", TdJson::Arr(vec![])),
+        ];
+        if let Some(pq) = &view.pq_consensus {
+            let json = pq.to_json();
+            let keys = json["keys"]
+                .as_array()
+                .map(|keys| {
+                    keys.iter()
+                        .map(|key| {
+                            typed(
+                                "engine.validator.pqConsensusKey",
+                                vec![
+                                    (
+                                        "consensus_key_file",
+                                        text(key["consensus_key_file"].as_str().unwrap_or("")),
+                                    ),
+                                    ("valid_from", int(key["valid_from"].as_i64().unwrap_or(0))),
+                                    ("expire_at", int(key["expire_at"].as_i64().unwrap_or(0))),
+                                ],
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            extra.push((
+                "pq_consensus",
+                typed(
+                    "engine.validator.pqConsensus",
+                    vec![
+                        ("validator_id", text(json["validator_id"].as_str().unwrap_or(""))),
+                        (
+                            "consensus_key_file",
+                            text(json["consensus_key_file"].as_str().unwrap_or("")),
+                        ),
+                        ("keys", TdJson::Arr(keys)),
+                    ],
+                ),
+            ));
+        }
+        fields.push(("extraconfig", typed("engine.validator.extraConfig", extra)));
+    }
+    let liteservers = view
+        .lite_server
+        .iter()
+        .map(|server| {
+            typed("engine.liteServer", vec![("id", text(&server.id)), ("port", int(server.port))])
+        })
+        .collect();
+    fields.push(("liteservers", TdJson::Arr(liteservers)));
+    let control = view
+        .control_server
+        .iter()
+        .map(|server| {
+            // As the reference configuration reads them: a later entry for a
+            // client replaces an earlier one, and zero permissions remove it.
+            let mut listed = std::collections::BTreeMap::new();
+            for (id, bits) in &server.clients {
+                if *bits == 0 {
+                    listed.remove(&id_bytes(id));
+                } else {
+                    listed.insert(id_bytes(id), (id.clone(), *bits));
+                }
+            }
+            let clients: Vec<_> = listed.into_values().collect();
+            typed(
+                "engine.controlInterface",
+                vec![
+                    ("id", text(&server.id)),
+                    ("port", int(server.port)),
+                    (
+                        "allowed",
+                        TdJson::Arr(
+                            clients
+                                .iter()
+                                .map(|(id, bits)| {
+                                    typed(
+                                        "engine.controlProcess",
+                                        vec![("id", text(id)), ("permissions", int(*bits))],
+                                    )
+                                })
+                                .collect(),
+                        ),
+                    ),
+                ],
+            )
+        })
+        .collect();
+    fields.push(("control", TdJson::Arr(control)));
+    fields.push(("shards_to_monitor", TdJson::Arr(vec![])));
+    fields.push(("gc", typed("engine.gc", vec![("ids", TdJson::Arr(vec![]))])));
+    Ok(typed("engine.validator.config", fields))
+}
+
+/// A JSON value written the way the reference engine's JSON builder writes
+/// it: fields in schema order, three-space indentation, `" : "` between a
+/// name and its value, an empty array as `[` and `]` on separate lines.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TdJson {
+    Int(i64),
+    Bool(bool),
+    Str(String),
+    Arr(Vec<TdJson>),
+    Obj(Vec<(&'static str, TdJson)>),
+}
+
+impl TdJson {
+    /// The pretty form with its final newline.
+    pub fn encode_pretty(&self) -> String {
+        let mut out = String::new();
+        self.write(&mut out, 0);
+        out.push('\n');
+        out
+    }
+
+    fn newline(out: &mut String, depth: usize) {
+        out.push('\n');
+        for _ in 0..depth {
+            out.push_str("   ");
+        }
+    }
+
+    fn write(&self, out: &mut String, depth: usize) {
+        match self {
+            TdJson::Int(value) => out.push_str(&value.to_string()),
+            TdJson::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+            TdJson::Str(value) => Self::write_string(out, value),
+            TdJson::Arr(items) => {
+                out.push('[');
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    Self::newline(out, depth + 1);
+                    item.write(out, depth + 1);
+                }
+                Self::newline(out, depth);
+                out.push(']');
+            }
+            TdJson::Obj(fields) => {
+                out.push('{');
+                for (index, (name, value)) in fields.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    Self::newline(out, depth + 1);
+                    Self::write_string(out, name);
+                    out.push_str(" : ");
+                    value.write(out, depth + 1);
+                }
+                Self::newline(out, depth);
+                out.push('}');
+            }
+        }
+    }
+
+    fn write_string(out: &mut String, value: &str) {
+        out.push('"');
+        for ch in value.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\u{8}' => out.push_str("\\b"),
+                '\u{c}' => out.push_str("\\f"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
+                ch => out.push(ch),
+            }
+        }
+        out.push('"');
+    }
+}
+
+/// How the running node changes its log level when an operator asks.
+pub trait VerbosityControl: Send + Sync {
+    fn set_level(&self, level: log::LevelFilter) -> Result<()>;
+}
+
+static VERBOSITY_CONTROL: std::sync::OnceLock<Box<dyn VerbosityControl>> =
+    std::sync::OnceLock::new();
+
+/// Installs the logging backend's control; there is one per process.
+pub fn install_verbosity_control(control: Box<dyn VerbosityControl>) -> Result<()> {
+    VERBOSITY_CONTROL.set(control).map_err(|_| error!("a verbosity control is already installed"))
+}
+
+/// The level of the reference engine's verbosity `v`, which is the level
+/// ERROR raised by `v`: 0 logs errors only, 1 warnings, 2 information,
+/// 3 debug, and 4 to 10 everything.
+pub fn verbosity_level(verbosity: i32) -> log::LevelFilter {
+    match verbosity {
+        i32::MIN..=0 => log::LevelFilter::Error,
+        1 => log::LevelFilter::Warn,
+        2 => log::LevelFilter::Info,
+        3 => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Trace,
+    }
+}
+
+/// Applies a level through the installed control, else to the log facade.
+pub fn apply_verbosity(level: log::LevelFilter) -> Result<()> {
+    match VERBOSITY_CONTROL.get() {
+        Some(control) => control.set_level(level),
+        None => {
+            log::set_max_level(level);
+            Ok(())
+        }
+    }
 }
 
 fn into_answer(result: QueryResult) -> Result<Option<QueryAnswer>> {
@@ -655,72 +1074,71 @@ impl ControlQuerySubscriber {
         Ok(Stats { stats })
     }
 
+    /// The configuration as the reference engine reports it: its schema,
+    /// field order and JSON layout, every list ordered by id.
     async fn get_validator_config(&self) -> Result<JsonConfig> {
-        let mut dht = Vec::new();
-        let mut adnl = Vec::new();
-        let mut adnl_keys = HashSet::new();
-        for (adnl_key_id, tag) in self.config.get_adnl_keys().await? {
-            let category = match tag {
-                NodeNetwork::TAG_DHT_KEY => {
-                    dht.push(serde_json::json!({
-                        "@type": "engine.dht",
-                        "id": adnl_key_id
-                    }));
-                    0
-                }
-                NodeNetwork::TAG_OVERLAY_KEY => 1, // full node
-                _ => 2,                            // other - unreachable
-            };
-            adnl.push(serde_json::json!({
-                  "@type": "engine.adnl",
-                  "id": adnl_key_id,
-                  "category": category
-            }));
-            adnl_keys.insert(adnl_key_id);
+        let view = self.config.control_view().await?;
+        Ok(JsonConfig { data: config_json(&view)?.encode_pretty() })
+    }
+
+    /// The reference engine's statistics that this node keeps, under the
+    /// same names and formats; statistics of components this node does not
+    /// have are not reported.
+    async fn get_stats(&self) -> Result<QueryResult> {
+        let DataSource::Engine(engine) = &self.data_source else {
+            return control_error(ERROR_CODE_NOTREADY, "validator manager not started");
+        };
+        let mut stats = Vec::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        Self::add_stats(&mut stats, "unixtime", now);
+        if let Some(mc_block_id) = engine.load_last_applied_mc_block_id()? {
+            Self::add_stats(&mut stats, "masterchainblock", block_id_to_str(&mc_block_id));
+            let state = engine.load_last_applied_mc_state().await?;
+            Self::add_stats(&mut stats, "masterchainblocktime", state.state()?.gen_time());
+            // A state without a key block reference reports none.
+            if let Ok(key_block) = state.last_keyblock_id() {
+                Self::add_stats(&mut stats, "keymasterchainblock", block_id_to_str(&key_block));
+            }
         }
-        let mut ids = Vec::new();
-        for key in self.config.get_actual_validator_keys()? {
-            let temp_key = serde_json::json!([{
-                "@type": "engine.validatorTempKey",
-                "key": key.validator_key_id,
-                "expire_at": key.expire_at
-            }]);
-            let adnl_key;
-            if let Some(adnl_key_id) = key.validator_adnl_key_id {
-                adnl_key = serde_json::json!([{
-                    "@type": "engine.validatorAdnlAddress",
-                    "id": adnl_key_id,
-                    "expire_at": key.expire_at
-                }]);
-                if !adnl_keys.contains(&adnl_key_id) {
-                    adnl.push(serde_json::json!({
-                        "@type": "engine.adnl",
-                        "id": adnl_key_id,
-                        "category": 0
-                    }));
-                    adnl_keys.insert(adnl_key_id);
-                }
-            } else {
-                adnl_key = serde_json::json!([])
-            };
-            let json = serde_json::json!({
-                "@type": "engine.validator",
-                "id": key.validator_key_id,
-                "temp_keys": temp_key,
-                "adnl_addrs": adnl_key,
-                "election_date": key.election_id,
-                "expire_at": key.expire_at,
-            });
-            ids.push(json);
+        if let Some(shard_client) = engine.load_shard_client_mc_block_id()? {
+            Self::add_stats(&mut stats, "shardclientmasterchainseqno", shard_client.seq_no());
         }
-        let json = serde_json::json!({
-            "@type": "engine.validator.config",
-            "adnl": adnl,
-            "dht": dht,
-            "validators": ids
-        });
-        let data = format!("{json:#}");
-        Ok(JsonConfig { data })
+        let view = self.config.control_view().await?;
+        Self::add_stats(&mut stats, "stateserializerenabled", view.state_serializer_enabled);
+        QueryResult::consume_boxed(
+            Stats { stats }.into_boxed(),
+            #[cfg(feature = "telemetry")]
+            None,
+        )
+    }
+
+    /// Every private key of the node, encrypted to the client's key as the
+    /// reference engine encrypts them.
+    async fn export_all_private_keys(&self, encryption_key: &PublicKey) -> Result<QueryResult> {
+        let PublicKey::Pub_Ed25519(key) = encryption_key else {
+            return control_error(ERROR_CODE_PROTOVIOLATION, "encryption key is not Ed25519");
+        };
+        let keys = self.config.exportable_private_keys().await?;
+        let mut plain = Vec::new();
+        for key in &keys {
+            // The size, then the key as a serialized private key.
+            plain.extend_from_slice(&36u32.to_le_bytes());
+            plain.extend_from_slice(&PRIVATE_KEY_ED25519.to_le_bytes());
+            plain.extend_from_slice(&key.secret);
+        }
+        let mut tail = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut tail);
+        plain.extend_from_slice(&tail);
+        let encrypted = encrypt_for(key.key.as_slice(), &plain);
+        plain.iter_mut().for_each(|byte| *byte = 0);
+        QueryResult::consume_boxed(
+            ExportedPrivateKeys { encrypted_data: encrypted? }.into_boxed(),
+            #[cfg(feature = "telemetry")]
+            None,
+        )
     }
 
     pub async fn add_custom_overlay(&self, overlay: CustomOverlay) -> Result<Success> {
@@ -926,6 +1344,46 @@ impl ControlQuerySubscriber {
         if permissions & required != required {
             return control_error(ERROR_CODE_ERROR, "not authorized");
         }
+        let query = match query.downcast::<GetTime>() {
+            Ok(_) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs())
+                    .unwrap_or(0);
+                let time = i32::try_from(now).unwrap_or(i32::MAX);
+                return QueryResult::consume_boxed(
+                    Time { time }.into_boxed(),
+                    #[cfg(feature = "telemetry")]
+                    None,
+                );
+            }
+            Err(query) => query,
+        };
+        let query = match query.downcast::<SetVerbosity>() {
+            Ok(query) => {
+                if !(0..=10).contains(&query.verbosity) {
+                    return control_error(ERROR_CODE_ERROR, "verbosity should be in range [0..10]");
+                }
+                if let Err(error) = apply_verbosity(verbosity_level(query.verbosity)) {
+                    return control_error(reply_code(&error), error.to_string());
+                }
+                return QueryResult::consume_boxed(
+                    Success::Engine_Validator_Success,
+                    #[cfg(feature = "telemetry")]
+                    None,
+                );
+            }
+            Err(query) => query,
+        };
+        let query = match query.downcast::<ExportPrivateKey>() {
+            // The reference engine has no single-key export.
+            Ok(_) => return control_error(ERROR_CODE_NOTREADY, "not implemented"),
+            Err(query) => query,
+        };
+        let query = match query.downcast::<ExportAllPrivateKeys>() {
+            Ok(query) => return self.export_all_private_keys(&query.encryption_key).await,
+            Err(query) => query,
+        };
         let query = match query.downcast::<GetShardAccountState>() {
             Ok(account) => {
                 let answer = self.get_account_state(account.account_address).await?;
@@ -1217,14 +1675,7 @@ impl ControlQuerySubscriber {
             Err(query) => query,
         };
         let query = match query.downcast::<GetStats>() {
-            Ok(_) => {
-                let answer = self.get_selected_stats(None).await?;
-                return QueryResult::consume_boxed(
-                    answer.into_boxed(),
-                    #[cfg(feature = "telemetry")]
-                    None,
-                );
-            }
+            Ok(_) => return self.get_stats().await,
             Err(query) => query,
         };
         let query = match query.downcast::<GetSelectedStats>() {
@@ -1385,3 +1836,7 @@ mod key_tests;
 #[cfg(test)]
 #[path = "../tests/test_control_pq_section.rs"]
 mod pq_section_tests;
+
+#[cfg(test)]
+#[path = "../tests/test_control_handlers.rs"]
+mod handler_tests;

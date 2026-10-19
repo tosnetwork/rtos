@@ -871,9 +871,13 @@ async fn test_stats() {
         let (control, mut client, _, key_id) =
             start_control(DataSource::Engine(engine.clone()), "test_stats").await?;
 
-        let request_started = UnixTime::now();
+        // getStats answers under the reference engine's names.
         let answer: Stats = request(&mut client, GetStats).await?;
-        check_stats(&answer, &engine, &key_id, false, request_started);
+        let names: Vec<&str> = answer.stats().iter().map(|stat| stat.key.as_str()).collect();
+        assert_eq!(names.first(), Some(&"unixtime"));
+        assert!(names.contains(&"masterchainblock"), "{names:?}");
+        assert!(names.contains(&"masterchainblocktime"), "{names:?}");
+        assert_eq!(names.last(), Some(&"stateserializerenabled"));
 
         let request_started = UnixTime::now();
         let answer: Stats =
