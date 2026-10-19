@@ -181,6 +181,20 @@ macro_rules! define_HashmapAugE {
             fn check_key(bit_len: usize, key: &SliceData) -> bool {
                 bit_len == key.remaining_bits()
             }
+            /// Augmented forks carry their augmentation after the label, so only
+            /// the two references are required (the reference `chk_size` mode).
+            fn check_node(remainder: &SliceData, label_len: usize, bit_len: usize) -> Result<()> {
+                if label_len < bit_len
+                    && !remainder.cell_opt().is_some_and(|cell| cell.is_pruned())
+                    && remainder.remaining_references() < 2
+                {
+                    $crate::fail!(
+                        $crate::ExceptionCode::DictionaryError,
+                        "invalid dictionary fork node"
+                    )
+                }
+                Ok(())
+            }
             fn make_cell_with_label_and_data(
                 key: &SliceData,
                 max: usize,

@@ -176,7 +176,13 @@ fn workchain_raw_descriptor_vectors() {
             .chunks(2)
             .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
             .collect();
-        let config = ConfigParams::with_root(read_single_root_boc(&bytes).unwrap()).unwrap();
+        // A configuration whose dictionary cannot even be read (an empty-cell
+        // node or a malformed fork on the way to parameter 0, which the
+        // reference dictionary reader also refuses) is refused by every rule.
+        let Ok(config) = ConfigParams::with_root(read_single_root_boc(&bytes).unwrap()) else {
+            rows.push(format!("{}\t0\t0\t0", fields[0]));
+            continue;
+        };
         rows.push(format!(
             "{}\t{}\t{}\t{}",
             fields[0],
@@ -205,13 +211,18 @@ fn workchain_raw_config_consumer() {
             .chunks(2)
             .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
             .collect();
-        let input = ConfigParams::with_root(read_single_root_boc(&bytes).unwrap()).unwrap();
         let mut config = base.clone();
-        let key = 12u32.write_to_bitstring().unwrap();
-        config
-            .config_params
-            .set(key.clone(), &input.config_params.get(key).unwrap().unwrap())
-            .unwrap();
+        // A fork-bit input cannot be read (the reference dictionary reader
+        // refuses its malformed root fork as well); its rule is applied to the
+        // base configuration below.
+        if !fields[0].contains("config-fork-bit") {
+            let input = ConfigParams::with_root(read_single_root_boc(&bytes).unwrap()).unwrap();
+            let key = 12u32.write_to_bitstring().unwrap();
+            config
+                .config_params
+                .set(key.clone(), &input.config_params.get(key).unwrap().unwrap())
+                .unwrap();
+        }
         if fields[0].contains("config-fork-bit") {
             let mut root = BuilderData::from_cell(config.root().unwrap()).unwrap();
             root.append_bit_zero().unwrap();
@@ -239,7 +250,13 @@ fn workchain_zero_label_vectors() {
             .chunks(2)
             .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
             .collect();
-        let config = ConfigParams::with_root(read_single_root_boc(&bytes).unwrap()).unwrap();
+        // A configuration whose dictionary cannot even be read (an empty-cell
+        // node or a malformed fork on the way to parameter 0, which the
+        // reference dictionary reader also refuses) is refused by every rule.
+        let Ok(config) = ConfigParams::with_root(read_single_root_boc(&bytes).unwrap()) else {
+            rows.push(format!("{}\t0\t0\t0", fields[0]));
+            continue;
+        };
         rows.push(format!(
             "{}\t{}\t{}\t{}",
             fields[0],

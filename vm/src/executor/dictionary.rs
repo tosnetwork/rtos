@@ -21,7 +21,7 @@ use crate::{
 };
 use rtos_block::{
     fail, BuilderData, ExceptionCode, GasConsumer, HashmapE, HashmapSubtree, HashmapType, Mask,
-    PfxHashmapE, Result, SliceData, Status,
+    PfxHashmapE, Result, SliceData, Status, ADD, REPLACE,
 };
 
 fn try_unref_leaf(slice: SliceData) -> Result<StackItem> {
@@ -60,7 +60,10 @@ const SWITCH: u8 = 0x80; // SWITCH to found value
 
 const CMD: u8 = 0x01; // Get key from CMD
 
-type KeyReader = fn(&StackItem, usize) -> Result<SliceData>;
+/// Reads a dictionary key. `None` is a finite integer key that does not fit in
+/// the key width: look-ups treat it as absent, modifications as a range check
+/// error (the reference reads integer keys quietly only for look-ups).
+type KeyReader = fn(&StackItem, usize, u8) -> Result<Option<SliceData>>;
 type ValAccessor = fn(&mut Engine, &mut HashmapE, SliceData) -> Result<Option<StackItem>>;
 
 // Legend: ret = 0 if INV or -1
@@ -85,8 +88,8 @@ fn dict(
     fetch_stack(engine, params)?;
     let nbits = engine.cmd.var(0).as_integer_value(0..=1023)?;
     let mut dict = HashmapE::with_hashmap(nbits, engine.cmd.var(1).as_dict()?.cloned());
-    let key = keyreader(engine.cmd.var(2), nbits)?;
-    if !key.is_empty_bitstring() {
+    let key = keyreader(engine.cmd.var(2), nbits, how)?;
+    if let Some(key) = key {
         let val = handler(engine, &mut dict, key)?;
         if how.any(SET | DEL) {
             engine.cc.stack.push(StackItem::dict(dict.data()));
@@ -102,9 +105,12 @@ fn dict(
             engine.cc.stack.push(boolean!(ret));
         }
     } else if how.any(SET | DEL) {
-        fail!(ExceptionCode::RangeCheckError, "key cannot be empty for set or delete")
+        fail!(ExceptionCode::RangeCheckError, "dictionary index out of bounds")
     } else if how.bit(RET) {
         engine.cc.stack.push(boolean!(false));
+    } else if how.bit(GET) {
+        // optional-reference look-up of an absent key
+        engine.cc.stack.push(StackItem::None);
     }
     Ok(())
 }
@@ -115,8 +121,11 @@ fn dictcont(engine: &mut Engine, name: &'static str, keyreader: KeyReader, how: 
     fetch_stack(engine, 3)?;
     let nbits = engine.cmd.var(0).as_integer_value(0..=1023)?;
     let dict = HashmapE::with_hashmap(nbits, engine.cmd.var(1).as_dict()?.cloned());
-    let key = keyreader(engine.cmd.var(2), nbits)?;
-    if let Some(data) = convert_dict_error(dict.get_with_gas(key, engine))? {
+    let data = match keyreader(engine.cmd.var(2), nbits, 0)? {
+        Some(key) => convert_dict_error(dict.get_with_gas(key, engine))?,
+        None => None,
+    };
+    if let Some(data) = data {
         engine.cmd.vars.push(StackItem::continuation(ContinuationData::with_code(data)));
         let n = engine.cmd.var_count() - 1;
         if how.bit(SWITCH) {
@@ -189,34 +198,17 @@ fn pfxdictset(engine: &mut Engine, name: &'static str, how: u8) -> Status {
     let mut dict = PfxHashmapE::with_hashmap(nbits, engine.cmd.var(1).as_dict()?.cloned());
     let key = engine.cmd.var(2).as_slice()?.clone();
     let key_valid = if how.bit(DEL) {
-        // remove
-        convert_dict_error(dict.remove_with_gas(key, engine))?.is_some()
+        convert_dict_error(dict.lookup_delete_with_gas(&key, engine))?
     } else {
-        let value = engine.cmd.var(3).as_slice()?.clone();
-        if how.bit(INV) {
-            // add
-            if !convert_dict_error(dict.is_prefix(key.clone()))?
-                && convert_dict_error(dict.get(key.clone()))?.is_none()
-            {
-                convert_dict_error(dict.set_with_gas(key, &value, engine))?;
-                true
-            } else {
-                convert_dict_error(dict.get_with_gas(key, engine))?;
-                false
-            }
+        let value = engine.cmd.var(3).as_slice()?.as_builder()?;
+        let mode = if how.bit(INV) {
+            ADD
         } else if how.bit(GET) {
-            // replace
-            convert_dict_error(dict.replace_with_gas(key, &value, engine))?.is_some()
+            REPLACE
         } else {
-            // set
-            if !convert_dict_error(dict.is_prefix(key.clone()))? {
-                convert_dict_error(dict.set_with_gas(key, &value, engine))?;
-                true
-            } else {
-                convert_dict_error(dict.get_prefix_leaf_with_gas(key, engine))?;
-                false
-            }
-        }
+            ADD | REPLACE
+        };
+        convert_dict_error(dict.set_with_mode_and_gas(&key, &value, mode, engine))?
     };
     engine.cc.stack.push(StackItem::dict(dict.data()));
     engine.cc.stack.push(boolean!(key_valid));
@@ -242,16 +234,17 @@ fn pfxdictget(engine: &mut Engine, name: &'static str, how: u8) -> Status {
         dict = PfxHashmapE::with_hashmap(nbits, engine.cmd.var(1).as_dict()?.cloned());
         key = engine.cmd.var(2).as_slice()?.clone();
     }
-    if let (prefix, Some(value), suffix) =
-        convert_dict_error(dict.get_prefix_leaf_with_gas(key.clone(), engine))?
+    if let Some((value, prefix_len)) =
+        convert_dict_error(dict.lookup_prefix_with_gas(&key, engine))?
     {
-        engine.cc.stack.push(StackItem::Slice(key.shrink_data(prefix.remaining_bits()..)));
+        // the matched prefix (bits only), the value, then the rest of the key
+        engine.cc.stack.push(StackItem::Slice(key.shrink_data(prefix_len..)));
         if get_cont {
             engine.cmd.vars.push(StackItem::continuation(ContinuationData::with_code(value)));
         } else {
             engine.cc.stack.push(StackItem::Slice(value));
         }
-        engine.cc.stack.push(StackItem::Slice(suffix));
+        engine.cc.stack.push(StackItem::Slice(key));
         if how.bit(RET) {
             engine.cc.stack.push(boolean!(true));
         }
@@ -278,36 +271,44 @@ fn pfxdictget(engine: &mut Engine, name: &'static str, how: u8) -> Status {
     }
 }
 
-fn keyreader_from_slice(key: &StackItem, nbits: usize) -> Result<SliceData> {
+fn keyreader_from_slice(key: &StackItem, nbits: usize, _how: u8) -> Result<Option<SliceData>> {
     let mut key = key.as_slice()?.clone();
     if key.remaining_bits() < nbits {
         fail!(ExceptionCode::CellUnderflow)
     } else {
         key.shrink_data(..nbits);
         key.shrink_references(..0)?;
-        Ok(key)
+        Ok(Some(key))
     }
 }
 
-fn keyreader_from_int(key: &StackItem, nbits: usize) -> Result<SliceData> {
+/// An integer key: NaN is an integer overflow, except for SET-family
+/// operations, which take any integer and so report it as out of bounds.
+fn integer_key(key: &StackItem, nbits: usize, signed: bool, how: u8) -> Result<Option<SliceData>> {
     let key = key.as_integer()?;
     if key.is_nan() {
+        if how.bit(SET) {
+            return Ok(None);
+        }
         fail!(ExceptionCode::IntegerOverflow);
     }
-    key.as_slice(nbits, true, true)
+    if !signed && key.is_neg() {
+        return Ok(None);
+    }
+    Ok(key.as_slice(nbits, signed, true).ok())
 }
 
-fn keyreader_from_uint(key: &StackItem, nbits: usize) -> Result<SliceData> {
-    let key = key.as_integer()?;
-    if key.is_nan() || key.is_neg() {
-        fail!(ExceptionCode::IntegerOverflow);
-    }
-    key.as_slice(nbits, false, true)
+fn keyreader_from_int(key: &StackItem, nbits: usize, how: u8) -> Result<Option<SliceData>> {
+    integer_key(key, nbits, true, how)
+}
+
+fn keyreader_from_uint(key: &StackItem, nbits: usize, how: u8) -> Result<Option<SliceData>> {
+    integer_key(key, nbits, false, how)
 }
 
 fn read_key(key: &StackItem, nbits: usize, how: u8) -> Result<(Option<SliceData>, bool)> {
     if how.bit(SLC) {
-        return Ok((Some(keyreader_from_slice(key, nbits)?), false));
+        return Ok((keyreader_from_slice(key, nbits, how)?, false));
     } else {
         let key = key.as_integer()?;
         if how.bit(SIGN) {
@@ -1283,7 +1284,10 @@ fn subdict(
     let dict = engine.cmd.var(1).as_dict()?.cloned();
     let dict = HashmapE::with_hashmap(nbits, dict);
     let lbits = engine.cmd.var(2).as_integer_value(0..=nbits)?;
-    let key = keyreader(engine.cmd.var(3), lbits)?;
+    // an integer prefix that does not fit is reported like a short slice prefix
+    let Some(key) = keyreader(engine.cmd.var(3), lbits, 0)? else {
+        fail!(ExceptionCode::CellUnderflow, "not enough bits for a dictionary key prefix")
+    };
     let dict = into(&dict, &key, engine)?;
     engine.cc.stack.push(StackItem::dict(dict.data()));
     Ok(())

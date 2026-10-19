@@ -105,6 +105,14 @@ impl LabelReader {
             len += 1;
         }
         *max = max.checked_sub(len).ok_or(ExceptionCode::CellUnderflow)?;
+        Self::take_label_bits(cursor, len)
+    }
+    /// The `len` label bits that follow a short or long label header; a label
+    /// whose bits are missing is malformed (cell underflow).
+    fn take_label_bits(cursor: &mut SliceData, len: usize) -> Result<SliceData> {
+        if cursor.remaining_bits() < len {
+            fail!(ExceptionCode::CellUnderflow)
+        }
         Ok(cursor.shrink_data(len..))
     }
     fn get_label_short_length(cursor: &mut SliceData, max: usize) -> Result<usize> {
@@ -112,7 +120,7 @@ impl LabelReader {
         while cursor.get_next_bit()? {
             len += 1;
         }
-        if len <= max {
+        if len <= max && cursor.remaining_bits() >= len {
             Ok(len)
         } else {
             fail!(ExceptionCode::CellUnderflow)
@@ -121,11 +129,11 @@ impl LabelReader {
     fn get_label_long(cursor: &mut SliceData, max: &mut usize) -> Result<SliceData> {
         let len = cursor.get_next_size(*max)? as usize;
         *max = max.checked_sub(len).ok_or(ExceptionCode::CellUnderflow)?;
-        Ok(cursor.shrink_data(len..))
+        Self::take_label_bits(cursor, len)
     }
     fn get_label_long_length(cursor: &mut SliceData, max: usize) -> Result<usize> {
         let len = cursor.get_next_size(max)? as usize;
-        if len <= max {
+        if len <= max && cursor.remaining_bits() >= len {
             Ok(len)
         } else {
             fail!(ExceptionCode::CellUnderflow)
@@ -188,8 +196,7 @@ impl LabelReader {
         max: &mut usize,
         mut key: BuilderData,
     ) -> Result<BuilderData> {
-        if cursor.is_empty_bitstring() {
-        } else if !cursor.get_next_bit()? {
+        if !cursor.get_next_bit()? {
             key.append_bytestring(&Self::get_label_short(cursor, max)?)?;
         } else if !cursor.get_next_bit()? {
             key.append_bytestring(&Self::get_label_long(cursor, max)?)?;
@@ -199,9 +206,7 @@ impl LabelReader {
         Ok(key)
     }
     pub fn read_label_length(cursor: &mut SliceData, max: usize) -> Result<usize> {
-        if cursor.is_empty_bitstring() {
-            Ok(0)
-        } else if !cursor.get_next_bit()? {
+        if !cursor.get_next_bit()? {
             Self::get_label_short_length(cursor, max)
         } else if !cursor.get_next_bit()? {
             Self::get_label_long_length(cursor, max)
@@ -216,12 +221,11 @@ impl LabelReader {
         self.already_read = true;
         Self::read_label(&mut self.cursor, max)
     }
+    /// Reads a node label. Every label has a header of at least two bits, so a
+    /// node with fewer bits (an empty cell included) is a cell underflow, as is
+    /// a label whose bits are missing; a null root is handled by the callers.
     pub fn read_label(cursor: &mut SliceData, mut max: usize) -> Result<SliceData> {
-        // note: in case of max is 0 it is normal to read bits from the slice
-        // but if you mistakely pass 0 to this function it causes undefined behavoiur
-        if cursor.is_empty_bitstring() {
-            Ok(SliceData::default())
-        } else if !cursor.get_next_bit()? {
+        if !cursor.get_next_bit()? {
             Self::get_label_short(cursor, &mut max)
         } else if !cursor.get_next_bit()? {
             Self::get_label_long(cursor, &mut max)
@@ -239,10 +243,7 @@ impl LabelReader {
         }
         self.already_read = true;
         let mut len = 0;
-        // note: in case of max is 0 it is normal to read bits from the slice
-        // but if you mistakely pass 0 to this function it causes undefined behavoiur
-        if self.cursor.is_empty_bitstring() {
-        } else if !self.cursor.get_next_bit()? {
+        if !self.cursor.get_next_bit()? {
             while self.cursor.get_next_bit()? {
                 len += 1;
             }
@@ -259,6 +260,14 @@ impl LabelReader {
     }
     pub fn is_fork<T: HashmapType + ?Sized>(&mut self) -> Result<bool> {
         T::is_fork(&mut self.cursor)
+    }
+    /// Shape check of this node after its label (see [`HashmapType::check_node`]).
+    pub fn check_node<T: HashmapType + ?Sized>(
+        &self,
+        label_len: usize,
+        bit_len: usize,
+    ) -> Result<()> {
+        T::check_node(&self.cursor, label_len, bit_len)
     }
     pub fn is_leaf<T: HashmapType + ?Sized>(&mut self) -> Result<bool> {
         Ok(T::is_leaf(&mut self.cursor))
@@ -291,6 +300,7 @@ pub fn find_leaf<T: HashmapType + ?Sized>(
 ) -> Result<Option<SliceData>> {
     let mut cursor = gas_consumer.load_cell(data.clone())?;
     let label = LabelReader::read_label(&mut cursor, bit_len)?;
+    T::check_node(&cursor, label.remaining_bits(), bit_len)?;
     match SliceData::common_prefix(&key, &label) {
         (_, None, Some(_)) => fail!(ExceptionCode::DictionaryError),
         (prefix_opt, Some(remainder), Some(_)) => {
@@ -366,6 +376,7 @@ pub fn get_min_max<T: HashmapType + ?Sized>(
         let mut cursor = gas_consumer.load_cell(data)?;
         let label = LabelReader::read_label(&mut cursor, bit_len)?;
         let label_length = label.remaining_bits();
+        T::check_node(&cursor, label_length, bit_len)?;
         if path.is_empty() && !label.is_empty_bitstring() {
             index = next_index;
         }
@@ -404,7 +415,8 @@ pub trait HashmapType {
 
     fn check_key(bit_len: usize, key: &SliceData) -> bool;
     fn check_key_fail(bit_len: usize, key: &SliceData) -> Result<()> {
-        match !key.is_empty_bitstring() && Self::check_key(bit_len, key) {
+        // an empty key is the only key of a zero-bit dictionary
+        match (bit_len == 0 || !key.is_empty_bitstring()) && Self::check_key(bit_len, key) {
             true => Ok(()),
             false => fail!("Bad key {} for dict", key),
         }
@@ -451,7 +463,12 @@ pub trait HashmapType {
             bit_len.checked_sub(key.remaining_bits() + 1).ok_or(ExceptionCode::CellUnderflow)?;
         let mut key = key.as_builder()?;
         key.append_bit_bool(!is_left)?;
+        let prefix_len = key.length_in_bits();
+        let child_bit_len = next_bit_len;
         let label = LabelReader::read_label_raw(&mut next, &mut next_bit_len, key)?;
+        let label_len =
+            label.length_in_bits().checked_sub(prefix_len).ok_or(ExceptionCode::CellUnderflow)?;
+        Self::check_node(&next, label_len, child_bit_len)?;
         let is_leaf = Self::is_leaf(&mut next);
         Self::make_cell_with_label_and_data(
             &SliceData::load_bitstring(label)?,
@@ -505,6 +522,22 @@ pub trait HashmapType {
             }
         }
     }
+    /// Shape check of a visited node, applied right after its label is read
+    /// and before the label is compared with a key, as the reference label
+    /// parser does. Ordinary dictionaries use its strictest mode: a fork (a
+    /// node whose label is shorter than the remaining key length) holds exactly
+    /// the label bits and exactly two references.
+    /// A pruned branch reached inside a Merkle proof is not a node and keeps
+    /// its earlier handling: a walk into it finds nothing.
+    fn check_node(remainder: &SliceData, label_len: usize, bit_len: usize) -> Result<()> {
+        if label_len < bit_len
+            && !remainder.cell_opt().is_some_and(|cell| cell.is_pruned())
+            && (remainder.remaining_bits() != 0 || remainder.remaining_references() != 2)
+        {
+            fail!(ExceptionCode::DictionaryError, "invalid dictionary fork node")
+        }
+        Ok(())
+    }
     fn is_fork(slice: &mut SliceData) -> Result<bool>;
     fn is_leaf(slice: &mut SliceData) -> bool;
     fn inner(self) -> Option<Cell>;
@@ -522,6 +555,7 @@ pub trait HashmapType {
             _ => return Ok(None),
         };
         let mut label = LabelReader::read_label(&mut cursor, bit_len)?;
+        Self::check_node(&cursor, label.remaining_bits(), bit_len)?;
         while key.erase_prefix(&label) && !key.is_empty_bitstring() {
             if !Self::is_fork(&mut cursor)? {
                 return Ok(None);
@@ -532,6 +566,7 @@ pub trait HashmapType {
                 .checked_sub(label.remaining_bits() + 1)
                 .ok_or(ExceptionCode::CellUnderflow)?;
             label = LabelReader::read_label(&mut cursor, bit_len)?;
+            Self::check_node(&cursor, label.remaining_bits(), bit_len)?;
         }
         if key.is_empty_bitstring() && Self::is_leaf(&mut cursor) {
             Ok(Some(cursor))
@@ -1350,6 +1385,7 @@ impl<'a, T: HashmapType + ?Sized> HashmapInserter<'a, T> {
         let mut result = Ok(None);
         let mut slice = self.gas_consumer.load_cell(cell.clone())?;
         let label = LabelReader::read_label(&mut slice, bit_len)?;
+        T::check_node(&slice, label.remaining_bits(), bit_len)?;
         if label == key {
             // replace existing leaf
             if T::is_leaf(&mut slice) {
@@ -1488,6 +1524,7 @@ fn remove_node<T: HashmapType + ?Sized>(
         _ => return Ok(None),
     };
     let label = LabelReader::read_label(&mut cursor, bit_len)?;
+    T::check_node(&cursor, label.remaining_bits(), bit_len)?;
     match SliceData::common_prefix(&label, &key) {
         // end of label - recursive down by tree
         (_, None, Some(mut remainder)) => {
@@ -1944,7 +1981,11 @@ where
 {
     let mut key = BuilderData::default();
     loop {
+        let (key_len, node_bit_len) = (key.length_in_bits(), bit_len);
         key = cursor.get_label_raw(&mut bit_len, key)?;
+        let label_len =
+            key.length_in_bits().checked_sub(key_len).ok_or(ExceptionCode::CellUnderflow)?;
+        cursor.check_node::<T>(label_len, node_bit_len)?;
         let label = SliceData::load_cell(key.clone().into_cell()?)?;
         match SliceData::common_prefix(&label, prefix) {
             (_, None, Some(mut rem_prefix)) => {
