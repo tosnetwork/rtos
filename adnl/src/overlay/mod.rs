@@ -37,6 +37,7 @@ use rtos_api::{
             blockupdate::BlockUpdate as CatchainBlockUpdate,
             FirstBlock as CatchainFirstBlock, Update as CatchainBlockUpdateBoxed,
         },
+        fec::Type as FecType,
         overlay::{
             broadcast::BroadcastFec,
             membercertificate::MemberCertificate,
@@ -47,7 +48,8 @@ use rtos_api::{
             nodes::Nodes as NodesV1,
             nodesv2::NodesV2,
             nodev2::NodeV2,
-            Broadcast, MemberCertificate as MemberCertificateBoxed, Message as OverlayMessageBoxed,
+            Broadcast, Certificate as OverlayCertificateTl,
+            MemberCertificate as MemberCertificateBoxed, Message as OverlayMessageBoxed,
             Nodes as NodesV1Boxed, NodesV2 as NodesV2Boxed, Pong,
         },
         pub_::publickey::Overlay as OverlayKey,
@@ -93,9 +95,9 @@ use broadcast::{
 };
 pub use broadcast::{BroadcastRecvInfo, BroadcastSendInfo};
 pub use privacy::{
-    BroadcastCheckResult, OverlayCertificate, OverlayPrivacyRules, BROADCAST_FLAG_ANY_SENDER,
-    BROADCAST_FLAG_FIXED_NEIGHBOURS, CERTIFICATE_FLAG_ALLOW_FEC, CERTIFICATE_FLAG_TRUSTED,
-    MAX_FEC_BROADCAST_SIZE, MAX_SIMPLE_BROADCAST_SIZE,
+    BroadcastCheckResult, OverlayCertificate, OverlayPrivacyRules, PublicBroadcastCheck,
+    BROADCAST_FLAG_ANY_SENDER, BROADCAST_FLAG_FIXED_NEIGHBOURS, CERTIFICATE_FLAG_ALLOW_FEC,
+    CERTIFICATE_FLAG_TRUSTED, MAX_FEC_BROADCAST_SIZE, MAX_SIMPLE_BROADCAST_SIZE,
 };
 
 /// Owned readiness lease for one concrete overlay generation. Dropping it
@@ -580,6 +582,9 @@ declare_counted!(
         plumtree: OnceLock<PlumtreeTransport>,
         // Common broadcast verifier: issuer limiters and signature rejections
         verifier: Arc<privacy::BroadcastVerifier>,
+        // Explicit privacy rules of a public overlay; none keeps the overlay
+        // without source authorization
+        public_policy: Option<privacy::PublicBroadcastPolicy>,
         // Peers waiting for ADNL address resolution before being added to known_peers
         pending_peers: lockfree::queue::Queue<Arc<KeyId>>,
         purge_broadcasts: lockfree::queue::Queue<BroadcastId>,
@@ -626,6 +631,65 @@ impl Overlay {
     const TIMEOUT_ONE_TIME_BROADCAST_SEC: u64 = 60;
     #[cfg(feature = "xp25")]
     const TIMEOUT_REPEATED_BROADCAST_SEC: u64 = 2;
+
+    /// Source verdict for a received broadcast relayed by `from`. Overlays
+    /// without privacy rules keep their own authorization: every source is
+    /// allowed here.
+    pub(crate) fn broadcast_verdict(
+        &self,
+        source: &Arc<dyn KeyOption>,
+        certificate: &OverlayCertificateTl,
+        size: usize,
+        is_fec: bool,
+        is_any_sender: bool,
+        from: &Arc<KeyId>,
+    ) -> BroadcastCheckResult {
+        let Some(policy) = &self.public_policy else {
+            return BroadcastCheckResult::Allowed;
+        };
+        let Ok(size) = u32::try_from(size) else {
+            return BroadcastCheckResult::Forbidden;
+        };
+        let Ok(certificate) = OverlayCertificate::from_tl(certificate) else {
+            return BroadcastCheckResult::Forbidden;
+        };
+        self.verifier.check_source_eligible(
+            &policy.rules(),
+            false,
+            self.overlay_id.data(),
+            source.id().data(),
+            certificate.as_ref(),
+            size,
+            is_fec,
+            is_any_sender,
+            Some(from),
+        )
+    }
+
+    pub(crate) fn has_public_policy(&self) -> bool {
+        self.public_policy.is_some()
+    }
+
+    /// Application approval of a `NeedCheck` broadcast; refused when the
+    /// overlay has no application check.
+    pub(crate) async fn application_check(&self, source: &Arc<KeyId>, data: &[u8]) -> Result<()> {
+        let Some(policy) = &self.public_policy else {
+            fail!("Overlay {} has no application broadcast check", self.overlay_id);
+        };
+        policy.check(source, data).await
+    }
+
+    /// Broadcast signature check through the common verifier: a bad
+    /// signature refuses the relaying peer for a short time.
+    pub(crate) fn verify_broadcast_signature(
+        &self,
+        key: &Arc<dyn KeyOption>,
+        message: &[u8],
+        signature: &[u8],
+        from: &Arc<KeyId>,
+    ) -> Result<()> {
+        self.verifier.check_signature_from_peer(key, message, signature, Some(from))
+    }
 
     pub(crate) fn calc_broadcast_neighbours(
         &self,
@@ -1667,6 +1731,50 @@ impl OverlayNode {
         self.add_overlay(OverlayType::Public, params)
     }
 
+    /// Add a public overlay whose broadcasts are authorized by `rules`
+    /// from the first received message on. An existing overlay keeps its
+    /// generation; its rules are replaced when it already has a policy.
+    pub fn add_public_overlay_with_rules(
+        &self,
+        params: OverlayParams,
+        rules: OverlayPrivacyRules,
+    ) -> Result<bool> {
+        let _generation = self.generations.lock().unwrap();
+        let overlay_id = params.overlay_id.clone();
+        let added = self.add_overlay_locked(OverlayType::Public, params, Some(rules.clone()))?;
+        if !added {
+            self.set_public_privacy_rules(&overlay_id, rules)?;
+        }
+        Ok(added)
+    }
+
+    /// Replace the privacy rules of a public overlay created with rules.
+    pub fn set_public_privacy_rules(
+        &self,
+        overlay_id: &Arc<OverlayShortId>,
+        rules: OverlayPrivacyRules,
+    ) -> Result<()> {
+        let overlay = self.get_overlay(overlay_id, "Setting privacy rules of unknown overlay")?;
+        let Some(policy) = &overlay.public_policy else {
+            fail!("Overlay {overlay_id} was created without privacy rules");
+        };
+        overlay.verifier.retain_authorized(&rules);
+        policy.set_rules(rules)
+    }
+
+    /// Install (or remove) the application check of a public overlay.
+    pub fn set_public_broadcast_check(
+        &self,
+        overlay_id: &Arc<OverlayShortId>,
+        check: Option<Arc<dyn PublicBroadcastCheck>>,
+    ) -> Result<()> {
+        let overlay = self.get_overlay(overlay_id, "Setting broadcast check of unknown overlay")?;
+        let Some(policy) = &overlay.public_policy else {
+            fail!("Overlay {overlay_id} was created without privacy rules");
+        };
+        policy.set_check(check)
+    }
+
     /// Add overlay for other workchain
     pub fn add_other_workchain_overlay(&self, mut params: OverlayParams) -> Result<bool> {
         params.flags |= Overlay::FLAG_OVERLAY_OTHER_WORKCHAIN;
@@ -2387,9 +2495,17 @@ impl OverlayNode {
 
     fn add_overlay(&self, overlay_type: OverlayType, params: OverlayParams) -> Result<bool> {
         let _generation = self.generations.lock().unwrap();
-        self.add_overlay_locked(overlay_type, params)
+        self.add_overlay_locked(overlay_type, params, None)
     }
-    fn add_overlay_locked(&self, overlay_type: OverlayType, params: OverlayParams) -> Result<bool> {
+    fn add_overlay_locked(
+        &self,
+        overlay_type: OverlayType,
+        params: OverlayParams,
+        public_rules: Option<OverlayPrivacyRules>,
+    ) -> Result<bool> {
+        if public_rules.is_some() && !overlay_type.is_public() {
+            fail!("Privacy rules apply to public overlays only");
+        }
         {
             let mut retired = self.retired.lock().unwrap();
             retired.retain(|_, tasks| tasks.upgrade().is_some_and(|tasks| !tasks.drained()));
@@ -2435,6 +2551,7 @@ impl OverlayNode {
             owned_broadcasts: lockfree::map::Map::new(),
             plumtree: OnceLock::new(),
             verifier: Arc::new(privacy::BroadcastVerifier::default()),
+            public_policy: public_rules.map(privacy::PublicBroadcastPolicy::new),
             pending_peers: lockfree::queue::Queue::new(),
             purge_broadcasts: lockfree::queue::Queue::new(),
             purge_broadcasts_count: AtomicU32::new(0),
@@ -2670,7 +2787,7 @@ impl OverlayNode {
     ) -> Result<bool> {
         let _generation = self.generations.lock().unwrap();
         let overlay_id = params.overlay_id.clone();
-        if !self.add_overlay_locked(overlay_type, params)? {
+        if !self.add_overlay_locked(overlay_type, params, None)? {
             return Ok(false);
         }
         let initialization = (|| -> Result<()> {
@@ -2729,6 +2846,23 @@ impl OverlayNode {
         CONSTRAINTS.check_fec_type(&message.fec)?;
         CONSTRAINTS.check_data_size(message.data_size)?;
         Constraints::check_seqno(message.seqno as u32)
+    }
+
+    /// The peer's structural FEC limits on overlays with privacy rules.
+    fn check_public_fec_broadcast_message(message: &BroadcastFec) -> Result<()> {
+        let FecType::Fec_RaptorQ(fec) = &message.fec else {
+            fail!("Unsupported FEC type");
+        };
+        if fec.data_size as u32 > MAX_FEC_BROADCAST_SIZE {
+            fail!("Too big FEC broadcast: {} bytes", fec.data_size as u32);
+        }
+        if fec.data_size != message.data_size {
+            fail!("FEC data size mismatch: {} vs {}", fec.data_size, message.data_size);
+        }
+        if (message.seqno as u32 as u64) >= (fec.symbols_count as u32 as u64) * 2 + 4 {
+            fail!("Too big FEC seqno {}", message.seqno as u32);
+        }
+        Ok(())
     }
 
     fn delete_overlay(&self, overlay_id: &Arc<OverlayShortId>, is_private: bool) -> Result<bool> {
@@ -2902,6 +3036,14 @@ impl Subscriber for OverlayNode {
             );
             return Ok(true);
         }
+        if overlay.verifier.is_peer_banned(peers.other()) {
+            log::debug!(
+                target: TARGET,
+                "Message from temporarily banned peer {} in overlay {overlay_id}",
+                peers.other()
+            );
+            return Ok(true);
+        }
 
         let suffix = &data[suffix_offset..];
         let consumer = if let Some(consumer) = overlay.consumer.get() {
@@ -2987,6 +3129,7 @@ impl Subscriber for OverlayNode {
                 hops,
                 overlay: &overlay,
                 peers,
+                verdict: BroadcastCheckResult::Allowed,
             };
             let message = match first.downcast::<Broadcast>() {
                 Ok(Broadcast::Overlay_BroadcastFec(bcast)) => {
@@ -2994,6 +3137,12 @@ impl Subscriber for OverlayNode {
                         // Ignore invalid messages as early as possible
                         log::warn!(target: TARGET, "Received bad FEC broadcast. {e}");
                         return Ok(true);
+                    }
+                    if overlay.public_policy.is_some() {
+                        if let Err(e) = Self::check_public_fec_broadcast_message(&bcast) {
+                            log::warn!(target: TARGET, "Received bad public FEC broadcast. {e}");
+                            return Ok(true);
+                        }
                     }
                     BroadcastFecProtocol::for_recv().recv(bcast, ctx).await?;
                     return Ok(true);
@@ -3105,6 +3254,9 @@ impl Subscriber for OverlayNode {
             return Ok(QueryResult::Consumed(QueryAnswer::Ready(None)));
         }
         overlay.check_peer(peers.other(), certificate.as_ref())?;
+        if overlay.verifier.is_peer_banned(peers.other()) {
+            fail!("Query from temporarily banned peer {} in overlay {overlay_id}", peers.other());
+        }
 
         let other_workchain = (overlay.flags & Overlay::FLAG_OVERLAY_OTHER_WORKCHAIN) != 0;
         #[cfg(feature = "telemetry")]

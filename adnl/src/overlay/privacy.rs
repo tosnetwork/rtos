@@ -23,7 +23,7 @@ use rtos_api::{
 use rtos_block::{error, fail, sha256_digest, KeyId, KeyOption, Result, UInt256};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -602,6 +602,75 @@ impl BroadcastVerifier {
         if let Ok(mut limiters) = self.limiters.lock() {
             limiters.retain(|key, _| rules.is_authorized_key(key));
         }
+    }
+}
+
+/// Application approval for a public-overlay broadcast whose source verdict
+/// is `NeedCheck`. `Ok` approves the broadcast; an error refuses it.
+#[async_trait::async_trait]
+pub trait PublicBroadcastCheck: Send + Sync {
+    async fn check_broadcast(&self, source: &Arc<KeyId>, data: &[u8]) -> Result<()>;
+}
+
+/// Outstanding application checks per overlay; further checks are refused.
+pub(crate) const MAX_PENDING_APPLICATION_CHECKS: usize = 256;
+
+/// Receive policy of a public overlay with explicit privacy rules.
+pub(crate) struct PublicBroadcastPolicy {
+    rules: RwLock<Arc<OverlayPrivacyRules>>,
+    check: RwLock<Option<Arc<dyn PublicBroadcastCheck>>>,
+    pending: Arc<tokio::sync::Semaphore>,
+}
+
+impl PublicBroadcastPolicy {
+    pub(crate) fn new(rules: OverlayPrivacyRules) -> Self {
+        Self {
+            rules: RwLock::new(Arc::new(rules)),
+            check: RwLock::new(None),
+            pending: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_APPLICATION_CHECKS)),
+        }
+    }
+
+    pub(crate) fn rules(&self) -> Arc<OverlayPrivacyRules> {
+        match self.rules.read() {
+            Ok(rules) => rules.clone(),
+            // A poisoned lock admits nobody: no key is authorized and no
+            // unauthorized size is accepted.
+            Err(_) => Arc::new(OverlayPrivacyRules::default()),
+        }
+    }
+
+    pub(crate) fn set_rules(&self, rules: OverlayPrivacyRules) -> Result<()> {
+        *self.rules.write().map_err(|_| error!("Overlay privacy rules lock poisoned"))? =
+            Arc::new(rules);
+        Ok(())
+    }
+
+    pub(crate) fn set_check(&self, check: Option<Arc<dyn PublicBroadcastCheck>>) -> Result<()> {
+        *self.check.write().map_err(|_| error!("Overlay broadcast check lock poisoned"))? = check;
+        Ok(())
+    }
+
+    /// Run the application check. A missing check, or one more outstanding
+    /// check than the bound, refuses the broadcast.
+    pub(crate) async fn check(&self, source: &Arc<KeyId>, data: &[u8]) -> Result<()> {
+        let check = self
+            .check
+            .read()
+            .map_err(|_| error!("Overlay broadcast check lock poisoned"))?
+            .clone()
+            .ok_or_else(|| error!("No application check installed for this overlay"))?;
+        let _permit = self
+            .pending
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| error!("Too many outstanding application checks"))?;
+        check.check_broadcast(source, data).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn outstanding_checks(&self) -> usize {
+        MAX_PENDING_APPLICATION_CHECKS - self.pending.available_permits()
     }
 }
 

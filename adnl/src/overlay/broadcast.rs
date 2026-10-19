@@ -14,7 +14,13 @@ use crate::{
     },
     declare_counted,
     node::PeerHistory,
-    overlay::{Overlay, OverlayNode, OverlayType, TARGET, TARGET_BROADCAST},
+    overlay::{
+        privacy::{
+            BroadcastCheckResult, OverlayCertificate as SourceCertificate,
+            BROADCAST_FLAG_ANY_SENDER, BROADCAST_FLAG_FIXED_NEIGHBOURS, MAX_FEC_BROADCAST_SIZE,
+        },
+        Overlay, OverlayNode, OverlayType, TARGET, TARGET_BROADCAST,
+    },
     rldp::{RaptorqDecoder, RaptorqEncoder},
 };
 #[cfg(feature = "telemetry")]
@@ -42,10 +48,11 @@ use rtos_block::{base64_encode, error, fail, sha256_digest, KeyId, KeyOption, Re
 #[cfg(feature = "telemetry")]
 use std::sync::atomic::AtomicU32;
 use std::{
+    collections::HashSet,
     fmt::{Display, Formatter},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -70,6 +77,8 @@ fn system_clock_secs() -> f64 {
 pub(crate) struct BroadcastCheckInfo {
     bcast_id: BroadcastId,
     dup: bool,
+    // Source verdict of protocols that decide it once per broadcast
+    verdict: BroadcastCheckResult,
     data_len: usize,
     seqno: u32,
     #[cfg(feature = "telemetry")]
@@ -80,6 +89,8 @@ pub(crate) enum BroadcastData<'a> {
     Buf(Vec<u8>),
     None,
     Raw(&'a [u8]),
+    // Re-serialized broadcast without the hops postfix
+    Rebuilt(Vec<u8>),
     Stream(Option<BroadcastStream>),
 }
 
@@ -127,6 +138,7 @@ pub(crate) struct BroadcastRecvContext<'a> {
     pub(crate) hops: Option<u8>,
     pub(crate) overlay: &'a Arc<Overlay>,
     pub(crate) peers: &'a AdnlPeers,
+    pub(crate) verdict: BroadcastCheckResult,
 }
 
 pub(crate) struct BroadcastSendContext<'a> {
@@ -183,12 +195,35 @@ pub(crate) enum OwnedBroadcast {
     WillBeRecv(BroadcastType),
 }
 
+/// Parts of one ordinary FEC broadcast that wait for its application check.
+const MAX_HELD_PARTS: usize = 4096;
+
+struct HeldPart {
+    buf: Vec<u8>,
+    seqno: u32,
+    count: u32,
+    local: Arc<KeyId>,
+    skip: Arc<KeyId>,
+}
+
+#[derive(Default)]
+struct FecRelayState {
+    // The application check approved the broadcast
+    checked: bool,
+    // The application check refused the broadcast
+    refused: bool,
+    held: Vec<HeldPart>,
+    fixed_neighbours: Option<Vec<Arc<KeyId>>>,
+}
+
 declare_counted!(
     pub(crate) struct RecvTransferFec<T> {
+        accepted_parts: Mutex<HashSet<u32>>,
         completed: AtomicBool,
         data_hash: [u8; 32],
         history: PeerHistory,
-        sender: tokio::sync::mpsc::UnboundedSender<Option<T>>,
+        relay: Mutex<FecRelayState>,
+        sender: tokio::sync::mpsc::UnboundedSender<Option<(T, bool)>>,
         src_key_id: Arc<KeyId>,
         #[cfg(feature = "telemetry")]
         telemetry: RecvTransferFecTelemetry,
@@ -242,6 +277,7 @@ declare_counted!(
 // Broadcast traits ***********************************************************
 
 pub(crate) trait BroadcastParsed {
+    fn certificate(&self) -> &OverlayCertificate;
     fn date(&self) -> i32;
     fn src_key(&self) -> Result<Arc<dyn KeyOption>>;
     #[cfg(feature = "telemetry")]
@@ -320,7 +356,13 @@ pub(crate) trait BroadcastProtocol<T: BroadcastParsed + Send + 'static>:
         neighbours: &mut BroadcastNeighbours,
     ) -> Result<()> {
         // Transit broadcasts will be traced untagged
-        if let Some(hops) = &neighbours.hops {
+        if let BroadcastData::Rebuilt(rebuilt) = &mut ctx.data {
+            let mut buf = std::mem::take(rebuilt);
+            if let Some(hops) = neighbours.hops.or(ctx.hops) {
+                buf.push(hops);
+            }
+            ctx.data = BroadcastData::Buf(buf);
+        } else if let Some(hops) = &neighbours.hops {
             let BroadcastData::Raw(raw_data) = &ctx.data else {
                 fail!("INTERNAL ERROR: unexpected broadcast data type for rebroadcast");
             };
@@ -394,6 +436,7 @@ pub(crate) trait BroadcastProtocol<T: BroadcastParsed + Send + 'static>:
             ctx.peers.other(),
             ctx.overlay.overlay_id
         );
+        ctx.verdict = info.verdict;
         let (recv, resend) = self.process_broadcast(bcast, &mut ctx, &info.bcast_id).await?;
         if let Some(recv) = recv {
             ctx.overlay.received_rawbytes.push(recv);
@@ -441,7 +484,7 @@ pub(crate) trait BroadcastProtocol<T: BroadcastParsed + Send + 'static>:
             return Ok(());
         };
         let data = match &ctx.data {
-            BroadcastData::Buf(data) => data,
+            BroadcastData::Buf(data) | BroadcastData::Rebuilt(data) => data,
             BroadcastData::None => return Ok(()),
             BroadcastData::Raw(data) => *data,
             BroadcastData::Stream(_) => fail!("INTERNAL ERROR: unprepared stream data"),
@@ -562,6 +605,7 @@ pub(crate) trait BroadcastProtocol<T: BroadcastParsed + Send + 'static>:
 pub(crate) trait FecBroadcastParsed: BroadcastParsed {
     fn data_hash(&self) -> &[u8; 32];
     fn data_size(&self) -> usize;
+    fn wire_flags(&self) -> u32;
     fn extra(&self) -> Option<&[u8]> {
         None
     }
@@ -576,6 +620,9 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
     /// Two-step FEC re-checks the date after its precheck, where reception can
     /// suspend, before a part reaches the decoder (C++ broadcast-twostep.cpp).
     const RECHECK_DATE_BEFORE_DECODE: bool = false;
+    /// Two-step broadcasts are checked as never sent by any sender; ordinary
+    /// FEC broadcasts carry the any-sender flag on the wire.
+    const TWOSTEP: bool = false;
 
     fn build_broadcast_part(
         data: Vec<u8>,
@@ -592,6 +639,10 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
     fn unwrap_transfer(wrapped: &OwnedBroadcast) -> Option<&RecvTransferFec<T>>;
     fn wrap_transfer(transfer: RecvTransferFec<T>) -> OwnedBroadcast;
 
+    fn is_any_sender(bcast: &T) -> bool {
+        !Self::TWOSTEP && (bcast.wire_flags() & BROADCAST_FLAG_ANY_SENDER) != 0
+    }
+
     fn create_transfer(
         ctx: &BroadcastRecvContext,
         bcast_id: &BroadcastId,
@@ -601,7 +652,7 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
         let Some(fec_type) = bcast.fec_type() else {
             fail!("Wrong FEC type set for {bcast_type} broadcast");
         };
-        let (sender, mut reader) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut reader) = tokio::sync::mpsc::unbounded_channel::<Option<(T, bool)>>();
         let mut decoder = RaptorqDecoder::with_params(fec_type.clone())?;
         let bcast_id_recv = *bcast_id;
         let overlay = ctx.overlay.clone();
@@ -618,7 +669,7 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
             let mut len = 0;
             let mut tag = 0;
             while let Some(bcast) = reader.recv().await {
-                let bcast: T = match bcast {
+                let (bcast, untrusted): (T, bool) = match bcast {
                     Some(bcast) => bcast,
                     None => break,
                 };
@@ -665,13 +716,44 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
                             len = data.len() as u32;
                             flags |= RecvTransferFecTelemetry::FLAG_RECEIVED;
                         }
-                        overlay.received_rawbytes.push(BroadcastRecvInfo {
-                            packets,
-                            data,
-                            extra,
-                            recv_from: src_key_id.clone(),
-                        });
-                        received = true;
+                        // The part completing the decode decides: a part whose
+                        // source needs a check delivers only after approval.
+                        let approved = if untrusted {
+                            match overlay.application_check(&src_key_id, &data).await {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    log::debug!(
+                                        target: TARGET,
+                                        "Application check refused {bcast_type} broadcast {} \
+                                        in overlay {}: {e}",
+                                        base64_encode(&bcast_id_recv),
+                                        overlay.overlay_id
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            true
+                        };
+                        if approved {
+                            overlay.received_rawbytes.push(BroadcastRecvInfo {
+                                packets,
+                                data,
+                                extra,
+                                recv_from: src_key_id.clone(),
+                            });
+                            received = true;
+                        }
+                        if untrusted {
+                            Self::checked(&overlay, &bcast_id_recv, approved).await;
+                        }
+                        if !approved {
+                            if let Some(transfer) = overlay.owned_broadcasts.get(&bcast_id_recv) {
+                                if let Some(transfer) = Self::unwrap_transfer(transfer.val()) {
+                                    transfer.completed.store(true, Ordering::Relaxed);
+                                }
+                            }
+                        }
                     }
                     Ok(None) => continue,
                 }
@@ -762,9 +844,11 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
             }
         });
         let transfer = RecvTransferFec {
+            accepted_parts: Mutex::new(HashSet::new()),
             completed: AtomicBool::new(false),
             data_hash: *bcast.data_hash(),
             history: PeerHistory::for_recv(),
+            relay: Mutex::new(FecRelayState::default()),
             sender,
             src_key_id: src_key.id().clone(),
             #[cfg(feature = "telemetry")]
@@ -782,6 +866,66 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
             .recv_transfers
             .update(ctx.overlay.allocated.recv_transfers.load(Ordering::Relaxed));
         Ok(Self::wrap_transfer(transfer))
+    }
+
+    /// Outcome of an application check of a broadcast whose completing part
+    /// needed one. Ordinary FEC releases the parts it held back on approval.
+    async fn checked(overlay: &Arc<Overlay>, bcast_id: &BroadcastId, approved: bool) {
+        if Self::TWOSTEP {
+            return;
+        }
+        let held = {
+            let Some(transfer) = overlay.owned_broadcasts.get(bcast_id) else {
+                return;
+            };
+            let Some(transfer) = Self::unwrap_transfer(transfer.val()) else {
+                return;
+            };
+            let Ok(mut relay) = transfer.relay.lock() else {
+                return;
+            };
+            if approved {
+                relay.checked = true;
+            } else {
+                relay.refused = true;
+            }
+            let held = std::mem::take(&mut relay.held);
+            if !approved {
+                return;
+            }
+            held.into_iter()
+                .map(|part| {
+                    let neighbours = relay.fixed_neighbours.clone().unwrap_or_else(|| {
+                        overlay.select_broadcast_neighbours(part.count, Some(&part.skip))
+                    });
+                    (part, neighbours)
+                })
+                .collect::<Vec<_>>()
+        };
+        for (part, neighbours) in held {
+            if let Err(e) = overlay
+                .distribute_broadcast(
+                    &TaggedByteSlice {
+                        object: &part.buf,
+                        #[cfg(feature = "telemetry")]
+                        tag: 0,
+                    },
+                    bcast_id,
+                    part.seqno,
+                    &part.local,
+                    &neighbours,
+                    &BroadcastSendMethod::Fast,
+                )
+                .await
+            {
+                log::warn!(
+                    target: TARGET,
+                    "Cannot relay checked broadcast {} part {}: {e}",
+                    base64_encode(bcast_id),
+                    part.seqno
+                );
+            }
+        }
     }
 
     fn prepare_part(overlay: &Arc<Overlay>, transfer: &mut SendTransferFec) -> Result<Vec<u8>> {
@@ -802,11 +946,14 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
         overlay.serialize_broadcast(&bcast)
     }
 
-    async fn process_broadcast(
+    /// Admit one received part: source verdict, duplicate and same-source
+    /// checks, the part signature, then the decoder. Returns `None` for a
+    /// dropped part, otherwise whether its source needs an application check.
+    async fn admit_part(
         bcast: T,
         ctx: &BroadcastRecvContext,
         bcast_id: &BroadcastId,
-    ) -> Result<(Option<BroadcastRecvInfo>, bool)> {
+    ) -> Result<Option<bool>> {
         #[cfg(feature = "telemetry")]
         log::info!(
             target: TARGET_BROADCAST,
@@ -831,11 +978,87 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
                         base64_encode(bcast_id),
                         ctx.overlay.overlay_id
                     );
-                    return Ok((None, false));
+                    return Ok(None);
                 }
             }
         }
         let bcast_type = Self::broadcast_type();
+        let src_key = bcast.src_key()?;
+        let peer = ctx.peers.other();
+        if Self::TWOSTEP
+            && ctx.overlay.has_public_policy()
+            && (bcast.data_size() > MAX_FEC_BROADCAST_SIZE as usize
+                || bcast.part_data().len() >= bcast.data_size())
+        {
+            log::debug!(
+                target: TARGET,
+                "Bad {bcast_type} broadcast {} dimensions in overlay {}",
+                base64_encode(bcast_id),
+                ctx.overlay.overlay_id
+            );
+            return Ok(None);
+        }
+        let any_sender = Self::is_any_sender(&bcast);
+        let verdict = ctx.overlay.broadcast_verdict(
+            &src_key,
+            bcast.certificate(),
+            bcast.data_size(),
+            true,
+            any_sender,
+            peer,
+        );
+        if verdict == BroadcastCheckResult::Forbidden {
+            log::debug!(
+                target: TARGET,
+                "Forbidden {bcast_type} broadcast {} from {peer} in overlay {}",
+                base64_encode(bcast_id),
+                ctx.overlay.overlay_id
+            );
+            return Ok(None);
+        }
+        if let Some(existing) = ctx.overlay.owned_broadcasts.get(bcast_id) {
+            if let Some(transfer) = Self::unwrap_transfer(existing.val()) {
+                let seen = transfer
+                    .accepted_parts
+                    .lock()
+                    .map_err(|_| error!("FEC part table lock poisoned"))?
+                    .contains(&bcast.seqno());
+                if seen {
+                    return Ok(None);
+                }
+                if !Self::TWOSTEP
+                    && verdict != BroadcastCheckResult::NeedCheck
+                    && !any_sender
+                    && &transfer.src_key_id != src_key.id()
+                {
+                    log::debug!(
+                        target: TARGET,
+                        "Bad source of {bcast_type} broadcast {} part in overlay {}",
+                        base64_encode(bcast_id),
+                        ctx.overlay.overlay_id
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+        let to_sign = Self::calc_to_sign(
+            bcast_id,
+            bcast.data_size(),
+            bcast.part_data(),
+            bcast.seqno(),
+            bcast.date(),
+        )?;
+        if let Err(e) =
+            ctx.overlay.verify_broadcast_signature(&src_key, &to_sign, bcast.signature(), peer)
+        {
+            log::debug!(
+                target: TARGET,
+                "Bad signature of {bcast_type} broadcast {} part {} from {peer}: {e}",
+                base64_encode(bcast_id),
+                bcast.seqno()
+            );
+            return Ok(None);
+        }
         let transfer = loop {
             if let Some(transfer) = ctx.overlay.owned_broadcasts.get(bcast_id) {
                 break transfer;
@@ -876,7 +1099,7 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
         };
         let Some(transfer) = Self::unwrap_transfer(transfer.val()) else {
             // Not a proper broadcast
-            return Ok((None, false));
+            return Ok(None);
         };
         transfer.updated_at.refresh();
         if &transfer.data_hash != bcast.data_hash() {
@@ -887,10 +1110,10 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
                 base64_encode(transfer.data_hash),
                 base64_encode(bcast.data_hash()),
                 transfer.src_key_id,
-                bcast.src_key()?.id(),
+                src_key.id(),
                 ctx.overlay.overlay_id
             );
-            return Ok((None, false));
+            return Ok(None);
         }
         if !transfer.history.update(bcast.seqno() as u64, TARGET_BROADCAST).await? {
             log::debug!(
@@ -900,7 +1123,7 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
                 bcast.seqno(),
                 ctx.overlay.overlay_id
             );
-            return Ok((None, false));
+            return Ok(None);
         }
         if Self::RECHECK_DATE_BEFORE_DECODE
             && !broadcast_date_admissible(bcast.date(), system_clock_secs())
@@ -913,33 +1136,32 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
                 bcast.date() as u32,
                 ctx.overlay.overlay_id
             );
-            return Ok((None, false));
+            return Ok(None);
         }
+        transfer
+            .accepted_parts
+            .lock()
+            .map_err(|_| error!("FEC part table lock poisoned"))?
+            .insert(bcast.seqno());
+        let untrusted = verdict != BroadcastCheckResult::Allowed;
         if !transfer.completed.load(Ordering::Relaxed) {
             transfer
                 .sender
-                .send(Some(bcast))
+                .send(Some((bcast, untrusted)))
                 .map_err(|e| error!("Error sending broadcast packet to processing: {e}"))?;
         }
         #[cfg(feature = "telemetry")]
         stats.passed.fetch_add(1, Ordering::Relaxed);
-        Ok((None, true))
+        Ok(Some(untrusted))
     }
 
+    /// Decode one part whose source and signature were already checked.
     fn process_part(
         decoder: &mut RaptorqDecoder,
         bcast_id: &BroadcastId,
         bcast: &T,
     ) -> Result<Option<Vec<u8>>> {
         let bcast_type = Self::broadcast_type();
-        let to_sign = Self::calc_to_sign(
-            bcast_id,
-            bcast.data_size(),
-            bcast.part_data(),
-            bcast.seqno(),
-            bcast.date(),
-        )?;
-        bcast.src_key()?.verify(&to_sign, bcast.signature())?;
         if let Some(ret) = decoder.decode(bcast.seqno(), bcast.part_data()) {
             let ret = if ret.len() != bcast.data_size() as usize {
                 fail!("Expected {} bytes, but received {}", bcast.data_size(), ret.len())
@@ -975,6 +1197,14 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
             Ok(None)
         }
     }
+}
+
+/// Re-serialize a received certificate in its normalized wire form.
+fn normalized_certificate(certificate: &OverlayCertificate) -> Result<OverlayCertificate> {
+    Ok(match SourceCertificate::from_tl(certificate)? {
+        Some(certificate) => certificate.to_tl(),
+        None => OverlayCertificate::Overlay_EmptyCertificate,
+    })
 }
 
 trait BroadcastMultistep {
@@ -1066,6 +1296,7 @@ trait BroadcastTwostep {
 
 #[rustfmt::skip]
 impl BroadcastParsed for BroadcastFec {
+    fn certificate(&self) -> &OverlayCertificate { &self.certificate }
     fn date(&self) -> i32 { self.date }
     fn src_key(&self) -> Result<Arc<dyn KeyOption>> { (&self.src).try_into() }
     #[cfg(feature = "telemetry")]
@@ -1078,6 +1309,7 @@ impl BroadcastParsed for BroadcastFec {
 impl FecBroadcastParsed for BroadcastFec {
     fn data_hash(&self) -> &[u8; 32] { self.data_hash.as_slice() }
     fn data_size(&self) -> usize { self.data_size as usize }
+    fn wire_flags(&self) -> u32 { self.flags as u32 }
     fn part_data(&self) -> &[u8] { &self.data }
     fn seqno(&self) -> u32 { self.seqno as u32 }
     fn signature(&self) -> &[u8] { &self.signature }
@@ -1185,6 +1417,7 @@ impl BroadcastProtocol<BroadcastFec> for BroadcastFecProtocol {
                 fec_type,
             )?,
             dup: false,
+            verdict: BroadcastCheckResult::Allowed,
             data_len: bcast.data.len(),
             seqno: bcast.seqno(),
             #[cfg(feature = "telemetry")]
@@ -1198,7 +1431,91 @@ impl BroadcastProtocol<BroadcastFec> for BroadcastFecProtocol {
         ctx: &mut BroadcastRecvContext,
         bcast_id: &BroadcastId,
     ) -> Result<(Option<BroadcastRecvInfo>, bool)> {
-        <Self as FecProtocol<BroadcastFec>>::process_broadcast(bcast, ctx, bcast_id).await
+        let seqno = bcast.seqno();
+        let flags = bcast.flags as u32;
+        // A relayed part carries the envelope rebuilt from its parsed fields,
+        // with the certificate in its normalized wire form.
+        let relay = ctx.overlay.serialize_broadcast(
+            &BroadcastFec {
+                certificate: normalized_certificate(&bcast.certificate)?,
+                ..bcast.clone()
+            }
+            .into_boxed(),
+        )?;
+        let Some(untrusted) =
+            <Self as FecProtocol<BroadcastFec>>::admit_part(bcast, ctx, bcast_id).await?
+        else {
+            return Ok((None, false));
+        };
+        let options = ctx.overlay.options.load(Ordering::Relaxed);
+        if (options & Overlay::OPTION_DISABLE_BROADCAST_RETRANSMIT) != 0 {
+            return Ok((None, false));
+        }
+        let hops = match ctx.hops {
+            Some(hops) if (hops & 0x0F) <= 1 => return Ok((None, false)),
+            Some(hops) => Some(hops),
+            None => ctx.overlay.hops,
+        };
+        let (relay_hops, count) =
+            ctx.overlay.calc_broadcast_neighbours(hops, Overlay::SIZE_NEIGHBOURS_LONG_BROADCAST)?;
+        let mut buf = relay;
+        if let Some(hops) = relay_hops.or(ctx.hops) {
+            buf.push(hops);
+        }
+        let neighbours = {
+            let Some(guard) = ctx.overlay.owned_broadcasts.get(bcast_id) else {
+                return Ok((None, false));
+            };
+            let Some(transfer) = Self::unwrap_transfer(guard.val()) else {
+                return Ok((None, false));
+            };
+            let mut relay =
+                transfer.relay.lock().map_err(|_| error!("FEC relay state lock poisoned"))?;
+            // Parts whose source needs a check wait for the broadcast's verdict.
+            if untrusted && !relay.checked {
+                if !relay.refused && relay.held.len() < MAX_HELD_PARTS {
+                    relay.held.push(HeldPart {
+                        buf,
+                        seqno,
+                        count,
+                        local: ctx.peers.local().clone(),
+                        skip: ctx.peers.other().clone(),
+                    });
+                }
+                return Ok((None, false));
+            }
+            if (flags & BROADCAST_FLAG_FIXED_NEIGHBOURS) != 0 {
+                relay
+                    .fixed_neighbours
+                    .get_or_insert_with(|| {
+                        ctx.overlay.select_broadcast_neighbours(count, Some(ctx.peers.other()))
+                    })
+                    .clone()
+            } else {
+                ctx.overlay.select_broadcast_neighbours(count, Some(ctx.peers.other()))
+            }
+        };
+        if neighbours.is_empty() {
+            return Ok((None, false));
+        }
+        #[cfg(feature = "telemetry")]
+        ctx.overlay
+            .get_per_transfer_stats(bcast_id)?
+            .resent
+            .fetch_add(neighbours.len() as u64, Ordering::Relaxed);
+        Self::distribute_broadcast(
+            ctx.overlay,
+            &buf,
+            bcast_id,
+            seqno,
+            &neighbours,
+            ctx.peers.local(),
+            &self.send_method(),
+            #[cfg(feature = "telemetry")]
+            BroadcastFec::constructor_const(),
+        )
+        .await?;
+        Ok((None, false))
     }
 
     // Send side
@@ -1394,6 +1711,7 @@ impl FecProtocol<BroadcastFec> for BroadcastFecProtocol {
 
 #[rustfmt::skip]
 impl BroadcastParsed for BroadcastSimple {
+    fn certificate(&self) -> &OverlayCertificate { &self.certificate }
     fn date(&self) -> i32 { self.date }
     fn src_key(&self) -> Result<Arc<dyn KeyOption>> { (&self.src).try_into() }
     #[cfg(feature = "telemetry")]
@@ -1450,12 +1768,37 @@ impl BroadcastSimpleProtocol {
         ctx: &BroadcastRecvContext,
     ) -> Result<BroadcastCheckInfo> {
         let src_key: Arc<dyn KeyOption> = (&bcast.src).try_into()?;
-        let bcast_id = Self::calc_broadcast_id(&bcast.data, &src_key, bcast.flags as u32)?;
+        let flags = bcast.flags as u32;
+        let bcast_id = Self::calc_broadcast_id(&bcast.data, &src_key, flags)?;
+        let mut verdict = BroadcastCheckResult::Allowed;
         let dup = if add_unbound_object_to_map(&ctx.overlay.owned_broadcasts, bcast_id, || {
             Ok(OwnedBroadcast::Send)
         })? {
-            let to_sign = Self::calc_to_sign(&bcast_id, bcast.date)?;
-            src_key.verify(&to_sign, &bcast.signature)?;
+            verdict = ctx.overlay.broadcast_verdict(
+                &src_key,
+                &bcast.certificate,
+                bcast.data.len(),
+                false,
+                (flags & BROADCAST_FLAG_ANY_SENDER) != 0,
+                ctx.peers.other(),
+            );
+            let checked = if verdict == BroadcastCheckResult::Forbidden {
+                Err(error!("Broadcast is forbidden"))
+            } else {
+                Self::calc_to_sign(&bcast_id, bcast.date).and_then(|to_sign| {
+                    ctx.overlay.verify_broadcast_signature(
+                        &src_key,
+                        &to_sign,
+                        &bcast.signature,
+                        ctx.peers.other(),
+                    )
+                })
+            };
+            if let Err(e) = checked {
+                // A refused broadcast is not registered: a valid copy may follow.
+                ctx.overlay.owned_broadcasts.remove(&bcast_id);
+                return Err(e);
+            }
             false
         } else {
             true
@@ -1464,6 +1807,7 @@ impl BroadcastSimpleProtocol {
         Ok(BroadcastCheckInfo {
             bcast_id,
             dup,
+            verdict,
             data_len,
             seqno: 0,
             #[cfg(feature = "telemetry")]
@@ -1485,6 +1829,78 @@ impl BroadcastSimpleProtocol {
             recv_from: src_key.id().clone(),
         };
         Ok((Some(info), true))
+    }
+
+    /// The relayed envelope, rebuilt with the normalized certificate.
+    fn relay_bytes(overlay: &Overlay, bcast: &BroadcastSimple) -> Result<Vec<u8>> {
+        overlay.serialize_broadcast(
+            &BroadcastSimple {
+                certificate: normalized_certificate(&bcast.certificate)?,
+                ..bcast.clone()
+            }
+            .into_boxed(),
+        )
+    }
+
+    /// Application check of a `NeedCheck` simple broadcast, then delivery and
+    /// relay. Runs apart from the receive path; the broadcast stays
+    /// registered either way, so a refused copy is not processed again.
+    fn check_then_relay(
+        ctx: &BroadcastRecvContext,
+        bcast_id: &BroadcastId,
+        info: BroadcastRecvInfo,
+        relay: Vec<u8>,
+    ) {
+        let overlay = ctx.overlay.clone();
+        let peers = ctx.peers.clone();
+        let hops = ctx.hops;
+        let verdict = ctx.verdict;
+        let bcast_id = *bcast_id;
+        let tasks = overlay.tasks.clone();
+        tasks.spawn_cancelable("overlay broadcast application check", async move {
+            let approved = overlay.application_check(&info.recv_from, &info.data).await;
+            let purge = overlay.setup_broadcast_purge(
+                bcast_id,
+                #[cfg(feature = "xp25")]
+                0,
+            );
+            if let Err(e) = purge {
+                log::warn!(target: TARGET, "Cannot setup broadcast purge: {e}");
+            }
+            if let Err(e) = approved {
+                log::debug!(
+                    target: TARGET,
+                    "Application check refused broadcast {} in overlay {}: {e}",
+                    base64_encode(&bcast_id),
+                    overlay.overlay_id
+                );
+                return;
+            }
+            overlay.received_rawbytes.push(info);
+            let mut ctx = BroadcastRecvContext {
+                data: BroadcastData::Rebuilt(relay),
+                hops,
+                overlay: &overlay,
+                peers: &peers,
+                verdict,
+            };
+            if let Err(e) = BroadcastSimpleProtocol
+                .resend_broadcast(
+                    &mut ctx,
+                    &bcast_id,
+                    0,
+                    #[cfg(feature = "telemetry")]
+                    BroadcastSimple::constructor_const(),
+                )
+                .await
+            {
+                log::warn!(
+                    target: TARGET,
+                    "Cannot relay checked broadcast {}: {e}",
+                    base64_encode(&bcast_id)
+                );
+            }
+        });
     }
 }
 
@@ -1536,10 +1952,19 @@ impl BroadcastProtocol<BroadcastSimple> for BroadcastSimpleProtocol {
     async fn process_broadcast(
         &self,
         bcast: BroadcastSimple,
-        _ctx: &mut BroadcastRecvContext,
-        _bcast_id: &BroadcastId,
+        ctx: &mut BroadcastRecvContext,
+        bcast_id: &BroadcastId,
     ) -> Result<(Option<BroadcastRecvInfo>, bool)> {
-        Self::process_broadcast(bcast)
+        let relay = Self::relay_bytes(ctx.overlay, &bcast)?;
+        let (info, resend) = Self::process_broadcast(bcast)?;
+        if ctx.verdict != BroadcastCheckResult::Allowed {
+            if let Some(info) = info {
+                Self::check_then_relay(ctx, bcast_id, info, relay);
+            }
+            return Ok((None, false));
+        }
+        ctx.data = BroadcastData::Rebuilt(relay);
+        Ok((info, resend))
     }
 
     // Send side
@@ -1567,6 +1992,7 @@ impl BroadcastProtocol<BroadcastSimple> for BroadcastSimpleProtocol {
 
 #[rustfmt::skip]
 impl BroadcastParsed for BroadcastStream {
+    fn certificate(&self) -> &OverlayCertificate { &self.data.certificate }
     fn date(&self) -> i32 { self.data.date }
     fn src_key(&self) -> Result<Arc<dyn KeyOption>> { (&self.data.src).try_into() }
     #[cfg(feature = "telemetry")]
@@ -1658,9 +2084,26 @@ impl BroadcastProtocol<BroadcastStream> for BroadcastStreamSimpleProtocol {
         &self,
         bcast: BroadcastStream,
         ctx: &mut BroadcastRecvContext,
-        _bcast_id: &BroadcastId,
+        bcast_id: &BroadcastId,
     ) -> Result<(Option<BroadcastRecvInfo>, bool)> {
         let ret = BroadcastSimpleProtocol::process_broadcast(bcast.data.clone())?;
+        if ctx.verdict != BroadcastCheckResult::Allowed {
+            let src_key: Arc<dyn KeyOption> = (&bcast.data.src).try_into()?;
+            if let Err(e) = ctx.overlay.application_check(src_key.id(), &bcast.data.data).await {
+                log::debug!(
+                    target: TARGET,
+                    "Application check refused stream broadcast {} in overlay {}: {e}",
+                    base64_encode(bcast_id),
+                    ctx.overlay.overlay_id
+                );
+                ctx.overlay.setup_broadcast_purge(
+                    *bcast_id,
+                    #[cfg(feature = "xp25")]
+                    0,
+                )?;
+                return Ok((None, false));
+            }
+        }
         ctx.data = BroadcastData::Stream(Some(bcast));
         Ok(ret)
     }
@@ -1699,6 +2142,7 @@ impl BroadcastProtocol<BroadcastStream> for BroadcastStreamSimpleProtocol {
 
 #[rustfmt::skip]
 impl BroadcastParsed for BroadcastTwostepFec {
+    fn certificate(&self) -> &OverlayCertificate { &self.certificate }
     fn date(&self) -> i32 { self.date }
     fn src_key(&self) -> Result<Arc<dyn KeyOption>> { (&self.src).try_into() }
     #[cfg(feature = "telemetry")]
@@ -1711,6 +2155,7 @@ impl BroadcastParsed for BroadcastTwostepFec {
 impl FecBroadcastParsed for BroadcastTwostepFec {
     fn data_hash(&self) -> &[u8; 32] { self.data_hash.as_slice() }
     fn data_size(&self) -> usize { self.data_size as usize }
+    fn wire_flags(&self) -> u32 { self.flags as u32 }
     fn fec_type(&self) -> Option<FecTypeRaptorQ> {
         if self.part.is_empty() {
             return None;
@@ -1809,6 +2254,7 @@ impl BroadcastProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
                 &bcast.extra,
             )?,
             dup: false,
+            verdict: BroadcastCheckResult::Allowed,
             data_len: bcast.part.len(),
             seqno: bcast.seqno(),
             #[cfg(feature = "telemetry")]
@@ -1822,19 +2268,12 @@ impl BroadcastProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
         ctx: &mut BroadcastRecvContext,
         bcast_id: &BroadcastId,
     ) -> Result<(Option<BroadcastRecvInfo>, bool)> {
-        let (info, mut resend) =
-            <Self as FecProtocol<BroadcastTwostepFec>>::process_broadcast(bcast, ctx, bcast_id)
-                .await?;
-        if resend {
-            let Some(bcast) = ctx.overlay.owned_broadcasts.get(bcast_id) else {
-                return Ok((info, false));
-            };
-            let Some(transfer) = Self::unwrap_transfer(bcast.val()) else {
-                return Ok((info, false));
-            };
-            resend = ctx.peers.other() == &transfer.src_key_id;
-        }
-        Ok((info, resend))
+        let src_adnl_key_id = KeyId::from_data(*bcast.src_adnl_id.as_slice());
+        let admitted =
+            <Self as FecProtocol<BroadcastTwostepFec>>::admit_part(bcast, ctx, bcast_id).await?;
+        // Only a part received from its origin is relayed, before any
+        // application check; the check gates local delivery only.
+        Ok((None, admitted.is_some() && ctx.peers.other() == &src_adnl_key_id))
     }
 
     // Send side
@@ -1963,6 +2402,7 @@ impl BroadcastProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
 
 impl FecProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
     const RECHECK_DATE_BEFORE_DECODE: bool = true;
+    const TWOSTEP: bool = true;
 
     fn build_broadcast_part(
         data: Vec<u8>,
@@ -2016,6 +2456,7 @@ impl FecProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
 
 #[rustfmt::skip]
 impl BroadcastParsed for BroadcastTwostepSimple {
+    fn certificate(&self) -> &OverlayCertificate { &self.certificate }
     fn date(&self) -> i32 { self.date }
     fn src_key(&self) -> Result<Arc<dyn KeyOption>> { (&self.src).try_into() }
     #[cfg(feature = "telemetry")]
@@ -2099,11 +2540,35 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
             bcast.flags as u32,
             &bcast.extra,
         )?;
+        let mut verdict = BroadcastCheckResult::Allowed;
         let dup = if add_unbound_object_to_map(&ctx.overlay.owned_broadcasts, bcast_id, || {
             Ok(OwnedBroadcast::Send)
         })? {
-            let to_sign = Self::calc_to_sign(bcast_id, &bcast.data)?;
-            src_key.verify(&to_sign, &bcast.signature)?;
+            // Two-step checks its simple carrier as FEC and never any-sender.
+            verdict = ctx.overlay.broadcast_verdict(
+                &src_key,
+                &bcast.certificate,
+                data_size,
+                true,
+                false,
+                ctx.peers.other(),
+            );
+            let checked = if verdict == BroadcastCheckResult::Forbidden {
+                Err(error!("Broadcast is forbidden"))
+            } else {
+                Self::calc_to_sign(bcast_id, &bcast.data).and_then(|to_sign| {
+                    ctx.overlay.verify_broadcast_signature(
+                        &src_key,
+                        &to_sign,
+                        &bcast.signature,
+                        ctx.peers.other(),
+                    )
+                })
+            };
+            if let Err(e) = checked {
+                ctx.overlay.owned_broadcasts.remove(&bcast_id);
+                return Err(e);
+            }
             false
         } else {
             true
@@ -2112,6 +2577,7 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
         Ok(BroadcastCheckInfo {
             bcast_id,
             dup,
+            verdict,
             data_len,
             seqno: 0,
             #[cfg(feature = "telemetry")]
@@ -2145,12 +2611,39 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
         }
         let src_adnl_key_id = KeyId::from_data(*bcast.src_adnl_id.as_slice());
         let resend = ctx.peers.other() == &src_adnl_key_id;
+        let src_key_id = bcast.src_key()?.id().clone();
         let info = BroadcastRecvInfo {
             packets: 1,
             data: bcast.data.into(),
             extra: Some(bcast.extra),
             recv_from: src_adnl_key_id,
         };
+        if ctx.verdict != BroadcastCheckResult::Allowed {
+            // Relay may precede the application check, which gates delivery.
+            let overlay = ctx.overlay.clone();
+            let bcast_id = *bcast_id;
+            let tasks = overlay.tasks.clone();
+            tasks.spawn_cancelable("overlay broadcast application check", async move {
+                let approved = overlay.application_check(&src_key_id, &info.data).await;
+                if let Err(e) = overlay.setup_broadcast_purge(
+                    bcast_id,
+                    #[cfg(feature = "xp25")]
+                    0,
+                ) {
+                    log::warn!(target: TARGET, "Cannot setup broadcast purge: {e}");
+                }
+                match approved {
+                    Ok(()) => overlay.received_rawbytes.push(info),
+                    Err(e) => log::debug!(
+                        target: TARGET,
+                        "Application check refused two-step broadcast {} in overlay {}: {e}",
+                        base64_encode(&bcast_id),
+                        overlay.overlay_id
+                    ),
+                }
+            });
+            return Ok((None, resend));
+        }
         Ok((Some(info), resend))
     }
 
@@ -2200,3 +2693,7 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
 #[cfg(test)]
 #[path = "broadcast_date_tests.rs"]
 mod date_tests;
+
+#[cfg(test)]
+#[path = "broadcast_privacy_tests.rs"]
+mod privacy_tests;

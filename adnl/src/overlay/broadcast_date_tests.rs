@@ -106,6 +106,7 @@ async fn broadcast_outside_the_date_window_is_neither_delivered_nor_relayed() {
             hops: Some(0),
             overlay: &overlay,
             peers: &peers,
+            verdict: super::BroadcastCheckResult::Allowed,
         };
         BroadcastSimpleProtocol.recv(bcast, ctx).await.unwrap();
         // A refused broadcast is dropped before it is registered, so it can be neither
