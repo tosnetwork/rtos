@@ -2661,14 +2661,43 @@ impl SimplexState {
         // Save candidate hash -> CandidateId mapping for BlockFinalizedEvent
         self.candidate_ids.insert(candidate.id.hash.clone(), candidate.id.clone());
 
+        // C++ consensus.cpp CandidateReceived: a slot already voted notarize ignores
+        // further candidates, the first candidate stored for a slot wins (a different
+        // one is the leader's equivocation), and only the stored candidate is then
+        // offered to notarization, whose own gate (`try_notar`) re-checks the slot.
+        let offset = desc.get_slot_offset_in_window(slot) as usize;
+        self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
+        let Some(window) = self.get_window_mut(window_idx) else {
+            return Ok(());
+        };
+        let slot_state = &mut window.slots[offset];
+        if slot_state.voted_notar.is_some() {
+            log::trace!(
+                "SimplexState::on_candidate: ({}/{}) already notarized, ignoring candidate",
+                window_idx,
+                slot
+            );
+            return Ok(());
+        }
+        if let Some(existing) = &slot_state.pending_block {
+            if existing.id.hash != candidate.id.hash {
+                log::warn!(
+                    "SimplexState::on_candidate: ({window_idx}/{slot}) \
+                    pending_block already set with different hash, ignoring"
+                );
+            }
+            return Ok(());
+        }
+        let candidate_hash = candidate.id.hash.clone();
+        slot_state.pending_block = Some(candidate);
+        self.pending_slots.push(PendingSlot(slot));
+
         log::trace!(
             "SimplexState::on_candidate: slot={}, parent={:?}, calling try_notar",
             slot,
             parent
         );
-
-        // If try_notar succeeds, continue with pending checks.
-        if self.try_notar(desc, slot, &candidate.id.hash, parent.as_ref()) {
+        if self.try_notar(desc, slot, &candidate_hash, parent.as_ref()) {
             log::trace!(
                 "SimplexState::on_candidate: ({}/{}) try_notar succeeded, checking pending blocks",
                 window_idx,
@@ -2676,52 +2705,6 @@ impl SimplexState {
             );
             // Retry any queued pending candidates.
             self.check_pending_blocks(desc);
-        }
-        // Otherwise, store as pending when slot is not already dominated.
-        else {
-            let offset = desc.get_slot_offset_in_window(slot) as usize;
-
-            self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
-
-            // C++ consensus.cpp CandidateReceived only gates on voted_notar (line 170),
-            // NOT voted_skip. A local skip vote must NOT prevent storing a candidate as
-            // pending — the pending retry (`check_pending_blocks`) will notarize it once
-            // the parent base propagates through skip certs.
-            //
-            let dominated = if let Some(window) = self.get_window(window_idx) {
-                window.slots[offset].voted_notar.is_some()
-            } else {
-                false
-            };
-
-            if !dominated {
-                log::trace!(
-                    "SimplexState::on_candidate: ({}/{}) try_notar=false, storing as pending block",
-                    window_idx,
-                    slot
-                );
-                // C++ parity: first pending candidate wins. If a pending block already
-                // exists for this slot, reject any different candidate (equivocation).
-                if let Some(window) = self.get_window_mut(window_idx) {
-                    if let Some(ref existing) = window.slots[offset].pending_block {
-                        if existing.id.hash != candidate.id.hash {
-                            log::warn!(
-                                "SimplexState::on_candidate: ({window_idx}/{slot}) \
-                                pending_block already set with different hash, ignoring"
-                            );
-                        }
-                        return Ok(());
-                    }
-                    window.slots[offset].pending_block = Some(candidate);
-                    self.pending_slots.push(PendingSlot(slot));
-                }
-            } else {
-                log::trace!(
-                    "SimplexState::on_candidate: ({}/{}) already notarized, ignoring candidate",
-                    window_idx,
-                    slot
-                );
-            }
         }
 
         // Dump state at trace level (compact one-line format)
@@ -3627,19 +3610,25 @@ impl SimplexState {
 
         self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
 
-        // C++ parity: consensus.cpp on_candidate_to_notarize checks only voted_notar,
-        // allowing Notarize after Skip.
+        // C++ consensus.cpp try_notarize() `may_vote`: a local notarize vote needs
+        // no earlier notarize, skip or finalize vote for the slot, and no observed
+        // notarization certificate for a different candidate. (`may_vote` also
+        // requires finality not to be behind; that backpressure is not modelled here.)
         if let Some(window) = self.get_window(window_idx) {
             let slot_state = &window.slots[offset];
-            // C++ parity: only voted_notar gates notarization. C++ try_notarize()
-            // does NOT check voted_final/is_completed — a slot that was finalized on a
-            // previous run can still be re-notarized after restart (the later
-            // auto-finalize simply skips re-broadcasting).
-            let already_voted = slot_state.voted_notar.is_some();
-
-            if already_voted {
+            if slot_state.voted_notar.is_some() || slot_state.voted_skip || slot_state.voted_final {
                 log::trace!("SimplexState::try_notar: slot {} already voted", slot);
                 return false;
+            }
+            if let Some(cert) = &slot_state.observed_notar_certificate {
+                if cert.slot != slot || &cert.hash != block_hash {
+                    log::trace!(
+                        "SimplexState::try_notar: slot {} has a notarization certificate for {}",
+                        slot,
+                        Self::format_block(cert.slot, &cert.hash)
+                    );
+                    return false;
+                }
             }
         }
 
@@ -4028,8 +4017,8 @@ impl SimplexState {
                 window.slots[offset].voted_skip = true;
                 window.slots[offset].is_timeout_skipped = true;
                 // C++ alarm() only sets voted_skip — it does NOT clear pending_block.
-                // The async try_notarize() coroutine can still complete after a skip
-                // vote, producing both Skip and Notar votes for the same slot.
+                // The pending candidate keeps a different one out of the slot, but it
+                // can no longer be notarized locally: try_notar refuses after a skip.
             }
         }
     }
