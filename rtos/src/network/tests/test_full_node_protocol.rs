@@ -569,3 +569,36 @@ fn neighbour_rotation_matches_the_reference() {
         }
     }
 }
+
+// ------------------------------------------------------------ A3-13 key blocks
+
+pub(super) const CPP_NKB: &str = include_str!("data/fullnode-proto/out-nkb.txt");
+
+#[test]
+fn key_block_answers_follow_the_reference_requester() {
+    use crate::network::full_node_overlay_client::next_key_block_ids;
+    // keyBlocks.<incomplete><error> carry one block; the reference requester
+    // fails "not ready" on the error flag whatever the list holds, and takes
+    // the list otherwise.
+    assert!(cpp_value(CPP_NKB, "error_with_blocks").starts_with("error 651"));
+    assert!(cpp_value(CPP_NKB, "error_incomplete_with_blocks").starts_with("error 651"));
+    assert!(cpp_value(CPP_NKB, "incomplete_empty").starts_with("ok 0"));
+    assert!(cpp_value(CPP_NKB, "complete_empty").starts_with("ok 0"));
+    for (key, ok) in [
+        ("keyBlocks.00", true),
+        ("keyBlocks.10", true),
+        ("keyBlocks.01", false),
+        ("keyBlocks.11", false),
+    ] {
+        let answer = WireProfile::T0
+            .deserialize_value::<KeyBlocks>(&hex_bytes(cpp_value(CPP_TL, key)))
+            .unwrap();
+        match next_key_block_ids(answer) {
+            Ok(blocks) => {
+                assert!(ok, "{key} must be refused");
+                assert_eq!(blocks.len(), 1);
+            }
+            Err(_) => assert!(!ok, "{key} must be accepted"),
+        }
+    }
+}

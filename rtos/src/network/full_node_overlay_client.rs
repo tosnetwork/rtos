@@ -86,6 +86,17 @@ impl std::fmt::Display for BoundedBocDecodeRejected {
 }
 impl std::error::Error for BoundedBocDecodeRejected {}
 
+/// The key blocks of a getNextKeyBlockIds answer. An answer with the error
+/// flag is "not ready" as a whole and its block list is discarded; the
+/// incomplete flag only says that the list is short.
+pub(crate) fn next_key_block_ids(answer: KeyBlocks) -> Result<Vec<BlockIdExt>> {
+    let answer = answer.only();
+    if answer.error.into() {
+        fail!("the answer carries the error flag");
+    }
+    Ok(answer.blocks)
+}
+
 fn checked_pss_slice(
     offset: usize,
     max_size: usize,
@@ -1371,12 +1382,10 @@ impl FullNodeOverlayClient {
     ) -> Result<Vec<BlockIdExt>> {
         let request =
             GetNextKeyBlockIds { block: block_id.clone(), max_size }.into_tl_object().into();
-        let (ids, _): (KeyBlocks, _) =
+        let (ids, peer): (KeyBlocks, _) =
             self.client.send_adnl_query(&request, None, None, None).await?;
-        if !ids.blocks().is_empty() {
-            return Ok(ids.only().blocks);
-        }
-        return Ok(Vec::new());
+        next_key_block_ids(ids)
+            .map_err(|e| error!("getNextKeyBlockIds for {block_id} from {}: {e}", peer.id()))
     }
 
     // tonNode.downloadNextBlockFull prev_block:tonNode.blockIdExt = tonNode.DataFull;

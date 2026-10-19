@@ -1,0 +1,6 @@
+NKB error_with_blocks error 651 queries 9/adnl/2bc35b22/0 
+NKB error_empty error 651 queries 9/adnl/2bc35b22/0 
+NKB incomplete_empty ok 0 queries 9/adnl/2bc35b22/0 
+NKB complete_empty ok 0 queries 9/adnl/2bc35b22/0 
+NKB error_incomplete_with_blocks error 651 queries 9/adnl/2bc35b22/0 
+NKB notready_code 651
