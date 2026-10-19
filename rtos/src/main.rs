@@ -66,11 +66,14 @@ use crate::{
 use rtos_block::Result;
 #[cfg(feature = "mirrornet")]
 use rtos_block::UnixTime;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicI32, Ordering},
+    Arc, OnceLock,
+};
 #[cfg(feature = "trace_alloc")]
 use std::{
     alloc::{GlobalAlloc, Layout, System},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::AtomicU64,
     thread,
     time::Duration,
 };
@@ -321,14 +324,112 @@ fn check_debug_build() {
     }
 }
 
-fn main() {
-    check_debug_build();
+/// Exit status for a refused option, configuration or configuration lock.
+const EXIT_CONFIG: i32 = 2;
+/// Exit status for a failure after the configuration was accepted.
+const EXIT_RUNTIME: i32 = 1;
+/// Name of the lock held over the configuration directory while the node runs.
+const CONFIG_LOCK_NAME: &str = "config.json.lock";
 
-    println!("{}", get_build_info());
-    let version = get_version();
-    println!("{}", version);
+/// Set by the panic hook on any thread; a run that panicked never exits 0.
+static PANICKED: AtomicBool = AtomicBool::new(false);
+/// The stop signal received, 0 if none. The process ends by that signal.
+static RECEIVED_SIGNAL: AtomicI32 = AtomicI32::new(0);
+/// Lets the panic hook request a failed stop once the engine stopper exists.
+static PANIC_STOPPER: OnceLock<Arc<Stopper>> = OnceLock::new();
+/// The configuration lock; never released before the process exits.
+static CONFIG_LOCK: OnceLock<std::fs::File> = OnceLock::new();
 
+/// How the node run ended, before the process status is chosen.
+#[derive(Debug, PartialEq, Eq)]
+enum RunEnd {
+    Exit(i32),
+    Panicked,
+}
+
+/// The process status: an exit code, or termination by a signal.
+#[derive(Debug, PartialEq, Eq)]
+enum Disposition {
+    Exit(i32),
+    Signal(i32),
+}
+
+/// A received stop signal decides the status even when cleanup failed or a
+/// thread panicked. Otherwise any panic seen anywhere turns success into a
+/// runtime failure.
+fn final_disposition(end: RunEnd, signal: i32, panicked: bool) -> Disposition {
+    if signal != 0 {
+        return Disposition::Signal(signal);
+    }
+    match end {
+        RunEnd::Exit(0) if panicked => Disposition::Exit(EXIT_RUNTIME),
+        RunEnd::Exit(code) => Disposition::Exit(code),
+        RunEnd::Panicked => Disposition::Exit(EXIT_RUNTIME),
+    }
+}
+
+/// Ends the process by `signal` with its default action, so the parent sees
+/// a signal termination.
+fn terminate_by_signal(signal: i32) -> ! {
+    // SAFETY: plain libc calls on a valid signal number; the sigset is
+    // initialised by sigemptyset before use.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, signal);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        libc::raise(signal);
+    }
+    // Not reached for a terminating signal; keep the shell convention.
+    std::process::exit(128 + signal)
+}
+
+/// Takes the configuration lock: a whole-file write record lock (fcntl), held
+/// for the process lifetime. A second node, or a tool editing the
+/// configuration under the same lock, cannot run beside this one.
+fn acquire_config_lock(configs_dir: &str) -> std::result::Result<std::fs::File, String> {
+    use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd};
+    let path = std::path::Path::new(configs_dir).join(CONFIG_LOCK_NAME);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|e| format!("cannot open the configuration lock {}: {e}", path.display()))?;
+    // SAFETY: flock is a plain C structure; zeroed is a valid initial value.
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as _;
+    lock.l_whence = libc::SEEK_SET as _;
+    lock.l_start = 0;
+    lock.l_len = 0;
+    // SAFETY: the descriptor is open and the structure outlives the call.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) } == -1 {
+        let error = std::io::Error::last_os_error();
+        return Err(match error.raw_os_error() {
+            Some(libc::EAGAIN) | Some(libc::EACCES) => format!(
+                "the configuration lock {} is held by another process: a node already \
+                running with this configuration, or a tool editing it: {error}",
+                path.display()
+            ),
+            _ => format!("cannot lock the configuration lock {}: {error}", path.display()),
+        });
+    }
+    Ok(file)
+}
+
+fn build_command() -> clap::Command {
     let app = clap::Command::new("rtos")
+        .disable_version_flag(true)
+        .arg(
+            clap::Arg::new("version")
+                .short('V')
+                .long("version")
+                .action(clap::ArgAction::SetTrue)
+                .help("show build information and exit"),
+        )
         .arg(
             clap::Arg::new("zerostate")
                 .short('z')
@@ -386,15 +487,120 @@ fn main() {
             .value_name("timeshift")
             .help("shift the node's time by the specified number of seconds (can be negative) for testing purposes"),
     );
+    app
+}
 
-    let matches = app.get_matches();
-
-    let truncate_db = matches.get_one::<String>("truncate_db").map(|s| s.as_str()).map(|s| {
-        s.parse::<u32>().unwrap_or_else(|e| {
-            eprintln!("truncate_db value must be a valid u32: {}", e);
-            std::process::exit(1);
+fn build_runtime(name: &str) -> std::result::Result<tokio::runtime::Runtime, i32> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .map_err(|e| {
+            eprintln!("Can't create {name} tokio runtime: {e}");
+            EXIT_RUNTIME
         })
+}
+
+/// Parses every configuration section the engine parses again at start, so a
+/// malformed section is refused as a configuration error.
+fn preflight_config(config: &TonNodeConfig) -> Result<()> {
+    config.load_global_config()?;
+    config.adnl_node()?;
+    config.control_server()?;
+    config.lite_server()?;
+    config.json_rpc_server()?;
+    Ok(())
+}
+
+/// Waits for SIGINT, SIGTERM or SIGHUP, records it and requests the stop. A
+/// second signal ends the process at once, by that signal.
+fn install_stop_signals(
+    runtime: &tokio::runtime::Runtime,
+    stopper: Arc<Stopper>,
+) -> std::result::Result<(), String> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let (mut interrupt, mut terminate, mut hangup) = runtime
+        .block_on(async {
+            Ok::<_, std::io::Error>((
+                signal(SignalKind::interrupt())?,
+                signal(SignalKind::terminate())?,
+                signal(SignalKind::hangup())?,
+            ))
+        })
+        .map_err(|e| format!("Error setting termination signals handler: {e}"))?;
+    runtime.spawn(async move {
+        let mut first = true;
+        loop {
+            let received = tokio::select! {
+                _ = interrupt.recv() => libc::SIGINT,
+                _ = terminate.recv() => libc::SIGTERM,
+                _ = hangup.recv() => libc::SIGHUP,
+            };
+            if !first {
+                terminate_by_signal(received);
+            }
+            first = false;
+            RECEIVED_SIGNAL.store(received, Ordering::SeqCst);
+            log::warn!("Got signal {received}, starting node's safe stopping...");
+            stopper.set_stop();
+        }
     });
+    Ok(())
+}
+
+fn main() {
+    // Installed first: a panic on any thread at any time is recorded.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        PANICKED.store(true, Ordering::SeqCst);
+        log::error!("FATAL PANIC: {info}");
+        if let Some(stopper) = PANIC_STOPPER.get() {
+            // A panic requests shutdown but can never authorize a clean-shutdown marker.
+            stopper.report_service_failure(0, format!("panic: {info}"));
+        }
+        default_hook(info);
+    }));
+    let end = match std::panic::catch_unwind(run_node) {
+        Ok(code) => RunEnd::Exit(code),
+        Err(_) => RunEnd::Panicked,
+    };
+    match final_disposition(
+        end,
+        RECEIVED_SIGNAL.load(Ordering::SeqCst),
+        PANICKED.load(Ordering::SeqCst),
+    ) {
+        Disposition::Signal(signal) => terminate_by_signal(signal),
+        Disposition::Exit(code) => std::process::exit(code),
+    }
+}
+
+fn run_node() -> i32 {
+    check_debug_build();
+
+    let matches = match build_command().try_get_matches() {
+        Ok(matches) => matches,
+        Err(error) => {
+            // Help is printed and ends like a refused option.
+            let _ = error.print();
+            return EXIT_CONFIG;
+        }
+    };
+
+    println!("{}", get_build_info());
+    let version = get_version();
+    println!("{}", version);
+    if matches.get_flag("version") {
+        return 0;
+    }
+
+    let truncate_db = match matches.get_one::<String>("truncate_db").map(|s| s.parse::<u32>()) {
+        None => None,
+        Some(Ok(seqno)) => Some(seqno),
+        Some(Err(e)) => {
+            eprintln!("truncate_db value must be a valid u32: {}", e);
+            return EXIT_CONFIG;
+        }
+    };
 
     let flags = EngineFlags {
         initial_sync_disabled: matches.get_flag("initial_sync_disabled"),
@@ -407,7 +613,7 @@ fn main() {
         Some(config) => config.as_str(),
         None => {
             eprintln!("Can't load config: config dir is not set!");
-            return;
+            return EXIT_CONFIG;
         }
     };
 
@@ -416,24 +622,32 @@ fn main() {
 
     let zerostate_path = matches.get_one::<String>("zerostate").map(String::as_str);
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(8 * 1024 * 1024)
-        .build()
-        .expect("Can't create Engine tokio runtime");
-    let validator_runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(8 * 1024 * 1024)
-        .build()
-        .expect("Can't create Validator tokio runtime");
-    let liteserver_runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(8 * 1024 * 1024)
-        .build()
-        .expect("Can't create Liteserver tokio runtime");
+    // The lock is taken before the configuration is read or generated.
+    match acquire_config_lock(config_dir_path) {
+        Ok(file) => {
+            let _ = CONFIG_LOCK.set(file);
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            return EXIT_CONFIG;
+        }
+    }
 
-    let mut config = match runtime.block_on(async {
-        TonNodeConfig::from_file(
+    let runtime = match build_runtime("Engine") {
+        Ok(runtime) => runtime,
+        Err(code) => return code,
+    };
+    let validator_runtime = match build_runtime("Validator") {
+        Ok(runtime) => runtime,
+        Err(code) => return code,
+    };
+    let liteserver_runtime = match build_runtime("Liteserver") {
+        Ok(runtime) => runtime,
+        Err(code) => return code,
+    };
+
+    let (mut config, created) = match runtime.block_on(async {
+        TonNodeConfig::load_or_create(
             config_dir_path,
             CONFIG_NAME,
             None,
@@ -442,44 +656,71 @@ fn main() {
         )
         .await
     }) {
-        Ok(c) => c,
+        Ok(loaded) => loaded,
         Err(e) => {
             eprintln!("Can't load config: {e:?}");
-            return;
+            return EXIT_CONFIG;
         }
     };
 
-    if process_conf_and_exit {
-        println!("Finish node because of --process-conf-and-exit flag is set");
-        return;
+    if created {
+        let path = std::path::Path::new(config_dir_path).join(CONFIG_NAME);
+        eprintln!("created config file '{}'", path.display());
+        eprintln!("check it manually before continue");
+        return 0;
     }
 
-    init_logger(config.log_config_path());
+    if process_conf_and_exit {
+        println!("Finish node because of --process-conf-and-exit flag is set");
+        return 0;
+    }
+
+    if let Some(path) = config.log_config_path() {
+        if let Err(error) = log4rs::init_file(&path, Default::default()) {
+            eprintln!("cannot initialize logging from {}: {error}", path.display());
+            return EXIT_CONFIG;
+        }
+    } else {
+        init_logger::<std::path::PathBuf>(None);
+    }
     log::info!("{}", version);
 
     #[cfg(feature = "mirrornet")]
     if let Some(timeshift) = matches.get_one::<String>("timeshift") {
-        let timeshift = timeshift.parse::<i64>().unwrap_or_else(|e| {
-            log::error!("Invalid timeshift value {timeshift}: {e}");
-            std::process::exit(1);
-        });
+        let timeshift = match timeshift.parse::<i64>() {
+            Ok(timeshift) => timeshift,
+            Err(e) => {
+                log::error!("Invalid timeshift value {timeshift}: {e}");
+                return EXIT_CONFIG;
+            }
+        };
         if let Err(e) = UnixTime::set_timeshift(timeshift) {
             log::error!("Failed to set timeshift: {e}");
-            std::process::exit(1);
+            return EXIT_CONFIG;
         }
         log::warn!("Node time is shifted by {} seconds", timeshift);
     }
 
-    let metrics_handle = config
-        .metrics()
-        .expect("Bad metrics config")
-        .map(|mc| (mc.address, engine::init_prometheus_recorder(&mc)));
+    let metrics_handle = match config.metrics() {
+        Ok(metrics) => metrics.map(|mc| (mc.address, engine::init_prometheus_recorder(&mc))),
+        Err(e) => {
+            log::error!("Bad metrics config: {e:?}");
+            eprintln!("Bad metrics config: {e:?}");
+            return EXIT_CONFIG;
+        }
+    };
 
     // Load secrets from vault to config
     if let Err(e) = runtime.block_on(SecretsVaultConfig::on_load(&mut config)) {
         log::error!("Can't load secrets from the vault: {e:?}");
         eprintln!("Can't load secrets from the vault: {e:?}");
-        return;
+        return EXIT_CONFIG;
+    }
+
+    if let Err(e) = preflight_config(&config) {
+        log::error!("Configuration refused: {e:?}");
+        eprintln!("Configuration refused: {e:?}");
+        return EXIT_CONFIG;
     }
 
     #[cfg(feature = "trace_alloc_detail")]
@@ -524,21 +765,15 @@ fn main() {
     });
 
     let stopper = Arc::new(Stopper::new());
-    let stopper_ctrl_c = stopper.clone();
-    ctrlc::set_handler(move || {
-        log::warn!("Got SIGINT, starting node's safe stopping...");
-        stopper_ctrl_c.set_stop();
-    })
-    .expect("Error setting termination signals handler");
-
-    // A panic requests shutdown but can never authorize a clean-shutdown marker.
-    let stopper_panic = stopper.clone();
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        log::error!("FATAL PANIC: {info}");
-        stopper_panic.report_service_failure(0, format!("panic: {info}"));
-        default_hook(info);
-    }));
+    let _ = PANIC_STOPPER.set(stopper.clone());
+    if PANICKED.load(Ordering::SeqCst) {
+        stopper.report_service_failure(0, "panic before the engine started".to_owned());
+    }
+    if let Err(error) = install_stop_signals(&runtime, stopper.clone()) {
+        log::error!("{error}");
+        eprintln!("{error}");
+        return EXIT_RUNTIME;
+    }
 
     let validator_rt_handle = validator_runtime.handle().clone();
     let liteserver_rt_handle = liteserver_runtime.handle().clone();
@@ -579,8 +814,10 @@ fn main() {
     runtime.shutdown_timeout(shutdown_timeout);
     validator_runtime.shutdown_timeout(shutdown_timeout);
     liteserver_runtime.shutdown_timeout(shutdown_timeout);
-    if !clean_shutdown {
-        std::process::exit(1);
+    if clean_shutdown {
+        0
+    } else {
+        EXIT_RUNTIME
     }
 }
 
@@ -620,6 +857,54 @@ mod shutdown_tests {
             directory.path().to_str().unwrap()
         ));
         assert!(beacon.exists(), "failed stop must require database recovery");
+    }
+
+    #[test]
+    fn exit_status_classes() {
+        assert_eq!(final_disposition(RunEnd::Exit(0), 0, false), Disposition::Exit(0));
+        assert_eq!(
+            final_disposition(RunEnd::Exit(EXIT_CONFIG), 0, false),
+            Disposition::Exit(EXIT_CONFIG)
+        );
+        assert_eq!(
+            final_disposition(RunEnd::Exit(EXIT_RUNTIME), 0, false),
+            Disposition::Exit(EXIT_RUNTIME)
+        );
+        // A panic on any thread turns a clean stop into a runtime failure.
+        assert_eq!(final_disposition(RunEnd::Exit(0), 0, true), Disposition::Exit(EXIT_RUNTIME));
+        assert_eq!(final_disposition(RunEnd::Panicked, 0, true), Disposition::Exit(EXIT_RUNTIME));
+        // A stop signal decides the status whatever the cleanup did.
+        for end in [RunEnd::Exit(0), RunEnd::Exit(EXIT_RUNTIME), RunEnd::Panicked] {
+            assert_eq!(
+                final_disposition(end, libc::SIGTERM, true),
+                Disposition::Signal(libc::SIGTERM)
+            );
+        }
+        assert_eq!(
+            final_disposition(RunEnd::Exit(EXIT_RUNTIME), libc::SIGINT, false),
+            Disposition::Signal(libc::SIGINT)
+        );
+    }
+
+    #[test]
+    fn config_lock_excludes_a_second_holder_in_another_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_str().unwrap();
+        let held = acquire_config_lock(path).unwrap();
+        // fcntl record locks are per process: probe from a child process.
+        let probe = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(
+                "import fcntl,sys\n\
+                 f=open(sys.argv[1],'r+')\n\
+                 try:\n fcntl.lockf(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept OSError:\n sys.exit(3)\n",
+            )
+            .arg(directory.path().join(CONFIG_LOCK_NAME))
+            .status()
+            .unwrap();
+        assert_eq!(probe.code(), Some(3), "a held configuration lock must refuse a second holder");
+        drop(held);
+        assert!(acquire_config_lock(path).is_ok());
     }
 
     #[tokio::test]

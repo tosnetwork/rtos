@@ -112,6 +112,11 @@ def main():
     rust_rpc = 'http://' + default['json_rpc_server']['address'] + '/jsonRPC'
     checkpoints = {identity(checkpoint['last']): observations}
     try:
+        if not (rust / 'config.json').exists():
+            # The node creates config.json from default_config.json and exits.
+            with (rust / 'node-generate.log').open('w') as log:
+                subprocess.run([str(args.rust_node.resolve()), '--configs', str(rust)], cwd=rust,
+                               stdout=log, stderr=log, check=True, timeout=60)
         with (rust / 'node.log').open('w') as log:
             command = [str(args.rust_node.resolve()), '--configs', str(rust), '--initial-sync-disabled']
             process = subprocess.Popen(command, cwd=rust, stdout=log, stderr=log,

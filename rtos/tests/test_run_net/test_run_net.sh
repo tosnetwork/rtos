@@ -108,7 +108,12 @@ do
     cp $NODE_TARGET/default_config$N.json $TEST_ROOT/tmp/default_config$N.json
 
     rm -f tmp_output > /dev/null 2>&1
-    (./node_singlehost --configs . --ckey "$(cat console_public_json)" > tmp_output 2>&1 & wait 2>/dev/null) &
+    # The node creates config.json and console_config.json, then exits.
+    if ! ./node_singlehost --configs . --ckey "$(cat console_public_json)" > tmp_output_generate 2>&1; then
+        echo "ERROR: node config generation failed"
+        exit 1
+    fi
+    (./node_singlehost --configs . > tmp_output 2>&1 & wait 2>/dev/null) &
     echo "  waiting for 5 secs"
     sleep 5
     if [ ! -f "console_config.json" ]; then

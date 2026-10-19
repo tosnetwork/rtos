@@ -746,8 +746,30 @@ impl TonNodeConfig {
         default_config_name: &str,
         client_console_key: Option<String>,
     ) -> Result<Self> {
+        let (config, _) = Self::load_or_create(
+            configs_dir,
+            json_file_name,
+            adnl_config,
+            default_config_name,
+            client_console_key,
+        )
+        .await?;
+        Ok(config)
+    }
+
+    /// Loads the node configuration, or creates it from the default
+    /// configuration when it does not exist yet. The flag is true only when
+    /// this call wrote a new configuration file.
+    pub async fn load_or_create(
+        configs_dir: &str,
+        json_file_name: &str,
+        adnl_config: Option<AdnlNodeConfigJson>,
+        default_config_name: &str,
+        client_console_key: Option<String>,
+    ) -> Result<(Self, bool)> {
         let config_file_path = TonNodeConfig::build_path(configs_dir, json_file_name);
         let config_file = File::open(config_file_path.clone());
+        let mut created = false;
 
         let mut config_json = match config_file {
             Ok(file) => {
@@ -788,6 +810,7 @@ impl TonNodeConfig {
                 config.create_and_save_lite_configs(configs_dir).await?;
                 config.ip_address = None;
                 write_config_durable(&config_file_path, &serde_json::to_vec_pretty(&config)?)?;
+                created = true;
                 config
             }
             Err(error) => return Err(error.into()),
@@ -806,7 +829,7 @@ impl TonNodeConfig {
 
         config_json.configs_dir = configs_dir.to_string();
         config_json.file_name = json_file_name.to_string();
-        Ok(config_json)
+        Ok((config_json, created))
     }
 
     pub fn adnl_node(&self) -> Result<AdnlNodeConfig> {
@@ -845,11 +868,14 @@ impl TonNodeConfig {
         self.lite_server.as_ref().map(LiteServerConfig::from_json_config).transpose()
     }
 
+    /// The configured log configuration file; an empty name means none.
     pub fn log_config_path(&self) -> Option<PathBuf> {
-        if let Some(log_config_name) = &self.log_config_name {
-            return Some(self.build_config_path(log_config_name));
+        match &self.log_config_name {
+            Some(log_config_name) if !log_config_name.is_empty() => {
+                Some(self.build_config_path(log_config_name))
+            }
+            _ => None,
         }
-        None
     }
 
     pub fn unsafe_catchain_patches_files(&self) -> Vec<String> {

@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -102,6 +103,9 @@ async def stop_rust(node):
             except ProcessLookupError:
                 pass
             await process.wait()
+    # The node ends by the stop signal itself, as the reference engine does.
+    if process.returncode == -signal.SIGTERM:
+        return 0
     return process.returncode
 
 

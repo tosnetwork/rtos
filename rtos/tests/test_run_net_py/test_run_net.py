@@ -473,7 +473,13 @@ def prepare_node(
     console_public = {"type_id": 1209251014, "pub_key": console_key_json["pubkey"]}
     params = ["--configs", ".", "--ckey", json.dumps(console_public)]
     print(f"Starting node {node_index} to generate configs...")
-    node_proc = run_rust_node(params, node_index, with_vault=False)
+    # The node creates its configs and exits; then it is started on them.
+    generate_proc = run_rust_node(params, node_index, with_vault=False)
+    if generate_proc.wait(timeout=60) != 0:
+        raise RuntimeError(
+            f"Config generation for node {node_index} exited {generate_proc.returncode}"
+        )
+    node_proc = run_rust_node(["--configs", "."], node_index, with_vault=False)
     try:
         node_work_path = build_node_work_path(node_index)
 

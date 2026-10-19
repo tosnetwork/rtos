@@ -169,6 +169,13 @@ async def main():
             (root / 'quorum.json').write_text(json.dumps(dict(total_weight=total_weight,
                 quorum_weight=quorum, cpp_weight=cpp_weight,
                 rust_weight=weights[prepared['validator_id']], cpp_alone_can_finalize=cpp_weight >= quorum)))
+        if not (rust / 'config.json').exists():
+            # The node creates config.json from default_config.json and exits.
+            with (rust / 'node-generate.log').open('w') as log:
+                generate = await asyncio.create_subprocess_exec(
+                    str(args.rust_node.resolve()), '--configs', str(rust), cwd=rust, stdout=log, stderr=log)
+                if await asyncio.wait_for(generate.wait(), 60):
+                    raise RuntimeError(f'Rust config generation exited {generate.returncode}; see rust/node-generate.log')
         with (rust / 'node.log').open('w') as log:
             process = await asyncio.create_subprocess_exec(
                 str(args.rust_node.resolve()), '--configs', str(rust), '--zerostate', str(zero_dir),
