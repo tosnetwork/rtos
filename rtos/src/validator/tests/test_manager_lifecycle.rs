@@ -213,7 +213,9 @@ async fn test_manager_lifecycle_drains_current_future_and_observer_before_restar
     manager.current_sessions.insert(current_id.clone(), current);
     manager.future_sessions.insert(future_id.clone(), future);
     let (observer, fixture) = observer_fixture().await;
-    manager.block_sync_observers.insert(fixture.session_id.clone(), observer.clone());
+    manager
+        .block_sync_observers
+        .insert((fixture.session_id.clone(), observer_key()), observer.clone());
     let stop = tokio::spawn(async move {
         manager.stop_validation().await.unwrap();
         manager
@@ -234,6 +236,11 @@ async fn test_manager_lifecycle_drains_current_future_and_observer_before_restar
     let replacement = fixture.create().unwrap();
     replacement.stop_and_wait().await.unwrap();
     observer.stop_and_wait().await.unwrap();
+}
+
+/// The local identity the observer fixtures are registered under.
+fn observer_key() -> consensus_common::PublicKeyHash {
+    rtos_block::KeyId::from_data([0x33; 32])
 }
 
 fn manager_fixture(engine: Arc<LifecycleEngine>) -> ValidatorManagerImpl {
@@ -459,8 +466,10 @@ async fn test_manager_lifecycle_failed_observer_remains_owned_after_removal() {
     let mut manager = manager_fixture(engine);
     let (observer, fixture) = observer_fixture().await;
     abort_listener_for_test(&observer);
-    manager.block_sync_observers.insert(fixture.session_id.clone(), observer.clone());
-    manager.retire_observer(&fixture.session_id);
+    manager
+        .block_sync_observers
+        .insert((fixture.session_id.clone(), observer_key()), observer.clone());
+    manager.retire_observer(&(fixture.session_id.clone(), observer_key()));
     let error = manager.drain_retiring().await.unwrap_err();
     assert!(error.to_string().contains("observer task join failed"));
     assert!(manager.block_sync_observers.is_empty());
@@ -481,7 +490,9 @@ async fn test_manager_lifecycle_lost_observer_completion_does_not_exempt_service
     let mut manager = manager_fixture(engine.clone());
     let (observer, fixture) = observer_fixture().await;
     lose_completion_for_test(&observer);
-    manager.block_sync_observers.insert(fixture.session_id.clone(), observer.clone());
+    manager
+        .block_sync_observers
+        .insert((fixture.session_id.clone(), observer_key()), observer.clone());
     let error = manager.stop_validation().await.unwrap_err();
     manager.report_teardown_failure(error.to_string());
     assert_eq!(
@@ -534,7 +545,9 @@ async fn test_manager_lifecycle_observer_callback_panic_retains_owner_until_join
     let (observer, fixture) = observer_fixture().await;
     let callback_entered = panic_during_deletion_for_test(&observer);
     let gate = gate_listener_exit_for_test(&observer);
-    manager.block_sync_observers.insert(fixture.session_id.clone(), observer.clone());
+    manager
+        .block_sync_observers
+        .insert((fixture.session_id.clone(), observer_key()), observer.clone());
     {
         let mut stop = Box::pin(manager.stop_validation());
         assert!(futures::poll!(&mut stop).is_pending());

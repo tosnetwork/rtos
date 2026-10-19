@@ -936,6 +936,38 @@ impl consensus_common::finality_delivery::DurableFinalitySink for BootstrapUnava
 
 #[async_trait::async_trait]
 impl EngineOperations for BootstrapTestEngine {
+    // A custody-signed validator collates in its leader slots.
+    fn collator_config(&self) -> &crate::config::CollatorConfig {
+        static CONFIG: std::sync::OnceLock<crate::config::CollatorConfig> =
+            std::sync::OnceLock::new();
+        CONFIG.get_or_init(Default::default)
+    }
+    fn collator_config_mc(&self) -> &crate::config::CollatorConfig {
+        self.collator_config()
+    }
+    fn test_bundles_config(&self) -> &crate::config::CollatorTestBundlesGeneralConfig {
+        static CONFIG: std::sync::OnceLock<crate::config::CollatorTestBundlesGeneralConfig> =
+            std::sync::OnceLock::new();
+        CONFIG.get_or_init(Default::default)
+    }
+    #[cfg(feature = "telemetry")]
+    fn collator_telemetry(&self) -> &crate::validator::telemetry::CollatorValidatorTelemetry {
+        static TELEMETRY: std::sync::OnceLock<crate::validator::telemetry::CollatorValidatorTelemetry> =
+            std::sync::OnceLock::new();
+        TELEMETRY.get_or_init(Default::default)
+    }
+    #[cfg(feature = "telemetry")]
+    fn validator_telemetry(&self) -> &crate::validator::telemetry::CollatorValidatorTelemetry {
+        self.collator_telemetry()
+    }
+    // This adapter collates nothing: a leader slot's collation fails cleanly.
+    async fn get_shard_blocks(
+        &self,
+        _last_mc_state: &Arc<ShardStateStuff>,
+        _actual_last_mc_seqno: Option<&mut u32>,
+    ) -> Result<Vec<Arc<crate::types::top_block_descr::TopBlockDescrStuff>>> {
+        fail!("collation is not available in this test adapter")
+    }
     fn reserve_normal_session_namespace(
         &self,
         runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,

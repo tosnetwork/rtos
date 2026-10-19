@@ -890,6 +890,24 @@ struct AdmittedValidator {
     signer: Option<simplex::SessionSigner>,
 }
 
+/// The local role one Simplex session runtime is admitted for.
+enum SessionAdmission<'a> {
+    /// The validator identity custody selected in the committee.
+    Validator(&'a UInt256),
+    /// One identity of the reference observer selection.
+    Observer(consensus_common::session_runtime::AuthorizedObserver),
+}
+
+/// An observer group is owned per session and local transport identity, as
+/// the reference node keys its observer groups: one node may observe a session
+/// under several identities, and validate it under yet another.
+type ObserverGroupId = (UInt256, consensus_common::PublicKeyHash);
+
+/// The largest committee an observer group is created for, as the reference
+/// launch limits cap the masterchain and shard committees.
+const OBSERVER_MAX_MASTERCHAIN_COMMITTEE: usize = 21;
+const OBSERVER_MAX_SHARD_COMMITTEE: usize = 21;
+
 struct ValidatorManagerImpl {
     engine: Arc<dyn EngineOperations>,
     startup_recovery_gate: Option<super::finality_recovery_owner::RecoveryBootstrapGate>,
@@ -952,8 +970,16 @@ struct ValidatorManagerImpl {
     sync_complete: bool,
     /// Wall-clock timestamp of the last full metrics dump.
     last_metrics_dump: tokio::time::Instant,
-    /// active block-sync observers, keyed by session_id
-    block_sync_observers: HashMap<UInt256, Arc<super::block_sync_observer::BlockSyncObserver>>,
+    /// Active block-sync observers of protocol 1, by session and identity.
+    block_sync_observers:
+        HashMap<ObserverGroupId, Arc<super::block_sync_observer::BlockSyncObserver>>,
+    /// Observer groups of a protocol that puts observers in the private
+    /// overlay, by session and identity. They are independent of the
+    /// validator groups of the same session.
+    observer_groups: HashMap<ObserverGroupId, Arc<ValidatorGroup>>,
+    /// Observer identities refused because this node already joins their
+    /// session's overlays under another identity; each is reported once.
+    observer_transport_conflicts: HashSet<ObserverGroupId>,
 }
 
 impl ValidatorManagerImpl {
@@ -1024,12 +1050,19 @@ impl ValidatorManagerImpl {
             };
             if let Some(page) = page {
                 let db_root = self.engine.db_root_dir().map(str::to_owned);
-                let (current, future, retiring) =
-                    (&self.current_sessions, &self.future_sessions, &self.retiring_groups);
+                let (current, future, retiring, observers) = (
+                    &self.current_sessions,
+                    &self.future_sessions,
+                    &self.retiring_groups,
+                    &self.observer_groups,
+                );
+                // A session with any live group, an observer group included,
+                // keeps every namespace of that session.
                 let is_live = |session: &UInt256| {
                     current.contains_key(session)
                         || future.contains_key(session)
                         || retiring.iter().any(|(id, _, _)| id == session)
+                        || observers.keys().any(|(id, _)| id == session)
                 };
                 let ancestor =
                     |checkpoint: &BlockIdExt| gc::ancestor_or_equal(&gc_state, checkpoint);
@@ -1144,6 +1177,7 @@ impl ValidatorManagerImpl {
         self.current_sessions.contains_key(session)
             || self.future_sessions.contains_key(session)
             || self.retiring_groups.iter().any(|(id, _, _)| id == session)
+            || self.observer_groups.keys().any(|(id, _)| id == session)
     }
 
     /// One page of durable candidate cleanup claims. A claim whose session
@@ -1629,7 +1663,12 @@ impl ValidatorManagerImpl {
                     return Ok(Some(current.clone()));
                 }
                 _ = tokio::time::sleep_until(retry_at) => {
-                    for group in self.current_sessions.values().chain(self.future_sessions.values()) {
+                    for group in self
+                        .current_sessions
+                        .values()
+                        .chain(self.future_sessions.values())
+                        .chain(self.observer_groups.values())
+                    {
                         if group.needs_materialization_retry().await {
                             return Ok(Some(current.clone()));
                         }
@@ -1680,7 +1719,29 @@ impl ValidatorManagerImpl {
             sync_complete: false,
             last_metrics_dump: tokio::time::Instant::now(),
             block_sync_observers: HashMap::new(),
+            observer_groups: HashMap::new(),
+            observer_transport_conflicts: HashSet::new(),
         }
+    }
+
+    /// The local identity under which this node already joins the overlays of
+    /// the session of `id` other than `id` itself: its validator group, or an
+    /// observer of the session at another identity.
+    fn session_transport_owner(&self, id: &ObserverGroupId) -> Option<String> {
+        let (session, adnl) = id;
+        if let Some(group) =
+            self.current_sessions.get(session).or_else(|| self.future_sessions.get(session))
+        {
+            return Some(match group.authenticated_runtime() {
+                Some(runtime) => format!("validator {}", runtime.local_adnl()),
+                None => "validator".to_owned(),
+            });
+        }
+        self.observer_groups
+            .keys()
+            .chain(self.block_sync_observers.keys())
+            .find(|(other_session, other)| other_session == session && other != adnl)
+            .map(|(_, other)| format!("observer {other}"))
     }
 
     #[cfg(test)]
@@ -1830,9 +1891,9 @@ impl ValidatorManagerImpl {
         }))
     }
 
-    /// The local admission of a Simplex session over `committee`: as the
-    /// validator the caller selected, or, where the protocol puts observers
-    /// in the private overlay, as the first authorized observer.
+    /// The authenticated runtime of a Simplex session over `committee` for
+    /// one explicit local admission: the validator the caller selected, or
+    /// one identity of the reference observer selection.
     #[allow(clippy::too_many_arguments)]
     fn simplex_session_runtime(
         &self,
@@ -1842,15 +1903,14 @@ impl ValidatorManagerImpl {
         vertical_seqno: u32,
         last_key_block_seqno: u32,
         committee: &[ValidatorDescr],
-        selected: Option<&UInt256>,
-        observers_in_overlay: bool,
-    ) -> Result<Option<Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>>> {
+        admission: SessionAdmission<'_>,
+    ) -> Result<Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>> {
         use consensus_common::session_runtime::{
             AuthenticatedSessionRuntime, LocalAdmission, SessionNetworkPin,
         };
         let config = mc_state.config_params()?;
-        let admission = match selected {
-            Some(validator_id) => {
+        let admission = match admission {
+            SessionAdmission::Validator(validator_id) => {
                 let index = committee
                     .iter()
                     .position(|member| member.validator_id().is_ok_and(|id| &id == validator_id))
@@ -1860,13 +1920,7 @@ impl ValidatorManagerImpl {
                     index: u32::try_from(index)?,
                 }
             }
-            None if observers_in_overlay => {
-                match self.local_observers(config, committee)?.into_iter().next() {
-                    Some(observer) => LocalAdmission::Observer(observer),
-                    None => return Ok(None),
-                }
-            }
-            None => return Ok(None),
+            SessionAdmission::Observer(observer) => LocalAdmission::Observer(observer),
         };
         let runtime = AuthenticatedSessionRuntime::from_authenticated_admission(
             SessionNetworkPin {
@@ -1885,7 +1939,7 @@ impl ValidatorManagerImpl {
             admission,
         )?
         .bind_recovery_anchor(mc_state.block_id().clone())?;
-        Ok(Some(Arc::new(runtime)))
+        Ok(Arc::new(runtime))
     }
 
     /// The reference node's group-creation checks once the caller selected
@@ -1990,45 +2044,27 @@ impl ValidatorManagerImpl {
         Some((admitted.transport_key, admitted.signer))
     }
 
-    /// Try to spawn a `BlockSyncObserver` for a shard we are not validating
-    ///
-    /// Requires `enable_observers=true` (caller has already checked via `Some(bs_params)`)
-    /// and a descriptor of the previous, current or next total set outside the
-    /// session committee that this node holds. `Err` carries a reason
-    #[allow(clippy::too_many_arguments)]
+    /// Spawn the protocol 1 `BlockSyncObserver` of one observer identity, a
+    /// descriptor of the previous, current or next total set outside the
+    /// session committee that the reference observer selection chose for this
+    /// node. `Err` carries the reason it could not start now.
     fn try_spawn_observer(
         &mut self,
         shard: &ShardIdent,
-        session_id: &UInt256,
-        mc_state: &ShardStateStuff,
-        committee: &[ValidatorDescr],
+        id: &ObserverGroupId,
         bs_params: consensus_common::BlockSyncOverlayParams,
         use_quic: bool,
         proto_version: u32,
     ) -> Result<()> {
-        // (1) The observer identity: a descriptor of the previous, current or
-        // next total set that is not a committee member and that this node
-        // holds, selected by custody (or a classical key for a classical one).
-        // One observer per session joins with the first selected identity.
-        let observers = self.local_observers(mc_state.config_params()?, committee)?;
-        let local_adnl_id =
-            observers.first().map(|observer| observer.adnl().clone()).ok_or_else(|| {
-                error!(
-                    "this node holds no descriptor of a previous, current or next validator \
-                     outside this committee"
-                )
-            })?;
-
-        // (3) Resolve the ADNL KeyOption from the adnl node.
+        let (session_id, local_adnl_id) = id;
         let overlay_node = self
             .engine
             .overlay_node()
             .ok_or_else(|| error!("engine.overlay_node() returned None"))?;
-        let local_adnl_key = self.engine.adnl_key_by_id(&local_adnl_id).ok_or_else(|| {
+        let local_adnl_key = self.engine.adnl_key_by_id(local_adnl_id).ok_or_else(|| {
             error!("local ADNL key {local_adnl_id} not registered with adnl node yet")
         })?;
-
-        // (4) Spawn the observer with the session's negotiated proto version
+        // Spawn the observer with the session's negotiated proto version
         let observer = super::block_sync_observer::BlockSyncObserver::create(
             self.rt.clone(),
             overlay_node,
@@ -2043,10 +2079,10 @@ impl ValidatorManagerImpl {
         )?;
         log::info!(
             target: "validator_manager",
-            "SESSION_LIFECYCLE: observer_started shard={shard} session_id={:x}",
-            session_id,
+            "SESSION_LIFECYCLE: observer_started shard={shard} session_id={session_id:x} \
+             local_key={local_adnl_id}",
         );
-        self.block_sync_observers.insert(session_id.clone(), observer);
+        self.block_sync_observers.insert(id.clone(), observer);
         Ok(())
     }
 
@@ -2184,7 +2220,12 @@ impl ValidatorManagerImpl {
         log::trace!(target: "validator_manager", "Garbage collect lists");
         let mut lists_gc = self.validator_list_status.known_hashes();
 
-        for id in self.current_sessions.values().chain(self.future_sessions.values()) {
+        for id in self
+            .current_sessions
+            .values()
+            .chain(self.future_sessions.values())
+            .chain(self.observer_groups.values())
+        {
             lists_gc.remove(&id.get_validator_list_id());
         }
 
@@ -2232,7 +2273,8 @@ impl ValidatorManagerImpl {
     ) {
         consensus_common::check_execution_time!(5000); // 5ms max
 
-        for (session_id, group) in self.current_sessions.iter() {
+        let observers = self.observer_groups.iter().map(|((session_id, _), group)| (session_id, group));
+        for (session_id, group) in self.current_sessions.iter().chain(observers) {
             if !group.is_simplex() {
                 continue;
             }
@@ -2418,11 +2460,54 @@ impl ValidatorManagerImpl {
         }
     }
 
-    fn retire_observer(&mut self, id: &UInt256) {
+    fn retire_observer(&mut self, id: &ObserverGroupId) {
         if let Some(observer) = self.block_sync_observers.remove(id) {
             self.retiring_observers.push(observer.clone());
             observer.stop();
         }
+    }
+
+    /// Retires every observer of `session` on this node, of either protocol.
+    fn retire_session_observers(&mut self, session: &UInt256) {
+        let groups: Vec<_> =
+            self.observer_groups.keys().filter(|(id, _)| id == session).cloned().collect();
+        for id in groups {
+            self.retire_observer_group(&id);
+        }
+        let observers: Vec<_> =
+            self.block_sync_observers.keys().filter(|(id, _)| id == session).cloned().collect();
+        for id in observers {
+            self.retire_observer(&id);
+        }
+    }
+
+    /// Retires an observer group that is no longer selected. Its observer
+    /// namespace, keyed by its own identity, gets a durable cleanup record
+    /// persisted before the group closes; the session is not fenced, since an
+    /// observer retirement says nothing about the session's validator groups.
+    fn retire_observer_group(&mut self, id: &ObserverGroupId) {
+        let Some(group) = self.observer_groups.remove(id) else {
+            return;
+        };
+        let (session, adnl) = id;
+        let generation = match self.cleanup_record(session, &group) {
+            Ok(record) => {
+                let generation = self.cleanup.on_group_retired(&record);
+                let namespace = record.namespace.clone();
+                self.pending_cleanup_records.push(record);
+                Some((namespace, generation))
+            }
+            Err(error) => {
+                log::error!(target: "validator_manager",
+                    "No cleanup record for the observer namespace of {session:x} at {adnl}; \
+                     it is retained: {error}");
+                None
+            }
+        };
+        log::info!(target: "validator_manager",
+            "SESSION_LIFECYCLE: observer_retired shard={} session_id={session:x} local_key={adnl}",
+            group.shard());
+        self.retire_group_generation(session.clone(), group, generation);
     }
 
     // Every object is registered before the first await. A cancelled caller can
@@ -2485,6 +2570,7 @@ impl ValidatorManagerImpl {
     fn report_teardown_failure(&self, error: String) {
         let drained = self.current_sessions.is_empty()
             && self.future_sessions.is_empty()
+            && self.observer_groups.is_empty()
             && self.block_sync_observers.is_empty()
             && self.background_tasks.is_empty()
             && self.retiring_observers.iter().all(|observer| observer.teardown_drained())
@@ -2858,6 +2944,14 @@ impl ValidatorManagerImpl {
                 self.retire_group_generation(id, group, None);
             }
         }
+        let observer_groups: Vec<_> = self.observer_groups.keys().cloned().collect();
+        for id in observer_groups {
+            if reason == DisableReason::Retire {
+                self.retire_observer_group(&id);
+            } else if let Some(group) = self.observer_groups.remove(&id) {
+                self.retire_group_generation(id.0, group, None);
+            }
+        }
         let observer_ids: Vec<_> = self.block_sync_observers.keys().cloned().collect();
         for id in observer_ids {
             self.retire_observer(&id);
@@ -2955,12 +3049,9 @@ impl ValidatorManagerImpl {
         // We retain only sessions selected by the current shard iteration and swap atomically
         // at the end. Old current entries that are not selected are stopped right after swap.
         let mut new_current_sessions: HashMap<UInt256, Arc<ValidatorGroup>> = HashMap::new();
-        // same pattern for block-sync observers.
-        // Session ids touched this pass survive the swap; the rest are
-        // reaped (stop + remove). D3 lifecycle: an observer dies when
-        // we start validating its shard (session_id won't appear in this pass)
-        // or the session simply ends
-        let mut touched_observer_sessions: HashSet<UInt256> = HashSet::new();
+        // Observer groups are selected after the validator groups, over the
+        // same shards, as the reference node does.
+        let observer_shards = new_shards.clone();
 
         for (ident, prev_blocks) in new_shards {
             let cc_seqno_from_state = if ident.is_masterchain() {
@@ -3086,28 +3177,22 @@ impl ValidatorManagerImpl {
                 ConsensusOptions::Simplex(options) => Some(options.protocol),
                 _ => None,
             };
-            let observers_in_overlay =
-                simplex_protocol.is_some_and(|protocol| protocol.observers_in_private_overlay());
-            // Every Simplex session, of every protocol, is admitted from this
-            // authenticated snapshot: as the validator custody selected, or as
-            // an observer the reference observer selection admits.
-            let authenticated = match simplex_protocol {
-                Some(_) => self.simplex_session_runtime(
+            // Every Simplex validator group, of every protocol, is admitted
+            // from this authenticated snapshot as the validator custody
+            // selected. Observer groups are selected separately, as the
+            // reference node does, independently of this node's membership.
+            let authenticated = match (simplex_protocol, local_member.as_ref()) {
+                (Some(_), Some(validator)) => Some(self.simplex_session_runtime(
                     mc_state,
                     &ident,
                     cc_seqno,
                     max_vertical_seqno,
                     keyblock_seqno,
                     vsubset.list(),
-                    local_member.as_ref(),
-                    observers_in_overlay,
-                )?,
-                None => None,
+                    SessionAdmission::Validator(validator),
+                )?),
+                _ => None,
             };
-            if observers_in_overlay && authenticated.is_none() {
-                // Neither a member nor an authorized observer of this session.
-                continue;
-            }
             if let Some(runtime) = &authenticated {
                 if self.engine.finality_recovery_owns(runtime) {
                     // A recovery owner will wake this manager after checked join.
@@ -3146,8 +3231,6 @@ impl ValidatorManagerImpl {
             let runs_group =
                 authenticated.is_some() || (simplex_protocol.is_none() && local_member.is_some());
             if runs_group {
-                self.retire_observer(&session_id);
-                self.drain_retiring().await?;
                 log::debug!(
                     target: "validator_manager",
                     "subset for session: shard {}, cc_seqno {}, keyblock_seqno {}, \
@@ -3204,6 +3287,11 @@ impl ValidatorManagerImpl {
                         ) else {
                             continue;
                         };
+                        // The validator group takes the session's overlays over
+                        // from any observer identity of this node: the transport
+                        // carries one local identity per overlay.
+                        self.retire_session_observers(&session_id);
+                        self.drain_retiring().await?;
                         log::info!(target: "validator_manager",
                             "SESSION_LIFECYCLE: create_current shard={} cc_seqno={} \
                              session_id={:x} consensus={} local_key={}",
@@ -3280,30 +3368,6 @@ impl ValidatorManagerImpl {
                 }
             } else {
                 log::trace!(target: "validator_manager", "We are not in subset for {}", ident);
-                // Observer mode for shards we don't validate
-                // (C++ `manager.cpp:2462-2554`, `get_or_make_next_group` is_validator=false)
-                if let Some(bs_params) = block_sync_overlay_params.as_ref() {
-                    touched_observer_sessions.insert(session_id.clone());
-                    if !self.block_sync_observers.contains_key(&session_id) {
-                        let simplex = consensus_options.as_simplex();
-                        let use_quic = simplex.map(|o| o.use_quic).unwrap_or(false);
-                        let proto_version = simplex.map(|o| o.proto_version).unwrap_or(5);
-                        if let Err(e) = self.try_spawn_observer(
-                            &ident,
-                            &session_id,
-                            mc_state,
-                            vsubset.list(),
-                            bs_params.clone(),
-                            use_quic,
-                            proto_version,
-                        ) {
-                            log::warn!(
-                                target: "validator_manager",
-                                "observer not spawned for shard={ident} session={session_id:x}: {e}"
-                            );
-                        }
-                    }
-                }
             }
             log::trace!(target: "validator_manager", "Session {} started (if necessary)", ident);
         }
@@ -3317,21 +3381,274 @@ impl ValidatorManagerImpl {
             self.current_sessions.len()
         );
 
-        // reap observers whose session_id wasn't touched this pass.
-        // Triggers when we begin validating a previously-observed
-        // shard (the group arm fires instead of the observer arm)
-        // or when the shard simply rotates out
-        let stale_observer_ids: Vec<UInt256> = self
+        self.start_observer_groups(
+            &observer_shards,
+            &validator_list_id,
+            full_validator_set.utime_since(),
+            keyblock_seqno,
+            sessions_options,
+            mc_state,
+            mc_state_extra,
+            master_cc_range,
+            last_masterchain_block,
+            do_unsafe_catchain_rotate,
+        )
+        .await
+    }
+
+    /// The reference node's observer groups: for every current shard whose
+    /// protocol has observers (block sync, or observers in the private
+    /// overlay), one group per session and local transport identity the
+    /// reference observer selection admits. This is independent of whether
+    /// this node validates the same session under another identity. A
+    /// committee that is not post-quantum or exceeds the launch ceiling gets
+    /// none. Groups no longer selected are retired; a retired observer
+    /// namespace gets its own cleanup record and the session is not fenced.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_observer_groups(
+        &mut self,
+        shards: &HashMap<ShardIdent, Vec<BlockIdExt>>,
+        validator_list_id: &ValidatorListHash,
+        utime_since: u32,
+        keyblock_seqno: u32,
+        sessions_options: &SessionsOptions,
+        mc_state: &ShardStateStuff,
+        mc_state_extra: &McStateExtra,
+        master_cc_range: &RangeInclusive<u32>,
+        last_masterchain_block: &BlockIdExt,
+        do_unsafe_catchain_rotate: bool,
+    ) -> Result<()> {
+        let full_validator_set = mc_state_extra.config.validator_set()?;
+        let max_vertical_seqno = u32::try_from(self.engine.hardforks().len())?;
+        let mc_now = mc_state.state()?.gen_time();
+        let mut selected: HashSet<ObserverGroupId> = HashSet::new();
+        let mut first_failure: Option<rtos_block::Error> = None;
+        for (ident, prev_blocks) in shards {
+            // Unsafe rotation cannot alter the canonical session identity; the
+            // validator pass refuses it, and no observer is selected either.
+            if do_unsafe_catchain_rotate {
+                break;
+            }
+            let cc_seqno = if ident.is_masterchain() {
+                *master_cc_range.end()
+            } else {
+                mc_state_extra.shards().calc_shard_cc_seqno(ident)?
+            };
+            let prev = PrevBlockHistory::with_prevs(ident, prev_blocks.clone());
+            let Some(subset) = try_calc_subset_for_workchain(
+                &full_validator_set,
+                mc_state,
+                ident,
+                cc_seqno,
+                prev.get_next_seqno().unwrap_or_default(),
+            )?
+            else {
+                continue;
+            };
+            let vsubset =
+                ValidatorSet::with_cc_seqno(0, 0, 0, cc_seqno, subset.validators.clone())?;
+            let (general_session_info, session_id) = derive_governing_session_info(
+                mc_state,
+                ident,
+                vsubset.list(),
+                cc_seqno,
+                keyblock_seqno,
+                max_vertical_seqno,
+            )?;
+            // A missing or unsupported configuration, or a committee that is
+            // not post-quantum, selects no observer group.
+            let (consensus_options, block_sync_params) = match self.select_consensus_options(
+                &session_id,
+                ident,
+                mc_state,
+                sessions_options.get_session_options(ident),
+                cc_seqno,
+                &vsubset,
+            ) {
+                Ok(selected) => selected,
+                Err(error) => {
+                    log::debug!(target: "validator_manager",
+                        "No observer group for shard {ident} session {session_id:x}: {error}");
+                    continue;
+                }
+            };
+            let ConsensusOptions::Simplex(options) = &consensus_options else {
+                continue;
+            };
+            let protocol = options.protocol;
+            if !protocol.enable_block_sync() && !protocol.observers_in_private_overlay() {
+                continue;
+            }
+            let observers = self.local_observers(mc_state.config_params()?, vsubset.list())?;
+            if observers.is_empty() {
+                continue;
+            }
+            let ceiling = if ident.is_masterchain() {
+                OBSERVER_MAX_MASTERCHAIN_COMMITTEE
+            } else {
+                OBSERVER_MAX_SHARD_COMMITTEE
+            };
+            if vsubset.list().len() > ceiling {
+                log::error!(target: "validator_manager",
+                    "refusing to create observer group for {ident}: committee has {} members, \
+                     above launch ceiling {ceiling}", vsubset.list().len());
+                continue;
+            }
+            for observer in observers {
+                let id: ObserverGroupId = (session_id.clone(), observer.adnl().clone());
+                if let Some(other) = self.session_transport_owner(&id) {
+                    // The private and block-sync overlays of a session are
+                    // registered once per overlay identity, under one local
+                    // transport key; a second local identity of the same
+                    // session cannot join them on this node.
+                    if self.observer_transport_conflicts.insert(id.clone()) {
+                        log::error!(target: "validator_manager",
+                            "observer group of shard {ident} session {session_id:x} at {} is \
+                             not created: this node already joins the session's overlays as \
+                             {other}, and the transport carries one local identity per overlay",
+                            id.1);
+                    }
+                    continue;
+                }
+                self.observer_transport_conflicts.remove(&id);
+                selected.insert(id.clone());
+                if !protocol.observers_in_private_overlay() {
+                    let Some(bs_params) = block_sync_params.as_ref() else {
+                        continue;
+                    };
+                    if !self.block_sync_observers.contains_key(&id) {
+                        if let Err(error) = self.try_spawn_observer(
+                            ident,
+                            &id,
+                            bs_params.clone(),
+                            options.use_quic,
+                            options.proto_version,
+                        ) {
+                            log::warn!(target: "validator_manager",
+                                "observer not spawned for shard={ident} \
+                                 session={session_id:x} local_key={}: {error}", id.1);
+                        }
+                    }
+                    continue;
+                }
+                let runtime = self.simplex_session_runtime(
+                    mc_state,
+                    ident,
+                    cc_seqno,
+                    max_vertical_seqno,
+                    keyblock_seqno,
+                    vsubset.list(),
+                    SessionAdmission::Observer(observer),
+                )?;
+                if self.engine.finality_recovery_owns(&runtime) {
+                    // A recovery owner will wake this manager after checked join;
+                    // an existing group is kept through the reservation race.
+                    continue;
+                }
+                // Admission changes can happen without changing the session hash.
+                if self.observer_groups.get(&id).is_some_and(|group| {
+                    !group.authenticated_runtime().is_some_and(|old| old.same_admission(&runtime))
+                }) {
+                    if let Some(old) = self.observer_groups.remove(&id) {
+                        self.retire_replaced_admission(session_id.clone(), old, &runtime);
+                    }
+                    self.drain_retiring().await?;
+                }
+                let group = match self.observer_groups.get(&id) {
+                    Some(group) => group.clone(),
+                    None => {
+                        if self.cleanup.is_delete_in_flight(&session_id) {
+                            log::info!(target: "validator_manager",
+                                "Deferring observer group {session_id:x} for shard {ident}: \
+                                 cleanup delete in flight");
+                            continue;
+                        }
+                        if !self.admit_session_creation(&session_id) {
+                            continue;
+                        }
+                        let Some((transport_key, _)) = self.admit_session_group(
+                            ident,
+                            vsubset.list(),
+                            None,
+                            Some(&runtime),
+                            &consensus_options,
+                        ) else {
+                            continue;
+                        };
+                        log::info!(target: "validator_manager",
+                            "SESSION_LIFECYCLE: create_observer shard={ident} cc_seqno={cc_seqno} \
+                             session_id={session_id:x} local_key={}", id.1);
+                        metrics::counter!(
+                            "rtos_node_validator_session_created_total",
+                            "consensus" => "simplex"
+                        )
+                        .increment(1);
+                        self.cleanup.on_group_created(&session_id);
+                        let group = ValidatorGroup::new(
+                            general_session_info.clone(),
+                            transport_key,
+                            session_id.clone(),
+                            validator_list_id.clone(),
+                            vsubset.clone(),
+                            utime_since,
+                            consensus_options.clone(),
+                            self.engine.clone(),
+                            self.config.unsafe_resync_catchains.contains(&cc_seqno),
+                            block_sync_params.clone(),
+                        )
+                        .with_recovered_authenticated_runtime(runtime.clone())
+                        .await?;
+                        let group = Arc::new(group);
+                        // Registered before any await of its start.
+                        self.observer_groups.insert(id.clone(), group.clone());
+                        group
+                    }
+                };
+                // One observer group failing to start does not hold back the
+                // others: it stays owned, the pass goes on, and the first
+                // failure is returned once the pass is complete, so a retryable
+                // one is retried and a permanent one leaves the invocation.
+                let started = async {
+                    if group.try_prepare_start().await? {
+                        group
+                            .start_session(
+                                prev.get_prevs().to_vec(),
+                                last_masterchain_block.clone(),
+                                SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(mc_now)),
+                                self.rt.clone(),
+                            )
+                            .await?;
+                    }
+                    Ok::<_, rtos_block::Error>(())
+                }
+                .await;
+                if let Err(error) = started {
+                    log::warn!(target: "validator_manager",
+                        "observer group of shard {ident} session {session_id:x} at {} did not \
+                         start: {error}", id.1);
+                    first_failure.get_or_insert(error);
+                }
+            }
+        }
+        let stale: Vec<_> =
+            self.observer_groups.keys().filter(|id| !selected.contains(*id)).cloned().collect();
+        for id in stale {
+            self.retire_observer_group(&id);
+        }
+        let stale: Vec<_> = self
             .block_sync_observers
             .keys()
-            .filter(|sid| !touched_observer_sessions.contains(*sid))
+            .filter(|id| !selected.contains(*id))
             .cloned()
             .collect();
-        for sid in stale_observer_ids {
-            self.retire_observer(&sid);
+        for id in stale {
+            self.retire_observer(&id);
         }
         self.drain_retiring().await?;
-        Ok(())
+        match first_failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Main per-masterchain-block update loop.
@@ -3683,16 +4000,15 @@ impl ValidatorManagerImpl {
                 };
 
                 let authenticated = match &consensus_options {
-                    ConsensusOptions::Simplex(_) => self.simplex_session_runtime(
+                    ConsensusOptions::Simplex(_) => Some(self.simplex_session_runtime(
                         &mc_state,
                         ident,
                         *next_cc_seqno,
                         max_vertical_seqno,
                         keyblock_seqno,
                         vsubset.list(),
-                        Some(&selected),
-                        false,
-                    )?,
+                        SessionAdmission::Validator(&selected),
+                    )?),
                     _ => None,
                 };
                 if authenticated

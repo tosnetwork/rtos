@@ -49,6 +49,7 @@ fn configure(
     bootstrap: &mut EmulatorNetworkBootstrap,
     members: &[&Member],
     previous: &[ValidatorDescr],
+    next: &[ValidatorDescr],
     protocol: u8,
 ) -> Result<()> {
     let set: Vec<_> = members.iter().map(|member| member.descriptor()).collect();
@@ -60,6 +61,13 @@ fn configure(
         bootstrap.config_params.set_config(ConfigParamEnum::ConfigParam32(
             rtos_block::ConfigParam32 {
                 prev_validators: ValidatorSet::with_cc_seqno(0, u32::MAX, 1, 0, previous.to_vec())?,
+            },
+        ))?;
+    }
+    if !next.is_empty() {
+        bootstrap.config_params.set_config(ConfigParamEnum::ConfigParam36(
+            rtos_block::ConfigParam36 {
+                next_validators: ValidatorSet::with_cc_seqno(0, u32::MAX, 1, 0, next.to_vec())?,
             },
         ))?;
     }
@@ -95,8 +103,19 @@ async fn build_fixture(
     custody: Option<Arc<PqCustodyShared>>,
     transports: &[&Member],
 ) -> Result<Fixture> {
+    build_fixture_with_next(members, previous, &[], protocol, custody, transports).await
+}
+
+async fn build_fixture_with_next(
+    members: &[&Member],
+    previous: &[ValidatorDescr],
+    next: &[ValidatorDescr],
+    protocol: u8,
+    custody: Option<Arc<PqCustodyShared>>,
+    transports: &[&Member],
+) -> Result<Fixture> {
     let mut bootstrap = EmulatorNetworkBootstrap::build(2)?;
-    configure(&mut bootstrap, members, previous, protocol)?;
+    configure(&mut bootstrap, members, previous, next, protocol)?;
     let mut engine = BootstrapTestEngine::new_with_local_keys(&bootstrap, Vec::new()).await?;
     engine.custody = custody;
     let network = Arc::get_mut(&mut engine.validator_network).unwrap();
@@ -137,7 +156,11 @@ async fn teardown(mut manager: ValidatorManagerImpl) -> Result<()> {
         manager.current_sessions.keys().chain(manager.future_sessions.keys()).cloned().collect();
     tokio::time::timeout(Duration::from_secs(20), manager.stop_and_remove_sessions(&ids))
         .await
-        .map_err(|e| error!("custody manager teardown: {e}"))?
+        .map_err(|e| error!("custody manager teardown: {e}"))??;
+    // Observer groups are not session-fenced; shutdown stops them.
+    tokio::time::timeout(Duration::from_secs(20), manager.stop_validation())
+        .await
+        .map_err(|e| error!("custody manager observer teardown: {e}"))?
 }
 
 fn masterchain_committee(fixture: &Fixture) -> Result<Vec<ValidatorDescr>> {
@@ -346,18 +369,15 @@ async fn protocol_2_custody_selects_the_validator_admission() -> Result<()> {
     let manager = manager_of(&fixture);
     let selected = manager.local_validator_id(&committee).expect("custody member");
     anyhow::ensure!(selected == ours.validator_id);
-    let runtime = manager
-        .simplex_session_runtime(
-            &fixture.state,
-            &ShardIdent::masterchain(),
-            0,
-            0,
-            0,
-            &committee,
-            Some(&selected),
-            true,
-        )?
-        .ok_or_else(|| error!("no admission"))?;
+    let runtime = manager.simplex_session_runtime(
+        &fixture.state,
+        &ShardIdent::masterchain(),
+        0,
+        0,
+        0,
+        &committee,
+        SessionAdmission::Validator(&selected),
+    )?;
     let LocalRole::Validator(index) = runtime.local_role() else { fail!("observer admission") };
     anyhow::ensure!(committee[index as usize].validator_id()? == ours.validator_id);
     anyhow::ensure!(runtime.local_adnl() == ours.transport.id());
@@ -393,21 +413,23 @@ async fn observers_are_selected_by_custody_outside_the_committee() -> Result<()>
         .await?;
         let committee = masterchain_committee(&fixture)?;
         let manager = manager_of(&fixture);
-        let observers = manager
-            .local_observers(fixture.state.config_params()?, &committee)?
+        let selected = manager.local_observers(fixture.state.config_params()?, &committee)?;
+        let observers = selected.iter().map(|observer| observer.adnl().clone()).collect::<Vec<_>>();
+        let runtime = selected
             .into_iter()
-            .map(|observer| observer.adnl().clone())
-            .collect::<Vec<_>>();
-        let runtime = manager.simplex_session_runtime(
-            &fixture.state,
-            &ShardIdent::masterchain(),
-            0,
-            0,
-            0,
-            &committee,
-            None,
-            true,
-        )?;
+            .next()
+            .map(|observer| {
+                manager.simplex_session_runtime(
+                    &fixture.state,
+                    &ShardIdent::masterchain(),
+                    0,
+                    0,
+                    0,
+                    &committee,
+                    SessionAdmission::Observer(observer),
+                )
+            })
+            .transpose()?;
         teardown(manager).await?;
         Ok::<_, anyhow::Error>((observers, runtime))
     };
@@ -496,18 +518,15 @@ async fn a_group_takes_only_the_signer_of_its_admitted_member() -> Result<()> {
     let committee = set.list().to_vec();
     let shard = ShardIdent::masterchain();
     let manager = manager_of(&fixture);
-    let runtime = manager
-        .simplex_session_runtime(
-            &fixture.state,
-            &shard,
-            0,
-            0,
-            0,
-            &committee,
-            Some(&ours.validator_id),
-            false,
-        )?
-        .unwrap();
+    let runtime = manager.simplex_session_runtime(
+        &fixture.state,
+        &shard,
+        0,
+        0,
+        0,
+        &committee,
+        SessionAdmission::Validator(&ours.validator_id),
+    )?;
     let (info, id) = derive_governing_session_info(&fixture.state, &shard, &committee, 0, 0, 0)?;
     let ConsensusOptions::Simplex(options) = simplex_options(1) else { unreachable!() };
     let options = SimplexSessionOptions {
@@ -586,18 +605,15 @@ async fn the_session_factory_takes_a_signer_for_validators_only() -> Result<()> 
         let committee = masterchain_committee(&fixture)?;
         let shard = ShardIdent::masterchain();
         let manager = manager_of(&fixture);
-        let validator = manager
-            .simplex_session_runtime(
-                &fixture.state,
-                &shard,
-                0,
-                0,
-                0,
-                &committee,
-                Some(&ours.validator_id),
-                false,
-            )?
-            .ok_or_else(|| error!("protocol {protocol}: no validator admission"))?;
+        let validator = manager.simplex_session_runtime(
+            &fixture.state,
+            &shard,
+            0,
+            0,
+            0,
+            &committee,
+            SessionAdmission::Validator(&ours.validator_id),
+        )?;
         let options = SimplexSessionOptions {
             protocol: validator.protocol(),
             proto_version: validator.carrier_version(),
@@ -680,4 +696,178 @@ async fn the_session_factory_takes_a_signer_for_validators_only() -> Result<()> 
         teardown(manager).await?;
     }
     Ok(())
+}
+
+/// Every observer group of the manager, checked to be an observer of its key.
+fn observer_groups_of(manager: &ValidatorManagerImpl) -> Result<Vec<(ObserverGroupId, LocalRole)>> {
+    let mut groups = Vec::new();
+    for ((session, adnl), group) in &manager.observer_groups {
+        let runtime = group.authenticated_runtime().ok_or_else(|| error!("no runtime"))?;
+        anyhow::ensure!(runtime.session_id() == session, "observer group under another session");
+        anyhow::ensure!(runtime.local_adnl() == adnl, "observer group under another identity");
+        anyhow::ensure!(group.consensus_signer().is_none(), "an observer group has a signer");
+        groups.push(((session.clone(), adnl.clone()), runtime.local_role()));
+    }
+    Ok(groups)
+}
+
+/// The reference manager keys observer groups by session and local identity,
+/// independently of validator membership: a node that validates one session
+/// observes the other sessions it is no committee member of, under the
+/// custody-selected observer identity, with no signer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observer_groups_are_owned_per_session_beside_validator_groups() -> Result<()> {
+    let first = Member::new(0x70, 0)?;
+    let second = Member::new(0x71, 0)?;
+    let third = Member::new(0x72, 0)?;
+    let fixture = build_fixture(
+        &[&first, &second, &third],
+        &[],
+        2,
+        Some(custody_of(&third, &[(third.store.clone(), 0)])),
+        &[&third],
+    )
+    .await?;
+    let mut manager = manager_of(&fixture);
+    update(&mut manager, &fixture.state).await;
+    let observers = observer_groups_of(&manager)?;
+    anyhow::ensure!(!observers.is_empty(), "no observer group");
+    for ((session, adnl), role) in &observers {
+        anyhow::ensure!(*role == LocalRole::Observer);
+        anyhow::ensure!(adnl == third.transport.id());
+        anyhow::ensure!(
+            !manager.current_sessions.contains_key(session),
+            "a session is both validated and observed under one transport"
+        );
+    }
+    // The masterchain committee is the two main validators: the third observes it.
+    let masterchain = observers.iter().find(|((session, _), _)| {
+        manager
+            .observer_groups
+            .get(&(session.clone(), third.transport.id().clone()))
+            .is_some_and(|group| group.shard().is_masterchain())
+    });
+    anyhow::ensure!(masterchain.is_some(), "the masterchain session is not observed");
+    for group in manager.current_sessions.values() {
+        let runtime = group.authenticated_runtime().ok_or_else(|| error!("no runtime"))?;
+        anyhow::ensure!(matches!(runtime.local_role(), LocalRole::Validator(_)));
+        anyhow::ensure!(group.consensus_signer().is_some(), "a validator group lacks its signer");
+    }
+    anyhow::ensure!(manager.observer_transport_conflicts.is_empty());
+    // An unchanged pass keeps the same groups.
+    let before: Vec<_> = manager.observer_groups.values().cloned().collect();
+    update(&mut manager, &fixture.state).await;
+    for group in before {
+        anyhow::ensure!(
+            manager.observer_groups.values().any(|kept| Arc::ptr_eq(kept, &group)),
+            "an unchanged observer group was recreated"
+        );
+    }
+    teardown(manager).await
+}
+
+/// A descriptor listed in several total sets is one observer identity. Two
+/// identities of one session are distinct observer ids; the transport joins
+/// a session's overlays under one local identity, so the second is reported
+/// and not created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observer_identities_are_deduplicated_and_one_session_joins_once() -> Result<()> {
+    let first = Member::new(0x74, 0)?;
+    let second = Member::new(0x75, 0)?;
+    let outside = Member::new(0x76, 0)?;
+    let other = Member::new(0x77, 0)?;
+    // The same outside descriptor in the previous and next sets.
+    let fixture = build_fixture_with_next(
+        &[&first, &second],
+        &[outside.descriptor()],
+        &[outside.descriptor()],
+        2,
+        Some(custody_of(&outside, &[(outside.store.clone(), 0)])),
+        &[&outside],
+    )
+    .await?;
+    let committee = masterchain_committee(&fixture)?;
+    let manager = manager_of(&fixture);
+    let selected = manager.local_observers(fixture.state.config_params()?, &committee)?;
+    anyhow::ensure!(selected.len() == 1, "one descriptor in two sets is one identity");
+    teardown(manager).await?;
+
+    // Two outside identities, both custodied: two observer ids per session.
+    let mut custody = PqConsensusCustody::default();
+    custody.install(outside.validator_id.clone(), outside.store.clone(), 0, 0)?;
+    custody.install(other.validator_id.clone(), other.store.clone(), 0, 0)?;
+    let custody = Arc::new(PqCustodyShared::new(outside.validator_id.clone(), custody));
+    let fixture = build_fixture_with_next(
+        &[&first, &second],
+        &[outside.descriptor()],
+        &[other.descriptor()],
+        2,
+        Some(custody),
+        &[&outside, &other],
+    )
+    .await?;
+    let committee = masterchain_committee(&fixture)?;
+    let mut manager = manager_of(&fixture);
+    let selected = manager.local_observers(fixture.state.config_params()?, &committee)?;
+    anyhow::ensure!(selected.len() == 2, "two distinct observer identities");
+    update(&mut manager, &fixture.state).await;
+    let observers = observer_groups_of(&manager)?;
+    let sessions: HashSet<_> = observers.iter().map(|((session, _), _)| session.clone()).collect();
+    anyhow::ensure!(!sessions.is_empty());
+    anyhow::ensure!(observers.len() == sessions.len(), "one transport identity per session");
+    let first_id = selected[0].adnl().clone();
+    for ((session, adnl), _) in &observers {
+        anyhow::ensure!(adnl == &first_id, "the first selected identity joins the session");
+        anyhow::ensure!(manager
+            .observer_transport_conflicts
+            .contains(&(session.clone(), selected[1].adnl().clone())));
+    }
+    teardown(manager).await
+}
+
+/// An observer group whose identity custody no longer holds is retired
+/// through the ordinary update: its own observer namespace gets a cleanup
+/// record and the session is never fenced; retiring one observer group
+/// leaves another one intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retired_observer_groups_record_their_own_namespace_without_a_fence() -> Result<()> {
+    use consensus_common::validator_cleanup::{parse_canonical_namespace_name, NamespaceLayout};
+    let first = Member::new(0x78, 0)?;
+    let second = Member::new(0x79, 0)?;
+    let outside = Member::new(0x7a, 1000)?;
+    let fixture = build_fixture(
+        &[&first, &second],
+        &[outside.descriptor()],
+        2,
+        Some(custody_of(&outside, &[(outside.store.clone(), 1000)])),
+        &[&outside],
+    )
+    .await?;
+    let mut manager = manager_of(&fixture);
+    update(&mut manager, &fixture.state).await;
+    let ids: Vec<_> = manager.observer_groups.keys().cloned().collect();
+    anyhow::ensure!(ids.len() >= 2, "expected masterchain and shard observer groups: {ids:?}");
+    let groups: Vec<_> = manager.observer_groups.values().cloned().collect();
+    // Retire one: its own namespace record, no fence, the others stay.
+    let fence = manager.destroyed_sessions.clone();
+    manager.retire_observer_group(&ids[0]);
+    anyhow::ensure!(manager.pending_cleanup_records.len() == 1);
+    let record = manager.pending_cleanup_records[0].clone();
+    anyhow::ensure!(record.session_id == ids[0].0);
+    anyhow::ensure!(
+        parse_canonical_namespace_name(&record.namespace, &ids[0].0).map(|parsed| parsed.layout)
+            == Some(NamespaceLayout::V2Observer(UInt256::from(*ids[0].1.data())))
+    );
+    anyhow::ensure!(manager.destroyed_sessions == fence, "an observer retirement fenced");
+    anyhow::ensure!(manager.observer_groups.len() == ids.len() - 1);
+    manager.drain_retiring().await?;
+    // Custody expiry retires every remaining observer group at the next update.
+    fixture.engine.clock_default.store(2000, Ordering::SeqCst);
+    update(&mut manager, &fixture.state).await;
+    anyhow::ensure!(manager.observer_groups.is_empty(), "an expired identity still observes");
+    anyhow::ensure!(manager.destroyed_sessions == fence, "an observer retirement fenced");
+    for group in groups {
+        anyhow::ensure!(group.teardown_drained(), "a retired observer group was not drained");
+    }
+    teardown(manager).await
 }
