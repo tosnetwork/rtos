@@ -1503,3 +1503,32 @@ fn test_block_order() {
     let block = Block::construct_from_bytes(&block).unwrap();
     pretty_assertions::assert_eq!("17b00540960604", block_order(&block, 123).unwrap());
 }
+
+#[test]
+fn chained_temp_key_signature_has_no_json_form() {
+    let key =
+        ValidatorTempKey::with_params(UInt256::from([3; 32]), SigPubKey::with_bytes([4; 32]), 1, 2);
+    let simple = CryptoSignature::with_r_s(&[1; 32], &[2; 32]);
+    let certificate = SignedCertificate {
+        certificate: Certificate {
+            temp_key: SigPubKey::with_bytes([5; 32]),
+            valid_since: 1,
+            valid_until: 2,
+        },
+        certificate_signature: simple.clone(),
+    };
+    for (signature, ok) in
+        [(simple.clone(), true), (CryptoSignature::chained(certificate, [6; 64]), false)]
+    {
+        let mut param = ConfigParam39::new();
+        param
+            .insert(
+                &UInt256::from([1; 32]),
+                &ValidatorSignedTempKey::with_key_and_signature(key.clone(), signature),
+            )
+            .unwrap();
+        let cell = param.serialize().unwrap();
+        let json = serialize_known_config_param(39, cell, SerializationMode::Standart);
+        assert_eq!(json.is_ok(), ok);
+    }
+}

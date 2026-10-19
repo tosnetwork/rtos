@@ -1134,3 +1134,332 @@ fn test_signature_weight_rejects_duplicate_unknown_and_invalid_membership() {
     oversized[0].weight = crate::MAX_TOTAL_VALIDATOR_WEIGHT;
     assert!(signatures.check_signatures(&oversized, data).is_err());
 }
+
+// CryptoSignature shapes (simple, chained, nested chains and malformed
+// variants) inside three consumers: a standalone CryptoSignature cell, a
+// standalone ValidatorSignedTempKey cell and a ConfigParam 39 value. The
+// reference verdicts in tests/data/crypto-signature-vectors.tsv come from the
+// generated reference validators (validate_ref with 1024 cells).
+
+fn sig_bits(b: &mut BuilderData, tag: usize, fill: u8, bits: usize) {
+    b.append_bits(tag, 4).unwrap();
+    b.append_raw(&[fill; 64], bits).unwrap();
+}
+
+/// A signed-certificate cell; `sig` appends the certificate signature.
+fn cert_cell(cert_tag: usize, key_tag: u32, sig: &dyn Fn(&mut BuilderData)) -> Cell {
+    let mut b = BuilderData::new();
+    b.append_bits(cert_tag, 4).unwrap();
+    b.append_u32(key_tag).unwrap();
+    b.append_raw(&[0x33; 32], 256).unwrap();
+    b.append_u32(10).unwrap();
+    b.append_u32(20).unwrap();
+    sig(&mut b);
+    b.into_cell().unwrap()
+}
+
+/// A chain of `depth` certificates ending in a simple certificate signature.
+fn chain(depth: usize) -> Cell {
+    let mut cell = cert_cell(4, 0x8e81278a, &|b| sig_bits(b, 5, 0x44, 512));
+    for _ in 1..depth {
+        let inner = cell.clone();
+        cell = cert_cell(4, 0x8e81278a, &move |b| {
+            b.append_bits(15, 4).unwrap();
+            b.checked_append_reference(inner.clone()).unwrap();
+            sig_bits(b, 5, 0x45, 512);
+        });
+    }
+    cell
+}
+
+fn chained_with(cert: Cell) -> BuilderData {
+    let mut b = BuilderData::new();
+    b.append_bits(15, 4).unwrap();
+    b.checked_append_reference(cert).unwrap();
+    sig_bits(&mut b, 5, 0x22, 512);
+    b
+}
+
+fn signature_shapes() -> Vec<(&'static str, BuilderData)> {
+    let simple = |fill| {
+        let mut b = BuilderData::new();
+        sig_bits(&mut b, 5, fill, 512);
+        b
+    };
+    let cert = |sig: &dyn Fn(&mut BuilderData)| cert_cell(4, 0x8e81278a, sig);
+    let mut shapes = vec![
+        ("simple", simple(0x11)),
+        ("chained", chained_with(chain(1))),
+        ("chained-depth2", chained_with(chain(2))),
+        ("chained-depth3", chained_with(chain(3))),
+        ("chained-depth40", chained_with(chain(40))),
+    ];
+    let mut short = BuilderData::new();
+    sig_bits(&mut short, 5, 0x11, 511);
+    shapes.push(("simple-short", short));
+    for (name, tag) in [("tag0", 0usize), ("tag4", 4), ("tag6", 6), ("tag14", 14)] {
+        let mut b = BuilderData::new();
+        sig_bits(&mut b, tag, 0x11, 512);
+        shapes.push((name, b));
+    }
+    let mut no_ref = BuilderData::new();
+    no_ref.append_bits(15, 4).unwrap();
+    sig_bits(&mut no_ref, 5, 0x22, 512);
+    shapes.push(("chained-no-ref", no_ref));
+    let mut temp_chained = BuilderData::new();
+    temp_chained.append_bits(15, 4).unwrap();
+    temp_chained.checked_append_reference(chain(1)).unwrap();
+    temp_chained.append_bits(15, 4).unwrap();
+    temp_chained.checked_append_reference(chain(1)).unwrap();
+    sig_bits(&mut temp_chained, 5, 0x22, 512);
+    shapes.push(("chained-temp-chained", temp_chained));
+    shapes.push((
+        "chained-cert-trailing-bit",
+        chained_with(cert(&|b| {
+            sig_bits(b, 5, 0x44, 512);
+            b.append_bit_one().unwrap();
+        })),
+    ));
+    shapes.push((
+        "chained-cert-extra-ref",
+        chained_with(cert(&|b| {
+            sig_bits(b, 5, 0x44, 512);
+            b.checked_append_reference(Cell::default()).unwrap();
+        })),
+    ));
+    shapes.push(("chained-cert-short", chained_with(cert(&|b| sig_bits(b, 5, 0x44, 511)))));
+    shapes.push((
+        "chained-cert-tag3",
+        chained_with(cert_cell(3, 0x8e81278a, &|b| sig_bits(b, 5, 0x44, 512))),
+    ));
+    shapes.push((
+        "chained-cert-tag5",
+        chained_with(cert_cell(5, 0x8e81278a, &|b| sig_bits(b, 5, 0x44, 512))),
+    ));
+    shapes.push((
+        "chained-cert-key-tag",
+        chained_with(cert_cell(4, 0x8e81278b, &|b| sig_bits(b, 5, 0x44, 512))),
+    ));
+    shapes.push((
+        "chained-depth2-inner-trailing-bit",
+        chained_with(cert(&|b| {
+            b.append_bits(15, 4).unwrap();
+            b.checked_append_reference(cert_cell(4, 0x8e81278a, &|b| {
+                sig_bits(b, 5, 0x44, 512);
+                b.append_bit_one().unwrap();
+            }))
+            .unwrap();
+            sig_bits(b, 5, 0x45, 512);
+        })),
+    ));
+    shapes.push(("chained-cert-special", {
+        let mut b = BuilderData::new();
+        b.append_bits(15, 4).unwrap();
+        let certs = chain(2);
+        let root = certs.repr_hash().clone();
+        let proof =
+            crate::MerkleProof::create(&certs, |h| *h == root).unwrap().serialize().unwrap();
+        assert_ne!(proof.cell_type(), crate::CellType::Ordinary);
+        b.checked_append_reference(proof).unwrap();
+        sig_bits(&mut b, 5, 0x22, 512);
+        b
+    }));
+    shapes
+}
+
+enum Outer {
+    Exact,
+    TrailingBit,
+    ExtraRef,
+}
+
+fn finish(mut b: BuilderData, outer: &Outer) -> Cell {
+    match outer {
+        Outer::Exact => {}
+        Outer::TrailingBit => {
+            b.append_bit_one().unwrap();
+        }
+        Outer::ExtraRef => {
+            b.checked_append_reference(Cell::default()).unwrap();
+        }
+    }
+    b.into_cell().unwrap()
+}
+
+fn append(b: &mut BuilderData, other: &BuilderData) {
+    b.checked_append_references_and_data(&SliceData::load_builder(other.clone()).unwrap()).unwrap();
+}
+
+fn temp_key_builder(sig: &BuilderData) -> BuilderData {
+    let key = crate::ValidatorTempKey::with_params(
+        UInt256::from([0x66; 32]),
+        SigPubKey::with_bytes([0x77; 32]),
+        3,
+        1000,
+    );
+    let mut b = BuilderData::new();
+    b.append_bits(4, 4).unwrap();
+    b.checked_append_reference(key.serialize().unwrap()).unwrap();
+    append(&mut b, sig);
+    b
+}
+
+/// (id, kind, cell) rows for the reference codec driver.
+fn crypto_signature_rows() -> Vec<(String, &'static str, Cell)> {
+    let mut rows = Vec::new();
+    for (shape, sig) in signature_shapes() {
+        for (suffix, outer) in [
+            ("", Outer::Exact),
+            ("-trailing-bit", Outer::TrailingBit),
+            ("-extra-ref", Outer::ExtraRef),
+        ] {
+            if !suffix.is_empty() && !matches!(shape, "simple" | "chained") {
+                continue;
+            }
+            rows.push((format!("{shape}{suffix}"), "cryptosig", finish(sig.clone(), &outer)));
+            rows.push((
+                format!("{shape}{suffix}"),
+                "signedtempkey",
+                finish(temp_key_builder(&sig), &outer),
+            ));
+            let mut dict = crate::HashmapE::with_bit_len(256);
+            let leaf = {
+                let mut leaf = temp_key_builder(&sig);
+                match outer {
+                    Outer::Exact => {}
+                    Outer::TrailingBit => {
+                        leaf.append_bit_one().unwrap();
+                    }
+                    Outer::ExtraRef => {
+                        leaf.checked_append_reference(Cell::default()).unwrap();
+                    }
+                }
+                leaf
+            };
+            dict.set_builder(SliceData::new(vec![0x55; 33]).get_slice(0, 256).unwrap(), &leaf)
+                .unwrap();
+            let mut p39 = BuilderData::new();
+            dict.write_hashmap_data(&mut p39).unwrap();
+            rows.push((format!("{shape}{suffix}"), "p39", p39.into_cell().unwrap()));
+        }
+    }
+    rows
+}
+
+/// The Rust verdict for one row: the typed reader for the standalone cells
+/// (with exact consumption) and the schema check for ConfigParam 39; every
+/// accepted cell must re-serialize to the identical cell.
+fn crypto_signature_verdict(kind: &str, cell: &Cell) -> bool {
+    match kind {
+        "cryptosig" => {
+            let mut slice = SliceData::load_cell(cell.clone()).unwrap();
+            match CryptoSignature::construct_from(&mut slice) {
+                Ok(sig) if slice.is_empty_cell() => {
+                    assert_eq!(&sig.serialize().unwrap(), cell);
+                    true
+                }
+                _ => false,
+            }
+        }
+        "signedtempkey" => {
+            let mut slice = SliceData::load_cell(cell.clone()).unwrap();
+            match crate::ValidatorSignedTempKey::construct_from(&mut slice) {
+                Ok(key) if slice.is_empty_cell() => {
+                    assert_eq!(&key.serialize().unwrap(), cell);
+                    true
+                }
+                _ => false,
+            }
+        }
+        "p39" => {
+            let valid =
+                crate::config_params::config_param_schema::config_param_is_valid(39, cell.clone());
+            if valid {
+                let param = crate::ConfigParam39::construct_from_cell(cell.clone()).unwrap();
+                let mut entries = 0;
+                param
+                    .validator_keys
+                    .iterate(|_| {
+                        entries += 1;
+                        Ok(true)
+                    })
+                    .unwrap();
+                assert_eq!(entries, 1);
+                assert_eq!(&param.serialize().unwrap(), cell);
+            }
+            valid
+        }
+        _ => unreachable!("{kind}"),
+    }
+}
+
+#[test]
+fn crypto_signature_shapes_match_reference_verdicts() {
+    let rows = crypto_signature_rows();
+    if let Ok(path) = std::env::var("RTOS_CRYPTO_SIGNATURE_EXPORT") {
+        let text: String = rows
+            .iter()
+            .map(|(id, kind, cell)| {
+                format!("{id}\t{kind}\t{}\n", hex::encode(crate::write_boc(cell).unwrap()))
+            })
+            .collect();
+        std::fs::write(path, text).unwrap();
+        return;
+    }
+    let fixture = include_str!("../../tests/data/crypto-signature-vectors.tsv");
+    let header = fixture.lines().next().unwrap();
+    assert!(header.contains("reference_commit=881240331ee48a291b96d73f8b8b93bae005ace0"));
+    let expected: std::collections::HashMap<_, _> = fixture
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| {
+            let f: Vec<_> = line.split('\t').collect();
+            ((f[0], f[1]), f[2] == "1")
+        })
+        .collect();
+    assert_eq!(expected.len(), rows.len());
+    let mut accepted = 0;
+    for (id, kind, cell) in &rows {
+        let reference = expected[&(id.as_str(), *kind)];
+        assert_eq!(crypto_signature_verdict(kind, cell), reference, "{id} {kind}");
+        accepted += usize::from(reference);
+    }
+    // simple and the four chain depths, in each of the three consumers
+    assert_eq!(accepted, 15);
+}
+
+#[test]
+fn chained_signature_accessors_and_refusals() {
+    let cell = finish(chained_with(chain(2)), &Outer::Exact);
+    let sig = CryptoSignature::construct_from_cell(cell).unwrap();
+    assert!(sig.is_chained());
+    assert_eq!(sig.as_bytes(), &[0x22; 64]);
+    let first = sig.signed_certificate().unwrap();
+    assert_eq!(first.certificate.temp_key.as_slice(), &[0x33; 32]);
+    assert_eq!((first.certificate.valid_since, first.certificate.valid_until), (10, 20));
+    assert!(first.certificate_signature.is_chained());
+    assert_eq!(first.certificate_signature.as_bytes(), &[0x45; 64]);
+    let second = first.certificate_signature.signed_certificate().unwrap();
+    assert!(!second.certificate_signature.is_chained());
+    assert_eq!(second.certificate_signature.as_bytes(), &[0x44; 64]);
+
+    // A chained signature never verifies as a signature by a key.
+    let key = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
+    let data = b"data";
+    let simple = CryptoSignature::from_bytes(&key.sign(data).unwrap()).unwrap();
+    let public = SigPubKey::from_bytes(key.pub_key().unwrap()).unwrap();
+    assert!(public.verify_signature(data, &simple));
+    let chained = CryptoSignature::chained(first.clone(), *simple.as_bytes());
+    assert!(!public.verify_signature(data, &chained));
+
+    // Block signature pairs refuse chained signatures on writing and reading.
+    let pair = CryptoSignaturePair::with_params(UInt256::from([1; 32]), chained.clone());
+    assert!(pair.serialize().is_err());
+    let mut b = BuilderData::new();
+    b.append_raw(&[1; 32], 256).unwrap();
+    chained.write_to(&mut b).unwrap();
+    assert!(CryptoSignaturePair::construct_from_cell(b.into_cell().unwrap()).is_err());
+    let pair = CryptoSignaturePair::with_params(UInt256::from([1; 32]), simple.clone());
+    let read = CryptoSignaturePair::construct_from_cell(pair.serialize().unwrap()).unwrap();
+    assert_eq!(read, pair);
+}

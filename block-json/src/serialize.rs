@@ -983,6 +983,11 @@ fn serialize_validator_signed_temp_keys(stk: &ValidatorKeys) -> Result<Value> {
         );
         serialize_field(&mut map, "seqno", val.key().seqno());
         serialize_field(&mut map, "valid_until", val.key().valid_until());
+        // The JSON form has only r and s; refuse a chained signature
+        // instead of dropping its certificate chain.
+        if val.signature().is_chained() {
+            fail!("chained signature of temporary key {} has no JSON form", key.as_hex_string())
+        }
         let (r, s) = val.signature().as_r_s_bytes();
         serialize_field(&mut map, "signature_r", hex::encode(r));
         serialize_field(&mut map, "signature_s", hex::encode(s));

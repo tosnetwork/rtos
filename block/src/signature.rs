@@ -29,23 +29,44 @@ use std::{
 use thiserror::Error;
 
 /*
-ed25519_signature#5 R:bits256 s:bits256 = CryptoSignature;
+ed25519_signature#5 R:bits256 s:bits256 = CryptoSignatureSimple;
+_ CryptoSignatureSimple = CryptoSignature;
+certificate#4 temp_key:SigPubKey valid_since:uint32 valid_until:uint32 = Certificate;
+signed_certificate$_ certificate:Certificate certificate_signature:CryptoSignature
+  = SignedCertificate;
+chained_signature#f signed_cert:^SignedCertificate temp_key_signature:CryptoSignatureSimple
+  = CryptoSignature;
 */
 ///
-/// CryptoSignature
+/// CryptoSignature: a simple Ed25519 signature, or a chained signature made
+/// with a temporary key that a signed certificate delegates. The certificate
+/// signature is a CryptoSignature again, so chains nest.
 ///
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CryptoSignature([u8; ED25519_SIGNATURE_LENGTH]);
+pub struct CryptoSignature {
+    /// The simple signature; for a chained signature, the temporary-key one.
+    signature: [u8; ED25519_SIGNATURE_LENGTH],
+    signed_cert: Option<Box<SignedCertificate>>,
+}
 
 impl Default for CryptoSignature {
     fn default() -> Self {
-        Self([0; ED25519_SIGNATURE_LENGTH])
+        Self::with_bytes([0; ED25519_SIGNATURE_LENGTH])
     }
 }
 
 impl CryptoSignature {
     pub fn with_bytes(bytes: [u8; ED25519_SIGNATURE_LENGTH]) -> Self {
-        Self(bytes)
+        Self { signature: bytes, signed_cert: None }
+    }
+
+    /// A chained signature: `temp_key_signature` made with the key that
+    /// `signed_cert` delegates.
+    pub fn chained(
+        signed_cert: SignedCertificate,
+        temp_key_signature: [u8; ED25519_SIGNATURE_LENGTH],
+    ) -> Self {
+        Self { signature: temp_key_signature, signed_cert: Some(Box::new(signed_cert)) }
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
@@ -54,10 +75,10 @@ impl CryptoSignature {
 
     pub fn from_r_s_str(r: &str, s: &str) -> Result<Self> {
         let mut signature = Self::default();
-        hex::decode_to_slice(r, &mut signature.0[..ED25519_SIGNATURE_LENGTH / 2]).map_err(
+        hex::decode_to_slice(r, &mut signature.signature[..ED25519_SIGNATURE_LENGTH / 2]).map_err(
             |err| BlockError::InvalidData(format!("error parsing `r` hex string: {}", err)),
         )?;
-        hex::decode_to_slice(s, &mut signature.0[ED25519_SIGNATURE_LENGTH / 2..]).map_err(
+        hex::decode_to_slice(s, &mut signature.signature[ED25519_SIGNATURE_LENGTH / 2..]).map_err(
             |err| BlockError::InvalidData(format!("error parsing `s` hex string: {}", err)),
         )?;
         Ok(signature)
@@ -65,19 +86,65 @@ impl CryptoSignature {
 
     pub fn with_r_s(r: &[u8; 32], s: &[u8; 32]) -> Self {
         let mut signature = Self::default();
-        signature.0[..ED25519_SIGNATURE_LENGTH / 2].copy_from_slice(r);
-        signature.0[ED25519_SIGNATURE_LENGTH / 2..].copy_from_slice(s);
+        signature.signature[..ED25519_SIGNATURE_LENGTH / 2].copy_from_slice(r);
+        signature.signature[ED25519_SIGNATURE_LENGTH / 2..].copy_from_slice(s);
         signature
     }
 
+    /// R and s of the simple signature; for a chained signature, of the
+    /// temporary-key signature (check `is_chained` first).
     pub fn as_r_s_bytes(&self) -> (&[u8], &[u8]) {
-        let r_bytes = &self.0[..ED25519_SIGNATURE_LENGTH / 2];
-        let s_bytes = &self.0[ED25519_SIGNATURE_LENGTH / 2..];
+        let r_bytes = &self.signature[..ED25519_SIGNATURE_LENGTH / 2];
+        let s_bytes = &self.signature[ED25519_SIGNATURE_LENGTH / 2..];
         (r_bytes, s_bytes)
     }
 
+    /// The simple signature; for a chained signature, the temporary-key
+    /// signature, which is not a signature by the certifying key (check
+    /// `is_chained` first).
     pub fn as_bytes(&self) -> &[u8; ED25519_SIGNATURE_LENGTH] {
-        &self.0
+        &self.signature
+    }
+
+    pub fn is_chained(&self) -> bool {
+        self.signed_cert.is_some()
+    }
+
+    pub fn signed_certificate(&self) -> Option<&SignedCertificate> {
+        self.signed_cert.as_deref()
+    }
+
+    /// Reads a CryptoSignatureSimple: tag #5 and the 512-bit signature.
+    fn read_simple(slice: &mut SliceData) -> Result<[u8; ED25519_SIGNATURE_LENGTH]> {
+        let tag = slice.get_next_int(4)? as u8;
+        if tag != CRYPTO_SIGNATURE_TAG {
+            fail!(Self::invalid_tag(tag as u32))
+        }
+        let mut signature = [0; ED25519_SIGNATURE_LENGTH];
+        slice.get_next_bytes_to_slice(&mut signature)?;
+        Ok(signature)
+    }
+
+    fn write_simple(
+        signature: &[u8; ED25519_SIGNATURE_LENGTH],
+        cell: &mut BuilderData,
+    ) -> Result<()> {
+        cell.append_bits(CRYPTO_SIGNATURE_TAG as usize, 4)?;
+        cell.append_raw(signature, ED25519_SIGNATURE_LENGTH * 8)?;
+        Ok(())
+    }
+
+    /// Writes a simple signature; a chained one is refused.
+    fn write_simple_only(&self, cell: &mut BuilderData) -> Result<()> {
+        if self.is_chained() {
+            fail!(BlockError::InvalidData("a chained signature is not allowed here".to_string()))
+        }
+        Self::write_simple(&self.signature, cell)
+    }
+
+    /// Reads a simple signature; a chained one is refused.
+    fn read_simple_only(slice: &mut SliceData) -> Result<Self> {
+        Ok(Self::with_bytes(Self::read_simple(slice)?))
     }
 }
 
@@ -85,29 +152,152 @@ impl FromStr for CryptoSignature {
     type Err = crate::Error;
     fn from_str(s: &str) -> Result<Self> {
         let mut signature = Self::default();
-        hex::decode_to_slice(s, &mut signature.0)?;
+        hex::decode_to_slice(s, &mut signature.signature)?;
         Ok(signature)
     }
 }
 
 const CRYPTO_SIGNATURE_TAG: u8 = 0x5;
+const CHAINED_SIGNATURE_TAG: u8 = 0xf;
+const CERTIFICATE_TAG: u8 = 0x4;
+
+/*
+certificate#4 temp_key:SigPubKey valid_since:uint32 valid_until:uint32 = Certificate;
+*/
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Certificate {
+    pub temp_key: SigPubKey,
+    pub valid_since: u32,
+    pub valid_until: u32,
+}
+
+/*
+signed_certificate$_ certificate:Certificate certificate_signature:CryptoSignature
+  = SignedCertificate;
+*/
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SignedCertificate {
+    pub certificate: Certificate,
+    pub certificate_signature: CryptoSignature,
+}
+
+/// One signed-certificate cell of a chain: its certificate and the simple
+/// part of its certificate signature.
+struct CertificateLink {
+    certificate: Certificate,
+    signature: [u8; ED25519_SIGNATURE_LENGTH],
+}
+
+impl CertificateLink {
+    fn write_cell(&self, next: Option<Cell>) -> Result<Cell> {
+        let mut cell = BuilderData::new();
+        cell.append_bits(CERTIFICATE_TAG as usize, 4)?;
+        self.certificate.temp_key.write_to(&mut cell)?;
+        cell.append_u32(self.certificate.valid_since)?;
+        cell.append_u32(self.certificate.valid_until)?;
+        if let Some(next) = next {
+            cell.append_bits(CHAINED_SIGNATURE_TAG as usize, 4)?;
+            cell.checked_append_reference(next)?;
+        }
+        CryptoSignature::write_simple(&self.signature, &mut cell)?;
+        cell.into_cell()
+    }
+}
 
 impl Serializable for CryptoSignature {
     fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
-        cell.append_bits(CRYPTO_SIGNATURE_TAG as usize, 4)?;
-        cell.append_raw(&self.0, ED25519_SIGNATURE_LENGTH * 8)?;
-        Ok(())
+        let Some(first) = self.signed_cert.as_deref() else {
+            return Self::write_simple(&self.signature, cell);
+        };
+        // Collect the chain and build its cells from the innermost one, so a
+        // long chain does not grow the call stack.
+        let mut links = Vec::new();
+        let mut current = Some(first);
+        while let Some(signed) = current {
+            links.push(CertificateLink {
+                certificate: signed.certificate.clone(),
+                signature: signed.certificate_signature.signature,
+            });
+            current = signed.certificate_signature.signed_cert.as_deref();
+        }
+        let mut next = None;
+        for link in links.iter().rev() {
+            next = Some(link.write_cell(next)?);
+        }
+        let Some(cert_cell) = next else { fail!("empty certificate chain") };
+        cell.append_bits(CHAINED_SIGNATURE_TAG as usize, 4)?;
+        cell.checked_append_reference(cert_cell)?;
+        Self::write_simple(&self.signature, cell)
     }
 }
 
 impl Deserializable for CryptoSignature {
     fn read_from(&mut self, slice: &mut SliceData) -> Result<()> {
-        let tag = slice.get_next_int(4)? as u8;
-        if tag != CRYPTO_SIGNATURE_TAG {
-            fail!(Self::invalid_tag(tag as u32))
+        match slice.get_int(4)? as u8 {
+            CRYPTO_SIGNATURE_TAG => {
+                *self = Self::with_bytes(Self::read_simple(slice)?);
+                Ok(())
+            }
+            CHAINED_SIGNATURE_TAG => {
+                slice.move_by(4)?;
+                let mut cert_cell = slice.checked_drain_reference()?;
+                let temp_key_signature = Self::read_simple(slice)?;
+                // Each referenced certificate cell is consumed exactly; the
+                // chain is read iteratively (its length is bounded by the
+                // cell depth limit).
+                let mut links = Vec::new();
+                loop {
+                    if cert_cell.cell_type() != CellType::Ordinary {
+                        fail!(BlockError::InvalidData(
+                            "signed certificate is not an ordinary cell".to_string()
+                        ))
+                    }
+                    let mut cert = SliceData::load_cell(cert_cell)?;
+                    let tag = cert.get_next_int(4)? as u8;
+                    if tag != CERTIFICATE_TAG {
+                        fail!(BlockError::InvalidConstructorTag {
+                            t: tag as u32,
+                            s: "Certificate".to_string()
+                        })
+                    }
+                    let certificate = Certificate {
+                        temp_key: SigPubKey::construct_from(&mut cert)?,
+                        valid_since: cert.get_next_u32()?,
+                        valid_until: cert.get_next_u32()?,
+                    };
+                    let next = match cert.get_int(4)? as u8 {
+                        CHAINED_SIGNATURE_TAG => {
+                            cert.move_by(4)?;
+                            Some(cert.checked_drain_reference()?)
+                        }
+                        _ => None,
+                    };
+                    let signature = Self::read_simple(&mut cert)?;
+                    if !cert.is_empty_cell() {
+                        fail!(BlockError::InvalidData(
+                            "signed certificate cell is not consumed exactly".to_string()
+                        ))
+                    }
+                    links.push(CertificateLink { certificate, signature });
+                    match next {
+                        Some(next) => cert_cell = next,
+                        None => break,
+                    }
+                }
+                let mut inner: Option<Box<SignedCertificate>> = None;
+                while let Some(link) = links.pop() {
+                    let certificate_signature =
+                        Self { signature: link.signature, signed_cert: inner.take() };
+                    inner = Some(Box::new(SignedCertificate {
+                        certificate: link.certificate,
+                        certificate_signature,
+                    }));
+                }
+                *self = Self { signature: temp_key_signature, signed_cert: inner };
+                Ok(())
+            }
+            tag => fail!(Self::invalid_tag(tag as u32)),
         }
-        slice.get_next_bytes_to_slice(&mut self.0)?;
-        Ok(())
     }
 }
 
@@ -133,10 +323,13 @@ impl CryptoSignaturePair {
     }
 }
 
+// Block signature pairs take simple signatures only (the reference block
+// signature set requires exactly 256 + 4 + 512 bits with tag #5 and no
+// references), on reading and on writing.
 impl Serializable for CryptoSignaturePair {
     fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
         self.node_id_short.write_to(cell)?;
-        self.sign.write_to(cell)?;
+        self.sign.write_simple_only(cell)?;
         Ok(())
     }
 }
@@ -144,7 +337,7 @@ impl Serializable for CryptoSignaturePair {
 impl Deserializable for CryptoSignaturePair {
     fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
         self.node_id_short.read_from(cell)?;
-        self.sign.read_from(cell)?;
+        self.sign = CryptoSignature::read_simple_only(cell)?;
         Ok(())
     }
 }
@@ -186,8 +379,10 @@ impl SigPubKey {
     }
 
     // be careful here - we recreate public key object everytime
+    /// Verifies a simple signature by this key. A chained signature is
+    /// refused: its bytes are a temporary-key signature, not one by this key.
     pub fn verify_signature(&self, data: &[u8], signature: &CryptoSignature) -> bool {
-        self.pub_key().verify(data, signature.as_bytes()).is_ok()
+        !signature.is_chained() && self.pub_key().verify(data, signature.as_bytes()).is_ok()
     }
 
     pub fn as_slice(&self) -> &[u8; 32] {

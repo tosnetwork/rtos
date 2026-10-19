@@ -3202,8 +3202,10 @@ impl Deserializable for ValidatorSignedTempKey {
         if tag != VALIDATOR_SIGNED_TEMP_KEY_TAG {
             fail!(Self::invalid_tag(tag as u32))
         }
+        // The key is the first reference; a chained signature holds the next.
+        let key = slice.checked_drain_reference()?;
         self.signature.read_from(slice)?;
-        self.key.read_from_cell(slice.checked_drain_reference()?)?;
+        self.key.read_from_cell(key)?;
         Ok(())
     }
 }
@@ -3211,8 +3213,8 @@ impl Deserializable for ValidatorSignedTempKey {
 impl Serializable for ValidatorSignedTempKey {
     fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
         cell.append_bits(VALIDATOR_SIGNED_TEMP_KEY_TAG as usize, 4)?;
-        self.signature.write_to(cell)?;
         cell.checked_append_reference(self.key.serialize()?)?;
+        self.signature.write_to(cell)?;
         Ok(())
     }
 }
