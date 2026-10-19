@@ -95,13 +95,17 @@ impl PropagationPlan {
     /// Inputs must describe the authenticated session and candidate. `is_creator`
     /// means a local validator owns the candidate's verified leader index; an
     /// observer must always supply false. Empty consensus candidates have no block.
+    ///
+    /// Mirrors the reference block accepter: with Plumtree broadcasts every
+    /// finalized block inside the recency window gets a finality broadcast,
+    /// whether it was accepted with a final set or, as a finalized ancestor,
+    /// with its notarization (approve) set.
     pub fn for_event(
         protocol: SimplexProtocol,
         event: PropagationEvent,
         id: &BlockIdExt,
         nonempty: bool,
         is_creator: bool,
-        is_final: bool,
         last_mc_finalized_seqno: u32,
         candidate_already_sent: bool,
     ) -> Self {
@@ -142,9 +146,7 @@ impl PropagationPlan {
             plan.block_targets.fast_sync = !v2;
         }
         if v2 {
-            if is_final {
-                plan.finality_targets = TargetSet::ALL;
-            }
+            plan.finality_targets = TargetSet::ALL;
         } else if candidate_already_sent {
             plan.block_targets.fast_sync = false;
             plan.block_targets.custom = false;
@@ -331,7 +333,6 @@ mod tests {
             &id(10, false),
             true,
             true,
-            true,
             10,
             false,
         );
@@ -365,17 +366,20 @@ mod tests {
             .is_err());
     }
 
+    /// The reference block accepter: with Plumtree broadcasts the finality
+    /// mode is custom|fast_sync|public on every FinalizeBlock inside the
+    /// recency window, whatever signature set the block carries, a leader's
+    /// block goes to custom|public, and no shard description is sent.
     #[test]
     fn propagation_v2_creator_observer_and_approval_modes() {
         for creator in [true, false] {
-            for final_ in [true, false] {
+            for mc in [true, false] {
                 let plan = PropagationPlan::for_event(
                     SimplexProtocol::PrivateObserversPlumtree,
                     PropagationEvent::Finalized,
-                    &id(10, false),
+                    &id(10, mc),
                     true,
                     creator,
-                    final_,
                     10,
                     false,
                 );
@@ -384,13 +388,34 @@ mod tests {
                     plan.block_targets,
                     TargetSet { public: creator, fast_sync: false, custom: true }
                 );
-                assert_eq!(
-                    plan.finality_targets,
-                    if final_ { TargetSet::ALL } else { TargetSet::NONE }
-                );
+                assert_eq!(plan.finality_targets, TargetSet::ALL);
                 assert!(!plan.send_shard_description);
             }
         }
+        // Older than last_mc - 2: nothing but the candidate recovery.
+        let stale = PropagationPlan::for_event(
+            SimplexProtocol::PrivateObserversPlumtree,
+            PropagationEvent::Finalized,
+            &id(7, false),
+            true,
+            true,
+            10,
+            false,
+        );
+        assert_eq!(stale.block_targets, TargetSet::NONE);
+        assert_eq!(stale.finality_targets, TargetSet::NONE);
+        // Exactly last_mc - 2 is still recent.
+        let boundary = PropagationPlan::for_event(
+            SimplexProtocol::PrivateObserversPlumtree,
+            PropagationEvent::Finalized,
+            &id(8, false),
+            true,
+            false,
+            10,
+            false,
+        );
+        assert_eq!(boundary.finality_targets, TargetSet::ALL);
+        assert_eq!(boundary.block_targets, TargetSet::CUSTOM);
     }
     #[test]
     fn propagation_v0_v1_generated_candidate_and_block_modes() {
@@ -402,7 +427,6 @@ mod tests {
                     &id(10, mc),
                     true,
                     true,
-                    false,
                     10,
                     false,
                 );
@@ -416,7 +440,6 @@ mod tests {
                 protocol,
                 PropagationEvent::Finalized,
                 &id(10, false),
-                true,
                 true,
                 true,
                 10,
@@ -437,7 +460,6 @@ mod tests {
                 SimplexProtocol::PrivateObserversPlumtree,
                 event,
                 &id(seq, false),
-                true,
                 true,
                 true,
                 last,
@@ -461,7 +483,6 @@ mod tests {
             PropagationEvent::CandidateReceived,
             &id(10, false),
             false,
-            true,
             true,
             10,
             false,

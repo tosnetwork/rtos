@@ -2263,7 +2263,6 @@ impl ValidatorGroup {
             block.id(),
             true,
             is_creator,
-            false,
             last_mc,
             false,
         );

@@ -1305,7 +1305,6 @@ impl State {
             &entry.record.block_id,
             true,
             entry.record.locally_generated,
-            entry.record.carrier.is_final(),
             delivery.last_mc,
             delivery.candidate_already_sent,
         );
@@ -2134,7 +2133,6 @@ fn validate_plan(entry: &UnverifiedRecord) -> Result<PropagationPlan> {
         &entry.record.block_id,
         true,
         entry.record.locally_generated,
-        entry.record.carrier.is_final(),
         0,
         false,
     );

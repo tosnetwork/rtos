@@ -123,7 +123,6 @@ async fn propagation_authenticated_normal_finality_applies_by_mc_and_reopens() {
             pair.shard.id(),
             true,
             false,
-            true,
             0,
             false,
         );
@@ -249,7 +248,7 @@ async fn propagation_authenticated_normal_finality_applies_by_mc_and_reopens() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn propagation_authenticated_approval_uses_block_fec_without_finality() {
+async fn propagation_authenticated_approval_uses_block_fec_and_plans_its_finality() {
     let pair = Pair::with_propagation_profile("included", false, true).await;
     let result = std::panic::AssertUnwindSafe(async {
         let fixture: serde_json::Value =
@@ -278,12 +277,13 @@ async fn propagation_authenticated_approval_uses_block_fec_without_finality() {
             pair.shard.id(),
             true,
             true,
-            false,
             0,
             false,
         );
         assert!(plan.block_targets.public);
-        assert_eq!(plan.finality_targets, crate::validator::propagation::TargetSet::NONE);
+        // The reference block accepter broadcasts the approve set of a
+        // finalized shard ancestor as its finality.
+        assert_eq!(plan.finality_targets, crate::validator::propagation::TargetSet::ALL);
         let destinations =
             pair.provider.resolve_propagation_targets(pair.shard.id(), &plan).await.unwrap();
         let public = destinations
@@ -360,7 +360,6 @@ async fn propagation_authenticated_finalize_candidate_fallback_keeps_partial_del
             pair.shard.id(),
             true,
             false,
-            false,
             0,
             false,
         );
@@ -368,7 +367,11 @@ async fn propagation_authenticated_finalize_candidate_fallback_keeps_partial_del
         assert!(sent(&outcome, PropagationKind::Candidate), "{outcome:?}");
         assert!(outcome.needs_retry(), "the fast overlay has no observer peers: {outcome:?}");
         assert!(!sent(&outcome, PropagationKind::Block));
-        assert!(!sent(&outcome, PropagationKind::Finality));
+        // The approve set of a finalized shard ancestor is its finality broadcast.
+        assert!(
+            outcome.receipts.iter().any(|r| r.kind == PropagationKind::Finality),
+            "{outcome:?}"
+        );
         tokio::time::timeout(Duration::from_secs(15), async {
             while pair.receiver.try_get_cached_block_candidate(pair.shard.id()).is_none() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -381,7 +384,6 @@ async fn propagation_authenticated_finalize_candidate_fallback_keeps_partial_del
             PropagationEvent::CandidateReceived,
             pair.shard.id(),
             true,
-            false,
             false,
             0,
             false,

@@ -182,9 +182,13 @@ fn pq_block_wire(
     )
 }
 
+/// The tosNode.blockFinalityBroadcast of an accepted block and its transport
+/// identity. As in the reference block accepter, a shard block carries the set
+/// it was accepted with, the notarization (approve) set of a finalized
+/// ancestor included; a masterchain block is accepted only with a final set.
 fn pq_finality_wire(signatures: &PqNetworkSignatureSet) -> Result<(Vec<u8>, [u8; 32])> {
-    if !signatures.is_final() {
-        rtos_block::fail!("Notarization has no finality broadcast authority");
+    if !signatures.is_final() && signatures.block_id().shard().is_masterchain() {
+        rtos_block::fail!("A masterchain finality broadcast requires a final signature set");
     }
     let signature_set = signatures.to_node().into_boxed();
     let signature_hash = UInt256::calc_file_hash(&WireProfile::T0.serialize(&signature_set)?);
@@ -482,9 +486,7 @@ impl FullNodeOverlaysRouter {
                         outcome.receipts.extend(sent.receipts);
                     }
                     if plan.finality_targets != TargetSet::NONE {
-                        let finality =
-                            accepted.final_network_signatures().and_then(|s| pq_finality_wire(&s));
-                        let sent = match finality {
+                        let sent = match pq_finality_wire(&signatures) {
                             Ok((bytes, id)) => {
                                 self.propagate_wire(
                                     accepted.block().id(),
@@ -600,19 +602,21 @@ mod tests {
         BlockSignaturesSimplex, BlockSignaturesSimplexPq, PqBlockSignaturePair, ValidatorBaseInfo,
     };
     fn carrier() -> BlockSignaturesSimplexPq {
+        carrier_of("ordinary", "finalize")
+    }
+    fn carrier_of(kind: &str, role: &str) -> BlockSignaturesSimplexPq {
         let data: serde_json::Value =
             serde_json::from_str(include_str!("../../../../tl/rtos_api/tests/data/live-pq.json"))
                 .unwrap();
-        let rows: Vec<_> = data["rows"]
+        let mut rows: Vec<_> = data["rows"]
             .as_array()
             .unwrap()
             .iter()
             .filter(|r| {
-                r["kind"] == "ordinary"
-                    && r["role"] == "finalize"
-                    && r["context"] == "TOS-CONSENSUS-SIMPLEX-v1"
+                r["kind"] == kind && r["role"] == role && r["context"] == "TOS-CONSENSUS-SIMPLEX-v1"
             })
             .collect();
+        rows.sort_by_key(|r| r["index"].as_u64());
         let bytes = |value: &serde_json::Value| hex::decode(value.as_str().unwrap()).unwrap();
         BlockSignaturesSimplexPq {
             validator_info: ValidatorBaseInfo::with_params(1, 7),
@@ -666,11 +670,50 @@ mod tests {
                 .unwrap()
                 .1
         );
+        // A masterchain block is never broadcast with an approve set.
         let approval =
             rtos_api::pq_finality::PqApproval::from_notarization_fields(carrier).unwrap();
         let approval = PqNetworkSignatureSet::from_approval(&approval).unwrap();
         assert!(!approval.is_final());
+        assert!(approval.block_id().shard().is_masterchain());
         assert!(pq_finality_wire(&approval).is_err());
+    }
+
+    /// The final and the approve set of one shard block, built from the same
+    /// fixture rows by a driver over the reference node's signature-set
+    /// factories, serialize to the same tosNode.blockFinalityBroadcast bytes
+    /// and the same distinct transport identities here.
+    #[test]
+    fn propagation_shard_final_and_approve_finality_match_reference_vectors() {
+        let vectors = include_str!("testdata/finality-broadcast-vector.tsv");
+        let field = |line: &str, name: &str| {
+            line.split('\t')
+                .find_map(|f| f.strip_prefix(&format!("{name}=")))
+                .map(str::to_owned)
+                .unwrap()
+        };
+        let mut ids = Vec::new();
+        for line in vectors.lines().skip(1) {
+            let kind = line.split('\t').next().unwrap();
+            let signatures = if kind == "final" {
+                PqNetworkSignatureSet::from_final_fields(&carrier_of("shard_ordinary", "finalize"))
+                    .unwrap()
+            } else {
+                let approval = rtos_api::pq_finality::PqApproval::from_notarization_fields(
+                    carrier_of("shard_ordinary", "notarize"),
+                )
+                .unwrap();
+                PqNetworkSignatureSet::from_approval(&approval).unwrap()
+            };
+            assert!(!signatures.block_id().shard().is_masterchain());
+            assert_eq!(signatures.is_final(), field(line, "final") == "1", "{kind}");
+            let (bytes, id) = pq_finality_wire(&signatures).unwrap();
+            assert_eq!(hex::encode(&bytes), field(line, "wire"), "{kind} wire");
+            assert_eq!(hex::encode(id), field(line, "transport_id"), "{kind} transport id");
+            ids.push(id);
+        }
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "approve and final broadcasts of one block are distinct");
     }
 }
 

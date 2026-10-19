@@ -769,8 +769,13 @@ fn validate_record(
         {
             fail!("Shard-description publication target mismatch");
         }
+        // A shard block accepted with its notarization set as a finalized
+        // ancestor broadcasts that set as its finality, as the reference node
+        // does; a shard description and any masterchain finality stay final-only.
         if !record.carrier.is_final()
-            && matches!(effect.kind, PublicationKind::Finality | PublicationKind::ShardDescription)
+            && (effect.kind == PublicationKind::ShardDescription
+                || (effect.kind == PublicationKind::Finality
+                    && record.block_id.shard().is_masterchain()))
         {
             fail!("Approval cannot authorize final-only publication effects");
         }
@@ -1742,6 +1747,31 @@ mod tests {
             .record
             .carrier
             .is_final());
+        // A shard block accepted with its notarization set broadcasts that set
+        // as its finality; its shard description stays final-only.
+        let shard = |seqno| {
+            BlockIdExt::with_params(
+                ShardIdent::full(0),
+                seqno,
+                UInt256::from([seqno as u8 + 1; 32]),
+                UInt256::from([seqno as u8 + 2; 32]),
+            )
+        };
+        let mut approval = record(3);
+        approval.block_id = shard(3);
+        approval.prev = vec![shard(2)];
+        approval.carrier = StoredCarrier::Approval(vec![9]);
+        approval.effects = vec![effect(PublicationKind::Block), effect(PublicationKind::Finality)];
+        let approval_id = reopened.enqueue(approval.clone())?;
+        let saved = reopened.pending()?.into_iter().find(|p| p.id == approval_id).unwrap();
+        assert_eq!(saved.record.effects, approval.effects);
+        approval.effects = vec![PublicationEffect {
+            kind: PublicationKind::ShardDescription,
+            target: PublicationTarget::ShardDescription,
+        }];
+        approval.block_id = shard(4);
+        approval.prev = vec![shard(3)];
+        assert!(reopened.enqueue(approval).is_err());
         Ok(())
     }
 
