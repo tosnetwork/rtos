@@ -75,6 +75,9 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 #[cfg(test)]
+#[path = "tests/test_extra_flags.rs"]
+mod extra_flags_tests;
+#[cfg(test)]
 #[path = "tests/test_validate_query.rs"]
 mod tests;
 
@@ -255,6 +258,17 @@ impl ValidateBase {
             .ok_or_else(|| error!("Next state is not initialized in validator query"))?
             .state()
     }
+}
+
+/// Reserved `extra_flags` bits of inbound and imported internal messages: from
+/// global version 12 only the bits the executor supports may be set. The
+/// version is compared as the signed integer the reference reads it as.
+fn extra_flags_within_valid_mask(extra_flags: &Coins, global_version: u32) -> bool {
+    if i32::from_be_bytes(global_version.to_be_bytes()) < 12 {
+        return true;
+    }
+    let mask = u128::from(rtos_executor::SUPPORTED_EXTRA_FLAGS);
+    extra_flags.inner() & !mask == 0
 }
 
 /// The configuration dictionary root held by a configuration contract: the
@@ -3316,6 +3330,7 @@ impl ValidateQuery {
         created_lt: u64,
     ) -> Result<()> {
         let (cur_prefix, next_prefix) = env.calc_cur_next_prefix()?;
+        Self::check_imported_extra_flags(base, env)?;
         if !base.shard().contains_full_prefix(&next_prefix) {
             reject_query!(
                 "imported message with hash {env_hash:x} has next hop address {next_prefix}... not in this shard"
@@ -3355,6 +3370,36 @@ impl ValidateQuery {
                 belonging to any neighbor"
             )
         }
+    }
+
+    fn check_imported_extra_flags(base: &ValidateBase, env: &MsgEnvelope) -> Result<()> {
+        let msg_hash = env.message_hash();
+        let Some(header) = env.read_message()?.int_header().cloned() else {
+            reject_query!(
+                "cannot unpack MsgEnvelope of an imported internal message with hash {msg_hash:x}"
+            )
+        };
+        if !extra_flags_within_valid_mask(&header.extra_flags, base.config_params.global_version())
+        {
+            reject_query!(
+                "imported internal message with hash {msg_hash:x} has invalid reserved extra_flags"
+            )
+        }
+        Ok(())
+    }
+
+    fn check_inbound_extra_flags(
+        base: &ValidateBase,
+        key: &UInt256,
+        header: &rtos_block::InternalMessageHeader,
+    ) -> Result<()> {
+        if !extra_flags_within_valid_mask(&header.extra_flags, base.config_params.global_version())
+        {
+            reject_query!(
+                "inbound internal message with hash {key:x} has invalid reserved extra_flags"
+            )
+        }
+        Ok(())
     }
 
     ///
@@ -3505,6 +3550,7 @@ impl ValidateQuery {
                 but it does not refer to an inbound internal message"
             )
         };
+        Self::check_inbound_extra_flags(base, key, header)?;
         // extract source, current, next hop and destination address prefixes
         let Some(src) = header.src_ref() else {
             reject_query!(
