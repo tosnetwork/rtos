@@ -1825,6 +1825,25 @@ impl OverlayNode {
         Ok(())
     }
 
+    /// The privacy rules of a public overlay created with rules.
+    pub fn public_privacy_rules(
+        &self,
+        overlay_id: &Arc<OverlayShortId>,
+    ) -> Result<Option<OverlayPrivacyRules>> {
+        let overlay = self.get_overlay(overlay_id, "Reading privacy rules of unknown overlay")?;
+        Ok(overlay.public_policy.as_ref().map(|policy| (*policy.rules()).clone()))
+    }
+
+    /// The certificate attached when sending as `key` in one overlay.
+    pub fn local_certificate(
+        &self,
+        overlay_id: &Arc<OverlayShortId>,
+        key: &Arc<KeyId>,
+    ) -> Result<Option<OverlayCertificate>> {
+        let overlay = self.get_overlay(overlay_id, "Reading certificate of unknown overlay")?;
+        Ok(overlay.local_certificate(key))
+    }
+
     /// Install (or remove) the application check of a public overlay.
     pub fn set_public_broadcast_check(
         &self,

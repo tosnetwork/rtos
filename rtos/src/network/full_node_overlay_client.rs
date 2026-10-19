@@ -24,7 +24,6 @@ use crate::{
 use adnl::{
     common::{TaggedByteSlice, TaggedObject},
     node::AdnlSendMethod,
-    OverlayNode,
 };
 #[cfg(feature = "telemetry")]
 use rtos_api::Constructor;
@@ -47,7 +46,7 @@ use rtos_api::{
 };
 use rtos_block::{
     error, fail, lz4_decompress, read_boc, write_boc, BlockIdExt, BocFlags, BocWriter, KeyId,
-    Lz4DecompressMode, Result, ShardIdent,
+    KeyOption, Lz4DecompressMode, Result, ShardIdent,
 };
 use std::sync::Arc;
 
@@ -1403,17 +1402,15 @@ impl FullNodeOverlayClient {
         }
     }
 
+    /// Send as `source` (the node key when `None`) with exactly `flags`.
     pub async fn send_broadcast(
         &self,
         data: &TaggedByteSlice<'_>,
+        source: Option<&Arc<dyn KeyOption>>,
         flags: u32,
         method: AdnlSendMethod,
     ) -> Result<()> {
-        match self
-            .client
-            .broadcast(data, None, flags | OverlayNode::FLAG_BCAST_ANY_SENDER, method)
-            .await
-        {
+        match self.client.broadcast(data, source, flags, method).await {
             Ok(info) => {
                 #[cfg(feature = "telemetry")]
                 log::debug!(

@@ -35,6 +35,7 @@ use crate::{
         node_network::NodeNetwork,
         overlay_client::OverlayClient,
         pack_block_signatures,
+        shard_overlay_certificates::{OverlayInstall, ShardOverlayCertificates},
     },
     types::{
         awaiters_pool::AwaitersPool, owned_tasks::OwnedTasks, top_block_descr::TopBlockDescrStuff,
@@ -46,7 +47,8 @@ use adnl::OverlayNode;
 use adnl::{
     common::{add_unbound_object_to_map_with_update, TaggedByteSlice},
     node::AdnlSendMethod,
-    DhtSearchPolicy, OverlayUtils,
+    DhtSearchPolicy, OverlayPrivacyRules, OverlayUtils, BROADCAST_FLAG_ANY_SENDER,
+    BROADCAST_FLAG_FIXED_NEIGHBOURS, MAX_SIMPLE_BROADCAST_SIZE,
 };
 #[cfg(feature = "telemetry")]
 use rtos_api::{
@@ -150,6 +152,31 @@ pub struct FullNodeOverlaysRouter {
     actual_monitor_min_split: AtomicU8,
     monitor_min_split_worker_started: AtomicBool,
     fast_sync_peer_resolver: tokio::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+    shard_certificates: Arc<ShardOverlayCertificates>,
+    certificate_refresh_started: AtomicBool,
+}
+
+/// What a public shard broadcast carries; it decides the wire flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublicBroadcastKind {
+    /// Blocks, candidates and finality: FEC, any sender.
+    Block,
+    /// Shard block descriptions: simple up to 768 bytes, else FEC any sender.
+    ShardBlock,
+    /// External messages: simple up to 768 bytes, else FEC to fixed neighbours.
+    ExternalMessage,
+}
+
+impl PublicBroadcastKind {
+    pub(crate) fn flags(self, size: usize) -> u32 {
+        let fec = size > MAX_SIMPLE_BROADCAST_SIZE as usize;
+        match self {
+            Self::Block => BROADCAST_FLAG_ANY_SENDER,
+            Self::ShardBlock if fec => BROADCAST_FLAG_ANY_SENDER,
+            Self::ExternalMessage if fec => BROADCAST_FLAG_FIXED_NEIGHBOURS,
+            Self::ShardBlock | Self::ExternalMessage => 0,
+        }
+    }
 }
 
 // Keeps a partially constructed generation unreachable through the router and
@@ -215,6 +242,8 @@ impl FullNodeOverlaysRouter {
             actual_monitor_min_split,
             monitor_min_split_worker_started: AtomicBool::new(false),
             fast_sync_peer_resolver: tokio::sync::Mutex::new(None),
+            shard_certificates: Arc::new(ShardOverlayCertificates::new()),
+            certificate_refresh_started: AtomicBool::new(false),
         }))
     }
 
@@ -403,6 +432,7 @@ impl FullNodeOverlaysRouter {
                                 self.policy.clone(),
                                 self.network.default_rldp_roundtrip(),
                                 self.tasks.clone(),
+                                self.public_rules_for_new_overlay()?,
                                 #[cfg(test)]
                                 gate,
                             )
@@ -417,7 +447,9 @@ impl FullNodeOverlaysRouter {
                                 shard.clone(),
                                 self.tasks.clone(),
                             )?;
-                            if let Err(error) = self.configure_public_propagation(&fullnode_client)
+                            if let Err(error) = self
+                                .configure_public_authorization(&fullnode_client)
+                                .and_then(|_| self.configure_public_propagation(&fullnode_client))
                             {
                                 fullnode_client.stop_and_wait().await?;
                                 return Err(error);
@@ -1187,6 +1219,244 @@ impl FullNodeOverlaysRouter {
         Ok(None)
     }
 
+    fn shard_authorization_enabled(&self) -> bool {
+        self.network.context().stack.overlay.wire_profile() == rtos_api::WireProfile::T0
+    }
+
+    fn full_node_adnl_key(&self) -> Result<Arc<dyn KeyOption>> {
+        self.network.context().stack.adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)
+    }
+
+    fn public_rules_for_new_overlay(&self) -> Result<Option<OverlayPrivacyRules>> {
+        if !self.shard_authorization_enabled() {
+            return Ok(None);
+        }
+        Ok(Some(self.shard_certificates.rules()?))
+    }
+
+    /// A new public overlay gets the current rules and its shard's sources,
+    /// whose ephemeral key and certificates survive recreation.
+    fn configure_public_authorization(&self, client: &FullNodeOverlayClient) -> Result<()> {
+        if !self.shard_authorization_enabled() {
+            return Ok(());
+        }
+        let overlay_id = KeyId::from_data(*client.overlay_client().id().data());
+        let install = self.shard_certificates.register_overlay(
+            client.shard(),
+            &overlay_id,
+            self.full_node_adnl_key()?.id(),
+            rtos_block::UnixTime::now() as i32,
+        )?;
+        Self::install_on(client.overlay_client(), &install)
+    }
+
+    fn install_on(client: &OverlayClient, install: &OverlayInstall) -> Result<()> {
+        if let Some(rules) = &install.rules {
+            client.set_privacy_rules(rules.clone())?;
+        }
+        for (key, certificate) in &install.certificates {
+            client.update_certificate(key, certificate.clone())?;
+        }
+        Ok(())
+    }
+
+    fn apply_installs(&self, installs: &[OverlayInstall]) {
+        for install in installs {
+            let client = self
+                .public_overlays
+                .iter()
+                .find(|guard| guard.val().overlay_client().id().data() == install.overlay_id.data())
+                .map(|guard| guard.val().clone());
+            if let Some(client) = client {
+                if let Err(error) = Self::install_on(client.overlay_client(), install) {
+                    log::warn!(
+                        "Cannot install shard overlay authorization for {}: {error}",
+                        client.shard()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The certificate signer of this node: the first canonical transport
+    /// root among its registered, unexpired validator transport identities.
+    async fn local_transport_signer(
+        &self,
+        roots: &[Arc<KeyId>],
+    ) -> Result<Option<Arc<dyn KeyOption>>> {
+        let handler = self.network.config_handler();
+        let now = rtos_block::UnixTime::now() as i64;
+        let local = handler
+            .get_actual_validator_keys()?
+            .into_iter()
+            .filter(|entry| i64::from(entry.expire_at) > now)
+            .filter_map(|entry| entry.validator_adnl_key_id)
+            .map(|id| {
+                let bytes = rtos_block::base64_decode(&id)?;
+                Ok(KeyId::from_data(bytes.as_slice().try_into()?))
+            })
+            .collect::<Result<HashSet<_>>>()?;
+        let Some(id) = crate::network::shard_overlay_certificates::select_signer(roots, &local)
+        else {
+            return Ok(None);
+        };
+        match handler.get_validator_key(&id).await {
+            Some((key, _)) if key.id() == &id => Ok(Some(key)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Install the shard rules of the applied state's previous, current and
+    /// next validator transport roots, and refresh the signing authority.
+    pub(super) async fn update_public_authorization(
+        self: &Arc<Self>,
+        roots: &[Arc<KeyId>],
+    ) -> Result<()> {
+        if !self.shard_authorization_enabled() {
+            return Ok(());
+        }
+        let signer =
+            if roots.is_empty() { None } else { self.local_transport_signer(roots).await? };
+        let installs = self.shard_certificates.update_authority(
+            roots,
+            signer,
+            rtos_block::UnixTime::now() as i32,
+        )?;
+        self.apply_installs(&installs);
+        self.start_certificate_refresh();
+        if roots.is_empty() {
+            rtos_block::fail!("Applied state has no validator transport roots");
+        }
+        Ok(())
+    }
+
+    fn start_certificate_refresh(self: &Arc<Self>) {
+        if self.certificate_refresh_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let router = Arc::downgrade(self);
+        let spawned = self.tasks.spawn_cancelable("shard overlay certificates", async move {
+            loop {
+                tokio::time::sleep(
+                    crate::network::shard_overlay_certificates::SELF_CERTIFICATE_REFRESH,
+                )
+                .await;
+                let Some(router) = router.upgrade() else {
+                    break;
+                };
+                match router.shard_certificates.refresh(rtos_block::UnixTime::now() as i32) {
+                    Ok(installs) => router.apply_installs(&installs),
+                    Err(error) => log::warn!("Shard overlay certificate refresh: {error}"),
+                }
+            }
+        });
+        if spawned.is_err() {
+            self.certificate_refresh_started.store(false, Ordering::Release);
+        }
+    }
+
+    /// Send on a public shard overlay with the kind's flags, as the shard's
+    /// outbound source.
+    pub(crate) async fn send_public_broadcast(
+        &self,
+        client: &FullNodeOverlayClient,
+        broadcast: &TaggedByteSlice<'_>,
+        kind: PublicBroadcastKind,
+    ) -> Result<()> {
+        self.send_public_broadcast_with(client, broadcast, kind, 0).await
+    }
+
+    async fn send_public_broadcast_with(
+        &self,
+        client: &FullNodeOverlayClient,
+        broadcast: &TaggedByteSlice<'_>,
+        kind: PublicBroadcastKind,
+        extra_flags: u32,
+    ) -> Result<()> {
+        let size = broadcast.object.len();
+        if !self.shard_authorization_enabled() {
+            return client
+                .send_broadcast(
+                    broadcast,
+                    None,
+                    extra_flags | BROADCAST_FLAG_ANY_SENDER,
+                    AdnlSendMethod::Fast,
+                )
+                .await;
+        }
+        let source = self.shard_certificates.choose_outbound_source(
+            client.shard(),
+            &self.full_node_adnl_key()?,
+            size,
+            size > MAX_SIMPLE_BROADCAST_SIZE as usize,
+            rtos_block::UnixTime::now() as i32,
+        )?;
+        client
+            .send_broadcast(
+                broadcast,
+                Some(&source),
+                kind.flags(size) | extra_flags,
+                AdnlSendMethod::Fast,
+            )
+            .await
+    }
+
+    /// Console import of a certificate for one of this node's shard sources.
+    pub fn import_shard_overlay_certificate(
+        &self,
+        shard: &ShardIdent,
+        signed_key: &Arc<KeyId>,
+        certificate: &rtos_api::ton::overlay::Certificate,
+    ) -> Result<()> {
+        let install = self.shard_certificates.import_certificate(
+            shard,
+            signed_key,
+            certificate,
+            rtos_block::UnixTime::now() as i32,
+        )?;
+        self.apply_installs(&[install]);
+        Ok(())
+    }
+
+    /// Console signing of a certificate for `subject` in `shard`.
+    pub fn sign_shard_overlay_certificate(
+        &self,
+        shard: &ShardIdent,
+        subject: &Arc<KeyId>,
+        expire_at: i32,
+        max_size: u32,
+    ) -> Result<rtos_api::ton::overlay::Certificate> {
+        self.shard_certificates.sign_overlay_certificate(shard, subject, expire_at, max_size)
+    }
+
+    /// The full-node ADNL identity changed: drop its certificates only.
+    pub fn reset_full_node_adnl_certificates(&self) -> Result<()> {
+        let installs = self.shard_certificates.reset_adnl_source_certificates()?;
+        self.apply_installs(&installs);
+        Ok(())
+    }
+
+    /// Issuer loop step over this node's public shard overlays.
+    pub fn issue_shard_overlay_certificates(
+        &self,
+        targets: &[Arc<KeyId>],
+    ) -> Result<
+        Vec<(Arc<KeyId>, rtos_api::ton::rpc::engine::validator::ImportShardOverlayCertificate)>,
+    > {
+        let mut shards: Vec<_> = self.public_overlays.iter().map(|g| g.key().clone()).collect();
+        shards.sort();
+        self.shard_certificates.issue_shard_overlay_certificates(
+            targets,
+            &shards,
+            rtos_block::UnixTime::now() as i32,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shard_certificates(&self) -> &Arc<ShardOverlayCertificates> {
+        &self.shard_certificates
+    }
+
     /// Look up the local ADNL key for the given validator set.
     ///
     /// Returns `None` both when the node is not a validator and when it is a validator
@@ -1296,7 +1566,7 @@ impl FullNodeOverlaysRouter {
                     #[cfg(feature = "telemetry")]
                     tag: BlockBroadcast::constructor_const(),
                 };
-                client.send_broadcast(&broadcast, 0, AdnlSendMethod::Fast).await?;
+                self.send_public_broadcast(&client, &broadcast, PublicBroadcastKind::Block).await?;
             }
             BlockSignaturesVariant::Simplex(_) => {
                 // Use V2 format for simplex signatures (required for proper verification)
@@ -1325,7 +1595,7 @@ impl FullNodeOverlaysRouter {
                 }
 
                 let client = self.overlay_client(block.id().shard()).await?;
-                client.send_broadcast(&broadcast, 0, AdnlSendMethod::Fast).await?;
+                self.send_public_broadcast(&client, &broadcast, PublicBroadcastKind::Block).await?;
             }
         }
 
@@ -1356,7 +1626,13 @@ impl FullNodeOverlaysRouter {
             client.send_broadcast(&broadcast, flags, AdnlSendMethod::Fast).await?;
         }
         let client = self.overlay_client(tbd.proof_for().shard()).await?;
-        client.send_broadcast(&broadcast, flags, AdnlSendMethod::Fast).await?;
+        self.send_public_broadcast_with(
+            &client,
+            &broadcast,
+            PublicBroadcastKind::ShardBlock,
+            flags,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1385,9 +1661,8 @@ impl FullNodeOverlaysRouter {
             }
         }
         if !skip_public {
-            self.overlay_client(&to.shard_ident()?)
-                .await?
-                .send_broadcast(&broadcast, 0, AdnlSendMethod::Fast)
+            let client = self.overlay_client(&to.shard_ident()?).await?;
+            self.send_public_broadcast(&client, &broadcast, PublicBroadcastKind::ExternalMessage)
                 .await?;
         }
         Ok(())

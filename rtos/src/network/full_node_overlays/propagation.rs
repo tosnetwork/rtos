@@ -86,6 +86,9 @@ impl FullNodeOverlaysRouter {
             &all,
             self.network.context().stack.overlay.wire_profile(),
         )?;
+        // Shard overlay rules follow every applied refresh, including ones
+        // that leave the propagation configuration unchanged.
+        self.update_public_authorization(&public).await?;
         // T0 current_validators_adnl_ is named historically: it contains the
         // previous/current/next union, not merely ConfigParam34.
         let desired = PropagationConfig {
@@ -290,7 +293,7 @@ impl FullNodeOverlaysRouter {
                         .ok_or_else(|| error!("No authenticated public transport signer"))?;
                     client.overlay_client().broadcast_plumtree(&signer, simple_id, bytes).await
                 } else {
-                    client.send_broadcast(&tagged, 0, AdnlSendMethod::Fast).await
+                    self.send_public_broadcast(&client, &tagged, PublicBroadcastKind::Block).await
                 }
             }
             .await;

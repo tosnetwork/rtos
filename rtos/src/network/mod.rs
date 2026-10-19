@@ -20,6 +20,7 @@ pub mod liteserver;
 pub mod neighbours;
 pub mod node_network;
 pub mod overlay_client;
+pub mod shard_overlay_certificates;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
 

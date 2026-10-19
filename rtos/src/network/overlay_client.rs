@@ -22,8 +22,9 @@ use crate::{
 use adnl::{
     common::{spawn_cancelable, Subscriber, TaggedByteSlice, TaggedObject, TaggedTlObject},
     node::{AdnlNode, AdnlSendMethod},
-    BroadcastSendInfo, DhtNode, DhtSearchPolicy, OverlayId, OverlayNode, OverlayNodeInfo,
-    OverlayNodesResolveContext, OverlayNodesSearchContext, OverlayParams, OverlayShortId,
+    BroadcastSendInfo, DhtNode, DhtSearchPolicy, OverlayCertificate, OverlayId, OverlayNode,
+    OverlayNodeInfo, OverlayNodesResolveContext, OverlayNodesSearchContext, OverlayParams,
+    OverlayPrivacyRules, OverlayShortId, PublicBroadcastCheck,
 };
 use rand::{
     seq::{IteratorRandom, SliceRandom},
@@ -153,6 +154,9 @@ impl OverlayClient {
         &self.ctx.cancellation_token
     }
 
+    /// `rules` authorize received broadcasts from the first message on;
+    /// without rules the overlay keeps no source authorization.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new_public(
         id: Arc<OverlayShortId>,
         id_full: OverlayId,
@@ -161,6 +165,7 @@ impl OverlayClient {
         policy: DhtSearchPolicy,
         default_rldp_roundtrip: Option<u32>,
         owner: Arc<OwnedTasks>,
+        rules: Option<OverlayPrivacyRules>,
         #[cfg(test)] gate: Option<Arc<OverlayInitGate>>,
     ) -> Result<Arc<Self>> {
         let _admission = owner.enter()?;
@@ -171,7 +176,12 @@ impl OverlayClient {
             overlay_id: &id,
             runtime: None,
         };
-        network_context.stack.overlay.add_local_workchain_overlay(params)?;
+        match rules {
+            Some(rules) => {
+                network_context.stack.overlay.add_public_overlay_with_rules(params, rules)?
+            }
+            None => network_context.stack.overlay.add_local_workchain_overlay(params)?,
+        };
         let mut registration = OverlayRegistration::new(
             network_context.clone(),
             id.clone(),
@@ -435,6 +445,26 @@ impl OverlayClient {
             || self.ping_handle.as_ref().map_or(false, |h| h.is_finished())
             || self.resolve_incoming_query_peers_handle.is_finished()
             || self.saving_to_dht_handle.as_ref().map_or(false, |h| h.is_finished())
+    }
+
+    pub(crate) fn set_privacy_rules(&self, rules: OverlayPrivacyRules) -> Result<()> {
+        self.ctx.overlay_node().set_public_privacy_rules(&self.ctx.id, rules)
+    }
+
+    pub(crate) fn set_broadcast_check(
+        &self,
+        check: Option<Arc<dyn PublicBroadcastCheck>>,
+    ) -> Result<()> {
+        self.ctx.overlay_node().set_public_broadcast_check(&self.ctx.id, check)
+    }
+
+    /// Certificate attached when sending as `key`; `None` removes it.
+    pub(crate) fn update_certificate(
+        &self,
+        key: &Arc<KeyId>,
+        certificate: Option<OverlayCertificate>,
+    ) -> Result<()> {
+        self.ctx.overlay_node().update_certificate(&self.ctx.id, key, certificate)
     }
 
     pub(crate) fn configure_plumtree(&self, policy: adnl::PlumtreeConfig) -> Result<()> {

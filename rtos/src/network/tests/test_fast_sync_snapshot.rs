@@ -103,6 +103,10 @@ impl Fixture {
             actual_monitor_min_split: AtomicU8::new(0),
             monitor_min_split_worker_started: AtomicBool::new(false),
             fast_sync_peer_resolver: tokio::sync::Mutex::new(None),
+            shard_certificates: Arc::new(
+                crate::network::shard_overlay_certificates::ShardOverlayCertificates::new(),
+            ),
+            certificate_refresh_started: AtomicBool::new(false),
         });
         Ok(Self { router, engine, bootstrap })
     }
@@ -644,6 +648,85 @@ async fn fast_sync_snapshot_registration_expiring_during_lookup_cannot_publish()
     assert_eq!(f.router.fast_sync_overlays.iter().count(), 0);
     assert_eq!(f.engine.fail_after.load(Ordering::SeqCst), usize::MAX);
     assert!(f.router.fast_sync_snapshot.lock().await.as_ref().unwrap().local_key.is_none());
+    f.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_shard_overlays_follow_the_applied_authority() -> Result<()> {
+    use crate::network::shard_overlay_certificates::{authority_rules, startup_rules};
+    use rtos_block::{ConfigParam32, ConfigParam34, ConfigParamEnum};
+    let f = Fixture::new().await?;
+    let node = f.router.network.context().stack.overlay.clone();
+    let id_of =
+        |client: &FullNodeOverlayClient| KeyId::from_data(*client.overlay_client().id().data());
+    let master = ShardIdent::MASTERCHAIN;
+    let mc_id = id_of(&*f.router.overlay_client(&master).await?);
+    assert_eq!(node.public_privacy_rules(&mc_id)?, Some(startup_rules()));
+
+    // The applied previous set holds this node's transport root.
+    let transport = f.bootstrap.validators[0].adnl_key.id().clone();
+    let mut remote = f.member(1);
+    remote.adnl_addr = Some(UInt256::from([199; 32]));
+    let mut config = f.bootstrap.config_params().clone();
+    config.set_config(ConfigParamEnum::ConfigParam32(ConfigParam32::with_validator_set(set(
+        vec![f.member(0)],
+    ))))?;
+    config.set_config(ConfigParamEnum::ConfigParam34(ConfigParam34::with_validator_set(set(
+        vec![remote.clone()],
+    ))))?;
+    // Clients are not retained across a refresh, which may recreate overlays.
+    f.router.update_private_overlays(&config).await?;
+    let mc = f.router.overlay_client(&master).await?;
+    assert_eq!(id_of(&mc), mc_id);
+    let authority = |config: &ConfigParams| -> Result<Vec<Arc<KeyId>>> {
+        let mut all = Vec::new();
+        for set in
+            [config.prev_validator_set()?, config.validator_set()?, config.next_validator_set()?]
+        {
+            all.extend_from_slice(set.list());
+        }
+        Ok(fast_sync_transport_authority(&all, rtos_api::WireProfile::T0)?.0)
+    };
+    let rules = authority_rules(&authority(&config)?);
+    assert!(rules.is_authorized_key(transport.data()));
+    assert!(rules.is_authorized_key(&[199; 32]));
+    assert_eq!(node.public_privacy_rules(&id_of(&mc))?, Some(rules.clone()));
+    let certificates = f.router.shard_certificates();
+    assert_eq!(certificates.signer_id()?, Some(transport.clone()));
+    let ephemeral = certificates.local_key(&master).unwrap();
+    let cert = node.local_certificate(&id_of(&mc), ephemeral.id())?.unwrap();
+    assert_eq!(cert.issuer_hash(), transport.data());
+    let now = rtos_block::UnixTime::now() as i32;
+    let adnl = f.router.full_node_adnl_key()?;
+    let source = certificates.choose_outbound_source(&master, &adnl, 4000, true, now)?;
+    assert_eq!(source.id(), ephemeral.id(), "uncertified full-node key is not chosen");
+
+    // An overlay created later starts with the current rules and a certificate.
+    let base = f.router.overlay_client(&ShardIdent::BASE_WORKCHAIN).await?;
+    assert_eq!(node.public_privacy_rules(&id_of(&base))?, Some(rules.clone()));
+    let base_key = certificates.local_key(&ShardIdent::BASE_WORKCHAIN).unwrap();
+    assert!(node.local_certificate(&id_of(&base), base_key.id())?.is_some());
+
+    // Recreation keeps the ephemeral identity and reinstalls its certificate,
+    // with rules installed although the propagation configuration is unchanged.
+    mc.stop_and_wait().await?;
+    drop(mc);
+    f.router.public_overlays.remove(&master);
+    let again = f.router.overlay_client(&master).await?;
+    assert_eq!(certificates.local_key(&master).unwrap().id(), ephemeral.id());
+    assert_eq!(node.public_privacy_rules(&id_of(&again))?, Some(rules.clone()));
+    assert!(node.local_certificate(&id_of(&again), ephemeral.id())?.is_some());
+
+    // The root leaves the applied sets: its authority and the signer go.
+    config.set_config(ConfigParamEnum::ConfigParam32(ConfigParam32::with_validator_set(set(
+        vec![remote],
+    ))))?;
+    f.router.update_private_overlays(&config).await?;
+    let reduced = authority_rules(&authority(&config)?);
+    assert!(!reduced.is_authorized_key(transport.data()));
+    assert_eq!(node.public_privacy_rules(&id_of(&again))?, Some(reduced));
+    assert_eq!(certificates.signer_id()?, None);
     f.stop().await;
     Ok(())
 }
