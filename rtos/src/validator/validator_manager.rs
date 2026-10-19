@@ -173,6 +173,8 @@ fn build_runtime_simplex_session_options(
         candidate_resolve_cooldown: Duration::from_millis(np.candidate_resolve_cooldown_ms as u64),
         standstill_timeout: Duration::from_millis(np.standstill_timeout_ms as u64),
         standstill_max_egress_bytes_per_s: np.standstill_max_egress_bytes_per_s,
+        standstill_min_egress_bytes_per_s: np.standstill_min_egress_bytes_per_s,
+        certificate_gossip_neighbors: np.certificate_gossip_neighbors,
         max_leader_window_desync: np.max_leader_window_desync,
         bad_signature_ban_duration: Duration::from_millis(np.bad_signature_ban_duration_ms as u64),
         candidate_resolve_rate_limit: np.candidate_resolve_rate_limit,

@@ -725,6 +725,36 @@ fn test_runtime_simplex_options_keep_cpp_empty_block_policy() {
 }
 
 #[test]
+fn test_runtime_simplex_options_carry_noncritical_params() {
+    let catchain_options = CatchainSessionOptions {
+        proto_version: 4,
+        max_block_size: 1024,
+        max_collated_data_size: 2048,
+        ..Default::default()
+    };
+    let defaults = build_runtime_simplex_session_options(
+        &ShardIdent::masterchain(),
+        &SimplexConfig::default(),
+        &catchain_options,
+    )
+    .unwrap();
+    assert_eq!(defaults.target_rate, Duration::from_millis(400));
+    assert_eq!(defaults.certificate_gossip_neighbors, 20);
+    assert_eq!(defaults.standstill_min_egress_bytes_per_s, 1 << 17);
+
+    let mut cfg = SimplexConfig::default();
+    cfg.noncritical_params.target_rate_ms = 750;
+    cfg.noncritical_params.certificate_gossip_neighbors = 3;
+    cfg.noncritical_params.standstill_min_egress_bytes_per_s = 9_000;
+    let opts =
+        build_runtime_simplex_session_options(&ShardIdent::masterchain(), &cfg, &catchain_options)
+            .unwrap();
+    assert_eq!(opts.target_rate, Duration::from_millis(750));
+    assert_eq!(opts.certificate_gossip_neighbors, 3);
+    assert_eq!(opts.standstill_min_egress_bytes_per_s, 9_000);
+}
+
+#[test]
 fn test_mc_registered_top_for_shard_returns_session_specific_block_id() {
     let mut mc_state_extra = McStateExtra::default();
     let root_hash = UInt256::rand();

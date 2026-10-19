@@ -1126,6 +1126,12 @@ fn serialize_simplex_config(cfg: &SimplexConfig) -> Result<Value> {
         "no_empty_blocks_on_error_timeout_ms",
         np.no_empty_blocks_on_error_timeout_ms,
     );
+    serialize_field(&mut map, "certificate_gossip_neighbors", np.certificate_gossip_neighbors);
+    serialize_field(
+        &mut map,
+        "standstill_min_egress_bytes_per_s",
+        np.standstill_min_egress_bytes_per_s,
+    );
     Ok(map.into())
 }
 

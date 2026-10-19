@@ -1091,6 +1091,74 @@ fn test_simplex_config_custom_noncritical_params() {
     assert_eq!(config, config2);
 }
 
+#[test]
+fn test_noncritical_params_defaults_match_cpp_enumeration() {
+    // C++ tos/tos-types.h ENUMERATE_NONCRITICAL_PARAMS at the fixed baseline:
+    // (key, default) with durations in milliseconds and doubles as f32 bits.
+    let expected: BTreeMap<u8, u32> = BTreeMap::from([
+        (0, 400),
+        (1, 1_000),
+        (2, (1.2f32).to_bits()),
+        (3, 100_000),
+        (4, 1_000),
+        (5, (1.2f32).to_bits()),
+        (6, 10_000),
+        (7, 10),
+        (8, 10_000),
+        (9, 50 << 17),
+        (10, 250),
+        (11, 5_000),
+        (12, 10),
+        (13, 0),
+        (14, 15_000),
+        (15, 20),
+        (16, 1 << 17),
+    ]);
+    assert_eq!(NoncriticalParams::default().to_raw_map(), expected);
+}
+
+/// Build a raw simplex_config_v2#22 cell whose noncritical map holds only `params`.
+fn build_v2_cell(slots: u32, params: &[(u8, u32)]) -> Cell {
+    let mut b = BuilderData::new();
+    b.append_u8(0x22).unwrap();
+    b.append_u8(0).unwrap();
+    slots.write_to(&mut b).unwrap();
+    let mut map = HashmapE::with_bit_len(8);
+    for &(key, value) in params {
+        let mut vb = BuilderData::new();
+        value.write_to(&mut vb).unwrap();
+        map.set(SliceData::from_raw(vec![key], 8), &SliceData::load_builder(vb).unwrap()).unwrap();
+    }
+    map.write_hashmap_data(&mut b).unwrap();
+    b.into_cell().unwrap()
+}
+
+#[test]
+fn test_v2_config_without_target_rate_uses_cpp_default() {
+    let config = SimplexConfig::construct_from_cell(build_v2_cell(4, &[(1, 2_000)])).unwrap();
+    assert_eq!(config.noncritical_params.target_rate_ms, 400);
+    assert_eq!(config.noncritical_params.first_block_timeout_ms, 2_000);
+    assert_eq!(config.noncritical_params.certificate_gossip_neighbors, 20);
+    assert_eq!(config.noncritical_params.standstill_min_egress_bytes_per_s, 1 << 17);
+}
+
+#[test]
+fn test_v2_config_reads_gossip_and_min_egress_keys() {
+    let cell = build_v2_cell(4, &[(15, 7), (16, 4_096), (17, 99)]);
+    let config = SimplexConfig::construct_from_cell(cell).unwrap();
+    assert_eq!(config.noncritical_params.certificate_gossip_neighbors, 7);
+    assert_eq!(config.noncritical_params.standstill_min_egress_bytes_per_s, 4_096);
+    // Key 17 is not a C++ noncritical parameter and leaves every field at its default.
+    let expected = NoncriticalParams {
+        certificate_gossip_neighbors: 7,
+        standstill_min_egress_bytes_per_s: 4_096,
+        ..Default::default()
+    };
+    assert_eq!(config.noncritical_params, expected);
+    let reserialized = config.write_to_new_cell().unwrap().into_cell().unwrap();
+    assert_eq!(SimplexConfig::construct_from_cell(reserialized).unwrap(), config);
+}
+
 // ===================== v1 deserialization backward-compat tests =====================
 
 /// Build a raw simplex_config#21 cell by hand (the legacy on-chain format).

@@ -758,6 +758,12 @@ impl StateParser {
                 no_empty_blocks_on_error_timeout_ms: p
                     .get_num32("no_empty_blocks_on_error_timeout_ms")
                     .unwrap_or(d.no_empty_blocks_on_error_timeout_ms),
+                certificate_gossip_neighbors: p
+                    .get_num32("certificate_gossip_neighbors")
+                    .unwrap_or(d.certificate_gossip_neighbors),
+                standstill_min_egress_bytes_per_s: p
+                    .get_num32("standstill_min_egress_bytes_per_s")
+                    .unwrap_or(d.standstill_min_egress_bytes_per_s),
             },
         })
     }

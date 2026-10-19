@@ -522,6 +522,13 @@ pub struct SessionOptions {
     // C++ parity: pool.cpp standstill_resolution_task byte budget.
     pub standstill_max_egress_bytes_per_s: u32,
 
+    // ConfigParam30 noncritical key 16: the standstill egress floor, and key 15:
+    // how many random peers a new certificate is gossiped to. Carried from the
+    // configuration; the receiver's certificate fan-out and standstill budget do
+    // not read them yet.
+    pub standstill_min_egress_bytes_per_s: u32,
+    pub certificate_gossip_neighbors: u32,
+
     // Wired into slot/vote acceptance bounds in SimplexState + Receiver.
     // C++ parity: consensus.cpp/pool.cpp future-window rejection.
     pub max_leader_window_desync: u32,
@@ -602,6 +609,8 @@ impl Default for SessionOptions {
             candidate_resolve_timeout_cap: Duration::from_secs(10),
             candidate_resolve_cooldown: Duration::from_millis(10),
             standstill_max_egress_bytes_per_s: 50 << 17,
+            standstill_min_egress_bytes_per_s: 1 << 17,
+            certificate_gossip_neighbors: 20,
             max_leader_window_desync: 250,
             bad_signature_ban_duration: Duration::from_secs(5),
             candidate_resolve_rate_limit: 10,

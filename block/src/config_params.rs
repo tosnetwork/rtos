@@ -3956,7 +3956,7 @@ const SIMPLEX_CONFIG_V2_TAG: u8 = 0x22;
 /// All fields have concrete default values matching C++. For v1 configs the three
 /// on-chain fields (`target_rate_ms`, `first_block_timeout_ms`, `max_leader_window_desync`)
 /// are populated from the TL-B, the rest keep their defaults. For v2, the on-chain hashmap
-/// overrides any subset of the 13 parameters.
+/// overrides any subset of the 17 parameters (keys 0..=16, C++ `ENUMERATE_NONCRITICAL_PARAMS`).
 ///
 /// "double" parameters (multipliers) are stored as raw `f32` bit patterns in a `u32`,
 /// matching the C++ `store_double` / `read_double` convention.
@@ -3977,12 +3977,14 @@ pub struct NoncriticalParams {
     pub candidate_resolve_rate_limit: u32,              // idx 12, uint32
     pub min_block_interval_ms: u32,                     // idx 13, duration
     pub no_empty_blocks_on_error_timeout_ms: u32,       // idx 14, duration
+    pub certificate_gossip_neighbors: u32,              // idx 15, uint32
+    pub standstill_min_egress_bytes_per_s: u32,         // idx 16, uint32
 }
 
 impl Default for NoncriticalParams {
     fn default() -> Self {
         Self {
-            target_rate_ms: 2400,
+            target_rate_ms: 400,
             first_block_timeout_ms: 1000,
             first_block_timeout_multiplier_bits: (1.2f32).to_bits(),
             first_block_timeout_cap_ms: 100_000,
@@ -3997,6 +3999,8 @@ impl Default for NoncriticalParams {
             candidate_resolve_rate_limit: 10,
             min_block_interval_ms: 0,
             no_empty_blocks_on_error_timeout_ms: 15_000,
+            certificate_gossip_neighbors: 20,
+            standstill_min_egress_bytes_per_s: 1 << 17,
         }
     }
 }
@@ -4020,6 +4024,9 @@ impl NoncriticalParams {
             12 => self.candidate_resolve_rate_limit = value,
             13 => self.min_block_interval_ms = value,
             14 => self.no_empty_blocks_on_error_timeout_ms = value,
+            15 => self.certificate_gossip_neighbors = value,
+            16 => self.standstill_min_egress_bytes_per_s = value,
+            // C++ reads only the enumerated keys; any other key is ignored.
             _ => {}
         }
     }
@@ -4051,6 +4058,8 @@ impl NoncriticalParams {
             (12, self.candidate_resolve_rate_limit),
             (13, self.min_block_interval_ms),
             (14, self.no_empty_blocks_on_error_timeout_ms),
+            (15, self.certificate_gossip_neighbors),
+            (16, self.standstill_min_egress_bytes_per_s),
         ])
     }
 }
