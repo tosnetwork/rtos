@@ -643,3 +643,35 @@ fn varuinteger3_and_7_bounds() {
     assert_eq!(typed_read::<VarUInteger7>(&len7), "-");
     assert_eq!(typed_skip::<VarUInteger7>(&len7), "0");
 }
+
+/// Consumers of the Coins and VarUInteger 32 codecs, each against the
+/// reference reader of the same consumer (not one reader for every typed
+/// decoder):
+/// - Coins read: message value, fee and flag fields, which the reference
+///   reads with the strict handwritten `as_integer` (leading zero refused);
+/// - Coins skip: structural skips, the handwritten `skip`;
+/// - VarUInteger32 read: the GETEXTRABALANCE value, which the reference
+///   reads with the lenient VM loader (leading zero and zero length allowed).
+/// Extra-currency dictionary values (VarUIntegerPos 32 in the reference)
+/// are a separate consumer and are not asserted here.
+#[test]
+fn coins_and_varuinteger32_match_their_reference_consumers() {
+    let rows = varuint_reference_rows();
+    let (mut coins, mut extra) = (0, 0);
+    for row in &rows {
+        let (id, bits) = (row[0], row[2]);
+        match row[1] {
+            "16" => {
+                assert_eq!(typed_read::<Coins>(bits), row[4], "{id} read");
+                assert_eq!(typed_skip::<Coins>(bits), row[5], "{id} skip");
+                coins += 1;
+            }
+            "32" => {
+                assert_eq!(typed_read::<VarUInteger32>(bits), row[11], "{id} read");
+                extra += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((coins, extra), (93, 189));
+}

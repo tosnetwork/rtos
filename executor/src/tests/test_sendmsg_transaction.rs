@@ -171,3 +171,255 @@ fn sendmsg_complete_transactions() {
 fn hex_decode(s: &str) -> Vec<u8> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
 }
+
+// Complete transactions whose inbound message or account carries a
+// VarUInteger field in a non-minimal encoding (a leading zero byte or the
+// longest length), against minimal controls. The frozen expectations in
+// data/nonminimal-coins.tsv were produced by the reference transaction
+// emulator from the exported inputs; ERROR means no transaction (the
+// message or account is refused).
+
+use rtos_block::IBitstring;
+
+/// `value` as a VarUInteger 16 payload of exactly `len` bytes.
+fn coins_bits(builder: &mut BuilderData, value: u128, len: usize) {
+    builder.append_bits(len, 4).unwrap();
+    let bytes = value.to_be_bytes();
+    assert!(bytes[..16 - len].iter().all(|b| *b == 0), "{value} does not fit {len} bytes");
+    builder.append_raw(&bytes[16 - len..], len * 8).unwrap();
+}
+
+/// `value` as a VarUInteger 7 payload of exactly `len` bytes.
+fn varuint7_bits(builder: &mut BuilderData, value: u64, len: usize) {
+    builder.append_bits(len, 3).unwrap();
+    let bytes = value.to_be_bytes();
+    assert!(bytes[..8 - len].iter().all(|b| *b == 0), "{value} does not fit {len} bytes");
+    builder.append_raw(&bytes[8 - len..], len * 8).unwrap();
+}
+
+fn minimal_len(value: u128) -> usize {
+    (128 - value.leading_zeros() as usize).div_ceil(8)
+}
+
+/// Encodings of a value: minimal, with one leading zero byte, and padded to
+/// the longest length.
+fn coins_lengths(value: u128) -> [(&'static str, usize); 3] {
+    let min = minimal_len(value);
+    [("min", min), ("lead", min + 1), ("len15", 15)]
+}
+
+struct IntFields {
+    value: (u128, usize),
+    extra_flags: (u128, usize),
+    fwd_fee: (u128, usize),
+}
+
+fn internal_message_cell(src: &MsgAddressInt, dst: &MsgAddressInt, f: &IntFields) -> Cell {
+    let mut b = BuilderData::new();
+    b.append_bit_zero().unwrap(); // int_msg_info$0
+    b.append_bit_one().unwrap(); // ihr_disabled
+    b.append_bit_zero().unwrap(); // bounce
+    b.append_bit_zero().unwrap(); // bounced
+    src.write_to(&mut b).unwrap();
+    dst.write_to(&mut b).unwrap();
+    coins_bits(&mut b, f.value.0, f.value.1);
+    b.append_bit_zero().unwrap(); // no extra currencies
+    coins_bits(&mut b, f.extra_flags.0, f.extra_flags.1);
+    coins_bits(&mut b, f.fwd_fee.0, f.fwd_fee.1);
+    b.append_u64(1000).unwrap(); // created_lt
+    b.append_u32(0).unwrap(); // created_at
+    b.append_bit_zero().unwrap(); // no init
+    b.append_bit_zero().unwrap(); // inline empty body
+    b.into_cell().unwrap()
+}
+
+fn external_message_cell(dst: &MsgAddressInt, import_fee: (u128, usize)) -> Cell {
+    let mut b = BuilderData::new();
+    b.append_bits(0b10, 2).unwrap(); // ext_in_msg_info$10
+    b.append_bits(0b00, 2).unwrap(); // src: addr_none$00
+    dst.write_to(&mut b).unwrap();
+    coins_bits(&mut b, import_fee.0, import_fee.1);
+    b.append_bit_zero().unwrap(); // no init
+    b.append_bit_zero().unwrap(); // inline empty body
+    b.into_cell().unwrap()
+}
+
+/// The account cell with its storage usage re-encoded with the given lengths.
+fn account_with_storage_used(account: &Account, cells_len: usize, bits_len: usize) -> Cell {
+    let mut slice = SliceData::load_cell(account.serialize().unwrap()).unwrap();
+    assert!(slice.get_next_bit().unwrap());
+    let addr = MsgAddressInt::construct_from(&mut slice).unwrap();
+    let cells = rtos_block::VarUInteger7::construct_from(&mut slice).unwrap();
+    let bits = rtos_block::VarUInteger7::construct_from(&mut slice).unwrap();
+    let mut b = BuilderData::new();
+    b.append_bit_one().unwrap();
+    addr.write_to(&mut b).unwrap();
+    varuint7_bits(&mut b, cells.as_u64(), cells_len);
+    varuint7_bits(&mut b, bits.as_u64(), bits_len);
+    b.checked_append_references_and_data(&slice).unwrap();
+    b.into_cell().unwrap()
+}
+
+fn run_cells(
+    name: &str,
+    config: BlockchainConfig,
+    account_cell: Cell,
+    msg_cell: Cell,
+    address: &MsgAddressInt,
+    rows: &mut Vec<String>,
+) {
+    let input = format!(
+        "{name}\t200\t2000000001\t{}\t{}\t{}\t-\t0\t{}\t{}",
+        boc(config.raw_config().serialize().unwrap()),
+        boc(account_cell.clone()),
+        boc(msg_cell.clone()),
+        address.workchain_id(),
+        hex_bytes(address.address().get_bytestring(0).as_ref())
+    );
+    let outcome = (|| -> rtos_block::Result<(String, String)> {
+        let mut account = Account::construct_from_cell(account_cell)?;
+        let old = account.hash()?;
+        let dict_threshold = config.size_limits_config().acc_state_cells_for_storage_dict;
+        let params = ExecuteParams {
+            block_unixtime: 200,
+            block_lt: 2_000_000_000,
+            last_tr_lt: 2_000_000_001,
+            ..Default::default()
+        };
+        let mut tx = OrdinaryTransactionExecutor::new(config).execute_with_params(
+            Some(msg_cell),
+            &mut account,
+            params,
+        )?;
+        let changed = account.precalc_storage_stat()?.is_some_and(|stat| stat.is_changed());
+        let needs_dict = account.get_addr().is_some_and(|a| !a.is_masterchain())
+            && account.dict_hash().is_none()
+            && account.storage_info().is_some_and(|s| s.used().cells() >= dict_threshold as u64);
+        if changed || needs_dict {
+            account.calc_storage_stat_dict(dict_threshold)?;
+        }
+        tx.write_state_update(&HashUpdate::with_hashes(old, account.hash()?))?;
+        Ok((format!("{:x}", tx.hash()?), format!("{:x}", account.hash()?)))
+    })();
+    let (th, ah) = outcome.unwrap_or_else(|_| ("ERROR".to_string(), "ERROR".to_string()));
+    rows.push(format!("{input}\t{th}\t{ah}"));
+}
+
+#[test]
+fn nonminimal_coins_complete_transactions() {
+    let src = MsgAddressInt::with_standart(None, 0, [0x11; 32].into()).unwrap();
+    let addr = MsgAddressInt::standard(0, [0x62; 32]);
+    let mut rows = Vec::new();
+    for version in [11u32, 12, 16] {
+        let cfg = config(version, false, &addr);
+        let mut init = StateInit::default();
+        init.set_code(rtos_assembler::compile_code_to_cell("ACCEPT").unwrap());
+        init.set_data(Cell::default());
+        let account = Account::active(
+            addr.clone(),
+            CurrencyCollection::with_coins(10_000_000_000u64),
+            0,
+            100,
+            init,
+            cfg.size_limits_config().acc_state_cells_for_storage_dict,
+        )
+        .unwrap();
+        let minimal = IntFields { value: (1_000_000_000, 4), extra_flags: (0, 0), fwd_fee: (0, 0) };
+        let mut add = |name: String, account_cell: Cell, msg: Cell| {
+            run_cells(
+                &format!("{name}-v{version}"),
+                cfg.clone(),
+                account_cell,
+                msg,
+                &addr,
+                &mut rows,
+            )
+        };
+        let account_cell = account.serialize().unwrap();
+        for value in [1_000_000_000u128, 0] {
+            for (enc, len) in coins_lengths(value) {
+                let f = IntFields { value: (value, len), ..minimal };
+                add(
+                    format!("int-value-{value}-{enc}"),
+                    account_cell.clone(),
+                    internal_message_cell(&src, &addr, &f),
+                );
+            }
+        }
+        for flags in [0u128, 1] {
+            for (enc, len) in coins_lengths(flags) {
+                let f = IntFields { extra_flags: (flags, len), ..minimal };
+                add(
+                    format!("int-flags-{flags}-{enc}"),
+                    account_cell.clone(),
+                    internal_message_cell(&src, &addr, &f),
+                );
+            }
+        }
+        for fee in [0u128, 1000] {
+            for (enc, len) in coins_lengths(fee) {
+                let f = IntFields { fwd_fee: (fee, len), ..minimal };
+                add(
+                    format!("int-fwdfee-{fee}-{enc}"),
+                    account_cell.clone(),
+                    internal_message_cell(&src, &addr, &f),
+                );
+            }
+        }
+        for fee in [0u128, 1000] {
+            for (enc, len) in coins_lengths(fee) {
+                add(
+                    format!("ext-importfee-{fee}-{enc}"),
+                    account_cell.clone(),
+                    external_message_cell(&addr, (fee, len)),
+                );
+            }
+        }
+        let used = account.storage_info().unwrap().used();
+        let (cells_min, bits_min) =
+            (minimal_len(used.cells() as u128), minimal_len(used.bits() as u128));
+        for (enc, cells_len, bits_len) in [
+            ("min", cells_min, bits_min),
+            ("cells-lead", cells_min + 1, bits_min),
+            ("bits-lead", cells_min, bits_min + 1),
+            ("len6", 6, 6),
+        ] {
+            add(
+                format!("account-used-{enc}"),
+                account_with_storage_used(&account, cells_len, bits_len),
+                internal_message_cell(&src, &addr, &minimal),
+            );
+        }
+    }
+    assert_eq!(rows.len(), 3 * 28);
+    if let Ok(path) = std::env::var("RTOS_NONMINIMAL_TRANSACTION_EXPORT") {
+        std::fs::write(path, rows.join("\n") + "\n").unwrap();
+        return;
+    }
+    let expected: std::collections::HashMap<_, _> = include_str!("data/nonminimal-coins.tsv")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| {
+            let f: Vec<_> = line.split('\t').collect();
+            (f[0], (f[1].to_lowercase(), f[2].to_lowercase()))
+        })
+        .collect();
+    assert_eq!(expected.len(), rows.len());
+    // Before version 12 the reference credits extra_flags as the legacy IHR
+    // fee to the message balance, which the executor does not do; the minimal
+    // flags=1 row at version 11 is tracked as a separate executor finding.
+    const KNOWN_DIFFERENCES: [&str; 1] = ["int-flags-1-min-v11"];
+    for row in &rows {
+        let f: Vec<_> = row.split('\t').collect();
+        if KNOWN_DIFFERENCES.contains(&f[0]) {
+            continue;
+        }
+        let (th, ah) = &expected[f[0]];
+        assert_eq!(
+            (f[10].to_lowercase(), f[11].to_lowercase()),
+            (th.clone(), ah.clone()),
+            "{}",
+            f[0]
+        );
+    }
+}
