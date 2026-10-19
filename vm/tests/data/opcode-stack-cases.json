@@ -998,5 +998,2413 @@
     "code": "00",
     "version": 14,
     "gas": 1000000
+  },
+  {
+    "name": "setcp-ff00-v16",
+    "code": "ff00",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff01-v16",
+    "code": "ff01",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff02-v16",
+    "code": "ff02",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff03-v16",
+    "code": "ff03",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff04-v16",
+    "code": "ff04",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff05-v16",
+    "code": "ff05",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff06-v16",
+    "code": "ff06",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff07-v16",
+    "code": "ff07",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff08-v16",
+    "code": "ff08",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff09-v16",
+    "code": "ff09",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff0a-v16",
+    "code": "ff0a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff0b-v16",
+    "code": "ff0b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff0c-v16",
+    "code": "ff0c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff0d-v16",
+    "code": "ff0d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff0e-v16",
+    "code": "ff0e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff0f-v16",
+    "code": "ff0f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff10-v16",
+    "code": "ff10",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff11-v16",
+    "code": "ff11",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff12-v16",
+    "code": "ff12",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff13-v16",
+    "code": "ff13",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff14-v16",
+    "code": "ff14",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff15-v16",
+    "code": "ff15",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff16-v16",
+    "code": "ff16",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff17-v16",
+    "code": "ff17",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff18-v16",
+    "code": "ff18",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff19-v16",
+    "code": "ff19",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff1a-v16",
+    "code": "ff1a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff1b-v16",
+    "code": "ff1b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff1c-v16",
+    "code": "ff1c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff1d-v16",
+    "code": "ff1d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff1e-v16",
+    "code": "ff1e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff1f-v16",
+    "code": "ff1f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff20-v16",
+    "code": "ff20",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff21-v16",
+    "code": "ff21",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff22-v16",
+    "code": "ff22",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff23-v16",
+    "code": "ff23",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff24-v16",
+    "code": "ff24",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff25-v16",
+    "code": "ff25",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff26-v16",
+    "code": "ff26",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff27-v16",
+    "code": "ff27",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff28-v16",
+    "code": "ff28",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff29-v16",
+    "code": "ff29",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff2a-v16",
+    "code": "ff2a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff2b-v16",
+    "code": "ff2b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff2c-v16",
+    "code": "ff2c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff2d-v16",
+    "code": "ff2d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff2e-v16",
+    "code": "ff2e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff2f-v16",
+    "code": "ff2f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff30-v16",
+    "code": "ff30",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff31-v16",
+    "code": "ff31",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff32-v16",
+    "code": "ff32",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff33-v16",
+    "code": "ff33",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff34-v16",
+    "code": "ff34",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff35-v16",
+    "code": "ff35",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff36-v16",
+    "code": "ff36",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff37-v16",
+    "code": "ff37",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff38-v16",
+    "code": "ff38",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff39-v16",
+    "code": "ff39",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff3a-v16",
+    "code": "ff3a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff3b-v16",
+    "code": "ff3b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff3c-v16",
+    "code": "ff3c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff3d-v16",
+    "code": "ff3d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff3e-v16",
+    "code": "ff3e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff3f-v16",
+    "code": "ff3f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff40-v16",
+    "code": "ff40",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff41-v16",
+    "code": "ff41",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff42-v16",
+    "code": "ff42",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff43-v16",
+    "code": "ff43",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff44-v16",
+    "code": "ff44",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff45-v16",
+    "code": "ff45",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff46-v16",
+    "code": "ff46",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff47-v16",
+    "code": "ff47",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff48-v16",
+    "code": "ff48",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff49-v16",
+    "code": "ff49",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff4a-v16",
+    "code": "ff4a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff4b-v16",
+    "code": "ff4b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff4c-v16",
+    "code": "ff4c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff4d-v16",
+    "code": "ff4d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff4e-v16",
+    "code": "ff4e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff4f-v16",
+    "code": "ff4f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff50-v16",
+    "code": "ff50",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff51-v16",
+    "code": "ff51",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff52-v16",
+    "code": "ff52",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff53-v16",
+    "code": "ff53",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff54-v16",
+    "code": "ff54",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff55-v16",
+    "code": "ff55",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff56-v16",
+    "code": "ff56",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff57-v16",
+    "code": "ff57",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff58-v16",
+    "code": "ff58",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff59-v16",
+    "code": "ff59",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff5a-v16",
+    "code": "ff5a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff5b-v16",
+    "code": "ff5b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff5c-v16",
+    "code": "ff5c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff5d-v16",
+    "code": "ff5d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff5e-v16",
+    "code": "ff5e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff5f-v16",
+    "code": "ff5f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff60-v16",
+    "code": "ff60",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff61-v16",
+    "code": "ff61",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff62-v16",
+    "code": "ff62",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff63-v16",
+    "code": "ff63",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff64-v16",
+    "code": "ff64",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff65-v16",
+    "code": "ff65",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff66-v16",
+    "code": "ff66",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff67-v16",
+    "code": "ff67",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff68-v16",
+    "code": "ff68",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff69-v16",
+    "code": "ff69",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff6a-v16",
+    "code": "ff6a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff6b-v16",
+    "code": "ff6b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff6c-v16",
+    "code": "ff6c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff6d-v16",
+    "code": "ff6d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff6e-v16",
+    "code": "ff6e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff6f-v16",
+    "code": "ff6f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff70-v16",
+    "code": "ff70",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff71-v16",
+    "code": "ff71",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff72-v16",
+    "code": "ff72",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff73-v16",
+    "code": "ff73",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff74-v16",
+    "code": "ff74",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff75-v16",
+    "code": "ff75",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff76-v16",
+    "code": "ff76",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff77-v16",
+    "code": "ff77",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff78-v16",
+    "code": "ff78",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff79-v16",
+    "code": "ff79",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff7a-v16",
+    "code": "ff7a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff7b-v16",
+    "code": "ff7b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff7c-v16",
+    "code": "ff7c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff7d-v16",
+    "code": "ff7d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff7e-v16",
+    "code": "ff7e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff7f-v16",
+    "code": "ff7f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff80-v16",
+    "code": "ff80",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff81-v16",
+    "code": "ff81",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff82-v16",
+    "code": "ff82",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff83-v16",
+    "code": "ff83",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff84-v16",
+    "code": "ff84",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff85-v16",
+    "code": "ff85",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff86-v16",
+    "code": "ff86",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff87-v16",
+    "code": "ff87",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff88-v16",
+    "code": "ff88",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff89-v16",
+    "code": "ff89",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff8a-v16",
+    "code": "ff8a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff8b-v16",
+    "code": "ff8b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff8c-v16",
+    "code": "ff8c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff8d-v16",
+    "code": "ff8d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff8e-v16",
+    "code": "ff8e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff8f-v16",
+    "code": "ff8f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff90-v16",
+    "code": "ff90",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff91-v16",
+    "code": "ff91",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff92-v16",
+    "code": "ff92",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff93-v16",
+    "code": "ff93",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff94-v16",
+    "code": "ff94",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff95-v16",
+    "code": "ff95",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff96-v16",
+    "code": "ff96",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff97-v16",
+    "code": "ff97",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff98-v16",
+    "code": "ff98",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff99-v16",
+    "code": "ff99",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff9a-v16",
+    "code": "ff9a",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff9b-v16",
+    "code": "ff9b",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff9c-v16",
+    "code": "ff9c",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff9d-v16",
+    "code": "ff9d",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff9e-v16",
+    "code": "ff9e",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff9f-v16",
+    "code": "ff9f",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffa0-v16",
+    "code": "ffa0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffa1-v16",
+    "code": "ffa1",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffa2-v16",
+    "code": "ffa2",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffa3-v16",
+    "code": "ffa3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffa4-v16",
+    "code": "ffa4",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffa5-v16",
+    "code": "ffa5",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffa6-v16",
+    "code": "ffa6",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffa7-v16",
+    "code": "ffa7",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffa8-v16",
+    "code": "ffa8",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffa9-v16",
+    "code": "ffa9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffaa-v16",
+    "code": "ffaa",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffab-v16",
+    "code": "ffab",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffac-v16",
+    "code": "ffac",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffad-v16",
+    "code": "ffad",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffae-v16",
+    "code": "ffae",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffaf-v16",
+    "code": "ffaf",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffb0-v16",
+    "code": "ffb0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffb1-v16",
+    "code": "ffb1",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffb2-v16",
+    "code": "ffb2",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffb3-v16",
+    "code": "ffb3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffb4-v16",
+    "code": "ffb4",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffb5-v16",
+    "code": "ffb5",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffb6-v16",
+    "code": "ffb6",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffb7-v16",
+    "code": "ffb7",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffb8-v16",
+    "code": "ffb8",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffb9-v16",
+    "code": "ffb9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffba-v16",
+    "code": "ffba",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffbb-v16",
+    "code": "ffbb",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffbc-v16",
+    "code": "ffbc",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffbd-v16",
+    "code": "ffbd",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffbe-v16",
+    "code": "ffbe",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffbf-v16",
+    "code": "ffbf",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffc0-v16",
+    "code": "ffc0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffc1-v16",
+    "code": "ffc1",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffc2-v16",
+    "code": "ffc2",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffc3-v16",
+    "code": "ffc3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffc4-v16",
+    "code": "ffc4",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffc5-v16",
+    "code": "ffc5",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffc6-v16",
+    "code": "ffc6",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffc7-v16",
+    "code": "ffc7",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffc8-v16",
+    "code": "ffc8",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffc9-v16",
+    "code": "ffc9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffca-v16",
+    "code": "ffca",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffcb-v16",
+    "code": "ffcb",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffcc-v16",
+    "code": "ffcc",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffcd-v16",
+    "code": "ffcd",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffce-v16",
+    "code": "ffce",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffcf-v16",
+    "code": "ffcf",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffd0-v16",
+    "code": "ffd0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffd1-v16",
+    "code": "ffd1",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffd2-v16",
+    "code": "ffd2",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffd3-v16",
+    "code": "ffd3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffd4-v16",
+    "code": "ffd4",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffd5-v16",
+    "code": "ffd5",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffd6-v16",
+    "code": "ffd6",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffd7-v16",
+    "code": "ffd7",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffd8-v16",
+    "code": "ffd8",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffd9-v16",
+    "code": "ffd9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffda-v16",
+    "code": "ffda",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffdb-v16",
+    "code": "ffdb",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffdc-v16",
+    "code": "ffdc",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffdd-v16",
+    "code": "ffdd",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffde-v16",
+    "code": "ffde",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffdf-v16",
+    "code": "ffdf",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffe0-v16",
+    "code": "ffe0",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffe1-v16",
+    "code": "ffe1",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffe2-v16",
+    "code": "ffe2",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffe3-v16",
+    "code": "ffe3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffe4-v16",
+    "code": "ffe4",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffe5-v16",
+    "code": "ffe5",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffe6-v16",
+    "code": "ffe6",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffe7-v16",
+    "code": "ffe7",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffe8-v16",
+    "code": "ffe8",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffe9-v16",
+    "code": "ffe9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffea-v16",
+    "code": "ffea",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffeb-v16",
+    "code": "ffeb",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffec-v16",
+    "code": "ffec",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffed-v16",
+    "code": "ffed",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffee-v16",
+    "code": "ffee",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffef-v16",
+    "code": "ffef",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-fff1-v16",
+    "code": "fff1",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-fff2-v16",
+    "code": "fff2",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-fff3-v16",
+    "code": "fff3",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-fff4-v16",
+    "code": "fff4",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-fff5-v16",
+    "code": "fff5",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-fff6-v16",
+    "code": "fff6",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-fff7-v16",
+    "code": "fff7",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-fff8-v16",
+    "code": "fff8",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-fff9-v16",
+    "code": "fff9",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-fffa-v16",
+    "code": "fffa",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-fffb-v16",
+    "code": "fffb",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-fffc-v16",
+    "code": "fffc",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-fffd-v16",
+    "code": "fffd",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-fffe-v16",
+    "code": "fffe",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffff-v16",
+    "code": "ffff",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff00-v0",
+    "code": "ff00",
+    "version": 0,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff01-v0",
+    "code": "ff01",
+    "version": 0,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffef-v0",
+    "code": "ffef",
+    "version": 0,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-fff1-v0",
+    "code": "fff1",
+    "version": 0,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffff-v0",
+    "code": "ffff",
+    "version": 0,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff00-v4",
+    "code": "ff00",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff01-v4",
+    "code": "ff01",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffef-v4",
+    "code": "ffef",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-fff1-v4",
+    "code": "fff1",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ffff-v4",
+    "code": "ffff",
+    "version": 4,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcp-ff01-g18-v16",
+    "code": "ff01",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 18
+  },
+  {
+    "name": "setcp-ff01-g44-v16",
+    "code": "ff01",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 44
+  },
+  {
+    "name": "setcp-ff01-g45-v16",
+    "code": "ff01",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 45
+  },
+  {
+    "name": "setcp-ff01-g46-v16",
+    "code": "ff01",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 46
+  },
+  {
+    "name": "setcp-ff01-g70-v16",
+    "code": "ff01",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 70
+  },
+  {
+    "name": "setcp-ff01-g95-v16",
+    "code": "ff01",
+    "version": 16,
+    "setup": "PUSHINT 5",
+    "tail": "PUSHINT 7",
+    "gas": 95
+  },
+  {
+    "name": "setcpx-0-v0",
+    "code": "fff0",
+    "version": 0,
+    "setup": "PUSHINT 0",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-1-v0",
+    "code": "fff0",
+    "version": 0,
+    "setup": "PUSHINT 1",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-m1-v0",
+    "code": "fff0",
+    "version": 0,
+    "setup": "PUSHINT -1",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-255-v0",
+    "code": "fff0",
+    "version": 0,
+    "setup": "PUSHINT 255",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-16384-v0",
+    "code": "fff0",
+    "version": 0,
+    "setup": "PUSHINT 16384",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-16385-v0",
+    "code": "fff0",
+    "version": 0,
+    "setup": "PUSHINT 16385",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-32767-v0",
+    "code": "fff0",
+    "version": 0,
+    "setup": "PUSHINT 32767",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-m32768-v0",
+    "code": "fff0",
+    "version": 0,
+    "setup": "PUSHINT -32768",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-32768-v0",
+    "code": "fff0",
+    "version": 0,
+    "setup": "PUSHINT 32768",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-m32769-v0",
+    "code": "fff0",
+    "version": 0,
+    "setup": "PUSHINT -32769",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-nan-v0",
+    "code": "fff0",
+    "version": 0,
+    "setup": "PUSHNAN",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-null-v0",
+    "code": "fff0",
+    "version": 0,
+    "setup": "PUSHNULL",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-builder-v0",
+    "code": "fff0",
+    "version": 0,
+    "setup": "NEWC",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-empty-v0",
+    "code": "fff0",
+    "version": 0,
+    "setup": "NOP",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-0-under-null-v0",
+    "code": "fff0",
+    "version": 0,
+    "setup": "PUSHNULL PUSHINT 0",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-0-v16",
+    "code": "fff0",
+    "version": 16,
+    "setup": "PUSHINT 0",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-1-v16",
+    "code": "fff0",
+    "version": 16,
+    "setup": "PUSHINT 1",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-m1-v16",
+    "code": "fff0",
+    "version": 16,
+    "setup": "PUSHINT -1",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-255-v16",
+    "code": "fff0",
+    "version": 16,
+    "setup": "PUSHINT 255",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-16384-v16",
+    "code": "fff0",
+    "version": 16,
+    "setup": "PUSHINT 16384",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-16385-v16",
+    "code": "fff0",
+    "version": 16,
+    "setup": "PUSHINT 16385",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-32767-v16",
+    "code": "fff0",
+    "version": 16,
+    "setup": "PUSHINT 32767",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-m32768-v16",
+    "code": "fff0",
+    "version": 16,
+    "setup": "PUSHINT -32768",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-32768-v16",
+    "code": "fff0",
+    "version": 16,
+    "setup": "PUSHINT 32768",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-m32769-v16",
+    "code": "fff0",
+    "version": 16,
+    "setup": "PUSHINT -32769",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-nan-v16",
+    "code": "fff0",
+    "version": 16,
+    "setup": "PUSHNAN",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-null-v16",
+    "code": "fff0",
+    "version": 16,
+    "setup": "PUSHNULL",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-builder-v16",
+    "code": "fff0",
+    "version": 16,
+    "setup": "NEWC",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-empty-v16",
+    "code": "fff0",
+    "version": 16,
+    "setup": "NOP",
+    "tail": "PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "setcpx-0-under-null-v16",
+    "code": "fff0",
+    "version": 16,
+    "setup": "PUSHNULL PUSHINT 0",
+    "tail": "PUSHINT 7",
+    "gas": 1000
   }
 ]
