@@ -127,6 +127,29 @@ impl Serializable for AuthPolicy {
     }
 }
 
+/// Admission of a masterchain configuration before it becomes trusted state.
+///
+/// `previous` is `None` when no trusted state precedes the candidate (initial or
+/// restored state); otherwise it is the lookup of the currently trusted
+/// configuration. The branch order is part of the contract: a candidate lookup
+/// error is reported first and never reads as an absent configuration; then a
+/// previous lookup error; then a previous configuration without a root, which
+/// would otherwise read as "no policy" and admit a fresh sequence-zero policy.
+pub fn validate_auth_policy_admission(
+    candidate: Result<&ConfigParams>,
+    previous: Option<Result<&ConfigParams>>,
+) -> Result<()> {
+    let next = candidate?;
+    let Some(previous) = previous else {
+        return next.validate_auth_policy_config();
+    };
+    let old = previous?;
+    if old.root().is_none() {
+        fail!("previous AUTH configuration root is missing");
+    }
+    old.validate_auth_policy_transition(next)
+}
+
 impl ConfigParams {
     fn auth_parameter_cell(&self, number: u32) -> Result<Option<Cell>> {
         auth_lookup(self.root(), number.write_to_bitstring()?)?

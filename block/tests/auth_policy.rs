@@ -119,6 +119,11 @@ fn auth_policy_reference_matrix() {
                     policies.iter().cloned().chain(malformed.iter().cloned().map(Some)).enumerate()
                 {
                     let cfg = config(version, cell.clone(), mandatory, critical);
+                    // Admission without a predecessor is exactly the standalone check.
+                    assert_eq!(
+                        validate_auth_policy_admission(Ok(&cfg), None).is_ok(),
+                        cfg.validate_auth_policy_config().is_ok()
+                    );
                     rows.push((
                         format!("config-{version}-{mandatory}-{critical}-{i}"),
                         "c".into(),
@@ -134,6 +139,10 @@ fn auth_policy_reference_matrix() {
         for (j, new) in policies.iter().enumerate() {
             let old = config(16, old.clone(), true, true);
             let new = config(16, new.clone(), true, true);
+            assert_eq!(
+                validate_auth_policy_admission(Ok(&new), Some(Ok(&old))).is_ok(),
+                old.validate_auth_policy_transition(&new).is_ok()
+            );
             rows.push((
                 format!("transition-{i}-{j}"),
                 "t".into(),
@@ -146,6 +155,10 @@ fn auth_policy_reference_matrix() {
     for (i, cell) in malformed.iter().enumerate() {
         let old = config(16, Some(cell.clone()), true, true);
         let new = config(16, policies[1].clone(), true, true);
+        assert_eq!(
+            validate_auth_policy_admission(Ok(&new), Some(Ok(&old))).is_ok(),
+            old.validate_auth_policy_transition(&new).is_ok()
+        );
         rows.push((
             format!("transition-malformed-old-{i}"),
             "t".into(),
@@ -170,6 +183,10 @@ fn auth_policy_reference_matrix() {
                         .unwrap();
                 }
             }
+            assert_eq!(
+                validate_auth_policy_admission(Ok(&cfg), None).is_ok(),
+                cfg.validate_auth_policy_config().is_ok()
+            );
             rows.push((
                 format!("config-field-{number}-{mutation}"),
                 "c".into(),
@@ -226,4 +243,82 @@ fn config_validation_consumes_auth_policy() {
     ))
     .unwrap();
     assert!(!cfg.valid_config_data(true, None).unwrap());
+}
+
+// Mirrors the reference test helper: network is 123 in the low 32 bits.
+fn reference_policy(sequence: u64, retired: u16, deadline: u32) -> Cell {
+    let mut network = [0u8; 32];
+    network[28..].copy_from_slice(&123u32.to_be_bytes());
+    AuthPolicy { network: UInt256::from(network), sequence, retired, deadline }.serialize().unwrap()
+}
+
+fn admit(candidate: Result<&ConfigParams>, previous: Option<Result<&ConfigParams>>) -> String {
+    match validate_auth_policy_admission(candidate, previous) {
+        Ok(()) => "ok".to_string(),
+        Err(error) => error.to_string(),
+    }
+}
+
+// One-to-one port of the reference trusted-state admission assertions, followed
+// by the precedence cases the reference encodes through its branch order.
+#[test]
+fn trusted_state_admission_preserves_errors_and_retirement() {
+    let initial = config(16, Some(reference_policy(0, 0, 0)), true, true);
+    let retired = config(16, Some(reference_policy(1, 2, 0)), true, true);
+    let missing = config(16, None, true, true);
+    let cleared = config(16, Some(reference_policy(2, 0, 0)), true, true);
+    let no_root = ConfigParams::default();
+    assert!(no_root.root().is_none());
+    let rollback = "AUTH retirement policy cannot roll back";
+    let candidate_error = "candidate proof unavailable";
+    let previous_error = "previous proof unavailable";
+    let previous_root = "previous AUTH configuration root is missing";
+
+    assert_eq!(admit(Ok(&initial), None), "ok");
+    assert_eq!(admit(Ok(&retired), Some(Ok(&initial))), "ok");
+    assert_eq!(admit(Ok(&retired), Some(Ok(&retired))), "ok");
+    assert_ne!(admit(Ok(&missing), None), "ok");
+    assert_eq!(admit(Ok(&cleared), Some(Ok(&retired))), rollback);
+    assert_eq!(admit(Ok(&initial), Some(Ok(&no_root))), previous_root);
+    assert_eq!(admit(Err(error!("{candidate_error}")), Some(Ok(&initial))), candidate_error);
+    assert_eq!(admit(Ok(&initial), Some(Err(error!("{previous_error}")))), previous_error);
+
+    // The candidate lookup is unwrapped first, whatever the previous holds.
+    assert_eq!(
+        admit(Err(error!("{candidate_error}")), Some(Err(error!("{previous_error}")))),
+        candidate_error
+    );
+    assert_eq!(admit(Err(error!("{candidate_error}")), None), candidate_error);
+    assert_eq!(admit(Err(error!("{candidate_error}")), Some(Ok(&no_root))), candidate_error);
+    // A missing candidate root is refused, never read as a legacy configuration.
+    assert_eq!(admit(Ok(&no_root), None), "AUTH configuration root is missing");
+    assert_eq!(admit(Ok(&no_root), Some(Ok(&initial))), "AUTH configuration root is missing");
+    // Without the root-missing branch this rollback would pass as a fresh policy.
+    assert_eq!(admit(Ok(&retired), Some(Ok(&no_root))), previous_root);
+
+    // Equal sequence is accepted only for an identical policy cell.
+    let changed_same_sequence = config(16, Some(reference_policy(1, 2, 100)), true, true);
+    assert_eq!(admit(Ok(&changed_same_sequence), Some(Ok(&retired))), rollback);
+}
+
+// Keeps only the dictionary root; every branch below it becomes a pruned cell,
+// as in a configuration read through a proof that does not cover AUTH.
+fn pruned_config(config: &ConfigParams) -> ConfigParams {
+    let root = config.root().unwrap();
+    let proof = MerkleProof::create(root, |hash| hash == root.repr_hash()).unwrap();
+    let virtual_root = proof.proof.clone().virtualize(1);
+    assert_eq!(virtual_root.repr_hash(), root.repr_hash());
+    ConfigParams::with_address_and_params(AccountId::from([1; 32]), Some(virtual_root))
+}
+
+#[test]
+fn trusted_state_admission_refuses_pruned_configuration() {
+    let initial = config(16, Some(reference_policy(0, 0, 0)), true, true);
+    let retired = config(16, Some(reference_policy(1, 2, 0)), true, true);
+    let pruned_initial = pruned_config(&initial);
+    let pruned_retired = pruned_config(&retired);
+    assert_eq!(admit(Ok(&retired), Some(Ok(&initial))), "ok");
+    assert_ne!(admit(Ok(&pruned_retired), None), "ok");
+    assert_ne!(admit(Ok(&pruned_retired), Some(Ok(&initial))), "ok");
+    assert_ne!(admit(Ok(&retired), Some(Ok(&pruned_initial))), "ok");
 }
