@@ -2746,3 +2746,64 @@ fn test_cont_invalid_opcode() {
         }
     }
 }
+
+/// Number of rows in `data/short-code.tsv`; a regenerated fixture must update it explicitly.
+const SHORT_CODE_ROWS: usize = 2096;
+
+/// Truncated and fragment-terminated code compared with results frozen from the reference VM:
+/// exit code, consumed gas and executed steps for every row.
+#[test]
+fn short_code_matches_reference() {
+    use rtos_block::BuilderData;
+    use rtos_vm::{
+        error::{tvm_exception_code, tvm_exception_or_custom_code},
+        executor::{gas::gas_state::Gas, Engine},
+        stack::savelist::SaveList,
+    };
+    use std::collections::HashSet;
+
+    let mut ids = HashSet::new();
+    let mut rows = 0;
+    for line in include_str!("data/short-code.tsv").lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let f = line.split('\t').collect::<Vec<_>>();
+        assert_eq!(f.len(), 9, "{line}");
+        assert!(ids.insert(f[0]), "duplicate id {}", f[0]);
+        rows += 1;
+        let version = f[1].parse::<u32>().unwrap();
+        let gas_limit = f[2].parse::<i64>().unwrap();
+        let items = f[3].parse::<i64>().unwrap();
+        let bits = f[4].parse::<usize>().unwrap();
+        let bytes = hex::decode(f[5]).unwrap();
+        assert_eq!(bytes.len(), bits.div_ceil(8), "{}", f[0]);
+        let padding = bytes.len() * 8 - bits;
+        assert_eq!(bytes.last().unwrap() & ((1u16 << padding) - 1) as u8, 0, "{}: padding", f[0]);
+        let mut code = BuilderData::new();
+        code.append_raw(&bytes, bits).unwrap();
+        let code = code.into_cell().unwrap();
+        assert_eq!(code.bit_length(), bits, "{}", f[0]);
+        let mut stack = Stack::new();
+        for i in 1..=items {
+            stack.push(int!(i));
+        }
+        let mut ctrls = SaveList::new();
+        ctrls.put(7, StackItem::tuple(vec![])).unwrap();
+        let mut vm = Engine::with_capabilities(0)
+            .setup_checked(code, ctrls, stack, Gas::test_with_limit(gas_limit), vec![])
+            .unwrap();
+        vm.set_block_version(version);
+        let exit = match vm.execute() {
+            Ok(n) => n,
+            Err(e) => match tvm_exception_code(&e) {
+                Some(ExceptionCode::OutOfGas) => -14,
+                Some(n) => n as i32,
+                None => tvm_exception_or_custom_code(&e),
+            },
+        };
+        let actual = [exit.to_string(), vm.gas_used().to_string(), vm.steps().to_string()];
+        assert_eq!(actual, [f[6], f[7], f[8]], "{}: exit, gas, steps", f[0]);
+    }
+    assert_eq!(rows, SHORT_CODE_ROWS);
+}
