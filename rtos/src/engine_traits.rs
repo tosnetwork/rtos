@@ -191,6 +191,10 @@ pub trait PrivateOverlayOperations: Sync + Send {
     fn stop_catchain_client(&self, overlay_short_id: &Arc<PrivateOverlayShortId>);
 }
 
+/// Default window, in seconds, of recent blocks an initial sync downloads
+/// instead of starting from a persistent state inside it.
+pub const DEFAULT_SYNC_BLOCKS_BEFORE: u32 = 3600;
+
 // TODO make separate traits for read and write operations (may be critical and not etc.)
 #[async_trait::async_trait]
 #[allow(unused)]
@@ -1068,9 +1072,10 @@ pub trait EngineOperations: Sync + Send {
         unimplemented!()
     }
 
-    // Time in past to get blocks in
+    // Time in past to get blocks in: a cold boot starts from a key block at
+    // least this old and downloads the blocks after it.
     fn sync_blocks_before(&self) -> u32 {
-        0
+        DEFAULT_SYNC_BLOCKS_BEFORE
     }
 
     fn key_block_utime_step(&self) -> u32 {
@@ -1475,3 +1480,7 @@ pub trait Stoppable: Send + Sync {
     fn name(&self) -> &'static str;
     async fn shutdown(self: Box<Self>);
 }
+
+#[cfg(test)]
+#[path = "tests/test_sync_blocks_before.rs"]
+mod sync_blocks_before_tests;
