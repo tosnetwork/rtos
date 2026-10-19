@@ -7266,3 +7266,118 @@ fn test_tn1362_verified_certificate_materializer_ignores_finalized_slots_like_cp
         "certificate materialization must allow the first tracked slot"
     );
 }
+
+/*
+    ========================================================================
+    Finalization backpressure (C++ FinalizationBacklog consumers)
+    ========================================================================
+*/
+
+fn count_votes(events: &[SimplexEvent], kind: fn(&Vote) -> bool) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, SimplexEvent::BroadcastVote(vote) if kind(vote)))
+        .count()
+}
+
+fn is_notarize(vote: &Vote) -> bool {
+    matches!(vote, Vote::Notarize(_))
+}
+
+fn is_finalize(vote: &Vote) -> bool {
+    matches!(vote, Vote::Finalize(_))
+}
+
+fn is_skip(vote: &Vote) -> bool {
+    matches!(vote, Vote::Skip(_))
+}
+
+#[test]
+fn test_finality_behind_gives_up_notarize_for_the_slot() {
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc).expect("Failed to create SimplexState");
+    state.set_finality_behind(true);
+
+    let hash = UInt256::from([7u8; 32]);
+    let candidate = create_test_candidate(0, hash.clone(), BlockIdExt::default(), None, 0);
+    state.on_candidate(&desc, candidate).expect("on_candidate should succeed");
+    assert_eq!(count_votes(&drain_events(&mut state), is_notarize), 0);
+    assert!(state.is_notarization_abandoned(&desc, SlotIndex::new(0)));
+
+    // The backlog clears: C++ try_notarize is one-shot, so nothing asks again.
+    state.set_finality_behind(false);
+    state.check_all(&desc);
+    assert_eq!(count_votes(&drain_events(&mut state), is_notarize), 0);
+    assert!(
+        state.get_window(WindowIndex::new(0)).unwrap().slots[0].pending_block.is_some(),
+        "the pending candidate is kept (it still rules out a second one)"
+    );
+}
+
+#[test]
+fn test_finality_cleared_before_candidate_notarizes_normally() {
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc).expect("Failed to create SimplexState");
+    state.set_finality_behind(true);
+    state.set_finality_behind(false);
+
+    let candidate =
+        create_test_candidate(0, UInt256::from([7u8; 32]), BlockIdExt::default(), None, 0);
+    state.on_candidate(&desc, candidate).expect("on_candidate should succeed");
+    assert_eq!(count_votes(&drain_events(&mut state), is_notarize), 1);
+    assert!(!state.is_notarization_abandoned(&desc, SlotIndex::new(0)));
+}
+
+#[test]
+fn test_finality_behind_suppresses_finalize_vote() {
+    for behind in [false, true] {
+        let desc = create_test_desc(4, 2);
+        let mut state = SimplexState::new(&desc).expect("Failed to create SimplexState");
+        let hash = UInt256::from([7u8; 32]);
+        let candidate = create_test_candidate(0, hash.clone(), BlockIdExt::default(), None, 0);
+        state.on_candidate(&desc, candidate).expect("on_candidate should succeed");
+        assert_eq!(count_votes(&drain_events(&mut state), is_notarize), 1);
+
+        state.set_finality_behind(behind);
+        let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+        let cert = create_test_notar_cert(&desc, SlotIndex::new(0), hash.clone(), &signers);
+        state.set_notarize_certificate(&desc, SlotIndex::new(0), &hash, cert).unwrap();
+        state.check_all(&desc);
+        assert_eq!(
+            count_votes(&drain_events(&mut state), is_finalize),
+            usize::from(!behind),
+            "behind={behind}"
+        );
+    }
+}
+
+#[test]
+fn test_finality_behind_timeout_casts_no_skip_and_marks_nothing() {
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc).expect("Failed to create SimplexState");
+    let t0 = desc.get_time();
+    state.reset_timeouts_on_start(&desc);
+    state.set_finality_behind(true);
+
+    desc.set_time(t0 + Duration::from_secs(5));
+    state.check_all(&desc);
+
+    assert_eq!(count_votes(&drain_events(&mut state), is_skip), 0);
+    let window = state.get_window(WindowIndex::new(0)).unwrap();
+    assert!(!window.slots[0].voted_skip && !window.slots[1].voted_skip);
+    assert!(!window.had_timeouts, "no skip was cast, so the window had none");
+    assert!(state.skip_slot >= SlotIndex::new(2), "the alarm is still consumed to the window end");
+    assert!(state.skip_timestamp.is_none(), "and not re-armed until the next window");
+}
+
+#[test]
+fn test_finality_behind_suppresses_restart_skip_votes() {
+    for behind in [false, true] {
+        let desc = create_test_desc(4, 2);
+        let mut state = SimplexState::new(&desc).expect("Failed to create SimplexState");
+        state.set_finality_behind(behind);
+        let queued = state.generate_restart_skip_votes(WindowIndex::new(1), 2);
+        assert_eq!(queued, if behind { 0 } else { 2 }, "behind={behind}");
+        assert_eq!(count_votes(&drain_events(&mut state), is_skip), queued as usize);
+    }
+}

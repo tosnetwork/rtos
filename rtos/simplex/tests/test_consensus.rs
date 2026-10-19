@@ -211,6 +211,34 @@ struct TestConfig {
     /// Set > 1 to test candidate chaining within a leader window.
     /// Precollation depth is derived automatically as (window - 1).
     slots_per_leader_window: Option<u32>,
+    /// Override the ConfigParam30 certificate fan-out (default 20).
+    certificate_gossip_neighbors: Option<u32>,
+    /// Hold every node's finality acceptance for a while, then release it.
+    finality_hold: Option<FinalityHoldConfig>,
+}
+
+/// Finality-hold configuration: once every node has `start_after_finalized`
+/// finalizations, every node's acceptance gate is held for `hold_for`.
+#[derive(Clone, Debug)]
+struct FinalityHoldConfig {
+    start_after_finalized: u32,
+    hold_for: Duration,
+    /// The trailing part of the hold during which nothing may be collated.
+    quiet_tail: Duration,
+    report: Arc<Mutex<Option<FinalityHoldReport>>>,
+}
+
+/// What the harness observed across a finality hold.
+#[derive(Clone, Debug, Default)]
+struct FinalityHoldReport {
+    collations_at_hold: u32,
+    collations_at_quiet_start: u32,
+    collations_at_release: u32,
+    staged_at_hold: usize,
+    staged_at_quiet_start: usize,
+    staged_at_release: usize,
+    parked_at_release: usize,
+    finalized_at_release: u32,
 }
 
 /// Network gremlin configuration (net-gremlin).
@@ -269,6 +297,8 @@ impl Default for TestConfig {
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
             slots_per_leader_window: None,
+            certificate_gossip_neighbors: None,
+            finality_hold: None,
         }
     }
 }
@@ -1172,6 +1202,9 @@ where
     if let Some(st) = config.standstill_timeout {
         session_opts.standstill_timeout = st;
     }
+    if let Some(neighbors) = config.certificate_gossip_neighbors {
+        session_opts.certificate_gossip_neighbors = neighbors;
+    }
     let session_opts = committee.options(&session_opts);
 
     let finalized_blocks: FinalizedBlocksMap = Arc::new(Mutex::new(HashSet::new()));
@@ -1389,6 +1422,16 @@ where
             next_pick_at: Instant::now() + cfg.restart_interval,
             cycles_done: 0,
         });
+
+    #[derive(Clone, Copy)]
+    enum HoldState {
+        Waiting,
+        Holding(Instant),
+        Released,
+    }
+    let mut hold_state = HoldState::Waiting;
+    let mut hold_report = FinalityHoldReport::default();
+    let mut hold_quiet_marked = false;
 
     'main_loop: loop {
         // Fail fast if any session thread panicked.
@@ -1656,6 +1699,49 @@ where
             }
         }
 
+        // Finality-hold tick.
+        if let Some(hold) = config.finality_hold.as_ref() {
+            let collations: u32 = instances.iter().map(|inst| inst.lock().collation_count()).sum();
+            let min_finalized =
+                instances.iter().map(|inst| inst.lock().on_block_finalized_count()).min();
+            let now = Instant::now();
+            match hold_state {
+                HoldState::Waiting
+                    if min_finalized.is_some_and(|count| count >= hold.start_after_finalized) =>
+                {
+                    committee.hold_finality(true);
+                    log::info!("[finality-hold] holding acceptance at {collations} collations");
+                    hold_report.collations_at_hold = collations;
+                    hold_report.staged_at_hold = committee.finality_staged();
+                    hold_state = HoldState::Holding(now);
+                }
+                HoldState::Holding(since) => {
+                    if now >= since + hold.hold_for.saturating_sub(hold.quiet_tail)
+                        && !hold_quiet_marked
+                    {
+                        hold_quiet_marked = true;
+                        hold_report.collations_at_quiet_start = collations;
+                        hold_report.staged_at_quiet_start = committee.finality_staged();
+                    }
+                    if now >= since + hold.hold_for {
+                        hold_report.collations_at_release = collations;
+                        hold_report.staged_at_release = committee.finality_staged();
+                        hold_report.parked_at_release = committee.finality_parked();
+                        hold_report.finalized_at_release = instances
+                            .iter()
+                            .map(|inst| inst.lock().on_block_finalized_count())
+                            .max()
+                            .unwrap_or(0);
+                        log::info!("[finality-hold] releasing: {hold_report:?}");
+                        committee.hold_finality(false);
+                        *hold.report.lock().unwrap() = Some(hold_report.clone());
+                        hold_state = HoldState::Released;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let not_finished: Vec<usize> = instances
             .iter()
             .enumerate()
@@ -1918,6 +2004,8 @@ fn test_simplex_consensus_basic() {
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
             slots_per_leader_window: None,
+            certificate_gossip_neighbors: None,
+            finality_hold: None,
         },
         |instances| {
             // Verify commit rate meets minimum requirement
@@ -1976,6 +2064,8 @@ fn test_simplex_consensus_with_failures() {
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
             slots_per_leader_window: None,
+            certificate_gossip_neighbors: None,
+            finality_hold: None,
         },
         |instances| {
             // Verify commit rate meets minimum requirement
@@ -2044,6 +2134,8 @@ fn test_simplex_consensus_finalcert_recovery() {
             lossy_overlay_node_indices: Some(vec![0]),
             standstill_timeout: None,
             slots_per_leader_window: None,
+            certificate_gossip_neighbors: None,
+            finality_hold: None,
         },
         |instances| {
             let config = &instances[0].lock().config.clone();
@@ -2117,6 +2209,8 @@ fn test_simplex_consensus_shard_with_mc_notifications() {
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
             slots_per_leader_window: None,
+            certificate_gossip_neighbors: None,
+            finality_hold: None,
         },
         |instances| {
             // Verify commit rate meets minimum requirement
@@ -2174,6 +2268,8 @@ fn test_simplex_consensus_adnl_overlay() {
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
             slots_per_leader_window: None,
+            certificate_gossip_neighbors: None,
+            finality_hold: None,
         },
         |instances| {
             // Verify commit rate meets minimum requirement
@@ -2235,6 +2331,8 @@ fn test_simplex_consensus_adnl_net_gremlin() {
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
             slots_per_leader_window: None,
+            certificate_gossip_neighbors: None,
+            finality_hold: None,
         },
         |instances| {
             // Verify commit rate meets minimum requirement (best-effort under partitions).
@@ -2300,6 +2398,8 @@ fn test_simplex_consensus_restart_gremlin() {
             // causing receiver queues to explode and the test to stall intermittently.
             standstill_timeout: Some(Duration::from_secs(5)),
             slots_per_leader_window: None,
+            certificate_gossip_neighbors: None,
+            finality_hold: None,
         },
         |instances| {
             let config = &instances[0].lock().config.clone();
@@ -2487,6 +2587,8 @@ fn test_simplex_start_gate() {
         lossy_overlay_node_indices: None,
         standstill_timeout: None,
         slots_per_leader_window: None,
+        certificate_gossip_neighbors: None,
+        finality_hold: None,
     };
 
     for i in 0..node_count {
@@ -2652,6 +2754,8 @@ fn test_simplex_consensus_candidate_chaining() {
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
             slots_per_leader_window: Some(4),
+            certificate_gossip_neighbors: None,
+            finality_hold: None,
         },
         |instances| {
             let config = &instances[0].lock().config.clone();
@@ -2712,6 +2816,8 @@ fn test_simplex_consensus_candidate_chaining_with_lossy_overlay() {
             lossy_overlay_node_indices: Some(vec![0]),
             standstill_timeout: None,
             slots_per_leader_window: Some(4),
+            certificate_gossip_neighbors: None,
+            finality_hold: None,
         },
         |instances| {
             let config = &instances[0].lock().config.clone();
@@ -2774,6 +2880,8 @@ fn test_simplex_consensus_ghost_parent_resolver_probe() {
             lossy_overlay_node_indices: Some(vec![0]),
             standstill_timeout: None,
             slots_per_leader_window: Some(4),
+            certificate_gossip_neighbors: None,
+            finality_hold: None,
         },
         |instances| {
             let probe = instances[0].lock();
@@ -2821,4 +2929,83 @@ fn test_empty_collated_data_hash() {
         "SHA256 of empty data should NOT be UInt256::default(). \
         Empty collated_data is valid but must still be hashed properly."
     );
+}
+
+/// Finalization backpressure across a committee (C++ FinalizationBacklog).
+///
+/// Every node's finality acceptance is held. Consensus keeps agreeing until each
+/// node holds more than 16 unconverted finalizations, then stops producing and
+/// voting: no further finalization reaches any node during a quiet tail of the
+/// hold, while the finalizations agreed before the stop kept reaching the nodes.
+/// Releasing the gates drains the backlog; the leader window abandoned while
+/// behind is then skipped by its first-block timeout and the group finishes the
+/// run. The timeout is longer than the hold on purpose: a skip timeout that
+/// expires while finality is behind casts no skip and is consumed (C++
+/// consensus.cpp alarm), so the abandoned window would never be left.
+#[test]
+fn test_simplex_consensus_finalization_backpressure() {
+    let report = Arc::new(Mutex::new(None));
+    let node_count = 4usize;
+    let slots_per_window = 1u32;
+    run_simplex_consensus_test(
+        TestConfig {
+            total_rounds: 40,
+            min_finalized_percent: 0.3,
+            node_count,
+            generation_failure_probability: 0.0,
+            candidate_rejection_probability: 0.0,
+            max_collations: 10000,
+            target_rate: Duration::from_millis(200),
+            first_block_timeout: Duration::from_secs(20),
+            test_name: "simplex_finalization_backpressure".to_string(),
+            test_timeout: Duration::from_secs(240),
+            expect_timeout: false,
+            shard: ShardIdent::masterchain(),
+            mc_notification_interval: None,
+            overlay_type: OverlayType::InProcess,
+            net_gremlin: None,
+            restart_gremlin: None,
+            lossy_overlay: None,
+            lossy_overlay_node_indices: None,
+            standstill_timeout: None,
+            slots_per_leader_window: Some(slots_per_window),
+            certificate_gossip_neighbors: None,
+            finality_hold: Some(FinalityHoldConfig {
+                start_after_finalized: 5,
+                hold_for: Duration::from_secs(10),
+                quiet_tail: Duration::from_secs(4),
+                report: report.clone(),
+            }),
+        },
+        |_instances| {},
+    );
+
+    let Some(report) = report.lock().unwrap().clone() else {
+        // Logging disabled: the harness did not run.
+        return;
+    };
+    log::info!("[finality-hold] report: {report:?}");
+    let staged = report.staged_at_release - report.staged_at_hold;
+    let bound = (17 + 2 * slots_per_window as usize) * node_count;
+    assert!(
+        report.staged_at_release > report.staged_at_hold,
+        "finalization work must keep reaching the nodes after acceptance is held"
+    );
+    assert!(
+        staged <= bound,
+        "consensus must stop once the backlog passes 16: {staged} finalizations staged \
+         (bound {bound})"
+    );
+    assert_eq!(
+        report.staged_at_release, report.staged_at_quiet_start,
+        "no finalization agreed during the quiet tail of the hold"
+    );
+    assert_eq!(
+        report.collations_at_release, report.collations_at_quiet_start,
+        "no collation during the quiet tail of the hold"
+    );
+    assert!(report.parked_at_release > 0, "acceptance was held");
+    // The harness requires every node to reach total_rounds, more than were
+    // reached when the gates opened: the drain-and-resume evidence.
+    assert!(report.finalized_at_release < 40, "the hold started well before completion");
 }

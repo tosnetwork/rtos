@@ -790,6 +790,12 @@ pub(crate) struct FullDumpSnapshot {
     pub(crate) rejected_count: usize,
     /// Number of finalized entries still awaiting body delivery.
     pub(crate) finalized_pending_body_count: usize,
+    /// Attempted, unresolved candidate finalizations (stalled included).
+    pub(crate) finalization_backlog_pending: usize,
+    /// Candidate finalizations stopped for a reason retrying cannot mend.
+    pub(crate) finalization_backlog_stalled: usize,
+    /// Whether the group stopped producing because finality is behind.
+    pub(crate) finalization_backlog_over_limit: bool,
 
     /* Collation summary (scalars) */
     /// Current consensus slot.
@@ -2421,6 +2427,12 @@ impl SessionTelemetry {
             full.approved_count,
             full.rejected_count,
             full.finalized_pending_body_count,
+        ));
+        r.push_str(&format!(
+            "    finalization backlog: pending={} stalled_permanently={} finality_behind={}\n",
+            full.finalization_backlog_pending,
+            full.finalization_backlog_stalled,
+            full.finalization_backlog_over_limit,
         ));
 
         // ---- Collation (per-window) ----

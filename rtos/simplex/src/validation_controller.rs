@@ -318,6 +318,11 @@ pub(crate) struct ValidationController {
     /// `if let Some(tc) = &self.trace_collector`. Cheap-to-clone handle cloned
     /// from `SessionProcessor` at construction
     trace_collector: Option<TraceCollector>,
+    /// Candidates whose parent became ready while finality was behind. C++
+    /// `try_notarize` checks `may_vote` right after `WaitForParent`, before
+    /// validation; a refusal there gives up the local notarize vote even if the
+    /// backlog clears while validation runs. Validation itself still proceeds.
+    notarization_abandoned: HashSet<RawCandidateId>,
 }
 
 // ======================================================================
@@ -367,7 +372,14 @@ impl ValidationController {
             validation_attempt_map: HashMap::new(),
             validated_candidates: VecDeque::new(),
             trace_collector,
+            notarization_abandoned: HashSet::new(),
         }
+    }
+
+    /// Whether the local notarize vote for this candidate was given up when its
+    /// parent became ready while finality was behind. Consumes the mark.
+    pub(crate) fn take_notarization_abandoned(&mut self, candidate_id: &RawCandidateId) -> bool {
+        self.notarization_abandoned.remove(candidate_id)
     }
 
     /// Session identifier, from the held description. Mirrors
@@ -693,7 +705,11 @@ impl ValidationController {
             }
 
             match wait_for_parent_decision {
-                WaitForParentDecision::Ready => {}
+                WaitForParentDecision::Ready => {
+                    if backend.simplex_state().finality_behind() {
+                        self.notarization_abandoned.insert(candidate_id.clone());
+                    }
+                }
                 WaitForParentDecision::Wait => continue,
                 WaitForParentDecision::Reject(reason) => {
                     log::warn!(
@@ -1597,6 +1613,7 @@ impl ValidationController {
         self.approved.retain(|id, _| id.slot >= up_to_slot);
         self.validation_attempt_map.retain(|id, _| id.slot >= up_to_slot);
         self.validated_candidates.retain(|c| c.id.slot >= up_to_slot);
+        self.notarization_abandoned.retain(|id| id.slot >= up_to_slot);
     }
 }
 

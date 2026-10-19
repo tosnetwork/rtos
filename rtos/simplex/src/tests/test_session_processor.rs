@@ -6028,10 +6028,11 @@ fn test_apply_bootstrap_restore_candidate_bytes_skips_non_empty_and_keeps_empty(
 // Finalized journal cleanup tests
 // ============================================================================
 
-/// Verify that `cleanup_old_candidates` prunes stale finalized-journal entries for old slots
-/// without treating them as session errors.
+/// Verify that `cleanup_old_candidates` never ages out an unresolved finalized-journal
+/// entry (C++ keeps every agreed certificate until it is converted) and treats the old
+/// entry as no session error.
 #[test]
-fn test_journal_cleanup_removes_stale_entries() {
+fn test_journal_cleanup_keeps_unresolved_entries() {
     let mut fixture = TestFixture::new(4);
 
     let old_slot = SlotIndex::new(5);
@@ -6084,11 +6085,11 @@ fn test_journal_cleanup_removes_stale_entries() {
     let errors_before =
         fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
 
-    // Cleanup slots < 10 — old_slot(5) should be removed, current_slot(20) kept.
+    // Cleanup slots < 10 — both unresolved entries stay, old_slot(5) included.
     fixture.processor.cleanup_old_candidates(SlotIndex::new(10));
 
-    assert_eq!(fixture.processor.consensus.finalized_pending_body_len(), 1);
-    assert!(!fixture.processor.consensus.finalized_pending_body_contains(&old_id));
+    assert_eq!(fixture.processor.consensus.finalized_pending_body_len(), 2);
+    assert!(fixture.processor.consensus.finalized_pending_body_contains(&old_id));
     assert!(fixture.processor.consensus.finalized_pending_body_contains(&current_id));
 
     let errors_after =
@@ -12973,4 +12974,476 @@ fn own_vote_rejected_locally_is_never_published() {
     let actions = receiver.drain_actions();
     assert_eq!(published(&actions), 1, "an applied own vote is sent exactly once");
     assert!(actions.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })));
+}
+
+// ============================================================================
+// Finalization backpressure
+// ============================================================================
+//
+// Every finalization attempt is tracked per candidate. An attempted candidate
+// that has not finished, or that stopped for a reason retrying cannot mend,
+// counts as pending; over the limit (or with any permanent stall) the group is
+// told to stop producing, and told again when the backlog clears.
+
+/// Workchain fixture with a recording listener and synchronous callbacks.
+fn backlog_fixture(
+) -> (TestFixture, Arc<RecordingListener>, Arc<dyn consensus_common::SessionListener + Send + Sync>)
+{
+    let mut opts = SessionOptions::default();
+    opts.use_callback_thread = false;
+    let mut fixture = TestFixture::new_with_shard_and_local_idx(
+        4,
+        0,
+        ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap(),
+        opts,
+    );
+    let recording = RecordingListener::new();
+    let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
+    (fixture, recording, listener)
+}
+
+fn backlog_id(slot: u32) -> RawCandidateId {
+    let mut hash = [0x5Au8; 32];
+    hash[..4].copy_from_slice(&slot.to_le_bytes());
+    RawCandidateId { slot: SlotIndex::new(slot), hash: UInt256::from(hash) }
+}
+
+/// Seed a received candidate (one seqno per slot) and, optionally, its
+/// notarization certificate.
+fn seed_backlog_node(
+    fixture: &mut TestFixture,
+    slot: u32,
+    parent: Option<u32>,
+    is_empty: bool,
+    notarize: bool,
+) -> RawCandidateId {
+    let id = backlog_id(slot);
+    let shard = fixture.description.get_shard().clone();
+    let mut root = [0x11u8; 32];
+    root[..4].copy_from_slice(&slot.to_le_bytes());
+    let block_id = BlockIdExt::with_params(shard, slot, UInt256::from(root), UInt256::from(root));
+    let received = crate::candidate_book::ReceivedCandidate {
+        slot: id.slot,
+        source_idx: ValidatorIndex::new(0),
+        candidate_hash_data_bytes: vec![0xAB, slot as u8],
+        block_id,
+        root_hash: UInt256::from(root),
+        file_hash: UInt256::from(root),
+        data: consensus_common::ConsensusCommonFactory::create_block_payload(if is_empty {
+            vec![]
+        } else {
+            vec![1u8, slot as u8]
+        }),
+        collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(vec![]),
+        gen_utime_ms: None,
+        receive_time: SystemTime::now(),
+        is_empty,
+        parent_id: parent.map(backlog_id),
+    };
+    fixture.processor.candidate_book_mut().insert_received(id.clone(), received);
+    if notarize {
+        notarize_slot(fixture, id.slot, &id.hash);
+    }
+    id
+}
+
+fn finalize_backlog_trigger(fixture: &mut TestFixture, id: &RawCandidateId) {
+    let block_id = fixture.processor.candidate_book().received(id).map(|r| r.block_id.clone());
+    fixture.processor.handle_block_finalized(BlockFinalizedEvent {
+        slot: id.slot,
+        block_hash: id.hash.clone(),
+        block_id,
+        certificate: make_test_final_cert(id.slot, id.hash.clone()),
+    });
+}
+
+fn retry_backlog(fixture: &mut TestFixture) {
+    fixture.processor.with_consensus_backend(|consensus, backend| {
+        consensus.retry_pending_recursive_finalization(backend)
+    });
+}
+
+fn assert_backlog_counts_match_recount(fixture: &TestFixture) {
+    let consensus = &fixture.processor.consensus;
+    assert_eq!(
+        consensus.recount_finalizations_for_test(),
+        (consensus.pending_finalizations(), consensus.stalled_finalizations()),
+        "incremental backlog counts must equal a full recount"
+    );
+}
+
+/// A chain of `children` candidates above a root whose body has not arrived:
+/// finalizing the top attempts every candidate down to the missing root.
+fn seed_chain_over_missing_root(
+    fixture: &mut TestFixture,
+    root: u32,
+    children: u32,
+) -> RawCandidateId {
+    let root_id = backlog_id(root);
+    notarize_slot(fixture, root_id.slot, &root_id.hash);
+    let mut top = root_id;
+    for slot in root + 1..=root + children {
+        top = seed_backlog_node(fixture, slot, Some(slot - 1), false, true);
+    }
+    top
+}
+
+fn is_stalled(state: Option<crate::consensus_controller::CandidateFinalization>) -> bool {
+    matches!(state, Some(crate::consensus_controller::CandidateFinalization::StalledPermanently(_)))
+}
+
+#[test]
+fn test_finalization_backlog_default_limit_and_override_parsing() {
+    use crate::consensus_controller::parse_pending_finalizations_max as parse;
+    assert_eq!(crate::consensus_controller::DEFAULT_PENDING_FINALIZATIONS_MAX, 16);
+    assert_eq!(parse(None), 16);
+    assert_eq!(parse(Some("3")), 3);
+    assert_eq!(parse(Some("0")), 16, "zero is not a usable limit");
+    assert_eq!(parse(Some("-1")), 16);
+    assert_eq!(parse(Some("abc")), 16);
+}
+
+#[test]
+fn test_finalization_backlog_sixteen_pending_keeps_producing() {
+    let (mut fixture, _recording, _listener) = backlog_fixture();
+    fixture.processor.consensus.set_pending_finalizations_max_for_test(16);
+    let top = seed_chain_over_missing_root(&mut fixture, 40, 15);
+
+    finalize_backlog_trigger(&mut fixture, &top);
+
+    let consensus = &fixture.processor.consensus;
+    assert_eq!(consensus.pending_finalizations(), 16, "15 children + the missing root");
+    assert!(!consensus.backlog_over_limit(), "16 is not over the limit of 16");
+    assert!(!fixture.processor.simplex_state.finality_behind());
+    assert!(consensus.backlog_transitions_for_test().is_empty());
+    assert_backlog_counts_match_recount(&fixture);
+}
+
+#[test]
+fn test_finalization_backlog_seventeenth_stops_and_clears_at_root_completion() {
+    let (mut fixture, recording, _listener) = backlog_fixture();
+    fixture.processor.consensus.set_pending_finalizations_max_for_test(16);
+    let top = seed_chain_over_missing_root(&mut fixture, 40, 16);
+
+    finalize_backlog_trigger(&mut fixture, &top);
+
+    assert_eq!(fixture.processor.consensus.pending_finalizations(), 17);
+    assert!(fixture.processor.consensus.backlog_over_limit());
+    assert!(fixture.processor.simplex_state.finality_behind(), "the FSM is told to stop");
+    assert_eq!(fixture.processor.consensus.backlog_transitions_for_test(), &[(true, 17)]);
+    assert_eq!(
+        fixture.processor.consensus.candidate_finalization(&backlog_id(40)),
+        Some(crate::consensus_controller::CandidateFinalization::Idle),
+        "the missing root was attempted and is retried"
+    );
+    assert!(drain_finalized_events(&recording).is_empty());
+    assert_backlog_counts_match_recount(&fixture);
+
+    // The root arrives. Completions are applied ancestor first, so the backlog
+    // clears exactly when the root's own attempt completes (17 -> 16).
+    seed_backlog_node(&mut fixture, 40, None, false, true);
+    retry_backlog(&mut fixture);
+
+    let consensus = &fixture.processor.consensus;
+    assert_eq!(consensus.backlog_transitions_for_test(), &[(true, 17), (false, 16)]);
+    assert_eq!(consensus.pending_finalizations(), 0);
+    assert!(!consensus.backlog_over_limit());
+    assert!(!fixture.processor.simplex_state.finality_behind(), "the FSM produces again");
+    assert!(!consensus.finalized_pending_body_contains(&top));
+    for slot in 40..=56 {
+        assert_eq!(
+            consensus.candidate_finalization(&backlog_id(slot)),
+            Some(crate::consensus_controller::CandidateFinalization::Finalized),
+            "slot {slot}"
+        );
+    }
+    assert_eq!(drain_finalized_events(&recording).len(), 17);
+    assert_backlog_counts_match_recount(&fixture);
+}
+
+#[test]
+fn test_finalization_backlog_overlapping_triggers_count_shared_ancestors_once() {
+    let (mut fixture, _recording, _listener) = backlog_fixture();
+    fixture.processor.consensus.set_pending_finalizations_max_for_test(2);
+    notarize_slot(&mut fixture, backlog_id(40).slot, &backlog_id(40).hash);
+    let a = seed_backlog_node(&mut fixture, 41, Some(40), false, true);
+    let b = seed_backlog_node(&mut fixture, 42, Some(41), false, true);
+
+    finalize_backlog_trigger(&mut fixture, &a);
+    assert_eq!(fixture.processor.consensus.pending_finalizations(), 2, "a + missing root");
+    assert!(!fixture.processor.consensus.backlog_over_limit());
+
+    finalize_backlog_trigger(&mut fixture, &b);
+    let consensus = &fixture.processor.consensus;
+    assert_eq!(consensus.pending_finalizations(), 3, "b, a and the root, each once");
+    assert!(consensus.backlog_over_limit());
+    assert!(consensus.finalization_attempts_for_test(&backlog_id(40)) >= 2);
+    assert_eq!(consensus.finalization_attempts_for_test(&b), 1);
+    assert_backlog_counts_match_recount(&fixture);
+}
+
+#[test]
+fn test_finalization_backlog_partial_parent_completion() {
+    let (mut fixture, recording, _listener) = backlog_fixture();
+    let root = seed_backlog_node(&mut fixture, 40, None, false, true);
+    // The middle candidate has no notarization certificate yet.
+    let middle = seed_backlog_node(&mut fixture, 41, Some(40), false, false);
+    let top = seed_backlog_node(&mut fixture, 42, Some(41), false, true);
+
+    finalize_backlog_trigger(&mut fixture, &top);
+
+    use crate::consensus_controller::CandidateFinalization;
+    let consensus = &fixture.processor.consensus;
+    assert_eq!(consensus.candidate_finalization(&root), Some(CandidateFinalization::Finalized));
+    assert_eq!(consensus.candidate_finalization(&middle), Some(CandidateFinalization::Idle));
+    assert_eq!(consensus.candidate_finalization(&top), Some(CandidateFinalization::Idle));
+    assert_eq!(consensus.pending_finalizations(), 2, "a finished parent no longer counts");
+    assert_eq!(drain_finalized_events(&recording).len(), 1, "only the root was handed off");
+    assert_backlog_counts_match_recount(&fixture);
+
+    notarize_slot(&mut fixture, middle.slot, &middle.hash);
+    retry_backlog(&mut fixture);
+    assert_eq!(fixture.processor.consensus.pending_finalizations(), 0);
+    assert_eq!(fixture.processor.consensus.finalization_attempts_for_test(&middle), 2);
+}
+
+#[test]
+fn test_finalization_backlog_retryable_handoff_failure_is_retried() {
+    let (mut fixture, recording, _listener) = backlog_fixture();
+    let only = seed_backlog_node(&mut fixture, 40, None, false, true);
+    fixture.processor.consensus.inject_handoff_failures_for_test(1, 0);
+
+    finalize_backlog_trigger(&mut fixture, &only);
+    use crate::consensus_controller::CandidateFinalization;
+    assert_eq!(
+        fixture.processor.consensus.candidate_finalization(&only),
+        Some(CandidateFinalization::Idle)
+    );
+    assert_eq!(fixture.processor.consensus.pending_finalizations(), 1);
+    assert_eq!(fixture.processor.consensus.stalled_finalizations(), 0);
+    assert!(drain_finalized_events(&recording).is_empty());
+
+    retry_backlog(&mut fixture);
+    assert_eq!(
+        fixture.processor.consensus.candidate_finalization(&only),
+        Some(CandidateFinalization::Finalized)
+    );
+    assert_eq!(fixture.processor.consensus.finalization_attempts_for_test(&only), 2);
+    assert_eq!(fixture.processor.consensus.pending_finalizations(), 0);
+    assert_eq!(drain_finalized_events(&recording).len(), 1);
+}
+
+#[test]
+fn test_finalization_backlog_permanent_stall_propagates_and_is_never_retried() {
+    let (mut fixture, recording, _listener) = backlog_fixture();
+    let root = seed_backlog_node(&mut fixture, 40, None, false, true);
+    let child = seed_backlog_node(&mut fixture, 41, Some(40), false, true);
+    fixture.processor.consensus.inject_handoff_failures_for_test(0, 1);
+
+    finalize_backlog_trigger(&mut fixture, &child);
+
+    let consensus = &fixture.processor.consensus;
+    assert!(is_stalled(consensus.candidate_finalization(&root)), "the failure is the root's");
+    assert!(is_stalled(consensus.candidate_finalization(&child)), "and its dependents'");
+    assert_eq!(consensus.stalled_finalizations(), 2);
+    assert_eq!(consensus.pending_finalizations(), 2);
+    assert!(consensus.backlog_over_limit(), "one stall is enough, whatever the limit");
+    assert!(fixture.processor.simplex_state.finality_behind());
+    assert!(consensus.finalized_pending_body_contains(&child), "kept, not dropped");
+    assert!(drain_finalized_events(&recording).is_empty());
+    let root_attempts = consensus.finalization_attempts_for_test(&root);
+
+    // A second trigger on top of the stalled chain fails with it, without
+    // another attempt on the stalled ancestors.
+    let grandchild = seed_backlog_node(&mut fixture, 42, Some(41), false, true);
+    finalize_backlog_trigger(&mut fixture, &grandchild);
+    retry_backlog(&mut fixture);
+    retry_backlog(&mut fixture);
+    let consensus = &fixture.processor.consensus;
+    assert!(is_stalled(consensus.candidate_finalization(&grandchild)));
+    assert_eq!(consensus.finalization_attempts_for_test(&root), root_attempts);
+    assert_eq!(consensus.finalization_attempts_for_test(&child), 1, "never retried");
+    assert_eq!(consensus.finalization_attempts_for_test(&grandchild), 1);
+    assert_eq!(consensus.stalled_finalizations(), 3);
+    assert!(drain_finalized_events(&recording).is_empty());
+    assert_backlog_counts_match_recount(&fixture);
+}
+
+#[test]
+fn test_finalization_backlog_parent_cycle_is_kept_and_retried_until_repaired() {
+    let (mut fixture, recording, _listener) = backlog_fixture();
+    // Inconsistent local metadata: 41 names 42 as its parent and 42 names 41.
+    let a = seed_backlog_node(&mut fixture, 41, Some(42), false, true);
+    let b = seed_backlog_node(&mut fixture, 42, Some(41), false, true);
+
+    finalize_backlog_trigger(&mut fixture, &b);
+
+    use crate::consensus_controller::CandidateFinalization;
+    let consensus = &fixture.processor.consensus;
+    assert_eq!(consensus.candidate_finalization(&a), Some(CandidateFinalization::Idle));
+    assert_eq!(consensus.candidate_finalization(&b), Some(CandidateFinalization::Idle));
+    assert_eq!(consensus.pending_finalizations(), 2);
+    assert_eq!(consensus.stalled_finalizations(), 0);
+    assert!(consensus.finalized_pending_body_contains(&b), "a non-custody session keeps it too");
+
+    // The repaired body names the real parent: the same trigger completes.
+    seed_backlog_node(&mut fixture, 41, None, false, true);
+    retry_backlog(&mut fixture);
+    assert_eq!(fixture.processor.consensus.pending_finalizations(), 0);
+    assert_eq!(drain_finalized_events(&recording).len(), 2);
+}
+
+#[test]
+fn test_finalization_backlog_survives_pruning_and_eviction() {
+    let (mut fixture, _recording, _listener) = backlog_fixture();
+    let done = seed_backlog_node(&mut fixture, 40, None, false, true);
+    finalize_backlog_trigger(&mut fixture, &done);
+    let missing = backlog_id(50);
+    notarize_slot(&mut fixture, missing.slot, &missing.hash);
+    let waiting = seed_backlog_node(&mut fixture, 51, Some(50), false, true);
+    finalize_backlog_trigger(&mut fixture, &waiting);
+    assert_eq!(fixture.processor.consensus.pending_finalizations(), 2);
+    assert_eq!(
+        fixture.processor.consensus.durable_pending_floor(),
+        Some(SlotIndex::new(0)),
+        "an unresolved finalization pins the history for every session"
+    );
+
+    // A prune far above every slot releases only finalized entries.
+    fixture.processor.consensus.prune_below(SlotIndex::new(10_000));
+    let consensus = &fixture.processor.consensus;
+    assert_eq!(consensus.candidate_finalization(&done), None, "finalized entry evicted");
+    assert_eq!(consensus.pending_finalizations(), 2, "eviction changes no pending count");
+    assert!(consensus.finalized_pending_body_contains(&waiting), "unresolved trigger kept");
+    assert_eq!(consensus.finalization_status_len_for_test(), 2);
+    assert_backlog_counts_match_recount(&fixture);
+}
+
+#[test]
+fn test_finalization_backlog_chain_longer_than_former_depth_limit_progresses() {
+    let mut opts = SessionOptions::default();
+    opts.use_callback_thread = false;
+    let mut fixture = TestFixture::new_with_opts(4, opts);
+    let recording = RecordingListener::new();
+    let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
+
+    // A non-empty root under a run of empty candidates longer than the former
+    // 100_000-candidate walk limit. The final certificate flows through the
+    // empty run to the root, as in C++.
+    let depth = 100_010u32;
+    let root = seed_backlog_node(&mut fixture, 1, None, false, false);
+    let mut top = root.clone();
+    for slot in 2..=depth + 1 {
+        top = seed_backlog_node(&mut fixture, slot, Some(slot - 1), true, false);
+    }
+    finalize_backlog_trigger(&mut fixture, &top);
+
+    let consensus = &fixture.processor.consensus;
+    assert!(!consensus.finalized_pending_body_contains(&top), "the deep chain completed");
+    assert_eq!(consensus.pending_finalizations(), 0);
+    assert_eq!(consensus.stalled_finalizations(), 0);
+    let root_block = fixture.processor.candidate_book().received(&root).unwrap().block_id.clone();
+    assert_eq!(drain_finalized_events(&recording), vec![(root_block, true)]);
+}
+
+#[test]
+fn test_finality_behind_drops_own_vote_before_journal() {
+    let h = crate::signing_coordinator::tests::Harness::custody(rtos_api::WireProfile::Legacy);
+    h.description.install_coordinator(h.coordinator.clone()).unwrap();
+    let mut processor =
+        make_pq_processor_with_description_for_test(h.db.clone(), h.description.clone());
+    let receiver = MockReceiver::new();
+    processor.receiver = receiver.clone();
+    let vote = crate::simplex_state::Vote::Skip(crate::simplex_state::SkipVote {
+        slot: SlotIndex::new(0),
+    });
+
+    processor.simplex_state.set_finality_behind(true);
+    processor.broadcast_vote(vote.clone());
+    assert!(
+        !receiver.drain_actions().iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
+        "a vote reaching the pool while finality is behind is not sent"
+    );
+    assert_eq!(h.signature_count(), 0, "nor signed or journalled");
+
+    processor.simplex_state.set_finality_behind(false);
+    processor.broadcast_vote(vote);
+    assert!(receiver.drain_actions().iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })));
+    assert_eq!(h.signature_count(), 1);
+}
+
+#[test]
+fn test_finality_behind_at_parent_ready_abandons_notarization_after_validation() {
+    // C++ try_notarize checks may_vote right after WaitForParent; a backlog
+    // present then gives the vote up even if it clears while validation runs.
+    // Validation itself is not suppressed.
+    for behind_at_parent_ready in [false, true] {
+        let mut fixture = TestFixture::new(4);
+        let id = RawCandidateId { slot: SlotIndex::new(0), hash: UInt256::rand() };
+        let block = crate::block::BlockCandidate {
+            id: BlockIdExt::with_params(
+                ShardIdent::masterchain(),
+                1,
+                UInt256::rand(),
+                UInt256::rand(),
+            ),
+            collated_file_hash: UInt256::rand(),
+            data: vec![1, 2, 3],
+            collated_data: vec![4, 5, 6],
+            creator: fixture.nodes[0].public_key.clone().into(),
+        };
+        let raw = crate::block::RawCandidate::new(
+            id.clone(),
+            None,
+            ValidatorIndex::new(0),
+            block.clone(),
+            vec![],
+        );
+        let time = fixture.description.get_time();
+        insert_pending_validation(&mut fixture.processor, &id, raw, time);
+
+        fixture.processor.simplex_state.set_finality_behind(behind_at_parent_ready);
+        fixture.processor.check_validation();
+        assert!(
+            fixture.processor.validation.pending_approve_contains(&id),
+            "validation proceeds whatever the backlog"
+        );
+
+        // The backlog clears before validation and storage complete.
+        fixture.processor.simplex_state.set_finality_behind(false);
+        while fixture.processor.simplex_state.pull_event().is_some() {}
+        let candidate = crate::block::Candidate::new(
+            crate::block::CandidateId {
+                slot: id.slot,
+                hash: id.hash.clone(),
+                block: block.id.clone(),
+            },
+            None,
+            ValidatorIndex::new(0),
+            Some(block),
+            vec![],
+        );
+        fixture.processor.feed_validated_candidate_to_fsm(candidate);
+        let mut notar_votes = 0;
+        while let Some(event) = fixture.processor.simplex_state.pull_event() {
+            if matches!(
+                event,
+                crate::simplex_state::SimplexEvent::BroadcastVote(
+                    crate::simplex_state::Vote::Notarize(_)
+                )
+            ) {
+                notar_votes += 1;
+            }
+        }
+        assert_eq!(notar_votes, usize::from(!behind_at_parent_ready));
+        assert_eq!(
+            fixture
+                .processor
+                .simplex_state
+                .is_notarization_abandoned(&fixture.description, id.slot),
+            behind_at_parent_ready
+        );
+    }
 }

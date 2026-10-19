@@ -464,6 +464,9 @@ struct FakeCollationBackend {
     /// Records `forget_self_collation_tracking(slot, reason)` calls so the
     /// pipeline-reset effect can be asserted (interior-mutable; `&self` method).
     forgotten: std::cell::RefCell<Vec<(SlotIndex, String)>>,
+    /// Backing for the `finality_behind` seam (interior-mutable so a test can
+    /// flip it between calls that borrow the backend immutably).
+    finality_behind: std::cell::Cell<bool>,
 }
 
 impl FakeCollationBackend {
@@ -485,6 +488,7 @@ impl FakeCollationBackend {
             last_mc_finalized_seqno: None,
             wake_at: std::cell::Cell::new(None),
             forgotten: std::cell::RefCell::new(Vec::new()),
+            finality_behind: std::cell::Cell::new(false),
         }
     }
 
@@ -514,6 +518,10 @@ impl CollationBackend for FakeCollationBackend {
 
     fn current_leader_window_idx(&self) -> WindowIndex {
         self.current_leader_window_idx
+    }
+
+    fn finality_behind(&self) -> bool {
+        self.finality_behind.get()
     }
 
     fn has_available_parent(&self, slot: SlotIndex) -> bool {
@@ -2355,4 +2363,123 @@ fn late_callback_cannot_replace_newer_generation_or_rewind_precollation() {
     ctrl.on_collation_complete(&mut backend, old_slot, 94,
         CollationResult::Empty { parent_block_id: make_block_id(42, 0xBA) });
     assert_eq!(backend.published.borrow().len(), 1);
+}
+
+/*
+    --------------------------------------------------------------------
+    Finalization backpressure (C++ start_generation / generate_candidates)
+    --------------------------------------------------------------------
+*/
+
+/// Backend for slot 4 (window 1 with 4 slots per window) whose parent at slot
+/// 3 is available and resolvable when `with_parent` is set.
+fn backlog_collation_backend(
+    description: &SessionDescription,
+    slot: SlotIndex,
+    with_parent: bool,
+) -> FakeCollationBackend {
+    let mut backend = FakeCollationBackend::new(slot, description.get_window_idx(slot));
+    if with_parent {
+        let parent = make_parent_info(slot.value() - 1, 0xC1);
+        backend.available_parents.insert(slot, parent);
+        backend = backend.with_received(
+            make_candidate_id(slot.value() - 1, 0xC1),
+            make_received(slot.value() - 1, make_block_id(7, 0xC1), None),
+        );
+    }
+    backend
+}
+
+fn collation_started(ctrl: &CollationController) -> bool {
+    ctrl.block_generation_active.is_some() || ctrl.precollated_count() > 0
+}
+
+#[test]
+fn finality_behind_while_parent_unavailable_does_not_abandon_the_window() {
+    let description = Arc::new(make_mc_description_spw(1, 4));
+    let mut ctrl = mk_ctrl(description.clone());
+    let slot = SlotIndex::new(4);
+    let window = description.get_window_idx(slot);
+
+    // Behind while the parent is still unavailable: C++ start_generation has
+    // not reached its check yet (it runs after the base state resolves).
+    let mut waiting = backlog_collation_backend(&description, slot, false);
+    waiting.finality_behind.set(true);
+    ctrl.check_collation(&mut waiting);
+    assert!(!ctrl.is_finality_suppressed(window));
+    assert!(!collation_started(&ctrl));
+
+    // The backlog clears before the parent resolves: the window starts.
+    let mut ready = backlog_collation_backend(&description, slot, true);
+    ctrl.check_collation(&mut ready);
+    assert!(!ctrl.is_finality_suppressed(window));
+    assert!(collation_started(&ctrl), "the window produces normally");
+}
+
+#[test]
+fn finality_behind_once_parent_resolved_abandons_the_rest_of_the_window() {
+    let description = Arc::new(make_mc_description_spw(1, 4));
+    let mut ctrl = mk_ctrl(description.clone());
+    let slot = SlotIndex::new(4);
+    let window = description.get_window_idx(slot);
+
+    let mut backend = backlog_collation_backend(&description, slot, true);
+    backend.finality_behind.set(true);
+    ctrl.check_collation(&mut backend);
+    assert!(ctrl.is_finality_suppressed(window));
+    assert!(!collation_started(&ctrl));
+
+    // Cleared within the same window: C++ never resumes a window it did not start.
+    backend.finality_behind.set(false);
+    ctrl.check_collation(&mut backend);
+    ctrl.precollate_block(&mut backend, SlotIndex::new(5));
+    assert!(!collation_started(&ctrl), "no slot of the abandoned window begins work");
+
+    // The next own window starts normally.
+    let next = SlotIndex::new(8);
+    let mut next_backend = backlog_collation_backend(&description, next, true);
+    ctrl.check_collation(&mut next_backend);
+    assert!(!ctrl.is_finality_suppressed(description.get_window_idx(next)));
+    assert!(collation_started(&ctrl));
+}
+
+#[test]
+fn finality_behind_when_a_slot_begins_work_abandons_the_window() {
+    let description = Arc::new(make_mc_description_spw(1, 4));
+    let mut ctrl = mk_ctrl(description.clone());
+    let slot = SlotIndex::new(5);
+    let mut backend = backlog_collation_backend(&description, slot, true);
+    backend.finality_behind.set(true);
+
+    ctrl.precollate_block(&mut backend, slot);
+
+    assert!(ctrl.is_finality_suppressed(description.get_window_idx(slot)));
+    assert_eq!(ctrl.precollated_count(), 0);
+}
+
+#[test]
+fn finality_behind_discards_a_collated_candidate_arriving_late() {
+    use crate::{pq_fixture as f, signing_coordinator::tests::Harness};
+    let h = Harness::custody(rtos_api::WireProfile::T0);
+    h.description.install_coordinator(h.coordinator.clone()).unwrap();
+    let mut controller = mk_ctrl(h.description.clone());
+    let slot = SlotIndex::new(99);
+    let window = h.description.get_window_idx(slot);
+    let mut backend = FakeCollationBackend::new(slot, window);
+    let result = CollationResult::Empty { parent_block_id: f::block_id("empty") };
+    let parent =
+        Some(CandidateParentInfo { slot: SlotIndex::new(98), hash: UInt256::from([5; 32]) });
+
+    // Collation began before the round stopped taking candidates.
+    backend.finality_behind.set(true);
+    controller.publish_candidate(&mut backend, slot, parent.clone(), result.clone(), None);
+    assert!(backend.published.borrow().is_empty(), "not published");
+    assert!(backend.self_received.borrow().is_empty(), "not looped back");
+    assert_eq!(h.signature_count(), 0, "not signed");
+    assert!(controller.is_finality_suppressed(window));
+
+    // Still nothing for this window once the backlog clears.
+    backend.finality_behind.set(false);
+    controller.publish_candidate(&mut backend, slot, parent, result, None);
+    assert!(backend.published.borrow().is_empty());
 }

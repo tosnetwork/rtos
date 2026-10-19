@@ -164,6 +164,48 @@ pub struct PqCommittee {
     /// Per-node ledger of delivered finalizations. It outlives a session, as
     /// a node's ledger does across a session restart.
     ledgers: Vec<Arc<std::sync::Mutex<std::collections::HashSet<BlockIdExt>>>>,
+    /// Per-node acceptance gate: a held gate parks every finality completion,
+    /// as a node whose acceptance has stopped keeping up would.
+    gates: Vec<Arc<FinalityGate>>,
+}
+
+/// Holds a node's finality completions while closed and runs them on release.
+#[derive(Default)]
+pub struct FinalityGate {
+    held: std::sync::atomic::AtomicBool,
+    parked: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+    staged: std::sync::atomic::AtomicUsize,
+}
+
+impl FinalityGate {
+    fn complete(&self, completion: Box<dyn FnOnce() + Send>) {
+        let mut parked = self.parked.lock().unwrap();
+        if self.held.load(std::sync::atomic::Ordering::SeqCst) {
+            parked.push(completion);
+        } else {
+            drop(parked);
+            std::thread::spawn(completion);
+        }
+    }
+
+    fn set_held(&self, held: bool) {
+        let released = {
+            let mut parked = self.parked.lock().unwrap();
+            self.held.store(held, std::sync::atomic::Ordering::SeqCst);
+            if held {
+                Vec::new()
+            } else {
+                std::mem::take(&mut *parked)
+            }
+        };
+        for completion in released {
+            std::thread::spawn(completion);
+        }
+    }
+
+    fn parked(&self) -> usize {
+        self.parked.lock().unwrap().len()
+    }
 }
 
 impl PqCommittee {
@@ -195,7 +237,34 @@ impl PqCommittee {
             })
             .collect();
         let ledgers = (0..transports.len()).map(|_| Default::default()).collect();
-        Self { test: test.to_owned(), members, transports, shard, slots_per_leader_window, ledgers }
+        let gates = (0..transports.len()).map(|_| Default::default()).collect();
+        Self {
+            test: test.to_owned(),
+            members,
+            transports,
+            shard,
+            slots_per_leader_window,
+            ledgers,
+            gates,
+        }
+    }
+
+    /// Close or open every node's acceptance gate; opening runs what was parked.
+    pub fn hold_finality(&self, held: bool) {
+        for gate in &self.gates {
+            gate.set_held(held);
+        }
+    }
+
+    /// Finalizations staged at all nodes so far (the source keeps handing work
+    /// to the node while acceptance is held).
+    pub fn finality_staged(&self) -> usize {
+        self.gates.iter().map(|gate| gate.staged.load(std::sync::atomic::Ordering::SeqCst)).sum()
+    }
+
+    /// Completions currently parked behind closed gates.
+    pub fn finality_parked(&self) -> usize {
+        self.gates.iter().map(|gate| gate.parked()).sum()
     }
 
     pub fn descriptors(&self) -> Vec<ValidatorDescr> {
@@ -302,6 +371,7 @@ impl PqCommittee {
         let sink: Arc<dyn DurableFinalitySink> = Arc::new(ListenerSink {
             listener: listener.clone(),
             delivered: self.ledgers[index].clone(),
+            gate: self.gates[index].clone(),
         });
         SessionFactory::create_authenticated_validator_session_checked(
             options,
@@ -327,6 +397,7 @@ struct ListenerSink {
     /// A node ledger records each finalized block once; a source may stage the
     /// same block again while an earlier completion is still in flight.
     delivered: Arc<std::sync::Mutex<std::collections::HashSet<BlockIdExt>>>,
+    gate: Arc<FinalityGate>,
 }
 
 impl DurableFinalitySink for ListenerSink {
@@ -337,7 +408,7 @@ impl DurableFinalitySink for ListenerSink {
         _request: consensus_common::finality_delivery::CanonicalFinalityRequest,
         completion: Box<dyn FnOnce(Result<()>) + Send>,
     ) -> Result<()> {
-        std::thread::spawn(move || completion(Ok(())));
+        self.gate.complete(Box::new(move || completion(Ok(()))));
         Ok(())
     }
 
@@ -361,7 +432,8 @@ impl DurableFinalitySink for ListenerSink {
                 Vec::new(),
             );
         }
-        std::thread::spawn(move || completion(Ok(record)));
+        self.gate.staged.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.gate.complete(Box::new(move || completion(Ok(record))));
         Ok(())
     }
 }

@@ -365,6 +365,15 @@ struct Slot {
     /// Did this slot get marked by timeout-driven skip handling?
     /// Window skip marker for this slot.
     is_timeout_skipped: bool,
+
+    /// The local notarize vote for this slot was given up because finality was
+    /// behind when it was due.
+    ///
+    /// C++ `consensus.cpp try_notarize` is one-shot per candidate: once
+    /// `may_vote` refuses (here: `finality_behind_`), nothing asks again, so the
+    /// candidate is never notarized locally even after the backlog clears. The
+    /// pending block is kept (it still rules out a second candidate).
+    notar_abandoned: bool,
 }
 
 impl Slot {
@@ -956,6 +965,10 @@ pub(crate) struct SimplexState {
     num_validators: usize,
     local_is_validator: bool,
 
+    /// Finalization is behind: the group produces no votes and no candidates
+    /// until the backlog clears (C++ `FinalizationBacklog`). Not persisted.
+    finality_behind: bool,
+
     /// Mapping from candidate hash to CandidateId
     ///
     /// Populated by `on_candidate` when a candidate is received.
@@ -1098,6 +1111,7 @@ impl SimplexState {
             slot_votes: HashMap::new(),
             num_validators,
             local_is_validator: desc.is_validator(),
+            finality_behind: false,
             candidate_ids: HashMap::new(),
             first_non_progressed_slot: SlotIndex(0),
             skip_intervals: BTreeSet::new(),
@@ -2288,6 +2302,46 @@ impl SimplexState {
 }
 
 // ======================================================================
+// SimplexState — finalization backpressure
+// ======================================================================
+// The stop-producing signal from the finalization pipeline (C++
+// `FinalizationBacklog`) and the one-shot notarize abandonment it causes.
+impl SimplexState {
+    /// Finality can fall behind and catch up; this follows it both ways.
+    pub fn set_finality_behind(&mut self, behind: bool) {
+        self.finality_behind = behind;
+    }
+
+    /// Whether finalization is behind and this group must not produce.
+    pub fn finality_behind(&self) -> bool {
+        self.finality_behind
+    }
+
+    /// Give up the local notarize vote for `slot` for good: C++ `try_notarize`
+    /// returns once `may_vote` refuses and nothing asks again.
+    pub fn abandon_notarization(&mut self, desc: &SessionDescription, slot: SlotIndex) {
+        let window_idx = desc.get_window_idx(slot);
+        let offset = desc.get_slot_offset_in_window(slot) as usize;
+        self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
+        if let Some(window) = self.get_window_mut(window_idx) {
+            if let Some(slot_state) = window.slots.get_mut(offset) {
+                slot_state.notar_abandoned = true;
+            }
+        }
+    }
+
+    /// Whether the local notarize vote for `slot` was given up.
+    #[cfg(test)]
+    pub fn is_notarization_abandoned(&self, desc: &SessionDescription, slot: SlotIndex) -> bool {
+        let window_idx = desc.get_window_idx(slot);
+        let offset = desc.get_slot_offset_in_window(slot) as usize;
+        self.get_window(window_idx)
+            .and_then(|window| window.slots.get(offset))
+            .is_some_and(|slot_state| slot_state.notar_abandoned)
+    }
+}
+
+// ======================================================================
 // SimplexState — timeout management
 // ======================================================================
 // Self-contained timeout scheduling: get_next_timeout() advertises the next
@@ -2458,12 +2512,14 @@ impl SimplexState {
                     voted={is_voted}, is_completed={is_completed} -> skip window"
                 );
 
-                // Mark window as having timeouts
-                if let Some(window) = self.get_window_mut(window_idx) {
-                    window.had_timeouts = true;
+                // Mark the window as having had a skip only when one was cast
+                // (C++ alarm() sets previous_window_had_skip_ per cast vote; none
+                // is cast while finality is behind).
+                if self.try_skip_window(window_idx) {
+                    if let Some(window) = self.get_window_mut(window_idx) {
+                        window.had_timeouts = true;
+                    }
                 }
-
-                self.try_skip_window(window_idx);
 
                 // C++ behavior: skip entire remaining window at once, then STOP.
                 // Reference: C++ consensus.cpp alarm():
@@ -3611,13 +3667,20 @@ impl SimplexState {
         self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
 
         // C++ consensus.cpp try_notarize() `may_vote`: a local notarize vote needs
-        // no earlier notarize, skip or finalize vote for the slot, and no observed
-        // notarization certificate for a different candidate. (`may_vote` also
-        // requires finality not to be behind; that backpressure is not modelled here.)
+        // no earlier notarize, skip or finalize vote for the slot, no observed
+        // notarization certificate for a different candidate, and finality not
+        // behind. A refusal for finality is final for the slot (`notar_abandoned`).
         if let Some(window) = self.get_window(window_idx) {
             let slot_state = &window.slots[offset];
             if slot_state.voted_notar.is_some() || slot_state.voted_skip || slot_state.voted_final {
                 log::trace!("SimplexState::try_notar: slot {} already voted", slot);
+                return false;
+            }
+            if slot_state.notar_abandoned {
+                log::trace!(
+                    "SimplexState::try_notar: slot {} notarization was given up while finality was behind",
+                    slot
+                );
                 return false;
             }
             if let Some(cert) = &slot_state.observed_notar_certificate {
@@ -3649,6 +3712,19 @@ impl SimplexState {
             Self::format_parent(parent),
             can_vote_notar
         );
+
+        // The second C++ `may_vote` check, after validation and storage: the
+        // base is known here, so this is the point the vote would be cast.
+        if can_vote_notar && self.finality_behind {
+            log::debug!(
+                "SimplexState::try_notar: ({window_idx}/{slot}) finality is behind; \
+                 giving up the notarize vote for this slot"
+            );
+            if let Some(window) = self.get_window_mut(window_idx) {
+                window.slots[offset].notar_abandoned = true;
+            }
+            return false;
+        }
 
         if can_vote_notar {
             log::trace!(
@@ -3697,6 +3773,14 @@ impl SimplexState {
     /// ```
     fn try_final(&mut self, desc: &SessionDescription, slot: SlotIndex, block_hash: &UInt256) {
         if !self.local_is_validator {
+            return;
+        }
+        // C++ consensus.cpp try_vote_final: `... && !finality_behind_`. The call
+        // is event-driven, so a refusal here is not retried.
+        if self.finality_behind {
+            log::debug!(
+                "SimplexState::try_final: slot {slot} finality is behind; no finalize vote"
+            );
             return;
         }
         let window_idx = desc.get_window_idx(slot);
@@ -3968,9 +4052,13 @@ impl SimplexState {
     ///         state[k] ← state[k] ∪ {Voted, TimeoutSkipped}
     ///         pendingBlocks[k] ← ⊥
     /// ```
-    fn try_skip_window(&mut self, window_idx: WindowIndex) {
+    ///
+    /// Returns whether any skip vote was cast. C++ `alarm()` casts none while
+    /// finality is behind (`!voted_final && !finality_behind_`), and only a cast
+    /// skip marks the window as having had one.
+    fn try_skip_window(&mut self, window_idx: WindowIndex) -> bool {
         if !self.local_is_validator {
-            return;
+            return false;
         }
         self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
 
@@ -3986,7 +4074,7 @@ impl SimplexState {
                 // vote skip. This prevents split-brain deadlocks where some
                 // nodes vote skip and others vote final.
                 // Reference: C++ consensus.cpp alarm(): if (!affected_slot->voted_final)
-                let should_skip = !window.slots[i].voted_final;
+                let should_skip = !window.slots[i].voted_final && !self.finality_behind;
                 if should_skip {
                     slots_to_skip.push(start_slot + i as u32);
                 }
@@ -3994,7 +4082,7 @@ impl SimplexState {
         }
 
         if slots_to_skip.is_empty() {
-            return;
+            return false;
         }
 
         {
@@ -4021,6 +4109,7 @@ impl SimplexState {
                 // can no longer be notarized locally: try_notar refuses after a skip.
             }
         }
+        true
     }
 
     /// function checkPendingBlocks()
@@ -5423,8 +5512,11 @@ impl SimplexState {
             let _ = self.window_at_mut(window_idx);
 
             // Check if slot is already finalized (is_completed in C++)
+            // C++ consensus.cpp start_up: `!voted_final && !finality_behind_`.
             let should_skip = if let Some(window) = self.get_window(window_idx) {
-                offset < window.slots.len() && !window.slots[offset].is_completed
+                offset < window.slots.len()
+                    && !window.slots[offset].is_completed
+                    && !self.finality_behind
             } else {
                 false
             };

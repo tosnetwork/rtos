@@ -1625,6 +1625,10 @@ impl CollationBackend for CollationBackendAdapter<'_> {
         self.simplex_state.get_current_leader_window_idx()
     }
 
+    fn finality_behind(&self) -> bool {
+        self.simplex_state.finality_behind()
+    }
+
     fn has_available_parent(&self, slot: SlotIndex) -> bool {
         self.simplex_state.has_available_parent(self.runtime.description(), slot)
     }
@@ -2957,6 +2961,11 @@ impl SessionProcessor {
             candidate.id.slot,
         );
 
+        let candidate_id =
+            RawCandidateId { slot: candidate.id.slot, hash: candidate.id.hash.clone() };
+        if self.validation.take_notarization_abandoned(&candidate_id) {
+            self.simplex_state.abandon_notarization(self.runtime.description(), candidate.id.slot);
+        }
         if let Err(e) = self.simplex_state.on_candidate(self.runtime.description(), candidate) {
             log::warn!(
                 "Session {} process_validated_candidates: FSM rejected candidate: {}",
@@ -3546,6 +3555,9 @@ impl SessionProcessor {
             approved_count: self.validation.approved_count(),
             rejected_count: self.validation.rejected_count(),
             finalized_pending_body_count: self.consensus.finalized_pending_body_len(),
+            finalization_backlog_pending: self.consensus.pending_finalizations(),
+            finalization_backlog_stalled: self.consensus.stalled_finalizations(),
+            finalization_backlog_over_limit: self.consensus.backlog_over_limit(),
             current_slot: first_non_progressed,
             current_slot_pending_generate: self.runtime.is_pending_generate(first_non_progressed),
             current_slot_generated: self.runtime.is_generated(first_non_progressed),

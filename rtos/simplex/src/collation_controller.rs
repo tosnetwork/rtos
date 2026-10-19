@@ -495,6 +495,11 @@ pub(crate) trait CollationBackend {
     /// and precollations from an older window must be reset.
     fn current_leader_window_idx(&self) -> WindowIndex;
 
+    /// Finalization is behind (C++ `FinalizationBacklog`): no leader window
+    /// starts, no slot begins generation, and no collated candidate is
+    /// published until it clears. `SessionProcessor`-owned (`SimplexState`).
+    fn finality_behind(&self) -> bool;
+
     /// Does the FSM have an available parent (notarized/skip base) for `slot`?
     ///
     /// `SessionProcessor`-owned (`SimplexState::has_available_parent`). Used by
@@ -787,6 +792,11 @@ pub(crate) struct CollationController {
     /// Highest consensus-finalized seqno observed so far. Only used to detect the
     /// advance that bumps `last_consensus_finalized_at`.
     last_observed_finalized_seqno: Option<u32>,
+    /// Leader window abandoned because finality was behind when work for one of
+    /// its slots was due (C++ `start_generation` never starts the window, and the
+    /// `generate_candidates` loop breaks). Nothing more is produced in it even if
+    /// the backlog clears; the next own window starts normally.
+    finality_suppressed_window: Option<WindowIndex>,
 }
 
 // ======================================================================
@@ -837,7 +847,37 @@ impl CollationController {
             block_generation_active: None,
             last_consensus_finalized_at: None,
             last_observed_finalized_seqno: None,
+            finality_suppressed_window: None,
         }
+    }
+
+    /// Whether `window` was abandoned because finality was behind.
+    pub(crate) fn is_finality_suppressed(&self, window: WindowIndex) -> bool {
+        self.finality_suppressed_window == Some(window)
+    }
+
+    /// If finality is behind, abandon the rest of `window`: drop its pipeline and
+    /// produce nothing more in it. Returns whether production must stop.
+    fn suppress_window_if_finality_behind(
+        &mut self,
+        backend: &dyn CollationBackend,
+        window: WindowIndex,
+        point: &str,
+    ) -> bool {
+        if self.is_finality_suppressed(window) {
+            return true;
+        }
+        if !backend.finality_behind() {
+            return false;
+        }
+        log::warn!(
+            "Session {} {point}: finality is behind; leader window {window} produces no more \
+             candidates",
+            &self.session_id().to_hex_string()[..8],
+        );
+        self.finality_suppressed_window = Some(window);
+        self.reset(backend);
+        true
     }
 
     /// Session identifier, read from the held [`SessionDescription`]. Mirrors
@@ -1515,6 +1555,11 @@ impl CollationController {
             return;
         }
 
+        // A window abandoned for finality stays abandoned (C++ never resumes it).
+        if self.is_finality_suppressed(current_window) {
+            return;
+        }
+
         let Some(self_idx) = self.description.require_validator_index().ok() else {
             return;
         };
@@ -1557,6 +1602,14 @@ impl CollationController {
                 backend.request_parent_candidate(parent_info.slot, parent_info.hash.clone());
                 return;
             }
+        }
+
+        // C++ consensus.cpp start_generation checks finality once the base state
+        // is resolved, and block-producer.cpp checks it again at the top of every
+        // slot: the parent is known here, so this is that point. A backlog that
+        // was present only while the parent was unavailable does not count.
+        if self.suppress_window_if_finality_behind(backend, current_window, "check_collation") {
+            return;
         }
 
         // Mark pending_generate for this slot.
@@ -1638,6 +1691,10 @@ impl CollationController {
         pinned_deadlines: Option<CollationDeadlineContext>,
     ) {
         instrument!();
+        let window = self.description.get_window_idx(slot);
+        if self.suppress_window_if_finality_behind(backend, window, "restart_collation") {
+            return;
+        }
         let Some(self_idx) = self.try_begin_collation_slot(slot) else {
             return;
         };
@@ -2064,6 +2121,12 @@ impl CollationController {
         // filling. The still-in-flight real will re-tag onto the head when it
         // completes, or be discarded if the window has changed by then.
         if self.description.get_window_idx(loop_slot) != active_window {
+            return;
+        }
+
+        // C++ block-producer.cpp generate_candidates: finality is checked at the
+        // top of every slot iteration; behind ends the window.
+        if self.suppress_window_if_finality_behind(backend, active_window, "on_slot_deadline") {
             return;
         }
 
@@ -2926,9 +2989,26 @@ impl CollationController {
             return;
         }
 
-        // C++ parity: only the leader-window freshness gate applies here. If the
-        // callback is late but still belongs to the current leader window, C++
-        // still publishes CandidateGenerated/CandidateReceived.
+        // C++ block-producer.cpp: collation began before the round stopped taking
+        // candidates. Publishing now would put one into a round that has stopped,
+        // or add to a finality backlog nothing is draining.
+        if self.suppress_window_if_finality_behind(backend, slot_window, "generated_block") {
+            if let Some(tc) = &self.trace_collector {
+                tc.record_collate_failed(self.session_id(), slot, "finality_behind");
+            }
+            self.telemetry.note_generated_candidate_validation_missed_for_slot(
+                slot,
+                format!("generated_block_finality_behind window={slot_window}"),
+                &self.description,
+                self.now(),
+            );
+            self.invalidate_local_chain_head();
+            return;
+        }
+
+        // C++ parity: only the leader-window freshness and finality gates apply
+        // here. If the callback is late but still belongs to the current leader
+        // window, C++ still publishes CandidateGenerated/CandidateReceived.
         let fsm_first_non_progressed_slot = backend.first_non_progressed_slot();
         if slot < fsm_first_non_progressed_slot {
             log::trace!(
@@ -3205,6 +3285,12 @@ impl CollationController {
     ///
     /// Reference: validator-session/src/session_processor.rs precollate_block.
     pub(crate) fn precollate_block(&mut self, backend: &mut dyn CollationBackend, slot: SlotIndex) {
+        // Starting work for a slot is the top of a C++ generation-loop iteration.
+        let window = self.description.get_window_idx(slot);
+        if self.suppress_window_if_finality_behind(backend, window, "precollate_block") {
+            return;
+        }
+
         // Pipeline-depth limit.
         let max_precollated =
             self.description.opts().slots_per_leader_window.saturating_sub(1) as usize;

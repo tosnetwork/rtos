@@ -98,7 +98,7 @@
 
 use crate::{
     block::{CandidateId as BlockCandidateId, RawCandidateId, SlotIndex, ValidatorIndex},
-    candidate_book::{CandidateBook, ReceivedCandidate, EMPTY_CHAIN_WARN_DEPTH, MAX_CHAIN_DEPTH},
+    candidate_book::{CandidateBook, ReceivedCandidate, EMPTY_CHAIN_WARN_DEPTH},
     database::{FinalizedBlockRecord, VoteRecord},
     finality_recovery::ExpectedFinalityOutput,
     misbehavior::{MisbehaviorReport, VoteResult},
@@ -215,6 +215,108 @@ impl FinalityRetryPass {
         }
         output
     }
+}
+
+/// How many attempted, unresolved finalizations the group holds before it stops
+/// producing. Nothing is dropped to stay under it: reaching it means conversion is
+/// not keeping up, and the response is that the round pauses until it clears.
+pub(crate) const DEFAULT_PENDING_FINALIZATIONS_MAX: usize = 16;
+
+/// Environment override for [`DEFAULT_PENDING_FINALIZATIONS_MAX`].
+pub(crate) const PENDING_FINALIZATIONS_MAX_ENV: &str = "TOS_SIMPLEX_PENDING_FINALIZATIONS_MAX";
+
+/// Parse the pending-finalization limit override: a positive integer, anything
+/// else falls back to the default with a warning.
+pub(crate) fn parse_pending_finalizations_max(value: Option<&str>) -> usize {
+    let Some(value) = value else {
+        return DEFAULT_PENDING_FINALIZATIONS_MAX;
+    };
+    match value.trim().parse::<usize>() {
+        Ok(parsed) if parsed > 0 => parsed,
+        _ => {
+            log::warn!(
+                "Simplex finalization: ignoring invalid {PENDING_FINALIZATIONS_MAX_ENV}={value}"
+            );
+            DEFAULT_PENDING_FINALIZATIONS_MAX
+        }
+    }
+}
+
+/// Why one candidate's finalization attempt did not finish.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FinalizationFailure {
+    /// A dependency that was not ready yet (a body, a notarization certificate,
+    /// a node acknowledgement, a store that refused the write for now). A later
+    /// attempt can find it gone, so the candidate stays queued.
+    Retryable(String),
+    /// Retrying cannot mend it (signature-set conversion failure, a parent
+    /// cycle). The candidate is kept, never retried, and its dependents fail with it.
+    Permanent(String),
+    /// The session is stopping. Nothing is retried and nothing is reported.
+    Cancelled,
+}
+
+/// What has happened to one candidate's finalization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CandidateFinalization {
+    /// No attempt is running; one may have failed for a reason that may not recur.
+    Idle,
+    /// An attempt is running in the current pass.
+    InFlight,
+    /// The candidate is finalized.
+    Finalized,
+    /// The conversion failed in a way retrying cannot mend. Kept and counted.
+    StalledPermanently(String),
+}
+
+#[derive(Clone, Debug)]
+struct CandidateFinalizationEntry {
+    state: CandidateFinalization,
+    attempts: u32,
+}
+
+impl CandidateFinalizationEntry {
+    /// Held un-converted: stopped for good, or attempted and not finished.
+    fn is_pending(&self) -> bool {
+        match self.state {
+            CandidateFinalization::StalledPermanently(_) => true,
+            CandidateFinalization::Idle | CandidateFinalization::InFlight => self.attempts > 0,
+            CandidateFinalization::Finalized => false,
+        }
+    }
+
+    fn is_stalled(&self) -> bool {
+        matches!(self.state, CandidateFinalization::StalledPermanently(_))
+    }
+}
+
+/// The candidates one trigger's finalization attempted in one pass and how each
+/// own step ended. A candidate's attempt completes only after its parent's, and
+/// a parent's failure is its children's failure, so outcomes are applied
+/// ancestor first.
+#[derive(Default)]
+struct ChainAttempt {
+    /// Attempted candidates, trigger first, each parent after its child.
+    chain: Vec<RawCandidateId>,
+    /// Result of each candidate's own step, when it was reached.
+    own: HashMap<RawCandidateId, std::result::Result<(), FinalizationFailure>>,
+}
+
+impl ChainAttempt {
+    fn succeed(&mut self, id: &RawCandidateId) {
+        self.own.entry(id.clone()).or_insert(Ok(()));
+    }
+
+    fn fail(&mut self, id: &RawCandidateId, failure: FinalizationFailure) {
+        self.own.insert(id.clone(), Err(failure));
+    }
+}
+
+/// Outcome of handing one finalized block to the node.
+enum FinalityHandoff {
+    Delivered,
+    Pending,
+    Permanent(String),
 }
 
 /// Session-owned reads/effects the finalization pipeline needs but cannot reach
@@ -450,6 +552,30 @@ pub(crate) struct ConsensusController {
     /// &self.trace_collector`. Cheap-to-clone handle cloned from
     /// `SessionProcessor` at construction
     trace_collector: Option<TraceCollector>,
+
+    /*
+        Finalization backpressure
+
+        One entry per candidate whose finalization was attempted. Unresolved
+        entries are never dropped; finalized ones are released with old slots.
+    */
+    finalization_status: HashMap<RawCandidateId, CandidateFinalizationEntry>,
+    /// Entries that are `is_pending()`, kept equal to a full recount.
+    pending_finalizations: usize,
+    /// Entries stopped for a reason retrying cannot mend.
+    stalled_finalizations: usize,
+    /// Whether the group has been told to stop producing.
+    backlog_over_limit: bool,
+    pending_finalizations_max: usize,
+    /// A permanent handoff failure reported by the last emission attempt.
+    handoff_failure: Option<(RawCandidateId, String)>,
+    /// Every backlog flip, in order (over_limit, pending), for tests.
+    #[cfg(test)]
+    backlog_transitions: Vec<(bool, usize)>,
+    /// Handoff failures to inject, as the C++ state resolver's fault injection
+    /// does for its finalization attempts: (retryable, permanent).
+    #[cfg(test)]
+    injected_handoff_failures: std::cell::Cell<(usize, usize)>,
 }
 
 // ======================================================================
@@ -499,6 +625,18 @@ impl ConsensusController {
             accepted_normal_head_block_id: None,
             misbehavior_reports: Vec::new(),
             trace_collector,
+            finalization_status: HashMap::new(),
+            pending_finalizations: 0,
+            stalled_finalizations: 0,
+            backlog_over_limit: false,
+            pending_finalizations_max: parse_pending_finalizations_max(
+                std::env::var(PENDING_FINALIZATIONS_MAX_ENV).ok().as_deref(),
+            ),
+            handoff_failure: None,
+            #[cfg(test)]
+            backlog_transitions: Vec::new(),
+            #[cfg(test)]
+            injected_handoff_failures: std::cell::Cell::new((0, 0)),
         }
     }
 
@@ -666,9 +804,16 @@ impl ConsensusController {
     /// old `received_candidates` remain retained, dropping the seqno dedup
     /// could let a later recursive parent-chain walk re-emit an
     /// already-delivered finalized callback.
+    ///
+    /// An unresolved finalization never ages out: pending triggers and every
+    /// unresolved or permanently stalled candidate are kept whatever their slot
+    /// (C++ never erases them), and [`Self::durable_pending_floor`] keeps their
+    /// dependencies from being pruned while any exists. Only finalized status
+    /// entries are released with old slots.
     pub(crate) fn prune_below(&mut self, up_to_slot: SlotIndex) {
-        let source_replay = &self.replayed_source_finalizations;
-        self.finalized_pending_body.retain(|id, _| id.slot >= up_to_slot || source_replay.contains(id));
+        self.finalization_status.retain(|id, entry| {
+            id.slot >= up_to_slot || entry.state != CandidateFinalization::Finalized
+        });
         self.telemetry.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
         self.finalized_delivery_sent.retain(|id| id.slot >= up_to_slot);
         // C++ keeps an in-flight finalization's completed parent operation;
@@ -681,6 +826,212 @@ impl ConsensusController {
             .collect();
         self.acknowledged_ancestor_approvals.retain(|id|
             id.slot >= up_to_slot || in_flight_ancestors.contains(id));
+    }
+}
+
+// ======================================================================
+// Finalization backpressure
+// ======================================================================
+// Per-candidate finalization status, the pending/stalled counts, and the
+// stop-producing signal published to the FSM when the backlog crosses the limit.
+impl ConsensusController {
+    /// Attempted, unresolved finalizations held right now (stalled included).
+    pub(crate) fn pending_finalizations(&self) -> usize {
+        self.pending_finalizations
+    }
+
+    /// Finalizations stopped for a reason retrying cannot mend.
+    pub(crate) fn stalled_finalizations(&self) -> usize {
+        self.stalled_finalizations
+    }
+
+    /// Whether the group has been told to stop producing.
+    pub(crate) fn backlog_over_limit(&self) -> bool {
+        self.backlog_over_limit
+    }
+
+    /// Finalization state of one candidate, if it was ever attempted.
+    #[cfg(test)]
+    pub(crate) fn candidate_finalization(
+        &self,
+        id: &RawCandidateId,
+    ) -> Option<CandidateFinalization> {
+        self.finalization_status.get(id).map(|entry| entry.state.clone())
+    }
+
+    fn is_permanently_stalled(&self, id: &RawCandidateId) -> bool {
+        self.finalization_status.get(id).is_some_and(CandidateFinalizationEntry::is_stalled)
+    }
+
+    /// Replace one status entry, keeping the counts equal to a recount.
+    fn store_finalization_status(&mut self, id: RawCandidateId, entry: CandidateFinalizationEntry) {
+        let (pending, stalled) = (entry.is_pending(), entry.is_stalled());
+        if let Some(old) = self.finalization_status.insert(id, entry) {
+            if old.is_pending() {
+                self.pending_finalizations = self.pending_finalizations.saturating_sub(1);
+            }
+            if old.is_stalled() {
+                self.stalled_finalizations = self.stalled_finalizations.saturating_sub(1);
+            }
+        }
+        if pending {
+            self.pending_finalizations = self.pending_finalizations.saturating_add(1);
+        }
+        if stalled {
+            self.stalled_finalizations = self.stalled_finalizations.saturating_add(1);
+        }
+    }
+
+    /// Start one candidate's finalization attempt within `attempt`.
+    ///
+    /// Returns the state the candidate had. A finalized candidate is not
+    /// attempted again; a permanently stalled one is not retried but is joined
+    /// to the chain so its dependents fail with it; one already in flight in
+    /// this pass joins that operation.
+    fn begin_candidate_attempt(
+        &mut self,
+        attempt: &mut ChainAttempt,
+        id: &RawCandidateId,
+    ) -> CandidateFinalization {
+        let current = self.finalization_status.get(id).cloned();
+        match current.as_ref().map(|entry| &entry.state) {
+            Some(CandidateFinalization::Finalized) => return CandidateFinalization::Finalized,
+            Some(CandidateFinalization::InFlight) => return CandidateFinalization::InFlight,
+            Some(CandidateFinalization::StalledPermanently(reason)) => {
+                let reason = reason.clone();
+                if !attempt.chain.contains(id) {
+                    attempt.chain.push(id.clone());
+                }
+                attempt.fail(
+                    id,
+                    FinalizationFailure::Permanent(format!(
+                        "slot {} is permanently stalled: {reason}",
+                        id.slot
+                    )),
+                );
+                return CandidateFinalization::StalledPermanently(reason);
+            }
+            Some(CandidateFinalization::Idle) | None => {}
+        }
+        let attempts = current.map_or(0, |entry| entry.attempts).saturating_add(1);
+        self.store_finalization_status(
+            id.clone(),
+            CandidateFinalizationEntry { state: CandidateFinalization::InFlight, attempts },
+        );
+        attempt.chain.push(id.clone());
+        CandidateFinalization::Idle
+    }
+
+    /// Complete one candidate's attempt and recount, as C++ does at the end of
+    /// every attempt. Finalized and stalled are terminal.
+    fn complete_candidate_attempt(
+        &mut self,
+        backend: &mut dyn ConsensusBackend,
+        id: &RawCandidateId,
+        result: std::result::Result<(), FinalizationFailure>,
+    ) {
+        let Some(entry) = self.finalization_status.get(id).cloned() else {
+            return;
+        };
+        if matches!(
+            entry.state,
+            CandidateFinalization::Finalized | CandidateFinalization::StalledPermanently(_)
+        ) {
+            return;
+        }
+        let state = match result {
+            Ok(()) => CandidateFinalization::Finalized,
+            Err(FinalizationFailure::Retryable(_)) | Err(FinalizationFailure::Cancelled) => {
+                CandidateFinalization::Idle
+            }
+            Err(FinalizationFailure::Permanent(reason)) => {
+                log::error!(
+                    "Session {} finalization: the certificate for slot {} cannot be finalized and \
+                     retrying will not change that: {reason}. It is kept rather than dropped, and \
+                     this group stops producing.",
+                    self.session_id().to_hex_string(),
+                    id.slot,
+                );
+                CandidateFinalization::StalledPermanently(reason)
+            }
+        };
+        self.store_finalization_status(
+            id.clone(),
+            CandidateFinalizationEntry { state, attempts: entry.attempts },
+        );
+        self.update_finalization_backlog(backend);
+    }
+
+    /// Apply a trigger's attempt outcomes ancestor first. A candidate whose own
+    /// step was not reached inherits its parent's failure; with no failure on
+    /// the way it succeeded when the whole operation completed, and is still
+    /// pending otherwise.
+    fn finish_chain_attempt(
+        &mut self,
+        backend: &mut dyn ConsensusBackend,
+        attempt: ChainAttempt,
+        complete: bool,
+    ) {
+        let mut inherited: Option<FinalizationFailure> = None;
+        for id in attempt.chain.iter().rev() {
+            let result = match (&inherited, attempt.own.get(id)) {
+                (Some(failure), _) => Err(failure.clone()),
+                (None, Some(own)) => own.clone(),
+                (None, None) if complete => Ok(()),
+                (None, None) => Err(FinalizationFailure::Retryable(
+                    "finalization did not complete in this pass".to_string(),
+                )),
+            };
+            if let Err(failure) = &result {
+                inherited = Some(failure.clone());
+            }
+            self.complete_candidate_attempt(backend, id, result);
+        }
+    }
+
+    /// Tell the group when the backlog crosses the limit or clears.
+    ///
+    /// One finalization beyond retrying is enough on its own: it is not a queue
+    /// that is still moving but a chain that cannot pass this slot.
+    fn update_finalization_backlog(&mut self, backend: &mut dyn ConsensusBackend) {
+        let over = self.pending_finalizations > self.pending_finalizations_max
+            || self.stalled_finalizations > 0;
+        if over == self.backlog_over_limit {
+            return;
+        }
+        self.backlog_over_limit = over;
+        if over {
+            log::error!(
+                "Session {} finalization: {} agreed certificates are waiting to be finalized \
+                 ({} permanently stalled), over the limit of {}; this group stops producing \
+                 until they clear. Nothing is discarded.",
+                self.session_id().to_hex_string(),
+                self.pending_finalizations,
+                self.stalled_finalizations,
+                self.pending_finalizations_max,
+            );
+        } else {
+            log::warn!(
+                "Session {} finalization: the finalization backlog has cleared; this group \
+                 produces again.",
+                self.session_id().to_hex_string(),
+            );
+        }
+        backend.simplex_state_mut().set_finality_behind(over);
+        #[cfg(test)]
+        self.backlog_transitions.push((over, self.pending_finalizations));
+    }
+
+    /// The failure a not-ready handoff of `id` stands for.
+    fn take_handoff_failure(&mut self, id: &RawCandidateId) -> FinalizationFailure {
+        match self.handoff_failure.take() {
+            Some((failed, reason)) if &failed == id => FinalizationFailure::Permanent(reason),
+            // A handoff refused while the session stops is cancelled, not retried.
+            _ if self.callbacks.is_stopping() => FinalizationFailure::Cancelled,
+            _ => FinalizationFailure::Retryable(
+                "finalized block handoff is not complete".to_string(),
+            ),
+        }
     }
 }
 
@@ -1365,6 +1716,18 @@ impl ConsensusController {
         backend: &mut dyn ConsensusBackend,
         vote: Vote,
     ) {
+        // C++ pool.cpp cast_our_vote: finality fell behind while this vote was
+        // being prepared. The consensus bookkeeping that produced it stays as it
+        // is, but the vote is not journalled, signed, applied or sent.
+        if backend.simplex_state().finality_behind() {
+            log::debug!(
+                "Session {} broadcast_vote: finality is behind, not casting {:?}",
+                self.session_id().to_hex_string(),
+                vote
+            );
+            return;
+        }
+
         // Track first notarize vote in this slot (stage 2 latency).
         if let Vote::Notarize(v) = &vote {
             let vote_slot = v.slot;
@@ -1784,13 +2147,22 @@ impl ConsensusController {
         // retry must poll the real handoff again, with its original evidence.
         let mut pass = FinalityRetryPass::default();
         for trigger_id in pending_ids {
+            // A stopping session cancels: nothing is attempted, retried or reported.
+            if self.callbacks.is_stopping() {
+                break;
+            }
             // Clone event payload to avoid holding a map borrow across processing.
             let Some(event) =
                 self.finalized_pending_body.get(trigger_id).map(|entry| entry.event.clone())
             else {
                 continue;
             };
+            // Kept, counted and reported, but never retried: retrying cannot mend it.
+            if self.is_permanently_stalled(trigger_id) {
+                continue;
+            }
 
+            let mut attempt = ChainAttempt::default();
             if self.description.authenticated_runtime().is_some()
                 && !self.finalized_pending_body.get(trigger_id).unwrap().intent_retained
             {
@@ -1799,18 +2171,42 @@ impl ConsensusController {
                     &event,
                 ) {
                     log::error!("Cannot durably retain finality intent: {error}");
+                    // The durable source store retains and retries every refusal.
+                    self.begin_candidate_attempt(&mut attempt, trigger_id);
+                    attempt.fail(
+                        trigger_id,
+                        FinalizationFailure::Retryable(format!(
+                            "finality intent not retained: {error}"
+                        )),
+                    );
+                    self.finish_chain_attempt(backend, attempt, false);
                     continue;
                 }
                 self.finalized_pending_body.get_mut(trigger_id).unwrap().intent_retained = true;
             }
 
-            if self.try_finalize_recursive_chain(backend, trigger_id, &event, &mut pass) {
-                if self.description.authenticated_runtime().is_some() {
-                    if let Err(error) = self.callbacks.resolve_finality_intent(trigger_id) {
-                        log::error!("Cannot durably resolve source finality intent: {error}");
-                        continue;
-                    }
+            let walked = self.try_finalize_recursive_chain(
+                backend,
+                trigger_id,
+                &event,
+                &mut pass,
+                &mut attempt,
+            );
+            let mut done = walked;
+            if done && self.description.authenticated_runtime().is_some() {
+                if let Err(error) = self.callbacks.resolve_finality_intent(trigger_id) {
+                    log::error!("Cannot durably resolve source finality intent: {error}");
+                    attempt.fail(
+                        trigger_id,
+                        FinalizationFailure::Retryable(format!(
+                            "finality intent not resolved: {error}"
+                        )),
+                    );
+                    done = false;
                 }
+            }
+            self.finish_chain_attempt(backend, attempt, walked);
+            if done {
                 completed.push(trigger_id.clone());
             }
         }
@@ -1847,6 +2243,7 @@ impl ConsensusController {
         trigger_id: &RawCandidateId,
         event: &BlockFinalizedEvent,
         pass: &mut FinalityRetryPass,
+        attempt: &mut ChainAttempt,
     ) -> bool {
         if self.description.authenticated_runtime().is_some()
             && self.finalized_pending_body.get(trigger_id)
@@ -1858,6 +2255,13 @@ impl ConsensusController {
                 Err(error) => {
                     log::error!("Session {} source {}:{} cannot bind sealed output requirements: {error}",
                         self.session_id().to_hex_string(), trigger_id.slot, trigger_id.hash.to_hex_string());
+                    self.begin_candidate_attempt(attempt, trigger_id);
+                    attempt.fail(
+                        trigger_id,
+                        FinalizationFailure::Retryable(format!(
+                            "sealed output requirements unavailable: {error}"
+                        )),
+                    );
                     return false;
                 }
             }
@@ -1865,7 +2269,9 @@ impl ConsensusController {
         if !self.description.get_shard().is_masterchain()
             && self.description.authenticated_runtime().is_some()
         {
-            if let Some(result) = self.resume_finality_plan(backend, trigger_id, event, pass) {
+            if let Some(result) =
+                self.resume_finality_plan(backend, trigger_id, event, pass, attempt)
+            {
                 return result;
             }
         }
@@ -1914,18 +2320,9 @@ impl ConsensusController {
                     &trigger_id.hash.to_hex_string()[..8],
                 );
             }
-            if depth > MAX_CHAIN_DEPTH {
-                log::error!(
-                    "Session {} recursive finalization: exceeded MAX_CHAIN_DEPTH={} \
-                     while resolving trigger=s{}:{}",
-                    &self.session_id().to_hex_string()[..8],
-                    MAX_CHAIN_DEPTH,
-                    trigger_id.slot,
-                    &trigger_id.hash.to_hex_string()[..8],
-                );
-                self.telemetry.increment_error();
-                return self.description.authenticated_runtime().is_none();
-            }
+            // There is no depth limit: as in C++, a valid chain is walked to its
+            // finalized base however long it is. The walk is iterative and the
+            // visited set below bounds it by the distinct candidates held.
             if !visited.insert(current_id.clone()) {
                 log::error!(
                     "Session {} recursive finalization: parent-cycle detected at s{}:{} \
@@ -1937,7 +2334,20 @@ impl ConsensusController {
                     &trigger_id.hash.to_hex_string()[..8],
                 );
                 self.telemetry.increment_error();
-                return self.description.authenticated_runtime().is_none();
+                // A candidate id commits to its parent, so a cycle can only come
+                // from inconsistent local metadata, which a repaired body
+                // replaces. The deepest attempted candidate waits on that repair;
+                // the walk is retried rather than dropped or stopped for good.
+                if let Some(deepest) = attempt.chain.last().cloned() {
+                    attempt.fail(
+                        &deepest,
+                        FinalizationFailure::Retryable(format!(
+                            "parent cycle at slot {}",
+                            current_id.slot
+                        )),
+                    );
+                }
+                return false;
             }
 
             // C++ StateResolver::finalization_of checks its persisted marker
@@ -1978,6 +2388,14 @@ impl ConsensusController {
                 entry.walked_candidates.insert(current_id.clone());
             }
 
+            // C++ finalize_blocks: a candidate stopped for good answers its
+            // dependents with the same refusal, without another attempt.
+            if let CandidateFinalization::StalledPermanently(_) =
+                self.begin_candidate_attempt(attempt, &current_id)
+            {
+                return false;
+            }
+
             // Step 1: resolve candidate metadata/body holder.
             let Some(received) = backend.candidate_book().received(&current_id).cloned() else {
                 log::debug!(
@@ -1994,6 +2412,10 @@ impl ConsensusController {
                     current_id.hash.clone(),
                     Some(Duration::ZERO),
                 );
+                attempt.fail(
+                    &current_id,
+                    FinalizationFailure::Retryable("candidate metadata unavailable".to_string()),
+                );
                 complete = false;
                 break;
             };
@@ -2005,6 +2427,8 @@ impl ConsensusController {
                 if !received.is_empty && !self.finalized_delivery_sent.contains(&current_id) {
                     self.finalized_delivery_sent.insert(current_id.clone());
                 }
+                // C++ finalize_blocks_inner returns success at once here.
+                attempt.succeed(&current_id);
                 break;
             }
 
@@ -2037,7 +2461,15 @@ impl ConsensusController {
                         current_id.slot.value(), current_id.hash.to_hex_string(),
                         received.candidate_hash_data_bytes.len(), received.data.data().len(), received.is_empty,
                         remaining_required.len());
-                    backend.request_candidate_for_finality(current_id.slot, current_id.hash.clone(), Some(Duration::ZERO));
+                    backend.request_candidate_for_finality(
+                        current_id.slot,
+                        current_id.hash.clone(),
+                        Some(Duration::ZERO),
+                    );
+                    attempt.fail(
+                        &current_id,
+                        FinalizationFailure::Retryable("candidate body unavailable".to_string()),
+                    );
                     return false;
                 }
                 resolved_workchain.push((current_id.clone(), received.clone(), has_final_cert));
@@ -2047,11 +2479,16 @@ impl ConsensusController {
                 if !durable
                     && !self.maybe_apply_finalized_state(backend, &current_id, has_final_cert)
                 {
+                    attempt.fail(
+                        &current_id,
+                        FinalizationFailure::Retryable("finalized state not persisted".to_string()),
+                    );
                     complete = false;
                     break;
                 }
 
                 // Step 4: callback emission policy + signature mode is handled per block.
+                let mut step_ready = true;
                 self.try_emit_recursive_finalized_callback(
                     backend,
                     &current_id,
@@ -2060,15 +2497,28 @@ impl ConsensusController {
                     has_final_cert,
                     trigger_slot,
                     &trigger_candidate_hash_data,
-                    &mut complete,
+                    &mut step_ready,
                 );
-                if durable {
-                    if !complete
-                        || !self.maybe_apply_finalized_state(backend, &current_id, has_final_cert)
-                    {
-                        complete = false;
+                if !step_ready {
+                    let failure = self.take_handoff_failure(&current_id);
+                    attempt.fail(&current_id, failure);
+                    complete = false;
+                    if durable {
                         break;
                     }
+                } else if durable && !complete {
+                    break;
+                } else if durable
+                    && !self.maybe_apply_finalized_state(backend, &current_id, has_final_cert)
+                {
+                    attempt.fail(
+                        &current_id,
+                        FinalizationFailure::Retryable("finalized state not persisted".to_string()),
+                    );
+                    complete = false;
+                    break;
+                } else {
+                    attempt.succeed(&current_id);
                 }
             } else if !block_below_applied_floor {
                 log::debug!(
@@ -2085,11 +2535,18 @@ impl ConsensusController {
                     current_id.hash.clone(),
                     Some(Duration::ZERO),
                 );
+                attempt.fail(
+                    &current_id,
+                    FinalizationFailure::Retryable("candidate body unavailable".to_string()),
+                );
                 complete = false;
             }
 
             // Step 5: stop climbing once we reached already-applied floor.
             if block_below_applied_floor {
+                if !workchain {
+                    attempt.succeed(&current_id);
+                }
                 if !received.is_empty && !self.finalized_delivery_sent.contains(&current_id) {
                     log::debug!(
                         "Session {} recursive finalization: stopping parent walk below applied-top \
@@ -2114,6 +2571,12 @@ impl ConsensusController {
 
             let Some(parent_id) = received.parent_id else {
                 if has_final_cert && self.description.authenticated_runtime().is_some() {
+                    attempt.fail(
+                        &current_id,
+                        FinalizationFailure::Retryable(
+                            "final certificate not consumed by a non-empty candidate".to_string(),
+                        ),
+                    );
                     complete = false;
                 }
                 break;
@@ -2129,8 +2592,18 @@ impl ConsensusController {
         if !remaining_required.is_empty() || required_output_set.as_ref().is_some_and(|required|
             expected_outputs.iter().any(|output| !required.contains(output)))
         {
-            log::debug!("Session {} source {}:{} sealed output obligations not fully resolved",
-                self.session_id().to_hex_string(), trigger_id.slot, trigger_id.hash.to_hex_string());
+            log::debug!(
+                "Session {} source {}:{} sealed output obligations not fully resolved",
+                self.session_id().to_hex_string(),
+                trigger_id.slot,
+                trigger_id.hash.to_hex_string()
+            );
+            attempt.fail(
+                trigger_id,
+                FinalizationFailure::Retryable(
+                    "sealed output obligations not resolved".to_string(),
+                ),
+            );
             return false;
         }
         if workchain {
@@ -2163,7 +2636,9 @@ impl ConsensusController {
                 });
                 // Larger plans retain the original complete walk. The bound is
                 // only on cached work, never on valid ancestry or output debt.
-                return self.resume_finality_plan(backend, trigger_id, event, pass).unwrap_or(false);
+                return self
+                    .resume_finality_plan(backend, trigger_id, event, pass, attempt)
+                    .unwrap_or(false);
             }
             // ResolveCandidate/parent failure or a pending node handoff stops
             // this pass. The retained trigger retries the same parent first.
@@ -2176,9 +2651,19 @@ impl ConsensusController {
                         "FINALITY_OUTPUT_PENDING: session={} source_slot={} source_hash={} dependency_slot={} dependency_hash={} block_id={} final=false body_bytes={} joined=true",
                         self.session_id().to_hex_string(), trigger_id.slot.value(), trigger_id.hash.to_hex_string(),
                         id.slot.value(), id.hash.to_hex_string(), received.block_id, received.data.data().len());
+                    attempt.fail(
+                        &id,
+                        FinalizationFailure::Retryable(
+                            "joined a pending ancestor handoff".to_string(),
+                        ),
+                    );
                     return false;
                 }
                 if !durable && !self.maybe_apply_finalized_state(backend, &id, has_final_cert) {
+                    attempt.fail(
+                        &id,
+                        FinalizationFailure::Retryable("finalized state not persisted".to_string()),
+                    );
                     return false;
                 }
                 let mut ready = true;
@@ -2187,21 +2672,38 @@ impl ConsensusController {
                     trigger_slot, &trigger_candidate_hash_data, &mut ready,
                 );
                 if !ready {
+                    let failure = self.take_handoff_failure(&id);
+                    attempt.fail(&id, failure);
                     if durable && !has_final_cert {
                         pass.pending_ancestors.insert(id);
                     }
                     return false;
                 }
                 if durable && !self.maybe_apply_finalized_state(backend, &id, has_final_cert) {
+                    attempt.fail(
+                        &id,
+                        FinalizationFailure::Retryable("finalized state not persisted".to_string()),
+                    );
                     return false;
                 }
+                attempt.succeed(&id);
             }
         }
 
         if complete && self.description.authenticated_runtime().is_some() {
             if let Err(error) = self.callbacks.seal_finality_outputs(trigger_id, expected_outputs) {
-                log::error!("Session {} source {}:{} cannot seal complete finality output set: {error}",
-                    self.session_id().to_hex_string(), trigger_id.slot, trigger_id.hash.to_hex_string());
+                log::error!(
+                    "Session {} source {}:{} cannot seal complete finality output set: {error}",
+                    self.session_id().to_hex_string(),
+                    trigger_id.slot,
+                    trigger_id.hash.to_hex_string()
+                );
+                attempt.fail(
+                    trigger_id,
+                    FinalizationFailure::Retryable(format!(
+                        "finality output set not sealed: {error}"
+                    )),
+                );
                 return false;
             }
         }
@@ -2216,12 +2718,13 @@ impl ConsensusController {
         trigger_id: &RawCandidateId,
         event: &BlockFinalizedEvent,
         pass: &mut FinalityRetryPass,
+        attempt: &mut ChainAttempt,
     ) -> Option<bool> {
         let mut plan = self.finalized_pending_body.get_mut(trigger_id)?.continuation.take()?;
         if self.finalized_pending_body.get(trigger_id)?.sealed_output_requirements != plan.requirements {
             return None; // Newly bound obligations need the complete original resolver.
         }
-        let result = self.drive_finality_plan(backend, trigger_id, event, pass, &mut plan);
+        let result = self.drive_finality_plan(backend, trigger_id, event, pass, &mut plan, attempt);
         if result.is_some() {
             self.finalized_pending_body.get_mut(trigger_id)?.continuation = Some(plan);
         }
@@ -2235,10 +2738,30 @@ impl ConsensusController {
         event: &BlockFinalizedEvent,
         pass: &mut FinalityRetryPass,
         plan: &mut FinalityContinuation,
+        attempt: &mut ChainAttempt,
     ) -> Option<bool> {
+        // Every step not yet completed is attempted again, child after parent
+        // in the chain order (trigger first), as the C++ recursion re-enters
+        // each unfinished parent operation.
+        let remaining: Vec<RawCandidateId> =
+            plan.steps.iter().skip(plan.next).rev().map(|step| step.id.clone()).collect();
+        for id in &remaining {
+            self.begin_candidate_attempt(attempt, id);
+        }
         while let Some(step) = plan.steps.get(plan.next) {
+            if self.is_permanently_stalled(&step.id) {
+                return Some(false);
+            }
             let Some(received) = backend.candidate_book().received(&step.id).cloned() else {
-                backend.request_candidate_for_finality(step.id.slot, step.id.hash.clone(), Some(Duration::ZERO));
+                backend.request_candidate_for_finality(
+                    step.id.slot,
+                    step.id.hash.clone(),
+                    Some(Duration::ZERO),
+                );
+                attempt.fail(
+                    &step.id,
+                    FinalizationFailure::Retryable("candidate metadata unavailable".to_string()),
+                );
                 return Some(false);
             };
             let source = (!received.is_empty).then(||
@@ -2260,7 +2783,15 @@ impl ConsensusController {
                     self.session_id().to_hex_string(), trigger_id.slot.value(), trigger_id.hash.to_hex_string(),
                     step.id.slot.value(), step.id.hash.to_hex_string(), received.candidate_hash_data_bytes.len(),
                     received.data.data().len(), received.is_empty);
-                backend.request_candidate_for_finality(step.id.slot, step.id.hash.clone(), Some(Duration::ZERO));
+                backend.request_candidate_for_finality(
+                    step.id.slot,
+                    step.id.hash.clone(),
+                    Some(Duration::ZERO),
+                );
+                attempt.fail(
+                    &step.id,
+                    FinalizationFailure::Retryable("candidate body unavailable".to_string()),
+                );
                 return Some(false);
             }
             if !step.has_final_cert && pass.pending_ancestors.contains(&step.id) {
@@ -2268,6 +2799,10 @@ impl ConsensusController {
                     "FINALITY_OUTPUT_PENDING: session={} source_slot={} source_hash={} dependency_slot={} dependency_hash={} block_id={} final=false body_bytes={} joined=true continuation=true",
                     self.session_id().to_hex_string(), trigger_id.slot.value(), trigger_id.hash.to_hex_string(),
                     step.id.slot.value(), step.id.hash.to_hex_string(), received.block_id, received.data.data().len());
+                attempt.fail(
+                    &step.id,
+                    FinalizationFailure::Retryable("joined a pending ancestor handoff".to_string()),
+                );
                 return Some(false);
             }
             let mut ready = true;
@@ -2276,12 +2811,19 @@ impl ConsensusController {
                 trigger_id.slot, &plan.trigger_hash_data, &mut ready,
             );
             if !ready {
+                let failure = self.take_handoff_failure(&step.id);
+                attempt.fail(&step.id, failure);
                 if !step.has_final_cert { pass.pending_ancestors.insert(step.id.clone()); }
                 return Some(false);
             }
             if !self.maybe_apply_finalized_state(backend, &step.id, step.has_final_cert) {
+                attempt.fail(
+                    &step.id,
+                    FinalizationFailure::Retryable("finalized state not persisted".to_string()),
+                );
                 return Some(false);
             }
+            attempt.succeed(&step.id);
             // The non-empty handoff (or the prior parent for an empty step)
             // and the same materialization gate as the full walk have succeeded.
             // WAL custody or a startup marker cannot advance a non-empty step.
@@ -2291,8 +2833,16 @@ impl ConsensusController {
                 self.session_id().to_hex_string(), trigger_id.slot.value(), plan.next, plan.steps.len());
         }
         if let Err(error) = self.callbacks.seal_finality_outputs(trigger_id, plan.outputs.clone()) {
-            log::error!("Session {} source {}:{} cannot seal original finality plan: {error}",
-                self.session_id().to_hex_string(), trigger_id.slot, trigger_id.hash.to_hex_string());
+            log::error!(
+                "Session {} source {}:{} cannot seal original finality plan: {error}",
+                self.session_id().to_hex_string(),
+                trigger_id.slot,
+                trigger_id.hash.to_hex_string()
+            );
+            attempt.fail(
+                trigger_id,
+                FinalizationFailure::Retryable(format!("finality output set not sealed: {error}")),
+            );
             return Some(false);
         }
         Some(true)
@@ -2457,7 +3007,7 @@ impl ConsensusController {
         };
 
         let source_info = self.build_source_info_for_received(received);
-        let delivered = self.notify_block_finalized(
+        let handoff = self.notify_block_finalized(
             received.block_id.clone(),
             source_info,
             received.root_hash.clone(),
@@ -2469,16 +3019,16 @@ impl ConsensusController {
             sig_hash_data,
             has_final_cert,
         );
-        if !durable && self.description.get_shard().is_masterchain() && has_final_cert {
-            assert!(
-                delivered,
-                "Session {} protocol breach: failed to emit masterchain FinalCert callback \
-                 for block_id={} seqno={}",
-                &self.session_id().to_hex_string()[..8],
-                received.block_id,
-                seqno,
-            );
-        }
+        let delivered = match handoff {
+            FinalityHandoff::Delivered => true,
+            FinalityHandoff::Pending => false,
+            FinalityHandoff::Permanent(reason) => {
+                // C++ to_signature_set refuses before FinalizeBlock is
+                // published; the caller stops this candidate for good.
+                self.handoff_failure = Some((candidate_id.clone(), reason));
+                false
+            }
+        };
         if delivered {
             if durable && !has_final_cert {
                 self.acknowledged_ancestor_approvals.insert(candidate_id.clone());
@@ -2528,13 +3078,15 @@ impl ConsensusController {
     }
 
     /// Pending source work must retain its ancestry until node WAL takeover.
+    ///
+    /// This holds for every session: an unresolved or permanently stalled
+    /// finalization never ages out, and neither do the bodies and notarization
+    /// certificates its chain still needs.
     pub(crate) fn durable_pending_floor(&self) -> Option<SlotIndex> {
-        if self.description.authenticated_runtime().is_none() {
-            return None;
-        }
         // A pending trigger may still depend on an older ancestor whose body
         // has not arrived. Keep the whole session history until this closes.
-        (!self.finalized_pending_body.is_empty()).then_some(SlotIndex::new(0))
+        (!self.finalized_pending_body.is_empty() || self.pending_finalizations > 0)
+            .then_some(SlotIndex::new(0))
     }
 
     /// A materialized row must remain authenticatable after a crash. The
@@ -2549,7 +3101,9 @@ impl ConsensusController {
         candidate: &RawCandidateId,
     ) -> bool {
         let mut cursor = candidate.clone();
-        for _ in 0..MAX_CHAIN_DEPTH {
+        // Parent slots strictly decrease (checked below), so this terminates
+        // without an implementation depth limit.
+        loop {
             let Some(received) = backend.candidate_book().received(&cursor) else {
                 log::debug!(target: "simplex_resolver",
                     "RECOVERY_ANCESTRY_PENDING: session={} candidate_slot={} candidate_hash={} dependency_slot={} dependency_hash={} reason=missing_metadata",
@@ -2586,8 +3140,6 @@ impl ConsensusController {
             }
             cursor = parent;
         }
-        log::error!("Session {} recovery ancestry exceeds MAX_CHAIN_DEPTH", self.session_id());
-        false
     }
 
     /// Apply finalized-driven local state once the candidate body is available.
@@ -2777,8 +3329,23 @@ impl ConsensusController {
         slot: SlotIndex,
         candidate_hash_data_bytes: Vec<u8>,
         is_final: bool,
-    ) -> bool {
+    ) -> FinalityHandoff {
         check_execution_time!(20_000);
+
+        #[cfg(test)]
+        {
+            let (retryable, permanent) = self.injected_handoff_failures.get();
+            if retryable > 0 {
+                self.injected_handoff_failures.set((retryable - 1, permanent));
+                return FinalityHandoff::Pending;
+            }
+            if permanent > 0 {
+                self.injected_handoff_failures.set((retryable, permanent - 1));
+                return FinalityHandoff::Permanent(
+                    "injected permanent handoff failure".to_string(),
+                );
+            }
+        }
 
         let signatures_variant = match self.build_simplex_signatures_variant(
             &signatures,
@@ -2794,7 +3361,7 @@ impl ConsensusController {
                     e
                 );
                 self.telemetry.increment_error();
-                return false;
+                return FinalityHandoff::Permanent(format!("signature set conversion failed: {e}"));
             }
         };
 
@@ -2813,13 +3380,16 @@ impl ConsensusController {
                     .unwrap_or(0),
             };
             return match self.callbacks.poll_durable_finality(draft) {
-                Ok(durable) => durable,
+                Ok(true) => FinalityHandoff::Delivered,
+                Ok(false) => FinalityHandoff::Pending,
                 Err(error) => {
                     log::error!(
                         "Session {} finality retained/retry required: {error}",
                         self.session_id()
                     );
-                    false
+                    // The durable source retains every refused handoff and is
+                    // polled again; its errors are the retryable class.
+                    FinalityHandoff::Pending
                 }
             };
         }
@@ -2833,7 +3403,7 @@ impl ConsensusController {
             signatures_variant,
             approve_signatures,
         );
-        true
+        FinalityHandoff::Delivered
     }
 
     fn build_finalization_raw_signatures(
@@ -3134,6 +3704,42 @@ impl ConsensusController {
     ) {
         self.finalized_pending_body.insert(id, FinalizedEntry { event, intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), resolved_output_plan: Vec::new(), continuation: None, sealed_output_requirements: None, finalized_at });
         self.telemetry.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
+    }
+
+    /* Finalization backpressure seams */
+
+    /// Inject handoff failures for the next emissions: retryable ones first.
+    pub(crate) fn inject_handoff_failures_for_test(&mut self, retryable: usize, permanent: usize) {
+        self.injected_handoff_failures.set((retryable, permanent));
+    }
+
+    /// Inject the pending-finalization limit (no environment change in tests).
+    pub(crate) fn set_pending_finalizations_max_for_test(&mut self, max: usize) {
+        self.pending_finalizations_max = max;
+    }
+
+    pub(crate) fn pending_finalizations_max_for_test(&self) -> usize {
+        self.pending_finalizations_max
+    }
+
+    /// Every backlog flip so far, in order, as (over_limit, pending).
+    pub(crate) fn backlog_transitions_for_test(&self) -> &[(bool, usize)] {
+        &self.backlog_transitions
+    }
+
+    /// Full recount, to check the incremental counts against.
+    pub(crate) fn recount_finalizations_for_test(&self) -> (usize, usize) {
+        let pending = self.finalization_status.values().filter(|e| e.is_pending()).count();
+        let stalled = self.finalization_status.values().filter(|e| e.is_stalled()).count();
+        (pending, stalled)
+    }
+
+    pub(crate) fn finalization_attempts_for_test(&self, id: &RawCandidateId) -> u32 {
+        self.finalization_status.get(id).map_or(0, |entry| entry.attempts)
+    }
+
+    pub(crate) fn finalization_status_len_for_test(&self) -> usize {
+        self.finalization_status.len()
     }
 }
 

@@ -359,6 +359,11 @@ impl SessionCallbacks {
         self.use_callback_thread
     }
 
+    /// Whether the session is stopping; work started now would be cancelled.
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.stop_flag.load(Ordering::Relaxed)
+    }
+
     /// Invoke a listener-bound closure.
     ///
     /// When `use_callback_thread=true`, the closure is posted onto the
