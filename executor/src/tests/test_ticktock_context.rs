@@ -122,6 +122,77 @@ fn ticktock_context_matches_cpp_transactions() {
     }
 }
 
+/// Complete transactions whose compute phase exercises VM charges and step counts aligned with
+/// the reference VM (truncated code, debug opcodes, code pages, PushInt returns, extra-balance
+/// cheap calls). Transaction and account roots are frozen from the reference emulator.
+#[test]
+fn ticktock_vm_alignment_matches_cpp_transactions() {
+    fn raw(bytes: &[u8], bits: usize) -> Cell {
+        let mut b = rtos_block::BuilderData::new();
+        b.append_raw(bytes, bits).unwrap();
+        b.into_cell().unwrap()
+    }
+    fn asm(source: &str) -> Cell {
+        rtos_assembler::compile_code_to_cell(source).unwrap()
+    }
+    let store = "NEWC STU 8 ENDC POPROOT";
+    let extra_calls = |n: u32| {
+        let calls = (0..n).map(|i| format!("PUSHINT {i} GETEXTRABALANCE DROP")).collect::<Vec<_>>();
+        format!("{} PUSHINT 7 GETEXTRABALANCE NEWC STU 64 ENDC POPROOT", calls.join(" "))
+    };
+    let cases: Vec<(&str, Cell, bool)> = vec![
+        ("merged-fragment-b14", raw(&[0x00, 0x6c], 14), false),
+        ("merged-fragment-b16", raw(&[0x68, 0x6c], 16), false),
+        ("truncated-b16-b7a9", raw(&[0xb7, 0xa9], 16), false),
+        ("truncated-b17-16f6d", raw(&[0xb7, 0xb6, 0x80], 17), false),
+        ("debug-fe0f-fef1", raw(&[0xfe, 0x0f, 0xfe, 0xf1, 0xc3, 0xa9, 0x77], 56), false),
+        ("debug-fe40", raw(&[0xfe, 0x40, 0x77], 24), false),
+        ("setcp-ff01", raw(&[0x77, 0xff, 0x01, 0x77], 32), false),
+        ("setcpx-zero", asm("PUSHINT 0 SETCPX PUSHINT 7 NEWC STU 8 ENDC POPROOT"), false),
+        ("booleval-ret", asm(&format!("PUSHCONT {{ PUSHINT 5 }} BOOLEVAL DROP {store}")), false),
+        (
+            "booleval-nested",
+            asm(&format!("PUSHCONT {{ PUSHCONT {{ RETALT }} BOOLEVAL }} BOOLEVAL {store}")),
+            false,
+        ),
+        ("extrabalance-1", asm(&extra_calls(0)), true),
+        ("extrabalance-5", asm(&extra_calls(4)), true),
+        ("extrabalance-8", asm(&extra_calls(7)), true),
+    ];
+    let mut rows = Vec::new();
+    for version in [16] {
+        for (probe, code, extra) in &cases {
+            let address = MsgAddressInt::with_standart(None, -1, [0x5a; 32].into()).unwrap();
+            let cfg = config(version, true, &address);
+            let mut state = StateInit::default();
+            state.set_code(code.clone());
+            state.set_data(Cell::default());
+            state.set_special(rtos_block::TickTock { tick: true, tock: true });
+            let mut balance = CurrencyCollection::with_coins(10_000_000_000);
+            if *extra {
+                for key in 0..8u32 {
+                    balance.set_other(key, 1_000 + u128::from(key)).unwrap();
+                }
+            }
+            let account = Account::active(
+                address,
+                balance,
+                0,
+                0,
+                state,
+                cfg.size_limits_config().acc_state_cells_for_storage_dict,
+            )
+            .unwrap();
+            let name = format!("align-v{version}-tick-{probe}");
+            run(&name, cfg, account, rtos_block::TransactionTickTock::Tick, true, &mut rows);
+        }
+    }
+    assert_eq!(rows.len(), cases.len());
+    if let Ok(path) = std::env::var("RTOS_TICKTOCK_ALIGN_EXPORT") {
+        std::fs::write(path, rows.join("\n") + "\n").unwrap();
+    }
+}
+
 #[test]
 fn ticktock_rejects_inbound_message_without_mutating_account() {
     let address = MsgAddressInt::with_standart(None, -1, [0x5a; 32].into()).unwrap();
