@@ -12,6 +12,7 @@
 use crate::{
     executor::{
         engine::{storage::fetch_stack, Engine},
+        gas::gas_state::Gas,
         types::{Instruction, InstructionOptions},
     },
     stack::{
@@ -20,8 +21,9 @@ use crate::{
     },
 };
 use rtos_block::{
-    fail, Deserializable, ExceptionCode, GasLimitsPrices, HashmapE, MsgForwardPrices, Serializable,
-    Status, StoragePrices, VarUInteger32,
+    error, fail, BuilderData, Cell, Deserializable, ExceptionCode, GasConsumer, GasLimitsPrices,
+    HashmapE, MsgForwardPrices, Result, Serializable, SliceData, Status, StoragePrices,
+    VarUInteger32,
 };
 
 fn execute_config_param(engine: &mut Engine, name: &'static str, opt: bool) -> Status {
@@ -48,6 +50,45 @@ pub(super) fn execute_balance(engine: &mut Engine) -> Status {
     extract_config(engine, "BALANCE")
 }
 
+/// The first calls of GETEXTRABALANCE in a VM (counted across non-isolated child VMs) are cheap.
+const EXTRA_BALANCE_CHEAP_CALLS: usize = 5;
+/// Cell-load gas charged by one cheap call; loads beyond it are recorded as free gas.
+const EXTRA_BALANCE_CHEAP_MAX_GAS: i64 = 200;
+
+/// Cell loads of one cheap GETEXTRABALANCE call: each load is still registered as visited and
+/// priced as usual, but only the first `EXTRA_BALANCE_CHEAP_MAX_GAS` of this call is charged;
+/// once that allowance is used up the rest is recorded as free gas. Cell creation is not
+/// charged.
+struct CheapCellLoads<'a> {
+    engine: &'a mut Engine,
+    remaining: i64,
+}
+
+impl GasConsumer for CheapCellLoads<'_> {
+    fn finalize_cell(&mut self, builder: BuilderData) -> Result<Cell> {
+        builder
+            .finalize(1024)
+            .map_err(|err| error!(ExceptionCode::CellOverflow, "finalize cell error: {:?}", err))
+    }
+    fn load_cell(&mut self, cell: Cell) -> Result<SliceData> {
+        let remaining = &mut self.remaining;
+        self.engine.load_hashed_cell_charged(cell, true, &mut |engine, first| {
+            let price = Gas::load_cell_price(first);
+            let charged = price.min(*remaining);
+            engine.try_use_gas(charged)?;
+            *remaining = remaining.saturating_sub(charged);
+            if *remaining == 0 {
+                engine.use_free_gas(price.saturating_sub(charged));
+            }
+            Ok(())
+        })
+    }
+    fn finalize_cell_and_load(&mut self, builder: BuilderData) -> Result<SliceData> {
+        let cell = self.finalize_cell(builder)?;
+        self.load_cell(cell)
+    }
+}
+
 // - int
 pub(super) fn execute_extra_balance(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("GETEXTRABALANCE"))?;
@@ -56,7 +97,19 @@ pub(super) fn execute_extra_balance(engine: &mut Engine) -> Status {
     let extra = engine.smci_param(7)?.tuple_item_ref(1)?.as_dict()?;
     let dict = HashmapE::with_hashmap(32, extra.cloned());
     let key = index.write_to_bitstring()?;
-    let value = if let Some(mut slice) = dict.get_with_gas(key, engine)? {
+    // The call is counted after the operand and balance checks and before the lookup, so a
+    // failing lookup still uses up a cheap call.
+    engine.get_extra_balance_counter = engine
+        .get_extra_balance_counter
+        .checked_add(1)
+        .ok_or_else(|| error!(ExceptionCode::IntegerOverflow, "extra balance call counter"))?;
+    let value = if engine.get_extra_balance_counter <= EXTRA_BALANCE_CHEAP_CALLS {
+        let mut loads = CheapCellLoads { engine, remaining: EXTRA_BALANCE_CHEAP_MAX_GAS };
+        dict.get_with_gas(key, &mut loads)?
+    } else {
+        dict.get_with_gas(key, engine)?
+    };
+    let value = if let Some(mut slice) = value {
         StackItem::int(VarUInteger32::construct_from(&mut slice)?.inner())
     } else {
         StackItem::int(0)

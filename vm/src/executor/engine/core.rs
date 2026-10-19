@@ -95,7 +95,9 @@ pub struct Engine {
     pub(in crate::executor) libraries: Vec<HashmapE>, // 256 bit dictionaries
     pub(in crate::executor) modifiers: BehaviorModifiers,
     pub(in crate::executor) checked_signatures_count: usize,
-    // get_extra_balance_counter: usize, // TODO: what is it?
+    /// GETEXTRABALANCE calls so far; the first few calls have capped cell-load gas. Shared with
+    /// non-isolated child VMs and reset on isolated entry, like the signature-check counter.
+    pub(in crate::executor) get_extra_balance_counter: usize,
     // SliceData::load_cell() is faster than trying to cache SliceData for each
     // visited cell with HashMap<UInt256, SliceData>
     visited_cells: HashSet<UInt256>,
@@ -208,6 +210,7 @@ impl Engine {
             libraries: Vec::new(),
             modifiers: BehaviorModifiers::default(),
             checked_signatures_count: 0,
+            get_extra_balance_counter: 0,
             visited_cells: HashSet::new(),
             loaded_libraries: HashSet::new(),
             max_library_loads: None,
@@ -893,13 +896,26 @@ impl Engine {
     }
 
     /// Loads cell to slice checking in precashed map
-    pub fn load_hashed_cell(&mut self, mut cell: Cell, resolve_special: bool) -> Result<SliceData> {
+    pub fn load_hashed_cell(&mut self, cell: Cell, resolve_special: bool) -> Result<SliceData> {
+        self.load_hashed_cell_charged(cell, resolve_special, &mut |engine, first| {
+            engine.try_use_gas(Gas::load_cell_price(first))
+        })
+    }
+
+    /// Loads a cell like `load_hashed_cell`; every registered load (first or repeated, after
+    /// it is recorded as visited) is charged through `charge` instead of the full price.
+    pub(in crate::executor) fn load_hashed_cell_charged(
+        &mut self,
+        mut cell: Cell,
+        resolve_special: bool,
+        charge: &mut dyn FnMut(&mut Engine, bool) -> Status,
+    ) -> Result<SliceData> {
         let mut library_loaded = false;
         loop {
             if !library_loaded {
                 let hash = cell.repr_hash();
                 let first = self.visited_cells.insert(hash.clone());
-                self.try_use_gas(Gas::load_cell_price(first))?;
+                charge(self, first)?;
             }
             let mut slice = SliceData::load_cell(cell)?;
             if !resolve_special || slice.cell_type() == CellType::Ordinary {
@@ -1111,6 +1127,7 @@ impl Engine {
         } else {
             self.try_use_gas(self.free_gas_consumed)?;
             self.checked_signatures_count = 0;
+            self.get_extra_balance_counter = 0;
             self.free_gas_consumed = 0;
             HashSet::new()
         };
@@ -1145,6 +1162,7 @@ impl Engine {
             max_library_loads: self.max_library_loads,
             modifiers: self.modifiers.clone(),
             checked_signatures_count: self.checked_signatures_count,
+            get_extra_balance_counter: self.get_extra_balance_counter,
             visited_cells,
             cstate: None,
             time: self.time,
@@ -1195,6 +1213,7 @@ impl Engine {
         self.loaded_libraries = std::mem::take(&mut child.loaded_libraries);
         self.free_gas_consumed = child.free_gas_consumed;
         self.checked_signatures_count = child.checked_signatures_count;
+        self.get_extra_balance_counter = child.get_extra_balance_counter;
         log::debug!(
             target: "tvm",
             "Child VM finished. res: {result}, steps: {}, gas: {}, stack depth: {}\n",
