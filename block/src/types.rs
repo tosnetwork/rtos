@@ -649,6 +649,9 @@ macro_rules! define_VarIntegerN {
             fn read_from(&mut self, slice: &mut SliceData) -> Result<()> {
                 let bits = 8 - ($N as u8).leading_zeros();
                 let bytes = slice.get_next_int(bits as usize)? as usize;
+                if bytes > $N {
+                    fail!("{} length {} exceeds {} bytes", stringify!($varname), bytes, $N)
+                }
                 let max = std::mem::size_of::<$tt>();
                 let mut buffer = [0; std::mem::size_of::<$tt>()];
                 if bytes > 0 {
@@ -666,8 +669,11 @@ macro_rules! define_VarIntegerN {
             }
             fn skip(slice: &mut SliceData) -> Result<()> {
                 let bits = 8 - ($N as u8).leading_zeros();
-                let bytes = slice.get_next_int(bits as usize)?;
-                slice.move_by(8 * bytes as usize)?;
+                let bytes = slice.get_next_int(bits as usize)? as usize;
+                if bytes > $N {
+                    fail!("{} length {} exceeds {} bytes", stringify!($varname), bytes, $N)
+                }
+                slice.move_by(8 * bytes)?;
                 Ok(())
             }
         }
@@ -872,14 +878,17 @@ macro_rules! define_VarIntegerN {
     };
 }
 
-// Coins is `VarUInteger 16`, but macro is defined in the way,
-// that it uses `$N.leading_zeros` to define type length, so length 15 is used here
+// For the fixed-width forms `$N` is the largest payload length in bytes,
+// `VarUInteger n` allows payloads of at most n - 1 bytes, and the length field
+// is sized by `$N.leading_zeros`: Coins is `VarUInteger 16` (15 bytes, 4-bit
+// length), VarUInteger3 has 2 bytes (2-bit length), VarUInteger7 has 6 bytes
+// (3-bit length).
 define_VarIntegerN!(Coins, 15, u128);
 // Macro which defines the type using BigInt as underlying type,
 // calculates length with `($N - 1).log2 + 1`, so proper length is used here
 define_VarIntegerN!(VarUInteger32, 32, BigInt);
-define_VarIntegerN!(VarUInteger3, 3, u32);
-define_VarIntegerN!(VarUInteger7, 7, u64);
+define_VarIntegerN!(VarUInteger3, 2, u32);
+define_VarIntegerN!(VarUInteger7, 6, u64);
 
 pub type VarUInteger16 = Coins;
 

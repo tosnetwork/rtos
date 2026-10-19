@@ -299,8 +299,8 @@ fn test_varuinteger7_from_into() {
 #[test]
 fn test_varuinteger7_serialization() {
     VarUInteger7::try_from(u64::MAX).expect_err("should not be contructable");
-    VarUInteger7::try_from(0x01FF_FFFF_FFFF_FFFFu64).expect_err("should not be contructable");
-    let v = VarUInteger7::try_from(0x00FF_FFFF_FFFF_FFFFu64).unwrap();
+    VarUInteger7::try_from(0x0001_0000_0000_0000u64).expect_err("should not be contructable");
+    let v = VarUInteger7::try_from(0x0000_FFFF_FFFF_FFFFu64).unwrap();
     v.serialize().unwrap();
 
     let mut v = VarUInteger7::default();
@@ -516,13 +516,13 @@ fn test_coins_parsing() {
 
 #[test]
 fn test_checked_operations() {
-    let mut v = VarUInteger7::try_from(0x00FF_FFFF_FFFF_FFFFu64).unwrap();
+    let mut v = VarUInteger7::try_from(0x0000_FFFF_FFFF_FFFFu64).unwrap();
     let one = VarUInteger7::one();
     assert!(!v.add_checked(&one));
     assert!(v.sub_checked(&one));
     assert!(v.add_checked(&one));
 
-    let mut v = VarUInteger3::try_from(0x00FF_FFFFu32).unwrap();
+    let mut v = VarUInteger3::try_from(0x0000_FFFFu32).unwrap();
     let one = VarUInteger3::one();
     assert!(!v.add_checked(&one));
     assert!(v.sub_checked(&one));
@@ -553,4 +553,93 @@ fn test_math_traits() {
     let mut a = Coins::zero();
     assert!(!a.sub_checked(&Coins::one()), "should not sub with negative");
     assert!(a.checked_sub(&Coins::one()).is_none(), "should not sub with negative");
+}
+
+/// Reference verdicts of every VarUInteger encoding (see the header of
+/// `tests/data/varuint-reference-verdicts.tsv`), one row per encoding.
+fn varuint_reference_rows() -> Vec<Vec<&'static str>> {
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/varuint-reference-verdicts.tsv"))
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| line.split('\t').collect())
+        .collect()
+}
+
+fn slice_of_bits(bits: &str) -> SliceData {
+    let mut builder = BuilderData::new();
+    if bits != "-" {
+        for bit in bits.chars() {
+            builder.append_bit_bool(bit == '1').unwrap();
+        }
+    }
+    SliceData::load_builder(builder).unwrap()
+}
+
+/// Exact typed read (the whole encoding consumed): the value, or `-`.
+fn typed_read<T: Deserializable + std::fmt::Display>(bits: &str) -> String {
+    let mut slice = slice_of_bits(bits);
+    match T::construct_from(&mut slice) {
+        Ok(value) if slice.is_empty_cell() => value.to_string(),
+        _ => "-".to_string(),
+    }
+}
+
+fn typed_skip<T: Deserializable>(bits: &str) -> String {
+    let mut slice = slice_of_bits(bits);
+    let accepted = T::skip(&mut slice).is_ok() && slice.is_empty_cell();
+    if accepted { "1" } else { "0" }.to_string()
+}
+
+#[test]
+fn varuinteger3_and_7_match_reference_length_bound() {
+    let rows = varuint_reference_rows();
+    assert_eq!(rows.len(), 348);
+    let mut checked = 0;
+    for row in rows.iter().filter(|row| row[1] == "3" || row[1] == "7") {
+        let (id, bits) = (row[0], row[2]);
+        // the typed codec is the strict handwritten reader; its skip is the
+        // handwritten skip (leading zeros allowed, length below the width)
+        let (read, skip) = if row[1] == "3" {
+            (typed_read::<VarUInteger3>(bits), typed_skip::<VarUInteger3>(bits))
+        } else {
+            (typed_read::<VarUInteger7>(bits), typed_skip::<VarUInteger7>(bits))
+        };
+        assert_eq!(read, row[4], "{id} read");
+        assert_eq!(skip, row[5], "{id} skip");
+        checked += 1;
+    }
+    assert_eq!(checked, 21 + 45);
+}
+
+#[test]
+fn varuinteger3_and_7_bounds() {
+    assert_eq!(VarUInteger3::MAX.as_u64(), (1 << 16) - 1);
+    assert_eq!(VarUInteger7::MAX.as_u64(), (1 << 48) - 1);
+    VarUInteger3::try_from(1u32 << 16).expect_err("three bytes do not fit VarUInteger 3");
+    VarUInteger7::try_from(1u64 << 48).expect_err("seven bytes do not fit VarUInteger 7");
+    let mut max3 = VarUInteger3::MAX;
+    assert!(!max3.add_checked(&VarUInteger3::one()));
+    let mut max7 = VarUInteger7::MAX;
+    assert!(!max7.add_checked(&VarUInteger7::one()));
+    assert!(CheckedAdd::checked_add(&VarUInteger7::MAX, &VarUInteger7::one()).is_none());
+    // the maximum serializes with the largest valid length; one more fails
+    // without appending anything
+    let mut builder = BuilderData::new();
+    VarUInteger3::MAX.write_to(&mut builder).unwrap();
+    assert_eq!(builder.length_in_bits(), 2 + 16);
+    VarUInteger7::MAX.write_to(&mut builder).unwrap();
+    assert_eq!(builder.length_in_bits(), 2 + 16 + 3 + 48);
+    let before = builder.clone();
+    (VarUInteger3::MAX + 1).write_to(&mut builder).expect_err("VarUInteger 3 overflow");
+    (VarUInteger7::MAX + 1).write_to(&mut builder).expect_err("VarUInteger 7 overflow");
+    assert_eq!(builder, before);
+    // length == width and truncated payloads are refused by read and skip
+    let len3 = format!("11{}", "1".repeat(24));
+    for bits in ["11", len3.as_str(), "10111111111111111"] {
+        assert_eq!(typed_read::<VarUInteger3>(bits), "-", "{bits}");
+    }
+    assert_eq!(typed_skip::<VarUInteger3>(&len3), "0");
+    let len7 = format!("111{}", "1".repeat(56));
+    assert_eq!(typed_read::<VarUInteger7>(&len7), "-");
+    assert_eq!(typed_skip::<VarUInteger7>(&len7), "0");
 }
