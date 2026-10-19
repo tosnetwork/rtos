@@ -19,7 +19,7 @@ use rtos_api::{
     ton::{
         engine::validator::{
             ControlQueryError as ControlQueryErrorBoxed, KeyHash as KeyHashBoxed,
-            Signature as SignatureBoxed, Success as SuccessBoxed,
+            Signature as SignatureBoxed,
         },
         rpc::engine::validator::GetTime,
     },
@@ -342,8 +342,9 @@ async fn modify_bits_run_modify_and_entry_only_queries() {
     assert_eq!(refusal(ask(&mut connection, GetStats::default()).await), not_authorized());
     assert_eq!(refusal(ask(&mut connection, GenerateKeyPair::default()).await), not_authorized());
     assert!(key_ring.untouched());
-    let success = ask(&mut connection, AddValidatorTempKey::default()).await;
-    assert!(success.downcast::<SuccessBoxed>().is_ok(), "AddValidatorTempKey runs");
+    // The handler runs and refuses: a status-only server is not started.
+    let reply = ask(&mut connection, AddValidatorTempKey::default()).await;
+    assert_eq!(refusal(reply), Some((651, "not started".to_string())));
     // A lite-server query needs only the entry; its handler runs and fails
     // here because this server has no engine.
     let (code, message) = refusal(ask(&mut connection, GetConfigAll::default()).await).unwrap();

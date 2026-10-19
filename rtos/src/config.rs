@@ -516,6 +516,16 @@ pub struct TonNodeConfig {
     #[serde(default)]
     extensions: NodeExtensions,
     validator_keys: Option<Vec<ValidatorKeysJson>>,
+    /// ADNL ids added by the operator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    adnl_ids: Vec<AdnlIdJson>,
+    /// Temporary keys of permanent validator keys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    validator_temp_keys: Vec<ValidatorBoundKeyJson>,
+    /// ADNL addresses of permanent validator keys. The address a validator
+    /// entry is bound to at run time is one of its unexpired addresses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    validator_adnl_addresses: Vec<ValidatorBoundKeyJson>,
     /// Explicit local transport ownership only; never a consensus signing key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     consensus_transport_bindings: Vec<ConsensusTransportBindingJson>,
@@ -615,6 +625,76 @@ pub struct ValidatorKeysJson {
     pub validator_key_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validator_adnl_key_id: Option<String>,
+}
+
+/// An ADNL id added by the operator, with its address category. The node's
+/// own overlay and DHT identities are members without an entry, in category 0.
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct AdnlIdJson {
+    pub id: String,
+    pub category: u8,
+}
+
+/// A temporary key or an ADNL address bound to a permanent validator key.
+/// The expiry is the unsigned reading of the wire value.
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ValidatorBoundKeyJson {
+    pub validator_key_id: String,
+    pub key_id: String,
+    pub expire_at: u32,
+}
+
+/// Reply codes of the reference engine for key commands.
+pub const KEY_COMMAND_ERROR: i32 = 602;
+pub const KEY_COMMAND_PROTOVIOLATION: i32 = 621;
+pub const KEY_COMMAND_NOTREADY: i32 = 651;
+/// The highest ADNL address category the reference engine accepts.
+pub const MAX_ADNL_CATEGORY: u8 = 250;
+
+/// A refused key command with the code the reference engine replies with.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct KeyCommandError {
+    pub code: i32,
+    pub message: String,
+}
+
+fn key_command_error(code: i32, message: &str) -> rtos_block::Error {
+    KeyCommandError { code, message: message.to_string() }.into()
+}
+
+/// A key command of the control interface, with the reference engine's
+/// configuration semantics.
+#[derive(Debug, Clone)]
+pub enum KeyCommand {
+    AddAdnlId { id: String, category: u8 },
+    DelAdnlId { id: String },
+    AddPermanentKey { validator: String, election_date: i32, expire_at: u32 },
+    AddTempKey { validator: String, key: String, expire_at: u32 },
+    AddAdnlAddress { validator: String, adnl: String, expire_at: u32 },
+    DelPermanentKey { validator: String },
+    DelTempKey { validator: String, key: String },
+    DelAdnlAddress { validator: String, adnl: String },
+}
+
+/// The parts of the configuration a key command changes.
+struct KeyState {
+    validator_keys: Option<Vec<ValidatorKeysJson>>,
+    adnl_ids: Vec<AdnlIdJson>,
+    validator_temp_keys: Vec<ValidatorBoundKeyJson>,
+    validator_adnl_addresses: Vec<ValidatorBoundKeyJson>,
+    validator_key_ring: Option<HashMap<String, KeyOptionJson>>,
+}
+
+/// What a key command changed, for the runtime effects that follow it.
+#[derive(Debug, Default)]
+struct KeyChange {
+    changed: bool,
+    updated: Option<ValidatorKeysJson>,
+    removed: Option<ValidatorKeysJson>,
+    bound: Vec<(String, i32)>,
+    unbound: Vec<(String, i32)>,
+    released: Vec<String>,
 }
 
 #[cfg(test)]
@@ -1483,6 +1563,7 @@ impl TonNodeConfig {
         Ok(last_updated.unwrap())
     }
 
+    #[cfg(test)]
     async fn remove_validator_key(
         &mut self,
         validator_key_id: String,
@@ -1527,6 +1608,452 @@ impl TonNodeConfig {
         }
         Ok(true)
     }
+
+    /// The node's own ADNL identities (full-node overlay and DHT).
+    fn node_adnl_ids(&self) -> Vec<String> {
+        self.node_identities_tagged().into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// The category of a member of the ADNL id list, `None` for a non-member.
+    fn adnl_category(&self, id: &str) -> Option<u8> {
+        if let Some(entry) = self.adnl_ids.iter().find(|entry| entry.id == id) {
+            return Some(entry.category);
+        }
+        self.node_adnl_ids().iter().any(|own| own == id).then_some(0)
+    }
+
+    fn validator_entry(&self, validator: &str) -> Option<&ValidatorKeysJson> {
+        self.validator_keys.as_ref()?.iter().find(|key| key.validator_key_id == validator)
+    }
+
+    fn require_validator(&self, validator: &str) -> Result<()> {
+        if self.validator_entry(validator).is_none() {
+            return Err(key_command_error(KEY_COMMAND_NOTREADY, "unknown permanent validator key"));
+        }
+        Ok(())
+    }
+
+    /// Whether any configured role still refers to `id`.
+    fn key_referenced(&self, id: &str) -> bool {
+        let as_validator = self.validator_keys.as_ref().is_some_and(|keys| {
+            keys.iter().any(|key| {
+                key.validator_key_id == id || key.validator_adnl_key_id.as_deref() == Some(id)
+            })
+        });
+        let bound = self
+            .validator_temp_keys
+            .iter()
+            .chain(self.validator_adnl_addresses.iter())
+            .any(|entry| entry.key_id == id);
+        let transport = self
+            .consensus_transport_bindings
+            .iter()
+            .any(|binding| binding.adnl_key_id == id || binding.validator_id == id);
+        as_validator
+            || bound
+            || transport
+            || self.adnl_ids.iter().any(|entry| entry.id == id)
+            || self.node_adnl_ids().iter().any(|own| own == id)
+    }
+
+    /// Selects the ADNL address the runtime binds `validator` to: the current
+    /// one while it stays an unexpired listed address, else the most recently
+    /// added unexpired one.
+    fn rebind_validator(&mut self, validator: &str, now: u32, change: &mut KeyChange) {
+        let active: Vec<String> = self
+            .validator_adnl_addresses
+            .iter()
+            .filter(|entry| {
+                entry.validator_key_id == validator
+                    && entry.expire_at > now
+                    && self.adnl_category(&entry.key_id).is_some()
+            })
+            .map(|entry| entry.key_id.clone())
+            .collect();
+        let Some(entry) = self
+            .validator_keys
+            .as_mut()
+            .and_then(|keys| keys.iter_mut().find(|key| key.validator_key_id == validator))
+        else {
+            return;
+        };
+        let current = entry.validator_adnl_key_id.clone();
+        let selected = match &current {
+            Some(current) if active.contains(current) => Some(current.clone()),
+            _ => active.last().cloned(),
+        };
+        if selected == current {
+            return;
+        }
+        entry.validator_adnl_key_id = selected.clone();
+        let election = entry.election_id;
+        change.updated = Some(entry.clone());
+        if let Some(old) = current {
+            change.unbound.push((old, election));
+        }
+        if let Some(new) = selected {
+            change.bound.push((new, election));
+        }
+    }
+
+    /// Applies one key command to the configuration as the reference engine
+    /// does: every refusal happens before any change.
+    fn apply_key_command(&mut self, command: KeyCommand, now: u32) -> Result<KeyChange> {
+        let mut change = KeyChange::default();
+        match command {
+            KeyCommand::AddAdnlId { id, category } => {
+                if category > MAX_ADNL_CATEGORY {
+                    return Err(key_command_error(
+                        KEY_COMMAND_PROTOVIOLATION,
+                        "bad category value",
+                    ));
+                }
+                if let Some(entry) = self.adnl_ids.iter_mut().find(|entry| entry.id == id) {
+                    if entry.category != category {
+                        entry.category = category;
+                        change.changed = true;
+                    }
+                } else if self.adnl_category(&id) != Some(category) {
+                    self.adnl_ids.push(AdnlIdJson { id, category });
+                    change.changed = true;
+                }
+            }
+            KeyCommand::DelAdnlId { id } => {
+                if self.adnl_category(&id).is_none() {
+                    return Ok(change);
+                }
+                let in_use = self.node_adnl_ids().contains(&id)
+                    || self.validator_adnl_addresses.iter().any(|entry| entry.key_id == id)
+                    || self.validator_keys.as_ref().is_some_and(|keys| {
+                        keys.iter().any(|key| key.validator_adnl_key_id.as_deref() == Some(&id))
+                    });
+                if in_use {
+                    return Err(key_command_error(KEY_COMMAND_ERROR, "adnl addr still in use"));
+                }
+                self.adnl_ids.retain(|entry| entry.id != id);
+                change.changed = true;
+                change.released.push(id);
+            }
+            KeyCommand::AddPermanentKey { validator, election_date, expire_at } => {
+                let keys = self.validator_keys.get_or_insert_with(Vec::new);
+                if keys.iter().any(|key| {
+                    key.election_id == election_date && key.validator_key_id != validator
+                }) {
+                    return Err(key_command_error(
+                        KEY_COMMAND_PROTOVIOLATION,
+                        "duplicate election date",
+                    ));
+                }
+                // The expiry keeps its wire bit pattern.
+                let expire_bits = i32::from_ne_bytes(expire_at.to_ne_bytes());
+                if let Some(key) = keys.iter_mut().find(|key| key.validator_key_id == validator) {
+                    if key.election_id != election_date {
+                        return Err(key_command_error(
+                            KEY_COMMAND_PROTOVIOLATION,
+                            "election date changed",
+                        ));
+                    }
+                    if key.expire_at != expire_bits {
+                        key.expire_at = expire_bits;
+                        change.changed = true;
+                        change.updated = Some(key.clone());
+                    }
+                } else {
+                    let key = ValidatorKeysJson {
+                        expire_at: expire_bits,
+                        election_id: election_date,
+                        validator_key_id: validator,
+                        validator_adnl_key_id: None,
+                    };
+                    keys.push(key.clone());
+                    change.changed = true;
+                    change.updated = Some(key);
+                }
+            }
+            KeyCommand::AddTempKey { validator, key, expire_at } => {
+                self.require_validator(&validator)?;
+                change.changed =
+                    Self::upsert_bound(&mut self.validator_temp_keys, validator, key, expire_at);
+            }
+            KeyCommand::AddAdnlAddress { validator, adnl, expire_at } => {
+                if self.adnl_category(&adnl).is_none() {
+                    return Err(key_command_error(
+                        KEY_COMMAND_NOTREADY,
+                        "to-be-added validator adnl address not in adnl nodes list",
+                    ));
+                }
+                self.require_validator(&validator)?;
+                change.changed = Self::upsert_bound(
+                    &mut self.validator_adnl_addresses,
+                    validator.clone(),
+                    adnl,
+                    expire_at,
+                );
+                if change.changed {
+                    self.rebind_validator(&validator, now, &mut change);
+                }
+            }
+            KeyCommand::DelPermanentKey { validator } => {
+                let Some(keys) = self.validator_keys.as_mut() else {
+                    return Ok(change);
+                };
+                let Some(position) = keys.iter().position(|key| key.validator_key_id == validator)
+                else {
+                    return Ok(change);
+                };
+                let removed = keys.remove(position);
+                if let Some(adnl) = &removed.validator_adnl_key_id {
+                    change.unbound.push((adnl.clone(), removed.election_id));
+                    change.released.push(adnl.clone());
+                }
+                for list in [&mut self.validator_temp_keys, &mut self.validator_adnl_addresses] {
+                    list.retain(|entry| {
+                        if entry.validator_key_id == validator {
+                            change.released.push(entry.key_id.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+                change.released.push(validator);
+                change.removed = Some(removed);
+                change.changed = true;
+            }
+            KeyCommand::DelTempKey { validator, key } => {
+                self.require_validator(&validator)?;
+                let before = self.validator_temp_keys.len();
+                self.validator_temp_keys
+                    .retain(|entry| !(entry.validator_key_id == validator && entry.key_id == key));
+                if self.validator_temp_keys.len() != before {
+                    change.changed = true;
+                    change.released.push(key);
+                }
+            }
+            KeyCommand::DelAdnlAddress { validator, adnl } => {
+                self.require_validator(&validator)?;
+                let before = self.validator_adnl_addresses.len();
+                self.validator_adnl_addresses
+                    .retain(|entry| !(entry.validator_key_id == validator && entry.key_id == adnl));
+                if self.validator_adnl_addresses.len() != before {
+                    change.changed = true;
+                    change.released.push(adnl);
+                    self.rebind_validator(&validator, now, &mut change);
+                }
+            }
+        }
+        Ok(change)
+    }
+
+    fn key_state(&self) -> KeyState {
+        KeyState {
+            validator_keys: self.validator_keys.clone(),
+            adnl_ids: self.adnl_ids.clone(),
+            validator_temp_keys: self.validator_temp_keys.clone(),
+            validator_adnl_addresses: self.validator_adnl_addresses.clone(),
+            validator_key_ring: self.validator_key_ring.clone(),
+        }
+    }
+
+    fn restore_key_state(&mut self, state: KeyState) {
+        self.validator_keys = state.validator_keys;
+        self.adnl_ids = state.adnl_ids;
+        self.validator_temp_keys = state.validator_temp_keys;
+        self.validator_adnl_addresses = state.validator_adnl_addresses;
+        self.validator_key_ring = state.validator_key_ring;
+    }
+
+    /// Inserts or updates a bound key; whether anything changed.
+    fn upsert_bound(
+        list: &mut Vec<ValidatorBoundKeyJson>,
+        validator_key_id: String,
+        key_id: String,
+        expire_at: u32,
+    ) -> bool {
+        if let Some(entry) = list
+            .iter_mut()
+            .find(|entry| entry.validator_key_id == validator_key_id && entry.key_id == key_id)
+        {
+            if entry.expire_at == expire_at {
+                return false;
+            }
+            entry.expire_at = expire_at;
+            return true;
+        }
+        list.push(ValidatorBoundKeyJson { validator_key_id, key_id, expire_at });
+        true
+    }
+
+    /// Keys the configuration no longer refers to after a command; they leave
+    /// the key ring, as the reference engine collects them.
+    fn collect_released(&mut self, released: &[String]) -> Vec<String> {
+        let mut collected = Vec::new();
+        for id in released {
+            if collected.contains(id) || self.key_referenced(id) {
+                continue;
+            }
+            if let Some(ring) = self.validator_key_ring.as_mut() {
+                ring.remove(id);
+            }
+            collected.push(id.clone());
+        }
+        collected
+    }
+
+    /// The validator keys with their temporary keys and ADNL addresses, for
+    /// the configuration projection of the control interface.
+    pub(crate) fn validator_key_view(
+        &self,
+    ) -> Vec<(ValidatorKeysJson, Vec<ValidatorBoundKeyJson>, Vec<ValidatorBoundKeyJson>)> {
+        let Some(keys) = &self.validator_keys else {
+            return Vec::new();
+        };
+        keys.iter()
+            .map(|key| {
+                let pick = |list: &[ValidatorBoundKeyJson]| {
+                    list.iter()
+                        .filter(|entry| entry.validator_key_id == key.validator_key_id)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                (key.clone(), pick(&self.validator_temp_keys), pick(&self.validator_adnl_addresses))
+            })
+            .collect()
+    }
+
+    /// The ADNL id list with categories: the node's own identities first,
+    /// then the operator's entries.
+    pub(crate) fn adnl_id_view(&self) -> Vec<AdnlIdJson> {
+        let mut result: Vec<AdnlIdJson> = Vec::new();
+        for id in self.node_adnl_ids() {
+            if !result.iter().any(|entry| entry.id == id) {
+                result.push(AdnlIdJson { category: self.adnl_category(&id).unwrap_or(0), id });
+            }
+        }
+        for entry in &self.adnl_ids {
+            if !result.iter().any(|known| known.id == entry.id) {
+                result.push(entry.clone());
+            }
+        }
+        result
+    }
+
+    /// The server key id, port and listed clients of a server section.
+    fn server_view(value: serde_json::Value) -> Result<ServerView> {
+        let key: KeyOptionJson = serde_json::from_value(
+            value.get("server_key").cloned().ok_or_else(|| error!("server without a key"))?,
+        )?;
+        let id = base64_encode(get_key_option_factory().from_private_key_json(&key)?.id().data());
+        let address: SocketAddr = value
+            .get("address")
+            .and_then(|address| address.as_str())
+            .ok_or_else(|| error!("server without an address"))?
+            .parse()?;
+        let mut clients = Vec::new();
+        if let Some(list) = value.get("clients").and_then(|clients| clients.get("list")) {
+            for client in list.as_array().into_iter().flatten() {
+                let key: KeyOptionJson = serde_json::from_value(client.clone())?;
+                let id =
+                    base64_encode(get_key_option_factory().from_public_key_json(&key)?.id().data());
+                let permissions = match client.get("permissions") {
+                    Some(serde_json::Value::Number(number)) => number.as_i64(),
+                    Some(serde_json::Value::String(text)) => text.parse::<i64>().ok(),
+                    _ => Some(0),
+                }
+                .and_then(|bits| i32::try_from(bits).ok())
+                .ok_or_else(|| error!("client permissions are not a 32-bit integer"))?;
+                clients.push((id, permissions));
+            }
+        }
+        Ok(ServerView { id, port: address.port(), clients })
+    }
+
+    /// Everything the configuration projection of the control interface
+    /// reads, taken in one step.
+    fn control_view(&self) -> Result<ControlConfigView> {
+        let node = self.node_identities_tagged();
+        let pq_consensus = match std::fs::read(self.build_config_path(&self.file_name)) {
+            Ok(bytes) => {
+                let json: serde_json::Value = serde_json::from_slice(&bytes)?;
+                crate::pq_consensus_config::parse_pq_consensus(&json)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(ControlConfigView {
+            ip_address: self
+                .adnl_node
+                .as_ref()
+                .and_then(|node| serde_json::to_value(node).ok())
+                .and_then(|node| {
+                    node.get("ip_address").and_then(|ip| ip.as_str()).map(String::from)
+                }),
+            adnl: self.adnl_id_view(),
+            dht: node
+                .iter()
+                .filter(|(_, tag)| *tag == NodeNetwork::TAG_DHT_KEY)
+                .map(|(id, _)| id.clone())
+                .collect(),
+            fullnode: node
+                .iter()
+                .find(|(_, tag)| *tag == NodeNetwork::TAG_OVERLAY_KEY)
+                .map(|(id, _)| id.clone()),
+            validators: self.validator_key_view(),
+            lite_server: self
+                .lite_server
+                .as_ref()
+                .map(|lite| {
+                    serde_json::to_value(lite).map_err(Into::into).and_then(Self::server_view)
+                })
+                .transpose()?,
+            control_server: self
+                .control_server
+                .as_ref()
+                .map(|server| {
+                    serde_json::to_value(server).map_err(Into::into).and_then(Self::server_view)
+                })
+                .transpose()?,
+            ext_messages_broadcast_disabled: self.ext_messages_broadcast_disabled,
+            state_serializer_enabled: !self.skip_saving_persistent_states,
+            pq_consensus,
+        })
+    }
+
+    fn node_identities_tagged(&self) -> Vec<(String, usize)> {
+        let mut result = Vec::new();
+        if let Some(adnl_config) = &self.adnl_node {
+            for tag in [NodeNetwork::TAG_OVERLAY_KEY, NodeNetwork::TAG_DHT_KEY] {
+                if let Ok(key) = adnl_config.key_by_tag(tag, true) {
+                    result.push((base64_encode(key.id().data()), tag));
+                }
+            }
+        }
+        result
+    }
+}
+
+/// A control or lite server as the configuration projection lists it.
+#[derive(Debug, Clone)]
+pub struct ServerView {
+    pub id: String,
+    pub port: u16,
+    pub clients: Vec<(String, i32)>,
+}
+
+/// The configuration as the control interface projects it.
+#[derive(Debug)]
+pub struct ControlConfigView {
+    pub ip_address: Option<String>,
+    pub adnl: Vec<AdnlIdJson>,
+    pub dht: Vec<String>,
+    pub fullnode: Option<String>,
+    pub validators:
+        Vec<(ValidatorKeysJson, Vec<ValidatorBoundKeyJson>, Vec<ValidatorBoundKeyJson>)>,
+    pub lite_server: Option<ServerView>,
+    pub control_server: Option<ServerView>,
+    pub ext_messages_broadcast_disabled: bool,
+    pub state_serializer_enabled: bool,
+    pub pq_consensus: Option<crate::pq_consensus_config::PqConsensusConfig>,
 }
 
 pub enum ConfigEvent {
@@ -1543,7 +2070,9 @@ pub trait NodeConfigSubscriber: Send + Sync {
 enum Task {
     Generate(i32),
     ImportPrivateKey(PrivateKey),
+    #[cfg(test)]
     AddValidatorKey([u8; 32], i32, i32),
+    #[cfg(test)]
     AddValidatorAdnlKey([u8; 32], [u8; 32]),
     GetKey([u8; 32]),
     ExportAdnlKeys,
@@ -1551,6 +2080,8 @@ enum Task {
     DelCustomOverlay(String),
     GetCustomOverlays,
     SetExtMessagesBroadcastDisabled(bool),
+    KeyCommand(KeyCommand),
+    ControlView,
 }
 
 #[derive(Debug)]
@@ -1561,6 +2092,7 @@ enum Answer {
     Result(Result<()>),
     AdnlKeys(Vec<(String, usize)>),
     CustomOverlays(Result<CustomOverlaysConfigBoxed>),
+    ControlView(Box<ControlConfigView>),
 }
 
 impl ExtMessagesSetting {
@@ -1761,6 +2293,7 @@ impl NodeConfigHandler {
         !self.validator_keys.is_empty()
     }
 
+    #[cfg(test)]
     pub async fn add_validator_key(
         &self,
         key_hash: &[u8; 32],
@@ -1782,6 +2315,7 @@ impl NodeConfigHandler {
         }
     }
 
+    #[cfg(test)]
     pub async fn add_validator_adnl_key(
         &self,
         validator_key_hash: &[u8; 32],
@@ -2068,100 +2602,7 @@ impl NodeConfigHandler {
         Ok(key_id)
     }
 
-    async fn revision_validator_keys(
-        self: &Arc<Self>,
-        validator_keys: &Arc<ValidatorKeys>,
-        config: &mut TonNodeConfig,
-        subscribers: &[Arc<dyn NodeConfigSubscriber>],
-    ) -> Result<()> {
-        let Some(config_validator_keys) = &config.validator_keys else {
-            return Ok(());
-        };
-        if config_validator_keys.len() <= 3 {
-            // 3 for launching new network case
-            return Ok(());
-        }
-        let Some(oldest_key) = NodeConfigHandler::get_oldest_validator_key(config) else {
-            return Ok(());
-        };
-        let election_id = oldest_key.election_id;
-        log::info!(
-            "revision_validator_keys: removing oldest key election_id={election_id} adnl={:?}",
-            oldest_key.validator_adnl_key_id,
-        );
-        // Keep the old election as a retry record until all vault deletions
-        // have been flushed. A failed attempt must not shrink len to three and
-        // make the next public rotation command silently skip retirement.
-        let remaining = |id: &str| {
-            config.validator_keys.as_ref().unwrap().iter().any(|key| {
-                key.election_id != election_id
-                    && (key.validator_key_id == id
-                        || key.validator_adnl_key_id.as_deref() == Some(id))
-            })
-        };
-        let mut retired = Vec::new();
-        for id in std::iter::once(&oldest_key.validator_key_id)
-            .chain(oldest_key.validator_adnl_key_id.iter())
-        {
-            if !remaining(id) && !retired.contains(id) {
-                retired.push(id.clone());
-            }
-        }
-        // Close both new lookup paths before any fallible I/O. This cannot
-        // revoke KeyOption Arcs already returned to callers, and is not a
-        // durable cross-process retirement fence.
-        for id in &retired {
-            if let Some(ring) = config.validator_key_ring.as_mut() {
-                ring.remove(id);
-            }
-            self.key_ring.remove(id);
-        }
-        for id in &retired {
-            SecretsVaultConfig::on_drop(id).await?;
-        }
-        config.remove_validator_key(oldest_key.validator_key_id.clone(), election_id).await?;
-        self.update_validator_transport(|| {
-            validator_keys.remove(&oldest_key)?;
-            Ok(())
-        })?;
-        let Some(adnl_key_id) = &oldest_key.validator_adnl_key_id else {
-            return Ok(());
-        };
-        // Stable-adnl-key rotations: share one ADNL key across several
-        // ValidatorKeysJson entries. Keyring and ADNL/QUIC teardown must wait
-        // until the LAST entry referencing this ADNL key is pruned.
-        let still_used = config
-            .validator_keys
-            .as_ref()
-            .map(|keys| {
-                keys.iter().any(|k| k.validator_adnl_key_id.as_deref() == Some(adnl_key_id))
-            })
-            .unwrap_or(false);
-        if still_used {
-            log::info!(
-                "revision_validator_keys: adnl_key {adnl_key_id} \
-                is still referenced by another election, skipping removal"
-            );
-        } else {
-            // Notify subscribers to clean up ADNL/QUIC/DHT state for the
-            // removed election entry, only when the ADNL key is actually torn
-            // down (avoids spurious removals while the key is still in use).
-            let adnl_key_bytes = base64_decode(adnl_key_id)?;
-            let adnl_key_id = KeyId::from_data(
-                adnl_key_bytes[..]
-                    .try_into()
-                    .map_err(|e| error!("Invalid ADNL key Id {adnl_key_id}: {e}"))?,
-            );
-            for subscriber in subscribers.iter() {
-                self.dispatch_config_event(
-                    subscriber.clone(),
-                    ConfigEvent::RemoveValidatorAdnlKey(adnl_key_id.clone(), election_id),
-                );
-            }
-        }
-        Ok(())
-    }
-
+    #[cfg(test)]
     async fn add_validator_adnl_key_and_save(
         self: Arc<Self>,
         validator_keys: &Arc<ValidatorKeys>,
@@ -2184,12 +2625,131 @@ impl NodeConfigHandler {
             );
         }
 
-        // check validator keys — remove oldest if more than 2
-        self.revision_validator_keys(validator_keys, config, subscribers).await?;
         config.save_to_file(&config.file_name).await?;
         Ok(())
     }
 
+    /// Runs one key command in the configuration actor. The configuration
+    /// changes first, then the runtime follows it (validator key map, vault,
+    /// ADNL bindings, key ring), and the file is written last: a failed write
+    /// is reported with the change already in force, as the reference engine
+    /// reports a failed configuration write.
+    async fn apply_key_command_and_save(
+        &self,
+        validator_keys: &Arc<ValidatorKeys>,
+        key_ring: &Arc<lockfree::map::Map<String, Arc<dyn KeyOption>>>,
+        config: &mut TonNodeConfig,
+        command: KeyCommand,
+        subscribers: &[Arc<dyn NodeConfigSubscriber>],
+    ) -> Result<()> {
+        let now = u32::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| error!("system clock before the epoch: {e}"))?
+                .as_secs(),
+        )
+        .map_err(|_| error!("system clock beyond the 32-bit Unix time range"))?;
+        let before = config.key_state();
+        let change = config.apply_key_command(command, now)?;
+        if !change.changed {
+            return Ok(());
+        }
+        let collected = config.collect_released(&change.released);
+        // The vault records go first: when one of them cannot be written the
+        // configuration is put back, so that repeating the command repeats
+        // the whole change instead of leaving a record the next start reloads.
+        let durable = async {
+            if let Some(removed) = &change.removed {
+                SecretsVaultConfig::drop_validator_metadata(&removed.validator_key_id).await?;
+            }
+            if let Some(updated) = &change.updated {
+                try_n_times(3, Duration::from_millis(150), || {
+                    SecretsVaultConfig::save_validator_key(updated)
+                })
+                .await?;
+            }
+            for id in &collected {
+                SecretsVaultConfig::on_drop(id).await?;
+            }
+            Ok::<(), rtos_block::Error>(())
+        };
+        if let Err(error) = durable.await {
+            config.restore_key_state(before);
+            return Err(error);
+        }
+        if let Some(removed) = &change.removed {
+            self.update_validator_transport(|| validator_keys.remove(removed).map(|_| ()))?;
+        }
+        if let Some(updated) = &change.updated {
+            self.update_validator_transport(|| validator_keys.add(updated.clone()))?;
+        }
+        let event_key = |adnl: &str| -> Result<Arc<KeyId>> {
+            let bytes = base64_decode(adnl)?;
+            Ok(KeyId::from_data(
+                bytes[..].try_into().map_err(|e| error!("Invalid ADNL key Id {adnl}: {e}"))?,
+            ))
+        };
+        for (adnl, election) in &change.unbound {
+            // The transport of a key bound by another validator entry stays.
+            let still_bound = config.validator_keys.as_ref().is_some_and(|keys| {
+                keys.iter().any(|key| key.validator_adnl_key_id.as_deref() == Some(adnl.as_str()))
+            });
+            if still_bound {
+                continue;
+            }
+            let id = event_key(adnl)?;
+            for subscriber in subscribers {
+                self.dispatch_config_event(
+                    subscriber.clone(),
+                    ConfigEvent::RemoveValidatorAdnlKey(id.clone(), *election),
+                );
+            }
+        }
+        for (adnl, election) in &change.bound {
+            let id = event_key(adnl)?;
+            for subscriber in subscribers {
+                self.dispatch_config_event(
+                    subscriber.clone(),
+                    ConfigEvent::AddValidatorAdnlKey(id.clone(), *election),
+                );
+            }
+        }
+        for id in &collected {
+            key_ring.remove(id);
+        }
+        config.save_to_file(&config.file_name).await
+    }
+
+    /// Runs a key command of the control interface.
+    pub async fn key_command(&self, command: KeyCommand) -> Result<()> {
+        let (wait, mut queue_reader) = Wait::new();
+        let pushed_task = (wait.clone(), Task::KeyCommand(command));
+        wait.request();
+        self.send_task(pushed_task)?;
+        match wait.wait(&mut queue_reader, true).await {
+            Some(None) => fail!("Answer was not set!"),
+            Some(Some(Answer::Result(result))) => result,
+            Some(Some(_)) => fail!("Bad answer (KeyCommand)!"),
+            None => fail!("Waiting returned an internal error!"),
+        }
+    }
+
+    /// The configuration as the control interface projects it.
+    pub async fn control_view(&self) -> Result<ControlConfigView> {
+        let (wait, mut queue_reader) = Wait::new();
+        let pushed_task = (wait.clone(), Task::ControlView);
+        wait.request();
+        self.send_task(pushed_task)?;
+        match wait.wait(&mut queue_reader, true).await {
+            Some(None) => fail!("Answer was not set!"),
+            Some(Some(Answer::ControlView(view))) => Ok(*view),
+            Some(Some(Answer::Result(Err(error)))) => Err(error),
+            Some(Some(_)) => fail!("Bad answer (ControlView)!"),
+            None => fail!("Waiting returned an internal error!"),
+        }
+    }
+
+    #[cfg(test)]
     async fn add_validator_key_and_save(
         &self,
         validator_keys: Arc<ValidatorKeys>,
@@ -2234,22 +2794,6 @@ impl NodeConfigHandler {
         )
         .await?;
         Ok(config.custom_overlays.clone())
-    }
-
-    fn get_oldest_validator_key(config: &TonNodeConfig) -> Option<ValidatorKeysJson> {
-        let mut oldest_validator_key: Option<ValidatorKeysJson> = None;
-        if let Some(validator_keys) = &config.validator_keys {
-            for key in validator_keys.iter() {
-                if let Some(oldest_val_key) = &oldest_validator_key {
-                    if key.election_id < oldest_val_key.election_id {
-                        oldest_validator_key = Some(key.clone());
-                    }
-                } else {
-                    oldest_validator_key = Some(key.clone());
-                }
-            }
-        }
-        oldest_validator_key
     }
 
     fn get_key(config: &TonNodeConfig, key_id: [u8; 32]) -> Option<Arc<dyn KeyOption>> {
@@ -2421,6 +2965,7 @@ impl NodeConfigHandler {
                         self.notify_validator_transport_changed();
                         Answer::ImportPrivateKey(result)
                     }
+                    #[cfg(test)]
                     Task::AddValidatorAdnlKey(key, adnl_key) => {
                         let result = NodeConfigHandler::add_validator_adnl_key_and_save(
                             self.clone(),
@@ -2434,6 +2979,7 @@ impl NodeConfigHandler {
                         self.notify_validator_transport_changed();
                         Answer::Result(result)
                     }
+                    #[cfg(test)]
                     Task::AddValidatorKey(key, election_id, expire_at) => {
                         let result = self
                             .add_validator_key_and_save(
@@ -2447,6 +2993,23 @@ impl NodeConfigHandler {
                         self.notify_validator_transport_changed();
                         Answer::Result(result)
                     }
+                    Task::KeyCommand(command) => {
+                        let result = self
+                            .apply_key_command_and_save(
+                                &validator_keys,
+                                &key_ring,
+                                &mut actual_config,
+                                command,
+                                &subscribers,
+                            )
+                            .await;
+                        self.notify_validator_transport_changed();
+                        Answer::Result(result)
+                    }
+                    Task::ControlView => match actual_config.control_view() {
+                        Ok(view) => Answer::ControlView(Box::new(view)),
+                        Err(error) => Answer::Result(Err(error)),
+                    },
                     Task::GetKey(key_data) => {
                         let result = NodeConfigHandler::get_key(&actual_config, key_data);
                         Answer::GetKey(result)

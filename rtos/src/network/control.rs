@@ -11,7 +11,7 @@
  */
 use crate::{
     collator_test_bundle::CollatorTestBundle,
-    config::{KeyRing, NodeConfigHandler},
+    config::{KeyCommand, KeyCommandError, KeyRing, NodeConfigHandler},
     engine::Engine,
     engine_traits::{EngineOperations, Stoppable},
     network::{
@@ -50,10 +50,12 @@ use rtos_api::{
         rpc::{
             engine::validator::{
                 AddAdnlId, AddCustomOverlay, AddValidatorAdnlAddress, AddValidatorPermanentKey,
-                AddValidatorTempKey, ControlQuery, DelCustomOverlay, ExportPublicKey,
-                GenerateKeyPair, GetBundle, GetConfig, GetFutureBundle, GetSelectedStats, GetStats,
-                ImportPrivateKey, ImportShardOverlayCertificate, SetExtMessagesBroadcastDisabled,
-                ShowCustomOverlays, Sign, SignShardOverlayCertificate,
+                AddValidatorTempKey, ControlQuery, DelAdnlId, DelCustomOverlay,
+                DelValidatorAdnlAddress, DelValidatorPermanentKey, DelValidatorTempKey,
+                ExportPublicKey, GenerateKeyPair, GetBundle, GetConfig, GetFutureBundle,
+                GetSelectedStats, GetStats, ImportPrivateKey, ImportShardOverlayCertificate,
+                SetExtMessagesBroadcastDisabled, ShowCustomOverlays, Sign,
+                SignShardOverlayCertificate,
             },
             lite_server::{
                 GetBlock, GetConfigAll, GetConfigParams, Query as LiteServerQuery, SendMessage,
@@ -68,8 +70,8 @@ use rtos_api::{
     IntoBoxed, TLObject,
 };
 use rtos_block::{
-    error, fail, AccountId, BlockIdExt, KeyId, MerkleProof, MsgAddressInt, Result, Serializable,
-    ShardAccount, ShardIdent, UInt256, UnixTime, ED25519_KEY_TYPE,
+    base64_encode, error, fail, AccountId, BlockIdExt, KeyId, MerkleProof, MsgAddressInt, Result,
+    Serializable, ShardAccount, ShardIdent, UInt256, ED25519_KEY_TYPE,
 };
 use rtos_block_json::serialize_config_param;
 use std::{collections::HashSet, sync::Arc};
@@ -102,6 +104,10 @@ pub(crate) fn required_permission(query: &TLObject) -> Option<u32> {
         AddValidatorTempKey => VEP_MODIFY,
         AddValidatorAdnlAddress => VEP_MODIFY,
         AddAdnlId => VEP_MODIFY,
+        DelAdnlId => VEP_MODIFY,
+        DelValidatorPermanentKey => VEP_MODIFY,
+        DelValidatorTempKey => VEP_MODIFY,
+        DelValidatorAdnlAddress => VEP_MODIFY,
         GetStats => VEP_DEFAULT,
         GetConfig => VEP_DEFAULT,
         AddCustomOverlay => VEP_MODIFY,
@@ -132,6 +138,34 @@ fn control_error(code: i32, message: impl Into<String>) -> Result<QueryResult> {
         #[cfg(feature = "telemetry")]
         None,
     )
+}
+
+/// The errno the reference key ring reports for a key it does not hold.
+const ERROR_CODE_KEY_NOT_FOUND: i32 = 2;
+
+/// Why a key lookup failed, after the reference key ring's "key not in db".
+fn key_not_found(key_hash: &[u8; 32]) -> String {
+    format!("no key {} in the key ring", hex::encode_upper(key_hash))
+}
+
+/// The reply code of a failed command: the code it carries, the errno of an
+/// operating-system error, else 0.
+fn reply_code(error: &rtos_block::Error) -> i32 {
+    if let Some(error) = error.downcast_ref::<KeyCommandError>() {
+        return error.code;
+    }
+    error_code(error)
+}
+
+/// The reference engine answers some malformed queries with no reply and
+/// closes the connection; a handler returns this error to do the same.
+#[derive(Debug, thiserror::Error)]
+#[error("query refused without a reply")]
+struct CloseConnection;
+
+/// A signed wire field read as the unsigned value it encodes.
+fn wire_unsigned(value: i32) -> u32 {
+    u32::from_ne_bytes(value.to_ne_bytes())
 }
 
 fn into_answer(result: QueryResult) -> Result<Option<QueryAnswer>> {
@@ -723,38 +757,48 @@ impl ControlQuerySubscriber {
         Ok(Signature { signature: sign })
     }
 
-    async fn add_validator_permanent_key(
-        &self,
-        key_hash: &[u8; 32],
-        election_date: ton::int,
-        ttl: ton::int,
-    ) -> Result<Success> {
-        let expire_at = UnixTime::now() as i32 + ttl;
-        self.config.add_validator_key(key_hash, election_date, expire_at).await?;
-        Ok(Success::Engine_Validator_Success)
+    fn started(&self) -> bool {
+        matches!(self.data_source, DataSource::Engine(_))
     }
 
-    fn add_validator_temp_key(
-        &self,
-        _perm_key_hash: &[u8; 32],
-        _key_hash: &[u8; 32],
-        _ttl: ton::int,
-    ) -> Result<Success> {
-        Ok(Success::Engine_Validator_Success)
+    /// The key-ring lookup that precedes a key command: a key this node does
+    /// not hold is refused as the reference key ring refuses it.
+    async fn check_key(&self, key_hash: &[u8; 32]) -> std::result::Result<(), (i32, String)> {
+        if self.key_ring.find(key_hash).is_ok() {
+            return Ok(());
+        }
+        let id = base64_encode(key_hash);
+        let own = self.config.get_adnl_keys().await.unwrap_or_default();
+        if own.iter().any(|(key, _)| key == &id) {
+            return Ok(());
+        }
+        Err((ERROR_CODE_KEY_NOT_FOUND, format!("key not in db: {}", key_not_found(key_hash))))
     }
 
-    async fn add_validator_adnl_address(
+    /// A key command after the permission and readiness checks: the key
+    /// lookup when the command names one, then the configuration change.
+    async fn run_key_command(
         &self,
-        perm_key_hash: &[u8; 32],
-        key_hash: &[u8; 32],
-        _ttl: ton::int,
-    ) -> Result<Success> {
-        self.config.add_validator_adnl_key(perm_key_hash, key_hash).await?;
-        Ok(Success::Engine_Validator_Success)
-    }
-
-    fn add_adnl_address(&self, _key_hash: &[u8; 32], _category: ton::int) -> Result<Success> {
-        Ok(Success::Engine_Validator_Success)
+        checked_key: Option<&[u8; 32]>,
+        command: KeyCommand,
+        failure_prefix: &str,
+    ) -> Result<QueryResult> {
+        if !self.started() {
+            return control_error(ERROR_CODE_NOTREADY, "not started");
+        }
+        if let Some(key) = checked_key {
+            if let Err((code, message)) = self.check_key(key).await {
+                return control_error(code, format!("failed to get public key: {message}"));
+            }
+        }
+        match self.config.key_command(command).await {
+            Ok(()) => QueryResult::consume_boxed(
+                Success::Engine_Validator_Success,
+                #[cfg(feature = "telemetry")]
+                None,
+            ),
+            Err(error) => control_error(reply_code(&error), format!("{failure_prefix}{error}")),
+        }
     }
 
     async fn prepare_bundle(&self, block_id: BlockIdExt) -> Result<Success> {
@@ -962,75 +1006,140 @@ impl ControlQuerySubscriber {
         };
         let query = match query.downcast::<ExportPublicKey>() {
             Ok(query) => {
+                if let Err((code, message)) = self.check_key(query.key_hash.as_slice()).await {
+                    return control_error(code, message);
+                }
                 return QueryResult::consume_boxed(
                     self.export_public_key(query.key_hash.as_slice())?,
                     #[cfg(feature = "telemetry")]
                     None,
-                )
+                );
             }
             Err(query) => query,
         };
         let query = match query.downcast::<Sign>() {
             Ok(query) => {
+                if self.key_ring.find(query.key_hash.as_slice()).is_err() {
+                    let message =
+                        format!("key not in db: {}", key_not_found(query.key_hash.as_slice()));
+                    return control_error(ERROR_CODE_KEY_NOT_FOUND, message);
+                }
                 return QueryResult::consume(
                     self.process_sign_data(query.key_hash.as_slice(), &query.data)?,
                     #[cfg(feature = "telemetry")]
                     None,
-                )
-            }
-            Err(query) => query,
-        };
-        let query = match query.downcast::<AddValidatorPermanentKey>() {
-            Ok(query) => {
-                return QueryResult::consume_boxed(
-                    self.add_validator_permanent_key(
-                        query.key_hash.as_slice(),
-                        query.election_date,
-                        query.ttl,
-                    )
-                    .await?,
-                    #[cfg(feature = "telemetry")]
-                    None,
-                )
-            }
-            Err(query) => query,
-        };
-        let query = match query.downcast::<AddValidatorTempKey>() {
-            Ok(query) => {
-                return QueryResult::consume_boxed(
-                    self.add_validator_temp_key(
-                        query.permanent_key_hash.as_slice(),
-                        query.key_hash.as_slice(),
-                        query.ttl,
-                    )?,
-                    #[cfg(feature = "telemetry")]
-                    None,
-                )
-            }
-            Err(query) => query,
-        };
-        let query = match query.downcast::<AddValidatorAdnlAddress>() {
-            Ok(query) => {
-                return QueryResult::consume_boxed(
-                    self.add_validator_adnl_address(
-                        query.permanent_key_hash.as_slice(),
-                        query.key_hash.as_slice(),
-                        query.ttl,
-                    )
-                    .await?,
-                    #[cfg(feature = "telemetry")]
-                    None,
-                )
+                );
             }
             Err(query) => query,
         };
         let query = match query.downcast::<AddAdnlId>() {
             Ok(query) => {
-                return QueryResult::consume_boxed(
-                    self.add_adnl_address(query.key_hash.as_slice(), query.category)?,
-                    #[cfg(feature = "telemetry")]
-                    None,
-                )
+                if !self.started() {
+                    return control_error(ERROR_CODE_NOTREADY, "not started");
+                }
+                // A category outside 0..=255 fails before the key lookup; the
+                // reference engine then drops the reply and the connection.
+                let Ok(category) = u8::try_from(query.category) else {
+                    return Err(CloseConnection.into());
+                };
+                let key = query.key_hash.inner();
+                return self
+                    .run_key_command(
+                        Some(&key),
+                        KeyCommand::AddAdnlId { id: base64_encode(key), category },
+                        "failed to add adnl node: ",
+                    )
+                    .await;
+            }
+            Err(query) => query,
+        };
+        let query = match query.downcast::<DelAdnlId>() {
+            Ok(query) => {
+                let id = base64_encode(query.key_hash.inner());
+                return self
+                    .run_key_command(
+                        None,
+                        KeyCommand::DelAdnlId { id },
+                        "failed to del adnl node: ",
+                    )
+                    .await;
+            }
+            Err(query) => query,
+        };
+        let query = match query.downcast::<AddValidatorPermanentKey>() {
+            Ok(query) => {
+                let key = query.key_hash.inner();
+                let command = KeyCommand::AddPermanentKey {
+                    validator: base64_encode(key),
+                    election_date: query.election_date,
+                    expire_at: wire_unsigned(query.ttl),
+                };
+                return self
+                    .run_key_command(Some(&key), command, "failed to add validator permanent key: ")
+                    .await;
+            }
+            Err(query) => query,
+        };
+        let query = match query.downcast::<AddValidatorTempKey>() {
+            Ok(query) => {
+                let key = query.key_hash.inner();
+                let command = KeyCommand::AddTempKey {
+                    validator: base64_encode(query.permanent_key_hash.inner()),
+                    key: base64_encode(key),
+                    expire_at: wire_unsigned(query.ttl),
+                };
+                return self
+                    .run_key_command(Some(&key), command, "failed to add validator temp key: ")
+                    .await;
+            }
+            Err(query) => query,
+        };
+        let query = match query.downcast::<AddValidatorAdnlAddress>() {
+            Ok(query) => {
+                let key = query.key_hash.inner();
+                let command = KeyCommand::AddAdnlAddress {
+                    validator: base64_encode(query.permanent_key_hash.inner()),
+                    adnl: base64_encode(key),
+                    expire_at: wire_unsigned(query.ttl),
+                };
+                return self
+                    .run_key_command(Some(&key), command, "failed to add validator adnl address: ")
+                    .await;
+            }
+            Err(query) => query,
+        };
+        let query = match query.downcast::<DelValidatorPermanentKey>() {
+            Ok(query) => {
+                let command = KeyCommand::DelPermanentKey {
+                    validator: base64_encode(query.key_hash.inner()),
+                };
+                return self
+                    .run_key_command(None, command, "failed to del validator permanent key: ")
+                    .await;
+            }
+            Err(query) => query,
+        };
+        let query = match query.downcast::<DelValidatorTempKey>() {
+            Ok(query) => {
+                let command = KeyCommand::DelTempKey {
+                    validator: base64_encode(query.permanent_key_hash.inner()),
+                    key: base64_encode(query.key_hash.inner()),
+                };
+                return self
+                    .run_key_command(None, command, "failed to del validator temp key: ")
+                    .await;
+            }
+            Err(query) => query,
+        };
+        let query = match query.downcast::<DelValidatorAdnlAddress>() {
+            Ok(query) => {
+                let command = KeyCommand::DelAdnlAddress {
+                    validator: base64_encode(query.permanent_key_hash.inner()),
+                    adnl: base64_encode(query.key_hash.inner()),
+                };
+                return self
+                    .run_key_command(None, command, "failed to del validator adnl addr: ")
+                    .await;
             }
             Err(query) => query,
         };
@@ -1233,6 +1342,7 @@ impl ControlQuerySubscriber {
         };
         let result = match self.dispatch(query, permissions).await {
             Ok(result) => result,
+            Err(err) if err.downcast_ref::<CloseConnection>().is_some() => return Err(err),
             Err(err) => QueryResult::consume_boxed(
                 ControlQueryError { code: -1, message: err.to_string() }.into_boxed(),
                 #[cfg(feature = "telemetry")]
@@ -1267,3 +1377,7 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests/test_control_permissions.rs"]
 mod permissions_tests;
+
+#[cfg(test)]
+#[path = "../tests/test_control_keys.rs"]
+mod key_tests;

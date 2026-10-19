@@ -480,8 +480,12 @@ impl NodeConfigSubscriber for RotationConfigSubscriber {
     }
 }
 
+fn adnl_command(key: &Arc<KeyId>) -> KeyCommand {
+    KeyCommand::AddAdnlId { id: base64_encode(key.data()), category: 0 }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn config_scheduler_fourth_election_retires_old_key_without_callback_deadlock() {
+async fn config_scheduler_fourth_election_keeps_every_key_without_callback_deadlock() {
     // All identities below are public deterministic test seeds. This test uses
     // only its temporary JSON config and the ordinary non-vault key backend.
     assert!(get_vault().is_none(), "isolated configuration fixture requires no global vault");
@@ -521,35 +525,44 @@ async fn config_scheduler_fourth_election_retires_old_key_without_callback_deadl
     });
     handler.clone().start_sheduler(context, vec![subscriber.clone()]).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
-        handler.add_validator_key(validator_ids[3].data(), 1004, i32::MAX).await.unwrap();
-        // This public command invokes actual revision_validator_keys at four
-        // registrations and emits Remove for the oldest, unshared ADNL key.
-        handler.add_validator_adnl_key(validator_ids[3].data(), adnl_ids[3].data()).await.unwrap();
+        handler
+            .key_command(KeyCommand::AddPermanentKey {
+                validator: base64_encode(validator_ids[3].data()),
+                election_date: 1004,
+                expire_at: i32::MAX as u32,
+            })
+            .await
+            .unwrap();
+        handler.key_command(adnl_command(&adnl_ids[3])).await.unwrap();
+        // The binding callback reenters the actor for its key.
+        handler
+            .key_command(KeyCommand::AddAdnlAddress {
+                validator: base64_encode(validator_ids[3].data()),
+                adnl: base64_encode(adnl_ids[3].data()),
+                expire_at: i32::MAX as u32,
+            })
+            .await
+            .unwrap();
     })
     .await
     .expect("the fourth registration must not wait on its own GetKey queue");
-    assert!(handler.find(adnl_ids[0].data()).is_err());
-    assert!(handler.find(validator_ids[0].data()).is_err());
-    assert!(handler.sign_data(adnl_ids[0].data(), b"retired key").is_err());
-    assert!(handler.sign_data(validator_ids[0].data(), b"retired key").is_err());
-    assert!(handler.get_key_raw(*adnl_ids[0].data()).await.is_none());
-    assert!(handler.get_key_raw(*validator_ids[0].data()).await.is_none());
-    assert!(handler.get_key_raw(*adnl_ids[3].data()).await.is_some());
+    // A fourth election retires nothing: keys leave only when deleted.
+    for id in validator_ids.iter().chain(adnl_ids.iter()) {
+        assert!(handler.find(id.data()).is_ok());
+        assert!(handler.get_key_raw(*id.data()).await.is_some());
+    }
     tokio::time::timeout(Duration::from_secs(3), handler.stop_and_wait()).await.unwrap().unwrap();
     assert_eq!(
         *subscriber.events.lock().unwrap(),
-        vec![(1, 1001), (1, 1002), (1, 1003), (1, 1004), (2, 1001)]
+        vec![(1, 1001), (1, 1002), (1, 1003), (1, 1004)]
     );
     let saved: TonNodeConfig =
         serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap()).unwrap();
-    let saved_keys = saved.validator_keys.unwrap();
-    assert_eq!(saved_keys.len(), 3);
-    assert!(!saved_keys.iter().any(|entry| entry.election_id == 1001));
-    assert!(saved_keys.iter().any(|entry| entry.election_id == 1004));
+    assert_eq!(saved.validator_keys.unwrap().len(), 4);
     let saved_ring = saved.validator_key_ring.unwrap();
-    assert!(!saved_ring.contains_key(&base64_encode(adnl_ids[0].data())));
-    assert!(!saved_ring.contains_key(&base64_encode(validator_ids[0].data())));
-    assert!(saved_ring.contains_key(&base64_encode(adnl_ids[3].data())));
+    for id in validator_ids.iter().chain(adnl_ids.iter()) {
+        assert!(saved_ring.contains_key(&base64_encode(id.data())));
+    }
     let weak = Arc::downgrade(&handler);
     drop(subscriber);
     drop(handler);
@@ -557,106 +570,67 @@ async fn config_scheduler_fourth_election_retires_old_key_without_callback_deadl
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn config_scheduler_rotation_keeps_shared_key_until_last_role_is_retired() {
+async fn config_scheduler_shared_key_leaves_the_ring_with_its_last_role() {
     assert!(get_vault().is_none(), "isolated fixture requires no global vault");
     let dir = tempfile::tempdir().unwrap();
     let mut config = scheduler_test_config();
     config.configs_dir = dir.path().to_str().unwrap().into();
     config.file_name = "config.json".into();
-    let mut validators = Vec::new();
-    let mut transports = Vec::new();
-    for index in 0..6u8 {
+    let mut keys = Vec::new();
+    for seed in [151u8, 152, 153] {
         let (json, key) =
-            Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[151 + index; 32])
-                .unwrap();
+            Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[seed; 32]).unwrap();
         config.validator_key_ring.as_mut().unwrap().insert(base64_encode(key.id().data()), json);
-        validators.push(key.id().clone());
-        let (json, key) =
-            Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[161 + index; 32])
-                .unwrap();
-        config.validator_key_ring.as_mut().unwrap().insert(base64_encode(key.id().data()), json);
-        transports.push(key.id().clone());
+        keys.push(key.id().clone());
     }
-    // The same private key is used by two validator registrations and two ADNL
-    // bindings. After election 1002 retires, it remains needed only as ADNL.
-    for (index, validator, adnl) in [
-        (0, &validators[0], &validators[0]),
-        (1, &validators[0], &transports[1]),
-        (2, &validators[2], &validators[0]),
-    ] {
+    // Key 0 is a permanent key and, also for validator 1, the ADNL address.
+    for (election, validator) in [(1001, &keys[0]), (1003, &keys[1])] {
         config.validator_keys.as_mut().unwrap().push(ValidatorKeysJson {
             expire_at: i32::MAX,
-            election_id: 1001 + index,
+            election_id: election,
             validator_key_id: base64_encode(validator.data()),
-            validator_adnl_key_id: Some(base64_encode(adnl.data())),
+            validator_adnl_key_id: Some(base64_encode(keys[0].data())),
         });
     }
     let (handler, context) =
         NodeConfigHandler::create(config, tokio::runtime::Handle::current()).unwrap();
     let subscriber = Arc::new(RotationConfigSubscriber {
         handler: handler.clone(),
-        retained_key: transports[5].clone(),
+        retained_key: keys[2].clone(),
         events: Default::default(),
     });
     handler.clone().start_sheduler(context, vec![subscriber.clone()]).unwrap();
-    for index in 3..6 {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            handler
-                .add_validator_key(validators[index].data(), 1001 + index as i32, i32::MAX)
-                .await
-                .unwrap();
-            handler
-                .add_validator_adnl_key(validators[index].data(), transports[index].data())
-                .await
-                .unwrap();
+    // One permanent key is never registered for a second election.
+    let refused = handler
+        .key_command(KeyCommand::AddPermanentKey {
+            validator: base64_encode(keys[0].data()),
+            election_date: 1002,
+            expire_at: i32::MAX as u32,
         })
         .await
-        .unwrap();
-        let saved: TonNodeConfig =
-            serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap())
-                .unwrap();
-        assert_eq!(saved.validator_keys.as_ref().unwrap().len(), 3);
-        let retained = index < 5;
-        assert_eq!(
-            saved
-                .validator_key_ring
-                .as_ref()
-                .unwrap()
-                .contains_key(&base64_encode(validators[0].data())),
-            retained
-        );
-        assert_eq!(handler.get_key_raw(*validators[0].data()).await.is_some(), retained);
-        assert_eq!(handler.find(validators[0].data()).is_ok(), retained);
-        if retained {
-            let signature =
-                handler.sign_data(validators[0].data(), b"shared transport key").unwrap();
-            handler
-                .find(validators[0].data())
-                .unwrap()
-                .verify(b"shared transport key", &signature)
-                .unwrap();
-        } else {
-            assert!(handler.sign_data(validators[0].data(), b"retired shared key").is_err());
-        }
-        if index >= 4 {
-            assert!(handler.find(transports[1].data()).is_err());
-            assert!(handler.get_key_raw(*transports[1].data()).await.is_none());
-        }
-    }
+        .unwrap_err();
+    let refused = refused.downcast_ref::<KeyCommandError>().unwrap();
+    assert_eq!((refused.code, refused.message.as_str()), (621, "election date changed"));
+    let delete =
+        |key: &Arc<KeyId>| KeyCommand::DelPermanentKey { validator: base64_encode(key.data()) };
+    handler.key_command(delete(&keys[0])).await.unwrap();
+    // Still the ADNL address of validator 1.
+    assert!(handler.find(keys[0].data()).is_ok());
+    assert!(handler.sign_data(keys[0].data(), b"shared transport key").is_ok());
+    handler.key_command(delete(&keys[1])).await.unwrap();
+    assert!(handler.find(keys[0].data()).is_err());
+    assert!(handler.find(keys[1].data()).is_err());
+    assert!(handler.get_key_raw(*keys[0].data()).await.is_none());
+    assert!(handler.find(keys[2].data()).is_ok(), "a key no role ever held stays");
     handler.stop_and_wait().await.unwrap();
-    assert_eq!(
-        *subscriber.events.lock().unwrap(),
-        vec![
-            (1, 1001),
-            (1, 1002),
-            (1, 1003),
-            (1, 1004),
-            (1, 1005),
-            (2, 1002),
-            (1, 1006),
-            (2, 1003),
-        ]
-    );
+    // The shared transport is torn down only with its last binding.
+    assert_eq!(*subscriber.events.lock().unwrap(), vec![(1, 1001), (1, 1003), (2, 1003)]);
+    let saved: TonNodeConfig =
+        serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap()).unwrap();
+    assert!(saved.validator_keys.unwrap().is_empty());
+    let saved_ring = saved.validator_key_ring.unwrap();
+    assert!(!saved_ring.contains_key(&base64_encode(keys[0].data())));
+    assert!(saved_ring.contains_key(&base64_encode(keys[2].data())));
     let weak = Arc::downgrade(&handler);
     drop(subscriber);
     drop(handler);
@@ -775,7 +749,7 @@ pub(super) fn block_retirement_vault_write(namespace: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn config_scheduler_vault_failure_retries_retirement() {
+async fn config_scheduler_vault_failure_keeps_key_command_repeatable() {
     const CHILD: &str = "RTOS_RETIREMENT_FAILURE_CHILD";
     let Ok(namespace) = std::env::var(CHILD) else {
         let mut failures = Vec::new();
@@ -785,7 +759,7 @@ async fn config_scheduler_vault_failure_retries_retirement() {
             let dir = tempfile::tempdir().unwrap();
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
-                    "config::tests::config_scheduler_vault_failure_retries_retirement",
+                    "config::tests::config_scheduler_vault_failure_keeps_key_command_repeatable",
                     "--exact",
                     "--nocapture",
                 ])
@@ -847,7 +821,7 @@ async fn config_scheduler_vault_failure_retries_retirement() {
         SecretsVaultConfig::save_private_key(&id, json, &key).await.unwrap();
         keys.push(key);
     }
-    // Key 0 retires. Key 1 keeps a role in another election.
+    // Key 0 is deleted. Key 1 keeps a role in another election.
     for (index, adnl) in [(0, 1), (1, 1), (2, 2)] {
         let entry = ValidatorKeysJson {
             expire_at: i32::MAX,
@@ -861,34 +835,36 @@ async fn config_scheduler_vault_failure_retries_retirement() {
     let (handler, context) =
         NodeConfigHandler::create(config, tokio::runtime::Handle::current()).unwrap();
     handler.clone().start_sheduler(context, vec![]).unwrap();
-    handler.add_validator_key(keys[3].id().data(), 1004, i32::MAX).await.unwrap();
     assert!(handler.find(keys[0].id().data()).is_ok());
     assert!(handler.get_key_raw(*keys[0].id().data()).await.is_some());
-    assert!(handler.sign_data(keys[0].id().data(), b"before retirement").is_ok());
+    assert!(handler.sign_data(keys[0].id().data(), b"before deletion").is_ok());
+    let delete = KeyCommand::DelPermanentKey { validator: base64_encode(keys[0].id().data()) };
     std::env::set_var("RTOS_RETIREMENT_FAIL_NAMESPACE", &namespace);
-    let result = handler.add_validator_adnl_key(keys[3].id().data(), keys[4].id().data()).await;
+    let result = handler.key_command(delete.clone()).await;
     assert!(result.is_err(), "real file write must fail at {namespace}");
     eprintln!("ACTUAL_VAULT_WRITE_FAILED {namespace}: {}", result.unwrap_err());
-    assert!(
-        handler.find(keys[0].id().data()).is_err(),
-        "pending retirement must deny new runtime lookup"
-    );
-    assert!(handler.sign_data(keys[0].id().data(), b"pending").is_err());
-    assert!(handler.get_key_raw(*keys[0].id().data()).await.is_none());
-    assert!(handler.find(keys[1].id().data()).is_ok());
-    assert!(handler.get_key_raw(*keys[1].id().data()).await.is_some());
-    assert!(handler.sign_data(keys[1].id().data(), b"retained").is_ok());
+    // The failed command changed nothing in the configuration, so it can be
+    // repeated as a whole. (The file vault may already have dropped the
+    // in-memory copy of a record it failed to write.)
+    assert!(handler.find(keys[0].id().data()).is_ok());
+    assert!(handler
+        .get_actual_validator_keys()
+        .unwrap()
+        .iter()
+        .any(|key| key.validator_key_id == base64_encode(keys[0].id().data())));
     std::env::remove_var("RTOS_RETIREMENT_FAIL_NAMESPACE");
     std::fs::remove_dir(std::env::var_os("RTOS_RETIREMENT_BLOCK_PATH").unwrap()).unwrap();
     for _ in 0..2 {
-        handler.add_validator_adnl_key(keys[3].id().data(), keys[4].id().data()).await.unwrap();
+        handler.key_command(delete.clone()).await.unwrap();
         assert!(handler.find(keys[0].id().data()).is_err());
-        assert!(handler.sign_data(keys[0].id().data(), b"retired").is_err());
+        assert!(handler.sign_data(keys[0].id().data(), b"deleted").is_err());
         assert!(handler.get_key_raw(*keys[0].id().data()).await.is_none());
+        assert!(handler.find(keys[1].id().data()).is_ok());
+        assert!(handler.sign_data(keys[1].id().data(), b"retained").is_ok());
         let saved: TonNodeConfig =
             serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap())
                 .unwrap();
-        assert_eq!(saved.validator_keys.as_ref().unwrap().len(), 3);
+        assert_eq!(saved.validator_keys.as_ref().unwrap().len(), 2);
         assert!(saved.validator_keys.as_ref().unwrap().iter().all(|k| k.election_id != 1001));
         assert!(!saved
             .validator_key_ring

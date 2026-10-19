@@ -44,8 +44,8 @@ use rtos_api::{
         raw::{AppliedShardsInfo, ShardAccountMeta, ShardAccountState},
         rpc::{
             engine::validator::{
-                AddValidatorAdnlAddress, AddValidatorPermanentKey, ControlQuery, GenerateKeyPair,
-                GetConfig, GetSelectedStats, GetStats, ImportPrivateKey,
+                AddAdnlId, AddValidatorAdnlAddress, AddValidatorPermanentKey, ControlQuery,
+                GenerateKeyPair, GetConfig, GetSelectedStats, GetStats, ImportPrivateKey,
             },
             lite_server::GetConfigAll,
             raw::{
@@ -501,16 +501,14 @@ async fn test_connect_to_control() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_connect_to_control_with_import_private_key() {
-    struct TestSource;
-    impl StatusReporter for TestSource {
-        fn get_report(&self) -> u32 {
-            0
-        }
-    }
+    // Key commands need a started engine; this one serves nothing else.
+    struct StartedEngine;
+    #[async_trait::async_trait]
+    impl EngineOperations for StartedEngine {}
 
     init_test_log();
     let (control, mut client, _, _) = start_control(
-        DataSource::Status(Arc::new(TestSource)),
+        DataSource::Engine(Arc::new(StartedEngine)),
         "test_connect_to_control_with_import_private_key",
     )
     .await
@@ -522,8 +520,10 @@ async fn test_connect_to_control_with_import_private_key() {
     log::debug!("key_hash: {}", base64_encode(&key_hash));
     assert_eq!(base64_encode(&key_hash), "bWTFYRDLaHY6FlS64a/2hVRfdqudGuQ7+jfz8GKo6M0=");
 
-    let ttl = 36000;
+    // The wire field is the absolute expiry; an expired ADNL address is
+    // listed but not bound, so the expiry is in the future.
     let election_date = 1763281111;
+    let ttl = 2_100_000_000;
     let query = AddValidatorPermanentKey { key_hash, election_date, ttl };
     let _answer: Success = request(&mut client, query).await.unwrap();
 
@@ -538,6 +538,9 @@ async fn test_connect_to_control_with_import_private_key() {
     let pvt_key = "cyO76Whw2CKnSbEftGllH53Ph29SHdqzGra9Wb93bOE=";
     let key_hash = import_private_key(&mut client, pvt_key).await.unwrap();
 
+    // A validator ADNL address must be in the ADNL id list first.
+    let query = AddAdnlId { key_hash: key_hash.clone(), category: 0 };
+    let _answer: Success = request(&mut client, query).await.unwrap();
     let query = AddValidatorAdnlAddress { permanent_key_hash, key_hash, ttl };
     let _answer: Success = request(&mut client, query).await.unwrap();
 

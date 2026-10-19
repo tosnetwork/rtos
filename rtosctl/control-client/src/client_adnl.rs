@@ -23,7 +23,7 @@ use rtos_api::{
         rpc::engine::validator::ControlQuery as TonControlQuery,
     },
 };
-use rtos_block::{BlockIdExt, Deserializable, ShardAccount, UInt256, UnixTime, write_boc};
+use rtos_block::{BlockIdExt, Deserializable, ShardAccount, UInt256, write_boc};
 
 pub trait ToFromTL {
     type Rq;
@@ -208,7 +208,8 @@ impl ToFromTL for AddValidatorPermKeyRqRs {
     fn serialize(rq: &Self::Rq) -> anyhow::Result<TLObject> {
         let key_hash = UInt256::from_raw(rq.key_hash.clone(), 256);
         let election_date = rq.election_date;
-        let ttl = rq.expire_at - election_date;
+        // The wire field carries the absolute expiry.
+        let ttl = rq.expire_at;
 
         let ret =
             ton::rpc::engine::validator::AddValidatorPermanentKey { key_hash, election_date, ttl };
@@ -229,8 +230,7 @@ impl ToFromTL for AddValidatorTempKeyRqRs {
     fn serialize(rq: &Self::Rq) -> anyhow::Result<TLObject> {
         let perm_key_hash = UInt256::from_raw(rq.perm_key_hash.clone(), 256);
         let key_hash = UInt256::from_raw(rq.key_hash.clone(), 256);
-        let expire_at = rq.expire_at;
-        let ttl = expire_at - UnixTime::now() as i32;
+        let ttl = rq.expire_at;
 
         let ret = ton::rpc::engine::validator::AddValidatorTempKey {
             permanent_key_hash: perm_key_hash,
@@ -278,8 +278,7 @@ impl ToFromTL for AddValidatorAdnlAddrRqRs {
     fn serialize(rq: &Self::Rq) -> anyhow::Result<TLObject> {
         let perm_key_hash = UInt256::from_raw(rq.perm_key_hash.clone(), 256);
         let key_hash = UInt256::from_raw(rq.key_hash.clone(), 256);
-        let expire_at = rq.expire_at;
-        let ttl = expire_at - UnixTime::now() as i32;
+        let ttl = rq.expire_at;
 
         let ret = ton::rpc::engine::validator::AddValidatorAdnlAddress {
             permanent_key_hash: perm_key_hash,
@@ -637,6 +636,47 @@ mod tests {
             connect_elapsed >= Duration::from_millis(700),
             "connect returned in {connect_elapsed:?}, expected ~800ms timeout"
         );
+    }
+}
+
+#[cfg(test)]
+mod key_request_tests {
+    use super::*;
+
+    /// The reference engine reads the `ttl` field of the key requests as the
+    /// absolute expiry, and its console sends the expiry unchanged.
+    #[test]
+    fn key_requests_send_the_absolute_expiry() {
+        let perm = AddValidatorPermKeyRq {
+            key_hash: vec![1; 32],
+            election_date: 1000,
+            expire_at: 2_000_000_001,
+        };
+        let query = AddValidatorPermKeyRqRs::serialize(&perm)
+            .unwrap()
+            .downcast::<ton::rpc::engine::validator::AddValidatorPermanentKey>()
+            .unwrap();
+        assert_eq!((query.election_date, query.ttl), (1000, 2_000_000_001));
+        let temp = AddValidatorTempKeyRq {
+            perm_key_hash: vec![1; 32],
+            key_hash: vec![2; 32],
+            expire_at: -16,
+        };
+        let query = AddValidatorTempKeyRqRs::serialize(&temp)
+            .unwrap()
+            .downcast::<ton::rpc::engine::validator::AddValidatorTempKey>()
+            .unwrap();
+        assert_eq!(query.ttl, -16);
+        let addr = AddValidatorAdnlAddrRq {
+            perm_key_hash: vec![1; 32],
+            key_hash: vec![3; 32],
+            expire_at: 5,
+        };
+        let query = AddValidatorAdnlAddrRqRs::serialize(&addr)
+            .unwrap()
+            .downcast::<ton::rpc::engine::validator::AddValidatorAdnlAddress>()
+            .unwrap();
+        assert_eq!(query.ttl, 5);
     }
 }
 

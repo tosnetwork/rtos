@@ -358,7 +358,8 @@ impl<Q: ToString> SendReceive<Q> for AddValidatorPermKey {
     fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
         let key_hash = parse_int256(params.next(), "key_hash")?;
         let election_date = parse_int(params.next(), "election_date")?;
-        let ttl = parse_int(params.next(), "expire_at")? - election_date;
+        // The wire field carries the absolute expiry.
+        let ttl = parse_int(params.next(), "expire_at")?;
         let ret =
             ton::rpc::engine::validator::AddValidatorPermanentKey { key_hash, election_date, ttl };
         Ok(ret.into_tl_object())
@@ -369,7 +370,7 @@ impl<Q: ToString> SendReceive<Q> for AddValidatorTempKey {
     fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
         let permanent_key_hash = parse_int256(params.next(), "permanent_key_hash")?;
         let key_hash = parse_int256(params.next(), "key_hash")?;
-        let ttl = parse_int(params.next(), "expire_at")? - UnixTime::now() as i32;
+        let ttl = parse_int(params.next(), "expire_at")?;
         let ret =
             ton::rpc::engine::validator::AddValidatorTempKey { permanent_key_hash, key_hash, ttl };
         Ok(ret.into_tl_object())
@@ -380,7 +381,7 @@ impl<Q: ToString> SendReceive<Q> for AddValidatorAdnlAddr {
     fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
         let permanent_key_hash = parse_int256(params.next(), "permanent_key_hash")?;
         let key_hash = parse_int256(params.next(), "key_hash")?;
-        let ttl = parse_int(params.next(), "expire_at")? - UnixTime::now() as i32;
+        let ttl = parse_int(params.next(), "expire_at")?;
         let ret = ton::rpc::engine::validator::AddValidatorAdnlAddress {
             permanent_key_hash,
             key_hash,
