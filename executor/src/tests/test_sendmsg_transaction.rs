@@ -581,19 +581,74 @@ fn inbound_extra_flags_complete_transactions() {
         &rows,
         include_str!("data/inbound-extra-flags.tsv"),
         "RTOS_INBOUND_EXTRA_FLAGS_EXPORT",
-        // The credited account balance exceeds the serialized maximum; the
-        // reference keeps it transiently (credit overflow, a separate finding).
-        &[
-            "a245-zerovalue-f1329227995784915872903807060280344575-v11",
-            "a245-maxvalue-f0-v11",
-            "a245-maxvalue-f0-v12",
-            "a245-maxvalue-f1-v12",
-            "a245-maxvalue-f2-v12",
-            "a245-maxvalue-f3-v12",
-            "a245-maxvalue-f0-v16",
-            "a245-maxvalue-f1-v16",
-            "a245-maxvalue-f2-v16",
-            "a245-maxvalue-f3-v16",
-        ],
+        &[],
+    );
+}
+
+// Complete transactions whose credited balance (account balance plus message
+// value) exceeds the serialized coins maximum by `over`. The reference keeps
+// the wider balance through the transaction and checks it only when the result
+// is serialized, so gas fees, outbound values or a bounce can bring it back
+// into range. data/credit-overflow.tsv holds the reference roots.
+#[test]
+fn credit_overflow_complete_transactions() {
+    let src = MsgAddressInt::with_standart(None, 0, [0x11; 32].into()).unwrap();
+    let addr = MsgAddressInt::standard(0, [0x62; 32]);
+    let max = (1u128 << 120) - 1;
+    let value = 1u128 << 110;
+    let none = rtos_block::ExtraCurrencyCollection::default;
+    let mut rows = Vec::new();
+    for version in [11u32, 16] {
+        let cfg = config(version, false, &addr);
+        let reply = |v| data_with_refs(&[outbound_cell(&addr, &src, v, none())]);
+        let contracts = [
+            ("accept", "ACCEPT".to_string(), Cell::default(), false),
+            ("acceptb", "ACCEPT".to_string(), Cell::default(), true),
+            ("throw", "THROW 100".to_string(), Cell::default(), false),
+            ("bounce", "THROW 100".to_string(), Cell::default(), true),
+            ("send128", send_code(128), reply(0), false),
+            ("sendfixed", send_code(0), reply(1 << 119), false),
+            ("send64", send_code(64), reply(0), false),
+            (
+                "reserve128",
+                format!("PUSHINT {} PUSHINT 0 RAWRESERVE {}", 1u128 << 119, send_code(128)),
+                reply(0),
+                false,
+            ),
+            (
+                "balance",
+                "BALANCE FIRST NEWC STVARUINT32 ENDC POPROOT".to_string(),
+                Cell::default(),
+                false,
+            ),
+            (
+                "balance16",
+                "BALANCE FIRST NEWC STVARUINT16 ENDC POPROOT".to_string(),
+                Cell::default(),
+                false,
+            ),
+        ];
+        for (tag, code, data, bounce) in contracts {
+            for over in [0u128, 1, 1_000_000, 1_000_000_000, 1 << 100] {
+                let account =
+                    account_cell(&addr, &cfg, max + over - value, none(), &code, data.clone());
+                let m = Inbound { bounce, ..Inbound::value(value) };
+                run_cells(
+                    &format!("a249-{tag}-o{over}-v{version}"),
+                    cfg.clone(),
+                    account,
+                    inbound_cell(&src, &addr, &m),
+                    &addr,
+                    &mut rows,
+                );
+            }
+        }
+    }
+    assert_eq!(rows.len(), 100);
+    check_reference_rows(
+        &rows,
+        include_str!("data/credit-overflow.tsv"),
+        "RTOS_CREDIT_OVERFLOW_EXPORT",
+        &[],
     );
 }

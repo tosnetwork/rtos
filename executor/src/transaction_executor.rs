@@ -312,7 +312,14 @@ pub trait TransactionExecutor {
             "credit_phase: add funds {} to {}",
             msg_balance.coins, acc_balance.coins
         );
-        acc_balance.add(msg_balance)?;
+        // The credited balance may exceed the serialized coins maximum: it is
+        // kept as is and checked when the transaction result is serialized, so
+        // fees, outbound values or a bounce can still bring it back into range.
+        if !acc_balance.add_with_transient_coins(msg_balance)? {
+            fail!(ExecutorError::TrExecutorError(
+                "cannot credit currency collection to account".to_string()
+            ))
+        }
         Ok(TrCreditPhase::new(msg_balance.clone()))
     }
 

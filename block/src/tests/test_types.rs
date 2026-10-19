@@ -675,3 +675,41 @@ fn coins_and_varuinteger32_match_their_reference_consumers() {
     }
     assert_eq!((coins, extra), (93, 189));
 }
+
+#[test]
+fn add_with_transient_coins_keeps_balance_above_serialized_maximum() {
+    let max = Coins::MAX.inner();
+    // Happy path within range, extras summed.
+    let mut acc = CurrencyCollection::from_coins(Coins(5));
+    acc.set_other(7, 10).unwrap();
+    let mut msg = CurrencyCollection::from_coins(Coins(3));
+    msg.set_other(7, 4).unwrap();
+    msg.set_other(9, 1).unwrap();
+    assert!(acc.add_with_transient_coins(&msg).unwrap());
+    assert_eq!(acc.coins.inner(), 8);
+    assert_eq!(acc.get_other(7).unwrap(), Some(VarUInteger32::from(14u32)));
+    assert_eq!(acc.get_other(9).unwrap(), Some(VarUInteger32::from(1u32)));
+
+    // Above the serialized maximum: `add` refuses, the transient add keeps it,
+    // and serialization refuses the result.
+    let mut acc = CurrencyCollection::from_coins(Coins::MAX);
+    let one = CurrencyCollection::from_coins(Coins(1));
+    assert!(!acc.clone().add(&one).unwrap());
+    assert!(acc.add_with_transient_coins(&one).unwrap());
+    assert_eq!(acc.coins.inner(), max + 1);
+    assert!(acc.serialize().is_err());
+
+    // Leaving the u128 range is refused and leaves the balance unchanged.
+    let mut acc = CurrencyCollection::from_coins(Coins(u128::MAX));
+    acc.set_other(7, 2).unwrap();
+    let before = acc.clone();
+    let mut msg = CurrencyCollection::from_coins(Coins(1));
+    msg.set_other(7, 3).unwrap();
+    assert!(!acc.add_with_transient_coins(&msg).unwrap());
+    assert_eq!(acc, before);
+
+    // Zero added is a no-op.
+    let mut acc = CurrencyCollection::from_coins(Coins(max));
+    assert!(acc.add_with_transient_coins(&CurrencyCollection::default()).unwrap());
+    assert_eq!(acc.coins.inner(), max);
+}

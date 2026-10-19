@@ -1228,6 +1228,26 @@ impl CurrencyCollection {
         self.other.retire(|value| !value.is_zero())?;
         Ok(())
     }
+
+    /// Adds `other` like `add`, except that the coins sum is bounded only by
+    /// the u128 range, not by the serialized 120-bit maximum: an execution
+    /// balance may exceed it transiently and is checked when it is serialized
+    /// (`Coins::write_to` refuses it). Returns false, leaving `self` unchanged,
+    /// when the coins sum leaves the u128 range or an extra-currency sum is
+    /// not representable.
+    pub fn add_with_transient_coins(&mut self, other: &Self) -> Result<bool> {
+        let Some(coins) = self.coins.inner().checked_add(other.coins.inner()) else {
+            return Ok(false);
+        };
+        let mut extras = CurrencyCollection { coins: Coins::zero(), other: self.other.clone() };
+        let other_extras = CurrencyCollection { coins: Coins::zero(), other: other.other.clone() };
+        if !extras.add(&other_extras)? {
+            return Ok(false);
+        }
+        self.coins = Coins(coins);
+        self.other = extras.other;
+        Ok(true)
+    }
 }
 
 impl Serializable for CurrencyCollection {
