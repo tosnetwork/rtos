@@ -315,8 +315,13 @@ async fn outbox_auth_rejects_tampered_domains_body_carrier_and_pending() {
     assert!(authenticate_publication(&MasterchainProofVerifier::default(), &engine, good, &limits)
         .await
         .is_err());
+    // An approval authorizes no shard description; its finality broadcast of a
+    // shard block, as the reference block accepter sends it, is a valid effect.
     let (engine, mut approval) = fixture(false).await;
-    std::sync::Arc::make_mut(&mut approval.record).effects[0].kind = PublicationKind::Finality;
+    std::sync::Arc::make_mut(&mut approval.record).effects[0] = PublicationEffect {
+        kind: PublicationKind::ShardDescription,
+        target: PublicationTarget::ShardDescription,
+    };
     approval.pending = approval.record.effects.clone();
     assert!(authenticate_publication(
         &MasterchainProofVerifier::default(),
