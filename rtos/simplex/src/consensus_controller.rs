@@ -273,6 +273,22 @@ pub(crate) enum CandidateFinalization {
 struct CandidateFinalizationEntry {
     state: CandidateFinalization,
     attempts: u32,
+    /// The failure of the last unfinished attempt, bounded; for diagnostics only.
+    last_failure: Option<String>,
+}
+
+/// Most candidates one backlog transition reports.
+const BACKLOG_DIAGNOSTIC_ENTRIES: usize = 32;
+/// Longest failure text kept per candidate for that report.
+const BACKLOG_DIAGNOSTIC_FAILURE_BYTES: usize = 256;
+
+/// `text` cut to at most `max` bytes on a character boundary.
+fn bounded_text(text: &str, max: usize) -> String {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    text[..end].to_string()
 }
 
 impl CandidateFinalizationEntry {
@@ -572,6 +588,9 @@ pub(crate) struct ConsensusController {
     /// Every backlog flip, in order (over_limit, pending), for tests.
     #[cfg(test)]
     backlog_transitions: Vec<(bool, usize)>,
+    /// The backlog snapshots logged, in order, for tests.
+    #[cfg(test)]
+    backlog_snapshots: Vec<Vec<String>>,
     /// Handoff failures to inject, as the C++ state resolver's fault injection
     /// does for its finalization attempts: (retryable, permanent).
     #[cfg(test)]
@@ -635,6 +654,8 @@ impl ConsensusController {
             handoff_failure: None,
             #[cfg(test)]
             backlog_transitions: Vec::new(),
+            #[cfg(test)]
+            backlog_snapshots: Vec::new(),
             #[cfg(test)]
             injected_handoff_failures: std::cell::Cell::new((0, 0)),
         }
@@ -913,10 +934,14 @@ impl ConsensusController {
             }
             Some(CandidateFinalization::Idle) | None => {}
         }
-        let attempts = current.map_or(0, |entry| entry.attempts).saturating_add(1);
+        let attempts = current.as_ref().map_or(0, |entry| entry.attempts).saturating_add(1);
         self.store_finalization_status(
             id.clone(),
-            CandidateFinalizationEntry { state: CandidateFinalization::InFlight, attempts },
+            CandidateFinalizationEntry {
+                state: CandidateFinalization::InFlight,
+                attempts,
+                last_failure: current.and_then(|entry| entry.last_failure),
+            },
         );
         attempt.chain.push(id.clone());
         CandidateFinalization::Idle
@@ -939,6 +964,14 @@ impl ConsensusController {
         ) {
             return;
         }
+        let last_failure = match &result {
+            Ok(()) => None,
+            Err(FinalizationFailure::Retryable(reason))
+            | Err(FinalizationFailure::Permanent(reason)) => {
+                Some(bounded_text(reason, BACKLOG_DIAGNOSTIC_FAILURE_BYTES))
+            }
+            Err(FinalizationFailure::Cancelled) => Some("cancelled".to_string()),
+        };
         let state = match result {
             Ok(()) => CandidateFinalization::Finalized,
             Err(FinalizationFailure::Retryable(_)) | Err(FinalizationFailure::Cancelled) => {
@@ -957,7 +990,7 @@ impl ConsensusController {
         };
         self.store_finalization_status(
             id.clone(),
-            CandidateFinalizationEntry { state, attempts: entry.attempts },
+            CandidateFinalizationEntry { state, attempts: entry.attempts, last_failure },
         );
         self.update_finalization_backlog(backend);
     }
@@ -1010,6 +1043,7 @@ impl ConsensusController {
                 self.stalled_finalizations,
                 self.pending_finalizations_max,
             );
+            self.log_backlog_snapshot(backend);
         } else {
             log::warn!(
                 "Session {} finalization: the finalization backlog has cleared; this group \
@@ -1020,6 +1054,69 @@ impl ConsensusController {
         backend.simplex_state_mut().set_finality_behind(over);
         #[cfg(test)]
         self.backlog_transitions.push((over, self.pending_finalizations));
+    }
+
+    /// Log the held certificates once, when the backlog crosses the limit: at
+    /// most [`BACKLOG_DIAGNOSTIC_ENTRIES`] of the lowest slots, each with its
+    /// parent, stage, attempts and last failure. Runs on the transition only.
+    fn log_backlog_snapshot(&mut self, backend: &dyn ConsensusBackend) {
+        let lines = self.backlog_snapshot_lines(backend);
+        for line in &lines {
+            log::error!(
+                "Session {} finalization backlog: {line}",
+                self.session_id().to_hex_string()
+            );
+        }
+        #[cfg(test)]
+        self.backlog_snapshots.push(lines);
+    }
+
+    fn backlog_snapshot_lines(&self, backend: &dyn ConsensusBackend) -> Vec<String> {
+        let mut held: Vec<_> =
+            self.finalization_status.iter().filter(|(_, entry)| entry.is_pending()).collect();
+        held.sort_by(|(left, _), (right, _)| {
+            left.slot
+                .value()
+                .cmp(&right.slot.value())
+                .then_with(|| left.hash.as_slice().cmp(right.hash.as_slice()))
+        });
+        let total = held.len();
+        let mut lines: Vec<String> = held
+            .into_iter()
+            .take(BACKLOG_DIAGNOSTIC_ENTRIES)
+            .map(|(id, entry)| {
+                let parent = backend
+                    .candidate_book()
+                    .received(id)
+                    .and_then(|received| received.parent_id.clone())
+                    .map_or_else(
+                        || "none".to_string(),
+                        |parent| format!("{}:{}", parent.slot, &parent.hash.to_hex_string()[..8]),
+                    );
+                let stage = match &entry.state {
+                    CandidateFinalization::Idle => "idle",
+                    CandidateFinalization::InFlight => "in_flight",
+                    CandidateFinalization::Finalized => "finalized",
+                    CandidateFinalization::StalledPermanently(_) => "stalled",
+                };
+                format!(
+                    "candidate={}:{} parent={parent} stage={stage} trigger={} attempts={} \
+                     last_failure={}",
+                    id.slot,
+                    &id.hash.to_hex_string()[..8],
+                    self.finalized_pending_body.contains_key(id),
+                    entry.attempts,
+                    entry.last_failure.as_deref().unwrap_or("none"),
+                )
+            })
+            .collect();
+        if total > BACKLOG_DIAGNOSTIC_ENTRIES {
+            lines.push(format!(
+                "{} further held certificates not listed",
+                total.saturating_sub(BACKLOG_DIAGNOSTIC_ENTRIES)
+            ));
+        }
+        lines
     }
 
     /// The failure a not-ready handoff of `id` stands for.
@@ -3740,6 +3837,10 @@ impl ConsensusController {
 
     pub(crate) fn finalization_status_len_for_test(&self) -> usize {
         self.finalization_status.len()
+    }
+
+    pub(crate) fn backlog_snapshots_for_test(&self) -> &[Vec<String>] {
+        &self.backlog_snapshots
     }
 }
 

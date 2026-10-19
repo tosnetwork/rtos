@@ -13162,6 +13162,45 @@ fn test_finalization_backlog_seventeenth_stops_and_clears_at_root_completion() {
     assert_backlog_counts_match_recount(&fixture);
 }
 
+/// The backlog crossing logs one bounded snapshot of the held certificates,
+/// lowest slot first, and nothing more while it stays over the limit.
+#[test]
+fn test_finalization_backlog_transition_logs_one_bounded_snapshot() {
+    let (mut fixture, _recording, _listener) = backlog_fixture();
+    fixture.processor.consensus.set_pending_finalizations_max_for_test(2);
+    let top = seed_chain_over_missing_root(&mut fixture, 40, 40);
+
+    finalize_backlog_trigger(&mut fixture, &top);
+    retry_backlog(&mut fixture);
+    retry_backlog(&mut fixture);
+
+    let consensus = &fixture.processor.consensus;
+    assert!(consensus.backlog_over_limit());
+    let snapshots = consensus.backlog_snapshots_for_test();
+    assert_eq!(snapshots.len(), 1, "only the transition is reported, not every attempt");
+    let lines = &snapshots[0];
+    assert_eq!(lines.len(), 33, "32 candidates and the count of the rest");
+    assert_eq!(lines[32], "9 further held certificates not listed");
+    let root = backlog_id(40);
+    assert!(
+        lines[0].starts_with(&format!(
+            "candidate=s40:{} parent=none stage=idle trigger=false attempts=1 last_failure=",
+            &root.hash.to_hex_string()[..8]
+        )),
+        "{}",
+        lines[0]
+    );
+    assert!(!lines[0].ends_with("last_failure=none"), "{}", lines[0]);
+    assert!(
+        lines[1].contains(&format!("parent=s40:{}", &root.hash.to_hex_string()[..8])),
+        "{}",
+        lines[1]
+    );
+    for line in lines.iter().take(32) {
+        assert!(line.len() < 512, "bounded line: {line}");
+    }
+}
+
 #[test]
 fn test_finalization_backlog_overlapping_triggers_count_shared_ancestors_once() {
     let (mut fixture, _recording, _listener) = backlog_fixture();
