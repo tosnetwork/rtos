@@ -498,6 +498,13 @@ fn build_command() -> clap::Command {
                     "accept shard overlay certificates from sender ADNL id (hex), or \"*\" for \
                      any validator issuer",
                 ),
+        )
+        .arg(
+            clap::Arg::new("shutdown_at")
+                .long("shutdown-at")
+                .value_name("unixtime")
+                .action(clap::ArgAction::Append)
+                .help("stop the node at the given time (unix timestamp)"),
         );
 
     #[cfg(feature = "mirrornet")]
@@ -664,6 +671,18 @@ fn run_node() -> i32 {
         }
     };
 
+    // Scheduled before the configuration is read, as the reference engine
+    // schedules it; the lines are logged once logging is set up.
+    let shutdown_lines = match scheduled_shutdown::parse_all(&matches)
+        .and_then(|times| scheduled_shutdown::schedule_all(&times))
+    {
+        Ok(lines) => lines,
+        Err(error) => {
+            eprintln!("failed to parse options: [Error : 0 : {error}]");
+            return EXIT_CONFIG;
+        }
+    };
+
     let flags = EngineFlags {
         initial_sync_disabled: matches.get_flag("initial_sync_disabled"),
         force_check_db: matches.get_flag("force_check_db"),
@@ -748,6 +767,7 @@ fn run_node() -> i32 {
         init_logger::<std::path::PathBuf>(None);
     }
     log::info!("{}", version);
+    scheduled_shutdown::log_lines(&shutdown_lines);
 
     #[cfg(feature = "mirrornet")]
     if let Some(timeshift) = matches.get_one::<String>("timeshift") {
@@ -900,6 +920,89 @@ fn finish_node_shutdown(result: Result<()>, db_dir: &str) -> bool {
         }
     }
 }
+
+/// `--shutdown-at <unix time>`: at that time the process ends with status 0
+/// at once, without an orderly stop, as the reference engine ends. The next
+/// start recovers the database as after any unclean end. There is no
+/// equivalent here of the reference engine's index flush before it ends.
+mod scheduled_shutdown {
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    /// A line to log once logging is set up, with its level.
+    pub(super) type Line = (log::Level, String);
+
+    /// The values as the reference option parser reads an unsigned 32-bit
+    /// integer: decimal digits only, without sign or spaces, within range.
+    pub(super) fn parse(value: &str) -> std::result::Result<u32, String> {
+        let refused = || format!("Can't parse \"{value}\" as number");
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(refused());
+        }
+        value.parse::<u32>().map_err(|_| refused())
+    }
+
+    pub(super) fn parse_all(matches: &clap::ArgMatches) -> std::result::Result<Vec<u32>, String> {
+        matches.get_many::<String>("shutdown_at").into_iter().flatten().map(|v| parse(v)).collect()
+    }
+
+    fn unix_now() -> f64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs_f64())
+            .unwrap_or(0.0)
+    }
+
+    /// Arms one timer per value; each is a monotonic deadline taken from the
+    /// Unix time now, and the earliest ends the process.
+    pub(super) fn schedule_all(times: &[u32]) -> std::result::Result<Vec<Line>, String> {
+        let mut lines = Vec::new();
+        for &at in times {
+            let delay = f64::from(at) - unix_now();
+            if delay < 0.0 {
+                lines.push((
+                    log::Level::Debug,
+                    format!("Scheduled shutdown is in past ({at}.000000)"),
+                ));
+                continue;
+            }
+            lines.push((
+                log::Level::Info,
+                format!("Schedule shutdown for {at}.000000 (in {delay:.6}s)"),
+            ));
+            let deadline = Instant::now() + Duration::from_secs_f64(delay);
+            std::thread::Builder::new()
+                .name("scheduled shutdown".to_string())
+                .spawn(move || end_at(deadline))
+                .map_err(|error| format!("cannot schedule the shutdown: {error}"))?;
+        }
+        Ok(lines)
+    }
+
+    pub(super) fn log_lines(lines: &[Line]) {
+        for (level, line) in lines {
+            log::log!(*level, "{line}");
+        }
+    }
+
+    fn end_at(deadline: Instant) {
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            std::thread::sleep(deadline - now);
+        }
+        log::warn!("Shutting down as scheduled");
+        log::logger().flush();
+        // SAFETY: `_exit` ends the process at once with status 0 and runs no
+        // exit handlers, as the reference engine ends at this point.
+        unsafe { libc::_exit(0) }
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/test_scheduled_shutdown.rs"]
+mod scheduled_shutdown_tests;
 
 #[cfg(test)]
 mod shutdown_tests {
