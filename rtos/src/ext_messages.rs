@@ -784,6 +784,13 @@ impl Iterator for MessagePoolIter {
     }
 }
 
+/// Check-only verdict on a broadcast external message: the size, BOC shape,
+/// depth and inbound header this node requires before any pool decision.
+/// It neither adds the message to the pool nor approves its relay by itself.
+pub fn check_external_message(data: &[u8]) -> Result<UInt256> {
+    create_ext_message(data).map(|(id, _)| id)
+}
+
 pub fn create_ext_message(data: &[u8]) -> Result<(UInt256, Message)> {
     if data.len() > MAX_EXTERNAL_MESSAGE_SIZE {
         fail!("External message is too large: {}", data.len())

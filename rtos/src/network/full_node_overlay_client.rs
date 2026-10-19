@@ -45,10 +45,17 @@ use rtos_api::{
     AnyBoxedSerialize, BoxedSerialize,
 };
 use rtos_block::{
-    error, fail, lz4_decompress, read_boc, write_boc, BlockIdExt, BocFlags, BocWriter, KeyId,
-    KeyOption, Lz4DecompressMode, Result, ShardIdent,
+    error, fail, lz4_decompress, read_boc, sha256_digest, write_boc, BlockIdExt, BocFlags,
+    BocWriter, KeyId, KeyOption, Lz4DecompressMode, Result, ShardIdent,
 };
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    time::{Duration, Instant},
+};
 
 struct HistoryNetworkDecode {
     budget: Arc<HistoryReadBudget>,
@@ -362,6 +369,140 @@ impl std::io::Write for LimitedBocOutput {
 }
 
 /// Wrapper for OverlayClient that provides methods for performing fullnode network requests
+/// Processed and sent external-message hashes are bulk-cleared this often.
+pub const EXT_MESSAGE_HASHES_LIFETIME: Duration = Duration::from_secs(60);
+
+struct ExtMessageHashes {
+    processed: HashSet<[u8; 32]>,
+    mine: HashSet<[u8; 32]>,
+    cleared: Instant,
+}
+
+/// External-message state of one public shard overlay, kept across overlay
+/// recreation: payload hashes processed or sent by this node, and the
+/// node-wide switch that stops rebroadcasting external messages.
+pub struct ShardExtMessages {
+    engine: Arc<dyn EngineOperations>,
+    disabled: Arc<AtomicBool>,
+    hashes: Mutex<ExtMessageHashes>,
+}
+
+impl ShardExtMessages {
+    pub fn new(engine: Arc<dyn EngineOperations>, disabled: Arc<AtomicBool>) -> Arc<Self> {
+        Arc::new(Self {
+            engine,
+            disabled,
+            hashes: Mutex::new(ExtMessageHashes {
+                processed: HashSet::new(),
+                mine: HashSet::new(),
+                cleared: Instant::now(),
+            }),
+        })
+    }
+
+    fn hashes(&self) -> Result<std::sync::MutexGuard<'_, ExtMessageHashes>> {
+        let mut hashes =
+            self.hashes.lock().map_err(|_| error!("External message hashes lock poisoned"))?;
+        if hashes.cleared.elapsed() >= EXT_MESSAGE_HASHES_LIFETIME {
+            hashes.processed.clear();
+            hashes.mine.clear();
+            hashes.cleared = Instant::now();
+        }
+        Ok(hashes)
+    }
+
+    pub fn broadcast_disabled(&self) -> bool {
+        self.disabled.load(Ordering::Acquire)
+    }
+
+    /// Send side: whether this node may broadcast `data`; a sent message is
+    /// recorded so its echo is not processed again.
+    pub fn admit_send(&self, data: &[u8]) -> Result<bool> {
+        if self.broadcast_disabled() {
+            return Ok(false);
+        }
+        let hash = sha256_digest(data);
+        let mut hashes = self.hashes()?;
+        if hashes.processed.contains(&hash) {
+            return Ok(false);
+        }
+        hashes.mine.insert(hash);
+        Ok(true)
+    }
+
+    /// Receive side of an external message broadcast. The hash is recorded
+    /// before admission, so a refused payload is not processed again within
+    /// the window; this node's own messages are approved unprocessed.
+    pub async fn process(
+        &self,
+        active: bool,
+        src: &Arc<KeyId>,
+        message: rtos_api::ton::ton_node::broadcast::ExternalMessageBroadcast,
+    ) -> Result<()> {
+        if !active {
+            fail!("cannot process broadcast: shard is not active");
+        }
+        let hash = sha256_digest(&message.message.data);
+        {
+            let mut hashes = self.hashes()?;
+            if !hashes.processed.insert(hash) {
+                fail!("duplicate external message broadcast");
+            }
+            if hashes.mine.contains(&hash) {
+                return Ok(());
+            }
+        }
+        if !self.engine.check_sync().await? {
+            fail!("node not synced");
+        }
+        crate::ext_messages::check_external_message(&message.message.data)?;
+        self.engine.process_ext_msg_broadcast(message, src.clone()).await;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_hashes_for_test(&self, by: Duration) {
+        let mut hashes = self.hashes.lock().unwrap();
+        hashes.cleared = hashes.cleared.checked_sub(by).unwrap();
+    }
+}
+
+/// Application check of a public shard overlay: only external message
+/// broadcasts can be approved. With rebroadcasting disabled the message is
+/// still processed locally but the relay is refused.
+pub struct ShardExtMessageCheck {
+    messages: Arc<ShardExtMessages>,
+    active: Box<dyn Fn() -> bool + Send + Sync>,
+    wire_profile: rtos_api::WireProfile,
+}
+
+impl ShardExtMessageCheck {
+    pub fn new(
+        messages: Arc<ShardExtMessages>,
+        active: Box<dyn Fn() -> bool + Send + Sync>,
+        wire_profile: rtos_api::WireProfile,
+    ) -> Self {
+        Self { messages, active, wire_profile }
+    }
+}
+
+#[async_trait::async_trait]
+impl adnl::PublicBroadcastCheck for ShardExtMessageCheck {
+    async fn check_broadcast(&self, source: &Arc<KeyId>, data: &[u8]) -> Result<()> {
+        let Ok(Broadcast::TonNode_ExternalMessageBroadcast(message)) =
+            self.wire_profile.deserialize_typed::<Broadcast>(data)
+        else {
+            fail!("only external message broadcasts can be checked");
+        };
+        let disabled = self.messages.broadcast_disabled();
+        let processed = self.messages.process((self.active)(), source, message).await;
+        if disabled {
+            fail!("rebroadcasting external messages is disabled");
+        }
+        processed
+    }
+}
+
 pub struct FullNodeOverlayClient {
     #[cfg(test)]
     test_consumer_gate: std::sync::Mutex<Option<Arc<super::test_broadcast_faults::ConsumerGate>>>,
@@ -369,6 +510,7 @@ pub struct FullNodeOverlayClient {
     bad_peers: lockfree::set::Set<Arc<KeyId>>,
     engine: Arc<dyn EngineOperations>,
     client: Arc<OverlayClient>,
+    ext_messages: OnceLock<Arc<ShardExtMessages>>,
     shard: ShardIdent,
     tasks: Arc<OwnedTasks>,
     #[cfg(test)]
@@ -399,6 +541,7 @@ impl FullNodeOverlayClient {
             bad_peers: lockfree::set::Set::new(),
             engine,
             client,
+            ext_messages: OnceLock::new(),
             shard,
             #[cfg(test)]
             exit_gate: std::sync::Mutex::new(None),
@@ -424,6 +567,17 @@ impl FullNodeOverlayClient {
 
     pub fn shard(&self) -> &ShardIdent {
         &self.shard
+    }
+
+    /// Route received external messages through the shard's state.
+    pub(crate) fn set_ext_messages(&self, messages: Arc<ShardExtMessages>) -> Result<()> {
+        self.ext_messages
+            .set(messages)
+            .map_err(|_| error!("External message state is already installed"))
+    }
+
+    pub(crate) fn ext_messages(&self) -> Option<&Arc<ShardExtMessages>> {
+        self.ext_messages.get()
     }
 
     #[cfg(test)]
@@ -554,7 +708,18 @@ impl FullNodeOverlayClient {
                 self.engine.clone().process_block_broadcast(broadcast, src.clone())
             }
             Broadcast::TonNode_ExternalMessageBroadcast(broadcast) => {
-                self.engine.process_ext_msg_broadcast(broadcast, src.clone()).await
+                match self.ext_messages.get() {
+                    // Delivery takes the same path as the application check,
+                    // whose own hash makes an already checked copy a duplicate.
+                    Some(messages) => {
+                        if let Err(error) =
+                            messages.process(self.client.is_active(), src, broadcast).await
+                        {
+                            log::debug!("External message broadcast from {src}: {error}");
+                        }
+                    }
+                    None => self.engine.process_ext_msg_broadcast(broadcast, src.clone()).await,
+                }
             }
             Broadcast::TonNode_IhrMessageBroadcast(broadcast) => {
                 log::debug!("Skipped TonNode_IhrMessageBroadcast from {src}: {broadcast:?}")
@@ -1622,3 +1787,7 @@ mod bounded_download_tests {
         assert!(check_lz4_expansion(&[0xf0, 255], 4096).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_shard_ext_messages.rs"]
+mod shard_ext_messages_tests;

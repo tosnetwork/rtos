@@ -30,7 +30,7 @@ use crate::{
         build_block_broadcast_compressed_v2, build_block_candidate_broadcast_compressed,
         custom_overlay_client::CustomOverlayClient,
         fast_sync_overlay_client::{fast_sync_transport_authority, FastSyncOverlayClient},
-        full_node_overlay_client::FullNodeOverlayClient,
+        full_node_overlay_client::{FullNodeOverlayClient, ShardExtMessageCheck, ShardExtMessages},
         full_node_service::FullNodeOverlayService,
         node_network::NodeNetwork,
         overlay_client::OverlayClient,
@@ -154,6 +154,8 @@ pub struct FullNodeOverlaysRouter {
     fast_sync_peer_resolver: tokio::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
     shard_certificates: Arc<ShardOverlayCertificates>,
     certificate_refresh_started: AtomicBool,
+    ext_messages: std::sync::Mutex<std::collections::HashMap<ShardIdent, Arc<ShardExtMessages>>>,
+    ext_messages_broadcast_disabled: Arc<AtomicBool>,
 }
 
 /// What a public shard broadcast carries; it decides the wire flags.
@@ -244,6 +246,8 @@ impl FullNodeOverlaysRouter {
             fast_sync_peer_resolver: tokio::sync::Mutex::new(None),
             shard_certificates: Arc::new(ShardOverlayCertificates::new()),
             certificate_refresh_started: AtomicBool::new(false),
+            ext_messages: Default::default(),
+            ext_messages_broadcast_disabled: Arc::new(AtomicBool::new(false)),
         }))
     }
 
@@ -1247,7 +1251,35 @@ impl FullNodeOverlaysRouter {
             self.full_node_adnl_key()?.id(),
             rtos_block::UnixTime::now() as i32,
         )?;
-        Self::install_on(client.overlay_client(), &install)
+        Self::install_on(client.overlay_client(), &install)?;
+        let messages = self.shard_ext_messages(client.shard())?;
+        client.set_ext_messages(messages.clone())?;
+        let overlay = Arc::downgrade(client.overlay_client());
+        client.overlay_client().set_broadcast_check(Some(Arc::new(ShardExtMessageCheck::new(
+            messages,
+            Box::new(move || overlay.upgrade().is_some_and(|overlay| overlay.is_active())),
+            self.network.context().stack.overlay.wire_profile(),
+        ))))
+    }
+
+    fn shard_ext_messages(&self, shard: &ShardIdent) -> Result<Arc<ShardExtMessages>> {
+        let mut all =
+            self.ext_messages.lock().map_err(|_| error!("External message table poisoned"))?;
+        Ok(all
+            .entry(shard.clone())
+            .or_insert_with(|| {
+                ShardExtMessages::new(
+                    self.engine.clone(),
+                    self.ext_messages_broadcast_disabled.clone(),
+                )
+            })
+            .clone())
+    }
+
+    /// Stop (or resume) rebroadcasting external messages; received ones are
+    /// still processed locally.
+    pub fn set_ext_messages_broadcast_disabled(&self, disabled: bool) {
+        self.ext_messages_broadcast_disabled.store(disabled, Ordering::Release);
     }
 
     fn install_on(client: &OverlayClient, install: &OverlayInstall) -> Result<()> {
@@ -1662,8 +1694,19 @@ impl FullNodeOverlaysRouter {
         }
         if !skip_public {
             let client = self.overlay_client(&to.shard_ident()?).await?;
-            self.send_public_broadcast(&client, &broadcast, PublicBroadcastKind::ExternalMessage)
+            // A disabled switch or an already processed message sends nothing.
+            let admitted = match client.ext_messages() {
+                Some(messages) => messages.admit_send(data)?,
+                None => true,
+            };
+            if admitted {
+                self.send_public_broadcast(
+                    &client,
+                    &broadcast,
+                    PublicBroadcastKind::ExternalMessage,
+                )
                 .await?;
+            }
         }
         Ok(())
     }

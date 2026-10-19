@@ -107,6 +107,8 @@ impl Fixture {
                 crate::network::shard_overlay_certificates::ShardOverlayCertificates::new(),
             ),
             certificate_refresh_started: AtomicBool::new(false),
+            ext_messages: Default::default(),
+            ext_messages_broadcast_disabled: Arc::new(AtomicBool::new(false)),
         });
         Ok(Self { router, engine, bootstrap })
     }
