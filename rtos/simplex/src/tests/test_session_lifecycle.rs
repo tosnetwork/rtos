@@ -305,6 +305,10 @@ async fn authenticated_validator_isolated_worker_signs_and_retains_journal_on_de
         nodes.iter().map(|node| node.descriptor.clone().unwrap()).collect(), keys[1].clone());
     options.first_block_timeout = Duration::from_millis(30);
     options.target_rate = Duration::from_millis(30);
+    // The session's members are the runtime's committee, with its canonical
+    // weight prefixes, not the fixture descriptors it was built from.
+    let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor)
+        .collect::<Result<Vec<_>>>().unwrap();
     let path = std::path::PathBuf::from(runtime.runtime_directory(directory.path().to_str().unwrap()).unwrap());
     crate::runtime_manifest::RuntimeManifest::provision_test_validator(&runtime, &path).unwrap();
     let (_, config) = AdnlNodeConfig::from_ip_address_and_private_keys("127.0.0.1:0", vec![([0x73; 32], 0)]).unwrap();
