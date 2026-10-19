@@ -2207,7 +2207,7 @@ fn own_journal_real_full_and_empty_publish_barriers() {
             Some("after_signed"),
         ] {
             let h = Harness::new();
-            h.description.install_test_coordinator(h.coordinator.clone()).unwrap();
+            h.description.install_coordinator(h.coordinator.clone()).unwrap();
             *h.coordinator.fail_at.lock().unwrap() = stage;
             let mut controller = mk_ctrl(h.description.clone());
             let slot = SlotIndex::new(99);
@@ -2270,7 +2270,7 @@ fn custody_real_full_and_empty_publish_barriers() {
             Some("after_signed"),
         ] {
             let h = Harness::custody(rtos_api::WireProfile::T0);
-            h.description.install_test_coordinator(h.coordinator.clone()).unwrap();
+            h.description.install_coordinator(h.coordinator.clone()).unwrap();
             *h.coordinator.fail_at.lock().unwrap() = stage;
             let mut controller = mk_ctrl(h.description.clone());
             let slot = SlotIndex::new(99);

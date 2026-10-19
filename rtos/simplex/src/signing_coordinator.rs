@@ -1,7 +1,15 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
-//! Own decisions are separate from peer caches. No production signer is enabled.
-//! Synchronous waits run on the session thread, never on the independent storage
-//! worker or a storage callback. Any uncertain write poisons this coordinator.
+//! Own decisions are separate from peer caches. The production signer is a
+//! `SessionSigner`, the custody store the committee descriptor records for this
+//! validator; it journals into a schema-4 namespace it owns. Synchronous waits
+//! run on the session thread, never on the independent storage worker or a
+//! storage callback. Any uncertain write poisons this coordinator; a signature
+//! the custody store refuses drops only that decision.
+//!
+//! Remaining differences from the reference node: own candidates are journalled
+//! here (kind 3) although the reference journals only votes, and a journal write
+//! failure stops every later decision of the session where the reference drops
+//! only the affected vote.
 use crate::{block::SlotIndex, database::SimplexDbPtr, simplex_state::Vote, utils};
 use consensus_common::ValidatorIdentity;
 use rtos_api::{
@@ -21,6 +29,12 @@ use std::{
 
 pub(crate) const PREFIX: &[u8; 4] = b"RSJ1";
 const HEADER: &[u8] = b"RSJ1H";
+/// Production journals carry neither a persisted retirement latch nor the key
+/// deadline in their binding: the custody store owns the deadline and the
+/// process-global retirement registry owns retirement, as in the reference.
+pub(crate) const PRODUCTION_SCHEMA: u32 = 4;
+/// Ownership marker of a production journal, inside the session namespace.
+pub(crate) const OWNER_FILE: &str = "signer.owner";
 const MAX_RECORD: usize = 64 << 20;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -41,8 +55,12 @@ pub(crate) struct SigningBinding {
     pub algorithm: u32,
     pub key_id: [u8; 32],
     pub public_key: Vec<u8>,
+    /// Internal metadata. A production namespace always uses generation 1; it
+    /// is not a rollback-prevention mechanism.
     pub generation: u64,
-    pub expire_at: u64,
+    /// Present in schemas 2 and 3 only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire_at: Option<u64>,
     pub shard_workchain: i32,
     pub shard_prefix: u64,
     /// Carrier envelope version. This retains the schema-2 meaning.
@@ -60,11 +78,30 @@ pub(crate) struct SigningBinding {
 impl SigningBinding {
     /// Construct schema 3 solely from an authenticated runtime. Provisioning and
     /// custody remain separate capabilities; this does not enable a signer.
+    #[cfg(any(test, feature = "isolated-consensus-signing"))]
     pub(crate) fn from_authenticated_runtime(
         runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
         generation: u64,
         expire_at: u64,
     ) -> Result<Self> {
+        Self::for_runtime(runtime, 3, generation, Some(expire_at))
+    }
+    /// The production binding: schema 4, generation 1, no deadline.
+    pub(crate) fn production(
+        runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+    ) -> Result<Self> {
+        Self::for_runtime(runtime, PRODUCTION_SCHEMA, 1, None)
+    }
+    /// The binding `runtime` implies for an existing header's schema.
+    pub(crate) fn for_runtime(
+        runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+        schema: u32,
+        generation: u64,
+        expire_at: Option<u64>,
+    ) -> Result<Self> {
+        if schema != 3 && schema != PRODUCTION_SCHEMA {
+            fail!("Authenticated runtime has no signing binding schema {schema}");
+        }
         let consensus_common::session_runtime::LocalRole::Validator(index) = runtime.local_role() else {
             fail!("Observer cannot own a signing journal");
         };
@@ -73,8 +110,8 @@ impl SigningBinding {
         let identity = ValidatorIdentity::from_descriptor(member)?;
         let key = identity.pq_key().ok_or_else(|| error!("Authenticated journal requires PQ key"))?;
         let pin = runtime.pin();
-        Ok(Self {
-            schema: 3, wire_profile: runtime.wire_profile() as u8,
+        let binding = Self {
+            schema, wire_profile: runtime.wire_profile() as u8,
             global_id: pin.global_id, zerostate_workchain: pin.zerostate.shard().workchain_id(),
             zerostate_root: *pin.zerostate.root_hash().as_array(), zerostate_file: *pin.zerostate.file_hash().as_array(),
             profile: *runtime.profile().as_array(), session: *runtime.session_id().as_array(),
@@ -85,15 +122,25 @@ impl SigningBinding {
             simplex_protocol: Some(runtime.protocol().version()), local_adnl: Some(*runtime.local_adnl().data()),
             local_index: index, validator_count: runtime.committee().len().try_into()?,
             slots_per_window: runtime.slots_per_leader_window(),
-        })
+        };
+        binding.validate_schema()?;
+        Ok(binding)
     }
 
     fn validate_schema(&self) -> Result<()> {
-        match (self.schema, self.simplex_protocol, self.local_adnl) {
-            (2, None, None) => Ok(()),
-            (3, Some(protocol), Some(adnl)) if protocol <= 2 && adnl != [0; 32] => Ok(()),
+        match (self.schema, self.simplex_protocol, self.local_adnl, self.expire_at) {
+            (2, None, None, Some(_)) => Ok(()),
+            (3, Some(protocol), Some(adnl), Some(_)) if protocol <= 2 && adnl != [0; 32] => Ok(()),
+            (PRODUCTION_SCHEMA, Some(protocol), Some(adnl), None)
+                if protocol <= 2 && adnl != [0; 32] && self.generation == 1 =>
+            {
+                Ok(())
+            }
             _ => fail!("unsupported or inconsistent signing binding schema"),
         }
+    }
+    fn production_schema(&self) -> bool {
+        self.schema == PRODUCTION_SCHEMA
     }
 
     fn wire(&self) -> Result<rtos_api::WireProfile> {
@@ -109,7 +156,25 @@ impl SigningBinding {
 #[serde(deny_unknown_fields)]
 struct Header {
     binding: SigningBinding,
-    retired: bool,
+    /// Persisted only by schemas 2 and 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retired: Option<bool>,
+}
+impl Header {
+    fn new(binding: SigningBinding) -> Self {
+        let retired = (!binding.production_schema()).then_some(false);
+        Self { binding, retired }
+    }
+    fn validate(&self) -> Result<()> {
+        self.binding.validate_schema()?;
+        if self.retired.is_some() == self.binding.production_schema() {
+            fail!("signing header retirement field differs from its schema");
+        }
+        Ok(())
+    }
+    fn retired(&self) -> bool {
+        self.retired == Some(true)
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,10 +236,7 @@ fn key(decision: &Decision) -> Result<Vec<u8>> {
 pub(crate) fn validate_record(key_bytes: &[u8], value: &[u8]) -> Result<()> {
     if key_bytes == HEADER {
         let header: Header = decode(value)?;
-        header
-            .binding
-            .validate_schema()
-            .map_err(|e| error!("unsupported signing header schema: {e}"))?;
+        header.validate().map_err(|e| error!("unsupported signing header schema: {e}"))?;
         header.binding.wire()?;
     } else {
         let record: Record = decode(value)?;
@@ -201,8 +263,8 @@ fn compatible(a: &Decision, b: &Decision) -> bool {
     a.hash == b.hash
 }
 
-#[allow(dead_code)] // Production construction deliberately remains Disabled.
 pub(crate) enum Signer {
+    #[cfg(test)]
     Disabled,
     Custody(CustodySigner),
     #[cfg(test)]
@@ -211,6 +273,7 @@ pub(crate) enum Signer {
 impl Signer {
     fn sign(&self, bytes: &[u8]) -> Result<Vec<u8>> {
         match self {
+            #[cfg(test)]
             Self::Disabled => {
                 let _ = bytes;
                 fail!("PQ consensus signer is Disabled")
@@ -229,8 +292,8 @@ impl Signer {
         }
     }
 }
-/// The adapter has no production provisioning constructor. The only current
-/// factory is test-only; enabling it at runtime needs authenticated provisioning.
+/// A custody store bound to the validator identity it signs for. Production code
+/// builds it only through `SessionSigner::from_custody_match`.
 pub(crate) struct CustodySigner {
     validator: [u8; 32],
     algorithm: u32,
@@ -267,18 +330,26 @@ impl CustodySigner {
     }
 }
 impl Signer {
+    // Production builds have only the custody signer.
+    #[allow(irrefutable_let_patterns)]
     fn check_binding(&self, binding: &SigningBinding) -> Result<()> {
         if let Self::Custody(signer) = self {
             let key = signer.store.consensus_key();
-            if signer.validator != binding.validator
+            let identity_differs = signer.validator != binding.validator
                 || signer.algorithm != binding.algorithm
                 || *key.key_id.as_array() != binding.key_id
-                || key.public_key != binding.public_key
-                || u64::from(signer.store.expire_at()) != binding.expire_at
-                || signer.store.expired_now()
-            {
+                || key.public_key != binding.public_key;
+            // Schemas 2 and 3 bind the deadline and refuse an expired key at
+            // open. A production journal leaves the deadline to the store, which
+            // checks it around each signature.
+            let deadline_differs = !binding.production_schema()
+                && (Some(u64::from(signer.store.expire_at())) != binding.expire_at
+                    || signer.store.expired_now());
+            if identity_differs || deadline_differs {
                 fail!("custody/signing journal identity or deadline mismatch");
             }
+        } else if binding.production_schema() {
+            fail!("a production signing journal requires a custody signer");
         }
         Ok(())
     }
@@ -299,6 +370,84 @@ impl Signer {
         }))
     }
 }
+/// The production consensus signer of one session. It holds exactly the custody
+/// store that matches, byte for byte, the descriptor the committee records for
+/// this validator: `PqConsensusCustody::get_matching_store` is its only source,
+/// so no other held key, network key or validator identity alone can sign.
+#[derive(Clone)]
+pub struct SessionSigner {
+    validator: UInt256,
+    descriptor: rtos_block::ValidatorDescr,
+    store: std::sync::Arc<rtos_pq_consensus::ConsensusKeyStore>,
+}
+impl SessionSigner {
+    /// The signer for `descriptor` at `now`, or why there is none.
+    pub fn from_custody_match(
+        custody: &rtos_pq_consensus::PqConsensusCustody,
+        validator: &UInt256,
+        descriptor: &rtos_block::ValidatorDescr,
+        now: u32,
+    ) -> Result<Self> {
+        let store = custody.get_matching_store(validator, descriptor, now).ok_or_else(|| {
+            error!(
+                "this node does not custody, unexpired, the exact consensus key the set \
+                 records for validator {}",
+                validator.to_hex_string()
+            )
+        })?;
+        if descriptor.validator_id()? != *validator
+            || descriptor.pq_key() != Some(store.consensus_key())
+        {
+            fail!("custody returned a store that differs from the descriptor");
+        }
+        Ok(Self { validator: validator.clone(), descriptor: descriptor.clone(), store })
+    }
+    pub fn validator(&self) -> &UInt256 {
+        &self.validator
+    }
+    pub fn descriptor(&self) -> &rtos_block::ValidatorDescr {
+        &self.descriptor
+    }
+    pub fn store(&self) -> &std::sync::Arc<rtos_pq_consensus::ConsensusKeyStore> {
+        &self.store
+    }
+    /// Open the production journal of the session `runtime` admits this node to
+    /// as validator. The runtime's member at the local index must be exactly
+    /// the descriptor this signer was selected for.
+    pub(crate) fn open(
+        &self,
+        runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+        db: SimplexDbPtr,
+    ) -> Result<std::sync::Arc<SigningCoordinator>> {
+        let consensus_common::session_runtime::LocalRole::Validator(index) = runtime.local_role()
+        else {
+            fail!("An observer session has no consensus signer");
+        };
+        let member = runtime
+            .committee()
+            .get(index as usize)
+            .ok_or_else(|| error!("Runtime validator index is outside committee"))?;
+        if member.validator_id()? != self.validator
+            || member.pq_key() != self.descriptor.pq_key()
+            || member.pq_key().is_none()
+        {
+            fail!("The session's local member is not the descriptor this signer was selected for");
+        }
+        let binding = SigningBinding::production(runtime)?;
+        let signer = Signer::Custody(CustodySigner {
+            validator: *self.validator.as_array(),
+            algorithm: u32::from(self.store.consensus_key().algorithm_id),
+            store: self.store.clone(),
+        });
+        Ok(std::sync::Arc::new(SigningCoordinator::open_namespace(
+            db,
+            binding,
+            ValidatorIdentity::from_descriptor(member)?,
+            signer,
+        )?))
+    }
+}
+
 /// Isolated test capability: compiled out of production and never sourced from
 /// node configuration. It exercises the actual session worker/journal/custody path.
 #[cfg(any(test, feature = "isolated-consensus-signing"))]
@@ -320,6 +469,27 @@ impl TestSessionSigner {
         let signer = Signer::from_test_custody(&custody, &stable, member)?;
         Ok(std::sync::Arc::new(SigningCoordinator::open(db, binding,
             ValidatorIdentity::from_descriptor(member)?, &self.owner_root, self.initialize, signer)?))
+    }
+}
+
+/// The signer a session is created with: the production custody signer, or
+/// the isolated test capability, which is compiled out of production builds.
+pub(crate) enum OwnSigner {
+    Production(SessionSigner),
+    #[cfg(any(test, feature = "isolated-consensus-signing"))]
+    Isolated(TestSessionSigner),
+}
+impl OwnSigner {
+    pub(crate) fn open(
+        self,
+        runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+        db: SimplexDbPtr,
+    ) -> Result<std::sync::Arc<SigningCoordinator>> {
+        match self {
+            Self::Production(signer) => signer.open(runtime, db),
+            #[cfg(any(test, feature = "isolated-consensus-signing"))]
+            Self::Isolated(signer) => signer.open(runtime, db),
+        }
     }
 }
 
@@ -345,10 +515,11 @@ pub(crate) struct SigningCoordinator {
 }
 #[allow(dead_code)]
 impl SigningCoordinator {
-    /// `initialize` is explicit trusted provisioning, never inferred from an
-    /// empty DB. Recover requires the durable ownership marker and DB header.
-    /// The caller selects one protected identity-wide directory on this host.
-    /// This is not distributed fencing or protection from storage rollback.
+    /// Schemas 2 and 3 (isolated and test journals). `initialize` is explicit
+    /// trusted provisioning, never inferred from an empty DB. Recover requires
+    /// the durable ownership marker and DB header. The caller selects one
+    /// protected identity-wide directory on this host. This is not distributed
+    /// fencing or protection from storage rollback.
     pub fn open(
         db: SimplexDbPtr,
         binding: SigningBinding,
@@ -357,6 +528,120 @@ impl SigningCoordinator {
         initialize: bool,
         signer: Signer,
     ) -> Result<Self> {
+        if binding.production_schema() {
+            fail!("a production signing journal is opened through its namespace");
+        }
+        Self::validate_binding(&binding, &identity, &signer)?;
+        // The protected directory must already exist; provisioning is outside
+        // session cache lifecycle and must not be created by untrusted requests.
+        let owner_path = owner_root.join(format!("{}.signer", hex::encode(binding.validator)));
+        let mut owner =
+            OpenOptions::new().read(true).write(true).create_new(initialize).open(&owner_path)?;
+        owner.try_lock().map_err(|e| error!("identity writer already owns journal: {e}"))?;
+        let expected = Self::ownership(&db, &binding)?;
+        if initialize {
+            owner.write_all(&expected)?;
+            owner.sync_all()?;
+            File::open(owner_root)?.sync_all()?;
+        } else if Self::read_owner(&mut owner)? != expected {
+            fail!("identity ownership binding/database/generation mismatch");
+        }
+        let (header, records) = Self::load_journal(&db)?;
+        if initialize && (!records.is_empty() || header.is_some()) {
+            fail!("cannot initialize existing signing journal");
+        }
+        let header = match header {
+            Some(h) if h.binding == binding => h,
+            Some(_) => fail!("signing journal binding mismatch"),
+            None if initialize => Self::write_header(&db, binding)?,
+            None => fail!("initialized signing journal header missing"),
+        };
+        Self::admit(db, identity, signer, owner, header, records)
+    }
+
+    /// A production journal in its own session namespace: the ownership marker
+    /// `<namespace>/signer.owner` and the journal header both bind this session.
+    /// A namespace whose journal prefix is empty is fresh, as an empty database
+    /// is in the reference node. Initialization is crash-recoverable at every
+    /// step without ever replacing a complete conflicting binding:
+    /// - no marker, empty journal: create the marker, then the header;
+    /// - an empty or incomplete (unparseable) marker with an empty journal: no
+    ///   decision can exist yet, so the marker is rewritten;
+    /// - the exact marker with an empty journal: write the header;
+    /// - a complete marker for another binding, a missing or incomplete marker
+    ///   beside a nonempty journal, records without a header, or a header of
+    ///   another schema or binding (including schema-3 and retired headers):
+    ///   refused, with nothing rewritten or erased.
+    ///
+    /// The marker's lock is held until the coordinator is dropped.
+    pub fn open_namespace(
+        db: SimplexDbPtr,
+        binding: SigningBinding,
+        identity: ValidatorIdentity,
+        signer: Signer,
+    ) -> Result<Self> {
+        if !binding.production_schema() {
+            fail!("a namespace-owned signing journal requires the production schema");
+        }
+        Self::validate_binding(&binding, &identity, &signer)?;
+        let namespace = db.get_path().to_path_buf();
+        let owner_path = namespace.join(OWNER_FILE);
+        let mut owner = match OpenOptions::new().read(true).write(true).open(&owner_path) {
+            Ok(owner) => owner,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !db.storage.get_by_prefix(PREFIX.to_vec(), None).wait()?.is_empty() {
+                    fail!("signing journal exists without its ownership marker");
+                }
+                // Never truncated here: an incomplete marker is judged below.
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&owner_path)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        owner.try_lock().map_err(|e| error!("another writer owns this signing namespace: {e}"))?;
+        test_cut(&namespace, "owner_locked")?;
+        let expected = Self::ownership(&db, &binding)?;
+        let persisted = Self::read_owner(&mut owner)?;
+        let (header, records) = Self::load_journal(&db)?;
+        let fresh = header.is_none() && records.is_empty();
+        if persisted != expected {
+            if !fresh {
+                fail!("signing namespace ownership marker differs from its nonempty journal");
+            }
+            if decode::<Ownership>(&persisted).is_ok() {
+                fail!("signing namespace is owned by another binding");
+            }
+            owner.set_len(0)?;
+            std::io::Seek::rewind(&mut owner)?;
+            test_cut_partial(&namespace, &mut owner, &expected)?;
+            owner.write_all(&expected)?;
+            owner.sync_all()?;
+            File::open(&namespace)?.sync_all()?;
+        }
+        test_cut(&namespace, "owner_committed")?;
+        let header = match header {
+            Some(h) if h.binding.schema != PRODUCTION_SCHEMA => fail!(
+                "signing journal schema {} is not the production schema; it is not migrated",
+                h.binding.schema
+            ),
+            Some(h) if h.binding == binding => h,
+            Some(_) => fail!("signing journal binding mismatch"),
+            None if records.is_empty() => Self::write_header(&db, binding)?,
+            None => fail!("signing journal records exist without a header"),
+        };
+        test_cut(&namespace, "header_committed")?;
+        Self::admit(db, identity, signer, owner, header, records)
+    }
+
+    fn validate_binding(
+        binding: &SigningBinding,
+        identity: &ValidatorIdentity,
+        signer: &Signer,
+    ) -> Result<()> {
         let pq = identity.pq_key().ok_or_else(|| error!("journal requires PQ identity"))?;
         binding.validate_schema()?;
         crate::SessionOptions::validate_carrier(binding.wire()?, binding.protocol)?;
@@ -371,31 +656,22 @@ impl SigningCoordinator {
         {
             fail!("signing identity/profile binding mismatch");
         }
-        binding.wire()?;
-        signer.check_binding(&binding)?;
+        signer.check_binding(binding)?;
         ShardIdent::with_tagged_prefix(binding.shard_workchain, binding.shard_prefix)?;
-        // The protected directory must already exist; provisioning is outside
-        // session cache lifecycle and must not be created by untrusted requests.
-        let owner_path = owner_root.join(format!("{}.signer", hex::encode(binding.validator)));
-        let mut owner =
-            OpenOptions::new().read(true).write(true).create_new(initialize).open(&owner_path)?;
-        owner.try_lock().map_err(|e| error!("identity writer already owns journal: {e}"))?;
-        let ownership = Ownership {
+        Ok(())
+    }
+    fn ownership(db: &SimplexDbPtr, binding: &SigningBinding) -> Result<Vec<u8>> {
+        encode(&Ownership {
             binding: binding.clone(),
             database: db.get_path().canonicalize()?.to_string_lossy().into_owned(),
-        };
-        let expected = encode(&ownership)?;
-        if initialize {
-            owner.write_all(&expected)?;
-            owner.sync_all()?;
-            File::open(owner_root)?.sync_all()?;
-        } else {
-            let mut persisted = Vec::new();
-            (&mut owner).take((MAX_RECORD + 1) as u64).read_to_end(&mut persisted)?;
-            if persisted != expected {
-                fail!("identity ownership binding/database/generation mismatch");
-            }
-        }
+        })
+    }
+    fn read_owner(owner: &mut File) -> Result<Vec<u8>> {
+        let mut persisted = Vec::new();
+        owner.take((MAX_RECORD + 1) as u64).read_to_end(&mut persisted)?;
+        Ok(persisted)
+    }
+    fn load_journal(db: &SimplexDbPtr) -> Result<(Option<Header>, Records)> {
         let raw = db.storage.get_by_prefix(PREFIX.to_vec(), None).wait()?;
         let mut header = None;
         let mut records = BTreeMap::new();
@@ -407,27 +683,29 @@ impl SigningCoordinator {
                 records.insert(k.clone(), decode::<Record>(v)?);
             }
         }
-        if initialize && (!records.is_empty() || header.is_some()) {
-            fail!("cannot initialize existing signing journal");
+        Ok((header, records))
+    }
+    fn write_header(db: &SimplexDbPtr, binding: SigningBinding) -> Result<Header> {
+        let h = Header::new(binding);
+        db.storage
+            .set(HEADER.to_vec(), encode(&h)?, None)
+            .wait_timeout(TIMEOUT)
+            .ok_or_else(|| error!("journal initialization timeout"))??;
+        // Persist newly created DB directory entries as well as its WAL.
+        File::open(db.get_path())?.sync_all()?;
+        if let Some(parent) = db.get_path().parent() {
+            File::open(parent)?.sync_all()?;
         }
-        let header = match header {
-            Some(h) if h.binding == binding => h,
-            Some(_) => fail!("signing journal binding mismatch"),
-            None if initialize => {
-                let h = Header { binding, retired: false };
-                db.storage
-                    .set(HEADER.to_vec(), encode(&h)?, None)
-                    .wait_timeout(TIMEOUT)
-                    .ok_or_else(|| error!("journal initialization timeout"))??;
-                // Persist newly created DB directory entries as well as its WAL.
-                File::open(db.get_path())?.sync_all()?;
-                if let Some(parent) = db.get_path().parent() {
-                    File::open(parent)?.sync_all()?;
-                }
-                h
-            }
-            None => fail!("initialized signing journal header missing"),
-        };
+        Ok(h)
+    }
+    fn admit(
+        db: SimplexDbPtr,
+        identity: ValidatorIdentity,
+        signer: Signer,
+        owner: File,
+        header: Header,
+        records: BTreeMap<Vec<u8>, Record>,
+    ) -> Result<Self> {
         let result = Self {
             db,
             identity,
@@ -441,7 +719,7 @@ impl SigningCoordinator {
         };
         {
             let state = result.state.lock().map_err(|_| error!("journal lock poisoned"))?;
-            if state.header.retired {
+            if state.header.retired() {
                 fail!("signing generation retired");
             }
             let mut previous = Vec::new();
@@ -470,7 +748,8 @@ impl SigningCoordinator {
         let state = self.state.lock().map_err(|_| error!("journal lock poisoned"))?;
         let b = &state.header.binding;
         if let Some(runtime) = description.authenticated_runtime() {
-            let expected = SigningBinding::from_authenticated_runtime(runtime, b.generation, b.expire_at)?;
+            let expected =
+                SigningBinding::for_runtime(runtime, b.schema, b.generation, b.expire_at)?;
             if b != &expected {
                 fail!("Signing journal differs from authenticated runtime domain");
             }
@@ -539,14 +818,20 @@ impl SigningCoordinator {
         Ok(())
     }
     fn live(&self, state: &mut State) -> Result<()> {
-        if state.poisoned || state.header.retired {
+        if state.poisoned || state.header.retired() {
             fail!("signing journal stopped/retired");
         }
-        if state.header.binding.expire_at != 0 && self.now()? >= state.header.binding.expire_at {
+        // Production journals have no deadline of their own: the custody store
+        // checks it immediately before and after each signature, as the
+        // reference does, and nothing here re-checks it after storage waits.
+        let Some(expire_at) = state.header.binding.expire_at else {
+            return Ok(());
+        };
+        if expire_at != 0 && self.now()? >= expire_at {
             // Failed persistence poisons this process. Without an external
             // monotonic anchor, an old active header plus clock rollback after
             // restart cannot prove that expiry was previously observed.
-            state.header.retired = true;
+            state.header.retired = Some(true);
             self.put(HEADER.to_vec(), encode(&state.header)?)?;
             fail!("signing generation expired and retired");
         }
@@ -618,6 +903,16 @@ impl SigningCoordinator {
         Ok(())
     }
     fn authorize(&self, decision: Decision) -> Result<Vec<u8>> {
+        match self.authorize_outcome(decision)? {
+            Authorized::Bytes(bytes) => Ok(bytes),
+            Authorized::Refused(error) => Err(error),
+        }
+    }
+    /// A production journal reports a signature the custody store refused
+    /// (expired or retired key, signing backend failure) as `Refused` without
+    /// stopping the coordinator: the intent stays durable, no signature exists,
+    /// and only this decision is dropped, as the reference drops that vote.
+    fn authorize_outcome(&self, decision: Decision) -> Result<Authorized> {
         let started = Instant::now();
         let kind = decision.kind;
         let slot = decision.slot;
@@ -627,6 +922,8 @@ impl SigningCoordinator {
         let mut signing_elapsed = Duration::ZERO;
         let mut verification_elapsed = Duration::ZERO;
         let mut signed_elapsed = Duration::ZERO;
+        let production = state.header.binding.production_schema();
+        let mut refused = None;
         let result = (|| {
             self.live(&mut state)?;
             let k = key(&decision)?;
@@ -635,6 +932,8 @@ impl SigningCoordinator {
             }
             if let Some(record) = state.records.get(&k) {
                 if let Some(bytes) = &record.signed {
+                    // Committed bytes are released as stored and never signed
+                    // again: a second randomized signature is another object.
                     return Ok(bytes.clone());
                 }
             }
@@ -670,7 +969,14 @@ impl SigningCoordinator {
             let phase_started = Instant::now();
             let signature = self.signer.sign(&preimage);
             signing_elapsed = phase_started.elapsed();
-            let signature = signature?;
+            let signature = match signature {
+                Ok(signature) => signature,
+                Err(error) if production => {
+                    refused = Some(error);
+                    fail!("custody refused the signature");
+                }
+                Err(error) => return Err(error),
+            };
             self.checkpoint("after_sign")?;
             self.live(&mut state)?;
             let phase_started = Instant::now();
@@ -726,10 +1032,14 @@ impl SigningCoordinator {
             self.live(&mut state)?;
             Ok(bytes)
         });
-        if result.is_err() {
-            state.poisoned = true;
+        match (result, refused) {
+            (Ok(bytes), _) => Ok(Authorized::Bytes(bytes)),
+            (Err(_), Some(error)) => Ok(Authorized::Refused(error)),
+            (Err(error), None) => {
+                state.poisoned = true;
+                Err(error)
+            }
         }
-        result
     }
     pub fn vote(&self, vote: &Vote) -> Result<simplex::vote::Vote> {
         Ok(tl::<simplex::Vote>(&self.authorize(vote_decision(vote)?)?)?.only())
@@ -753,7 +1063,20 @@ impl SigningCoordinator {
         };
         records.sort_by_key(|r| r.sequence);
         for record in records {
-            let bytes = self.authorize(record.decision.clone())?;
+            let bytes = match self.authorize_outcome(record.decision.clone())? {
+                Authorized::Bytes(bytes) => bytes,
+                Authorized::Refused(error) if binding.production_schema() => {
+                    log::error!(
+                        "SIGNING_FLOW: session={} replayed intent kind={} slot={} was not \
+                         signed ({error}); not applying it",
+                        UInt256::from(binding.session).to_hex_string(),
+                        record.decision.kind,
+                        record.decision.slot,
+                    );
+                    continue;
+                }
+                Authorized::Refused(error) => return Err(error),
+            };
             let id = crate::block::RawCandidateId {
                 slot: SlotIndex::new(record.decision.slot),
                 hash: UInt256::from(record.decision.hash.unwrap_or_default()),
@@ -826,7 +1149,13 @@ pub(crate) fn verify_recovery_journal(
     let headers = raw.iter().filter(|(key, _)| key == HEADER).collect::<Vec<_>>();
     if headers.len() != 1 { fail!("Recovery journal requires exactly one header"); }
     let header: Header = decode(&headers[0].1)?;
-    let expected = SigningBinding::from_authenticated_runtime(runtime, header.binding.generation, header.binding.expire_at)?;
+    header.validate()?;
+    let expected = SigningBinding::for_runtime(
+        runtime,
+        header.binding.schema,
+        header.binding.generation,
+        header.binding.expire_at,
+    )?;
     if header.binding != expected || expected.generation == 0 { fail!("Recovery journal authenticated binding mismatch"); }
     let identity = ValidatorIdentity::from_descriptor(&runtime.committee()[expected.local_index as usize])?;
     let mut previous = Vec::new();
@@ -843,6 +1172,44 @@ pub(crate) fn verify_recovery_journal(
         previous.push(record.decision);
     }
     if sequences.iter().copied().ne(1..=sequences.len() as u64) { fail!("Recovery journal sequence gap"); }
+    Ok(())
+}
+
+type Records = BTreeMap<Vec<u8>, Record>;
+
+enum Authorized {
+    Bytes(Vec<u8>),
+    Refused(rtos_block::Error),
+}
+
+#[cfg(test)]
+pub(crate) static NAMESPACE_CUT: Mutex<Option<(std::path::PathBuf, &'static str)>> =
+    Mutex::new(None);
+#[cfg(test)]
+fn cut_armed(namespace: &Path, point: &str) -> bool {
+    NAMESPACE_CUT
+        .lock()
+        .map(|cut| cut.as_ref().is_some_and(|(path, armed)| path == namespace && *armed == point))
+        .unwrap_or(false)
+}
+/// Test-only crash cut inside namespace ownership initialization.
+fn test_cut(namespace: &Path, point: &'static str) -> Result<()> {
+    #[cfg(test)]
+    if cut_armed(namespace, point) {
+        fail!("injected namespace cut {point}");
+    }
+    let _ = (namespace, point);
+    Ok(())
+}
+/// Test-only crash cut that leaves a durable, incomplete ownership marker.
+fn test_cut_partial(namespace: &Path, owner: &mut File, expected: &[u8]) -> Result<()> {
+    #[cfg(test)]
+    if cut_armed(namespace, "owner_partial") {
+        owner.write_all(&expected[..expected.len() / 2])?;
+        owner.sync_all()?;
+        fail!("injected namespace cut owner_partial");
+    }
+    let _ = (namespace, owner, expected);
     Ok(())
 }
 
@@ -929,6 +1296,10 @@ fn candidate_decision(mut candidate: CandidateData, b: &SigningBinding) -> Resul
 #[cfg(test)]
 #[path = "tests/test_signing_coordinator.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "tests/test_production_signer.rs"]
+mod production_tests;
 
 fn candidate_hash_data(candidate: &CandidateData, b: &SigningBinding) -> Result<Vec<u8>> {
     Ok(match candidate {

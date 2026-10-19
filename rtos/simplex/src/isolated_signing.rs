@@ -142,11 +142,13 @@ impl crate::SessionFactory {
             Some(delivered) => crate::session::SessionImpl::create_with_profile_delivered_checked(
                 &checked, runtime.session_id(), runtime.shard(), nodes, local_transport_key,
                 db_path, overlay_manager, listener, trace_collector, runtime.catchain_seqno(),
-                Some(runtime.clone()), delivery_sink, Some(delivered), false, Some(signer)),
+                Some(runtime.clone()), delivery_sink, Some(delivered), false,
+                Some(crate::signing_coordinator::OwnSigner::Isolated(signer))),
             None => crate::session::SessionImpl::create_with_profile_checked(
                 &checked, runtime.session_id(), runtime.shard(), nodes, local_transport_key,
                 db_path, overlay_manager, listener, trace_collector, runtime.catchain_seqno(),
-                Some(runtime.clone()), delivery_sink, false, Some(signer)),
+                Some(runtime.clone()), delivery_sink, false,
+                Some(crate::signing_coordinator::OwnSigner::Isolated(signer))),
         }
     }
 }

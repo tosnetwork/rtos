@@ -541,7 +541,7 @@ impl SessionImpl {
         recovery_complete: Arc<AtomicBool>,
         recovery_pending: Arc<std::sync::atomic::AtomicUsize>,
         storage_teardown: Arc<Mutex<Option<consensus_common::StorageTeardownReceipt>>>,
-        #[cfg(any(test, feature = "isolated-consensus-signing"))] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
+        own_signer: Option<crate::signing_coordinator::OwnSigner>,
     ) {
         log::info!(
             "SimplexSession main loop is started (session_id is {}); \
@@ -645,16 +645,18 @@ impl SessionImpl {
         };
         *storage_teardown.lock().unwrap_or_else(|e| e.into_inner()) = db.teardown_receipt();
 
-        #[cfg(any(test, feature = "isolated-consensus-signing"))]
-        let test_coordinator = match test_signer {
-            Some(profile) => match authenticated_runtime
+        // The own signing journal opens right after the database and before any
+        // bootstrap is loaded, so recovery authenticates every own decision
+        // against the signer this session was created with.
+        let own_coordinator = match own_signer {
+            Some(signer) => match authenticated_runtime
                 .as_deref()
-                .ok_or_else(|| error!("Isolated signer requires authenticated runtime"))
-                .and_then(|runtime| profile.open(runtime, db.clone()))
+                .ok_or_else(|| error!("A consensus signer requires an authenticated runtime"))
+                .and_then(|runtime| signer.open(runtime, db.clone()))
             {
                 Ok(coordinator) => Some(coordinator),
                 Err(error) => {
-                    fail_startup(error, "isolated signer admission failed");
+                    fail_startup(error, "consensus signer admission failed");
                     return;
                 }
             },
@@ -761,9 +763,8 @@ impl SessionImpl {
             .and_then(|description| description.bind_pq_session(catchain_seqno))
             .and_then(|description| {
                 let description = description.with_recovery_only(recovery_only);
-                #[cfg(any(test, feature = "isolated-consensus-signing"))]
-                if let Some(coordinator) = &test_coordinator {
-                    description.install_test_coordinator(coordinator.clone())?;
+                if let Some(coordinator) = &own_coordinator {
+                    description.install_coordinator(coordinator.clone())?;
                 }
                 Ok(description)
             })
@@ -901,9 +902,8 @@ impl SessionImpl {
         .and_then(|d| d.bind_pq_session(catchain_seqno))
         .and_then(|description| {
             let description = description.with_recovery_only(recovery_only);
-            #[cfg(any(test, feature = "isolated-consensus-signing"))]
-            if let Some(coordinator) = &test_coordinator {
-                description.install_test_coordinator(coordinator.clone())?;
+            if let Some(coordinator) = &own_coordinator {
+                description.install_coordinator(coordinator.clone())?;
             }
             Ok(description)
         }) {
@@ -1441,7 +1441,6 @@ impl SessionImpl {
             authenticated_runtime,
             delivery_sink,
             false,
-            #[cfg(any(test, feature = "isolated-consensus-signing"))]
             None,
         )
     }
@@ -1463,7 +1462,7 @@ impl SessionImpl {
         >,
         delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
         recovery_only: bool,
-        #[cfg(any(test, feature = "isolated-consensus-signing"))] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
+        own_signer: Option<crate::signing_coordinator::OwnSigner>,
     ) -> Result<SessionPtr> {
         Self::create_with_profile_checked(
             options,
@@ -1479,8 +1478,7 @@ impl SessionImpl {
             authenticated_runtime,
             delivery_sink,
             recovery_only,
-            #[cfg(any(test, feature = "isolated-consensus-signing"))]
-            test_signer,
+            own_signer,
         )
         .map_err(crate::SessionCreationFailure::into_error)
     }
@@ -1501,7 +1499,7 @@ impl SessionImpl {
         >,
         delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
         recovery_only: bool,
-        #[cfg(any(test, feature = "isolated-consensus-signing"))] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
+        own_signer: Option<crate::signing_coordinator::OwnSigner>,
     ) -> std::result::Result<SessionPtr, crate::SessionCreationFailure> {
         Self::create_with_profile_delivered_checked(
             options,
@@ -1518,8 +1516,7 @@ impl SessionImpl {
             delivery_sink,
             None,
             recovery_only,
-            #[cfg(any(test, feature = "isolated-consensus-signing"))]
-            test_signer,
+            own_signer,
         )
     }
 
@@ -1540,7 +1537,7 @@ impl SessionImpl {
         delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
         delivered_completion: Option<crate::finality_delivery::DeliveredCompletionSink>,
         recovery_only: bool,
-        #[cfg(any(test, feature = "isolated-consensus-signing"))] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
+        own_signer: Option<crate::signing_coordinator::OwnSigner>,
     ) -> std::result::Result<SessionPtr, crate::SessionCreationFailure> {
         let mut owner: Option<SessionPtr> = None;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1559,8 +1556,7 @@ impl SessionImpl {
                 delivery_sink,
                 delivered_completion,
                 recovery_only,
-                #[cfg(any(test, feature = "isolated-consensus-signing"))]
-                test_signer,
+                own_signer,
                 &mut owner,
             )
         }));
@@ -1591,7 +1587,7 @@ impl SessionImpl {
         delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
         delivered_completion: Option<crate::finality_delivery::DeliveredCompletionSink>,
         recovery_only: bool,
-        #[cfg(any(test, feature = "isolated-consensus-signing"))] test_signer: Option<crate::signing_coordinator::TestSessionSigner>,
+        own_signer: Option<crate::signing_coordinator::OwnSigner>,
         failure_owner: &mut Option<SessionPtr>,
     ) -> Result<SessionPtr> {
         log::info!(
@@ -1761,8 +1757,7 @@ impl SessionImpl {
                         recovery_complete,
                         recovery_pending,
                         storage_teardown,
-                        #[cfg(any(test, feature = "isolated-consensus-signing"))]
-                        test_signer,
+                        own_signer,
                     );
                 }));
 

@@ -355,14 +355,6 @@ pub(crate) trait ConsensusBackend {
     /// Mirrors C++ `pool.cpp::handle(BroadcastVote)` publishing
     /// `OutgoingProtocolMessage`.
     fn send_vote(&self, signed_vote: TlVote);
-
-    /// Persist a locally produced signed vote to the session DB (non-blocking):
-    /// register the in-flight `save_vote_async` write on the SXMAIN async-DB
-    /// registry, whose continuation only logs / bumps the error counter. The
-    /// broadcast is **not** gated on it — mirrors C++
-    /// `db.cpp::process(BroadcastVote)`, where the `co_await db->set(...)` lives
-    /// in the db actor only and does not gate pool's publish.
-    fn persist_our_vote(&mut self, signed_vote: &TlVote);
 }
 
 /// Per-session consensus finalization controller.
@@ -1413,11 +1405,8 @@ impl ConsensusController {
             }
         };
 
-        // PQ publication is already gated by durable intent and exact bytes.
-        // Classical persistence retains its legacy asynchronous behavior.
-        if !self.description.is_pq() {
-            backend.persist_our_vote(&signed_vote);
-        }
+        // Publication is gated by the durable intent and the exact signed bytes
+        // the signing journal committed before returning them.
 
         log::trace!(
             "Session {} broadcast_vote: sending signed vote",

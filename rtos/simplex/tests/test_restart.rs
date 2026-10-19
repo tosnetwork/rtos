@@ -628,6 +628,7 @@ fn run_single_node_restart_test(test_name: &str) {
 */
 
 #[test]
+#[ignore = "classical sessions no longer sign own votes (no classical fallback); needs a post-quantum custody session port"]
 fn test_single_session_restart_round_monotonicity_first_commit_after_finalized() {
     run_single_node_restart_test("simplex_restart_single_first_commit");
 }

@@ -1068,8 +1068,75 @@ impl SessionFactory {
             Some(runtime.clone()),
             delivery_sink,
             false,
-            #[cfg(any(test, feature = "isolated-consensus-signing"))]
             None,
+        )
+    }
+
+    /// Create a validator session that signs with `signer`, the custody store
+    /// matching exactly the descriptor the committee records for this node.
+    /// The runtime must admit this node as that validator; an observer session
+    /// takes no signer. The own journal opens in the session namespace right
+    /// after the database and before any bootstrap state is loaded.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_authenticated_validator_session_checked(
+        options: &SessionOptions,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        signer: SessionSigner,
+        local_transport_key: &PrivateKey,
+        db_path: String,
+        overlay_manager: ConsensusOverlayManagerPtr,
+        listener: SessionListenerPtr,
+        trace_collector: Option<TraceCollector>,
+        delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
+        delivered_completion: Option<finality_delivery::DeliveredCompletionSink>,
+    ) -> std::result::Result<SessionPtr, SessionCreationFailure> {
+        let nodes = (|| -> Result<_> {
+            options.validate_authenticated(&runtime)?;
+            if delivery_sink.is_none() {
+                fail!("Authenticated session requires durable finality sink");
+            }
+            if runtime.local_adnl() != local_transport_key.id() {
+                fail!("Local transport key differs from authenticated runtime");
+            }
+            let consensus_common::session_runtime::LocalRole::Validator(index) =
+                runtime.local_role()
+            else {
+                fail!("An observer session takes no consensus signer");
+            };
+            let member = runtime.committee().get(index as usize).ok_or_else(|| {
+                rtos_block::error!("Runtime validator index is outside committee")
+            })?;
+            if member.validator_id()? != *signer.validator()
+                || member.pq_key().is_none()
+                || member.pq_key() != signer.descriptor().pq_key()
+            {
+                fail!("The consensus signer was selected for a different committee member");
+            }
+            runtime
+                .committee()
+                .iter()
+                .map(SimplexSessionNode::from_descriptor)
+                .collect::<Result<Vec<_>>>()
+        })()
+        .map_err(SessionCreationFailure::before_worker)?;
+        let mut checked_options = *options;
+        checked_options.wait_for_db_init = true;
+        session::SessionImpl::create_with_profile_delivered_checked(
+            &checked_options,
+            runtime.session_id(),
+            runtime.shard(),
+            nodes,
+            local_transport_key,
+            db_path,
+            overlay_manager,
+            listener,
+            trace_collector,
+            runtime.catchain_seqno(),
+            Some(runtime.clone()),
+            delivery_sink,
+            delivered_completion,
+            false,
+            Some(signing_coordinator::OwnSigner::Production(signer)),
         )
     }
 
@@ -1118,7 +1185,6 @@ impl SessionFactory {
             delivery_sink,
             Some(delivered_completion),
             false,
-            #[cfg(any(test, feature = "isolated-consensus-signing"))]
             None,
         )
     }
@@ -1196,7 +1262,6 @@ impl SessionFactory {
             Some(runtime.clone()),
             Some(delivery_sink),
             true,
-            #[cfg(any(test, feature = "isolated-consensus-signing"))]
             None,
         )?;
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1262,7 +1327,6 @@ impl SessionFactory {
             Some(delivery_sink),
             Some(delivered_completion),
             true,
-            #[cfg(any(test, feature = "isolated-consensus-signing"))]
             None,
         )?;
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1302,6 +1366,7 @@ pub mod finality_delivery;
 pub mod finality_recovery;
 mod runtime_manifest;
 mod signing_coordinator;
+pub use signing_coordinator::SessionSigner;
 
 #[cfg(test)]
 #[path = "tests/authenticated_fixture.rs"]

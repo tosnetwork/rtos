@@ -151,9 +151,8 @@ use rtos_api::{
         },
         CandidateData,
     },
-    IntoBoxed,
 };
-use rtos_block::{error, sha256_digest, BlockIdExt, Error, Result, UInt256};
+use rtos_block::{error, BlockIdExt, Error, Result, UInt256};
 use std::{
     collections::HashMap,
     sync::{atomic::AtomicBool, Arc, Mutex},
@@ -2177,70 +2176,6 @@ impl ConsensusBackend for ConsensusBackendAdapter<'_> {
         // Receiver serializes the TL vote, broadcasts to all validators, and
         // loops it back through the listener for our own FSM accounting.
         self.receiver.send_vote(signed_vote);
-    }
-
-    fn persist_our_vote(&mut self, tl_vote: &TlVote) {
-        let Some(local_index) = self.runtime.description().local_validator_index() else {
-            return;
-        };
-        // Run-from-the-borrowing-backend twin of the former
-        // `SessionProcessor::persist_our_vote_before_broadcast`: serialize the
-        // signed vote, register the async `save_vote_async` write on the SXMAIN
-        // registry (continuation only logs / bumps the error counter), and
-        // return without gating the broadcast.
-        let serialized =
-            consensus_common::serialize_tl_boxed_object!(&tl_vote.clone().into_boxed());
-        let vote_hash = UInt256::from_slice(&sha256_digest(&serialized));
-        let record = VoteRecord {
-            vote_hash,
-            data: serialized.into(),
-            node_idx: local_index,
-            seqno: 0, // assigned by save_vote_async
-        };
-
-        let result = match self.database.db().save_vote_async(&record) {
-            Ok(r) => r,
-            Err(e) => {
-                log::error!(
-                    "Session {} broadcast_vote: failed to create vote save: {}",
-                    &self.runtime.description().get_session_id().to_hex_string()[..8],
-                    e
-                );
-                self.telemetry.increment_error();
-                return;
-            }
-        };
-
-        let session_short =
-            self.runtime.description().get_session_id().to_hex_string()[..8].to_string();
-        let vote_hash_short = record.vote_hash.to_hex_string()[..8].to_string();
-        let node_idx = record.node_idx;
-
-        log::trace!(
-            "Session {session_short} broadcast_vote: scheduling vote db.set \
-             (hash={vote_hash_short}, node_idx={node_idx})",
-        );
-
-        self.post_async_db_result(
-            "persist_our_vote_before_broadcast",
-            result,
-            DEFAULT_ASYNC_DB_WRITE_TIMEOUT,
-            move |processor, res| match res {
-                Ok(()) => {
-                    log::trace!(
-                        "Session {session_short} broadcast_vote: stored vote \
-                         (hash={vote_hash_short}, node_idx={node_idx})",
-                    );
-                }
-                Err(e) => {
-                    log::error!(
-                        "Session {session_short} broadcast_vote: failed to store vote \
-                         (hash={vote_hash_short}): {e}",
-                    );
-                    processor.increment_error();
-                }
-            },
-        );
     }
 
     fn candidate_book(&self) -> &CandidateBook {

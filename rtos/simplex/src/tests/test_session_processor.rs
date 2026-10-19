@@ -7547,44 +7547,40 @@ fn test_broadcast_finalize_vote_aborts_when_notar_cert_is_missing() {
 
 #[test]
 fn test_broadcast_skip_vote_bypasses_durability_wait() {
-    let mut fixture = TestFixture::new(4);
-    let slot = SlotIndex::new(92);
+    let h = crate::signing_coordinator::tests::Harness::custody(rtos_api::WireProfile::Legacy);
+    h.description.install_coordinator(h.coordinator.clone()).unwrap();
+    let mut processor =
+        make_pq_processor_with_description_for_test(h.db.clone(), h.description.clone());
+    let receiver = MockReceiver::new();
+    processor.receiver = receiver.clone();
+    let slot = SlotIndex::new(0);
     let vote = crate::simplex_state::Vote::Skip(crate::simplex_state::SkipVote { slot });
-    let persist_fail_before = metrics_counter(&fixture.processor, "simplex_votes_out_persist_fail");
+    let persist_fail_before = metrics_counter(&processor, "simplex_votes_out_persist_fail");
 
-    fixture.processor.broadcast_vote(vote);
+    processor.broadcast_vote(vote);
 
-    let actions = fixture.drain_receiver_actions();
+    let actions = receiver.drain_actions();
     assert!(
         actions.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
         "skip vote must still be sent without candidate/notar durability waits"
     );
+    assert!(
+        processor.database.pending_iter().all(|entry| !entry.op_label.starts_with("ensure_")),
+        "skip vote registers no durability wait"
+    );
     assert_eq!(
-        metrics_counter(&fixture.processor, "simplex_votes_out_persist_fail"),
+        metrics_counter(&processor, "simplex_votes_out_persist_fail"),
         persist_fail_before,
         "skip vote path must not increment persist-failure counter"
     );
+    assert_eq!(h.signature_count(), 1);
 }
 
-// ----------------------------------------------------------------------------
-// `persist_our_vote_before_broadcast` migration to the async-DB-results registry.
-// ----------------------------------------------------------------------------
-//
-// C++ parity: `pool.cpp::handle(BroadcastVote)` publishes `OutgoingProtocolMessage`
-// while `db.cpp::process(BroadcastVote)` persists in a separate actor — the persist
-// `co_await` does NOT gate the broadcast. After this migration, the Rust runtime
-// behaves the same way: `broadcast_vote()` calls `receiver.send_vote(...)` immediately
-// after registering the persist with the async-DB-results registry, instead of parking
-// SXMAIN on `result.wait()`.
-
-/// `broadcast_vote` must register vote persist asynchronously and proceed with the
-/// network send immediately, matching C++ where pool's broadcast publish is not
-/// gated on db's `co_await db->set(...)`.
+/// A classical (non-post-quantum) session never signs an own vote: there is no
+/// classical or network-key fallback, so nothing is persisted, applied or sent.
 #[test]
-fn test_broadcast_vote_registers_async_persist_and_sends_immediately() {
+fn test_classical_session_refuses_to_sign_or_send_an_own_vote() {
     let mut fixture = TestFixture::new(4);
-    // Skip votes bypass the (still-synchronous) `wait_candidate_info_stored` path,
-    // so this test isolates the slice-1 (vote-persist) migration.
     let slot = SlotIndex::new(123);
     let vote = crate::simplex_state::Vote::Skip(crate::simplex_state::SkipVote { slot });
 
@@ -7596,45 +7592,18 @@ fn test_broadcast_vote_registers_async_persist_and_sends_immediately() {
 
     let actions = fixture.drain_receiver_actions();
     assert!(
-        actions.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
-        "vote must be sent without blocking on persist completion",
+        !actions.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
+        "a classical session must not publish an own vote",
     );
-
     assert_eq!(
         fixture.processor.database.pending_count(),
-        pending_before + 1,
-        "persist_our_vote_before_broadcast must register exactly one pending entry",
-    );
-    let entry = fixture
-        .processor
-        .database
-        .pending_iter()
-        .last()
-        .expect("pending entry must exist after broadcast_vote");
-    assert_eq!(
-        entry.op_label, "persist_our_vote_before_broadcast",
-        "pending entry must carry the op label for diagnostics",
-    );
-
-    // Drain the registry — the real RocksDB write completes on the storage thread.
-    // Allow a few polls for the background storage thread to flush.
-    for _ in 0..200 {
-        fixture.processor.process_pending_async_db_results();
-        if fixture.processor.database.pending_is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-
-    assert_eq!(
-        fixture.processor.database.pending_count(),
-        0,
-        "registry must drain after the storage thread confirms the write",
+        pending_before,
+        "no own-vote write is registered for a vote that was never signed",
     );
     assert_eq!(
         fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
-        errors_before,
-        "successful vote persist must not bump the error counter",
+        errors_before + 1,
+        "the refused signature is counted as an error",
     );
 }
 
@@ -8488,17 +8457,17 @@ fn test_second_leader_collates_after_timeout_skip() {
     // C++ timeout fires at: base + first_block_timeout + target_rate = 3.5s
     fixture.advance_time(opts.first_block_timeout + opts.target_rate + Duration::from_millis(1));
 
-    // check_all: processes timeout → our node broadcasts SkipVote for slot 0.
+    // check_all: processes timeout → our node decides to skip slot 0. This
+    // classical fixture has no post-quantum signer, so no own vote is sent.
     fixture.processor.check_all();
 
     let actions_after_timeout = fixture.drain_receiver_actions();
     assert!(
-        actions_after_timeout.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
-        "we must broadcast a skip vote after timeout"
+        !actions_after_timeout.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
+        "a classical session never signs or sends its skip vote"
     );
 
     // Inject skip certificate from other validators for slot 0 (quorum = 3 of 4).
-    // We already voted skip, so we include ourselves (v1) plus v2, v3.
     let skip_cert = build_skip_certificate_tl(
         fixture.description.get_session_id(),
         &fixture.nodes,
@@ -9747,47 +9716,53 @@ fn test_handle_finalization_reached_treats_result_already_taken_as_ok() {
 /// registry continuation when candidateInfo persist is still pending.
 #[test]
 fn test_broadcast_vote_defers_send_when_candidate_info_pending() {
-    let mut fixture = TestFixture::new(4);
-    let slot = SlotIndex::new(80);
+    let h = crate::signing_coordinator::tests::Harness::custody(rtos_api::WireProfile::Legacy);
+    h.description.install_coordinator(h.coordinator.clone()).unwrap();
+    let mut processor =
+        make_pq_processor_with_description_for_test(h.db.clone(), h.description.clone());
+    let receiver = MockReceiver::new();
+    processor.receiver = receiver.clone();
+    let slot = SlotIndex::new(0);
     let block_hash = UInt256::rand();
     let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
 
     // Inject a manually-controlled pending result into the dedup map so the poll
     // returns Pending instead of Ready/NotFound.
     let pending = ManualAsyncResult::pending();
-    fixture.processor.database.insert_candidate_info_store(candidate_id.clone(), pending.clone());
+    processor.database.insert_candidate_info_store(candidate_id.clone(), pending.clone());
 
     let vote = crate::simplex_state::Vote::Notarize(crate::simplex_state::NotarizeVote {
         slot,
         block_hash,
     });
 
-    fixture.drain_receiver_actions();
-    fixture.processor.broadcast_vote(vote);
+    receiver.drain_actions();
+    processor.broadcast_vote(vote);
 
-    let pending_entries: Vec<_> =
-        fixture.processor.database.pending_iter().map(|e| e.op_label).collect();
+    let pending_entries: Vec<_> = processor.database.pending_iter().map(|e| e.op_label).collect();
     assert!(
         pending_entries.contains(&"ensure_candidate_info_stored:candidate_info"),
         "broadcast_vote(Notarize) must register a pending continuation when candidateInfo \
          is in flight, got entries: {pending_entries:?}",
     );
 
-    let actions_before = fixture.drain_receiver_actions();
+    let actions_before = receiver.drain_actions();
     assert!(
         !actions_before.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
         "vote send must be deferred to the continuation while persist is pending",
     );
+    assert_eq!(h.signature_count(), 0, "nothing is signed before candidateInfo is durable");
 
     // Complete the persist; drain registry; verify vote is now sent.
     pending.complete_ok();
-    fixture.processor.process_pending_async_db_results();
+    processor.process_pending_async_db_results();
 
-    let actions_after = fixture.drain_receiver_actions();
+    let actions_after = receiver.drain_actions();
     assert!(
         actions_after.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
         "vote must be sent once the persist continuation runs",
     );
+    assert_eq!(h.signature_count(), 1);
 }
 
 /// `broadcast_vote` (Notarize variant) must abort with a persist-fail bump when
@@ -11100,7 +11075,7 @@ fn own_journal_real_vote_controller_and_recovery() {
         Some("after_signed"),
     ] {
         let h = Harness::new();
-        h.description.install_test_coordinator(h.coordinator.clone()).unwrap();
+        h.description.install_coordinator(h.coordinator.clone()).unwrap();
         *h.coordinator.fail_at.lock().unwrap() = stage;
         let mut processor =
             make_pq_processor_with_description_for_test(h.db.clone(), h.description.clone());
@@ -11154,7 +11129,7 @@ fn own_journal_real_vote_controller_and_recovery() {
         let result = h.coordinator.vote(&vote("notarize"));
         assert_eq!(result.is_err(), intent_only);
         h = h.reopen();
-        h.description.install_test_coordinator(h.coordinator.clone()).unwrap();
+        h.description.install_coordinator(h.coordinator.clone()).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let bootstrap =
             h.db.load_pq_bootstrap_cancellable(&cancel, Duration::from_millis(10)).unwrap();
@@ -11215,7 +11190,7 @@ fn own_journal_real_candidate_recovery_uses_durable_carrier() {
                 let signed = h.coordinator.candidate(candidate.clone());
                 assert_eq!(signed.is_err(), intent_only);
                 let h = h.reopen();
-                h.description.install_test_coordinator(h.coordinator.clone()).unwrap();
+                h.description.install_coordinator(h.coordinator.clone()).unwrap();
                 let cancel = Arc::new(AtomicBool::new(false));
                 let bootstrap =
                     h.db.load_pq_bootstrap_cancellable(&cancel, Duration::from_millis(10)).unwrap();
@@ -11552,7 +11527,7 @@ fn custody_real_vote_controller_and_recovery() {
             Some("after_signed"),
         ] {
             let h = Harness::custody(rtos_api::WireProfile::T0);
-            h.description.install_test_coordinator(h.coordinator.clone()).unwrap();
+            h.description.install_coordinator(h.coordinator.clone()).unwrap();
             *h.coordinator.fail_at.lock().unwrap() = stage;
             let mut processor =
                 make_pq_processor_with_description_for_test(h.db.clone(), h.description.clone());
@@ -11606,7 +11581,7 @@ fn custody_real_vote_controller_and_recovery() {
             let result = h.coordinator.vote(&vote(role));
             assert_eq!(result.is_err(), intent_only);
             h = h.reopen();
-            h.description.install_test_coordinator(h.coordinator.clone()).unwrap();
+            h.description.install_coordinator(h.coordinator.clone()).unwrap();
             let cancel = Arc::new(AtomicBool::new(false));
             let bootstrap =
                 h.db.load_pq_bootstrap_cancellable(&cancel, Duration::from_millis(10)).unwrap();
@@ -11663,7 +11638,7 @@ fn custody_real_candidate_recovery_uses_durable_carrier() {
                 let signed = h.coordinator.candidate(candidate.clone());
                 assert_eq!(signed.is_err(), intent_only);
                 let h = h.reopen();
-                h.description.install_test_coordinator(h.coordinator.clone()).unwrap();
+                h.description.install_coordinator(h.coordinator.clone()).unwrap();
                 let cancel = Arc::new(AtomicBool::new(false));
                 let bootstrap =
                     h.db.load_pq_bootstrap_cancellable(&cancel, Duration::from_millis(10)).unwrap();
@@ -11765,7 +11740,7 @@ fn custody_real_candidate_recovery_uses_durable_carrier() {
 fn custody_retired_backend_stops_real_vote_publication() {
     use crate::signing_coordinator::tests::{vote, Harness};
     let h = Harness::custody_with_key(rtos_api::WireProfile::T0, [0xa7; 32], 4_000_000_000);
-    h.description.install_test_coordinator(h.coordinator.clone()).unwrap();
+    h.description.install_coordinator(h.coordinator.clone()).unwrap();
     let mut processor =
         make_pq_processor_with_description_for_test(h.db.clone(), h.description.clone());
     let receiver = MockReceiver::new();
@@ -12949,3 +12924,4 @@ fn test_query_repair_restores_absent_body_despite_retained_validation_decision()
         }
     }
 }
+

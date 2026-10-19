@@ -311,18 +311,17 @@ impl SessionDescription {
         self.sources.iter().any(|source| source.public_key.pq_key().is_some())
     }
 
+    /// Own votes are signed only with the custodied post-quantum consensus key,
+    /// through the session's journal. A session that is not post-quantum, or
+    /// has no signer, produces no vote: there is no classical or network-key
+    /// fallback.
     pub fn sign_own_vote(
         &self,
         vote: &crate::simplex_state::Vote,
     ) -> Result<rtos_api::ton::consensus::simplex::vote::Vote> {
         self.require_validator_index()?;
         if !self.is_pq() {
-            return Ok(crate::utils::sign_vote(
-                vote,
-                &self.session_id,
-                self.get_legacy_signing_key()?,
-            )?
-            .only());
+            fail!("no post-quantum consensus signer for a classical session; refusing to vote");
         }
         let guard = self.own_signing.lock().map_err(|_| error!("signer capability poisoned"))?;
         guard.as_ref().ok_or_else(|| error!("PQ consensus signer is Disabled"))?.vote(vote)
@@ -368,8 +367,9 @@ impl SessionDescription {
         }
     }
 
-    #[cfg(any(test, feature = "isolated-consensus-signing"))]
-    pub fn install_test_coordinator(
+    /// Install the session's own signing journal once, after checking that it
+    /// binds exactly this session, committee, validator and key.
+    pub fn install_coordinator(
         &self,
         coordinator: std::sync::Arc<crate::signing_coordinator::SigningCoordinator>,
     ) -> Result<()> {

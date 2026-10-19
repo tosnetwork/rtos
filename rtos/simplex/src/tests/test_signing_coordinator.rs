@@ -84,7 +84,7 @@ pub(crate) fn binding(d: &SessionDescription) -> SigningBinding {
         key_id: *key.key_id.as_array(),
         public_key: key.public_key.clone(),
         generation: 1,
-        expire_at: 0,
+        expire_at: Some(0),
         shard_workchain: -1,
         shard_prefix: 0x8000000000000000,
         protocol: 0,
@@ -231,7 +231,7 @@ impl Harness {
         let description = custody_description(wire_profile, &store);
         let db = crate::database::SimplexDb::open(root.join("db"), "own-signing").unwrap();
         let mut journal_binding = binding(&description);
-        journal_binding.expire_at = u64::from(store.expire_at());
+        journal_binding.expire_at = Some(u64::from(store.expire_at()));
         let coordinator = Arc::new(
             SigningCoordinator::open(
                 db.clone(),
@@ -270,7 +270,7 @@ impl Harness {
         };
         let mut journal_binding = binding(&description);
         if let Some(store) = &store {
-            journal_binding.expire_at = u64::from(store.expire_at());
+            journal_binding.expire_at = Some(u64::from(store.expire_at()));
         }
         let coordinator = Arc::new(
             SigningCoordinator::open(
@@ -517,7 +517,7 @@ fn own_journal_expiry_and_retirement_survive_clock_rollback() {
         std::fs::create_dir(&root).unwrap();
         let d = description();
         let mut b = binding(&d);
-        b.expire_at = 200;
+        b.expire_at = Some(200);
         let db = crate::database::SimplexDb::open(root.join("db"), "expiry").unwrap();
         let clock = Arc::new(std::sync::atomic::AtomicU64::new(if after_sign { 100 } else { 200 }));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -762,7 +762,7 @@ fn own_journal_failed_retirement_needs_external_monotonic_anchor() {
     std::fs::create_dir(&root).unwrap();
     let description = description();
     let mut binding = binding(&description);
-    binding.expire_at = 200;
+    binding.expire_at = Some(200);
     let identity = description.get_source_public_key(description.get_self_idx()).clone();
     let calls = Arc::new(AtomicUsize::new(0));
     let db = crate::database::SimplexDb::open(root.join("db"), "retirement-gap").unwrap();
@@ -943,7 +943,7 @@ fn custody_binding_rejects_wrong_backend_before_journal_creation() {
                     signer.algorithm = 99;
                 }
             }
-            "deadline" => b.expire_at = 4_000_000_000,
+            "deadline" => b.expire_at = Some(4_000_000_000),
             _ => unreachable!(),
         }
         let root = std::env::temp_dir().join(format!("rtos-custody-binding-{}", UInt256::rand()));
@@ -1129,7 +1129,7 @@ fn authenticated_schema3_native_signing_and_exact_recovery_bind_runtime() {
         assert!(coordinator.check_session(&description).is_err(), "domain {mode}");
         coordinator.state.lock().unwrap().header.binding = binding.clone();
     }
-    description.install_test_coordinator(coordinator.clone()).unwrap();
+    description.install_coordinator(coordinator.clone()).unwrap();
     let original = description.sign_own_vote(&vote("skip")).unwrap();
     let wire = options.wire_profile.serialize(&original.into_boxed()).unwrap();
     assert_eq!(store.consensus_signatures_produced(), 1);
@@ -1139,7 +1139,7 @@ fn authenticated_schema3_native_signing_and_exact_recovery_bind_runtime() {
     let description = make_description();
     let recovered = Arc::new(SigningCoordinator::open(db.clone(), binding.clone(), identity.clone(),
         root.path(), false, custody_backend(&description, store.clone())).unwrap());
-    description.install_test_coordinator(recovered.clone()).unwrap();
+    description.install_coordinator(recovered.clone()).unwrap();
     assert_eq!(options.wire_profile.serialize(&description.sign_own_vote(&vote("skip")).unwrap().into_boxed()).unwrap(), wire);
     assert_eq!(store.consensus_signatures_produced(), 1, "recovery must not invoke native signer again");
     drop(description);
