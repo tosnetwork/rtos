@@ -13447,3 +13447,32 @@ fn test_finality_behind_at_parent_ready_abandons_notarization_after_validation()
         );
     }
 }
+
+/// C++ pool.cpp handle_prospective_certificate: a certificate is broadcast only
+/// after SaveCertificate succeeded. A certificate that could not be stored is
+/// not relayed.
+#[test]
+fn test_handle_notarization_reached_does_not_relay_when_persist_fails() {
+    let mut fixture = TestFixture::new(4);
+    let slot = crate::block::SlotIndex::new(9);
+    let block_hash = UInt256::rand();
+    let signatures = vec![
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![1]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![2]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![3]),
+    ];
+    let vote = crate::simplex_state::NotarizeVote { slot, block_hash: block_hash.clone() };
+    let cert = Arc::new(crate::certificate::Certificate { vote, signatures });
+    let event =
+        crate::simplex_state::NotarizationReachedEvent { slot, block_hash, certificate: cert };
+
+    fixture.processor.database.db().fail_next_notar_cert_save_for_test();
+    fixture.processor.handle_notarization_reached(event);
+    fixture.drain_pending_async_db_results();
+
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        !actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "a certificate that was not stored must not be relayed"
+    );
+}

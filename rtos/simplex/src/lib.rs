@@ -518,14 +518,13 @@ pub struct SessionOptions {
     pub candidate_resolve_timeout_cap: Duration,
     pub candidate_resolve_cooldown: Duration,
 
-    // Wired into Receiver standstill replay token-bucket shaping.
-    // C++ parity: pool.cpp standstill_resolution_task byte budget.
+    // Receiver standstill replay budget: max(min, max / 2^shard_prefix_len)
+    // bytes per second. C++ parity: pool.cpp standstill_resolution_task.
     pub standstill_max_egress_bytes_per_s: u32,
 
     // ConfigParam30 noncritical key 16: the standstill egress floor, and key 15:
-    // how many random peers a new certificate is gossiped to. Carried from the
-    // configuration; the receiver's certificate fan-out and standstill budget do
-    // not read them yet.
+    // how many random peers a newly obtained certificate is sent to (C++
+    // pool.cpp BroadcastToRandom). Both are read by the receiver.
     pub standstill_min_egress_bytes_per_s: u32,
     pub certificate_gossip_neighbors: u32,
 

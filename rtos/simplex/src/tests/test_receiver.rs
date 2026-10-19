@@ -1710,6 +1710,7 @@ fn test_receiver_standstill_replay_respects_egress_budget() {
             max_candidate_query_answer_size,
             standstill_timeout: Duration::from_millis(200),
             standstill_max_egress_bytes_per_s: low_egress_budget,
+            standstill_min_egress_bytes_per_s: low_egress_budget,
             ..Default::default()
         },
     )
@@ -1731,6 +1732,7 @@ fn test_receiver_standstill_replay_respects_egress_budget() {
             max_candidate_query_answer_size,
             standstill_timeout: Duration::from_millis(200),
             standstill_max_egress_bytes_per_s: low_egress_budget,
+            standstill_min_egress_bytes_per_s: low_egress_budget,
             ..Default::default()
         },
     )
@@ -1765,7 +1767,7 @@ fn test_receiver_standstill_replay_respects_egress_budget() {
 }
 
 #[test]
-fn test_receiver_standstill_rebuilds_pending_queue_from_fresh_state() {
+fn test_receiver_standstill_builds_each_slot_from_its_state_at_its_turn() {
     let _ = env_logger::Builder::new().filter_level(log::LevelFilter::Trace).try_init();
 
     let overlay_manager = SessionFactory::create_in_process_overlay_manager(2);
@@ -1812,6 +1814,7 @@ fn test_receiver_standstill_rebuilds_pending_queue_from_fresh_state() {
             max_candidate_query_answer_size,
             standstill_timeout: Duration::from_millis(200),
             standstill_max_egress_bytes_per_s: low_egress_budget,
+            standstill_min_egress_bytes_per_s: low_egress_budget,
             ..Default::default()
         },
     )
@@ -1833,6 +1836,7 @@ fn test_receiver_standstill_rebuilds_pending_queue_from_fresh_state() {
             max_candidate_query_answer_size,
             standstill_timeout: Duration::from_millis(200),
             standstill_max_egress_bytes_per_s: low_egress_budget,
+            standstill_min_egress_bytes_per_s: low_egress_budget,
             ..Default::default()
         },
     )
@@ -1840,32 +1844,33 @@ fn test_receiver_standstill_rebuilds_pending_queue_from_fresh_state() {
 
     thread::sleep(Duration::from_millis(500));
 
+    // Slot 1 goes first and takes the low budget; slot 3 holds only our vote.
+    receiver0.cache_standstill_certificate(
+        1,
+        crate::receiver::StandstillCertificateType::Skip,
+        serialize_boxed(&make_skip_certificate(1)).expect("serialize cert"),
+    );
     receiver0.cache_our_vote_for_standstill(signed_vote);
     receiver0.set_standstill_slots(0, 10);
     receiver0.reschedule_standstill();
 
     wait_until(Duration::from_secs(2), || stats0.standstill_triggers.load(Ordering::Relaxed) >= 1);
-
-    assert_eq!(
-        stats1.votes_received.load(Ordering::Relaxed),
-        0,
-        "low egress budget should keep the first standstill snapshot pending"
-    );
     assert_eq!(
         stats1.certificates_received.load(Ordering::Relaxed),
         0,
-        "no certificate should be replayed before the snapshot is refreshed"
+        "the low egress budget paces the first message"
     );
 
+    // Before slot 3's turn, a skip certificate for it is obtained. C++ builds a
+    // slot's messages when its turn comes, so the vote it covers is not sent.
     receiver0.cache_standstill_certificate(
         3,
         crate::receiver::StandstillCertificateType::Skip,
         cert_bytes,
     );
 
-    wait_until(Duration::from_secs(3), || stats0.standstill_triggers.load(Ordering::Relaxed) >= 2);
-    wait_until(Duration::from_secs(6), || {
-        stats1.certificates_received.load(Ordering::Relaxed) >= 1
+    wait_until(Duration::from_secs(10), || {
+        stats1.certificates_received.load(Ordering::Relaxed) >= 2
     });
 
     receiver0.stop();
@@ -1875,11 +1880,7 @@ fn test_receiver_standstill_rebuilds_pending_queue_from_fresh_state() {
     assert_eq!(
         stats1.votes_received.load(Ordering::Relaxed),
         0,
-        "fresh standstill snapshot must drop the stale queued vote once a matching cert is cached"
-    );
-    assert!(
-        stats1.certificates_received.load(Ordering::Relaxed) >= 1,
-        "expected the refreshed standstill snapshot to replay the new certificate"
+        "a vote covered by a certificate at its slot's turn is not replayed"
     );
 }
 
@@ -2656,5 +2657,230 @@ fn restored_cache_delivery_case(mode: &str) {
             *receiver.stats.received_candidate_notars.lock().unwrap(),
             vec![Some(notar.clone()), Some(notar)]
         );
+    }
+}
+
+/*
+    Certificate fan-out and standstill egress (C++ pool.cpp / private-overlay.cpp)
+*/
+
+fn gossip_key(byte: u8) -> Arc<rtos_block::KeyId> {
+    rtos_block::KeyId::from_data([byte; 32])
+}
+
+#[test]
+fn test_select_gossip_targets_samples_others_without_replacement() {
+    use rand::SeedableRng;
+    let members: Vec<_> = (1..=6u8).map(gossip_key).collect();
+    let local = gossip_key(3);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+    for count in 0..=8usize {
+        for _ in 0..50 {
+            let targets =
+                crate::receiver::select_gossip_targets(members.iter(), &local, count, &mut rng);
+            assert_eq!(targets.len(), count.min(5), "count={count}");
+            assert!(!targets.contains(&local), "never this node");
+            let unique: std::collections::HashSet<_> = targets.iter().collect();
+            assert_eq!(unique.len(), targets.len(), "no peer twice");
+            assert!(targets.iter().all(|t| members.contains(t)));
+        }
+    }
+    // Every other member, observers included, can be chosen.
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..500 {
+        seen.extend(crate::receiver::select_gossip_targets(members.iter(), &local, 1, &mut rng));
+    }
+    assert_eq!(seen.len(), 5);
+    // A seeded generator gives a reproducible choice.
+    let pick = |seed| {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        crate::receiver::select_gossip_targets(members.iter(), &local, 2, &mut rng)
+    };
+    assert_eq!(pick(11), pick(11));
+}
+
+#[test]
+fn test_standstill_egress_rate_is_max_of_floor_and_shard_share() {
+    use crate::receiver::StandstillEgress;
+    assert_eq!(StandstillEgress::rate(1 << 17, 50 << 17, 0), (50 << 17) as f64);
+    assert_eq!(StandstillEgress::rate(1 << 17, 50 << 17, 2), (50 << 17) as f64 / 4.0);
+    assert_eq!(StandstillEgress::rate(1 << 17, 50 << 17, 8), (1 << 17) as f64, "floor dominates");
+    assert_eq!(StandstillEgress::rate(1000, 0, 0), 1000.0, "max 0 is not unshaped");
+    assert_eq!(StandstillEgress::rate(0, 0, 0), 0.0);
+}
+
+#[test]
+fn test_standstill_egress_budget_with_controlled_clock() {
+    use crate::receiver::StandstillEgress;
+    let t0 = Instant::now();
+    let ms = Duration::from_millis;
+    // 1000 B/s; a fresh resolution starts with 10 ms of history and no quota.
+    let mut egress = StandstillEgress::new(1000.0, t0);
+    // A 10-byte message fits the initial 10 ms allowance.
+    assert_eq!(egress.try_send(10.0, t0), Ok(()));
+    // The next one has to wait for its share: 10 more bytes = 10 ms.
+    assert_eq!(egress.try_send(10.0, t0), Err(Some(t0 + ms(10))));
+    // Oversleeping refills by the time actually elapsed, capped at one second.
+    assert_eq!(egress.try_send(10.0, t0 + ms(5000)), Ok(()));
+    assert!((egress.quota() - 990.0).abs() < 1e-6, "capped at 1000, minus 10");
+
+    // A message larger than one second of budget is paced, not starved: it goes
+    // when its wait has passed and leaves the quota in debt.
+    let mut egress = StandstillEgress::new(1000.0, t0);
+    let wait = egress.try_send(2500.0, t0).unwrap_err().unwrap();
+    assert_eq!(wait, t0 + ms(2490));
+    assert_eq!(egress.try_send(2500.0, wait), Ok(()));
+    assert!((egress.quota() - (1000.0 - 2500.0)).abs() < 1e-6, "negative debt retained");
+    // A second oversized message waits for the debt and itself.
+    let second = egress.try_send(2500.0, wait).unwrap_err().unwrap();
+    assert_eq!(second, wait + ms(4000));
+    assert_eq!(egress.try_send(2500.0, second + ms(1)), Ok(()));
+
+    // A zero budget never sends and never asks to be woken.
+    let mut egress = StandstillEgress::new(0.0, t0);
+    assert_eq!(egress.try_send(1.0, t0 + ms(100_000)), Err(None));
+}
+
+#[test]
+fn test_standstill_replay_orders_slots_and_stops_at_new_final_certificate() {
+    use crate::receiver::{StandstillReplay, StandstillStep};
+    let t0 = Instant::now();
+    let slot_messages = |slot: u32| -> Vec<(String, f64)> {
+        vec![(format!("cert{slot}"), 1.0), (format!("vote{slot}"), 1.0)]
+    };
+    let mut replay = StandstillReplay::new(Some((9, "final9".to_string(), 1.0)), 10, 1e9, t0);
+    let mut sent = Vec::new();
+    // Last final certificate first, then slot 10 certificates before votes.
+    for _ in 0..3 {
+        match replay.step(t0, Some(9), 10, 13, slot_messages) {
+            StandstillStep::Send(message) => sent.push(message),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(sent, ["final9", "cert10", "vote10"]);
+    // A newer final certificate arrives mid-slot: the messages already built
+    // for this slot still go, the next slot is not started.
+    let mut replay = StandstillReplay::new(None, 10, 1e9, t0);
+    assert_eq!(replay.step(t0, None, 10, 13, slot_messages), StandstillStep::Send("cert10".into()));
+    assert_eq!(
+        replay.step(t0, Some(11), 10, 13, slot_messages),
+        StandstillStep::Send("vote10".into())
+    );
+    assert_eq!(replay.step(t0, Some(11), 10, 13, slot_messages), StandstillStep::Done);
+    // The range is read at every slot: a range that grows is walked further.
+    let mut replay = StandstillReplay::new(None, 10, 1e9, t0);
+    let mut count = 0;
+    while let StandstillStep::Send(_) = replay.step(t0, None, 10, 11 + count / 2, slot_messages) {
+        count += 1;
+        if count > 10 {
+            break;
+        }
+    }
+    assert!(count > 2, "slots added while the resolution runs are replayed");
+    // Budget exhaustion yields a deadline, a zero budget blocks without one.
+    let mut replay = StandstillReplay::new(None, 10, 100.0, t0);
+    assert!(matches!(
+        replay.step(t0, None, 10, 13, |_| vec![("big".to_string(), 50.0)]),
+        StandstillStep::WaitUntil(_)
+    ));
+    let mut replay = StandstillReplay::new(None, 10, 0.0, t0);
+    assert_eq!(replay.step(t0, None, 10, 13, slot_messages), StandstillStep::Blocked);
+}
+
+/// Start `count` in-process receivers sharing one overlay; receiver 0 uses
+/// `neighbors` for its certificate fan-out.
+fn start_fanout_receivers(
+    count: usize,
+    neighbors: u32,
+) -> (
+    Vec<crate::receiver::ReceiverPtr>,
+    Vec<Arc<ReceiverStats>>,
+    Vec<Arc<dyn ReceiverListener + Send + Sync>>,
+) {
+    let overlay_manager = SessionFactory::create_in_process_overlay_manager(count);
+    let session_id = UInt256::rand();
+    let keys: Vec<_> = (0..count)
+        .map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key"))
+        .collect();
+    let nodes: Vec<SessionNode> = keys
+        .iter()
+        .map(|k| SessionNode { public_key: k.clone(), adnl_id: k.id().clone(), weight: 1 })
+        .collect();
+    let shard = ShardIdent::masterchain();
+    let mut receivers = Vec::new();
+    let mut stats = Vec::new();
+    let mut listeners = Vec::new();
+    for (index, key) in keys.iter().enumerate() {
+        let (listener, listener_stats) = TestReceiverListener::create(index as u32);
+        let listener_arc: Arc<dyn ReceiverListener + Send + Sync> = listener.clone();
+        let receiver = crate::receiver::ReceiverWrapper::create(
+            session_id.clone(),
+            &shard,
+            &nodes,
+            key,
+            overlay_manager.clone(),
+            Arc::downgrade(&listener_arc),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+            crate::receiver::ReceiverSettings {
+                standstill_timeout: Duration::from_millis(300),
+                certificate_gossip_neighbors: if index == 0 { neighbors } else { 20 },
+                ..Default::default()
+            },
+        )
+        .expect("Failed to create receiver");
+        receivers.push(receiver);
+        stats.push(listener_stats);
+        listeners.push(listener_arc);
+    }
+    thread::sleep(Duration::from_millis(500));
+    (receivers, stats, listeners)
+}
+
+fn certificates_received_by_peers(stats: &[Arc<ReceiverStats>]) -> Vec<u32> {
+    stats[1..].iter().map(|s| s.certificates_received.load(Ordering::Relaxed)).collect()
+}
+
+#[test]
+fn test_receiver_certificate_fanout_reaches_exactly_the_configured_neighbors() {
+    let _ = env_logger::Builder::new().filter_level(log::LevelFilter::Info).try_init();
+    for (neighbors, expected) in [(2u32, 2u32), (20, 4), (0, 0)] {
+        let (receivers, stats, _listeners) = start_fanout_receivers(5, neighbors);
+        // The test listeners record and never relay, so every delivery is one
+        // of receiver 0's own sends.
+        receivers[0].send_certificate(make_skip_certificate(1));
+        if expected > 0 {
+            wait_until(Duration::from_secs(3), || {
+                certificates_received_by_peers(&stats).iter().sum::<u32>() >= expected
+            });
+        }
+        thread::sleep(Duration::from_millis(500));
+        let per_peer = certificates_received_by_peers(&stats);
+        for receiver in &receivers {
+            receiver.stop();
+        }
+        assert_eq!(per_peer.iter().sum::<u32>(), expected, "neighbors={neighbors}: {per_peer:?}");
+        assert!(per_peer.iter().all(|&n| n <= 1), "no peer receives it twice: {per_peer:?}");
+    }
+}
+
+#[test]
+fn test_receiver_standstill_replays_certificates_to_every_validator() {
+    let _ = env_logger::Builder::new().filter_level(log::LevelFilter::Info).try_init();
+    // Fan-out of one for fresh certificates; standstill replay is not gossip.
+    let (receivers, stats, _listeners) = start_fanout_receivers(5, 1);
+    let cert = make_skip_certificate(2);
+    receivers[0].cache_standstill_certificate(
+        2,
+        crate::receiver::StandstillCertificateType::Skip,
+        serialize_boxed(&cert).expect("serialize cert"),
+    );
+    receivers[0].set_standstill_slots(0, 10);
+    receivers[0].reschedule_standstill();
+    wait_until(Duration::from_secs(5), || {
+        certificates_received_by_peers(&stats).iter().all(|&n| n >= 1)
+    });
+    for receiver in &receivers {
+        receiver.stop();
     }
 }

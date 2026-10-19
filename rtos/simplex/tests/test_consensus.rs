@@ -3009,3 +3009,38 @@ fn test_simplex_consensus_finalization_backpressure() {
     // reached when the gates opened: the drain-and-resume evidence.
     assert!(report.finalized_at_release < 40, "the hold started well before completion");
 }
+
+/// Sparse certificate fan-out (ConfigParam30 key 15): each node sends a newly
+/// obtained certificate to one random peer only (C++ BroadcastToRandom). Votes
+/// still reach every validator, so every node still forms the certificates it
+/// needs and the committee finishes the run.
+#[test]
+fn test_simplex_consensus_sparse_certificate_gossip() {
+    run_simplex_consensus_test(
+        TestConfig {
+            total_rounds: 30,
+            min_finalized_percent: 0.3,
+            node_count: 5,
+            generation_failure_probability: 0.0,
+            candidate_rejection_probability: 0.0,
+            max_collations: 10000,
+            target_rate: Duration::from_millis(200),
+            first_block_timeout: Duration::from_millis(1000),
+            test_name: "simplex_sparse_certificate_gossip".to_string(),
+            test_timeout: Duration::from_secs(180),
+            expect_timeout: false,
+            shard: ShardIdent::masterchain(),
+            mc_notification_interval: None,
+            overlay_type: OverlayType::InProcess,
+            net_gremlin: None,
+            restart_gremlin: None,
+            lossy_overlay: None,
+            lossy_overlay_node_indices: None,
+            standstill_timeout: None,
+            slots_per_leader_window: None,
+            certificate_gossip_neighbors: Some(1),
+            finality_hold: None,
+        },
+        |_instances| {},
+    );
+}

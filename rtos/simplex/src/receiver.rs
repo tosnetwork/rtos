@@ -97,7 +97,7 @@ use std::{
         Arc, Weak,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 // ======================================================================
@@ -467,7 +467,6 @@ pub(crate) struct ReceiverImpl {
     /// Local source index
     local_idx: Option<u32>,
     membership: consensus_common::simplex_protocol::SimplexMembership,
-    protocol: consensus_common::simplex_protocol::SimplexProtocol,
     /// Receiver listener (weak reference to SessionProcessor)
     listener: ReceiverListenerPtr,
     /// Per-source statistics
@@ -512,8 +511,12 @@ pub(crate) struct ReceiverImpl {
     _activity_node: ActivityNodePtr,
     /// Standstill timeout duration
     standstill_timeout: Duration,
-    /// Standstill replay egress budget in bytes/sec.
+    /// Standstill replay egress budget in bytes/sec, before shard scaling.
     standstill_max_egress_bytes_per_s: u32,
+    /// Standstill replay egress floor in bytes/sec.
+    standstill_min_egress_bytes_per_s: u32,
+    /// Peers a newly obtained certificate is sent to.
+    certificate_gossip_neighbors: u32,
     /// Next standstill alarm timestamp (reset on finalization and after re-broadcast)
     standstill_alarm: Option<SystemTime>,
     /// Standstill slot range [begin, end) for vote re-broadcast
@@ -531,12 +534,15 @@ pub(crate) struct ReceiverImpl {
     our_votes: Vec<(u32, TlVote)>,
     /// Dedup set for `our_votes` replay cache.
     our_vote_keys: HashSet<StandstillVoteKey>,
-    /// Pending standstill replay items to be sent under egress shaping.
-    standstill_replay_queue: VecDeque<StandstillReplayItem>,
-    /// Current token bucket quota for standstill replay (bytes).
-    standstill_egress_quota_bytes: f64,
-    /// Last token bucket update time.
-    standstill_egress_quota_time: SystemTime,
+    /// The standstill resolution in progress, if any.
+    standstill_replay: Option<StandstillReplay<StandstillReplayItem>>,
+    /// When the resolution in progress may send its next message.
+    standstill_replay_wake: Option<Instant>,
+    /// A standstill was detected while a resolution was still running; a fresh
+    /// one starts as soon as it ends (C++ coalesces the notification).
+    standstill_restart_pending: bool,
+    /// The zero-budget refusal has been logged.
+    standstill_zero_budget_logged: bool,
     /// Candidate resolver cache (local to this thread)
     resolver_cache: CandidateResolverCache,
     /// Delayed actions to execute at scheduled times
@@ -744,9 +750,15 @@ impl ReceiverImpl {
             .filter_map(|a| a.expiration_time.duration_since(now).ok())
             .min();
 
-        match earliest_action {
+        let timeout = match earliest_action {
             Some(until_action) => default_timeout.min(until_action),
             None => default_timeout,
+        };
+        // The standstill resolution sleeps until its next message may go (C++
+        // coro_sleep); the loop wakes at that deadline rather than on a poll.
+        match self.standstill_replay_wake {
+            Some(at) => timeout.min(at.saturating_duration_since(Instant::now())),
+            None => timeout,
         }
     }
 }
@@ -1412,11 +1424,17 @@ impl ReceiverImpl {
         );
     }
 
-    fn send_serialized_certificate_to_all(&mut self, bytes: Vec<u8>) {
+    /// Standstill replay of a certificate: every validator but this node
+    /// (C++ `BroadcastToValidators`), whatever the protocol.
+    fn send_serialized_certificate_to_validators(&mut self, bytes: Vec<u8>) {
         let payload = ConsensusCommonFactory::create_block_payload(bytes.into());
-        // v0/v1 retain their historical broadcast-to-committee replay behavior.
-        let random = self.protocol == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree;
-        self.send_certificate_payload_to_members(&payload, random);
+        let targets: Vec<PublicKeyHash> = self
+            .send_order
+            .iter()
+            .filter(|&&idx| Some(idx) != self.local_idx)
+            .filter_map(|&idx| self.sources.get(idx as usize).map(|stats| stats.adnl_id.clone()))
+            .collect();
+        self.send_certificate_payload_to(&payload, targets);
     }
 
     /// Shuffle send order for fairness
@@ -1564,7 +1582,8 @@ impl ReceiverImpl {
             up_to_slot
         );
 
-        self.standstill_replay_queue.clear();
+        // A resolution in progress is not cut here: the new final certificate
+        // that comes with finalization ends it at its next slot boundary.
 
         // Clean up old votes (keep votes for slot >= up_to_slot)
         let old_count = self.our_votes.len();
@@ -2107,18 +2126,23 @@ impl ReceiverImpl {
         let serialized = self.wire_profile.serialize(&certificate).expect("fixed wire carrier");
         let payload = ConsensusCommonFactory::create_block_payload(serialized.into());
 
-        self.send_certificate_payload_to_members(&payload, false);
+        // C++ pool.cpp handle_saved_certificate: BroadcastToRandom with
+        // certificate_gossip_neighbors peers, sampled from every overlay member
+        // but this node (observers may be members).
+        let targets = select_gossip_targets(
+            self.membership.members(),
+            &self.local_adnl_id,
+            self.certificate_gossip_neighbors as usize,
+            &mut rand::thread_rng(),
+        );
+        self.send_certificate_payload_to(&payload, targets);
     }
 
-    /// Certificates may be forwarded by observers. Initial publication reaches
-    /// every authenticated transport member; standstill gossip samples a member.
-    fn send_certificate_payload_to_members(&mut self, payload: &BlockPayloadPtr, random: bool) {
-        let mut targets: Vec<_> = self.membership.members()
-            .filter(|key| *key != &self.local_adnl_id).cloned().collect();
-        if random {
-            targets.shuffle(&mut rand::thread_rng());
-            targets.truncate(1);
-        }
+    fn send_certificate_payload_to(
+        &mut self,
+        payload: &BlockPayloadPtr,
+        targets: Vec<PublicKeyHash>,
+    ) {
         let count = targets.len() as u64;
         let bytes = payload.data().len() as u64 * count;
         self.out_messages_bytes.increment(bytes);
@@ -2199,6 +2223,166 @@ impl ReceiverImpl {
 // Liveness fallback: scheduling, the bounded replay queue, egress shaping,
 // and the vote/certificate replay caches.
 
+/// Choose the peers a newly obtained certificate is sent to.
+///
+/// C++ `private-overlay.cpp` `BroadcastToRandom{certificate_gossip_neighbors}`:
+/// a uniform sample without replacement of `min(count, n)` peers from the
+/// overlay members other than this node (observers included when they are
+/// members). The membership set is already sorted and duplicate-free.
+pub(crate) fn select_gossip_targets<'a, R: Rng + ?Sized>(
+    members: impl Iterator<Item = &'a PublicKeyHash>,
+    local: &PublicKeyHash,
+    count: usize,
+    rng: &mut R,
+) -> Vec<PublicKeyHash> {
+    let others: Vec<&PublicKeyHash> = members.filter(|member| *member != local).collect();
+    let take = count.min(others.len());
+    others.choose_multiple(rng, take).map(|member| (*member).clone()).collect()
+}
+
+/// Standstill resolution egress budget (C++ `pool.cpp`
+/// `standstill_resolution_task`).
+///
+/// At time `now` a resolution may have sent `quota + (now - quota_time) * rate`
+/// bytes, never accumulating more than one second of budget. A message costs its
+/// size times the validator count (self included). A message larger than the
+/// budget is sent once its wait has passed and leaves the quota negative, so it
+/// is paced rather than starved.
+#[derive(Clone, Debug)]
+pub(crate) struct StandstillEgress {
+    rate: f64,
+    quota: f64,
+    quota_time: Instant,
+}
+
+impl StandstillEgress {
+    /// `max(min, max / 2^prefix_len)` bytes per second.
+    pub(crate) fn rate(min_bytes_per_s: u32, max_bytes_per_s: u32, shard_prefix_len: u8) -> f64 {
+        let scale = 2f64.powi(i32::from(shard_prefix_len));
+        f64::from(min_bytes_per_s).max(f64::from(max_bytes_per_s) / scale)
+    }
+
+    /// A fresh resolution: the quota is mostly cleared so it does not start with
+    /// a burst (C++ resets it to zero, 10 ms in the past).
+    pub(crate) fn new(rate: f64, now: Instant) -> Self {
+        let quota_time = now.checked_sub(Duration::from_millis(10)).unwrap_or(now);
+        Self { rate, quota: 0.0, quota_time }
+    }
+
+    /// Charge `cost` bytes if the message may go now. Otherwise return when it
+    /// may, or `None` when it never can (a zero rate).
+    pub(crate) fn try_send(
+        &mut self,
+        cost: f64,
+        now: Instant,
+    ) -> std::result::Result<(), Option<Instant>> {
+        if self.quota < cost {
+            if !self.rate.is_finite() || self.rate <= 0.0 {
+                return Err(None);
+            }
+            let wait = Duration::from_secs_f64((cost - self.quota) / self.rate);
+            let ready = self.quota_time.checked_add(wait).ok_or(None)?;
+            if now < ready {
+                return Err(Some(ready));
+            }
+            let elapsed = now.saturating_duration_since(self.quota_time).as_secs_f64();
+            self.quota = (self.quota + elapsed * self.rate).min(self.rate);
+            self.quota_time = now;
+        }
+        self.quota -= cost;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quota(&self) -> f64 {
+        self.quota
+    }
+}
+
+/// What a standstill resolution does next.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StandstillStep<T> {
+    /// Send this message now.
+    Send(T),
+    /// The next message may go at this time.
+    WaitUntil(Instant),
+    /// The next message can never go under the current budget (a zero rate).
+    Blocked,
+    /// The resolution is over: the tracked range is exhausted, or a new final
+    /// certificate arrived and the remaining slots are not walked.
+    Done,
+}
+
+/// One standstill resolution (C++ `pool.cpp` `standstill_resolution_task`).
+///
+/// The last final certificate goes first. Then each tracked slot in turn: its
+/// certificates, then this node's votes that no certificate covers. A slot's
+/// messages are built when its turn comes, from the state at that moment, and
+/// the resolution stops at a slot boundary once a newer final certificate has
+/// been obtained; messages already built for the current slot still go.
+#[derive(Debug)]
+pub(crate) struct StandstillReplay<T> {
+    final_cert_slot: Option<u32>,
+    next_slot: u32,
+    current: VecDeque<(T, f64)>,
+    egress: StandstillEgress,
+}
+
+impl<T> StandstillReplay<T> {
+    pub(crate) fn new(
+        last_final_cert: Option<(u32, T, f64)>,
+        begin: u32,
+        rate: f64,
+        now: Instant,
+    ) -> Self {
+        let mut current = VecDeque::new();
+        let final_cert_slot = last_final_cert.map(|(slot, message, cost)| {
+            current.push_back((message, cost));
+            slot
+        });
+        Self {
+            final_cert_slot,
+            next_slot: begin,
+            current,
+            egress: StandstillEgress::new(rate, now),
+        }
+    }
+
+    /// Next step at `now`. `final_cert_slot` is the slot of the newest final
+    /// certificate held now, `begin..end` the tracked range now, and
+    /// `slot_messages` builds one slot's messages with their costs.
+    pub(crate) fn step(
+        &mut self,
+        now: Instant,
+        final_cert_slot: Option<u32>,
+        begin: u32,
+        end: u32,
+        mut slot_messages: impl FnMut(u32) -> Vec<(T, f64)>,
+    ) -> StandstillStep<T> {
+        loop {
+            if let Some((_, cost)) = self.current.front() {
+                return match self.egress.try_send(*cost, now) {
+                    Ok(()) => match self.current.pop_front() {
+                        Some((message, _)) => StandstillStep::Send(message),
+                        None => StandstillStep::Done,
+                    },
+                    Err(Some(at)) => StandstillStep::WaitUntil(at),
+                    Err(None) => StandstillStep::Blocked,
+                };
+            }
+            if final_cert_slot != self.final_cert_slot {
+                return StandstillStep::Done;
+            }
+            let slot = self.next_slot.max(begin);
+            if slot >= end {
+                return StandstillStep::Done;
+            }
+            self.next_slot = slot.saturating_add(1);
+            self.current.extend(slot_messages(slot));
+        }
+    }
+}
+
 /// Certificate kind for standstill cache
 ///
 /// Used to distinguish certificate types when caching for standstill replay.
@@ -2271,13 +2455,19 @@ impl ReceiverImpl {
 
     /// Check and handle standstill
     ///
-    /// Called periodically from the main processing loop.
-    /// If standstill alarm has expired, re-broadcast votes in the tracked slot range.
+    /// Called from the main processing loop, which also wakes at the deadline
+    /// of the resolution in progress. When the alarm expires, a standstill
+    /// resolution starts (or, if one is still running, a fresh one is queued
+    /// behind it); the running resolution sends whatever its budget allows.
     ///
-    /// Reference: C++ pool.cpp alarm()
+    /// Reference: C++ pool.cpp alarm() + standstill_resolution_task()
     fn check_standstill(&mut self) {
         check_execution_time!(10_000);
-        self.drain_standstill_replay_queue();
+        // C++ standstill_resolution_task: only a validator resolves standstills.
+        if self.local_idx.is_none() {
+            return;
+        }
+        self.drain_standstill_replay();
 
         let now = SystemTime::now();
 
@@ -2291,23 +2481,15 @@ impl ReceiverImpl {
             return;
         }
 
-        // Filter votes to only those in tracked range [begin, end)
-        // Reference: C++ pool.cpp alarm() iterates tracked_slots_interval()
         let begin = self.standstill_slot_begin;
         let end = self.standstill_slot_end;
 
         self.standstill_triggers_counter.increment(1);
         self.health_counters.standstill_triggers.fetch_add(1, Ordering::Relaxed);
-        let (cert_count, vote_count, replaced_items) =
-            self.rebuild_standstill_replay_queue(begin, end);
-        if replaced_items > 0 {
-            log::trace!(
-                "SimplexReceiver {}: replaced {} pending standstill replay items with a fresh \
-                snapshot",
-                self.session_id.to_hex_string(),
-                replaced_items
-            );
-        }
+        let cert_count = self.collect_standstill_certificate_payloads(begin, end).len() as u32;
+        let vote_count = self.collect_standstill_votes_for_replay(begin, end).len() as u32;
+        self.standstill_certs_rebroadcast_counter.increment(u64::from(cert_count));
+        self.standstill_votes_rebroadcast_counter.increment(u64::from(vote_count));
 
         if let Some(listener) = self.listener.upgrade() {
             listener.on_standstill_trigger(StandstillTriggerNotification {
@@ -2327,7 +2509,16 @@ impl ReceiverImpl {
                 end
             );
         }
-        self.drain_standstill_replay_queue();
+
+        let blocked = self.standstill_replay.is_some() && self.standstill_replay_wake.is_none();
+        if self.standstill_replay.is_none() || blocked {
+            // A resolution that can never send (a zero budget) holds nothing a
+            // fresh one would not hold too, so it is replaced rather than waited on.
+            self.start_standstill_replay();
+        } else {
+            self.standstill_restart_pending = true;
+        }
+        self.drain_standstill_replay();
 
         // Reschedule standstill timer (reschedule after re-broadcast)
         self.reschedule_standstill();
@@ -2335,7 +2526,9 @@ impl ReceiverImpl {
 
     /// Set the range of slots for standstill vote re-broadcast
     ///
-    /// Sets `[begin, end)` range and removes votes outside this range.
+    /// Sets `[begin, end)` range and removes votes outside this range. A
+    /// resolution in progress keeps going and walks the new range (C++ reads
+    /// `tracked_slots_interval()` at every slot).
     /// Reference: C++ pool.cpp tracked_slots_interval() = [first_non_finalized, current_window_end)
     fn set_standstill_slots_impl(&mut self, begin: u32, end: u32) {
         if self.standstill_slot_begin == begin && self.standstill_slot_end == end {
@@ -2351,7 +2544,6 @@ impl ReceiverImpl {
 
         self.standstill_slot_begin = begin;
         self.standstill_slot_end = end;
-        self.standstill_replay_queue.clear();
 
         // Remove votes outside the range
         let old_count = self.our_votes.len();
@@ -2369,65 +2561,151 @@ impl ReceiverImpl {
     }
 
     // ------------------------------------------------------------------
-    // Replay queue
+    // Replay
     // ------------------------------------------------------------------
 
-    fn drain_standstill_replay_queue(&mut self) {
-        if self.standstill_replay_queue.is_empty() {
-            return;
-        }
-
-        if self.standstill_max_egress_bytes_per_s == 0 {
-            while let Some(item) = self.standstill_replay_queue.pop_front() {
-                self.send_standstill_replay_item(item);
-            }
-            return;
-        }
-
-        self.refill_standstill_egress_quota();
-
-        while let Some(front) = self.standstill_replay_queue.front() {
-            let cost = self.estimate_standstill_replay_item_cost(front) as f64;
-            if cost > 0.0 && self.standstill_egress_quota_bytes < cost {
-                break;
-            }
-            if cost > 0.0 {
-                self.standstill_egress_quota_bytes -= cost;
-            }
-            let item = self.standstill_replay_queue.pop_front().expect("queue front exists");
-            self.send_standstill_replay_item(item);
-        }
+    /// The standstill egress budget of this session, in bytes per second.
+    fn standstill_egress_rate(&self) -> f64 {
+        StandstillEgress::rate(
+            self.standstill_min_egress_bytes_per_s,
+            self.standstill_max_egress_bytes_per_s,
+            self.shard.prefix_len(),
+        )
     }
 
-    fn rebuild_standstill_replay_queue(&mut self, begin: u32, end: u32) -> (u32, u32, usize) {
-        let cert_payloads = self.collect_standstill_certificate_payloads(begin, end);
-        let cert_count = cert_payloads.len() as u32;
-        let votes_to_rebroadcast = self.collect_standstill_votes_for_replay(begin, end);
-        let vote_count = votes_to_rebroadcast.len() as u32;
-        let replaced_items = self.standstill_replay_queue.len();
+    /// What one replayed message costs against the budget: its size times the
+    /// validator count, this node included (C++ `validator_set.size()`).
+    fn standstill_message_cost(&self, item: &StandstillReplayItem) -> f64 {
+        let bytes = match item {
+            StandstillReplayItem::Vote(vote) => {
+                self.wire_profile.serialize(&vote.clone().into_boxed()).map_or(0, |b| b.len())
+            }
+            StandstillReplayItem::Certificate(bytes) => bytes.len(),
+        };
+        bytes as f64 * self.send_order.len() as f64
+    }
 
-        self.standstill_replay_queue.clear();
-        for bytes in cert_payloads {
-            self.standstill_replay_queue.push_back(StandstillReplayItem::Certificate(bytes));
-        }
-        for vote in votes_to_rebroadcast {
-            self.standstill_replay_queue.push_back(StandstillReplayItem::Vote(vote));
-        }
-        if replaced_items == 0 {
-            self.reset_standstill_egress_budget_for_replay();
-        }
+    fn start_standstill_replay(&mut self) {
+        let rate = self.standstill_egress_rate();
+        let last_final = self.last_final_cert.as_ref().map(|(slot, bytes)| {
+            let item = StandstillReplayItem::Certificate(bytes.clone());
+            let cost = self.standstill_message_cost(&item);
+            (*slot, item, cost)
+        });
+        log::warn!(
+            "SimplexReceiver {}: standstill resolution broadcast started",
+            self.session_id.to_hex_string()
+        );
+        self.standstill_replay = Some(StandstillReplay::new(
+            last_final,
+            self.standstill_slot_begin,
+            rate,
+            Instant::now(),
+        ));
+        self.standstill_replay_wake = None;
+        self.standstill_restart_pending = false;
+    }
 
-        self.standstill_certs_rebroadcast_counter.increment(cert_count as u64);
-        self.standstill_votes_rebroadcast_counter.increment(vote_count as u64);
+    /// One slot's replay messages, built from the state at its turn: its
+    /// certificates (notar, skip, final), then this node's votes no
+    /// certificate of the same kind covers (C++ `CertificateBundle::serialize_to`
+    /// and `VotesState::serialize_to`).
+    fn standstill_slot_messages(&self, slot: u32) -> Vec<(StandstillReplayItem, f64)> {
+        let mut items = Vec::new();
+        let bundle = self.standstill_certs.get(&slot);
+        if let Some(bundle) = bundle {
+            for bytes in [&bundle.notar, &bundle.skip, &bundle.final_].into_iter().flatten() {
+                items.push(StandstillReplayItem::Certificate(bytes.clone()));
+            }
+        }
+        let mut votes: Vec<&TlVote> = self
+            .our_votes
+            .iter()
+            .filter(|(vote_slot, vote)| {
+                *vote_slot == slot
+                    && match &vote.vote {
+                        UnsignedVote::Consensus_Simplex_NotarizeVote(_) => {
+                            bundle.is_none_or(|b| b.notar.is_none())
+                        }
+                        UnsignedVote::Consensus_Simplex_SkipVote(_) => {
+                            bundle.is_none_or(|b| b.skip.is_none())
+                        }
+                        UnsignedVote::Consensus_Simplex_FinalizeVote(_) => {
+                            bundle.is_none_or(|b| b.final_.is_none())
+                        }
+                    }
+            })
+            .map(|(_, vote)| vote)
+            .collect();
+        votes.sort_by_key(|vote| Self::standstill_vote_key(vote).kind);
+        items.extend(votes.into_iter().map(|vote| StandstillReplayItem::Vote(vote.clone())));
+        items
+            .into_iter()
+            .map(|item| {
+                let cost = self.standstill_message_cost(&item);
+                (item, cost)
+            })
+            .collect()
+    }
 
-        (cert_count, vote_count, replaced_items)
+    /// Send what the running resolution's budget allows now, and remember
+    /// when to come back for the rest.
+    fn drain_standstill_replay(&mut self) {
+        loop {
+            let Some(mut replay) = self.standstill_replay.take() else {
+                return;
+            };
+            let final_cert_slot = self.last_final_cert.as_ref().map(|(slot, _)| *slot);
+            let (begin, end) = (self.standstill_slot_begin, self.standstill_slot_end);
+            let step = replay.step(Instant::now(), final_cert_slot, begin, end, |slot| {
+                self.standstill_slot_messages(slot)
+            });
+            match step {
+                StandstillStep::Send(item) => {
+                    self.standstill_replay = Some(replay);
+                    self.standstill_replay_wake = None;
+                    self.send_standstill_replay_item(item);
+                }
+                StandstillStep::WaitUntil(at) => {
+                    self.standstill_replay = Some(replay);
+                    self.standstill_replay_wake = Some(at);
+                    return;
+                }
+                StandstillStep::Blocked => {
+                    // Kept, not sent, and not polled: nothing can change the
+                    // budget until a fresh resolution replaces this one.
+                    if !self.standstill_zero_budget_logged {
+                        self.standstill_zero_budget_logged = true;
+                        log::error!(
+                            "SimplexReceiver {}: standstill egress budget is zero; the \
+                             resolution is held without sending",
+                            self.session_id.to_hex_string()
+                        );
+                    }
+                    self.standstill_replay = Some(replay);
+                    self.standstill_replay_wake = None;
+                    return;
+                }
+                StandstillStep::Done => {
+                    log::warn!(
+                        "SimplexReceiver {}: standstill resolution broadcast stopped",
+                        self.session_id.to_hex_string()
+                    );
+                    self.standstill_replay_wake = None;
+                    if !self.standstill_restart_pending {
+                        return;
+                    }
+                    self.start_standstill_replay();
+                }
+            }
+        }
     }
 
     fn send_standstill_replay_item(&mut self, item: StandstillReplayItem) {
         match item {
             StandstillReplayItem::Vote(vote) => self.send_vote_impl(vote, true),
             StandstillReplayItem::Certificate(bytes) => {
-                self.send_serialized_certificate_to_all(bytes)
+                self.send_serialized_certificate_to_validators(bytes)
             }
         }
     }
@@ -2494,65 +2772,6 @@ impl ReceiverImpl {
             left_key.slot.cmp(&right_key.slot).then(left_key.kind.cmp(&right_key.kind))
         });
         votes
-    }
-
-    // ------------------------------------------------------------------
-    // Egress shaping
-    // ------------------------------------------------------------------
-
-    fn refill_standstill_egress_quota(&mut self) {
-        if self.standstill_max_egress_bytes_per_s == 0 {
-            self.standstill_egress_quota_bytes = f64::INFINITY;
-            self.standstill_egress_quota_time = SystemTime::now();
-            return;
-        }
-
-        let now = SystemTime::now();
-        if let Ok(elapsed) = now.duration_since(self.standstill_egress_quota_time) {
-            let max_bytes = self.standstill_max_egress_bytes_per_s as f64;
-            // Allow accumulation across multiple seconds; otherwise a replay item bigger
-            // than one-second budget could starve forever.
-            self.standstill_egress_quota_bytes += elapsed.as_secs_f64() * max_bytes;
-        }
-        self.standstill_egress_quota_time = now;
-    }
-
-    fn reset_standstill_egress_budget_for_replay(&mut self) {
-        if self.standstill_max_egress_bytes_per_s == 0 {
-            self.standstill_egress_quota_bytes = f64::INFINITY;
-            self.standstill_egress_quota_time = SystemTime::now();
-            return;
-        }
-
-        let now = SystemTime::now();
-        self.standstill_egress_quota_bytes = 0.0;
-        self.standstill_egress_quota_time =
-            now.checked_sub(Duration::from_millis(10)).unwrap_or(now);
-    }
-
-    fn estimate_standstill_replay_item_cost(&self, item: &StandstillReplayItem) -> u64 {
-        let recipient_count = self.standstill_cost_recipient_count();
-        if recipient_count == 0 {
-            return 0;
-        }
-        match item {
-            StandstillReplayItem::Vote(vote) => {
-                let serialized = self
-                    .wire_profile
-                    .serialize(&vote.clone().into_boxed())
-                    .expect("fixed wire carrier");
-                serialized.len() as u64 * recipient_count
-            }
-            StandstillReplayItem::Certificate(bytes) => bytes.len() as u64 * recipient_count,
-        }
-    }
-
-    fn standstill_send_recipient_count(&self) -> u64 {
-        self.send_order.iter().filter(|&&idx| Some(idx) != self.local_idx).count() as u64
-    }
-
-    fn standstill_cost_recipient_count(&self) -> u64 {
-        self.send_order.len() as u64
     }
 
     // ------------------------------------------------------------------
@@ -4591,9 +4810,14 @@ pub(crate) struct ReceiverSettings {
     /// Standstill alarm period - re-broadcasts cached votes/certs after this long
     /// without finalization progress.
     pub standstill_timeout: Duration,
-    /// Token-bucket cap on standstill replay egress, in bytes per second.
-    /// Set to 0 to disable shaping.
+    /// Standstill replay egress budget for the whole network, in bytes per
+    /// second; a shard session gets `max / 2^prefix_len` of it.
     pub standstill_max_egress_bytes_per_s: u32,
+    /// Floor of the standstill replay egress budget, in bytes per second
+    /// (ConfigParam30 key 16).
+    pub standstill_min_egress_bytes_per_s: u32,
+    /// Peers a newly obtained certificate is sent to (ConfigParam30 key 15).
+    pub certificate_gossip_neighbors: u32,
     /// Temporary peer ban after a bad vote/cert signature; mirrors C++
     /// `pool.cpp` `bad_signature_bans_`.
     pub bad_signature_ban_duration: Duration,
@@ -4629,6 +4853,8 @@ impl ReceiverSettings {
             proto_version: options.proto_version,
             standstill_timeout: options.standstill_timeout,
             standstill_max_egress_bytes_per_s: options.standstill_max_egress_bytes_per_s,
+            standstill_min_egress_bytes_per_s: options.standstill_min_egress_bytes_per_s,
+            certificate_gossip_neighbors: options.certificate_gossip_neighbors,
             bad_signature_ban_duration: options.bad_signature_ban_duration,
             slots_per_leader_window: options.slots_per_leader_window,
             max_leader_window_desync: options.max_leader_window_desync,
@@ -4965,6 +5191,8 @@ impl ReceiverWrapper {
             proto_version,
             standstill_timeout,
             standstill_max_egress_bytes_per_s,
+            standstill_min_egress_bytes_per_s,
+            certificate_gossip_neighbors,
             bad_signature_ban_duration,
             slots_per_leader_window,
             max_leader_window_desync,
@@ -5152,7 +5380,6 @@ impl ReceiverWrapper {
                     local_adnl_id: local_adnl_id.clone(),
                     local_idx,
                     membership,
-                    protocol,
                     listener: listener_clone,
                     sources,
                     adnl_to_idx,
@@ -5174,14 +5401,17 @@ impl ReceiverWrapper {
                     _activity_node: activity_node.clone(),
                     standstill_timeout,
                     standstill_max_egress_bytes_per_s,
+                    standstill_min_egress_bytes_per_s,
+                    certificate_gossip_neighbors,
                     standstill_alarm: None, // Armed by Receiver::start() when session becomes current
                     standstill_slot_begin: STANDSTILL_INITIAL_SLOT_BEGIN,
                     standstill_slot_end: STANDSTILL_INITIAL_SLOT_END,
                     our_votes: Vec::new(),
                     our_vote_keys: HashSet::new(),
-                    standstill_replay_queue: VecDeque::new(),
-                    standstill_egress_quota_bytes: 0.0,
-                    standstill_egress_quota_time: SystemTime::now(),
+                    standstill_replay: None,
+                    standstill_replay_wake: None,
+                    standstill_restart_pending: false,
+                    standstill_zero_budget_logged: false,
                     resolver_cache,
                     delayed_actions: Vec::new(),
                     pending_requests: HashMap::new(),
