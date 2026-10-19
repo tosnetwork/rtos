@@ -1114,7 +1114,10 @@ fn test_noncritical_params_defaults_match_cpp_enumeration() {
         (15, 20),
         (16, 1 << 17),
     ]);
-    assert_eq!(NoncriticalParams::default().to_raw_map(), expected);
+    assert_eq!(NoncriticalParams::default().to_full_map(), expected);
+    // Default keys 15 and 16 are not serialized, so default-built cells are unchanged.
+    let serialized = NoncriticalParams::default().to_raw_map();
+    assert_eq!(serialized.keys().copied().collect::<Vec<_>>(), (0u8..=14).collect::<Vec<_>>());
 }
 
 /// Build a raw simplex_config_v2#22 cell whose noncritical map holds only `params`.

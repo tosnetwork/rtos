@@ -44,10 +44,16 @@ pub fn config() -> ConfigParams {
             ..Default::default()
         }))
         .unwrap();
+    // The pinned fixture (config cell, governing session, signatures) was built with
+    // a 2400 ms target rate; keep it explicit rather than following the default.
+    let simplex = SimplexConfig {
+        noncritical_params: NoncriticalParams { target_rate_ms: 2400, ..Default::default() },
+        ..Default::default()
+    };
     config
         .set_config(ConfigParamEnum::ConfigParam30(NewConsensusConfigAll {
-            mc: Some(SimplexConfig::default()),
-            shard: Some(SimplexConfig::default()),
+            mc: Some(simplex.clone()),
+            shard: Some(simplex),
         }))
         .unwrap();
     config

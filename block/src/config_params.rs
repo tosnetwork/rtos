@@ -4040,9 +4040,22 @@ impl NoncriticalParams {
         p
     }
 
-    /// Convert all fields to a raw hashmap for on-chain v2 serialization.
+    /// Every C++ noncritical parameter as (key, value), all seventeen keys.
+    pub fn to_full_map(&self) -> BTreeMap<u8, u32> {
+        let mut map = self.to_raw_map();
+        map.insert(15, self.certificate_gossip_neighbors);
+        map.insert(16, self.standstill_min_egress_bytes_per_s);
+        map
+    }
+
+    /// Raw hashmap for on-chain v2 serialization. Keys 0..=14 are always written;
+    /// keys 15 and 16 only when they differ from the C++ default, which a reader
+    /// assumes for an absent key, so a configuration that leaves them at their
+    /// defaults keeps the cell (and the session identity derived from it) that it
+    /// had before these keys were read.
     pub fn to_raw_map(&self) -> BTreeMap<u8, u32> {
-        BTreeMap::from([
+        let defaults = Self::default();
+        let mut map = BTreeMap::from([
             (0, self.target_rate_ms),
             (1, self.first_block_timeout_ms),
             (2, self.first_block_timeout_multiplier_bits),
@@ -4058,9 +4071,14 @@ impl NoncriticalParams {
             (12, self.candidate_resolve_rate_limit),
             (13, self.min_block_interval_ms),
             (14, self.no_empty_blocks_on_error_timeout_ms),
-            (15, self.certificate_gossip_neighbors),
-            (16, self.standstill_min_egress_bytes_per_s),
-        ])
+        ]);
+        if self.certificate_gossip_neighbors != defaults.certificate_gossip_neighbors {
+            map.insert(15, self.certificate_gossip_neighbors);
+        }
+        if self.standstill_min_egress_bytes_per_s != defaults.standstill_min_egress_bytes_per_s {
+            map.insert(16, self.standstill_min_egress_bytes_per_s);
+        }
+        map
     }
 }
 
