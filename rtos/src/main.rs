@@ -9,6 +9,7 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+mod auth_admission;
 mod block;
 mod block_proof;
 mod boot;
