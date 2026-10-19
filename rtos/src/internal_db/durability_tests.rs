@@ -98,14 +98,17 @@ async fn archive_gc_waits_for_durable_authority_before_deleting() -> Result<()> 
     db.save_full_node_state(ARCHIVES_GC_BLOCK, &mc(40))?;
     let gc_db = db.clone();
     let mut gc = tokio::spawn(async move { gc_db.archive_gc(&mc(30)).await });
-    let finished_while_held =
-        tokio::time::timeout(std::time::Duration::from_millis(500), &mut gc).await.is_ok();
+    let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut gc).await;
+    let finished_while_held = early.is_ok();
     let stored = |key: &str| -> Result<bool> {
         Ok(db.full_node_state_db.try_get_raw(key.as_bytes())?.is_some())
     };
     let authority_while_held = stored(LAST_UNNEEDED_KEY_BLOCK)?;
     held.release.notify_one();
-    gc.await.map_err(|e| error!("{e}"))??;
+    match early {
+        Ok(joined) => joined.map_err(|e| error!("{e}"))??,
+        Err(_) => gc.await.map_err(|e| error!("{e}"))??,
+    }
     assert!(!finished_while_held, "archive GC ran while earlier pointers were not durable");
     assert!(!authority_while_held);
     assert!(stored(ARCHIVES_GC_BLOCK)? && stored(LAST_UNNEEDED_KEY_BLOCK)?);
