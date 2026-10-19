@@ -6,7 +6,7 @@
  */
 
 //! Constructor domains are part of the protocol, including nested boxed fields.
-//! The target profile is pinned to reference 8f083dc06bff16705710a01de15eb3123d5d696b.
+//! The target profile is pinned to reference 881240331ee48a291b96d73f8b8b93bae005ace0.
 //! This codec translates only constructor boundaries, never opaque byte strings.
 //! Local storage formats keep their explicit legacy codec; selecting a network
 //! profile does not rename databases or open a new signing journal.
@@ -176,9 +176,6 @@ const UNSUPPORTED: &[u32] = &[
     0xc8aee82e, 0x127ce464, // consensus.stats.sessionEnd
     0x7f9bc9b3, // consensus.stats.sessionOptions
     0xf937fdce, // consensus.stats.validationFailed
-    0x7f99e3b8, // tosNode.downloadPersistentState
-    0xf5e9e6e3, // tosNode.downloadPersistentStateSlice
-    0x4667fc2d, // tosNode.getPersistentStateSize
 ];
 
 impl WireProfile {

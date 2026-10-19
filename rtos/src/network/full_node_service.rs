@@ -25,11 +25,10 @@ use rtos_api::{
         rpc::ton_node::{
             DownloadBlock, DownloadBlockFull, DownloadBlockProof, DownloadBlockProofLink,
             DownloadKeyBlockProof, DownloadKeyBlockProofLink, DownloadNextBlockFull,
-            DownloadPersistentState, DownloadPersistentStateSlice, DownloadPersistentStateSliceV2,
-            DownloadZeroState, GetArchiveInfo, GetArchiveSlice, GetCapabilities,
-            GetNextBlockDescription, GetNextKeyBlockIds, GetPersistentStateSize,
-            GetPersistentStateSizeV2, GetShardArchiveInfo, PrepareBlock, PrepareBlockProof,
-            PrepareKeyBlockProof, PreparePersistentState, PrepareZeroState,
+            DownloadPersistentStateSliceV2, DownloadZeroState, GetArchiveInfo, GetArchiveSlice,
+            GetCapabilities, GetNextBlockDescription, GetNextKeyBlockIds, GetPersistentStateSizeV2,
+            GetShardArchiveInfo, PrepareBlock, PrepareBlockProof, PrepareKeyBlockProof,
+            PreparePersistentState, PrepareZeroState,
         },
         ton_node::{
             self,
@@ -401,49 +400,6 @@ impl FullNodeOverlayService {
     // tonNode.downloadBlocks blocks:(vector tonNode.blockIdExt) = tonNode.DataList;
     // Not supported in t-node
 
-    // tonNode.downloadPersistentState block:tonNode.blockIdExt masterchain_block:tonNode.blockIdExt = tonNode.Data;
-    async fn download_persistent_state(
-        &self,
-        query: DownloadPersistentState,
-    ) -> Result<TaggedByteVec> {
-        // This request is never called in t-node, because new downloadPersistentStateSlice exists.
-        // Because of state is pretty big it is bad idea to send it by one request.
-        fail!(
-            "`tonNode.downloadPersistentState` request is not supported (block: {}, mc block: {})",
-            query.block,
-            query.masterchain_block
-        );
-    }
-
-    // tonNode.downloadPersistentStateSlice block:tonNode.blockIdExt masterchain_block:tonNode.blockIdExt offset:long max_size:long = tonNode.Data;
-    async fn download_persistent_state_slice(
-        &self,
-        query: DownloadPersistentStateSlice,
-    ) -> Result<TaggedByteVec> {
-        if query.max_size as usize > PART_MAX_SIZE {
-            fail!("Part size {} is too big, max is {}", query.max_size, PART_MAX_SIZE);
-        }
-        if let Some(handle) = self.engine.load_block_handle(&query.block)? {
-            if handle.has_persistent_state() {
-                let data = self
-                    .engine
-                    .load_persistent_state_slice(
-                        &PersistentStatePartId::WholeState(handle.id().clone()),
-                        query.offset as u64,
-                        query.max_size as u64,
-                    )
-                    .await?;
-                let answer = TaggedByteVec {
-                    object: data,
-                    #[cfg(feature = "telemetry")]
-                    tag: 0x8000000B, // Raw reply to download state slice
-                };
-                return Ok(answer);
-            }
-        }
-        fail!("Persistent state for block {} is not exist", query.block)
-    }
-
     async fn download_persistent_state_slice_v2(
         &self,
         query: DownloadPersistentStateSliceV2,
@@ -494,11 +450,6 @@ impl FullNodeOverlayService {
             }
         }
         fail!("Zero state {} is not inited", query.block)
-    }
-
-    async fn get_persistent_state_size(&self, query: GetPersistentStateSize) -> Result<TLObject> {
-        self.get_persistent_state_size_internal(PersistentStatePartId::WholeState(query.block))
-            .await
     }
 
     fn convert_pss_id(id: &PersistentStateIdV2) -> PersistentStatePartId {
@@ -563,13 +514,6 @@ impl FullNodeOverlayService {
             max_size: PART_MAX_SIZE as i64,
         };
         let answer = self.download_persistent_state_slice_v2(query).await?;
-        if id.is_whole_state() {
-            let old = self.download_persistent_state_slice(DownloadPersistentStateSlice {
-                block: id.block_id().clone(), masterchain_block: id.block_id().clone(),
-                offset: 0, max_size: PART_MAX_SIZE as i64,
-            }).await?;
-            if old.object != answer.object { fail!("v1/v2 persistent slice mismatch"); }
-        }
         Ok(answer.object)
     }
 
@@ -941,28 +885,6 @@ impl Subscriber for FullNodeOverlayService {
             };
 
         let query = match self
-            .consume_query_raw::<DownloadPersistentState, _>(
-                query,
-                &Self::download_persistent_state,
-            )
-            .await?
-        {
-            Ok(answer) => return Ok(answer),
-            Err(query) => query,
-        };
-
-        let query = match self
-            .consume_query_raw::<DownloadPersistentStateSlice, _>(
-                query,
-                &Self::download_persistent_state_slice,
-            )
-            .await?
-        {
-            Ok(answer) => return Ok(answer),
-            Err(query) => query,
-        };
-
-        let query = match self
             .consume_query_raw::<DownloadZeroState, _>(query, &Self::download_zero_state)
             .await?
         {
@@ -1026,14 +948,6 @@ impl Subscriber for FullNodeOverlayService {
             };
 
         let query = match self
-            .consume_query::<GetPersistentStateSize, _>(query, &Self::get_persistent_state_size)
-            .await?
-        {
-            Ok(answer) => return Ok(answer),
-            Err(query) => query,
-        };
-
-        let query = match self
             .consume_query_raw::<DownloadPersistentStateSliceV2, _>(
                 query,
                 &Self::download_persistent_state_slice_v2,
@@ -1067,3 +981,7 @@ impl Subscriber for FullNodeOverlayService {
         fail!("Unsupported full node query {:?}", query);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_full_node_protocol.rs"]
+mod tests;
