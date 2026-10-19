@@ -142,6 +142,8 @@ pub(crate) struct BroadcastRecvContext<'a> {
 }
 
 pub(crate) struct BroadcastSendContext<'a> {
+    // Source certificate attached to every carrier and part
+    pub(crate) certificate: OverlayCertificate,
     pub(crate) data: &'a TaggedByteSlice<'a>,
     pub(crate) flags: u32,
     pub(crate) overlay: &'a Arc<Overlay>,
@@ -263,6 +265,7 @@ impl RecvTransferFecTelemetry {
 declare_counted!(
     struct SendTransferFec {
         bcast_id: BroadcastId,
+        certificate: OverlayCertificate,
         data_hash: [u8; 32],
         date: i32,
         encoder: RaptorqEncoder,
@@ -1555,6 +1558,7 @@ impl BroadcastProtocol<BroadcastFec> for BroadcastFecProtocol {
         };
         let mut transfer = SendTransferFec {
             bcast_id: *bcast_id,
+            certificate: ctx.certificate.clone(),
             data_hash: sha256_digest(ctx.data.object),
             date,
             encoder,
@@ -1600,7 +1604,6 @@ impl BroadcastProtocol<BroadcastFec> for BroadcastFecProtocol {
         });
         let bcast_id = *bcast_id;
         let bcast_type = Self::broadcast_type();
-        #[cfg(feature = "xp25")]
         let flags = ctx.flags;
         let hops = neighbours.hops;
         let neighbours_count = neighbours.expected_count;
@@ -1635,7 +1638,10 @@ impl BroadcastProtocol<BroadcastFec> for BroadcastFecProtocol {
                         overlay.overlay_id
                     );
                 }
-                neighbours = overlay.select_broadcast_neighbours(neighbours_count, None);
+                // FixedNeighbours sends every part to one neighbour set.
+                if (flags & BROADCAST_FLAG_FIXED_NEIGHBOURS) == 0 {
+                    neighbours = overlay.select_broadcast_neighbours(neighbours_count, None);
+                }
             }
             // Graceful close
             reader.close();
@@ -1664,7 +1670,7 @@ impl FecProtocol<BroadcastFec> for BroadcastFecProtocol {
     ) -> Result<Broadcast> {
         Ok(BroadcastFec {
             src: (&transfer.src_key).try_into()?,
-            certificate: OverlayCertificate::Overlay_EmptyCertificate,
+            certificate: transfer.certificate.clone(),
             data_hash: UInt256::with_array(transfer.data_hash),
             data_size: transfer.encoder.params().data_size,
             flags: transfer.flags as i32,
@@ -1732,7 +1738,7 @@ impl BroadcastSimpleProtocol {
         let signature = ctx.src_key.sign(&to_sign)?;
         Ok(BroadcastSimple {
             src: ctx.src_key.try_into()?,
-            certificate: OverlayCertificate::Overlay_EmptyCertificate,
+            certificate: ctx.certificate.clone(),
             flags: ctx.flags as i32,
             data: ctx.data.object.to_vec(),
             date,
@@ -2327,6 +2333,7 @@ impl BroadcastProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
         }
         let mut transfer = SendTransferFec {
             bcast_id: *bcast_id,
+            certificate: ctx.certificate.clone(),
             data_hash: sha256_digest(ctx.data.object),
             date,
             encoder: RaptorqEncoder::with_data(ctx.data.object, Some(send_ctx.part_size as u32)),
@@ -2414,7 +2421,7 @@ impl FecProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
             flags: transfer.flags as i32,
             src: (&transfer.src_key).try_into()?,
             src_adnl_id: UInt256::from_slice(transfer.src_adnl_key_id.data()),
-            certificate: OverlayCertificate::Overlay_EmptyCertificate,
+            certificate: transfer.certificate.clone(),
             data_hash: UInt256::with_array(transfer.data_hash),
             data_size: transfer.encoder.params().data_size as i32,
             seqno: transfer.seqno as i32,
@@ -2680,7 +2687,7 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
                 flags: ctx.flags as i32,
                 src: ctx.src_key.try_into()?,
                 src_adnl_id: UInt256::from_slice(ctx.src_adnl_key_id.data()),
-                certificate: OverlayCertificate::Overlay_EmptyCertificate,
+                certificate: ctx.certificate.clone(),
                 data,
                 extra: self.extra.take().unwrap_or_default(),
                 signature,
@@ -2697,3 +2704,7 @@ mod date_tests;
 #[cfg(test)]
 #[path = "broadcast_privacy_tests.rs"]
 mod privacy_tests;
+
+#[cfg(test)]
+#[path = "broadcast_send_tests.rs"]
+mod send_tests;

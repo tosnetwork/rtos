@@ -585,6 +585,8 @@ declare_counted!(
         // Explicit privacy rules of a public overlay; none keeps the overlay
         // without source authorization
         public_policy: Option<privacy::PublicBroadcastPolicy>,
+        // Certificates attached to broadcasts sent with each local source key
+        certificates: std::sync::RwLock<HashMap<Arc<KeyId>, OverlayCertificate>>,
         // Peers waiting for ADNL address resolution before being added to known_peers
         pending_peers: lockfree::queue::Queue<Arc<KeyId>>,
         purge_broadcasts: lockfree::queue::Queue<BroadcastId>,
@@ -668,6 +670,49 @@ impl Overlay {
 
     pub(crate) fn has_public_policy(&self) -> bool {
         self.public_policy.is_some()
+    }
+
+    /// Certificate this overlay attaches to broadcasts sent as `source`.
+    pub(crate) fn local_certificate(&self, source: &Arc<KeyId>) -> Option<OverlayCertificate> {
+        self.certificates.read().ok().and_then(|certs| certs.get(source).cloned())
+    }
+
+    /// Sender admission of an ordinary broadcast: `Forbidden` is refused,
+    /// `NeedCheck` must pass the application check on the local payload.
+    async fn admit_ordinary_send(
+        &self,
+        source: &Arc<dyn KeyOption>,
+        certificate: Option<&OverlayCertificate>,
+        data: &[u8],
+        is_fec: bool,
+        is_any_sender: bool,
+    ) -> Result<()> {
+        let Some(policy) = &self.public_policy else {
+            return Ok(());
+        };
+        let size = u32::try_from(data.len()).map_err(|_| error!("Broadcast is too large"))?;
+        let verdict = self.verifier.check_source_eligible(
+            &policy.rules(),
+            false,
+            self.overlay_id.data(),
+            source.id().data(),
+            certificate,
+            size,
+            is_fec,
+            is_any_sender,
+            None,
+        );
+        match verdict {
+            BroadcastCheckResult::Allowed => Ok(()),
+            BroadcastCheckResult::NeedCheck => policy.check(source.id(), data).await,
+            BroadcastCheckResult::Forbidden => {
+                fail!(
+                    "Broadcast source {} is forbidden in overlay {}",
+                    source.id(),
+                    self.overlay_id
+                )
+            }
+        }
     }
 
     /// Application approval of a `NeedCheck` broadcast; refused when the
@@ -1762,6 +1807,24 @@ impl OverlayNode {
         policy.set_rules(rules)
     }
 
+    /// Install, replace or (with `None`) remove the certificate attached to
+    /// broadcasts this node sends in one overlay as the source `key`.
+    pub fn update_certificate(
+        &self,
+        overlay_id: &Arc<OverlayShortId>,
+        key: &Arc<KeyId>,
+        certificate: Option<OverlayCertificate>,
+    ) -> Result<()> {
+        let overlay = self.get_overlay(overlay_id, "Updating certificate of unknown overlay")?;
+        let mut certificates =
+            overlay.certificates.write().map_err(|_| error!("Certificate store lock poisoned"))?;
+        match certificate {
+            Some(certificate) => certificates.insert(key.clone(), certificate),
+            None => certificates.remove(key),
+        };
+        Ok(())
+    }
+
     /// Install (or remove) the application check of a public overlay.
     pub fn set_public_broadcast_check(
         &self,
@@ -1964,24 +2027,40 @@ impl OverlayNode {
         log::trace!(target: TARGET, "Broadcast {} bytes", data.object.len());
         let overlay = self.get_overlay(overlay_id, "Trying broadcast to unknown overlay")?;
         let _lease = overlay.tasks.enter()?;
+        let src_key = self.calc_src_key_for_broadcast(&overlay, src_key);
+        let certificate = overlay.local_certificate(src_key.id());
         let mut ctx = BroadcastSendContext {
+            certificate: certificate
+                .as_ref()
+                .map_or(OverlayCertificateTl::Overlay_EmptyCertificate, |cert| cert.to_tl()),
             data,
             flags,
             overlay: &overlay,
-            src_key: self.calc_src_key_for_broadcast(&overlay, src_key),
+            src_key,
             src_adnl_key_id: overlay.overlay_key().unwrap_or(&self.node_key).id(),
         };
         // Outgoing broadcast auth (C++ `OverlayPrivacyRules`, all paths).
         if let OverlayType::Private { bcast_check: Some(check), .. } = &overlay.overlay_type {
             check.on_send(ctx.src_key.id(), data.object.len())?;
         }
-        if let AdnlSendMethod::Fast = &method {
-            if data.object.len() > Self::MAX_SIZE_ORDINARY_BROADCAST {
-                return BroadcastFecProtocol::for_send(&ctx).send(ctx).await;
-            }
+        let is_fec = matches!(&method, AdnlSendMethod::Fast)
+            && data.object.len() > Self::MAX_SIZE_ORDINARY_BROADCAST;
+        if !is_fec {
+            // Ignore ANY_SENDER flag for non-FEC broadcasts
+            ctx.flags &= !Self::FLAG_BCAST_ANY_SENDER;
         }
-        // Ignore ANY_SENDER flag for non-FEC broadcasts
-        ctx.flags &= !Self::FLAG_BCAST_ANY_SENDER;
+        overlay
+            .admit_ordinary_send(
+                ctx.src_key,
+                certificate.as_ref(),
+                data.object,
+                is_fec,
+                (ctx.flags & Self::FLAG_BCAST_ANY_SENDER) != 0,
+            )
+            .await?;
+        if is_fec {
+            return BroadcastFecProtocol::for_send(&ctx).send(ctx).await;
+        }
         match method {
             AdnlSendMethod::Fast => BroadcastSimpleProtocol.send(ctx).await,
             AdnlSendMethod::Safe => BroadcastStreamSimpleProtocol.send(ctx).await,
@@ -2001,11 +2080,15 @@ impl OverlayNode {
         let overlay =
             self.get_overlay(overlay_id, "Trying two-step broadcast to unknown overlay")?;
         let _lease = overlay.tasks.enter()?;
+        let src_key = self.calc_src_key_for_broadcast(&overlay, src_key);
         let ctx = BroadcastSendContext {
+            certificate: overlay
+                .local_certificate(src_key.id())
+                .map_or(OverlayCertificateTl::Overlay_EmptyCertificate, |cert| cert.to_tl()),
             data,
             flags,
             overlay: &overlay,
-            src_key: self.calc_src_key_for_broadcast(&overlay, src_key),
+            src_key,
             src_adnl_key_id: overlay.overlay_key().unwrap_or(&self.node_key).id(),
         };
         // Outgoing broadcast auth (C++ `OverlayPrivacyRules`).
@@ -2552,6 +2635,7 @@ impl OverlayNode {
             plumtree: OnceLock::new(),
             verifier: Arc::new(privacy::BroadcastVerifier::default()),
             public_policy: public_rules.map(privacy::PublicBroadcastPolicy::new),
+            certificates: std::sync::RwLock::new(HashMap::new()),
             pending_peers: lockfree::queue::Queue::new(),
             purge_broadcasts: lockfree::queue::Queue::new(),
             purge_broadcasts_count: AtomicU32::new(0),
