@@ -251,7 +251,6 @@ fn get_workchain_desc() -> WorkchainDescr {
     wc.enabled_since = 332;
     wc.accept_msgs = true;
     wc.active = false;
-    wc.flags = 0x345;
     wc.version = 1;
     wc.zerostate_file_hash = UInt256::rand();
     wc.zerostate_root_hash = UInt256::rand();
@@ -628,6 +627,37 @@ fn test_config_params() {
     serialize_config(&mut json, &cp, SerializationMode::Debug).unwrap();
     let parsed_config = parse_config(json.get("config").unwrap().as_object().unwrap()).unwrap();
     check_params(&cp, &parsed_config);
+}
+
+// Reserved descriptor flags violate the schema constraint { flags = 0 }: the
+// typed reader refuses them, and so does a configuration read from JSON.
+#[test]
+fn test_workchain_reserved_flags_are_refused() {
+    let refused = |cp: &ConfigParams| match cp.config(12) {
+        Ok(Some(ConfigParamEnum::ConfigParam12(p))) => p.workchains.get(&0).is_err(),
+        Ok(_) => false,
+        Err(_) => true,
+    };
+    let mut wc = get_workchain_desc();
+    wc.flags = 0x345;
+    let mut cp12 = ConfigParam12::new();
+    cp12.insert(0, &wc).unwrap();
+    let mut cp = ConfigParams::default();
+    cp.set_config(ConfigParamEnum::ConfigParam12(cp12)).unwrap();
+    assert!(refused(&cp));
+
+    let mut valid = ConfigParams::default();
+    let mut cp12 = ConfigParam12::new();
+    cp12.insert(0, &get_workchain_desc()).unwrap();
+    valid.set_config(ConfigParamEnum::ConfigParam12(cp12)).unwrap();
+    assert!(!refused(&valid));
+    let mut json = serde_json::Map::<String, Value>::new();
+    serialize_config(&mut json, &valid, SerializationMode::QServer).unwrap();
+    let mut config = json.get("config").unwrap().as_object().unwrap().clone();
+    let p12 = config.get_mut("p12").unwrap().as_array_mut().unwrap();
+    p12[0].as_object_mut().unwrap().insert("flags".to_string(), 0x345.into());
+    let parsed = parse_config(&config);
+    assert!(parsed.map_or(true, |cp| refused(&cp)));
 }
 
 #[test]

@@ -21,7 +21,7 @@ use crate::{
         ChildCell, Coins, ExtraCurrencyCollection, Number12, Number13, Number16, Number32, Number8,
     },
     validators::{ValidatorDescr, ValidatorSet},
-    AccountId, BlockError, BuilderData, Cell, Deserializable, EmptyValue, HashmapE,
+    AccountId, BlockError, BuilderData, Cell, CellType, Deserializable, EmptyValue, HashmapE,
     HashmapIterator, HashmapType, IBitstring, MsgAddressInt, Result, Serializable, SliceData,
     UInt256, BASE_WORKCHAIN_ID, MAX_SPLIT_DEPTH,
 };
@@ -500,70 +500,140 @@ impl ConfigParams {
     }
 }
 
-const MANDATORY_CONFIG_PARAMS: [u32; 9] = [18, 20, 21, 22, 23, 24, 25, 28, 34];
+const MANDATORY_CONFIG_PARAMS: [i32; 9] = [18, 20, 21, 22, 23, 24, 25, 28, 34];
+
+#[path = "config_param_schema.rs"]
+pub mod config_param_schema;
+
+fn config_entry_is_valid(
+    index: i32,
+    cell: &Cell,
+    config_addr: &AccountId,
+    relax_par0: bool,
+) -> bool {
+    match u32::try_from(index) {
+        Ok(0) => {
+            if cell.cell_type() != CellType::Ordinary
+                || cell.bit_length() != 256
+                || cell.references_count() != 0
+            {
+                return false;
+            }
+            relax_par0
+                || SliceData::load_cell(cell.clone())
+                    .is_ok_and(|address| address.compare_bitstrings(config_addr).is_eq())
+        }
+        Ok(index) => config_param_schema::config_param_is_valid(index, cell.clone()),
+        Err(_) => true,
+    }
+}
+
+/// A mandatory-parameter list is a `Hashmap 32` with empty leaves under
+/// signed keys; an absent list requires nothing.
+fn mandatory_params_present(present: &std::collections::BTreeSet<i32>, root: Option<Cell>) -> bool {
+    let Some(root) = root else {
+        return true;
+    };
+    let Some(leaves) = config_param_schema::dictionary_leaves(root, 32) else {
+        log::error!(target: "block", "invalid mandatory parameters dictionary");
+        return false;
+    };
+    for (key, value) in leaves {
+        if !value.is_empty_cell() {
+            log::error!(target: "block", "invalid mandatory parameters dictionary");
+            return false;
+        }
+        let index = signed_key(key);
+        if !present.contains(&index) {
+            log::error!(
+                target: "block",
+                "configuration parameter #{index} (declared as mandatory) is missing"
+            );
+            return false;
+        }
+    }
+    true
+}
+
+/// Reads a 32-bit dictionary key as the signed integer it encodes.
+fn signed_key(key: u64) -> i32 {
+    i32::from_be_bytes((key as u32).to_be_bytes())
+}
 
 impl ConfigParams {
+    /// Checks a configuration as a block validator does before accepting it:
+    /// the AUTH rules, then every dictionary entry (exactly one reference and
+    /// no data; parameter 0 is exactly the 256-bit configuration address
+    /// unless `relax_par0`; negative indices are not checked further; every
+    /// positive index must be a schema parameter whose value passes the
+    /// schema check), then the hardcoded mandatory parameters, the list in
+    /// parameter 9 and the list in `mparams` (the previous parameter 9).
+    /// Malformed input yields `Ok(false)`, never an error.
     pub fn valid_config_data(
         &self,
         relax_par0: bool,
         mparams: Option<MandatoryParams>,
     ) -> Result<bool> {
+        Ok(self.config_data_is_valid(relax_par0, mparams.as_ref().and_then(|m| m.root().cloned())))
+    }
+
+    /// As [`Self::valid_config_data`], with the previous mandatory-parameter
+    /// list given as its raw dictionary root.
+    pub fn config_data_is_valid(&self, relax_par0: bool, old_mparams: Option<Cell>) -> bool {
+        let Some(root) = self.root().cloned() else {
+            return false;
+        };
         if let Err(error) = self.validate_auth_policy_config() {
             log::warn!(target: "block", "invalid AUTH configuration: {error}");
-            return Ok(false);
+            return false;
         }
-        if self.validate_workchain_descriptor_config().is_err() {
-            return Ok(false);
-        }
-        if !relax_par0 {
-            match self.config(0) {
-                Ok(Some(ConfigParamEnum::ConfigParam0(param))) => {
-                    if param.config_addr != self.config_addr {
-                        log::warn!(
-                            target: "block",
-                            "config address is not set in config parameters root {}",
-                            param.config_addr
-                        );
-                        return Ok(false);
-                    }
-                }
-                _ => return Ok(false),
-            }
-        }
-        // porting from Durov's code
-        // previously was not 9 parameter in config params
-        for index in &MANDATORY_CONFIG_PARAMS {
-            if self.config(*index)?.is_none() {
-                log::error!(target: "block", "configuration parameter #{} \
-                    (hardcoded as mandatory) is missing)", index);
-                return Ok(false);
-            }
-        }
-        let result = match self.config(9) {
-            Ok(Some(ConfigParamEnum::ConfigParam9(param))) => {
-                self.config_params_present(Some(param.mandatory_params))?
-            }
-            _ => {
-                log::error!(target: "block", "invalid mandatory parameters dictionary while checking \
-                    existence of all mandatory configuration parameters");
-                false
-            }
+        let Some(leaves) = config_param_schema::dictionary_leaves(root, 32) else {
+            log::warn!(target: "block", "malformed configuration dictionary");
+            return false;
         };
-        Ok(result && self.config_params_present(mparams)?)
-    }
-    fn config_params_present(&self, params: Option<MandatoryParams>) -> Result<bool> {
-        match params {
-            Some(params) => params.iterate_keys(|index: u32| match self.config(index) {
-                Ok(Some(_)) => Ok(true),
-                _ => {
-                    log::error!(target: "block", "configuration parameter #{} \
-                        (declared as mandatory in configuration parameter #9) is missing)", index);
-                    Ok(false)
-                }
-            }),
-            None => Ok(true),
+        let mut present = std::collections::BTreeSet::new();
+        let mut param9 = None;
+        for (key, value) in leaves {
+            if value.remaining_bits() != 0 || value.remaining_references() != 1 {
+                return false;
+            }
+            let Ok(cell) = value.reference(0) else {
+                return false;
+            };
+            let index = signed_key(key);
+            if !config_entry_is_valid(index, &cell, &self.config_addr, relax_par0) {
+                log::error!(target: "block", "configuration parameter #{index} is invalid");
+                return false;
+            }
+            if index == 9 {
+                param9 = Some(cell);
+            }
+            present.insert(index);
         }
+        for index in MANDATORY_CONFIG_PARAMS {
+            if !present.contains(&index) {
+                log::error!(target: "block", "mandatory configuration parameter #{index} is missing");
+                return false;
+            }
+        }
+        mandatory_params_present(&present, param9)
+            && mandatory_params_present(&present, old_mparams)
     }
+
+    /// The raw root of the mandatory-parameter list in parameter 9, if present.
+    pub fn mandatory_params_root(&self) -> Result<Option<Cell>> {
+        Ok(self
+            .config_params
+            .get(9u32.write_to_bitstring()?)?
+            .and_then(|value| value.reference_opt(0)))
+    }
+
+    /// Checks the `config:^(Hashmap 32 ^Cell)` field of `ConfigParams` within
+    /// the shape budget, without visiting the parameter values.
+    pub fn config_params_shape_is_valid(&self) -> bool {
+        self.root().cloned().is_some_and(config_param_schema::config_dictionary_shape_is_valid)
+    }
+
     // when these parameters change, the block must be marked as a key block
     pub fn important_config_parameters_changed(
         &self,

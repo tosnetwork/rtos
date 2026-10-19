@@ -1609,3 +1609,6 @@ fn size_limits_cpp_cell_hashes() {
     }
     assert_eq!(count, 14);
 }
+
+#[path = "test_config_param_schema.rs"]
+mod schema_corpus;
