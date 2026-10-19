@@ -1784,7 +1784,8 @@ impl OverlayNode {
         params: OverlayParams,
         rules: OverlayPrivacyRules,
     ) -> Result<bool> {
-        let _generation = self.generations.lock().unwrap();
+        let _generation =
+            self.generations.lock().map_err(|_| error!("Overlay generation lock poisoned"))?;
         let overlay_id = params.overlay_id.clone();
         let added = self.add_overlay_locked(OverlayType::Public, params, Some(rules.clone()))?;
         if !added {

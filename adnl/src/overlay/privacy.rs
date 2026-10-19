@@ -187,7 +187,7 @@ impl OverlayCertificate {
                 issued_by: self.issuer.clone(),
                 expire_at: self.expire_at,
                 max_size: self.max_size as i32,
-                signature: self.signature.clone().into(),
+                signature: self.signature.clone(),
             }
             .into_boxed()
         } else {
@@ -196,7 +196,7 @@ impl OverlayCertificate {
                 expire_at: self.expire_at,
                 max_size: self.max_size as i32,
                 flags: self.flags as i32,
-                signature: self.signature.clone().into(),
+                signature: self.signature.clone(),
             }
             .into_boxed()
         }

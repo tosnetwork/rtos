@@ -101,6 +101,12 @@ pub struct ShardOverlayCertificates {
     state: Mutex<State>,
 }
 
+impl Default for ShardOverlayCertificates {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ShardOverlayCertificates {
     pub fn new() -> Self {
         Self {
