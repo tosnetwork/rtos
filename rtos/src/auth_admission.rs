@@ -51,6 +51,20 @@ fn with_config<T>(
     f(state.config_params())
 }
 
+/// Admit an authenticated configuration with no trusted predecessor before it
+/// is published (for example as overlay authority during cold boot).
+pub(crate) fn admit_auth_policy_config(
+    context: &str,
+    id: &rtos_block::BlockIdExt,
+    config: &ConfigParams,
+) -> Result<()> {
+    #[cfg(test)]
+    let overridden = test_override::get(id);
+    #[cfg(test)]
+    let config = overridden.as_ref().unwrap_or(config);
+    validate_auth_policy_admission(Ok(config), None).map_err(|error| refusal(context, id, error))
+}
+
 fn refusal(
     context: &str,
     id: &rtos_block::BlockIdExt,

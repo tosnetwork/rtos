@@ -1990,9 +1990,18 @@ impl Engine {
         .await?;
 
         log::debug!("After applying block... {}", block.id());
+        // The crafted block is adopted like any next masterchain block: admitted
+        // against the (truncated) published head before anything is marked.
+        let _publication = self.mc_head_publication.lock().await;
+        if handle.is_applied() {
+            return Ok(());
+        }
+        let advances_head = self.admit_next_mc_block(block).await?;
         let gen_utime = block.gen_utime()?;
         let ago = UnixTime::now() as i32 - gen_utime as i32;
-        self.save_last_applied_mc_block_id(block.id())?;
+        if advances_head {
+            self.save_last_applied_mc_block_id(block.id())?;
+        }
         self.last_applied_mc_block_utime.store(gen_utime, Ordering::Relaxed);
         metrics::gauge!("rtos_node_engine_last_mc_block_seqno").set(block.id().seq_no() as f64);
         metrics::gauge!("rtos_node_engine_timediff_seconds").set(ago as f64);
@@ -3017,6 +3026,9 @@ async fn boot(
                 crate::boot::warm_boot(engine.clone(), id.clone(), hardfork_path).await.map_err(
                     |e| error!("Warm boot failed: {e}. Preserve the database and inspect recovery proofs and the configured trust anchor"),
                 )?;
+            // The state the node restarts from is admitted before any service,
+            // overlay or keeper uses it; a refusal stops the node.
+            crate::boot::admit_restored_state(engine.as_ref(), &id).await?;
             (id, false)
         }
         _ => {
@@ -3024,6 +3036,7 @@ async fn boot(
             let result = boot::cold_boot(engine.clone(), pss_downloading_threads).await;
             engine.release_stop(Engine::MASK_SERVICE_BOOT);
             let id = result?.id().clone();
+            boot::admit_initial_state(engine.load_state(&id).await?.as_ref())?;
             engine.save_last_applied_mc_block_id(&id)?;
 
             (id, true)

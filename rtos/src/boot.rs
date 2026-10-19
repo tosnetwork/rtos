@@ -43,6 +43,8 @@ pub(crate) async fn run_cold(
         let handle = download_zerostate(engine, block_id).await?;
         engine.save_last_applied_mc_block_id(&block_id)?;
         let zero_state = engine.load_state(handle.id()).await?;
+        // Before its configuration authorizes any overlay or key-block history.
+        admit_initial_state(&zero_state)?;
         return Ok((handle, Some(zero_state), None));
     }
 
@@ -266,16 +268,18 @@ async fn get_key_blocks(
                     match engine.download_block(&p.id(), Some(5)).await {
                         Ok((block, _)) => {
                             block.verify_expected_id(history.id())?;
-                            engine
-                                .update_public_overlays(block.id(), &block.read_config_params()?)
-                                .await?;
+                            let config = block.read_config_params()?;
+                            admit_initial_config(block.id(), &config)?;
+                            engine.update_public_overlays(block.id(), &config).await?;
                         }
                         Err(err) => {
                             log::warn!(target: "boot", "cannot download block {}, skipping overlays update: {}", p.id(), err);
                         }
                     }
                 } else {
-                    engine.update_public_overlays(handle.id(), &history.config()?).await?;
+                    let config = history.config()?;
+                    admit_initial_config(history.id(), &config)?;
+                    engine.update_public_overlays(handle.id(), &config).await?;
                 };
                 return Ok(key_blocks);
             }
@@ -557,6 +561,10 @@ pub(crate) async fn download_start_blocks_and_states(
         };
     }
 
+    // The downloaded masterchain state is admitted before anything is marked
+    // applied; a refusal is not a download failure and is never retried.
+    admit_initial_state(engine.load_state(mc_handle.id()).await?.as_ref())?;
+
     // Mark all states as applied
     for handle in handles {
         handle.set_persistent_state();
@@ -685,7 +693,7 @@ pub async fn cold_boot(
                     .await
             {
                 i += 1;
-                if i >= MAX_RETRIES {
+                if i >= MAX_RETRIES || crate::error::AuthPolicyRefused::is(&err) {
                     break Err(err);
                 }
                 log::warn!(target: "boot", "{}", err)
@@ -1010,9 +1018,14 @@ pub async fn warm_boot(
 ) -> Result<BlockIdExt> {
     log::info!(target: "boot", "Warm boot");
     ensure_block_chain_for_state(&engine, &block_id).await?;
-    if !engine.hardforks().is_empty() {
+    if let Some(hardfork_id) = engine.hardforks().last() {
         authenticate_recovered_state(engine.as_ref(), &block_id).await?;
-        if let Some(block_id) = check_hardforks(&engine, &block_id, hardfork_path).await? {
+        // A refused restored state must stop startup here; it must not be
+        // truncated and repaired past by applying a crafted successor.
+        admit_restored_state(engine.as_ref(), &block_id).await?;
+        if let Some(block_id) =
+            check_hardfork(&engine, hardfork_id, &block_id, hardfork_path).await?
+        {
             authenticate_recovered_state(engine.as_ref(), &block_id).await?;
             return Ok(block_id);
         }
@@ -1138,14 +1151,44 @@ async fn ensure_block_chain_for_state(engine: &Arc<Engine>, start: &BlockIdExt) 
     }
 }
 
-async fn check_hardforks(
+/// Admit the restored masterchain state on its own, as the reference does for
+/// the state it restarts from. A refusal is fatal to startup.
+pub(crate) async fn admit_restored_state(
+    engine: &dyn EngineOperations,
+    block_id: &BlockIdExt,
+) -> Result<()> {
+    let state = engine.load_state(block_id).await?;
+    crate::auth_admission::admit_auth_policy_state(
+        "refusing restored masterchain AUTH policy of",
+        &state,
+        None,
+    )
+}
+
+/// Admit an initial masterchain state (zero state or downloaded persistent
+/// state) before it is used as trusted state. A refusal is fatal to startup.
+pub(crate) fn admit_initial_state(state: &ShardStateStuff) -> Result<()> {
+    crate::auth_admission::admit_auth_policy_state(
+        "refusing initial masterchain AUTH policy of",
+        state,
+        None,
+    )
+}
+
+fn admit_initial_config(id: &BlockIdExt, config: &rtos_block::ConfigParams) -> Result<()> {
+    crate::auth_admission::admit_auth_policy_config(
+        "refusing initial masterchain AUTH policy of",
+        id,
+        config,
+    )
+}
+
+pub(crate) async fn check_hardfork(
     engine: &Arc<Engine>,
+    hardfork_id: &BlockIdExt,
     last_applied_mc_block: &Arc<BlockIdExt>,
     hardfork_path: impl AsRef<Path>,
 ) -> Result<Option<BlockIdExt>> {
-    let Some(hardfork_id) = engine.hardforks().last() else {
-        return Ok(None);
-    };
     log::info!(
         target: "boot",
         "last hardfork block id = {} last applied block id = {}",
@@ -1245,7 +1288,24 @@ async fn check_hardforks(
                 prev_id, hardfork_prev_id
             )
         }
-        engine.clone().apply_hardfork_block(&handle, &block).await?;
+        // The (truncated) base is what the crafted block is admitted against.
+        admit_restored_state(engine.as_ref(), &prev_id).await?;
+        match engine.clone().apply_hardfork_block(&handle, &block).await {
+            Ok(()) => {}
+            // As in the reference, a refused crafted block stays unapplied and
+            // the node continues from its predecessor; later attempts to adopt
+            // the block are refused again. Every other failure keeps failing boot.
+            Err(error) if crate::error::AuthPolicyRefused::is(&error) => {
+                log::error!(
+                    target: "boot",
+                    "crafted block {} is not adopted, continuing from {}: {}",
+                    hardfork_id, prev_id, error
+                );
+                engine.save_last_applied_mc_block_id(&prev_id)?;
+                return Ok(Some(prev_id));
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(Some(hardfork_id.clone()))
 }

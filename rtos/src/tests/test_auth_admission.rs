@@ -167,7 +167,7 @@ async fn run_engine(
 }
 
 struct Network {
-    _bootstrap: Arc<EmulatorNetworkBootstrap>,
+    bootstrap: Arc<EmulatorNetworkBootstrap>,
     engine: Arc<Engine>,
     join: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     stopper: Arc<Stopper>,
@@ -187,8 +187,7 @@ impl Network {
         let publication_gate = Arc::new(PublicationGate::default());
         *engine.mc_publication_test_gate.lock().unwrap() = Some(publication_gate.clone());
         let join = std::sync::Mutex::new(Some(join));
-        let network =
-            Self { _bootstrap: bootstrap, engine, join, stopper, apply_gate, publication_gate };
+        let network = Self { bootstrap, engine, join, stopper, apply_gate, publication_gate };
         tokio::time::timeout(Duration::from_secs(60), network.apply_gate.target(blocks)).await?;
         Ok(network)
     }
@@ -380,4 +379,178 @@ async fn auth_admission_live_application() -> Result<()> {
         Ok(())
     })
     .await
+}
+
+/// Re-issues a block as a crafted key block carrying `config`: same predecessor
+/// and state update, new identity.
+fn craft_key_block(block: &BlockStuff, config: &ConfigParams) -> Result<BlockStuff> {
+    let mut crafted = block.block()?.clone();
+    let mut info = crafted.read_info()?;
+    info.set_key_block(true);
+    crafted.write_info(&info)?;
+    let mut extra = crafted.read_extra()?;
+    let mut custom = extra.read_custom()?.ok_or_else(|| error!("no masterchain extra"))?;
+    *custom.config_mut() = Some(config.clone());
+    extra.write_custom(&custom)?;
+    crafted.write_extra(&extra)?;
+    let cell = crafted.serialize()?;
+    let data = rtos_block::write_boc(&cell)?;
+    let mut id = block.id().clone();
+    id.root_hash = cell.repr_hash().clone();
+    id.file_hash = UInt256::calc_file_hash(&data);
+    BlockStuff::deserialize_block(id, Arc::new(data))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auth_admission_hardfork() -> Result<()> {
+    with_network(4, |network| async move {
+        let crafted_dir = tempfile::tempdir()?;
+        network.apply(2).await??;
+        let two = network.id(2).await;
+        let (_, three) = network.stuff(3).await?;
+        let base = network.base_config(2).await?;
+        let crafted = craft_key_block(&three, &base)?;
+        let crafted_id = crafted.id().clone();
+        std::fs::write(
+            crafted_dir.path().join(crafted_id.root_hash().as_hex_string()),
+            crafted.data(),
+        )?;
+        let head = Arc::new(two.clone());
+        let cursors = |engine: &Engine| -> Result<_> {
+            Ok((engine.load_shard_client_mc_block_id()?, engine.load_pss_keeper_mc_block_id()?))
+        };
+        // No cursor may point past the kept predecessor.
+        let cursors_kept = |engine: &Engine| -> Result<bool> {
+            let (shard_client, keeper) = cursors(engine)?;
+            Ok(shard_client.is_none_or(|id| id.seq_no <= 2)
+                && keeper.is_none_or(|id| id.seq_no <= 2))
+        };
+
+        // Any other failure still fails boot: the stored ordinary block 3 is
+        // not a key block.
+        let error =
+            crate::boot::check_hardfork(&network.engine, three.id(), &head, crafted_dir.path())
+                .await
+                .unwrap_err();
+        assert!(!AuthPolicyRefused::is(&error), "{error}");
+
+        // A refused restored base is fatal and is not repaired by the crafted block.
+        test_override::set(&two, with_required_version(&base));
+        let error =
+            crate::boot::check_hardfork(&network.engine, &crafted_id, &head, crafted_dir.path())
+                .await
+                .unwrap_err();
+        assert!(AuthPolicyRefused::is(&error), "{error}");
+        assert!(!network.is_applied(&crafted_id)?);
+        test_override::clear(&two);
+
+        // A refused crafted block stays unapplied; boot continues from its
+        // predecessor with every cursor where it was.
+        for (form, config) in rollback_forms(&base) {
+            test_override::set(&crafted_id, config);
+            let kept = crate::boot::check_hardfork(
+                &network.engine,
+                &crafted_id,
+                &head,
+                crafted_dir.path(),
+            )
+            .await?;
+            assert_eq!(kept.as_ref(), Some(&two), "{form}");
+            assert!(!network.is_applied(&crafted_id)?, "{form}");
+            assert_eq!(network.head()?, two, "{form}");
+            assert!(cursors_kept(&network.engine)?, "{form}");
+        }
+
+        // An admissible crafted block is adopted.
+        test_override::clear(&crafted_id);
+        let adopted =
+            crate::boot::check_hardfork(&network.engine, &crafted_id, &head, crafted_dir.path())
+                .await?;
+        assert_eq!(adopted.as_ref(), Some(&crafted_id));
+        assert!(network.is_applied(&crafted_id)?);
+        assert_eq!(network.head()?, crafted_id);
+        test_override::clear(&crafted_id);
+        Ok(())
+    })
+    .await
+}
+
+/// Starts the node and returns its startup diagnostic. A node that starts is
+/// stopped again and reported as such, so the caller's assertion fails cleanly.
+async fn startup_refusal(bootstrap: &EmulatorNetworkBootstrap) -> String {
+    let stopper = Arc::new(Stopper::new());
+    match run_engine(bootstrap, stopper.clone()).await {
+        Ok((engine, join)) => {
+            stopper.set_stop();
+            let _ = tokio::time::timeout(Duration::from_secs(10), join).await;
+            let _ = engine.wait_stop().await;
+            "the node started with a refused masterchain state".to_string()
+        }
+        Err(error) => format!("{error:#}"),
+    }
+}
+
+// Warm boot: the restored head is admitted before anything uses it, the
+// refusal is fatal, and it recurs on every restart while the state is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auth_admission_refuses_restored_state() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let network = Network::start(3).await?;
+    network.apply(2).await??;
+    let bootstrap = network.bootstrap.clone();
+    // Stop with the apply gate still installed (open), so it keeps recording
+    // every block adopted until the engine has stopped.
+    network.apply_gate.release.close();
+    network.stopper.set_stop();
+    let join = network.join.lock().unwrap().take();
+    if let Some(join) = join {
+        let _ = tokio::time::timeout(Duration::from_secs(10), join).await;
+    }
+    network.engine.clone().wait_stop().await?;
+    *network.engine.parent_apply_test_gate.lock().unwrap() = None;
+    // Every block anything tried to adopt passed the apply gate, so the
+    // restored head is among them, wherever recovery places it.
+    let adopted: Vec<BlockIdExt> =
+        network.apply_gate.seen.lock().unwrap().values().cloned().collect();
+    assert!(!adopted.is_empty());
+    // Release the database before reopening it.
+    drop(network);
+    let refused = with_required_version(&configured_policy_config()?);
+    for id in &adopted {
+        test_override::set(id, refused.clone());
+    }
+    for _ in 0..2 {
+        let diagnostic = startup_refusal(&bootstrap).await;
+        assert!(diagnostic.contains("refusing restored masterchain AUTH policy"), "{diagnostic}");
+    }
+    for id in &adopted {
+        test_override::clear(id);
+    }
+    // The same database starts once the restored state is admissible.
+    let stopper = Arc::new(Stopper::new());
+    let (engine, join) = run_engine(&bootstrap, stopper.clone()).await?;
+    stopper.set_stop();
+    let _ = tokio::time::timeout(Duration::from_secs(10), join).await;
+    engine.wait_stop().await
+}
+
+fn configured_policy_config() -> Result<ConfigParams> {
+    let mut config = ConfigParams::default();
+    configure_policy(&mut config)?;
+    Ok(config)
+}
+
+// Cold boot: a zero state whose configuration is refused never becomes the
+// initial trusted state, and the refusal is fatal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auth_admission_refuses_initial_state() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let bootstrap = EmulatorNetworkBootstrap::build_with_config(4, |config, _| {
+        config.set_config(ConfigParamEnum::ConfigParam8(ConfigParam8 {
+            global_version: GlobalVersion { version: 16, capabilities: 0 },
+        }))
+    })?;
+    let diagnostic = startup_refusal(&bootstrap).await;
+    assert!(diagnostic.contains("refusing initial masterchain AUTH policy"), "{diagnostic}");
+    Ok(())
 }
