@@ -694,17 +694,6 @@ impl StateParser {
         })
     }
 
-    pub fn parse_accelerated_consensus_config(p63: &PathMap) -> Result<ConfigParamEnum> {
-        Ok(ConfigParamEnum::ConfigParam63(AcceleratedConsensusConfig {
-            enabled: p63.get_bool("enabled")?,
-            failed_collation_retry_timeout_ms: p63
-                .get_num32("failed_collation_retry_timeout_ms")?,
-            skip_rounds_count_for_collator_rotation: p63
-                .get_num32("skip_rounds_count_for_collator_rotation")?,
-            max_precollated_blocks: p63.get_num32("max_precollated_blocks")?,
-        }))
-    }
-
     fn parse_simplex_config(p: &PathMap) -> Result<SimplexConfig> {
         let d = NoncriticalParams::default();
         let protocol_version = match p.map.get("protocol_version") {
@@ -1035,8 +1024,6 @@ impl StateParser {
             Ok(ConfigParamEnum::ConfigParam45(pl))
         })?;
 
-        self.parse_parameter(config, 63, Self::parse_accelerated_consensus_config)?;
-
         self.parse_parameter(config, 71, |p| {
             let p = Self::parse_oracle_bridge_params(p)?;
             Ok(ConfigParamEnum::ConfigParam71(p))
@@ -1060,6 +1047,10 @@ impl StateParser {
         self.parse_parameter(config, 82, |p| {
             let p = Self::parse_jetton_bridge_params(p)?;
             Ok(ConfigParamEnum::ConfigParam82(p))
+        })?;
+        self.parse_parameter(config, 83, |p| {
+            let p = Self::parse_jetton_bridge_params(p)?;
+            Ok(ConfigParamEnum::ConfigParam83(p))
         })?;
         Ok(())
     }

@@ -634,6 +634,20 @@ fn test_config_params() {
     };
     assert_eq!(jetton_bridge_params, c);
 
+    cp.set_config(ConfigParamEnum::ConfigParam83(jetton_bridge_params.clone())).unwrap();
+    let ConfigParamEnum::ConfigParam83(c) = cp.config(83).unwrap().unwrap() else {
+        panic!("Expected ConfigParam83");
+    };
+    assert_eq!(jetton_bridge_params, c);
+
+    let mut policy = ValidatorControllerPolicy::default();
+    policy.controller_codes.set(&UInt256::from([7; 32]), &EmptyValue).unwrap();
+    cp.set_config(ConfigParamEnum::ConfigParam47(policy.clone())).unwrap();
+    let ConfigParamEnum::ConfigParam47(c) = cp.config(47).unwrap().unwrap() else {
+        panic!("Expected ConfigParam47");
+    };
+    assert_eq!(policy, c);
+
     write_read_and_assert(cp.clone());
 }
 
@@ -919,17 +933,37 @@ fn test_calc_storage_fees_max() {
     assert_eq!(fee, "42620366456847542539545850799900483125749000".parse().unwrap());
 }
 
+// Canonical encodings of the two schema parameters that gained typed
+// decoders must survive decode and re-encode bit for bit.
 #[test]
-fn test_accelerated_consensus_config() {
-    let config = AcceleratedConsensusConfig {
-        enabled: true,
-        failed_collation_retry_timeout_ms: 1000,
-        skip_rounds_count_for_collator_rotation: 5,
-        max_precollated_blocks: 11,
-    };
-    let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();
-    let config2 = AcceleratedConsensusConfig::construct_from_cell(cell).unwrap();
-    assert_eq!(config, config2);
+fn test_config_param_47_83_round_trip_is_bit_identical() {
+    let mut policy = ValidatorControllerPolicy::default();
+    for byte in [1u8, 2, 0x80] {
+        policy.controller_codes.set(&UInt256::from([byte; 32]), &EmptyValue).unwrap();
+    }
+    let empty = ValidatorControllerPolicy::default();
+    let bridge = JettonBridgeParams::default();
+    for (index, cell) in [
+        (47, policy.serialize().unwrap()),
+        (47, empty.serialize().unwrap()),
+        (83, bridge.serialize().unwrap()),
+    ] {
+        let decoded = ConfigParamEnum::construct_from_cell_and_number(cell.clone(), index).unwrap();
+        let mut builder = BuilderData::new();
+        assert_eq!(decoded.write_to_cell(&mut builder).unwrap(), index);
+        assert_eq!(builder.references()[0], cell, "parameter {index}");
+    }
+}
+
+// Index 63 has no schema type: it decodes only as a raw value and the
+// compatibility accessor reports the feature as unavailable.
+#[test]
+fn test_config_param_63_has_no_typed_decoder() {
+    let mut cp = ConfigParams::default();
+    let cell = AcceleratedConsensusConfig::default().serialize().unwrap();
+    cp.set_config(ConfigParamEnum::ConfigParamAny(63, cell.clone())).unwrap();
+    assert_eq!(cp.config(63).unwrap(), Some(ConfigParamEnum::ConfigParamAny(63, cell)));
+    assert!(cp.accelerated_consensus_params().is_err());
 }
 
 #[test]

@@ -379,11 +379,11 @@ impl ConfigParams {
             _ => Ok(None),
         }
     }
+    /// Index 63 is not a configuration parameter of the schema, and a
+    /// configuration carrying it fails validation, so this accessor always
+    /// reports the feature as unavailable.
     pub fn accelerated_consensus_params(&self) -> Result<AcceleratedConsensusConfig> {
-        match self.config(63)? {
-            Some(ConfigParamEnum::ConfigParam63(params)) => Ok(params),
-            _ => fail!("no AcceleratedConsensusConfig in config_params"),
-        }
+        fail!("configuration parameter 63 is not part of the configuration schema")
     }
 
     /// Select the original referenced Param30 cell without re-encoding it.
@@ -643,14 +643,15 @@ pub enum ConfigParamEnum {
     ConfigParam43(SizeLimitsConfig),
     ConfigParam44(SuspendedAddressList),
     ConfigParam45(PrecompiledContractsList),
+    ConfigParam47(ValidatorControllerPolicy),
     ConfigParam48(crate::AuthPolicy),
-    ConfigParam63(AcceleratedConsensusConfig),
     ConfigParam71(OracleBridgeParams), // Ethereum bridge
     ConfigParam72(OracleBridgeParams), // Binance Smart Chain bridge
     ConfigParam73(OracleBridgeParams), // Polygon bridge
     ConfigParam79(JettonBridgeParams), // ETH->TOS token bridge
     ConfigParam81(JettonBridgeParams), // BNB->TOS token bridge
     ConfigParam82(JettonBridgeParams), // Polygon->TOS token bridge
+    ConfigParam83(JettonBridgeParams),
     ConfigParamAny(u32, Cell),
 }
 
@@ -710,14 +711,15 @@ impl ConfigParamEnum {
             43 => read_config!(ConfigParam43, SizeLimitsConfig,             cell),
             44 => read_config!(ConfigParam44, SuspendedAddressList,         cell),
             45 => read_config!(ConfigParam45, PrecompiledContractsList,     cell),
+            47 => read_config!(ConfigParam47, ValidatorControllerPolicy,    cell),
             48 => return Ok(ConfigParamEnum::ConfigParam48(crate::AuthPolicy::construct_from_cell(cell)?)),
-            63 => read_config!(ConfigParam63, AcceleratedConsensusConfig,   cell),
             71 => read_config!(ConfigParam71, OracleBridgeParams,           cell),
             72 => read_config!(ConfigParam72, OracleBridgeParams,           cell),
             73 => read_config!(ConfigParam73, OracleBridgeParams,           cell),
             79 => read_config!(ConfigParam79, JettonBridgeParams,           cell),
             81 => read_config!(ConfigParam81, JettonBridgeParams,           cell),
             82 => read_config!(ConfigParam82, JettonBridgeParams,           cell),
+            83 => read_config!(ConfigParam83, JettonBridgeParams,           cell),
             index => Ok(ConfigParamEnum::ConfigParamAny(index, cell)),
         }
     }
@@ -772,14 +774,15 @@ impl ConfigParamEnum {
             ConfigParamEnum::ConfigParam43(ref c) => serialize(builder, c, 43),
             ConfigParamEnum::ConfigParam44(ref c) => serialize(builder, c, 44),
             ConfigParamEnum::ConfigParam45(ref c) => serialize(builder, c, 45),
+            ConfigParamEnum::ConfigParam47(ref c) => serialize(builder, c, 47),
             ConfigParamEnum::ConfigParam48(ref c) => serialize(builder, c, 48),
-            ConfigParamEnum::ConfigParam63(ref c) => serialize(builder, c, 63),
             ConfigParamEnum::ConfigParam71(ref c) => serialize(builder, c, 71),
             ConfigParamEnum::ConfigParam72(ref c) => serialize(builder, c, 72),
             ConfigParamEnum::ConfigParam73(ref c) => serialize(builder, c, 73),
             ConfigParamEnum::ConfigParam79(ref c) => serialize(builder, c, 79),
             ConfigParamEnum::ConfigParam81(ref c) => serialize(builder, c, 81),
             ConfigParamEnum::ConfigParam82(ref c) => serialize(builder, c, 82),
+            ConfigParamEnum::ConfigParam83(ref c) => serialize(builder, c, 83),
             ConfigParamEnum::ConfigParamAny(index, cell) => {
                 builder.checked_append_reference(cell.clone())?;
                 Ok(*index)
@@ -2107,6 +2110,31 @@ impl IntoIterator for &FundamentalSmcAddresses {
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.iter()
+    }
+}
+
+/*
+validator_controller_policy_v1#_ controller_codes:(HashmapE 256 True) = ValidatorControllerPolicy;
+_ ValidatorControllerPolicy = ConfigParam 47;
+*/
+
+/// Code hashes a validator controller account may have been deployed with.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ValidatorControllerPolicy {
+    pub controller_codes: ControllerCodes,
+}
+
+define_HashmapE! {ControllerCodes, 256, EmptyValue}
+
+impl Deserializable for ValidatorControllerPolicy {
+    fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
+        self.controller_codes.read_from(cell)
+    }
+}
+
+impl Serializable for ValidatorControllerPolicy {
+    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
+        self.controller_codes.write_to(cell)
     }
 }
 

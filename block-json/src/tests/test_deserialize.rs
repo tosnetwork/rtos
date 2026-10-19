@@ -360,15 +360,6 @@ fn get_config_param45() -> PrecompiledContractsList {
     cfg
 }
 
-fn get_config_param63() -> AcceleratedConsensusConfig {
-    AcceleratedConsensusConfig {
-        enabled: false,
-        failed_collation_retry_timeout_ms: 2000,
-        skip_rounds_count_for_collator_rotation: 7,
-        max_precollated_blocks: 11,
-    }
-}
-
 fn get_config_param30() -> NewConsensusConfigAll {
     NewConsensusConfigAll {
         mc: Some(SimplexConfig {
@@ -596,9 +587,6 @@ fn prepare_config_params() -> ConfigParams {
     let c30 = get_config_param30();
     cp.set_config(ConfigParamEnum::ConfigParam30(c30)).unwrap();
 
-    let c63 = get_config_param63();
-    cp.set_config(ConfigParamEnum::ConfigParam63(c63)).unwrap();
-
     let oracle_bridge_params = OracleBridgeParams::default();
 
     cp.set_config(ConfigParamEnum::ConfigParam71(oracle_bridge_params.clone())).unwrap();
@@ -609,7 +597,8 @@ fn prepare_config_params() -> ConfigParams {
 
     cp.set_config(ConfigParamEnum::ConfigParam79(jetton_bridge_params.clone())).unwrap();
     cp.set_config(ConfigParamEnum::ConfigParam81(jetton_bridge_params.clone())).unwrap();
-    cp.set_config(ConfigParamEnum::ConfigParam82(jetton_bridge_params)).unwrap();
+    cp.set_config(ConfigParamEnum::ConfigParam82(jetton_bridge_params.clone())).unwrap();
+    cp.set_config(ConfigParamEnum::ConfigParam83(jetton_bridge_params)).unwrap();
 
     cp
 }

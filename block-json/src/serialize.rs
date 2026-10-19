@@ -1066,23 +1066,6 @@ fn serialize_precompiled_contracts_list(pl: &PrecompiledContractsList) -> Result
     Ok(map.into())
 }
 
-fn serialize_accelerator(acc: &AcceleratedConsensusConfig) -> Result<Value> {
-    let mut map = Map::new();
-    serialize_field(&mut map, "enabled", acc.enabled);
-    serialize_field(
-        &mut map,
-        "failed_collation_retry_timeout_ms",
-        acc.failed_collation_retry_timeout_ms,
-    );
-    serialize_field(
-        &mut map,
-        "skip_rounds_count_for_collator_rotation",
-        acc.skip_rounds_count_for_collator_rotation,
-    );
-    serialize_field(&mut map, "max_precollated_blocks", acc.max_precollated_blocks);
-    Ok(map.into())
-}
-
 fn serialize_simplex_config(cfg: &SimplexConfig) -> Result<Value> {
     let mut map = Map::new();
     serialize_field(&mut map, "protocol_version", cfg.protocol_version);
@@ -1396,9 +1379,6 @@ pub fn serialize_known_config_param(
         ConfigParamEnum::ConfigParam45(ref c) => {
             return Ok(Some(serialize_precompiled_contracts_list(c)?));
         }
-        ConfigParamEnum::ConfigParam63(ref c) => {
-            return Ok(Some(serialize_accelerator(c)?));
-        }
         ConfigParamEnum::ConfigParam71(ref c) => {
             return Ok(Some(serialize_oracle_bridge_params(c)?));
         }
@@ -1415,6 +1395,9 @@ pub fn serialize_known_config_param(
             return Ok(Some(serialize_jetton_bridge_params(c, mode)?));
         }
         ConfigParamEnum::ConfigParam82(ref c) => {
+            return Ok(Some(serialize_jetton_bridge_params(c, mode)?));
+        }
+        ConfigParamEnum::ConfigParam83(ref c) => {
             return Ok(Some(serialize_jetton_bridge_params(c, mode)?));
         }
         _ => return Ok(None),
