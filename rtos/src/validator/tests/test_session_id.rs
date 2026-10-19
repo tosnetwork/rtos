@@ -329,6 +329,25 @@ fn make_validator_descr_from_key(key: &PublicKey) -> ValidatorDescr {
     ValidatorDescr::with_params(SigPubKey::from_bytes(key.pub_key().unwrap()).unwrap(), 1, None)
 }
 
+/// The classical membership the reference node's generic helpers give: the
+/// local classical keys, with no consensus key held.
+fn classical_member(
+    status: &ValidatorListStatus,
+    validators: &[ValidatorDescr],
+) -> Option<UInt256> {
+    rtos_pq_consensus::local_consensus_member(
+        validators,
+        &status.classical_keys(),
+        &Default::default(),
+        &rtos_pq_consensus::PqConsensusCustody::default(),
+        0,
+    )
+}
+
+fn key_identity(key: &PublicKey) -> UInt256 {
+    UInt256::from(*key.id().data())
+}
+
 #[test]
 fn test_validator_list_status_get_local_key_for_list() {
     let mut status = ValidatorListStatus::default();
@@ -341,10 +360,6 @@ fn test_validator_list_status_get_local_key_for_list() {
     status.add_list(list_next.clone(), vec![key_b.clone()]);
     status.curr = Some(list_curr.clone());
     status.next = Some(list_next.clone());
-
-    // get_local_keys returns only the curr list's keys
-    let local = status.get_local_keys().unwrap();
-    assert_eq!(local[0].id(), key_a.id());
 
     // get_local_keys_for_list returns the keys for the specified list
     let local_curr = status.get_local_keys_for_list(&list_curr).unwrap();
@@ -368,10 +383,7 @@ fn test_validator_list_status_get_local_key_curr_none() {
     status.next = Some(list_next.clone());
     // curr is None
 
-    // get_local_keys returns None when curr is None
-    assert!(status.get_local_keys().is_none());
-
-    // but get_local_keys_for_list still finds the next list key
+    // get_local_keys_for_list finds the next list key without a current list
     let found = status.get_local_keys_for_list(&list_next).unwrap();
     assert_eq!(found[0].id(), key.id());
 }
@@ -418,10 +430,9 @@ fn test_validator_list_status_next_only_membership_remains_usable_for_future_ses
     status.add_list(next_list.clone(), vec![key.clone()]);
     status.next = Some(next_list.clone());
 
-    let selected =
-        find_local_validator_key(&validators, status.get_local_keys_for_list(&next_list))
-            .expect("next-list pubkey membership should stay usable for future sessions");
-    assert_eq!(selected.id(), key.id());
+    let selected = classical_member(&status, &validators)
+        .expect("next-list pubkey membership should stay usable for future sessions");
+    assert_eq!(selected, key_identity(&key));
 }
 
 #[test]
@@ -434,9 +445,9 @@ fn test_curr_membership_remains_usable_without_context_gate() {
     status.add_list(curr_list.clone(), vec![key.clone()]);
     status.curr = Some(curr_list);
 
-    let selected = find_local_validator_key(&validators, status.get_local_keys())
+    let selected = classical_member(&status, &validators)
         .expect("curr-list pubkey membership should stay usable without context gate");
-    assert_eq!(selected.id(), key.id());
+    assert_eq!(selected, key_identity(&key));
 }
 
 #[test]
@@ -449,10 +460,9 @@ fn test_next_membership_remains_usable_without_context_gate() {
     status.add_list(next_list.clone(), vec![key.clone()]);
     status.next = Some(next_list.clone());
 
-    let selected =
-        find_local_validator_key(&validators, status.get_local_keys_for_list(&next_list))
-            .expect("next-list pubkey membership should stay usable without context gate");
-    assert_eq!(selected.id(), key.id());
+    let selected = classical_member(&status, &validators)
+        .expect("next-list pubkey membership should stay usable without context gate");
+    assert_eq!(selected, key_identity(&key));
 }
 
 #[test]
@@ -547,15 +557,18 @@ fn test_current_map_swap_model_leaves_unselected_old_session_for_destroy() {
 }
 
 #[test]
-fn test_find_local_validator_key_uses_local_key_order_per_subset() {
+fn test_local_member_is_the_first_descriptor_in_set_order() {
     let key_a = make_test_key();
     let key_b = make_test_key();
-    let validators = vec![make_validator_descr_from_key(&key_b)];
-    let local_keys = vec![key_a, key_b.clone()];
-
-    let selected = find_local_validator_key(&validators, Some(local_keys.as_slice()))
-        .expect("second local key should match the subset");
-    assert_eq!(selected.id(), key_b.id());
+    let mut status = ValidatorListStatus::default();
+    status.add_list(UInt256::from([14; 32]), vec![key_a.clone(), key_b.clone()]);
+    // Local key order never decides: the first descriptor of the set does.
+    let validators =
+        vec![make_validator_descr_from_key(&key_b), make_validator_descr_from_key(&key_a)];
+    assert_eq!(classical_member(&status, &validators), Some(key_identity(&key_b)));
+    let validators =
+        vec![make_validator_descr_from_key(&key_a), make_validator_descr_from_key(&key_b)];
+    assert_eq!(classical_member(&status, &validators), Some(key_identity(&key_a)));
 }
 
 #[test]
@@ -611,25 +624,22 @@ fn test_session_id_with_accelerated_consensus() {
 }
 
 #[test]
-fn test_find_local_validator_key_matches_subset() {
+fn test_classical_member_matches_subset() {
     let key = make_test_key();
-    let validator = make_validator_descr_from_key(&key);
-    let local_keys = vec![key.clone()];
-
-    let found = find_local_validator_key(&[validator], Some(local_keys.as_slice()))
+    let mut status = ValidatorListStatus::default();
+    status.add_list(UInt256::from([15; 32]), vec![key.clone()]);
+    let found = classical_member(&status, &[make_validator_descr_from_key(&key)])
         .expect("local validator key should match the subset");
-
-    assert_eq!(found.id(), key.id());
+    assert_eq!(found, key_identity(&key));
 }
 
 #[test]
-fn test_find_local_validator_key_returns_none_when_key_not_in_subset() {
+fn test_classical_member_returns_none_when_key_not_in_subset() {
     let key = make_test_key();
     let other_key = make_test_key();
-    let validator = make_validator_descr_from_key(&other_key);
-    let local_keys = vec![key];
-
-    assert!(find_local_validator_key(&[validator], Some(local_keys.as_slice())).is_none());
+    let mut status = ValidatorListStatus::default();
+    status.add_list(UInt256::from([16; 32]), vec![key]);
+    assert!(classical_member(&status, &[make_validator_descr_from_key(&other_key)]).is_none());
 }
 
 #[test]

@@ -732,6 +732,14 @@ struct BootstrapTestEngine {
     #[cfg(feature = "telemetry")]
     telemetry: Arc<crate::engine_traits::EngineTelemetry>,
     allocated: Arc<crate::engine_traits::EngineAlloc>,
+    /// The consensus-key custody of this test node, if any.
+    custody: Option<Arc<crate::pq_consensus_config::PqCustodyShared>>,
+    /// Custody clock values returned in order, then `clock_default`.
+    clock_script: std::sync::Mutex<std::collections::VecDeque<u32>>,
+    clock_default: std::sync::atomic::AtomicU32,
+    clock_reads: std::sync::atomic::AtomicUsize,
+    /// Transport keys loaded after the engine was shared.
+    late_transport_keys: RwLock<Vec<PrivateKey>>,
 }
 
 impl BootstrapTestEngine {
@@ -805,6 +813,11 @@ impl BootstrapTestEngine {
             #[cfg(feature = "telemetry")]
             telemetry,
             allocated,
+            custody: None,
+            clock_script: std::sync::Mutex::new(Default::default()),
+            clock_default: std::sync::atomic::AtomicU32::new(1),
+            clock_reads: Default::default(),
+            late_transport_keys: RwLock::new(Vec::new()),
         })
     }
 
@@ -977,7 +990,23 @@ impl EngineOperations for BootstrapTestEngine {
         Ok(&self.init_mc_block_id)
     }
     fn adnl_key_by_id(&self, id: &Arc<rtos_block::KeyId>) -> Option<PrivateKey> {
-        self.validator_network.transport_keys.iter().find(|key| key.id() == id).cloned()
+        self.validator_network
+            .transport_keys
+            .iter()
+            .chain(self.late_transport_keys.read().unwrap().iter())
+            .find(|key| key.id() == id)
+            .cloned()
+    }
+    fn pq_consensus_custody(&self) -> Option<Arc<crate::pq_consensus_config::PqCustodyShared>> {
+        self.custody.clone()
+    }
+    fn pq_custody_now(&self) -> u32 {
+        self.clock_reads.fetch_add(1, Ordering::SeqCst);
+        self.clock_script
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| self.clock_default.load(Ordering::SeqCst))
     }
 
     async fn check_sync(&self) -> Result<bool> {
@@ -1485,7 +1514,7 @@ async fn test_manager_creates_emulator_sessions_from_generated_mc_states() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_manager_selects_validator_key_by_validator_key_order() -> Result<()> {
+async fn test_manager_selects_member_by_set_order() -> Result<()> {
     const TARGET_SEQNO: u32 = 50;
 
     let bootstrap = EmulatorNetworkBootstrap::build(4)?;
@@ -1563,12 +1592,16 @@ async fn test_manager_selects_validator_key_by_validator_key_order() -> Result<(
         .ok_or_else(|| error!("missing descriptor for expected second key"))?
         .clone();
 
-    // Deliberately place descriptors in a different order: key selection must still
-    // follow local validator key order, not descriptor order.
+    // As in the reference node, the member is the first descriptor of the set
+    // this node holds, whatever the order of the local validator keys.
     let selected = manager
-        .find_us_for_list(&[second_descr, first_descr], &current_list_id)
-        .ok_or_else(|| error!("expected selected local key for subset"))?;
-    assert_eq!(*selected.id().data(), expected_first);
+        .local_validator_id(&[second_descr.clone(), first_descr.clone()])
+        .ok_or_else(|| error!("expected selected local member for subset"))?;
+    assert_eq!(selected, second_descr.validator_id()?);
+    let selected = manager
+        .local_validator_id(&[first_descr, second_descr])
+        .ok_or_else(|| error!("expected selected local member for subset"))?;
+    assert_eq!(*selected.as_array(), expected_first);
 
     let session_ids =
         manager.current_sessions.keys().cloned().collect::<std::collections::HashSet<_>>();
@@ -1742,3 +1775,7 @@ async fn test_manager_session_identity_binds_governing_state() -> Result<()> {
 
 #[path = "test_authenticated_manager.rs"]
 mod authenticated_manager;
+
+#[cfg(test)]
+#[path = "test_custody_manager.rs"]
+mod custody_manager;

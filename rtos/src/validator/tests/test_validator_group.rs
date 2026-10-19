@@ -1200,7 +1200,7 @@ async fn pq_live_group_uses_stable_local_identity_through_accept_and_broadcast()
         key_seqno: 10,
         max_vertical_seqno: 0,
     });
-    let group = ValidatorGroup::new(
+    let mut group = ValidatorGroup::new(
         info,
         transport,
         carrier.session_id.clone(),
@@ -1212,6 +1212,11 @@ async fn pq_live_group_uses_stable_local_identity_through_accept_and_broadcast()
         false,
         None,
     );
+    // Holding the transport key of a member's descriptor makes nobody that
+    // member: a post-quantum group learns its identity only from the runtime
+    // the manager admitted it with, which this fixture stands in for.
+    assert!(group.local_identity.is_none());
+    group.local_identity = Some(source.clone());
     assert_eq!(group.local_identity.as_ref().unwrap().id(), source.id());
     let mut corrupt = carrier.clone();
     corrupt.signatures[0].signature[0] ^= 1;

@@ -307,26 +307,6 @@ fn unsafe_rotation_block_seqno(
     shard.is_masterchain().then_some(last_masterchain_block.seq_no)
 }
 
-/// Check whether any local key belongs to the given validator subset.
-///
-/// Mirrors the inner loop of C++ `get_validator()` (`manager.cpp`) which
-/// iterates `temp_keys_` and calls `val_set->is_validator(key)`. Returns the first local
-/// key, in local-key order, that matches any validator descriptor's short ID.
-fn find_local_validator_key(
-    validators: &[ValidatorDescr],
-    local_keys: Option<&[PublicKey]>,
-) -> Option<PublicKey> {
-    for local_key in local_keys? {
-        let local_keyhash = local_key.id().data();
-        for val in validators {
-            if val.compute_node_id_short().is_ok_and(|id| id.as_slice() == local_keyhash) {
-                return Some(local_key.clone());
-            }
-        }
-    }
-    None
-}
-
 enum ExistingSessionSource<T> {
     Current(T),
     Future(T),
@@ -768,29 +748,30 @@ impl ValidatorListStatus {
         self.known_lists.get(list_id)
     }
 
+    #[cfg(test)]
     fn get_local_keys_for_list(&self, list_id: &ValidatorListHash) -> Option<&[PublicKey]> {
         self.get_list(list_id).map(|entry| entry.keys.as_slice())
     }
 
-    /// Local validator keys for the validator arm (curr-only); prev keys are reachable
-    /// via `get_all_local_keys` for observer-mode lookups
-    fn get_local_keys(&self) -> Option<&[PublicKey]> {
-        self.curr.as_ref().and_then(|current_list| self.get_local_keys_for_list(current_list))
+    /// The classical keys this node holds, the reference node's temporary and
+    /// permanent keys: every local key the engine matched for any known list.
+    /// They confer membership of a classical descriptor only.
+    fn classical_keys(&self) -> std::collections::BTreeSet<UInt256> {
+        self.known_lists
+            .values()
+            .flat_map(|entry| entry.keys.iter())
+            .map(|key| UInt256::from(*key.id().data()))
+            .collect()
     }
 
-    /// Union of local keys across curr|next|prev; deduped by `KeyOption::id`
-    fn get_all_local_keys(&self) -> Vec<PublicKey> {
-        let mut out: Vec<PublicKey> = Vec::new();
-        for list_id in [&self.curr, &self.next, &self.prev].into_iter().flatten() {
-            if let Some(keys) = self.get_local_keys_for_list(list_id) {
-                for k in keys {
-                    if !out.iter().any(|existing| existing.id() == k.id()) {
-                        out.push(k.clone());
-                    }
-                }
-            }
-        }
-        out
+    /// The local classical key with this identity, if one is held.
+    #[cfg(test)]
+    fn classical_key(&self, id: &UInt256) -> Option<PublicKey> {
+        self.known_lists
+            .values()
+            .flat_map(|entry| entry.keys.iter())
+            .find(|key| key.id().data() == id.as_array())
+            .cloned()
     }
 
     fn actual_or_coming(&self, list_id: &ValidatorListHash) -> bool {
@@ -899,6 +880,15 @@ enum CleanupOutcome {
 
 /// Dry verdicts kept for observability.
 const CLEANUP_VERDICTS_KEPT: usize = 256;
+
+/// What the group-creation checks admitted this node as: its committee index,
+/// the transport key of its descriptor and, for a post-quantum committee, the
+/// custody signer of exactly that descriptor.
+struct AdmittedValidator {
+    index: u32,
+    transport_key: PublicKey,
+    signer: Option<simplex::SessionSigner>,
+}
 
 struct ValidatorManagerImpl {
     engine: Arc<dyn EngineOperations>,
@@ -1769,121 +1759,265 @@ impl ValidatorManagerImpl {
         Ok(())
     }
 
-    /// Find the first matching local key for a subset using a specific validator list.
-    ///
-    /// Used for future-session creation where the validator list may differ from `curr`.
-    fn find_us_for_list(
+    /// One read decision over the custody, empty when none is configured.
+    fn with_custody<R>(
         &self,
-        validators: &[ValidatorDescr],
-        list_id: &ValidatorListHash,
-    ) -> Option<PublicKey> {
-        find_local_validator_key(
-            validators,
-            self.validator_list_status.get_local_keys_for_list(list_id),
-        )
+        decide: impl FnOnce(&rtos_pq_consensus::PqConsensusCustody) -> R,
+    ) -> R {
+        match self.engine.pq_consensus_custody() {
+            Some(custody) => custody.read(decide),
+            None => decide(&rtos_pq_consensus::PqConsensusCustody::default()),
+        }
     }
 
-    /// Find the first matching local key for a subset using the current validator list.
-    ///
-    /// Used for active-session creation in `start_sessions`.
-    fn find_us(&self, validators: &[ValidatorDescr]) -> Option<PublicKey> {
-        find_local_validator_key(validators, self.validator_list_status.get_local_keys())
+    /// The validator identity this node is a member of `set` as, the reference
+    /// node's get_validator_id, at a fresh custody-clock read. A post-quantum
+    /// descriptor is ours only while custody holds, unexpired, the exact key it
+    /// records; a network or operator key never makes this node a member. A
+    /// classical descriptor is matched by the local classical keys; whether
+    /// such a set can run a group is decided at group admission.
+    fn local_validator_id(&self, set: &[ValidatorDescr]) -> Option<UInt256> {
+        let now = self.engine.pq_custody_now();
+        let classical = self.validator_list_status.classical_keys();
+        let permanent = std::collections::BTreeSet::new();
+        self.with_custody(|custody| {
+            rtos_pq_consensus::local_consensus_member(set, &classical, &permanent, custody, now)
+        })
     }
 
-    /// Resolve transport ownership independently of a PQ signing capability.
-    /// Every candidate identity comes from this authenticated governing snapshot;
-    /// only a key actually loaded by the engine may be selected.
-    fn authenticated_transport_key(
+    /// The observer transport identities this node may join `committee` with:
+    /// the descriptors of the previous, current and next total sets that are
+    /// not members of the committee and that this node holds, as the reference
+    /// node's get_observer_adnl_ids selects them.
+    fn local_observers(
         &self,
         config: &rtos_block::ConfigParams,
-        preferred: &[ValidatorDescr],
-    ) -> Result<Option<PublicKey>> {
-        let sets =
-            [config.validator_set()?, config.prev_validator_set()?, config.next_validator_set()?];
-        let bindings = self.engine.consensus_transport_bindings()?;
-        for binding in &bindings {
-            let known = sets
-                .iter()
-                .flat_map(|set| set.list())
-                .filter(|member| member.validator_id().is_ok_and(|id| id == binding.validator_id))
-                .collect::<Vec<_>>();
-            if !known.is_empty()
-                && !known
-                    .iter()
-                    .any(|member| member.adnl_addr().is_ok_and(|id| id == binding.adnl_key_id))
-            {
-                fail!("Configured consensus transport differs from governing descriptor");
-            }
-        }
-        for member in preferred.iter().chain(sets.iter().flat_map(|set| set.list())) {
-            let id = member.adnl_addr()?;
-            let stable = member.validator_id()?;
-            if !bindings
-                .iter()
-                .any(|binding| binding.validator_id == stable && binding.adnl_key_id == id)
-            {
-                continue;
-            }
-            if let Some(key) = self.engine.adnl_key_by_id(&id) {
-                if key.id() != &id {
-                    fail!("Engine returned a transport key with a different identity");
-                }
-                return Ok(Some(key));
-            }
-        }
-        Ok(None)
+        committee: &[ValidatorDescr],
+    ) -> Result<Vec<consensus_common::session_runtime::AuthorizedObserver>> {
+        let now = self.engine.pq_custody_now();
+        let classical = self.validator_list_status.classical_keys();
+        let permanent = std::collections::BTreeSet::new();
+        self.with_custody(|custody| {
+            consensus_common::session_runtime::AuthorizedObserver::select(
+                config,
+                committee,
+                |descriptor| {
+                    rtos_pq_consensus::local_consensus_descriptor(
+                        descriptor, &classical, &permanent, custody, now,
+                    )
+                },
+            )
+        })
     }
 
-    fn has_authenticated_v2_transport(&self, config: &rtos_block::ConfigParams) -> Result<bool> {
-        let mut enabled = false;
-        for masterchain in [false, true] {
-            if let Some(selected) = config.selected_simplex_config(masterchain)? {
-                enabled |= selected.config.protocol_version == 2;
-            }
+    /// Whether custody makes this node a member of the current or next total
+    /// set, and of any of the previous, current and next total sets.
+    fn custody_set_roles(&self, config: &rtos_block::ConfigParams) -> Result<(bool, bool)> {
+        if self.engine.pq_consensus_custody().is_none() {
+            return Ok((false, false));
         }
-        Ok(enabled && self.authenticated_transport_key(config, &[])?.is_some())
+        let (current, next, previous) =
+            (config.validator_set()?, config.next_validator_set()?, config.prev_validator_set()?);
+        let now = self.engine.pq_custody_now();
+        let none = std::collections::BTreeSet::new();
+        Ok(self.with_custody(|custody| {
+            let member = |set: &ValidatorSet| {
+                rtos_pq_consensus::local_consensus_member(set.list(), &none, &none, custody, now)
+                    .is_some()
+            };
+            let active = member(&current) || member(&next);
+            (active, active || member(&previous))
+        }))
+    }
+
+    /// The local admission of a Simplex session over `committee`: as the
+    /// validator the caller selected, or, where the protocol puts observers
+    /// in the private overlay, as the first authorized observer.
+    #[allow(clippy::too_many_arguments)]
+    fn simplex_session_runtime(
+        &self,
+        mc_state: &ShardStateStuff,
+        shard: &ShardIdent,
+        catchain_seqno: u32,
+        vertical_seqno: u32,
+        last_key_block_seqno: u32,
+        committee: &[ValidatorDescr],
+        selected: Option<&UInt256>,
+        observers_in_overlay: bool,
+    ) -> Result<Option<Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>>> {
+        use consensus_common::session_runtime::{
+            AuthenticatedSessionRuntime, LocalAdmission, SessionNetworkPin,
+        };
+        let config = mc_state.config_params()?;
+        let admission = match selected {
+            Some(validator_id) => {
+                let index = committee
+                    .iter()
+                    .position(|member| member.validator_id().is_ok_and(|id| &id == validator_id))
+                    .ok_or_else(|| error!("Selected validator is not a committee member"))?;
+                LocalAdmission::Validator {
+                    validator_id: validator_id.clone(),
+                    index: u32::try_from(index)?,
+                }
+            }
+            None if observers_in_overlay => {
+                match self.local_observers(config, committee)?.into_iter().next() {
+                    Some(observer) => LocalAdmission::Observer(observer),
+                    None => return Ok(None),
+                }
+            }
+            None => return Ok(None),
+        };
+        let runtime = AuthenticatedSessionRuntime::from_authenticated_admission(
+            SessionNetworkPin {
+                global_id: mc_state.state()?.global_id(),
+                zerostate: self.engine.zerostate_id()?.clone(),
+            },
+            config,
+            rtos_api::session_identity::SessionCoordinates {
+                shard,
+                catchain_seqno,
+                vertical_seqno,
+                last_key_block_seqno,
+                new_catchain_ids: false,
+            },
+            committee.to_vec(),
+            admission,
+        )?
+        .bind_recovery_anchor(mc_state.block_id().clone())?;
+        Ok(Some(Arc::new(runtime)))
+    }
+
+    /// The reference node's group-creation checks once the caller selected
+    /// this node as `selected`, in its order: membership read again at a fresh
+    /// custody clock (a key that expired since makes this node a member no
+    /// longer), a committee that is not post-quantum, then the exact custody
+    /// signer at a fresh clock. Each refusal is logged and retried at the next
+    /// update; none fences the session.
+    fn admit_validator_group(
+        &self,
+        shard: &ShardIdent,
+        committee: &[ValidatorDescr],
+        selected: &UInt256,
+        consensus_options: &ConsensusOptions,
+    ) -> Option<AdmittedValidator> {
+        let Some(validator_id) =
+            self.local_validator_id(committee).filter(|validator_id| validator_id == selected)
+        else {
+            log::error!(target: "validator_manager",
+                "refusing to create validator group for {shard}: this node no longer holds an \
+                 unexpired consensus key the set records for it");
+            return None;
+        };
+        let (index, descriptor) = committee
+            .iter()
+            .enumerate()
+            .find(|(_, member)| member.validator_id().is_ok_and(|id| id == validator_id))?;
+        let index = u32::try_from(index).ok()?;
+        let Some(key) = descriptor.pq_key() else {
+            // A classical committee runs only the test emulator.
+            #[cfg(test)]
+            if matches!(consensus_options, ConsensusOptions::Emulator(_)) {
+                let transport_key = self.validator_list_status.classical_key(&validator_id)?;
+                return Some(AdmittedValidator { index, transport_key, signer: None });
+            }
+            let _ = consensus_options;
+            log::error!(target: "validator_manager",
+                "refusing to create validator group for {shard}: the set is not post-quantum; \
+                 validation for this shard is disabled until the set is post-quantum");
+            return None;
+        };
+        let now = self.engine.pq_custody_now();
+        let signer = self.with_custody(|custody| {
+            simplex::SessionSigner::from_custody_match(custody, &validator_id, descriptor, now).ok()
+        });
+        let Some(signer) = signer else {
+            log::error!(target: "validator_manager",
+                "refusing to create validator group for {shard}: this node is post-quantum \
+                 validator {} but does not custody, unexpired, the exact consensus key the set \
+                 records for it (key {}); validation for this shard is disabled until the key is \
+                 provisioned",
+                validator_id.to_hex_string(), key.key_id.to_hex_string());
+            return None;
+        };
+        // Transport is not a membership predicate. Without the descriptor's
+        // transport key loaded this node cannot construct the group at all, so
+        // construction is deferred and retried, unfenced.
+        let adnl = descriptor.adnl_addr().ok()?;
+        let Some(transport_key) = self.engine.adnl_key_by_id(&adnl) else {
+            log::warn!(target: "validator_manager",
+                "deferring validator group for {shard}: transport key {adnl} of validator {} is \
+                 not loaded", validator_id.to_hex_string());
+            return None;
+        };
+        Some(AdmittedValidator { index, transport_key, signer: Some(signer) })
+    }
+
+    /// The transport key and signer a new group of a session is created with.
+    /// A validator group passes the reference creation-time checks; an
+    /// observer group joins with its authorized observer transport key and
+    /// takes no signer. `None` means no group is created now: it is retried at
+    /// the next update and the session is not fenced.
+    fn admit_session_group(
+        &self,
+        shard: &ShardIdent,
+        committee: &[ValidatorDescr],
+        selected: Option<&UInt256>,
+        runtime: Option<&consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        consensus_options: &ConsensusOptions,
+    ) -> Option<(PublicKey, Option<simplex::SessionSigner>)> {
+        use consensus_common::session_runtime::LocalRole;
+        if let Some(runtime) = runtime.filter(|runtime| runtime.local_role() == LocalRole::Observer)
+        {
+            let Some(key) = self.engine.adnl_key_by_id(runtime.local_adnl()) else {
+                log::warn!(target: "validator_manager",
+                    "deferring observer group for {shard}: transport key {} is not loaded",
+                    runtime.local_adnl());
+                return None;
+            };
+            return Some((key, None));
+        }
+        let admitted =
+            self.admit_validator_group(shard, committee, selected?, consensus_options)?;
+        if runtime
+            .is_some_and(|runtime| runtime.local_role() != LocalRole::Validator(admitted.index))
+        {
+            log::error!(target: "validator_manager",
+                "refusing to create validator group for {shard}: this node no longer holds an \
+                 unexpired consensus key the set records for it");
+            return None;
+        }
+        Some((admitted.transport_key, admitted.signer))
     }
 
     /// Try to spawn a `BlockSyncObserver` for a shard we are not validating
     ///
     /// Requires `enable_observers=true` (caller has already checked via `Some(bs_params)`)
-    /// and a validator-class key in any of prev|curr|next mc sets. `Err` carries a reason
+    /// and a descriptor of the previous, current or next total set outside the
+    /// session committee that this node holds. `Err` carries a reason
+    #[allow(clippy::too_many_arguments)]
     fn try_spawn_observer(
         &mut self,
         shard: &ShardIdent,
         session_id: &UInt256,
         mc_state: &ShardStateStuff,
+        committee: &[ValidatorDescr],
         bs_params: consensus_common::BlockSyncOverlayParams,
         use_quic: bool,
         proto_version: u32,
     ) -> Result<()> {
-        // (1) Confirm we hold a key in any of prev/curr/next mc sets.
-        // Build the union and call `find_local_validator_key` (which scans
-        // our temp+permanent keys against ValidatorDescr pubkey hashes).
-        let config_params = mc_state.config_params()?;
-        let prev = config_params.prev_validator_set().unwrap_or_default();
-        let curr = config_params.validator_set()?;
-        let next = config_params.next_validator_set().unwrap_or_default();
-        let mut union: Vec<ValidatorDescr> = Vec::new();
-        union.extend(prev.list().iter().cloned());
-        union.extend(curr.list().iter().cloned());
-        union.extend(next.list().iter().cloned());
-        let all_keys = self.validator_list_status.get_all_local_keys();
-        let local_validator_key =
-            find_local_validator_key(&union, Some(&all_keys)).ok_or_else(|| {
-                error!("we hold no validator-class key in any of prev|curr|next mc sets")
+        // (1) The observer identity: a descriptor of the previous, current or
+        // next total set that is not a committee member and that this node
+        // holds, selected by custody (or a classical key for a classical one).
+        // One observer per session joins with the first selected identity.
+        let observers = self.local_observers(mc_state.config_params()?, committee)?;
+        let local_adnl_id =
+            observers.first().map(|observer| observer.adnl().clone()).ok_or_else(|| {
+                error!(
+                    "this node holds no descriptor of a previous, current or next validator \
+                     outside this committee"
+                )
             })?;
-
-        // (2) Resolve the corresponding ADNL id from `union` so we can pick a
-        // local ADNL key the observer can join with. The ADNL id is whichever
-        // ValidatorDescr in `union` matches our local validator pubkey
-        let local_pkhash = local_validator_key.id().data();
-        let local_adnl_id = union
-            .iter()
-            .find(|v| v.compute_node_id_short().is_ok_and(|id| id.as_slice() == local_pkhash))
-            .map(|v| v.adnl_addr())
-            .transpose()?
-            .ok_or_else(|| error!("local pubkey not found in union (logic error)"))?;
 
         // (3) Resolve the ADNL KeyOption from the adnl node.
         let overlay_node = self
@@ -2797,7 +2931,7 @@ impl ValidatorManagerImpl {
         let full_validator_set = mc_state_extra.config.validator_set()?;
         let validator_list_id = match self.validator_list_status.curr.as_ref() {
             Some(list_id) => list_id.clone(),
-            None if self.has_authenticated_v2_transport(mc_state.config_params()?)? => {
+            None if self.custody_set_roles(mc_state.config_params()?)?.1 => {
                 compute_validator_list_id(full_validator_set.list(), None)?
                     .ok_or_else(|| error!("Authenticated current set is empty"))?
             }
@@ -2893,9 +3027,11 @@ impl ValidatorManagerImpl {
                 max_vertical_seqno,
             )?;
 
-            let local_id_option = self.find_us(&subset.validators);
+            // The reference node's get_validator_id at the caller's selection:
+            // custody decides membership, never a transport key this node holds.
+            let local_member = self.local_validator_id(&subset.validators);
 
-            if local_id_option.is_some() {
+            if local_member.is_some() {
                 // Track owned current subsets independently of whether this specific session
                 // is temporarily suppressed by the destroyed-session blacklist.
                 // Otherwise health classification can mislabel a missing owned current session
@@ -2945,39 +3081,36 @@ impl ValidatorManagerImpl {
                 }
             };
 
-            let authenticated = if consensus_options.as_simplex().is_some_and(|options|
-                options.protocol == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree)
-            {
-                self.authenticated_transport_key(mc_state.config_params()?, &subset.validators)?
-                    .map(|key| {
-                        use consensus_common::session_runtime::{AuthenticatedSessionRuntime, SessionNetworkPin};
-                        let runtime = AuthenticatedSessionRuntime::from_authenticated_config(
-                            SessionNetworkPin {
-                                global_id: mc_state.state()?.global_id(),
-                                zerostate: self.engine.zerostate_id()?.clone(),
-                            },
-                            mc_state.config_params()?,
-                            rtos_api::session_identity::SessionCoordinates {
-                                shard: &ident,
-                                catchain_seqno: cc_seqno,
-                                vertical_seqno: max_vertical_seqno,
-                                last_key_block_seqno: keyblock_seqno,
-                                new_catchain_ids: false,
-                            },
-                            vsubset.list().to_vec(),
-                            key.id().clone(),
-                        )?
-                        .bind_recovery_anchor(mc_state.block_id().clone())?;
-                        Ok::<_, anyhow::Error>((key, Arc::new(runtime)))
-                    }).transpose()?
-            } else { None };
-            if consensus_options.as_simplex().is_some_and(|options|
-                options.protocol == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree)
-                && authenticated.is_none() {
-                // No transport ownership, and no fallback to a PQ signing identity.
+            // The test emulator carries Simplex options but runs no Simplex session.
+            let simplex_protocol = match &consensus_options {
+                ConsensusOptions::Simplex(options) => Some(options.protocol),
+                _ => None,
+            };
+            let observers_in_overlay = simplex_protocol
+                == Some(
+                    consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree,
+                );
+            // Every Simplex session, of every protocol, is admitted from this
+            // authenticated snapshot: as the validator custody selected, or as
+            // an observer the reference observer selection admits.
+            let authenticated = match simplex_protocol {
+                Some(_) => self.simplex_session_runtime(
+                    mc_state,
+                    &ident,
+                    cc_seqno,
+                    max_vertical_seqno,
+                    keyblock_seqno,
+                    vsubset.list(),
+                    local_member.as_ref(),
+                    observers_in_overlay,
+                )?,
+                None => None,
+            };
+            if observers_in_overlay && authenticated.is_none() {
+                // Neither a member nor an authorized observer of this session.
                 continue;
             }
-            if let Some((_, runtime)) = &authenticated {
+            if let Some(runtime) = &authenticated {
                 if self.engine.finality_recovery_owns(runtime) {
                     // A recovery owner will wake this manager after checked join.
                     // Preserve any existing group during a reservation race;
@@ -3010,9 +3143,11 @@ impl ValidatorManagerImpl {
                 }
                 self.drain_retiring().await?;
             }
-            let session_key =
-                authenticated.as_ref().map(|(key, _)| key).or(local_id_option.as_ref());
-            if let Some(local_id) = session_key {
+            // A test emulator session over a classical committee is the only
+            // group created without an authenticated runtime.
+            let runs_group =
+                authenticated.is_some() || (simplex_protocol.is_none() && local_member.is_some());
+            if runs_group {
                 self.retire_observer(&session_id);
                 self.drain_retiring().await?;
                 log::debug!(
@@ -3062,11 +3197,20 @@ impl ValidatorManagerImpl {
                             ConsensusOptions::Emulator(_) => "emulator",
                             ConsensusOptions::Catchain(_) => "catchain",
                         };
+                        let Some((transport_key, signer)) = self.admit_session_group(
+                            &ident,
+                            vsubset.list(),
+                            local_member.as_ref(),
+                            authenticated.as_deref(),
+                            &consensus_options,
+                        ) else {
+                            continue;
+                        };
                         log::info!(target: "validator_manager",
                             "SESSION_LIFECYCLE: create_current shard={} cc_seqno={} \
                              session_id={:x} consensus={} local_key={}",
                             ident, cc_seqno, session_id, consensus_name,
-                            hex::encode(local_id.id().data()));
+                            hex::encode(transport_key.id().data()));
                         metrics::counter!(
                             "rtos_node_validator_session_created_total",
                             "consensus" => consensus_name
@@ -3075,7 +3219,7 @@ impl ValidatorManagerImpl {
                         self.cleanup.on_group_created(&session_id);
                         let group = ValidatorGroup::new(
                             general_session_info.clone(),
-                            local_id.clone(),
+                            transport_key,
                             session_id.clone(),
                             validator_list_id.clone(),
                             vsubset.clone(),
@@ -3085,10 +3229,14 @@ impl ValidatorManagerImpl {
                             allow_unsafe_self_blocks_resync,
                             block_sync_overlay_params.clone(),
                         );
-                        Arc::new(match &authenticated {
-                            Some((_, runtime)) => {
+                        let group = match &authenticated {
+                            Some(runtime) => {
                                 group.with_recovered_authenticated_runtime(runtime.clone()).await?
                             }
+                            None => group,
+                        };
+                        Arc::new(match signer {
+                            Some(signer) => group.with_consensus_signer(signer)?,
                             None => group,
                         })
                     }
@@ -3146,6 +3294,7 @@ impl ValidatorManagerImpl {
                             &ident,
                             &session_id,
                             mc_state,
+                            vsubset.list(),
                             bs_params.clone(),
                             use_quic,
                             proto_version,
@@ -3172,7 +3321,7 @@ impl ValidatorManagerImpl {
 
         // reap observers whose session_id wasn't touched this pass.
         // Triggers when we begin validating a previously-observed
-        // shard (the local_id_option arm fires instead of the observer arm)
+        // shard (the group arm fires instead of the observer arm)
         // or when the shard simply rotates out
         let stale_observer_ids: Vec<UInt256> = self
             .block_sync_observers
@@ -3210,8 +3359,9 @@ impl ValidatorManagerImpl {
             self.current_sessions.len(), self.future_sessions.len());
 
         let has_validator_key = self.update_validator_lists(&mc_state).await?;
-        let has_v2_transport = self.has_authenticated_v2_transport(mc_state.config_params()?)?;
-        if !has_validator_key && !has_v2_transport {
+        // Custody membership of the current or next set, and of any total set.
+        let (custody_active, custody_listed) = self.custody_set_roles(mc_state.config_params()?)?;
+        if !has_validator_key && !custody_listed {
             log::info!(target: "validator_manager",
                 "VALIDATION_STATUS: not a validator (not in prev/curr/next set), disabling");
             self.disable_validation(DisableReason::Retire).await?;
@@ -3221,10 +3371,11 @@ impl ValidatorManagerImpl {
         // Observer-only path: we hold a key in prev only (rotated out of curr/next).
         // Validator groups stay disabled, but the per-shard loop still runs so the
         // observer arm and the observer reaper at the bottom rotate session_ids
-        let observer_only =
-            self.validator_list_status.curr.is_none() && self.validator_list_status.next.is_none();
+        let observer_only = self.validator_list_status.curr.is_none()
+            && self.validator_list_status.next.is_none()
+            && !custody_active;
         if observer_only {
-            if has_v2_transport {
+            if custody_listed {
                 // Observer sessions still own their runtime and receive state, but
                 // must not advertise validator eligibility or acquire signer rights.
                 self.engine.set_will_validate(false);
@@ -3440,7 +3591,7 @@ impl ValidatorManagerImpl {
         // Iterate over shards and start all missing sessions
         log::trace!(target: "validator_manager", "Starting missing sessions");
         let validation_status = self.engine.validation_status();
-        if validation_status.allows_validate() || has_v2_transport {
+        if validation_status.allows_validate() || custody_listed {
             self.start_sessions(
                 new_shards,
                 &mut our_current_shards,
@@ -3466,8 +3617,9 @@ impl ValidatorManagerImpl {
                 mc_validators.append(&mut wc.validators.clone());
             }
 
-            let legacy_local_key = self.find_us_for_list(&wc.validators, next_val_list_id);
-            if legacy_local_key.is_some() || has_v2_transport {
+            // A future group exists only for a session this node is a member of,
+            // as custody selects it at this read of the custody clock.
+            if let Some(selected) = self.local_validator_id(&wc.validators) {
                 let max_vertical_seqno = self.engine.hardforks().len() as u32;
                 if self.is_accelerated_consensus_enabled_for_shard(mc_state_extra, &ident) {
                     fail!("accelerated consensus has not been admitted for the target protocol");
@@ -3532,44 +3684,27 @@ impl ValidatorManagerImpl {
                     }
                 };
 
-                let authenticated = if consensus_options.as_simplex().is_some_and(|options|
-                    options.protocol == consensus_common::simplex_protocol::SimplexProtocol::PrivateObserversPlumtree) {
-                    let Some(key) = self.authenticated_transport_key(mc_state.config_params()?, &wc.validators)? else { continue; };
-                    use consensus_common::session_runtime::{AuthenticatedSessionRuntime, SessionNetworkPin};
-                    let runtime = Arc::new(AuthenticatedSessionRuntime::from_authenticated_config(
-                        SessionNetworkPin { global_id: mc_state.state()?.global_id(), zerostate: self.engine.zerostate_id()?.clone() },
-                        mc_state.config_params()?,
-                        rtos_api::session_identity::SessionCoordinates { shard: ident, catchain_seqno: *next_cc_seqno,
-                            vertical_seqno: max_vertical_seqno, last_key_block_seqno: keyblock_seqno, new_catchain_ids: false },
-                        vsubset.list().to_vec(), key.id().clone(),
-                    )?.bind_recovery_anchor(mc_state.block_id().clone())?);
-                    Some((key, runtime))
-                } else { None };
+                let authenticated = match &consensus_options {
+                    ConsensusOptions::Simplex(_) => self.simplex_session_runtime(
+                        &mc_state,
+                        ident,
+                        *next_cc_seqno,
+                        max_vertical_seqno,
+                        keyblock_seqno,
+                        vsubset.list(),
+                        Some(&selected),
+                        false,
+                    )?,
+                    _ => None,
+                };
                 if authenticated
                     .as_ref()
-                    .is_some_and(|(_, runtime)| self.engine.finality_recovery_owns(runtime))
+                    .is_some_and(|runtime| self.engine.finality_recovery_owns(runtime))
                 {
                     continue;
                 }
-                let local_id = match &authenticated {
-                    Some((key, runtime)) => {
-                        if matches!(
-                            runtime.local_role(),
-                            consensus_common::session_runtime::LocalRole::Validator(_)
-                        ) {
-                            owned_future_shards += 1;
-                        }
-                        key.clone()
-                    }
-                    None => match legacy_local_key {
-                        Some(key) => {
-                            owned_future_shards += 1;
-                            key
-                        }
-                        None => continue,
-                    },
-                };
-                if let Some((_, runtime)) = &authenticated {
+                owned_future_shards += 1;
+                if let Some(runtime) = &authenticated {
                     if self.future_sessions.get(&session_id).is_some_and(|group| {
                         !group
                             .authenticated_runtime()
@@ -3593,6 +3728,15 @@ impl ValidatorManagerImpl {
                 let group = if let Some(group) = self.future_sessions.get(&session_id) {
                     group.clone()
                 } else {
+                    let Some((transport_key, signer)) = self.admit_session_group(
+                        ident,
+                        vsubset.list(),
+                        Some(&selected),
+                        authenticated.as_deref(),
+                        &consensus_options,
+                    ) else {
+                        continue;
+                    };
                     let consensus_name = match &consensus_options {
                         ConsensusOptions::Simplex(_) => "simplex",
                         #[cfg(test)]
@@ -3611,7 +3755,7 @@ impl ValidatorManagerImpl {
                     self.cleanup.on_group_created(&session_id);
                     let group = ValidatorGroup::new(
                         new_session_info,
-                        local_id,
+                        transport_key,
                         session_id.clone(),
                         next_val_list_id.clone(),
                         vsubset.clone(),
@@ -3621,8 +3765,14 @@ impl ValidatorManagerImpl {
                         self.config.unsafe_resync_catchains.contains(next_cc_seqno),
                         block_sync_overlay_params.clone(),
                     );
-                    let group = Arc::new(match &authenticated {
-                        Some((_, runtime)) => group.with_recovered_authenticated_runtime(runtime.clone()).await?,
+                    let group = match &authenticated {
+                        Some(runtime) => {
+                            group.with_recovered_authenticated_runtime(runtime.clone()).await?
+                        }
+                        None => group,
+                    };
+                    let group = Arc::new(match signer {
+                        Some(signer) => group.with_consensus_signer(signer)?,
                         None => group,
                     });
                     self.future_sessions.insert(session_id.clone(), group.clone());
@@ -4169,17 +4319,18 @@ fn spawn_validator_manager_with_startup_gate(
             target: "validator_manager",
             "checking if current node is a validator during {CHECK_VALIDATOR_TIMEOUT} secs"
         );
-        while !engine.get_validator_status() && match engine.consensus_transport_bindings() {
-            Ok(bindings) => bindings.is_empty(),
-            Err(error) => {
-                engine.report_service_failure(0, format!("Invalid consensus transport configuration: {error}"));
-                // No group or session has been created. This owner has finished;
-                // retain the failure, but do not leave a phantom live service.
-                engine.release_stop(Engine::MASK_SERVICE_VALIDATOR_MANAGER);
-                return;
-            }
-        } {
-            // With no current bindings there is no normal namespace to protect.
+        match engine.consensus_transport_bindings() {
+            Ok(bindings) if !bindings.is_empty() => log::warn!(target: "validator_manager",
+                "consensus_transport_bindings are configured but confer no consensus membership, \
+                 signer or transport identity; custody and the governing descriptors decide them"),
+            Ok(_) => {}
+            Err(error) => log::warn!(target: "validator_manager",
+                "consensus_transport_bindings are unreadable and are ignored: {error}"),
+        }
+        // A node that holds no classical validator key and no consensus key
+        // cannot be a member of any set.
+        while !engine.has_local_validator_keys() {
+            // With no local validator key there is no normal namespace to protect.
             startup_recovery_gate.take();
             log::trace!(target: "validator_manager", "Not a validator, waiting...");
             for _ in 0..CHECK_VALIDATOR_TIMEOUT {

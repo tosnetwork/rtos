@@ -828,6 +828,7 @@ impl ValidatorGroupImpl {
                         g.engine.trace_collector(),
                         g.durable_finality_sink.get().cloned(),
                         g.delivered_finality_sink.get().cloned().flatten(),
+                        g.consensus_signer.clone(),
                     );
                     return match created {
                         Ok(session) => Ok(session),
@@ -844,37 +845,10 @@ impl ValidatorGroupImpl {
                         }
                     };
                 }
-                let nodes = g
-                    .validator_set
-                    .list()
-                    .iter()
-                    .map(|member| {
-                        if matches!(member.key, rtos_block::ValidatorKey::Pq(_)) {
-                            simplex::SimplexSessionNode::from_descriptor(member)
-                        } else {
-                            validatordescr_to_session_node(member).map(Into::into)
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                let overlay_manager: ConsensusOverlayManagerPtr =
-                    Arc::new(ConsensusOverlayManagerImpl::new(
-                        g.engine.validator_network(),
-                        g.validator_list_id.clone(),
-                        block_sync_params_with_identity,
-                    ));
-                ConsensusFactory::create_simplex_based_session(
-                    simplex_options,
-                    &g.session_id,
-                    &g.shard,
-                    nodes,
-                    &g.local_key,
-                    db_root,
-                    g.general_session_info.catchain_seqno,
-                    overlay_manager,
-                    listener,
-                    g.engine.trace_collector(),
-                )
+                // There is no signer-less Simplex session: a session of either
+                // role is created only from the manager's authenticated runtime,
+                // and a validator session only with its custody signer.
+                fail!("A Simplex session requires the authenticated runtime of its admission")
             }
             #[cfg(test)]
             ConsensusOptions::Emulator(emulator_options) => {
@@ -1107,6 +1081,10 @@ pub struct ValidatorGroup {
     pq_session: std::result::Result<Option<rtos_api::pq_finality::PqSessionContext>, String>,
     authenticated_runtime:
         Option<Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>>,
+    /// The custody store that matches exactly the descriptor the committee
+    /// records for this node, selected once by the manager. A validator session
+    /// signs only with it; an observer group has none.
+    consensus_signer: Option<simplex::SessionSigner>,
     recovered_session_start: Option<(Vec<BlockIdExt>, BlockIdExt)>,
     namespace_admission: Mutex<NormalNamespaceAdmission>,
     durable_finality_sink:
@@ -1281,6 +1259,40 @@ impl ValidatorGroup {
         Ok(self)
     }
 
+    /// Attach the consensus signer the manager selected from custody. The group
+    /// must already carry its runtime, admitted as the validator the signer was
+    /// selected for, at the committee member whose descriptor records exactly
+    /// the signer's key.
+    pub fn with_consensus_signer(mut self, signer: simplex::SessionSigner) -> Result<Self> {
+        use consensus_common::session_runtime::LocalRole;
+        if self.consensus_signer.is_some() {
+            fail!("A selected consensus signer cannot be replaced");
+        }
+        let runtime = self.authenticated_runtime.as_ref().ok_or_else(|| {
+            error!("A consensus signer requires the group's authenticated runtime")
+        })?;
+        let LocalRole::Validator(index) = runtime.local_role() else {
+            fail!("An observer group takes no consensus signer");
+        };
+        let member = runtime
+            .committee()
+            .get(index as usize)
+            .ok_or_else(|| error!("Authenticated local validator index out of range"))?;
+        if &member.validator_id()? != signer.validator()
+            || member.pq_key().is_none()
+            || member.pq_key() != signer.descriptor().pq_key()
+        {
+            fail!("The consensus signer was selected for a different committee member");
+        }
+        self.consensus_signer = Some(signer);
+        Ok(self)
+    }
+
+    /// The consensus signer this group's validator session signs with, if any.
+    pub fn consensus_signer(&self) -> Option<&simplex::SessionSigner> {
+        self.consensus_signer.as_ref()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         general_session_info: Arc<GeneralSessionInfo>,
@@ -1348,21 +1360,10 @@ impl ValidatorGroup {
         } else {
             Ok(None)
         };
-        let local_identity = if matches!(&pq_session, Ok(Some(_))) {
-            validator_set
-                .list()
-                .iter()
-                .find(|v| {
-                    v.adnl_addr
-                        .as_ref()
-                        .is_some_and(|adnl| adnl.as_slice() == local_key.id().data())
-                })
-                .and_then(|v| consensus_common::ValidatorIdentity::from_descriptor(v).ok())
-        } else if matches!(&pq_session, Ok(None)) {
-            Some(local_key.clone().into())
-        } else {
-            None
-        };
+        // A post-quantum group learns its local identity only from the runtime
+        // the manager admitted it with, never from a transport key it holds.
+        let local_identity =
+            if matches!(&pq_session, Ok(None)) { Some(local_key.clone().into()) } else { None };
         ValidatorGroup {
             shard: general_session_info.shard.clone(),
             general_session_info,
@@ -1373,6 +1374,7 @@ impl ValidatorGroup {
             validator_set,
             pq_session,
             authenticated_runtime: None,
+            consensus_signer: None,
             recovered_session_start: None,
             durable_finality_sink: tokio::sync::OnceCell::new(),
             delivered_finality_sink: tokio::sync::OnceCell::new(),

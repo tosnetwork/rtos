@@ -1508,11 +1508,19 @@ impl EngineOperations for Engine {
         }
         if let consensus_common::session_runtime::LocalRole::Validator(index) = runtime.local_role()
         {
-            let identity = runtime.committee()[index as usize].validator_id()?;
-            if !self.consensus_transport_bindings()?.iter().any(|binding| {
-                binding.validator_id == identity && &binding.adnl_key_id == runtime.local_adnl()
-            }) {
-                fail!("Finality sink validator transport binding unavailable");
+            // The validator identity is this node's only if custody is
+            // configured for it; a transport binding confers nothing.
+            let member = runtime
+                .committee()
+                .get(index as usize)
+                .ok_or_else(|| error!("Finality sink validator index outside the committee"))?;
+            let identity = member.validator_id()?;
+            if self.pq_consensus_custody().is_none_or(|custody| custody.validator_id() != &identity)
+            {
+                fail!("Finality sink validator is not the one this node custodies keys for");
+            }
+            if &member.adnl_addr()? != runtime.local_adnl() {
+                fail!("Finality sink validator transport differs from its descriptor");
             }
         }
         Ok(self.ensure_publication_worker().await?.sink(runtime))

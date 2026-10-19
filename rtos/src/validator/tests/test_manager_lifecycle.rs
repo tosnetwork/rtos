@@ -26,6 +26,7 @@ struct LifecycleEngine {
     no_applied_mc: std::sync::atomic::AtomicBool,
     rotation: std::sync::Mutex<Option<BlockIdExt>>,
     fail_rotation: std::sync::atomic::AtomicBool,
+    custody: Option<Arc<crate::pq_consensus_config::PqCustodyShared>>,
 }
 
 struct StateGate {
@@ -110,6 +111,9 @@ impl EngineOperations for LifecycleEngine {
     }
     fn get_validator_status(&self) -> bool {
         !self.invalid_transport.load(Ordering::Acquire)
+    }
+    fn pq_consensus_custody(&self) -> Option<Arc<crate::pq_consensus_config::PqCustodyShared>> {
+        self.custody.clone()
     }
     fn consensus_transport_bindings(
         &self,
@@ -562,7 +566,10 @@ async fn test_manager_lifecycle_observer_callback_panic_retains_owner_until_join
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn test_manager_lifecycle_invalid_transport_releases_unstarted_owner() {
+async fn test_manager_lifecycle_transport_bindings_do_not_admit_a_node_without_keys() {
+    // No classical key, no custody, and an unreadable transport binding list:
+    // the binding neither admits the node nor fails it; the manager waits for
+    // a key until the engine stops.
     let engine = Arc::new(LifecycleEngine::default());
     engine.invalid_transport.store(true, Ordering::Release);
     let task = spawn_validator_manager(
@@ -571,15 +578,48 @@ async fn test_manager_lifecycle_invalid_transport_releases_unstarted_owner() {
         ValidatorManagerConfig::default(),
     )
     .unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(engine.invocations.load(Ordering::Relaxed), 0);
+    engine.stopping.store(true, Ordering::Release);
     tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
     assert!(engine.acquired.load(Ordering::Acquire));
     assert!(engine.released.load(Ordering::Acquire));
     assert_eq!(engine.invocations.load(Ordering::Relaxed), 0);
-    let terminal = tokio::time::timeout(Duration::from_secs(5), engine.stopper.clone().wait_stop())
-        .await
-        .expect("invalid startup retained a live manager mask");
-    assert!(terminal.unwrap_err().to_string().contains("invalid transport configuration"));
-    assert_eq!(engine.reported.lock().unwrap().len(), 1);
+    assert!(engine.reported.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_manager_lifecycle_custody_alone_admits_the_manager() {
+    // Holding only a consensus key, with no classical validator key, is a
+    // local validator key: the manager starts its invocations.
+    let store = Arc::new(rtos_pq_consensus::ConsensusKeyStore::from_seed(&[0xa7; 32], 0).unwrap());
+    let mut custody = rtos_pq_consensus::PqConsensusCustody::default();
+    custody.install(UInt256::from([0xa7; 32]), store, 0, 0).unwrap();
+    let engine = Arc::new(LifecycleEngine {
+        custody: Some(Arc::new(crate::pq_consensus_config::PqCustodyShared::new(
+            UInt256::from([0xa7; 32]),
+            custody,
+        ))),
+        ..Default::default()
+    });
+    engine.invalid_transport.store(true, Ordering::Release);
+    assert!(!engine.get_validator_status());
+    let task = spawn_validator_manager(
+        engine.clone(),
+        tokio::runtime::Handle::current(),
+        ValidatorManagerConfig::default(),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.invocations.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("custody did not admit the manager");
+    engine.stopping.store(true, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+    assert!(engine.released.load(Ordering::Acquire));
 }
 
 fn mc(seqno: u32) -> BlockIdExt {

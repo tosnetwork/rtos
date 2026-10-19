@@ -1,5 +1,10 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Offline preparation of a fresh mixed-network validator using public test seeds.
+//!
+//! The validator is configured as a production node is: its consensus seed in
+//! a private key file and the node configuration's `pq_consensus` section,
+//! which the node loads into custody at startup. No isolated signing profile
+//! is provisioned.
 use clap::Parser;
 use consensus_common::session_runtime::{
     AuthenticatedSessionRuntime, LocalRole, SessionNetworkPin,
@@ -31,16 +36,25 @@ struct Args {
     /// Also provision only the exact successor set committed in Genesis.
     #[arg(long)]
     include_genesis_successor: bool,
-    /// A finite offline custody deadline for this public test member.
+    /// A finite consensus key window end for this public test member: the
+    /// configured key's `expire_at`.
     #[arg(long)]
     signer_expire_at: Option<u32>,
 }
 
+/// The configured window end of the key: 0 (never) unless an explicit future
+/// deadline a node configuration can state is given.
 fn signer_expiry(explicit: Option<u32>, now: u64) -> anyhow::Result<u32> {
     match explicit {
-        None => Ok(u32::MAX),
-        Some(value) if value != u32::MAX && u64::from(value) > now && value != 0 => Ok(value),
-        _ => fail!("Explicit fixture signer expiry must be finite and in the future"),
+        None => Ok(0),
+        Some(value)
+            if value != 0
+                && u64::from(value) > now
+                && value <= rtos::pq_consensus_config::MAX_CONSENSUS_KEY_TIME =>
+        {
+            Ok(value)
+        }
+        _ => fail!("Explicit fixture signer expiry must be finite, in the future and at most 2147483647"),
     }
 }
 
@@ -49,12 +63,13 @@ mod expiry_tests {
     use super::*;
     #[test]
     fn explicit_custody_deadline_cannot_be_expired_or_unbounded() {
-        assert_eq!(signer_expiry(None, 100).unwrap(), u32::MAX);
+        assert_eq!(signer_expiry(None, 100).unwrap(), 0);
         assert_eq!(signer_expiry(Some(101), 100).unwrap(), 101);
-        for deadline in [0, 1, 99, 100, u32::MAX] {
+        assert_eq!(signer_expiry(Some(0x7fff_ffff), 100).unwrap(), 0x7fff_ffff);
+        for deadline in [0, 1, 99, 100, 0x8000_0000, u32::MAX] {
             assert!(signer_expiry(Some(deadline), 100).is_err());
         }
-        assert!(signer_expiry(Some(u32::MAX - 1), u64::from(u32::MAX)).is_err());
+        assert!(signer_expiry(Some(0x7fff_fffe), 0x7fff_ffff).is_err());
     }
 }
 
@@ -80,9 +95,7 @@ async fn main() -> anyhow::Result<()> {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())?;
     let root = args.configs.canonicalize()?;
     // Do not provision a running, previously used, or partially prepared node.
-    for name in
-        ["config.json", "node_db", "isolated-custody", "isolated-owner", "validator-prepared.json"]
-    {
+    for name in ["config.json", "node_db", "consensus-keys", "validator-prepared.json"] {
         if fs::symlink_metadata(root.join(name)).is_ok() {
             fail!("Fresh interop configuration required: {name} already exists");
         }
@@ -183,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
     // Bind the fresh database before creating any session namespaces. Hold the
     // same production network lock throughout offline provisioning.
     let _network_binding = rtos::DbNetworkBinding::acquire(&root.join("node_db"), &zero)?;
-    let custody = root.join("isolated-custody");
+    let custody = root.join("consensus-keys");
     create_private_directory(&custody)?;
     let key_file = custody.join("public-test-seed");
     let mut options = OpenOptions::new();
@@ -196,20 +209,36 @@ async fn main() -> anyhow::Result<()> {
     let mut file = options.open(&key_file)?;
     file.write_all(public_seed("seed", args.member).as_slice())?;
     file.sync_all()?;
-    let owner = root.join("isolated-owner");
-    create_private_directory(&owner)?;
-    if args.include_genesis_successor {
-        let successors = runtimes.iter().filter(|(phase, _)| *phase == "successor")
-            .map(|(_, runtime)| runtime.clone()).collect::<Vec<_>>();
-        if !successors.is_empty() {
-            let schedule_expiry = config.next_validator_set()?.utime_since().checked_add(600)
-                .ok_or_else(|| error!("Successor fixture expiry overflow"))?;
-            simplex::isolated_signing::provision_schedule(&successors, &root.join("node_db/catchains"),
-                &owner, &key_file, schedule_expiry.min(expire_at))?;
-        }
-    }
+    // The node loads exactly this binding into custody at startup; refuse to
+    // write one it would refuse.
+    let pq_consensus = rtos::pq_consensus_config::PqConsensusConfig {
+        validator_id: stable_id.clone(),
+        keys: vec![rtos_pq_consensus::ConfiguredKey {
+            key_file: key_file.clone(),
+            valid_from: 0,
+            expire_at,
+        }],
+    };
+    let loaded = rtos::pq_consensus_config::load_pq_consensus_config(
+        pq_consensus.clone(),
+        u32::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())
+            .unwrap_or(u32::MAX),
+    )?;
+    let key_id = loaded
+        .key_ids_by_file
+        .get(&key_file)
+        .copied()
+        .ok_or_else(|| error!("The prepared consensus key was not loaded"))?;
     let mut sessions = Vec::new();
     for (phase, runtime) in runtimes {
+        let LocalRole::Validator(index) = runtime.local_role() else {
+            fail!("Prepared session admits this member as observer");
+        };
+        if runtime.committee()[index as usize].pq_key().map(|key| *key.key_id.as_array())
+            != Some(key_id)
+        {
+            fail!("A scheduled committee records another consensus key for this member");
+        }
         let namespace = PathBuf::from(
             runtime.runtime_directory(
                 root.join("node_db/catchains")
@@ -217,24 +246,6 @@ async fn main() -> anyhow::Result<()> {
                     .ok_or_else(|| error!("Invalid configuration path"))?,
             )?,
         );
-        // Each independent test shard has its own explicit journal owner. Never
-        // reuse one single-session ownership record for MC and WC journals.
-        let shard_owner = owner.join(format!(
-            "{}-{}-{}-{}",
-            runtime.shard().workchain_id(),
-            runtime.shard().shard_prefix_with_tag(),
-            runtime.catchain_seqno(),
-            runtime.session_id().to_hex_string()
-        ));
-        create_private_directory(&shard_owner)?;
-        simplex::isolated_signing::provision(
-            &runtime,
-            &namespace,
-            &shard_owner,
-            &key_file,
-            1,
-            expire_at,
-        )?;
         sessions.push(serde_json::json!({"shard":runtime.shard().to_string(),
             "committee_phase":phase,"expire_at":expire_at,
             "masterchain":runtime.shard().is_masterchain(),
@@ -262,6 +273,9 @@ async fn main() -> anyhow::Result<()> {
     overlay["data"] = serde_json::to_value(&transport_json)?;
     node["validator_key_ring"][rtos_block::base64_encode(transport.id().data())] =
         serde_json::to_value(&transport_json)?;
+    node[rtos::pq_consensus_config::CONFIG_FIELD] = pq_consensus.to_json();
+    // Transport routing of recovered local publications still reads this
+    // binding; it confers no consensus membership, signer or transport identity.
     node["consensus_transport_bindings"] = serde_json::json!([{
         "validator_id":rtos_block::base64_encode(stable_id.as_slice()),
         "adnl_key_id":rtos_block::base64_encode(transport.id().data())}]);
@@ -271,7 +285,9 @@ async fn main() -> anyhow::Result<()> {
         serde_json::to_vec_pretty(&serde_json::json!({
             "public_test_member":args.member,"validator_id":stable_id.to_hex_string(),
             "local_adnl":hex::encode(transport.id().data()),"zerostate":zero.to_string(),
-            "sessions":sessions,"signer_expire_at":expire_at,"active_voting_qualified":false
+            "sessions":sessions,"signer_expire_at":expire_at,
+            "consensus_key_file":key_file,"consensus_key_id":hex::encode(key_id),
+            "active_voting_qualified":false
         }))?,
     )?;
     Ok(())

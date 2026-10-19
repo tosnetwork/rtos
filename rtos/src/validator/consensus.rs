@@ -559,83 +559,15 @@ impl ConsensusFactory {
     // Simplex-based session creation
     // -------------------------------------------------------------------------
 
-    /// Construct database path for simplex session.
-    ///
-    /// Path format matches C++ `bridge.cpp`:
-    /// `{db_root}/consensus/consensus.{workchain}.{shard_hex}.{cc_seqno}.{session_id_hex}/`
-    ///
-    /// # Arguments
-    ///
-    /// * `db_root` - Base database root directory
-    /// * `shard` - Shard identifier
-    /// * `catchain_seqno` - Catchain sequence number
-    /// * `session_id` - Session identifier
-    pub fn make_simplex_db_path(
-        db_root: &str,
-        shard: &ShardIdent,
-        catchain_seqno: u32,
-        session_id: &SessionId,
-    ) -> String {
-        consensus_common::simplex_protocol::SimplexNamespace {
-            protocol: Default::default(),
-            role: consensus_common::simplex_protocol::OverlayMemberRole::Validator(0),
-            shard,
-            catchain_seqno,
-            session_id,
-        }
-        .runtime_directory(db_root)
-        .expect("legacy validator namespace is admitted")
-    }
-
-    /// Create a simplex-based consensus session
-    ///
-    /// This is the primary method for creating simplex sessions.
-    ///
-    /// Returns a `SessionHolderPtr` for direct access to `SessionHolder` methods.
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_simplex_based_session<N: Into<simplex::SimplexSessionNode>>(
-        options: &SimplexSessionOptions,
-        session_id: &SessionId,
-        shard: &ShardIdent,
-        nodes: Vec<N>,
-        local_key: &PrivateKey,
-        db_root: String,
-        catchain_seqno: u32,
-        overlay_manager: ConsensusOverlayManagerPtr,
-        listener: SessionListenerPtr,
-        trace_collector: Option<simplex::TraceCollector>,
-    ) -> consensus_common::Result<SessionHolderPtr> {
-        let mut options = options.clone();
-        options.use_callback_thread = false;
-
-        options.validate()?;
-        let db_path = consensus_common::simplex_protocol::SimplexNamespace {
-            protocol: options.protocol,
-            role: consensus_common::simplex_protocol::OverlayMemberRole::Validator(0),
-            shard,
-            catchain_seqno,
-            session_id,
-        }
-        .runtime_directory(&db_root)?;
-
-        let simplex_session = Self::create_simplex_session(
-            &options,
-            session_id,
-            shard,
-            nodes,
-            local_key,
-            db_path,
-            overlay_manager,
-            listener,
-            trace_collector,
-            catchain_seqno,
-        )?;
-
-        Ok(Arc::new(SessionHolder::simplex(simplex_session)))
-    }
-
     /// Create from the manager's frozen authenticated config and role. Options
     /// may tune local timing but cannot change protocol domains or leader schedule.
+    ///
+    /// A validator session signs only with `signer`, the custody store the
+    /// manager selected for exactly this committee's descriptor of this node;
+    /// an observer session takes none. A configured isolated signing profile is
+    /// never combined with a custody signer, and is honoured only by a build
+    /// with the isolated-consensus-signing capability.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_simplex_authenticated_session(
         options: &SimplexSessionOptions,
         runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
@@ -646,43 +578,108 @@ impl ConsensusFactory {
         trace_collector: Option<simplex::TraceCollector>,
         delivery_sink: Option<consensus_common::finality_delivery::DurableFinalitySinkPtr>,
         delivered_sink: Option<simplex::finality_delivery::DeliveredCompletionSink>,
+        signer: Option<simplex::SessionSigner>,
     ) -> std::result::Result<SessionHolderPtr, simplex::SessionCreationFailure> {
-        options.validate_authenticated(&runtime).map_err(simplex::SessionCreationFailure::before_worker)?;
+        use simplex::SessionCreationFailure;
+        let refuse =
+            |message: &str| SessionCreationFailure::before_worker(rtos_block::error!("{message}"));
+        options.validate_authenticated(&runtime).map_err(SessionCreationFailure::before_worker)?;
         let mut options = options.clone();
         options.use_callback_thread = false;
         options.wait_for_db_init = true;
-        let db_path = runtime.runtime_directory(&db_root).map_err(simplex::SessionCreationFailure::before_worker)?;
+        let db_path =
+            runtime.runtime_directory(&db_root).map_err(SessionCreationFailure::before_worker)?;
         let isolated_profile = std::path::Path::new(&db_path).join("isolated-signing.json");
-        let isolated_schedule = std::path::Path::new(&db_path).parent()
-            .ok_or_else(|| simplex::SessionCreationFailure::before_worker(rtos_block::error!("Missing runtime parent")))?
+        let isolated_schedule = std::path::Path::new(&db_path)
+            .parent()
+            .ok_or_else(|| refuse("Missing runtime parent"))?
             .join("isolated-signing-schedule.json");
-        let scheduled_validator = matches!(runtime.local_role(), consensus_common::session_runtime::LocalRole::Validator(_))
-            && isolated_schedule.try_exists().map_err(|e| simplex::SessionCreationFailure::before_worker(e.into()))?;
-        if scheduled_validator || isolated_profile.try_exists().map_err(|e| simplex::SessionCreationFailure::before_worker(e.into()))? {
-            #[cfg(feature = "isolated-consensus-signing")]
-            {
-                let session = simplex::SessionFactory::create_isolated_authenticated_session_checked(
-                    &options, runtime, local_transport_key, db_path, overlay_manager,
-                    listener, trace_collector, delivery_sink, delivered_sink,
-                )?;
-                return Ok(Arc::new(SessionHolder::simplex(session)));
+        let validator = matches!(
+            runtime.local_role(),
+            consensus_common::session_runtime::LocalRole::Validator(_)
+        );
+        let isolated_configured = (validator
+            && isolated_schedule
+                .try_exists()
+                .map_err(|e| SessionCreationFailure::before_worker(e.into()))?)
+            || isolated_profile
+                .try_exists()
+                .map_err(|e| SessionCreationFailure::before_worker(e.into()))?;
+        match (validator, signer) {
+            (true, Some(signer)) => {
+                if isolated_configured {
+                    return Err(refuse(
+                        "An isolated signing profile is configured for a session custody signs; \
+                         refusing to choose between them",
+                    ));
+                }
+                let session =
+                    simplex::SessionFactory::create_authenticated_validator_session_checked(
+                        &options,
+                        runtime,
+                        signer,
+                        local_transport_key,
+                        db_path,
+                        overlay_manager,
+                        listener,
+                        trace_collector,
+                        delivery_sink,
+                        delivered_sink,
+                    )?;
+                Ok(Arc::new(SessionHolder::simplex(session)))
             }
-            #[cfg(not(feature = "isolated-consensus-signing"))]
-            return Err(simplex::SessionCreationFailure::before_worker(rtos_block::error!(
-                "Isolated signing profile requires an explicit isolated-consensus-signing build")));
+            (false, Some(_)) => Err(refuse("An observer session takes no consensus signer")),
+            (_, None) if isolated_configured => {
+                #[cfg(feature = "isolated-consensus-signing")]
+                {
+                    let session =
+                        simplex::SessionFactory::create_isolated_authenticated_session_checked(
+                            &options,
+                            runtime,
+                            local_transport_key,
+                            db_path,
+                            overlay_manager,
+                            listener,
+                            trace_collector,
+                            delivery_sink,
+                            delivered_sink,
+                        )?;
+                    Ok(Arc::new(SessionHolder::simplex(session)))
+                }
+                #[cfg(not(feature = "isolated-consensus-signing"))]
+                Err(refuse("Isolated signing profile requires an explicit isolated-consensus-signing build"))
+            }
+            (true, None) => {
+                Err(refuse("A validator session requires its consensus signer from custody"))
+            }
+            (false, None) => {
+                let session = if let Some(delivered) = delivered_sink {
+                    simplex::SessionFactory::create_authenticated_session_with_delivered_checked(
+                        &options,
+                        runtime,
+                        local_transport_key,
+                        db_path,
+                        overlay_manager,
+                        listener,
+                        trace_collector,
+                        delivery_sink,
+                        delivered,
+                    )?
+                } else {
+                    simplex::SessionFactory::create_authenticated_session_checked(
+                        &options,
+                        runtime,
+                        local_transport_key,
+                        db_path,
+                        overlay_manager,
+                        listener,
+                        trace_collector,
+                        delivery_sink,
+                    )?
+                };
+                Ok(Arc::new(SessionHolder::simplex(session)))
+            }
         }
-        let session = if let Some(delivered) = delivered_sink {
-            simplex::SessionFactory::create_authenticated_session_with_delivered_checked(
-                &options, runtime, local_transport_key, db_path, overlay_manager,
-                listener, trace_collector, delivery_sink, delivered,
-            )?
-        } else {
-            simplex::SessionFactory::create_authenticated_session_checked(
-                &options, runtime, local_transport_key, db_path, overlay_manager,
-                listener, trace_collector, delivery_sink,
-            )?
-        };
-        Ok(Arc::new(SessionHolder::simplex(session)))
     }
 
     /// Create a test-only Simplex-compatible session backed by ConsensusEmulator.
@@ -845,38 +842,6 @@ impl ConsensusFactory {
     /// Create empty block payload
     pub fn create_empty_block_payload() -> BlockPayloadPtr {
         catchain::CatchainFactory::create_empty_block_payload()
-    }
-
-    // -------------------------------------------------------------------------
-    // Simplex session creation - Phase 2
-    // -------------------------------------------------------------------------
-
-    /// Create a simplex consensus session
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_simplex_session<N: Into<simplex::SimplexSessionNode>>(
-        options: &SimplexSessionOptions,
-        session_id: &SessionId,
-        shard: &ShardIdent,
-        nodes: Vec<N>,
-        local_key: &PrivateKey,
-        db_path: String,
-        overlay_manager: ConsensusOverlayManagerPtr,
-        listener: SessionListenerPtr,
-        trace_collector: Option<simplex::TraceCollector>,
-        catchain_seqno: u32,
-    ) -> consensus_common::Result<SimplexSessionPtr> {
-        simplex::SessionFactory::create_session(
-            options,
-            session_id,
-            shard,
-            nodes,
-            local_key,
-            db_path,
-            overlay_manager,
-            listener,
-            trace_collector,
-            catchain_seqno,
-        )
     }
 }
 
